@@ -12,8 +12,12 @@ import unittest
 from unittest import mock
 
 import loop_manager
+from loop_manager_internal.catalog import execplan_catalog
 from tests.support.git import isolated_git_test
-from loop_manager_internal.storage import maintenance_state, planning_publication_state, planning_input_state
+from loop_manager_internal.storage import (
+    execplan_catalog_state, maintenance_state, planning_publication_state,
+    planning_input_state,
+)
 from loop_manager_internal.maintenance.maintenance_planning import PlanRevision, ReadyPlanSnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion, MutableReadySnapshot, mutable_snapshot_token
 
@@ -267,6 +271,83 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
         self.assertEqual(row["status"], "READY")
         self.assertTrue(row["path"].startswith("docs/plans/archive/"))
+
+    def test_git_adapter_ignores_deleted_verified_merged_archive_for_dependencies(self):
+        original_path = self.paths["G-001"]
+        archived_path = "docs/plans/archive/[G-001] First.md"
+        original_file = self.repo / original_path
+        archive_file = self.repo / archived_path
+        archived_text = original_file.read_text(encoding="utf-8")
+        archive_file.parent.mkdir(parents=True)
+        archive_file.write_text(archived_text, encoding="utf-8", newline="\n")
+        original_file.unlink()
+        dependent_path = self.repo / self.paths["G-002"]
+        dependent_text = plan_text("G-002", "Second").replace(
+            "depends_on: []", "depends_on:\n  - G-001",
+        )
+        dependent_path.write_text(dependent_text, encoding="utf-8", newline="\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "archive merged prerequisite")
+        archive_revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", archive_revision)
+        entry = execplan_catalog.snapshot_from_documents(
+            {archived_path: archived_text},
+        ).archived["G-001"]
+        self.connection.execute(
+            "UPDATE projects SET active_sha=? WHERE repo=?",
+            (archive_revision, str(self.repo)),
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET path=?, status='MERGED', content_hash=?, "
+            "current_revision_sha=? WHERE repo=? AND plan_id='G-001'",
+            (archived_path, entry.content_hash, archive_revision,
+             str(self.repo)),
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET depends_on=?, content_hash=?, current_revision_sha=? "
+            "WHERE repo=? AND plan_id='G-002'",
+            (json.dumps(["G-001"]), hashlib.sha256(dependent_text.encode()).hexdigest(),
+             archive_revision, str(self.repo)),
+        )
+        execplan_catalog_state.CatalogStateRepository(self.connection).record(
+            str(self.repo), entry,
+            original_path=original_path,
+            original_content_hash=entry.content_hash,
+            plan_sha=self.base,
+            proof=execplan_catalog_state.MergeProof(
+                True, kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
+                plan_sha=self.base, publication_content_hash=entry.content_hash,
+                revision=archive_revision,
+            ),
+            diagnostic=None, identity_verified=True,
+        )
+        self.connection.commit()
+        adopted = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        self.assertTrue(adopted.usable)
+
+        archive_file.unlink()
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "remove merged archive document")
+        deletion_revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", deletion_revision)
+        self.connection.execute(
+            "UPDATE projects SET active_sha=? WHERE repo=?",
+            (deletion_revision, str(self.repo)),
+        )
+        self.connection.commit()
+
+        result = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+
+        self.assertTrue(result.usable)
+        self.assertNotIn("G-002", result.withheld_plan_ids)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM execplan_catalog_holds WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        ).fetchone())
 
     def test_remote_deletion_started_history_and_dependents_are_scoped(self):
         result, _ = self._remote_deletion(started=True, new_plan=True)
@@ -850,6 +931,39 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertFalse(loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main").withheld_plan_ids)
         self.assertEqual(snapshot.recovery_goals, loop_manager._planning_result_from_manifest(loop_manager._planning_result_manifest(result)).mutable_snapshot.recovery_goals)
 
+        evidence = json.loads(row["recovery_evidence"])
+        prior_resolution = evidence["resolved"]["G-002"]
+        path = self.repo / self.paths["G-002"]
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\nSee G-001 for historical context.\n",
+            encoding="utf-8", newline="\n",
+        )
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "reintroduce cancelled prerequisite reference")
+        observed_revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", observed_revision)
+        self.connection.execute(
+            "UPDATE projects SET active_sha=? WHERE repo=?",
+            (observed_revision, str(self.repo)),
+        )
+        self.connection.commit()
+
+        reopened = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        current_evidence = json.loads(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE repo=? AND plan_id='G-001'",
+            (str(self.repo),),
+        ).fetchone()[0])
+
+        self.assertEqual(set(reopened.withheld_plan_ids), {"G-002"})
+        self.assertNotIn("G-002", current_evidence["resolved"])
+        self.assertEqual(current_evidence["resolution_history"]["G-002"], [prior_resolution])
+        goal = next(json.loads(raw) for raw in loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, observed_revision,
+        ).recovery_goals if json.loads(raw)["id"] == "G-001")
+        self.assertEqual(goal["affected_ids"], ["G-002"])
+
     def test_remote_deletion_snapshot_race_preserves_audit_and_held_graph(self):
         self._remote_deletion()
         snapshot, validate = self._recovery_result()
@@ -968,6 +1082,82 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         body = plan_text("G-007", "Independent").replace("depends_on: []", "depends_on:\n  - G-001")
         self._assert_new_plan_deletion_reference(body)
 
+    def test_rowless_cancellation_reference_recovers_original_identity_and_text(self):
+        self._remote_deletion(dependent=False, new_plan=True)
+        self.connection.execute(
+            "UPDATE execplan_cancellations SET recovery_evidence=NULL WHERE plan_id='G-001'"
+        )
+        body = plan_text("G-007", "Independent").replace(
+            "depends_on: []", "depends_on:\n  - G-001",
+        )
+        (self.repo / "docs/plans/[G-007] Independent.md").write_text(
+            body, encoding="utf-8", newline="\n",
+        )
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "reference cancelled prerequisite")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        self.connection.execute("UPDATE projects SET active_sha=?", (self.base,))
+        self.connection.commit()
+
+        result = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        evidence = json.loads(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'"
+        ).fetchone()[0])
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base,
+        )
+
+        self.assertEqual(set(result.withheld_plan_ids), {"G-007"})
+        self.assertIn("Implement First", evidence["text"])
+        self.assertEqual(evidence["identity"]["id"], "G-001")
+        self.assertEqual(evidence["identity"]["path"], self.paths["G-001"])
+        self.assertIsNone(evidence["unknown_reason"])
+        goal = next(json.loads(raw) for raw in snapshot.recovery_goals
+                    if json.loads(raw)["id"] == "G-001")
+        self.assertEqual(goal["affected_ids"], ["G-007"])
+
+    def test_unverifiable_rowless_cancellation_holds_only_current_references(self):
+        self._remote_deletion(dependent=False, new_plan=True)
+        self.connection.execute(
+            "UPDATE execplan_cancellations SET recovery_evidence=NULL, plan_sha='unknown' "
+            "WHERE plan_id='G-001'"
+        )
+        dependent = plan_text("G-007", "Independent").replace(
+            "depends_on: []", "depends_on:\n  - G-001",
+        )
+        (self.repo / "docs/plans/[G-007] Independent.md").write_text(
+            dependent, encoding="utf-8", newline="\n",
+        )
+        (self.repo / "docs/plans/[G-008] Unrelated.md").write_text(
+            plan_text("G-008", "Unrelated"), encoding="utf-8", newline="\n",
+        )
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "reference unverifiable cancellation")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        self.connection.execute("UPDATE projects SET active_sha=?", (self.base,))
+        self.connection.commit()
+
+        result = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        evidence = json.loads(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'"
+        ).fetchone()[0])
+        unrelated = self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo=? AND plan_id='G-008'", (str(self.repo),),
+        ).fetchone()
+
+        self.assertEqual(set(result.withheld_plan_ids), {"G-007"})
+        self.assertEqual(evidence["text"], "")
+        self.assertIsNotNone(evidence["unknown_reason"])
+        self.assertEqual(evidence["affected"], ["G-007"])
+        self.assertIsNotNone(unrelated)
+        self.assertEqual(unrelated["status"], "READY")
+
     def _assert_new_plan_deletion_reference(self, body):
         result, remote_deletions = self._remote_deletion(dependent=False, new_plan_text=body)
         self.assertEqual(set(result.withheld_plan_ids), {"G-007"})
@@ -994,6 +1184,103 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
     def test_remote_deletion_new_missing_priority_preserves_pending_goal(self):
         body = plan_text("G-007", "Independent").replace("priority: normal\n", "") + "\nUse G-001.\n"
         self._assert_pending_deletion_goal_survives_correction(body)
+
+    def test_rowless_hold_deletion_and_later_reference_is_reobserved(self):
+        from loop_manager_internal.catalog import remote_deletions
+
+        held_path = "docs/plans/[G-008] Held.md"
+        held_body = plan_text("G-008", "Held").replace("priority: normal\n", "")
+        (self.repo / held_path).write_text(held_body, encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "add invalid pre-registration plan")
+        original_revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", original_revision)
+        self.connection.execute("UPDATE projects SET active_sha=?", (original_revision,))
+        self.connection.commit()
+        registered = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        self.assertTrue(registered.usable)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE repo=? AND plan_id='G-008'", (str(self.repo),),
+        ).fetchone())
+        self.assertIsNotNone(self.connection.execute(
+            "SELECT 1 FROM execplan_catalog_holds WHERE repo=? AND plan_id='G-008'", (str(self.repo),),
+        ).fetchone())
+
+        (self.repo / held_path).unlink()
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "delete held pre-registration plan")
+        deletion_revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", deletion_revision)
+        self.connection.execute("UPDATE projects SET active_sha=?", (deletion_revision,))
+        self.connection.commit()
+        deleted = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        self.assertTrue(deleted.usable)
+        held = json.loads(self.connection.execute(
+            "SELECT evidence FROM execplan_catalog_holds WHERE repo=? AND plan_id='G-008'",
+            (str(self.repo),),
+        ).fetchone()[0])
+        first_observation = held["deleted_goal"]
+        self.assertEqual(first_observation["text"], held_body)
+        self.assertEqual(first_observation["original_revision"], original_revision)
+        self.assertEqual(first_observation["observed_revision"], deletion_revision)
+        self.assertIn("삭제 의도를 확인할 수 없습니다", first_observation["unknown_reason"])
+
+        dependent_body = plan_text("G-009", "Dependent").replace(
+            "depends_on: []", "depends_on:\n  - G-008",
+        )
+        dependent_path = "docs/plans/[G-009] Dependent.md"
+        (self.repo / dependent_path).write_text(dependent_body, encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "add reference to deleted held plan")
+        reference_revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", reference_revision)
+        self.connection.execute("UPDATE projects SET active_sha=?", (reference_revision,))
+        self.connection.commit()
+        referenced = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        self.assertTrue(referenced.usable)
+        self.assertIsNotNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE repo=? AND plan_id='G-009'", (str(self.repo),),
+        ).fetchone())
+
+        goal = next(json.loads(raw) for raw in remote_deletions.recovery_goals(
+            self.connection, str(self.repo),
+        ) if json.loads(raw)["id"] == "G-008")
+        self.assertEqual(goal["kind"], "missing-plan")
+        self.assertEqual(goal["path"], held_path)
+        self.assertEqual(goal["deletion_revision"], deletion_revision)
+        self.assertEqual(goal["affected_ids"], ["G-009"])
+        evidence = json.loads(goal["evidence"])
+        self.assertEqual(evidence["text"], held_body)
+        self.assertEqual(evidence["row"]["plan_id"], "G-008")
+        self.assertEqual(evidence["row"]["path"], held_path)
+        self.assertEqual(evidence["observed_revision"], deletion_revision)
+        self.assertEqual(evidence["last_observed_revision"], reference_revision)
+        self.assertIn("삭제 의도를 확인할 수 없습니다", evidence["unknown_reason"])
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, reference_revision,
+        )
+        prompt_goal = next(item for item in json.loads(snapshot.prompt_payload())["deleted_goals"]
+                           if item["id"] == "G-008")
+        self.assertEqual(prompt_goal["text"], held_body)
+        self.assertEqual(prompt_goal["unknown_reason"], evidence["unknown_reason"])
+        self.assertEqual(prompt_goal["plan_revision"], original_revision)
+
+        repeated = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        self.assertTrue(repeated.usable)
+        repeated_goal = next(json.loads(raw) for raw in remote_deletions.recovery_goals(
+            self.connection, str(self.repo),
+        ) if json.loads(raw)["id"] == "G-008")
+        self.assertEqual(repeated_goal["deletion_revision"], deletion_revision)
+        self.assertEqual(repeated_goal["affected_ids"], ["G-009"])
+        self.assertEqual(json.loads(repeated_goal["evidence"])["text"], held_body)
 
     def test_remote_deletion_new_missing_source_preserves_pending_goal(self):
         (self.repo / "docs/requirements/R.md").unlink()
@@ -1022,6 +1309,35 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
             self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-008'").fetchone())
             self.assertEqual(loop_manager.select_ready_execplan(self.connection, str(self.repo))["plan_id"], "G-002")
+
+    def test_remote_deletion_pending_hold_rejects_changed_plan_path(self):
+        body = plan_text("G-007", "Independent").replace("depends_on: []", "depends_on:\n  - G-008") + "\nUse G-001.\n"
+        (self.repo / "docs/plans/[G-007] Independent.md").write_text(body, encoding="utf-8")
+        (self.repo / "docs/plans/[G-008] Invalid.md").write_text(
+            plan_text("G-008", "Invalid").replace("priority: normal\n", ""), encoding="utf-8")
+        (self.repo / self.paths["G-001"]).unlink()
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "delete prerequisite and add held plans")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        observed = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertTrue(observed.usable)
+        self.assertEqual(set(observed.withheld_plan_ids), {"G-007", "G-008"})
+
+        old_path = self.repo / "docs/plans/[G-007] Independent.md"
+        new_path = self.repo / "docs/plans/[G-007] Renamed.md"
+        old_path.unlink()
+        renamed_body = plan_text("G-007", "Renamed").replace(
+            "depends_on: []", "depends_on:\n  - G-008",
+        ) + "\nUse G-001.\n"
+        new_path.write_text(renamed_body, encoding="utf-8")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "move held plan to a different identity path")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        rejected = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertFalse(rejected.usable)
+        self.assertEqual(rejected.diagnostic.code, "unknown-plan-id")
 
     def _assert_pending_deletion_goal_survives_correction(self, body, *, extra_held=frozenset()):
         result, remote_deletions = self._remote_deletion(dependent=False, new_plan_text=body)

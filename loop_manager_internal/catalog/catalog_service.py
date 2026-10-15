@@ -127,6 +127,7 @@ def revision_execplan_snapshot(
     revision: str,
     *,
     archive_conflict_plan_ids: frozenset[str] = frozenset(),
+    satisfied_dependencies: frozenset[str] = frozenset(),
     isolate_errors: bool = False,
 ) -> execplan_catalog.ExecPlanCatalogSnapshot:
     """Read and fully validate active/archive plans from one immutable tree."""
@@ -194,6 +195,7 @@ def revision_execplan_snapshot(
         invalid_plan_entries=invalid_plan_entries,
         revision_sha=revision_sha,
         archive_conflict_plan_ids=archive_conflict_plan_ids,
+        satisfied_dependencies=satisfied_dependencies,
         isolate_errors=isolate_errors,
     )
 
@@ -268,12 +270,14 @@ class _GitCatalogDefinitionPort:
         remote_ref: str,
         archive_conflict_plan_ids: Callable[[], frozenset[str]],
         pinned_revision: str | None = None,
+        satisfied_dependencies: frozenset[str] = frozenset(),
     ):
         self._effects = effects
         self.repo = repo
         self.remote_ref = remote_ref
         self.archive_conflict_plan_ids = archive_conflict_plan_ids
         self.pinned_revision = pinned_revision
+        self.satisfied_dependencies = satisfied_dependencies
         self.loaded: execplan_catalog_state.PinnedCatalog | None = None
 
     def current_revision(self) -> str:
@@ -293,6 +297,7 @@ class _GitCatalogDefinitionPort:
                 self.repo,
                 revision_sha,
                 archive_conflict_plan_ids=self.archive_conflict_plan_ids(),
+                satisfied_dependencies=self.satisfied_dependencies,
                 isolate_errors=True,
             )
         except execplan_catalog.ExecPlanCatalogError as error:
@@ -430,6 +435,7 @@ def reconcile_execplan_catalog(
             connection, repo_path, repo, remote_sha or port.current_revision(),
         ),
         pinned_revision=remote_sha,
+        satisfied_dependencies=execplan_catalog_state.verified_historical_merge_ids(connection, repo),
     )
     # The Git adapter proves a real deletion against the last adopted bytes.
     # Fake/alternate ports may already provide their own pinned evidence.
@@ -448,6 +454,15 @@ def reconcile_execplan_catalog(
             references = remote_deletions.reference_issues(
                 connection, repo, repo_path, pinned, git_bytes=port._effects.git_bytes,
             )
+            pinned = replace(pinned, rowless_hold_deletions=remote_deletions.rowless_hold_deletion_evidence(
+                connection, repo, repo_path, pinned, references, git_bytes=port._effects.git_bytes,
+            ))
+            port.loaded = pinned
+            pinned = replace(pinned, cancellation_recovery=remote_deletions.cancellation_recovery_evidence(
+                connection, repo, repo_path, pinned, references,
+                git=effects.git, git_bytes=port._effects.git_bytes,
+            ))
+            port.loaded = pinned
             port.loaded = replace(pinned, deletions=remote_deletions.prove_deletions(
                 connection, repo, repo_path, pinned, git=effects.git,
                 git_bytes=port._effects.git_bytes, references=references, pr_for_branch=effects.pr_for_branch,

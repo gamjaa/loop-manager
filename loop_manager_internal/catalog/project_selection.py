@@ -1,6 +1,6 @@
 """catalog project selection boundaries and named composition effects."""
 from __future__ import annotations
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import CatalogScheduleDecision
 from loop_manager_internal.catalog.effective_priority import effective_priorities
@@ -154,7 +154,7 @@ class PrerequisiteValidationRowsEffects:
 
 def prerequisite_validation_rows(
     effects: PrerequisiteValidationRowsEffects, connection: sqlite3.Connection, repo: str
-) -> list[sqlite3.Row]:
+) -> list[Mapping[str, object]]:
     """Load active plans and only their verified, merged dependency closure."""
 
     effects._ensure_execplans_schema(connection)
@@ -166,6 +166,7 @@ def prerequisite_validation_rows(
         (repo,),
     ).fetchall()
     held = scoped_blocking.catalog_held_plan_ids(connection, repo)
+    verified_history = execplan_catalog_state.verified_historical_merge_ids(connection, repo)
     active = [row for row in active if str(row["plan_id"]) not in held]
     included = {str(row["plan_id"]): row for row in active}
     pending = list(active)
@@ -192,6 +193,11 @@ def prerequisite_validation_rows(
                 (repo, dependency),
             ).fetchone()
             if row is None:
+                if dependency in verified_history:
+                    included[dependency] = (
+                        execplan_catalog_state.verified_historical_merge_row(dependency)
+                    )
+                    continue
                 raise MaintenanceOrchestrationError(
                     f"선행 후보의 dependency가 catalog에 없습니다: {plan_id} -> {dependency}"
                 )
@@ -245,8 +251,6 @@ def prerequisite_validation_rows(
             included[dependency] = row
             pending.append(row)
     return list(included.values())
-
-
 @dataclass(frozen=True)
 class CatalogScheduleDecisionEffects:
     """Named effects for catalog_schedule_decision; no entry-point/module access."""
@@ -299,19 +303,14 @@ def catalog_schedule_decision(
     rows = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
     ).fetchall()
-    historical_confirmation = {
-        str(row["plan_id"]): bool(row["merge_confirmed"]) and not row["diagnostic_code"]
-        for row in connection.execute(
-            """
-            SELECT plan_id, merge_confirmed, diagnostic_code
-            FROM execplan_catalog_history
-            WHERE repo = ?
-              AND currently_archived = 1
-            """,
-            (repo,),
-        ).fetchall()
+    verified_history = execplan_catalog_state.verified_historical_merge_ids(connection, repo)
+    historical_ids = {
+        str(row[0]) for row in connection.execute(
+            "SELECT plan_id FROM execplan_catalog_history "
+            "WHERE repo = ? AND currently_archived = 1", (repo,),
+        )
     }
-    historical_ids = set(historical_confirmation)
+    historical_confirmation = {key: key in verified_history for key in historical_ids}
     project_is_blocked = scoped_blocking.project_block(connection, repo) is not None
     statuses = {
         row["plan_id"]: (
@@ -322,6 +321,7 @@ def catalog_schedule_decision(
         )
         for row in rows
     }
+    statuses.update({key: "MERGED" for key in verified_history if key not in statuses})
     held = scoped_blocking.catalog_held_plan_ids(connection, repo)
     drafts = execplan_draft_state.pending_ids(connection, repo)
     ready = [
@@ -337,7 +337,12 @@ def catalog_schedule_decision(
             and row["status"] == "MERGED"
         ))
     ]
-    priorities = effective_priorities(execution_rows)
+    row_ids = {str(row["plan_id"]) for row in rows}
+    missing_history_rows = [
+        execplan_catalog_state.verified_historical_merge_row(plan_id)
+        for plan_id in sorted(verified_history - row_ids)
+    ]
+    priorities = effective_priorities(execution_rows, verified_history)
     candidates = []
     for row in ready:
         if str(row["plan_id"]) not in priorities:
@@ -362,8 +367,10 @@ def catalog_schedule_decision(
             if dependents.issubset(affected):
                 break
             affected.update(dependents)
-        priorities = effective_priorities([row for row in execution_rows
-                                           if str(row["plan_id"]) not in affected])
+        priorities = effective_priorities(
+            [row for row in execution_rows if str(row["plan_id"]) not in affected],
+            verified_history,
+        )
         candidates = [row for row in candidates if str(row["plan_id"]) in priorities]
         if active is None and not project_is_blocked and candidates:
             selected = min(candidates, key=lambda row: priorities[str(row["plan_id"])].sort_key(str(row["plan_id"])))
@@ -372,7 +379,10 @@ def catalog_schedule_decision(
         maintenance_state.MaintenancePhase.REFACTORING,
         maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
     }:
-        selected = effects.select_cycle_ready_execplan(execution_rows, cycle, catalog_rows=rows)
+        selected = effects.select_cycle_ready_execplan(
+            [*execution_rows, *missing_history_rows], cycle,
+            catalog_rows=[*rows, *missing_history_rows],
+        )
     elif active is None and not project_is_blocked and effects.assessment_can_yield(cycle):
         resumable = [row for row in candidates if not effects.is_unowned_ready(row)]
         if resumable:

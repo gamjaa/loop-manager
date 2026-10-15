@@ -8,6 +8,7 @@ from loop_manager_internal.application.contracts import RequirementArchiveError
 from loop_manager_internal.catalog import requirement_archive
 from loop_manager_internal.git import command_adapter
 from loop_manager_internal.runtime.contracts import GitLockError
+from loop_manager_internal.storage import execplan_catalog_state
 from pathlib import Path
 import json
 import sqlite3
@@ -131,12 +132,14 @@ def _revision_execplan_catalog(
     revision: str,
     *,
     archive_conflict_plan_ids: frozenset[str] = frozenset(),
+    satisfied_dependencies: frozenset[str] = frozenset(),
 ) -> dict[str, dict[str, object]]:
     try:
         snapshot = effects.revision_execplan_snapshot(
             repo_path,
             revision,
             archive_conflict_plan_ids=archive_conflict_plan_ids,
+            satisfied_dependencies=satisfied_dependencies,
         )
     except GitLockError:
         raise
@@ -189,6 +192,9 @@ def requirement_archive_snapshot(
             raise RequirementArchiveError(
                 f"ExecPlan {plan_id}의 source 관계 또는 상태를 확정할 수 없습니다."
             )
+    verified_history = execplan_catalog_state.verified_historical_merge_ids(connection, repo)
+    for plan_id in verified_history - set(states):
+        states[plan_id] = {"plan_id": plan_id, "status": "MERGED"}
     catalog = effects._revision_execplan_catalog(
         repo_path,
         revision,
@@ -196,7 +202,18 @@ def requirement_archive_snapshot(
             plan_id for plan_id, row in states.items()
             if str(row["status"]) == "MERGED"
         ),
+        satisfied_dependencies=verified_history,
     )
+    for plan_id in verified_history - set(catalog):
+        audit = connection.execute(
+            "SELECT observed_path FROM execplan_catalog_history WHERE repo=? AND plan_id=?",
+            (repo, plan_id),
+        ).fetchone()
+        catalog[plan_id] = {
+            "id": plan_id, "title": plan_id, "path": str(audit[0]),
+            "sources": [], "depends_on": [], "complexity": None, "risk": None,
+            "priority": "normal", "content_hash": "",
+        }
     historical_rows = connection.execute(
         "SELECT plan_id, merge_confirmed, diagnostic_code FROM execplan_catalog_history "
         "WHERE repo = ? AND currently_archived = 1",

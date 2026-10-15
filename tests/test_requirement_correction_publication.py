@@ -413,6 +413,19 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         self.assertIsNone(self.publisher.dispatch('main'))
         self.assertEqual((self.observations.commits, self.observations.pushes), (1, 1))
 
+    def test_confirmed_correction_result_deletion_keeps_audit_and_allows_independent_review(self):
+        commit = self.publisher.dispatch('main')
+        self.observations.add_tree('deleted-result', {A: requirement('A')})
+        self.observations.parents['deleted-result'] = commit
+        self.observations.remote = 'deleted-result'
+
+        self.assertIsNone(self.publisher.dispatch('main'))
+        confirmed = self.publisher.repository.confirmed('repo')
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]['commit_oid'], commit)
+        self.assertNotIn(NEW, self.observations.trees['deleted-result'])
+        self.assertEqual((self.observations.commits, self.observations.pushes), (1, 1))
+
     def test_manual_preparation_gate_reads_durable_correction_reservation(self):
         from types import SimpleNamespace
         from loop_manager_internal.application.manual_concurrency import preparation_gate

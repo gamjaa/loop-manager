@@ -371,10 +371,14 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
             ),
         )
 
-        def snapshot(_repo, _revision, *, archive_conflict_plan_ids):
+        def snapshot(
+            _repo, _revision, *, archive_conflict_plan_ids,
+            satisfied_dependencies,
+        ):
             return execplan_catalog.snapshot_from_documents(
                 documents,
                 archive_conflict_plan_ids=archive_conflict_plan_ids,
+                satisfied_dependencies=satisfied_dependencies,
             )
 
         oid = "1" * 40
@@ -439,6 +443,23 @@ class ScopedCatalogParsingTest(unittest.TestCase):
         with self.assertRaises(execplan_catalog.ExecPlanCatalogError):
             execplan_catalog.snapshot_from_documents(
                 documents, validate_sources=True, available_regular_paths={'docs/PRODUCT.md'})
+
+    def test_archived_source_absence_and_verified_history_dependency_are_historical(self):
+        snapshot = execplan_catalog.snapshot_from_documents(
+            {
+                'docs/plans/archive/[G-001] Archived.md': execplan_header(
+                    'G-001', 'Archived', sources=('docs/requirements/Deleted.md',)),
+                'docs/plans/[G-002] Current.md': plan_text(
+                    'G-002', 'Current', depends_on=('G-001',)),
+            },
+            validate_sources=True,
+            available_regular_paths={'docs/PRODUCT.md'},
+            satisfied_dependencies=frozenset({'G-001'}),
+            isolate_errors=True,
+        )
+        self.assertEqual(set(snapshot.archived), {'G-001'})
+        self.assertEqual(set(snapshot.active), {'G-002'})
+        self.assertEqual(snapshot.issues, ())
 
     def test_unique_invalid_metadata_and_dependency_cycles_remain_non_executable(self):
         for broken in (

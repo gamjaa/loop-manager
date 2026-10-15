@@ -9,6 +9,7 @@ from loop_manager_internal.catalog import execplan_catalog as catalog
 from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
 from loop_manager_internal.maintenance.maintenance_orchestration import is_unowned_ready
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+from loop_manager_internal.storage import execplan_catalog_state
 from loop_manager_internal.storage.planning_publication_state import _mutable_ready_cas_where
 
 
@@ -41,12 +42,44 @@ def mutable_row(connection, repo, plan_id):
 def reference_issues(connection, repo, repository, pinned, *, git_bytes):
     """Observe deletion impacts independently of cancellation eligibility."""
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
+    verified_merged_rows = execplan_catalog_state.verified_merged_archive_execution_ids(
+        connection, repo, rows,
+    )
     missing = {str(row["plan_id"]): str(row["path"]) for row in rows
-               if str(row["plan_id"]) not in pinned.snapshot.observed_ids}
-    if not missing:
-        return ()
+               if str(row["plan_id"]) not in pinned.snapshot.observed_ids
+               and str(row["plan_id"]) not in verified_merged_rows}
+    cancellations = connection.execute(
+        "SELECT * FROM execplan_cancellations WHERE repo=? ORDER BY plan_id", (repo,),
+    ).fetchall() if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'"
+    ).fetchone() else ()
+    holds = connection.execute(
+        "SELECT plan_id, revision_sha, evidence FROM execplan_catalog_holds "
+        "WHERE repo=? ORDER BY plan_id", (repo,),
+    ).fetchall() if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_holds'"
+    ).fetchone() else ()
+    for row in cancellations:
+        key = str(row["plan_id"])
+        if key not in pinned.snapshot.observed_ids:
+            missing.setdefault(key, str(row["path"]))
+    hold_evidence = {}
+    for row in holds:
+        key = str(row["plan_id"])
+        if key in pinned.snapshot.observed_ids:
+            continue
+        try:
+            evidence = json.loads(row["evidence"])
+        except (TypeError, ValueError) as error:
+            raise PlannerValidationError("catalog hold identity 근거 JSON이 유효하지 않습니다.") from error
+        path = evidence.get("path") if isinstance(evidence, dict) else None
+        if isinstance(path, str) and path:
+            missing.setdefault(key, path)
+            hold_evidence[key] = (row, evidence)
     latest_contents = {key: entry.text.encode("utf-8") for key, entry in pinned.snapshot.all.items()}
     paths = {str(row["plan_id"]): str(row["path"]) for row in rows}
+    paths.update({str(row["plan_id"]): str(row["path"]) for row in cancellations})
+    paths.update({key: str(evidence["path"]) for key, (_row, evidence) in hold_evidence.items()})
     withheld_paths = {key: path for key, path, _hash in pinned.snapshot.withheld}
     paths.update(withheld_paths)
     paths.update({key: entry.path for key, entry in pinned.snapshot.all.items()})
@@ -54,18 +87,56 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
     for row in rows:
         revision = str(row["current_revision_sha"] or row["plan_sha"] or "")
         if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
-            contents = git_bytes(repository, "show", f"{revision}:{row['path']}")
+            try:
+                contents = git_bytes(repository, "show", f"{revision}:{row['path']}")
+            except (RuntimeError, OSError):
+                continue
             if catalog.plan_content_hash(contents) == row["content_hash"]:
                 previous_contents[str(row["plan_id"])] = contents
-    prior = [(str(row["plan_id"]), json.loads(row["evidence"])) for row in connection.execute(
-        "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo=?", (repo,))]
+    for row in cancellations:
+        key, path = str(row["plan_id"]), str(row["path"])
+        if key not in missing or key in previous_contents:
+            continue
+        revision = str(row["plan_sha"] or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
+            continue
+        try:
+            contents = git_bytes(repository, "show", f"{revision}:{path}")
+            text = contents.decode("utf-8")
+            plan = catalog.parse_execplan_text(path, text, validate_sources=False)
+        except (RuntimeError, OSError, UnicodeError):
+            continue
+        if (catalog.plan_content_hash(contents) == row["content_hash"]
+                and plan["id"] == key and plan["title"] == row["title"]
+                and plan["sources"] == json.loads(row["sources"])
+                and plan["depends_on"] == json.loads(row["depends_on"])
+                and plan["priority"] == row["priority"]):
+            previous_contents[key] = contents
+    prior = [(str(row["plan_id"]), json.loads(row["evidence"])) for row in holds]
+    prior_cancellations = {}
+    for row in cancellations:
+        if not row["recovery_evidence"]:
+            continue
+        try:
+            prior_cancellations[str(row["plan_id"])] = json.loads(row["recovery_evidence"])
+        except (TypeError, ValueError) as error:
+            raise PlannerValidationError("삭제 목표 감사 JSON이 유효하지 않습니다.") from error
     issues = []
     for key, path in missing.items():
         reference = re.compile(rb"(?<![A-Za-z0-9-])" + key.encode("ascii") + rb"(?![A-Za-z0-9-])")
         reference_path = path.encode("utf-8")
-        affected = {str(row["plan_id"]) for row in rows if key in json.loads(row["depends_on"])}
+        def refers(contents):
+            declaration = b"\n".join(
+                line for line in contents.splitlines()
+                if not line.lstrip().startswith(b"DEPENDENCY_RECOVERY:")
+            )
+            return reference_path in declaration or reference.search(declaration)
+
+        current_references = {str(row["plan_id"]) for row in rows
+                              if key in json.loads(row["depends_on"])}
+        affected = set(current_references)
         affected.update(other for other, contents in previous_contents.items()
-                        if reference_path in contents or reference.search(contents))
+                        if refers(contents))
         for other in pinned.snapshot.observed_ids:
             latest = latest_contents.get(other)
             latest_path = withheld_paths.get(other)
@@ -73,8 +144,9 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
                     and latest_path in pinned.regular_paths):
                 latest = git_bytes(repository, "show", f"{pinned.revision_sha}:{latest_path}")
                 latest_contents[other] = latest
-            if latest is not None and (reference_path in latest or reference.search(latest)):
+            if latest is not None and refers(latest):
                 affected.add(other)
+                current_references.add(other)
         # Keep unadopted references until their missing prerequisite returns;
         # removing a reference cannot establish that its goal is unnecessary.
         for other, evidence in prior:
@@ -83,6 +155,9 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
                         and cause.get("source") == path):
                     affected.add(other)
                     paths.setdefault(other, evidence["path"])
+        saved = prior_cancellations.get(key, {})
+        affected.update((set(saved.get("affected", ())) - set(saved.get("resolved", {}))) &
+                        (set(pinned.snapshot.observed_ids) | set(str(row["plan_id"]) for row in rows)))
         approvals = dict(prior).get(key, {}).get("resolved_references", {})
         for other, approval in approvals.items():
             contents = latest_contents.get(other)
@@ -92,10 +167,208 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
                     and approval.get("path") == paths.get(other)
                     and approval.get("content_hash") == catalog.plan_content_hash(contents)):
                 affected.discard(other)
+        # A published recovery judgment resolves the old declaration evidence.
+        # Keep it held if the current declaration still points back to the deleted plan.
+        for other in set(saved.get("resolved", {})) - current_references:
+            if latest_contents.get(other) is not None:
+                affected.discard(other)
         issues.extend(catalog.CatalogIssue(other, paths[other], "missing-plan-reference",
             f"삭제된 계획의 참조 근거를 보존합니다: {other} -> {key}", path)
             for other in sorted(affected - {key}))
     return tuple(issues)
+
+
+def rowless_hold_deletion_evidence(connection, repo, repository, pinned, references, *, git_bytes):
+    """Preserve deleted pre-registration hold identity and its current references."""
+    references_by_path = {}
+    for issue in references:
+        if issue.code == "missing-plan-reference" and issue.source:
+            references_by_path.setdefault(issue.source, set()).add(issue.plan_id)
+    result = {}
+    rows = connection.execute(
+        "SELECT plan_id FROM exec_plans WHERE repo=?", (repo,),
+    ).fetchall()
+    execution_ids = {str(row[0]) for row in rows}
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_holds'"
+    ).fetchone():
+        return result
+    holds = connection.execute(
+        "SELECT plan_id, revision_sha, evidence FROM execplan_catalog_holds "
+        "WHERE repo=? ORDER BY plan_id", (repo,),
+    ).fetchall()
+    for hold in holds:
+        key = str(hold["plan_id"])
+        if key in execution_ids or key in pinned.snapshot.observed_ids:
+            continue
+        try:
+            evidence = json.loads(hold["evidence"])
+            if not isinstance(evidence, dict):
+                raise ValueError("hold evidence must be an object")
+        except (TypeError, ValueError) as error:
+            raise PlannerValidationError("catalog hold identity 근거 JSON이 유효하지 않습니다.") from error
+        path = evidence.get("path")
+        if not isinstance(path, str) or not re.fullmatch(
+            rf"docs/plans/\[{re.escape(key)}\] [^/]+\.md", path,
+        ):
+            continue
+        if pinned.regular_paths is None or path in pinned.regular_paths:
+            continue
+        prior = evidence.get("deleted_goal")
+        if prior is not None:
+            if (not isinstance(prior, dict) or not isinstance(prior.get("text"), str)
+                    or not isinstance(prior.get("row"), dict)
+                    or not isinstance(prior.get("affected"), list)
+                    or not isinstance(prior.get("resolved"), dict)
+                    or not isinstance(prior.get("unknown_reason"), str)):
+                raise PlannerValidationError("row 없는 삭제 목표 근거가 유효하지 않습니다.")
+            goal = dict(prior)
+        else:
+            revision = str(hold["revision_sha"] or "")
+            content_hash = evidence.get("content_hash")
+            text = ""
+            unknown_reason = "등록 전 보류된 계획은 실행·취소 이력이 없어 삭제 의도를 확인할 수 없습니다."
+            row = {
+                "plan_id": key, "path": path, "title": "", "sources": "[]",
+                "depends_on": "[]", "content_hash": content_hash or "",
+                "plan_sha": revision, "current_revision_sha": revision,
+            }
+            if (re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision)
+                    and isinstance(content_hash, str)
+                    and re.fullmatch(r"[0-9a-fA-F]{64}", content_hash)):
+                try:
+                    contents = git_bytes(repository, "show", f"{revision}:{path}")
+                    candidate_text = contents.decode("utf-8")
+                    header = catalog.parse_frontmatter(candidate_text)
+                except (RuntimeError, OSError, UnicodeError) as error:
+                    unknown_reason += " 저장된 보류 revision에서 원문을 확인하지 못했습니다."
+                else:
+                    if catalog.plan_content_hash(contents) != content_hash:
+                        unknown_reason += " 저장된 원문 hash가 보류 identity와 다릅니다."
+                    elif (header.get("id") != key or not isinstance(header.get("title"), str)
+                            or path != f"docs/plans/[{key}] {header['title']}.md"):
+                        unknown_reason += " 저장된 원문에서 hold ID와 경로 identity를 확인하지 못했습니다."
+                    else:
+                        text = candidate_text
+                        row.update({
+                            "title": header["title"],
+                            "sources": json.dumps(
+                                header.get("sources") if isinstance(header.get("sources"), list) else [],
+                                ensure_ascii=False,
+                            ),
+                            "depends_on": json.dumps(
+                                header.get("depends_on") if isinstance(header.get("depends_on"), list) else [],
+                                ensure_ascii=False,
+                            ),
+                            "priority": header.get("priority", "normal"),
+                        })
+            else:
+                unknown_reason += " 보류 revision 또는 content hash 근거가 유효하지 않습니다."
+            goal = {
+                "path": path,
+                "original_revision": revision,
+                "observed_revision": pinned.revision_sha,
+                "last_observed_revision": pinned.revision_sha,
+                "text": text,
+                "row": row,
+                "affected": [],
+                "resolved": {},
+                "unknown_reason": unknown_reason,
+            }
+        current_references = set(references_by_path.get(path, ()))
+        for row in connection.execute(
+            "SELECT plan_id, depends_on FROM exec_plans WHERE repo=?", (repo,),
+        ):
+            if key in json.loads(row["depends_on"]):
+                current_references.add(str(row["plan_id"]))
+        goal["affected"] = sorted(set(goal["affected"]) | current_references)
+        goal["last_observed_revision"] = pinned.revision_sha
+        result[key] = goal
+    return result
+
+
+def cancellation_recovery_evidence(connection, repo, repository, pinned, references, *, git, git_bytes):
+    """Pin newly observed references to rowless cancellation audit without recreating a plan row."""
+    result = {}
+    affected_by_path = {}
+    for issue in references:
+        if issue.code == "missing-plan-reference" and issue.source:
+            affected_by_path.setdefault(issue.source, set()).add(issue.plan_id)
+    if not affected_by_path:
+        return result
+    for row in connection.execute(
+        "SELECT * FROM execplan_cancellations WHERE repo=? ORDER BY plan_id", (repo,),
+    ):
+        key, path = str(row["plan_id"]), str(row["path"])
+        affected = affected_by_path.get(path, set())
+        if not affected or key in pinned.snapshot.observed_ids:
+            continue
+        prior_text = row["recovery_evidence"]
+        if prior_text:
+            try:
+                evidence = json.loads(prior_text)
+                if (not isinstance(evidence, dict) or not isinstance(evidence.get("text"), str)
+                        or not isinstance(evidence.get("row"), dict)
+                        or not isinstance(evidence.get("affected"), list)
+                        or not isinstance(evidence.get("resolved"), dict)):
+                    raise ValueError("invalid cancellation evidence")
+            except (ValueError, TypeError) as error:
+                raise PlannerValidationError("삭제 목표 감사 JSON이 유효하지 않습니다.") from error
+        else:
+            evidence = {"text": "", "row": dict(row), "affected": [], "resolved": {}}
+            evidence["identity"] = {
+                "id": key, "path": path, "content_hash": str(row["content_hash"]),
+                "plan_sha": str(row["plan_sha"]), "deletion_revision": str(row["deletion_commit"]),
+            }
+            evidence["observed_revision"] = pinned.revision_sha
+            evidence["unknown_reason"] = "삭제 원문 revision과 identity를 검증하지 못했습니다."
+            plan_sha = str(row["plan_sha"] or "")
+            deletion_revision = str(row["deletion_commit"] or "")
+            valid_sha = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
+            if valid_sha.fullmatch(plan_sha) and valid_sha.fullmatch(deletion_revision):
+                try:
+                    deletion_ancestor = git(repository, "merge-base", "--is-ancestor",
+                                            deletion_revision, pinned.revision_sha, check=False)
+                    plan_ancestor = git(repository, "merge-base", "--is-ancestor",
+                                        plan_sha, deletion_revision, check=False)
+                except (RuntimeError, OSError):
+                    deletion_ancestor = plan_ancestor = None
+                if (deletion_ancestor is not None and plan_ancestor is not None
+                        and deletion_ancestor.returncode == 0 and plan_ancestor.returncode == 0):
+                    try:
+                        contents = git_bytes(repository, "show", f"{plan_sha}:{path}")
+                        text = contents.decode("utf-8")
+                        parsed = catalog.parse_execplan_text(path, text, validate_sources=False)
+                    except (RuntimeError, OSError, UnicodeError):
+                        pass
+                    else:
+                        if (catalog.plan_content_hash(contents) == row["content_hash"]
+                                and parsed["id"] == key and parsed["title"] == row["title"]
+                                and parsed["sources"] == json.loads(row["sources"])
+                                and parsed["depends_on"] == json.loads(row["depends_on"])
+                                and parsed["complexity"] == row["complexity"]
+                                and parsed["risk"] == row["risk"]
+                                and parsed["priority"] == row["priority"]):
+                            evidence["text"] = text
+                            evidence["unknown_reason"] = None
+            elif not plan_sha or not deletion_revision:
+                evidence["unknown_reason"] = "취소 감사에 source revision 근거가 없습니다."
+        old_affected = set(evidence["affected"])
+        resolution_history = evidence.setdefault("resolution_history", {})
+        if not isinstance(resolution_history, dict):
+            raise PlannerValidationError("삭제 목표 감사 JSON이 유효하지 않습니다.")
+        reopened = set(affected) & set(evidence["resolved"])
+        for plan_id in reopened:
+            previous = evidence["resolved"].pop(plan_id)
+            history = resolution_history.setdefault(plan_id, [])
+            if not isinstance(history, list) or not all(isinstance(item, str) for item in history):
+                raise PlannerValidationError("삭제 목표 감사 JSON이 유효하지 않습니다.")
+            if previous not in history:
+                history.append(previous)
+        evidence["affected"] = sorted(old_affected | affected)
+        if evidence["affected"] != sorted(old_affected) or reopened or not prior_text:
+            result[key] = (prior_text, json.dumps(evidence, ensure_ascii=False, sort_keys=True))
+    return result
 
 
 def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, references=None, pr_for_branch=None):
@@ -168,14 +441,21 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, ref
 def requirement_deletions(connection, repo, repository, pinned, *, git, git_bytes):
     """이전 source 원문과 현재 실제 부재를 원격 revision에 결합한다."""
     result = {}
-    rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
+    rows = list(connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall())
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'"
+    ).fetchone():
+        rows.extend(connection.execute(
+            "SELECT * FROM execplan_cancellations WHERE repo=?", (repo,),
+        ).fetchall())
     if not any(source.startswith("docs/requirements/") for row in rows for source in json.loads(row["sources"])):
         return result
     from loop_manager_internal.catalog import requirement_sources
     from loop_manager_internal.git.command_adapter import revision_requirement_documents
     documents = revision_requirement_documents(git_bytes, repository, pinned.revision_sha)
     for row in rows:
-        revision = str(row["current_revision_sha"] or row["plan_sha"] or "")
+        current_revision = row["current_revision_sha"] if "current_revision_sha" in row.keys() else None
+        revision = str(current_revision or row["plan_sha"] or "")
         if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
             continue
         for source in json.loads(row["sources"]):
@@ -266,6 +546,41 @@ def recovery_goals(connection, repo):
             goals.append(json.dumps({"id": "requirement:" + source, "path": source, "kind": "missing-source",
                 "deletion_revision": proof["deletion_revision"], "evidence": evidence,
                 "affected_ids": affected}, ensure_ascii=False, sort_keys=True))
+    execution_ids = {str(row["plan_id"]) for row in rows}
+    for key, held in sorted(holds.items()):
+        if key in execution_ids:
+            continue
+        deleted = held.get("deleted_goal")
+        if deleted is None:
+            continue
+        if (not isinstance(deleted, dict) or not isinstance(deleted.get("text"), str)
+                or not isinstance(deleted.get("row"), dict)
+                or not isinstance(deleted.get("affected"), list)
+                or not all(isinstance(item, str) for item in deleted["affected"])
+                or not isinstance(deleted.get("resolved"), dict)
+                or not isinstance(deleted.get("unknown_reason"), str)):
+            raise PlannerValidationError("row 없는 삭제 목표 감사 JSON이 유효하지 않습니다.")
+        path = deleted.get("path")
+        if not isinstance(path, str) or not path:
+            raise PlannerValidationError("row 없는 삭제 목표 경로가 유효하지 않습니다.")
+        affected = ((set(deleted["affected"]) & observed_ids)
+                    - set(deleted["resolved"]))
+        current_dependents = {str(row["plan_id"]) for row in rows
+                              if key in json.loads(row["depends_on"])}
+        affected.update(current_dependents)
+        approvals = held.get("resolved_references", {})
+        for other, approval in approvals.items():
+            dependent = next((row for row in rows if str(row["plan_id"]) == other), None)
+            if (dependent is not None and key not in json.loads(dependent["depends_on"])
+                    and approval.get("path") == dependent["path"]
+                    and approval.get("content_hash") == dependent["content_hash"]):
+                affected.discard(other)
+        affected.discard(key)
+        if affected:
+            evidence = json.dumps(deleted, ensure_ascii=False, sort_keys=True)
+            goals.append(json.dumps({"id": key, "path": path, "kind": "missing-plan",
+                "deletion_revision": deleted["observed_revision"], "evidence": evidence,
+                "affected_ids": sorted(affected)}, ensure_ascii=False, sort_keys=True))
     for row in rows:
         key, path = str(row["plan_id"]), str(row["path"])
         held = holds.get(key, {})

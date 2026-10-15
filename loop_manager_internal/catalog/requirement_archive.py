@@ -217,6 +217,8 @@ def calculate(
     resolved_sources: dict[tuple[str, str], str] = {}
     if requirement_documents is not None:
         for plan_id, plan in catalog.items():
+            if str(plan.get("path", "")).startswith("docs/plans/archive/"):
+                continue
             for source in plan["sources"]:
                 if source in {"docs/PRODUCT.md", "manager:verify-inputs"}:
                     continue
@@ -238,6 +240,7 @@ def calculate(
         related = tuple(
             (plan_id, states.get(plan_id, "UNVERIFIED"))
             for plan_id, plan in sorted(catalog.items())
+            if not str(plan.get("path", "")).startswith("docs/plans/archive/")
             if any(
                 (resolved_sources.get((plan_id, str(plan_source)), str(plan_source)) == source)
                 for plan_source in plan["sources"]
