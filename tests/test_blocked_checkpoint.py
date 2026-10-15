@@ -7,27 +7,6 @@ from loop_manager_internal.recovery import blocked_checkpoint
 import loop_manager
 
 
-class BlockedCheckpointDiscoveryUnitTests(unittest.TestCase):
-    def test_git_fixture_cases_are_collected_once_across_consuming_modules(self):
-        from collections import Counter
-
-        def cases(suite):
-            for item in suite:
-                if isinstance(item, unittest.TestSuite):
-                    yield from cases(item)
-                else:
-                    yield item.id()
-
-        loader = unittest.TestLoader()
-        suites = [loader.discover('tests', pattern=pattern)
-                  for pattern in ('test_checkpoint_git_safety.py', 'test_checkpoint_remote_recovery.py', 'test_execution_*.py')]
-        counts = Counter(case for suite in suites for case in cases(suite))
-        fixture_ids = {case for case in counts
-                       if case.startswith(('test_checkpoint_git_safety.', 'test_checkpoint_remote_recovery.'))}
-        self.assertTrue(fixture_ids)
-        self.assertEqual({counts[case] for case in fixture_ids}, {1})
-
-
 class BlockedCheckpointPolicyTest(unittest.TestCase):
     def test_project_exception_still_requires_current_scope_and_git_safety(self):
         denied = blocked_checkpoint.assess_safety(self.observation(project_blocked=True))

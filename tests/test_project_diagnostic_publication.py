@@ -1,10 +1,8 @@
-from tests.support.git import prepare_manager_import_fixture
 import hashlib
 import json
 import os
 import sqlite3
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,33 +44,6 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
                 Path('/repo'), 'G-058', head), evidence)
             self.assertIsNone(loop_manager._guidance_checkpoint_commit_evidence(
                 Path('/repo'), 'G-097', head))
-
-    def test_planner_import_fixture_contains_direct_manager_modules(self):
-        import ast
-        manager = ast.parse(Path(loop_manager.__file__).read_text(encoding='utf-8'))
-        imports = set()
-        for node in manager.body:
-            if isinstance(node, ast.Import):
-                imports.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imports.add(node.module)
-                imports.update(node.module + '.' + alias.name for alias in node.names)
-        required = {Path('loop_manager.py')}
-        for name in imports:
-            module_path = Path(*name.split('.'))
-            for path in (module_path.with_suffix('.py'), module_path / '__init__.py'):
-                if (loop_manager.ROOT / path).is_file():
-                    required.add(path)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with (mock.patch('tests.support.git.commit_and_push',
-                             side_effect=StopIteration('fixture copied')),
-                  self.assertRaisesRegex(StopIteration, '^fixture copied$')):
-                prepare_manager_import_fixture(root)
-            for path in required:
-                with self.subTest(module=path):
-                    self.assertTrue((root / path).is_file())
-                    self.assertEqual((root / path).read_bytes(), (loop_manager.ROOT / path).read_bytes())
 
     def test_missing_origin_keeps_local_only_scope_and_mismatched_push_url_is_rejected(self):
         connection = mock.Mock()

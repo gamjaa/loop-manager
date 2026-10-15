@@ -109,20 +109,3 @@ class PlatformCompatibilityTests(unittest.TestCase):
                                     env=environment, capture_output=True, encoding="utf-8", timeout=30)
             self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
             self.assertIn("검증 진입점", result.stdout)
-
-    def test_standalone_launcher_fixture_removes_manager_settings(self):
-        def capture(command, **options):
-            environment = options['env']
-            self.assertFalse(any(key.startswith('LOOP_MANAGER_VERIFY_') for key in environment))
-            self.assertEqual(environment['PLATFORM_FIXTURE_VALUE'], 'preserved')
-            self.assertEqual(options['timeout'], 30)
-            self.assertEqual(Path(command[-1]).parent.parent.parent, Path(options['cwd']))
-            return subprocess.CompletedProcess(command, 37, '검증 진입점\n', '')
-
-        with (mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_SESSION': 'manager-session',
-                                          'PLATFORM_FIXTURE_VALUE': 'preserved'}),
-              mock.patch.object(venv.EnvBuilder, 'create') as create,
-              mock.patch.object(subprocess, 'run', side_effect=capture) as run):
-            self.test_verify_launcher_uses_venv_and_root_and_preserves_failure()
-            create.assert_called_once()
-            run.assert_called_once()

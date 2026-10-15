@@ -74,49 +74,19 @@ class ExecPlanHeaderRenderingTest(unittest.TestCase):
             "---",
         )
 
-    def test_catalog_fixtures_share_header_and_keep_their_body_forms(self):
-        expected = execplan_header("G-001", "Shared")
-        self.assertTrue(
-            catalog_fixtures.plan_text("G-001", "Shared").startswith(
-                expected + "\n\n## Purpose\n"
-            )
+    def test_catalog_fixtures_preserve_invalid_metadata_for_regressions(self):
+        cases = (
+            (catalog_fixtures.plan_text("G-001", "Invalid", priority=None), "priority"),
+            (catalog_fixtures.CatalogReconciliationFixture._text(
+                "G-001", "Invalid", sources=(),
+            ), "frontmatter"),
+            (catalog_fixtures.CatalogReconciliationFixture._text(
+                "G-001", "Invalid", priority=None,
+            ), "priority"),
         )
-        self.assertIn(
-            "priority: None\n",
-            catalog_fixtures.plan_text("G-001", "Shared", priority=None),
-        )
-        self.assertTrue(
-            catalog_fixtures.archived_entry("G-001", "Shared").text.startswith(
-                expected + "\n\n## Purpose\n"
-            )
-        )
-
-        empty_source_header = execplan_header(
-            "G-002", "Empty", sources=(), empty_sources_as_list=False,
-        )
-        self.assertTrue(
-            catalog_fixtures.CatalogReconciliationFixture._text(
-                "G-002", "Empty", sources=(),
-            ).startswith(empty_source_header + "\n\n## Purpose\n")
-        )
-        self.assertIn(
-            "priority: None\n",
-            catalog_fixtures.CatalogReconciliationFixture._text(
-                "G-002", "Empty", priority=None,
-            ),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            root = catalog_fixtures.make_catalog_root(directory)
-            path = catalog_fixtures.write_execplan(root, "G-001", "Shared")
-            self.assertTrue(
-                path.read_text(encoding="utf-8").startswith(
-                    expected + "\n\n## Purpose\n"
-                )
-            )
-            no_priority = catalog_fixtures.write_execplan(
-                root, "G-002", "No Priority", priority=None,
-            ).read_text(encoding="utf-8")
-            self.assertNotIn("priority:", no_priority.split("---", 2)[1])
+        for text, field in cases:
+            with self.subTest(text=text), self.assertRaisesRegex(RuntimeError, field):
+                execplan_catalog.parse_execplan_text("docs/plans/[G-001] Invalid.md", text)
 
 
 class ExecPlanCatalogSnapshotTest(unittest.TestCase):
