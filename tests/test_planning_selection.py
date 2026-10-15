@@ -133,6 +133,41 @@ class PlanningSelectionTest(PlanningCase):
         planning_input_state.record_general(connection, '/repo', 'new', entries)
         self.assertFalse(state.pending_user_decision('/repo', entries))
 
+    def test_draft_reassessment_and_requirement_answer_are_reviewed_once(self):
+        from loop_manager_internal.planning.state_ports import _PlanningStatePorts
+        from loop_manager_internal.storage import execplan_draft_state
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        execplan_draft_state.ensure_schema(connection)
+        path = 'docs/plans/[G-001] Decision.md'
+        entries = {path: ('blob', 'unchanged')}
+        planning_input_state.record_general(connection, '/repo', 'old', entries)
+        state = object.__new__(_PlanningStatePorts)
+        state._connection = connection
+        for saved in (
+                {'path': path, 'revision': 'basis-1', 'reassessment': True, 'user_changes': {}},
+                {'path': path, 'revision': 'basis-2', 'user_changes': {'docs/requirements/R.md': {
+                    'verified': True, 'before': 'Question', 'after': 'Question\nAnswer'}}}):
+            with self.subTest(saved=saved):
+                connection.execute('INSERT OR REPLACE INTO execplan_drafts VALUES (?, ?, ?, ?)',
+                                   ('/repo', 'G-001', 1, json.dumps(saved)))
+                self.assertTrue(state.pending_user_decision('/repo', entries))
+                ports = self._code_check_ports()
+                ports.state.pending_user_decision = lambda *_: state.pending_user_decision('/repo', entries)
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(self.context)
+                coordinator._selection._select_planning_work(run)
+                self.assertEqual(run.selection.kind, PlanningDecisionKind.RUN_SPECIFICATION_PLANNING)
+                planning_input_state.record_general(connection, '/repo', 'new', entries)
+                self.assertFalse(state.pending_user_decision('/repo', entries))
+                self.assertFalse(state.pending_user_decision('/repo', {path: ('blob', 'progress-only')}))
+                self.assertIn('G-001', execplan_draft_state.pending_ids(connection, '/repo'))
+                recorded = execplan_draft_state.evidence(connection, '/repo', 'G-001')
+                recorded['revision'] = saved['revision'] + '-new-condition'
+                connection.execute('UPDATE execplan_drafts SET evidence=?', (json.dumps(recorded),))
+                self.assertTrue(state.pending_user_decision('/repo', entries))
+
     def test_general_planning_finishes_before_resuming_same_active_execution(self):
         original = planning_snapshot(phase='VERIFYING', active_sha='old-base', worktree='/saved',
             processed_sha='old-base', planning_fingerprint='old-full', specification_fingerprint='old-spec')

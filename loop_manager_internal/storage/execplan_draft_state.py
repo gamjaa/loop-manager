@@ -36,24 +36,48 @@ def evidence(connection: sqlite3.Connection, repo: str, plan_id: str) -> dict | 
     return json.loads(row[0]) if row else None
 
 
+def user_question_ids(connection: sqlite3.Connection, repo: str) -> frozenset[str]:
+    return frozenset(plan_id for plan_id in pending_ids(connection, repo)
+                     if (saved := evidence(connection, repo, plan_id))
+                     and saved.get("pending") and saved.get("question") and not saved.get("reassessment"))
+
+
+def semantic_review_identity(saved: Mapping) -> str | None:
+    changes = {path: change for path, change in saved.get("user_changes", {}).items()
+               if change.get("verified") and change.get("before") != change.get("after")}
+    if not saved.get("reassessment") and not changes:
+        return None
+    return execplan_drafts.content_digest(json.dumps(
+        {"revision": saved.get("revision"), "decision": saved.get("decision"), "user_changes": changes},
+        ensure_ascii=False, sort_keys=True).encode())
+
+
 def needs_semantic_review(connection: sqlite3.Connection, repo: str, entries) -> bool:
-    from loop_manager_internal.storage import planning_input_state
-    baseline = planning_input_state._saved(connection, repo) or {}
     for plan_id in pending_ids(connection, repo):
         saved = evidence(connection, repo, plan_id) or {}
-        path = saved.get('path')
-        if path not in entries or baseline.get(path) == entries[path]:
-            continue
-        if any(change.get('verified') and change.get('before') != change.get('after')
-               for change in saved.get('user_changes', {}).values()):
+        identity = semantic_review_identity(saved)
+        if saved.get("path") in entries and identity and identity != saved.get("reviewed_identity"):
             return True
     return False
+
+
+def record_semantic_review(connection: sqlite3.Connection, repo: str) -> None:
+    """Only successful general planning consumes this review input, never its hold."""
+    for plan_id in pending_ids(connection, repo):
+        saved = evidence(connection, repo, plan_id)
+        identity = semantic_review_identity(saved)
+        if identity:
+            saved["reviewed_identity"] = identity
+            connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo=? AND plan_id=?",
+                               (json.dumps(saved, ensure_ascii=False, sort_keys=True), repo, plan_id))
 
 
 def prompt_evidence(connection: sqlite3.Connection, repo: str, plan_id: str, *,
                     include_changes: bool = True) -> dict:
     saved = evidence(connection, repo, plan_id) or {}
-    payload = {key: saved[key] for key in ("question", "path", "revision", "url") if key in saved}
+    payload = {key: saved[key] for key in ("question", "path", "revision", "url", "reassessment", "resolutions") if key in saved}
+    if "resolutions" in payload:
+        payload["resolutions"] = [item["assessment"] for item in payload["resolutions"]]
     if include_changes and "user_changes" in saved:
         # Keep full before/after only in the decision audit, not every Planner input.
         payload["user_changes"] = {
@@ -101,19 +125,20 @@ def observe(connection: sqlite3.Connection, repo: str, path: str, plan: Mapping[
     previous = evidence(connection, repo, plan_id)
     if not previous and not plan.get("draft"):
         return
-    if (previous and not previous.get("pending") and not plan.get("draft")
-            and not plan.get("draft_question") and not plan.get("draft_decision")):
-        return  # 정리된 양식의 부재로 해결된 질문을 다시 만들지 않는다.
     relevant = set(plan["sources"]) | {"docs/PRODUCT.md", "docs/ARCHITECTURE.md"}
     basis = {"scope": plan.get("draft_scope"),
              "inputs": {key: value for key, value in (inputs or {}).items() if key in relevant}}
+    cleaned = bool(previous and not plan.get("draft") and not plan.get("draft_question")
+                   and not plan.get("draft_decision") and (not previous.get("pending") or previous.get("reassessment")))
+    if cleaned and previous["basis"] == basis:
+        return  # 양식 정리·동일 입력 재관측은 새 승인이 아니다.
     question = str(plan.get("draft_question") or (previous or {}).get("question", ""))
     # An absent question is not a decision, and cannot erase the saved question.
     unchanged = bool(previous and previous["basis"] == basis and plan.get("draft_question"))
     if (previous and not previous.get("pending") and unchanged and not plan.get("draft")
             and plan.get("draft_decision", {}) == previous.get("decision", {})):
         return  # 이전 버전에서 이미 확정한 동일 결정을 다시 승인 대기로 만들지 않는다.
-    if agent and previous and not plan.get("draft") and (previous["pending"] or not unchanged):
+    if agent and previous and not plan.get("draft") and not cleaned and (previous["pending"] or not unchanged):
         raise RuntimeError("Agent는 게시된 draft의 사용자 판단 대기를 해제할 수 없습니다.")
     # Include the inputs and their observation revision, even when plan bytes
     # did not change. A basis that changes and later returns also needs consent.
@@ -122,10 +147,16 @@ def observe(connection: sqlite3.Connection, repo: str, path: str, plan: Mapping[
                    ensure_ascii=False, sort_keys=True).encode("utf-8"))
     decision = dict(plan.get("draft_decision", {}))
     changes = dict(user_changes or {})
-    origin_verified = bool(changes.get(path, {}).get("verified"))
+    retained_decision = bool(previous and unchanged and previous.get("decision_ready")
+                             and decision == previous.get("decision"))
+    if retained_decision:
+        changes = {**previous.get("user_changes", {}), **changes}
+    origin_verified = bool(changes.get(path, {}).get("verified") or retained_decision)
     approved = bool(not agent and origin_verified and unchanged
                     and decision.get("Decision") == "approve"
-                    and decision.get("Revision", held_revision) == held_revision and decision.get("Answer"))
+                    and (decision.get("Revision", held_revision) == held_revision
+                         or previous.get("decision_ready") and decision == previous.get("decision"))
+                    and decision.get("Answer"))
     decisions = list((previous or {}).get("decisions", ()))
     if not agent and decision:
         audit = {"value": decision, "basis": basis, "revision": content_hash, "accepted": approved}
@@ -137,10 +168,14 @@ def observe(connection: sqlite3.Connection, repo: str, path: str, plan: Mapping[
               "path": path, "remote_revision": question_revision, "pending": True,
               "decision": decision if not agent else (previous or {}).get("decision", {}),
               "decisions": decisions, "decision_ready": approved, "user_changes": changes}
+    if cleaned:
+        record.update(question="", identity=None, reassessment=True)
     if previous and unchanged and previous.get("prepared_resolution"):
         record["prepared_resolution"] = previous["prepared_resolution"]
     if previous and previous.get("resolutions"):
         record["resolutions"] = previous["resolutions"]
+    if previous and previous.get("reviewed_identity"):
+        record["reviewed_identity"] = previous["reviewed_identity"]
     origin = remote_url or (previous or {}).get("remote_url")
     if origin:
         record["remote_url"] = origin
@@ -184,8 +219,11 @@ def resolve(connection, repo, path, plan, content_hash, revision, resolution, *,
                  identity=execplan_drafts.question_identity(plan), resolutions=history,
                  basis={"scope": plan.get("draft_scope"), "inputs": {
                      key: value for key, value in (inputs or {}).items() if key in relevant}},
-                 decision={}, decision_ready=False, user_changes={})
+                 decision=plan.get("draft_decision", {}) if pending else {},
+                 decision_ready=bool(pending and plan.get("draft_decision") and saved.get("decision_ready")),
+                 user_changes=saved.get("user_changes", {}) if pending else {})
     saved.pop("prepared_resolution", None)
+    saved.pop("reassessment", None)
     saved["revision"] = execplan_drafts.content_digest(json.dumps(saved["basis"], sort_keys=True).encode())
     if saved.get("remote_url"):
         saved["url"] = saved["remote_url"].removesuffix(".git").rstrip("/") + "/blob/" + revision + "/" + quote(path, safe="/")

@@ -20,6 +20,7 @@ from loop_manager_internal.storage import (
     execplan_catalog_state, execplan_draft_state, planning_publication_state, runtime_state,
 )
 from loop_manager_internal.notifications import work_exhaustion
+from loop_manager_internal.maintenance.maintenance_planning import markdown_sections
 from tests.support.catalog import plan_text, make_catalog_root, FakeDefinitionPort, QUESTION, draft_text, accepted_text
 from tests.support.database import AutomationCatalogFixture
 
@@ -294,6 +295,116 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(self.waiting(), saved)
         self.assertTrue(self.waiting()['pending'])
 
+    def test_shared_prompt_evidence_retains_distinct_origins_and_partial_holds(self):
+        from loop_manager_internal.planning.validation_ports import _PlanningValidationPorts
+        second_path = 'docs/plans/[G-002] Retry.md'
+        first_question = draft_decisions.questions(self.waiting()['question'])[0]
+        remaining_question = 'Which retention limit should this goal use?'
+        self.text = self.text.replace('Question: ' + first_question,
+                                      'Question: - ' + first_question + '\n- ' + remaining_question)
+        documents = {PATH: self.text, second_path: draft_text('G-002', 'Retry').replace('storage policy', 'retry policy')}
+        answer = 'Use policy A and retain history.'
+        before = ''.join(f'Unchanged context {index}\n' for index in range(1000)) + 'Policy: undecided\n'
+        after = before + answer + '\n'
+        inputs = {**self.inputs, 'docs/PRODUCT.md': execplan_drafts.content_digest(after.encode())}
+        self.reconcile(documents, 'c' * 40, inputs=inputs)
+        changes = {'docs/PRODUCT.md': {'verified': True, 'revision': 'c' * 40, 'commit': 'user-commit',
+                   'author': 'user@example.test', 'before': before, 'after': after}}
+        snapshots, saved_by_id = [], {}
+        for plan_id, path in (('G-001', PATH), ('G-002', second_path)):
+            saved = execplan_draft_state.evidence(self.connection, 'repo', plan_id)
+            saved['user_changes'] = {**changes, 'docs/ARCHITECTURE.md': {
+                **changes['docs/PRODUCT.md'], 'before': 'Old ' + plan_id, 'after': 'New ' + plan_id}}
+            saved_by_id[plan_id] = saved
+            self.connection.execute('UPDATE execplan_drafts SET evidence=? WHERE plan_id=?', (json.dumps(saved), plan_id))
+            row = self.connection.execute('SELECT * FROM exec_plans WHERE plan_id=?', (plan_id,)).fetchone()
+            snapshots.append(loop_manager._ready_plan_snapshot_from_contents(row, documents[path].encode(), allow_started=True))
+        self.connection.commit()
+        snapshot = MutableReadySnapshot('repo', 'c' * 40, tuple(snapshots), 'fixture')
+        effects = SimpleNamespace(planner_prompt=loop_manager.planner_prompt, is_loop_manager_repository=lambda _: False, git=None, git_bytes=None)
+        ports = _PlanningValidationPorts(effects, self.connection)
+        def payload():
+            catalog = loop_manager.compact_execplan_catalog(self.connection, 'repo')
+            self.assertNotIn('user_changes', catalog)
+            prompt = ports.planner_prompt(None, catalog, snapshot)
+            value, _end = json.JSONDecoder().raw_decode(prompt.split('Manager의 draft 질문·사용자 원격 변경 근거:\n')[1])
+            return prompt, value
+        prompt, value = payload()
+        self.assertEqual(prompt.count('+' + answer), 1)
+        self.assertNotIn(before, prompt)
+        self.assertEqual(len(value['user_changes']), 3)
+        references = [item['user_changes']['docs/PRODUCT.md'] for item in value['decisions']]
+        self.assertEqual(references[0], references[1])
+        self.assertEqual([item['revision'] for item in value['decisions']], [saved_by_id[p]['revision'] for p in ('G-001', 'G-002')])
+        second = saved_by_id['G-002']
+        for field, different in (('before', before + 'Different origin'), ('after', after + 'Different result'),
+                                  ('author', 'other@example.test'), ('verified', False)):
+            with self.subTest(field=field):
+                second['user_changes'] = {**second['user_changes'], 'docs/PRODUCT.md': {**changes['docs/PRODUCT.md'], field: different}}
+                with self.connection:
+                    self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE plan_id='G-002'", (json.dumps(second),))
+                _prompt, distinct = payload()
+                self.assertEqual(len(distinct['user_changes']), 4)
+                self.assertNotEqual(*(item['user_changes']['docs/PRODUCT.md'] for item in distinct['decisions']))
+        second['user_changes'] = {**second['user_changes'], **changes}
+        with self.connection:
+            self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE plan_id='G-002'", (json.dumps(second),))
+            self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'", (draft_decisions.PREFIX + json.dumps([{
+                'id': 'G-001', 'revision': saved_by_id['G-001']['revision'], 'remaining': QUESTION.replace(first_question, remaining_question),
+                'resolved': [{'question': first_question, 'answer': answer, 'source': 'docs/PRODUCT.md', 'quote': answer}]}]),))
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            for path, text in documents.items():
+                (root / path).write_text(draft_decisions.replace_section(text, 'Implementation', answer), encoding='utf-8')
+            prepared = draft_decisions.prepare(self.connection, 'repo', root, snapshot)
+            self.assertEqual(set(prepared), {'G-001'})
+            self.assertIn('draft: true', (root / PATH).read_text())
+            self.assertIn(remaining_question, (root / PATH).read_text())
+            for plan_id in ('G-001', 'G-002'):
+                saved = execplan_draft_state.evidence(self.connection, 'repo', plan_id)
+                self.assertEqual(saved['user_changes']['docs/PRODUCT.md'], changes['docs/PRODUCT.md'])
+                self.assertTrue(saved['pending'])
+
+    def test_reassessment_coexists_with_user_question_list_and_new_question(self):
+        from loop_manager_internal.notifications import notifications
+        notifications.configure_session(self.connection, enabled=True)
+        self.addCleanup(notifications.configure_session, self.connection, enabled=False)
+        documents = {PATH: accepted_text(self.text, self.waiting()['revision'])}
+        self.reconcile(documents)
+        self.publish_decision(documents)
+        second_path = 'docs/plans/[G-002] Retry.md'
+        documents[second_path] = draft_text('G-002', 'Retry').replace('storage policy', 'retry policy')
+        self.reconcile(documents, '1' * 40)
+        inputs = {**self.inputs, 'docs/PRODUCT.md': 'changed-policy'}
+        self.reconcile(documents, '2' * 40, inputs=inputs)
+        self.assertTrue(self.waiting()['reassessment'])
+        self.assertEqual(execplan_draft_state.pending_ids(self.connection, 'repo'), {'G-001', 'G-002'})
+        self.assertEqual(execplan_draft_state.user_question_ids(self.connection, 'repo'), {'G-002'})
+        notifications.enqueue_draft_decisions(self.connection, 'repo')
+        row = self.connection.execute("SELECT event_key FROM notification_outbox WHERE event_type='draft_decisions'").fetchone()
+        key = row[0]
+        self.reconcile(documents, '2' * 40, inputs=inputs)
+        notifications.enqueue_draft_decisions(self.connection, 'repo')
+        self.connection.commit()
+        sent = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=sent), 1)
+        audit = self.connection.execute('SELECT sent_at, canceled_at FROM notification_outbox WHERE event_key=?', (key,)).fetchone()
+        self.assertIsNotNone(audit[0])
+        self.assertIsNone(audit[1])
+        saved = self.waiting()
+        with self.connection:
+            self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'", (draft_decisions.PREFIX + json.dumps([
+                {'id': 'G-001', 'revision': saved['revision'], 'outcome': 'valid', 'reason': 'The selected policy remains valid.'}]),))
+        self.publish_decision(documents, inputs=inputs)
+        self.assertEqual(execplan_draft_state.user_question_ids(self.connection, 'repo'), {'G-002'})
+        documents[PATH] = documents[PATH].replace('risk: low', 'risk: low\ndraft: true') + QUESTION.replace('storage policy', 'retention policy')
+        self.reconcile(documents, '3' * 40, inputs=inputs)
+        self.assertEqual(execplan_draft_state.user_question_ids(self.connection, 'repo'), {'G-001', 'G-002'})
+        notifications.enqueue_draft_decisions(self.connection, 'repo')
+        self.connection.commit()
+        self.assertEqual(notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=sent), 1)
+        self.assertIn('draft 작업 2건', sent.call_args.args[2])
+
     def test_only_remote_explicit_current_decision_releases_draft(self):
         revision = self.waiting()["revision"]
         documents = {PATH: accepted_text(self.text, revision)}
@@ -374,6 +485,159 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         self.reconcile(documents, "e" * 40)
         self.assertEqual(self.waiting(), saved)
 
+    def test_cleaned_resolution_reassesses_changed_inputs_without_reasking_user(self):
+        documents = {PATH: accepted_text(self.text, self.waiting()["revision"])}
+        self.reconcile(documents)
+        self.publish_decision(documents)
+        history = self.waiting()["resolutions"]
+        documents[PATH] = documents[PATH].replace("- [ ] Pending", "- [x] Documentation only")
+        self.reconcile(documents, "1" * 40)
+        self.assertFalse(self.waiting()["pending"])
+        changed_inputs = {**self.inputs, "docs/PRODUCT.md": "new-policy"}
+        self.reconcile(documents, "2" * 40, inputs=changed_inputs)
+        saved = self.waiting()
+        self.assertTrue(saved["reassessment"])
+        self.assertTrue(saved["pending"])
+        self.assertEqual(saved["question"], "")
+        self.assertEqual(saved["resolutions"], history)
+        self.assertIsNone(loop_manager.select_ready_execplan(self.connection, "repo"))
+        result = [{"id": "G-001", "revision": saved["revision"], "outcome": "valid",
+                   "reason": "The changed policy preserves the selected storage contract."}]
+        self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'",
+                                (draft_decisions.PREFIX + json.dumps(result),))
+        self.connection.commit()
+        cleaned = self.publish_decision(documents, inputs=changed_inputs)
+        self.assertIn(result[0]["reason"], cleaned)
+        self.assertNotIn("## User Decision", cleaned)
+        self.assertFalse(self.waiting()["pending"])
+        self.assertEqual(len(self.waiting()["resolutions"]), 2)
+        self.reconcile(documents, "3" * 40, inputs=changed_inputs)
+        self.assertFalse(self.waiting()["pending"])
+        documents[PATH] = documents[PATH].replace("Preserve user behavior", "Change the retention policy")
+        self.reconcile(documents, "4" * 40, inputs=changed_inputs)
+        self.assertTrue(self.waiting()["reassessment"])
+        new_question = QUESTION.replace("storage policy", "retention policy")
+        documents[PATH] = documents[PATH].replace("risk: low", "risk: low\ndraft: true") + new_question
+        self.reconcile(documents, "5" * 40, inputs=changed_inputs)
+        self.assertTrue(self.waiting()["pending"])
+        self.assertNotIn("reassessment", self.waiting())
+        self.assertIn("retention policy", self.waiting()["question"])
+
+    def test_requirement_answer_requires_current_source_and_preserves_user_document(self):
+        source = "docs/requirements/[R-001] Policy.md"
+        self.text = self.text.replace("docs/PRODUCT.md", source)
+        before = "# [R-001] Policy\n\nPolicy is undecided.\n"
+        answer = "Use policy A and retain history."
+        after = before + answer + "\n"
+        inputs = {**self.inputs, source: execplan_drafts.content_digest(after.encode())}
+        self.reconcile({PATH: self.text}, "c" * 40, inputs=inputs)
+        saved = self.waiting()
+        saved['user_changes'] = {source: {'verified': True, 'revision': 'c' * 40,
+                                          'before': before, 'after': after}}
+        with self.connection:
+            self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo='repo' AND plan_id='G-001'", (json.dumps(saved),))
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
+        original = loop_manager._ready_plan_snapshot_from_contents(row, self.text.encode(), allow_started=True)
+        snapshot = MutableReadySnapshot("repo", row["current_revision_sha"], (original,), "fixture")
+        result = [{"id": "G-001", "revision": saved['revision'], "remaining": "",
+                   "resolved": [{"question": draft_decisions.questions(saved['question'])[0],
+                                 "answer": answer, "source": source, "quote": answer}]}]
+        with self.connection:
+            self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'", (draft_decisions.PREFIX + json.dumps(result),))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / source).parent.mkdir(parents=True)
+            (root / source).write_text(after, encoding='utf-8')
+            target = root / PATH
+            target.parent.mkdir(parents=True)
+            target.write_text(draft_decisions.replace_section(self.text, "Implementation", answer), encoding='utf-8')
+            stale = {**saved, 'basis': {**saved['basis'], 'inputs': {**inputs, source: 'stale'}}}
+            with self.connection:
+                self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo='repo' AND plan_id='G-001'", (json.dumps(stale),))
+            with self.assertRaisesRegex(loop_manager.PlannerValidationError, '현재 source'):
+                draft_decisions.prepare(self.connection, 'repo', root, snapshot)
+            with self.connection:
+                self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo='repo' AND plan_id='G-001'", (json.dumps(saved),))
+            prepared = draft_decisions.prepare(self.connection, 'repo', root, snapshot)
+            self.assertIn('G-001', prepared)
+            self.assertNotIn('draft: true', target.read_text())
+            self.assertEqual((root / source).read_text(), after)
+            self.assertTrue(self.waiting()['pending'])
+
+    def test_malformed_resolution_never_changes_document_or_hold(self):
+        documents = {PATH: accepted_text(self.text, self.waiting()["revision"])}
+        self.reconcile(documents)
+        saved = self.waiting()
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
+        original = loop_manager._ready_plan_snapshot_from_contents(row, documents[PATH].encode(), allow_started=True)
+        snapshot = MutableReadySnapshot("repo", row["current_revision_sha"], (original,), "fixture")
+        valid = {"id": "G-001", "revision": saved["revision"], "remaining": "",
+                 "resolved": [{"question": draft_decisions.questions(saved["question"])[0],
+                               "answer": saved["decision"]["Answer"], "source": PATH,
+                               "quote": saved["decision"]["Answer"]}]}
+        malformed = [json.dumps([valid]).replace('"id": "G-001"', '"id": "G-999", "id": "G-001"'),
+                     json.dumps([valid, valid]), json.dumps([{**valid, "outcome": "approved"}]),
+                     json.dumps([{**valid, "extra": True}]), json.dumps([{**valid, "id": []}]),
+                     json.dumps([{**valid, "revision": "stale"}]),
+                     json.dumps([{**valid, "remaining": QUESTION}])]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / PATH
+            target.parent.mkdir(parents=True)
+            target.write_text(draft_decisions.replace_section(documents[PATH], "Implementation", saved["decision"]["Answer"]), encoding="utf-8")
+            before = target.read_bytes()
+            for output in [draft_decisions.PREFIX + value for value in malformed] + [
+                    (draft_decisions.PREFIX + json.dumps([valid]) + "\n") * 2]:
+                with self.subTest(output=output):
+                    self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'", (output,))
+                    self.connection.commit()
+                    with self.assertRaises(loop_manager.PlannerValidationError):
+                        draft_decisions.prepare(self.connection, "repo", root, snapshot)
+                    self.assertEqual(target.read_bytes(), before)
+                    self.assertEqual(self.waiting(), saved)
+
+    def test_partial_resolution_preserves_unanswered_user_decision_and_reuses_it(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        self.text = self.text.replace("Question: " + first, "Question: - " + first + "\n- " + second)
+        self.reconcile({PATH: self.text}, "c" * 40)
+        first_answer = "Use policy A and retain history."
+        second_answer = "Retry only transient errors."
+        text = accepted_text(self.text, self.waiting()["revision"], answer=first_answer + "\n" + second_answer)
+        text = text.replace("risk: low\n", "risk: low\ndraft: true\n")
+        documents = {PATH: text}
+        self.reconcile(documents, "d" * 40)
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
+        original = loop_manager._ready_plan_snapshot_from_contents(row, text.encode(), allow_started=True)
+        snapshot = MutableReadySnapshot("repo", row["current_revision_sha"], (original,), "fixture")
+        result = [{"id": "G-001", "revision": self.waiting()["revision"],
+                   "remaining": QUESTION.replace(first, second),
+                   "resolved": [{"question": first, "answer": first_answer, "source": PATH, "quote": first_answer}]}]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / PATH
+            target.parent.mkdir(parents=True)
+            target.write_text(draft_decisions.replace_section(text, "Implementation", first_answer), encoding="utf-8")
+            self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'",
+                                    (draft_decisions.PREFIX + json.dumps(result),))
+            self.connection.commit()
+            prepared = draft_decisions.prepare(self.connection, "repo", root, snapshot)
+            cleaned = target.read_text()
+            self.assertEqual(execplan_drafts.fields(markdown_sections(cleaned).values["User Decision"])["Answer"], second_answer)
+            plan = execplan_catalog.parse_execplan_text(PATH, cleaned, validate_sources=False)
+            with self.connection:
+                execplan_draft_state.resolve(self.connection, "repo", PATH, plan,
+                    execplan_catalog.plan_content_hash(target.read_bytes()), "f" * 40, prepared["G-001"], inputs=self.inputs)
+            self.assertTrue(self.waiting()["decision_ready"])
+            self.assertTrue(self.waiting()["user_changes"][PATH]["verified"])
+            self.assertTrue(self.waiting()["pending"])
+        documents[PATH] = cleaned
+        self.reconcile(documents, "f" * 40)
+        self.assertTrue(self.waiting()["decision_ready"])
+        self.publish_decision(documents)
+        self.assertFalse(self.waiting()["pending"])
+        self.assertIn(second_answer, documents[PATH])
+
     def test_partial_resolution_keeps_only_the_remaining_question(self):
         first = "Which storage policy should this goal use?"
         second = "Which retry policy should this goal use?"
@@ -395,6 +659,46 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertTrue(self.waiting()["pending"])
         self.assertIn("/blob/" + "f" * 40, self.waiting()["url"])
         self.assertIsNone(loop_manager.select_ready_execplan(self.connection, "repo"))
+
+    def test_started_cleaned_plan_keeps_execution_and_resolution_history(self):
+        documents = {PATH: accepted_text(self.text, self.waiting()["revision"])}
+        self.reconcile(documents)
+        self.publish_decision(documents)
+        saved = self.waiting()
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET ever_started=1, status='IMPLEMENTING', worker_session_id='session' WHERE plan_id='G-001'")
+        self.reconcile(documents, "e" * 40, inputs={**self.inputs, "docs/PRODUCT.md": "changed"})
+        self.assertEqual(self.waiting(), saved)
+        row = self.connection.execute("SELECT status, worker_session_id FROM exec_plans WHERE plan_id='G-001'").fetchone()
+        self.assertEqual(tuple(row), ('IMPLEMENTING', 'session'))
+
+    def test_user_provenance_checks_the_entire_path_history(self):
+        text = accepted_text(self.text, self.waiting()["revision"])
+        snapshot = execplan_catalog.snapshot_from_documents({PATH: text}, revision_sha="b" * 40)
+        pinned = execplan_catalog_state.PinnedCatalog("b" * 40, snapshot, frozenset({PATH}))
+        for history, status, verified in (
+                ("user\0user@example.test", 0, True),
+                ("user\0user@example.test\nagent\0agent@example.test", 0, False),
+                ("user\0user@example.test\n" + "a" * 40 + "\0user@example.test", 0, False),
+                ("user\0user@example.test", 128, False),
+                ("", 0, False)):
+            calls = []
+            def git(_repository, *args, **kwargs):
+                calls.append(args)
+                if args[:3] == ("config", "--get", "user.email"):
+                    return SimpleNamespace(returncode=0, stdout="user@example.test\n")
+                if args[0] == "merge-base":
+                    return SimpleNamespace(returncode=0, stdout="")
+                if args[0] == "show":
+                    return SimpleNamespace(returncode=0, stdout=self.text)
+                if args[0] == "log":
+                    return SimpleNamespace(returncode=status, stdout=history)
+                self.fail(args)
+            with self.subTest(history=history, status=status):
+                observed = draft_decisions.user_changes(self.connection, "repo", Path("repo"), pinned,
+                    git=git, git_bytes=lambda *_args: text.encode())
+                self.assertEqual(observed["G-001"][PATH]["verified"], verified)
+                self.assertIn(("log", "--follow", "--format=%H%x00%ae", "a" * 40 + ".." + "b" * 40, "--", PATH), calls)
 
     def test_unverified_source_cannot_prepare_explicit_approval(self):
         self.reconcile({PATH: accepted_text(self.text, self.waiting()["revision"])}, provenance=False)
@@ -714,6 +1018,169 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         result = self.reconcile(documents)
         self.assertEqual(result.kind, execplan_catalog_state.ReconciliationKind.INVALID_CATALOG)
         self.assertEqual(result.diagnostic.code, "draft-owned")
+
+
+class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
+    """Observe real evidence/state transitions; only remote Git and Planner are fakes."""
+
+    def setUp(self):
+        self.connection = self._connection()
+        self.trees = {}
+
+    def observe(self, revision, tree):
+        self.trees[revision] = tree
+        self.current = revision
+        snapshot = execplan_catalog.snapshot_from_documents({PATH: tree[PATH]}, revision_sha=revision)
+        inputs = {path: execplan_drafts.content_digest(text.encode())
+                  for path, text in tree.items() if path != PATH}
+        pinned = execplan_catalog_state.PinnedCatalog(revision, snapshot, frozenset(tree), draft_inputs=inputs)
+
+        def git(_repository, *args, **kwargs):
+            if args == ("config", "--get", "user.email"):
+                return SimpleNamespace(returncode=0, stdout="user@example.test")
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                self.assertIn(args[2], self.trees)
+                self.assertEqual(args[3], revision)
+                return SimpleNamespace(returncode=0, stdout="")
+            if args[0] == "show":
+                commit, path = args[1].split(":", 1)
+                text = self.trees.get(commit, {}).get(path)
+                return SimpleNamespace(returncode=0 if text is not None else 128, stdout=text or "")
+            if args[:3] == ("log", "--follow", "--format=%H%x00%ae"):
+                self.assertTrue(args[3].endswith(".." + revision))
+                return SimpleNamespace(returncode=0, stdout=revision + "\0user@example.test")
+            self.fail(args)
+
+        def git_bytes(_repository, command, spec):
+            self.assertEqual(command, "show")
+            commit, path = spec.split(":", 1)
+            return self.trees[commit][path].encode()
+
+        changes = draft_decisions.user_changes(self.connection, "repo", Path("repo"), pinned,
+                                               git=git, git_bytes=git_bytes)
+        pinned = replace(pinned, draft_changes=changes)
+        repository = execplan_catalog_state.DefinitionStateRepository(self.connection)
+        result = execplan_catalog_state.CatalogReconciliationService(repository, FakeDefinitionPort(pinned)).reconcile("repo")
+        self.assertTrue(result.usable)
+        return execplan_draft_state.evidence(self.connection, "repo", "G-001")
+
+    def prepare(self, source, question, answer, remaining=""):
+        tree = self.trees[self.current]
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
+        original = loop_manager._ready_plan_snapshot_from_contents(row, tree[PATH].encode(), allow_started=True)
+        snapshot = MutableReadySnapshot("repo", self.current, (original,), "fixture")
+        saved = execplan_draft_state.evidence(self.connection, "repo", "G-001")
+        result = [{"id": "G-001", "revision": saved["revision"], "remaining": remaining,
+                   "resolved": [{"question": question, "answer": answer, "source": source, "quote": answer}]}]
+        with self.connection:
+            self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'", (draft_decisions.PREFIX + json.dumps(result),))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path, text in tree.items():
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            target = root / PATH
+            body = markdown_sections(tree[PATH]).values['Implementation']
+            target.write_text(draft_decisions.replace_section(tree[PATH], "Implementation", body + "\n" + answer), encoding="utf-8")
+            prepared = draft_decisions.prepare(self.connection, "repo", root, snapshot)
+            cleaned = target.read_text()
+            for path, text in tree.items():
+                if path != PATH:
+                    self.assertEqual((root / path).read_text(), text)
+        self.assertTrue(execplan_draft_state.evidence(self.connection, "repo", "G-001")["pending"])
+        return cleaned, prepared['G-001']
+
+    def test_body_answer_survives_reobservation(self):
+        initial = {PATH: draft_text(), "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        answer = "Use policy A and retain history."
+        tree = {**initial, PATH: draft_decisions.replace_section(initial[PATH], "Implementation", answer)}
+        first = self.observe("b" * 40, tree)
+        self.assertEqual(first['remote_revision'], "b" * 40)
+        evidence = first['user_changes'][PATH]
+        self.assertTrue(evidence['verified'])
+        for _ in range(2):
+            saved = self.observe("b" * 40, tree)
+            self.assertEqual(saved['user_changes'].get(PATH), evidence)
+        question = draft_decisions.questions(saved['question'])[0]
+        cleaned, _receipt = self.prepare(PATH, question, answer)
+        self.assertNotIn("draft: true", cleaned)
+
+    def test_requirement_answers_survive_partial_cleanup_and_reobservation(self):
+        self.partial_answers("docs/requirements/[R-001] Policy.md")
+
+    def test_body_answers_survive_partial_cleanup_and_reobservation(self):
+        self.partial_answers(PATH)
+
+    def test_body_answers_survive_progress_edit_after_partial_cleanup(self):
+        self.partial_answers(PATH, progress=True)
+
+    def test_progress_edit_does_not_preserve_withdrawn_body_answer(self):
+        self.partial_answers(PATH, progress=True, withdraw=True)
+
+    def partial_answers(self, source, *, progress=False, withdraw=False):
+        first_question = "Which storage policy should this goal use?"
+        second_question = "Which retry policy should this goal use?"
+        plan = draft_text().replace(
+            "Question: " + first_question, "Question: - " + first_question + "\n- " + second_question)
+        if source != PATH:
+            plan = plan.replace("docs/PRODUCT.md", source)
+        initial = {PATH: plan, source if source != PATH else "docs/PRODUCT.md": "# [R-001] Policy\n"}
+        self.observe("a" * 40, initial)
+        first_answer = "Use policy A and retain history."
+        second_answer = "Retry only transient errors."
+        answer = first_answer + "\n" + second_answer + "\n"
+        tree = {**initial, source: (draft_decisions.replace_section(plan, "Implementation", answer)
+                                   if source == PATH else initial[source] + answer)}
+        first = self.observe("b" * 40, tree)
+        self.assertEqual(first['remote_revision'], "b" * 40)
+        evidence = first['user_changes'][source]
+        self.assertTrue(evidence['verified'])
+        saved = self.observe("b" * 40, tree)
+        self.assertEqual(saved['user_changes'].get(source), evidence)
+        cleaned, receipt = self.prepare(source, first_question, first_answer, QUESTION.replace(first_question, second_question))
+        parsed = execplan_catalog.parse_execplan_text(PATH, cleaned, validate_sources=False)
+        with self.connection:
+            execplan_draft_state.resolve(self.connection, "repo", PATH, parsed,
+                execplan_catalog.plan_content_hash(cleaned.encode()), "f" * 40, receipt, inputs=saved['basis']['inputs'])
+        published = {**tree, PATH: cleaned}
+        for _ in range(2):
+            saved = self.observe("f" * 40, published)
+            self.assertEqual(saved['user_changes'].get(source), evidence)
+            self.assertEqual(draft_decisions.questions(saved['question']), (second_question,))
+        if progress:
+            held_revision = saved['revision']
+            progressed = {**published, PATH: draft_decisions.replace_section(cleaned, "Progress", "- [x] Initial decision integrated.")}
+            if withdraw:
+                progressed[PATH] = progressed[PATH].replace(second_answer, "Retry policy remains undecided.")
+            saved = self.observe("e" * 40, progressed)
+            if not withdraw:
+                self.assertEqual(saved['revision'], held_revision)
+                self.assertEqual(saved['user_changes'].get(source), evidence)
+            saved = self.observe("e" * 40, progressed)
+            if withdraw:
+                with self.assertRaises(loop_manager.PlannerValidationError):
+                    self.prepare(source, second_question, second_answer)
+                self.assertTrue(saved['pending'])
+                return
+            self.assertEqual(saved['user_changes'].get(source), evidence)
+        cleaned, _receipt = self.prepare(source, second_question, second_answer)
+        self.assertNotIn("draft: true", cleaned)
+        self.assertIn(first_answer, cleaned)
+        self.assertIn(second_answer, cleaned)
+
+    def test_reobservation_does_not_restore_reverted_body_answer(self):
+        initial = {PATH: draft_text(), "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        answer = "Use policy A and retain history."
+        self.observe("b" * 40, {**initial, PATH: draft_decisions.replace_section(initial[PATH], "Implementation", answer)})
+        self.observe("c" * 40, initial)
+        saved = self.observe("c" * 40, initial)
+        question = draft_decisions.questions(saved['question'])[0]
+        with self.assertRaises(loop_manager.PlannerValidationError):
+            self.prepare(PATH, question, answer)
+        self.assertTrue(saved['pending'])
 
 
 class ExecPlanDraftPublicationTest(AutomationCatalogFixture, unittest.TestCase):
