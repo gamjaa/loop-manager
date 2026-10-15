@@ -1,5 +1,9 @@
 # [R-080] Git Mock Defaults for Tests
 
+## Summary
+
+자체 테스트의 상태·정책 조합은 Git 관측을 mock으로 제공해 실제 판단·SQLite·파일 보존 결과를 검사하고, 실제 Git·CLI는 그 효과나 연결 계약을 확인해야 할 최소 회귀에 사용한다. assertion과 실패·중단·재개 조건을 유지하고 불필요한 조합·재개 후 반복을 줄인다. 실제 Git fixture는 seed부터 자식까지 사용자 설정·template에서 격리하며 비용 감소를 검증 범위 축소로 대신하지 않는다.
+
 ## Context
 
 Loop Manager 자체 테스트는 상태·정책의 조건 조합을 검사할 때도 Git 저장소 생성과 관측을 반복해 verify 비용이 커지고 있다. Git 관측값만으로 판단을 검증할 수 있는 테스트는 mock을 사용하고, 실제 Git 동작이 검증 대상인 회귀에 실행 비용을 집중해야 한다.

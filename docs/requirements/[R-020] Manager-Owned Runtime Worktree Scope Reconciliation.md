@@ -1,5 +1,9 @@
 # [R-020] Manager-Owned Runtime Worktree Scope Reconciliation
 
+## Summary
+
+부모 bootstrap과 runtime 자식이 선택한 원격 SHA·정확한 runtime 경로·repository·실행 identity를 공유해, 정상 runtime 등록이나 다른 ref·worktree 변화가 저장된 Agent 작업을 차단하지 않게 한다. 현재 선택 runtime의 실제 유효성과 sandbox 경계는 유지하고, 기존 Git 오탐은 작업물·session·감사를 보존해 자동 재평가한다.
+
 ## Context
 
 Loop Manager의 exact-SHA runtime 선택·등록·실행 identity 검증은 기존 ARCHITECTURE의 계약이다. 이 Requirement는 runtime 준비·재사용을 과거 Agent Git 상태와 비교해 접근 권한 위반으로 오인하는 잔여 경로를 제거하고 중단된 작업을 이어가는 데 집중한다. 접근 권한의 sandbox 강제, Git 범위 검사 제거와 기존 차단의 자동 복구는 R-055를 따른다.

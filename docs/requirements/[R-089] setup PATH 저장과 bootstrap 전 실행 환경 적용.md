@@ -1,5 +1,9 @@
 # [R-089] setup PATH 저장과 bootstrap 전 실행 환경 적용
 
+## Summary
+
+Linux setup이 정상 터미널 PATH를 정리·검사해 source checkout의 Git 제외 config/execution-path.txt에 원자적으로 저장하고, source 진입은 bootstrap 첫 외부 명령 전에 저장값 → 현재 PATH → 시스템 후보 순으로 확정한다. 같은 실행의 runtime·Agent·verify가 이를 유지하며 캐시 부재는 기존 PATH로 지원하고 손상은 조용히 대체하지 않는다. 사용자 셸·cron·작업 이력을 바꾸지 않고 setup 재실행으로 갱신·복구한다.
+
 ## Context
 
 Linux의 cron 실행 환경에서는 정상 터미널에서 사용하는 사용자 설치 디렉터리가 PATH에 없어 Codex 등 외부 프로그램을 찾지 못할 수 있다. 현재 `scripts/setup.sh`는 가상환경과 Python 의존성만 준비하고, `run.sh`는 가상환경 Python을 절대 경로로 실행한다. `loop_manager.py`의 bootstrap은 부모 PATH를 그대로 사용하며 runtime 자식과 Agent도 이를 이어받는다. 따라서 가상환경 Python을 찾는 것만으로 Git·gh·Agent CLI·Node와 verify 내부 프로그램의 탐색 문제가 해결되지는 않는다.

@@ -1,5 +1,9 @@
 # [R-056] 원격 기준을 유지하는 비차단 로컬 base 동기화
 
+## Summary
+
+자동 planning·구현·runtime은 검증한 원격 OID를 사용하고 로컬 base 동기화는 별도 부수 처리로 둔다. equal은 유지, ahead는 보존·skip, behind는 변경 보존 가능한 FF-only, clean diverged는 안전한 rebase, dirty diverged는 skip하며 실패가 원격 기준 작업을 막지 않게 한다. 사용자 operation·파일·index를 보호하고 Manager 소유 rebase만 확인된 조건에서 복구한다.
+
 ## Context
 
 현재 기본 worktree 동기화와 bootstrap은 원격 revision 선택을 로컬 상태와 분리하며, 안전한 fast-forward와 clean diverged의 로컬 commit rebase를 지원한다. 이미 구현된 기능을 다시 만들지 않고 아래 상태별 처리와 보존 조건의 누락을 확인한다.

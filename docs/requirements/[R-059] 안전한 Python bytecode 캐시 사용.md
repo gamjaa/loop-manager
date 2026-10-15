@@ -1,5 +1,9 @@
 # [R-059] 안전한 Python bytecode 캐시 사용
 
+## Summary
+
+bootstrap·runtime·관리 worktree의 Python bytecode 캐시를 기본적으로 허용해 안전하게 생성·재사용하고 일괄 비활성화의 잔여 경로를 제거한다. 캐시만으로 차단하지 않되 현재 소스·interpreter·revision·소유권과 tracked 경로 보존은 확인하며, 손상·권한 문제는 안전한 재생성 또는 무캐시 실행으로 처리한다. 실제 cold/warm 비용과 미측정 효과를 구분한다.
+
 ## Context
 
 현재 관리 worktree의 ignored·index-free 파일은 Agent 범위 위반으로 취급하지 않으며 Planner·Worker 환경에 `PYTHONDONTWRITEBYTECODE`를 강제하지 않는다. 그러나 bootstrap이 실행하는 runtime 자식은 `-B`로 bytecode 생성을 막는다. runtime의 검증·정리와 ignored 캐시 보존 조건까지 고려해 Python 캐시를 안전하게 사용할 수 있는지 확인해야 한다.

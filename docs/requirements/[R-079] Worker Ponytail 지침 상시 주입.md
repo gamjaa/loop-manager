@@ -1,5 +1,9 @@
 # [R-079] Worker Ponytail 지침 상시 주입
 
+## Summary
+
+Worker에 runtime에 고정한 Ponytail AGENTS 원문을 기존 common+Worker instruction과 정확히 한 번 합쳐 항상 전달한다. Plugin 설치 목록 조회·설치 판정·원격 갱신을 제거하고 다른 역할·사용자 prompt에는 추가하지 않는다. 사용자 Plugin 설정·기존 확장 차단·쓰기 제한·자동 승인 검토와 과거 지침 snapshot을 보존하며 스타일 지침으로 필수 요구·검증을 생략하지 않는다.
+
 ## Context
 
 Worker가 불필요한 코드·추상화·의존성을 추가하지 않고 기존 구현을 재사용하도록 Ponytail의 코딩 지침을 제공한다. Codex 자동 실행은 현재 파일 쓰기 경계를 유지하기 위해 Plugin·App을 비활성화한다. [Codex 0.161.0의 command Hook](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/hooks/src/engine/command_runner.rs)은 별도 셸 프로세스로 직접 실행되며, 외부 MCP 도구에도 Worker의 내장 파일 sandbox가 동일하게 적용된다고 보장할 수 없다.

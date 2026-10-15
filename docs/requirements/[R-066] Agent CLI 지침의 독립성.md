@@ -1,5 +1,9 @@
 # [R-066] Agent CLI 지침의 독립성
 
+## Summary
+
+프로젝트 루트 AGENTS.md의 해석을 Agent CLI에 맡기고 Manager의 등록·planning 입력·해시·변경 제안·사전 승인·patch 대조에서 제외한다. 과거 승인 대기는 일반 복구 흐름으로 전환하되 감사·작업물·일반 사용자 결정은 보존하고, 공통·역할 instruction과 실제 검증·Review·게시 조건은 유지한다.
+
 ## Context
 
 프로젝트의 개발 지침 해석은 AI Agent CLI가 담당한다. Loop Manager가 같은 파일을 등록·승인·계획 입력으로 별도 관리하면 CLI의 작업 문맥과 중복된 정책이 생긴다.

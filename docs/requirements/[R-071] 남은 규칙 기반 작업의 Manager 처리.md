@@ -1,5 +1,9 @@
 # [R-071] 남은 규칙 기반 작업의 Manager 처리
 
+## Summary
+
+확정 가능한 새 ExecPlan ID·dependency·barrier·결과 형식과 Requirement ID·제목·파일명 교정을 추가 모델 호출 없이 Manager가 처리한다. 유효한 frontmatter 또는 기존 첫 제목의 원본 식별 규칙과 최대 번호 다음 배정을 사용하고, archive·기존 작업 참조·sources 문자열을 보존해 rename 뒤에도 같은 문서를 조회한다. 모호한 의미 판단·실제 검증·게시·사용자 결정은 기존 경계에 남긴다.
+
 ## Context
 
 확정된 ID·dependency·파일명·형식·객관적 사실은 Manager 코드가 처리하고 의미 판단은 기존 Agent 역할에 남긴다. 이런 정보를 모델에게 다시 작성시키면 불필요한 호출과 교정이 발생한다. 새 ExecPlan 충돌 교정, 유지보수 barrier 추가와 결과 형식 처리뿐 아니라 Requirement의 중복 R ID·제목·파일명 교정에도 같은 원칙을 적용한다.

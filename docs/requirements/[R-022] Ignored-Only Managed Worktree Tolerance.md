@@ -1,5 +1,9 @@
 # [R-022] Ignored-Only Managed Worktree Tolerance
 
+## Summary
+
+시작 ignore 규칙으로 확인한 index-free ignored 파일의 생성·수정·삭제를 비권위 로컬 상태로 취급해 planning·구현·verify·Review·복구의 오탐을 없앤다. 게시 가능한 변경과 Git 쓰기 직전의 tracked 경로 충돌은 계속 검사하며, 기존 작업 공간을 함께 사용하고 정상 종료한 정확한 소유 worktree만 전체 수명 정리 대상으로 삼는다.
+
 ## Context
 
 Loop Manager는 Agent 실행 전후의 Git snapshot을 비교해 역할별 허용 범위 밖의 변경을 차단한다. ignored 파일의 관측 자료를 권위 있는 변경과 동일하게 비교하면 Planner, Reviewer 또는 Manager 검증이 자동 생성한 `__pycache__/*.pyc`, test cache와 임시 artifact까지 범위 위반이나 소유권 실패로 취급할 수 있다.

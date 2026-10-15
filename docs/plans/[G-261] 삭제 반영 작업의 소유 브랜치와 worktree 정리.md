@@ -18,7 +18,7 @@ priority: high
 
 ## Purpose
 
-확인된 문서 삭제를 반영한 취소·완료 작업의 정확한 Manager 소유 로컬·원격 브랜치와 worktree를, 작업물 보존과 기대 OID 검증 뒤 정리한다. 현재 Merge된 로컬 브랜치만 비강제 삭제하는 경계에서 원격 ref 삭제까지 확장하는 구현은 Architecture Change Policy의 사용자 판단을 기다린다.
+확인된 문서 삭제를 반영한 취소·완료 작업의 정확한 Manager 소유 로컬·원격 브랜치와 worktree를, 작업물 보존과 기대 OID 검증 뒤 정리한다. 원격 ref 삭제까지 확장하는 경계는 아래 User Decision의 선택지 A로 승인됐다. 승인된 대상·보존·소유권·PR head·기대 OID·중단 복구 조건의 구현과 검증은 남아 있다.
 
 ## Draft Decision
 
@@ -44,7 +44,7 @@ Answer: 선택지 A를 승인한다. 앞으로 작업 문서의 확인된 삭제
 
 ## Implementation
 
-승인 후 `git/cleanup_service.py`·`merge_cleanup_service.py`의 소유권·재검사·pending 처리, 기존 Manager Git journal·자원 claim·PR 관측·게시 lease를 재사용한다. 취소/완료의 현재 수명과 자원별 보존·삭제 intent를 연결하고 실제 ref 삭제 효과를 의미 판단·DB 취소와 분리한다. 복구 가능한 보존·정확한 기대 OID의 거부를 기존 관리 저장 경계 안에서 구현하며 새로운 외부 서비스·비호환 migration·독립 운영 상태 원본을 만들지 않는다.
+아래 User Decision의 승인 범위에서 `git/cleanup_service.py`·`merge_cleanup_service.py`의 소유권·재검사·pending 처리, 기존 Manager Git journal·자원 claim·PR 관측·게시 lease를 재사용한다. 취소/완료의 현재 수명과 자원별 보존·삭제 intent를 연결하고 실제 ref 삭제 효과를 의미 판단·DB 취소와 분리한다. 복구 가능한 보존·정확한 기대 OID의 거부를 기존 관리 저장 경계 안에서 구현하며 새로운 외부 서비스·비호환 migration·독립 운영 상태 원본을 만들지 않는다.
 
 G-238의 명시적 reset/manual stop·READY 복귀는 이 작업에 포함하지 않는다. 해당 경로와 공통 보존·Git journal 책임이 있으면 현재 Merge된 helper를 재사용하되 미완료 CLI 구현을 복제하거나 수동 소유 권한을 확대하지 않는다. PRODUCT·ARCHITECTURE에는 승인 후 실제 구현한 삭제 대상·보존·PR/lease·pending/재개 계약을 현행 정리 절에 통합한다.
 

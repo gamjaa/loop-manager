@@ -1,5 +1,9 @@
 # [R-033] Minimal Worker Session Prompts
 
+## Summary
+
+같은 Worker 세션의 사용자 prompt에는 직전 turn 이후 새 작업 변화·미해결 교정만 전달하고, 고정된 common+Worker instruction은 매 호출 유지한다. provider·Model 변경이나 session 복구로 새 세션을 시작할 때만 선택 작업·작업 공간·미완료 요점을 최소 문맥으로 전달하며 결과 형식·권한·검증 책임을 보존한다.
+
 ## Context
 
 Loop Manager는 Codex CLI 또는 Claude Code의 Worker 세션을 재개하지만, 작업 prompt의 역할 규칙·ExecPlan 경로·작업 범위가 반복되면 새 정보 없이 문맥과 입력량만 늘어난다. CLI가 같은 세션의 대화를 관리하는 동안 작업별 입력은 새 사실에 한정해야 한다. 반대로 Model 변경이나 세션 복구로 새 세션을 시작할 때는 미완료 작업을 이어갈 최소 문맥이 필요하다.

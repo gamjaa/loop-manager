@@ -1,5 +1,9 @@
 # [R-023] Self-Hosted Runtime Refresh Handoff
 
+## Summary
+
+로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 새 self PR Merge 뒤 원격이 실행 runtime의 후속이면 상태를 보존해 종료하고 다음 외부 실행으로 넘긴다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 강제하며 정상 Git 변화의 오탐 복구와 Codex·Claude의 호출별 실패 경계를 유지한다.
+
 ## Context
 
 Loop Manager는 현재 source checkout과 분리된 등록 origin/<base-branch>의 exact SHA의 detached runtime worktree에서 실행된다. 등록된 self 프로젝트의 base branch는 현재 `main`이지만 앞으로 `develop` 등 다른 branch가 될 수 있으므로, 이 변경의 PR 동기화·source checkout 갱신·runtime handoff는 `main`을 상수로 사용하지 않고 등록 상태에서 해석한 하나의 `<base-branch>`와 `origin/<base-branch>`를 끝까지 사용해야 한다.
