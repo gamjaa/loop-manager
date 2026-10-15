@@ -10,9 +10,7 @@ Planner와 사용자가 현재 채택한 구조·책임·데이터 형식·호�
 
 - 제품 목표와 규칙: `docs/PRODUCT.md` (선택)
 - 개별 요구사항: `docs/requirements/*.md` (선택)
-- ExecPlan 작성 규칙: `docs/PLANS.md`
-
-<!-- PRODUCT.md와 requirements/*.md 중 하나 이상은 프로젝트에 존재해야 한다. -->
+- 작업 계획 작성 규칙: `docs/PLANS.md` (있는 경우)
 
 ## Overview
 
