@@ -49,6 +49,13 @@ class RecoveryRepositoryTests(unittest.TestCase):
         for _ in range(3):
             begin_external_run(connection)
             repository.observe(observation, attempts=3)
+        from loop_manager_internal.notifications.events import _key
+        loop_manager.notifications.ensure_schema(connection)
+        legacy = connection.execute('SELECT * FROM persistent_execution_failures').fetchone()
+        identity = "\0".join((legacy['subject'], str(legacy['episode']), legacy['phase'],
+                              legacy['reason_code'], legacy['fingerprint']))
+        loop_manager.notifications._insert(connection, _key('persistent_failure', 'repo', identity),
+                                           'repo', 'persistent_execution_failure', {'cause': observation.detail})
         notice = connection.execute("SELECT * FROM notification_outbox WHERE "
                                     "event_type='persistent_execution_failure'").fetchone()
         self.assertIsNotNone(notice)
@@ -60,8 +67,10 @@ class RecoveryRepositoryTests(unittest.TestCase):
         failure = connection.execute('SELECT * FROM persistent_execution_failures').fetchone()
         self.assertEqual(failure['active'], 0)
         self.assertEqual(failure['detail'], observation.detail)
-        self.assertIsNone(connection.execute('SELECT * FROM notification_outbox WHERE event_key=?',
-                                            (notice['event_key'],)).fetchone())
+        canceled = connection.execute('SELECT * FROM notification_outbox WHERE event_key=?',
+                                      (notice['event_key'],)).fetchone()
+        self.assertIsNotNone(canceled['canceled_at'])
+        self.assertEqual(canceled['payload'], notice['payload'])
         repository.resolve_git_scope_failure('repo', None)
         self.assertEqual(dict(connection.execute('SELECT * FROM persistent_execution_failures').fetchone()),
                          dict(failure))

@@ -214,7 +214,6 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             before = repository.external_run_snapshot(repo)
             repository.observe(failure)
             repository.observe_external_run(repo, before)
-            notifications.enqueue_persistent_execution_failure_events(connection, repo)
             notifications.enqueue_worker_failure(connection, repo, 'G-018', cause, status='다음 실행에서 교정')
         self.assertEqual(self.events(connection), [])
         diagnostic = connection.execute('SELECT consecutive_runs, notification_eligible, notification_queued, detail '
