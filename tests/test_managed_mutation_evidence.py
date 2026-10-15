@@ -1056,7 +1056,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             self.assertEqual(caught.exception.reason, RecoveryReason.AGENT_SCOPE_VIOLATION)
             begin.assert_not_called()
 
-    def test_continuation_intent_carries_only_matching_saved_stage_files(self):
+    def test_continuation_defers_intermediate_content_and_retains_stage_audit(self):
         case = pending_current_case(self)
         current = case.checkpoint.get('repo', 'G-047')
         self.assertEqual(current.snapshot['stage_evidence'], {'old': 'audit'})
@@ -1065,11 +1065,11 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         self.assertNotIn('stage_evidence', begin.call_args.kwargs['expected'])
         self.assertEqual(case.checkpoint.get('repo', 'G-047'), current)
         case.observed = replace(case.observed, staged=(FileChange('docs/requirements/archive/UserGuidance.md', '100644', '100644', 'old', 'foreign', 'M'),))
-        with mock.patch.object(journal, 'begin_current_rebase') as begin:
-            with self.assertRaises(RecoveryFailure) as caught:
-                case.handler._begin_rebase_continuation(case.fixture.context(), CorrectionAction.CONTINUE)
-            self.assertEqual(caught.exception.reason, RecoveryReason.AGENT_SCOPE_VIOLATION)
-            begin.assert_not_called()
+        with mock.patch.object(journal, 'begin_current_rebase', return_value='pending') as begin:
+            self.assertEqual(case.handler._begin_rebase_continuation(
+                case.fixture.context(), CorrectionAction.CONTINUE), 'pending')
+        self.assertNotIn('stage_evidence', begin.call_args.kwargs['expected'])
+        self.assertEqual(case.checkpoint.get('repo', 'G-047'), current)
 
     def test_dropped_rebase_patch_leaves_journal_unverified_for_no_change_gate(self):
         handler = execution_handler_stub()
@@ -1216,6 +1216,36 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
 
 class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     """The production factory's identity/input adapters, with no Git process."""
+    def test_auxiliary_markers_preserve_original_document_preflight_exception(self):
+        from loop_manager_internal.git.managed_rebase_runtime import build_service
+        from tests.support.runtime import runtime_rebase_fixture
+        from tests.support.rebase_observations import observation
+        from loop_manager_internal.git.managed_rebase_validation import WorktreeFile
+        ports, _ = self._user_document_service()
+        connection, *_ = runtime_rebase_fixture(self)
+        path = 'docs/plans/[G-265] Historical.md'
+        auxiliary = {'REBASE_HEAD': 'last-commit', 'MERGE_MSG': 'message'}
+        ports._owned_rebase_metadata.return_value = None
+        ports.capture_git_snapshot.return_value = SimpleNamespace(head='before', operations=auxiliary)
+        original_git = ports.git.side_effect
+        def git(root, *args, **kwargs):
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(stdout='', returncode=1)
+            if args == ('merge-base', 'base', 'before'):
+                return SimpleNamespace(stdout='common', returncode=0)
+            if args[0] == 'diff' and '--name-only' in args:
+                return SimpleNamespace(stdout=path + '\0', returncode=0)
+            return original_git(root, *args, **kwargs)
+        ports.git.side_effect = git
+        service = build_service(ports, connection, Path(REPO), Path('/state'),
+                                'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
+        current = observation(service.expected, head='before', operations=tuple(auxiliary.items()),
+            committed=(FileChange(path, '100644', '100644', 'old', 'historical', 'M'),))
+        self.assertTrue(service.adapters.path_allowed(path))
+        self.assertTrue(service.adapters.contracts_allowed(current))
+        self.assertFalse(service.adapters.contracts_allowed(replace(current,
+            files=(WorktreeFile(path, ('unstaged',), '100644', 'new-edit'),))))
+
     def test_windows_file_modes_reuse_index_without_per_file_git_queries(self):
         from loop_manager_internal.git import managed_rebase_runtime
         ports, service = self._user_document_service()
@@ -1456,7 +1486,20 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                     def build():
                         return build_service(ports, connection, Path(REPO), Path('/state'),
                                              'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
-                    if allowed:
+                    if metadata is not None or index:
+                        service = build()
+                        ports.requirement_archive_move_set.assert_not_called()
+                        from tests.support.rebase_observations import observation
+                        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+                        final = observation(service.expected,
+                            input_fingerprint=service.expected.input_fingerprint,
+                            scope_fingerprint=service.expected.scope_fingerprint)
+                        with mock.patch('loop_manager_internal.git.managed_rebase_observation._once',
+                                        return_value=(final, None)):
+                            observed, decision = service.observe()
+                        self.assertEqual(decision.status, RebaseStatus.UNAVAILABLE)
+                        self.assertIn('refresh archive contracts', observed.detail)
+                    elif allowed:
                         service = build()
                         ports.requirement_archive_move_set.assert_called_once_with(
                             Path(REPO), 'common', Path('/owned'))

@@ -20,6 +20,7 @@ from loop_manager_internal.recovery.work_branch_integration import user_changes,
 from loop_manager_internal.agents.agent_scope_decision import _worker_path_allowed
 from dataclasses import replace
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,12 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     # and the transactional recheck.
     pending_metadata = ports._owned_rebase_metadata(worktree)
     pending_index = ports.git(worktree, 'ls-files', '-u', '-z').stdout
+    content_pending = bool(pending_metadata is not None or pending_index)
+    if expected.autostash_oid and not content_pending:
+        staged = ports.git(worktree, 'diff', '--cached', '--quiet', check=False)
+        if staged.returncode not in (0, 1):
+            raise MutationEvidenceError('autostash index observation failed')
+        content_pending = staged.returncode == 1
     from loop_manager_internal.git.rebase_documents import document_path, adopted_originals
     metadata_owned = bool(isinstance(pending_metadata, dict) and checkpoint.operation == 'rebase'
         and pending_metadata.get('orig-head') == expected.before_head
@@ -205,7 +212,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     if (expected.before_head and checkpoint.operation in {None, 'rebase'}
             and pending_metadata is None and not pending_index):
         start = ports.capture_git_snapshot(worktree)
-        if start.head == expected.before_head and not start.operations:
+        if start.head == expected.before_head and not controlling_git_operation(start.operations):
             ancestor = ports.git(worktree, 'merge-base', '--is-ancestor',
                                  target, start.head, check=False)
             if ancestor.returncode == 1:
@@ -253,7 +260,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                 mode, _ = read_file(worktree, path, desired['mode'])
                 if (mode, hashed.stdout.strip()) in document_blobs[path]:
                     document_files.add(path)
-    if pending_metadata is None and not pending_index:
+    if not content_pending:
         options = {}
         try:
             if owned_definition:
@@ -273,7 +280,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     archive_ok = True
     archive_blobs = {}
     archive_signatures = {}
-    if archives:
+    if archives and not content_pending:
         archive_base = target
         # Before the rebase starts, this checkout cannot contain requirements
         # added by the target. Match the observation adapter's original-branch
@@ -334,6 +341,9 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         path, expected.plan_path, archives, (), common)
     checked_contracts = contracts
     def scoped_contracts(observed):
+        if archives and content_pending:
+            # A service built during replay must rebuild final archive inputs.
+            raise MutationEvidenceError('current rebase phase changed; refresh archive contracts')
         # A pending Manager rebase may start with the previous Worker branch's
         # stale document versions. Permit only exact Requirement/ExecPlan paths
         # changed on both sides of the merge base, and only while HEAD is still
@@ -341,7 +351,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         # with the pinned target bytes before a later observation can complete.
         starting_documents = (start_document_paths
             if (observed.head == expected.before_head and observed.metadata is None
-                and not observed.operations and not observed.staged
+                and not controlling_git_operation(dict(observed.operations)) and not observed.staged
                 and not any(entry.stage for entry in observed.index)) else set())
         if starting_documents:
             if any(file.path in starting_documents for file in observed.files):

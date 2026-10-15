@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import CleanupAssessment
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from pathlib import Path
@@ -45,10 +46,12 @@ def assess_cleanup(effects: AssessCleanupEffects, worktree: Path, pr_head_oid: s
         operations = effects._git_operation_entries(worktree)
     except RuntimeError as error:
         return CleanupAssessment("unverifiable", f"worktree 상태 확인 실패: {error}")
-    if dirty or operations:
+    active_operations = [name for name in operations
+                         if controlling_git_operation({name: operations[name]})]
+    if dirty or active_operations:
         return CleanupAssessment(
             "dirty", "index flag 또는 Git operation 변경: "
-            + ", ".join(sorted((*dirty, *operations))),
+            + ", ".join(sorted((*dirty, *active_operations))),
         )
 
     if not pr_head_oid:

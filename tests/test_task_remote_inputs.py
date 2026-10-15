@@ -113,6 +113,16 @@ class TaskRemoteInputTests(TestCase):
         self.assertIsNone(self.plan()['worker_result'])
         self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-034'))
 
+    def test_restart_requires_current_live_remote_observation(self):
+        self.deleted()
+        before = lm.capture_git_snapshot(self.fx.worktree)
+        with mock.patch('loop_manager_internal.git.manager_git_journal.live_remote_branch_oid',
+                        side_effect=RuntimeError('remote observation unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'remote observation unavailable'):
+                self.restart()
+        self.assertEqual(lm.capture_git_snapshot(self.fx.worktree), before)
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+
     def test_interrupted_restart_resumes_the_same_archive(self):
         self.deleted()
         original = self.effects.git

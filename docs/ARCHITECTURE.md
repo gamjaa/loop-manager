@@ -469,6 +469,8 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 
 모든 관리 rebase의 시작·충돌 해결·완료·중단 복구는 현재 repository·계획·canonical worktree·소유 branch·target base·원격 OID와 PR identity/head를 확인한다. Worker 교정 turn, 승인 stage tree, 명령 receipt, reflog 표식, 원본 commit별 replay와 journal 완전성은 완료 조건이 아니며 기존 기록과 실패 감사는 보존한다
 
+역할별 전체 diff와 문서·archive의 최종 내용 검사는 rebase 시작 전과 완료 후에 수행한다. 소유 rebase의 중간 HEAD·index, 일부 충돌의 stage 0 전환과 autostash 복원 대기는 최종 후보로 검사하지 않으며 경로·mode·index flags와 operation 소유권 검증은 유지한다. 충돌 해결 Agent의 sandbox·접근 권한과 호출 전후 변경 검사는 이 구분으로 면제되지 않는다. 중간 상태에서 만든 서비스는 완료 시 필요한 archive 원문 검증을 새로 구성하며, 관측 중 단계가 바뀌면 성공이나 범위 위반으로 확정하지 않고 재관측한다. `REBASE_HEAD`·`MERGE_MSG`·`MERGE_MODE`만 남은 상태는 진행 중 operation이나 autostash 복원 대기로 취급하지 않고 worktree 정리에서도 같은 controlling operation 기준을 사용한다.
+
 rebase 시작 전 Worker branch와 target의 merge-base 이후 모두 바뀐 Requirement·ExecPlan 경로는 해당 소유 rebase의 문서 재생 입력으로만 허용한다. 이 예외는 Worker 변경 승인으로 이어지지 않으며, 충돌 해결·stage·재시작 뒤에도 target revision의 고정 원문과 경로로 대조하기 전에는 완료 채택하지 않는다.
 
 자동 Worker 해결과 사용자의 수동 파일 해결·stage·continue·완료를 같은 현재 상태 판정으로 수용한다. 소유 rebase의 Requirement·ExecPlan 충돌은 `rebase_documents`가 관측한 원격 base의 immutable revision에서 catalog·ID·source·dependency와 실제 PR 경계를 확인한 뒤 해당 문서의 bytes·mode·경로·삭제를 채택한다. PRODUCT·ARCHITECTURE·지침과 코드·테스트·설정은 자동 선택하지 않는다. rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업의 삭제·archive·미반영 rename으로 유효성을 확정할 수 없으면 원인과 범위를 checkpoint에 보존한다.

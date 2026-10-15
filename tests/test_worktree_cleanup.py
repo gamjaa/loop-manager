@@ -327,6 +327,27 @@ class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
                 self.assertTrue(worktree.exists())
                 self.assertEqual(marker.read_bytes(), b'keep')
 
+    def test_auxiliary_operation_markers_allow_cleanup_but_active_operations_and_flags_do_not(self):
+        from loop_manager_internal.git.cleanup_service import assess_cleanup
+        head = 'a' * 40
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            effects = mock.Mock()
+            effects._capture_local_worktree_state.return_value = (head, 'branch', {}, {})
+            def git(_root, *args, **kwargs):
+                return subprocess.CompletedProcess([], 0, '' if args[0] == 'status' else head)
+            effects.git.side_effect = git
+            auxiliary = {'REBASE_HEAD': 'last-commit', 'MERGE_MSG': 'message', 'MERGE_MODE': 'mode'}
+            effects._git_operation_entries.return_value = auxiliary
+            self.assertEqual(assess_cleanup(effects, worktree, head).status, 'safe')
+            for marker in ('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'sequencer'):
+                with self.subTest(marker=marker):
+                    effects._git_operation_entries.return_value = {**auxiliary, marker: 'active'}
+                    self.assertEqual(assess_cleanup(effects, worktree, head).status, 'dirty')
+            effects._git_operation_entries.return_value = auxiliary
+            effects._capture_local_worktree_state.return_value = (head, 'branch', {}, {'hidden': 'flags'})
+            self.assertEqual(assess_cleanup(effects, worktree, head).status, 'dirty')
+
     def test_local_only_and_unverifiable_commits_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

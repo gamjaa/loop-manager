@@ -147,6 +147,14 @@ def _safe_path(path: str) -> bool:
                     part.casefold() not in {'', '.', '..', '.git'} for part in path.split('/')))
 
 
+def rebase_content_pending(expected: RebaseExpectation, observed: RebaseObservation) -> bool:
+    """Intermediate replay/restoration bytes are not a final candidate."""
+    return bool(observed.metadata is not None
+                or {'rebase-merge', 'rebase-apply'}.intersection(dict(observed.operations))
+                or (expected.autostash_oid
+                    and (observed.staged or any(entry.stage for entry in observed.index))))
+
+
 def assess_scope(
     expected: RebaseExpectation, observed: RebaseObservation, *,
     path_allowed: Callable[[str], bool],
@@ -160,11 +168,12 @@ def assess_scope(
     These callbacks are pure and must not query Git or mutate state.
     """
     violations = []
+    content_pending = rebase_content_pending(expected, observed)
     paths = {change.path for change in (*observed.committed, *observed.staged)}
     paths.update(file.path for file in observed.files)
     paths.update(entry.path for entry in observed.index if entry.stage)
     for path in sorted(paths):
-        if not _safe_path(path) or not path_allowed(path):
+        if not _safe_path(path) or (not content_pending and not path_allowed(path)):
             violations.append(f'path:{path}')
     for change in (*observed.committed, *observed.staged):
         if (change.old_mode not in _MODES or change.new_mode not in _MODES
@@ -192,7 +201,7 @@ def assess_scope(
     if any((path, 0) in seen and any((path, stage) in seen for stage in (1, 2, 3))
            for path, _stage in seen):
         violations.append('index:mixed_stages')
-    if not contracts_allowed(observed):
+    if not content_pending and not contracts_allowed(observed):
         violations.append('current_guidance_or_archive_contract')
     return ScopeResult(
         not violations, expected.input_fingerprint, expected.scope_fingerprint,
@@ -334,7 +343,7 @@ def assess_current_rebase(
             return RebaseDecision(RebaseStatus.START, 'owned_original_head_before_rebase')
         return reject('target_base_not_ancestor')
     if expected.autostash_oid and (
-            any(entry.stage for entry in observed.index) or observed.staged or operations):
+            any(entry.stage for entry in observed.index) or observed.staged):
         if set(operations) - {'MERGE_MSG', 'MERGE_MODE', 'REBASE_HEAD'}:
             return reject('unresolved_operation_or_index')
         return RebaseDecision(RebaseStatus.WAITING, 'owned_autostash_restore_pending')

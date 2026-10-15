@@ -54,6 +54,21 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
         self.assertEqual(self.validate(), {'id': 'G-092'})
         self.service.require_owned.assert_called_once()
 
+    def test_worker_delta_preserves_manager_replay_documents_but_rejects_new_edits(self):
+        from loop_manager_internal.agents.scope_contracts import AgentScopeError
+        path = 'docs/plans/[G-265] Historical.md'
+        self.before = replace(self.before,
+            refs={**self.before.refs, 'refs/remotes/origin/main': ('latest-main', '')},
+            index={**self.before.index, path: ('H 100644 historical 0',)},
+            dirty={path: (('staged',), 'historical')})
+        self.after = replace(self.after, refs=self.before.refs,
+            index={**self.after.index, path: self.before.index[path]},
+            dirty={**self.after.dirty, **self.before.dirty})
+        self.assertEqual(self.validate(), {'id': 'G-092'})
+        self.after = replace(self.after, dirty={**self.after.dirty, path: (('unstaged',), 'worker-edit')})
+        with self.assertRaises(AgentScopeError):
+            self.validate()
+
     def test_allow_rebase_alone_cannot_accept_uncertain_metadata_remote_or_scope(self):
         self.service.require_owned.side_effect = RuntimeError('current ownership or remote mismatch')
         with self.assertRaises(loop_manager.WorkspaceOwnershipError):

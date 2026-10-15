@@ -18,6 +18,54 @@ from loop_manager_internal.git.managed_rebase_validation import FileChange, Inde
 
 
 class CurrentRebasePolicyTests(unittest.TestCase):
+    def test_intermediate_replay_defers_content_but_keeps_structural_and_ownership_checks(self):
+        expected = expectation()
+        path = 'docs/plans/[G-265] Historical.md'
+        replay = FileChange(path, '000000', '100644', '0', 'historical', 'A')
+        pending = observation(expected, head='partial', branch=None, branch_ref=('before', ''),
+            registration=('HEAD=partial', 'detached=True'), branch_worktrees=(),
+            operations=(('rebase-merge', 'owned'),), base_is_ancestor=True,
+            metadata=(('head-name', f'refs/heads/{expected.branch}'),
+                      ('orig-head', 'before'), ('onto', 'base')),
+            committed=(replay,), staged=(replay,), index_clean=False,
+            index=(IndexEntry(path, '100644', 'historical', 0, 'H', 0),
+                   IndexEntry('app.py', '100644', 'conflict', 2, 'M', 0x2000)),
+            files=(WorktreeFile(path, ('staged',), '100644', 'historical'),))
+        content = mock.Mock(side_effect=AssertionError('intermediate content is not final'))
+        scope = scope_for(expected, pending, contracts_allowed=content)
+        self.assertEqual(assess_current_rebase(expected, pending, scope).status, RebaseStatus.WAITING)
+        content.assert_not_called()
+        for changes in (
+            {'committed': (replace(replay, path='../outside'),)},
+            {'committed': (replace(replay, new_mode='040000'),)},
+            {'index': (replace(pending.index[0], flags=0x8000),)},
+            {'metadata': (('head-name', 'refs/heads/other'), ('orig-head', 'before'), ('onto', 'base'))},
+            {'operations': (*pending.operations, ('MERGE_HEAD', 'foreign'))},
+            {'remote': replace(expected.remote, oid='external')},
+        ):
+            with self.subTest(changes=changes):
+                actual = replace(pending, **changes)
+                self.assertEqual(decision_for(expected, actual).status, RebaseStatus.REJECTED)
+        final = observation(expected, committed=(replay,))
+        self.assertEqual(decision_for(expected, final).status, RebaseStatus.REJECTED)
+
+    def test_autostash_content_waits_for_restoration_but_auxiliary_markers_do_not(self):
+        expected = expectation(autostash_oid='stash')
+        change = FileChange('docs/requirements/Preserved.md', '100644', '100644', 'old', 'saved', 'M')
+        pending = observation(expected, staged=(change,), index_clean=False,
+            files=(WorktreeFile(change.path, ('staged', 'unstaged'), '100644', 'saved'),),
+            operations=(('REBASE_HEAD', 'last-commit'), ('MERGE_MSG', 'message')))
+        content = mock.Mock(side_effect=AssertionError('restoration is not final'))
+        scope = scope_for(expected, pending, contracts_allowed=content)
+        self.assertEqual(assess_current_rebase(expected, pending, scope).status, RebaseStatus.WAITING)
+        content.assert_not_called()
+        unsafe = replace(pending, operations=(*pending.operations, ('MERGE_HEAD', 'foreign')))
+        self.assertEqual(decision_for(expected, unsafe).status, RebaseStatus.REJECTED)
+        final = observation(expected, operations=pending.operations)
+        self.assertEqual(decision_for(expected, final).status, RebaseStatus.COMPLETE)
+        self.assertEqual(decision_for(expected, replace(final, committed=(change,))).status,
+                         RebaseStatus.REJECTED)
+
     def test_service_scope_failure_is_explicit_recovery_not_transient_polling(self):
         from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
         from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
