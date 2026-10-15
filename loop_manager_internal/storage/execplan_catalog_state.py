@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Callable, Iterator, Mapping, Protocol
+from typing import Callable, Iterable, Iterator, Mapping, Protocol
 from uuid import uuid4
 from loop_manager_internal.storage import execplan_draft_state
 
@@ -111,6 +111,54 @@ def verified_historical_merge_ids(connection: sqlite3.Connection, repo: str) -> 
         and row[8] in {kind.value for kind in MergeProofKind if kind is not MergeProofKind.NONE}
         and row[10] is None
     ))
+
+
+def verified_historical_merge_row(plan_id: str) -> dict[str, object]:
+    """Represent a proof-verified merge in read-only dependency consumers."""
+    return {
+        "plan_id": plan_id,
+        "title": plan_id,
+        "status": "MERGED",
+        "priority": "normal",
+        "depends_on": "[]",
+        "branch": None,
+        "worktree": None,
+        "workspace_owned": 0,
+        "worker_session_id": None,
+        "reviewer_session_id": None,
+        "pr_url": None,
+        "pr_head_oid": None,
+        "pr_conflict_recovery": 0,
+        "pr_conflict_head_oid": None,
+        "pr_conflict_base_oid": None,
+    }
+
+
+def verified_merged_archive_execution_ids(
+    connection: sqlite3.Connection,
+    repo: str,
+    execution_rows: Iterable[Mapping[str, object]],
+) -> frozenset[str]:
+    """Match MERGED execution rows to their verified archived identity and bytes."""
+    history_ids = verified_historical_merge_ids(connection, repo)
+    if not history_ids:
+        return frozenset()
+    history = {
+        str(row["plan_id"]): (str(row["observed_path"]), str(row["final_content_hash"]))
+        for row in connection.execute(
+            "SELECT plan_id, observed_path, final_content_hash "
+            "FROM execplan_catalog_history WHERE repo=? AND currently_archived=1",
+            (repo,),
+        )
+        if str(row["plan_id"]) in history_ids
+    }
+    return frozenset(
+        plan_id for row in execution_rows
+        if (plan_id := str(row["plan_id"])) in history
+        and str(row["status"]) == "MERGED"
+        and str(row["path"]) == history[plan_id][0]
+        and str(row["content_hash"]) == history[plan_id][1]
+    )
 
 
 class MergeProofPort(Protocol):
@@ -1141,23 +1189,14 @@ class CatalogReconciliationService:
         catalog_ids = pinned.snapshot.observed_ids
         pending_ids = {item[0] for item in expected.holds}
         historical_ids = self.repository.historical_ids(repo)
-        verified_history = verified_historical_merge_ids(self.repository.connection, repo)
-        historical_rows = {
-            str(row["plan_id"]): row
-            for row in self.repository.connection.execute(
-                "SELECT plan_id, observed_path, final_content_hash FROM execplan_catalog_history "
-                "WHERE repo=? AND currently_archived=1", (repo,),
-            )
-        }
-        verified_merged_rows = set()
-        for row in expected.rows:
-            values = dict(zip(_ROW_VERSION_FIELDS, row.values))
-            history = historical_rows.get(row.plan_id)
-            if (row.plan_id in verified_history and history is not None
-                    and values["status"] == "MERGED"
-                    and values["path"] == history["observed_path"]
-                    and values["content_hash"] == history["final_content_hash"]):
-                verified_merged_rows.add(row.plan_id)
+        verified_merged_rows = verified_merged_archive_execution_ids(
+            self.repository.connection,
+            repo,
+            (
+                dict(zip(_ROW_VERSION_FIELDS, row.values))
+                for row in expected.rows
+            ),
+        )
         missing_files = sorted(stored_ids - catalog_ids - verified_merged_rows)
         cancelled = {item.snapshot.plan_id for item in pinned.deletions}
         missing_pending = sorted(pending_ids - catalog_ids - stored_ids - historical_ids)

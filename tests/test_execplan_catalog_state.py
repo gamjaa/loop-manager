@@ -408,7 +408,7 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         self.assertEqual(decision.runnable_ready["plan_id"], "G-002")
         self.assertEqual([item["id"] for item in compact], ["G-002"])
 
-    def test_verified_history_without_execution_row_satisfies_dependency(self):
+    def test_verified_history_without_execution_row_satisfies_dependency_and_cycle(self):
         self._record_historical("G-001", confirmed=True)
         self._insert_plan("G-002", "READY", ("G-001",))
         self.connection.commit()
@@ -450,6 +450,33 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         )
         cycle_decision = loop_manager.catalog_schedule_decision(self.connection, "/repo")
         self.assertEqual(cycle_decision.runnable_ready["plan_id"], "G-002")
+        maintenance_rows = repository.plan_rows("/repo")
+        self.assertEqual(
+            {row["plan_id"]: row["status"] for row in maintenance_rows}["G-001"],
+            "MERGED",
+        )
+        self.assertEqual(
+            loop_manager._advance_maintenance_cycle_after_merges(
+                self.connection, "/repo", "d" * 40,
+            ).phase,
+            maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET status='MERGED' WHERE repo='/repo' AND plan_id='G-002'"
+        )
+        self.connection.execute(
+            "INSERT INTO execplan_catalog_revisions (repo, revision_sha, catalog_fingerprint) "
+            "VALUES ('/repo', ?, 'verified-test-snapshot') "
+            "ON CONFLICT(repo) DO UPDATE SET revision_sha=excluded.revision_sha, "
+            "catalog_fingerprint=excluded.catalog_fingerprint",
+            ("e" * 40,),
+        )
+        self.assertEqual(
+            loop_manager._advance_maintenance_cycle_after_merges(
+                self.connection, "/repo", "e" * 40,
+            ).phase,
+            maintenance_state.MaintenancePhase.IDLE,
+        )
 
     def test_unverified_archived_ready_row_is_never_selected_or_prompted(self):
         self._insert_plan("G-001", "READY")

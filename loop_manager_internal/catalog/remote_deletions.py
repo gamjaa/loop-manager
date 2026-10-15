@@ -9,6 +9,7 @@ from loop_manager_internal.catalog import execplan_catalog as catalog
 from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
 from loop_manager_internal.maintenance.maintenance_orchestration import is_unowned_ready
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+from loop_manager_internal.storage import execplan_catalog_state
 from loop_manager_internal.storage.planning_publication_state import _mutable_ready_cas_where
 
 
@@ -41,8 +42,12 @@ def mutable_row(connection, repo, plan_id):
 def reference_issues(connection, repo, repository, pinned, *, git_bytes):
     """Observe deletion impacts independently of cancellation eligibility."""
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
+    verified_merged_rows = execplan_catalog_state.verified_merged_archive_execution_ids(
+        connection, repo, rows,
+    )
     missing = {str(row["plan_id"]): str(row["path"]) for row in rows
-               if str(row["plan_id"]) not in pinned.snapshot.observed_ids}
+               if str(row["plan_id"]) not in pinned.snapshot.observed_ids
+               and str(row["plan_id"]) not in verified_merged_rows}
     cancellations = connection.execute(
         "SELECT * FROM execplan_cancellations WHERE repo=? ORDER BY plan_id", (repo,),
     ).fetchall() if connection.execute(

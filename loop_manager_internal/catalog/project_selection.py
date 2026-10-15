@@ -194,7 +194,9 @@ def prerequisite_validation_rows(
             ).fetchone()
             if row is None:
                 if dependency in verified_history:
-                    included[dependency] = _verified_history_merge_row(dependency)
+                    included[dependency] = (
+                        execplan_catalog_state.verified_historical_merge_row(dependency)
+                    )
                     continue
                 raise MaintenanceOrchestrationError(
                     f"선행 후보의 dependency가 catalog에 없습니다: {plan_id} -> {dependency}"
@@ -249,28 +251,6 @@ def prerequisite_validation_rows(
             included[dependency] = row
             pending.append(row)
     return list(included.values())
-
-
-def _verified_history_merge_row(plan_id: str) -> dict[str, object]:
-    """Represent rowless, proof-verified historical merges to closure consumers."""
-    return {
-        "plan_id": plan_id,
-        "status": "MERGED",
-        "priority": "normal",
-        "depends_on": "[]",
-        "branch": None,
-        "worktree": None,
-        "workspace_owned": 0,
-        "worker_session_id": None,
-        "reviewer_session_id": None,
-        "pr_url": None,
-        "pr_head_oid": None,
-        "pr_conflict_recovery": 0,
-        "pr_conflict_head_oid": None,
-        "pr_conflict_base_oid": None,
-    }
-
-
 @dataclass(frozen=True)
 class CatalogScheduleDecisionEffects:
     """Named effects for catalog_schedule_decision; no entry-point/module access."""
@@ -359,7 +339,7 @@ def catalog_schedule_decision(
     ]
     row_ids = {str(row["plan_id"]) for row in rows}
     missing_history_rows = [
-        _verified_history_merge_row(plan_id)
+        execplan_catalog_state.verified_historical_merge_row(plan_id)
         for plan_id in sorted(verified_history - row_ids)
     ]
     priorities = effective_priorities(execution_rows, verified_history)

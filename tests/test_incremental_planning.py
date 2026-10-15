@@ -12,8 +12,12 @@ import unittest
 from unittest import mock
 
 import loop_manager
+from loop_manager_internal.catalog import execplan_catalog
 from tests.support.git import isolated_git_test
-from loop_manager_internal.storage import maintenance_state, planning_publication_state, planning_input_state
+from loop_manager_internal.storage import (
+    execplan_catalog_state, maintenance_state, planning_publication_state,
+    planning_input_state,
+)
 from loop_manager_internal.maintenance.maintenance_planning import PlanRevision, ReadyPlanSnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion, MutableReadySnapshot, mutable_snapshot_token
 
@@ -267,6 +271,83 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
         self.assertEqual(row["status"], "READY")
         self.assertTrue(row["path"].startswith("docs/plans/archive/"))
+
+    def test_git_adapter_ignores_deleted_verified_merged_archive_for_dependencies(self):
+        original_path = self.paths["G-001"]
+        archived_path = "docs/plans/archive/[G-001] First.md"
+        original_file = self.repo / original_path
+        archive_file = self.repo / archived_path
+        archived_text = original_file.read_text(encoding="utf-8")
+        archive_file.parent.mkdir(parents=True)
+        archive_file.write_text(archived_text, encoding="utf-8", newline="\n")
+        original_file.unlink()
+        dependent_path = self.repo / self.paths["G-002"]
+        dependent_text = plan_text("G-002", "Second").replace(
+            "depends_on: []", "depends_on:\n  - G-001",
+        )
+        dependent_path.write_text(dependent_text, encoding="utf-8", newline="\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "archive merged prerequisite")
+        archive_revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", archive_revision)
+        entry = execplan_catalog.snapshot_from_documents(
+            {archived_path: archived_text},
+        ).archived["G-001"]
+        self.connection.execute(
+            "UPDATE projects SET active_sha=? WHERE repo=?",
+            (archive_revision, str(self.repo)),
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET path=?, status='MERGED', content_hash=?, "
+            "current_revision_sha=? WHERE repo=? AND plan_id='G-001'",
+            (archived_path, entry.content_hash, archive_revision,
+             str(self.repo)),
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET depends_on=?, content_hash=?, current_revision_sha=? "
+            "WHERE repo=? AND plan_id='G-002'",
+            (json.dumps(["G-001"]), hashlib.sha256(dependent_text.encode()).hexdigest(),
+             archive_revision, str(self.repo)),
+        )
+        execplan_catalog_state.CatalogStateRepository(self.connection).record(
+            str(self.repo), entry,
+            original_path=original_path,
+            original_content_hash=entry.content_hash,
+            plan_sha=self.base,
+            proof=execplan_catalog_state.MergeProof(
+                True, kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
+                plan_sha=self.base, publication_content_hash=entry.content_hash,
+                revision=archive_revision,
+            ),
+            diagnostic=None, identity_verified=True,
+        )
+        self.connection.commit()
+        adopted = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        self.assertTrue(adopted.usable)
+
+        archive_file.unlink()
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "remove merged archive document")
+        deletion_revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", deletion_revision)
+        self.connection.execute(
+            "UPDATE projects SET active_sha=? WHERE repo=?",
+            (deletion_revision, str(self.repo)),
+        )
+        self.connection.commit()
+
+        result = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+
+        self.assertTrue(result.usable)
+        self.assertNotIn("G-002", result.withheld_plan_ids)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM execplan_catalog_holds WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        ).fetchone())
 
     def test_remote_deletion_started_history_and_dependents_are_scoped(self):
         result, _ = self._remote_deletion(started=True, new_plan=True)
