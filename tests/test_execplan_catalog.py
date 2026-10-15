@@ -371,10 +371,14 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
             ),
         )
 
-        def snapshot(_repo, _revision, *, archive_conflict_plan_ids):
+        def snapshot(
+            _repo, _revision, *, archive_conflict_plan_ids,
+            satisfied_dependencies,
+        ):
             return execplan_catalog.snapshot_from_documents(
                 documents,
                 archive_conflict_plan_ids=archive_conflict_plan_ids,
+                satisfied_dependencies=satisfied_dependencies,
             )
 
         oid = "1" * 40
