@@ -728,13 +728,20 @@ def enqueue_draft_decisions(connection, repo):
     if not _enabled(connection):
         return
     plans = []
-    for plan_id in sorted(execplan_draft_state.pending_ids(connection, repo)):
+    for plan_id in sorted(execplan_draft_state.user_question_ids(connection, repo)):
         saved = execplan_draft_state.evidence(connection, repo, plan_id)
         plan = connection.execute("SELECT title FROM exec_plans WHERE repo = ? AND plan_id = ?",
                                   (repo, plan_id)).fetchone()
         if saved and saved.get("pending") and plan:
             plans.append({"id": plan_id, "title": str(plan[0]), "url": saved.get("url"),
                           "decision_identity": saved.get("identity"), "decision_revision": saved["revision"]})
+    if not plans:
+        ensure_schema(connection)
+        connection.execute(
+            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
+            "WHERE repo = ? AND event_type = 'draft_decisions' "
+            "AND sent_at IS NULL AND canceled_at IS NULL", (repo,))
+        return
     if plans:
         ensure_schema(connection)
         previous = connection.execute(

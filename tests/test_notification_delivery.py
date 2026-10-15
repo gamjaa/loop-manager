@@ -17,7 +17,7 @@ from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
 from loop_manager_internal.storage.recovery_state import RecoveryRepository
 
-from support.notification import NotificationFixture
+from tests.support.notification import NotificationFixture
 
 
 class TelegramTransportTest(unittest.TestCase):
@@ -967,6 +967,59 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
                                      (entity["offset"] + entity["length"]) * 2].decode("utf-16-le"))
                 self.assertEqual(entity["url"], "https://example.test/second")
         self.assertEqual(fragments, ["G-", "019"])
+
+    def test_resolution_during_split_list_cancels_only_remaining_pieces(self):
+        from loop_manager_internal.storage import execplan_draft_state
+        connection = self.connection()
+        with connection:
+            self.draft(connection, title="Large title " * 650)
+            self.draft(connection, "G-019", "Remaining question")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        original = self.events(connection)[0]
+        calls = []
+        def send(*args):
+            calls.append(args[2])
+            with connection:
+                execplan_draft_state.cancel(connection, self.repo, "G-018", "resolved")
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=send), 0)
+        self.assertEqual(len(calls), 1)
+        canceled = self.events(connection)[0]
+        self.assertEqual(canceled['confirmed_pieces'], 1)
+        self.assertIsNotNone(canceled['canceled_at'])
+        self.assertEqual(canceled['payload'], original['payload'])
+        with connection:
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        sent = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
+        self.assertIn('G-019', sent.call_args.args[2])
+        self.assertEqual(self.events(connection)[0]['confirmed_pieces'], 1)
+
+    def test_legacy_split_retry_preserves_payload_text_and_cursor(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection)
+            notifications.enqueue_progress(connection, self.repo, 'draft_decision', 'legacy-split',
+                execplan_id='G-018', question='Question: ' + 'Large legacy question ' * 500,
+                url='https://example.test/original', decision_revision='revision', silent=False)
+        original = self.events(connection)[0]
+        calls = []
+        def send(*args):
+            calls.append(args[2])
+            if len(calls) == 2:
+                raise RuntimeError('Fixture retry boundary')
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        paused = self.events(connection)[0]
+        self.assertEqual(paused['confirmed_pieces'], 1)
+        with connection:
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        sent = mock.Mock()
+        notifications.dispatch_pending(connection, 'token', 'chat', adapter=sent)
+        self.assertEqual(sent.call_args_list[0].args[2], calls[1])
+        completed = self.events(connection)[0]
+        self.assertEqual(completed['payload'], original['payload'])
+        self.assertEqual(completed['rendered_text'], paused['rendered_text'])
+        self.assertIsNotNone(completed['sent_at'])
+        self.assertIsNone(completed['canceled_at'])
 
     def test_legacy_individual_notice_keeps_original_payload_and_text(self):
         connection = self.connection()

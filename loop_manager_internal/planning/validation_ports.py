@@ -94,21 +94,40 @@ class _PlanningValidationPorts:
                     return prompt  # This call is reserved for the approved document draft.
         prompt += self._verify_request_prompt(mutable_snapshot.repo, mutable_snapshot.active_sha)
         from loop_manager_internal.storage import execplan_draft_state
-        decisions = [dict(id=plan.plan_id, **execplan_draft_state.prompt_evidence(
-            self._connection, mutable_snapshot.repo, plan.plan_id))
-            for plan in mutable_snapshot.plans
-            if plan.plan_id in execplan_draft_state.pending_ids(self._connection, mutable_snapshot.repo)]
+        import json
+        decisions, user_changes, identities = [], {}, {}
+        pending = execplan_draft_state.pending_ids(self._connection, mutable_snapshot.repo)
+        for plan in mutable_snapshot.plans:
+            if plan.plan_id not in pending:
+                continue
+            saved = execplan_draft_state.evidence(self._connection, mutable_snapshot.repo, plan.plan_id)
+            item = dict(id=plan.plan_id, **execplan_draft_state.prompt_evidence(
+                self._connection, mutable_snapshot.repo, plan.plan_id))
+            references = {}
+            for path, change in item.get("user_changes", {}).items():
+                identity = json.dumps([path, saved["user_changes"][path]], ensure_ascii=False, sort_keys=True)
+                if identity not in identities:
+                    key = "change-" + str(len(identities) + 1)
+                    identities[identity] = key
+                    user_changes[key] = {"path": path, **change}
+                references[path] = identities[identity]
+            item["user_changes"] = references
+            decisions.append(item)
         if decisions:
-            import json
-            prompt += "\n\nManager의 draft 질문·사용자 원격 변경 근거:\n" + json.dumps(decisions, ensure_ascii=False)
+            prompt += "\n\nManager의 draft 질문·사용자 원격 변경 근거:\n" + json.dumps(
+                {"decisions": decisions, "user_changes": user_changes}, ensure_ascii=False)
             prompt += ("\n본문 변경 또는 User Decision의 질문 해소를 판단할 때 한 줄 DRAFT_DECISION_RESULT: JSON 배열을 반환하라. "
                        "각 객체는 id, revision(위 판단 지문), resolved(질문별 question·answer·source·quote), "
                        "remaining(남은 Question/Facts/Options/Impact 본문 또는 빈 문자열)을 가진다. "
-                       "user_changes.diff는 저장된 사용자 변경 before/after의 문맥 diff다. 필요하면 해당 revision의 원문을 읽어라. "
+                       "decisions의 user_changes는 source 경로별 공통 근거 ID이며 최상위 user_changes[ID].diff가 저장된 before/after의 문맥 diff다. resolved.source에는 근거 ID 대신 해당 source 경로를 반환하라. 필요하면 해당 revision의 원문을 읽어라. "
                        "question은 기존 질문의 정확한 문장, quote는 verified 사용자 변경의 추가 원문이며 저장된 after에 있고 before에는 없어야 한다. "
                        "answer는 제품 동작·설계 선택으로 해당 계획 본문에 통합하라. "
                        "승인 표시나 답변 존재만으로 해소하지 말고 질문별 의미와 충분성을 확인하라. "
                        "일부 해소는 남은 질문을 보존하고 불확실하면 outcome: uncertain으로 반환하라. "
+                       "reassessment: true는 양식 정리 후 입력 변경에 따른 기존 결정의 유효성 재검토다. "
+                       "resolutions의 이전 판단과 현재 목표·source를 비교하라. 기존 선택이 여전히 유효하면 "
+                       "id·revision·outcome: valid·reason(현재에도 유효한 이유)을 반환하며 새 사용자 승인을 만들지 마라. "
+                       "새 사용자 판단이 필요하면 해당 계획을 draft로 개정하고 필요한 새 질문만 작성하라. "
                        "draft·User Decision을 직접 제거하지 마라. 검증·정리·대기 전환은 Manager가 수행한다.")
         return prompt
 

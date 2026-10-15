@@ -18,7 +18,7 @@ from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
 from loop_manager_internal.storage.recovery_state import RecoveryRepository, begin_external_run
 
-from support.notification import NotificationFixture
+from tests.support.notification import NotificationFixture
 
 
 class NotificationRenderingTest(unittest.TestCase):
@@ -851,6 +851,44 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=delivered), 0)
         delivered.assert_not_called()
         self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+
+    def test_draft_notice_tracks_question_revision_and_preserves_sent_audit(self):
+        from loop_manager_internal.storage import execplan_draft_state
+        connection = self.connection()
+        repo = '/projects/alpha'
+        plan = {'id': 'G-018', 'title': 'Reliable notices', 'sources': ['docs/PRODUCT.md'],
+                'draft': True, 'draft_scope': 'scope', 'draft_question':
+                'Question: Choose A or B?\nFacts: known\nOptions: A, B\nImpact: history',
+                'draft_question_identity': 'question-1'}
+        with connection:
+            execplan_draft_state.observe(connection, repo, 'docs/plans/choice.md', plan, 'hash', 'remote-sha',
+                                        remote_url='https://github.com/org/repo')
+            notifications.enqueue_current_project_events(connection, repo)
+        first = self.events(connection)[0]
+        saved = execplan_draft_state.evidence(connection, repo, 'G-018')
+        saved['question'] = saved['question'].replace('A or B', 'C or D')
+        saved['revision'] = 'new-decision'
+        saved['identity'] = 'question-2'
+        saved['url'] = saved['url'].replace('remote-sha', 'new-sha')
+        with connection:
+            connection.execute('UPDATE execplan_drafts SET evidence=? WHERE repo=? AND plan_id=?',
+                               (json.dumps(saved), repo, 'G-018'))
+        delivered = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=delivered), 0)
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+        saved['revision'] = 'new-decision'
+        with connection:
+            connection.execute('UPDATE execplan_drafts SET evidence=? WHERE repo=? AND plan_id=?',
+                               (json.dumps(saved), repo, 'G-018'))
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=delivered), 1)
+        with connection:
+            execplan_draft_state.cancel(connection, repo, 'G-018', 'resolved')
+        notifications.dispatch_pending(connection, 'token', 'chat', adapter=delivered)
+        sent = [row for row in self.events(connection) if row['sent_at']]
+        self.assertEqual(len(sent), 1)
+        self.assertIsNone(sent[0]['canceled_at'])
+        self.assertNotEqual(sent[0]['event_key'], first['event_key'])
 
     def test_automatic_failure_deduplicates_retry_but_separates_progress(self):
         connection = self.connection()

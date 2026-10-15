@@ -97,6 +97,8 @@ def record_general(
         (repo, SCOPE, revision, revision, FORMAT, FULL_FORMAT, _encoded(entries),
          common_guidance.planning_content_hash(connection, repo) or common_guidance.runtime_content_hash()),
     )
+    from . import execplan_draft_state
+    execplan_draft_state.record_semantic_review(connection, repo)
     check = planner_check_state.get(connection, repo)
     if check is not None and check['stage'] != 'accepted':
         # A full validated planning result resolves its preceding check/handoff.

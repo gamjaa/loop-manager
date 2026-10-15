@@ -146,7 +146,7 @@ def collect(
                         reason_code="execplan_catalog_invalid", evidence=holds[plan_id])
         elif status == "DRAFT":
             waiting = execplan_draft_state.evidence(connection, repo, plan_id)
-            item.update(reason="ExecPlan 사용자 판단 대기", question=waiting["question"],
+            item.update(reason="ExecPlan 기존 결정 유효성 재검토" if waiting.get("reassessment") else "ExecPlan 사용자 판단 대기", question=waiting["question"],
                         path=waiting["path"], revision=waiting["revision"])
             if waiting.get("url"):
                 item["url"] = waiting["url"]
