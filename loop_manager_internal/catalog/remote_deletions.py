@@ -221,8 +221,19 @@ def cancellation_recovery_evidence(connection, repo, repository, pinned, referen
             elif not plan_sha or not deletion_revision:
                 evidence["unknown_reason"] = "취소 감사에 source revision 근거가 없습니다."
         old_affected = set(evidence["affected"])
+        resolution_history = evidence.setdefault("resolution_history", {})
+        if not isinstance(resolution_history, dict):
+            raise PlannerValidationError("삭제 목표 감사 JSON이 유효하지 않습니다.")
+        reopened = set(affected) & set(evidence["resolved"])
+        for plan_id in reopened:
+            previous = evidence["resolved"].pop(plan_id)
+            history = resolution_history.setdefault(plan_id, [])
+            if not isinstance(history, list) or not all(isinstance(item, str) for item in history):
+                raise PlannerValidationError("삭제 목표 감사 JSON이 유효하지 않습니다.")
+            if previous not in history:
+                history.append(previous)
         evidence["affected"] = sorted(old_affected | affected)
-        if evidence["affected"] != sorted(old_affected) or not prior_text:
+        if evidence["affected"] != sorted(old_affected) or reopened or not prior_text:
             result[key] = (prior_text, json.dumps(evidence, ensure_ascii=False, sort_keys=True))
     return result
 

@@ -1,6 +1,6 @@
 """catalog project selection boundaries and named composition effects."""
 from __future__ import annotations
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import CatalogScheduleDecision
 from loop_manager_internal.catalog.effective_priority import effective_priorities
@@ -154,7 +154,7 @@ class PrerequisiteValidationRowsEffects:
 
 def prerequisite_validation_rows(
     effects: PrerequisiteValidationRowsEffects, connection: sqlite3.Connection, repo: str
-) -> list[sqlite3.Row]:
+) -> list[Mapping[str, object]]:
     """Load active plans and only their verified, merged dependency closure."""
 
     effects._ensure_execplans_schema(connection)
@@ -194,6 +194,7 @@ def prerequisite_validation_rows(
             ).fetchone()
             if row is None:
                 if dependency in verified_history:
+                    included[dependency] = _verified_history_merge_row(dependency)
                     continue
                 raise MaintenanceOrchestrationError(
                     f"선행 후보의 dependency가 catalog에 없습니다: {plan_id} -> {dependency}"
@@ -248,6 +249,26 @@ def prerequisite_validation_rows(
             included[dependency] = row
             pending.append(row)
     return list(included.values())
+
+
+def _verified_history_merge_row(plan_id: str) -> dict[str, object]:
+    """Represent rowless, proof-verified historical merges to closure consumers."""
+    return {
+        "plan_id": plan_id,
+        "status": "MERGED",
+        "priority": "normal",
+        "depends_on": "[]",
+        "branch": None,
+        "worktree": None,
+        "workspace_owned": 0,
+        "worker_session_id": None,
+        "reviewer_session_id": None,
+        "pr_url": None,
+        "pr_head_oid": None,
+        "pr_conflict_recovery": 0,
+        "pr_conflict_head_oid": None,
+        "pr_conflict_base_oid": None,
+    }
 
 
 @dataclass(frozen=True)
@@ -336,6 +357,11 @@ def catalog_schedule_decision(
             and row["status"] == "MERGED"
         ))
     ]
+    row_ids = {str(row["plan_id"]) for row in rows}
+    missing_history_rows = [
+        _verified_history_merge_row(plan_id)
+        for plan_id in sorted(verified_history - row_ids)
+    ]
     priorities = effective_priorities(execution_rows, verified_history)
     candidates = []
     for row in ready:
@@ -373,7 +399,10 @@ def catalog_schedule_decision(
         maintenance_state.MaintenancePhase.REFACTORING,
         maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
     }:
-        selected = effects.select_cycle_ready_execplan(execution_rows, cycle, catalog_rows=rows)
+        selected = effects.select_cycle_ready_execplan(
+            [*execution_rows, *missing_history_rows], cycle,
+            catalog_rows=[*rows, *missing_history_rows],
+        )
     elif active is None and not project_is_blocked and effects.assessment_can_yield(cycle):
         resumable = [row for row in candidates if not effects.is_unowned_ready(row)]
         if resumable:

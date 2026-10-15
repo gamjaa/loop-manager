@@ -417,7 +417,16 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         rows = loop_manager.prerequisite_validation_rows(self.connection, "/repo")
 
         self.assertEqual(decision.runnable_ready["plan_id"], "G-002")
-        self.assertEqual([row["plan_id"] for row in rows], ["G-002"])
+        self.assertEqual(
+            {row["plan_id"] for row in rows}, {"G-001", "G-002"},
+        )
+        self.assertEqual(
+            {row["plan_id"]: row["status"] for row in rows}["G-001"], "MERGED",
+        )
+        self.assertEqual(
+            loop_manager.validate_prerequisite_plan_ids(rows, ("G-002",)),
+            ("G-002",),
+        )
         self.assertEqual(
             maintenance_state.MaintenanceRepository(self.connection)._merged_count("/repo"), 1,
         )
@@ -425,6 +434,22 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         self.assertIsNone(work_exhaustion.collect(
             self.connection, "/repo", cycle="cycle", active_requirements=(),
         ))
+
+        maintenance_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO maintenance_cycles "
+            "(repo, phase, cycle_base_sha, cycle_start_merged_count, revision) "
+            "VALUES ('/repo', 'assessment', ?, 0, 1)", ("c" * 40,),
+        )
+        repository = maintenance_state.MaintenanceRepository(self.connection)
+        cycle = repository.get("/repo")
+        repository.transition(
+            "/repo", expected_phase=cycle.phase, expected_revision=cycle.revision,
+            next_phase=maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+            prerequisite_plan_ids=("G-002",),
+        )
+        cycle_decision = loop_manager.catalog_schedule_decision(self.connection, "/repo")
+        self.assertEqual(cycle_decision.runnable_ready["plan_id"], "G-002")
 
     def test_unverified_archived_ready_row_is_never_selected_or_prompted(self):
         self._insert_plan("G-001", "READY")
@@ -589,6 +614,43 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
         self.assertIsNotNone(execplan_catalog_state.CatalogStateRepository(
             self.connection, ensure=False,
         ).historical_row("/repo", "G-003"))
+
+    def test_missing_archived_document_with_merged_row_does_not_hold_dependents(self):
+        entry = archived_entry("G-003", "Historical")
+        self._record_verified_history("G-003", "Historical")
+        self._insert("G-003", "Historical", status="MERGED")
+        self.connection.execute(
+            "UPDATE exec_plans SET path=?, content_hash=? WHERE repo='/repo' AND plan_id='G-003'",
+            (entry.path, entry.content_hash),
+        )
+        self._insert("G-004", "Dependent", status="READY")
+        self.connection.execute(
+            "UPDATE exec_plans SET depends_on='[\"G-003\"]' "
+            "WHERE repo='/repo' AND plan_id='G-004'"
+        )
+        documents = {
+            "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+            "docs/plans/[G-004] Dependent.md": self._text(
+                "G-004", "Dependent", depends_on=("G-003",),
+            ),
+        }
+        snapshot = execplan_catalog.snapshot_from_documents(
+            documents, revision_sha="c" * 40,
+            satisfied_dependencies=frozenset({"G-003"}),
+        )
+        pinned = execplan_catalog_state.PinnedCatalog(
+            "c" * 40, snapshot, frozenset({"docs/PRODUCT.md"}),
+        )
+
+        result = self._service(pinned).reconcile("/repo")
+
+        self.assertTrue(result.usable)
+        self.assertNotIn("G-003", result.withheld_plan_ids)
+        self.assertNotIn("G-004", result.withheld_plan_ids)
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo='/repo' AND plan_id='G-004'"
+        ).fetchone()[0], "READY")
 
     def test_active_reappearance_of_historical_id_stays_reserved(self):
         self._record_verified_history("G-003", "Historical")

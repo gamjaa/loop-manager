@@ -132,12 +132,14 @@ def _revision_execplan_catalog(
     revision: str,
     *,
     archive_conflict_plan_ids: frozenset[str] = frozenset(),
+    satisfied_dependencies: frozenset[str] = frozenset(),
 ) -> dict[str, dict[str, object]]:
     try:
         snapshot = effects.revision_execplan_snapshot(
             repo_path,
             revision,
             archive_conflict_plan_ids=archive_conflict_plan_ids,
+            satisfied_dependencies=satisfied_dependencies,
         )
     except GitLockError:
         raise
@@ -200,6 +202,7 @@ def requirement_archive_snapshot(
             plan_id for plan_id, row in states.items()
             if str(row["status"]) == "MERGED"
         ),
+        satisfied_dependencies=verified_history,
     )
     for plan_id in verified_history - set(catalog):
         audit = connection.execute(

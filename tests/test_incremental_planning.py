@@ -850,6 +850,39 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertFalse(loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main").withheld_plan_ids)
         self.assertEqual(snapshot.recovery_goals, loop_manager._planning_result_from_manifest(loop_manager._planning_result_manifest(result)).mutable_snapshot.recovery_goals)
 
+        evidence = json.loads(row["recovery_evidence"])
+        prior_resolution = evidence["resolved"]["G-002"]
+        path = self.repo / self.paths["G-002"]
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\nSee G-001 for historical context.\n",
+            encoding="utf-8", newline="\n",
+        )
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "reintroduce cancelled prerequisite reference")
+        observed_revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", observed_revision)
+        self.connection.execute(
+            "UPDATE projects SET active_sha=? WHERE repo=?",
+            (observed_revision, str(self.repo)),
+        )
+        self.connection.commit()
+
+        reopened = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        current_evidence = json.loads(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE repo=? AND plan_id='G-001'",
+            (str(self.repo),),
+        ).fetchone()[0])
+
+        self.assertEqual(set(reopened.withheld_plan_ids), {"G-002"})
+        self.assertNotIn("G-002", current_evidence["resolved"])
+        self.assertEqual(current_evidence["resolution_history"]["G-002"], [prior_resolution])
+        goal = next(json.loads(raw) for raw in loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, observed_revision,
+        ).recovery_goals if json.loads(raw)["id"] == "G-001")
+        self.assertEqual(goal["affected_ids"], ["G-002"])
+
     def test_remote_deletion_snapshot_race_preserves_audit_and_held_graph(self):
         self._remote_deletion()
         snapshot, validate = self._recovery_result()

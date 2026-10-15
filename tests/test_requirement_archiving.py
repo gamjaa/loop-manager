@@ -9,6 +9,7 @@ import loop_manager
 from loop_manager_internal.catalog import requirement_archive
 from loop_manager_internal.storage import execplan_catalog_state
 from tests.support.git import isolated_git_test
+from tests.support.catalog import archived_entry
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -76,6 +77,39 @@ class RequirementArchiveEligibilityTest(unittest.TestCase):
         )
 
         self.assertEqual(result.candidates, (source,))
+
+    def test_archive_snapshot_accepts_dependency_on_rowless_verified_merge(self):
+        source = self.requirement("Current")
+        self.plan("G-002", "Current", (source,), "IMPLEMENTING")
+        path = self.repo / "docs/plans/[G-002] Current.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "depends_on: []", "depends_on:\n  - G-001",
+            ),
+            encoding="utf-8",
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET depends_on='[\"G-001\"]' "
+            "WHERE repo=? AND plan_id='G-002'", (str(self.repo),),
+        )
+        entry = archived_entry("G-001", "Historical")
+        execplan_catalog_state.CatalogStateRepository(self.connection).record(
+            str(self.repo), entry, original_path=entry.active_path,
+            original_content_hash=entry.content_hash, plan_sha="a" * 40,
+            proof=execplan_catalog_state.MergeProof(
+                True, kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
+                plan_sha="a" * 40, publication_content_hash=entry.content_hash,
+                revision="b" * 40,
+            ), diagnostic=None, identity_verified=True,
+        )
+        self.connection.commit()
+        revision = self.commit("Active plan depends on archived history")
+
+        snapshot = loop_manager.requirement_archive_snapshot(
+            self.connection, self.repo, str(self.repo), revision, "G-002",
+        )
+
+        self.assertEqual(snapshot.candidates, (source,))
 
     def requirement(self, name: str, contents: str | None = None) -> str:
         source = f"docs/requirements/{name}.md"

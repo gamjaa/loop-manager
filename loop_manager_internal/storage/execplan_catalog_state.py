@@ -1140,9 +1140,26 @@ class CatalogReconciliationService:
         stored_ids = expected.plan_ids
         catalog_ids = pinned.snapshot.observed_ids
         pending_ids = {item[0] for item in expected.holds}
-        missing_files = sorted(stored_ids - catalog_ids)
-        cancelled = {item.snapshot.plan_id for item in pinned.deletions}
         historical_ids = self.repository.historical_ids(repo)
+        verified_history = verified_historical_merge_ids(self.repository.connection, repo)
+        historical_rows = {
+            str(row["plan_id"]): row
+            for row in self.repository.connection.execute(
+                "SELECT plan_id, observed_path, final_content_hash FROM execplan_catalog_history "
+                "WHERE repo=? AND currently_archived=1", (repo,),
+            )
+        }
+        verified_merged_rows = set()
+        for row in expected.rows:
+            values = dict(zip(_ROW_VERSION_FIELDS, row.values))
+            history = historical_rows.get(row.plan_id)
+            if (row.plan_id in verified_history and history is not None
+                    and values["status"] == "MERGED"
+                    and values["path"] == history["observed_path"]
+                    and values["content_hash"] == history["final_content_hash"]):
+                verified_merged_rows.add(row.plan_id)
+        missing_files = sorted(stored_ids - catalog_ids - verified_merged_rows)
+        cancelled = {item.snapshot.plan_id for item in pinned.deletions}
         missing_pending = sorted(pending_ids - catalog_ids - stored_ids - historical_ids)
         if missing_pending and not pinned.snapshot.isolation_enabled:
             return self._invalid(pinned.revision_sha, "missing-plan",
