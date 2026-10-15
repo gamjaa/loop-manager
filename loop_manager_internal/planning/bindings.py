@@ -284,7 +284,6 @@ def register(assembly: Composition) -> None:
             recover_maintenance_planning_batch=assembly.callback('recover_maintenance_planning_batch'),
             reconcile_execplan_catalog=assembly.callback('reconcile_execplan_catalog'),
             register_execplans=assembly.callback('register_execplans'),
-            update_project=assembly.callback('update_project'),
         ),
     )
 

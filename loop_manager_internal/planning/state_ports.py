@@ -36,7 +36,6 @@ class PlanningStatePortsEffects:
     recover_maintenance_planning_batch: Callable[..., object]
     reconcile_execplan_catalog: Callable[..., object]
     register_execplans: Callable[..., object]
-    update_project: Callable[..., object]
     preserve_remote_planning_diagnostics: Callable[..., object] | None = None
 
 
@@ -201,7 +200,7 @@ class _PlanningStatePorts:
         notifications.flush_project_events(self._connection, repo)
 
     def update(self, repo: str, **values: object) -> None:
-        self._effects.update_project(self._connection, repo, **values)
+        self._runtime_repository.update_project(repo, values)
         self.flush_notifications(repo)
 
     def local_recheck_consumed(self, request_id: str) -> bool:

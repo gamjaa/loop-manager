@@ -16,6 +16,31 @@ from tests.support.database import runtime_connection
 
 
 class ProjectServiceCompositionTests(unittest.TestCase):
+    def test_planning_updates_keep_nested_transaction_and_rollback(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                connection = runtime_connection()
+                self.addCleanup(connection.close)
+                port = loop_manager._PlanningStatePorts(connection,
+                    loop_manager.runtime_state.RuntimeStateRepository(connection),
+                    loop_manager.maintenance_state.MaintenanceRepository(connection), Path('/state'))
+                try:
+                    with port.transaction():
+                        with port.transaction():
+                            port.update('repo', planning_error='current failure')
+                            self.assertTrue(connection.in_transaction)
+                            self.assertEqual(port.planning('repo').planning_error, 'current failure')
+                            if fail:
+                                raise ValueError('interrupt paired planning writes')
+                except ValueError:
+                    if not fail:
+                        raise
+                self.assertFalse(connection.in_transaction)
+                self.assertEqual(port.planning('repo').planning_error,
+                    None if fail else 'current failure')
+                port.update('repo', planning_error=None)
+                self.assertFalse(connection.in_transaction)
+
     def test_project_recovery_routes_to_planning_while_execution_is_paused(self):
         for planning_owns_slot in (False, True):
             with self.subTest(planning_owns_slot=planning_owns_slot):
