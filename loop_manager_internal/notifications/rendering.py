@@ -47,6 +47,12 @@ def _message(kind: str, payload: dict[str, object]) -> str:
 
 
 def _event_message(kind: str, payload: dict[str, object]) -> str:
+    if kind == "draft_decisions":
+        plans = payload["plans"]
+        lines = [f"[{payload['project']}] draft 작업 {len(plans)}건 · 사용자 판단 대기", ""]
+        lines.extend(f"• {plan['id']} · {' '.join(str(plan['title']).split())}" for plan in plans)
+        lines.extend(["", "각 작업 문서에서 질문을 확인하고 결정을 반영해 주세요."])
+        return "\n".join(lines)
     if kind in {"work_started", "stage_failed", "planning_result", "plans_published", "draft_decision",
                 "maintenance_started", "maintenance_completed"}:
         labels = {"work_started": "작업 시작", "stage_failed": "단계 실패",
@@ -214,3 +220,20 @@ MESSAGE_LIMIT = 4096
 def _pieces(text: str) -> list[str]:
     return [text[start:start + MESSAGE_LIMIT]
             for start in range(0, len(text), MESSAGE_LIMIT)]
+
+
+def _draft_entities(payload: dict, text: str, start: int, end: int) -> list[dict]:
+    entities = []
+    for plan in payload["plans"]:
+        if not plan.get("url"):
+            continue
+        position = text.find("\n• " + plan["id"] + " · ")
+        if position < 0:
+            continue
+        left = max(position + 3, start)
+        right = min(position + 3 + len(plan["id"]), end)
+        if left < right:
+            entities.append({"type": "text_link", "url": plan["url"],
+                             "offset": len(text[start:left].encode("utf-16-le")) // 2,
+                             "length": len(text[left:right].encode("utf-16-le")) // 2})
+    return entities

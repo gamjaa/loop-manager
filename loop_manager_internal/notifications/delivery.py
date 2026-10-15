@@ -8,7 +8,7 @@ import json
 import sqlite3
 from .repository import adopt_legacy_block_notices, ensure_schema
 from .incidents import _current_block_key, _materialize_resumption, _materialize_unnotified_start
-from .rendering import _message, _pieces
+from .rendering import _message, _pieces, _draft_entities, MESSAGE_LIMIT
 from .transport import send_telegram
 
 def _cancel_stale_block(
@@ -28,7 +28,7 @@ def _cancel_stale_block(
 
 def _claim_piece(
     connection: sqlite3.Connection, event_key: str, *, first_attempt_only: bool,
-) -> tuple[str, int, int] | None:
+) -> tuple[str, int, int, list[dict]] | None:
     with connection:
         if not connection.in_transaction:
             connection.execute("BEGIN IMMEDIATE")
@@ -48,6 +48,20 @@ def _claim_piece(
             connection.execute("UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP, "
                                "delivery_started_at=NULL WHERE event_key=? AND sent_at IS NULL", (event_key,))
             return None  # Sent pieces and original diagnostics remain auditable.
+        if row[1] == "draft_decisions":
+            from loop_manager_internal.storage import execplan_draft_state
+            current = execplan_draft_state.pending_ids(connection, str(row[0]))
+            stale = current != {plan["id"] for plan in payload["plans"]}
+            for plan in payload["plans"]:
+                saved = execplan_draft_state.evidence(connection, str(row[0]), plan["id"])
+                if (not saved or not saved.get("pending")
+                        or saved["revision"] != plan["decision_revision"]
+                        or saved.get("identity") != plan["decision_identity"]):
+                    stale = True
+            if stale:
+                connection.execute("UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
+                                   "delivery_started_at = NULL WHERE event_key = ?", (event_key,))
+                return None
         if row[1] == "draft_decision":
             from loop_manager_internal.storage import execplan_draft_state
             saved = execplan_draft_state.evidence(connection, str(row[0]), str(payload["execplan_id"]))
@@ -86,7 +100,10 @@ def _claim_piece(
             + (" AND attempts = 0" if first_attempt_only else ""),
             (text, event_key, cursor),
         ).rowcount
-        return (pieces[cursor], cursor, len(pieces)) if claimed == 1 else None
+        entities = (_draft_entities(payload, text, cursor * MESSAGE_LIMIT,
+                                    (cursor + 1) * MESSAGE_LIMIT)
+                    if row[1] == "draft_decisions" else [])
+        return (pieces[cursor], cursor, len(pieces), entities) if claimed == 1 else None
 
 
 def dispatch_pending(
@@ -156,12 +173,13 @@ def _deliver_rows(
             )
             if claimed is None:
                 break
-            piece, cursor, total = claimed
+            piece, cursor, total, entities = claimed
             first_piece = False
             try:
                 if adapter is send_telegram:
                     adapter(token, chat_id, piece, disable_notification=bool(
-                        json.loads(str(row[2])).get("silent", False)))
+                        json.loads(str(row[2])).get("silent", False)),
+                        **({"entities": entities} if entities else {}))
                 else:
                     adapter(token, chat_id, piece)
             except Exception as error:
