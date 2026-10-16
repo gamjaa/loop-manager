@@ -479,8 +479,11 @@ class RecoveryRepository:
         from loop_manager_internal.git.rebase_block_reconciliation import REBASE_BLOCK_REASONS
 
         saved = self.row(repo, plan_id)
+        input_cause = (saved is not None and block['reason_code'] == RecoveryReason.PLAN_INPUT_INVALID.value
+                       and saved['reason_code'] in {RecoveryReason.WORKER_CORRECTION.value,
+                                                   RecoveryReason.PLAN_INPUT_INVALID.value})
         if (saved is None or block['reason_code'] not in REBASE_BLOCK_REASONS
-                or saved['detail'] != block['evidence']
+                or (saved['detail'] != block['evidence'] and not input_cause)
                 or saved['reason_code'] not in {
                     RecoveryReason.REBASE_CONFLICT.value, RecoveryReason.STATUS_FAILED.value,
                     RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value,
@@ -489,7 +492,8 @@ class RecoveryRepository:
                     RecoveryReason.AGENT_SCOPE_VIOLATION.value,
                     RecoveryReason.DEFAULT_WORKTREE_MUTATION.value,
                     RecoveryReason.SHARED_REF_MUTATION.value,
-                    RecoveryReason.OUTSIDE_MANAGED_WORKTREE_MUTATION.value}):
+                    RecoveryReason.OUTSIDE_MANAGED_WORKTREE_MUTATION.value}
+                and not input_cause):
             return
         if saved['pending_action'] == 'final_block':
             try:

@@ -446,7 +446,7 @@ def resume_blocked_execplan_if_inputs_changed(
         )
     except (RuntimeError, WorkspaceOwnershipError) as error:
         message = f"BLOCKED worktree 복구 실패:\n{error}"
-        effects._update_blocked_error(connection, repo, str(plan["plan_id"]), message)
+        effects._update_blocked_error(connection, repo, str(plan["plan_id"]), message, preserve_cause=True)
         return False
     interrupted = effects._resume_interrupted_blocked_rebase(
         connection, repo_path, repo, base, plan, worktree, branch,

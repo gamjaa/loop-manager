@@ -492,8 +492,17 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
 
 class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase):
     def test_plan_input_block_uses_owned_rebase_before_ordinary_branch_recovery(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
         self.block(reason='plan_input_invalid')
         self.pending()
+        recovery = RecoveryRepository(self.connection)
+        recovery.observe(RecoveryObservation(RecoveryReason.WORKER_CORRECTION,
+            'repo', 'G-047', 'WORKING', 'revision', 'base', 'fingerprint', 'progress',
+            'original sources metadata failure'), correction_limit=1)
+        self.connection.execute("UPDATE recovery_records SET final_evidence=? WHERE repo='repo' AND subject='G-047'",
+            ('{"block_reason_code":"plan_input_invalid"}',))
+        self.connection.commit()
         original = self.case.observed
         with mock.patch.object(loop_manager, 'make_worktree',
                                side_effect=AssertionError('detached rebase is not an ordinary worktree')):
@@ -503,6 +512,8 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual(row['status'], 'IMPLEMENTING')
         self.assertEqual(row['worker_session_id'], 'saved-worker')
+        self.assertEqual(recovery.row('repo', 'G-047')['pending_action'], 'reconcile')
+        self.assertEqual(recovery.row('repo', 'G-047')['detail'], 'original sources metadata failure')
 
     def test_plan_input_rebase_block_keeps_original_cause_if_remote_changes(self):
         self.block(reason='plan_input_invalid')
