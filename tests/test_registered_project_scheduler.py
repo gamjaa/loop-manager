@@ -452,7 +452,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
         )
         return state_dir, connection, config, repos
 
-    def test_worker_pool_bounds_parallel_projects_and_isolates_connections(self):
+    def test_project_coordinators_do_not_consume_call_slots_and_keep_planner_serial(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir, connection, config, repos = self._scheduler_state(
                 directory,
@@ -505,7 +505,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                     external_run_ids.add(external_run_id)
                     active_workers += 1
                     maximum_workers = max(maximum_workers, active_workers)
-                    if active_workers == config.max_workers:
+                    if active_workers == len(repos):
                         both_workers_started.set()
                 self.assertTrue(both_workers_started.wait(timeout=1))
                 with planner_mutex:
@@ -548,7 +548,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 connection.close()
 
         self.assertEqual(tuple(item.repo for item in outcomes), repos)
-        self.assertEqual(maximum_workers, config.max_workers)
+        self.assertEqual(maximum_workers, len(repos))
         self.assertEqual(len(external_run_ids), 1)
         self.assertGreaterEqual(len(thread_ids), 2)
         self.assertEqual(maximum_planners, 1)
@@ -798,10 +798,9 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
         )
         connection.commit()
         self.assertIsNone(loop_manager.select_ready_execplan(connection, "repo"))
-        with self.assertRaises(sqlite3.IntegrityError):
-            with connection:
-                connection.execute(
-                    "UPDATE exec_plans SET status = 'IMPLEMENTING' "
-                    "WHERE repo = 'repo' AND plan_id = 'G-004'"
-                )
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository, RuntimeStateError
+        with self.assertRaisesRegex(RuntimeStateError, "관리 대상 한도"):
+            RuntimeStateRepository(connection).activate('repo','G-004',activation_sha='base',
+                                                       branch='four',worktree='four')
+        self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE plan_id='G-004'").fetchone()[0], 'READY')
         connection.close()

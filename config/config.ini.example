@@ -5,7 +5,12 @@
 ; config.ini는 Telegram token을 포함하므로 Git에 커밋하지 않는다.
 
 [loop]
+; 전체 프로젝트의 실제 Worker·Reviewer 동시 실행 상한.
 max_workers = 3
+; 프로젝트 DB 값이 0일 때 상속할 관리 대상 상한. verify 대기도 포함한다.
+max_tasks_per_project = 1
+; 전체 프로젝트의 verify 호출 동시 실행 상한. 내부 테스트 병렬도와 별개다.
+verify_concurrency = 1
 ; 첫 시작 기준 또는 마지막 성공한 파일별 평가 이후 이 수만큼 ExecPlan Merge가 확인되면 평가한다.
 # 새 MERGED 작업 수에 따른 자동 유지보수 주기. 0이면 자동 전환을 끈다.
 refactoring_review_interval = 20

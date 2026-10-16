@@ -531,10 +531,7 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
         effects.remote_base(
             repo_path, str(project["base_branch"]), state_dir=state_dir,
         )
-        persisted = connection.execute(
-            "SELECT pr_head_oid FROM projects WHERE repo = ?",
-            (repo,),
-        ).fetchone()
+        persisted = runtime_state.project_row(connection, repo)
         stored_head_oid = (
             str(persisted["pr_head_oid"])
             if persisted and persisted["pr_head_oid"]

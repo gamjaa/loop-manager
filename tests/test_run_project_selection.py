@@ -158,7 +158,7 @@ class RunProjectSelectionTests(unittest.TestCase):
         selected = project_registry.select_projects(self.connection, [str(first)])
         preflight = mock.Mock()
         run_one = mock.Mock(side_effect=lambda project, *_args, **_kwargs: project.repo)
-        effects = scheduler.ScheduleRegisteredProjectsEffects(preflight, run_one)
+        effects = scheduler.ScheduleRegisteredProjectsEffects(preflight, run_one, mock.Mock(), mock.Mock())
         coordinator = mock.MagicMock()
         coordinator.__enter__.return_value = coordinator
 

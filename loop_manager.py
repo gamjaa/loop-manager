@@ -36,6 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_commands.add_parser("init", help="상태 DB 초기화")
     config_commands.add_parser("list", help="등록 프로젝트 목록 조회")
+    task_limit = config_commands.add_parser("set", help="등록 프로젝트의 관리 대상 한도 설정")
+    task_limit.add_argument("repository", help="등록된 저장소 루트")
+    task_limit.add_argument("--max-tasks-per-project", type=int, required=True,
+                            help="관리 대상 상한. 0이면 config 기본값 상속")
+    status = subcommands.add_parser("status", help="프로젝트 관리 한도와 저장된 관리 대상 수 조회")
+    status.add_argument("repository", help="등록된 저장소 루트")
+    status.add_argument("--json", action="store_true", help="조회 결과를 JSON으로 출력")
     add = subcommands.add_parser("add", help="프로젝트 검증 및 등록")
     add.add_argument("repository", help="대상 Git 저장소 루트")
     add.add_argument("--base", help="기준 branch. 생략하면 origin/HEAD 사용")
@@ -133,6 +140,8 @@ def main() -> int:
         state_dir = state_directory(args.state_dir)
         config_path = source_config_path(ROOT, args.config)
         try:
+            if args.command == "status" or args.command == "config" and args.config_command == "set":
+                return configure_registry(args, state_dir, config_path)
             if args.command == "run" and not args.runtime_child:
                 raw_arguments = ["run"]
                 if args.skip_if_running:

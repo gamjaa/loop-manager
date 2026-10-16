@@ -257,15 +257,22 @@ class VerifyContractTests(unittest.TestCase):
         process.assert_not_called()
         self.assertEqual([call.args[0] for call in client.request.call_args_list], ['acquire', 'not_started'])
 
-    def test_resource_wait_counts_toward_command_deadline(self):
+    def test_resource_wait_preserves_command_execution_budget(self):
         client = mock.Mock()
-        client.request.return_value = {'granted': False, 'reason': 'pressure'}
-        process = mock.Mock()
-        with mock.patch.object(core.time, 'monotonic', side_effect=[0, 0, 2]), self.assertRaises(TimeoutError):
-            core.execute_command(['tool'], self.root, 1, self.writer(), client, 'run', 'compile',
-                                 run_process=process, sleep=lambda seconds: None)
-        process.assert_not_called()
-        self.assertEqual([call.args[0] for call in client.request.call_args_list], ['acquire'])
+        responses=iter([{'granted':False,'reason':'pressure'}, {'granted':True,'reason':'ready','token':'owned'}])
+        client.request.side_effect=lambda operation, **_kwargs: next(responses) if operation=='acquire' else {}
+        clock=[0.0]
+        def sleep(_seconds):
+            clock[0]+=30
+        def process(_argv,_cwd,timeout,**kwargs):
+            self.assertEqual(timeout,1)
+            self.assertEqual(clock[0],30)
+            kwargs['on_started'](SimpleNamespace(pid=123),None)
+            return True,False,verify_process.VerifyProcessOutput('passed',exit_code=0)
+        with mock.patch.object(core.time,'monotonic',side_effect=lambda:clock[0]), mock.patch.object(sys,'stdout',io.StringIO()):
+            self.assertTrue(core.execute_command(['tool'],self.root,1,self.writer(),client,'run','compile',
+                                                 run_process=process,sleep=sleep))
+        self.assertEqual([call.args[0] for call in client.request.call_args_list],['acquire','acquire','bind','release'])
 
     def test_runner_preserves_stage_order_and_stops_before_compile_on_test_failure(self):
         self.declare()

@@ -57,8 +57,11 @@ class AssessmentPending(RuntimeError):
 
 
 def slot_available(connection, repo, plan_id) -> bool:
+    from loop_manager_internal.storage.task_calls import management_available
+    if not management_available(connection,repo,plan_id):
+        return False
     runtime = runtime_state.RuntimeStateRepository(connection)
-    project = connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()
+    project = runtime_state.project_row(connection, repo)
     active = runtime.active_row(repo)
     projected = runtime.projected_row(repo)
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
@@ -274,7 +277,7 @@ class BlockedPlanReconciler:
         return plan
 
     def _remote(self, context, *, allow_published=False):
-        project = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (self.repo,)).fetchone()
+        project = runtime_state.project_row(self.connection, self.repo)
         if project['origin'] != context['registered_origin'] or project['base_branch'] != self.base:
             raise RuntimeError('등록 origin 또는 base branch가 변경됐습니다.')
         origin = self.ports.git(self.repo_path, 'remote', 'get-url', 'origin').stdout.strip()
@@ -713,7 +716,7 @@ class BlockedPlanReconciler:
                 else:
                     self._publish(plan, context)
                     outcome = 'blocked'
-                project = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (self.repo,)).fetchone()
+                project = runtime_state.project_row(self.connection, self.repo)
                 self.ports.observe_blocked_plan_remotes(self.connection, self.repo_path, self.repo, project, plan_id=plan_id)
                 current = self.connection.execute('SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
                                                   (self.repo, plan_id)).fetchone()

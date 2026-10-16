@@ -1,7 +1,7 @@
 """application contracts boundaries and named composition effects."""
 from __future__ import annotations
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from loop_manager_internal.agents.agent_invocation import AgentResult
 from loop_manager_internal.execution.validation_feedback import redact_secrets
@@ -49,6 +49,7 @@ class CatalogScheduleDecision:
     project_blocked: bool = False
     selection_reason: str | None = None
     has_draft: bool = False
+    priority_ranks: tuple[tuple[str, tuple[int, int]], ...] = field(default=(),compare=False,repr=False)
 
     @property
     def has_waiting(self) -> bool:

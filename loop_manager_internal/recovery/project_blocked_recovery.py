@@ -548,7 +548,7 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                 self._check_owner(plan_id, context)
                 if self._revalidate_project_cause(plan, context):
                     return 'recovered'
-                project = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (self.repo,)).fetchone()
+                project = runtime_state.project_row(self.connection, self.repo)
                 self.ports.observe_blocked_plan_remotes(self.connection, self.repo_path, self.repo, project, plan_id=plan_id)
                 current = self.connection.execute('SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
                                                   (self.repo, plan_id)).fetchone()

@@ -4,7 +4,7 @@
 
 Loop Manager는 Windows·Linux·macOS에서 외부 스케줄러가 반복 실행하는 Python 3 프로그램이다. Manager가 문서·GitHub 상태·실행 근거를 확인하고 Agent CLI에 판단·구현·Review를 맡기며, Git·검증·게시·상태 전이는 프로그램 코드가 수행한다.
 
-서로 다른 프로젝트는 `max_workers` 범위에서 병렬 처리하고 한 자동 실행의 Planner는 공유 mutex로 직렬화한다. 프로젝트마다 진행 중인 구현·검증·교정·게시의 실행 자리는 하나다. 안정된 PR Merge 대기는 자리를 비울 수 있으며 수동 공유 작업 공간은 [실행 자리와 유지보수](#실행-자리와-유지보수)의 별도 소유 규칙을 따른다.
+프로젝트별 조율 스레드와 작업별 SQLite 연결·실행 문맥을 분리한다. 전체 Worker·Reviewer 호출은 `max_workers`, verify 호출은 별도 `verify_concurrency`로 제한하고 한 자동 실행의 Planner는 공유 mutex로 직렬화한다. 안정된 PR Merge 대기는 자리를 비울 수 있으며 수동 공유 작업 공간은 [실행 자리와 유지보수](#실행-자리와-유지보수)의 별도 소유 규칙을 따른다.
 
 ### 구현 모듈과 의존성 조립
 
@@ -72,9 +72,11 @@ Python 표준 라이브러리 `configparser`로 source에서 확정한 운영 IN
 
 | 설정 | 타입·기본값·의미 |
 |---|---|
-| `[loop].max_workers` | 양의 정수, 기본 3. 동시 프로젝트 수의 상한 |
+| `[loop].max_workers` | 양의 정수, 기본 3. 전체 Worker·Reviewer 실제 호출 수의 상한 |
+| `[loop].max_tasks_per_project` | 양의 정수, 기본 1. DB 저장값이 0인 프로젝트의 관리 대상 상한 |
+| `[loop].verify_concurrency` | 양의 정수, 기본 1. 전체 verify 실제 호출 수의 상한 |
 | `[loop].refactoring_review_interval` | 0 이상 정수, 기본 20. 정상 종료/최초 실행 기준 이후 Merge 주기이며 0은 자동 유지보수 전환만 비활성화 |
-| `[loop].verify_timeout_seconds` | 양의 정수 초, 기본 600. 검증의 자원 대기를 포함한 전체 timeout |
+| `[loop].verify_timeout_seconds` | 양의 정수 초, 기본 600. 확인된 순번 대기를 제외한 verify 전체 실제 실행 시간 상한 |
 | `[loop].verify_parallelism` | `auto` 또는 양의 정수, 기본 `auto`. 1은 직렬, 나머지 정수는 실행량 상한 |
 | `[loop].verify_partial` | boolean, 기본 `true`. 자체 unittest의 부분 검증·일반 선행 Review 경로 사용 여부 |
 | `[<provider>].fast_mode` | boolean 또는 공란, 기본 `false`. 선택 provider의 Fast 요청 |
@@ -128,7 +130,7 @@ SQLite·manager runtime·프로젝트 관리 worktree·로그·관리 임시 파
 | 선택 실행 | `run [--skip-if-running] [repo...]`의 경로를 정규화·중복 제거하고 scheduler 전에 전체 등록 여부를 확인한다. 하나라도 미등록이면 invocation reconciliation·프로젝트 처리를 시작하지 않는다. |
 | 등록 해제 | PRODUCT의 비종료 작업·프로젝트 차단·planning 오류 gate를 검사하고 registry만 변경한다. 프로젝트 파일·branch·worktree·PR을 삭제하지 않는다. |
 
-run의 상대 저장소 경로는 부모 CLI의 현재 작업 디렉터리에서 절대화해 공백을 보존한 채 자식에 전달한다. scheduler는 검증된 등록 row만 받아 선택 범위에도 `max_workers`·self-merge 사전 확인·프로젝트별 독립 실행·실패 집계 경계를 적용한다.
+run의 상대 저장소 경로는 부모 CLI의 현재 작업 디렉터리에서 절대화해 공백을 보존한 채 자식에 전달한다. scheduler는 검증된 등록 row만 받아 선택 범위에도 호출·관리 한도와 self-merge 사전 확인·프로젝트별 독립 실행·실패 집계 경계를 적용한다.
 
 ## 문서 입력과 ExecPlan 파싱
 
@@ -527,12 +529,16 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 ## 실행 자리와 유지보수
 
-프로젝트마다 독립 SQLite 연결과 하나의 변경 실행 자리를 사용한다. 여러 작업의 branch·worktree·PR·오류를 보존할 수 있지만 변경 실행과 PR 충돌 복구는 하나만 진행한다. 서로 다른 프로젝트만 `max_workers` 안에서 병렬 제출하며 한 자동 실행의 Planner 호출은 프로젝트 간에도 직렬화한다.
+프로젝트 조율은 준비·planning을 수행하고, 관리 대상으로 선택한 각 작업은 별도 SQLite 연결과 `ContextVar` 실행 선택으로 단계 처리를 진행한다. `exec_plans`가 작업별 단계·session·scope·실패 이력의 원본이며, 병렬 작업은 공유 `projects` 투영을 덮어쓰지 않는다. 프로젝트 조율이 종료할 때 남은 활성 작업을 대표 투영으로 연결하고, 미확정 소유 상태가 있으면 투영을 임의로 비우지 않는다.
+
+공유 `TaskScheduler`가 관리 배정과 실제 호출 배정을 구분한다. 관리 선택은 프로젝트별 유효 상한 안에서 수동 제출·기존 작업·일반 신규 순서로 확정하며, 일반 신규는 기본 자리 없는 프로젝트부터 순환하고 이후 유효 priority를 사용한다. Worker·Reviewer 호출은 전체 `max_workers`, verify는 별도 `verify_concurrency`를 사용하고 프로젝트 조율·Planner mutex 대기는 이 호출 자리를 사용하지 않는다. 한 자동 실행의 Planner는 직렬이다.
+
+`projects.max_tasks_per_project`는 정수 0 이상이고 migration 기본 0이다. 0이면 해당 Manager가 읽은 config 기본값을 상속하며 양수는 보존한다. 배정 경계에서 DB를 재조회한다. `task_call_reservations`는 호출 token·repo·plan·종류·실행 receipt를 보존하고, 재시작 시 미시작 또는 실제 프로세스 종료 증거가 있는 호출만 회수한다. 종료 불명과 `execution_checkpoints.operation`이 남은 작업은 관리 자리도 유지한다. Agent는 기존 group/Job 종료 receipt, verify는 소유 프로세스·WSL lifecycle receipt를 사용한다. 불확실한 종류의 호출이 상한에 도달하면 해당 단계는 보존하고 다른 종류의 적격 호출을 계속한다.
 
 | 저장 상태 | 실행 자리와 보존 책임 |
 |---|---|
 | 작업별 실행 원본 | `exec_plans`에 단계·작업 identity·소유 자원·session·실패 이력을 유지한다. 프로젝트의 현재 작업을 바꾸어도 이 원본을 초기화하지 않는다. |
-| 프로젝트의 현재 작업 투영 | Manager가 현재 실행할 작업을 연결한다. 프로젝트 planning으로 전환할 때 재개할 작업을 고정하고 투영만 비우며, 검증·게시·DB 적용 후 같은 작업을 다시 투영한다. |
+| 프로젝트의 현재 작업 투영 | 프로젝트 조율의 대표 작업을 연결한다. 작업 스레드는 자신의 plan 선택으로 원본을 읽고 갱신한다. 프로젝트 planning으로 전환할 때 재개할 작업을 고정하고 투영만 비우며, 검증·게시·DB 적용 후 같은 작업을 다시 투영한다. |
 | 보존된 planning 상태 | worktree·session·미게시 결과·오류·실패 이력을 별도로 유지한다. 보존 기록이나 오류 자체가 실행 자리 점유를 뜻하지 않는다. |
 | 미확정 publication intent·공유 Git operation | 원격 게시·DB 적용과 소유 operation의 남은 처리를 복구한다. 미확정 게시나 종료 불명 writer가 있으면 다른 작업을 위해 자리를 해제하지 않는다. |
 
@@ -542,7 +548,7 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 오류 원인이 해소되기 전에는 새 Planner 주기와 프로젝트 완료를 선언하지 않으며 같은 입력·재시작에서 오류를 지우거나 호출을 반복하지 않는다. 이 오류 보존·실행 자리 해제는 현재 동작이다. R-055의 남은 문서 삭제·관리 자원 정리 목표는 [원격 catalog와 실행 이력의 분리](#원격-catalog와-실행-이력의-분리)에서 구분한다.
 
-상태별 실행 자격과 dependency·priority·명세 변경·유지보수 DAG의 선택 순서는 [PRODUCT의 작업 선택 정책](PRODUCT.md#작업-선택과-동시-실행)을 따른다. 같은 프로젝트의 병렬 파일 충돌 판정·PR 재정렬은 지원하지 않는다.
+상태별 실행 자격과 dependency·priority·명세 변경·유지보수 DAG의 선택 순서는 [PRODUCT의 작업 선택 정책](PRODUCT.md#작업-선택과-동시-실행)을 따른다. 일반 작업은 독립 branch·worktree를 사용하며 공유 수동 묶음 내부는 직렬이다. 병렬 결과의 통합은 기존 최신 base 확인·소유 rebase·재검증을 따르며 PR 자동 재정렬은 지원하지 않는다.
 
 ### 유지보수 분석과 성공 근거
 
@@ -1126,6 +1132,8 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 
 `result_validation.verify`는 선언이 없을 때만 기존 verify 경로를 실행한다. 잘못된 선언·미지원 version/adapter·실행 도구 부재는 연결 실패이며 기존 경로로 우회하지 않는다. 필수 필드·타입·경로와 단계 형식은 [선언 version 1](VERIFY.md#선언-version-1)을 따른다.
 
+실제 시간은 `ExecutionClock`이 동일 검증의 누계 디렉터리에서 확인한 순번 대기만 제외해 계산한다. coordinator는 실행 중·종료 불명 자식이 없는 session의 정상 배정 heartbeat 구간만 대기로 기록한다. 자식 일부가 실행 중이면 부모 시간도 계속 흐른다. Manager·launcher·runner와 Windows/WSL 단계가 이 누계를 공유하고 단계별 남은 예산을 전달하며 테스트 worker에는 조율 환경을 전달하지 않는다. 준비·수집·복사·I/O·실행·결과 처리·정리 시간은 그대로 계산한다. 상세 연결은 [시간 예산](VERIFY.md#순번-대기와-시간-예산)을 따른다.
+
 시간 상한을 전달하지 않는 구형 조율 호출은 runner·명령·프로세스/Windows Job 대기에서 바깥 Manager의 상한을 상속하며 새 기본 상한을 중첩하지 않는다. 명시적 상한과 단독 실행의 설정·기본 상한은 유지한다.
 
 `perl_reporter.pl`은 공식 TAP::Parser로 테스트를 실행하고 즉시 flush하는 native JSON Lines(`*.native.ndjson`) 및 원본 TAP spool을 제공한다.
@@ -1688,6 +1696,6 @@ reuse는 verify 프로세스·validation 실행 감사·사용량을 새로 만�
 - 인증 또는 비밀값 저장 방식 변경
 - 새로운 외부 infrastructure나 비용 발생 서비스 도입
 - 데이터 삭제 또는 비가역 migration
-- 같은 프로젝트의 병렬 실행 도입
+- 승인된 호출·관리 한도를 벗어나는 병렬 실행 정책 변경
 
 Planner는 [draft와 사용자 판단](PRODUCT.md#draft와-사용자-판단)으로 미결정 사항을 분리한다. Worker는 사용자 결정이 필요한 결과를 보고하고 Reviewer는 명세 누락·상충을 명세 교착으로 보고한다. Manager가 원인·영향 범위에 맞는 대기·차단 상태와 재개 조건을 기록하며, Agent가 직접 상태를 바꾸거나 독립 작업까지 일괄 중단하지 않는다. 기존 승인·안전·필수 검증 조건은 유지하고 실제 해소가 확인된 원인만 해제한다.

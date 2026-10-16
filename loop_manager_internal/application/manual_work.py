@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 import json
 import re
-from contextlib import closing
+from contextlib import closing, nullcontext
 from .manual_errors import ManualWorkError
 from .manual_concurrency import (ManualConflictError, manual_preparation, preparation_gate,
                                  group_resources, serial_manual_drive)
@@ -158,6 +158,16 @@ class ManualWorkService:
                  or (intent['kind']=='manual_branch_push' and intent['target']==f"refs/heads/{recovering['branch']}")))
         own_block = bool(releasing_plan is not None and releasing_plan['status']=='PLAN_BLOCKED'
                          and row['plan_path']==releasing_plan['path'] and row['phase'] in {'BLOCKED','PLAN_BLOCKED'})
+        from loop_manager_internal.application.task_scheduling import current_scheduler, managed_count
+        scheduler = current_scheduler.get()
+        if scheduler is not None:
+            from loop_manager_internal.runtime.project_registry import task_limit
+            _, limit, _ = task_limit(self.connection, self.repo, scheduler.config.max_tasks_per_project)
+            return not (managed_count(self.connection, self.repo) >= limit
+                or runtime_state.planning_owns_execution_slot(row)
+                or scoped_blocking.project_block(self.connection, self.repo)
+                or cycle.phase is not maintenance_state.MaintenancePhase.IDLE
+                or manager_git_journal.has_pending_project_mutation(self.state_dir, self.repo, recoverable=recoverable))
         return not (row['phase'] and not own_block or self.runtime.active_row(self.repo) or row['agent_snapshot']
             or runtime_state.planning_owns_execution_slot(row)
             or scoped_blocking.project_block(self.connection, self.repo)
@@ -438,12 +448,18 @@ class ManualWorkService:
         if not self.slot_available(recovering=recovering):
             return
         for group in pending:
+            from loop_manager_internal.application.task_scheduling import current_scheduler
+            owner = group['active_id'] or group['owner_id']
+            if current_scheduler.get() is not None and owner:
+                current = self.runtime.get(self.repo, owner)
+                if current.status in runtime_state.ACTIVE_STATUSES:
+                    continue
             try:
                 with resource_locks(self.state_dir, self.repo, group_resources(group), owner='manual-resume'):
                     self._resume_group(group)
                     if self.runtime.active_row(self.repo) is not None:
                         return
-            except ProcessLockBusyError:
+            except (ProcessLockBusyError, runtime_state.TaskLimitReached):
                 continue
             except (RuntimeError, OSError, ValueError, TypeError, KeyError) as error:
                 with self.connection:
@@ -479,10 +495,16 @@ class ManualWorkService:
             config_path=self.config_path,provider=self.project['provider'],
             resolve_profile=self.effects.resolve_profile).note_pending(
             SimpleNamespace(worktree=Path(group['worktree']),base_branch=self.base))
-        with self.connection:
-            self.runtime.update_plan(self.repo,owner,plan_values={'status':group['resume_phase']},enqueue=False)
-            self.runtime.hydrate(self.repo,owner)
-            self.store.update(group,active_id=owner)
+        from .task_scheduling import current_scheduler, Task
+        scheduler = current_scheduler.get()
+        with (scheduler.admission(Task(self.repo,owner,self.connection))
+              if scheduler is not None else nullcontext()):
+            if not self.slot_available(recovering=group):
+                return
+            with self.connection:
+                self.runtime.update_plan(self.repo,owner,plan_values={'status':group['resume_phase']},enqueue=False)
+                self.runtime.hydrate(self.repo,owner)
+                self.store.update(group,active_id=owner)
         return
 
     def display(self, group, *, accepted):

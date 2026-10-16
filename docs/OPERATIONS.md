@@ -59,9 +59,11 @@ Python source 진입은 bootstrap의 첫 Git 호출 전에 저장된 PATH, 현�
 | `planner_check` | 기존 호출 이력·저장 상태의 호환성을 위해 역할 설정을 유지한다. 코드·테스트·설정 변경만으로 새 점검 호출을 만들지 않는다. 유지보수 Planner는 `maintenance_planner`를 사용하며 생략하면 일반 `planner` 설정을 재사용한다. |
 | `[codex] fast_mode` · `[claude] fast_mode` | provider별 Fast 선택. 기본값은 `false`이며 공란·공백·section 또는 항목 생략도 off다. CLI 기본 설정이나 저장된 session에서 on이어도 off가 우선하도록 전달한다. `true`는 on이며 `on/off`·`yes/no`·`1/0`도 허용한다. 모델·Effort는 그대로 전달하며 지원·대체 실행은 CLI에 맡긴다. Fast 사용에는 추가 비용 또는 구독 사용량 증가가 발생할 수 있다. |
 | `[telegram]` | `token`·`chat_id`가 모두 있으면 알림 사용, 둘 다 없으면 비활성화, 하나만 있으면 설정 오류다. |
-| `[loop] max_workers` | 동시 처리 프로젝트 수. 기본값 `3`. |
+| `[loop] max_workers` | 전체 Worker·Reviewer 실제 동시 호출 상한. 기본값 `3`. |
+| `[loop] max_tasks_per_project` | 프로젝트별 관리 대상 기본 상한. 기본값 `1`. 프로젝트 DB의 0은 이 값을 상속하고 양수는 개별 상한이다. |
+| `[loop] verify_concurrency` | 전체 verify 동시 호출 상한. 기본값 `1`. Worker·Reviewer와 겹칠 수 있다. |
 | `[loop] refactoring_review_interval` | 새 MERGED 작업 수에 따른 자동 유지보수 주기. 기본값 `20`. `0`이면 자동 전환을 끄며 누적 수와 실행 중 cycle은 보존한다. `python loop_manager.py maintenance-review <project-path>`로 등록된 프로젝트의 다음 안전한 경계에 점검을 요청할 수 있다. |
-| `verify_timeout_seconds` | 전체 verify 상한(초). 기본값 `600`. 필요한 검증이 정상 진행 중이라는 근거가 있을 때 조정한다. |
+| `verify_timeout_seconds` | 확인된 순번 대기를 제외한 전체 verify 실제 실행 상한(초). 기본값 `600`. 필요한 검증이 정상 진행 중이라는 근거가 있을 때 조정한다. |
 | `verify_parallelism` | Loop Manager 자체 verify의 모듈 배정 상한. 기본값 `auto`, 양의 정수는 verify별 상한, `1`은 직렬이다. [배정·기록](#verify-배정과-진단) |
 
 Fast 선택은 한 번 실행을 시작할 때 읽어 신규·재개·재시도 호출에 고정한다. 설정 변경은 다음 Manager 실행에 반영하고 session·작업물·Worker level은 Fast 선택만으로 초기화하지 않는다. 호출 로그의 `loop_manager.fast_mode` 기록에서 요청값 `true`·`false`를 확인한다. 이 값은 실제 Fast 적용 성공을 뜻하지 않는다. CLI 진단·실패는 기존 처리 규칙을 따르며 모델별 사전 판정이나 CLI 버그 우회를 추가하지 않는다.
@@ -103,6 +105,20 @@ python loop_manager.py run /path/to/project-a '/path with spaces/project-b'
 ```
 
 상대 경로는 명령을 호출한 작업 디렉터리 기준으로 해석한다. 지정 경로는 정규화한 뒤 중복 제거하며 전체 경로의 등록 여부를 처리 전에 확인한다. 하나라도 등록되지 않으면 프로젝트 처리를 시작하지 않는다. `--skip-if-running`은 지정 범위에서도 기존처럼 다른 Loop Manager 실행이 있을 때 조용히 성공 종료한다.
+
+## 프로젝트별 관리 한도
+
+등록된 프로젝트의 관리 대상 상한은 실행 중에도 변경할 수 있다.
+
+```sh
+python loop_manager.py config set /path/to/my-project --max-tasks-per-project 4
+python loop_manager.py config set /path/to/my-project --max-tasks-per-project 0
+python loop_manager.py status /path/to/my-project --json
+```
+
+0은 config 기본값 상속, 양수는 개별 상한이다. 음수·정수가 아닌 값과 미등록 대상은 거부한다. 변경은 Agent·Git·bootstrap·Manager 재시작을 실행하지 않으며 다음 안전한 관리 배정에서 DB를 다시 읽는다. 상한 축소는 기존 작업·세션·작업물을 보존하고 새 관리 배정만 보류한다. pause 중에도 저장할 수 있다.
+
+`status <repo>`는 읽기 전용으로 저장값·유효값·출처·현재 DB의 관리 수를 표시한다. 유효값은 조회 명령이 읽은 config 기준이다. 실행 중 Manager의 config·실제 호출 수·반영 여부는 이 조회로 확인하지 않으며 JSON의 `warnings`에도 표시한다. 전체 운영 상태·다른 설정 CLI·Loop Manager 관리 Skill의 안내는 [R-076](requirements/%5BR-076%5D%20운영%20명령어와%20상태%20조회%20및%20Skill%20지원.md)의 별도 목표다.
 
 ## 수동 구현과 제출
 
@@ -175,7 +191,7 @@ Merge 확인 후 clean하고 PR head에 없는 로컬 commit이 없는 worktree�
 
 Worker는 관련 targeted unit test와 verify 스크립트를 준비하고 전체 verify는 Manager가 Agent 밖에서 실행한다. Windows는 `scripts/verify.ps1`, Linux·macOS는 `scripts/verify.sh`를 사용한다. Loop Manager 자체 스크립트는 `.venv`를 우선 사용하고 어디서 호출해도 저장소 루트에서 실행한다. 공통 runner가 전체 unittest·compile을 수행하며 테스트 프로세스의 실제 Agent CLI·외부 API 연결은 차단된다.
 
-`verify_parallelism = auto`는 허용 CPU·실제 부하·메모리 여유와 아직 관측에 반영되지 않은 예약을 확인해 새 테스트 모듈을 배정한다. 정수 상한 안에서도 자원이 부족하면 기다리며 관측 실패 시 직렬로 축소한다. macOS도 CPU·메모리 관측이 불가능하면 직렬로 축소한다. `max_workers`와 별개이며 다른 등록 프로젝트의 verify에는 적용하지 않는다.
+`verify_parallelism = auto`는 허용 CPU·실제 부하·메모리 여유와 아직 관측에 반영되지 않은 예약을 확인해 새 테스트 모듈을 배정한다. 정수 상한 안에서도 자원이 부족하면 기다리며 관측 실패 시 직렬로 축소한다. macOS도 CPU·메모리 관측이 불가능하면 직렬로 축소한다. `max_workers` 및 verify 호출 수를 제한하는 `verify_concurrency`와 별개이며 다른 등록 프로젝트의 내부 테스트 병렬도에는 적용하지 않는다.
 
 시간 이벤트·worker 원문·manifest·집계는 Manager 실행에서 `<state-dir>/logs/verify/<실행 ID>/`, 단독 스크립트에서 `.cache/verify/<실행 ID>/`에 남는다. 시간 집계만 읽으려면 다음을 실행한다. 테스트는 실행하지 않는다.
 

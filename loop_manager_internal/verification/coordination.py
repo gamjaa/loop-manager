@@ -85,8 +85,34 @@ class VerifyCoordinator:
     def open(self, cap, *, require_guard=False):
         session, secret = secrets.token_hex(16), secrets.token_hex(32)
         with self.lock:
-            self.sessions[session] = {"secret": secret, "cap": cap, "guard": None, "require_guard": require_guard}
+            self.sessions[session] = {"secret": secret, "cap": cap, "guard": None, "require_guard": require_guard,
+                "waiting": False, "waiting_seconds": 0.0, "waiting_at": self.clock(),
+                "budget_directory": os.environ.get("LOOP_MANAGER_VERIFY_BUDGET_DIR")}
         return session, secret
+
+    def track_waiting(self, session, directory):
+        with self.lock:
+            self.sessions[session]["budget_directory"] = str(directory)
+
+    def _record_wait(self, session, waiting):
+        owner = self.sessions[session]
+        now = self.clock()
+        interval = now-owner["waiting_at"]
+        # 배정 요청의 heartbeat가 끊긴 구간을 대기로 추정하지 않는다.
+        if owner["waiting"] and 0 <= interval <= 1:
+            owner["waiting_seconds"] += interval
+        owner.update(waiting=waiting, waiting_at=now)
+        if owner["budget_directory"]:
+            from loop_manager_internal.verification.timing import atomic_json
+            directory = Path(owner["budget_directory"])
+            directory.mkdir(parents=True, exist_ok=True)
+            atomic_json(directory / (session+".json"), {"waiting_seconds": owner["waiting_seconds"]})
+
+    def _allocation(self, session, reply):
+        active = any(value["active"] or value["uncertain"] for value in self.reservations.values()
+                     if value["session"] == session)
+        self._record_wait(session, not reply.get("granted") and not active)
+        return reply
 
     def guard(self, session, callback):
         with self.lock:
@@ -94,6 +120,8 @@ class VerifyCoordinator:
 
     def finish(self, session, *, stopped):
         with self.lock:
+            if session in self.sessions:
+                self._record_wait(session, False)
             if stopped:
                 self.reservations = {key: value for key, value in self.reservations.items() if value["session"] != session}
                 self.sessions.pop(session, None)
@@ -145,10 +173,10 @@ class VerifyCoordinator:
                                   global_running=global_running)
                 if running >= decision.limit:
                     self.waiters.remove(session)
-                    return {**asdict(decision), **diagnostics}
+                    return self._allocation(session, {**asdict(decision), **diagnostics})
                 if self.waiters[0] != session:
-                    return {**asdict(decision), **diagnostics,
-                            "granted": False, "reason": "다른 verify의 배정 순서"}
+                    return self._allocation(session, {**asdict(decision), **diagnostics,
+                            "granted": False, "reason": "다른 verify의 배정 순서"})
                 if decision.granted:
                     self.waiters.popleft()
                 else:
@@ -167,8 +195,9 @@ class VerifyCoordinator:
                         if value is not None:
                             self.reservations[token][key] = value
                     reply["token"] = token
-                return reply
+                return self._allocation(session, reply)
             token = data.get("token")
+            self._record_wait(session, False)
             reservation = self.reservations.get(token)
             if reservation is None or reservation["session"] != session:
                 raise RuntimeError("다른 verify 또는 알 수 없는 예약입니다.")

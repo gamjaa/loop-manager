@@ -13,7 +13,13 @@ Loop Manager 자체 검증은 `scripts/verify.json`으로 공통 runner를 선�
 /manager/runtime/python /manager/runtime/loop_manager_internal/verification/entrypoint.py --protocol-version 1 --project-python /project/.venv/bin/python --parallelism 1 --timeout 600
 ```
 
-Windows에서도 Python과 `entrypoint.py`의 절대 경로로 같은 인수를 전달한다. Manager 호출과 단독 호출은 같은 선언·수집·단계·결과 검증을 사용한다. 단독 호출은 로컬 자원 관측만 사용하고, 다른 Manager나 단독 실행과 예약을 공유하지 않는다. timeout은 수집·대기·테스트·명령·정리를 포함한다. 구형 Manager가 조율 session만 전달하고 시간 상한을 전달하지 않으면 runner·명령·자식 대기는 바깥 Manager의 기존 상한을 따르며 별도의 600초 상한을 만들지 않는다. 명시된 상한은 그대로 적용하고 단독 실행의 기본 상한은 600초(자체 설정이 있으면 해당 값)다. 자식 종료 불명은 성공으로 처리하지 않고 예약 진단을 보존한다.
+Windows에서도 Python과 `entrypoint.py`의 절대 경로로 같은 인수를 전달한다. Manager 호출과 단독 호출은 같은 선언·수집·단계·결과 검증을 사용한다. 단독 호출은 로컬 자원 관측만 사용하고, 다른 Manager나 단독 실행과 예약을 공유하지 않는다. timeout은 준비·수집·테스트·명령·결과 처리·정리의 실제 경과 시간을 포함하며 확인된 순번·자원 배정 대기는 제외한다. 구형 Manager가 조율 session만 전달하고 시간 상한을 전달하지 않으면 runner·명령·자식 대기는 바깥 Manager의 기존 상한을 따르며 별도의 600초 상한을 만들지 않는다. 명시된 상한은 그대로 적용하고 단독 실행의 기본 상한은 600초(자체 설정이 있으면 해당 값)다. 자식 종료 불명은 성공으로 처리하지 않고 예약 진단을 보존한다.
+
+## 순번 대기와 시간 예산
+
+Manager의 verify 호출 대기는 `verify_concurrency` 자리 배정 뒤 시간 측정을 시작한다. runner의 내부 자원 대기는 coordinator가 해당 session에 실행 중이거나 종료 불명인 자식이 없고 정상 heartbeat가 이어지는 구간만 확인해 누계로 남긴다. 다른 자식이 실행 중이거나 runner가 멈춘 구간은 제외하지 않는다. 부모의 경과 시간에서 확인된 대기만 빼며 병렬 자식 시간을 더하지 않는다.
+
+`LOOP_MANAGER_VERIFY_BUDGET_DIR`는 같은 검증의 Manager·launcher·runner가 누계를 공유하는 내부 환경값이다. 단계 사이에서 예산을 초기화하지 않고, 테스트 worker에는 이 조율 환경을 제거해 검증 대상이 부모 시간을 조작하지 않도록 한다. Windows·WSL 두 단계도 같은 실제 시간 예산을 사용하며 Windows Job 종료와 Linux 자식 종료·복사본 정리 근거를 함께 확인한다. WSL 종료가 불명이면 lifecycle receipt와 소유 예약을 보존하고 실행 자리를 임의로 회수하지 않는다.
 
 ## 선언 version 1
 

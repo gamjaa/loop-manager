@@ -21,6 +21,7 @@ from loop_manager_internal.agents import agent_profiles
 from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
 from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
+from loop_manager_internal.application.task_scheduling import scheduled_call
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class InvocationEffects:
     agent_provider: Callable[[str], AgentProvider]
 
 
+@scheduled_call("agent")
 def run_agent(
     provider: str,
     worktree: Path,
@@ -227,6 +229,11 @@ def run_agent(
     def observe_launch(launch):
         nonlocal prepared_launch
         prepared_launch = launch
+        from .process_receipt import receipt_path
+        from loop_manager_internal.storage import task_calls
+        task_calls.bind_agent_receipt(receipt_path(launch))
+        if identity is not None:
+            task_calls.bind_agent(identity)
         if ledger is not None and identity is not None:
             from .process_receipt import receipt_path
             ledger.bind_process_receipt(identity, str(receipt_path(launch)))

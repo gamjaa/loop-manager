@@ -210,12 +210,15 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         )
 
 
-    def test_waiting_rows_do_not_occupy_the_single_mutation_slot(self):
+    def test_waiting_rows_do_not_occupy_the_default_management_slot(self):
         self.plan("G-001", "PR_OPEN", branch="loop-manager/G-001")
         self.plan("G-002", "PR_OPEN", branch="loop-manager/G-002")
         self.plan("G-003", "IMPLEMENTING")
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.plan("G-004", "VERIFYING")
+        self.plan("G-004", "READY")
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository, RuntimeStateError
+        with self.assertRaises(RuntimeStateError):
+            RuntimeStateRepository(self.connection).activate(self.repo,'G-004',activation_sha='base',
+                branch='loop-manager/G-004',worktree='/managed/G-004')
 
         self.connection.execute(
             "UPDATE exec_plans SET status = 'PLAN_BLOCKED' "

@@ -398,6 +398,7 @@ def catalog_schedule_decision(
             key=lambda row: priorities[str(row["plan_id"])].sort_key(str(row["plan_id"])),
         )
     return CatalogScheduleDecision(
+        priority_ranks=tuple((plan_id,value.sort_key(plan_id)) for plan_id,value in priorities.items()),
         selection_reason=(priorities[str(selected["plan_id"])].reason(str(selected["plan_id"]))
                           if selected is not None else None),
         active=active,

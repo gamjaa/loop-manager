@@ -222,7 +222,9 @@ class ManualWorkRepository:
 
     def pending(self, repo):
         return self.connection.execute("SELECT * FROM manual_work_groups WHERE repo=? "
-            "AND state IN ('GENERATING','REGISTERING','AUTOMATIC') AND request_id IS NOT NULL ORDER BY rowid", (repo,)).fetchall()
+            "AND state IN ('GENERATING','REGISTERING','AUTOMATIC') AND request_id IS NOT NULL "
+            "ORDER BY (SELECT MIN(r.created_at) FROM manual_work_requests r "
+            "WHERE r.repo=manual_work_groups.repo AND r.group_id=manual_work_groups.group_id), rowid", (repo,)).fetchall()
 
     def create(self, repo, kind, branch, requirements, head, base, *, members=(), documents=()):
         group_id = uuid4().hex

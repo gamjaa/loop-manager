@@ -235,8 +235,9 @@ class FastModeTests(TestCase):
         worker = scheduler.RunRegisteredProjectEffects(mock.Mock(),
             lambda *args, **kwargs: sqlite3.connect(":memory:"), mock.Mock(), run_project)
         effects = scheduler.ScheduleRegisteredProjectsEffects(mock.Mock(),
-            partial(scheduler._run_registered_project, worker))
+            partial(scheduler._run_registered_project, worker), mock.Mock(), mock.Mock())
         with mock.patch.object(scheduler.project_registry, "list_projects", return_value=projects), \
+             mock.patch.object(scheduler, "TaskScheduler"), \
              mock.patch.object(scheduler, "next_local_recovery_request", return_value=None), \
              mock.patch.object(scheduler.notifications, "configure_session"), \
              mock.patch.object(scheduler.notifications, "immediate_delivery", return_value=nullcontext()), \

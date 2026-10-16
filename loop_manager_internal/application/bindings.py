@@ -47,6 +47,7 @@ def register(assembly: Composition) -> None:
             _self_runtime_project=assembly.callback('_self_runtime_project'),
             _update_blocked_error=assembly.callback('_update_blocked_error'),
             active_execplan=assembly.callback('active_execplan'),
+            activate_ready_execplan=assembly.callback('activate_ready_execplan'),
             backfill_plan_shas=assembly.callback('backfill_plan_shas'),
             block_active_execplan_from_revision=assembly.callback('block_active_execplan_from_revision'),
             block_persisted_agent_scope_violation=assembly.callback('block_persisted_agent_scope_violation'),
@@ -172,6 +173,8 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('schedule_registered_projects', scheduler.schedule_registered_projects,
         lambda: scheduler.ScheduleRegisteredProjectsEffects(
+            connect_database=assembly.callback('connect_database'),
+            catalog_schedule_decision=assembly.callback('catalog_schedule_decision'),
             _preflight_self_merge_handoff=assembly.callback('_preflight_self_merge_handoff'),
             _run_registered_project=assembly.callback('_run_registered_project'),
         ),

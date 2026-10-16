@@ -13,6 +13,7 @@ from types import SimpleNamespace
 MARKER = "LOOP_MANAGER_TEST_NO_AGENTS"
 _COORDINATION_ENV = (
     "LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SECRET", "LOOP_MANAGER_VERIFY_SESSION",
+    "LOOP_MANAGER_VERIFY_BUDGET_DIR",
 )
 _agent = re.compile(r"(?i)(?:^|[\s/\\\"'])(?:codex|claude)(?:\.(?:exe|cmd|bat))?(?=$|[\s\"'])")
 

@@ -16,6 +16,7 @@ from loop_manager_internal.config.managed_config import ManagedConfig, fast_mode
 from loop_manager_internal.config.managed_config import ManagedConfigError
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.runtime import project_registry
+from loop_manager_internal.storage.runtime_state import TaskLimitReached
 from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.handoff_gate import RuntimeHandoffGate
 from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
@@ -25,6 +26,7 @@ import secrets
 import sqlite3
 import threading
 from loop_manager_internal.verification.coordination import ExecutionSettings, VerifyCoordinator, settings as verify_settings
+from loop_manager_internal.application.task_scheduling import TaskScheduler, current_scheduler
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,8 @@ def _run_registered_project(
                             external_run_id=external_run_id,
                             **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
                         )
+        except TaskLimitReached as error:
+            result = ProjectRunResult(ProjectRunKind.WAITING, 0, str(error))
         except SelfMergeRuntimeHandoff:
             if handoff_gate is not None:
                 handoff_gate.stop()
@@ -145,6 +149,8 @@ class ScheduleRegisteredProjectsEffects:
     """Named effects for schedule_registered_projects; no entry-point/module access."""
     _preflight_self_merge_handoff: Callable[..., object]
     _run_registered_project: Callable[..., object]
+    connect_database: Callable[..., object]
+    catalog_schedule_decision: Callable[..., object]
 
 
 def schedule_registered_projects(
@@ -173,33 +179,40 @@ def schedule_registered_projects(
     planner_mutex = threading.Lock()
     handoff_gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
     external_run_id = secrets.token_hex(16)
-    worker_count = min(config.max_workers, len(projects))
-    with VerifyCoordinator() as verify_coordinator, ThreadPoolExecutor(
-        max_workers=worker_count,
-        thread_name_prefix="loop-project",
-    ) as pool:
-        futures = tuple(
-            pool.submit(
-                copy_context().run,
-                effects._run_registered_project,
-                project,
-                state_dir,
-                config.path,
-                config.telegram_token,
-                config.telegram_chat_id,
-                planner_mutex,
-                config.refactoring_review_interval,
-                config.verify_timeout_seconds,
-                external_run_id=external_run_id,
-                handoff_gate=handoff_gate,
-                verify_coordinator=verify_coordinator,
-                verify_parallelism=config.verify_parallelism,
-                managed_config=config,
-                **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+    # 프로젝트 조율과 대기는 실제 Agent 호출 자리를 소비하지 않는다.
+    worker_count = len(projects)
+    task_scheduler = TaskScheduler(config, effects.connect_database, state_dir, connection, external_run_id=external_run_id,
+                                   priority_reader=effects.catalog_schedule_decision)
+    scheduler_token = current_scheduler.set(task_scheduler)
+    try:
+        with VerifyCoordinator() as verify_coordinator, ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="loop-project",
+        ) as pool:
+            futures = tuple(
+                pool.submit(
+                    copy_context().run,
+                    effects._run_registered_project,
+                    project,
+                    state_dir,
+                    config.path,
+                    config.telegram_token,
+                    config.telegram_chat_id,
+                    planner_mutex,
+                    config.refactoring_review_interval,
+                    config.verify_timeout_seconds,
+                    external_run_id=external_run_id,
+                    handoff_gate=handoff_gate,
+                    verify_coordinator=verify_coordinator,
+                    verify_parallelism=config.verify_parallelism,
+                    managed_config=config,
+                    **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+                )
+                for project in projects
             )
-            for project in projects
-        )
-        return tuple(future.result() for future in futures)
+            return tuple(future.result() for future in futures)
+    finally:
+        current_scheduler.reset(scheduler_token)
 
 
 @dataclass(frozen=True)

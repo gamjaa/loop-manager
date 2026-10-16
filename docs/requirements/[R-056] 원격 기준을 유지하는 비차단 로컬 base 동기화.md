@@ -2,7 +2,7 @@
 
 ## Summary
 
-자동 planning·구현·runtime은 검증한 원격 OID를 사용하고 로컬 base 동기화는 별도 부수 처리로 둔다. equal은 유지, ahead는 보존·skip, behind는 변경 보존 가능한 FF-only, clean diverged는 안전한 rebase, dirty diverged는 skip하며 실패가 원격 기준 작업을 막지 않게 한다. 사용자 operation·파일·index를 보호하고 Manager 소유 rebase만 확인된 조건에서 복구한다.
+자동 planning·구현·runtime은 검증한 원격 OID를 사용하고 로컬 base 동기화는 별도 부수 처리로 둔다. equal은 유지, ahead는 보존·skip, behind는 변경 보존 가능한 FF-only, clean diverged는 안전한 rebase, dirty diverged는 skip하며 실패가 원격 기준 작업을 막지 않게 한다. 사용자 operation·파일·index를 보호하고 Manager 소유 rebase만 확인된 조건에서 복구한다. 작업의 실행·관리 한도와 배정은 R-091을 따르며 공유 Git 자원 보호는 유지한다.
 
 ## Context
 
@@ -36,6 +36,7 @@
 - 로컬 동기화의 skip·실패·충돌·정리 보류는 이유와 보존 상태를 기록하고 자동 작업 결과와 구분한다. 동일한 미해결 로컬 상태에 무한 rebase·복구를 반복하지 않는다.
 - bootstrap, 자체 runtime 갱신·handoff, 일반 프로젝트 처리와 차단 복구에도 같은 원격 기준을 적용한다. bootstrap은 source checkout의 동기화 실패나 ahead·diverged 때문에 검증된 원격 runtime 실행을 막지 않는다.
 - fetch 실패나 원격 삭제·재작성·소유권 불확실성 때문에 안전한 원격 기준 자체를 검증할 수 없으면 기존 재시도·보존 정책을 따른다. 로컬 HEAD 또는 오래된 입력으로 대체해 게시하지 않으며 다른 프로젝트까지 불필요하게 중단하지 않는다.
+- 작업의 실행·관리 한도와 배정 순서는 [R-091](%5BR-091%5D%20프로젝트%20공정%20배정과%20우선순위%20기반%20병렬%20작업.md)을 따른다. 프로젝트 전체의 단일 변경 실행은 요구하지 않으며, 같은 checkout·index·ref를 사용하는 Git 작업의 소유권·배타 조건은 유지한다.
 
 ## Acceptance Criteria
 
@@ -48,7 +49,7 @@
 - 기본 checkout의 코드·문서·index·HEAD·로컬 base ref가 작업 중 또는 차단 중에 바뀌어도 관리 작업의 입력·범위 위반·복구 조건을 바꾸지 않는다. 격리 증거 없는 legacy 실행에도 같은 비교 제외를 적용하며 과거 로컬 base 복원을 요구하지 않는다. 실제 Agent 위반의 보존과 선택 작업 재검증은 R-055를 따른다.
 - dirty behind의 안전한 FF-only·실패 시 보존, dirty diverged의 rebase 금지, clean diverged의 성공 및 Manager 소유 충돌 abort 뒤 시작 상태 보존을 구분해 검증한다. 사용자 operation은 abort하지 않는다.
 - 로그에서 사용한 원격 SHA, 로컬 관계, 수행·skip·실패·복구 이유를 구분할 수 있다. fetch 실패와 원격 기준 불확실성을 로컬 동기화 실패와 혼동하지 않는다.
-- 기존 안전·승인·lease·검증·Review·단일 변경 자리와 자동 Merge 금지 조건이 유지된다.
+- 실행·관리 한도와 배정은 R-091을 따르고, 기존 안전·승인·lease·검증·Review·공유 Git 자원 보호와 자동 Merge 금지 조건이 유지된다.
 
 ## Product Impact
 

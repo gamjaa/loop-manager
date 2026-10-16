@@ -13,9 +13,11 @@ from loop_manager_internal.runtime.process_lock import process_lock
 from loop_manager_internal.storage import agent_invocation_state, local_recovery_state, runtime_state
 from pathlib import Path
 import argparse
+import json
 import sqlite3
 import sys
 import threading
+from datetime import datetime, timezone
 
 
 @dataclass(frozen=True)
@@ -27,12 +29,73 @@ class ConfigureRegistryEffects:
     operation_print: Callable[..., object]
 
 
+def _project_limits_status(effects, args, state_dir, config_path):
+    repo = str(Path(args.repository).expanduser().resolve())
+    result = {"schema_version": 1, "command": "status", "queried_at": datetime.now(timezone.utc).isoformat(),
+              "repository": repo, "plan_id": None, "source": None, "data": None, "warnings": [], "error": None}
+    code = "configuration_error"
+    try:
+        config = effects.load_managed_config(config_path)
+        database_path = (state_dir / "loop-manager.db").resolve()
+        code = "db_not_found"
+        if not database_path.is_file():
+            raise RuntimeError("상태 DB가 없습니다.")
+        code = "db_unreadable"
+        with closing(sqlite3.connect(database_path.as_uri()+"?mode=ro", uri=True, timeout=5)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN")
+            code = "unsupported_schema"
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
+            if not {"repo", "registered", "max_tasks_per_project"}.issubset(columns):
+                raise RuntimeError("관리 한도 조회를 지원하지 않는 DB schema입니다.")
+            code = "unknown_project"
+            if connection.execute("SELECT 1 FROM projects WHERE repo=? AND registered=1", (repo,)).fetchone() is None:
+                raise RuntimeError(f"등록되지 않은 프로젝트입니다: {repo}")
+            code = "unsupported_schema"
+            stored, effective, source = project_registry.task_limit(connection, repo, config.max_tasks_per_project)
+            from loop_manager_internal.storage.task_calls import managed_count
+            result["data"] = {"max_tasks_per_project": stored, "effective_max_tasks_per_project": effective,
+                "source": source, "config": str(config.path), "managed_tasks": managed_count(connection, repo),
+                "max_workers": config.max_workers, "verify_concurrency": config.verify_concurrency,
+                "execution_config": None, "actual_calls": None}
+            result["warnings"] = ["실행 중 Manager의 config·실제 호출 수·설정 반영 여부는 미확인입니다."]
+    except (ManagedConfigError, project_registry.ProjectRegistryError, RuntimeError, OSError, sqlite3.DatabaseError) as error:
+        if isinstance(error, sqlite3.DatabaseError):
+            code = ("db_busy" if getattr(error, "sqlite_errorcode", None) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                    else "unsupported_schema" if "no such" in str(error) else "db_unreadable")
+        result["error"] = {"code": code, "message": str(error)}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    elif result["error"]:
+        effects.operation_print(result["error"]["message"], file=sys.stderr)
+    else:
+        data = result["data"]
+        effects.operation_print(f"{repo}: max_tasks_per_project={data['max_tasks_per_project']}; "
+            f"effective={data['effective_max_tasks_per_project']}; source={data['source']}; "
+            f"managed={data['managed_tasks']}; {result['warnings'][0]}")
+    return 1 if result["error"] else 0
+
+
 def configure_registry(
     effects: ConfigureRegistryEffects, args: argparse.Namespace,
     state_dir: Path,
     config_path: Path,
 ) -> int:
     command = args.config_command if args.command == "config" else args.command
+    if command == "status":
+        return _project_limits_status(effects, args, state_dir, config_path)
+    if command == "set":
+        config = effects.load_managed_config(config_path)
+        repo = str(Path(args.repository).expanduser().resolve())
+        with closing(effects.connect_database(state_dir)) as connection:
+            stored, effective, source = project_registry.set_task_limit(
+                connection, repo, args.max_tasks_per_project, config.max_tasks_per_project,
+            )
+        effects.operation_print(
+            f"{repo}: max_tasks_per_project={stored}; effective={effective}; source={source}; "
+            "실행 중 Manager는 자신의 config 기준으로 다음 안전한 배정에서 반영합니다."
+        )
+        return 0
     if command == "init":
         effects.load_managed_config(config_path)
         with closing(effects.connect_database(state_dir, create=True)) as connection, connection:

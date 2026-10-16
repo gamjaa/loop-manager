@@ -56,8 +56,13 @@ def run(effects, arguments, worktree, timeout, *, launch=None, partial_base=None
         coordinator.guard(session, job.contains if job else lambda pid: descendant(pid, process.pid))
     try:
         directory.mkdir(parents=True, exist_ok=True)
+        from loop_manager_internal.verification.execution_clock import current_execution_clock
+        budget = current_execution_clock.get()
+        budget_directory = budget.directory if budget is not None else directory / "budget"
+        coordinator.track_waiting(session, budget_directory)
         writer = EventWriter(directory / "manager.jsonl")
         environment = dict(os.environ, LOOP_MANAGER_VERIFY_LOG_DIR=str(directory),
+                           LOOP_MANAGER_VERIFY_BUDGET_DIR=str(budget_directory),
                            LOOP_MANAGER_VERIFY_RUNNER=str(Path(__file__).with_name("entrypoint.py").resolve()),
                            LOOP_MANAGER_VERIFY_RUNTIME_PYTHON=sys.executable,
                            LOOP_MANAGER_VERIFY_VERSION="1",

@@ -896,7 +896,7 @@ def resume_interrupted_blocked_agent_recovery(
             allow_rebase=effects._rebase_in_progress_for_branch(worktree, branch))
         from loop_manager_internal.storage import runtime_state
         with runtime_state._transaction(connection):
-            current = connection.execute('SELECT agent_recovery FROM projects WHERE repo = ?', (repo,)).fetchone()
+            current = runtime_state.project_row(connection, repo)
             if current['agent_recovery'] != project['agent_recovery']:
                 raise WorkspaceOwnershipError('폐기된 Git 복구 기록이 처리 중 변경됐습니다.')
             checkpoints = ExecutionCheckpointRepository(connection)
