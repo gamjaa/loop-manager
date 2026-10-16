@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import stat
 import unittest
 from uuid import uuid4
 import xml.etree.ElementTree as ET
@@ -30,13 +32,36 @@ RUNNER_INSTRUCTION = (
 def collect(directory):
     """완료된 개별 결과는 프로세스 중단 때도 보존한다. 불완전한 마지막 줄은 제외한다."""
     events = []
-    root = Path(directory).resolve()
-    for path in root.glob('targeted-*.jsonl'):
-        if path.is_symlink() or path.resolve().parent != root or path.stat().st_size > 16 * 1024 * 1024:
+    root = Path(directory).absolute()
+    if root.resolve() != root or not root.is_dir():
+        raise ValueError('targeted test 기록 폴더가 없거나 교체되었습니다.')
+    with os.scandir(root) as entries:
+        paths = sorted(root / entry.name for entry in entries
+                       if fnmatch.fnmatch(entry.name, 'targeted-*.jsonl'))
+    for path in paths:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or path.resolve().parent != root or info.st_size > 16 * 1024 * 1024:
             raise ValueError('targeted test 기록 경로·크기가 유효하지 않습니다.')
         run_id = path.stem.removeprefix('targeted-')
+        if not run_id:
+            raise ValueError('targeted test 실행 ID가 비었습니다.')
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+        with os.fdopen(descriptor, encoding='utf-8') as stream:
+            opened = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)):
+                raise ValueError('targeted test 기록 파일이 교체되었습니다.')
+            content = stream.read(16 * 1024 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+        current = path.lstat()
+        if (len(content.encode('utf-8')) > 16 * 1024 * 1024
+                or (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                != (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+                or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+                != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)):
+            raise ValueError('targeted test 수집 중 기록 파일이 변경되었습니다.')
         seen = set()
-        for line in path.read_text(encoding='utf-8').splitlines(keepends=True):
+        for line in content.splitlines(keepends=True):
             if not line.endswith('\n'):
                 break
             event = json.loads(line)

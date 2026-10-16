@@ -25,6 +25,42 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_collection_pending_keeps_explicit_user_decision(self):
+        from tests.support.worker import decision
+        self._decision_workspace()
+        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(
+            0, decision(), targeted_collection_pending=True)
+        result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(result.recovery.observation.reason, RecoveryReason.USER_DECISION)
+
+    def test_pending_targeted_collection_in_rebase_pauses_without_report_budget(self):
+        self.handler.guard(self.context())
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.effects, checkpoint=checkpoint)
+        checkpoint.record('repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base', observed_remote_oid=None, snapshot={})
+        self.state.update_project('repo', phase='WORKING', worker_session_id='worker-session',
+                                  last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(
+            1, 'targeted collection pending', kind=lm.AgentResultKind.PERMANENT_CONFIGURATION,
+            targeted_collection_pending=True)
+        result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(result.recovery.observation.reason, RecoveryReason.TARGETED_TEST_CORRECTION)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 0)
+        result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 0)
+        saved = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.assertEqual(saved.audit[-1]['worker_result'], 'targeted collection pending')
+        self.assertIsNone(saved.pending_turn)
+
     def test_rebase_response_is_saved_before_metadata_failure_without_worker_retry(self):
         self.handler.guard(self.context())
         delivered = self.handler._definition_snapshot
@@ -88,6 +124,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         result = self.handler.run(self.context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
         self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 0)
 
     def test_frontmatter_restore_is_reported_to_worker_without_final_block(self):
         def validate(*_args, **kwargs):

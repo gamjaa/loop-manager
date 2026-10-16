@@ -81,6 +81,8 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
     connection.execute(ISOLATION_SCHEMA)
     common_guidance_state.ensure_schema(connection)
+    from .targeted_test_state import ensure_schema as targeted_schema
+    targeted_schema(connection)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_invocations)")}
     for field, definition in (("transition_id", "TEXT"), ("previous_provider", "TEXT"),
                   ("previous_model", "TEXT"), ("purpose", "TEXT"), ("target", "TEXT"),
@@ -338,6 +340,8 @@ class InvocationRepository:
                     WHERE invocation_id = ? AND finished_at IS NULL""", (utc_now(),identity)).rowcount
         if state_dir is not None:
             self.reconcile_execution(state_dir=state_dir)
+            from .targeted_test_state import TargetedTestRepository
+            TargetedTestRepository(self.connection).reconcile(state_dir=state_dir)
         return count
 
     def summary(self, repo: str) -> list[sqlite3.Row]:

@@ -150,6 +150,7 @@ class RebaseHandler:
             saved = self.ports.rebase_corrections.observe(
                 self.ports.identity.repo, context.plan.plan_id, observation,
                 corrected=corrected,
+                count_correction=recovery_reason is not RecoveryReason.TARGETED_TEST_CORRECTION,
                 expected_generation=current.generation if current else None,
                 worker_session=self.ports._row()['worker_session_id'],
                 worker_result=worker_result,

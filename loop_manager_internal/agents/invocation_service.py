@@ -226,6 +226,18 @@ def run_agent(
 
     notify_process_start = (role_name in {"worker", "planner", "planner_check", "maintenance_planner"}
                             and has_notification_session and invocation is not None)
+    def observe_targeted(directory, receipt):
+        if role_name != 'worker' or invocation is None or not invocation.plan_id:
+            return
+        if ledger is None or identity is None:
+            raise agent_write_isolation.IsolationError('targeted test 기록을 결합할 invocation이 없습니다.')
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+        try:
+            TargetedTestRepository(connection).bind(identity, directory, receipt, state_dir=state_dir)
+            ledger.bind_process_receipt(identity, str(receipt))
+        except (OSError, ValueError, sqlite3.Error) as error:
+            raise agent_write_isolation.IsolationError('targeted test 호출 결합 저장 실패') from error
+
     def observe_launch(launch):
         nonlocal prepared_launch
         prepared_launch = launch
@@ -237,6 +249,7 @@ def run_agent(
         if ledger is not None and identity is not None:
             from .process_receipt import receipt_path
             ledger.bind_process_receipt(identity, str(receipt_path(launch)))
+        observe_targeted(launch.attempt, receipt_path(launch))
 
     request = AgentRequest(
         worktree=worktree,
@@ -259,6 +272,7 @@ def run_agent(
         prepared_launch=prepared_launch,
         on_execution_identity=observe_execution_identity,
         on_launch_prepared=observe_launch,
+        on_targeted_prepared=observe_targeted,
     )
     started = time.monotonic()
     targeted_collection_error = None
@@ -297,12 +311,13 @@ def run_agent(
                 pass
         raise
     finally:
-        if role_name == 'worker' and prepared_launch is not None and connection is not None and invocation is not None and invocation.plan_id:
-            from loop_manager_internal.verification.targeted import collect
+        if role_name == 'worker' and connection is not None and invocation is not None and invocation.plan_id:
             from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
             try:
-                TargetedTestRepository(connection).observe(invocation.repo, invocation.plan_id,
-                                                          collect(prepared_launch.attempt))
+                repository = TargetedTestRepository(connection)
+                repository.reconcile(state_dir=state_dir, repo=invocation.repo, plan_id=invocation.plan_id)
+                if repository.pending(invocation.repo, invocation.plan_id):
+                    targeted_collection_error = 'targeted test 실행 근거의 종료 확인·재수집 대기'
             except (OSError, ValueError, sqlite3.Error) as error:
                 targeted_collection_error = f'targeted test 실행 근거 수집 실패: {type(error).__name__}'
                 events.emit(targeted_collection_error, level='WARN', invocation_id=identity)
@@ -350,10 +365,9 @@ def run_agent(
                 input_tokens=result.usage.input_tokens, cached_input_tokens=result.usage.cached_input_tokens,
                 cache_write_input_tokens=result.usage.cache_write_input_tokens,
                 output_tokens=result.usage.output_tokens, reasoning_output_tokens=result.usage.reasoning_output_tokens)
-    if targeted_collection_error:
-        return replace(result, code=1, message=targeted_collection_error,
-                       kind=AgentResultKind.PERMANENT_CONFIGURATION,
-                       collection_status='error', isolation_invocation_id=identity)
+    if targeted_collection_error and result.code == 0:
+        return replace(result, collection_status='error', isolation_invocation_id=identity,
+                       targeted_collection_pending=True)
     if isinstance(raw, AgentResult):
         return replace(raw, collection_status=collection_status,
                        isolation_invocation_id=identity)
