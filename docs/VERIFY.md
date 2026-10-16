@@ -150,14 +150,26 @@ unittest와 perl-tap 이외의 미연결 도구는 기존 verify를 유지하며
 run별 `manifest.json`, 단계별 수집 요청/결과·단위 결과·worker 로그와 JSONL 이벤트, 전체 `summary.json`을 보존한다. 이벤트는 version·run·단계·단위/테스트 identity를 결합하며 단계별 로그도 전체 진단에 포함한다. 실패 피드백의 `[VERIFY_DIAGNOSTIC]` 경로로 원본 진단을 찾을 수 있다. 예약은 session·단위·PID와 프로세스 시작 identity에 결합한다. 종료가 확인된 자식/미시작 예약만 회수하고 종료 불명은 별도 journal에 보존한다.
 
 자체 `scripts/verify-inputs.json`은 `loop_manager.py`, `loop_manager_internal/**`, `tests/**`,
-`requirements.txt`, `scripts/verify.json`, 두 verify 스크립트, 두 copy 스크립트와 소비되는
-`run.sh`·`run.ps1`과 실행 코드 `.agents/skills/specification-docs/scripts/next_requirement_id.py`를
+`requirements.txt`, `scripts/verify.json`, 두 verify 스크립트, Windows driver·선택 목록, 두 copy 스크립트와 소비되는
+`run.sh`·`run.ps1`과 실행 코드 `.agents/skills/specification-docs/scripts/**`를
 관측한다. 복사 회귀는 이 조회 도구와 `loop_manager_internal/catalog/frontmatter.py`의 실제 bytes를
 샘플 source에 배치하고 배포 결과·조회 동작을 확인한다. 선언 파일은 실제 adapter·interpreter·수집·필수 compile 단계를
 정하므로 목록에 포함한다. Perl adapter의 `.py`·`.pl`·`.pm`과 두 언어 예제·launcher도 기존 `loop_manager_internal/**`·
 `tests/**`에 포함된다. `tests/**` 안의 고정 샘플이 문서·Skill·설정 예제 원본을 대체하며,
 실제 copy 스크립트는 이 샘플 source에서 실행해 결과 bytes·경로·보존·덮어쓰기 거부를 확인한다.
-`AGENTS.md`, README, docs와 `.agents`의 prose, `config/config.ini.example`, setup·ignore·attributes는
+`AGENTS.md`, README, docs와 `.agents`의 prose, `config/config.ini.example`·운영 설정, 소비하지 않는 setup·ignore·attributes는
 자체 verify의 prose/예제 입력에서 제외한다. 이 범위는 문서·예제의 품질 검증을 뜻하지 않으며
-필수 unittest 수집과 전체 compile을 유지한다. 이 정적 목록만으로 외부 interpreter·의존성·runtime·
-Git 또는 동적 입력의 완전성을 주장하지 않으며, 공통 runner 연결의 성공 재사용 관측은 계속 unknown이다.
+필수 unittest 수집과 전체 compile을 유지한다. Windows verify driver·선택 목록은 이미 포함돼 있으며
+테스트가 실제로 읽어 실행하는 `scripts/setup.sh`의 누락 보완은 R-072의 변경 목표다.
+
+성공 재사용의 채택 기준은 같은 프로젝트·ExecPlan·작업 주기의 실제 전체 성공과 저장소 코드 입력의
+동일성이다. 소스·테스트·fixture·의존성 선언·검증 스크립트/선언과 선택 진입점·목록의 bytes·경로·
+kind·mode를 비교하고 미커밋/untracked·목록 밖 코드 누락도 확인한다. 설치 interpreter·도구·
+환경변수·사용자/시스템 설정·외부 동적 입력·Git revision 값은 비교 범위 밖이며 그 미확인만으로
+전체 실행이나 별도 infrastructure를 요구하지 않는다. 환경 재현성을 보장하는 정책은 아니다.
+
+현재 일반 관측은 runtime identity 부재를 unknown으로 처리한다. 이는 R-072에 맞춰 바꿀 기존
+구현이며 코드 기준 재사용이 이미 구현됐다는 뜻은 아니다. 코드 입력 변경·목록/비교 오류·누락 의심·
+유효한 전체 성공 부재에는 전체 실행을 유지한다. 새 실패·중단을 과거 성공으로 덮지 않으며,
+부분 PASS·선행 Review·수동 면제와 실제 전체 run은 구분한다. 일반 선행 PASS 뒤 실제 전체 실행과
+Windows의 WSL 전체 검증+native 핵심 회귀 계약은 유지한다.

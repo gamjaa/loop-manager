@@ -2,7 +2,7 @@
 
 ## Summary
 
-로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 새 self PR Merge 뒤 원격이 실행 runtime의 후속이면 상태를 보존해 종료하고 다음 외부 실행으로 넘긴다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 강제하며 정상 Git 변화의 오탐 복구와 Codex·Claude의 호출별 실패 경계를 유지한다. runtime 교체의 전체 배정 중단과 안전한 호출 반환은 R-091을 따른다.
+로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 새 self PR Merge 뒤 원격이 실행 runtime의 후속이면 상태를 보존해 종료하고 다음 외부 실행으로 넘긴다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 구성한다. Claude는 일반적인 호출을 공식 문서·모의 테스트로 개발하며 실환경 완전 지원과 실행 중 managed 정책 변경 대응은 완료 조건에서 제외한다. 정상 Git 변화의 오탐 복구와 호출별 실제 실패 처리는 유지한다. runtime 교체의 전체 배정 중단과 안전한 호출 반환은 R-091을 따른다.
 
 ## Context
 
@@ -50,17 +50,17 @@ Agent는 선택 관리 worktree 밖 파일·shared Git metadata를 쓸 권한이
 
 Planner·Worker·Reviewer와 유지보수 Planner는 각 호출에서 선택된 관리 worktree를 workspace로 사용하며, provider의 내장 쓰기 제한을 적용한다. 작업 디렉터리 지정만으로 제한이 적용됐다고 간주하지 않는다. 기본 source checkout, 다른 worktree와 shared Git metadata는 쓰기 허용 범위에 포함하지 않고, Reviewer는 선택된 worktree도 읽기 전용으로 사용한다. workspace 쓰기 허용은 해당 역할의 문서·파일 변경 범위를 확대하지 않으며 역할별 최종 문서·결과 검증은 유지한다. 필요한 임시 작업은 해당 실행에 소유권이 있는 제한된 경로에서만 허용한다.
 
-Codex를 기본 provider와 기능·검증 수준의 기준으로 삼고 Claude도 같은 기능을 제공하는 전제로 지원한다. provider별 명칭·설정·호출 방식의 차이는 해당 provider 정책으로 대응한다. Claude는 기존 내장 기능의 실행별 설정, 파일 권한과 명령 sandbox를 조합해 역할별 쓰기 경계를 구성한다. 추가 디렉터리·쓰기 경로의 허용만으로 범위 밖 쓰기가 모두 차단된다고 판단하지 않으며, 상속 설정·배열 병합·기본 임시 경로까지 포함한 유효 정책을 확인한다. 구체적인 정책 조합은 ARCHITECTURE의 R-023 설계를 따른다.
+Codex를 기본 provider로 유지하고 Claude는 공식 문서에 근거해 일반적인 호출 범위에서 지원을 구현한다. Claude의 모든 기능·OS·CLI 조합이나 Codex와 동등한 실환경 검증 수준을 완료 조건으로 요구하지 않는다. 기존 내장 기능의 실행별 설정, 파일 권한과 명령 sandbox로 역할별 쓰기 경계를 구성하며 추가 디렉터리·쓰기 경로 허용만으로 범위 밖 쓰기가 모두 차단됐다고 판단하지 않는다. 시작 시 적용하는 설정의 우선순위·병합·기본 허용 경로는 문서와 모의 테스트로 확인한다.
 
-Claude 지원 구현은 공식 웹 문서의 기능·버전·설정 병합·역할별 경계 조사와 모의 테스트로 진행한다. CLI 설치·계정 확보·유료 모델 호출을 개발 시작이나 지원 구현 완료 조건으로 추가하지 않는다. 실제 호출 검증은 이용 가능한 환경에서 추가하고 미수행 범위를 명시하며, 문서 검토·설정 문자열·모의 테스트 성공을 실제 정책 적용 성공으로 기록하지 않는다. Claude 지원의 미검증 범위나 실행 실패는 Codex의 독립적인 구현·검증·자동 실행을 막지 않으며, 선택된 Claude 프로젝트를 다른 provider로 임의 전환하지 않는다.
+Claude 지원 구현은 공식 웹 문서의 호출·설정 계약과 신규·재개·fallback의 모의 테스트로 완료 여부를 판단한다. CLI 설치·계정 확보·유료 호출·금지 쓰기 실연이나 실환경 완전성 증명을 개발 시작·완료 조건으로 추가하지 않는다. 실제 호출 검증이 없어도 구현을 진행하고 완료할 수 있으며, 문서·mock으로 확인한 범위와 실환경 미확인 범위를 구분해 보고한다. 미확인만으로 지원 구현 전체나 독립 Codex 작업을 차단하거나 선택 provider를 임의 전환하지 않는다.
 
-내장 기능 우선과 위 개발 방식은 확정된 방향이다. 실행 중 managed 정책 갱신에도 쓰기 제한을 유지할 native 경로의 조사 미완료만으로 조직 관리 환경으로 지원을 좁히거나 외부 격리를 도입하는 선택이 반드시 필요하다고 판단하지 않는다. 해당 항목은 구현 조사·검증으로 계속 다루며 지원 구현 전체를 사용자 판단 대기로 확대하지 않는다. 기존 기능으로 충족할 수 없는 요구사항이 구체적으로 확인돼 실제 요구사항 변경이 필요할 때만, 충족할 수 없는 요구·조사한 기능과 CLI 버전·근거·남은 제약·필요한 변경을 제시해 사용자 판단을 요청한다. 조직 관리 환경으로의 지원 범위 축소와 외부 격리 도입은 아직 선택된 방향이 아니다.
+실행 중 조직 managed 정책 변경의 감시·적용 전 차단·지속 제한 보장은 현재 범위에서 제외한다. 이를 해결하기 위한 별도 hook·polling·외부 격리나 조직 관리 환경 도입을 요구하지 않는다. 실제 인증·역할별 쓰기·자동 검토·session·OS/CLI 호환성과 managed 변경 대응의 후속 점검은 [FUTURE_IDEAS](../FUTURE_IDEAS.md#claude-실환경-후속-점검)에 남기며 현재 작업의 선행·완료 조건으로 승격하지 않는다.
 
 Codex와 Claude의 자동 승인 검토는 쓰기 제한과 함께 유지한다. 쓰기 경계 확대와 격리 밖 재실행 요청은 자동 검토의 승인으로 허용할 수 없는 거부 대상으로 두고, 나머지 검토 대상은 provider의 자동 검토로 처리한다. 허용 범위 안의 모든 동작에 검토가 발생한다고 보장하지 않으며, 자동 검토가 비활성화된 설정이나 단순 편집 자동 승인 모드를 이 요구사항의 자동 검토 유지로 간주하지 않는다. Worker 결과에 대한 Loop Manager의 Reviewer 검토는 provider의 실행 전 승인 검토와 별개로 유지한다.
 
-실제 선택 호출에서 요구한 쓰기 제한과 자동 검토의 적용을 확인할 수 없거나, 격리 때문에 기존 허용 작업을 수행할 수 없으면 제한을 해제하거나 자동 검토를 끈 채 진행하지 않는다. 지원하지 않는 provider·운영체제·CLI 버전, 설정 충돌과 격리 초기화 실패의 구체적 원인을 남기고 작업물·session·재시도 이력을 보존한 채 해당 호출을 중단한다. 실행 중 managed 정책 갱신으로 정책 충돌·제한 적용 실패가 확인된 경우에도 해당 호출을 중단하고 변경 전후의 정책과 판단 근거를 보존한다. 이 호출별 거부와 기술 조사 미완료는 구분한다. 내장 sandbox를 지원하지 않는 Claude native Windows는 이러한 미지원 환경으로 명확히 판정하며, 이 요구사항을 근거로 WSL·컨테이너 등 새로운 실행 infrastructure를 자동 도입하지 않는다. 과거 실행의 기본 checkout 제외와 실제 위반 보존은 R-055를 따른다.
+실제 선택 호출에서 시작 설정의 정책 충돌·미지원·격리 초기화 실패가 확인되거나 실행 중 실제 권한·인증·도구 오류가 관측되면, 제한을 해제하거나 자동 검토를 끈 채 진행하지 않는다. 구체적인 원인과 작업물·session·재시도 이력을 보존해 해당 호출을 중단한다. 이 실제 실패 처리와 실환경 미검증·범위 밖 managed 변경 대응을 구분하며 후자의 미확인만으로 개발을 차단하지 않는다. 내장 sandbox가 없는 Claude native Windows는 현재 미지원 호출로 처리하고 WSL·컨테이너 등 새로운 infrastructure를 자동 도입하지 않는다. 과거 실행의 기본 checkout 제외와 실제 위반 보존은 R-055를 따른다.
 
-격리 적용·거부와 실제 효력 확인 결과는 provider·CLI 버전·실행 환경·역할·선택된 canonical worktree·repository identity·유효 설정·Agent session 및 개별 호출에 결합해 보존한다. CLI 인자나 설정의 존재만으로 격리 확인을 기록하지 않는다. Codex의 직접 실행과 확인 범위는 R-050을 따른다. Agent의 파일 변경·도구 실행에 적용되는 내장 정책을 확인하며, Codex 프로세스 전체의 내부 쓰기·mount 상태나 중첩 sandbox 호환성을 추가 증명 조건으로 요구하지 않는다. 정상 인증·session·로그 저장과 기존 PRODUCT가 허용한 Codex 임시 ref는 Agent의 workspace 밖 쓰기 권한과 구분한다. Claude도 같은 확인 수준을 적용한다. 공식 지원 기능, 병합 후 유효 정책, 역할별 workspace·파일 도구·shared Git 보호 설정과 호출 연결을 확인하며, 유료 모델 호출로 금지 쓰기나 승인 검토를 매번 시연하는 절차는 시작 조건으로 요구하지 않는다. 실제 실행에서 확인된 미지원·정책 충돌·초기화 실패는 해당 호출을 중단하고 보존하며, 개발 환경의 CLI·계정 부재만으로 별도의 사용자 정책 결정이나 지원 구현 차단을 만들지 않는다. 세션 재개, provider·설정 변경과 중단 뒤의 새 호출에서는 다시 확인한다. 비밀값이나 source checkout의 로컬 파일 내용은 증거에 저장하지 않는다.
+격리 적용·거부와 실제 효력 확인 결과는 provider·CLI 버전·역할·canonical worktree·repository identity·시작 설정·session 및 개별 호출에 결합해 보존한다. Codex는 R-050의 직접 실행과 내장 정책 확인 범위를 유지한다. 프로세스 전체의 내부 쓰기·mount 상태나 중첩 sandbox 호환성을 추가 증명 조건으로 요구하지 않으며 정상 인증·session·로그와 허용된 임시 ref를 workspace 밖 쓰기 권한과 구분한다. Claude는 문서·모의 테스트로 확인한 호출 구성을 실제 실행 관측과 구분해 기록하고, 설정 인자나 mock 성공을 실제 격리 성공으로 기록하지 않는다. 신규·재개·fallback과 provider·시작 설정 변경에는 해당 호출 구성을 다시 확인하며 실시간 managed 변경 감시는 요구하지 않는다. 비밀값이나 source checkout의 로컬 파일 내용은 증거에 저장하지 않는다.
 
 Loop Manager가 수행한 fetch·worktree 생성·정리·rebase·source 동기화는 실제 동작과 중단 복구에 필요한 대상·기대 상태·결과를 durable checkpoint로 보존한다. 이 기록은 미완료 Git 작업의 재개에 사용하며 Agent의 과거 snapshot을 현재 상태에 맞추는 절차를 요구하지 않는다. 중단 뒤 현재 원격·작업물과 완료 상태를 확인해 필요한 동기화·확정·재검증부터 이어간다.
 
@@ -109,11 +109,11 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - runtime handoff는 해석한 `<base-branch>`, 현재 runtime SHA, fetch된 원격 SHA, self repository, Merge된 PR과 source sync 결과를 비밀값 없이 로그에 남기며 오류나 BLOCKED 알림으로 취급하지 않는다.
 - 자동 테스트는 main·대체 base, 모든 로컬 source 상태의 원격 revision 선택·비차단 동기화, PR 상태 선반영, runtime보다 앞선 새 self Merge의 handoff와 이미 최신 runtime의 계속 실행을 확인한다. Planner push·다른 프로젝트 Merge·일반 외부 fetch는 handoff를 만들지 않는다. origin/source identity 오류·fetch 실패·non-fast-forward 관계·handoff 뒤 새 작업 미시작과 중단·재시작도 검증한다.
 - 접근 정책·Manager Git 작업·재개 테스트는 R-055의 T01–T06·T10–T14·T16–T17·T22·T25–T26에 대응한다. sandbox 적용, 호출 실패·단계 전환 뒤 Git 범위 검사 미재활성화, 원격 동기화·게시와 기존 오탐 자동 해제를 실제 소비자에 연결한다.
-- 각 역할의 신규 호출과 session 재개에서 workspace 및 허용 파일 쓰기와 source checkout·다른 worktree·shared Git metadata 쓰기 거부를 검증한다. Reviewer의 worktree 쓰기도 거부한다. Codex는 R-050의 직접 실행과 내장 정책 확인 범위를 적용하며, 파일 쓰기 제한과 R-064의 common+Reviewer 역할 instruction에 담긴 테스트 재실행 금지를 구분한다. Claude도 Codex와 같은 기능·검증 수준으로 provider별 정책을 대응하며, 확인된 유효 정책과 실제 호출 결과를 구분해 기록한다.
+- 각 역할의 신규 호출과 session 재개에서 workspace 및 허용 파일 쓰기와 source checkout·다른 worktree·shared Git metadata 쓰기 거부를 검증한다. Reviewer의 worktree 쓰기도 거부한다. Codex는 R-050의 직접 실행과 내장 정책 확인 범위를 적용하며, 파일 쓰기 제한과 R-064의 common+Reviewer 역할 instruction에 담긴 테스트 재실행 금지를 구분한다. Claude는 문서에 대응한 호출 구성·역할별 정책을 모의 검증하고 실제 호출 결과와 구분해 기록한다. Codex와 동등한 실환경 검증을 요구하지 않는다.
 - Codex·Claude의 지원 환경에서 쓰기 경계 확대와 격리 밖 재실행은 거부하면서 나머지 승인 검토 대상의 자동 검토가 유지됨을 검증한다. 단순 편집 자동 승인으로 대체하거나 자동 검토를 전부 비활성화한 설정은 실패로 판정한다. 기존 Loop Manager Reviewer 흐름도 유지한다.
-- CLI 버전·provider·설정 변경, session 재개와 중단 뒤의 정책 재확인, 설정 충돌·격리 초기화 실패·Claude native Windows 미지원 시 해당 호출의 중단과 상태 보존을 검증한다. 실제 sandbox 오류와 Git 오탐의 자동 복구를 구분하고 managed 정책 갱신의 제한 적용 실패도 해당 호출에서 처리한다. 확인·거부 기록에는 비밀값과 source checkout의 로컬 파일 내용을 포함하지 않는다.
-- Claude CLI·유료 계정이 없는 개발 환경에서도 공식 웹 문서에 대응하는 설정·호출 구성과 모의 테스트로 지원 구현을 검증할 수 있다. 신규·재개·fallback의 역할별 쓰기 제한, Bash·하위 프로세스와 Edit·Write·NotebookEdit 파일 도구의 source·다른 worktree·resolved shared Git 보호, 자동 승인 검토 유지 및 권한 확대 거부를 확인한다. 추가 허용 설정만으로 범위 제한을 인정하지 않고 상속·배열 병합·임시 경로를 확인한다. 실제 호출 검증 미수행은 명시하되 CLI 설치·계정 확보·유료 호출을 시작·완료 조건으로 추가하지 않는다. 실제 Claude 호출에서 관측한 인증·지원·정책 오류는 상태를 보존하고 해당 호출에 한해 처리하며 모의 성공과 실제 정책 적용 성공을 구분한다.
-- managed 정책 갱신의 제한 유지 경로 등 기술 조사 미완료를 지원 구현 전체의 사용자 판단 대기로 바꾸지 않는다. 요구사항 변경을 요청하는 경우에는 기존 기능으로 충족할 수 없는 요구·조사한 기능과 버전·근거·남은 제약·필요한 변경이 구체적으로 제시돼야 한다. 조사 미완료만으로 조직 관리 환경 한정이나 외부 격리를 필수 선택으로 제시하지 않는다.
+- CLI 버전·provider·설정 변경, session 재개와 중단 뒤의 정책 재확인, 설정 충돌·격리 초기화 실패·Claude native Windows 미지원 시 해당 호출의 중단과 상태 보존을 검증한다. 실제 관측한 sandbox 오류와 Git 오탐의 자동 복구를 구분하며 실행 중 managed 정책 변경을 별도로 감시하는 테스트는 요구하지 않는다. 확인·거부 기록에는 비밀값과 source checkout의 로컬 파일 내용을 포함하지 않는다.
+- Claude CLI·유료 계정이 없는 개발 환경에서도 공식 웹 문서에 대응하는 설정·호출 구성과 모의 테스트로 지원 구현을 검증할 수 있다. 신규·재개·fallback의 역할별 쓰기 제한, Bash·하위 프로세스와 Edit·Write·NotebookEdit 파일 도구의 source·다른 worktree·resolved shared Git 보호, 자동 승인 검토 유지 및 권한 확대 거부를 확인한다. 추가 허용 설정만으로 범위 제한을 인정하지 않고 상속·배열 병합·임시 경로를 확인한다. 실제 호출 검증 미수행은 명시하되 그 부재로 개발·완료를 보류하지 않는다. CLI 설치·계정 확보·유료 호출·완전 지원 증명을 시작·완료 조건으로 추가하지 않는다. 실제 Claude 호출에서 관측한 인증·지원·정책 오류는 상태를 보존하고 해당 호출에 한해 처리하며 모의 성공과 실제 정책 적용 성공을 구분한다.
+- 실행 중 managed 정책 변경의 감시·적용 전 차단·지속 제한 보장과 실환경 점검은 현재 완료 조건에서 제외되고 FUTURE_IDEAS에 후속 확인으로 남는다. 이 미확인 때문에 사용자 판단 대기·새 infrastructure 요구·독립 Codex 작업 차단을 만들지 않는다.
 - 전체 verify에서 exact-SHA runtime bootstrap, process lock, Manager runtime scope reconciliation, PR conflict recovery, source checkout 보존과 origin-only Planner·Worker 입력 규칙이 유지된다.
 
 ## Product Impact
@@ -125,7 +125,7 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - source checkout을 갱신할 수 없는 로컬 상태는 시작·복구 시점 모두 원격 bootstrap·runtime과 관리 worktree 작업을 막지 않는다.
 - bootstrap이 이미 원격 base revision이면 dirty 상태를 정리하지 않고 실행하며, Agent 실행 중 bootstrap 파일 상태가 바뀌어도 관리 worktree 위반으로 오인하거나 과거 signature에 프로젝트를 영구 차단하지 않는다.
 - Agent 접근 권한은 sandbox가 담당하며 Git 상태 차이의 범위 위반 판정을 제거한다. Manager는 현재 동작 조건으로 동기화·게시·복구를 수행하고 기존 Git 오탐 차단을 자동 해소한다.
-- Codex를 기본과 기능·검증 기준으로 삼고 Claude는 같은 기능을 provider별 정책으로 대응한다. 개발 환경의 Claude CLI·계정 부재만으로 지원 구현이나 독립 Codex 작업을 차단하지 않는다.
+- Codex를 기본으로 유지하고 Claude는 일반적인 호출 구성을 공식 문서·모의 테스트로 개발한다. 실환경 미검증과 범위 밖 managed 변경 대응은 지원 구현이나 독립 Codex 작업의 완료를 막지 않는다.
 - provider의 내장 workspace 쓰기 제한과 자동 승인 검토를 함께 사용한다. 격리 밖 쓰기 권한을 자동 승인하지 않으며, 실제 선택 호출에서 미지원·정책 충돌·제한 적용 실패가 확인되면 상태와 근거를 보존하고 해당 호출을 멈춘다.
 
 ## Non-Goals

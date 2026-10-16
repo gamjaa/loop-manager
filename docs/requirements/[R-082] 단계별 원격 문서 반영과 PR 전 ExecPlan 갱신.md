@@ -2,7 +2,7 @@
 
 ## Summary
 
-명세 변경의 작업 구성·개정은 프로젝트 일반 Planner에 모으고 원격 게시·catalog·DB 반영을 현재 작업 재개보다 먼저 확정한다. ExecPlan·코드 변경만으로 Planner를 호출하지 않으며 관련 작업은 PR 등록 전까지 같은 ID·작업물·기록을 보존해 갱신한다. Worker는 선택 작업 본문과 허용 설계 문서만 수정하고, 최신 조건·진행 기록·문서 충돌을 구분해 필요한 구현·검증·Review를 이어간다. 마지막 연결 작업 Merge 뒤에는 해당 Requirement를 바로 재확인한다. 병렬 작업의 신규·후속 배정을 중단하고 실행 중 호출이 반환한 뒤 planning을 반영한다.
+명세 변경의 작업 구성·개정은 프로젝트 일반 Planner에 모으고 원격 게시·catalog·DB 반영을 현재 작업 재개보다 먼저 확정한다. ExecPlan·코드 변경만으로 Planner를 호출하지 않으며 관련 작업은 PR 등록 전까지 같은 ID·작업물·기록을 보존해 갱신한다. Worker는 선택 작업 본문과 허용 설계 문서만 수정하고, 최신 조건·진행 기록·문서 충돌을 구분해 필요한 구현·검증·Review를 이어간다. rebase 시작에는 소유 자원·보존 조건을 확인하고 Worker 종료와 Git 완료 후 각각 실제 변경·최종 선언을 검증한다. 마지막 연결 작업 Merge 뒤에는 해당 Requirement를 바로 재확인한다. 병렬 작업의 신규·후속 배정을 중단하고 실행 중 호출이 반환한 뒤 planning을 반영한다.
 
 ## Context
 
@@ -74,7 +74,7 @@ Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소
 ### ExecPlan 갱신 경계
 
 - Worker는 선택된 ExecPlan의 구현·검증 기록 등 본문만 수정한다. frontmatter와 다른 ExecPlan, 활성·archive를 포함한 모든 Requirement는 수정하지 않는다. Worker는 현재 작업에 필요한 PRODUCT·ARCHITECTURE·FUTURE_IDEAS를 수정할 수 있다. Requirement 추가·삭제·rename·이동과 archive 후보 지정에 따른 Worker 수정 예외도 허용하지 않는다. frontmatter 변경은 Planner·Manager가 검증하고 공식 선언·catalog·DB에 반영한 뒤 실행 입력으로 사용한다.
-- 기존 source 경로의 rename 조회 호환은 R-071대로 유지한다. 누락·모호한 source나 잘못된 선언은 Worker 시작 전에 Manager가 확정 가능한 규칙으로 정합화하고, 확정할 수 없으면 원인과 작업을 보존해 기존 사용자 판단·복구 경로로 보류한다. ExecPlan 변경만으로 Planner를 호출하거나 Worker의 경로 수정·metadata 비교 완화로 우회하지 않는다. 교정은 기존 구현·문서·테스트·실행 기록을 보존하며 완료·verify 성공·차단 해제를 뜻하지 않는다.
+- 기존 source 경로의 rename 조회 호환은 R-071대로 유지한다. 누락·모호한 source나 잘못된 선언은 Worker 시작 전에 Manager가 확정 가능한 규칙으로 정합화하고, 확정할 수 없으면 원인과 작업을 보존해 기존 사용자 판단·복구 경로로 보류한다. ExecPlan 변경만으로 Planner를 호출하거나 Worker의 경로 수정·metadata 비교 완화로 우회하지 않는다. 교정은 기존 구현·문서·테스트·실행 기록을 보존하며 완료·verify 성공·차단 해제를 뜻하지 않는다. 소유 rebase의 시작·중간 worktree에 남은 과거 선언은 아래 검사 시점을 따르며 최신 target 선언과의 불일치만으로 rebase나 충돌 교정 진입을 막지 않는다.
 - 일반 Planner는 PR 등록 전인 ExecPlan을 관련 Requirement 변경에 맞춰 갱신한다. 최초 실행 여부, READY 복귀, 기존 branch·worktree·세션 또는 원격 checkpoint 존재만으로 갱신 대상에서 제외하지 않는다.
 - 진행 중 작업의 갱신은 같은 ExecPlan ID와 작업물·세션·실행 및 실패 이력을 보존한다. 이미 수행한 구현·검증 기록과 새 조건의 미충족 부분을 구분하며, 문서 갱신 자체를 작업 완료나 과거 실패 해소로 기록하지 않는다.
 - PR 등록 후 Merge를 기다리는 ExecPlan은 새 요구사항을 반영하기 위해 수정하지 않는다. 추가·변경 요구사항의 미충족 범위는 새 ExecPlan으로 작성하며 기존 작업과의 중복·dependency는 기존 카탈로그 규칙으로 확인한다.
@@ -155,7 +155,7 @@ Reviewer 진입 전 OID가 바뀌었거나 별도 진단 ref 게시가 보류돼
 
 ### rebase 충돌과 구현 조건 변경
 
-Worker의 최초 진입·재개·교정 진입은 필요한 일반 Planner 갱신·게시 후 최신 base의 작업 조건을 작업 branch에 반영하는 순서로 진행한다. Manager가 rebase를 수행하고 아래 기준으로 충돌을 분리한다. 계획·작업 문서는 Requirement·ExecPlan을 뜻하며 PRODUCT·ARCHITECTURE·공통 지침과 그 밖의 문서·코드·테스트·설정은 그 외 파일에 속한다.
+Worker의 최초 진입·재개·교정 진입은 필요한 일반 Planner 갱신·게시 후 최신 base의 작업 조건을 작업 branch에 반영하는 순서로 진행한다. Manager가 R-055의 대상·소유권·writer 경합·보존 조건을 확인해 rebase를 시작하고 아래 기준으로 충돌을 분리한다. 시작 전 형상은 비교·복구 근거로 보존하며 최신 frontmatter 일치나 역할별 전체 diff·최종 문서/archive 검사, 과거 definition snapshot의 존재를 시작 조건으로 요구하지 않는다. 계획·작업 문서는 Requirement·ExecPlan을 뜻하며 PRODUCT·ARCHITECTURE·공통 지침과 그 밖의 문서·코드·테스트·설정은 그 외 파일에 속한다.
 
 | 충돌 대상 | 처리 |
 |---|---|
@@ -166,11 +166,13 @@ Worker의 최초 진입·재개·교정 진입은 필요한 일반 Planner 갱�
 
 Worker는 이미 채택된 Planner·사용자의 최신 계획·작업 문서를 입력으로 최신 base와 보존된 작업 형상을 대조한다. 코드 충돌은 한쪽 형상 전체를 관례적으로 선택하지 않고 최신 목표·제약·완료 조건에 맞춰 필요한 변경을 선택·결합한다. 이전 조건으로 문서를 되돌리거나 Planner 갱신·문서 교체만으로 기존 코드의 적합성을 확정하지 않는다. 계획·작업 문서 충돌만 코드로 해소됐다면 문서 충돌 자체를 이유로 Worker를 호출하지 않고 위 발견 단계별 대응을 따른다. Worker·Reviewer는 각자의 단계에서 실제 구현·검증 근거로 진행 상황과 미충족 조건을 재점검하며, Reviewer의 읽기 전용 권한은 유지한다.
 
+충돌 해결 Worker 종료 시 해당 호출이 만든 변경의 역할별 허용 범위를 검사한다. Git rebase가 남아 있으면 전체 선언·문서/archive의 최종 검사는 완료까지 유예한다. Git 완료 후 Manager가 그 operation의 고정 target에서 선택 ExecPlan의 frontmatter를 복원하고 Worker 본문·mode·다른 파일을 보존한 뒤 전체 최종 결과를 검증한다. 완료 형상의 잘못된 선언·금지 변경은 채택하지 않는다.
+
 소유한 rebase에서 ExecPlan 본문·sources·연결 명세·archive 범위·공통 지침 등 구현 입력이 바뀌었다는 사실만으로 최종 차단하지 않는다. Manager가 변경된 조건·문서 교체·적용 revision·남은 충돌과 유효한 과거 근거를 구분해 전달하고 필요한 Worker 교정·검증으로 연결한다. dependency 미충족은 실행 준비 조건으로 별도 처리하며 충돌 교정을 이유로 우회하지 않는다. SHA만 바뀌거나 확인 가능한 진행 기록만 바뀐 경우에는 R-072의 입력 비교·재사용 정책을 유지한다.
 
 진행 중 rebase의 target을 새 원격 OID로 덮어쓰거나 두 번째 rebase를 겹치지 않는다. 기존 소유 operation과 원형을 보존해 완료·복구한 뒤 남은 최신 base 반영을 이어간다. 이전 정의 snapshot이 없어도 현재 작업의 identity·소유권·최신 조건과 보존된 작업을 확인할 수 있으면 과거 성공은 재사용하지 않고 교정·검증으로 연결한다. 실제 소유권·범위·문서 유효성·필수 사용자 결정이 불확실하거나 허용된 교정에서 진전이 없으면 기존 한도에 따라 영향받는 작업만 최종 차단한다. 사용자 operation을 임의 중단하거나 원형을 폐기해 복구하지 않는다.
 
-이 사유로 이미 차단된 작업도 같은 현재 근거로 재평가한다. 안전한 교정 경로가 확인되면 해당 차단 원인만 해제하고 기존 branch·worktree·session·실패 이력을 이어간다. 입력 변화 없이 같은 불일치를 다시 검사해 차단하는 순환이나 무한 Worker 호출을 만들지 않는다. 최신 조건의 targeted test·필요한 Manager verify·최종 후보 Review와 기존 게시 안전 조건이 충족되기 전에는 구현 완료나 PR 게시를 승인하지 않는다.
+이 사유로 이미 차단된 작업과 rebase 시작 전의 최종 선언 검사로 막힌 작업도 같은 현재 근거와 검사 시점으로 재평가한다. 안전한 교정 경로가 확인되면 해당 차단 원인만 해제하고 기존 branch·worktree·session·실패 이력을 이어간다. 입력 변화 없이 같은 불일치를 다시 검사해 차단하는 순환이나 무한 Worker 호출을 만들지 않는다. 최신 조건의 targeted test·필요한 Manager verify·최종 후보 Review와 기존 게시 안전 조건이 충족되기 전에는 구현 완료나 PR 게시를 승인하지 않는다.
 
 ### 검증 근거와 완료 조건
 
@@ -222,6 +224,7 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 - 완료 조건만 추가되고 코드·verify 명령이 같아도, 추가 조건의 검증 근거가 없으면 이전 PASS를 새 조건의 성공으로 재사용하거나 PR을 게시하지 않는다. 기존 성공을 재사용한 경우에는 최신 조건 충족과 R-072의 입력 증명 근거를 확인할 수 있다.
 - 관련 문서와 코드가 함께 변경됐거나 rebase 충돌이 발생하면 단계별 문서 대응과 기존 코드 검증·충돌 복구를 함께 적용한다. 최신 후보에 필요한 구현·검증·Review가 끝나기 전에 PR을 게시하지 않는다.
 - Worker 최초·재개·교정 진입 전에 필요한 Planner 갱신·게시와 최신 base 반영을 수행한다. Requirement·ExecPlan 충돌은 Manager 코드로 최신 base를 채택하고, 그 외 파일 충돌은 이전 단계와 관계없이 Worker 교정으로 연결한다. Git operation의 계속 진행·완료는 Manager가 수행한다.
+- rebase 시작 시 소유 자원·target·원격·writer 경합·보존 조건과 target의 유효한 작업 identity를 확인하되 최신 frontmatter 일치·전체 최종 diff·문서/archive 내용·과거 definition snapshot 존재는 요구하지 않는다. Worker 종료 시 해당 호출의 실제 변경을 검사하고 Git이 남은 형상은 최종 후보로 판정하지 않는다. 완료·선언 복원 후 남은 금지 변경·잘못된 최종 선언은 채택하지 않으며 정상 시작·재시작·수동 해결·기존 차단 재평가에 같은 기준을 적용한다.
 - rebase 중 구현 입력이 달라져도 안전한 소유권·유효한 최신 조건을 확인할 수 있으면 최종 차단 대신 기존 코드를 보존한 Worker 교정·targeted test·필요한 verify·Review를 수행한다. 본문·sources·연결 명세·archive 범위·공통 지침 변화와 코드 충돌이 함께 있는 경우를 포함한다.
 - Requirement·ExecPlan 충돌에서 필요한 Planner 갱신 또는 사용자 변경이 반영된 최신 base의 내용·경로·삭제를 채택한다. 병합이 어렵다면 해당 파일 전체를 base 원문으로 교체해도 보존 가능한 이전 문서 원형·코드·세션·실행 및 실패 이력이 남는다. branch·코드·index 전체 reset을 하지 않고 충돌 복구가 불가능한 파일에만 R-055의 파일별 원본 복원·재작업을 적용한다. 삭제·archive·rename·dependency·PR 경계는 기존 유효성 검사로 확인한다.
 - 계획·작업 문서 충돌만 자동 해소되면 문서 충돌 자체로 Worker를 반복하지 않고 단계별 재점검을 적용한다. 그 외 파일과의 혼합 충돌은 Worker로 돌아가 최신 문서를 기준으로 양쪽 형상을 검토·선택·결합하고 관련 targeted test를 수행한다. base 문서의 진행 표시를 현재 후보의 성공으로 간주하지 않으며 필요한 verify·Review 없이 게시하지 않는다.

@@ -20,11 +20,13 @@
 
 ## Verify 입력 목록 검토
 
-`scripts/verify-inputs.json`이 전체 구조와 실제 verify 명령의 코드·fixture·의존성·설정·
-스크립트 및 실제로 읽는 문서·`.agents/` 입력을 포함하는지 확인한다. 목록 축소·이동과
-목록 밖 새 코드·설정의 누락, 확인되지 않은 Git·외부·동적 입력이 재사용을 약화하지 않는지
-검토한다. 성공한 verify는 목록 완전성의 증명이 아니다. 제외 확인은 해당 경로·내용·kind·
-mode와 목록·명령·환경·runtime·Git/외부 입력에 결합한 bounded 근거에만 유효하다.
+`scripts/verify-inputs.json`이 소스·테스트·fixture·의존성 선언·저장소 검증 스크립트/선언과
+실제로 읽는 문서·`.agents/`를 포함하는지 확인한다. 목록 축소·이동·새 코드 입력 누락과
+현재 파일의 제외 근거를 검토하며 성공한 verify 자체를 목록 완전성의 증명으로 보지 않는다.
+제외 근거는 경로·내용·kind·mode·목록·저장소 진입점과 코드 입력에 결합한다.
+설치 도구·환경변수·사용자/시스템 설정·외부 동적 입력·Git revision 값의 동일성은
+verify 재사용 조건이 아니다. 이 완전성 미확인만으로 blocking issue나 새 infrastructure 요구를
+만들지 않으며 Review의 명세·diff·실제 지침·승인 조건은 별도로 검토한다.
 
 ## Verify adapter 계약 검토
 

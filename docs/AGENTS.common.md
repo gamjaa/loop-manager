@@ -20,6 +20,12 @@ mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서�
 - Manager의 SQLite 상태·실행 기록·Git 소유권을 직접 변경하거나 수행하지 않은 검증의
   성공을 기록하지 않는다. commit·fetch·rebase·push·PR 생성은 Manager가 담당한다.
 
+소유 rebase의 시작에는 Manager가 대상·소유권·target·원격·writer 경합·보존 조건을 확인한다.
+최신 frontmatter 일치·전체 diff·최종 문서/archive 검사는 시작 조건이 아니다.
+Worker 종료 시 해당 호출의 실제 변경을 검사하고, Git 완료·공식 선언 복원 후 전체 결과를 검사한다.
+충돌 해결 Worker가 종료해도 Git이 진행 중이면 전체 최종 후보로 판단하지 않는다.
+이 기준은 Agent의 Git 실행 권한이나 문서 수정 범위를 넓히지 않는다.
+
 ## 품질 기준
 
 Requirement의 명세 작성·검토 기준은 [Specification Skill](../.agents/skills/specification-docs/SKILL.md)에,

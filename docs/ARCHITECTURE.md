@@ -819,7 +819,7 @@ session은 Manager에 저장된 ID와 repository·worktree·role·작업 결합�
 
 현재 관리 Claude 호출은 역할·OS와 관계없이 격리 사전 검사에서 거부한다. 아래는 [R-023의 남은 provider 지원 목표](requirements/%5BR-023%5D%20Self-Hosted%20Runtime%20Refresh%20Handoff.md#requirement)에 필요한 설계이며 G-191의 구현 완료나 실제 실행 성공을 선언하지 않는다. Codex는 [현재 provider 계약](#provider의-현재-지원과-쓰기-정책)을 따르고 Manager의 Git 쓰기 책임은 양쪽에 유지한다.
 
-Claude는 Codex와 같은 기능·검증 수준을 provider의 내장 파일 권한·명령 sandbox·자동 승인 검토로 구성한다. 추가 허용 경로를 좁혔다는 사실만으로 범위 밖 쓰기가 차단됐다고 판단하지 않는다.
+Claude의 채택 범위는 공식 문서에 대응하는 일반적인 호출 구성과 모의 검증이다. provider 내장 파일 권한·명령 sandbox·자동 승인 검토를 조합하되 Codex와 동등한 실환경 검증이나 모든 조합의 완전 지원을 요구하지 않는다. 시작 시 적용하는 설정의 우선순위·병합은 확인하며 추가 허용 경로만으로 범위 밖 쓰기 차단을 인정하지 않는다.
 
 | 미구현 정책 경계 | 구현·확인할 계약 |
 |---|---|
@@ -828,17 +828,17 @@ Claude는 Codex와 같은 기능·검증 수준을 provider의 내장 파일 권
 | Bash·하위 프로세스 | OS 내장 sandbox에 `enabled=true`·`failIfUnavailable=true`·`allowUnsandboxedCommands=false`·빈 `excludedCommands`를 적용하고 병합 후에도 격리 밖 예외가 없는지 확인한다. `autoAllowBashIfSandboxed=false`로 permission mode의 검토 흐름을 유지한다. 파일 도구 규칙만으로 명령 쓰기를 제한했다고 판단하지 않는다. |
 | 유효 설정 | `--add-dir`·`permissions.additionalDirectories`·`sandbox.filesystem.allowWrite`는 추가 허용이다. 기본 cwd·임시 경로·파일 권한에서 파생한 허용, 전체 설정 source·우선순위·배열 병합을 확인한다. `--settings`가 전체 교체나 managed 정책 우선이라고 가정하지 않고 빈 배열로 상속 배열이 제거됐다고 판단하지 않는다. |
 | Git·임시 경로 | source checkout·다른 worktree·`.git` pointer와 resolved shared/worktree Git directory를 파일 도구의 `Edit` 거부와 `sandbox.filesystem.denyWrite`로 함께 보호한다. linked worktree의 기본 shared Git 허용도 확인한다. 임시 쓰기는 호출별 최소 소유 경로로 제한하며 상속·기본 임시 경로로 넓히지 않는다. |
-| 환경·실행 중 갱신 | 내장 sandbox가 없는 Claude native Windows는 미지원이다. 지원 환경에서도 기능·초기화·정책 충돌과 managed 갱신의 영향을 확인하고 제한 유지 실패는 해당 호출을 중단한다. 시작 설정이 실행 내내 고정된다고 가정하지 않는다. WSL·컨테이너·외부 격리를 자동 도입하지 않는다. |
+| 환경·지원 한계 | 내장 sandbox가 없는 Claude native Windows 등 확인된 미지원과 시작 정책 충돌·초기화 실패는 해당 호출에서 처리한다. 실행 중 조직 managed 정책 변경의 감시·적용 전 차단·지속 제한 보장은 현재 범위 밖이다. 이를 위한 hook·polling·WSL·컨테이너·외부 격리를 추가하지 않는다. |
 | 호출 증거 | provider·CLI 버전·환경·역할·canonical worktree·repository identity·요청 정책·적용 source·병합 후 유효 정책 지문·session/호출 identity·확인/거부 결과를 기존 invocation·snapshot과 호환 가능한 추가 저장으로 결합한다. 저장·확인 실패는 성공으로 인정하지 않는다. 재개·fallback·provider/설정 변경과 중단 뒤에는 새 호출에 다시 결합한다. |
-| 증거 보호·실패 | 문서 조사·모의 검증·실제 호출 관측을 구분하고 비밀값·인증 자료·source 로컬 파일 내용은 저장하지 않는다. 실행 중 충돌에는 변경 전후 정책과 실패 근거를 보존한다. 기존 작업물·session·재시도·과거 감사는 보존하며 Git snapshot 접근 검사를 되살리지 않는다. |
+| 증거 보호·실패 | 문서 조사·모의 검증·실제 호출 관측을 구분하고 비밀값·인증 자료·source 로컬 파일 내용은 저장하지 않는다. 실제 호출에서 관측한 오류의 근거를 보존하며 실시간 managed 변경 감시를 증거 수집 조건으로 요구하지 않는다. 기존 작업물·session·재시도·과거 감사는 보존하며 Git snapshot 접근 검사를 되살리지 않는다. |
 
-설정·CLI 조사는 [Claude CLI 옵션](https://code.claude.com/docs/en/cli-reference), [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit), [sandbox](https://code.claude.com/docs/en/sandboxing#configure-sandboxing), [설정 우선순위](https://code.claude.com/docs/en/settings#settings-precedence), [managed 갱신](https://code.claude.com/docs/en/server-managed-settings), [permission mode](https://code.claude.com/docs/en/permission-modes)의 기능·버전을 실제 호출 환경과 대조한다. 지원하지 않는 key를 무시한 실행을 격리 확인으로 기록하지 않는다.
+설정·CLI 조사는 [Claude CLI 옵션](https://code.claude.com/docs/en/cli-reference), [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit), [sandbox](https://code.claude.com/docs/en/sandboxing#configure-sandboxing), [설정 우선순위](https://code.claude.com/docs/en/settings#settings-precedence), [permission mode](https://code.claude.com/docs/en/permission-modes)의 기능·버전을 실제 호출 환경과 대조한다. 지원하지 않는 key를 무시한 실행을 격리 확인으로 기록하지 않는다.
 
-개발·완료 기준과 회귀 범위는 [R-023 Acceptance Criteria](requirements/%5BR-023%5D%20Self-Hosted%20Runtime%20Refresh%20Handoff.md#acceptance-criteria)를 따른다. 공식 문서 조사와 신규·재개·fallback 모의 테스트로 구현을 진행하고, CLI 설치·계정 확보·유료 모델 호출이나 금지 쓰기의 실시간 시연을 필수 probe로 추가하지 않는다. 가능한 실제 호출 검증은 별도로 기록하고 미수행을 명시한다. Claude의 환경 부재·인증 실패가 독립 Codex 실행을 막거나 선택 provider를 임의 전환하는 근거가 되지 않는다.
+개발·완료 기준과 회귀 범위는 [R-023 Acceptance Criteria](requirements/%5BR-023%5D%20Self-Hosted%20Runtime%20Refresh%20Handoff.md#acceptance-criteria)를 따른다. 공식 문서 조사와 신규·재개·fallback 모의 테스트로 지원 구현을 완료할 수 있다. 실제 CLI·계정·유료 모델 호출·금지 쓰기 시연과 실환경 완전성은 필수 조건이 아니다. 문서/mock 확인·실호출 확인·미수행을 구분하고 실제 인증·지원·권한·초기화 오류는 해당 호출에서 보존·처리한다. 미검증만으로 개발 완료·독립 Codex 실행을 막거나 선택 provider를 바꾸지 않는다.
 
 유효 정책과 실제 허용·거부를 확인하되 Codex 프로세스 전체의 mount·내부 쓰기나 중첩 sandbox 성공을 추가 증명 조건으로 요구하지 않는다. exec JSONL의 전용 필드 부재만으로 transport나 바깥 wrapper를 추가하지 않는다. 정상 인증·session·로그와 허용된 임시 ref는 Agent의 범위 밖 쓰기 권한과 구분한다. Reviewer의 읽기·명령·테스트 경계는 [테스트와 Reviewer의 책임](#테스트와-reviewer의-책임)을 따른다.
 
-실제 CLI 정책 조합과 managed 갱신 시 제한 유지의 실행 검증은 아직 완료되지 않았다. 기존 기능으로 충족할 수 없는 요구가 구체적으로 확인돼 요구 변경이 필요한 경우에만 조사한 기능·버전·근거·남은 제약·필요한 결정을 제시한다. 기술 조사 미완료를 새로운 infrastructure나 조직 관리 환경의 필수 선택으로 바꾸지 않는다.
+실제 CLI 정책 조합·인증·session·OS/버전별 동작과 managed 변경 대응의 후속 확인은 [FUTURE_IDEAS](FUTURE_IDEAS.md#claude-실환경-후속-점검)에 둔다. 이 목록을 현재 지원 구현의 선행·완료 조건이나 조직 관리 환경·외부 infrastructure의 필수 선택으로 사용하지 않는다.
 
 ## Model과 Effort
 
@@ -958,9 +958,11 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 
 모든 관리 rebase의 시작·충돌 해결·완료·중단 복구는 현재 repository·계획·canonical worktree·소유 branch·target base·원격 OID와 PR identity/head를 확인한다. Worker 교정 turn, 승인 stage tree, 명령 receipt, reflog 표식, 원본 commit별 replay와 journal 완전성은 완료 조건이 아니며 기존 기록과 실패 감사는 보존한다
 
-역할별 전체 diff와 문서·archive의 최종 내용 검사는 rebase 시작 전과 완료 후에 수행한다. 소유 rebase의 중간 HEAD·index, 일부 충돌의 stage 0 전환과 autostash 복원 대기는 최종 후보로 검사하지 않으며 경로·mode·index flags와 operation 소유권 검증은 유지한다. 충돌 해결 Agent의 sandbox와 역할별 허용 결과 검증은 유지하되, 호출 전후 Git 차이를 접근 권한 위반으로 판정하지 않는다. 중간 상태에서 만든 서비스는 완료 시 필요한 archive 원문 검증을 새로 구성하며, 관측 중 단계가 바뀌면 성공이나 범위 위반으로 확정하지 않고 재관측한다. `REBASE_HEAD`·`MERGE_MSG`·`MERGE_MODE`만 남은 상태는 진행 중 operation이나 autostash 복원 대기로 취급하지 않고 worktree 정리에서도 같은 controlling operation 기준을 사용한다.
+rebase의 검사 시점은 [R-055](requirements/%5BR-055%5D%20차단%20경로%20전수%20조사와%20불필요한%20작업%20중단%20축소.md#불필요한-중단의-수정)를 따른다. 시작에는 repository·계획·worktree·branch·시작 HEAD·고정 target·원격/PR·writer·index 안전·작업물 보존 조건만 확인하고 파일·선언을 비교·복구 기준으로 기록한다. 최신 target 선언과의 일치·역할별 전체 diff·문서/archive 최종 내용·과거 definition snapshot 존재는 시작 gate가 아니다. 공통 현재 상태 서비스는 checkpoint에 고정한 시작 HEAD가 아직 target을 포함하지 않는 형상을 시작 입력으로 구분한다. target 자체의 유효한 작업 identity·비draft 선언은 확인하고 현재 worktree의 최종 선언 검사는 유예한다. 시작·중간 형상에서 구성한 서비스가 완료 형상을 관측하면 최종 계약을 새로 구성하도록 요구하며 유예한 검사를 완료 승인으로 재사용하지 않는다.
 
-rebase 시작 전 Worker branch와 target의 merge-base 이후 모두 바뀐 Requirement·ExecPlan 경로는 해당 소유 rebase의 문서 재생 입력으로만 허용한다. 이 예외는 Worker 변경 승인으로 이어지지 않으며, 충돌 해결·stage·재시작 뒤에도 target revision의 고정 원문과 경로로 대조하기 전에는 완료 채택하지 않는다.
+Worker 종료 후에는 해당 호출이 만든 변경의 역할별 허용 범위를 검사한다. commit 재생·일부 stage·autostash 복원 중간 형상은 전체 최종 후보로 검사하지 않는다. Git 완료 후 고정 target의 선택 ExecPlan frontmatter를 본문·mode·다른 작업물 보존 하에 복원하고 갱신한 checkpoint·서비스·HEAD에서 최종 선언·전체 diff·보호 문서·archive를 검사한 뒤 채택한다. 최종 금지 변경·잘못된 선언은 거부한다. 충돌 해결 Agent의 sandbox는 계속 적용하며 Git 전후 차이를 접근 권한 위반으로 추정하지 않는다. 관측 중 단계가 바뀌면 재관측하고 최종 archive 계약을 새로 구성한다. `REBASE_HEAD`·`MERGE_MSG`·`MERGE_MODE`만 남은 상태는 controlling operation이나 autostash 복원 대기로 취급하지 않는다.
+
+시작 전 Worker branch·target의 merge-base 이후 문서·코드 형상은 소유 operation의 재생·보존 입력으로 기록한다. 이 기록은 역할별 전체 diff의 허용 판정이나 Worker 변경 승인이 아니다. Requirement·ExecPlan의 자동 채택은 고정 target 원문·경로·identity에 결합하고 최종 문서·archive 및 Worker 결과의 판정은 각 완료 시점에 수행한다.
 
 자동 Worker 해결과 사용자의 수동 파일 해결·stage·continue·완료를 같은 현재 상태 판정으로 수용한다. 소유 rebase의 Requirement·ExecPlan 충돌은 `rebase_documents`가 관측한 원격 base의 immutable revision에서 catalog·ID·source·dependency와 실제 PR 경계를 확인한 뒤 해당 문서의 bytes·mode·경로·삭제를 채택한다. PRODUCT·ARCHITECTURE·지침과 코드·테스트·설정은 자동 선택하지 않는다.
 
@@ -1166,7 +1168,7 @@ Popen wrapper는 호출자 환경을 복사·정제하고 해당 호출의 threa
 
 ### 결과 완결성과 지원 계약
 
-manifest·이벤트·결과는 version·run·단계·단위/테스트 identity를 결합하고 adapter가 예상 범위·fixture skip 근거·결과 완결성을 대조한다. command 종료 코드는 필수 단계 결과이며 테스트별 결과를 합성하지 않는다. 예약은 session·단위·PID/시작 identity에 결합하고 확인된 종료/미시작만 회수한다. 중단 자료와 종료 불명 예약 journal을 보존하고 다른 run은 제어하지 않는다. 단계별 이벤트를 전체 진단에 집계하며 외부 runtime·의존성·동적 입력이 미확인인 연결은 성공 재사용 근거를 제공하지 않는다.
+manifest·이벤트·결과는 version·run·단계·단위/테스트 identity를 결합하고 adapter가 예상 범위·fixture skip 근거·결과 완결성을 대조한다. command 종료 코드는 필수 단계 결과이며 테스트별 결과를 합성하지 않는다. 예약은 session·단위·PID/시작 identity에 결합하고 확인된 종료/미시작만 회수한다. 중단 자료와 종료 불명 예약 journal을 보존하고 다른 run은 제어하지 않는다. 단계별 이벤트를 전체 진단에 집계한다. 성공 재사용의 채택 기준은 R-072의 저장소 코드 입력이며 외부 runtime·동적 입력의 미확인을 별도 거부 조건으로 두지 않는다. 결과 완결성·실제 전체 run·receipt 출처 검증은 유지한다.
 
 상세 호출은 [실행 계약](VERIFY.md#실행), 도구별 지원·적합성은 [unittest](VERIFY.md#unittest-지원과-적합성)·[Perl TAP](VERIFY.md#perl-tap-지원과-두-언어-예제), 새 도구 연결은 [adapter 추가 경계](VERIFY.md#adapter-추가-경계)를 따른다. 지원 계약과 검증된 환경의 범위를 구분하며 미확인 연결을 검증 완료로 간주하지 않는다.
 
@@ -1571,10 +1573,10 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 | 거부 입력 | 절대 경로·상위 이동·역슬래시·문자 class·중복 key/경로·미지원 버전 |
 | 누락 | literal 누락은 오류, glob의 빈 결과는 관측 가능한 빈 집합 |
 | 파일 | symlink를 따라가지 않음. 경로·내용·kind·mode를 관측 |
-| 실행 | 목록 자체·실제 명령·환경·측정 runtime·Git/외부 입력 identity를 결합 |
-| 생성물·의존성 | Git 내부·bytecode는 생성물. `.venv`는 측정한 runtime/외부 의존성 identity로 확인 |
+| 실행 | 목록 자체·선택한 저장소 verify 진입점·코드/테스트/의존성·검증 선언의 파일 입력을 결합 |
+| 생성물·의존성 | Git 내부·bytecode·`.venv` 등 설치 환경은 비교 대상 밖이다. 저장소 의존성 선언·lock 파일과 테스트 고정 자료는 코드 입력이다. |
 
-관측 결과는 `fingerprint`만으로 증명하지 않는다. `InputObservation.proven`은 `fingerprint`가 `null`이 아니고 `reason`이 `null`인 경우이며, 입력이 미확인이면 지문이 계산돼도 재사용하지 않는다. runtime identity와 Git/외부 identity의 `None`은 미확인, Git/외부 identity의 빈 object `{}`는 해당 의존성이 없음을 확인한 뜻이다. 목록 밖 입력의 제외 증명은 [목록 밖 입력과 누락 요청](#목록-밖-입력과-누락-요청)의 정확한 completeness token에 결합한다.
+다음은 R-072에서 채택한 코드 입력 관측 계약이며 기존 환경 완전성 adapter를 이 기준으로 전환하는 구현이 필요하다. `InputObservation.proven`은 유효 목록·저장소 코드 입력 관측·목록 밖 코드 누락 확인과 `fingerprint`/`reason`으로 판단한다. 파일을 읽거나 비교할 수 없는 경우는 미확인이며 runtime·Git/외부 identity의 `None`은 그 자체로 미확인이 아니다. 기존 환경 관측 자료는 감사로 보존할 수 있으나 코드 기준 재사용 gate로 사용하지 않는다. 목록 밖 제외 근거는 아래 completeness token의 코드 입력에 결합한다.
 
 입력 목록의 부재·오류는 관측을 미확인으로 만들어 전체 verify를 유지한다. 공통 runner 연결 선언 `scripts/verify.json`의 형식·지원 오류는 [공통 verify 실행 경계](#공통-verify-실행-경계)에 따라 실행 실패이며 두 파일의 오류 처리를 혼동하지 않는다.
 
@@ -1583,13 +1585,13 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 자체 `scripts/verify-inputs.json`은 다음 입력을 고정 목록으로 관측한다.
 
 - `loop_manager.py`, `loop_manager_internal/**`, `tests/**`, `requirements.txt`
-- `scripts/verify.json`, `scripts/verify.sh`, `scripts/verify.ps1`
+- `scripts/verify.json`, `scripts/verify.sh`, `scripts/verify.ps1`, `scripts/verify_windows.py`, `scripts/verify-windows-tests.json`
 - `scripts/copy-project-files.sh`, `scripts/copy-project-files.ps1`
 - `.agents/skills/specification-docs/scripts/**`, `run.sh`, `run.ps1`
 
 `tests/**`의 등록·profile·프로젝트 준비 검증은 문서·설정 예제 대신 고정 샘플을 사용한다. 복사 회귀는 실제 copy 스크립트 bytes를 샘플 source root에서 실행해 결과 bytes·경로·기존 파일 보존·재실행 거부를 확인한다. 배포되는 조회 도구와 Skill 자체 문서 파서는 실제 실행 코드 bytes를 샘플 source에 배치해 배포 결과·조회 동작을 확인한다.
 
-샘플은 현재 문서 원본에서 자동 생성·동기화하지 않는다. `AGENTS.md`·README·docs와 `.agents`의 prose·`config.ini.example`·setup·ignore·attributes 변경은 자체 verify 입력이 아니다. 이 제외는 원문의 일관성·품질을 확인하지 않으며 필수 테스트·전체 compile·실제 verify/copy 스크립트 검증을 축소하지 않는다.
+샘플은 현재 문서 원본에서 자동 생성·동기화하지 않는다. `AGENTS.md`·README·docs와 `.agents`의 prose·`config.ini.example`·사용자 운영 설정·소비하지 않는 setup/ignore/attributes 변경은 자체 verify 입력이 아니다. Windows verify driver·선택 목록은 이미 포함돼 있다. 테스트가 실제로 읽어 실행하는 `scripts/setup.sh`의 누락 보완은 R-072의 변경 목표다. 이 제외는 원문의 일관성·품질을 확인하지 않으며 필수 테스트·전체 compile·실제 verify/copy 스크립트 검증을 축소하지 않는다.
 
 verify 기록은 실행 시 Python의 bytecode write 정책·cache tag·prefix와 프로젝트 Python cache의
 전후 개수, 생성·변경·유지·삭제 수를 남기며 snapshot 소요 시간을 별도 phase로 기록한다.
@@ -1598,9 +1600,9 @@ verify 기록은 실행 시 Python의 bytecode write 정책·cache tag·prefix�
 
 ### 목록 밖 입력과 누락 요청
 
-목록 밖 파일의 제외 확인은 경로·내용·kind·mode, 실행 context와 목록에 포함된 모든 입력의
-경로·내용·kind·mode에 결합한 completeness token으로 제한한다. 검증 스크립트·설정 변경도
-기존 제외 확인을 무효화한다. verify 성공은 이 근거를 만들지 않는다. 관측 API는 실행·성공 저장·
+목록 밖 파일의 제외 확인은 경로·내용·kind·mode, 선택 저장소 verify 진입점·판정 규칙과 목록에 포함된 코드 입력의
+경로·내용·kind·mode에 결합한 completeness token으로 제한한다. 저장소 검증 스크립트·선언 변경도
+기존 제외 확인을 무효화하며 실행 머신의 환경·설정·외부 동적 입력은 이 token에 요구하지 않는다. verify 성공은 이 근거를 만들지 않는다. 관측 API는 실행·성공 저장·
 재사용 정책과 분리하며, 목록 부재/오류는 기존 전체 verify를 유지한다.
 
 일반 planning의 prompt 준비는 최신 `origin/<base>`의 고정 revision과 실제 목록을 조회한다.
@@ -1635,7 +1637,7 @@ source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 �
 
 일반 activation은 새 주기를 만들고 유지보수의 기존 작업 재개는 주기를 보존한다. 구형 활성 작업은 새 주기로 시작하며 과거 성공 token을 receipt로 합성하지 않는다. 실행 전후 입력·HEAD·작업 파일·runtime 소유 상태를 대조하고 성공 receipt·후보 token을 같은 transaction에서 확정한다. 저장 경쟁·실패는 현재 후보의 성공으로 인정하지 않는다.
 
-재사용은 현재 주기에 선택된 실제 성공 run과 증명된 현재 관측이 일치할 때만 허용한다. 목록만 있거나 fingerprint가 계산된 사실·검증 성공 자체로 동적 입력·목록 밖 입력의 증명을 만들지 않는다. 실제 지원 범위는 [운영 입력 관측 adapter](#운영-입력-관측-adapter)를 따른다. 일반 선행 PASS 뒤에는 별도로 연결된 실제 전체 run이 필요하다.
+재사용은 현재 주기에 선택된 실제 전체 성공 run과 현재 저장소 코드 입력 관측이 일치할 때만 허용한다. 목록·fingerprint 계산이나 verify 성공 자체로 목록 밖 코드 입력 누락을 해소하지 않는다. 환경 재현성·외부 동적 입력의 동일성은 요구하지 않는다. 실제 지원 범위는 [운영 입력 관측 adapter](#운영-입력-관측-adapter)를 따른다. 일반 선행 PASS 뒤에는 별도로 연결된 실제 전체 run이 필요하다.
 
 | 수동 complete/submit 면제 조건 | 적용 |
 |---|---|
@@ -1649,43 +1651,18 @@ source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 �
 
 ### 운영 입력 관측 adapter
 
-입력 목록이 있어도 adapter가 실제 명령·유효 환경·runtime·Git/외부 identity를 증명하지 못하면 전체 verify를 실행한다. `ValidationEffects.observe_verify_inputs`가 이 관측 경계다.
+`ValidationEffects.observe_verify_inputs`는 R-072의 저장소 코드 입력 관측 경계다. 채택 기준은 일반 프로젝트 스크립트·자체 공통 runner·기존 isolated compile에 공통으로 적용한다.
 
-| 현재 실행 계약 | 운영 관측·처리 |
+| 관측 대상 | 코드 기준 재사용 계약 |
 |---|---|
-| 임의 프로젝트 스크립트·현재 자체 공통 runner | 동적 입력·runtime 전체를 증명하지 못하며 일반 경로는 `runtime_identity=None`으로 관측한다. 입력 목록이나 prose 제외만으로 전체 verify를 생략하지 않는다. |
-| Linux의 아래 고정 격리 compile 계약 | 실행 bytes·명령·입력·환경·측정 runtime이 모두 맞을 때만 증명된 관측을 제공한다. |
-| 다른 OS·변경된 계약·native loader hook·측정 실패/timeout·추가 조율 환경 | 미확인으로 처리해 전체 실행을 유지한다. |
+| 목록·파일 | 유효한 목록과 실제 소스·테스트·fixture·의존성 선언·검증 스크립트/선언의 bytes·경로·kind·mode를 관측한다. 미커밋·untracked도 포함한다. |
+| 진입점·판정 규칙 | 선택한 저장소 verify 진입점과 목록 해석·제외 확인·재사용 판정 기준을 결합한다. |
+| 범위 밖 | 설치 Python/Git/Bash/Perl·native library·환경변수·사용자/시스템 설정·외부 파일/동적 입력·Git HEAD/이력/revision 값은 지문·완전성의 필수 조건이 아니다. |
+| 전체 실행 | 목록/코드 관측 오류·코드 입력 누락 의심·변경·유효한 실제 전체 성공 부재에서는 전체 verify를 실행한다. |
 
-문자열 분석으로 의존성 없음을 추정하거나 단순 tree/SHA cache로 대체하지 않는다.
+현재 구현은 일반 경로에서 `runtime_identity=None`을 미확인으로 취급하며 고정 Linux isolated compile에만 환경·runtime 측정을 결합한 증명을 제공한다. 이는 새 정책의 완료 조건이 아니라 전환할 기존 구현이다. 일반 runner가 외부 의존성을 모두 증명하거나 고정 toolchain·통제된 Linux 환경을 도입해야 코드 기준 재사용을 구현할 수 있다고 판단하지 않는다. 기존 runtime 측정 자료·receipt는 보존하되 새 판정에서 불필요한 환경 증명은 제외한다.
 
-운영 port가 연결한 `result_validation.observe_verify_inputs`는 Linux에서
-`manager_adapter.ISOLATED_COMPILE_SCRIPT`와 전체 bytes가 같은 아래 계약도 지원한다.
-프로젝트가 이 명령을 전체 verify로 선택한 경우에만 적용한다. 실제 명령은 PATH에서 확인한
-Python 절대 경로로 `-I -S -B -c`와 같은 프로그램을 직접 실행하며 source를 실행하거나
-bytecode를 쓰지 않는다. 관측 목록이 제외하는 `.git`·`.venv`·`__pycache__` 아래 source도
-컴파일 대상에서 제외한다. 현재 자체 verify 스크립트와 필수 검증은 그대로 유지한다.
-
-```bash
-#!/usr/bin/env bash
-# loop-manager: isolated-compile-v1
-set -eu
-exec python3 -I -S -B -c 'from pathlib import Path; root = Path("src"); assert root.is_dir(); [compile(path.read_text(encoding="utf-8"), str(path), "exec") for path in root.rglob("*.py") if not {".git", ".venv", "__pycache__"}.intersection(path.relative_to(root).parts)]'
-```
-
-이 고정 계약은 프로젝트 import·site package·Git·네트워크를 사용하지 않는다. 별도 관측
-subprocess가 같은 격리 Python의 executable·sys.path runtime 파일·stdlib·실제 native library
-mapping의 bytes와 mode, Python flags·filesystem encoding·사용자·OS identity를 매번 측정한다.
-관측 프로그램 자체·실행 환경·cwd도 지문에 결합한다. manifest는 script와 src 입력을 모두
-포함해야 하고 입력 누락·symlink·관측 중 변경은 기존 불확실성 계약으로 거부한다. native loader
-hook, runtime 측정 불가/timeout, Linux 이외 환경 및 자체 runner의 추가 조율 환경은 unknown이다.
-임의 스크립트의 의미를 이 계약으로 추정하지 않으며 새 공통 runner를 필수로 요구하지 않는다.
-
-증명된 관측만 같은 주기의 실제
-성공 run과 비교하며 reuse 직전 transaction에서 다시 관측한다. Review·게시 revision gate도
-재사용 후보의 입력을 재관측하고 달라졌거나 관측할 수 없으면 VERIFYING으로 돌아간다.
-reuse는 verify 프로세스·validation 실행 감사·사용량을 새로 만들거나 실패 이력을 초기화하지
-않는다. Reviewer 승인과 최종 publication token·원격 lease는 계속 별도로 판단한다.
+실행 전후·reuse 직전 transaction과 Review/게시 revision gate에서 코드 입력을 재관측한다. 코드가 달라졌거나 읽기·비교를 확정할 수 없으면 필요한 verify로 돌아간다. 과거 receipt는 새 기준의 코드 입력·원래 run·작업 주기·후보 연결을 확인할 수 있는 경우만 재평가하고 과거 입력을 현재 값으로 합성하지 않는다. reuse는 새 verify 실행·성공 감사·사용량을 만들거나 새 실패를 지우지 않는다. Reviewer의 명세·diff·실제 지침·승인과 publication token·원격 lease는 별도 조건이다. 일반 선행 Review PASS 뒤 실제 전체 run과 수동 면제의 별도 후보/설정 계약은 유지한다.
 
 ## Architecture Change Policy
 

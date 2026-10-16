@@ -286,7 +286,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_document_stage_restart_keeps_owned_target(self):
         self._lifecycle(with_pr=False, documents='continue')
 
-    def test_worker_only_requirement_change_is_not_rebase_input(self):
+    def test_worker_only_requirement_change_is_rejected_after_rebase(self):
         self._lifecycle(with_pr=False, documents='worker-only')
 
     def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False,
@@ -598,7 +598,11 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                         handler._rebase_latest(handler._context(), handler._row(), target,
                                                publishing=False)
                     self.assertEqual(caught.exception.reason, RecoveryReason.AGENT_SCOPE_VIOLATION)
-                    self.assertEqual(git(worktree, 'rev-parse', 'HEAD').stdout.strip(), original)
+                    self.assertNotEqual(git(worktree, 'rev-parse', 'HEAD').stdout.strip(), original)
+                    self.assertEqual(git(worktree, 'merge-base', '--is-ancestor', target, 'HEAD',
+                                         check=False).returncode, 0)
+                    self.assertEqual((worktree / requirement_path).read_text(),
+                                     '# [R-001] Condition\n\nworker-later\n')
                     return
                 def interrupted_git(path, *arguments, **kwargs):
                     if documents == 'autostash' and arguments == ('rebase', target):

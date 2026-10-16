@@ -129,12 +129,33 @@ class CurrentRebasePolicyTests(unittest.TestCase):
             {'staged': current.committed},
             {'index': (IndexEntry('app.py', '100644', 'unmerged', 2, 'M', 0x2000),)},
             {'remote': replace(expected.remote, oid='changed')},
-            {'committed': (replace(current.committed[0], path='docs/requirements/archive/Protected.md'),)},
         ):
             with self.subTest(changes=changes):
                 self.assertEqual(decision_for(expected, replace(current, operations=auxiliary,
                                                                **changes)).status,
                                  RebaseStatus.REJECTED)
+
+    def test_reserved_start_defers_final_scope_but_completion_rejects_protected_changes(self):
+        expected = expectation()
+        protected = FileChange('docs/requirements/Protected.md', '100644', '100644', 'old', 'new', 'M')
+        current = observation(expected, head='before', branch_ref=('before', ''),
+            registration=('HEAD=before', f'branch=refs/heads/{expected.branch}'),
+            base_is_ancestor=False, committed=(protected,))
+        contract = mock.Mock(return_value=False)
+        scope = scope_for(expected, current, contracts_allowed=contract)
+        self.assertEqual(assess_current_rebase(expected, current, scope).status, RebaseStatus.START)
+        contract.assert_not_called()
+        for changes in (
+            {'committed': (replace(protected, path='../outside'),)},
+            {'index': (replace(current.index[0], flags=0x8000),)},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(decision_for(expected, replace(current, **changes)).status,
+                                 RebaseStatus.REJECTED)
+        final = observation(expected, committed=(protected,))
+        scope = scope_for(expected, final, contracts_allowed=contract)
+        self.assertEqual(assess_current_rebase(expected, final, scope).status, RebaseStatus.REJECTED)
+        contract.assert_called_once_with(final)
 
     def test_owned_detached_conflict_waits_without_mutating_index(self):
         expected = expectation()

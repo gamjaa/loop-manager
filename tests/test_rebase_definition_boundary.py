@@ -131,6 +131,33 @@ class RebaseDefinitionBoundaryTests(TestCase):
         return lm._current_rebase_service(self.connection, self.repo, self.state_dir,
             self.repo_key, 'G-047', self.worktree, self.branch, **options)
 
+    def test_missing_definition_starts_rebase_and_revalidates_completed_result(self):
+        # Real Git must adopt the target header without losing committed Worker code.
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        self.state.update_project(self.repo_key, definition_snapshot=None)
+        prior = self.checkpoints.get(self.repo_key, 'G-047')
+        self.checkpoints.record(self.repo_key, 'G-047', expected_generation=prior.generation,
+            operation='rebase', expected_head=self.head, target_base_oid=self.latest,
+            observed_remote_oid=None, snapshot={})
+        service = self.service()
+        self.assertFalse(service.normalize_frontmatter())
+        self.assertEqual(service.require_owned()[1].status, RebaseStatus.START)
+        self.assertEqual((self.worktree / self.plan_path).read_text(), self.old_text)
+        git_command(self.worktree, 'rebase', self.latest)
+        with self.assertRaises(journal.MutationEvidenceError):
+            service.require_owned()
+        service = self.service()
+        self.assertEqual(service.require_owned()[1].status, RebaseStatus.COMPLETE)
+        service.adopt(self.state, self.checkpoints)
+        self.assertEqual(self.checkpoints.get(self.repo_key, 'G-047').operation, None)
+        self.assertEqual((self.worktree / self.plan_path).read_text(), self.new_text)
+        self.assertEqual((self.worktree / 'app.py').read_text(), 'saved_worker_change = True\n')
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-worker')
+        for field in ('worker_result', 'verify_token', 'review_token', 'publication_token'):
+            self.assertIsNone(self.state.row()[field], field)
+        self.assertEqual(self.state.active_execplan(self.repo_key)['verify_failure_history'],
+                         '["prior verify failure"]')
+
     def test_completed_checkpoint_reaches_revision_gate_and_resumes_worker(self):
         self._assert_refresh_and_resume(dirty=False)
 

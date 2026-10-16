@@ -558,6 +558,12 @@ Loop Manager가 만드는 계획과 구현 변경은 대상 프로젝트 밖의 
 - Linux source 진입은 setup이 저장한 설치별 PATH, 현재 실행 환경, 기본 시스템 후보 순서로 bootstrap의 첫 외부 명령 전에 프로그램 탐색 환경을 확정한다. 캐시가 없으면 현재 PATH와 시스템 후보로 기존 설치·명시적 cron PATH를 지원하며 손상된 캐시는 진단하고 중단한다. 같은 실행의 runtime·Agent·verify는 확정값을 유지하고 setup의 갱신은 다음 실행부터 반영한다. PATH 캐시는 다른 설정·인증·작업 상태를 초기화하지 않는다.
 - runtime의 Python bytecode 캐시는 선택 source·revision·interpreter에 맞는 표준 Python 캐시로 재사용한다. 기본 캐시는 일회성 runtime worktree 밖에 두며 source checkout의 ignored 파일은 runtime 입력이 아니다. 캐시 생성·갱신·부재·손상·쓰기 실패는 현재 원본 실행과 Git 범위 판정을 바꾸지 않고, 사용자가 명시한 bytecode 비활성화나 캐시 경로 선택을 존중한다.
 
+#### Claude 개발·지원 범위
+
+Claude 지원은 [R-023](requirements/%5BR-023%5D%20Self-Hosted%20Runtime%20Refresh%20Handoff.md)의 일반 호출 구성을 공식 문서·모의 테스트로 구현하는 범위로 한정한다. 역할별 쓰기 제한·자동 승인 검토를 구성하되 Codex와 같은 실환경 검증 수준이나 모든 OS·CLI·기능 조합의 완전 지원을 완료 조건으로 요구하지 않는다. 실호출 미검증만으로 개발 완료·독립 Codex 작업을 막지 않으며 문서/mock 확인과 실제 실행 확인을 구분한다.
+
+실행 중 조직 managed 정책 변경의 감시·적용 전 차단·지속 제한 보장은 현재 범위 밖이다. 실제 호출에서 관측한 인증·지원·설정 충돌·권한·초기화 오류는 해당 호출에서 보존·처리한다. 실환경·session·OS/CLI·managed 변경의 후속 점검은 [FUTURE_IDEAS](FUTURE_IDEAS.md#claude-실환경-후속-점검)에 두며 현재 완료 조건으로 사용하지 않는다. 현재 구현 지원 여부와 남은 호출 구성은 [provider 계약](ARCHITECTURE.md#provider의-현재-지원과-쓰기-정책)을 따른다.
+
 ### 프로젝트 예약 경로
 
 Skill과 Manager가 프로젝트 안에서 고정 위치로 조회·작성하는 다음 경로는 위치를 유지한다.
@@ -846,7 +852,7 @@ Worker는 현재 작업의 테스트를 명세·구현과 대조해 폐기된 �
 - 명시적 공통 verify 연결은 unittest와 Perl TAP adapter를 제공한다. 도구·연결 오류와 부분 결과를 성공으로 처리하지 않으며 두 언어는 같은 자원 예약·종료·진단과 필수 compile 순서를 따른다. Perl의 Agent 호출 차단·지원 버전·한계는 [VERIFY.md](VERIFY.md#perl-tap-지원과-두-언어-예제)를 따른다.
 - 자체 verify는 실제 소스·테스트·고정 샘플·의존성·verify/copy/실행 스크립트를 관측한다. 문서·Skill·README·예제 설정의 정책·안내 문구 일관성은 검사하지 않고 문서 원본을 고정 샘플로 자동 동기화하지 않는다. 파서·등록·profile·파일 복사 검증과 필수 unittest·전체 compile은 유지하며 verify가 문서 품질을 보증하지는 않는다.
 
-  prose의 입력 제외만으로 전체 verify를 생략하지 않는다. 실제 명령·입력·runtime의 동일성을 증명한 지원 경로에서만 성공 결과를 재사용하며, 현재 자체 runner는 이 증명을 제공하지 않아 전체 verify를 실행한다.
+  prose 제외만으로 재사용을 허용하지 않고 아래 코드 입력 목록·누락 확인·실제 전체 성공 근거를 확인한다. 환경·runtime의 완전성 증명은 요구하지 않는다. 코드 기준 재사용으로의 전환은 R-072의 구현 대상이며, 현재 자체 runner의 환경 증명 부재를 새 정책의 완료 조건으로 유지하지 않는다.
 - `verify_parallelism`은 생략 시 `auto`, 양의 정수는 상한, `1`은 직렬이다. 프로그램이 CPU 제한·실제 부하·메모리 여유·미반영 예약으로 실행량을 정하며 등록 프로젝트 수로 고정 분할하지 않는다. 관측 실패는 직렬로 축소한다. 확인된 순번·자원 배정 대기는 timeout에서 제외하고 준비·수집·복사·호출·결과 처리·정리의 실제 경과 시간만 계산한다.
 - Manager 인스턴스가 동시 verify의 확인·예약을 조율한다. 자식 종료·미시작을 확인한 뒤 예약을 해제하고 종료 불명은 보존한다. 종료 불명 호출과 미확정 Git operation·게시는 관련 자리를 유지하며 과거 시간 자료는 현재 검증을 대신하지 않는다.
 
@@ -866,11 +872,11 @@ Worker는 현재 작업의 테스트를 명세·구현과 대조해 폐기된 �
 
 - Manager가 먼저 안전한 rebase를 시도하고 현재 후보의 구현·검증·Review 근거를 각각 재판정한다. 충돌 없이 완료되고 source 내용까지 포함한 구현 입력과 완료 Worker 결과가 같으면 SHA 변경만으로 Worker·완료한 targeted test를 반복하지 않는다. verify·Review 근거는 각 재사용 조건을 충족할 때만 연결하며, 충족하지 않으면 필요한 단계를 수행한다. 실제 구현 입력 변경·교정 사유·미해소 충돌은 기존 Worker/session 경로로 처리한다.
 - rebase 충돌 중 Progress 체크 상태와 명확한 기존 실행 결과만 바뀌고 구현 조건의 동일성이 증명되면 session·작업물·index·rebase 상태·retry·실패 감사를 보존해 해결을 이어간다. 절 이름만으로 목표·제약·검증 조건·사용자 결정을 제외하지 않으며 불확실한 기록이나 과거 원문 근거 부재는 기존 재확인·차단을 유지한다. 이 구분은 verify·Review 입력을 제외하지 않는다.
-- 같은 프로젝트·ExecPlan·작업 주기의 실제 전체 verify 성공과 파일 bytes·경로·종류·mode·목록·명령·환경·runtime·실제 Git/외부 입력의 지문이 같고 현재 후보에서 다시 확인되면 원래 run을 연결해 verify를 재사용한다. 목록 부재·오류·누락 의심, dirty/untracked 입력 변경, 미확인 동적·외부 입력과 유효한 성공 부재는 전체 verify를 실행한다. 일반 스크립트의 입력을 명령 문자열만으로 증명하지 않는다.
-- 운영 입력 증명 adapter는 고정된 격리 UTF-8 Python 문법 검증 계약을 지원한다. 해당 전체 verify 계약의 명령·프로젝트 입력·Python/stdlib/native runtime을 실제로 관측한 경우만 재사용하며, 임의 스크립트와 미지원 환경은 전체 실행을 유지한다. 정확한 계약과 지원 범위는 [ARCHITECTURE.md](ARCHITECTURE.md#verify-입력-관측과-생성-요청)에 둔다.
+- 같은 프로젝트·ExecPlan·작업 주기의 실제 전체 verify 성공과 현재 후보의 저장소 코드 입력이 같으면 원래 run을 연결해 재사용한다. 소스·테스트·fixture·의존성 선언·검증 스크립트/선언의 bytes·경로·종류·mode와 목록·선택 진입점을 비교하고 dirty/untracked 변경도 반영한다. 목록 부재·오류·코드 입력 누락 의심·비교 실패·실제 변경과 유효한 성공 부재는 전체 verify를 실행한다.
+- verify 재사용은 코드 입력 기준으로 판단하며 설치 도구·환경변수·사용자/시스템 설정·native runtime·외부 동적 입력·Git revision 값의 동일성을 요구하지 않는다. 그 변경이나 미확인만으로 재사용을 거부하거나 별도 검증 infrastructure를 요구하지 않으며 환경 재현성을 보장하지 않는다. Review의 문서·diff·지침·승인 조건과 R-086 일반 선행 승인 뒤 실제 전체 실행은 유지한다. 관측 계약과 현재 구현 차이는 [ARCHITECTURE.md](ARCHITECTURE.md#verify-입력-관측과-생성-요청)를 따른다.
 - 새 verify 실행은 과거 성공의 재사용 자격을 먼저 무효화한다. 실행·재사용 판정 중 입력 변경, 새 실패, 저장 중단·경쟁과 다른 작업 주기의 결과로 현재 후보를 통과시키지 않는다. 생략은 새 invocation·성공 실행·미측정 절감량을 만들거나 실패 감사를 초기화하지 않는다. Review·게시 gate는 독립적으로 유지한다.
 - 구현 PR 게시에는 Requirement 전체 완료나 archive 이동을 강제하지 않는다. Requirement 이동은 별도 planning 게시에서 최신 판단·원문·목적지와 원격 base를 다시 확인한다.
-- 관리 rebase는 자동 Worker 해결과 사용자 수동 해결을 같은 현재 상태 기준으로 수용한다. 현재 소유권·범위·Git 상태·원격 기대값을 검증하며, 과거 turn·stage·receipt·journal 완전성을 완료 조건으로 요구하지 않는다.
+- 관리 rebase는 시작 전에 대상·소유권·target·원격/PR 연결·writer 경합·index 안전·보존 가능 여부를 확인하고, 파일·선언은 비교·복구 기준으로 기록한다. 최신 frontmatter 일치·역할별 전체 diff·문서/archive 최종 내용이나 과거 definition snapshot 존재를 시작 조건으로 요구하지 않는다. Worker 종료 후 해당 호출의 실제 변경을 검사하고, Git 완료 후 Manager가 고정 target의 선택 ExecPlan 선언을 복원한 뒤 전체 최종 결과를 검사한다. 중간 충돌 해결은 최종 후보로 판정하지 않는다. 자동·수동 해결·재시작·기존 차단 재평가에 같은 시점을 적용하며 과거 turn·stage·receipt·journal 완전성을 완료 조건으로 요구하지 않는다.
 - 동일 계획의 기존 원격 작업 branch를 rebase한 결과는 다음 단계 전에 중간 checkpoint 게시 또는 현재 lease에 따른 보류를 확정한다. 새 원격 입력이 오면 낡은 게시 intent를 감사에 남기고 통합·재검증하며 새 lease만 끼워 넣어 push하지 않는다. 실제 push가 확인됐을 때만 완료를 기록하고 이미 확인한 push를 반복하지 않는다. 이 게시와 과거 receipt는 구현·verify·Review·PR 승인을 대신하지 않는다.
 
 #### PR 생성과 Merge 후 작업 공간

@@ -1219,11 +1219,11 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     _plan_text = ('---\nid: G-047\ntitle: Runtime\nsources:\n  - docs/PRODUCT.md\n'
                   'depends_on: []\ncomplexity: medium\nrisk: medium\n---\n\nOriginal body.\n')
 
-    def test_auxiliary_markers_preserve_original_document_preflight_exception(self):
+    def test_auxiliary_markers_defer_final_document_scope_before_start(self):
         from loop_manager_internal.git.managed_rebase_runtime import build_service
         from tests.support.runtime import runtime_rebase_fixture
         from tests.support.rebase_observations import observation
-        from loop_manager_internal.git.managed_rebase_validation import WorktreeFile
+        from loop_manager_internal.git.managed_rebase_validation import assess_scope, assess_current_rebase, RebaseStatus
         ports, previous = self._user_document_service()
         worktree = Path(previous.expected.worktree)
         connection, *_ = runtime_rebase_fixture(self)
@@ -1236,20 +1236,20 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         def git(root, *args, **kwargs):
             if args[:2] == ('merge-base', '--is-ancestor'):
                 return SimpleNamespace(stdout='', returncode=1)
-            if args == ('merge-base', 'base', 'before'):
-                return SimpleNamespace(stdout='common', returncode=0)
-            if args[0] == 'diff' and '--name-only' in args:
-                return SimpleNamespace(stdout=path + '\0', returncode=0)
             return original_git(root, *args, **kwargs)
         ports.git.side_effect = git
         service = build_service(ports, connection, Path(REPO), Path('/state'),
                                 'repo', 'G-047', worktree, 'loop-manager/G-047')
         current = observation(service.expected, head='before', operations=tuple(auxiliary.items()),
+            base_is_ancestor=False, branch_ref=('before', ''),
+            registration=('HEAD=before', f'branch=refs/heads/{service.expected.branch}'),
+            input_fingerprint=service.expected.input_fingerprint,
+            scope_fingerprint=service.expected.scope_fingerprint,
             committed=(FileChange(path, '100644', '100644', 'old', 'historical', 'M'),))
-        self.assertTrue(service.adapters.path_allowed(path))
-        self.assertTrue(service.adapters.contracts_allowed(current))
-        self.assertFalse(service.adapters.contracts_allowed(replace(current,
-            files=(WorktreeFile(path, ('unstaged',), '100644', 'new-edit'),))))
+        self.assertFalse(service.adapters.path_allowed(path))
+        scope = assess_scope(service.expected, current,
+            path_allowed=service.adapters.path_allowed, contracts_allowed=service.adapters.contracts_allowed)
+        self.assertEqual(assess_current_rebase(service.expected, current, scope).status, RebaseStatus.START)
 
     def test_windows_file_modes_reuse_index_without_per_file_git_queries(self):
         from loop_manager_internal.git import managed_rebase_runtime
@@ -1383,7 +1383,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                 'paths': [path], 'originals': {path: {'base': {'mode': '100644', 'oid': 'pinned'}}}}
             for completed in (False, True):
                 with self.subTest(state=state, completed=completed):
-                    _, service = self._user_document_service(record, completed=completed)
+                    _, service = self._user_document_service(record, completed=completed, pending=False)
                     current = observation(service.expected,
                         index=(IndexEntry(path, '100644', 'pinned', 0, 'H', 0),),
                         files=(WorktreeFile(path, ('unstaged',), '100644', 'new-worker-notes'),))
@@ -1423,8 +1423,11 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             staged=(replace(staged.staged[0], new_mode='100644', new_oid='stale'),))))
         final = replace(staged, metadata=None, staged=(),
                         committed=(replace(staged.staged[0], old_oid='old'),))
-        self.assertTrue(service.adapters.contracts_allowed(final))
-        self.assertFalse(service.adapters.contracts_allowed(replace(final,
+        with self.assertRaises(journal.MutationEvidenceError):
+            service.adapters.contracts_allowed(final)
+        _, finalized = self._user_document_service(record, worktree=Path(expected.worktree), pending=False)
+        self.assertTrue(finalized.adapters.contracts_allowed(final))
+        self.assertFalse(finalized.adapters.contracts_allowed(replace(final,
             committed=(), index=(IndexEntry(path, '100644', 'stale', 0, 'H', 0),))))
 
     def test_owned_user_document_conflicts_allow_preservation_without_final_acceptance(self):
@@ -1459,9 +1462,10 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                     committed=(FileChange(path, '100644', '100644', 'old', 'user', 'M'),),
                     index=(IndexEntry(path, '100644', 'user', 0, 'H', 0),),
                     input_fingerprint=expected.input_fingerprint, scope_fingerprint=expected.scope_fingerprint)
+                _, finalized = self._user_document_service(worktree=Path(expected.worktree), pending=False)
                 def decision_for(actual):
-                    scope = assess_scope(expected, actual, path_allowed=service.adapters.path_allowed,
-                                         contracts_allowed=service.adapters.contracts_allowed)
+                    scope = assess_scope(expected, actual, path_allowed=finalized.adapters.path_allowed,
+                                         contracts_allowed=finalized.adapters.contracts_allowed)
                     return assess_current_rebase(expected, actual, scope)
                 self.assertEqual(decision_for(final).status, RebaseStatus.COMPLETE)
                 unapproved = replace(final, committed=(replace(final.committed[0], new_oid='agent'),))
@@ -1498,7 +1502,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         # Once stages disappear, remaining manual bytes are subject to the final contract.
         self.assertFalse(service.adapters.contracts_allowed(replace(pending, index=())))
 
-    def test_archive_contract_uses_original_base_only_before_rebase(self):
+    def test_archive_contract_is_deferred_before_and_during_rebase(self):
         from loop_manager_internal.catalog import requirement_archive
         from loop_manager_internal.git.managed_rebase_runtime import build_service
         from tests.support.runtime import runtime_rebase_fixture
@@ -1526,6 +1530,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                     ports.requirement_archive_candidates.return_value = (source,)
                     ports.requirement_archive_path.side_effect = loop_manager.requirement_archive_path
                     ports._owned_rebase_metadata.return_value = metadata
+                    ports.capture_git_snapshot.return_value = SimpleNamespace(head=head, operations={})
                     ports._published_plan_allows_common_plans.return_value = False
                     ports._revision_execplan_input_fingerprint.return_value = 'published-input'
                     ports._worktree_execplan_input_fingerprint.return_value = 'current-input'
@@ -1535,7 +1540,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                             ('rev-parse', '--git-common-dir'): '/repo/.git',
                             ('rev-parse', 'HEAD'): head,
                             ('ls-files', '-u', '-z'): index,
-                            ('merge-base', 'base', 'before'): 'common',
+                            ('show', 'base:docs/plans/[G-047] Runtime.md'): self._plan_text,
                             ('ls-tree', '-z', 'base', '--', source):
                                 '100644 blob ' + 'a' * 40 + '\t' + source + '\0',
                         }.get(args, '')
@@ -1551,7 +1556,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                     def build():
                         return build_service(ports, connection, Path(REPO), Path('/state'),
                                              'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
-                    if metadata is not None or index:
+                    if metadata is not None or index or allowed:
                         service = build()
                         ports.requirement_archive_move_set.assert_not_called()
                         from tests.support.rebase_observations import observation
@@ -1563,23 +1568,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                                         return_value=(final, None)):
                             observed, decision = service.observe()
                         self.assertEqual(decision.status, RebaseStatus.UNAVAILABLE)
-                        self.assertIn('refresh archive contracts', observed.detail)
-                    elif allowed:
-                        service = build()
-                        ports.requirement_archive_move_set.assert_called_once_with(
-                            Path(REPO), 'common', Path('/owned'))
-                        from tests.support.rebase_observations import observation
-                        from loop_manager_internal.git.managed_rebase_validation import FileChange
-                        def archived_change(oid):
-                            return observation(service.expected, committed=(FileChange(
-                                archived, '000000', '100644', '0', oid, 'A'),))
-                        # 유효한 archive 근거도 Worker의 Requirement 쓰기 권한은 만들지 않는다.
-                        self.assertFalse(service.adapters.contracts_allowed(archived_change('a' * 40)))
-                        self.assertFalse(service.adapters.contracts_allowed(archived_change('b' * 40)))
-                        # Existing requirements still cannot disappear from both paths.
-                        (root / archived).unlink()
-                        with self.assertRaises(requirement_archive.ArchiveMoveError):
-                            build()
+                        self.assertIn('refresh final contracts', observed.detail)
                     else:
                         with self.assertRaises(requirement_archive.ArchiveMoveError):
                             build()

@@ -148,9 +148,12 @@ def _safe_path(path: str) -> bool:
 
 
 def rebase_content_pending(expected: RebaseExpectation, observed: RebaseObservation) -> bool:
-    """Intermediate replay/restoration bytes are not a final candidate."""
+    """The reserved start and replay/restoration bytes are not a final candidate."""
     return bool(observed.metadata is not None
                 or {'rebase-merge', 'rebase-apply'}.intersection(dict(observed.operations))
+                or (observed.head == expected.before_head
+                    and observed.base_is_ancestor is False
+                    and not controlling_git_operation(dict(observed.operations)))
                 or (expected.autostash_oid
                     and (observed.staged or any(entry.stage for entry in observed.index))))
 

@@ -208,9 +208,8 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     document_blobs = {}
     document_heads = {}
     document_files = set()
-    start_document_paths = set()
     starting_before_base = False
-    if (expected.before_head and checkpoint.operation in {None, 'rebase'}
+    if (owned_definition and expected.before_head and checkpoint.operation == 'rebase'
             and pending_metadata is None and not pending_index):
         start = ports.capture_git_snapshot(worktree)
         if start.head == expected.before_head and not controlling_git_operation(start.operations):
@@ -218,21 +217,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                                  target, start.head, check=False)
             if ancestor.returncode == 1:
                 starting_before_base = True
-                base = ports.git(worktree, 'merge-base', target, start.head, check=False)
-                if base.returncode == 0 and base.stdout.strip():
-                    def changed_paths(revision):
-                        result = ports.git(repo_path, 'diff', '--no-ext-diff', '--no-textconv',
-                                           '--name-only', '--no-renames', '-z',
-                                           base.stdout.strip(), revision, '--', check=False)
-                        output = result.stdout
-                        if result.returncode or (output and not output.endswith('\0')):
-                            return set()
-                        return {path for path in output.split('\0') if path}
-
-                    start_document_paths = {
-                        path for path in changed_paths(target) & changed_paths(start.head)
-                        if document_path(path)
-                    }
+    content_pending = content_pending or starting_before_base
     originals = {} if documents_adopted else adopted_originals(checkpoint)
     for path, desired in originals.items():
         document_blobs[path] = ({('000000', '0' * width) for width in (40, 64)}
@@ -274,7 +259,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             document_blobs[expected.plan_path].add((approved['mode'], blob))
             document_files.add(expected.plan_path)
     declaration_error = None
-    if not content_pending and not normalizing_frontmatter:
+    if (not content_pending or starting_before_base) and not normalizing_frontmatter:
         options = {}
         try:
             if owned_definition:
@@ -282,35 +267,23 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                 try:
                     options['rebase_target_metadata'] = parse_execplan_text(
                         str(row['path']), target_text, validate_sources=False)
+                    if (options['rebase_target_metadata']['id'] != plan_id
+                            or options['rebase_target_metadata'].get('draft')):
+                        raise ExecPlanMetadataError('소유된 rebase target ExecPlan identity가 다릅니다.')
                 except RuntimeError as error:
                     raise ExecPlanMetadataError(str(error)) from error
-            ports.validate_active_execplan_metadata(
-                repo_path, worktree, str(row['path']), row,
-                rebase_definition=applied, **options)
+            if not content_pending:
+                ports.validate_active_execplan_metadata(
+                    repo_path, worktree, str(row['path']), row,
+                    rebase_definition=applied, **options)
         except ExecPlanMetadataError as error:
-            # Deterministic declaration failures cannot improve by polling the
-            # same checkout. Preserve the diagnostic and use the input gate.
+            # Target validity is required to start; checkout declarations are final checks.
             declaration_error = RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, str(error))
     archive_ok = True
     archive_blobs = {}
     archive_signatures = {}
     if archives and not content_pending:
-        archive_base = target
-        # Before the rebase starts, this checkout cannot contain requirements
-        # added by the target. Match the observation adapter's original-branch
-        # diff base; once rebase starts or target is included, check target.
-        if pending_metadata is None and not pending_index and expected.before_head:
-            head = ports.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-            if head == expected.before_head:
-                ancestry = ports.git(worktree, 'merge-base', '--is-ancestor',
-                                     target, head, check=False)
-                if ancestry.returncode not in (0, 1):
-                    raise MutationEvidenceError('archive target ancestry unavailable')
-                if ancestry.returncode == 1:
-                    archive_base = ports.git(worktree, 'merge-base', target, head).stdout.strip()
-                    if not archive_base:
-                        raise MutationEvidenceError('archive original branch base unavailable')
-        moves = ports.requirement_archive_move_set(repo_path, archive_base, worktree)
+        moves = ports.requirement_archive_move_set(repo_path, target, worktree)
         archive_ok = not (set(moves) - set(archives))
         for source in archives:
             entry = ports.git(repo_path, 'ls-tree', '-z', target, '--', source).stdout
@@ -331,8 +304,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     if not content_pending:
         from loop_manager_internal.catalog.execplan_drafts import validate_agent_change
         try:
-            declaration_base = expected.before_head if starting_before_base else target
-            original = ports.git(repo_path, 'show', f'{declaration_base}:{expected.plan_path}').stdout
+            original = ports.git(repo_path, 'show', f'{target}:{expected.plan_path}').stdout
             selected = parse_execplan_text(expected.plan_path,
                 (worktree / expected.plan_path).read_text(encoding='utf-8'), validate_sources=False)
             validate_agent_change(selected, original)
@@ -368,24 +340,10 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         path, expected.plan_path, archives, (), common)
     checked_contracts = contracts
     def scoped_contracts(observed):
-        if archives and content_pending:
-            # A service built during replay must rebuild final archive inputs.
-            raise MutationEvidenceError('current rebase phase changed; refresh archive contracts')
-        # A pending Manager rebase may start with the previous Worker branch's
-        # stale document versions. Permit only exact Requirement/ExecPlan paths
-        # changed on both sides of the merge base, and only while HEAD is still
-        # the reserved pre-rebase commit. Rebase resolution must replace them
-        # with the pinned target bytes before a later observation can complete.
-        starting_documents = (start_document_paths
-            if (observed.head == expected.before_head and observed.metadata is None
-                and not controlling_git_operation(dict(observed.operations)) and not observed.staged
-                and not any(entry.stage for entry in observed.index)) else set())
-        if starting_documents:
-            if any(file.path in starting_documents for file in observed.files):
-                return False
-            observed = replace(observed, committed=tuple(
-                change for change in observed.committed
-                if change.path not in starting_documents))
+        if (content_pending and observed.metadata is None and not observed.staged
+                and not any(entry.stage for entry in observed.index)):
+            # Start/replay services have not read the final declaration or archive inputs.
+            raise MutationEvidenceError('current rebase phase changed; refresh final contracts')
         # Conflict bytes are preservation input, never a final approval. Only
         # recorded user paths in this exact owned operation may bypass Worker
         # document contracts while their nonzero index stages remain. The
@@ -453,7 +411,6 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         read_remote=read_remote, read_inputs=lambda _: current_contract()[-2:],
         read_file=read_file,
         path_allowed=lambda path: worker_allowed(path) or path in user_blobs
-            or path in start_document_paths
             or path in document_blobs or path in document_conflicts,
         contracts_allowed=scoped_contracts,
         normalize_ignored_snapshot=ports._normalize_legacy_ignored_snapshot,
