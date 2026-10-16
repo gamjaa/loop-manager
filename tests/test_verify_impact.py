@@ -425,10 +425,24 @@ class ImpactTests(unittest.TestCase):
 
     def test_verification_contract_changes_fall_back_even_with_common_checks(self):
         for path in ('scripts/verify.json', 'scripts/verify.sh',
-                     'loop_manager_internal/verification/runner.py', 'config/config.ini.example'):
+                     'loop_manager_internal/verification/runner.py', 'config/config.ini.example',
+                     'loop_manager_internal/execution/verify_process.py',
+                     'loop_manager_internal/execution/windows_job.py'):
             with self.subTest(path=path):
                 result = self.choose([('M', 'pkg/value.py', 'pkg/value.py'), ('M', path, path)])
                 self.assertIn('verification_contract_changed:' + path, result.fallback)
+
+    def test_process_contract_deletion_and_rename_are_verification_changes(self):
+        for old, new in (('loop_manager_internal/execution/verify_process.py', None),
+                         ('loop_manager_internal/execution/verify_process.py',
+                          'loop_manager_internal/execution/process_runner.py'),
+                         ('loop_manager_internal/execution/windows_job.py', None),
+                         ('loop_manager_internal/execution/windows_job.py',
+                          'loop_manager_internal/execution/job_scope.py')):
+            with self.subTest(old=old, new=new):
+                status = 'D' if new is None else 'R100'
+                result = self.choose([('M', 'pkg/value.py', 'pkg/value.py'), (status, old, new)])
+                self.assertIn('verification_contract_changed:' + old, result.fallback)
 
     def test_manifest_identity_and_selection_are_exact(self):
         selection = self.choose()

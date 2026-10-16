@@ -1541,7 +1541,7 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 
 변경 테스트는 필수이며 직접·가까운 간접 참조를 우선해 기본 24개 모듈 예산으로 선정한다. 변경 테스트는 예산을 초과해도 유지한다. 불확실성·공통 경계·문서 소비 범위 불명·관련 대상 부재에는 수집 명세의 공통 회귀 검사를 보완한다. 전역 불확실성·문서 병행 수정·50% 규모만으로 전체 경로로 전환하지 않는다. 문서 내용/mode·소비 근거·남은 불확실성·미선택 관련 대상은 `selection.analysis`와 전체 변경·승인 입력에 보존한다.
 
-알고리즘 버전·후보·기준·설정·수집 명세 identity를 검증하며 과거 알고리즘 결과를 실행하지 않는다. 검증 계약 변경·후보/수집 명세 불일치·대상 부재·전체 필수 대상은 전체 경로로 전환해 부분 모드에서 전체 명세를 중복 실행하지 않는다. `runner.py`는 전체 discovery 뒤 선택 모듈만 기존 unittest adapter/core에 전달하고 후속 command는 전체 실행에서 수행한다. manifest·후보 안정성·fixture 소유자·필수 결과와 interpreter·guard·예약·timeout/자식 종료 경계는 유지한다.
+알고리즘 버전·후보·기준·설정·수집 명세 identity를 검증하며 과거 알고리즘 결과를 실행하지 않는다. 검증 계약에는 공통 core·runner·Manager adapter가 사용하는 `execution/verify_process.py`의 실행·timeout·프로세스 트리 종료와 `execution/windows_job.py`의 Job 격리·자식 종료 구현이 포함된다. 두 경로의 수정·삭제·이동은 전체 경로로 전환하며, 프로세스 관련 이름이나 `execution/` 전체로 범위를 넓히지 않는다. 후보/수집 명세 불일치·대상 부재·전체 필수 대상도 전체 경로로 전환해 부분 모드에서 전체 명세를 중복 실행하지 않는다. `runner.py`는 전체 discovery 뒤 선택 모듈만 기존 unittest adapter/core에 전달하고 후속 command는 전체 실행에서 수행한다. manifest·후보 안정성·fixture 소유자·필수 결과와 interpreter·guard·예약·timeout/자식 종료 경계는 유지한다.
 
 `preliminary_reviews`는 전체 `verify_receipts`와 독립된 같은 작업 주기의 상태·후보/입력 identity·부분 결과·선행 결과를 저장한다. generation CAS와 전체 verify cycle 변경으로 오래된 쓰기를 거부한다. `partial_head`는 `verified_head`를 만들지 않으며 Worker 교정 감사에 검증 종류를 보존한다. 부분 실행 중단은 미완료로 남고 전체 경로로 재개한다.
 

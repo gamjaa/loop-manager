@@ -9,12 +9,14 @@ from loop_manager_internal.maintenance import code_index
 from loop_manager_internal.verification.contract import validate_manifest
 from loop_manager_internal.verification import impact_analysis
 
-VERSION = 4
+VERSION = 5
 MAX_MODULES = 24
 _SMOKE = ('test_preliminary_review', 'test_managed_configuration', 'test_notification_events')
 _VERIFY_INPUTS = ('loop_manager_internal/verification/', 'scripts/verify',
                  'scripts/unittest', 'sitecustomize.py', 'pyproject.toml',
-                 'requirements', 'config/config.ini')
+                 'requirements', 'config/config.ini',
+                 'loop_manager_internal/execution/verify_process.py',
+                 'loop_manager_internal/execution/windows_job.py')
 _PROTECTED = ('loop_manager_internal/git/', 'loop_manager_internal/storage/',
               'loop_manager_internal/recovery/', 'loop_manager_internal/verification/',
               'loop_manager_internal/security/', 'loop_manager_internal/agents/',
