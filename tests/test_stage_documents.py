@@ -14,6 +14,7 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, 
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from tests.support.execution import ExecutionFixture, READY_WORKER_RESULT
+from tests.support.git import git_command, isolated_git_test
 
 
 class DocumentProtocolTests(TestCase):
@@ -44,7 +45,12 @@ class DocumentProtocolTests(TestCase):
                      evidence='현재 구현이 변경된 조건을 충족하며 검증은 별도 확인한다.')
         output = 'DOCUMENT_RESULT: ' + json.dumps(value)
         self.assertEqual(documents.parse_assessment(output), value)
-        for invalid in (output + '\n' + output, 'DOCUMENT_RESULT: {}',
+        formatted = ('- **DOCUMENT_RESULT** =\n```json\n'
+                     + json.dumps(value, indent=2) + '\n```')
+        self.assertEqual(documents.parse_assessment(formatted), value)
+        duplicate_key = ('DOCUMENT_RESULT: {"relevant":false,"relevant":true,'
+                         '"implementation":"satisfied","plan_text":null,"evidence":"근거"}')
+        for invalid in (output + '\n' + output, 'DOCUMENT_RESULT: {}', duplicate_key,
                         'DOCUMENT_RESULT: ' + json.dumps({**value, 'evidence': ''}),
                         'DOCUMENT_RESULT: ' + json.dumps({**value, 'relevant': False, 'implementation': 'needed'})):
             with self.subTest(invalid=invalid), self.assertRaises(PlannerValidationError):
@@ -164,9 +170,6 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
 
 
 
-
-
-
     def test_upper_specification_does_not_repeat_task_planning(self):
         context = self.review_context()
         current = self.handler._definition_snapshot
@@ -228,7 +231,276 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
         self.assertIsNone(documents.pending(checkpoints, self.repo, 'G-047'))
         effects.run_agent.assert_not_called()
 
+    def test_prepared_document_pr_race_preserves_candidate_and_execution_history(self):
+        import hashlib
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.planning.planning_catalog import snapshot_to_dict
 
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        identity = self.handler._identity
+        plan_text = ('---\nid: G-047\ntitle: Existing plan\nsources:\n  - docs/PRODUCT.md\n'
+                     'depends_on: []\ncomplexity: low\nrisk: low\npriority: normal\n---\n')
+        original = ReadyPlanSnapshot(
+            plan_id='G-047', path=current.path, title='Existing plan',
+            sources=('docs/PRODUCT.md',), depends_on=(), complexity='low', risk='low',
+            priority='normal', content_hash='saved-content', plan_sha=current.revision_sha,
+            text=plan_text,
+        )
+        output = 'DOCUMENT_RESULT: ' + json.dumps(dict(
+            relevant=True, implementation='satisfied', plan_text=plan_text, evidence='saved proposal',
+        ))
+        worker_snapshot = GitSnapshot(
+            head=current.revision_sha, branch='work', index={}, dirty={}, operations={},
+            refs={}, worktrees={}, config={},
+        )
+        workspace = (identity.state_dir / 'worktrees' / hashlib.sha256(self.repo.encode()).hexdigest()[:16]
+                     / 'document-revisions' / 'G-047' / current.revision_sha)
+        saved = {
+            'version': 1, 'stage': 'prepared', 'base': current.revision_sha,
+            'phase': 'REVIEWING', 'paths': ['docs/PRODUCT.md'], 'document_only': True,
+            'previous': current.serialize(), 'assessment': documents.parse_assessment(output),
+            'assessment_raw_result': output, 'candidate': current.revision_sha,
+            'worker_snapshot': worker_snapshot.serialize(), 'workspace': str(workspace),
+            'commit': 'b' * 40, 'original': snapshot_to_dict(original),
+            'worker_result': 'saved worker result', 'verify_result': 'saved verify result',
+        }
+        documents.save(checkpoints, self.repo, 'G-047', saved)
+        effects = self.document_effects(current.revision_sha)
+        effects.assert_snapshot = mock.Mock()
+        effects.pr_for_branch.side_effect = [None, {'url': 'https://example/pr/1'}]
+        effects.git.side_effect = lambda _root, *args, **_kwargs: SimpleNamespace(
+            returncode=1 if args[0] == 'merge-base' else 0,
+            stdout=(current.revision_sha if args[0] == 'rev-parse' and args[-1] == 'origin/main' else ''),
+        )
+
+        result = documents.refresh(
+            effects, self.state, checkpoints, identity, context, current, current, [],
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(documents.pending(checkpoints, self.repo, 'G-047'), saved)
+        self.assertEqual(self.state.row()['worker_result'], 'worker result')
+        self.assertEqual(self.state.row()['verify_result'], 'successful verify output')
+        self.assertEqual(effects.pr_for_branch.call_count, 2)
+        self.assertFalse(any(call.args[1] == 'push' for call in effects.git.call_args_list))
+        effects.run_agent.assert_not_called()
+
+    def test_proposed_pr_race_from_snapshot_is_handed_off_by_revision_handler(self):
+        from loop_manager_internal.planning.planner_validation import (
+            MutableReadySnapshotEffects, mutable_ready_snapshot,
+        )
+        from loop_manager_internal.planning.planning_catalog import mutable_snapshot_token
+
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        plan_text = '---\nid: G-047\ntitle: Runtime\n---\n## Purpose\nRevised conditions\n'
+        assessment = dict(
+            relevant=True, implementation='satisfied', plan_text=plan_text, evidence='저장된 개정 후보',
+        )
+        output = 'DOCUMENT_RESULT: ' + json.dumps(assessment)
+        document_effects = self.document_effects()
+        saved = {
+            'version': 1, 'stage': 'proposed', 'base': current.revision_sha,
+            'phase': 'REVIEWING', 'paths': [current.path], 'document_only': True,
+            'previous': current.serialize(), 'assessment': assessment,
+            'assessment_result': assessment, 'assessment_raw_result': output,
+            'candidate': current.revision_sha,
+            'worker_snapshot': document_effects.capture_scope.return_value.serialize(),
+            'worker_result': 'saved worker result', 'verify_result': 'saved verify result',
+        }
+        documents.save(checkpoints, self.repo, 'G-047', saved)
+        self.connection.execute(
+            "UPDATE exec_plans SET status='REVIEWING', branch=?, ever_started=1 "
+            "WHERE repo=? AND plan_id='G-047'",
+            (context.branch, self.repo),
+        )
+        self.connection.commit()
+
+        pull_request = {'url': 'https://example/pr/1'}
+        pr_for_branch = mock.Mock(side_effect=[None, pull_request, pull_request])
+        snapshot_effects = MutableReadySnapshotEffects(
+            _ensure_execplans_schema=mock.Mock(),
+            _ready_plan_snapshot_at_revision=mock.Mock(
+                side_effect=AssertionError('PR-backed plan must be excluded before Git inspection')
+            ),
+            _row_is_mutable_ready=mock.Mock(return_value=True),
+            mutable_snapshot_token=mutable_snapshot_token,
+            pr_for_branch=pr_for_branch,
+        )
+        snapshots = []
+
+        def prepare_snapshot(connection, repo, worktree, active_sha):
+            snapshot = mutable_ready_snapshot(
+                snapshot_effects, connection, repo, worktree, active_sha,
+            )
+            snapshots.append(snapshot)
+            return snapshot
+
+        document_effects.prepare_snapshot.side_effect = prepare_snapshot
+        document_effects.pr_for_branch = pr_for_branch
+        self.effects = replace(
+            self.effects,
+            checkpoint=checkpoints,
+            revision=replace(
+                self.effects.revision,
+                refresh_documents=lambda active, previous, definition, changed: documents.refresh(
+                    document_effects, self.state, checkpoints, self.handler._identity,
+                    active, previous, definition, changed,
+                ),
+            ),
+        )
+        self.handler.effects = self.effects
+
+        result = self.handler.guard(context)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].by_id, {})
+        self.assertEqual(pr_for_branch.call_count, 3)
+        self.assertFalse(
+            isinstance(result, ExecutionOutcome) and result.kind is ExecutionOutcomeKind.FINAL_BLOCK
+        )
+        self.assertEqual(documents.pending(checkpoints, self.repo, 'G-047'), saved)
+        self.assertEqual(self.state.row()['worker_result'], 'worker result')
+        self.assertEqual(self.state.row()['verify_result'], 'successful verify output')
+        self.assertFalse(any(call.args[1] == 'push' for call in document_effects.git.call_args_list))
+
+    def test_unchanged_legacy_plan_keeps_raw_and_normalized_assessment(self):
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        effects = self.document_effects(current.revision_sha)
+        plan_text = '---\nid: G-047\ntitle: Existing plan\n---\n## Purpose\nKeep this plan\n'
+        assessment = dict(
+            relevant=True, implementation='satisfied', plan_text=plan_text, evidence='조건이 이미 반영됨',
+        )
+        raw_result = '- **DOCUMENT_RESULT** =\n```json\n' + json.dumps(assessment, indent=2) + '\n```'
+        worker_snapshot = effects.capture_scope.return_value.serialize()
+        saved = {
+            'version': 1, 'stage': 'proposed', 'base': current.revision_sha,
+            'phase': 'REVIEWING', 'paths': [current.path], 'document_only': True,
+            'previous': current.serialize(), 'assessment': assessment,
+            'assessment_raw_result': raw_result,
+            'candidate': current.revision_sha, 'worker_snapshot': worker_snapshot,
+        }
+        documents.save(checkpoints, self.repo, 'G-047', saved)
+        effects.prepare_snapshot.return_value = SimpleNamespace(
+            by_id={'G-047': SimpleNamespace(text=plan_text)},
+        )
+
+        result = documents.refresh(
+            effects, self.state, checkpoints, self.handler._identity,
+            context, current, current, [],
+        )
+
+        self.assertEqual(result['stage'], 'done')
+        self.assertIsNone(result['assessment']['plan_text'])
+        self.assertEqual(result['assessment_result'], assessment)
+        self.assertEqual(result['assessment_raw_result'], raw_result)
+        effects.run_agent.assert_not_called()
+
+    def test_legacy_raw_only_assessment_survives_published_resume(self):
+        import hashlib
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.planning.planning_catalog import snapshot_to_dict
+
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        identity = self.handler._identity
+        plan_text = ('---\nid: G-047\ntitle: Existing plan\nsources:\n  - docs/PRODUCT.md\n'
+                     'depends_on: []\ncomplexity: low\nrisk: low\npriority: normal\n---\n')
+        original = ReadyPlanSnapshot(
+            plan_id='G-047', path=current.path, title='Existing plan',
+            sources=('docs/PRODUCT.md',), depends_on=(), complexity='low', risk='low',
+            priority='normal', content_hash='saved-content', plan_sha=current.revision_sha,
+            text=plan_text,
+        )
+        assessment = dict(
+            relevant=True, implementation='satisfied', plan_text=plan_text, evidence='saved proposal',
+        )
+        raw_result = '- **DOCUMENT_RESULT** =\n```json\n' + json.dumps(assessment, indent=2) + '\n```'
+        worker_snapshot = GitSnapshot(
+            head=current.revision_sha, branch='work', index={}, dirty={}, operations={},
+            refs={}, worktrees={}, config={},
+        )
+        workspace = (identity.state_dir / 'worktrees' / hashlib.sha256(self.repo.encode()).hexdigest()[:16]
+                     / 'document-revisions' / 'G-047' / current.revision_sha)
+        saved = {
+            'version': 1, 'stage': 'prepared', 'base': current.revision_sha,
+            'phase': 'REVIEWING', 'paths': ['docs/PRODUCT.md'], 'document_only': True,
+            'previous': current.serialize(), 'assessment': assessment,
+            'assessment_raw_result': raw_result, 'candidate': current.revision_sha,
+            'worker_snapshot': worker_snapshot.serialize(), 'workspace': str(workspace),
+            'commit': 'b' * 40, 'original': snapshot_to_dict(original),
+        }
+        documents.save(checkpoints, self.repo, 'G-047', saved)
+        effects = self.document_effects(current.revision_sha)
+        effects.assert_snapshot = mock.Mock()
+        fetch_count = 0
+
+        def git(root, *args, **_kwargs):
+            nonlocal fetch_count
+            if args == ('fetch', 'origin'):
+                fetch_count += 1
+                return SimpleNamespace(returncode=0, stdout='')
+            if args == ('rev-parse', 'origin/main'):
+                return SimpleNamespace(returncode=0, stdout=('b' * 40 if fetch_count >= 2 else current.revision_sha))
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(returncode=1, stdout='')
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(returncode=0, stdout='b' * 40)
+            if args == ('status', '--porcelain'):
+                return SimpleNamespace(returncode=0, stdout='')
+            if args[:2] == ('diff', '--name-only'):
+                return SimpleNamespace(returncode=0, stdout=f'{current.path}\n')
+            if args[:1] == ('push',):
+                return SimpleNamespace(returncode=0, stdout='')
+            raise AssertionError((root, args))
+
+        effects.git.side_effect = git
+        published = documents.refresh(
+            effects, self.state, checkpoints, identity, context, current, current, [],
+        )
+
+        self.assertEqual(published['stage'], 'rebase')
+        self.assertTrue(published['assessment_complete'])
+        self.assertIsNone(published['assessment']['plan_text'])
+        self.assertEqual(published['assessment_result'], assessment)
+        self.assertEqual(published['assessment_raw_result'], raw_result)
+        self.assertEqual(fetch_count, 2)
+
+        next_definition = replace(current, revision_sha='b' * 40)
+        self.state.update_project(self.repo, active_sha='b' * 40)
+        resumed = documents.refresh(
+            effects, self.state, checkpoints, identity, context, current, next_definition, [],
+        )
+
+        self.assertEqual(resumed['stage'], 'done')
+        self.assertIsNone(resumed['assessment']['plan_text'])
+        self.assertEqual(resumed['assessment_result'], assessment)
+        self.assertEqual(resumed['assessment_raw_result'], raw_result)
+        self.assertEqual(fetch_count, 2)
+        self.assertEqual([call.args[1] for call in effects.git.call_args_list].count('push'), 1)
+        effects.run_agent.assert_not_called()
+
+    def test_remote_race_keeps_proposal_and_code_invalidation(self):
+        from tests.support.revision import definition
+        old = dict(previous=definition().serialize(), paths=['docs/PRODUCT.md'], document_only=True,
+            base='old', assessment={'evidence': 'old'}, assessment_result={'evidence': 'old'},
+            assessment_raw_result='raw DOCUMENT_RESULT', last_result='last output',
+            validation_error='old validation error', workspace='owned', commit='candidate')
+        item = documents.restart_assessment(old, 'new', ['app.py', 'docs/ARCHITECTURE.md'])
+        self.assertEqual(item['stage'], 'rebase')
+        self.assertFalse(item['document_only'])
+        self.assertIsNone(item['assessment'])
+        self.assertNotIn('workspace', item)
+        self.assertEqual(item['superseded'][0]['commit'], 'candidate')
+        self.assertEqual(item['superseded'][0]['assessment_raw_result'], 'raw DOCUMENT_RESULT')
+        for key in ('assessment_result', 'assessment_raw_result', 'last_result', 'validation_error'):
+            self.assertNotIn(key, item)
 
     def test_work_branch_document_observation_does_not_grant_adoption(self):
         context = self.review_context()
@@ -314,3 +586,132 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
             operation='rebase', expected_head='head', target_base_oid='new-base',
             observed_remote_oid=None, snapshot={'rebase': 'owned'})
         self.assertEqual(documents.pending(checkpoints, self.repo, 'G-047'), before)
+
+
+@isolated_git_test
+class ProposedDocumentPRRaceTests(ExecutionFixture, TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.repo_path = Path(self.temporary.name)
+        self.repo_path.mkdir(parents=True, exist_ok=True)
+        git_command(self.repo_path, 'init', '-b', 'main')
+        git_command(self.repo_path, 'config', 'user.email', 'worker@example.com')
+        git_command(self.repo_path, 'config', 'user.name', 'Worker Test')
+        self.plan_path = 'docs/plans/[G-047] Runtime.md'
+        self.plan_text = ('---\nid: G-047\ntitle: Runtime\nsources:\n  - docs/PRODUCT.md\n'
+                          'depends_on: []\ncomplexity: medium\nrisk: medium\npriority: normal\n'
+                          '---\n\n## Purpose\n\nKeep current behavior.\n')
+        (self.repo_path / 'docs/plans').mkdir(parents=True)
+        (self.repo_path / 'docs/PRODUCT.md').parent.mkdir(parents=True, exist_ok=True)
+        (self.repo_path / 'docs/PRODUCT.md').write_text('# Product\n', encoding='utf-8')
+        (self.repo_path / self.plan_path).write_text(self.plan_text, encoding='utf-8')
+        git_command(self.repo_path, 'add', '-A')
+        git_command(self.repo_path, 'commit', '-m', 'initial plan')
+        self.base = git_command(self.repo_path, 'rev-parse', 'HEAD')
+        self.repo = str(self.repo_path)
+        super().setUp()
+
+    def test_proposed_pr_race_keeps_candidate_when_real_snapshot_excludes_plan(self):
+        import hashlib
+        import loop_manager as lm
+        from loop_manager_internal.execution.execution_runtime import ExecutionPhase
+
+        self.handler.repo_path = self.repo_path
+        self.handler.base_sha = self.base
+        self.remote = self.base
+        digest = hashlib.sha256(self.plan_text.encode('utf-8')).hexdigest()
+        self.review_context()
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash=?, current_complexity='medium', current_risk='medium', "
+            "current_revision_sha=?, plan_sha=?, active_sha=? WHERE repo=? AND plan_id='G-047'",
+            (digest, self.base, self.base, self.base, self.repo),
+        )
+        self.connection.execute(
+            'UPDATE projects SET active_sha=?, validated_base_sha=? WHERE repo=?',
+            (self.base, self.base, self.repo),
+        )
+        self.connection.commit()
+        self.state.expected = self.repository.projected(self.repo)
+        definition = replace(self.handler._definition_snapshot, revision_sha=self.base)
+        self.handler._definition_snapshot = definition
+        verify_output = 'successful verify output'
+        self.state.update_project(
+            self.repo, active_sha=self.base, phase='REVIEWING', definition_snapshot=definition.serialize(),
+            worker_result=READY_WORKER_RESULT, worker_input_token=definition.worker_token,
+            archive_token=definition.archive_token, validated_base_sha=self.base,
+            verify_token=definition.verify_token(self.base, self.base, verify_output),
+        )
+        context = self.handler._context()
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        scope = GitSnapshot(
+            head='owned-head', branch=context.branch, index={}, dirty={}, operations={},
+            refs={}, worktrees={}, config={},
+        )
+        proposed = self.plan_text.replace('Keep current behavior.', 'Add a new behavior.')
+        assessment = dict(
+            relevant=True, implementation='needed', plan_text=proposed, evidence='The proposed change needs implementation.',
+        )
+        raw_result = 'DOCUMENT_RESULT: ' + json.dumps(assessment)
+        pending = {
+            'version': 1, 'stage': 'proposed', 'base': self.base,
+            'phase': ExecutionPhase.REVIEWING.value, 'paths': [self.plan_path], 'document_only': True,
+            'previous': definition.serialize(), 'worker_result': READY_WORKER_RESULT,
+            'verify_result': verify_output, 'verify_base': self.base,
+            'assessment': assessment, 'assessment_result': assessment,
+            'assessment_raw_result': raw_result, 'candidate': scope.head,
+            'worker_snapshot': scope.serialize(),
+        }
+        documents.save(checkpoints, self.repo, 'G-047', pending)
+
+        pr_visible = False
+        lookups = []
+        snapshots = []
+
+        def lookup(repository, branch, *_args):
+            lookups.append((str(repository), branch, pr_visible))
+            return {'url': 'https://example/pr/1'} if pr_visible else None
+
+        def prepare_snapshot(connection, repo, repository, active_sha):
+            nonlocal pr_visible
+            pr_visible = True
+            snapshot = lm.mutable_ready_snapshot(connection, repo, repository, active_sha)
+            snapshots.append(snapshot)
+            return snapshot
+
+        stage_effects = documents.StageDocumentEffects(
+            git=lambda _repo, *args, **_kwargs: SimpleNamespace(
+                returncode=0,
+                stdout=self.base if args[:2] == ('rev-parse', 'origin/main') else '',
+            ),
+            capture_scope=lambda _worktree: scope,
+            validate_scope=mock.Mock(),
+            prepare_snapshot=prepare_snapshot, assert_snapshot=mock.Mock(),
+            validate_result=mock.Mock(), validate_worktree=mock.Mock(),
+            pr_for_branch=lookup, log=mock.Mock(),
+        )
+        identity = self.handler._identity
+        self.handler.effects = replace(
+            self.handler.effects,
+            checkpoint=checkpoints,
+            revision=replace(
+                self.handler.effects.revision,
+                refresh_documents=lambda current, previous, latest, changed: documents.refresh(
+                    stage_effects, self.state, checkpoints, identity,
+                    current, previous, latest, changed,
+                ),
+            ),
+        )
+
+        with mock.patch.object(lm, 'pr_for_branch', side_effect=lookup):
+            result = self.handler.guard(context)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertNotIn('G-047', snapshots[0].by_id)
+        self.assertEqual(
+            [visible for _repository, _branch, visible in lookups], [False, True, True],
+            f'result={result!r}; pending={documents.pending(checkpoints, self.repo, "G-047")!r}',
+        )
+        self.assertFalse(isinstance(result, ExecutionOutcome)
+                         and result.kind is ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(documents.pending(checkpoints, self.repo, 'G-047'), pending)

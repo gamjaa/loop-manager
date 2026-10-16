@@ -19,6 +19,7 @@ from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, Rec
 from loop_manager_internal.storage import runtime_state, verify_receipts
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
+from loop_manager_internal.application.result_normalization import tagged_json
 from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.git.command_adapter import revision_requirement_documents
 
@@ -149,13 +150,15 @@ def restart_assessment(item, base, changed, *, git_bytes=None, repository=None):
     )
     return {**{key: value for key, value in item.items() if key not in {
                 'workspace', 'original', 'commit', 'candidate', 'assessment_complete', 'published_plan_text',
-                'planner_workspace', 'planner_generation', 'planner_scope', 'planner_scope_history', 'worker_snapshot'}},
+                'planner_workspace', 'planner_generation', 'planner_scope', 'planner_scope_history',
+                'worker_snapshot', 'assessment_result', 'assessment_raw_result', 'last_result', 'validation_error'}},
             'stage': 'rebase', 'base': base, 'assessment': None,
             'paths': sorted(set(item['paths']) | set(paths)),
             'document_only': item['document_only'] and documentary(changed),
             'superseded': [*item.get('superseded', []),
                 {key: item.get(key) for key in ('base', 'assessment', 'workspace', 'commit', 'candidate',
-                    'planner_workspace', 'planner_scope', 'planner_scope_history', 'worker_snapshot')}]}
+                    'planner_workspace', 'planner_scope', 'planner_scope_history', 'worker_snapshot',
+                    'assessment_result', 'assessment_raw_result', 'last_result', 'validation_error')}]}
 
 
 def review_pending(checkpoints, repo, plan_id, definition, candidate):
@@ -167,11 +170,8 @@ def review_pending(checkpoints, repo, plan_id, definition, candidate):
 
 
 def parse_assessment(output):
-    lines = [line for line in output.splitlines() if line.startswith("DOCUMENT_RESULT:")]
-    if len(lines) != 1:
-        raise PlannerValidationError("문서 영향 판단에는 하나의 DOCUMENT_RESULT가 필요합니다.")
     try:
-        value = json.loads(lines[0].partition(":")[2])
+        value = tagged_json(output, "DOCUMENT_RESULT")
     except (ValueError, TypeError) as error:
         raise PlannerValidationError("DOCUMENT_RESULT JSON이 유효하지 않습니다.") from error
     if (not isinstance(value, dict) or set(value) != {"relevant", "implementation", "plan_text", "evidence"}
@@ -241,7 +241,7 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
     if item is None:
         return None
     if row['pr_url'] or effects.pr_for_branch(identity.repo_path, context.branch) is not None:
-        if item is not None:
+        if item is not None and item['stage'] not in {'proposed', 'prepared'}:
             save(checkpoints, repo, plan_id, None)
         return None
     if item and item.get('work_branch'):
@@ -298,6 +298,11 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         return None
     assessment = item["assessment"]
     assessment = parse_assessment('DOCUMENT_RESULT: ' + json.dumps(assessment))
+    assessment_result = item.get('assessment_result', assessment)
+    if (item.get('assessment_raw_result') is not None
+            and parse_assessment(item['assessment_raw_result'])
+            != assessment_result):
+        raise PlannerValidationError('보존된 DOCUMENT_RESULT 원문과 정규화 결과가 다릅니다.')
     if item['stage'] == 'proposed' and not item.get('assessment_complete'):
         assert_assessment_inputs(effects, checkpoints, identity, context, item)
     if assessment["implementation"] == "uncertain":
@@ -307,9 +312,12 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         snapshot = effects.prepare_snapshot(state.connection, repo, identity.repo_path, item["base"])
         original = snapshot.by_id.get(plan_id)
         if original is None:
+            if effects.pr_for_branch(identity.repo_path, context.branch) is not None:
+                return None
             raise PlannerValidationError("현재 계획의 PR 전 갱신 권한이 없습니다.")
         if assessment['plan_text'] == original.text:
-            item = {**item, 'assessment': {**assessment, 'plan_text': None}}
+            item = {**item, 'assessment_result': assessment_result,
+                    'assessment': {**assessment, 'plan_text': None}}
             save(checkpoints, repo, plan_id, item)
             return refresh(effects, state, checkpoints, identity, context, previous, definition, changed)
         snapshot = MutableReadySnapshot(repo, snapshot.active_sha, (original,),
@@ -385,7 +393,7 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
             effects.assert_snapshot(state.connection, snapshot)
             assert_assessment_inputs(effects, checkpoints, identity, context, item)
             if effects.pr_for_branch(identity.repo_path, context.branch) is not None:
-                raise PlannerValidationError("문서 게시 전에 연결 PR이 등록됐습니다.")
+                return None
             if (effects.git(workspace, "rev-parse", "HEAD").stdout.strip() != item["commit"]
                     or effects.git(workspace, "status", "--porcelain").stdout.strip()
                     or effects.git(workspace, "diff", "--name-only", item["base"], item["commit"]).stdout.splitlines() != [original.path]):
@@ -405,6 +413,7 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace, published=True)
         item = {**item, "stage": "rebase", "base": remote,
                 "assessment_complete": True, "published_plan_text": assessment["plan_text"],
+                "assessment_result": assessment_result,
                 "assessment": {**assessment, "plan_text": None}}
         save(checkpoints, repo, plan_id, item)
         return item

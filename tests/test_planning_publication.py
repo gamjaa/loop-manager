@@ -380,6 +380,94 @@ class PlanningPublicationTest(PlanningCase):
             ("push", "origin", "HEAD:refs/heads/main"), commands
         )
 
+    def test_live_pr_race_defers_before_push_and_preserves_planning_candidate(self):
+        from loop_manager_internal.planning.planner_validation import MutableReadyPRConflict
+
+        ports = FakePorts(
+            planning_snapshot(
+                phase="PLANNING",
+                active_sha="base",
+                worktree="/planning",
+                planning_attempt_fingerprint="fingerprint",
+                planning_workspace_owned=1,
+                planning_result_pending_validation=True,
+                planning_result_completed=True,
+                planning_result="completed",
+            )
+        )
+        ports.git.dirty_files = ["docs/plans/[G-001] Plan.md"]
+        ports.state.record_general_intent = mock.Mock(
+            side_effect=MutableReadyPRConflict("mutable READY snapshot 이후 PR이 등록됐습니다: G-001")
+        )
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/planning")
+        run.validated_result = ports.validation.result
+        run.dirty_files = list(ports.git.dirty_files)
+        run.current_fingerprint = "fingerprint"
+        run.general_fingerprint = "fingerprint"
+        run.specification_fingerprint = "specification"
+
+        outcome = coordinator._publication._publish_planner_result(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+        self.assertEqual(ports.state.snapshot.phase, "PLANNING")
+        self.assertEqual(ports.state.snapshot.worktree, "/planning")
+        self.assertEqual(ports.state.snapshot.planning_result, "completed")
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        ports.state.record_general_intent.assert_called_once()
+        commands = [arguments for _repo, arguments, _check in ports.git.calls]
+        self.assertNotIn(("push", "origin", "HEAD:refs/heads/main"), commands)
+        self.assertEqual(ports.state.clear_calls, [])
+
+    def test_live_pr_race_after_fetch_supersedes_only_unpublished_intent(self):
+        from loop_manager_internal.planning.planner_validation import MutableReadyPRConflict
+
+        ports = FakePorts(
+            planning_snapshot(
+                phase="PLANNING",
+                active_sha="base",
+                worktree="/planning",
+                planning_attempt_fingerprint="fingerprint",
+                planning_workspace_owned=1,
+                planning_result_pending_validation=True,
+                planning_result_completed=True,
+                planning_result="completed",
+            )
+        )
+        ports.git.dirty_files = ["docs/plans/[G-001] Plan.md"]
+        record_intent = ports.state.record_general_intent
+        calls = 0
+
+        def record_or_race(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise MutableReadyPRConflict("mutable READY snapshot 이후 PR이 등록됐습니다: G-001")
+            return record_intent(*args)
+
+        ports.state.record_general_intent = mock.Mock(side_effect=record_or_race)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/planning")
+        run.validated_result = ports.validation.result
+        run.dirty_files = list(ports.git.dirty_files)
+        run.current_fingerprint = "fingerprint"
+        run.general_fingerprint = "fingerprint"
+        run.specification_fingerprint = "specification"
+
+        outcome = coordinator._publication._publish_planner_result(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+        self.assertIsNone(ports.state.general_intent)
+        self.assertEqual(ports.state.snapshot.worktree, "/planning")
+        self.assertEqual(ports.state.snapshot.planning_result, "completed")
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        self.assertEqual(ports.state.record_general_intent.call_count, 2)
+        commands = [arguments for _repo, arguments, _check in ports.git.calls]
+        self.assertNotIn(("push", "origin", "HEAD:refs/heads/main"), commands)
+        self.assertEqual(ports.state.clear_calls, [])
+
     def test_prepared_publication_recovers_before_agent_or_validation(self):
         cycle = maintenance_cycle(
             phase=maintenance_state.MaintenancePhase.ASSESSMENT,
