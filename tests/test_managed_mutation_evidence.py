@@ -1216,13 +1216,18 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
 
 class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     """The production factory's identity/input adapters, with no Git process."""
+    _plan_text = ('---\nid: G-047\ntitle: Runtime\nsources:\n  - docs/PRODUCT.md\n'
+                  'depends_on: []\ncomplexity: medium\nrisk: medium\n---\n\nOriginal body.\n')
+
     def test_auxiliary_markers_preserve_original_document_preflight_exception(self):
         from loop_manager_internal.git.managed_rebase_runtime import build_service
         from tests.support.runtime import runtime_rebase_fixture
         from tests.support.rebase_observations import observation
         from loop_manager_internal.git.managed_rebase_validation import WorktreeFile
-        ports, _ = self._user_document_service()
+        ports, previous = self._user_document_service()
+        worktree = Path(previous.expected.worktree)
         connection, *_ = runtime_rebase_fixture(self)
+        connection.execute("UPDATE exec_plans SET worktree=? WHERE plan_id='G-047'", (str(worktree),))
         path = 'docs/plans/[G-265] Historical.md'
         auxiliary = {'REBASE_HEAD': 'last-commit', 'MERGE_MSG': 'message'}
         ports._owned_rebase_metadata.return_value = None
@@ -1238,7 +1243,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             return original_git(root, *args, **kwargs)
         ports.git.side_effect = git
         service = build_service(ports, connection, Path(REPO), Path('/state'),
-                                'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
+                                'repo', 'G-047', worktree, 'loop-manager/G-047')
         current = observation(service.expected, head='before', operations=tuple(auxiliary.items()),
             committed=(FileChange(path, '100644', '100644', 'old', 'historical', 'M'),))
         self.assertTrue(service.adapters.path_allowed(path))
@@ -1269,7 +1274,14 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         from tests.support.runtime import runtime_rebase_fixture
         from loop_manager_internal.git.managed_rebase_runtime import build_service
         connection, _, checkpoints, *_ = runtime_rebase_fixture(self)
-        worktree = worktree or Path('/owned')
+        if worktree is None:
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            worktree = Path(directory.name)
+        selected = worktree / 'docs/plans/[G-047] Runtime.md'
+        selected.parent.mkdir(parents=True, exist_ok=True)
+        if not selected.exists():
+            selected.write_text(self._plan_text, encoding='utf-8')
         if str(worktree) != '/owned':
             connection.execute("UPDATE exec_plans SET worktree=? WHERE repo='repo' AND plan_id='G-047'", (str(worktree),))
         current = checkpoints.get('repo', 'G-047')
@@ -1286,10 +1298,14 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             elif args[0] == 'diff':
                 output = ''.join(':100644 100644 old user M\0' + path + '\0'
                     for path in ('docs/requirements/archive/UserGuidance.md', 'docs/requirements/archive/UserDesign.md'))
+            elif args[0] == 'show':
+                output = self._plan_text
             elif args[0] == 'hash-object':
                 output = 'worker-blob'
             return SimpleNamespace(stdout=output, returncode=0)
         ports.git.side_effect = git
+        ports.live_remote_branch_oid.return_value = 'remote'
+        ports.pr_for_branch.return_value = None
         ports.requirement_archive_candidates.return_value = ()
         ports._published_plan_allows_common_plans.return_value = False
         ports._revision_execplan_input_fingerprint.return_value = 'published-input'
@@ -1319,7 +1335,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         import hashlib
         from tests.support.rebase_observations import observation
         path = 'docs/plans/[G-047] Runtime.md'
-        pinned = b'---\nid: G-047\ntitle: Runtime\n---\n\nOriginal body.\n'
+        pinned = self._plan_text.encode()
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory)
             target = worktree / path
@@ -1346,6 +1362,17 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                 target.write_bytes(changed)
                 _, service = self._user_document_service(record, worktree=worktree, pending=False, worker=worker)
                 self.assertFalse(service.adapters.contracts_allowed(current))
+
+    def test_completed_rebase_rejects_worker_supplied_user_decision(self):
+        from tests.support.rebase_observations import observation
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            _, service = self._user_document_service(worktree=worktree, pending=False)
+            self.assertTrue(service.adapters.contracts_allowed(observation(service.expected)))
+            selected = worktree / 'docs/plans/[G-047] Runtime.md'
+            selected.write_text(self._plan_text + '\n## User Decision\nDecision: approved\n', encoding='utf-8')
+            _, changed = self._user_document_service(worktree=worktree, pending=False)
+            self.assertFalse(changed.adapters.contracts_allowed(observation(changed.expected)))
 
     def test_adopted_document_pin_does_not_reject_later_worker_notes(self):
         from tests.support.rebase_observations import observation
@@ -1560,30 +1587,13 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                             Path(REPO), 'base', Path('/owned'))
 
     def test_factory_uses_current_inputs_exact_lease_and_final_scope(self):
-        from tests.support.runtime import runtime_rebase_fixture
-        from loop_manager_internal.git.managed_rebase_runtime import build_service
         from tests.support.rebase_observations import observation
-        connection, runtime, checkpoints, original, expected, decision = runtime_rebase_fixture(self)
-        ports = mock.Mock()
-        ports.WORKSPACE_OWNED = 1
-        ports.git.side_effect = lambda _root, *args, **kwargs: SimpleNamespace(
-            stdout='/repo/.git' if args == ('rev-parse', '--git-common-dir') else '', returncode=0)
-        ports.requirement_archive_candidates.return_value = ()
-        ports._published_plan_allows_common_plans.return_value = False
-        ports._revision_execplan_input_fingerprint.return_value = 'published-input'
-        ports._worktree_execplan_input_fingerprint.return_value = 'current-input'
-        ports._owned_rebase_metadata.return_value = None
-        ports.live_remote_branch_oid.return_value = 'remote'
-        ports.pr_for_branch.return_value = None
-        ports._worker_path_allowed.side_effect = loop_manager._worker_path_allowed
-        service = build_service(ports, connection, Path(REPO), Path('/state'),
-                                'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
+        ports, service = self._user_document_service(pending=False)
         self.assertEqual(service.expected.remote.oid, 'remote')
         self.assertEqual(service.expected.before_head, 'before')
         self.assertIsNone(service.adapters.read_remote(service.expected).pull_request)
         self.assertTrue(service.adapters.path_allowed('app.py'))
         self.assertFalse(service.adapters.path_allowed('docs/requirements/Active.md'))
-        self.assertFalse(service.adapters.path_allowed('docs/requirements/archive/UserDesign.md'))
         self.assertFalse(service.adapters.path_allowed('docs/plans/[G-048] Other.md'))
         self.assertFalse(service.adapters.path_allowed('docs/requirements/archive/Other.md'))
         first = service.adapters.read_inputs(service.expected)
