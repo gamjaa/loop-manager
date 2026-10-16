@@ -17,6 +17,7 @@ from loop_manager_internal.config.managed_config import ManagedConfigError
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.storage.runtime_state import TaskLimitReached
+from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
 from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.handoff_gate import RuntimeHandoffGate
 from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
@@ -66,7 +67,7 @@ def _run_registered_project(
             # The scheduler connection completed migrations before starting any
             # project threads. Repeating DDL here races with another project's
             # state transaction and can fail with SQLITE_BUSY.
-            with closing(effects.connect_database(state_dir, run_migrations=False)) as connection, connection:
+            with closing(effects.connect_database(state_dir, run_migrations=False)) as connection:
                 notifications.configure_session(
                     connection, enabled=bool(telegram_token and telegram_chat_id)
                 )
@@ -111,6 +112,9 @@ def _run_registered_project(
                         )
         except TaskLimitReached as error:
             result = ProjectRunResult(ProjectRunKind.WAITING, 0, str(error))
+        except DatabaseWaitTimeout as error:
+            result = ProjectRunResult(ProjectRunKind.TRANSIENT_PAUSE, 0, str(error))
+            events.emit("DB 접근 대기 종료; 프로젝트 상태 보존", level="WARN", reason=str(error))
         except SelfMergeRuntimeHandoff:
             if handoff_gate is not None:
                 handoff_gate.stop()

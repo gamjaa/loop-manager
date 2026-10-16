@@ -243,6 +243,8 @@ class CoordinatedConnection(sqlite3.Connection):
                 self._release()
 
     def commit(self):
+        if not self.in_transaction:
+            return super().commit()
         with self.access():
             while True:
                 try:
@@ -256,6 +258,8 @@ class CoordinatedConnection(sqlite3.Connection):
                         time.sleep(min(.01, max(0, self._deadline-time.monotonic())))
 
     def rollback(self):
+        if not self.in_transaction:
+            return super().rollback()
         with self.access():
             return super().rollback()
 

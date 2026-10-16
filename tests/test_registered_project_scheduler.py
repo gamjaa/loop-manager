@@ -13,6 +13,17 @@ import loop_manager
 
 
 class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
+    def test_database_wait_during_project_setup_is_a_transient_pause(self):
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.runtime.project_registry import RegisteredProject
+        project = RegisteredProject('repo', 'main', 'codex', None, False)
+        with mock.patch('loop_manager.connect_database', side_effect=DatabaseWaitTimeout('waiting')):
+            result = loop_manager._run_registered_project(
+                project, Path('state'), Path('config.ini'), '', '', threading.Lock(), 20)
+        self.assertEqual(result.result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+        self.assertEqual(result.result.exit_code, 0)
+        self.assertEqual(result.result.detail, 'waiting')
+
     def test_handoff_run_reaps_child_and_closes_pipes_on_interruption(self):
         for error in (KeyboardInterrupt(), RuntimeError("communication failed")):
             with self.subTest(error=type(error).__name__):

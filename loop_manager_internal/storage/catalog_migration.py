@@ -396,6 +396,11 @@ def _migrate_execplan_catalog(connection, *, effects, reconcile_history, target_
                              manage_transaction=True, pinned_catalog=None, prepare_only=False,
                              prepared=None, registration=None):
     """Observe legacy Git/PR effects on an independent snapshot, then CAS the live rows."""
+    from .db_access import CoordinatedConnection
+    if not isinstance(connection, CoordinatedConnection) and not prepare_only and prepared is None:
+        # 독립 SQLite 호출자는 기존의 명시적 transaction 소유권을 유지한다.
+        return _apply_execplan_catalog(connection, effects=effects, reconcile_history=reconcile_history,
+            target_repo=target_repo, manage_transaction=manage_transaction, pinned_catalog=pinned_catalog)
     if prepared is None:
         if connection.in_transaction:
             raise RuntimeError('legacy catalog 관측 전에 DB transaction을 종료해야 합니다.')

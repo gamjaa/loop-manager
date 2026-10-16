@@ -322,6 +322,7 @@ def windows_main(root):
               'wsl': 'NOT_RUN', 'windows': 'NOT_RUN'}
     started = time.monotonic()
     budget = ExecutionClock()
+    budget.__enter__()
     previous_budget = os.environ.get(BUDGET_DIRECTORY)
     os.environ[BUDGET_DIRECTORY] = budget.environment[BUDGET_DIRECTORY]
     try:

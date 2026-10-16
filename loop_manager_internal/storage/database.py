@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS general_planning_publications (
 """
 
 
-from .db_access import CoordinatedConnection, open_connection
+from .db_access import CoordinatedConnection, DatabaseWaitTimeout, open_connection
 
 
 class StateConnection(CoordinatedConnection):
@@ -532,6 +532,9 @@ def connect_database(
     else:
         try:
             connection.execute("SELECT 1 FROM projects LIMIT 1")
+        except DatabaseWaitTimeout:
+            connection.close()
+            raise
         except sqlite3.DatabaseError as error:
             connection.close()
             raise RuntimeError("상태 DB를 읽을 수 없습니다. 백업을 복원하거나 다시 초기화하세요.") from error

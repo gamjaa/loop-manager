@@ -13,6 +13,7 @@ from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.scoped_blocking import PR_CLOSED_BLOCK_REASON
 from loop_manager_internal.storage import execplan_catalog_state
 from pathlib import Path
+from types import SimpleNamespace
 import os
 import re
 import sqlite3
@@ -501,26 +502,32 @@ def reconcile_execplan_catalog(
         try:
             pinned = port.load()
             effects.backfill_plan_shas(connection, target_repo=repo)
-            prepared = effects.migrate_legacy_execplans(connection, reconcile_history=True, target_repo=repo,
-                ensure_schema=False, pinned_catalog=pinned, prepare_only=True)
+            if pinned.snapshot.isolation_enabled and not pinned.deletions:
+                issues = execplan_catalog_state.new_declaration_issues(pinned, repository.capture(repo).plan_ids)
+                if issues:
+                    pinned = replace(pinned, snapshot=execplan_catalog.withhold_catalog_issues(pinned.snapshot, issues))
+                    port.loaded = pinned
+            expected = repository.capture(repo)
+            missing = expected.plan_ids - pinned.snapshot.observed_ids
+            prepared = (effects.migrate_legacy_execplans(connection, reconcile_history=True, target_repo=repo,
+                ensure_schema=False, pinned_catalog=pinned, prepare_only=True) if not missing else None)
+            observed_revision = port.current_revision()
+            observed_service = execplan_catalog_state.CatalogReconciliationService(repository,
+                SimpleNamespace(load=lambda: pinned, current_revision=lambda: observed_revision))
             with execplan_catalog_state._transaction(connection):
-                pinned = port.load()
-                # Deletion reconciliation validates new declarations before
-                # goal holds remove their dependency graph from the snapshot.
-                if pinned.snapshot.isolation_enabled and not pinned.deletions:
-                    issues = execplan_catalog_state.new_declaration_issues(pinned, repository.capture(repo).plan_ids)
-                    if issues:
-                        pinned = replace(pinned, snapshot=execplan_catalog.withhold_catalog_issues(pinned.snapshot, issues))
-                        port.loaded = pinned
-                if repository.capture(repo).plan_ids - pinned.snapshot.observed_ids:
-                    result = service.reconcile(repo)
+                if repository.capture(repo) != expected:
+                    raise project_catalog_refresh.CatalogRefreshStopped(
+                        execplan_catalog_state.CatalogReconciliationResult(
+                            execplan_catalog_state.ReconciliationKind.STALE, revision_sha=pinned.revision_sha))
+                if missing:
+                    result = observed_service.reconcile(repo)
                 else:
                     effects.migrate_legacy_execplans(
                         connection, reconcile_history=True, target_repo=repo,
                         ensure_schema=False, manage_transaction=False,
                         pinned_catalog=pinned, prepared=prepared,
                     )
-                    result = service.reconcile(repo)
+                    result = observed_service.reconcile(repo)
                 if not result.usable:
                     raise project_catalog_refresh.CatalogRefreshStopped(result)
         except execplan_catalog_state.InvalidPinnedCatalog as error:

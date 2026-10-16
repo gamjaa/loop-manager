@@ -616,7 +616,7 @@ Registration rollback fixture.
             def changed_remote_revision(repo, *arguments, **kwargs):
                 nonlocal revision_checks
                 result = real_git(repo, *arguments, **kwargs)
-                if snapshot_calls == 2 and arguments == (
+                if snapshot_calls == 1 and arguments == (
                     "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"
                 ):
                     revision_checks += 1
@@ -640,7 +640,7 @@ Registration rollback fixture.
                             provider="codex", requested_base=None,
                             approve_agents_mismatch=False,
                         )
-                self.assertEqual(snapshot_calls, 2)
+                self.assertEqual(snapshot_calls, 1)
                 self.assertEqual(revision_checks, 1)
                 for table in (
                     "projects", "exec_plans", "execplan_catalog_revisions",

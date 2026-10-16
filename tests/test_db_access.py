@@ -62,6 +62,8 @@ class DatabaseAccessTests(unittest.TestCase):
     def test_same_thread_nested_connection_is_rejected_without_deadlock(self):
         with closing(open_connection(self.path)) as other:
             with self.connection:
+                other.commit()
+                other.rollback()
                 with self.assertRaisesRegex(RuntimeError, '다른 연결'):
                     other.execute('SELECT * FROM sample')
                 with self.connection:
@@ -97,6 +99,25 @@ class DatabaseAccessTests(unittest.TestCase):
             external.rollback()
             with owned: owned.execute('UPDATE sample SET value=7 WHERE id=1')
         self.assertEqual(self.connection.execute('SELECT value FROM sample WHERE id=1').fetchone()[0], 7)
+
+    def test_cancelled_queue_request_does_not_retain_its_turn(self):
+        from unittest import mock
+        errors = []
+        def read():
+            try:
+                with closing(open_connection(self.path)) as other:
+                    other.execute('SELECT * FROM sample')
+            except RuntimeError as error:
+                errors.append(str(error))
+        with self.connection, mock.patch(
+                'loop_manager_internal.runtime.handoff_gate._check_runtime_handoff',
+                side_effect=RuntimeError('cancelled')):
+            thread = threading.Thread(target=read)
+            thread.start()
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, ['cancelled'])
+        self.assertEqual(self.connection.execute('SELECT count(*) FROM sample').fetchone()[0], 3)
 
     def test_independent_database_is_not_blocked(self):
         with self.connection, closing(open_connection(self.path.with_name('other.db'))) as other, other:

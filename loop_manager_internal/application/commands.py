@@ -104,7 +104,7 @@ def configure_registry(
         effects.operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
         return 0
 
-    with closing(effects.connect_database(state_dir)) as connection, connection:
+    with closing(effects.connect_database(state_dir)) as connection:
         if command == "list":
             projects = project_registry.list_projects(connection)
             if not projects:
@@ -586,11 +586,12 @@ def execute_runtime_command(
                 connection.commit()
             effects.operation_print(f"전체 정밀 점검 요청 저장: {repo}; 다음 안전한 작업 선택 경계에서 실행합니다.")
             return 0
-        with closing(effects.connect_database(state_dir)) as connection, connection:
+        with closing(effects.connect_database(state_dir)) as connection:
             selected_projects = project_registry.select_projects(
                 connection, getattr(args, "repositories", None),
             )
             agent_invocation_state.InvocationRepository(connection).reconcile_interrupted(state_dir=state_dir)
+            connection.commit()
             return effects.run_registered_projects(
                 connection, state_dir, config,
                 selected_projects=selected_projects,
