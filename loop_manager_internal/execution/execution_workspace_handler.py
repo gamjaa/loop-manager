@@ -356,7 +356,8 @@ class WorkspaceHandler:
                     self.ports._complete_rebase_intent(context)
                     return self.ports._context()
             marker = (current.snapshot or {}).get('blocked_resume')
-            if (self.ports.identity.newly_activated and marker
+            # An owned pending rebase reaches conflict recovery before it has an after_head.
+            if (self.ports.identity.newly_activated and marker and current.operation != 'rebase'
                     and (snapshot.local_head != marker['after_head']
                          or (current.snapshot or {}).get('reactivated_from_head')
                          != marker['after_head'])):

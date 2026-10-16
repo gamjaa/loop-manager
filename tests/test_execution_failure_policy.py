@@ -206,6 +206,27 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         self.assertEqual(saved.snapshot['reactivated_from_head'], 'owned-head')
 
 
+    def test_new_activation_rejects_incomplete_marker_without_owned_rebase(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.newly_activated = True
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0,
+            operation=None, expected_head='owned-head',
+            target_base_oid='base', observed_remote_oid='remote-head',
+            snapshot={'blocked_resume': {
+                'owner_oid': 'remote-head', 'before_head': 'old-execution-head',
+                'after_head': None, 'target_base_oid': 'base',
+            }},
+        )
+        self.effects.workspace.git.side_effect = self.observed_git
+        with mock.patch.object(self.handler, '_owned_checkpoint_remote', return_value=True):
+            recovered = self.handler.recover(self.context())
+
+        self.assertEqual(recovered.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertIn('재활성화 전후 HEAD', recovered.detail)
+        self.effects.agent.run_agent.assert_not_called()
+
     def test_commit_command_failure_preserves_expected_head_intent(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)

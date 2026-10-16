@@ -8,7 +8,7 @@ from unittest import TestCase, mock
 
 from loop_manager_internal.execution import execution_handlers as handlers
 import loop_manager as lm
-from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionOutcomeKind
+from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionPhase, ExecutionOutcomeKind
 from tests.support.execution import VALID_WORKER_RESULT
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 
@@ -366,6 +366,52 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
         with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
             service.adopt(self.state, self.checkpoint)
         self.assertEqual(self.checkpoint.get('repo', 'G-047'), before)
+
+    def test_reactivation_keeps_owned_conflict_without_completed_head(self):
+        from loop_manager_internal.git.managed_rebase_validation import IndexEntry
+        self._prepare_current_checkpoint_recovery()
+        self.handler.newly_activated = True
+        self.fixture.effects.workspace.is_directory.return_value = True
+        self.fixture.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.fixture.effects.workspace.git_operation_entries.return_value = {'rebase-merge': 'operation'}
+        self.state.update_project('repo', worker_result=None, last_error=lm.REBASE_IN_PROGRESS_ERROR)
+        marker = {'owner_oid': 'remote', 'before_head': 'before',
+                  'after_head': None, 'target_base_oid': 'base'}
+        current = self.checkpoint.get('repo', 'G-047')
+        self.checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head='before', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={'blocked_resume': marker,
+                'reactivated_from_head': 'before'})
+        self.observed = replace(self.observed, head='partial', branch=None,
+            branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
+            branch_worktrees=(), operations=(('rebase-merge', 'operation'),),
+            metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
+                      ('orig-head', 'before'), ('onto', 'base')),
+            index=(IndexEntry('app.py', '100644', 'conflict', 2, 'M', 0x2000),),
+            index_clean=False)
+        def git(root, *args, **kwargs):
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(stdout='partial', returncode=0)
+            if args[0] == 'symbolic-ref':
+                return SimpleNamespace(stdout='', returncode=1)
+            if args == ('ls-files', '-u', '-z'):
+                return SimpleNamespace(stdout='100644 conflict 2\tapp.py\0', returncode=0)
+            return self.fixture.observed_git(root, *args, **kwargs)
+        self.fixture.effects.workspace.git.side_effect = git
+
+        recovered = self.handler.recover(self.fixture.context())
+
+        self.assertIsInstance(recovered, ExecutionContext)
+        self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertTrue(recovered.resolving_rebase)
+        saved = self.checkpoint.get('repo', 'G-047')
+        self.assertEqual((saved.operation, saved.expected_head, saved.target_base_oid),
+                         ('rebase', 'before', 'base'))
+        self.assertEqual(saved.snapshot['blocked_resume'], marker)
+        self.assertEqual(saved.snapshot['reactivated_from_head'], 'before')
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-worker')
+        self.handler._finish_rebase_journal.assert_not_called()
+        self.fixture.effects.agent.run_agent.assert_not_called()
 
     def test_selected_baseline_keeps_original_and_unrelated_metadata(self):
         from loop_manager_internal.git.managed_rebase_adoption import selected_baseline
