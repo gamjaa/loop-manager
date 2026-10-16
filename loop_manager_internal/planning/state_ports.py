@@ -89,10 +89,12 @@ class _PlanningStatePorts:
         tables = {row[0] for row in self._connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'",
         )}
-        return "agent_invocations" in tables and self._connection.execute(
+        return ("task_call_reservations" in tables and self._connection.execute(
+            "SELECT 1 FROM task_call_reservations WHERE repo = ? LIMIT 1", (repo,),
+        ).fetchone() is not None) or ("agent_invocations" in tables and self._connection.execute(
             "SELECT 1 FROM agent_invocations WHERE repo = ? AND finished_at IS NULL LIMIT 1",
             (repo,),
-        ).fetchone() is not None
+        ).fetchone() is not None)
 
     def prepare_legacy_release(self, expected: runtime_state.PlanningSnapshot,
                                cycle: maintenance_state.MaintenanceCycle) -> maintenance_state.MaintenanceCycle:

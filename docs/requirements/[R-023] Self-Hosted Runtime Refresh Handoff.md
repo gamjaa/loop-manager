@@ -2,7 +2,7 @@
 
 ## Summary
 
-로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 새 self PR Merge 뒤 원격이 실행 runtime의 후속이면 상태를 보존해 종료하고 다음 외부 실행으로 넘긴다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 강제하며 정상 Git 변화의 오탐 복구와 Codex·Claude의 호출별 실패 경계를 유지한다.
+로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 새 self PR Merge 뒤 원격이 실행 runtime의 후속이면 상태를 보존해 종료하고 다음 외부 실행으로 넘긴다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 강제하며 정상 Git 변화의 오탐 복구와 Codex·Claude의 호출별 실패 경계를 유지한다. runtime 교체의 전체 배정 중단과 안전한 호출 반환은 R-091을 따른다.
 
 ## Context
 
@@ -17,6 +17,8 @@ Loop Manager 저장소 자체를 등록 프로젝트로 운영할 때는 영향�
 현재 Agent Git 범위 감시는 관리 worktree뿐 아니라 같은 repository의 worktree와 shared Git metadata까지 하나의 repository-wide 불변 조건으로 비교한다. 그 결과 bootstrap/source checkout의 사용자 변경이나 현재 계획과 무관한 branch·worktree 변경도 Agent 실행 중 우연히 발생하면 변경 주체와 관계없이 `worker Git 범위 위반`과 `PROJECT_BLOCKED`로 기록될 수 있다. Loop Manager가 저장된 Agent 시작 snapshot 뒤에 관리 rebase를 수행한 경우에도 그 HEAD·branch ref·worktree index 변화를 Agent 결과로 오인할 수 있다. 과거 snapshot의 정확한 복원을 요구하면 정상적인 fetch, runtime worktree 생성·정리와 source 갱신까지 차이로 누적되어 차단이 반복된다.
 
 ## Requirement
+
+runtime handoff의 배정 중단 범위는 R-091대로 현재 runtime 전체다. 실행 중 호출은 강제로 취소하지 않고 안전한 반환·정리와 종료 확인을 기다리며, 호출 대기 작업은 시작하지 않고 저장된 단계로 남긴다. 작업 전체의 PR 게시·Merge를 기다리지 않는다.
 
 bootstrap은 process lock을 획득한 뒤 runtime worktree를 선택·생성하거나 runtime 자식 및 프로젝트 PR 동기화를 시작하기 전에 self `<base-branch>`를 해석하고 `origin/<base-branch>`를 fetch해야 한다. 최신으로 검증한 원격 revision의 bootstrap·runtime으로 실행을 넘기며, source checkout의 commit·파일·동기화 성공은 그 revision의 선택과 실행 조건으로 사용하지 않는다. source에 있는 로컬 전용 코드·문서는 자동 실행 입력에 포함하지 않는다.
 

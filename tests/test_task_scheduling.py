@@ -24,15 +24,27 @@ from tests.support.database import AutomationCatalogFixture
 
 
 class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
         temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.directory = Path(temporary.name)
+        cls.addClassCleanup(temporary.cleanup)
+        cls.state_directory = Path(temporary.name)
+        cls.seed_database = sqlite3.connect(':memory:')
+        cls.addClassCleanup(cls.seed_database.close)
+        with closing(database.connect_database(cls.state_directory, create=True)) as connection:
+            connection.backup(cls.seed_database)
+        cls.database_inode = (cls.state_directory / 'loop-manager.db').stat().st_ino
+
+    def setUp(self):
+        self.directory = self.state_directory
         self.config_path = self.directory / 'config.ini'
         self.config_path.write_text('[loop]\nmax_tasks_per_project=3\n', encoding='utf-8')
         self.config = load_managed_config(self.config_path)
-        self.connection = database.connect_database(self.directory, create=True)
+        self.connection = database.connect_database(self.directory, run_migrations=False)
         self.addCleanup(self.connection.close)
+        self.seed_database.backup(self.connection)
+        self.assertEqual((self.directory / 'loop-manager.db').stat().st_ino, self.database_inode)
         for repo in ('A', 'B'):
             self.connection.execute("INSERT INTO projects(repo,base_branch) VALUES (?,'main')", (repo,))
         for plan_id, repo in (('G-001','A'), ('G-002','A'), ('G-003','B')):
@@ -377,6 +389,287 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual({item[0] for item in observations},{'G-001','G-002','G-004'})
         self.assertTrue(all(item[1]==1 and item[2]<=3 for item in observations))
         self.assertEqual(scheduling.managed_count(self.connection,'A'),0)
+
+
+    def test_manual_precedes_retry_then_resumed_and_new_calls_without_preemption(self):
+        scheduler = self.scheduler()
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        manual = ManualWorkRepository(self.connection)
+        group = manual.create('A', 'submit', 'manual', [], 'head', 'base', members=('G-001',))
+        manual.accept(group, head='head', base='base', input_token='input')
+        self._insert_plan(self.connection, 'G-004', 'READY', repo='B')
+        tasks = [scheduling.Task('A', 'G-001', self.connection),
+                 scheduling.Task('A', 'G-002', self.connection),
+                 scheduling.Task('B', 'G-003', self.connection),
+                 scheduling.Task('B', 'G-004', self.connection, resumed=False)]
+        scheduler.requeue(tasks[1])
+        scheduler.requeue(tasks[0])
+        self.assertEqual(tasks[0].rank()[0], 0)
+        for task in tasks:
+            scheduler.waiters['agent'].append((task, task.rank()))
+        chosen = []
+        while scheduler.waiters['agent']:
+            entry = scheduler._next('agent')
+            scheduler.waiters['agent'].remove(entry)
+            chosen.append(entry[0].plan_id)
+        self.assertEqual(chosen, ['G-001', 'G-002', 'G-003', 'G-004'])
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+        for task in (tasks[1], tasks[2]):
+            scheduler.requeue(task)
+            scheduler.waiters['agent'].append((task, task.rank()))
+        self.assertIs(scheduler._next('agent')[0], tasks[1])
+
+    def test_planning_drain_releases_queued_calls_but_keeps_running_and_other_projects(self):
+        scheduler = self.scheduler(max_workers=1)
+        errors = []
+        def queued():
+            try:
+                with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
+                    with scheduler.slot('agent', scheduling.Task('A', 'G-002', connection)):
+                        self.fail('Planner 대기 프로젝트의 새 호출이 실행됐습니다.')
+            except BaseException as error:
+                errors.append(error)
+        with scheduler.slot('agent', scheduling.Task('A', 'G-001', self.connection)):
+            thread = threading.Thread(target=queued)
+            thread.start()
+            with scheduler.condition:
+                self.assertTrue(scheduler.condition.wait_for(lambda: len(scheduler.waiters['agent']) == 1, 3))
+            scheduler.pause_project('A')
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(sum(scheduler.running['agent'].values()), 1)
+            with scheduler.slot('verify', scheduling.Task('B', 'G-003', self.connection)):
+                pass
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], scheduling.PlanningDrain)
+        with self.assertRaises(scheduling.PlanningDrain), scheduler.admission(
+                scheduling.Task('A', 'G-002', self.connection)):
+            self.fail('Planner 대기 중 새 관리 대상이 편입됐습니다.')
+        self.assertEqual(scheduler.waiters['agent'], [])
+
+    def test_project_reentry_keeps_manual_submissions_pending_until_planner_finishes(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        scheduler = self.scheduler()
+        effects = SimpleNamespace(resume_manual_work=mock.Mock(), pr_for_branch=mock.Mock())
+        identity = ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                                   True, threading.Lock(), 20, 600, None)
+        service = ProjectService(effects, identity)
+        service.state = ProjectObservations(Path('A'), repo='A')
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            scheduler.pause_project('A')
+            service._resume_manual_work()
+            service.state.row = {'branch': 'owned'}
+            self.assertIsNone(service._resume_existing_execution())
+            effects.pr_for_branch.assert_not_called()
+            effects.resume_manual_work.assert_not_called()
+            scheduler.draining_projects.clear()
+            service._resume_manual_work()
+            effects.resume_manual_work.assert_called_once()
+        finally:
+            scheduling.current_scheduler.reset(token)
+
+    def test_unconfirmed_call_defers_planner_without_reclaiming_capacity(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.application.contracts import PROJECT_STEP_TRANSIENT_PAUSE
+        scheduler = self.scheduler()
+        scheduler.running['verify']['A'] = 1
+        scheduler.pause_project('A')
+        identity = ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                                   True, threading.Lock(), 20, 600, None)
+        service = ProjectService(SimpleNamespace(operation_print=mock.Mock()), identity)
+        service.state = ProjectObservations(Path('A'), repo='A', row={})
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            self.assertEqual(service._run_coordinators(), PROJECT_STEP_TRANSIENT_PAUSE)
+            self.assertEqual(scheduler.running['verify']['A'], 1)
+        finally:
+            scheduling.current_scheduler.reset(token)
+
+    def test_reserved_call_only_blocks_actual_planning_release_for_its_project(self):
+        from loop_manager_internal.planning.state_ports import _PlanningStatePorts
+        from loop_manager_internal.storage import task_calls
+        port = _PlanningStatePorts(None, self.connection, None, None, self.directory)
+        owner = task_calls.reserve(self.connection, self.directory, 'A', 'G-001', 'verify', 'run')
+        self.assertTrue(port.planning_release_pending('A'))
+        self.assertFalse(port.planning_release_pending('B'))
+        task_calls.release(owner)
+        self.assertFalse(port.planning_release_pending('A'))
+
+    def test_reserved_verify_does_not_stop_project_selection_without_planning_drain(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        scheduler = self.scheduler()
+        scheduler.running['verify']['A'] = 1
+        effects = SimpleNamespace(_recorded_base_fetch=mock.Mock())
+        identity = ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                                   True, threading.Lock(), 20, 600, None)
+        service = ProjectService(effects, identity)
+        service.state = ProjectObservations(Path('A'), repo='A', row={})
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with mock.patch.object(service, '_refresh_catalog', side_effect=LookupError('selection reached')), \
+                 self.assertRaisesRegex(LookupError, 'selection reached'):
+                service._run_coordinators()
+            effects._recorded_base_fetch.assert_called_once()
+        finally:
+            scheduling.current_scheduler.reset(token)
+
+    def test_merge_planning_pending_drains_project_and_returns_to_coordinator(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        scheduler = self.scheduler(max_tasks_per_project=1)
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        identity = ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                                   True, threading.Lock(), 20, 600, None)
+        service = ProjectService(SimpleNamespace(activate_ready_execplan=mock.Mock(), resume_manual_work=None), identity)
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base', provider='codex')
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with mock.patch.object(ProjectService, '_dispatch_execution', return_value=loop_manager.PROJECT_STEP_PLANNING_PENDING):
+                self.assertEqual(scheduling.run_project_tasks(service, newly_activated=False), loop_manager.PROJECT_STEP_RETRY)
+            self.assertIn('A', scheduler.draining_projects)
+            service.effects.activate_ready_execplan.assert_not_called()
+        finally:
+            scheduling.current_scheduler.reset(token)
+
+    def test_local_transient_retry_preserves_three_attempt_pause_and_other_plan_records(self):
+        from loop_manager_internal.application.project_runner import retry_pause_detail
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        repository = RecoveryRepository(self.connection)
+        attempts = {}
+        before = {}
+        for index in range(3):
+            for plan_id in ('G-001', 'G-002'):
+                repository.observe(RecoveryObservation(RecoveryReason.STATUS_FAILED, 'A', plan_id, 'WORKING',
+                    'revision', 'base', str(index), 'progress', 'temporary'))
+            self.connection.commit()
+            detail = retry_pause_detail(self.connection, 'A', before, attempts, plan_id='G-001')
+            self.assertEqual(detail, 'temporary' if index == 2 else None)
+            before = {str(row['subject']): int(row['generation']) for row in self.connection.execute(
+                "SELECT subject,generation FROM recovery_records WHERE repo='A'")}
+        self.assertEqual(attempts, {'G-001|transient_retry': 3})
+        self.assertEqual(repository.row('A', 'G-001')['pending_action'], 'pause')
+        self.assertEqual(repository.row('A', 'G-002')['disposition'], 'transient_retry')
+
+    def test_requirement_revision_guard_requests_project_drain_before_next_phase(self):
+        from loop_manager_internal.execution.execution_revision_handler import RevisionHandler
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind, ExecutionPhase
+        scheduler = self.scheduler()
+        ports = SimpleNamespace(
+            state=mock.Mock(), identity=SimpleNamespace(repo='A'),
+            _publish_rebased_checkpoint=mock.Mock(), _fetch_latest_base=mock.Mock(return_value='new-base'),
+            planning_required=mock.Mock(return_value=True),
+            _retry=lambda detail: ExecutionOutcome(ExecutionOutcomeKind.RETRY, detail=detail))
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with mock.patch('loop_manager_internal.execution.execution_revision.advance_owned_record'), \
+                 mock.patch('loop_manager_internal.execution.manual_candidate.get_manual', return_value=None):
+                outcome = RevisionHandler(ports).guard(SimpleNamespace(repo='A', phase=ExecutionPhase.IMPLEMENTING, resolving_rebase=False))
+            self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+            self.assertEqual(scheduler.draining_projects, {'A'})
+            ports.planning_required.assert_called_once_with('new-base')
+        finally:
+            scheduling.current_scheduler.reset(token)
+
+    def test_phase_completion_yields_to_planner_before_starting_next_phase(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionPhase
+        scheduler = self.scheduler()
+        context = SimpleNamespace(repo='A', phase=ExecutionPhase.IMPLEMENTING, resolving_rebase=False)
+        coordinator = mock.Mock()
+        coordinator.prepare.return_value = context
+        def finish(_context):
+            scheduler.pause_project('A')
+            return ExecutionOutcome.advanced(context)
+        coordinator.dispatch.side_effect = finish
+        effects = SimpleNamespace(_ExecutionLifecyclePorts=mock.Mock(),
+                                  ExecutionPhaseCoordinator=mock.Mock(return_value=coordinator),
+                                  _check_runtime_handoff=mock.Mock())
+        identity = ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                                   True, threading.Lock(), 20, 600, None)
+        service = ProjectService(effects, identity)
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base', provider='codex')
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with scheduler.task('A', 'G-001', self.connection), \
+                 mock.patch('loop_manager_internal.application.project_service.notifications.flush_project_events'), \
+                 self.assertRaises(scheduling.PlanningDrain):
+                service._dispatch_execution(runtime_state.RuntimeStateRepository(self.connection), newly_activated=False)
+            self.assertEqual(coordinator.dispatch.call_count, 1)
+        finally:
+            scheduling.current_scheduler.reset(token)
+
+    def test_runtime_handoff_unwinds_waiters_without_reclaiming_running_calls(self):
+        from loop_manager_internal.runtime.handoff_gate import RuntimeHandoffGate, _runtime_handoff_signal, SelfMergeRuntimeHandoff
+        scheduler = self.scheduler()
+        gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
+        token = _runtime_handoff_signal.set(gate)
+        try:
+            with scheduler.slot('agent', scheduling.Task('A', 'G-001', self.connection)):
+                gate.stop()
+                with self.assertRaises(SelfMergeRuntimeHandoff), scheduler.slot(
+                        'verify', scheduling.Task('B', 'G-003', self.connection)):
+                    self.fail('runtime 교체 중 verify가 시작됐습니다.')
+                self.assertEqual(sum(scheduler.running['agent'].values()), 1)
+            with self.assertRaises(SelfMergeRuntimeHandoff), scheduler.admission(
+                    scheduling.Task('A', 'G-002', self.connection)):
+                self.fail('runtime 교체 중 관리 대상이 편입됐습니다.')
+        finally:
+            _runtime_handoff_signal.reset(token)
+        self.assertEqual(scheduler.waiters['verify'], [])
+
+    def test_retry_and_plan_block_progress_while_sibling_verify_is_running(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        self._insert_plan(self.connection, 'G-004', 'READY', repo='A')
+        scheduler = self.scheduler(max_workers=1, max_tasks_per_project=2)
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            for plan_id in ('G-001', 'G-002'):
+                runtime.activate('A', plan_id, activation_sha='base', branch=plan_id, worktree=plan_id)
+        identity = ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                                   True, threading.Lock(), 20, 600, None)
+        service = ProjectService(SimpleNamespace(activate_ready_execplan=loop_manager.activate_ready_execplan,
+                                                resume_manual_work=None), identity)
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base', provider='codex')
+        verifying, replacement = threading.Event(), threading.Event()
+        calls = []
+        def execute(child, repository, **options):
+            task = scheduling.current_task.get()
+            if task.plan_id == 'G-002':
+                with scheduler.slot('verify', task):
+                    verifying.set()
+                    self.assertTrue(replacement.wait(4), '형제 verify가 RETRY 또는 다른 작업 시작을 막았습니다.')
+                repository.transition_from_snapshot(repository.projected('A'), plan_values={'status': 'PR_OPEN'},
+                                                     project_values=runtime_state.clear_project_values())
+                return 0
+            if task.plan_id == 'G-001' and not calls:
+                self.assertTrue(verifying.wait(3))
+                calls.append('retry')
+                return loop_manager.PROJECT_STEP_RETRY
+            with scheduler.slot('agent', task):
+                if task.plan_id == 'G-001':
+                    self.assertIsNotNone(task.retry_order)
+                    self.assertFalse(options['newly_activated'])
+                    calls.append('correct')
+                    repository.transition_from_snapshot(repository.projected('A'), plan_values={'status': 'PLAN_BLOCKED'},
+                                                         project_values=runtime_state.clear_project_values())
+                    return 1
+                calls.append('replacement')
+                replacement.set()
+                repository.transition_from_snapshot(repository.projected('A'), plan_values={'status': 'PR_OPEN'},
+                                                     project_values=runtime_state.clear_project_values())
+                return 0
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with fast_mode_scope(replace(self.config, max_tasks_per_project=2)), \
+                 mock.patch.object(ProjectService, '_dispatch_execution', execute):
+                self.assertEqual(scheduling.run_project_tasks(service, newly_activated=False), 1)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(calls, ['retry', 'correct', 'replacement'])
+        self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+        self.assertEqual(scheduling.managed_count(self.connection, 'A'), 0)
 
 
 class ExecutionClockTests(unittest.TestCase):

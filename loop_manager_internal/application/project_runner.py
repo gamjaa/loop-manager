@@ -264,26 +264,10 @@ def _run_project_result(
         if on_step_completed is not None:
             on_step_completed()
         if step_result == PROJECT_STEP_RETRY:
-            for record in connection.execute(
-                "SELECT subject, generation, identity, disposition, detail "
-                "FROM recovery_records WHERE repo = ?", (repo,),
-            ):
-                if int(record["generation"]) <= recovery_before.get(str(record["subject"]), 0):
-                    continue
-                if record["disposition"] not in {"transient_retry", "state_reconcile"}:
-                    continue
-                identity = str(record["identity"])
-                run_key = f"{record['subject']}|{record['disposition']}"
-                recovery_attempts[run_key] = recovery_attempts.get(run_key, 0) + 1
-                if recovery_attempts[run_key] >= 3:
-                    with connection:
-                        recovery_state.RecoveryRepository(connection).mark_paused(
-                            repo, str(record["subject"]), identity,
-                            int(record["generation"]), recovery_attempts[run_key],
-                        )
-                    step_result = PROJECT_STEP_TRANSIENT_PAUSE
-                    pause_detail = str(record["detail"])
-                    break
+            paused = retry_pause_detail(connection, repo, recovery_before, recovery_attempts)
+            if paused is not None:
+                step_result = PROJECT_STEP_TRANSIENT_PAUSE
+                pause_detail = paused
         dispatch_checkpoints, checkpoint_plan_id = checkpoint_dispatch_scope()
         if dispatch_checkpoints and effects._checkpoint_dispatch_ready(connection, repo):
             pending_after = (
@@ -448,3 +432,28 @@ def run_project(
         refactoring_review_interval=refactoring_review_interval,
         verify_timeout_seconds=verify_timeout_seconds,
     ).exit_code
+
+
+def retry_pause_detail(connection, repo, recovery_before, recovery_attempts, *, plan_id=None):
+    """같은 실행의 일시 복구 한도를 프로젝트·작업 조율에서 함께 적용한다."""
+    for record in connection.execute(
+        "SELECT subject, generation, identity, disposition, detail "
+        "FROM recovery_records WHERE repo = ?", (repo,),
+    ):
+        if plan_id is not None and record["subject"] != plan_id:
+            continue
+        if int(record["generation"]) <= recovery_before.get(str(record["subject"]), 0):
+            continue
+        if record["disposition"] not in {"transient_retry", "state_reconcile"}:
+            continue
+        identity = str(record["identity"])
+        run_key = f"{record['subject']}|{record['disposition']}"
+        recovery_attempts[run_key] = recovery_attempts.get(run_key, 0) + 1
+        if recovery_attempts[run_key] >= 3:
+            with connection:
+                recovery_state.RecoveryRepository(connection).mark_paused(
+                    repo, str(record["subject"]), identity,
+                    int(record["generation"]), recovery_attempts[run_key],
+                )
+            return str(record["detail"])
+    return None
