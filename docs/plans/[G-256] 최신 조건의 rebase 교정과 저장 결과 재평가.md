@@ -243,3 +243,46 @@ python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_wor
 결과: **PASS — 16 tests, exit 0**. 이번 실행에서 새로 수집된 각 결과가 모두 `ok`이며 이전 후보의 결과를 재사용하지 않았다. 로그의 VERIFYING/REVIEWING 전이는 mock verify를 사용하는 unit assertion으로 실제 전체 verify·Review의 성공을 뜻하지 않는다. 실행은 Python 3.12/Linux, unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집 계약이며 필수 compile 선언은 유지한다. 기존 verify 입력 목록은 변경 코드·테스트를 포함한다.
 
 현재 Worker 범위 구현·targeted 검증을 마쳤다. 전체 verify·최종 Review·게시 및 사용자 Merge는 Manager의 후속 단계로 남기며 commit·push·PR 생성·scripts/verify·전체 suite·integration·전체 lint/build/type check는 이번 실행에서 수행하지 않았다.
+
+
+## Manager 부분 verify 진단 교정 (2026-10-16, e42dd326 revision 1)
+
+현재 HEAD `8b88055`의 ExecPlan·sources·검증 계약과 고정 base `ca05750ab3f3b100c28d7bc9f6c444de879d03b1` 대비 누적 diff를 확인했다. 직전 후보 성공을 이번 검증으로 재사용하지 않았다. 전달된 Manager summary는 부분 verify의 652개 성공·7개 실패이며 전체 verify 성공이 아니다. 생략된 진단에서도 `test_selected_body_contract_accepts_worker_receipt_before_completion`을 확인해 같은 targeted 실행에 포함했다.
+
+실패 원인은 최신 base에서 바뀐 두 계약을 테스트가 반영하지 않은 것이다. metadata 오류는 `PLAN_INPUT_INVALID`로 즉시 보류하므로 Worker 교정 반복/횟수 소진을 기대한 세 테스트를 첫 결과의 차단·원래 session/result·verify 출력 보존과 Agent 중복 호출 방지로 갱신했다. rebase 테스트는 실제 guard 입력과 범위 검사 전에 저장된 응답/input snapshot도 확인한다. 기존 테스트 ID는 같은 명령 재실행과 실행 이력 연결을 위해 유지한다.
+
+완료 시 선언·사용자 결정 검사는 실제 선택 ExecPlan 파일과 target 원문을 읽는다. runtime adapter fixture의 가상 `/owned`·빈 `git show`·필수 frontmatter 누락을 개별 테스트 전용 임시 worktree와 유효한 고정 원문으로 교체했다. identity 검사와 서비스 생성 시 declaration 검사를 분리해 확인하며 scope predicate의 I/O 부재 assertion을 유지한다. 기존 외부 notes·다른 문서·ID 변경·원격 소유권·중간/완료 경계의 거부 assertion은 유지했다. 생산 코드·계약을 완화하지 않았고 실제 Git/Agent 프로세스를 실행하지 않았다.
+
+최초 targeted 실행은 7개 test 실패(8개 실패 assertion/subtest 포함)로 종료했다. 첫 수정 뒤 metadata 3개는 해소됐지만 fixture 원문에 필수 frontmatter가 빠져 4개 test가 남았다(5개 실패 assertion/subtest 포함). 모든 필수 필드를 갖춘 원문과 실제 임시 경로 연결로 보완한 뒤 아래 동일 명령의 최종 재실행에서 7개 전부 통과했다. 앞선 두 실행은 통과로 집계하지 않는다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_rebase_metadata_correction_preserves_resume_context tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_verify_metadata_mismatch_returns_to_worker_with_output tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_worker_metadata_mismatch_corrects_then_final_blocks tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_adopted_document_pin_does_not_reject_later_worker_notes tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_auxiliary_markers_preserve_original_document_preflight_exception tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_factory_uses_current_inputs_exact_lease_and_final_scope tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_selected_body_contract_accepts_worker_receipt_before_completion
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_rebase_metadata_correction_preserves_resume_context tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_verify_metadata_mismatch_returns_to_worker_with_output tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_worker_metadata_mismatch_corrects_then_final_blocks tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_adopted_document_pin_does_not_reject_later_worker_notes tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_auxiliary_markers_preserve_original_document_preflight_exception tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_factory_uses_current_inputs_exact_lease_and_final_scope tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_selected_body_contract_accepts_worker_receipt_before_completion
+
+최종 재실행 결과: **PASS — 7 tests, exit 0**, 모든 test `ok`.
+
+공유 fixture를 사용하는 나머지 네 개 개별 unit만 추가 확인했다.
+
+```sh
+python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_windows_file_modes_reuse_index_without_per_file_git_queries tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_clean_replay_head_and_staged_document_are_checked_separately tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_owned_user_document_conflicts_allow_preservation_without_final_acceptance tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_user_document_conflict_permission_requires_recorded_input_and_exact_operation
+```
+
+결과: **PASS — 4 tests, exit 0**. 이번 후보에서 최종 성공한 개별 unit은 총 11개이며 과거 16개 성공을 이번 실행 결과로 합산하지 않는다. unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집·필수 compile 선언과 기존 verify 입력 목록을 유지하며 실행 환경은 Python 3.12/Linux다. Windows mode 테스트는 모의 OS unit이며 Windows native 실행을 뜻하지 않는다.
+
+선택된 계획 frontmatter·sources·사용자 결정·Requirement·다른 계획·PLANS는 변경하지 않았다. 누적 PRODUCT·ARCHITECTURE diff의 설명과 hash는 현재 base 대비로 다시 확인했다. 전체 verify·Review·게시·Merge는 Manager의 후속 단계이며 Worker는 전체 suite/integration/verify/compile·전체 lint/build/type check·commit/push/PR 생성을 실행하지 않았다.
+
+
+## 最新 base autostash 충돌 교정 (2026-10-16)
+
+지정 revision `890d296cc1df0afdd122fdf42a7a3887452b3ece`의 ExecPlan·PRODUCT·R-082·R-072·R-055를 git show로 확인하고 재생된 HEAD `39ee152` 및 autostash 형상과 대조했다. 최신 base에는 이전 verify 진단의 metadata 즉시 차단·유효한 임시 fixture 교정과 새 테스트 이름이 이미 있다. 해당 base 교정을 중복 구현하지 않고 stashed 응답/input snapshot·session 보존 assertion과 최초 occurrence·Agent 단일 호출 assertion을 결합했다.
+
+두 테스트 파일의 충돌 표식을 제거했다. runtime adapter는 최신 base의 `_plan_text`·공용 helper·명시적 remote fixture·사용자 결정 작성 거부 회귀를 유지했다. 충돌로 중복된 `git show` stub과 독립 fixture 생성을 제거하고 기존 helper의 유효한 원문·임시 worktree를 재사용한다. 보조 표식 테스트의 임시 DB 갱신은 repo/plan을 함께 지정한다. 선언 검사 선평가와 identity 관측 분리·순수 scope predicate assertion도 보존했다. 생산 코드의 저장 입력 guard·완료 definition·다음 충돌 READY 종료와 기존 문서 계약은 변경하지 않았다.
+
+현재 통합 후보에서 아래 개별 unit만 새로 실행했다. 이전 후보의 7+4 결과는 과거 기록이며 현재 성공으로 재사용하지 않는다. 과거 metadata 테스트 이름 셋은 최신 base가 바꾼 ID로 실행했다.
+
+```sh
+python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_rebase_metadata_block_preserves_resume_context tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_verify_metadata_mismatch_blocks_with_saved_output tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_worker_metadata_mismatch_blocks_without_repeated_correction tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_adopted_document_pin_does_not_reject_later_worker_notes tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_auxiliary_markers_preserve_original_document_preflight_exception tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_factory_uses_current_inputs_exact_lease_and_final_scope tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_selected_body_contract_accepts_worker_receipt_before_completion tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_completed_rebase_rejects_worker_supplied_user_decision
+```
+
+결과: **PASS — 8 tests, exit 0**, 모든 test `ok`. Git/Agent는 mock이며 SQLite·파일은 독립 fixture다. unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집·필수 compile 선언을 유지하며 실제 실행은 Python 3.12/Linux다. 전체 verify·integration·전체 suite·compile·전체 lint/build/type check는 실행하지 않았다.
+
+선택 계획의 기존 본문·수행 기록과 frontmatter·sources·사용자 결정을 보존했다. Requirement·다른 ExecPlan·PLANS는 수정하지 않았다. Worker는 파일 내용만 교정했으며 index의 unmerged 표시 해제·autostash 보존/정리·관리 Git 완료 및 후속 verify/Review는 Manager가 수행한다. commit·push·PR 생성·rebase continue·stash 명령과 운영 SQLite 변경을 수행하지 않았다. 누적 PRODUCT·ARCHITECTURE 보고 hash는 지정 base `890d296` 대비 최종 문서 diff로 다시 산출했다.

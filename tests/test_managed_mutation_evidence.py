@@ -1227,7 +1227,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         ports, previous = self._user_document_service()
         worktree = Path(previous.expected.worktree)
         connection, *_ = runtime_rebase_fixture(self)
-        connection.execute("UPDATE exec_plans SET worktree=? WHERE plan_id='G-047'", (str(worktree),))
+        connection.execute("UPDATE exec_plans SET worktree=? WHERE repo='repo' AND plan_id='G-047'", (str(worktree),))
         path = 'docs/plans/[G-265] Historical.md'
         auxiliary = {'REBASE_HEAD': 'last-commit', 'MERGE_MSG': 'message'}
         ports._owned_rebase_metadata.return_value = None
@@ -1599,6 +1599,10 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         first = service.adapters.read_inputs(service.expected)
         ports._worktree_execplan_input_fingerprint.return_value = 'edited-plan'
         self.assertNotEqual(service.adapters.read_inputs(service.expected), first)
+        # Declarations are checked when final content contracts are frozen;
+        # identity remains a separate structural observation.
+        ports.validate_active_execplan_metadata.assert_called_once()
+        self.assertIsNone(service.declaration_error)
         ports.validate_execplan_workspace_identity.assert_not_called()
         service.adapters.validate_identity(service.expected)
         ports.validate_execplan_workspace_identity.assert_called_once()
