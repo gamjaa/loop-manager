@@ -510,7 +510,7 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
     def setUp(self):
         import json
         from tests.support.database import runtime_connection
-        from tests.test_incremental_planning import plan_text
+        from tests.support.catalog import plan_text
         from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         from loop_manager_internal.catalog import remote_deletions
@@ -523,7 +523,7 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.worktree = Path(self.directory.name)
         self.sources = ['docs/requirements/[R-001] First.md', 'docs/requirements/[R-002] Second.md']
-        self.text = plan_text('G-047', 'Runtime').replace(
+        self.text = plan_text('G-047', 'Runtime', implementation='- Keep the boundary explicit.').replace(
             '  - docs/PRODUCT.md', '\n'.join('  - ' + source for source in self.sources))
         self.path = self.worktree / 'docs/plans/[G-047] Runtime.md'
         self.path.parent.mkdir(parents=True)

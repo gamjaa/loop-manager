@@ -37,7 +37,7 @@ Requirement 철회의 의미와 남은 공유 목표를 허용된 동일 ID 개�
 - [x] R-082의 부분 조건 철회는 `loop_manager_internal/planning/input_fingerprints.py`, `planner_validation.py`의 기존 변경 입력·snapshot 개정으로 처리한다. source 문자열만 지운 예시를 확장해 작업 항목·파일 목적·공유 구현·테스트·dependency의 근거 연결을 확인한다. 살아 있는 source가 필요한 계속 실행/새 계획 검증과 보존 원문으로 하는 전체 철회 검증을 혼동하지 않는다.
 - [x] `planner_validation.py`, `planning_catalog.py`, `planner_publication.py`와 `loop_manager_internal/storage/planning_publication_state.py`의 구현된 withdrawal manifest·정리 영수증·CAS·원자 적용을 재사용한다. 준비 중 및 게시 직전 실행/원문/삭제 revision·실제 PR·수동 준비/소유의 변화에서 오래된 판단을 적용하지 않으며 시작한 작업의 직접 파일 삭제는 계속 거부한다.
 - [x] G-257의 선행 보류 보존과 G-243의 수동 보호를 소비한다. 취소·요청 수명은 G-260, 물리 자원 정리는 G-261의 별도 범위로 연결하고 이 작업의 문서 게시만으로 그 완료를 만들지 않는다. snapshot 밖·PR/archive 계획은 편집하지 않는다.
-- [x] 기존 incremental planning의 문서 helper와 runtime SQLite fixture를 재사용해 `tests/test_planner_validation_recovery.py`에 독립 unit class를 추가했다. 원문 보존·withdrawn/retained·started resume과 기존 publication manifest·원자 적용을 함께 검증한다. PRODUCT·ARCHITECTURE는 이미 반영된 복구 설명을 유지하며 실제 보완한 계약만 통합한다.
+- [x] 기존 `tests.support.catalog`의 문서 helper와 runtime SQLite fixture를 재사용해 `tests/test_planner_validation_recovery.py`에 독립 unit class를 추가했다. 원문 보존·withdrawn/retained·started resume과 기존 publication manifest·원자 적용을 함께 검증한다. PRODUCT·ARCHITECTURE는 이미 반영된 복구 설명을 유지하며 실제 보완한 계약만 통합한다.
 
 - [x] 최신 base의 검증된 archive 참조 제외·기존 hold 재평가와 draft/피드백 표식 분리를 기존 복수 source 판단·withdrawal 준비·게시 소비 경계와 대조한다. 직접 구현된 catalog 취소·ID 예약을 다시 만들지 않고 실제 활성 목표·writer/PR/수동 보호와 전체 철회 판단 검증이 유지되는지 확인한다. 검증 후 Manager 문서 변경은 최신 `planning/publication_service.py`의 실제 변경 재조회·검증된 publication_paths·현재 plan commit 결합을 소비하며, 기존 저장 intent와 게시 후 DB 복구를 보존한다. 이 공유 게시 교정도 다시 구현하지 않는다.
 
@@ -51,6 +51,16 @@ Requirement 철회의 의미와 남은 공유 목표를 허용된 동일 ID 개�
 - 최신 base의 `tests/test_execplan_drafts.py:ExecPlanDraftCatalogTest` 원격 draft 삭제·archive 참조/legacy hold 제외·orphan feedback 표식 ID 예약 회귀를 기존 근거로 재사용한다. 보관 참조를 제외해도 실제 활성 작업·복수 source의 전체 철회 판단과 미확인 Merge·writer·PR·수동 소유권은 생략하지 않는다. 변경이 필요하면 기존 `RequirementRecoveryUnitTests`의 해당 최소 case만 보완하며 직접 구현된 catalog 조합을 중복 작성하지 않는다.
 
 ## Progress
+
+- [x] Manager verify delta `85872602290ec8d9a897e98923d52a7a45bdf9112567888249b644831758ade5` occurrence=1/revision=1 교정: 현재 HEAD `f1d0d82`와 base 대비 diff·최신 ExecPlan·R-055/R-082·unittest adapter 계약을 다시 확인했다. 두 보고 case를 최소 선택해 실행했고 같은 두 건을 재현했다. `test_planner_validation_recovery.py`는 다른 test module 대신 기존 `tests.support.catalog.plan_text`를 사용하고 기존 체크리스트 assertion의 입력을 유지했다. `test_project_services.py`의 export 회귀는 최신 한국어 무실패 표현 허용 계약에 맞춰 원문 보존을 확인하고, 실제 `FAILED (failures=1)`이 뒤따르면 계속 거부하도록 바꿨다. assertion을 삭제하거나 제품 검증기를 완화하지 않았다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_project_services.ProjectServiceCompositionTests.test_worker_publication_export_preserves_targeted_evidence_validation tests.test_support_fixtures.SupportFixtureTests.test_tests_and_support_do_not_import_test_fixtures
+
+초기 실행: FAIL (2 cases).
+
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_project_services.ProjectServiceCompositionTests.test_worker_publication_export_preserves_targeted_evidence_validation tests.test_support_fixtures.SupportFixtureTests.test_tests_and_support_do_not_import_test_fixtures
+
+최종 동일 명령: PASS — 2 tests, OK. 변경 helper를 직접 사용하는 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests`도 새 실행에서 PASS — 16 tests, OK였다. 전체 verify·integration·commit·push·PR 생성은 실행하지 않았으며 Manager verify·Review는 별도로 남는다. frontmatter·sources·Requirement·다른 ExecPlan은 보존했다.
 
 - [x] 관리 rebase 수용 후 현재 후보 검증: HEAD `449fee6`, base `ebbb32f` (`main`)에서 ExecPlan·PRODUCT·ARCHITECTURE·R-055/R-082와 base 대비 최종 diff 10개 파일 전체를 대조했다. 시작 시 worktree와 index는 clean이었고 과거 UU/충돌 복구 기록은 현재 상태가 아니다. unittest adapter version 1·launcher Python 계약을 확인했으며 이전 후보 결과를 재사용하지 않았다. 추가 코드 수정 없이 현재 후보의 `RequirementRecoveryUnitTests` 16개와 원격 draft 삭제·피드백 예약·archive legacy hold 제외·Manager 변경 후 게시 재조회의 기존 unit case 4개를 새 runner 호출로 실행해 총 20 tests, OK였다. 실행 명령은 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests tests.test_execplan_drafts.ExecPlanDraftCatalogTest.test_remote_draft_deletion_preserves_audit_and_independent_work tests.test_execplan_drafts.ExecPlanDraftCatalogTest.test_orphan_feedback_migration_keeps_plan_id_reserved tests.test_execplan_drafts.ExecPlanDraftCatalogTest.test_deleted_draft_does_not_reopen_archived_reference_or_legacy_hold tests.test_planning_publication.PlanningPublicationTest.test_publication_uses_current_changes_after_manager_validation`다. 이번 변경은 이 검증 기록뿐이며 frontmatter·sources는 보존했다. 전체 verify·Review는 Manager가 이어간다.
 
