@@ -584,6 +584,24 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
                 self.assertTrue(self.path.exists())
 
     def test_source_text_and_last_revision_are_snapshot_bound_before_preparation(self):
+        from loop_manager_internal.planning.planning_catalog import mutable_snapshot_token
+
+        source_goal = next(item for item in self.json.loads(self.snapshot.prompt_payload())['deleted_goals']
+                           if item['path'] == self.sources[0])
+        self.assertEqual(source_goal['text'], self.proofs[self.sources[0]]['text'])
+        self.assertEqual(source_goal['source_revision'], self.proofs[self.sources[0]]['revision'])
+        self.assertEqual(source_goal['deletion_revision'], self.proofs[self.sources[0]]['deletion_revision'])
+        self.assertEqual(source_goal['affected_ids'], ['G-047'])
+        token = mutable_snapshot_token('repo', 'base', self.snapshot.plans, self.snapshot.recovery_goals)
+        for field in ('text', 'revision', 'deletion_revision'):
+            changed_goal = self.json.loads(self.snapshot.recovery_goals[0])
+            changed_evidence = self.json.loads(changed_goal['evidence'])
+            changed_evidence[field] = 'changed proof'
+            changed_goal['evidence'] = self.json.dumps(changed_evidence, sort_keys=True)
+            changed_goals = (self.json.dumps(changed_goal, sort_keys=True), *self.snapshot.recovery_goals[1:])
+            with self.subTest(token_field=field):
+                self.assertNotEqual(token, mutable_snapshot_token('repo', 'base', self.snapshot.plans, changed_goals))
+
         for field in ('text', 'revision', 'deletion_revision'):
             with self.subTest(field=field):
                 proofs = {source: dict(proof) for source, proof in self.proofs.items()}
@@ -697,11 +715,168 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
             ('repo', 'G-048', 'deleted-revision', self.json.dumps({'deleted_sources': other})))
         goals = [self.json.loads(raw) for raw in self.recovery.recovery_goals(self.connection, 'repo')]
         self.assertTrue(all(goal['affected_ids'] == ['G-047', 'G-048'] for goal in goals))
-        other[self.sources[0]]['text'] = 'conflicting original'
-        self.connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE plan_id='G-048'",
-            (self.json.dumps({'deleted_sources': other}),))
-        with self.assertRaisesRegex(self.recovery.PlannerValidationError, '상충'):
-            self.recovery.recovery_goals(self.connection, 'repo')
+        for field in ('text', 'revision', 'deletion_revision'):
+            with self.subTest(field=field):
+                conflicting = {source: dict(proof, affected=['G-048']) for source, proof in self.proofs.items()}
+                conflicting[self.sources[0]][field] = 'conflicting proof'
+                self.connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE plan_id='G-048'",
+                    (self.json.dumps({'deleted_sources': conflicting}),))
+                with self.assertRaisesRegex(self.recovery.PlannerValidationError, '상충'):
+                    self.recovery.recovery_goals(self.connection, 'repo')
+
+    def test_requirement_deletions_union_only_identical_active_and_cancelled_proofs(self):
+        from loop_manager_internal.git import command_adapter
+
+        source = self.sources[0]
+        original_revision = 'a' * 40
+        current_revision = 'c' * 40
+        self.connection.execute('UPDATE exec_plans SET sources=?, plan_sha=? WHERE plan_id=?',
+            (self.json.dumps([source]), original_revision, 'G-047'))
+        self.connection.execute('''INSERT INTO exec_plans
+            (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha)
+            VALUES ('repo', 'G-048', 'docs/plans/[G-048] Active.md', 'Active', ?, '[]',
+                    'normal', 'active-hash', 'READY', ?)''',
+            (self.json.dumps([source]), original_revision))
+        self.connection.execute('''INSERT INTO execplan_cancellations
+            (repo, plan_id, path, title, sources, depends_on, complexity, risk, priority,
+             content_hash, plan_sha, deletion_commit, recovery_evidence)
+            VALUES ('repo', 'G-049', 'docs/plans/[G-049] Cancelled.md', 'Cancelled', ?, '[]',
+                    'low', 'low', 'normal', 'cancelled-hash', ?, 'cancelled-at', '{}')''',
+            (self.json.dumps([source]), original_revision))
+        self.connection.commit()
+
+        class Rows:
+            def __init__(self, items):
+                self.items = items
+
+            def fetchall(self):
+                return self.items
+
+            def fetchone(self):
+                return self.items[0] if self.items else None
+
+        class ReorderedConnection:
+            def __init__(self, connection, reverse):
+                self.connection = connection
+                self.reverse = reverse
+
+            def execute(self, statement, parameters=()):
+                cursor = self.connection.execute(statement, parameters)
+                if statement.startswith('SELECT * FROM exec_plans WHERE repo=') or statement.startswith(
+                        'SELECT * FROM execplan_cancellations WHERE repo='):
+                    rows = cursor.fetchall()
+                    if self.reverse:
+                        rows.reverse()
+                    return Rows(rows)
+                return cursor
+
+        contents = '# [R-001] First\n## Acceptance Criteria\n- Original goal\n'
+        git = mock.Mock(return_value=SimpleNamespace(returncode=0))
+
+        def documents(_git_bytes, _repository, revision):
+            return {} if revision == current_revision else {source: contents}
+
+        with mock.patch.object(command_adapter, 'revision_requirement_documents', side_effect=documents):
+            forward = self.recovery.requirement_deletions(self.connection, 'repo', self.worktree,
+                SimpleNamespace(revision_sha=current_revision), git=git, git_bytes=mock.Mock())
+            reversed_rows = self.recovery.requirement_deletions(ReorderedConnection(self.connection, True),
+                'repo', self.worktree, SimpleNamespace(revision_sha=current_revision), git=git, git_bytes=mock.Mock())
+        self.assertEqual(forward, reversed_rows)
+        self.assertEqual(forward[source]['affected'], ['G-047', 'G-048', 'G-049'])
+        self.assertEqual(forward[source]['revision'], original_revision)
+        self.assertEqual(forward[source]['deletion_revision'], current_revision)
+        self.assertEqual(forward[source]['row']['plan_id'], 'G-047')
+
+        self.connection.execute("UPDATE execplan_cancellations SET plan_sha=? WHERE plan_id='G-049'", ('b' * 40,))
+        self.connection.commit()
+
+        for conflict in ('revision', 'text'):
+            def changed_documents(_git_bytes, _repository, revision):
+                if revision == current_revision:
+                    return {}
+                body = contents + '- changed\n' if conflict == 'text' and revision != original_revision else contents
+                return {source: body}
+
+            for reverse in (False, True):
+                with self.subTest(conflict=conflict, reverse=reverse), mock.patch.object(
+                        command_adapter, 'revision_requirement_documents', side_effect=changed_documents):
+                    with self.assertRaisesRegex(self.recovery.PlannerValidationError, '상충'):
+                        self.recovery.requirement_deletions(ReorderedConnection(self.connection, reverse),
+                            'repo', self.worktree, SimpleNamespace(revision_sha=current_revision),
+                            git=git, git_bytes=mock.Mock())
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM exec_plans WHERE repo='repo'").fetchone()[0], 2)
+        self.assertEqual(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-049'").fetchone()[0], '{}')
+
+    def test_repeated_absence_keeps_first_proof_receipt_and_resume_phase(self):
+        from loop_manager_internal.catalog.execplan_catalog import CatalogIssue, ExecPlanCatalogSnapshot
+        from loop_manager_internal.storage.execplan_catalog_state import (
+            DefinitionStateRepository, PinnedCatalog,
+        )
+
+        source = self.sources[0]
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', sources=? WHERE plan_id='G-047'",
+            (self.json.dumps([source]),))
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE repo='repo' AND plan_id='G-047'")
+        self.connection.commit()
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-047'").fetchone()
+        first_revision, repeated_revision = 'a' * 40, 'b' * 40
+        first = {'text': '# Original Requirement\n', 'revision': 'plan-revision',
+            'deletion_revision': first_revision, 'row': dict(row), 'affected': ['G-047']}
+
+        def apply(revision, proof):
+            issue = CatalogIssue(
+                'G-047', 'docs/plans/[G-047] Runtime.md', 'missing-source', 'source is absent', source)
+            snapshot = ExecPlanCatalogSnapshot({}, {}, revision, True, (issue,),
+                (('G-047', 'docs/plans/[G-047] Runtime.md', 'hash'),))
+            repository = DefinitionStateRepository(self.connection)
+            expected = repository.capture('repo')
+            return repository.apply('repo', PinnedCatalog(revision, snapshot,
+                requirement_deletions={source: proof}), expected, revision_is_current=lambda: True)
+
+        apply(first_revision, first)
+        held_row = self.connection.execute("SELECT evidence, resume_status FROM execplan_catalog_holds WHERE plan_id='G-047'").fetchone()
+        evidence = self.json.loads(held_row['evidence'])
+        evidence['deleted_sources'][source]['resolved'] = {'G-047': 'published-repair'}
+        evidence['prepared_withdrawal'] = {'id': 'G-047', 'source': source, 'outcome': 'withdrawn',
+            'reason': 'previously prepared', 'preserved_text': self.text}
+        self.connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE plan_id='G-047'",
+            (self.json.dumps(evidence),))
+        self.connection.commit()
+
+        repeated = dict(first, deletion_revision=repeated_revision)
+        apply(repeated_revision, repeated)
+        saved = self.connection.execute(
+            "SELECT revision_sha, evidence, resume_status FROM execplan_catalog_holds WHERE plan_id='G-047'").fetchone()
+        saved_evidence = self.json.loads(saved['evidence'])
+        saved_proof = saved_evidence['deleted_sources'][source]
+        self.assertEqual(saved['revision_sha'], repeated_revision)
+        self.assertEqual(saved['resume_status'], 'IMPLEMENTING')
+        self.assertEqual(saved_proof['deletion_revision'], first_revision)
+        self.assertEqual(saved_proof['resolved'], {'G-047': 'published-repair'})
+        self.assertEqual(saved_evidence['prepared_withdrawal']['reason'], 'previously prepared')
+
+        expanded = dict(repeated, deletion_revision='e' * 40, affected=['G-047', 'G-048'])
+        apply('e' * 40, expanded)
+        expanded_row = self.connection.execute(
+            "SELECT revision_sha, evidence, resume_status FROM execplan_catalog_holds WHERE plan_id='G-047'").fetchone()
+        expanded_evidence = self.json.loads(expanded_row['evidence'])
+        expanded_proof = expanded_evidence['deleted_sources'][source]
+        self.assertEqual(expanded_row['revision_sha'], 'e' * 40)
+        self.assertEqual(expanded_row['resume_status'], 'IMPLEMENTING')
+        self.assertEqual(expanded_proof['deletion_revision'], first_revision)
+        self.assertEqual(expanded_proof['affected'], ['G-047', 'G-048'])
+        self.assertEqual(expanded_proof['resolved'], {'G-047': 'published-repair'})
+        self.assertNotIn('prepared_withdrawal', expanded_evidence)
+
+        changed = dict(expanded, text='# Changed Requirement\n')
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, '근거가 변경'):
+            apply('d' * 40, changed)
+        after_error = self.connection.execute(
+            "SELECT revision_sha, evidence, resume_status FROM execplan_catalog_holds WHERE plan_id='G-047'").fetchone()
+        self.assertEqual(after_error['revision_sha'], 'e' * 40)
+        self.assertEqual(after_error['evidence'], expanded_row['evidence'])
+        self.assertEqual(after_error['resume_status'], 'IMPLEMENTING')
 
     def test_feedback_marker_does_not_authorize_requirement_withdrawal_or_release_draft(self):
         from loop_manager_internal.storage import validation_feedback_state, execplan_draft_state

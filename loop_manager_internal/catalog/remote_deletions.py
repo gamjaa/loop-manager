@@ -19,6 +19,18 @@ class RemoteDeletion:
     evidence: str
 
 
+_REQUIREMENT_PROOF_FIELDS = ("text", "revision", "deletion_revision")
+
+
+def _requirement_proof_row_key(row):
+    """Choose stable display metadata only after the source proof is identical."""
+    return (
+        str(row.get("plan_id", "")),
+        str(row.get("current_revision_sha") or row.get("plan_sha") or ""),
+        json.dumps(row, ensure_ascii=False, sort_keys=True),
+    )
+
+
 def revisable_row(row):
     return (str(row["status"]) in {"READY", "IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PLAN_BLOCKED"}
             and all(row[field] is None for field in ("pr_url", "pr_head_oid", "pr_conflict_head_oid", "pr_conflict_base_oid"))
@@ -476,9 +488,22 @@ def requirement_deletions(connection, repo, repository, pinned, *, git, git_byte
                 source, previous_documents[revision], allow_archive=False)
             if original.status is not requirement_sources.ResolutionStatus.RESOLVED:
                 continue
-            proof = result.setdefault(source, {"text": original.contents, "revision": revision,
-                "deletion_revision": pinned.revision_sha, "row": dict(row), "affected": []})
+            candidate = {"text": original.contents, "revision": revision,
+                "deletion_revision": pinned.revision_sha, "row": dict(row), "affected": []}
+            proof = result.get(source)
+            if proof is None:
+                result[source] = candidate
+                proof = candidate
+            elif any(proof.get(field) != candidate[field] for field in _REQUIREMENT_PROOF_FIELDS):
+                raise PlannerValidationError("Requirement 삭제 원문·revision 근거가 상충합니다.")
+            elif _requirement_proof_row_key(candidate["row"]) < _requirement_proof_row_key(proof["row"]):
+                # Equivalent proofs may have different plan-row context. Keep
+                # that display context deterministic without selecting between
+                # conflicting source proofs.
+                proof["row"] = candidate["row"]
             proof["affected"].append(str(row["plan_id"]))
+    for proof in result.values():
+        proof["affected"] = sorted(set(proof["affected"]))
     return result
 
 
@@ -550,9 +575,11 @@ def recovery_goals(connection, repo):
             if previous is None:
                 sources[source] = dict(proof)
                 continue
-            if any(previous.get(field) != proof.get(field) for field in ("text", "revision", "deletion_revision")):
+            if any(previous.get(field) != proof.get(field) for field in _REQUIREMENT_PROOF_FIELDS):
                 raise PlannerValidationError("Requirement 삭제 원문·revision 근거가 상충합니다.")
             previous["affected"] = sorted(set(previous["affected"]) | set(proof["affected"]))
+            if _requirement_proof_row_key(proof["row"]) < _requirement_proof_row_key(previous["row"]):
+                previous["row"] = proof["row"]
             previous["resolved"] = {key: value for key, value in previous.get("resolved", {}).items()
                                     if proof.get("resolved", {}).get(key) == value}
     for source, proof in sorted(sources.items()):

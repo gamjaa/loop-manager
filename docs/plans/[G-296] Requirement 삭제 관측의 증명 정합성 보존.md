@@ -24,11 +24,11 @@ Requirement 삭제를 처음 관측하거나 다시 관측할 때 작업별 원�
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/catalog/remote_deletions.py:requirement_deletions()`의 source별 `setdefault()` 집계를 수정한다. 서로 다른 row의 조회 결과를 합치기 전에 증명 필드를 대조하고, 기존 `recovery_goals()`의 동일 proof 합집합·상충 거부와 일관되게 처리한다. 활성 row와 취소 감사 row를 모두 확인하고 과거 경로의 identity resolver를 재사용한다. row 조회 순서에 따라 증명이 달라지지 않게 한다.
-- [ ] 확인한 `loop_manager_internal/storage/execplan_catalog_state.py:DefinitionStateRepository._apply_execution_holds()`의 기존 `deleted_sources` 병합을 수정한다. 현재 코드는 새 관측에 같은 source가 있으면 이전 proof를 보존하지 않는다. 반복 부재 관측과 실제 증명 변경을 구분하고, 최초 proof·resolved 판단·prepared_withdrawal·resume_status를 현재 CAS/transaction과 대조해 보존한다. 기존 JSON 근거와 저장 책임을 재사용하며 비호환 schema나 별도 상태 원본을 추가하지 않는다.
-- [ ] 확인한 `loop_manager_internal/catalog/catalog_service.py:reconcile_execplan_catalog()`의 관측→hold 적용, `remote_deletions.py:recovery_goals()`·`requirement_recovery_decisions()`와 `loop_manager_internal/planning/planning_catalog.py:MutableReadySnapshot.prompt_payload()`를 끝까지 대조한다. 기존 결과 형식·snapshot 결합·현재 증명 검사로 전달하며, 상충을 Planner의 임의 의미 선택이나 성공 결과로 바꾸지 않는다.
-- [ ] 확인한 `tests/test_planner_validation_recovery.py:RequirementRecoveryUnitTests`와 `tests/test_incremental_planning.py`의 삭제/공유 목표·재관측 fixture를 확장한다. 현재의 단일 row 과거 원문 조회와 이미 저장된 복수 hold 상충 회귀는 유지하고 최초 집계·다음 원격 revision 재관측의 빠진 조건만 보완한다.
-- [ ] PRODUCT의 Requirement 변경·취소 절과 ARCHITECTURE의 개정 snapshot·작업 취소 절을 실제 구현과 대조한다. 이미 명시된 서로 다른 proof 비병합·반복 관측 보존 계약을 구현하고, 설명 보완이 필요하면 해당 절에만 통합한다. Requirement·다른 ExecPlan은 Worker가 수정하지 않는다.
+- [x] `requirement_deletions()`가 활성 실행 row와 취소 감사 row의 원문·원문 revision·삭제 관측 revision을 먼저 대조하고, 세 필드가 모두 같은 경우에만 영향 ID를 합치게 했다. 상충 proof는 기존 Planner 오류 경계로 거부하며 결과는 조회 순서와 무관하게 정렬한다. 동일 proof의 row 문맥도 안정적으로 선택한다.
+- [x] `_apply_execution_holds()`는 원문과 원문 revision이 같은 반복 부재에서 최초 proof·삭제 revision·row 문맥을 보존하고 최신 관측 revision은 hold에 따로 기록한다. 영향 ID가 늘면 기존 대상별 resolved 판단은 보존하고 전체 대상이 바뀐 `prepared_withdrawal`은 재사용하지 않는다. 원문 또는 원문 revision이 실제로 바뀌면 현재 CAS transaction을 롤백해 저장된 proof·receipt·resume_status를 보존한다.
+- [x] `catalog_service`의 기존 관측→hold transaction, `recovery_goals()`의 복수 proof 충돌 검사, `requirement_recovery_decisions()`의 최신 snapshot 재확인과 `prompt_payload()`·snapshot token 전달을 대조했다. 기존 결과 형식과 오류 경계를 유지하고 Planner가 상충 proof를 선택하지 않게 했다.
+- [x] `RequirementRecoveryUnitTests`에 활성/취소 row의 동일 proof 합집합·역순 관측, 상충 proof 거부, 반복 부재의 최초 증명·판단·receipt·resume_status 보존, 영향 ID 추가, prompt/token 증명 결합 회귀를 추가했다. 기존 rename/archive와 단일 row 조회 회귀도 유지한다.
+- [x] PRODUCT의 Requirement 변경·취소 절과 ARCHITECTURE의 삭제 관측·recovery snapshot 절이 proof 비병합, 최초 관측 보존, 최신 snapshot 결합을 이미 명시함을 확인했다. 현재 구현과의 차이를 이번 코드 변경으로 해소했으며 문서 추가 수정은 필요하지 않았다. Requirement·다른 ExecPlan은 수정하지 않았다.
 
 ## Validation
 
@@ -40,8 +40,18 @@ Requirement 삭제를 처음 관측하거나 다시 관측할 때 작업별 원�
 ## Progress
 
 - [x] 검토 revision `2a63e07c47f712b232717a7f5b471558b5a8c9d9`의 변경 diff와 현재 함수·저장 소비자·관련 테스트를 정적으로 대조했다. 최초 집계는 동일 source의 후속 원문/revision을 대조하지 않고, hold 갱신은 새 proof가 있으면 이전 proof를 대체함을 확인했다. 기존 비종료 catalog에는 이 관측 보완을 구현하는 독립 작업이 없다.
-- [ ] 최초 집계·반복 관측의 증명 보존과 기존 소비 경계 연결
-- [ ] 최소 targeted unit 회귀와 현재 제품·설계 계약 대조
+- [x] 최초 집계에서 상충을 거부하고 동일 proof만 합쳤으며, 반복 부재에서는 최초 proof와 기존 복구 상태를 CAS transaction 안에서 보존했다. 실제 원문·revision 변경은 최신 입력으로 조용히 덮지 않고 기존 hold와 함께 오류로 남긴다.
+- [x] PRODUCT·ARCHITECTURE의 현재 계약을 대조하고 좁은 targeted unit 회귀를 실행했다. 환경은 `scripts/verify.json`의 unittest adapter version 1, launcher Python 3.12.3/Linux이며 `docs/VERIFY.md`의 Python 3.11–3.14 지원 범위 안이다. 전체 verify는 실행하지 않았다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_repeated_source_proofs_union_affected_and_reject_stale_conflicts tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_requirement_deletions_union_only_identical_active_and_cancelled_proofs tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_repeated_absence_keeps_first_proof_receipt_and_resume_phase tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_deleted_renamed_source_uses_preserved_identity_and_observation_errors_are_not_withdrawal
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_repeated_source_proofs_union_affected_and_reject_stale_conflicts tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_requirement_deletions_union_only_identical_active_and_cancelled_proofs tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_repeated_absence_keeps_first_proof_receipt_and_resume_phase tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_deleted_renamed_source_uses_preserved_identity_and_observation_errors_are_not_withdrawal
+재실행 결과: PASS — 4 tests, OK. 최초 실패는 새 재관측 case가 setUp의 기존 hold proof를 제거하지 않아 발생했으며, fixture를 격리한 뒤 동일 명령으로 통과했다.
+
+TARGETED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_repeated_source_proofs_union_affected_and_reject_stale_conflicts tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_requirement_deletions_union_only_identical_active_and_cancelled_proofs tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_repeated_absence_keeps_first_proof_receipt_and_resume_phase tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_deleted_renamed_source_uses_preserved_identity_and_observation_errors_are_not_withdrawal tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_source_text_and_last_revision_are_snapshot_bound_before_preparation
+최종 결과: PASS — 5 tests, OK. 실패 이후 전체 suite·integration·end-to-end·lint·build·type check·`scripts/verify`는 실행하지 않았다.
+
+- [x] 2026-10-16 관리 rebase target이자 현재 HEAD `a5b182fe2da4b40d1c50097696905a548bc82b7c`를 기준으로 전체 Worker diff를 다시 검토했다. 변경은 이 ExecPlan 본문, `remote_deletions.py`, `execplan_catalog_state.py`, 관련 recovery test에 한정된다. R-055와 R-082 source 경로는 활성 파일과 일치하며 frontmatter·Requirement·다른 ExecPlan은 수정하지 않았다.
+- [x] 2026-10-16 재검증에서 이전 HEAD의 성공을 재사용하지 않고 현재 후보의 위 다섯 `RequirementRecoveryUnitTests` case를 실행해 PASS (5 tests, OK)를 확인했다. 환경은 `scripts/verify.json`의 unittest adapter version 1과 launcher Python 3.12.3/Linux이며 `docs/VERIFY.md`의 Python 3.11–3.14 지원 범위에 든다. 전체 verify는 실행하지 않았다.
 
 ## Decision Log
 

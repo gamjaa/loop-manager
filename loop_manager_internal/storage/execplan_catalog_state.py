@@ -1055,12 +1055,40 @@ class DefinitionStateRepository:
                 if key in (pinned.rowless_hold_deletions or {}):
                     current["deleted_goal"] = dict(pinned.rowless_hold_deletions[key])
                 missing_sources = {item.get("source") for item in issues if item["code"] == "missing-source"}
-                current["deleted_sources"].update({source: proof for source, proof in prior.get("deleted_sources", {}).items()
-                    if source in missing_sources and source not in current["deleted_sources"]})
+                prior_sources = prior.get("deleted_sources", {})
+                current_sources = current["deleted_sources"]
+                same_source_targets = set(prior_sources) == set(current_sources)
+                for source, proof in tuple(current_sources.items()):
+                    previous_proof = prior_sources.get(source)
+                    if previous_proof is None:
+                        same_source_targets = False
+                        continue
+                    if any(previous_proof.get(field) != proof.get(field) for field in ("text", "revision")):
+                        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+                        raise PlannerValidationError("Requirement 삭제 원문·revision 근거가 변경됐습니다.")
+                    previous_affected = set(previous_proof.get("affected", ()))
+                    observed_affected = set(proof.get("affected", ()))
+                    if previous_affected != observed_affected:
+                        same_source_targets = False
+                    preserved = dict(previous_proof)
+                    preserved["affected"] = sorted(previous_affected | observed_affected)
+                    # The first deletion revision and its row context remain
+                    # authoritative while the outer hold revision records the
+                    # latest observation.
+                    current_sources[source] = preserved
+                for source, proof in prior_sources.items():
+                    if source in missing_sources and source not in current_sources:
+                        current_sources[source] = proof
+                        same_source_targets = False
+                same_source_targets = same_source_targets and set(prior_sources) == set(current_sources)
                 if current.get("content_hash") == prior.get("content_hash"):
-                    for field in ("resolved_references", "prepared_withdrawal"):
-                        if field in prior:
-                            current[field] = prior[field]
+                    if "resolved_references" in prior:
+                        current["resolved_references"] = prior["resolved_references"]
+                    if "prepared_withdrawal" in prior:
+                        if same_source_targets:
+                            current["prepared_withdrawal"] = prior["prepared_withdrawal"]
+                        else:
+                            current.pop("prepared_withdrawal", None)
                 held[key] = json.dumps(current, ensure_ascii=False, sort_keys=True)
         previous = {item[0]: item[3] for item in expected.holds}
         resume = {key: previous.get(key) for key in held}
