@@ -42,7 +42,16 @@ class OwnershipHandler:
     ):
         """검증한 현재 작업 입력과 과거 게시 영수증을 분리한다."""
         pending_push = current is not None and current.operation == 'push' and current.expected_head == remote_oid
-        if current and remote_oid and (pending_push or remote_oid in (
+        # A confirmed intermediate push can precede the SQLite lease update;
+        # its exact intent retains ownership across older BLOCKED receipts.
+        publication = current.rebase_publication_intent() if current and current.operation == 'rebase_publish' else None
+        pending_checkpoint = bool(publication and remote_oid == publication['head']
+            and publication['remote_before'] == row['publication_remote_oid']
+            and publication['remote_before'] == (current.snapshot or {}).get('accepted_work_branch')
+            and publication['repo'] == self.ports.identity.repo
+            and publication['plan_id'] == context.plan.plan_id
+            and publication['branch'] == context.branch and publication['worktree'] == str(context.worktree))
+        if current and remote_oid and (pending_push or pending_checkpoint or remote_oid in (
                 (current.snapshot or {}).get('accepted_work_branch'),
                 (current.snapshot or {}).get('pending_work_branch_input'))):
             self.ports.validate_execplan_workspace_identity(
@@ -51,7 +60,7 @@ class OwnershipHandler:
             self.ports.validate_managed_worktree(
                 self.ports.identity.repo_path, context.worktree, context.branch,
                 allow_rebase=current.operation == 'rebase')
-            if pending_push and self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip() != remote_oid:
+            if (pending_push or pending_checkpoint) and self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip() != remote_oid:
                 return False
             if pull_request and ((row['pr_url'] and pull_request.get('url') != row['pr_url'])
                     or pull_request.get('headRefName') != context.branch

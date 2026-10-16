@@ -19,6 +19,36 @@ from tests.support.execution_assertions import _assert_manual_autostash_recovery
 class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
     """Real handler/CAS policies with immutable fake Git observations only."""
 
+    def test_pending_intermediate_push_keeps_adopted_owner_with_superseded_block(self):
+        self._prepare_current_checkpoint_recovery()
+        self.handler._complete_rebase_intent(self.fixture.context())
+        self.state.update_project('repo', publication_remote_oid='remote')
+        saved = self.checkpoint.get('repo', 'G-047')
+        current = self.checkpoint.record('repo', 'G-047', expected_generation=saved.generation,
+            operation=None, expected_head=saved.expected_head, target_base_oid=saved.target_base_oid,
+            observed_remote_oid=saved.observed_remote_oid,
+            snapshot={**saved.snapshot, 'accepted_work_branch': 'remote'})
+        current = self.checkpoint.begin_rebase_publication('repo', 'G-047',
+            expected_generation=current.generation, acceptance=saved.snapshot['current_rebase_acceptance'],
+            remote_before='remote')
+        self.fixture.connection.execute("UPDATE blocked_checkpoints SET phase='unpublished', result='local_only'")
+        self.observed = replace(self.observed, remote=replace(self.observed.remote, oid='owned-head'))
+        self.fixture.head = 'owned-head'
+        context = self.fixture.context()
+        self.assertTrue(self.handler._owned_checkpoint_remote(context, self.state.row(), 'owned-head', current))
+        git = self.fixture.effects.workspace.git
+        observed_git = git.side_effect
+        git.side_effect = lambda root, *args, **kwargs: (
+            SimpleNamespace(stdout='external-head', returncode=0) if args == ('rev-parse', 'HEAD')
+            else observed_git(root, *args, **kwargs))
+        self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), 'owned-head', current))
+        git.side_effect = observed_git
+        for changed in (replace(current, operation=None),
+                        replace(current, snapshot={**current.snapshot, 'accepted_work_branch': 'foreign'}),
+                        replace(current, snapshot={**current.snapshot, 'rebase_publication_intent': None})):
+            with self.subTest(changed=changed.operation):
+                self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), 'owned-head', changed))
+
     def test_adoption_shares_inspection_and_rejects_drift_at_transaction(self):
         from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
         from loop_manager_internal.storage.runtime_state import RuntimeStateError
