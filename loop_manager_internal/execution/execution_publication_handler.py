@@ -119,9 +119,14 @@ class PublicationHandler:
                 current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
                 saved = current.snapshot or {}
                 prior_record = saved.get('document_record') or {}
-                if prior_record and prior_record.get('applied') is not True:
+                preserve_unresolved_record = (
+                    isinstance(prior_record, dict)
+                    and prior_record.get('applied') is not True
+                )
+                if (preserve_unresolved_record
+                        and prior_record.get('unresolved_reason') != 'document_conditions_changed'):
                     raise manager_git_journal.MutationEvidenceError(
-                        'unresolved document record must be retained before another commit')
+                        'unresolved document record lacks correction-safe evidence')
                 definition = self.ports.snapshot()._definition_snapshot
                 planning_previous = definition.serialize() if definition is not None else None
                 if (definition is not None and prior_record.get('applied') is True
@@ -138,7 +143,8 @@ class PublicationHandler:
                     'plan_id': context.plan.plan_id,
                     'branch': context.branch,
                     'worktree': str(context.worktree),
-                } if definition is not None and definition.body_text is not None else None)
+                } if (not preserve_unresolved_record and definition is not None
+                      and definition.body_text is not None) else None)
                 checkpoint.record(
                     self.ports.identity.repo, context.plan.plan_id,
                     expected_generation=current.generation, operation='commit',
