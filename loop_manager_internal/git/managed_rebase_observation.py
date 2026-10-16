@@ -206,7 +206,8 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters, *, start=N
         committed=committed, staged=staged, files=tuple(files), remote=remote,
         input_fingerprint=inputs, scope_fingerprint=scope_policy,
         repository_state_fingerprint=fingerprint({
-            'refs': snapshot.refs, 'worktrees': snapshot.worktrees, 'config': snapshot.config,
+            'refs': {f'refs/heads/{expected.branch}': snapshot.refs.get(f'refs/heads/{expected.branch}')},
+            'worktrees': {expected.worktree: registration}, 'config': snapshot.config,
         }),
     )
     return observed, snapshot

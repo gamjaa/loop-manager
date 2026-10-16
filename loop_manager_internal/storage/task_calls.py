@@ -65,7 +65,7 @@ def managed_count(connection, repo, plan_id=None):
     return connection.execute("""SELECT COUNT(DISTINCT CASE WHEN m.group_id IS NULL
         THEN 'plan:'||p.plan_id ELSE 'manual:'||m.group_id END)
         FROM exec_plans p LEFT JOIN manual_work_members m ON m.repo=p.repo AND m.plan_id=p.plan_id
-        WHERE p.repo=? AND (p.status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING')
+        WHERE p.repo=? AND p.status <> 'PLAN_BLOCKED' AND (p.status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING')
             OR EXISTS (SELECT 1 FROM task_call_reservations c WHERE c.repo=p.repo AND c.plan_id=p.plan_id)
             OR EXISTS (SELECT 1 FROM execution_checkpoints x WHERE x.repo=p.repo
                        AND x.plan_id=p.plan_id AND x.operation IS NOT NULL))

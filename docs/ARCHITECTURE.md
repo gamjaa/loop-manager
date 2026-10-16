@@ -533,16 +533,18 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 공유 `TaskScheduler`가 관리 배정과 실제 호출 배정을 구분한다. 관리 선택은 프로젝트별 유효 상한 안에서 수동 제출·기존 작업·일반 신규 순서로 확정하며, 일반 신규는 기본 자리 없는 프로젝트부터 순환하고 이후 유효 priority를 사용한다. Worker·Reviewer 호출은 전체 `max_workers`, verify는 별도 `verify_concurrency`를 사용하고 프로젝트 조율·Planner mutex 대기는 이 호출 자리를 사용하지 않는다. 한 자동 실행의 Planner는 직렬이다.
 
-작업별 일반 RETRY는 프로젝트 조율로 반환하지 않고 실행 대기열의 재시도 순서로 재등록한다. RETRY마다 DB 상태를 다시 준비하고 기존 일시 복구의 같은 실행 3회 한도를 공통으로 적용한다. 재시도 우선순위는 수동 제출보다 낮고 다른 일반 작업보다 높으며 재등록 순서를 유지한다. 명세 변경을 감지하면 프로젝트 배정 중단 신호로 관리 편입·실행 대기 호출·후속 단계를 반환시키고 실행 중 처리를 join한 뒤 프로젝트 조율로 돌아간다. 그 후 Planner 게시·catalog·DB 반영이 성공한 경계에서 작업 배정을 다시 연다. runtime handoff는 기존 전체 launch gate로 새 호출을 막고 진행 중 처리의 반환을 기다린다.
+작업별 일반 RETRY는 프로젝트 조율로 반환하지 않고 실행 대기열의 재시도 순서로 재등록한다. RETRY마다 DB 상태를 다시 준비하고 기존 일시 복구의 같은 실행 3회 한도를 공통으로 적용한다. 단계 처리의 일반 예외는 작업별 상세 오류·traceback을 기록하고 미확정 transaction을 rollback한 뒤 같은 배정 경로로 제한 재시도한다. 예외 3회 실패는 해당 작업만 보류하며 Future의 일반 예외도 작업별 오류로 수집해 조율기의 추가 배정을 계속한다. Planner 배정 중단·runtime handoff·사용자 중단은 별도 제어 신호로 전파한다. 재시도 우선순위는 수동 제출보다 낮고 다른 일반 작업보다 높으며 재등록 순서를 유지한다. 명세 변경을 감지하면 프로젝트 배정 중단 신호로 관리 편입·실행 대기 호출·후속 단계를 반환시키고 실행 중 처리를 join한 뒤 프로젝트 조율로 돌아간다. 그 후 Planner 게시·catalog·DB 반영이 성공한 경계에서 작업 배정을 다시 연다. runtime handoff는 기존 전체 launch gate로 새 호출을 막고 진행 중 처리의 반환을 기다린다.
 
-`projects.max_tasks_per_project`는 정수 0 이상이고 migration 기본 0이다. 0이면 해당 Manager가 읽은 config 기본값을 상속하며 양수는 보존한다. 배정 경계에서 DB를 재조회한다. `task_call_reservations`는 호출 token·repo·plan·종류·실행 receipt를 보존하고, 재시작 시 미시작 또는 실제 프로세스 종료 증거가 있는 호출만 회수한다. 종료 불명과 `execution_checkpoints.operation`이 남은 작업은 관리 자리도 유지한다. Agent는 기존 group/Job 종료 receipt, verify는 소유 프로세스·WSL lifecycle receipt를 사용한다. 불확실한 종류의 호출이 상한에 도달하면 해당 단계는 보존하고 다른 종류의 적격 호출을 계속한다.
+`projects.max_tasks_per_project`는 정수 0 이상이고 migration 기본 0이다. 0이면 해당 Manager가 읽은 config 기본값을 상속하며 양수는 보존한다. 배정 경계에서 DB를 재조회한다. `task_call_reservations`는 호출 token·repo·plan·종류·실행 receipt를 보존하고, 재시작 시 미시작 또는 실제 프로세스 종료 증거가 있는 호출만 회수한다. `PLAN_BLOCKED`는 호출 예약이나 `execution_checkpoints.operation`이 남아 있어도 관리 개수에서 제외한다. 실제 호출의 실행 자리·자원 소유권·checkpoint는 삭제하지 않으며 차단 해제 후에는 관리 한도를 다시 확인한다. 차단되지 않은 작업은 미확정 호출·operation의 기존 관리 자리 보존 조건을 유지한다. Agent는 기존 group/Job 종료 receipt, verify는 소유 프로세스·WSL lifecycle receipt를 사용한다. 불확실한 종류의 호출이 상한에 도달하면 해당 단계는 보존하고 다른 종류의 적격 호출을 계속한다.
+
+rebase 관측의 안정성 지문에는 해당 branch·worktree의 등록과 공유 config만 포함하고 무관한 작업의 ref·worktree 변화는 제외한다. 해당 branch의 중복 등록·현재 후보·index·입력·원격 PR의 검증은 유지한다. rebase 완료·차단 해제의 Git·원격 재관측은 쓰기 transaction 전에 마치고, 짧은 DB transaction 안에서 작업 소유권·projection·checkpoint를 다시 비교해 acceptance와 상태·outbox를 함께 적용한다. 상위 execution 포트도 외부 재관측 전에 writer를 예약하지 않는다.
 
 | 저장 상태 | 실행 자리와 보존 책임 |
 |---|---|
 | 작업별 실행 원본 | `exec_plans`에 단계·작업 identity·소유 자원·session·실패 이력을 유지한다. 프로젝트의 현재 작업을 바꾸어도 이 원본을 초기화하지 않는다. |
 | 프로젝트의 현재 작업 투영 | 프로젝트 조율의 대표 작업을 연결한다. 작업 스레드는 자신의 plan 선택으로 원본을 읽고 갱신한다. 프로젝트 planning으로 전환할 때 재개할 작업을 고정하고 투영만 비우며, 검증·게시·DB 적용 후 같은 작업을 다시 투영한다. |
 | 보존된 planning 상태 | worktree·session·미게시 결과·오류·실패 이력을 별도로 유지한다. 보존 기록이나 오류 자체가 실행 자리 점유를 뜻하지 않는다. |
-| 미확정 publication intent·공유 Git operation | 원격 게시·DB 적용과 소유 operation의 남은 처리를 복구한다. 미확정 게시나 종료 불명 writer가 있으면 다른 작업을 위해 자리를 해제하지 않는다. |
+| 미확정 publication intent·공유 Git operation | 원격 게시·DB 적용과 소유 operation의 남은 처리를 복구한다. 미확정 게시나 종료 불명 writer의 실제 실행 자리·소유 예약을 다른 작업을 위해 해제하지 않으며, 관리 개수는 작업 상태별 조건을 따른다. |
 
 일반·유지보수 planning이 실행 자리나 미확정 게시·공유 Git operation을 소유하는 동안 다른 ExecPlan의 차단 복구는 프로젝트 투영을 교체·정리하지 않는다. 안전 gate가 허용한 PR Merge·Close 확인과 해당 계획의 상태·알림 기록은 계속할 수 있다.
 

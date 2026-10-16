@@ -434,6 +434,34 @@ class CurrentRebaseObservationTests(unittest.TestCase):
                         self.assertEqual(actual.area, 'state_changed')
                         self.assertIsNone(scope)
 
+    def test_other_tasks_refs_and_worktrees_do_not_invalidate_owned_rebase(self):
+        for mutation in ('other_ref', 'other_worktree', 'owned_ref', 'owned_worktree', 'duplicate_binding', 'config'):
+            with self.subTest(mutation=mutation):
+                adapters = self.adapters()
+                first = adapters.capture_snapshot.return_value
+                second = SimpleNamespace(**{**vars(first), 'refs': dict(first.refs),
+                                            'worktrees': dict(first.worktrees), 'config': dict(first.config)})
+                if mutation == 'other_ref':
+                    second.refs['refs/heads/other-task'] = ('new-head', '')
+                elif mutation == 'other_worktree':
+                    second.worktrees['/other-task'] = ('HEAD=new-head', 'branch=refs/heads/other-task')
+                elif mutation == 'owned_ref':
+                    second.refs[f'refs/heads/{self.expected.branch}'] = ('unexpected-head', '')
+                elif mutation == 'owned_worktree':
+                    second.worktrees[self.expected.worktree] = ('HEAD=unexpected-head',)
+                elif mutation == 'duplicate_binding':
+                    second.worktrees['/other-task'] = (f'branch=refs/heads/{self.expected.branch}',)
+                else:
+                    second.config['core.hooksPath'] = ('changed',)
+                adapters.capture_snapshot.side_effect = (first, second)
+                actual, scope = observe_current_rebase(self.expected, adapters)
+                if mutation in {'other_ref', 'other_worktree'}:
+                    self.assertIsInstance(actual, RebaseObservation)
+                    self.assertEqual(assess_current_rebase(self.expected, actual, scope).status, RebaseStatus.COMPLETE)
+                else:
+                    self.assertIsInstance(actual, ObservationFailure)
+                    self.assertEqual(actual.area, 'state_changed')
+
     def test_file_reader_receives_each_fresh_observations_index_mode(self):
         adapters = self.adapters()
         snapshot = adapters.capture_snapshot.return_value

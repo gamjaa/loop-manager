@@ -1024,18 +1024,17 @@ class RuntimeStateRepository:
             if (self.projected(repo) != expected or self.get(repo, plan_id) != expected
                     or projection is None or tuple(projection[key] for key in fields) != owner):
                 raise RuntimeStateError('execution ownership or project projection changed')
+        check_owner()
+        current = checkpoint_repository.get(repo, plan_id)
+        already_applied = current.current_rebase_acceptance() == dict(acceptance)
+        if not already_applied and current.generation != acceptance['generation']:
+            raise RuntimeStateError('current rebase acceptance generation is stale')
+        decision = reobserve()
+        if (not isinstance(decision, RebaseDecision)
+                or decision.status is not RebaseStatus.COMPLETE
+                or decision.acceptance != dict(acceptance)):
+            raise RuntimeStateError('current rebase state or inputs changed after validation')
         with _transaction(self.connection):
-            check_owner()
-            current = checkpoint_repository.get(repo, plan_id)
-            already_applied = current.current_rebase_acceptance() == dict(acceptance)
-            if not already_applied and current.generation != acceptance['generation']:
-                raise RuntimeStateError('current rebase acceptance generation is stale')
-            decision = reobserve()
-            if (not isinstance(decision, RebaseDecision)
-                    or decision.status is not RebaseStatus.COMPLETE
-                    or decision.acceptance != dict(acceptance)):
-                raise RuntimeStateError('current rebase state or inputs changed after validation')
-            # Rechecking Git may take time; compare SQLite ownership once more.
             check_owner()
             if checkpoint_repository.get(repo, plan_id) != current:
                 raise RuntimeStateError('checkpoint changed during rebase recheck')
@@ -1075,34 +1074,34 @@ class RuntimeStateRepository:
             raise RuntimeStateError('current rebase recovery is unsafe')
         if decision.status is RebaseStatus.COMPLETE and not valid_acceptance(decision.acceptance):
             raise RuntimeStateError('current rebase recovery acceptance is missing')
+        current_checkpoint = checkpoint_repository.get(repo, plan_id)
+        if current_checkpoint != expected_checkpoint:
+            raise RuntimeStateError('rebase recovery checkpoint changed before release')
+        saved = current_checkpoint.snapshot or {}
+        prior_release = saved.get('rebase_block_release') or {}
+        if (decision.status is RebaseStatus.WAITING
+                and prior_release.get('reason_code') == block['reason_code']
+                and saved.get('rebase_block_release_state') == observed.fingerprint):
+            raise RuntimeStateError('unchanged pending rebase recovery was already resumed')
+        def check_owner():
+            project = project_row(self.connection, repo)
+            current_block = (scoped_blocking.plan_block(self.connection, repo, plan_id)
+                             if is_plan_block else scoped_blocking.project_block(self.connection, repo))
+            active = self.active_row(repo)
+            if (project is None or block['repo'] != repo or block['plan_id'] != plan_id
+                    or dict(self._plan_row(repo, plan_id)) != dict(expected_plan)
+                    or dict(project) != dict(expected_project)
+                    or current_block is None or dict(current_block) != dict(block)
+                    or planning_owns_execution_slot(project)
+                    or (active is not None and active['plan_id'] != plan_id)
+                    or (is_plan_block and scoped_blocking.project_block(self.connection, repo) is not None)
+                    or not dependencies_ready()
+                    or checkpoint_repository.get(repo, plan_id) != current_checkpoint):
+                raise RuntimeStateError('rebase recovery owner, cause or execution slot changed')
+        check_owner()
+        if reobserve() != observation:
+            raise RuntimeStateError('current rebase state changed during block release')
         with _transaction(self.connection):
-            current_checkpoint = checkpoint_repository.get(repo, plan_id)
-            if current_checkpoint != expected_checkpoint:
-                raise RuntimeStateError('rebase recovery checkpoint changed before release')
-            saved = current_checkpoint.snapshot or {}
-            prior_release = saved.get('rebase_block_release') or {}
-            if (decision.status is RebaseStatus.WAITING
-                    and prior_release.get('reason_code') == block['reason_code']
-                    and saved.get('rebase_block_release_state') == observed.fingerprint):
-                raise RuntimeStateError('unchanged pending rebase recovery was already resumed')
-            def check_owner():
-                project = project_row(self.connection, repo)
-                current_block = (scoped_blocking.plan_block(self.connection, repo, plan_id)
-                                 if is_plan_block else scoped_blocking.project_block(self.connection, repo))
-                active = self.active_row(repo)
-                if (project is None or block['repo'] != repo or block['plan_id'] != plan_id
-                        or dict(self._plan_row(repo, plan_id)) != dict(expected_plan)
-                        or dict(project) != dict(expected_project)
-                        or current_block is None or dict(current_block) != dict(block)
-                        or planning_owns_execution_slot(project)
-                        or (active is not None and active['plan_id'] != plan_id)
-                        or (is_plan_block and scoped_blocking.project_block(self.connection, repo) is not None)
-                        or not dependencies_ready()
-                        or checkpoint_repository.get(repo, plan_id) != current_checkpoint):
-                    raise RuntimeStateError('rebase recovery owner, cause or execution slot changed')
-            check_owner()
-            if reobserve() != observation:
-                raise RuntimeStateError('current rebase state changed during block release')
             check_owner()
             separate_block = not is_plan_block and expected_plan['status'] == 'PLAN_BLOCKED'
             values = revalidation_values(current_checkpoint.target_base_oid)

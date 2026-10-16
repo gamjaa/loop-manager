@@ -10,12 +10,14 @@ from dataclasses import dataclass
 from functools import wraps
 import threading
 import time
+import traceback
 
 from loop_manager_internal.runtime import operation_events as events
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage import task_calls
 from loop_manager_internal.storage.task_calls import managed_count
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 
 current_scheduler: ContextVar[TaskScheduler | None] = ContextVar("task_scheduler", default=None)
@@ -298,21 +300,41 @@ def run_project_tasks(service, *, newly_activated):
                 with scheduler.task(repo, plan_id, owned, resumed=resumed), notifications.immediate_delivery(
                         owned, scheduler.config.telegram_token, scheduler.config.telegram_chat_id, repo):
                     attempts = {}
+                    exception_attempts = 0
                     while True:
                         scheduler.check_project(repo)
-                        before = {str(row['subject']): int(row['generation']) for row in owned.execute(
-                            "SELECT subject,generation FROM recovery_records WHERE repo=?", (repo,))}
-                        child.state.row = runtime_state.project_row(owned, repo)
-                        code = child._dispatch_execution(
-                            runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed)
-                        notifications.flush_project_events(owned, repo)
+                        try:
+                            before = {str(row['subject']): int(row['generation']) for row in owned.execute(
+                                "SELECT subject,generation FROM recovery_records WHERE repo=?", (repo,))}
+                            child.state.row = runtime_state.project_row(owned, repo)
+                            code = child._dispatch_execution(
+                                runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed)
+                            notifications.flush_project_events(owned, repo)
+                        except PlanningDrain:
+                            raise
+                        except Exception as error:
+                            owned.rollback()
+                            exception_attempts += 1
+                            detail = redact_secrets(traceback.format_exc())
+                            events.emit("작업 처리 예외", level="ERROR", project=repo, plan=plan_id,
+                                reason=f"{type(error).__name__}: {error}", traceback=detail, attempts=exception_attempts,
+                                next_action="작업 상태 재확인 후 재시도" if exception_attempts < 3 else "해당 작업 보류")
+                            runtime = runtime_state.RuntimeStateRepository(owned)
+                            if runtime.get(repo, plan_id).status not in runtime_state.ACTIVE_STATUSES:
+                                code = 1
+                                break
+                            runtime.update_plan(repo, plan_id, plan_values={"last_error": detail}, enqueue=False)
+                            if isinstance(error, task_calls.CallDeferred) or exception_attempts >= 3:
+                                code = PROJECT_STEP_TRANSIENT_PAUSE
+                                break
+                            before, code = None, PROJECT_STEP_RETRY
                         if code == PROJECT_STEP_PLANNING_PENDING:
                             scheduler.pause_project(repo)
                             raise PlanningDrain()
                         if code != PROJECT_STEP_RETRY:
                             break
                         scheduler.check_project(repo)
-                        if retry_pause_detail(owned, repo, before, attempts, plan_id=plan_id) is not None:
+                        if before is not None and retry_pause_detail(owned, repo, before, attempts, plan_id=plan_id) is not None:
                             code = PROJECT_STEP_TRANSIENT_PAUSE
                             break
                         scheduler.requeue(current_task.get())
@@ -340,7 +362,13 @@ def run_project_tasks(service, *, newly_activated):
             _check_runtime_handoff()
             for plan_id, result in tuple(running.items()):
                 if result.done():
-                    results.append(result.result())
+                    try:
+                        results.append(result.result())
+                    except Exception as error:
+                        events.emit("작업 처리 예외", level="ERROR", project=repo, plan=plan_id,
+                            reason=f"{type(error).__name__}: {error}", traceback=traceback.format_exc(),
+                            next_action="해당 작업 보존·독립 작업 계속")
+                        results.append(1)
                     del running[plan_id]
             existing = connection.execute("SELECT * FROM exec_plans WHERE repo=? "
                 "AND status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') ORDER BY plan_id", (repo,)).fetchall()
@@ -379,7 +407,10 @@ def run_project_tasks(service, *, newly_activated):
         active = runtime_state.RuntimeStateRepository(connection).active(repo)
         if active is not None:
             runtime_state.RuntimeStateRepository(connection).hydrate_snapshot(repo, active)
-        elif not managed_count(connection, repo):
+        elif not managed_count(connection, repo) and connection.execute(
+                "SELECT 1 FROM task_call_reservations WHERE repo=? UNION ALL "
+                "SELECT 1 FROM execution_checkpoints WHERE repo=? AND operation IS NOT NULL LIMIT 1",
+                (repo, repo)).fetchone() is None:
             runtime_state.RuntimeStateRepository(connection).update_project(
                 repo, runtime_state.EXECUTION_CLEAR_VALUES)
     return next((code for code in results if code in {PROJECT_STEP_PLANNING_PENDING, PROJECT_STEP_RETRY}),
