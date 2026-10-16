@@ -801,11 +801,13 @@ CLI·OS별 실행 전제는 [인증과 실행 조건](OPERATIONS.md#인증과-�
 | 경계 | 확인·저장하는 근거 |
 |---|---|
 | 실행 환경 준비 | `AgentRequest.prepared_launch`가 worktree·repository·role의 공통 홈과 호출별 임시 저장을 provider 조회 전에 선택한다. legacy profile callback도 `prepared_environment`의 같은 필터된 mapping을 사용하며 부모 `os.environ`·호출자 mapping은 바꾸지 않는다. |
-| 모델 호출 없는 사전 검사 | 현재 CLI·설정·확장·역할 정책과 별도 `codex sandbox` 안의 파일 도구 경계를 검사한다. 실제 Agent 실행을 감싸는 wrapper나 모델 호출·중첩 도구 시연과 구분한다. |
-| 실행 직전 | 같은 환경의 인증·Model/Effort·Fast·native 지침을 확인하고 workspace·설정·CLI와 인증 링크를 재검사한다. 전체 developer 지침·환경·정책 지문을 invocation에 결합한 뒤 실제 `codex exec`를 시작한다. |
+| 모델 호출 없는 사전 검사 | 현재 CLI·설정·확장·역할 정책과 별도 `codex sandbox` 안의 파일 도구 경계를 검사한다. version·feature·sandbox 조회가 끝난 뒤 설정 정책을 다시 확인하고 안정된 설정 지문을 계산한다. 실제 Agent 실행을 감싸는 wrapper나 모델 호출·중첩 도구 시연과 구분한다. |
+| 실행 직전 | 같은 환경의 인증·Model/Effort·Fast·native 지침을 확인하고 workspace·설정·CLI와 인증 링크를 재검사한다. 준비 조회가 안전한 설정을 바꿨으면 새 내용을 다시 검사해 최종 격리·실행 지문에 결합한다. 최종 증거를 invocation에 저장한 뒤 process handoff에서도 설정·workspace snapshot을 확인하고 실제 `codex exec`를 시작한다. |
 | 종료 | 프로세스 그룹 또는 Windows Job의 정리·wait 성공 뒤에만 종료 콜백을 호출한다. 시작·writer 종료·결과 성공·검증 성공은 별도 사실로 기록한다. |
 
 `provider_execution.observe`는 모델 실행 없이 현재 Codex Reviewer의 입력을 확인하거나 지정한 실제 invocation의 완료 기록을 읽는다. `execution_identity`의 문자열 필드는 `provider`·`model`·`effort`·`instruction`·`environment`·`policy`이며 지침·환경·정책은 지문으로 저장한다. 실제 호출 identity는 process 시작 전에 한 번 결합하고 현재 설정을 과거 행에 소급하지 않는다. credential 값·그 값의 해시·prompt 원문은 저장하지 않는다.
+
+준비 CLI가 공통 설정을 안전하게 생성·교체한 경우에는 새 내용을 재검사한 뒤 현재 invocation의 격리·실행 지문을 함께 갱신한다. MCP·plugin·hook·profile·권한·exec-policy 충돌, 읽기 실패, 검사 중 불안정한 내용은 거부한다. 저장된 증거 갱신은 process 시작 전의 미완료 invocation에만 허용하며 process handoff에서 설정과 workspace snapshot을 다시 대조한다. 최종 검사 뒤의 설정 변경은 호출을 시작하지 않고 기존 결과·session·작업 이력을 보존한다.
 
 일회성 임시 경로는 정확히 확인한 소유 디렉터리만 정규화한다. 실제 process 시작·종료·성공·격리·지침과 repository/plan/role/worktree 결합이 없거나 legacy 입력이 누락되면 재사용 증거를 반환하지 않는다. 현재 환경 확인만으로 과거 성공을 합성하지 않는다.
 

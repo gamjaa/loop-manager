@@ -275,12 +275,21 @@ class WriteIsolationTests(TestCase):
             provider_home = root / 'codex-home'
             provider_home.mkdir()
             config = provider_home / 'config.toml'
-            config.write_text('model = "first"\n', encoding='utf-8')
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repository')
             records = []
             launch = mock.Mock(probe_arguments=('standalone',), arguments=('inner',),
                                environment={'CODEX_HOME': str(provider_home)})
+            probe_count = 0
+
+            def probe():
+                nonlocal probe_count
+                probe_count += 1
+                replacement = config.with_suffix('.replacement')
+                replacement.write_text(f'model = "created-{probe_count}"\n', encoding='utf-8')
+                replacement.replace(config)
+
+            launch.probe.side_effect = probe
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
@@ -292,13 +301,45 @@ class WriteIsolationTests(TestCase):
                     result = isolation.prepare_isolation(
                         'codex', 'worker', root, root, False, records.append,
                         lambda: 'snapshot', expected_repository=str(root / 'source'),
-                        session_id=session, environment_variables={})
+                        session_id=session, environment_variables={}, config_path=root / 'config')
                     self.assertIs(result, launch)
-                    config.write_text('model = "second"\n', encoding='utf-8')
+                    evidence = records[-1]
+                    self.assertEqual(evidence.configuration_digest, isolation._configuration_digest(
+                        'codex', root, root / 'config', launch.environment))
+                    isolation.assert_current(evidence, root, root, root / 'config',
+                        str(root / 'source'), False, lambda: 'snapshot',
+                        environment_variables=launch.environment)
             self.assertEqual(launch.probe.call_count, 2)
             self.assertEqual([record.status for record in records], ['verified', 'verified'])
             self.assertNotEqual(records[0].policy_digest, records[1].policy_digest)
             self.assertEqual(records[0].repository_identity, 'repository')
+
+    def test_extension_conflict_created_during_probe_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider_home = root / 'codex-home'
+            provider_home.mkdir()
+            config = provider_home / 'config.toml'
+            boundary = isolation.WorktreeBoundary(root, root / 'source', (),
+                                                   root / 'git', root / 'common', 'repository')
+            records = []
+            launch = mock.Mock(probe_arguments=('standalone',), arguments=('inner',),
+                               environment={'CODEX_HOME': str(provider_home)})
+            launch.probe.side_effect = lambda: config.write_text('hooks=["unsafe"]\n')
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
+                 mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                 mock.patch.object(isolation.subprocess, 'run', return_value=
+                                   manager.subprocess.CompletedProcess(
+                                       ['codex', '--version'], 0, 'codex-cli 0.159.3\n', '')):
+                with self.assertRaisesRegex(isolation.IsolationError, 'MCP·plugin·hook'):
+                    isolation.prepare_isolation(
+                        'codex', 'worker', root, root, False, records.append,
+                        lambda: 'snapshot', expected_repository=str(root / 'source'),
+                        environment_variables={})
+            self.assertEqual(records[0].status, 'rejected')
+            self.assertIn('hooks', config.read_text(encoding='utf-8'))
 
     def test_unverified_codex_file_tools_stop_before_process_and_log_changes(self):
         with tempfile.TemporaryDirectory() as directory:

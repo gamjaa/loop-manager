@@ -30,10 +30,10 @@ priority: high
 
 ## Implementation
 
-- [ ] `loop_manager_internal/agents/agent_write_isolation.py`의 `prepare_isolation`이 `_configuration_digest`를 CLI version/features/probe보다 먼저 저장하는 순서를 보완한다. 기존 설정 검사·`assert_current`를 재사용해 준비 중 생성/교체된 설정을 다시 검토한 최종 증거와 검사 후 경쟁의 거부를 구분한다. 새 설정을 읽은 뒤 권한·확장 충돌을 반드시 다시 확인하며 불안정한 준비는 기존 보존/재시도 경계로 반환한다.
-- [ ] `provider_adapters.py`의 `run_codex`, `provider_execution.py`의 읽기 전용 `observe`와 G-262의 준비 환경을 대조한다. profile·native 지침 조회 등 실제 소비자에 같은 공통 홈과 최종 검사 기준을 적용하고, 최종 설정 변화에서는 실행/Review 동일성 증거를 만들지 않는다. 신규·재개·retry·fallback의 기존 session·ledger 관계를 바꾸지 않는다.
-- [ ] 확인한 `provider_home.py`, `agent_profiles.py`, `agent_codex_sandbox.py`의 공통 홈·인증 링크·호출별 attempt 구조를 유지한다. 삭제된 `_read_only_link`나 역할별 config 제거를 복원하지 않는다. `tests/test_provider_home.py`의 설정 수명/과거 홈 보존 fixture와 `tests/test_codex_native_invocation.py`·`test_agent_write_isolation.py`·`test_provider_runtime.py`의 실제 판단/모의 CLI 경계를 재사용한다.
-- [ ] PRODUCT·ARCHITECTURE·`docs/OPERATIONS.md`의 관련 절을 검사 시점·정상 생성·경쟁 거부에 맞춰 필요한 경우 통합한다. 공통 홈의 직접 사용과 과거 자료 보존은 이미 반영됐으므로 재구현 목표로 쓰지 않는다.
+- [x] `prepare_isolation`은 CLI version/features/sandbox 조회 전에 현재 설정을 검사하고, 조회 뒤 정책을 다시 검사해 안정된 최종 지문을 저장한다. `assert_current`와 process handoff 재검사로 이후 변경을 거부하며, 설정 생성·교체와 검사 뒤 경쟁을 구분한다. 불안정한 설정은 기존 보존/재시도 경계로 반환한다.
+- [x] `provider_adapters.py`의 `run_codex`, `provider_execution.py`의 읽기 전용 `observe`와 G-262의 준비 환경을 대조한다. profile·native 지침 조회 등 실제 소비자에 같은 공통 홈과 최종 검사 기준을 적용하고, 최종 설정 변화에서는 실행/Review 동일성 증거를 만들지 않는다. 신규·재개·retry·fallback의 기존 session·ledger 관계를 바꾸지 않는다.
+- [x] 확인한 `provider_home.py`, `agent_profiles.py`, `agent_codex_sandbox.py`의 공통 홈·인증 링크·호출별 attempt 구조를 유지한다. 삭제된 `_read_only_link`나 역할별 config 제거를 복원하지 않는다. `tests/test_provider_home.py`의 설정 수명/과거 홈 보존 fixture와 `tests/test_codex_native_invocation.py`·`test_agent_write_isolation.py`·`test_provider_runtime.py`의 실제 판단/모의 CLI 경계를 재사용한다.
+- [x] PRODUCT·ARCHITECTURE·`docs/OPERATIONS.md`의 관련 절을 검사 시점·정상 생성·경쟁 거부에 맞춰 통합한다. 공통 홈의 직접 사용과 과거 자료 보존은 이미 반영됐으므로 재구현 목표로 쓰지 않는다.
 
 ## Validation
 
@@ -44,11 +44,11 @@ priority: high
 
 ## Progress
 
-기존 전용 홈·기본 인증 연결에 대한 정적 확인은 보존한다. 최신 원격 직접 구현에서는 `prepare_launch`가 세 OS 공통 홈을 직접 사용하고 `_read_only_link`를 제거했으며 설정 수명·과거 홈 보존·동시 역할의 임시 경로 회귀가 추가됐다. 이 코드·테스트의 존재를 확인했으며 실행 성공은 기록하지 않았다.
+기존 전용 홈·기본 인증 연결에 대한 정적 확인은 보존한다. 최신 원격 직접 구현에서는 `prepare_launch`가 세 OS 공통 홈을 직접 사용하고 `_read_only_link`를 제거했으며 설정 수명·과거 홈 보존·동시 역할의 임시 경로 회귀가 추가됐다.
 
-- [ ] 준비 중 설정 생성/교체의 최종 검사 순서 보완
-- [ ] 호출 경계의 설정 수명·경쟁 targeted 검증
-- [ ] 필요한 제품·설계/안내 정합성
+- [x] 준비 중 생성·교체된 설정을 probe 뒤와 profile/native 지침 조회 뒤 다시 검사하고, 최종 지문·정책을 현재 invocation에 결합했다. process handoff에서 설정·workspace snapshot 변경을 다시 거부하며 미시작 invocation 증거만 갱신한다.
+- [x] 관리 rebase 후 현재 후보 `61ecda6`에서 targeted runner로 configuration drift·probe 중 안전한 원자 교체·probe 중 확장 충돌·native 지침 조회 중 생성/충돌·read-only 관측의 안전한 생성·최종 검사 뒤 경쟁 변경·공통 홈 설정 수명 등 8개 unit case를 재실행해 모두 통과했다. 전체 verify는 실행하지 않았다.
+- [x] PRODUCT·ARCHITECTURE·OPERATIONS에 정상 생성 수용과 검사·거부 순서를 반영했다.
 
 ## Decision Log
 

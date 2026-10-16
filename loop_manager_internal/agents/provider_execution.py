@@ -75,9 +75,12 @@ def observe(connection, *, repo: str, plan_id: str | None, worktree: Path,
         instructions = []
         provider_guidance.codex_arguments(guidance, worktree, environment=launch.environment,
             context_arguments=context, observe_instruction=instructions.append)
-        agent_write_isolation.assert_current(checked[0], worktree, state_dir, config_path,
+        evidence = agent_write_isolation.refresh_configuration_evidence(
+            checked[0], launch, worktree, state_dir, config_path, repo, True, snapshot_digest,
+            environment_variables=launch.environment)
+        agent_write_isolation.assert_current(evidence, worktree, state_dir, config_path,
             repo, True, snapshot_digest, environment_variables=launch.environment)
-        return execution_identity(checked[0], launch, profile, instructions[0], read_only=True)
+        return execution_identity(evidence, launch, profile, instructions[0], read_only=True)
     except (RuntimeError, OSError, ValueError, TypeError, IndexError, sqlite3.Error):
         return None
     finally:

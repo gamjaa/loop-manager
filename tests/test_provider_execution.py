@@ -2,6 +2,7 @@
 import unittest
 from unittest import mock
 from loop_manager_internal.agents import agent_profiles, agent_write_isolation as isolation
+from loop_manager_internal.agents import provider_adapters
 from loop_manager_internal.agents.agent_invocation import ResolvedProfile
 from loop_manager_internal.storage import agent_invocation_state
 from tests.support.provider_execution import ProviderExecutionFixture
@@ -27,6 +28,82 @@ class ProviderExecutionTests(ProviderExecutionFixture, unittest.TestCase):
         self.assertEqual(self.observe(), original)
         (self.child_home / 'config.toml').write_text('model="changed"\n')
         self.assertNotEqual(self.observe(), original)
+
+    def test_native_instruction_lookup_config_generation_is_bound_to_actual_call(self):
+        config = self.child_home / 'config.toml'
+
+        def create_config(arguments):
+            if 'debug' in arguments and not config.exists():
+                replacement = config.with_suffix('.replacement')
+                replacement.write_text('model="generated during instruction lookup"\n')
+                replacement.replace(config)
+
+        self.native_probe_hook = create_config
+        result = self.invoke()
+        self.assertEqual(result.code, 0)
+        proof = self.connection.execute(
+            'SELECT status, configuration_digest FROM agent_isolation_evidence').fetchone()
+        self.assertEqual(proof['status'], 'verified')
+        self.assertEqual(proof['configuration_digest'], isolation._configuration_digest(
+            'codex', self.worktree, self.config,
+            {'CODEX_HOME': str(self.child_home)}))
+        self.assertEqual(self.observe(invocation_id=result.isolation_invocation_id), self.observe())
+
+    def test_current_observation_accepts_safe_config_created_during_instruction_lookup(self):
+        config = self.child_home / 'config.toml'
+
+        def create_config(arguments):
+            if 'debug' in arguments and not config.exists():
+                config.write_text('model="created while observing"\n')
+
+        self.native_probe_hook = create_config
+        observed = self.observe()
+        self.assertIsNotNone(observed)
+        self.assertTrue(config.is_file())
+        self.assertEqual(self.observe(), observed)
+
+    def test_instruction_config_conflict_is_rejected_before_process_and_preserves_result(self):
+        config = self.child_home / 'config.toml'
+        log_dir = provider_adapters._provider_log_directory(self.worktree, self.state)
+        previous = log_dir / 'reviewer-last.txt'
+        previous.write_text('previous result')
+
+        def create_conflict(arguments):
+            if 'debug' in arguments and not config.exists():
+                config.write_text('hooks=["unsafe"]\n')
+
+        self.native_probe_hook = create_conflict
+        with self.assertRaisesRegex(isolation.IsolationError, 'hook'):
+            self.invoke()
+        self.popen.assert_not_called()
+        self.assertEqual(previous.read_text(), 'previous result')
+        proof = self.connection.execute(
+            'SELECT status, reason FROM agent_isolation_evidence').fetchone()
+        self.assertEqual(proof['status'], 'rejected')
+        self.assertIn('hook', proof['reason'])
+
+    def test_config_changed_after_final_check_is_rejected_at_process_handoff(self):
+        config = self.child_home / 'config.toml'
+        previous = provider_adapters._provider_log_directory(
+            self.worktree, self.state) / 'reviewer-last.txt'
+        previous.write_text('previous result')
+
+        def race_after_check():
+            replacement = config.with_suffix('.replacement')
+            replacement.write_text('model="changed after final check"\n')
+            replacement.replace(config)
+
+        self.before_handoff = race_after_check
+        with self.assertRaisesRegex(isolation.IsolationError, '변경됐습니다'):
+            self.invoke()
+        self.popen.assert_not_called()
+        self.assertEqual(previous.read_text(), 'previous result')
+        proof = self.connection.execute('''SELECT proof.status, call.execution_identity,
+            call.execution_started_at FROM agent_isolation_evidence proof
+            JOIN agent_invocations call USING(invocation_id)''').fetchone()
+        self.assertEqual(proof['status'], 'rejected')
+        self.assertIsNone(proof['execution_identity'])
+        self.assertIsNone(proof['execution_started_at'])
 
     def test_effective_native_instruction_change_does_not_rewrite_old_invocation(self):
         result = self.invoke()

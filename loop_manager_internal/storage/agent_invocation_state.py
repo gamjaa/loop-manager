@@ -226,19 +226,46 @@ class InvocationRepository:
             )
 
     def record_isolation(self, identity: str, evidence: IsolationEvidence) -> None:
-        """Tie preflight to one invocation, never to a reusable session alone."""
+        """Tie final preflight to one unstarted invocation, never to a reusable session."""
         with self.connection:
-            self.connection.execute("""INSERT INTO agent_isolation_evidence
+            result = self.connection.execute("""INSERT INTO agent_isolation_evidence
                 (invocation_id, provider, cli_version, environment, role,
                  canonical_worktree, repository_identity, policy_digest, snapshot_digest,
                  configuration_digest,
                  status, reason, checked_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(invocation_id) DO UPDATE SET
+                    provider=excluded.provider, cli_version=excluded.cli_version,
+                    environment=excluded.environment, role=excluded.role,
+                    canonical_worktree=excluded.canonical_worktree,
+                    repository_identity=excluded.repository_identity,
+                    policy_digest=excluded.policy_digest,
+                    snapshot_digest=excluded.snapshot_digest,
+                    configuration_digest=excluded.configuration_digest,
+                    status=excluded.status, reason=excluded.reason,
+                    checked_at=excluded.checked_at
+                WHERE EXISTS (SELECT 1 FROM agent_invocations call
+                    WHERE call.invocation_id=excluded.invocation_id
+                      AND call.provider=excluded.provider AND call.role=excluded.role
+                      AND call.execution_started_at IS NULL AND call.finished_at IS NULL)
+                  AND agent_isolation_evidence.status='verified'
+                  AND agent_isolation_evidence.provider=excluded.provider
+                  AND agent_isolation_evidence.cli_version=excluded.cli_version
+                  AND agent_isolation_evidence.environment=excluded.environment
+                  AND agent_isolation_evidence.role=excluded.role
+                  AND agent_isolation_evidence.canonical_worktree=excluded.canonical_worktree
+                  AND agent_isolation_evidence.repository_identity=excluded.repository_identity
+                  AND agent_isolation_evidence.snapshot_digest=excluded.snapshot_digest""",
                 (identity, evidence.provider, evidence.cli_version,
                  evidence.environment, evidence.role, evidence.worktree,
                  evidence.repository_identity, evidence.policy_digest,
                  evidence.snapshot_digest, evidence.configuration_digest,
                  evidence.status, evidence.reason, utc_now()))
+            if result.rowcount != 1:
+                raise sqlite3.IntegrityError('격리 증거 identity 또는 실행 전 갱신 경계가 유효하지 않습니다.')
+            self.connection.execute("""UPDATE agent_invocations SET execution_identity=NULL
+                WHERE invocation_id=? AND execution_started_at IS NULL AND finished_at IS NULL""",
+                (identity,))
 
     def record_execution_identity(self, identity: str, value: dict[str, str]) -> None:
         required = {'provider', 'model', 'effort', 'instruction', 'environment', 'policy'}
