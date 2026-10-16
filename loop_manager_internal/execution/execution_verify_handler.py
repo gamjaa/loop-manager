@@ -319,7 +319,8 @@ class VerifyHandler:
         try:
             origin_url = self.ports.git(context.worktree, 'remote', 'get-url', 'origin').stdout.strip()
             common_guidance_report(self.ports.git, context.worktree, context.active_sha,
-                                   candidate_head, origin_url, worker_publication.summary)
+                                   candidate_head, origin_url, worker_publication.summary,
+                                   selected_execplan_path=context.plan.path)
         except DocumentReportError as error:
             self.ports.state.update_project(self.ports.identity.repo, phase='WORKING',
                                             validated_base_sha=None, last_error=str(error))

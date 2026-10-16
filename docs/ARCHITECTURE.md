@@ -687,7 +687,7 @@ catalog와 snapshot은 탐색·검증 입력이며 그 자체로 쓰기 권한�
 
   `validate_active_execplan_metadata`는 이 처리를 포함한 Worker 결과를 검증·Review 전에 reconciled catalog의 title·sources·depends_on·complexity·risk·priority와 정확히 비교하고 불일치 필드를 보고한다. Requirement resolver의 경로 호환을 metadata 동등성으로 사용하지 않으며 잘못된 선언은 Worker 진입 전에 Planner·Manager 경계에서 교정한다
 
-- `documents/pr_description.py`는 기존 실행 지침 보고 경계와 publication 호출을 재사용해 최종 base/head의 name-status와 문서별 patch를 검증한다. `docs/` 아래 파일과 저장소의 Markdown·RST·TXT 문서를 대상으로 추가·삭제·rename·copy를 식별하며 rename·copy는 양쪽 경로를 포함한다.
+- `documents/pr_description.py`는 기존 실행 지침 보고 경계와 publication 호출을 재사용해 최종 base/head의 name-status와 문서별 patch를 검증한다. `docs/` 아래 파일과 저장소의 Markdown·RST·TXT 문서를 대상으로 추가·삭제·rename·copy를 식별하며 rename·copy는 양쪽 경로를 포함한다. 검증 전과 새 PR·기존 PR 게시 경계에서 현재 선택된 ExecPlan 경로를 전달하고, 최종 경로가 일치하는 파일만 문서 보고·`DOCUMENT_CHANGE` 제출 대상에서 제외한다. 이전 Worker 결과에 남은 해당 경로의 보고도 무시한다. 다른 문서의 보고 검사와 선택된 ExecPlan의 diff 검토·범위 검증, PR의 고정 링크·Purpose는 유지한다.
 
   Worker는 `PR_SUMMARY`의 각 줄 맨 앞에 `DOCUMENT_CHANGE:`를 두고 뒤에 JSON 객체 하나를 기록한다. 변경 문서별로 한 건이며 아래 필드는 모두 비어 있지 않은 문자열이어야 한다.
 

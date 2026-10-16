@@ -17,8 +17,8 @@ COMMON_REPORT_END = '<!-- loop-manager:common-guidance:end -->'
 
 
 def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
-                           origin_url: str, summary: str) -> str:
-    """Report every final document diff through the existing publication boundary."""
+                           origin_url: str, summary: str, *, selected_execplan_path: str) -> str:
+    """Report final document diffs except the selected ExecPlan."""
     fields = git(worktree, "diff", "--no-ext-diff", "--name-status", "-z", "--find-renames",
                  base_sha, head_sha).stdout.split("\0")
     changes, index = [], 0
@@ -28,8 +28,10 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
         paths = fields[index + 1:index + 1 + count]
         if len(paths) != count or any(not path for path in paths):
             raise RuntimeError("문서 최종 diff 경로를 확인할 수 없습니다.")
-        if any(path.startswith("docs/") or path.lower().endswith((".md", ".rst", ".txt"))
-               for path in paths):
+        if paths[-1] != selected_execplan_path and any(
+            path.startswith("docs/") or path.lower().endswith((".md", ".rst", ".txt"))
+            for path in paths
+        ):
             changes.append((status, paths))
         index += 1 + count
     if not changes:
@@ -40,6 +42,8 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
             continue
         try:
             item = json.loads(line.partition(":")[2])
+            if isinstance(item, dict) and item.get("path") == selected_execplan_path:
+                continue
             if not isinstance(item, dict) or any(
                 not isinstance(item.get(key), str) or not item[key].strip()
                 for key in ("path", "summary", "reason", "impact", "patch_sha256")
@@ -72,7 +76,7 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
     if errors:
         raise DocumentReportError("\n".join([
             *sorted(set(errors)), f"base={base_sha}, head={head_sha}",
-            "최종 응답의 PR_SUMMARY에 변경 문서 전체의 DOCUMENT_CHANGE를 함께 제출하라. "
+            "최종 응답의 PR_SUMMARY에 선택된 ExecPlan을 제외한 변경 문서 전체의 DOCUMENT_CHANGE를 함께 제출하라. "
             "유효한 기존 설명도 유지하고 현재 diff의 주요 내용·수정 이유·제품/설계 영향을 포함하라.",
             *required,
         ]))

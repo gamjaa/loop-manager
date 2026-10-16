@@ -2,7 +2,7 @@
 
 ## Summary
 
-Planner·Worker·Reviewer의 저장소 접근과 문서 수정·PR 보고 책임을 정리한다. Worker는 Requirement·다른 ExecPlan·선택 ExecPlan의 frontmatter를 수정하지 않으며 PR 문서 보고는 파일명·요약·이유·영향만 표시한다. 모호한 작업은 원격 draft로 게시하고, 사용자 본문 변경이나 User Decision의 출처·revision·현재 소유권을 검증해 결과를 본문에 통합하고 임시 판단 입력을 정리한다. 게시·DB 반영·감사·dependency를 보존하며 독립 작업은 계속한다.
+Planner·Worker·Reviewer의 저장소 접근과 문서 수정·PR 보고 책임을 정리한다. Worker는 Requirement·다른 ExecPlan·선택 ExecPlan의 frontmatter를 수정하지 않으며 PR 문서 보고는 파일명·요약·이유·영향만 표시한다. 선택된 ExecPlan은 문서 보고·DOCUMENT_CHANGE 제출 대상에서 제외하되 기존 diff 검토·범위 검증은 유지한다. 모호한 작업은 원격 draft로 게시하고, 사용자 본문 변경이나 User Decision의 출처·revision·현재 소유권을 검증해 결과를 본문에 통합하고 임시 판단 입력을 정리한다. 게시·DB 반영·감사·dependency를 보존하며 독립 작업은 계속한다.
 
 ## Context
 
@@ -69,7 +69,7 @@ Planner 입력에는 사용자 변경의 출처·revision과 문맥 diff를 제�
 
 - Worker는 구현에 필요한 PRODUCT·ARCHITECTURE·FUTURE_IDEAS·선택 ExecPlan 본문·공통 및 역할 지침·사용 안내·설정·테스트 등을 수정할 수 있다. R-082에 따라 활성·archive를 포함한 모든 Requirement의 추가·수정·삭제·rename·이동과 다른 ExecPlan·선택 ExecPlan frontmatter의 수정은 허용하지 않으며 archive 후보 지정도 예외가 아니다. 이 경계 안의 허용된 문서 수정을 경로 분류나 사용자 소유라는 이유만으로 범위 위반·작업 차단으로 처리하지 않는다.
 - 문서 수정은 현재 작업의 목표와 구현에 맞게 이유·동작·설계·작업 기록·검증을 정합하게 유지하기 위한 것이다. 실패를 숨기려고 Acceptance Criteria를 바꾸거나 사용자 요청·필수 검증을 삭제해 성공으로 만들지 않는다. 선택 ExecPlan 본문의 기존 구현·검증·실행 이력과 유효한 사용자 결정을 보존한다.
-- PR 본문의 문서 보고에는 R-087에 따라 실제 변경된 문서별 파일명·변경 요약·이유·영향만 표시한다. 새 파일·삭제·이름 변경도 포함하며 파일명 목록이나 일반적인 구현 Summary만으로 대신하지 않는다. 문서 발췌·전체 patch·diff 링크·검증용 hash는 PR 본문에 넣지 않는다.
+- PR 본문의 문서 보고에는 R-087에 따라 선택된 ExecPlan을 제외한 실제 변경 문서별 파일명·변경 요약·이유·영향만 표시한다. 선택된 ExecPlan은 `DOCUMENT_CHANGE` 제출 대상에서도 제외하며 기존 diff 검토·범위 검증과 PR의 ExecPlan 링크·Purpose는 유지한다. 새 파일·삭제·이름 변경도 포함하며 파일명 목록이나 일반적인 구현 Summary만으로 대신하지 않는다. 문서 발췌·전체 patch·diff 링크·검증용 hash는 PR 본문에 넣지 않는다.
 - Manager는 실제 최종 diff·hash와 Worker 보고를 대조해 PR 본문을 완성한다. PR head·rebase 변경 뒤에도 문서 보고를 최종 변경과 일치시키고, 누락되거나 오래된 내용은 해당 작업에서 보완한다. 변경하지 않은 문서를 수정했다고 보고하거나 다른 작업의 중단 사유로 확대하지 않는다.
 
 ### CLI 지침과 개별 작업 대기
@@ -97,7 +97,7 @@ Worker가 수정한 허용 문서도 검토 대상이다. 수정 전 요청과 �
 - Worker가 현재 작업에 필요한 PRODUCT·ARCHITECTURE·FUTURE_IDEAS와 선택 ExecPlan 본문을 수정해도 경로 분류만으로 범위 위반·차단하지 않는다. 모든 Requirement·다른 ExecPlan·선택 ExecPlan frontmatter의 변경은 거부한다. 합의된 목표·필수 검증·다른 작업 상태와 사용자 변경을 보존한다.
 - 지침 파일 변경에 별도 승인 양식을 요구하지 않으며, 과거 파일 승인·patch는 현재 실행 권한으로 사용하지 않는다. 기존 파일 승인 대기 전환에서도 일반 사용자 결정·독립 차단·작업물·session·감사를 보존한다.
 - 코드·설계·계획 변경으로 함께 바뀌어야 하는 허용 문서는 Worker가 갱신하고, 직접 수정할 수 없는 문서의 변경 필요성은 보고한다. Planner는 영향받는 허용 대상 ExecPlan만 개정한다. 최종 문서의 경로·계약·dependency·검증 설명이 구현과 일치하며 관련성만으로 목표·승인·실행 권한을 확대하지 않는다.
-- 변경된 모든 문서의 파일명·요약·이유·영향만 최종 PR 문서 보고에서 확인할 수 있고 발췌·patch·diff 링크·hash는 포함하지 않는다. 추가·삭제·rename·rebase·PR head 갱신 뒤에도 실제 최종 diff·hash와 보고의 일치를 검증한다.
+- 선택된 ExecPlan을 제외한 모든 변경 문서의 파일명·요약·이유·영향만 최종 PR 문서 보고에서 확인할 수 있고 발췌·patch·diff 링크·hash는 포함하지 않는다. 선택된 ExecPlan의 `DOCUMENT_CHANGE`를 요구하지 않으며 기존 diff 검토·범위 검증과 PR의 ExecPlan 링크·Purpose는 유지한다. 추가·삭제·rename·rebase·PR head 갱신 뒤에도 보고 대상 문서의 실제 최종 diff·hash와 보고의 일치를 검증한다.
 - Reviewer는 관련 문서·구현·문서 변경을 중심으로 읽기 전용 검토하고, 변경 전 목표와 변경 후 결과·PR 보고를 대조한다. 문서 수정만으로 FAIL하지 않으며 파일 쓰기·테스트 재실행을 수행하지 않는다.
 - 게시·사용자 판단 반영·작업 가능 전환·PR 보고 갱신의 중단·재시작에서 같은 계획과 결정·작업물을 보존하고 중복 게시·알림·승인 적용을 방지한다.
 - 역할 instruction·작업 prompt·계획 형식·catalog·범위 검사·PR 보고가 같은 정책으로 동작한다. 정적 역할 권한은 해당 지침 파일에 반영하고 사용자 prompt에 중복하지 않는다. 실행 이력·Git 쓰기·최종 검증·사용자 Merge의 기존 책임은 유지된다.

@@ -507,7 +507,7 @@ rebase로 원본 브랜치에서 유입된 다른 문서는 Worker의 범위 밖
 
 #### PR 문서 보고
 
-PR 본문의 문서 보고는 최종 diff에 포함된 모든 문서의 파일명·변경 요약·이유·영향을 제공한다. 추가·삭제·rename을 포함하며 실제 변경 내용·patch·diff 링크·검증용 hash는 본문에 넣지 않는다.
+PR 본문의 문서 보고는 최종 diff에서 선택된 ExecPlan을 제외한 모든 변경 문서의 파일명·변경 요약·이유·영향을 제공한다. 선택된 ExecPlan은 `DOCUMENT_CHANGE` 제출 대상에서도 제외하지만 기존 diff 검토·범위 검증과 PR의 ExecPlan 링크·Purpose는 유지한다. 추가·삭제·rename을 포함하며 실제 변경 내용·patch·diff 링크·검증용 hash는 본문에 넣지 않는다.
 
 Manager는 Worker Summary와 실제 최종 diff/hash를 대조하고 rebase·PR head 변경 뒤 보고도 갱신한다. 설명 누락·중복·형식 오류·최종 diff 불일치는 해당 Worker의 교정으로 보완한다. 오래된 일반 Summary나 patch로 대신하지 않으며 불완전한 보고를 게시하거나 보고 반영 전에 게시 완료로 처리하지 않는다.
 
