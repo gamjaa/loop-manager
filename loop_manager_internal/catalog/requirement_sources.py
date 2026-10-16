@@ -169,10 +169,11 @@ def reconcile_execplan_sources(path: str, raw: bytes, documents: Mapping[str, st
     for source in plan['sources']:
         if _ACTIVE.fullmatch(source) is None or source in documents:
             continue
-        resolved = resolve_requirement_source(source, documents, allow_archive=False)
+        resolved = resolve_requirement_source(source, documents)
         if resolved.status is ResolutionStatus.AMBIGUOUS:
             raise RequirementSourceLookupError(source, '같은 R-ID의 source 후보가 여러 개입니다')
-        if resolved.status is ResolutionStatus.RESOLVED and resolved.path != source:
+        if (resolved.status is ResolutionStatus.RESOLVED and resolved.path != source
+                and _ACTIVE.fullmatch(resolved.path)):
             replacements[source.encode('utf-8')] = resolved.path.encode('utf-8')
     if not replacements:
         return raw

@@ -20,6 +20,23 @@ def requirement(requirement_id: str, title: str) -> str:
 
 
 class RequirementSourceResolutionTest(unittest.TestCase):
+    def test_execplan_reconciliation_keeps_exact_archive_reference(self):
+        path = 'docs/plans/[G-001] Plan.md'
+        source = 'docs/requirements/[R-001] Original.md'
+        raw = execplan_header('G-001', 'Plan').replace('docs/PRODUCT.md', source).encode()
+        documents = {'docs/requirements/archive/[R-001] Original.md': requirement('R-001', 'Original'),
+                     'docs/requirements/[R-001] Renamed.md': requirement('R-001', 'Renamed')}
+        self.assertEqual(requirement_sources.reconcile_execplan_sources(path, raw, documents), raw)
+
+    def test_execplan_reconciliation_rejects_active_archive_id_ambiguity(self):
+        path = 'docs/plans/[G-001] Plan.md'
+        source = 'docs/requirements/[R-001] Missing.md'
+        raw = execplan_header('G-001', 'Plan').replace('docs/PRODUCT.md', source).encode()
+        documents = {'docs/requirements/archive/[R-001] Archived.md': requirement('R-001', 'Archived'),
+                     'docs/requirements/[R-001] Renamed.md': requirement('R-001', 'Renamed')}
+        with self.assertRaises(requirement_sources.RequirementSourceLookupError):
+            requirement_sources.reconcile_execplan_sources(path, raw, documents)
+
     def test_exact_path_wins_when_the_original_id_is_duplicated(self):
         source = "docs/requirements/[R-001] Original.md"
         exact = requirement("R-001", "Original")
