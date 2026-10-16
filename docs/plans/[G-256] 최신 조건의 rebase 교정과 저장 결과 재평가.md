@@ -361,3 +361,18 @@ python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_reb
 결과: **PASS — 11 tests, exit 0**, 모든 test `ok`. 실제 전달/응답 저장·호출 중 조건 변경·typed 입력 오류·중간 검사 유예/원격 확인·최종 거부·완료 다음 dispatch·다음 충돌/중단 재진입·정규화 뒤 checkpoint 재개를 확인했다. Git/Agent/verify는 mock이며 SQLite/파일은 독립 fixture다. mock VERIFYING/REVIEWING 로그는 전체 verify/Review 성공을 뜻하지 않는다. unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집·필수 compile 선언과 verify 입력 목록을 유지하며 실행은 Python 3.12/Linux다.
 
 이번 변경은 선택 계획 본문의 검증 기록뿐이다. 기존 본문·frontmatter·sources·사용자 결정·Requirement·다른 ExecPlan·PLANS는 보존했다. PRODUCT·ARCHITECTURE의 누적 diff hash를 현재 base 대비로 다시 확인했다. 실제 Git lifecycle 세 개·전체 verify·Review·게시·Merge는 Manager가 후속 검증하며 Worker는 전체 suite/integration/compile·전체 lint/build/type check·scripts/verify·commit/push/PR 생성과 운영 SQLite 변경을 수행하지 않았다.
+
+
+## PR lease 회귀의 Worker 호출 기대값 교정 (2026-10-16, 9791d11c revision 1)
+
+현재 HEAD `2aecfd0`, base `97459737e66adb29fab32b38378d168b1129e492`의 누적 diff와 현재 계획·sources·검증 계약을 다시 확인했다. Manager 진단 `2b24ed650872bfc1f89114e7a83f87cc`는 644 success·1 failure이며 전체 성공은 아니다. 남은 오류는 `PrConflictLeaseTests.test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push`의 과거 중복 Worker 호출 기대값이다. 실제 전달 입력과 완료 definition을 보존하므로 충돌 해결 Worker 한 번 뒤에는 두 Review가 실행된다.
+
+해당 실제 Git 회귀의 역할 순서를 `worker → reviewer → reviewer`, session 목록을 `worker-existing → reviewer-existing → reviewer-existing`으로 함께 교정했다. verify 두 번·push 두 번·각 예상 OID의 force-with-lease·기존 PR 및 source checkout 보존·새 PR 생성 거부·최종 상태 assertion은 유지했다. 생산 코드의 재사용 판정을 변경하거나 일반 실패/재교정 테스트의 Worker 호출 횟수를 일괄 바꾸지 않았다.
+
+```sh
+python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_first_worker_delivery_binds_guidance_to_saved_rebase_inputs tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_completed_changed_definition_survives_next_dispatch_without_worker tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_saved_ready_accepts_oid_and_source_fingerprint_only_changes
+```
+
+현재 후보 결과: **PASS — 3 tests, exit 0**, 모든 test `ok`. 실제 전달 근거·완료 후 다음 dispatch의 Worker 재호출 방지·OID/source 지문만의 변화 수용을 mock Git/Agent·격리 SQLite unit으로 확인했다. 이전 통과를 이번 결과로 재사용하지 않았다. 변경한 lease 테스트는 실제 Git/PR lifecycle이므로 Worker의 integration 실행 금지에 따라 실행하지 않았고 동일 테스트의 직접 재실행은 Manager 검증에 남긴다. 따라서 Manager가 보고한 과거 통합 오류가 재실행으로 해소됐다고 주장하지 않는다.
+
+unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집·필수 compile 선언과 verify 입력 목록은 유지하며 실행 환경은 Python 3.12/Linux다. 선택 계획 frontmatter·sources·사용자 결정·Requirement·다른 계획·PLANS는 변경하지 않았다. 누적 PRODUCT/ARCHITECTURE 문서 hash를 현재 base 대비로 다시 확인했다. 전체 verify·suite·integration·compile·전체 lint/build/type check·commit/push/PR 생성은 실행하지 않았다. 전체 verify·Review·게시·Merge는 Manager의 후속 단계다.

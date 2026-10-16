@@ -247,11 +247,10 @@ class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
             self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
             # Conflict correction keeps its Worker session; the later clean
             # rebase preserves that result and repeats only verify and Review.
-            self.assertEqual(roles, ["worker", "worker", "reviewer", "reviewer"])
+            self.assertEqual(roles, ["worker", "reviewer", "reviewer"])
             self.assertEqual(
                 session_ids,
-                ["worker-existing", "worker-existing", "reviewer-existing",
-                 "reviewer-existing"],
+                ["worker-existing", "reviewer-existing", "reviewer-existing"],
             )
             self.assertEqual(verify.call_count, 2)
             self.assertEqual(len(pushes), 2)
