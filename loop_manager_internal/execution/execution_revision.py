@@ -315,37 +315,101 @@ def advance_owned_record(ports, context) -> None:
         return
     checkpoint = checkpoints.get(ports.identity.repo, context.plan.plan_id)
     record = (checkpoint.snapshot or {}).get('document_record')
-    if not record or record.get('applied') or checkpoint.operation == 'commit':
+    if not isinstance(record, dict) or record.get('applied') is True or checkpoint.operation == 'commit':
         return
-    previous = DefinitionSnapshot.deserialize(record.get('previous'))
-    commit = record.get('commit') or (checkpoint.snapshot or {}).get('after_head')
-    if previous is None or not commit:
+
+    from loop_manager_internal.storage import runtime_state
+
+    def leave_unresolved(reason):
+        with runtime_state._transaction(ports.state.connection):
+            current_checkpoint = checkpoints.get(ports.identity.repo, context.plan.plan_id)
+            current_record = (current_checkpoint.snapshot or {}).get('document_record')
+            if current_record != record or current_record.get('unresolved_reason') == reason:
+                return
+            checkpoints.record(ports.identity.repo, context.plan.plan_id,
+                expected_generation=current_checkpoint.generation,
+                operation=current_checkpoint.operation,
+                expected_head=current_checkpoint.expected_head,
+                target_base_oid=current_checkpoint.target_base_oid,
+                observed_remote_oid=current_checkpoint.observed_remote_oid,
+                snapshot={**current_checkpoint.snapshot, 'document_record': {
+                    **current_record, 'unresolved_reason': reason}})
+
+    try:
+        previous = DefinitionSnapshot.deserialize(record.get('previous'))
+    except ValueError:
+        leave_unresolved('original_definition_invalid')
         return
+    if previous is None or previous.body_text is None:
+        leave_unresolved('original_definition_unavailable')
+        return
+    if any((record.get('repo') != ports.identity.repo,
+            record.get('plan_id') != context.plan.plan_id,
+            record.get('branch') != context.branch,
+            record.get('worktree') != str(context.worktree))):
+        leave_unresolved('commit_owner_changed')
+        return
+    intent = record.get('commit_intent')
+    commit = record.get('commit')
+    if (not isinstance(intent, dict)
+            or not intent.get('before_head') or not intent.get('message')
+            or not intent.get('tree') or record.get('tree') != intent.get('tree')
+            or not commit):
+        leave_unresolved('commit_result_unavailable')
+        return
+
     git = ports.git
-    if (git(context.worktree, 'rev-parse', f'{commit}^{{tree}}').stdout.strip() != record['tree']
-            or git(context.worktree, 'merge-base', '--is-ancestor', commit, 'HEAD', check=False).returncode):
+    from loop_manager_internal.recovery import checkpoint_ownership
+    if not checkpoint_ownership.committed_tree_matches_intent(
+        ports.identity.repo_path, intent['before_head'], commit,
+        {'before_head': intent['before_head'], 'commit_message': intent['message'],
+         'commit_tree_oid': intent['tree']}, git, strict_observation=True,
+    ):
+        leave_unresolved('commit_result_unconfirmed')
         return
+    ancestor = git(context.worktree, 'merge-base', '--is-ancestor', commit, 'HEAD', check=False)
+    if ancestor.returncode == 1:
+        leave_unresolved('commit_not_in_candidate_history')
+        return
+    if ancestor.returncode != 0:
+        raise RuntimeError('owned document commit ancestry observation failed')
     text = git(context.worktree, 'show', f'{commit}:{previous.path}').stdout
     updated = record_only_definition(previous, text)
-    if updated == previous:
+    if updated == previous and text != previous.body_text:
+        leave_unresolved('document_conditions_changed')
         return
-    from loop_manager_internal.storage import runtime_state
+
     with runtime_state._transaction(ports.state.connection):
+        current_checkpoint = checkpoints.get(ports.identity.repo, context.plan.plan_id)
+        current_record = (current_checkpoint.snapshot or {}).get('document_record')
+        if (current_checkpoint.generation != checkpoint.generation
+                or current_record != record):
+            return
         row = ports.state.row()
         current = DefinitionSnapshot.deserialize(row['definition_snapshot'])
         if current != previous:
+            checkpoints.record(ports.identity.repo, context.plan.plan_id,
+                expected_generation=current_checkpoint.generation,
+                operation=current_checkpoint.operation,
+                expected_head=current_checkpoint.expected_head,
+                target_base_oid=current_checkpoint.target_base_oid,
+                observed_remote_oid=current_checkpoint.observed_remote_oid,
+                snapshot={**current_checkpoint.snapshot, 'document_record': {
+                    **current_record, 'unresolved_reason': 'definition_baseline_changed'}})
             return
-        values = {'definition_snapshot': updated.serialize()}
-        if row['worker_input_token'] == previous.worker_token:
+        values = {'definition_snapshot': updated.serialize()} if updated != previous else {}
+        if values and row['worker_input_token'] == previous.worker_token:
             values['worker_input_token'] = updated.worker_token
+        applied = {**current_record, 'commit': commit, 'text': text, 'applied': True}
+        applied.pop('unresolved_reason', None)
         checkpoints.record(ports.identity.repo, context.plan.plan_id,
-            expected_generation=checkpoint.generation, operation=checkpoint.operation,
-            expected_head=checkpoint.expected_head, target_base_oid=checkpoint.target_base_oid,
-            observed_remote_oid=checkpoint.observed_remote_oid,
-            snapshot={**checkpoint.snapshot, 'document_record': {
-                **record, 'commit': commit, 'text': text, 'applied': True}})
-        ports.state.update_project(ports.identity.repo, preserve_transaction=True, **values)
-    if ports.update_snapshot is not None:
+            expected_generation=current_checkpoint.generation, operation=current_checkpoint.operation,
+            expected_head=current_checkpoint.expected_head, target_base_oid=current_checkpoint.target_base_oid,
+            observed_remote_oid=current_checkpoint.observed_remote_oid,
+            snapshot={**current_checkpoint.snapshot, 'document_record': applied})
+        if values:
+            ports.state.update_project(ports.identity.repo, preserve_transaction=True, **values)
+    if updated != previous and ports.update_snapshot is not None:
         ports.update_snapshot(_definition_snapshot=updated)
 
 

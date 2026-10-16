@@ -445,6 +445,71 @@ class WorkspaceHandler:
             )
             self.ports.state.check_context(context)
             decision = assess(snapshot)
+            if (current.operation == 'commit'
+                    and snapshot.local_head != current.expected_head
+                    and decision.reason in {
+                        'commit_completed_before_checkpoint',
+                        'commit_completed_before_rebase',
+                    }):
+                saved = current.snapshot or {}
+                if not checkpoint_ownership.committed_tree_matches_intent(
+                        self.ports.identity.repo_path, current.expected_head,
+                        snapshot.local_head, saved, self.ports.git,
+                        strict_observation=True):
+                    record = saved.get('document_record')
+                    if isinstance(record, dict) and record.get('applied') is not True:
+                        record = {**record, 'unresolved_reason': 'commit_result_unconfirmed'}
+                    else:
+                        record = None
+                    checkpoint.record(
+                        self.ports.identity.repo, context.plan.plan_id,
+                        expected_generation=current.generation, operation='commit',
+                        expected_head=current.expected_head,
+                        target_base_oid=current.target_base_oid,
+                        observed_remote_oid=current.observed_remote_oid,
+                        snapshot={**saved, 'commit_recovery': {
+                            'status': 'unconfirmed', 'head': snapshot.local_head,
+                        }, **({'document_record': record} if record is not None else {})},
+                    )
+                    return self.ports._recover(
+                        RecoveryReason.OWNERSHIP_UNCERTAIN,
+                        '중단된 commit의 parent·message·tree 결과를 intent와 일치시킬 수 없습니다.',
+                        context=context,
+                    )
+
+                record = saved.get('document_record')
+                if isinstance(record, dict) and record.get('applied') is not True:
+                    intent = record.get('commit_intent')
+                    if intent == {
+                            'before_head': saved.get('before_head'),
+                            'message': saved.get('commit_message'),
+                            'tree': saved.get('commit_tree_oid'),
+                    }:
+                        record = {**record, 'commit': snapshot.local_head}
+                        record.pop('unresolved_reason', None)
+                    else:
+                        record = {**record, 'unresolved_reason': 'commit_intent_mismatch'}
+                confirmed = {
+                    **saved,
+                    'after_head': snapshot.local_head,
+                    'commit_recovery': {
+                        'status': 'confirmed', 'head': snapshot.local_head,
+                    },
+                    **({'document_record': record} if isinstance(record, dict) else {}),
+                }
+                self.ports.state.correct_checkpoint(
+                    phase='VERIFYING', active_sha=base_oid,
+                    validated_base_sha=None, invalidate_validation=True,
+                    expected_catalog=catalog_marker,
+                )
+                checkpoint.record(
+                    self.ports.identity.repo, context.plan.plan_id,
+                    expected_generation=current.generation, operation=None,
+                    expected_head=snapshot.local_head,
+                    target_base_oid=base_oid, observed_remote_oid=remote_oid,
+                    snapshot={**asdict(snapshot), **confirmed},
+                )
+                return self.ports._context()
             if decision.action is CheckpointAction.CONTINUE:
                 return context
             if decision.action is CheckpointAction.CONFLICT:
@@ -483,7 +548,9 @@ class WorkspaceHandler:
                         {'completed_rebase': current.completed_rebase()}
                         if current.completed_rebase() else {}
                     ), **{key: current.snapshot[key] for key in
-                          ('accepted_work_branch', 'deleted_branch_restart', 'fresh_remote_creation', 'rebase_files')
+                          ('accepted_work_branch', 'deleted_branch_restart', 'fresh_remote_creation', 'rebase_files',
+                           'document_record', 'before_head', 'after_head', 'commit_message', 'commit_tree_oid',
+                           'commit_recovery', 'blocked_resume', 'worker_candidate_token')
                           if current.snapshot and key in current.snapshot}, **(
                         {'published_review_resume': current.snapshot['published_review_resume']}
                         if (current.snapshot or {}).get('published_review_resume')

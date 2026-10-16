@@ -677,6 +677,8 @@ complete/submit의 verify와 Review 생략 근거는 후보·base·환경·고�
 - 명세 변경은 실행 중인 Worker·verify·Reviewer 종료 후 안전한 단계 경계에서 프로젝트 일반 planning을 먼저 수행하고, 관련 ExecPlan 게시·DB 반영을 마친 뒤 현재 작업을 재개한다. 명세·작업 선언이 그대로이면 현재 작업을 먼저 재개한다. 확정 PR 충돌과 소유 Git operation의 복구는 기존 안전 경계에서 먼저 처리한다.
 - 작업은 마지막으로 반영한 ExecPlan의 조건 변경과 구현·검증 부족에 따라 대응한다. 작업별 영향·구현 적합성 Planner를 호출하지 않고 필요한 판단·보완은 기존 Worker 세션에서 함께 수행한다. 유효한 구현 충족 근거가 있으면 verify·Review를 계속한다. ID·작업물·세션·실패 이력과 실제 PR·수동 소유·dependency gate를 유지하고 자체 진행 기록은 확인한 delta만 기준에 반영한다.
 
+  Worker 소유 commit 뒤 완료 기록 저장 전에 중단되면, 복구는 보존된 원문과 실제 commit 결과를 확인해 같은 Progress 기록만 작업 기준에 반영하며 commit을 반복하지 않는다. commit·소유권·원문을 확인할 수 없거나 기록에 새 조건·frontmatter 변경이 섞이면 이전 기준과 미해결 사유를 보존한다. 원격에 같은 기록 내용이 확인된 경우에만 해당 문서 delta를 planning 기준에서 소비하며, Progress 기록은 verify·Review·실패 이력을 성공으로 바꾸지 않는다.
+
   Git 복구와 verify·Review의 입력 증명은 별도로 유지하며 세부 실패·재개 계약은 [프로젝트 planning과 작업 문서 반영 기준](ARCHITECTURE.md#프로젝트-planning과-작업-문서-반영-기준)을 따른다.
 
 - 저장된 단계별 문서 개정 후보를 재개할 때 proposed snapshot에서 해당 계획이 PR 때문에 제외된 경우나 prepared 후보의 게시 직전에 해당 branch에 PR이 나타나면 기존 PR의 문서와 작업 기록을 보존하고 후보 게시를 멈춘다. PR 출현은 ExecPlan 입력 오류로 처리하지 않으며 기존 PR 처리 뒤 남은 범위는 새 ExecPlan 기준으로 판단한다.

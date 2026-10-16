@@ -174,21 +174,41 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         text = '---\nid: G-047\n---\n## Purpose\nImplement safely\n## Progress\n- [ ] Run test\n'
         previous = dataclasses.replace(definition(), body_text=text, body_hash=str(ExecPlanBodyHash(text)))
         recorded = text.replace('[ ]', '[x]')
+        unconfirmed_text = '---\nid: G-048\n---\n## Purpose\nKeep this condition\n## Progress\n- [ ] Check another input\n'
+        unconfirmed = dataclasses.replace(
+            definition(), path='docs/plans/[G-048] Another.md', title='Another',
+            body_text=unconfirmed_text, body_hash=str(ExecPlanBodyHash(unconfirmed_text)),
+        )
+        unconfirmed_recorded = unconfirmed_text.replace('[ ]', '[x]')
         entry = lambda value: ('blob', hashlib.sha256(value.encode('utf-8')).hexdigest())
-        before = {previous.path: entry(text), 'other.md': ('blob', 'unseen-before')}
+        before = {previous.path: entry(text), unconfirmed.path: entry(unconfirmed_text),
+                  'other.md': ('blob', 'unseen-before')}
         planning_input_state.record_general(connection, 'repo', 'general', before)
         checkpoints = ExecutionCheckpointRepository(connection)
         checkpoints.record('repo', 'G-047', expected_generation=0, operation=None, expected_head='commit',
             target_base_oid='base', observed_remote_oid=None, snapshot={'document_record': {
                 'previous': previous.serialize(), 'text': recorded, 'commit': 'commit', 'applied': True}})
+        checkpoints.record('repo', 'G-048', expected_generation=0, operation=None, expected_head='other-commit',
+            target_base_oid='base', observed_remote_oid=None, snapshot={'document_record': {
+                'previous': unconfirmed.serialize(), 'text': unconfirmed_recorded,
+                'commit': 'other-commit', 'unresolved_reason': 'commit_result_unconfirmed'}})
         self.assertFalse(planning_input_state.consume_owned_records(connection, 'repo', 'base', before))
-        current = {previous.path: entry(recorded), 'other.md': ('blob', 'unseen-after')}
+        current = {previous.path: entry(recorded), unconfirmed.path: entry(unconfirmed_recorded),
+                   'other.md': ('blob', 'unseen-after')}
         self.assertTrue(planning_input_state.consume_owned_records(connection, 'repo', 'observed', current))
         self.assertFalse(planning_input_state.consume_owned_records(connection, 'repo', 'observed', current))
         saved = connection.execute("SELECT reference_revision,last_verified_revision,entries FROM planning_input_baselines").fetchone()
         self.assertEqual(tuple(saved[:2]), ('general', 'observed'))
         self.assertEqual(json.loads(saved['entries'])['other.md'], ['blob', 'unseen-before'])
+        self.assertEqual(json.loads(saved['entries'])[unconfirmed.path], list(before[unconfirmed.path]))
         self.assertFalse(planning_input_state.matches(connection, 'repo', current))
+        self.assertFalse(planning_input_state.consume_owned_records(
+            connection, 'repo', 'record-removed', {unconfirmed.path: current[unconfirmed.path]}
+        ))
+        remaining = connection.execute(
+            "SELECT entries FROM planning_input_baselines WHERE repo='repo'"
+        ).fetchone()
+        self.assertEqual(json.loads(remaining['entries'])[previous.path], list(current[previous.path]))
 
     def test_planning_handoff_preserves_execution_and_recovers_after_failure(self):
         connection = runtime_connection()
