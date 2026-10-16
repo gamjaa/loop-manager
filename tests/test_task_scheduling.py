@@ -43,6 +43,9 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.config = load_managed_config(self.config_path)
         self.connection = database.connect_database(self.directory, run_migrations=False)
         self.addCleanup(self.connection.close)
+        self._reset_catalog()
+
+    def _reset_catalog(self):
         self.seed_database.backup(self.connection)
         self.assertEqual((self.directory / 'loop-manager.db').stat().st_ino, self.database_inode)
         for repo in ('A', 'B'):
@@ -342,40 +345,44 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
 
     def test_reservation_db_wait_does_not_hold_scheduler_condition(self):
         from loop_manager_internal.storage import task_calls
-        scheduler = self.scheduler(max_workers=1)
-        entered, release, progressed = threading.Event(), threading.Event(), threading.Event()
-        errors = []
-        reserve = task_calls.reserve
-        def waiting_reserve(*args):
-            entered.set()
-            if not release.wait(3):
-                raise AssertionError('다른 작업의 배정기가 DB 대기 중 멈췄습니다.')
-            return reserve(*args)
-        def run():
-            try:
-                with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
-                    with scheduler.slot('agent', scheduling.Task('A', 'G-001', connection)):
-                        pass
-            except BaseException as error:
-                errors.append(error)
-        def progress():
-            scheduler.requeue(scheduling.Task('B', 'G-003', None))
-            progressed.set()
-        with mock.patch.object(task_calls, 'reserve', side_effect=waiting_reserve):
-            thread = threading.Thread(target=run)
-            other = threading.Thread(target=progress)
-            try:
-                thread.start()
-                self.assertTrue(entered.wait(3))
-                other.start()
-                self.assertTrue(progressed.wait(1))
-                self.assertEqual(sum(scheduler.running['agent'].values()), 1)
-            finally:
-                release.set()
-                thread.join(4)
-                if other.ident is not None:
-                    other.join(4)
-        self.assertEqual(errors, [])
+        for boundary in ('reserve', 'eligibility'):
+            with self.subTest(boundary=boundary):
+                scheduler = self.scheduler(max_workers=1)
+                entered, release, progressed = threading.Event(), threading.Event(), threading.Event()
+                errors = []
+                original = task_calls.reserve if boundary == 'reserve' else scheduler._eligible
+                def waiting(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(3):
+                        raise AssertionError('다른 작업의 배정기가 DB 대기 중 멈췄습니다.')
+                    return original(*args, **kwargs)
+                def run():
+                    try:
+                        with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
+                            with scheduler.slot('agent', scheduling.Task('A', 'G-001', connection)):
+                                pass
+                    except BaseException as error:
+                        errors.append(error)
+                def progress():
+                    scheduler.requeue(scheduling.Task('B', 'G-003', None))
+                    progressed.set()
+                target = task_calls if boundary == 'reserve' else scheduler
+                attribute = 'reserve' if boundary == 'reserve' else '_eligible'
+                with mock.patch.object(target, attribute, side_effect=waiting):
+                    thread = threading.Thread(target=run)
+                    other = threading.Thread(target=progress)
+                    try:
+                        thread.start()
+                        self.assertTrue(entered.wait(3))
+                        other.start()
+                        self.assertTrue(progressed.wait(1))
+                        self.assertEqual(sum(scheduler.running['agent'].values()), 1 if boundary == 'reserve' else 0)
+                    finally:
+                        release.set()
+                        thread.join(4)
+                        if other.ident is not None:
+                            other.join(4)
+                self.assertEqual(errors, [])
 
     def test_scheduled_effect_rechecks_input_after_reservation(self):
         from loop_manager_internal.storage import task_calls
@@ -885,6 +892,403 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             scheduling.current_task.reset(task)
             scheduling.current_scheduler.reset(token)
 
+    def test_waiting_calls_recheck_current_gates_and_candidate_before_start(self):
+        from loop_manager_internal.storage import execplan_draft_state
+        for change in ('project', 'catalog', 'draft', 'dependency', 'manual', 'maintenance', 'phase', 'candidate', 'ownership'):
+            with self.subTest(change=change):
+                self._reset_catalog()
+                scheduler = self.scheduler(max_workers=1)
+                scheduler.running['agent']['B'] = 1
+                errors, calls = [], []
+                def queued():
+                    try:
+                        with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
+                            with scheduler.slot('agent', scheduling.Task('A', 'G-001', connection)):
+                                calls.append('stale')
+                    except BaseException as error:
+                        errors.append(error)
+                thread = threading.Thread(target=queued)
+                thread.start()
+                with scheduler.condition:
+                    self.assertTrue(scheduler.condition.wait_for(lambda:len(scheduler.waiters['agent']) == 1, 3))
+                    if change == 'project':
+                        self.connection.execute("INSERT INTO project_blocks(repo,scope,reason_code,evidence) "
+                                                "VALUES ('A','project','repository_state_unsafe','unsafe')")
+                    elif change == 'catalog':
+                        self.connection.execute("INSERT INTO execplan_catalog_holds(repo,plan_id,revision_sha,evidence) "
+                                                "VALUES ('A','G-001','base','{}')")
+                    elif change == 'maintenance':
+                        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,refactoring_plan_ids) "
+                                                "VALUES ('A','refactoring','[\"G-002\"]')")
+                    elif change == 'draft':
+                        execplan_draft_state.ensure_schema(self.connection)
+                        self.connection.execute("INSERT INTO execplan_drafts VALUES ('A','G-001',1,'{}')")
+                    else:
+                        field, value = {'dependency': ('depends_on', '["G-002"]'),
+                                        'manual': ('status', 'MANUAL_WORKING'),
+                                        'phase': ('status', 'VERIFYING'),
+                                        'candidate': ('active_sha', 'new-head'),
+                                        'ownership': ('worktree', 'new-owner')}[change]
+                        self.connection.execute(f"UPDATE exec_plans SET {field}=? WHERE repo='A' AND plan_id='G-001'",
+                                                (value,))
+                    self.connection.commit()
+                    scheduler.running['agent']['B'] = 0
+                    scheduler.condition.notify_all()
+                thread.join(4)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(calls, [])
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], scheduling.SchedulingDeferred if change in {
+                    'project', 'catalog', 'draft', 'dependency', 'manual', 'maintenance'} else scheduling.SchedulingChanged)
+                with scheduler.slot('agent', scheduling.Task('B', 'G-003', self.connection)):
+                    pass
+                self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+
+    def test_waiting_queue_refreshes_manual_acceptance_and_skips_ineligible_head(self):
+        scheduler = self.scheduler(max_workers=1)
+        scheduler.running['agent']['A'] = 1
+        order, errors, threads = [], [], []
+        def queued(repo, plan_id):
+            try:
+                with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
+                    with scheduler.slot('agent', scheduling.Task(repo, plan_id, connection)):
+                        order.append(plan_id)
+            except BaseException as error:
+                errors.append(error)
+        for repo, plan_id in (('A', 'G-001'), ('A', 'G-002'), ('B', 'G-003')):
+            thread = threading.Thread(target=queued, args=(repo, plan_id))
+            threads.append(thread)
+            thread.start()
+        with scheduler.condition:
+            self.assertTrue(scheduler.condition.wait_for(lambda:len(scheduler.waiters['agent']) == 3, 3))
+            # 수락은 기존 행의 후보·실행 단계를 바꾸지 않지만 배정 순위는 바꾼다.
+            from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+            store = ManualWorkRepository(self.connection)
+            group = store.create('B', 'existing', 'manual', [], 'head', 'base', members=('G-003',))
+            store.update(group, owner_id='G-003', state='AUTOMATIC', request_id='accepted')
+            self.connection.execute("INSERT INTO manual_work_requests(request_id,repo,group_id,source_head,base_sha,"
+                "input_token,skip_verify,skip_review,reason,created_at) VALUES ('accepted','B',?,'head','base','input',0,0,'','2026-10-16')",
+                (group['group_id'],))
+            self.connection.execute("UPDATE exec_plans SET status='MANUAL_WORKING' WHERE plan_id='G-001'")
+            self.connection.commit()
+            scheduler.running['agent']['A'] = 0
+            scheduler.condition.notify_all()
+        for thread in threads:
+            thread.join(4)
+            self.assertFalse(thread.is_alive())
+        # 새 수락은 재준비하고, 실행 불가 선두는 적격 G-002를 막지 않는다.
+        self.assertEqual(order, ['G-002'])
+        self.assertCountEqual([type(error) for error in errors],
+                              [scheduling.SchedulingDeferred, scheduling.SchedulingChanged])
+        with scheduler.slot('agent', scheduling.Task('B', 'G-003', self.connection)):
+            order.append('G-003')
+        self.assertEqual(order, ['G-002', 'G-003'])
+
+    def test_activation_reselects_after_management_wait(self):
+        for change in ('priority', 'catalog'):
+            with self.subTest(change=change):
+                self._reset_catalog()
+                scheduler = self.scheduler()
+                scheduler.admitting = True
+                result, errors = [], []
+                def activate():
+                    token = scheduling.current_scheduler.set(scheduler)
+                    try:
+                        with closing(database.connect_database(self.directory, run_migrations=False)) as connection, \
+                             fast_mode_scope(self.config):
+                            result.append(loop_manager.activate_ready_execplan(connection, 'A', self.directory, 'base'))
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        scheduling.current_scheduler.reset(token)
+                thread = threading.Thread(target=activate)
+                thread.start()
+                with scheduler.condition:
+                    self.assertTrue(scheduler.condition.wait_for(lambda:bool(scheduler.waiters['management']), 3))
+                    if change == 'priority':
+                        self.connection.execute("UPDATE exec_plans SET priority='critical' WHERE plan_id='G-002'")
+                    else:
+                        self.connection.execute("INSERT INTO execplan_catalog_holds(repo,plan_id,revision_sha,evidence) "
+                                                "VALUES ('A','G-001','base','{}')")
+                    self.connection.commit()
+                    scheduler.admitting = False
+                    scheduler.condition.notify_all()
+                thread.join(4)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(result[0]['plan_id'], 'G-002')
+                self.assertEqual(runtime_state.RuntimeStateRepository(self.connection).get('A', 'G-001').status, 'READY')
+
+    def test_prepared_call_input_change_releases_unstarted_slot_and_reprepares(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.execution.execution_state import ExecutionStatePort
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+        scheduler = self.scheduler()
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        calls, outcomes = [], []
+        @scheduling.scheduled_call('verify')
+        def verify():
+            calls.append('verify')
+        with runtime_state.selected_execution('A', 'G-001'):
+            state = ExecutionStatePort(self.connection, runtime, 'A')
+        state.call_inputs = mock.Mock(side_effect=['prepared', 'changed'])
+        coordinator = mock.Mock()
+        coordinator.prepare.return_value = object()
+        coordinator.dispatch.side_effect = lambda _context: state.bind(verify, name='verify')()
+        service = ProjectService(SimpleNamespace(_ExecutionLifecyclePorts=mock.Mock(),
+            ExecutionPhaseCoordinator=mock.Mock(return_value=coordinator), _check_runtime_handoff=mock.Mock(),
+            operation_print=mock.Mock(), _execution_outcome_step_result=lambda result:outcomes.append(result.kind)),
+            ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                            True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base')
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with scheduler.task('A', 'G-001', self.connection, resumed=False):
+                service._dispatch_execution(runtime, newly_activated=False)
+                self.assertFalse(scheduling.current_task.get().resumed)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(outcomes, [ExecutionOutcomeKind.RETRY])
+        self.assertEqual(calls, [])
+        self.assertNotIn('verify', scheduler.cursor)
+        self.assertEqual(sum(scheduler.running['verify'].values()), 0)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+        self.assertIsNone(scheduling.call_revalidation.get())
+
+    def test_lifecycle_rechecks_waited_git_inputs_without_rejecting_sibling_refs(self):
+        from loop_manager_internal.agents.scope_contracts import GitSnapshot
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree=str(self.directory / 'one'))
+        for change in ('candidate', 'remote', 'sibling'):
+            with self.subTest(change=change):
+                scheduler = self.scheduler(verify_concurrency=1)
+                snapshot = [GitSnapshot('head', 'one', {}, {}, {}, {}, {}, {})]
+                base = ['base']
+                calls, errors, commands = [], [], []
+                def git(_path, *args, **_options):
+                    self.assertFalse(self.connection.in_transaction)
+                    commands.append(args)
+                    return SimpleNamespace(returncode=0, stdout=base[0])
+                @scheduling.scheduled_call('verify')
+                def verify():
+                    calls.append('verify')
+                def queued():
+                    token = scheduling.current_scheduler.set(scheduler)
+                    try:
+                        with closing(database.connect_database(self.directory, run_migrations=False)) as connection, \
+                             scheduler.task('A', 'G-001', connection):
+                            ports = loop_manager._ExecutionLifecyclePorts(connection,
+                                runtime_state.RuntimeStateRepository(connection), repo='A', repo_path=Path('A'),
+                                state_dir=self.directory, base='main', base_sha='base', provider='codex',
+                                config_path=self.config_path, newly_activated=False)
+                            ports.effects.state.bind(verify, name='verify')()
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        scheduling.current_scheduler.reset(token)
+                with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda _path:snapshot[0]), \
+                     mock.patch.object(loop_manager, 'git', side_effect=git):
+                    with scheduler.slot('verify', scheduling.Task('B', 'G-003', self.connection)):
+                        thread = threading.Thread(target=queued)
+                        thread.start()
+                        with scheduler.condition:
+                            self.assertTrue(scheduler.condition.wait_for(lambda:bool(scheduler.waiters['verify']), 3))
+                            if change == 'candidate':
+                                snapshot[0] = replace(snapshot[0], head='new-head')
+                            elif change == 'remote':
+                                base[0] = 'new-base'
+                            else:
+                                snapshot[0] = replace(snapshot[0], refs={'refs/heads/sibling':('oid', 'commit')},
+                                                      worktrees={'sibling':('new-head',)})
+                    thread.join(4)
+                self.assertFalse(thread.is_alive())
+                self.assertIn(('fetch', 'origin'), commands)
+                if change == 'sibling':
+                    self.assertEqual(errors, [])
+                    self.assertEqual(calls, ['verify'])
+                else:
+                    self.assertEqual(calls, [])
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsInstance(errors[0], scheduling.SchedulingChanged)
+                self.assertEqual(sum(scheduler.running['verify'].values()), 0)
+
+    def test_uncertain_verify_keeps_management_while_project_children_and_other_project_call_continue(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.runtime.contracts import PROJECT_STEP_RETRY
+        from loop_manager_internal.storage import task_calls
+        from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        scheduler = self.scheduler(max_workers=2)
+        with self.assertRaises(VerifyTerminationUncertain), scheduler.slot(
+                'verify', scheduling.Task('A', 'G-001', self.connection)):
+            receipt = task_calls.prepare_verify_receipt()
+            raise VerifyTerminationUncertain('child stop unknown')
+        restarted = self.scheduler(max_workers=2)
+        for kind in ('agent', 'verify'):
+            with self.assertRaises(task_calls.CallDeferred), restarted.slot(
+                    kind, scheduling.Task('A', 'G-001', self.connection)):
+                self.fail('종료 불명 verify의 같은 후보에서 호출을 시작했습니다.')
+        calls = []
+        def execute(child, repository, **_options):
+            task = scheduling.current_task.get()
+            if task.plan_id == 'G-001':
+                self.fail('종료 불명 호출을 재준비 대기 없이 dispatch했습니다.')
+            else:
+                with restarted.slot('agent', task):
+                    calls.append(task.plan_id)
+                    self.assertEqual(scheduling.managed_count(task.connection, 'A'), 2)
+                    with closing(database.connect_database(self.directory, run_migrations=False)) as other:
+                        with restarted.slot('agent', scheduling.Task('B', 'G-003', other)):
+                            calls.append('G-003')
+                repository.transition_from_snapshot(repository.projected('A'), plan_values={'status':'PR_OPEN'},
+                    project_values=runtime_state.clear_project_values())
+                restarted.pause_project('A')
+                return 0
+        service = ProjectService(SimpleNamespace(activate_ready_execplan=loop_manager.activate_ready_execplan,
+                                                resume_manual_work=None),
+            ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                            True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base')
+        token = scheduling.current_scheduler.set(restarted)
+        try:
+            with fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute):
+                self.assertEqual(scheduling.run_project_tasks(service, newly_activated=False), PROJECT_STEP_RETRY)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(calls, ['G-002', 'G-003'])
+        self.assertEqual(scheduling.managed_count(self.connection, 'A'), 1)
+        self.assertEqual(sum(restarted.running['verify'].values()), 1)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 1)
+        task_calls.verify_stopped(receipt)
+
+    def test_two_verify_slots_queue_third_without_blocking_independent_agent(self):
+        self._insert_plan(self.connection, 'G-004', 'READY', repo='B')
+        scheduler = self.scheduler(max_workers=1, verify_concurrency=2)
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        def third():
+            try:
+                with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
+                    with scheduler.slot('verify', scheduling.Task('A', 'G-002', connection)):
+                        entered.set()
+                        self.assertTrue(release.wait(3))
+            except BaseException as error:
+                errors.append(error)
+        with scheduler.slot('verify', scheduling.Task('A', 'G-001', self.connection)):
+            with scheduler.slot('verify', scheduling.Task('B', 'G-003', self.connection)):
+                thread = threading.Thread(target=third)
+                thread.start()
+                with scheduler.condition:
+                    self.assertTrue(scheduler.condition.wait_for(lambda:bool(scheduler.waiters['verify']), 3))
+                self.assertFalse(entered.is_set())
+                with scheduler.slot('agent', scheduling.Task('B', 'G-004', self.connection)):
+                    self.assertEqual(sum(scheduler.running['verify'].values()), 2)
+            try:
+                self.assertTrue(entered.wait(3))
+                self.assertEqual(sum(scheduler.running['verify'].values()), 2)
+            finally:
+                release.set()
+                thread.join(4)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(scheduler.running['verify'].values()), 0)
+
+    def test_manual_resume_rechecks_group_phase_and_active_member_after_admission_wait(self):
+        from loop_manager_internal.application.manual_work import ManualWorkService
+        from loop_manager_internal.execution.manual_candidate import ManualCandidate
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        self.connection.execute("UPDATE projects SET registered=1,provider='codex' WHERE repo='A'")
+        self.connection.execute("UPDATE exec_plans SET status='MANUAL_PENDING' WHERE repo='A'")
+        store = ManualWorkRepository(self.connection)
+        group = store.create('A', 'submit', 'manual', [], 'head', 'base', members=('G-001', 'G-002'))
+        store.update(group, state='AUTOMATIC', request_id='accepted', owner_id='G-001',
+                     branch='manual', worktree=str(self.directory / 'manual'))
+        self.connection.commit()
+        for change in ('phase', 'member'):
+            with self.subTest(change=change):
+                with self.connection:
+                    store.update(group, resume_phase='VERIFYING', active_id=None)
+                scheduler = self.scheduler()
+                scheduler.admitting = True
+                errors = []
+                def resume():
+                    token = scheduling.current_scheduler.set(scheduler)
+                    try:
+                        with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
+                            effects = SimpleNamespace(git=mock.Mock(), git_bytes=mock.Mock(),
+                                                      pr_for_branch=mock.Mock(), resolve_profile=mock.Mock())
+                            ManualWorkService(effects, connection, self.directory, Path('A'), self.config_path).resume()
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        scheduling.current_scheduler.reset(token)
+                with mock.patch.object(ManualCandidate, 'note_pending'):
+                    thread = threading.Thread(target=resume)
+                    thread.start()
+                    with scheduler.condition:
+                        self.assertTrue(scheduler.condition.wait_for(lambda:bool(scheduler.waiters['management']), 3))
+                        with self.connection:
+                            store.update(group, **({'resume_phase':'IMPLEMENTING'} if change == 'phase'
+                                                   else {'active_id':'G-002'}))
+                        scheduler.admitting = False
+                        scheduler.condition.notify_all()
+                    thread.join(4)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(store.get('A', group['group_id'])['attempts'], 0)
+                self.assertEqual([row[0] for row in self.connection.execute(
+                    "SELECT status FROM exec_plans WHERE repo='A' ORDER BY plan_id")],
+                    ['MANUAL_PENDING', 'MANUAL_PENDING'])
+
+    def test_actual_calls_allocate_basic_turn_before_priority_and_resume_cursor(self):
+        self.connection.execute("INSERT INTO projects(repo,base_branch) VALUES ('C','main')")
+        self.connection.commit()
+        for repo, plan_id, priority in (('A','G-004','critical'), ('A','G-005','high'),
+                                       ('C','G-006','low'), ('C','G-007','low'), ('A','G-008','critical')):
+            self._insert_plan(self.connection, plan_id, 'READY', repo=repo, priority=priority)
+        scheduler = self.scheduler(max_workers=2)
+        order, errors = [], []
+        def queued(repo, plan_id):
+            try:
+                with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
+                    with scheduler.slot('agent', scheduling.Task(repo, plan_id, connection, resumed=False)):
+                        order.append(plan_id)
+                        self.assertLessEqual(sum(scheduler.running['agent'].values()), scheduler.limits['agent'])
+            except BaseException as error:
+                errors.append(error)
+        with scheduler.slot('agent', scheduling.Task('A', 'G-001', self.connection, resumed=False)):
+            with scheduler.slot('agent', scheduling.Task('B', 'G-003', self.connection, resumed=False)):
+                threads = [threading.Thread(target=queued, args=(repo, plan_id))
+                           for repo, plan_id in (('A','G-004'), ('C','G-006'), ('A','G-005'))]
+                for thread in threads:
+                    thread.start()
+                with scheduler.condition:
+                    self.assertTrue(scheduler.condition.wait_for(lambda:len(scheduler.waiters['agent']) == 3, 3))
+            for thread in threads:
+                thread.join(4)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(order, ['G-006', 'G-004', 'G-005'])
+        self.assertEqual(errors, [])
+        scheduler = self.scheduler(max_workers=1)
+        self.assertEqual(scheduler.cursor['agent'], 'A')
+        scheduler.running['agent']['B'] = 1  # 두 후보의 등록 뒤 보존한 cursor로 한 자리를 연다.
+        threads = [threading.Thread(target=queued, args=(repo, plan_id))
+                   for repo, plan_id in (('A','G-008'), ('C','G-007'))]
+        for thread in threads:
+            thread.start()
+        with scheduler.condition:
+            self.assertTrue(scheduler.condition.wait_for(lambda:len(scheduler.waiters['agent']) == 2, 3))
+            scheduler.running['agent']['B'] = 0
+            scheduler.condition.notify_all()
+        for thread in threads:
+            thread.join(4)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(order, ['G-006', 'G-004', 'G-005', 'G-007', 'G-008'])
+        self.assertEqual(errors, [])
+
     def test_configuration_defaults_validation_and_project_override_inheritance(self):
         self.assertEqual((self.config.max_tasks_per_project, self.config.verify_concurrency), (3,1))
         self.assertEqual(project_registry.task_limit(self.connection,'A',3), (0,3,'config'))
@@ -1042,10 +1446,12 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(runtime.get('A', 'G-001').worktree, 'one')
 
     def test_limit_reduction_during_activation_preserves_ready_without_failure(self):
-        with mock.patch.object(runtime_state.RuntimeStateRepository,'activate',
-                               side_effect=runtime_state.TaskLimitReached('limit reduced')):
-            self.assertIsNone(loop_manager.activate_ready_execplan(self.connection,'A',self.directory,'base'))
-        self.assertEqual(runtime_state.RuntimeStateRepository(self.connection).get('A','G-001').status,'READY')
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        for error in (runtime_state.TaskLimitReached('limit reduced'), CallDeferred('call pending')):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(runtime_state.RuntimeStateRepository, 'activate', side_effect=error):
+                    self.assertIsNone(loop_manager.activate_ready_execplan(self.connection, 'A', self.directory, 'base'))
+                self.assertEqual(runtime_state.RuntimeStateRepository(self.connection).get('A', 'G-001').status, 'READY')
 
     def test_shared_manual_group_counts_once_and_stable_waits_release_management(self):
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository

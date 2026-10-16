@@ -1023,6 +1023,7 @@ class ProjectService:
             try:
                 execution_outcome = execution.dispatch(execution_context)
             except TaskRecheckRequired as error:
+                self.effects.operation_print(str(error))
                 return self.effects._execution_outcome_step_result(
                     ExecutionOutcome(ExecutionOutcomeKind.RETRY, detail=str(error)))
             except CallDeferred as error:

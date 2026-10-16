@@ -367,6 +367,8 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         )
         verify_handler = self.handler._verify_handler()
         latest_base = SimpleNamespace(reconcile=mock.Mock(return_value=None))
+        # This scenario enters verify after project planning has completed.
+        self.connection.execute("UPDATE projects SET planning_attempt_fingerprint=NULL WHERE repo='repo'")
         self.connection.commit()
         scheduler = TaskScheduler(
             SimpleNamespace(max_workers=1, verify_concurrency=1),

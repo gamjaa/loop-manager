@@ -36,12 +36,23 @@ def verify_preflight(callback: Callable[[], None]):
         current_verify_preflight.reset(token)
 
 
-class PlanningDrain(Exception):
-    """현재 프로젝트 호출을 비운 뒤 Planner로 돌아간다."""
+call_revalidation = ContextVar("scheduled_call_revalidation", default=None)
+
+
+class SchedulingDeferred(task_calls.CallDeferred):
+    """현재 자격이 없는 작업만 실패 횟수 없이 보류한다."""
 
 
 class TaskRecheckRequired(Exception):
     """대기 중 실행 입력이 바뀌어 같은 작업의 단계를 다시 준비한다."""
+
+
+class SchedulingChanged(TaskRecheckRequired):
+    """미시작 호출의 입력이 바뀌어 단계 준비부터 다시 관측한다."""
+
+
+class PlanningDrain(Exception):
+    """현재 프로젝트 호출을 비운 뒤 Planner로 돌아간다."""
 
 
 @dataclass
@@ -219,59 +230,147 @@ class TaskScheduler:
                 self.condition.notify_all()
         return True
 
+    def _eligible(self, task, connection, *, check_priority=True):
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.storage import execplan_draft_state
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        if (scoped_blocking.project_block(connection, task.repo) is not None
+                or scoped_blocking.plan_block(connection, task.repo, task.plan_id) is not None
+                or task.plan_id in scoped_blocking.catalog_held_plan_ids(connection, task.repo)
+                or task.plan_id in execplan_draft_state.pending_ids(connection, task.repo)):
+            return False
+        project = connection.execute("SELECT * FROM projects WHERE repo=?", (task.repo,)).fetchone()
+        if project is None or runtime_state.planning_owns_execution_slot(project):
+            return False
+        row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?",
+                                 (task.repo, task.plan_id)).fetchone()
+        if row is None or row['status'] in {'PLAN_BLOCKED', 'PR_OPEN', 'MERGED', 'MANUAL_WORKING'}:
+            return False
+        group = ManualWorkRepository(connection).for_plan(task.repo, task.plan_id)
+        if group is not None and (not group['request_id']
+                or (group['active_id'] or group['owner_id']) != task.plan_id
+                or (group['pending_source_head'] and not group['source_update_conflict'])):
+            return False
+        from loop_manager_internal.execution.plan_validation import unmet_execplan_dependencies
+        if unmet_execplan_dependencies(connection, task.repo, task.plan_id):
+            return False
+        from loop_manager_internal.storage import maintenance_state
+        from loop_manager_internal.maintenance.maintenance_orchestration import assessment_can_yield, cycle_scope_plan_ids, is_unowned_ready
+        cycle = maintenance_state.MaintenanceRepository(connection).get(task.repo)
+        if assessment_can_yield(cycle) and is_unowned_ready(row):
+            return False
+        if cycle.phase in {maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                           maintenance_state.MaintenancePhase.REFACTORING,
+                           maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION}:
+            rows = connection.execute('SELECT * FROM exec_plans WHERE repo=?', (task.repo,)).fetchall()
+            if task.plan_id not in cycle_scope_plan_ids(rows, cycle):
+                return False
+        if check_priority and self.priority_reader is not None:
+            decision = self.priority_reader(connection, task.repo)
+            if task.plan_id not in dict(decision.priority_ranks):
+                return False
+        return True
+
+    def _observation(self, task):
+        """호출 대기 동안 보존해야 하는 작업·공유 gate의 현재 원본."""
+        from loop_manager_internal.storage import maintenance_state
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        row = task.connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?",
+                                      (task.repo, task.plan_id)).fetchone()
+        group = ManualWorkRepository(task.connection).for_plan(task.repo, task.plan_id)
+        return (dict(row) if row is not None else None,
+                maintenance_state.MaintenanceRepository(task.connection).get(task.repo),
+                dict(group) if group is not None else None)
+
     @contextmanager
     def admission(self, task):
         """호출과 별개로 새 관리 배정의 선택·확정을 순서대로 수행한다."""
+        if task.connection.in_transaction:
+            raise runtime_state.RuntimeStateError("DB 쓰기 transaction을 유지한 채 관리 배정을 기다릴 수 없습니다.")
         entry = [task, task.rank(self.priority_reader)]
         count = managed_count(task.connection, task.repo)
         with self.condition:
             self.check_project(task.repo)
             self.running['management'][task.repo] = count
             self.waiters['management'].append(entry)
-            try:
-                while self.admitting or self._next('management') is not entry:
+            self.condition.notify_all()
+        try:
+            while True:
+                self.check_project(task.repo)
+                if not self._eligible(task, task.connection):
+                    raise SchedulingDeferred("작업의 관리 배정 자격이 변경되어 재관측을 기다립니다.")
+                next_entry = self._next('management', task.connection)
+                before = managed_count(task.connection, task.repo)
+                with self.condition:
                     self.check_project(task.repo)
+                    if not self.admitting and next_entry is entry:
+                        self.admitting = True
+                        break
                     self.condition.wait(0.2)
-                self.admitting = True
-            finally:
+        finally:
+            with self.condition:
                 self.waiters['management'].remove(entry)
         try:
             yield
         finally:
             try:
                 count = managed_count(task.connection, task.repo)
-                with runtime_state._transaction(task.connection):
-                    task.connection.execute("INSERT INTO task_scheduling_cursor VALUES ('management',?) "
-                        "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (task.repo,))
+                if count > before:
+                    with runtime_state._transaction(task.connection):
+                        task.connection.execute("INSERT INTO task_scheduling_cursor VALUES ('management',?) "
+                            "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (task.repo,))
                 with self.condition:
                     self.running['management'][task.repo] = count
-                    self.cursor['management']=task.repo
+                    if count > before:
+                        self.cursor['management']=task.repo
             finally:
                 with self.condition:
                     self.admitting = False
                     self.condition.notify_all()
 
-    def _next(self, kind):
-        waiting = self.waiters[kind]
-        if not waiting:
-            return None
-        category = min(item[1][0] for item in waiting)
-        candidates = [item for item in waiting if item[1][0] == category]
-        if category < 3:
-            return min(candidates, key=lambda item: (item[1], item[0].repo, item[0].plan_id))
-        basic = [item for item in candidates if not self.running[kind][item[0].repo]]
-        if basic:
-            repositories = sorted({item[0].repo for item in basic})
-            previous = self.cursor.get(kind, "")
-            repo = next((repo for repo in repositories if repo > previous), repositories[0])
-            candidates = [item for item in basic if item[0].repo == repo]
-        return min(candidates, key=lambda item: (item[1][2], item[0].repo, item[0].plan_id))
+    def _next(self, kind, connection=None):
+        with self.condition:
+            registered = list(self.waiters[kind])
+        waiting = registered
+        if connection is not None:
+            waiting = [item for item in waiting if self._eligible(item[0], connection)]
+            refreshed = []
+            for item in waiting:
+                # SQLite 연결은 해당 대기 스레드가 소유한 연결만 사용한다.
+                task = item[0]
+                count = managed_count(connection, task.repo) if kind == 'management' else None
+                rank = Task(task.repo, task.plan_id, connection, task.resumed,
+                            task.retry_order).rank(self.priority_reader)
+                refreshed.append((item, rank, count))
+        with self.condition:
+            if self.waiters[kind] != registered:
+                return None
+            if connection is not None:
+                for item, rank, count in refreshed:
+                    item[1] = rank
+                    if count is not None:
+                        self.running[kind][item[0].repo] = count
+            if not waiting:
+                return None
+            category = min(item[1][0] for item in waiting)
+            candidates = [item for item in waiting if item[1][0] == category]
+            if category < 3:
+                return min(candidates, key=lambda item: (item[1], item[0].repo, item[0].plan_id))
+            basic = [item for item in candidates if not self.running[kind][item[0].repo]]
+            if basic:
+                repositories = sorted({item[0].repo for item in basic})
+                previous = self.cursor.get(kind, "")
+                repo = next((repo for repo in repositories if repo > previous), repositories[0])
+                candidates = [item for item in basic if item[0].repo == repo]
+            return min(candidates, key=lambda item: (item[1][2], item[0].repo, item[0].plan_id))
 
     @contextmanager
     def slot(self, kind, task):
         if task.connection.in_transaction or getattr(task.connection, '_depth', 0):
             raise runtime_state.RuntimeStateError("DB 쓰기 transaction을 유지한 채 호출 배정을 기다릴 수 없습니다.")
         entry = [task, task.rank(self.priority_reader)]
+        observed = self._observation(task)
+        waited = False
         started = time.monotonic()
         with self.condition:
             self.waiters[kind].append(entry)
@@ -280,20 +379,28 @@ class TaskScheduler:
             while True:
                 with self.condition:
                     capacity = sum(self.running[kind].values()) < self.limits[kind]
+                self.check_project(task.repo)
+                current = self._observation(task)
+                if not self._eligible(task, task.connection, check_priority=capacity):
+                    raise SchedulingDeferred("작업의 호출 자격이 변경되어 재관측을 기다립니다.")
+                if current != observed:
+                    raise SchedulingChanged("호출 대기 중 작업·후보·유지보수 범위가 변경됐습니다.")
                 if capacity:
                     rank = task.rank(self.priority_reader)
+                    next_entry = self._next(kind, task.connection)
                 with self.condition:
                     if capacity:
                         entry[1] = rank
                     self.check_project(task.repo)
-                    if ((task.repo,task.plan_id,kind) in self.retained
+                    if (any(repo == task.repo and plan_id == task.plan_id for repo, plan_id, _ in self.retained)
                             or self.uncertain[kind]>=self.limits[kind]):
                         raise task_calls.CallDeferred("기존 호출의 종료가 확인되지 않아 실제 실행 자리를 보존합니다.")
-                    if capacity and sum(self.running[kind].values()) < self.limits[kind] and self._next(kind) is entry:
+                    if capacity and sum(self.running[kind].values()) < self.limits[kind] and next_entry is entry:
                         allocation = ("retry" if entry[1][0] == 1 else "manual" if entry[1][0] == 0 else "resume" if entry[1][0] == 2
                                       else "basic" if not self.running[kind][task.repo] else "priority")
                         self.running[kind][task.repo] += 1
                         break
+                    waited = True
                     self.condition.wait(0.2)
         finally:
             with self.condition:
@@ -303,23 +410,40 @@ class TaskScheduler:
             with runtime_state._transaction(task.connection):
                 owner = task_calls.reserve(task.connection, self.state_dir, task.repo,
                                            task.plan_id, kind, self.external_run_id)
-                task.connection.execute(
-                    "INSERT INTO task_scheduling_cursor VALUES (?,?) "
-                    "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (kind, task.repo))
-            with self.condition:
-                self.cursor[kind] = task.repo
         except BaseException:
             with self.condition:
                 self.running[kind][task.repo] -= 1
                 self.condition.notify_all()
             raise
-        events.emit("작업 호출 배정", kind=kind, project=task.repo, plan=task.plan_id,
-                    running=sum(self.running[kind].values()), limit=self.limits[kind],
-                    waiting_seconds=round(time.monotonic()-started, 3), allocation=allocation,
-                    waiting=len(self.waiters[kind]))
         uncertain = True
+        launched = False
         owner_token=task_calls.current_call.set(owner)
         try:
+            self.check_project(task.repo)
+            if self._observation(task) != observed:
+                raise SchedulingChanged("실행 직전 작업 입력이 변경됐습니다.")
+            if not self._eligible(task, task.connection):
+                raise SchedulingDeferred("실행 직전 작업의 호출 자격이 변경됐습니다.")
+            revalidate = call_revalidation.get()
+            if revalidate is not None:
+                revalidate(waited=waited)
+            self.check_project(task.repo)
+            if not self._eligible(task, task.connection):
+                raise SchedulingDeferred("입력 재관측 중 작업의 호출 자격이 변경됐습니다.")
+            if self._observation(task) != observed:
+                raise SchedulingChanged("호출 입력 재관측 중 작업 상태가 변경됐습니다.")
+            with runtime_state._transaction(task.connection):
+                task.connection.execute(
+                    "INSERT INTO task_scheduling_cursor VALUES (?,?) "
+                    "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (kind, task.repo))
+            with self.condition:
+                self.cursor[kind] = task.repo
+            events.emit("작업 호출 배정", kind=kind, project=task.repo, plan=task.plan_id,
+                        running=sum(self.running[kind].values()), limit=self.limits[kind],
+                        managed=managed_count(task.connection, task.repo),
+                        waiting_seconds=round(time.monotonic()-started, 3), allocation=allocation,
+                        waiting=len(self.waiters[kind]))
+            launched = True
             yield
             uncertain = not task_calls.confirmed(owner)
             if uncertain:
@@ -352,8 +476,9 @@ class TaskScheduler:
                                 self.uncertain[kind] += 1
                             self.retained[(task.repo, task.plan_id, kind)] = {"token": owner.token,
                                                                           'storage_only': storage_only}
-                        task.resumed = True
-                        task.retry_order = None
+                        if launched:
+                            task.resumed = True
+                            task.retry_order = None
                         self.condition.notify_all()
                 finally:
                     task_calls.current_call.reset(owner_token)

@@ -593,7 +593,7 @@ planning 게시의 외부 관측·복구·worktree 정리는 공통 DB 접근 �
 
 실제 호출 자리가 꽉 찬 동안에는 대기 작업의 유효 우선순위를 반복 계산하지 않는다. 대기 중 프로젝트 중단·종료 불명 예약 확인은 유지하고, 빈자리가 생기면 현재 우선순위를 다시 읽어 기존 배정 순서로 판단한다. 우선순위 계산과 DB 조회는 scheduler condition 잠금 밖에서 수행하고 배정 직전에 자리·중단 조건을 다시 확인한다.
 
-배정기의 공통 condition 안에서는 대기열·메모리 실행 자리만 갱신한다. 호출 자리를 먼저 확보하고 공통 condition을 놓은 뒤 DB에서 호출 예약과 배정 cursor를 같은 transaction으로 확정하며, 실패하면 미시작 자리를 반환한다. 종료 시 DB 예약 반환이 확인된 뒤 메모리 자리를 비우고 확인 실패는 종료 불명으로 보존한다. 호출 대기 중 rank를 갱신하고 실제 호출 직전 작업 snapshot·프로젝트 차단·catalog/draft 보류를 재검사한다. 입력 변경은 실패 횟수를 늘리지 않고 단계 재준비로 돌리며, 지속되는 차단·보류는 해당 작업의 대기로 반환한다.
+배정기의 공통 condition 안에서는 대기열·메모리 실행 자리만 갱신한다. 호출 자리를 먼저 확보하고 공통 condition을 놓은 뒤 DB에서 호출 예약을 확정한다. 예약 뒤 실행 입력을 다시 확인하고 배정 cursor를 확정하며, 실패하면 미시작 자리를 반환한다. 종료 시 DB 예약 반환이 확인된 뒤 메모리 자리를 비우고 확인 실패는 종료 불명으로 보존한다. 실제 호출 직전 작업 snapshot·프로젝트 차단·catalog/draft 보류를 재검사한다. 입력 변경은 실패 횟수를 늘리지 않고 단계 재준비로 돌리며, 지속되는 차단·보류는 해당 작업의 대기로 반환한다.
 
 수동 start·complete·submit은 Git·profile 관측 전에 group, 요청, 구성원별 `exec_plans` 전체 행과 수동 소유 fingerprint를 짧은 공통 DB 요청에서 snapshot으로 확보한다. 외부 관측 뒤 적용 요청은 그 snapshot과 후보 입력을 다시 비교하고, `preparation_gate`의 현재 자원·게시 예약을 함께 검사해 소유권·계획 리비전·상태가 그대로일 때만 예약·수락을 원자 적용한다. 차이가 있으면 충돌로 거부해 경쟁 상태와 기존 작업물을 보존한다. `run_database_request`는 이 DB 전용 재확인·적용만 rollback 후 다시 읽어 재시도하며 Git·profile·Agent·검증·게시를 감싸거나 반복하지 않는다.
 
@@ -604,6 +604,10 @@ planning 게시의 외부 관측·복구·worktree 정리는 공통 DB 접근 �
 작업별 일반 RETRY는 프로젝트 조율로 반환하지 않고 실행 대기열의 재시도 순서로 재등록한다. RETRY마다 DB 상태를 다시 준비하고 기존 일시 복구의 같은 실행 3회 한도를 공통으로 적용한다. 단계 처리의 일반 예외는 작업별 상세 오류·traceback을 기록하고 미확정 transaction을 rollback한 뒤 같은 배정 경로로 제한 재시도한다. 예외 3회 실패는 해당 작업만 보류하며 Future의 일반 예외도 작업별 오류로 수집해 조율기의 추가 배정을 계속한다. Planner 배정 중단·runtime handoff·사용자 중단은 별도 제어 신호로 전파한다. 재시도 우선순위는 수동 제출보다 낮고 다른 일반 작업보다 높으며 재등록 순서를 유지한다. 프로젝트 조율기가 명세 변경으로 planning이 필요하다고 판단하면 프로젝트 배정 중단 신호로 관리 편입·실행 대기 호출·후속 단계를 반환시키고 실행 중 처리를 join한 뒤 프로젝트 조율로 돌아간다. 진행 중 rebase의 작업물·index·checkpoint·원래 target은 보존하고 별도 planning worktree에서 Planner 게시·catalog·DB 반영을 먼저 완료한 뒤 작업 배정을 다시 연다. 재개한 실행은 갱신된 베이스와 명세를 기존 revision gate로 확인하며, 보존된 rebase를 완료로 간주하거나 강제로 중단하지 않는다. 다른 진행 중 Git operation과 미종료 호출의 안전 gate는 유지한다. runtime handoff는 기존 전체 launch gate로 새 호출을 막고 진행 중 처리의 반환을 기다린다.
 
 같은 원인·입력 지문·진전 marker의 관측이 세 번 이상인 일시 복구는 재시도 묶음의 상한 뒤 타이머만으로 다시 배정하지 않는다. 기존 `recovery_records.occurrence`와 `pending_action=pause`로 해당 작업을 보존하고 독립 작업을 계속한다. 입력이나 진전이 달라진 관측은 별도의 묶음으로 판단한다. 이 보류는 최종 차단·사용자 결정·성공을 만들지 않으며 다음 외부 실행의 현재 상태 재검사를 막지 않는다. 준비·단계 처리·결과 수집의 DB 대기 만료는 실패/교정 횟수에 합산하지 않고 같은 작업을 최대 세 번 재시도한 뒤 보존한다. 실제 결과가 이미 확보된 Agent 호출은 기존 결과 저장 재개 경계를 사용해 provider를 반복하지 않는다.
+
+배정 순위는 대기 스레드가 소유한 SQLite 연결에서 현재 수동 수락·RETRY·유효 priority로 다시 계산하며, 실행 불가 항목은 선택에서 제외한다. READY 활성화는 관리 순번을 받은 뒤 기존 selector로 재선택하고 현재 worktree HEAD를 읽는다. 수동 재개도 같은 경계에서 묶음·활성 구성원·요청이 보존됐는지 확인한다. DB 쓰기 transaction을 잡고 순번이나 외부 관측을 기다리지 않는다.
+
+호출 대기의 작업 행·유지보수·수동 묶음과 실행 자격을 예약 전후에 비교한다. execution 포트는 준비한 호출 입력의 재검사 함수를 `ContextVar`로 전달한다. 실제 대기 뒤에는 기존 latest-base fetch를 재사용하고, 호출 직전 현재 실행 snapshot·후보 HEAD·branch·index·dirty 파일·config·Git operation·대상 worktree 등록·원격 base를 대조한다. 무관한 branch ref·worktree 등록은 후보 변경으로 취급하지 않는다. 변경은 `SchedulingChanged`로 기존 재준비에, 현재 자격 부재는 `SchedulingDeferred`로 작업별 일시 보류에 연결하므로 검증 실패·예외 재시도 횟수를 소진하지 않는다. 재검사에 거부된 미시작 예약만 해제하고 호출 cursor·RETRY 순서는 소비하지 않으며, 종료 불명 예약은 기존 receipt 계약대로 보존한다.
 
 `projects.max_tasks_per_project`는 정수 0 이상이고 migration 기본 0이다. 0이면 해당 Manager가 읽은 config 기본값을 상속하며 양수는 보존한다. 배정 경계에서 DB를 재조회한다. `task_call_reservations`는 호출 token·repo·plan·종류·실행 receipt를 보존하고, 재시작 시 미시작 또는 실제 프로세스 종료 증거가 있는 호출만 회수한다. `PLAN_BLOCKED`는 호출 예약이나 `execution_checkpoints.operation`이 남아 있어도 관리 개수에서 제외한다. 실제 호출의 실행 자리·자원 소유권·checkpoint는 삭제하지 않으며 차단 해제 후에는 관리 한도를 다시 확인한다. 차단되지 않은 작업은 미확정 호출·operation의 기존 관리 자리 보존 조건을 유지한다. Agent는 기존 group/Job 종료 receipt, verify는 소유 프로세스·WSL lifecycle receipt를 사용한다. 불확실한 종류의 호출이 상한에 도달하면 해당 단계는 보존하고 다른 종류의 적격 호출을 계속한다.
 

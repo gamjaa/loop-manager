@@ -339,13 +339,27 @@ class ExecutionStatePort:
 
         @wraps(function)
         def invoke(*args, **kwargs):
+            from loop_manager_internal.application.task_scheduling import call_revalidation, current_scheduler
             if mutates or external:
                 self.check()
+            revalidation_token = None
+            if (name in {'run_agent', 'verify', 'partial_verify'} and current_scheduler.get() is not None
+                    and getattr(self, 'call_inputs', None) is not None):
+                from loop_manager_internal.application.task_scheduling import SchedulingChanged
+                observed = self.call_inputs()
+                def revalidate(*, waited):
+                    if waited and getattr(self, 'refresh_call_inputs', None) is not None:
+                        self.refresh_call_inputs()
+                    if self.call_inputs() != observed:
+                        raise SchedulingChanged('호출 배정 대기 중 실행 입력이 변경됐습니다.')
+                revalidation_token = call_revalidation.set(revalidate)
             if connected:
                 args = (self.connection, *args)
             try:
                 result = function(*args, **kwargs)
             finally:
+                if revalidation_token is not None:
+                    call_revalidation.reset(revalidation_token)
                 if mutates:
                     # A helper may adopt the rebase before checkpoint publication
                     # fails. Recovery must observe that durable state on retry.
