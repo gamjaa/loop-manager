@@ -149,7 +149,6 @@ class FakeStatePort:
         self.maintenance_due_required = False
         self.maintenance_due_reason = "interval_reached"
         self.maintenance_begin_count = 0
-        self.document_approval_pending = False
         self.plan_declarations_match_result = True
         self.check_record = None
         self.has_general_baseline = False
@@ -281,9 +280,6 @@ class FakeStatePort:
 
     def schedule(self, _repo):
         return self.schedule_result
-
-    def pending_document_approval(self, _repo, _repository, _base_branch):
-        return self.document_approval_pending
 
     def maintenance_due(self, _repo, _interval, *, self_repository=False,
                         completion_candidate=False):

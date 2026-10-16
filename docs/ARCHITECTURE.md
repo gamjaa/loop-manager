@@ -194,6 +194,14 @@ Manager의 `document-drafts` 문서 수정본 결과는 application의 `tagged_j
 
 후보의 내용 문자열은 해석 과정에서 정규화하지 않으며 전체 JSON의 2,100,000 UTF-8 byte 제한과 기존 저장 bytes/hash 계약을 유지한다. 형식 오류는 `DocumentDraftError` 경계로 전달되어 후보 저장이나 사용자 결정을 만들지 않고 기존 수정본·결정 상태를 보존한다.
 
+**승인 수정본과 기존 작업 전달.**
+
+승인 수정본은 독립 Planner 호출이나 새 ExecPlan 생성 대상이 아니다. 다음 조건을 모두 확인할 때만 정상 실행 선택으로 이미 시작한 기존 자동 Worker에게 artifact를 전달한다: 승인 당시의 source 관계가 한 개의 ExecPlan ID·sources로 현재 작업과 정확히 일치하고, 저장된 현재 선언의 path·sources와 repository가 같으며, 현재 단계가 구현 중이고 수동 소유나 PR 연결이 없다. 승인 시 source 관계가 없거나 여러 계획을 가리키면 `publication_error`에 미전달 이유를 기록하며, stale 원문·변경된 source·소유권 불명·수동 소유·PR·자동 실행 대상이 아닌 상태도 작업에 매핑하지 않고 승인 artifact를 보존한다. 이 보류는 독립 작업 선택과 별도 목적의 Planner 판단을 막지 않는다.
+
+`plan_id`의 기존 단일 연결과 compare-and-set을 재사용해 한 승인 artifact를 한 작업에만 결합한다. 연결 뒤에도 승인 snapshot에 포함된 계획의 source 관계를 원격 catalog와 다시 대조한다. source snapshot에 없는 계획을 제외하는 예외는 승인 뒤 생성된 legacy 문서 전용 계획에만 적용해 게시 복구를 유지한다. Worker에는 원본·제안·의미 근거·전체 diff를 입력으로 전달하고 대상 문서 직접 수정은 금지한다. 성공 결과를 확인한 뒤 Manager가 저장된 승인 identity·revision·bytes와 원격 원문·source 관계를 다시 검증하고 대상이 원본 bytes 또는 이미 적용된 승인 bytes일 때만 정확한 승인 bytes를 쓴다. 다른 task 변경은 유지하지만 대상 내용·diff·file mode가 승인과 다르면 덮어쓰지 않고 Worker 교정 경계로 돌린다. 이후에도 기존 targeted test·전체 verify·의미 보존 Review·PR gate를 통과해야 한다.
+
+기존에 게시된 `DOCUMENT_DRAFT_ID` claim을 가진 전용 계획은 legacy 복구 경로에서 승인 diff만 있는 worktree를 검증·적용한다. 이 claim과 R-027 source 제약은 예전 게시 결과를 위해 유지하며 새 문서 수정본의 작업으로 만들지 않는다.
+
 **ExecPlan 문서 형식.**
 
 ExecPlan은 [PLANS.md](PLANS.md)의 고정 key/value와 `sources`·`depends_on` 목록만 파싱하며 전체 YAML을 지원하지 않는다. 파일 앞의 `---` 경계 안에서 key를 한 번씩 선언하고 목록 항목은 두 칸 들여쓴 `- `로 쓴다. 허용 key 이외의 선언과 중복 key는 거부한다.

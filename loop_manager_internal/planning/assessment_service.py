@@ -225,8 +225,6 @@ class PlanningAssessmentService(PlanningService):
                         requirement_only = bool(requirement_only and row.planning_fingerprint
                             and row.specification_fingerprint == run.specification_fingerprint
                             and not getattr(self._ports.git, 'runtime_guidance_changed', lambda *_: False)(context.repo_path)
-                            and not self._ports.state.pending_document_approval(
-                                context.repo, context.repo_path, context.base_branch)
                             and not getattr(self._ports.state, 'pending_user_decision', lambda *_: False)(
                                 context.repo, self._ports.git.plan_declarations(context.repo_path, str(row.active_sha))))
                     instruction, attempt = prepare_review(

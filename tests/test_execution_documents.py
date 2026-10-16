@@ -2,7 +2,9 @@
 
 from tests.support.execution import ExecutionFixture
 import hashlib
+import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
@@ -17,6 +19,28 @@ from dataclasses import replace
 
 
 class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def approved_draft(self, relationships, *, plan_id=None):
+        drafts = handlers.document_drafts.DocumentDraftRepository(self.connection)
+        original, proposed = b'# Product\r\nOld.\r\n', b'# Product\r\nApproved.\r\n'
+        draft_id = 'a' * 32
+        diff = handlers.document_drafts._complete_diff(
+            'docs/PRODUCT.md', original, proposed,
+        )
+        self.connection.execute(
+            'INSERT INTO document_drafts (draft_id, repo, finding_ids, target_path, '
+            'assessment_revision, original_revision, original_hash, original_content, '
+            'proposed_hash, proposed_content, complete_diff, source_relationships, '
+            'meaning_evidence, state, requested_decision, decision_revision, plan_id) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (draft_id, self.repo, '[]', 'docs/PRODUCT.md', 'b' * 40, 'c' * 40,
+             hashlib.sha256(original).hexdigest(), original,
+             hashlib.sha256(proposed).hexdigest(), proposed, diff,
+             json.dumps([[plan, sorted(sources)] for plan, sources in relationships]),
+             'Repeated wording only.', 'approved', 'approve', 'd' * 32, plan_id),
+        )
+        self.connection.commit()
+        return drafts.get(draft_id)
+
     def test_document_reports_are_corrected_before_verify_and_review(self):
         patches = {'docs/PRODUCT.md': '-old product\n+new product\n',
                    'docs/ARCHITECTURE.md': '-old design\n+new design\n'}
@@ -156,6 +180,10 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
         draft = SimpleNamespace(
             draft_id="a" * 32, target_path="docs/PRODUCT.md",
         )
+        self.handler.plan = {
+            **self.plan,
+            "sources": [handlers.document_publication.R027_SOURCE],
+        }
         repository = mock.Mock()
         repository.assert_current = mock.Mock()
         with (
@@ -163,7 +191,7 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
             mock.patch.object(handlers.document_drafts, 'DocumentDraftRepository',
                               return_value=repository),
             mock.patch.object(handlers.document_publication, 'read_plan_text',
-                              return_value='approved plan'),
+                              return_value='DOCUMENT_DRAFT_ID: ' + draft.draft_id),
             mock.patch.object(handlers.document_publication, 'validate_document_plan'),
             mock.patch.object(handlers.document_publication, 'apply_approved_bytes') as apply,
         ):
@@ -174,6 +202,247 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
         self.effects.agent.run_agent.assert_not_called()
         self.assertIn('실행 가능한 관련 unit test가 없습니다',
                       self.state.row()['worker_result'])
+
+
+    def test_unique_existing_source_link_reaches_same_worker_and_applies_approved_bytes(self):
+        draft = self.approved_draft((('G-047', ('docs/PRODUCT.md',)),))
+        self.effects.agent.is_loop_manager_repository.return_value = True
+        self.effects.agent.worker_prompt.return_value = 'normal task prompt'
+        with (
+            mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                              'assert_current', return_value='remote'),
+            mock.patch.object(handlers.document_publication, 'read_plan_text',
+                              return_value='ordinary existing ExecPlan'),
+            mock.patch.object(handlers.document_publication,
+                              'apply_linked_approved_bytes') as apply,
+        ):
+            outcome = self.handler.run(self.context())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.agent.run_agent.assert_called_once()
+        prompt = self.effects.agent.run_agent.call_args.args[5]
+        self.assertIn('같은 Worker 세션', prompt)
+        self.assertIn(draft.draft_id, prompt)
+        self.assertIn(draft.proposed_content.decode('utf-8'), prompt)
+        apply.assert_called_once()
+        mapped = handlers.document_drafts.DocumentDraftRepository(
+            self.connection,
+        ).for_plan(self.repo, 'G-047')
+        self.assertEqual(mapped.draft_id, draft.draft_id)
+        self.assertEqual(mapped.state, 'approved')
+
+
+    def test_ambiguous_approved_source_links_remain_unapplied(self):
+        self.connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, "
+            "priority, content_hash, status) VALUES (?, 'G-048', ?, 'Other', ?, '[]', "
+            "'normal', 'hash', 'READY')",
+            (self.repo, 'docs/plans/[G-048] Other.md', '["docs/PRODUCT.md"]'),
+        )
+        draft = self.approved_draft((
+            ('G-047', ('docs/PRODUCT.md',)),
+            ('G-048', ('docs/PRODUCT.md',)),
+        ))
+        self.effects.agent.is_loop_manager_repository.return_value = True
+        with (
+            mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                              'assert_current', return_value='remote'),
+            mock.patch.object(handlers.document_publication, 'read_plan_text',
+                              return_value='ordinary existing ExecPlan'),
+        ):
+            self.assertIsNone(self.handler._document_draft(self.context()))
+        stored = handlers.document_drafts.DocumentDraftRepository(
+            self.connection,
+        ).get(draft.draft_id)
+        self.assertIsNone(stored.plan_id)
+        self.assertEqual(stored.state, 'approved')
+        self.assertIn('하나로 확정되지', stored.publication_error)
+
+
+    def test_stale_approval_does_not_bind_to_existing_work(self):
+        draft = self.approved_draft((('G-047', ('docs/PRODUCT.md',)),))
+        self.effects.agent.is_loop_manager_repository.return_value = True
+        with (
+            mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                              'assert_current', side_effect=handlers.document_drafts.DocumentDraftError('original changed')),
+            mock.patch.object(handlers.document_publication, 'read_plan_text',
+                              return_value='ordinary existing ExecPlan'),
+        ):
+            self.assertIsNone(self.handler._document_draft(self.context()))
+        stored = handlers.document_drafts.DocumentDraftRepository(
+            self.connection,
+        ).get(draft.draft_id)
+        self.assertIsNone(stored.plan_id)
+        self.assertEqual(stored.state, 'approved')
+        self.assertIn('original changed', stored.publication_error)
+
+
+    def test_changed_existing_plan_sources_hold_the_unbound_approval(self):
+        draft = self.approved_draft((('G-047', ('docs/PRODUCT.md',)),))
+        self.connection.execute(
+            "UPDATE exec_plans SET sources = '[\"docs/ARCHITECTURE.md\"]' "
+            "WHERE repo = ? AND plan_id = 'G-047'", (self.repo,),
+        )
+        self.connection.commit()
+        self.effects.agent.is_loop_manager_repository.return_value = True
+        with (
+            mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                              'assert_current', return_value='remote'),
+            mock.patch.object(handlers.document_publication, 'read_plan_text',
+                              return_value='ordinary existing ExecPlan'),
+        ):
+            self.assertIsNone(self.handler._document_draft(self.context()))
+        stored = handlers.document_drafts.DocumentDraftRepository(
+            self.connection,
+        ).get(draft.draft_id)
+        self.assertIsNone(stored.plan_id)
+        self.assertIn('source 선언', stored.publication_error)
+
+
+    def test_manual_ownership_holds_approval_from_automatic_work(self):
+        from loop_manager_internal.storage import manual_work_state
+
+        draft = self.approved_draft((('G-047', ('docs/PRODUCT.md',)),))
+        group = manual_work_state.ManualWorkRepository(self.connection).create(
+            self.repo, 'submit', 'user-branch', (), 'base', 'base', members=('G-047',),
+        )
+        self.connection.execute(
+            "UPDATE manual_work_groups SET state = 'MANUAL_WORKING', owner_id = 'G-047' "
+            "WHERE repo = ? AND group_id = ?", (self.repo, group['group_id']),
+        )
+        self.connection.commit()
+        self.effects.agent.is_loop_manager_repository.return_value = True
+        with (
+            mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                              'assert_current', return_value='remote'),
+            mock.patch.object(handlers.document_publication, 'read_plan_text',
+                              return_value='ordinary existing ExecPlan'),
+        ):
+            self.assertIsNone(self.handler._document_draft(self.context()))
+        stored = handlers.document_drafts.DocumentDraftRepository(
+            self.connection,
+        ).get(draft.draft_id)
+        self.assertIsNone(stored.plan_id)
+        self.assertIn('수동 소유', stored.publication_error)
+
+
+    def test_open_pr_holds_approval_from_existing_work_extension(self):
+        draft = self.approved_draft((('G-047', ('docs/PRODUCT.md',)),))
+        context = self.context()
+        self.connection.execute(
+            "UPDATE exec_plans SET status = 'PR_OPEN', pr_url = 'https://example.invalid/pr/47' "
+            "WHERE repo = ? AND plan_id = 'G-047'", (self.repo,),
+        )
+        self.connection.commit()
+        self.effects.agent.is_loop_manager_repository.return_value = True
+        with (
+            mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                              'assert_current', return_value='remote'),
+            mock.patch.object(handlers.document_publication, 'read_plan_text',
+                              return_value='ordinary existing ExecPlan'),
+        ):
+            self.assertIsNone(self.handler._document_draft(context))
+        stored = handlers.document_drafts.DocumentDraftRepository(
+            self.connection,
+        ).get(draft.draft_id)
+        self.assertIsNone(stored.plan_id)
+        self.assertIn('Worker 실행 전 상태', stored.publication_error)
+
+
+    def test_mapped_source_link_stays_in_remote_approval_checks(self):
+        draft = self.approved_draft(
+            (('G-047', ('docs/PRODUCT.md',)),), plan_id='G-047',
+        )
+        repository = handlers.document_drafts.DocumentDraftRepository(self.connection)
+        with (
+            mock.patch.object(handlers.document_drafts, 'remote_revision', return_value='remote'),
+            mock.patch.object(handlers.document_drafts, 'document_at',
+                              return_value=(draft.original_revision, draft.original_content)),
+            mock.patch.object(handlers.document_drafts, 'checked_source_relationships',
+                              return_value=draft.source_relationships) as relationships,
+        ):
+            repository.assert_current(draft, Path('/repo'), 'main')
+            self.assertEqual(repository.approved(self.repo, Path('/repo'), 'main'), (draft,))
+        self.assertEqual(relationships.call_count, 2)
+        self.assertIsNone(relationships.call_args.kwargs['exclude_plan_id'])
+
+
+    def test_approval_revision_change_during_worker_blocks_byte_application(self):
+        draft = self.approved_draft(
+            (('G-047', ('docs/PRODUCT.md',)),), plan_id='G-047',
+        )
+        context = self.context()
+        self.connection.execute(
+            "UPDATE document_drafts SET decision_revision = ? WHERE draft_id = ?",
+            ('e' * 32, draft.draft_id),
+        )
+        self.connection.commit()
+        with mock.patch.object(handlers.document_publication,
+                               'apply_linked_approved_bytes') as apply:
+            self.assertFalse(self.handler._apply_linked_document(context, draft))
+        apply.assert_not_called()
+        stored = handlers.document_drafts.DocumentDraftRepository(
+            self.connection,
+        ).get(draft.draft_id)
+        self.assertIn('identity·revision·bytes가 변경', stored.publication_error)
+
+
+    def test_conflicting_approved_target_records_unapplied_reason(self):
+        draft = self.approved_draft(
+            (('G-047', ('docs/PRODUCT.md',)),), plan_id='G-047',
+        )
+        with (
+            mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                              'assert_current', return_value='remote'),
+            mock.patch.object(handlers.document_publication,
+                              'apply_linked_approved_bytes',
+                              side_effect=handlers.document_drafts.DocumentDraftError('target mode changed')),
+        ):
+            with self.assertRaisesRegex(
+                handlers.document_drafts.DocumentDraftError, 'target mode changed',
+            ):
+                self.handler._apply_linked_document(self.context(), draft)
+        stored = handlers.document_drafts.DocumentDraftRepository(
+            self.connection,
+        ).get(draft.draft_id)
+        self.assertIn('target mode changed', stored.publication_error)
+
+
+    def test_linked_approved_bytes_preserve_exact_crlf_in_mixed_worktree(self):
+        draft = self.approved_draft((('G-047', ('docs/PRODUCT.md',)),), plan_id='G-047')
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            target = worktree / draft.target_path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(draft.original_content)
+            (worktree / 'app.py').write_text('implementation change', encoding='utf-8')
+            def git(_worktree, *arguments):
+                return (draft.original_content if arguments[0] == 'show' else b'')
+            with mock.patch.object(handlers.document_publication, '_git', side_effect=git):
+                handlers.document_publication.apply_linked_approved_bytes(
+                    draft, worktree, 'base',
+                )
+                handlers.document_publication.validate_linked_worktree(
+                    draft, worktree, 'base',
+                )
+            self.assertEqual(target.read_bytes(), draft.proposed_content)
+            target.write_bytes(b'# Product\r\nUnapproved.\r\n')
+            with mock.patch.object(handlers.document_publication, '_git', side_effect=git):
+                with self.assertRaises(handlers.document_drafts.DocumentDraftError):
+                    handlers.document_publication.validate_linked_worktree(
+                        draft, worktree, 'base',
+                    )
+            target.write_bytes(draft.proposed_content)
+            def changed_mode(_worktree, *arguments):
+                if arguments[0] == 'show':
+                    return draft.original_content
+                return b'mode change' if arguments[0] == 'diff' and '--summary' in arguments else b''
+            target.write_bytes(draft.original_content)
+            with mock.patch.object(handlers.document_publication, '_git', side_effect=changed_mode):
+                with self.assertRaises(handlers.document_drafts.DocumentDraftError):
+                    handlers.document_publication.apply_linked_approved_bytes(
+                        draft, worktree, 'base',
+                    )
+            self.assertEqual(target.read_bytes(), draft.original_content)
 
 
     def test_document_review_requires_explicit_meaning_and_diff_verdicts(self):
