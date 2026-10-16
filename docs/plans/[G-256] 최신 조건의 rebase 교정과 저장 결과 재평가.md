@@ -346,3 +346,18 @@ python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_worker_confli
 현재 통합 후보 결과: **PASS — 20 tests, exit 0**, 모든 test `ok`. 이전 후보의 결과를 성공으로 재사용하지 않았다. Git/Agent는 mock, SQLite/파일은 독립 fixture다. unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집·필수 compile 선언을 유지하며 실제 실행은 Python 3.12/Linux다. 실제 Git lifecycle 세 개와 전체 verify/Review는 Manager의 후속 검증에 남긴다. 전체 suite/integration/compile·scripts/verify·전체 lint/build/type check는 실행하지 않았다.
 
 Worker는 파일 내용 충돌만 해결했으며 index 확정·autostash 정리·관리 Git 완료·게시·Merge는 Manager에 맡긴다. commit/push/PR 생성·rebase continue/stash·운영 SQLite 변경은 수행하지 않았다. PRODUCT·ARCHITECTURE의 누적 문서 보고 hash는 지정 base `9745973` 대비로 다시 산출했다.
+
+
+## 管理 rebase 완료 HEAD 재검증 (2026-10-16)
+
+Manager가 수용한 현재 HEAD `5de88a9`의 clean 상태를 확인하고 현재 ExecPlan·PRODUCT·ARCHITECTURE·연결 R-082/R-072/R-055와 base `97459737e66adb29fab32b38378d168b1129e492` 대비 전체 25개 파일 diff를 이전 교정과 대조했다. 호출 전 입력/실제 전달 hash·저장 결과 재평가·완료 definition·다음 충돌 READY 종료 및 최신 중간/최종 scope 경계가 함께 유지된다. 추가 코드나 테스트 수정이 필요한 누락은 확인하지 않았다. 기존 테스트 변경과 실제 Git lifecycle의 단일 Worker 기대값 정합화도 보존한다.
+
+현재 후보를 직접 검증하기 위해 아래 개별 unit 11개를 새로 실행했다. 이전 후보의 20개 통과를 현재 결과로 재사용하거나 합산하지 않는다.
+
+```sh
+python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_first_worker_delivery_binds_guidance_to_saved_rebase_inputs tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_live_worker_ready_is_not_blessed_after_inputs_change_during_turn tests.test_execution_worker_phase.ExecutionWorkerPhaseTests.test_rebase_response_is_saved_before_metadata_failure_without_worker_retry tests.test_worker_conflict_scope.WorkerConflictScopeUnitTests.test_owned_rebase_preserves_typed_input_failure tests.test_worker_conflict_scope.WorkerConflictScopeUnitTests.test_pending_checkpoint_defers_final_declaration_checks_only_after_ownership tests.test_worker_conflict_scope.WorkerConflictScopeUnitTests.test_completed_rebase_uses_real_current_result_policy tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_worker_end_defers_intermediate_metadata_and_scope_but_rechecks_remote tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_completed_changed_definition_survives_next_dispatch_without_worker tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_next_conflict_after_continue_reenters_worker_without_replaying_ready tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_restart_after_continue_reenters_worker_without_replaying_ready tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_pending_recovery_uses_checkpoint_after_frontmatter_normalization
+```
+
+결과: **PASS — 11 tests, exit 0**, 모든 test `ok`. 실제 전달/응답 저장·호출 중 조건 변경·typed 입력 오류·중간 검사 유예/원격 확인·최종 거부·완료 다음 dispatch·다음 충돌/중단 재진입·정규화 뒤 checkpoint 재개를 확인했다. Git/Agent/verify는 mock이며 SQLite/파일은 독립 fixture다. mock VERIFYING/REVIEWING 로그는 전체 verify/Review 성공을 뜻하지 않는다. unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집·필수 compile 선언과 verify 입력 목록을 유지하며 실행은 Python 3.12/Linux다.
+
+이번 변경은 선택 계획 본문의 검증 기록뿐이다. 기존 본문·frontmatter·sources·사용자 결정·Requirement·다른 ExecPlan·PLANS는 보존했다. PRODUCT·ARCHITECTURE의 누적 diff hash를 현재 base 대비로 다시 확인했다. 실제 Git lifecycle 세 개·전체 verify·Review·게시·Merge는 Manager가 후속 검증하며 Worker는 전체 suite/integration/compile·전체 lint/build/type check·scripts/verify·commit/push/PR 생성과 운영 SQLite 변경을 수행하지 않았다.
