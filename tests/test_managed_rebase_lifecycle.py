@@ -582,8 +582,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                             operation=current.operation, expected_head=current.expected_head,
                             target_base_oid=current.target_base_oid,
                             observed_remote_oid=current.observed_remote_oid,
+                            # Worker inputs are independent of the Git journal format.
                             snapshot={key: value for key, value in current.snapshot.items()
-                                      if not key.startswith('rebase_')},
+                                      if not key.startswith('rebase_') or key == 'rebase_worker_input'},
                         )
                     return real_begin(state_path, **kwargs)
 
@@ -654,7 +655,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 if documents == 'mixed':
                     self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'app.txt')
                     self.assertIn('<<<<<<<', (worktree / 'app.txt').read_text())
-                    handler.run(handler._context())
+                    handler.run(handler.guard(handler._context()))
                     self.assertEqual(events, ['worker'])
                     self.assertEqual((worktree / requirement_path).read_bytes(), expected_requirement)
                 elif documents == 'autostash':
@@ -755,7 +756,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 effects.publication.push_managed_publication_branch.assert_not_called()
                 return
             if not manual and not publication_interruption and not legacy:
-                handler.run(conflict_context)
+                handler.run(handler.guard(conflict_context))
                 self.assertEqual(len(resolutions), 1)
                 self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
             variants = sealed_restart if isinstance(sealed_restart, tuple) else (sealed_restart,)
@@ -806,7 +807,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                                                                            side_effect=crash_after_git))
                         with crash:
                             with self.assertRaises(SimulatedProcessExit):
-                                handler.run(handler._context())
+                                handler.run(handler.guard(handler._context()))
                     resolution_count = 0 if publication_interruption else (1 if legacy else 2)
                     self.assertEqual(len(resolutions), resolution_count)
                     final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
@@ -956,8 +957,13 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     self.assertIn('checkpoint-push', events)
                     if with_pr:
                         self.assertEqual(effects.state.row()['pr_head_oid'], final_head)
-                    self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
-                    self.assertIsNone(effects.state.row()['worker_result'])
+                    proven_worker = not (manual or publication_interruption or cumulative)
+                    self.assertEqual(recovered.phase, ExecutionPhase.VERIFYING if proven_worker
+                                     else ExecutionPhase.IMPLEMENTING)
+                    self.assertEqual(effects.state.row()['worker_result'],
+                                     policy_fixture.READY_WORKER_RESULT if proven_worker else None)
+                    if proven_worker:
+                        self.assertIsNotNone(effects.state.row()['worker_input_token'])
                     self.assertIsNone(effects.state.row()['verify_result'])
                     self.assertIsNone(effects.state.row()['review_result'])
                     if publication_interruption:
@@ -979,10 +985,13 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                         self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), final_head)
                         self.assertEqual(events.count('checkpoint-push'), 2)
                     self.assertNotIsInstance(context, ExecutionOutcome)
-                    self.assertEqual(context.phase, ExecutionPhase.IMPLEMENTING)
+                    self.assertEqual(context.phase, ExecutionPhase.VERIFYING if proven_worker
+                                     else ExecutionPhase.IMPLEMENTING)
                     before_worker_count = events.count('worker')
-                    context = handler.run(context).context
-                    self.assertEqual(events.count('worker'), before_worker_count + 1)
+                    if not proven_worker:
+                        context = handler.run(context).context
+                    self.assertEqual(events.count('worker'), resolution_count if proven_worker
+                                     else before_worker_count + 1)
                     self.assertEqual(context.phase, ExecutionPhase.VERIFYING)
                     verified = handler.verify(context, handler)
                     self.assertEqual(verified.context.phase, ExecutionPhase.REVIEWING, verified.detail)

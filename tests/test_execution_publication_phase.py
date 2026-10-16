@@ -318,6 +318,7 @@ class ExecutionPublicationPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseS
 
 
     def test_owned_pr_correction_stages_only_publishable_resolution(self):
+        self.handler.guard(self.context())
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -348,7 +349,10 @@ class ExecutionPublicationPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseS
 
         result = self.handler.run(self.context())
 
-        self.assertEqual(result.context.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertEqual(result.context.phase, ExecutionPhase.VERIFYING)
+        self.assertIsNotNone(self.state.row()['worker_input_token'])
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.assertIsNone(self.state.row()['review_token'])
         additions = [call for call in self.effects.workspace.git.call_args_list
                      if call.args[1] == 'add']
         self.assertEqual(len(additions), 1)

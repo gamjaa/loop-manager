@@ -62,6 +62,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
     def test_targeted_rebase_failures_use_individual_execution_history_instead_of_report_count(self):
         from loop_manager_internal.execution.result_validation import TargetedTestFailure
         from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+        self.handler.guard(self.context())
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -781,6 +782,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
 
 
     def test_rebase_worker_result_format_error_stops_run_for_same_session_retry(self):
+        self.handler.guard(self.context())
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects

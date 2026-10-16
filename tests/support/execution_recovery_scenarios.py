@@ -837,5 +837,9 @@ class ExecutionRecoveryScenarios:
         self.dirty = False
         self.effects.workspace._rebase_in_progress_for_branch.return_value = False
         self.handler.guard(self.handler._context())
-        self.assertEqual(self.state.row()['phase'], 'WORKING')
-        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(self.state.row()['worker_input_token'], self.handler._definition_snapshot.worker_token)
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertEqual(self.effects.agent.run_agent.call_count, 1)
