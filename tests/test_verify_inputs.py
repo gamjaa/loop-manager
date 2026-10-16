@@ -306,6 +306,7 @@ class VerifyInputObservationTest(unittest.TestCase):
                      'tests/fixtures/provider-profiles.ini', 'scripts/verify.json',
                      'scripts/verify.sh', 'scripts/verify.ps1',
                      'scripts/verify_windows.py', 'scripts/verify-windows-tests.json',
+                     'scripts/setup.sh',
                      'scripts/copy-project-files.sh', 'scripts/copy-project-files.ps1',
                      '.agents/skills/specification-docs/scripts/next_requirement_id.py',
                      '.agents/skills/specification-docs/scripts/requirement_documents.py',
@@ -319,6 +320,32 @@ class VerifyInputObservationTest(unittest.TestCase):
                      'docs/PRODUCT.template.md', 'docs/ARCHITECTURE.template.md',
                      'docs/REQUIREMENT.template.md',
                      '.agents/skills/specification-docs/SKILL.md',
-                     'scripts/setup.sh', '.gitignore', '.gitattributes'):
+                     'scripts/setup.ps1', '.gitignore', '.gitattributes'):
             with self.subTest(path=path):
                 self.assertFalse(any(inputs.matches(path, pattern) for pattern in patterns))
+
+    def test_setup_input_changes_invalidate_fingerprint_and_exclusion_proof(self):
+        root = Path(__file__).resolve().parents[1]
+        setup = self.root / 'scripts/setup.sh'
+        source = (root / 'scripts/setup.sh').read_bytes()
+        self.manifest(['src/**', 'scripts/setup.sh'])
+        (self.root / 'notes.md').write_text('excluded by this unit fixture')
+        for change in ('bytes', 'kind', 'mode'):
+            with self.subTest(change=change):
+                if setup.is_symlink():
+                    setup.unlink()
+                setup.write_bytes(source)
+                setup.chmod(0o644)
+                before = self.observe()
+                self.assertTrue(self.observe(completeness=before.completeness_token).proven)
+                if change == 'bytes':
+                    setup.write_bytes(source + b'\n# changed setup\n')
+                elif change == 'kind':
+                    setup.unlink()
+                    setup.symlink_to('../src/app.py')
+                else:
+                    setup.chmod(0o755)
+                after = self.observe(completeness=before.completeness_token)
+                self.assertNotEqual(before.fingerprint, after.fingerprint)
+                self.assertNotEqual(before.completeness_token, after.completeness_token)
+                self.assertFalse(after.proven)

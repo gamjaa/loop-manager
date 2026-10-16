@@ -150,7 +150,7 @@ unittest와 perl-tap 이외의 미연결 도구는 기존 verify를 유지하며
 run별 `manifest.json`, 단계별 수집 요청/결과·단위 결과·worker 로그와 JSONL 이벤트, 전체 `summary.json`을 보존한다. 이벤트는 version·run·단계·단위/테스트 identity를 결합하며 단계별 로그도 전체 진단에 포함한다. 실패 피드백의 `[VERIFY_DIAGNOSTIC]` 경로로 원본 진단을 찾을 수 있다. 예약은 session·단위·PID와 프로세스 시작 identity에 결합한다. 종료가 확인된 자식/미시작 예약만 회수하고 종료 불명은 별도 journal에 보존한다.
 
 자체 `scripts/verify-inputs.json`은 `loop_manager.py`, `loop_manager_internal/**`, `tests/**`,
-`requirements.txt`, `scripts/verify.json`, 두 verify 스크립트, Windows driver·선택 목록, 두 copy 스크립트와 소비되는
+`requirements.txt`, `scripts/verify.json`, 두 verify 스크립트, Windows driver·선택 목록, `scripts/setup.sh`, 두 copy 스크립트와 소비되는
 `run.sh`·`run.ps1`과 실행 코드 `.agents/skills/specification-docs/scripts/**`를
 관측한다. 복사 회귀는 이 조회 도구와 `loop_manager_internal/catalog/frontmatter.py`의 실제 bytes를
 샘플 source에 배치하고 배포 결과·조회 동작을 확인한다. 선언 파일은 실제 adapter·interpreter·수집·필수 compile 단계를
@@ -159,8 +159,10 @@ run별 `manifest.json`, 단계별 수집 요청/결과·단위 결과·worker �
 실제 copy 스크립트는 이 샘플 source에서 실행해 결과 bytes·경로·보존·덮어쓰기 거부를 확인한다.
 `AGENTS.md`, README, docs와 `.agents`의 prose, `config/config.ini.example`·운영 설정, 소비하지 않는 setup·ignore·attributes는
 자체 verify의 prose/예제 입력에서 제외한다. 이 범위는 문서·예제의 품질 검증을 뜻하지 않으며
-필수 unittest 수집과 전체 compile을 유지한다. Windows verify driver·선택 목록은 이미 포함돼 있으며
-테스트가 실제로 읽어 실행하는 `scripts/setup.sh`의 누락 보완은 R-072의 변경 목표다.
+필수 unittest 수집과 전체 compile을 유지한다. Linux 실행 경로 회귀가 실제 `scripts/setup.sh`를
+임시 source에 복사해 실행하므로 이 파일의 bytes·kind·mode 변경은 입력 지문과 기존 제외 근거를 바꾼다.
+소비하지 않는 다른 플랫폼 setup은 추가하지 않는다. Windows driver·선택 목록의 코드 입력 관측은
+WSL/native 환경의 재현성 보장과 구분한다.
 
 성공 재사용의 채택 기준은 같은 프로젝트·ExecPlan·작업 주기의 실제 전체 성공과 저장소 코드 입력의
 동일성이다. 소스·테스트·fixture·의존성 선언·검증 스크립트/선언과 선택 진입점·목록의 bytes·경로·
