@@ -391,14 +391,22 @@ def validate_worker_workspace_scope(
         from loop_manager_internal.git.managed_rebase_validation import rebase_content_pending
         from loop_manager_internal.execution.plan_validation import _current_execplan_metadata
         checkpoint = ExecutionCheckpointRepository(connection).get(str(repo_path), str(catalog_plan['plan_id']))
-        if checkpoint.operation == 'rebase':
+        replay_pending = bool({'rebase-merge', 'rebase-apply'} & set(after.operations))
+        stash_pending = bool((checkpoint.snapshot or {}).get('stash_oid') and (
+            any(entry.split()[-1] != '0' for entries in after.index.values() for entry in entries)
+            or any('staged' in kinds for kinds, _signature in after.dirty.values())))
+        if checkpoint.operation == 'rebase' and (replay_pending or stash_pending):
+            from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
             owner_state = state_dir or effects._owned_rebase_state_dir(
                 str(repo_path), str(catalog_plan['plan_id']), worktree)
             if owner_state is None:
-                raise RuntimeError('현재 관리 rebase의 실행 대상을 확인할 수 없습니다.')
+                raise WorkspaceOwnershipError('현재 관리 rebase의 실행 대상을 확인할 수 없습니다.')
             service = effects._current_rebase_service(connection, repo_path, owner_state,
                 str(repo_path), str(catalog_plan['plan_id']), worktree, branch)
-            observed, _ = service.require_owned(checkpoint=checkpoint)
+            try:
+                observed, _ = service.require_owned(checkpoint=checkpoint)
+            except RuntimeError as error:
+                raise WorkspaceOwnershipError(f'현재 관리 rebase를 수용할 수 없습니다: {error}') from error
             if rebase_content_pending(service.expected, observed):
                 # The owned intermediate index is not the final Worker output.
                 return _current_execplan_metadata(catalog_plan, {})

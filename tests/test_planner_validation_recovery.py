@@ -633,14 +633,14 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
             loop_manager._execplan_metadata, loop_manager._row_is_mutable_ready, pr)
         def check(connection, snapshot):
             planner_validation._assert_mutable_ready_snapshot_current(effects, connection, snapshot)
-        with self.assertRaisesRegex(self.recovery.PlannerValidationError, 'PR'):
+        with self.assertRaisesRegex(planner_validation.MutableReadyPRConflict, 'PR'):
             self.prepare(assert_current=check)
         self.assertTrue(self.path.exists())
         pr.assert_called_once_with(Path('repo'), 'topic')
         pr.return_value = None
         self.prepare(assert_current=check)
         pr.return_value = {'url': 'PR on resume'}
-        with self.assertRaisesRegex(self.recovery.PlannerValidationError, 'PR'):
+        with self.assertRaisesRegex(planner_validation.MutableReadyPRConflict, 'PR'):
             self.prepare(assert_current=check)
 
     def test_user_decision_and_manual_preparation_intent_cannot_be_withdrawn(self):

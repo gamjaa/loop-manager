@@ -423,7 +423,7 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
             metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
                       ('orig-head', 'before'), ('onto', 'base')),
             index=(IndexEntry('app.py', '100644', 'conflict', 2, 'M', 0x2000),), index_clean=False)
-        before = lm.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {})
+        before = lm.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
         final_scope = mock.Mock(side_effect=AssertionError('intermediate content is not final'))
         final_metadata = mock.Mock(side_effect=AssertionError('declaration waits for Git completion'))
         effects = ValidateWorkerWorkspaceScopeEffects(
@@ -438,7 +438,7 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
                 connection=self.fixture.connection, state_dir=Path('/state'), allow_rebase=True)
         self.assertEqual(check()['id'], 'G-047')
         self.observed = replace(self.observed, remote=replace(self.expected.remote, oid='foreign'))
-        with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+        with self.assertRaises(lm.WorkspaceOwnershipError):
             check()
         final_scope.assert_not_called()
         final_metadata.assert_not_called()

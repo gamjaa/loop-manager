@@ -50,6 +50,18 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
             self.repo, self.worktree, 'loop-manager/G-092', 'main', self.plan['path'],
             self.plan, self.before, allow_rebase=True, connection=self.connection)
 
+    def test_pending_checkpoint_defers_final_declaration_checks_only_after_ownership(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        ExecutionCheckpointRepository(self.connection).record(
+            str(self.repo), 'G-092', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base', observed_remote_oid='remote', snapshot={})
+        self.service.require_owned.return_value = (SimpleNamespace(metadata={'onto': 'base'}), None)
+        self.assertEqual(self.validate()['id'], 'G-092')
+        loop_manager.validate_active_execplan_metadata.assert_not_called()
+        self.service.require_owned.side_effect = RuntimeError('foreign remote')
+        with self.assertRaises(loop_manager.WorkspaceOwnershipError):
+            self.validate()
+
     def test_normal_stage_resolution_requires_and_uses_current_owned_rebase(self):
         self.assertEqual(self.validate(), {'id': 'G-092'})
         self.service.require_owned.assert_called_once()
