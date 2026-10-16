@@ -33,6 +33,9 @@ class PublicFacadeTest(unittest.TestCase):
             "전체 test suite, integration test, end-to-end test",
             "프로젝트 전체 lint·build·type check",
             "scripts/verify 실행은 절대 실행하지 마라",
+            "소유된 rebase 충돌 해결 중에는 frontmatter를 복원하지 마라",
+            "고유 R-ID로 확인되는 source 파일명 차이만 남았다면 ready_for_validation",
+            "Manager가 Git rebase 완료 후 고정 base의 frontmatter를 복원한다",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, worker)
