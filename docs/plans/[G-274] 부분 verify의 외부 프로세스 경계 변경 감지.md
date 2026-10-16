@@ -37,7 +37,7 @@ priority: high
 ## Progress
 
 - [x] 2026-10-13 delta 기준 `f56739c31a49ec8fb5547a459688bfb02772586e`의 R-086·`_VERIFY_INPUTS`·core/runner/Manager adapter import와 선정/runner 회귀를 정적으로 확인했다. 검증 폴더·스크립트·설정 변경은 전환하지만 위 외부 프로세스 소유 경로는 빠져 있다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 외부 프로세스 계약 변경 판정·규칙 identity·설명과 최소 targeted unit 검증
+- [x] 외부 프로세스 계약 변경 판정·규칙 identity·설명을 갱신했다. `tests.test_verify_impact.ImpactTests.test_verification_contract_changes_fall_back_even_with_common_checks`와 `tests.test_verify_impact.ImpactTests.test_process_contract_deletion_and_rename_are_verification_changes`, `tests.test_partial_verify_runner.PartialRunnerTests.test_fresh_import_unselected_and_fallback_shards_never_count_as_completed`를 targeted runner로 실행해 통과했다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
