@@ -298,9 +298,10 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         return None
     assessment = item["assessment"]
     assessment = parse_assessment('DOCUMENT_RESULT: ' + json.dumps(assessment))
+    assessment_result = item.get('assessment_result', assessment)
     if (item.get('assessment_raw_result') is not None
             and parse_assessment(item['assessment_raw_result'])
-            != item.get('assessment_result', assessment)):
+            != assessment_result):
         raise PlannerValidationError('보존된 DOCUMENT_RESULT 원문과 정규화 결과가 다릅니다.')
     if item['stage'] == 'proposed' and not item.get('assessment_complete'):
         assert_assessment_inputs(effects, checkpoints, identity, context, item)
@@ -315,7 +316,8 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
                 return None
             raise PlannerValidationError("현재 계획의 PR 전 갱신 권한이 없습니다.")
         if assessment['plan_text'] == original.text:
-            item = {**item, 'assessment': {**assessment, 'plan_text': None}}
+            item = {**item, 'assessment_result': assessment_result,
+                    'assessment': {**assessment, 'plan_text': None}}
             save(checkpoints, repo, plan_id, item)
             return refresh(effects, state, checkpoints, identity, context, previous, definition, changed)
         snapshot = MutableReadySnapshot(repo, snapshot.active_sha, (original,),
@@ -411,6 +413,7 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace, published=True)
         item = {**item, "stage": "rebase", "base": remote,
                 "assessment_complete": True, "published_plan_text": assessment["plan_text"],
+                "assessment_result": assessment_result,
                 "assessment": {**assessment, "plan_text": None}}
         save(checkpoints, repo, plan_id, item)
         return item

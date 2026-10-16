@@ -382,7 +382,7 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
             'version': 1, 'stage': 'proposed', 'base': current.revision_sha,
             'phase': 'REVIEWING', 'paths': [current.path], 'document_only': True,
             'previous': current.serialize(), 'assessment': assessment,
-            'assessment_result': assessment, 'assessment_raw_result': raw_result,
+            'assessment_raw_result': raw_result,
             'candidate': current.revision_sha, 'worker_snapshot': worker_snapshot,
         }
         documents.save(checkpoints, self.repo, 'G-047', saved)
@@ -399,6 +399,91 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
         self.assertIsNone(result['assessment']['plan_text'])
         self.assertEqual(result['assessment_result'], assessment)
         self.assertEqual(result['assessment_raw_result'], raw_result)
+        effects.run_agent.assert_not_called()
+
+    def test_legacy_raw_only_assessment_survives_published_resume(self):
+        import hashlib
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.planning.planning_catalog import snapshot_to_dict
+
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        identity = self.handler._identity
+        plan_text = ('---\nid: G-047\ntitle: Existing plan\nsources:\n  - docs/PRODUCT.md\n'
+                     'depends_on: []\ncomplexity: low\nrisk: low\npriority: normal\n---\n')
+        original = ReadyPlanSnapshot(
+            plan_id='G-047', path=current.path, title='Existing plan',
+            sources=('docs/PRODUCT.md',), depends_on=(), complexity='low', risk='low',
+            priority='normal', content_hash='saved-content', plan_sha=current.revision_sha,
+            text=plan_text,
+        )
+        assessment = dict(
+            relevant=True, implementation='satisfied', plan_text=plan_text, evidence='saved proposal',
+        )
+        raw_result = '- **DOCUMENT_RESULT** =\n```json\n' + json.dumps(assessment, indent=2) + '\n```'
+        worker_snapshot = GitSnapshot(
+            head=current.revision_sha, branch='work', index={}, dirty={}, operations={},
+            refs={}, worktrees={}, config={},
+        )
+        workspace = (identity.state_dir / 'worktrees' / hashlib.sha256(self.repo.encode()).hexdigest()[:16]
+                     / 'document-revisions' / 'G-047' / current.revision_sha)
+        saved = {
+            'version': 1, 'stage': 'prepared', 'base': current.revision_sha,
+            'phase': 'REVIEWING', 'paths': ['docs/PRODUCT.md'], 'document_only': True,
+            'previous': current.serialize(), 'assessment': assessment,
+            'assessment_raw_result': raw_result, 'candidate': current.revision_sha,
+            'worker_snapshot': worker_snapshot.serialize(), 'workspace': str(workspace),
+            'commit': 'b' * 40, 'original': snapshot_to_dict(original),
+        }
+        documents.save(checkpoints, self.repo, 'G-047', saved)
+        effects = self.document_effects(current.revision_sha)
+        effects.assert_snapshot = mock.Mock()
+        fetch_count = 0
+
+        def git(root, *args, **_kwargs):
+            nonlocal fetch_count
+            if args == ('fetch', 'origin'):
+                fetch_count += 1
+                return SimpleNamespace(returncode=0, stdout='')
+            if args == ('rev-parse', 'origin/main'):
+                return SimpleNamespace(returncode=0, stdout=('b' * 40 if fetch_count >= 2 else current.revision_sha))
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(returncode=1, stdout='')
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(returncode=0, stdout='b' * 40)
+            if args == ('status', '--porcelain'):
+                return SimpleNamespace(returncode=0, stdout='')
+            if args[:2] == ('diff', '--name-only'):
+                return SimpleNamespace(returncode=0, stdout=f'{current.path}\n')
+            if args[:1] == ('push',):
+                return SimpleNamespace(returncode=0, stdout='')
+            raise AssertionError((root, args))
+
+        effects.git.side_effect = git
+        published = documents.refresh(
+            effects, self.state, checkpoints, identity, context, current, current, [],
+        )
+
+        self.assertEqual(published['stage'], 'rebase')
+        self.assertTrue(published['assessment_complete'])
+        self.assertIsNone(published['assessment']['plan_text'])
+        self.assertEqual(published['assessment_result'], assessment)
+        self.assertEqual(published['assessment_raw_result'], raw_result)
+        self.assertEqual(fetch_count, 2)
+
+        next_definition = replace(current, revision_sha='b' * 40)
+        self.state.update_project(self.repo, active_sha='b' * 40)
+        resumed = documents.refresh(
+            effects, self.state, checkpoints, identity, context, current, next_definition, [],
+        )
+
+        self.assertEqual(resumed['stage'], 'done')
+        self.assertIsNone(resumed['assessment']['plan_text'])
+        self.assertEqual(resumed['assessment_result'], assessment)
+        self.assertEqual(resumed['assessment_raw_result'], raw_result)
+        self.assertEqual(fetch_count, 2)
+        self.assertEqual([call.args[1] for call in effects.git.call_args_list].count('push'), 1)
         effects.run_agent.assert_not_called()
 
     def test_remote_race_keeps_proposal_and_code_invalidation(self):
