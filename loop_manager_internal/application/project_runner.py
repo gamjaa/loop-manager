@@ -439,7 +439,7 @@ def retry_pause_detail(connection, repo, recovery_before, recovery_attempts, *, 
     for record in connection.execute(
         "SELECT subject, generation, identity, disposition, detail "
         "FROM recovery_records WHERE repo = ?", (repo,),
-    ):
+    ).fetchall():
         if plan_id is not None and record["subject"] != plan_id:
             continue
         if int(record["generation"]) <= recovery_before.get(str(record["subject"]), 0):

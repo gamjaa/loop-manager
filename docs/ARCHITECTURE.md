@@ -531,6 +531,8 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 프로젝트 조율은 준비·planning을 수행하고, 관리 대상으로 선택한 각 작업은 별도 SQLite 연결과 `ContextVar` 실행 선택으로 단계 처리를 진행한다. `exec_plans`가 작업별 단계·session·scope·실패 이력의 원본이며, 병렬 작업은 공유 `projects` 투영을 덮어쓰지 않는다. 프로젝트 조율이 종료할 때 남은 활성 작업을 대표 투영으로 연결하고, 미확정 소유 상태가 있으면 투영을 임의로 비우지 않는다.
 
+운영 DB 연결은 공통 `db_access` 경계를 거쳐 파일별 스레드 순번과 프로세스 잠금을 사용한다. 조회 결과는 처리 구간 안에서 물질화해 cursor가 SQLite 읽기 잠금을 유지하지 않으며, 관련 조회·갱신은 같은 연결의 짧은 transaction으로 묶고 commit·rollback·close에서 접근 소유권을 반환한다. 별도 연결을 중첩 대기하는 호출은 거부하고 외부 관측은 DB 처리 밖에서 수행한 뒤 현재 상태·checkpoint·소유 예약을 재확인한다. 일시 DB 경합은 요청의 공통 대기 예산 안에서 처리하고 실제 실행·교정 실패 횟수와 구분한다. 읽기 전용 CLI·bootstrap과 호출 기록도 같은 진입점을 사용하며 독립 정적 snapshot은 별도로 유지한다. 대기 예산은 공통 계층에서 관리하며 SQLite 자체 대기로 중복 소비하지 않는다. 초기 등록·legacy catalog 이관은 독립 메모리 snapshot에서 기존 로직과 필요한 Git·PR 관측을 먼저 수행하고, 관측값과 원본 상태가 같은 DB 처리 안에서 기존 적용 로직을 실행한다. snapshot을 운영 DB에 덮어쓰지 않으며 관측 이후의 계획·소유·감사 변경은 거부한다.
+
 공유 `TaskScheduler`가 관리 배정과 실제 호출 배정을 구분한다. 관리 선택은 프로젝트별 유효 상한 안에서 수동 제출·기존 작업·일반 신규 순서로 확정하며, 일반 신규는 기본 자리 없는 프로젝트부터 순환하고 이후 유효 priority를 사용한다. Worker·Reviewer 호출은 전체 `max_workers`, verify는 별도 `verify_concurrency`를 사용하고 프로젝트 조율·Planner mutex 대기는 이 호출 자리를 사용하지 않는다. 한 자동 실행의 Planner는 직렬이다.
 
 작업별 일반 RETRY는 프로젝트 조율로 반환하지 않고 실행 대기열의 재시도 순서로 재등록한다. RETRY마다 DB 상태를 다시 준비하고 기존 일시 복구의 같은 실행 3회 한도를 공통으로 적용한다. 단계 처리의 일반 예외는 작업별 상세 오류·traceback을 기록하고 미확정 transaction을 rollback한 뒤 같은 배정 경로로 제한 재시도한다. 예외 3회 실패는 해당 작업만 보류하며 Future의 일반 예외도 작업별 오류로 수집해 조율기의 추가 배정을 계속한다. Planner 배정 중단·runtime handoff·사용자 중단은 별도 제어 신호로 전파한다. 재시도 우선순위는 수동 제출보다 낮고 다른 일반 작업보다 높으며 재등록 순서를 유지한다. 명세 변경을 감지하면 프로젝트 배정 중단 신호로 관리 편입·실행 대기 호출·후속 단계를 반환시키고 실행 중 처리를 join한 뒤 프로젝트 조율로 돌아간다. 그 후 Planner 게시·catalog·DB 반영이 성공한 경계에서 작업 배정을 다시 연다. runtime handoff는 기존 전체 launch gate로 새 호출을 막고 진행 중 처리의 반환을 기다린다.
@@ -1362,12 +1364,12 @@ PR 관계 동기화 뒤 기존 housekeeping 안전 gate 안에서 ExecPlan archi
 | 저장 상태 | 재개·확정 조건 |
 |---|---|
 | `prepared` | 부분 편집·commit 직후 중단·push 실패도 같은 후보·worktree·저장 commit을 검증해 재개한다. push 실패는 원인을 보존한다. |
-| `superseded` | base·참조·목적지·소유권 변경으로 이전 intent·작업물·commit·이유를 보존하고 다음 실행에서 새 snapshot을 계산한다. 입력이 돌아오면 같은 manifest·operation identity와 최신 입력 일치를 SQLite writer transaction 안에서 확인한 뒤 기존 행을 prepared로 재활성화한다. |
+| `superseded` | base·참조·목적지·소유권 변경으로 이전 intent·작업물·commit·이유를 보존하고 다음 실행에서 새 snapshot을 계산한다. 입력이 돌아오면 최신 외부 입력을 먼저 관측하고, 짧은 SQLite transaction에서 같은 manifest·operation identity·저장 상태를 재확인한 뒤 기존 행을 prepared로 재활성화한다. |
 | `confirmed` | push 결과 또는 원격에 포함된 저장 commit과 실제 결과 bytes를 확인해 확정한다. 이미 게시된 후보는 새 commit·push 없이 확정한다. 확정 commit이 원격 이력에 유지되면 감사도 유지하며 뒤이은 정상 rename·archive·실제 삭제는 source resolver로 분류한다. |
 
 파일은 worktree 밖 임시 파일에서 원자적으로 교체하고 rename 결과를 먼저 쓴 뒤 원문을 제거한다. 재개는 원문 또는 저장 결과만 허용하며 index·파일·단일 부모 commit의 전체 tree diff를 대조한다. worktree 파일은 CRLF/LF checkout 차이만 허용하고 index·commit·원격 blob은 저장 bytes와 정확히 일치해야 한다. 실제 내용·mode·허용 밖 변경과 변조된 후보는 덮어쓰거나 게시하지 않는다.
 
-게시 직전 최신 원격·관계·목적지·소유권으로 계산 결과를 다시 확인한다. 최종 관계 검사·원격 확인·DB 확정은 기존 SQLite writer transaction과 문서 자원 lock 안에서 처리한다. 원격에 저장 후보가 포함돼도 확정 전 결과가 제거·변경됐으면 보존하고 중단한다. confirmed 이후의 실제 Requirement 삭제는 확정 감사를 되돌리지 않고 source resolver가 새 삭제로 분류한다. 확정 commit의 원격 이력 제거·조회 실패도 계속 보류·실패로 처리하며 미확정 후보를 성공으로 바꾸지 않는다.
+게시 직전 최신 원격·관계·목적지·소유권으로 계산 결과를 다시 확인한다. 문서 자원 lock과 저장된 게시 예약을 유지하며 최종 관계·원격 확인과 push는 DB 처리 밖에서 수행한다. DB 확정은 짧은 transaction에서 같은 예약·intent·저장 상태를 재확인해 적용하며 원격 게시와 DB 변경을 하나의 원자 작업으로 가정하지 않는다. 원격에 저장 후보가 포함돼도 확정 전 결과가 제거·변경됐으면 보존하고 중단한다. confirmed 이후의 실제 Requirement 삭제는 확정 감사를 되돌리지 않고 source resolver가 새 삭제로 분류한다. 확정 commit의 원격 이력 제거·조회 실패도 계속 보류·실패로 처리하며 미확정 후보를 성공으로 바꾸지 않는다.
 
 갱신된 base는 기존 catalog refresh·관련성·입력 지문을 거쳐 후속 verify·Review에 전달한다. 교정 성공은 작업 완료·차단 해제·검증 성공을 뜻하지 않으며 기존 작업·session·실패·독립 차단과 후속 gate를 유지한다.
 
@@ -1672,7 +1674,7 @@ source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 �
 
 현재 구현은 일반 경로에서 `runtime_identity=None`을 미확인으로 취급하며 고정 Linux isolated compile에만 환경·runtime 측정을 결합한 증명을 제공한다. 이는 새 정책의 완료 조건이 아니라 전환할 기존 구현이다. 일반 runner가 외부 의존성을 모두 증명하거나 고정 toolchain·통제된 Linux 환경을 도입해야 코드 기준 재사용을 구현할 수 있다고 판단하지 않는다. 기존 runtime 측정 자료·receipt는 보존하되 새 판정에서 불필요한 환경 증명은 제외한다.
 
-실행 전후·reuse 직전 transaction과 Review/게시 revision gate에서 코드 입력을 재관측한다. 코드가 달라졌거나 읽기·비교를 확정할 수 없으면 필요한 verify로 돌아간다. 과거 receipt는 새 기준의 코드 입력·원래 run·작업 주기·후보 연결을 확인할 수 있는 경우만 재평가하고 과거 입력을 현재 값으로 합성하지 않는다. reuse는 새 verify 실행·성공 감사·사용량을 만들거나 새 실패를 지우지 않는다. Reviewer의 명세·diff·실제 지침·승인과 publication token·원격 lease는 별도 조건이다. 일반 선행 Review PASS 뒤 실제 전체 run과 수동 면제의 별도 후보/설정 계약은 유지한다.
+실행 전후·reuse 확정 직전과 Review/게시 revision gate에서 코드 입력을 재관측한다. 외부 입력 관측은 DB 처리 밖에서 수행하고 짧은 확정 transaction에서 같은 실행 상태·소유 identity를 재확인한다. 코드가 달라졌거나 읽기·비교를 확정할 수 없으면 필요한 verify로 돌아간다. 과거 receipt는 새 기준의 코드 입력·원래 run·작업 주기·후보 연결을 확인할 수 있는 경우만 재평가하고 과거 입력을 현재 값으로 합성하지 않는다. reuse는 새 verify 실행·성공 감사·사용량을 만들거나 새 실패를 지우지 않는다. Reviewer의 명세·diff·실제 지침·승인과 publication token·원격 lease는 별도 조건이다. 일반 선행 Review PASS 뒤 실제 전체 run과 수동 면제의 별도 후보/설정 계약은 유지한다.
 
 ## Architecture Change Policy
 

@@ -870,9 +870,12 @@ class DefinitionStateRepository:
 
         changed: list[str] = []
         try:
+            revision_current = revision_is_current()
+            self._fault("before-revision-recheck")
+            revision_stable = revision_is_current()
             with _transaction(self.connection):
                 if (self.capture(repo) != expected or self.has_publication_intent(repo)
-                        or not revision_is_current()):
+                        or not revision_current or not revision_stable):
                     raise _StaleCatalogSnapshot
                 project = self.connection.execute(
                     "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
@@ -1011,9 +1014,6 @@ class DefinitionStateRepository:
                         "revision_sha=excluded.revision_sha, catalog_fingerprint=excluded.catalog_fingerprint, "
                         "updated_at=CURRENT_TIMESTAMP", (repo, pinned.revision_sha, fingerprint),
                     )
-                self._fault("before-revision-recheck")
-                if not revision_is_current():
-                    raise _StaleCatalogSnapshot
         except _StaleCatalogSnapshot:
             return None
         return tuple(changed)

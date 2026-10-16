@@ -728,10 +728,21 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
     def test_task_setup_exception_does_not_abort_project_result_collection(self):
         self._assert_exception_isolation('setup')
 
+    def test_setup_db_wait_is_a_transient_pause(self):
+        self._assert_exception_isolation('db_setup')
+
+    def test_db_wait_preserves_task_and_keeps_independent_admission(self):
+        self._assert_exception_isolation('db_wait')
+
+    def test_pause_record_db_wait_is_inside_the_task_error_boundary(self):
+        self._assert_exception_isolation('pause_record')
+
     def _assert_exception_isolation(self, failure):
         from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
         from loop_manager_internal.application.contracts import PROJECT_STEP_TRANSIENT_PAUSE
         from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.application import project_runner
         from loop_manager_internal.notifications import notifications
         self._insert_plan(self.connection, 'G-004', 'READY', repo='A')
         scheduler = self.scheduler(max_workers=2)
@@ -748,8 +759,10 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         calls = []
         configure_session = notifications.configure_session
         def configure(connection, **options):
-            if failure == 'setup' and threading.current_thread().name == 'loop-task-G-001':
+            if failure in {'setup', 'db_setup'} and threading.current_thread().name == 'loop-task-G-001':
                 failed.set()
+                if failure == 'db_setup':
+                    raise DatabaseWaitTimeout('setup DB queue deadline')
                 raise RuntimeError('task setup failed')
             return configure_session(connection, **options)
         def execute(child, repository, **options):
@@ -766,6 +779,11 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                             self.assertIsNotNone(task.retry_order)
                             self.assertFalse(options['newly_activated'])
                         calls.append(task.plan_id)
+                        if failure in {'db_wait', 'pause_record'}:
+                            failed.set()
+                            if failure == 'db_wait':
+                                raise DatabaseWaitTimeout('DB queue deadline')
+                            return project_runner.PROJECT_STEP_RETRY
                         if failure == 'pause':
                             if len(calls) == 3:
                                 failed.set()
@@ -781,15 +799,21 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             repository.transition_from_snapshot(repository.projected('A'), plan_values={'status': 'PR_OPEN'},
                                                  project_values=runtime_state.clear_project_values())
             return 0
+        pause_detail = project_runner.retry_pause_detail
+        def pause(*args, **kwargs):
+            if failure == 'pause_record' and kwargs.get('plan_id') == 'G-001':
+                raise DatabaseWaitTimeout('pause record queue deadline')
+            return pause_detail(*args, **kwargs)
         token = scheduling.current_scheduler.set(scheduler)
         try:
             with fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute), \
-                 mock.patch.object(notifications, 'configure_session', configure):
+                 mock.patch.object(notifications, 'configure_session', configure), \
+                 mock.patch.object(project_runner, 'retry_pause_detail', pause):
                 result = scheduling.run_project_tasks(service, newly_activated=True)
         finally:
             scheduling.current_scheduler.reset(token)
-        self.assertEqual(len(calls), {'retry': 2, 'pause': 3, 'setup': 0}[failure])
-        self.assertEqual(result, {'retry': 0, 'pause': PROJECT_STEP_TRANSIENT_PAUSE, 'setup': 1}[failure])
+        self.assertEqual(len(calls), {'retry': 2, 'pause': 3, 'setup': 0, 'db_wait': 1, 'pause_record': 1, 'db_setup': 0}[failure])
+        self.assertEqual(result, {'retry': 0, 'pause': PROJECT_STEP_TRANSIENT_PAUSE, 'setup': 1, 'db_wait': PROJECT_STEP_TRANSIENT_PAUSE, 'pause_record': PROJECT_STEP_TRANSIENT_PAUSE, 'db_setup': PROJECT_STEP_TRANSIENT_PAUSE}[failure])
         self.assertEqual(runtime.get('A', 'G-004').status, 'PR_OPEN')
         self.assertEqual(runtime.get('A', 'G-002').status, 'PR_OPEN')
         if failure == 'pause':

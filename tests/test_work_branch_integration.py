@@ -291,7 +291,10 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
         self.service.observe.side_effect = changed
         with self.assertRaisesRegex(RuntimeError, '완료 관측'):
             self.complete_base()
-        self.assertEqual(self.store.get('repo', 'G-166'), original)
+        newer = self.store.get('repo', 'G-166')
+        self.assertEqual(newer.generation, original.generation + 1)
+        self.assertTrue(newer.snapshot['other-intent'])
+        self.assertEqual(newer.operation, original.operation)
         self.effects.git.assert_not_called()
 
     def test_manual_base_completion_still_requires_current_ownership(self):

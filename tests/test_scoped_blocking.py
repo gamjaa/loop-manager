@@ -2,6 +2,7 @@ import json
 from dataclasses import replace
 import sqlite3
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 import unittest
@@ -55,8 +56,10 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
             parent = loop_manager.connect_database(state, create=True)
             cleanup.callback(parent.close)
             parent.execute("BEGIN IMMEDIATE")
+            started = threading.Barrier(3)
 
             def query_worker(repo):
+                started.wait(timeout=5)
                 connection = loop_manager.connect_database(state, run_migrations=False)
                 try:
                     connection.execute("PRAGMA busy_timeout = 100")
@@ -79,8 +82,11 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
                     connection.close()
 
             with ThreadPoolExecutor(max_workers=2) as pool:
-                list(pool.map(query_worker, ("repo-a", "repo-b")))
-            parent.rollback()
+                futures = [pool.submit(query_worker, repo) for repo in ("repo-a", "repo-b")]
+                started.wait(timeout=5)
+                parent.rollback()
+                for future in futures:
+                    future.result()
 
 
     def test_reopened_conflict_precedes_independent_ready(self):

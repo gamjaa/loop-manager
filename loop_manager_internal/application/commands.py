@@ -14,6 +14,7 @@ from loop_manager_internal.storage import agent_invocation_state, local_recovery
 from pathlib import Path
 import argparse
 import json
+from loop_manager_internal.storage.db_access import open_connection
 import sqlite3
 import sys
 import threading
@@ -41,7 +42,7 @@ def _project_limits_status(effects, args, state_dir, config_path):
         if not database_path.is_file():
             raise RuntimeError("상태 DB가 없습니다.")
         code = "db_unreadable"
-        with closing(sqlite3.connect(database_path.as_uri()+"?mode=ro", uri=True, timeout=5)) as connection:
+        with closing(open_connection(database_path, read_only=True, timeout=5)) as connection:
             connection.row_factory = sqlite3.Row
             connection.execute("BEGIN")
             code = "unsupported_schema"
@@ -103,7 +104,7 @@ def configure_registry(
         effects.operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
         return 0
 
-    with closing(effects.connect_database(state_dir)) as connection, connection:
+    with closing(effects.connect_database(state_dir)) as connection:
         if command == "list":
             projects = project_registry.list_projects(connection)
             if not projects:
@@ -159,7 +160,7 @@ def _document_drafts_command(
             "일회성 문서 수정본은 Loop Manager 저장소 자체에서만 사용할 수 있습니다."
         )
     repo = str(repository)
-    with closing(effects.connect_database(state_dir)) as connection, connection:
+    with closing(effects.connect_database(state_dir)) as connection:
         project = connection.execute(
             "SELECT base_branch, provider FROM projects WHERE repo = ? AND registered = 1",
             (repo,),
@@ -585,11 +586,12 @@ def execute_runtime_command(
                 connection.commit()
             effects.operation_print(f"전체 정밀 점검 요청 저장: {repo}; 다음 안전한 작업 선택 경계에서 실행합니다.")
             return 0
-        with closing(effects.connect_database(state_dir)) as connection, connection:
+        with closing(effects.connect_database(state_dir)) as connection:
             selected_projects = project_registry.select_projects(
                 connection, getattr(args, "repositories", None),
             )
             agent_invocation_state.InvocationRepository(connection).reconcile_interrupted(state_dir=state_dir)
+            connection.commit()
             return effects.run_registered_projects(
                 connection, state_dir, config,
                 selected_projects=selected_projects,

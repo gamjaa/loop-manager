@@ -24,6 +24,7 @@ class RequirementCorrectionRepository:
 
     def record(self, repo, operation_id, manifest, *, current=lambda: True):
         encoded = json.dumps(manifest, sort_keys=True, ensure_ascii=False)
+        confirmed = current()
         with _transaction(self.connection):
             self.connection.execute(
                 "INSERT OR IGNORE INTO requirement_correction_publications "
@@ -36,7 +37,7 @@ class RequirementCorrectionRepository:
             ).fetchone()
             if row['manifest'] != encoded or row['stage'] not in {'prepared', 'superseded'}:
                 raise RuntimeError('Requirement 교정 intent가 기존 후보와 다릅니다.')
-            if not current():
+            if not confirmed:
                 raise RuntimeError('Requirement 교정 소유 예약 중 원격·참조 입력이 변경됐습니다.')
             if row['stage'] == 'superseded':
                 # Reuse the saved commit and worktree when the exact input

@@ -33,6 +33,9 @@ class ExecutionClock:
         self.started = self.clock()
         self.initial_wait = self.waiting()
         self.last_elapsed = 0.0
+        self.local_wait = 0.0
+        self.active_processes = 0
+        self._tokens = []
 
     def waiting(self):
         total = 0.0
@@ -47,7 +50,7 @@ class ExecutionClock:
         return total
 
     def elapsed(self):
-        self.last_elapsed = max(self.last_elapsed, self.clock()-self.started -
+        self.last_elapsed = max(self.last_elapsed, self.clock()-self.started - self.local_wait -
                                 max(0, self.waiting()-self.initial_wait))
         return self.last_elapsed
 
@@ -74,9 +77,11 @@ class ExecutionClock:
                 raise VerifyTerminationUncertain(f"WSL 자식 종료 근거를 보존합니다: {receipt}")
 
     def __enter__(self):
+        self._tokens.append(current_execution_clock.set(self))
         return self
 
     def __exit__(self, _kind, error, _traceback):
+        current_execution_clock.reset(self._tokens.pop())
         from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
         if not isinstance(error,VerifyTerminationUncertain):
             self.close()

@@ -327,9 +327,10 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             observed, decision = service.require_owned(checkpoint=current)
         if decision.status.value != 'complete' or observed.files:
             raise LocalWorkPending('rebase 미완료 또는 미커밋 작업을 local-only로 보존합니다.')
+        confirmed = service.observe(checkpoint=current)[1]
         with runtime_state._transaction(self.connection):
             self._check_owner(plan_id, context)
-            if service.observe(checkpoint=current)[1] != decision:
+            if checkpoints.get(self.repo, plan_id) != current or confirmed != decision:
                 raise InputChanged('project 복구 결과의 현재 Git 상태가 변경됐습니다.')
             values = revalidation_values(target)
             for field in ('phase', 'last_error', 'revision_resume_status'):

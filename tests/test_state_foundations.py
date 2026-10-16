@@ -39,7 +39,8 @@ class StateFoundationTests(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(resumed.execute('SELECT repo, base_branch FROM projects').fetchone()[:],
                                  ('saved', 'develop'))
                 self.assertTrue(resumed.execplans_schema_ready)
-                self.assertEqual(resumed.execute('PRAGMA busy_timeout').fetchone()[0], 30000)
+                self.assertEqual(resumed._timeout, 30)
+                self.assertEqual(resumed.execute('PRAGMA busy_timeout').fetchone()[0], 0)
             finally:
                 resumed.close()
             child = database.connect_database(state, run_migrations=False)
@@ -54,6 +55,23 @@ class StateFoundationTests(AutomationCatalogFixture, unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '상태 DB를 읽을 수 없습니다'):
                 database.connect_database(Path(directory))
             self.assertEqual(path.read_bytes(), b'corrupt')
+
+    def test_external_lock_during_open_is_a_wait_timeout_without_corruption_diagnosis(self):
+        from loop_manager_internal.storage.db_access import open_connection, DatabaseWaitTimeout
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            database.connect_database(state, create=True).close()
+            external = sqlite3.connect(state / 'loop-manager.db')
+            self.addCleanup(external.close)
+            external.execute('BEGIN EXCLUSIVE')
+            with mock.patch.object(database, 'open_connection',
+                    side_effect=lambda path, **kw: open_connection(path, timeout=.05, factory=kw['factory'])):
+                with self.assertRaises(DatabaseWaitTimeout):
+                    database.connect_database(state, run_migrations=False)
+            external.rollback()
+            external.close()
+            resumed = database.connect_database(state, run_migrations=False)
+            resumed.close()
 
     def test_schema_backfill_is_idempotent_and_does_not_commit_caller_changes(self):
         self._insert_plan(self.connection, 'G-001', 'READY')

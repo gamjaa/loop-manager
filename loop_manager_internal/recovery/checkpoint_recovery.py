@@ -449,28 +449,31 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         if adopted_snapshot.refs.get(remote_ref) == (observed, ''):
             scope_snapshot = replace(scope_snapshot, refs={
                 **scope_snapshot.refs, remote_ref: (observed, '')})
+        project = connection.execute(
+            'SELECT base_branch, origin FROM projects WHERE repo = ?', (repo,),
+        ).fetchone()
+        base_branch = project['base_branch']
+        resources = used_git_resources(
+            role='worker', phase='PLAN_BLOCKED',
+            base_branch=base_branch,
+            branch=branch, worktree_key=str(_canonical_path(worktree)))
+        current_snapshot = effects.capture_git_snapshot(worktree)
+        reconciled_adopted = reconcile_external_base(
+            effects.git, repo_path, str(base_branch), adopted_snapshot,
+            current_snapshot, resources, registered_origin=str(project['origin'] or ''),
+        )
+        before_commit, at_commit = scoped_metadata(
+            reconciled_adopted, current_snapshot, resources,
+            default_worktree=str(_canonical_path(repo_path)),
+            base_branch=str(base_branch),
+        )
+        if (before_commit != at_commit
+                or adapter.observe_remote(request) != observed):
+            return retry('원격 채택 확정 전 선택 후보·사용 자원 또는 원격 lease가 변경됐습니다.')
         with runtime_state._transaction(connection):
-            project = connection.execute(
-                'SELECT base_branch, origin FROM projects WHERE repo = ?', (repo,),
-            ).fetchone()
-            base_branch = project['base_branch']
-            resources = used_git_resources(
-                role='worker', phase='PLAN_BLOCKED',
-                base_branch=base_branch,
-                branch=branch, worktree_key=str(_canonical_path(worktree)))
-            current_snapshot = effects.capture_git_snapshot(worktree)
-            reconciled_adopted = reconcile_external_base(
-                effects.git, repo_path, str(base_branch), adopted_snapshot,
-                current_snapshot, resources, registered_origin=str(project['origin'] or ''),
-            )
-            before_commit, at_commit = scoped_metadata(
-                reconciled_adopted, current_snapshot, resources,
-                default_worktree=str(_canonical_path(repo_path)),
-                base_branch=str(base_branch),
-            )
-            if (before_commit != at_commit
-                    or adapter.observe_remote(request) != observed):
-                return retry('원격 채택 확정 전 선택 후보·사용 자원 또는 원격 lease가 변경됐습니다.')
+            if connection.execute(
+                    "SELECT base_branch, origin FROM projects WHERE repo=?", (repo,)).fetchone() != project:
+                return retry("원격 채택 중 프로젝트 설정이 변경됐습니다.")
             selected = connection.execute(
                 'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?', (repo, blocked['plan_id'])).fetchone()
             if selected is None or any(selected[field] != blocked[field] for field in (

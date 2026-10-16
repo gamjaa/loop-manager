@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
+from loop_manager_internal.storage.db_access import open_connection
 import sqlite3
 import subprocess
 import time
@@ -66,7 +67,7 @@ def run_agent(
         common_guidance.validate_state_root(guidance_context, worktree, state_dir)
         if connection is None:
             state_dir.mkdir(parents=True, exist_ok=True)
-            owned_connection = sqlite3.connect(state_dir / "loop-manager.db")
+            owned_connection = open_connection(state_dir / "loop-manager.db", timeout=5)
         guidance_repository = GuidanceRepository(connection or owned_connection)
         guidance_context = common_guidance.independent_context(
             guidance_repository.connection, guidance_context, worktree,
@@ -79,8 +80,11 @@ def run_agent(
         if session_task is not None and session_task != guidance.task_id:
             raise common_guidance.GuidanceError("Agent session과 공통 지침 작업 identity가 다릅니다.")
     except (common_guidance.GuidanceError, sqlite3.Error, OSError) as error:
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
         if owned_connection is not None:
             owned_connection.close()
+        if isinstance(error, DatabaseWaitTimeout):
+            raise
         return AgentResult(1, f"공통 지침 호출 준비 실패: {error}", session_id,
                            AgentResultKind.PERMANENT_CONFIGURATION)
     resolved: ResolvedProfile | None = resolved_profile

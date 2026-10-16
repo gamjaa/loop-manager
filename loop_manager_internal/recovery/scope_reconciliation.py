@@ -157,18 +157,19 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             raise
         except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
             return False
+        if checked is not None:
+            try:
+                effects.validate_planning_worktree_ownership(
+                    connection, repo_path, state_dir, repo,
+                    str(project['planning_attempt_fingerprint'] or ''), worktree)
+            except (RuntimeError, WorkspaceOwnershipError, ValueError):
+                return False
+        confirmed = effects.capture_git_snapshot(worktree) if checked is not None else None
         with runtime_state._transaction(connection):
-            if checked is not None:
-                try:
-                    effects.validate_planning_worktree_ownership(
-                        connection, repo_path, state_dir, repo,
-                        str(project['planning_attempt_fingerprint'] or ''), worktree)
-                except (RuntimeError, WorkspaceOwnershipError, ValueError):
-                    return False
             if (not scoped_blocking.project_cause_matches(connection, block)
                     or dict(runtime_state.project_row(connection, repo)) != dict(project)
                     or (checked is not None and not agent_scope_decision._same_local_snapshot(
-                        effects.capture_git_snapshot(worktree), checked))):
+                        confirmed, checked))):
                 return False
             effects._clear_project_block_without_losing_planning_error(connection, repo, project)
             if scoped_blocking.is_scope_baseline_block(block):
@@ -291,13 +292,14 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         raise
     except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
         return False
+    confirmed = effects.capture_git_snapshot(worktree) if checked is not None else None
     with runtime_state._transaction(connection):
         if (not scoped_blocking.project_cause_matches(connection, block)
                 or dict(runtime_state.project_row(connection, repo)) != dict(project)
                 or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                            (repo, plan_id)).fetchone()) != dict(plan)
                 or (checked is not None and not agent_scope_decision._same_local_snapshot(
-                        effects.capture_git_snapshot(worktree), checked))):
+                        confirmed, checked))):
             return False
         effects._clear_project_block_without_losing_planning_error(connection, repo, project)
         if scoped_blocking.is_scope_baseline_block(block):
@@ -933,6 +935,27 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
         raise
     except (OSError, RuntimeError, WorkspaceOwnershipError, ValueError):
         return False
+    confirmed_snapshot = effects.capture_git_snapshot(worktree)
+    confirmed_remote = effects.remote_branch_oid(repo_path, branch)
+    confirmed_pr = effects.pr_for_branch(repo_path, branch)
+    if plan['agent_snapshot']:
+        effects.validate_blocked_agent_scope(
+            connection, repo_path, repo, str(project['base_branch']), worktree,
+            str(plan['path']), saved_plan=plan, require_safe_result=True)
+    if checkpoint_ownership.owned_remote_oid(
+            connection, repo_path, repo, plan_id, branch, worktree,
+            before_head if pushed_review else remote_oid, effects.git,
+            before_head=current.head if direct_review else before_head,
+            recorded_oid=before_head if pushed_review else str(plan['publication_remote_oid'] or '') or None,
+            require_live=not pushed_review, strict_observation=True, allow_history=True) is None:
+        return False
+    if pushed_review:
+        try:
+            if manager_git_journal.live_remote_branch_oid(effects.git, repo_path, branch) != remote_oid:
+                return False
+        except (RuntimeError, OSError) as error:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint remote confirmation failed') from error
     with runtime_state._transaction(connection):
         if (not scoped_blocking.project_cause_matches(connection, block)
                 or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
@@ -942,29 +965,11 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
                     repo, plan_id) != checkpoint
                 or connection.execute('SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
                                       (repo, plan_id)).fetchone() != publication_before
-                or effects.capture_git_snapshot(worktree) != current
-                or effects.remote_branch_oid(repo_path, branch) != remote_oid
-                or effects.pr_for_branch(repo_path, branch) is not None
+                or confirmed_snapshot != current
+                or confirmed_remote != remote_oid
+                or confirmed_pr is not None
                 or effects.unmet_execplan_dependencies(connection, repo, plan_id)):
             return False
-        if plan['agent_snapshot']:
-            effects.validate_blocked_agent_scope(
-                connection, repo_path, repo, str(project['base_branch']), worktree,
-                str(plan['path']), saved_plan=plan, require_safe_result=True)
-        if checkpoint_ownership.owned_remote_oid(
-                connection, repo_path, repo, plan_id, branch, worktree,
-                before_head if pushed_review else remote_oid, effects.git,
-                before_head=current.head if direct_review else before_head,
-                recorded_oid=before_head if pushed_review else str(plan['publication_remote_oid'] or '') or None,
-                require_live=not pushed_review, strict_observation=True, allow_history=True) is None:
-            return False
-        if pushed_review:
-            try:
-                if manager_git_journal.live_remote_branch_oid(effects.git, repo_path, branch) != remote_oid:
-                    return False
-            except (RuntimeError, OSError) as error:
-                raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
-                                      'checkpoint remote confirmation failed') from error
         if direct_review and review_marker is None:
             execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
                 repo, plan_id, expected_generation=checkpoint.generation,

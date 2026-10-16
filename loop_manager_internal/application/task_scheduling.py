@@ -314,10 +314,19 @@ def run_project_tasks(service, *, newly_activated):
                             code = child._dispatch_execution(
                                 runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed)
                             notifications.flush_project_events(owned, repo)
+                            if code == PROJECT_STEP_RETRY and retry_pause_detail(
+                                    owned, repo, before, attempts, plan_id=plan_id) is not None:
+                                code = PROJECT_STEP_TRANSIENT_PAUSE
                         except PlanningDrain:
                             raise
                         except Exception as error:
                             owned.rollback()
+                            from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+                            if isinstance(error, DatabaseWaitTimeout):
+                                events.emit("DB 접근 대기 종료; 작업 상태 보존", level="WARN", project=repo,
+                                            plan=plan_id, reason=str(error))
+                                code = PROJECT_STEP_TRANSIENT_PAUSE
+                                break
                             exception_attempts += 1
                             detail = redact_secrets(traceback.format_exc())
                             events.emit("작업 처리 예외", level="ERROR", project=repo, plan=plan_id,
@@ -338,9 +347,6 @@ def run_project_tasks(service, *, newly_activated):
                         if code != PROJECT_STEP_RETRY:
                             break
                         scheduler.check_project(repo)
-                        if before is not None and retry_pause_detail(owned, repo, before, attempts, plan_id=plan_id) is not None:
-                            code = PROJECT_STEP_TRANSIENT_PAUSE
-                            break
                         scheduler.requeue(current_task.get())
                         resumed = True
             result.set_result(code)
@@ -398,7 +404,8 @@ def run_project_tasks(service, *, newly_activated):
                         events.emit("작업 처리 예외", level="ERROR", project=repo, plan=plan_id,
                             reason=f"{type(error).__name__}: {error}", traceback=traceback.format_exc(),
                             next_action="해당 작업 보존·독립 작업 계속")
-                        results.append(1)
+                        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+                        results.append(PROJECT_STEP_TRANSIENT_PAUSE if isinstance(error, DatabaseWaitTimeout) else 1)
                     key = recovery_keys.pop(plan_id, None)
                     if key is not None:
                         visited.discard(plan_id)

@@ -517,11 +517,12 @@ class BlockedPlanReconciler:
             if decision.status.value != 'complete' or observed.head != intent['head']:
                 raise RuntimeError('중간 checkpoint 게시 뒤 현재 rebase 결과가 다릅니다.')
             repository = BlockedCheckpointRepository(self.connection)
+            tree = self.ports.git(worktree, 'rev-parse', 'HEAD^{tree}').stdout.strip()
             with runtime_state._transaction(self.connection):
                 self._check_owner(plan_id, context)
                 repository.record_rebased_publication(
                     repository.get(self.repo, plan_id), intent['head'],
-                    self.ports.git(worktree, 'rev-parse', 'HEAD^{tree}').stdout.strip())
+                    tree)
         if pending and current.target_base_oid != context['base_oid']:
             # The saved result is now published. Only now may a newer target
             # start, and the original cause still has not been inspected.
