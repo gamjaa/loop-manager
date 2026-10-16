@@ -359,6 +359,8 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
 
 
     def test_preparation_resumes_durable_rebase_continue_without_worker(self):
+        self.handler.guard(self.context())
+        definition = self.handler._definition_snapshot
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -371,7 +373,8 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
             'repo', 'G-047', expected_generation=0, operation='rebase',
             expected_head='old-head', target_base_oid='new-base',
             observed_remote_oid=None,
-            snapshot={'pending': 'continue', 'worker_result': 'saved correction'},
+            snapshot={'pending': 'continue', 'worker_result': 'saved correction',
+                      'rebase_worker_input': definition.serialize()},
         )
         self.remote = 'new-base'
         operation = {'rebase': True}
@@ -400,8 +403,9 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
 
         recovered = self.handler.recover(context)
 
-        self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
-        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertEqual(recovered.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['worker_result'], 'saved correction')
+        self.assertEqual(self.state.row()['worker_input_token'], definition.worker_token)
         self.assertEqual(self.state.row()['active_sha'], 'new-base')
         self.assertIsNone(checkpoint.get('repo', 'G-047').operation)
         self.effects.agent.run_agent.assert_not_called()

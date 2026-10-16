@@ -55,6 +55,7 @@ class WorkspaceHandlerPorts:
     _final: Callable[..., ExecutionOutcome]
     _finish_rebase_journal: Callable[..., Any]
     _finish_worker: Callable[..., ExecutionOutcome]
+    _guard_rebase_worker_result: Callable[..., Any]
     _legacy_current_rebase: Callable[..., Any]
     _owned_checkpoint_remote: Callable[..., Any]
     _parse_worker_outcome: Callable[..., Any]
@@ -311,6 +312,37 @@ class WorkspaceHandler:
                         return self.ports._recover(RecoveryReason.WORKTREE_RECOVERY_FAILED, rebased.stdout, context=context)
                     self.ports._complete_rebase_intent(context)
                     return self.ports._context()
+                if ((current.snapshot or {}).get('pending') in {'stage', 'continue'}
+                        and (current.snapshot or {}).get('worker_result')):
+                    saved_result = current.snapshot['worker_result']
+                    try:
+                        disposition = self.ports._parse_worker_outcome(
+                            context, saved_result, allow_legacy_ready=True,
+                        )
+                        if disposition.kind == 'needs_user_decision':
+                            return self.ports._block_worker_decision(
+                                context, saved_result, disposition,
+                            )
+                    except WorkerOutcomeError as error:
+                        return self.ports._recover(
+                            RecoveryReason.WORKER_CORRECTION,
+                            f'저장된 Worker 결과 검증 실패: {error}',
+                            context=context,
+                        )
+                    guarded = self.ports._guard_rebase_worker_result(
+                        replace(context, resolving_rebase=True),
+                        current.snapshot.get('rebase_worker_input'),
+                    )
+                    if isinstance(guarded, ExecutionOutcome):
+                        return guarded
+                    context = guarded
+                    row = self.ports._row()
+                    current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+                    resumed = self.ports._finish_worker(
+                        replace(context, resolving_rebase=True), row, saved_result,
+                        staged=current.snapshot['pending'] == 'continue',
+                    )
+                    return resumed.context if resumed.kind is ExecutionOutcomeKind.PHASE_ADVANCED else resumed
                 if accepted.status is RebaseStatus.COMPLETE:
                     self.ports._finish_rebase_journal(context)
                     self.ports._complete_rebase_intent(context)
@@ -406,96 +438,6 @@ class WorkspaceHandler:
             )
             self.ports.state.check_context(context)
             decision = assess(snapshot)
-            if (current.operation == 'rebase'
-                    and decision.action not in {CheckpointAction.USER_ACTION, CheckpointAction.PAUSE}
-                    and (current.snapshot or {}).get('pending') == 'stage'
-                    and (current.snapshot or {}).get('worker_result')):
-                self.ports._current_rebase_service(context).require_owned()
-                unstaged = self.ports.git(context.worktree, 'diff', '--quiet', check=False)
-                if unstaged.returncode not in {0, 1}:
-                    raise manager_git_journal.MutationEvidenceError('current stage observation failed')
-                saved_result = current.snapshot['worker_result']
-                try:
-                    disposition = self.ports._parse_worker_outcome(
-                        context, saved_result, allow_legacy_ready=True,
-                    )
-                    if disposition.kind == 'needs_user_decision':
-                        return self.ports._block_worker_decision(
-                            context, saved_result, disposition,
-                        )
-                except WorkerOutcomeError as error:
-                    return self.ports._recover(
-                        RecoveryReason.WORKER_CORRECTION,
-                        f'저장된 Worker 결과 검증 실패: {error}',
-                        context=context,
-                    )
-                untracked = self.ports.git(
-                    context.worktree, 'ls-files', '--others', '--exclude-standard', '-z',
-                ).stdout
-                # The intent precedes staging. Identical accepted contents
-                # may still need staging, including accepted new files.
-                if unstaged.returncode == 1 or untracked or snapshot.unmerged_stages:
-                    try:
-                        stage = self.ports._stage_rebase_correction(context)
-                    except (RuntimeError, OSError) as error:
-                        return self.ports._recover(
-                            classify_exception(error, operation=RecoveryReason.STAGE_FAILED),
-                            str(error), context=context,
-                        )
-                    if stage.returncode:
-                        return self.ports._recover(RecoveryReason.STAGE_FAILED,
-                                             stage.output[-8000:], context=context)
-                resumed = self.ports._finish_worker(
-                    replace(context, resolving_rebase=True), row,
-                    current.snapshot['worker_result'], staged=True,
-                )
-                return (resumed.context
-                        if resumed.kind is ExecutionOutcomeKind.PHASE_ADVANCED
-                        else resumed)
-            if (current.operation == 'rebase'
-                    and decision.action not in {CheckpointAction.USER_ACTION, CheckpointAction.PAUSE}
-                    and (current.snapshot or {}).get('pending') == 'continue'
-                    and snapshot.git_operation == 'rebase'
-                    and not snapshot.unmerged_stages):
-                staged = self.ports.git(
-                    context.worktree, 'diff', '--cached', '--quiet', check=False
-                )
-                if staged.returncode not in {0, 1}:
-                    return self.ports._recover(RecoveryReason.STAGE_FAILED,
-                                         'staged rebase correction observation failed',
-                                         context=context)
-                observation = self.ports._rebase_observation(context)
-                action = next_action(
-                    observation, worker_result=True,
-                    staged=staged.returncode == 1,
-                )
-                try:
-                    continued = self.ports._execute_rebase_step(context, action)
-                except (RuntimeError, OSError) as error:
-                    return self.ports._recover(
-                        classify_exception(error, operation=RecoveryReason.REBASE_CONTINUE_FAILED),
-                        str(error), context=context,
-                    )
-                conflict = self.ports._post_rebase_observation(
-                    context, str(current.target_base_oid or base_oid),
-                    continued.output, corrected=True,
-                    worker_result=(current.snapshot or {}).get('worker_result'),
-                )
-                if conflict is not None:
-                    return conflict
-                if continued.returncode:
-                    return self.ports._recover(RecoveryReason.REBASE_CONTINUE_FAILED,
-                                         continued.output[-8000:], context=context)
-                self.ports._complete_rebase_intent(context, project_values={
-                    'phase': 'VERIFYING',
-                    'active_sha': str(current.target_base_oid or base_oid),
-                    'validated_base_sha': None, 'last_error': None,
-                    'revision_resume_status': None,
-                    'verify_result': None, 'review_result': None,
-                    'verify_token': None, 'review_token': None,
-                    'publication_token': None,
-                })
-                return self.ports._context()
             if decision.action is CheckpointAction.CONTINUE:
                 return context
             if decision.action is CheckpointAction.CONFLICT:

@@ -105,10 +105,10 @@ class ExecutionStatePort:
             )
 
     def retain_clean_rebase_worker(self, prior, definition, checkpoints):
-        """Bind an unchanged implementation result after a completed clean rebase.
+        """Bind proven Worker inputs to an adopted completed candidate.
 
-        Called only by the successful Manager invocation, never conflict or
-        interrupted-result adoption. Validation and Review remain invalidated.
+        Callers must check saved correction inputs before retaining their result.
+        Validation and Review remain invalidated.
         """
         if (not prior['worker_result'] or prior['worker_input_token'] != definition.worker_token
                 or prior['archive_token'] != definition.archive_token):

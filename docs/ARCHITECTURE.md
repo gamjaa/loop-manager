@@ -940,6 +940,10 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 
 그 밖의 자유 문장·새 조건·승인은 해당 절 안에서도 입력이다. 두 원문과 hash가 일치해야 기록 분리를 적용하며 legacy snapshot은 원래 revision/path를 다시 읽어 저장 hash를 확인한 경우에만 보강한다. 원문이 없으면 현재 기록으로 합성하지 않는다. 전체 definition·verify 단계 token에는 전체 body hash를 유지해 기록 변경을 Review·승인 예외로 확대하지 않는다.
 
+저장 교정의 입력 근거는 `rebase_corrections.input_snapshot`의 nullable JSON definition snapshot으로 결과와 함께 보존한다. 이는 Worker 호출에 전달한 definition이며 종료 뒤 갱신된 definition으로 대체하지 않는다. 기존 DB에는 nullable 열을 추가하고 과거 결과는 입력 근거가 없는 상태로 유지한다. `pending=stage/continue` checkpoint는 검증된 결과와 `rebase_worker_input`에 같은 definition을 결합한다. 저장 결과와 pending 소비는 기존 revision gate로 최신 선언·dependency를 확인하고 Worker·archive token을 비교한다. token은 순수 수행 기록과 원격 revision OID, 일반 planning에서 반영한 source 지문만의 변화를 구현 재실행 근거에서 제외하며 verify·Review의 입력은 계속 별도로 검사한다.
+
+입력 불일치·근거 부재에서는 checkpoint의 `rebase_worker_input_history`에 이전 입력·결과·turn·pending·stage 근거를 보존하고 해당 READY와 pending 승인만 무효화한다. 작업 파일·session·원래 operation·target·문서 채택/파일 복원 intent와 실패 이력은 유지한다. 같은 Worker에 최신 조건과 과거 결과를 전달해 필요한 구현·targeted test를 확인하며 새 Planner 호출은 만들지 않는다. 입력이 유효한 pending은 별도 stage/continue 결과 소비 경로 대신 기존 Worker 완료 경로로 재개한다. 완료 후보는 새 현재 상태 서비스의 전체 최종 검사와 adoption을 거친 뒤에만 검증된 Worker token을 완료 HEAD에 연결하고 verify·Review·게시 근거는 무효화한다.
+
 #### 현재 상태 검사와 문서 충돌
 
 모든 관리 rebase의 시작·충돌 해결·완료·중단 복구는 현재 repository·계획·canonical worktree·소유 branch·target base·원격 OID와 PR identity/head를 확인한다. Worker 교정 turn, 승인 stage tree, 명령 receipt, reflog 표식, 원본 commit별 replay와 journal 완전성은 완료 조건이 아니며 기존 기록과 실패 감사는 보존한다
@@ -956,7 +960,7 @@ rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업�
 
 적용·stage 중단은 같은 원문으로 재개하고 뒤늦은 replay 충돌도 같은 문서 revision을 사용한다. 후속 catalog·source·rename 판정 오류의 uncertain 기록도 이전 채택 이력과 원문·blob을 유지한다. 모든 재생 위치의 채택 경로를 checkpoint 이력에서 모아 완료 직전 HEAD·index·작업 파일을 원문과 대조한다. 후속 비충돌 재생이 원문을 바꿨으면 완료 채택을 거부하고 checkpoint와 작업물을 기존 복구 경계에 보존한다.
 
-충돌 해결 Worker의 종료 검사도 소유된 중간 상태에서는 최종 변경 범위·선언 판정을 유예하고 구조·operation·원격 소유권을 확인한다. 응답은 후속 검사 전에 교정 turn에 보존한다. Git rebase가 끝나면 Manager가 고정 target base의 선택된 ExecPlan frontmatter를 복원하며 구현·검증 본문과 mode는 보존한다. 복원 전후 bytes·다른 파일의 상태·commit tree를 execution checkpoint에 기록해 쓰기·stage·commit 중단을 같은 결과로 재개한다. 복원 후 전체 최종 범위·선언 검사와 기존 verify·Review를 수행한다. 선언 불일치는 Worker 반복 교정으로 보내지 않으며 plan_input_invalid의 소유 rebase도 일반 branch 검사 전에 같은 복구 경계로 재평가한다.
+충돌 해결 Worker의 종료 검사도 소유된 중간 상태에서는 최종 변경 범위·선언 판정을 유예하고 구조·operation·원격 소유권을 확인한다. 응답·실제 호출 전에 고정한 입력 snapshot·session·종료 코드·결과 종류는 후속 검사 전에 같은 교정 turn에 함께 보존한다. 검사 오류 뒤 재개에도 당시 입력을 최신 definition으로 대체하지 않는다. Git rebase가 끝나면 Manager가 고정 target base의 선택된 ExecPlan frontmatter를 복원하며 구현·검증 본문과 mode는 보존한다. 복원 전후 bytes·다른 파일의 상태·commit tree를 execution checkpoint에 기록해 쓰기·stage·commit 중단을 같은 결과로 재개한다. 복원 후 전체 최종 범위·선언 검사와 기존 verify·Review를 수행한다. 선언 불일치는 Worker 반복 교정으로 보내지 않으며 plan_input_invalid의 소유 rebase도 일반 branch 검사 전에 같은 복구 경계로 재평가한다.
 
 rebase target은 바꾸지 않으며 원격 재전진은 기존 operation 완료 후 반영한다. 문서 전용 충돌은 Manager가 continue/skip하고 혼합 충돌의 나머지 파일과 autostash 충돌은 기존 Worker 교정 경계에 남긴다. 문서 Progress는 현재 후보의 실행·검증 성공 증거가 아니며 완료 후의 입력 재평가·verify·Review·게시 gate는 유지한다
 

@@ -97,14 +97,20 @@ class RebaseCorrectionStateTests(TestCase):
         finished = reopened.finish_turn('repo', 'G-045',
                                         expected_generation=turn.generation,
                                         turn=turn.pending_turn, session='session',
-                                        result='worker output', scope_marker='accepted')
+                                        result='worker output', scope_marker='accepted',
+                                        input_snapshot='turn inputs')
         self.assertEqual(finished.worker_result, 'worker output')
         self.assertEqual(reopened.get('repo', 'G-045').outcome_contract_version, 1)
+        self.assertEqual(reopened.get('repo', 'G-045').input_snapshot, 'turn inputs')
         with self.assertRaises(CorrectionRace):
             reopened.finish_turn('repo', 'G-045',
                                  expected_generation=turn.generation,
                                  turn=turn.pending_turn, session='session',
                                  result='duplicate', scope_marker='accepted')
+        observed = reopened.observe('repo', 'G-045', self.observation(content='changed'),
+                                    worker_result='new observation')
+        self.assertIsNone(observed.input_snapshot)
+        self.assertEqual(observed.worker_result, 'new observation')
 
     def test_legacy_schema_upgrade_preserves_result_and_new_contract_after_reopen(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
@@ -113,7 +119,7 @@ class RebaseCorrectionStateTests(TestCase):
             connection.row_factory = sqlite3.Row
             connection.execute(SCHEMA.replace(
                 '    outcome_contract_version INTEGER NOT NULL DEFAULT 0,\n', '',
-            ))
+            ).replace('    input_snapshot TEXT,\n', ''))
             # Populate using the old columns before opening the upgraded repository.
             connection.execute(
                 "INSERT INTO rebase_corrections "
@@ -136,7 +142,7 @@ class RebaseCorrectionStateTests(TestCase):
             repository.finish_turn(
                 'repo', 'G-045', expected_generation=turn.generation,
                 turn=turn.pending_turn, session='session', result='new result',
-                scope_marker='accepted',
+                scope_marker='accepted', input_snapshot='immutable definition',
             )
             connection.commit()
             connection.close()
@@ -146,3 +152,4 @@ class RebaseCorrectionStateTests(TestCase):
             saved = RebaseCorrectionRepository(connection).get('repo', 'G-045')
             self.assertEqual(saved.worker_result, 'new result')
             self.assertEqual(saved.outcome_contract_version, 1)
+            self.assertEqual(saved.input_snapshot, 'immutable definition')

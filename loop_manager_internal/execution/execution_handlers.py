@@ -416,6 +416,7 @@ class ExecutionHandlers:
                 "_final": lambda *a, **kw: self._final(*a, **kw),
                 "_finish_rebase_journal": lambda *a, **kw: self._finish_rebase_journal(*a, **kw),
                 "_finish_worker": lambda *a, **kw: self._finish_worker(*a, **kw),
+                "_guard_rebase_worker_result": lambda *a, **kw: self._guard_rebase_worker_result(*a, **kw),
                 "_legacy_current_rebase": lambda *a, **kw: self._legacy_current_rebase(*a, **kw),
                 "_owned_checkpoint_remote": lambda *a, **kw: self._owned_checkpoint_remote(*a, **kw),
                 "_parse_worker_outcome": lambda *a, **kw: self._parse_worker_outcome(*a, **kw),
@@ -521,6 +522,7 @@ class ExecutionHandlers:
             self.effects, getattr(self, "_identity", ExecutionIdentity()),
             self._snapshot, self._update_snapshot,
             {
+                "guard": lambda *a, **kw: self.guard(*a, **kw),
                 "_advanced": lambda *a, **kw: self._advanced(*a, **kw),
                 "_archive_candidates_at": lambda *a, **kw: self._archive_candidates_at(*a, **kw),
                 "_archive_collision": lambda *a, **kw: self._archive_collision(*a, **kw),
@@ -558,6 +560,9 @@ class ExecutionHandlers:
 
     def run(self, context):
         return self._worker_handler().run(context)
+
+    def _guard_rebase_worker_result(self, context, input_snapshot):
+        return self._worker_handler()._guard_rebase_worker_result(context, input_snapshot)
 
     def _resume_saved_rebase_worker(self, context, saved, observation):
         return self._worker_handler()._resume_saved_rebase_worker(context, saved, observation)

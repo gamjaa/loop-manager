@@ -458,6 +458,7 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
 
 
     def test_pending_stage_with_unmerged_index_retries_only_accepted_paths(self):
+        self.handler.guard(self.context())
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -471,6 +472,7 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
             observed_remote_oid=None,
             snapshot={
                 'pending': 'stage', 'worker_result': 'accepted correction',
+                'rebase_worker_input': self.handler._definition_snapshot.serialize(),
                 'stage_evidence': {
                     'head': 'owned-head', 'branch': 'loop-manager/G-047',
                     'files': {'app.py': 'accepted-content'},
@@ -502,7 +504,7 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
         self.effects.workspace._rebase_in_progress_for_branch.return_value = True
         result = self.handler.recover(self.context())
 
-        self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
         self.assertFalse(unresolved['value'])
         self.effects.agent.run_agent.assert_not_called()
         additions = [call for call in self.effects.workspace.git.call_args_list
@@ -512,6 +514,7 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
 
 
     def test_stage_lock_resume_uses_checkpoint_without_new_worker_turn(self):
+        self.handler.guard(self.context())
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -553,12 +556,13 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
         self.assertEqual(checkpoint.get('repo', 'G-047').snapshot['pending'], 'stage')
 
         resumed = self.handler.recover(self.context())
-        self.assertEqual(resumed.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertEqual(resumed.phase, ExecutionPhase.VERIFYING)
         self.assertEqual(attempts['add'], 2)
         self.effects.agent.run_agent.assert_not_called()
 
 
     def test_continue_lock_resume_does_not_repeat_stage(self):
+        self.handler.guard(self.context())
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -600,7 +604,7 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
 
         self.effects.workspace.git.side_effect = finished_git
         resumed = self.handler.recover(self.context())
-        self.assertEqual(resumed.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertEqual(resumed.phase, ExecutionPhase.VERIFYING)
         self.assertEqual(attempts, {'add': 1, 'continue': 2})
         self.effects.agent.run_agent.assert_not_called()
 
@@ -638,3 +642,265 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
         self.assertEqual(self.effects.blocking.block_active_execplan.call_count, 2)
         for call in self.effects.blocking.block_active_execplan.call_args_list:
             self.assertEqual(call.kwargs['reason'], lm.BlockReasonCode.REPOSITORY_STATE_UNSAFE)
+
+
+class SavedRebaseInputTests(ExecutionRecoveryScenarios, ExecutionFixture, TestCase):
+    message = ('WORKER_OUTCOME: {"kind":"ready_for_validation"}\n'
+               'COMMIT_TITLE: Resolve conflict\n'
+               'PR_SUMMARY: Resolve the owned conflict.\n'
+               'TARGETED_TESTS:\nunit test: PASS')
+
+    def saved(self, *, pending=None, proof=True):
+        self.handler.guard(self.context())
+        definition = self.handler._definition_snapshot
+        context = self._save_rebase_worker_result(self.message)
+        repository = self.handler.rebase_corrections
+        saved = repository.get('repo', 'G-047')
+        repository.finish_turn(
+            'repo', 'G-047', expected_generation=saved.generation,
+            turn=saved.pending_turn, session=saved.worker_session,
+            result=saved.worker_result, scope_marker=saved.scope_marker,
+            input_snapshot=definition.serialize() if proof else None,
+        )
+        if pending:
+            checkpoint = self.handler.effects.checkpoint
+            current = checkpoint.get('repo', 'G-047')
+            checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+                operation=current.operation, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid=None,
+                snapshot={**current.snapshot, 'pending': pending, 'worker_result': self.message,
+                          'rebase_worker_input': definition.serialize() if proof else None,
+                          'stage_evidence': {'files': {'app.py': 'accepted'}}})
+        return context, definition
+
+    def assert_reassessment(self, context):
+        result = self.handler.run(context)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['worker_session_id'], 'same-session')
+        self.assertIsNone(self.state.row()['worker_input_token'])
+        current = self.handler.effects.checkpoint.get('repo', 'G-047')
+        self.assertEqual(current.operation, 'rebase')
+        self.assertEqual(current.target_base_oid, 'base')
+        self.assertEqual(current.snapshot['rebase_worker_input_history'][-1]['worker_result'], self.message)
+        self.assertIsNone(self.handler.rebase_corrections.get('repo', 'G-047').worker_result)
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertNotIn('add', self.calls)
+        self.assertNotIn('rebase', self.calls)
+
+    def test_pending_recovery_uses_checkpoint_after_frontmatter_normalization(self):
+        context, definition = self.saved(pending='continue')
+        checkpoint = self.handler.effects.checkpoint
+        original_service = self.handler._current_rebase_service
+        normalized = []
+        observed_generations = []
+        def service(ctx, **options):
+            current = checkpoint.get('repo', 'G-047')
+            result = original_service(ctx, **options)
+            observed_generations.append(current.generation)
+            def normalize():
+                updated = checkpoint.record('repo', 'G-047',
+                    expected_generation=current.generation, operation=current.operation,
+                    expected_head='normalized-head', target_base_oid=current.target_base_oid,
+                    observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**current.snapshot, 'rebase_frontmatter': {'state': 'completed'}})
+                normalized.append(updated.generation)
+                return True
+            result.normalize_frontmatter = normalize
+            return result
+        def finish(ctx, row, message, *, staged):
+            current = checkpoint.get('repo', 'G-047')
+            self.assertEqual(current.expected_head, 'normalized-head')
+            self.assertEqual(current.snapshot['rebase_frontmatter']['state'], 'completed')
+            self.assertEqual(current.snapshot['rebase_worker_input'], definition.serialize())
+            self.assertEqual(message, self.message)
+            self.assertTrue(staged)
+            self.assertGreaterEqual(observed_generations[-1], normalized[-1])
+            return self.handler._retry('continue normalized candidate')
+        with mock.patch.object(self.handler, '_current_rebase_service', side_effect=service), \
+             mock.patch.object(self.handler, '_finish_worker', side_effect=finish) as finished:
+            result = self.handler.recover(context)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(len(normalized), 1)
+        finished.assert_called_once()
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_saved_ready_rechecks_changed_body_with_identical_file_marker(self):
+        context, definition = self.saved()
+        self.effects.revision.body_hash.return_value = 'new implementation conditions'
+        self.assert_reassessment(context)
+        self.assertEqual(self.state.row()['definition_snapshot'], definition.serialize())
+        self.assertIn('body', self.state.row()['last_error'])
+        self.assertEqual(self.state.row()['worker_result'], self.message)
+
+    def test_saved_ready_without_definition_requires_same_session_reassessment(self):
+        context, _ = self.saved(proof=False)
+        self.assert_reassessment(context)
+
+    def test_saved_ready_accepts_oid_and_source_fingerprint_only_changes(self):
+        context, _ = self.saved()
+        self.remote = 'new-base'
+        def stable_replay(path, *args, **kwargs):
+            if args == ('rev-parse', '--verify', 'REBASE_HEAD'):
+                return SimpleNamespace(returncode=0, stdout='base')
+            return self.observed_git(path, *args, **kwargs)
+        self.effects.workspace.git.side_effect = stable_replay
+        self.effects.revision.source_fingerprint.return_value = 'new-source'
+        with mock.patch.object(self.handler, '_finish_worker', return_value='finished') as finish:
+            result = self.handler.run(context)
+        self.assertEqual(result, 'finished')
+        finish.assert_called_once()
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertEqual(self.handler.effects.checkpoint.get('repo', 'G-047').target_base_oid, 'base')
+
+
+    def test_pending_stage_changed_inputs_preserve_files_and_clear_only_pending_approval(self):
+        context, _ = self.saved(pending='stage')
+        self.effects.revision.body_hash.return_value = 'new conditions'
+        result = self.handler.recover(context)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        current = self.handler.effects.checkpoint.get('repo', 'G-047')
+        self.assertNotIn('pending', current.snapshot)
+        self.assertEqual(current.snapshot['rebase_worker_input_history'][-1]['stage_evidence'],
+                         {'files': {'app.py': 'accepted'}})
+        self.assertEqual(current.target_base_oid, 'base')
+        self.assertEqual(self.state.row()['worker_session_id'], 'same-session')
+        self.assertNotIn('add', self.calls)
+        self.assertNotIn('rebase', self.calls)
+
+    def test_pending_continue_rechecks_inputs_after_restart(self):
+        context, _ = self.saved(pending='continue')
+        self.handler._definition_snapshot = None
+        self.effects.revision.body_hash.return_value = 'new conditions'
+        result = self.handler.recover(context)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertNotIn('rebase', self.calls)
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_matching_pending_continue_resumes_finish_without_worker(self):
+        context, _ = self.saved(pending='continue')
+        self.handler._definition_snapshot = None
+        with mock.patch.object(self.handler, '_finish_worker',
+                               return_value=self.handler._retry('Git continuation')) as finish:
+            result = self.handler.recover(context)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        finish.assert_called_once()
+        self.assertTrue(finish.call_args.kwargs['staged'])
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_live_worker_ready_is_not_blessed_after_inputs_change_during_turn(self):
+        context, _ = self.saved()
+        saved = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.handler.rebase_corrections.abandon_turn('repo', 'G-047', expected_generation=saved.generation)
+        self.effects.validation.parse_worker_result.side_effect = None
+        def changed(*args, **kwargs):
+            kwargs['on_session_started']('same-session')
+            self.effects.revision.body_hash.return_value = 'changed during Worker'
+            return lm.AgentResult(0, self.message, session_id='same-session')
+        self.effects.agent.run_agent.side_effect = changed
+        result = self.handler.run(context)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.effects.agent.run_agent.assert_called_once()
+        self.assertIsNone(self.handler.rebase_corrections.get('repo', 'G-047').worker_result)
+        self.assertNotIn('add', self.calls)
+
+    def test_completed_pending_result_keeps_valid_worker_for_verify(self):
+        context, definition = self.saved(pending='continue')
+        self.effects = replace(self.effects, workspace=replace(
+            self.effects.workspace, current_rebase_service=self.handler._current_rebase_service))
+        self.handler.effects = self.effects
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        result = self.handler.recover(context)
+        self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['worker_result'], self.message)
+        self.assertEqual(self.state.row()['worker_input_token'], definition.worker_token)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertNotIn('add', self.calls)
+        self.assertNotIn('rebase', self.calls)
+
+
+    def test_saved_ready_checks_each_changed_declaration_without_old_definition(self):
+        context, definition = self.saved()
+        self.state.update_project('repo', definition_snapshot=None)
+        # The saved turn's own input proof survives loss of the applied definition.
+        with mock.patch.object(self.handler, '_finish_worker', return_value='finished') as finish:
+            self.assertEqual(self.handler.run(context), 'finished')
+        finish.assert_called_once()
+        for changes in ({'sources': ('docs/ARCHITECTURE.md',)},
+                        {'depends_on': ('G-999',)}, {'guidance_hash': 'new'},
+                        {'archive_candidates': ('docs/requirements/new.md',)}):
+            with self.subTest(changes=changes):
+                saved = self.handler.rebase_corrections.get('repo', 'G-047')
+                self.handler.rebase_corrections.finish_turn(
+                    'repo', 'G-047', expected_generation=saved.generation,
+                    turn=saved.pending_turn, session='same-session', result=self.message,
+                    scope_marker=self.handler._rebase_observation(self.context()).progress,
+                    input_snapshot=definition.serialize())
+                current = replace(definition, **changes)
+                with mock.patch.object(self.handler, 'guard', side_effect=lambda ctx: (
+                        setattr(self.handler, '_definition_snapshot', current) or ctx)):
+                    self.assert_reassessment(self.context())
+                # Recreate only the saved turn; keep its accumulated audit.
+                observed = self.handler._rebase_observation(context)
+                saved = self.handler.rebase_corrections.observe('repo', 'G-047', observed)
+                self.handler.rebase_corrections.begin_turn('repo', 'G-047',
+                    expected_generation=saved.generation, session='same-session')
+
+    def test_saved_ready_record_only_change_reuses_original_body_evidence(self):
+        from loop_manager_internal.execution.execution_revision import ExecPlanBodyHash
+        context, definition = self.saved()
+        text = '---\nid: G-047\n---\n## Purpose\nImplement\n## Progress\n- [ ] Run test\n'
+        original = ExecPlanBodyHash(text)
+        definition = replace(definition, body_hash=str(original), body_text=text)
+        saved = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.handler.rebase_corrections.finish_turn('repo', 'G-047',
+            expected_generation=saved.generation, turn=saved.pending_turn,
+            session='same-session', result=self.message, scope_marker=saved.scope_marker,
+            input_snapshot=definition.serialize())
+        self.state.update_project('repo', definition_snapshot=definition.serialize())
+        self.effects.revision.body_hash.return_value = ExecPlanBodyHash(text.replace('[ ]', '[x]'))
+        with mock.patch.object(self.handler, '_finish_worker', return_value='finished') as finish:
+            self.assertEqual(self.handler.run(context), 'finished')
+        finish.assert_called_once()
+
+    def test_pending_changed_inputs_rollback_before_discarding_ready(self):
+        context, _ = self.saved(pending='stage')
+        self.effects.revision.body_hash.return_value = 'new conditions'
+        checkpoint = self.handler.effects.checkpoint
+        before = self.handler.rebase_corrections.get('repo', 'G-047')
+        record = checkpoint.record
+        def fail_invalidation(*args, **kwargs):
+            if 'rebase_worker_input_history' in kwargs.get('snapshot', {}):
+                raise RuntimeError('interrupted invalidation')
+            return record(*args, **kwargs)
+        with mock.patch.object(checkpoint, 'record', side_effect=fail_invalidation):
+            result = self.handler.recover(context)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047'), before)
+        self.assertEqual(checkpoint.get('repo', 'G-047').snapshot['pending'], 'stage')
+        result = self.handler.recover(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertNotIn('pending', checkpoint.get('repo', 'G-047').snapshot)
+        self.assertEqual(self.state.row()['worker_result'], self.message)
+
+
+    def test_owned_completed_service_retains_worker_but_requires_new_verify_and_review(self):
+        from tests.support.revision import definition
+        case = current_rebase_case(self)
+        current = definition(path='docs/plans/[G-047] Runtime.md')
+        case.handler._definition_snapshot = current
+        result = case.handler._finish_worker(
+            replace(case.fixture.context(), resolving_rebase=True),
+            case.state.row(), self.message, staged=True)
+        self.assertEqual(result.context.phase, ExecutionPhase.VERIFYING)
+        row = case.state.row()
+        self.assertEqual(row['worker_result'], self.message)
+        self.assertEqual(row['worker_input_token'], current.worker_token)
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        self.assertIsNone(row['publication_token'])
+        saved = case.checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['worker_candidate_token'],
+                         current.worker_candidate_token('owned-head'))
+        case.fixture.effects.agent.run_agent.assert_not_called()

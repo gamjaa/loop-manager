@@ -23,7 +23,7 @@ from loop_manager_internal.execution.worker_session import (
 )
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
-from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot, classify_definition_delta
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.git.rebase_correction import CorrectionAction, next_action
 from loop_manager_internal.storage.rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
@@ -81,6 +81,7 @@ class WorkerHandlerPorts:
     _finish_worker: Callable[..., ExecutionOutcome]
     _metadata_correction: Callable[..., ExecutionOutcome]
     _post_effect_guard: Callable[[ExecutionContext], ExecutionContext | ExecutionOutcome]
+    guard: Callable[[ExecutionContext], ExecutionContext | ExecutionOutcome]
     _post_rebase_observation: Callable[..., Any]
     _rebase_conflict: Callable[..., Any]
     _rebase_observation: Callable[..., Any]
@@ -233,6 +234,7 @@ class WorkerHandler:
                     classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                     str(error), context=context,
                 )
+        turn_definition = self.ports.snapshot()._definition_snapshot
         resolved = self.ports.resolve_worker_profile(
             self.ports.identity.config_path, self.ports.identity.provider, self.ports.snapshot().level, context.worktree,
         )
@@ -452,6 +454,7 @@ class WorkerHandler:
                     session=result.session_id or self.ports._row()['worker_session_id'],
                     result=message, scope_marker=marker, code=code,
                     result_kind=result.result_kind.value,
+                    input_snapshot=turn_definition.serialize() if turn_definition else None,
                 )
             except CorrectionRace:
                 return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
@@ -570,6 +573,13 @@ class WorkerHandler:
             disposition = self._parse_worker_outcome(context, message)
             if disposition.kind == 'needs_user_decision':
                 return self._block_worker_decision(context, message, disposition)
+            if context.resolving_rebase:
+                checked = self._guard_rebase_worker_result(
+                    context, turn_definition.serialize() if turn_definition else None, refresh=False,
+                )
+                if isinstance(checked, ExecutionOutcome):
+                    return checked
+                context = checked
             self.ports.parse_worker_result(message, self.ports.snapshot().plan)
         except (WorkerOutcomeError, self.ports.contract.WorkerResultError) as error:
             self.ports.clear_agent_scope(self.ports.identity.repo)
@@ -636,6 +646,69 @@ class WorkerHandler:
             )
         notifications.flush_project_events(self.ports.state.connection, self.ports.identity.repo)
 
+    def _guard_rebase_worker_result(self, context, input_snapshot, *, refresh=True):
+        """Reconcile inputs before consuming READY or its pending Git continuation."""
+        if refresh:
+            context = self.ports.guard(context)
+            if isinstance(context, ExecutionOutcome):
+                return context
+        blocked = self._targeted_test_block(context)
+        if blocked is not None:
+            return blocked
+        current = self.ports.snapshot()._definition_snapshot
+        previous = DefinitionSnapshot.deserialize(input_snapshot)
+        if (previous is not None and current is not None
+                and previous.worker_token == current.worker_token
+                and previous.archive_token == current.archive_token):
+            return context
+        checkpoint = self.ports.checkpoint
+        saved = self.ports.rebase_corrections.get(self.ports.identity.repo, context.plan.plan_id)
+        message = saved.worker_result if saved else None
+        with runtime_state._transaction(self.ports.state.connection):
+            if checkpoint is not None:
+                intent = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+                snapshot = dict(intent.snapshot or {})
+                message = message or snapshot.get('worker_result')
+                history = snapshot.setdefault('rebase_worker_input_history', [])
+                history.append({
+                    'input_snapshot': input_snapshot,
+                    'worker_result': message,
+                    'stage_evidence': snapshot.get('stage_evidence'),
+                    'pending': snapshot.get('pending'),
+                    'turn': saved.pending_turn if saved else None,
+                })
+                for key in ('pending', 'worker_result', 'stage_evidence', 'rebase_worker_input'):
+                    snapshot.pop(key, None)
+                checkpoint.record(
+                    self.ports.identity.repo, context.plan.plan_id,
+                    expected_generation=intent.generation, operation=intent.operation,
+                    expected_head=intent.expected_head, target_base_oid=intent.target_base_oid,
+                    observed_remote_oid=intent.observed_remote_oid, snapshot=snapshot,
+                )
+            if saved is not None:
+                self.ports.rebase_corrections.abandon_turn(
+                    self.ports.identity.repo, context.plan.plan_id,
+                    expected_generation=saved.generation,
+                )
+            detail = self.ports.contract.REBASE_CONFLICT_PREFIX + (
+                '저장된 교정의 최신 구현 조건 근거가 없어 같은 Worker 세션에서 다시 확인합니다.\n'
+                + json.dumps({
+                    'previous_revision': previous.revision_sha if previous else None,
+                    'current_revision': current.revision_sha if current else None,
+                    'deltas': sorted(delta.value for delta in classify_definition_delta(previous, current))
+                        if previous and current else ['unproven_worker_input'],
+                }, ensure_ascii=False)
+            )
+            self.ports.state.update_project(
+                self.ports.identity.repo, preserve_transaction=True,
+                phase='WORKING', last_error=detail, validated_base_sha=None, worker_result=message,
+                worker_input_token=None, archive_token=None, verify_token=None,
+                review_token=None, publication_token=None, verify_result=None, review_result=None,
+            )
+        if self.ports._row()['agent_snapshot'] is not None:
+            self.ports.clear_agent_scope(self.ports.identity.repo)
+        return self.ports._retry(detail)
+
     def _resume_saved_rebase_worker(self, context, saved, observation):
         """Consume a completed Agent turn after interruption without invoking it twice."""
         checkpoint = self.ports.checkpoint
@@ -677,10 +750,8 @@ class WorkerHandler:
                 context, detail, corrected=True, worker_result=saved.worker_result,
                 abnormal_result=True,
             )
-        guarded = self.ports._post_effect_guard(context)
+        guarded = self.ports.guard(context)
         if isinstance(guarded, ExecutionOutcome):
-            if self.ports._row()['agent_snapshot'] is not None:
-                self.ports.clear_agent_scope(self.ports.identity.repo)
             return guarded
         context = guarded
         try:
@@ -692,6 +763,12 @@ class WorkerHandler:
                 return self._block_worker_decision(
                     context, saved.worker_result, disposition,
                 )
+            checked = self._guard_rebase_worker_result(
+                context, getattr(saved, 'input_snapshot', None), refresh=False,
+            )
+            if isinstance(checked, ExecutionOutcome):
+                return checked
+            context = checked
             self.ports.parse_worker_result(saved.worker_result, self.ports.snapshot().plan)
         except (WorkerOutcomeError, self.ports.contract.WorkerResultError) as error:
             if self.ports._row()['agent_snapshot'] is not None:
@@ -721,10 +798,16 @@ class WorkerHandler:
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
         latest_sha = str(row['active_sha'] or '')
         if context.resolving_rebase:
+            definition = self.ports.snapshot()._definition_snapshot
+            if definition is not None:
+                self.ports.state.update_project(
+                    self.ports.identity.repo, worker_result=message,
+                    worker_input_token=definition.worker_token, archive_token=definition.archive_token,
+                )
             if self.ports.current_rebase_service is not None:
                 _, decision = self.ports._current_rebase_service(context).require_owned()
                 if decision.status is RebaseStatus.COMPLETE:
-                    self.ports._complete_rebase_intent(context)
+                    self.ports._complete_rebase_intent(context, worker_definition=definition)
                     return self.ports._advanced()
             self.ports.state.update_project(self.ports.identity.repo, worker_result=message)
             if not staged:
@@ -831,7 +914,7 @@ class WorkerHandler:
                 'verify_result': None, 'review_result': None,
                 'verify_token': None, 'review_token': None,
                 'publication_token': None,
-            })
+            }, worker_definition=definition)
             return self.ports._advanced()
         if context.archive_sources:
             post_worker_revision = latest_sha if context.resolving_rebase else str(row['active_sha'] or '')

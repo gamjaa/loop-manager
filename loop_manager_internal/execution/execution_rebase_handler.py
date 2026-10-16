@@ -442,7 +442,9 @@ class RebaseHandler:
         if current.operation != 'rebase':
             return
         stage_evidence = (
-            {'stage_evidence': self.ports._rebase_stage_evidence(context)}
+            {'stage_evidence': self.ports._rebase_stage_evidence(context),
+             'rebase_worker_input': (self.ports.snapshot()._definition_snapshot.serialize()
+                 if self.ports.snapshot()._definition_snapshot else None)}
             if pending == 'stage' else {}
         )
         checkpoint.record(

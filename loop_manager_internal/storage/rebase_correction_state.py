@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS rebase_corrections (
     result_kind TEXT,
     scope_marker TEXT,
     outcome_contract_version INTEGER NOT NULL DEFAULT 0,
+    input_snapshot TEXT,
     PRIMARY KEY (repo, plan_id)
 )
 """
@@ -58,6 +59,7 @@ class CorrectionRecord:
     result_kind: str | None
     scope_marker: str | None
     outcome_contract_version: int = 0
+    input_snapshot: str | None = None
 
 
 class RebaseCorrectionRepository:
@@ -70,6 +72,9 @@ class RebaseCorrectionRepository:
                 'ALTER TABLE rebase_corrections ADD COLUMN '
                 'outcome_contract_version INTEGER NOT NULL DEFAULT 0'
             )
+
+        if 'input_snapshot' not in columns:
+            connection.execute('ALTER TABLE rebase_corrections ADD COLUMN input_snapshot TEXT')
 
     @staticmethod
     def _key(observation: ConflictObservation) -> str:
@@ -94,7 +99,7 @@ class RebaseCorrectionRepository:
             tuple(json.loads(row["audit"])),
             row["pending_turn"], row["worker_session"], row["worker_result"],
             row["worker_code"], row["result_kind"],
-            row["scope_marker"], int(row["outcome_contract_version"]),
+            row["scope_marker"], int(row["outcome_contract_version"]), row["input_snapshot"],
         )
 
     def observe(self, repo: str, plan_id: str, observation: ConflictObservation,
@@ -134,6 +139,7 @@ class RebaseCorrectionRepository:
                 "occurrence": history[key],
                 "worker_session": worker_session,
                 "worker_result": worker_result,
+                "input_snapshot": row["input_snapshot"] if row else None,
             })
         audit_payload = json.dumps(audit, sort_keys=True, ensure_ascii=False)
         if row is None:
@@ -165,7 +171,7 @@ class RebaseCorrectionRepository:
                 "plan_revision = ?, target_base = ?, before_head = ?, source = ?, "
                 "stash_oid = ?, observation = ?, history = ?, audit = ?, "
                 "pending_turn = ?, worker_session = ?, "
-                "worker_result = ?, worker_code = ?, result_kind = ?, scope_marker = ? "
+                "worker_result = ?, worker_code = ?, result_kind = ?, scope_marker = ?, input_snapshot = ? "
                 "WHERE repo = ? AND plan_id = ? "
                 "AND generation = ?",
                 (observation.plan_revision, observation.target_base,
@@ -178,6 +184,7 @@ class RebaseCorrectionRepository:
                  row["worker_code"] if preserve_worker_code else None,
                  row["result_kind"] if preserve_result_kind else None,
                  (row["scope_marker"] if preserve_scope_marker else scope_marker),
+                 row["input_snapshot"] if persist_worker_result and preserve_worker_result else None,
                  repo, plan_id, generation),
             )
             if changed.rowcount != 1:
@@ -194,7 +201,7 @@ class RebaseCorrectionRepository:
         changed = self.connection.execute(
             "UPDATE rebase_corrections SET generation = generation + 1, pending_turn = ?, "
             "worker_session = ?, worker_result = NULL, worker_code = NULL, "
-            "result_kind = NULL, scope_marker = NULL "
+            "result_kind = NULL, scope_marker = NULL, input_snapshot = NULL "
             "WHERE repo = ? AND plan_id = ? AND generation = ?",
             (uuid4().hex, session, repo, plan_id, expected_generation),
         )
@@ -206,13 +213,14 @@ class RebaseCorrectionRepository:
                     turn: str, session: str | None, result: str,
                     scope_marker: str, code: int = 0,
                     result_kind: str = 'success',
-                    outcome_contract_version: int = 1) -> CorrectionRecord:
+                    outcome_contract_version: int = 1,
+                    input_snapshot: str | None = None) -> CorrectionRecord:
         changed = self.connection.execute(
             "UPDATE rebase_corrections SET generation = generation + 1, "
             "worker_session = ?, worker_result = ?, worker_code = ?, "
-            "result_kind = ?, scope_marker = ?, outcome_contract_version = ? "
+            "result_kind = ?, scope_marker = ?, outcome_contract_version = ?, input_snapshot = ? "
             "WHERE repo = ? AND plan_id = ? AND generation = ? AND pending_turn = ?",
-            (session, result, code, result_kind, scope_marker, outcome_contract_version,
+            (session, result, code, result_kind, scope_marker, outcome_contract_version, input_snapshot,
              repo, plan_id, expected_generation, turn),
         )
         if changed.rowcount != 1:
@@ -227,7 +235,7 @@ class RebaseCorrectionRepository:
         changed = self.connection.execute(
             "UPDATE rebase_corrections SET generation = generation + 1, "
             "pending_turn = NULL, worker_result = NULL, worker_code = NULL, "
-            "result_kind = NULL, scope_marker = NULL "
+            "result_kind = NULL, scope_marker = NULL, input_snapshot = NULL "
             "WHERE repo = ? AND plan_id = ? AND generation = ?",
             (repo, plan_id, expected_generation),
         )

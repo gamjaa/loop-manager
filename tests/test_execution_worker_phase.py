@@ -26,6 +26,8 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
     def test_rebase_response_is_saved_before_metadata_failure_without_worker_retry(self):
+        self.handler.guard(self.context())
+        delivered = self.handler._definition_snapshot
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.handler.effects = replace(self.effects, checkpoint=checkpoint)
         checkpoint.record('repo', 'G-047', expected_generation=0, operation='rebase',
@@ -34,13 +36,25 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.effects.workspace.is_directory.return_value = True
         self.effects.workspace._rebase_in_progress_for_branch.return_value = True
         self.effects.workspace.git.side_effect = self.observed_git
-        self.effects.agent.validate_worker_workspace_scope.side_effect = lm.ExecPlanMetadataError('sources mismatch')
+        def fail_metadata(*_args, **_kwargs):
+            saved = self.handler.rebase_corrections.get('repo', 'G-047')
+            self.assertEqual(saved.input_snapshot, delivered.serialize())
+            self.assertEqual(saved.worker_session, 'session')
+            self.assertEqual(saved.result_kind, 'success')
+            self.assertEqual(saved.worker_code, 0)
+            # A later observation must not replace the invocation's own inputs.
+            self.handler._definition_snapshot = replace(delivered, body_hash='new condition')
+            raise lm.ExecPlanMetadataError('sources mismatch')
+        self.effects.agent.validate_worker_workspace_scope.side_effect = fail_metadata
 
         outcome = self.handler.run(self.context())
 
         saved = self.handler.rebase_corrections.get('repo', 'G-047')
         self.assertIn('ready_for_validation', saved.worker_result)
         self.assertEqual(saved.worker_code, 0)
+        reopened = type(self.handler.rebase_corrections)(self.connection).get('repo', 'G-047')
+        self.assertEqual(reopened.input_snapshot, delivered.serialize())
+        self.assertNotEqual(reopened.input_snapshot, self.handler._definition_snapshot.serialize())
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.assertEqual(outcome.recovery.observation.reason, RecoveryReason.PLAN_INPUT_INVALID)
         self.assertEqual(self.effects.agent.run_agent.call_count, 1)
