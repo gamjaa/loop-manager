@@ -1,6 +1,7 @@
 from tests.support.rebase_block import RebaseBlockFixture
 import json
 from dataclasses import replace
+from contextlib import nullcontext
 import sqlite3
 from pathlib import Path
 from unittest import mock
@@ -13,6 +14,9 @@ from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 
 class ScopedGateFixture:
     def setUp(self):
+        self.enterContext(mock.patch(
+            "loop_manager_internal.recovery.plan_recovery.resource_locks",
+            side_effect=lambda *args, **kwargs: nullcontext()))
         self.connection = sqlite3.connect(":memory:")
         self.addCleanup(self.connection.close)
         self.connection.row_factory = sqlite3.Row

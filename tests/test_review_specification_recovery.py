@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from tests.support.recovery import BoundedRecoveryFixture
 import json
 import tempfile
@@ -63,10 +64,14 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
             )
 
     def test_review_specification_block_requeues_only_after_input_change(self):
+        self.enterContext(mock.patch(
+            "loop_manager_internal.recovery.plan_recovery.resource_locks",
+            side_effect=lambda *args, **kwargs: nullcontext()))
         from tests.support.database import runtime_connection
 
         connection = runtime_connection()
         self.addCleanup(connection.close)
+        connection.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
         connection.execute(
             "UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
             "blocked_reason = 'review_specification_deadlock', "

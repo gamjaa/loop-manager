@@ -84,7 +84,7 @@ class ExecutionFixture:
         # Fake Git policy scenarios have no repository lease; concrete fetch
         # contention is covered by test_project_fetch_branch_deletion.
         for module in ('execution.execution_latest_base_handler', 'execution.stage_documents',
-                       'recovery.checkpoint_recovery', 'recovery.work_branch_integration'):
+                       'recovery.checkpoint_recovery', 'recovery.work_branch_integration', 'recovery.plan_recovery'):
             lease = mock.patch('loop_manager_internal.' + module + '.resource_locks',
                                side_effect=lambda *args, **kwargs: nullcontext())
             lease.start()

@@ -1655,6 +1655,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         from loop_manager_internal.storage import blocked_checkpoint_state
         case = current_rebase_case(self)
         connection, runtime = case.fixture.connection, case.fixture.repository
+        connection.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
         selected = runtime.projected('repo')
         runtime.transition_from_snapshot(selected,
             plan_values={'status': 'PLAN_BLOCKED', 'blocked_reason': 'verify',

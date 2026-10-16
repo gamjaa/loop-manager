@@ -775,6 +775,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                             raise MutationEvidenceError('stored rebase result differs')
                     else:
                         self.assertTrue(failed.wait(3))
+                        self.assertTrue(verifying.wait(3))
                         self.assertEqual(sum(scheduler.running['verify'].values()), 1)
                         replacement.set()
             repository.transition_from_snapshot(repository.projected('A'), plan_values={'status': 'PR_OPEN'},

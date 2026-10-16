@@ -966,7 +966,7 @@ class PersistedScopeServiceTests(TestCase):
             )
 
             self.assertTrue(blocked_plan_service.resume_blocked_execplan_if_inputs_changed(
-                effects, connection, Path('/repo'), 'repo', 'main', Path('/state'),
+                effects, connection, Path('/repo'), 'repo', 'main', worktree / 'state',
                 plan_id='G-047',
             ))
             validate.assert_called_once()
