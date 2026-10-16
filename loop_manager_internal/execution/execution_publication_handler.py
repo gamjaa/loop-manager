@@ -138,7 +138,7 @@ class PublicationHandler:
                     'plan_id': context.plan.plan_id,
                     'branch': context.branch,
                     'worktree': str(context.worktree),
-                } if definition is not None else None)
+                } if definition is not None and definition.body_text is not None else None)
                 checkpoint.record(
                     self.ports.identity.repo, context.plan.plan_id,
                     expected_generation=current.generation, operation='commit',

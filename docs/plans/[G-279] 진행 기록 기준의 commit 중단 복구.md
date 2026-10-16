@@ -51,6 +51,8 @@ Manager rebase로 갱신된 HEAD `270d89a`를 기준으로 아래 다섯 개 개
 - `tests.test_stage_documents.DocumentPhaseTests.test_unresolved_owned_record_blocks_followup_commit` — 통과. 미확정 기록이 후속 commit intent로 덮이지 않는 것을 확인했다.
 - `tests.test_runtime_state.RuntimeStateRepositoryTest.test_owned_progress_baseline_consumes_only_confirmed_published_delta` — 통과. 원격에서 확인한 기록 delta만 반영하고 미확정·무관한 입력을 보존했다.
 
+Manager verify의 최신 진단은 legacy `DefinitionSnapshot`의 `body_text=None` 상태에서도 commit path가 불완전한 `document_record`를 만들어, 다음 commit을 미해결 기록으로 차단하는 실패를 보였다. commit intent 생성은 변경 전 본문을 확보했을 때만 기록을 만들도록 제한했고, rebase adoption의 candidate-token 회귀에 phantom 기록이 없음을 assertion으로 추가했다. HEAD `d603899`에서 `tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_only_confirmed_worker_patch_carries_candidate_token_to_manager_commit`를 실행해 같은 selector가 통과했다.
+
 전체 verify는 Worker에서 실행하지 않았다.
 
 ## Decision Log

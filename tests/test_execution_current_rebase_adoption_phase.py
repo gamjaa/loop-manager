@@ -558,6 +558,7 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
                     return SimpleNamespace(stdout=output, returncode=0)
                 self.fixture.effects.workspace.git.side_effect = git
                 self.handler._commit_owned(self.handler._context(), 'Current patch', worker_confirmed=confirmed)
+                self.assertNotIn('document_record', self.checkpoint.get('repo', 'G-047').snapshot)
                 token = self.checkpoint.get('repo', 'G-047').snapshot['worker_candidate_token']
                 self.assertEqual(token, current.worker_candidate_token('committed' if confirmed else 'owned-head'))
 
