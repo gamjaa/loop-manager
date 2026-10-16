@@ -539,6 +539,10 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 rebase 관측의 안정성 지문에는 해당 branch·worktree의 등록과 공유 config만 포함하고 무관한 작업의 ref·worktree 변화는 제외한다. 해당 branch의 중복 등록·현재 후보·index·입력·원격 PR의 검증은 유지한다. rebase 완료·차단 해제의 Git·원격 재관측은 쓰기 transaction 전에 마치고, 짧은 DB transaction 안에서 작업 소유권·projection·checkpoint를 다시 비교해 acceptance와 상태·outbox를 함께 적용한다. 상위 execution 포트도 외부 재관측 전에 writer를 예약하지 않는다.
 
+차단 재평가는 대상 plan·branch·worktree의 자원 lease와 `selected_execution`으로 기존 복구 경로를 실행한다. 복구 컨텍스트에서만 PLAN_BLOCKED의 투영을 읽을 수 있고 일반 단계 실행의 활성 상태 조건은 유지한다. 실행 스레드도 계획 lease를 보유해 종료 정리와 재평가가 겹치지 않으며, 대상 호출 예약·미종료 invocation·같은 소유 자원의 다른 활성 계획을 확인한다. 복구 뒤 다른 계획의 대표 투영을 덮지 않고, 원래 투영이 비어 있거나 대상인 경우에만 기존 단일 작업 호출의 재개 투영을 연결한다. 병렬 조율은 관리 여유에서 변경된 차단 입력을 별도 Future·DB 연결의 재평가로 보낸다. 재평가가 의미 판단을 기다리는 동안에도 다른 신규 배정은 계속하며, 해소 뒤의 짧은 재개 확정은 기존 관리 배정 순서를 사용한다. 코드 수정 뒤의 첫 실행도 원인별 검사를 수행한다.
+
+사용자 질문은 입력 지문의 차이로 해제하지 않는다. 현재·이전의 명세와 작업 본문을 읽고 링크·frontmatter만의 변경을 제외한 뒤 읽기 전용 Reviewer로 원인을 판단한다. `USER_DECISION_ASSESSMENT` JSON의 `resolved`는 bool, `detail`은 비어 있지 않은 이유, `evidence`는 `source`·`quote` 배열이다. 해소 결과에는 변경된 현재 source의 정확한 인용과 ExecPlan 이외의 상위 명세 인용이 필요하며 질문이 남거나 결과가 불확실하면 차단을 유지한다. checkpoint의 `user_decision_assessment`와 이력에 입력 identity·원격 revision·기존 질문·판단·원문 근거를 보존하고 같은 입력 결과를 재사용한다. Requirement 이름 변경은 기존 R-ID resolver를 사용하며 저장된 draft 판단은 R-061의 출처·답변 검증에 맡긴다. Agent 실패·형식/인용 오류·source 또는 원인/CAS 변경은 해소 근거가 되지 않는다. 일반 입력 오류는 현재 metadata를 재검증하고 rebase의 안전한 시작·대기·완료는 기존 Git 소유 증거로 판단한다.
+
 | 저장 상태 | 실행 자리와 보존 책임 |
 |---|---|
 | 작업별 실행 원본 | `exec_plans`에 단계·작업 identity·소유 자원·session·실패 이력을 유지한다. 프로젝트의 현재 작업을 바꾸어도 이 원본을 초기화하지 않는다. |

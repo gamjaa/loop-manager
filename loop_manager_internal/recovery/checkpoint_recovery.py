@@ -69,6 +69,7 @@ class EvaluateRemoteCheckpointCauseEffects:
     """Effects for evaluate remote checkpoint cause; preserve existing safety gates."""
     MAX_REVIEWER_PROTOCOL_ATTEMPTS: int
     ROOT: Path
+    git: Callable[..., object]
     ReviewerProtocolError: type[Exception]
     WorkerResultError: type[Exception]
     _remote_checkpoint_has_new_failure: Callable[..., object]
@@ -610,6 +611,115 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     return "adopted"
 
 
+def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo, blocked, config):
+    import difflib
+    import hashlib
+    import re
+    from loop_manager_internal.storage import execplan_draft_state
+    if str(blocked['plan_id']) in execplan_draft_state.pending_ids(connection, repo):
+        return False, '저장된 draft 사용자 판단은 기존 출처·답변 검증 경로에서 확인합니다.', None
+    project = runtime_state.project_row(connection, repo)
+    revision = effects.git(repo_path, 'rev-parse', f"refs/remotes/origin/{project['base_branch']}").stdout.strip()
+    prior_revision = blocked['active_sha'] or blocked['plan_sha']
+    paths = sorted(set(json.loads(blocked['sources'])) | {blocked['path'], 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'})
+    current, changes = {}, {}
+    requirement_documents = {}
+    def source(revision, path):
+        from loop_manager_internal.catalog.manager_sources import SOURCE, source_content
+        if path == SOURCE:
+            return source_content(path)
+        result = effects.git(repo_path, 'show', f'{revision}:{path}', check=False)
+        if result.returncode == 0:
+            return result.stdout
+        from loop_manager_internal.catalog import requirement_sources
+        from loop_manager_internal.git.command_adapter import revision_requirement_documents
+        if requirement_sources.source_requirement_id(path) is not None:
+            if revision not in requirement_documents:
+                requirement_documents[revision] = revision_requirement_documents(
+                    lambda repo, *args: effects.git(repo, *args).stdout.encode('utf-8'), repo_path, revision)
+            resolved = requirement_sources.resolve_requirement_source(path, requirement_documents[revision], allow_archive=True)
+            if resolved.status is requirement_sources.ResolutionStatus.RESOLVED:
+                return resolved.contents
+        raise RuntimeError('차단 재평가의 이전·현재 source를 읽을 수 없습니다: ' + path)
+    def meaning(text):
+        text = re.sub(r'\A---\r?\n.*?\r?\n---\r?\n', '', text, count=1, flags=re.S)
+        return ' '.join(re.sub(r'\[([^]]*)\]\([^)]*\)', r'\1', text).split())
+    for path in paths:
+        from loop_manager_internal.catalog.manager_sources import SOURCE
+        if path != SOURCE and not _safe_path(path):
+            raise RuntimeError('차단 재평가 source 경로가 유효하지 않습니다.')
+        old, latest = source(prior_revision, path), source(revision, path)
+        current[path] = latest
+        if meaning(old) != meaning(latest):
+            changes[path] = ''.join(difflib.unified_diff(old.splitlines(True), latest.splitlines(True)))
+    if not changes:
+        return False, '기존 사용자 질문을 다시 판단할 명세·계획 본문 변경이 없습니다.', None
+    block = scoped_blocking.plan_block(connection, repo, str(blocked['plan_id']))
+    if block is None or block['reason_code'] != BlockReasonCode.USER_DECISION_REQUIRED.value:
+        raise RuntimeError('사용자 질문의 현재 차단 원인이 변경됐습니다.')
+    question = str(block['evidence'])
+    identity = hashlib.sha256(json.dumps([question, current], sort_keys=True).encode()).hexdigest()
+    checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    checkpoint = checkpoints.get(repo, str(blocked['plan_id']))
+    saved = (checkpoint.snapshot or {}).get('user_decision_assessment', {})
+    if saved.get('identity') == identity:
+        return saved['resolved'], saved['detail'], None
+    prompt = ("기존 사용자 판단 차단의 원인만 읽기 전용으로 재평가하라. "
+        "문서 수정·질문 삭제·Planner 판단을 사용자 승인으로 간주하지 마라. "
+        "최신 Requirement와 ExecPlan에서 기존 질문이 더는 필요 없거나 이미 명시적으로 결정된 경우만 resolved=true다. "
+        "실제 선택이 남거나 두 문서가 충돌하면 false로 유지하라. 새 사용자 승인·답변을 추론하지 마라. "
+        "링크·표현 변화나 무관한 변경은 해소 근거가 아니다. "
+        "필요하면 Git의 지정 revision에서 source 원문을 읽어라. 파일을 수정하지 마라. "
+        "한 줄 USER_DECISION_ASSESSMENT: JSON 객체를 반환하라. 필드는 resolved(bool), detail(이유), "
+        "evidence(근거별 source·quote 배열)다. true에는 변경된 source의 현재 원문 인용과 "
+        "ExecPlan 이외의 상위 명세가 질문 해소를 뒷받침하는 인용이 모두 필요하다.\n"
+        + json.dumps(dict(question=question, revision=revision, sources=paths,
+                         execplan=current[blocked['path']], changes=changes,
+                         manager_inputs={path: current[path] for path in paths if path.startswith('manager:')}), ensure_ascii=False))
+    worktree = Path(blocked['worktree'])
+    baseline = effects.capture_git_snapshot(worktree)
+    code, output = effects.run_agent(str(project['provider']), worktree, state_dir, config, 'reviewer', prompt,
+        read_only=True, connection=connection,
+        invocation=InvocationContext(repo, str(blocked['plan_id']), purpose='review', target=str(blocked['plan_id'])))
+    effects.validate_agent_scope('reviewer', worktree, baseline, effects.capture_git_snapshot(worktree),
+                                 external_worktree=repo_path)
+    lines = [line.removeprefix('USER_DECISION_ASSESSMENT:').strip() for line in str(output).splitlines()
+             if line.startswith('USER_DECISION_ASSESSMENT:')]
+    if code or len(lines) != 1:
+        raise RuntimeError('사용자 질문 재평가 결과가 미완료이거나 모호합니다.')
+    result = json.loads(lines[0])
+    if (not isinstance(result, dict) or set(result) != {'resolved', 'detail', 'evidence'}
+            or type(result.get('resolved')) is not bool
+            or not isinstance(result.get('detail'), str) or not result['detail'].strip()
+            or not isinstance(result.get('evidence'), list)):
+        raise RuntimeError('사용자 질문 재평가 결과 형식이 유효하지 않습니다.')
+    if result['resolved'] and (not result['evidence'] or any(
+            not isinstance(item, dict) or item.get('source') not in current
+            or not isinstance(item.get('quote'), str) or not item['quote'].strip()
+            or item['quote'] not in current[item['source']] for item in result['evidence'])
+            or not any(item['source'] in changes for item in result['evidence'])
+            or not any(item['source'] != blocked['path'] for item in result['evidence'])):
+        raise RuntimeError('사용자 질문 해소의 현재 명세 근거를 확인할 수 없습니다.')
+    if effects.git(repo_path, 'rev-parse', f"refs/remotes/origin/{project['base_branch']}").stdout.strip() != revision:
+        raise RuntimeError('사용자 질문 재평가 중 원격 입력이 변경됐습니다.')
+    with runtime_state._transaction(connection):
+        latest_plan = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?",
+                                         (repo, blocked['plan_id'])).fetchone()
+        if (latest_plan is None or any(latest_plan[key] != blocked[key]
+                for key in ('status', 'path', 'sources', 'content_hash', 'current_revision_sha'))
+                or checkpoints.get(repo, str(blocked['plan_id'])) != checkpoint
+                or dict(scoped_blocking.plan_block(connection, repo, str(blocked['plan_id'])) or {}) != dict(block or {})):
+            raise RuntimeError('사용자 질문 재평가 중 차단 원인 또는 checkpoint가 변경됐습니다.')
+        assessment = dict(identity=identity, revision=revision, question=question, **result)
+        checkpoints.record(repo, str(blocked['plan_id']), expected_generation=checkpoint.generation,
+            operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+            target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
+            snapshot={**(checkpoint.snapshot or {}), 'user_decision_assessment': assessment,
+                      'user_decision_assessment_history': [
+                          *(checkpoint.snapshot or {}).get('user_decision_assessment_history', []), assessment]})
+    return result['resolved'], result['detail'], None
+
+
 def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffects,
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, blocked: sqlite3.Row, config_path: Path | None,
@@ -623,6 +733,8 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
     project = connection.execute(
         "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
+    if blocked['blocked_reason'] == BlockReasonCode.USER_DECISION_REQUIRED.value:
+        return _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo, blocked, config)
     revision = effects._remote_checkpoint_review_revision(
         repo_path, worktree, str(project["base_branch"]), state_dir,
     )

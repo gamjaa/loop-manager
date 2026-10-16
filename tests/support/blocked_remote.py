@@ -19,7 +19,7 @@ class BlockedRemoteFixture:
     def _prepare_blocked_remote(self):
         # These scenarios replace Git effects on /repo and /state; real lease
         # contention belongs to the concrete fetch boundary regressions.
-        for module in ('checkpoint_recovery', 'blocked_plan_reconciliation', 'project_blocked_recovery'):
+        for module in ('checkpoint_recovery', 'blocked_plan_reconciliation', 'project_blocked_recovery', 'plan_recovery'):
             lease = mock.patch('loop_manager_internal.recovery.' + module + '.resource_locks',
                                side_effect=lambda *args, **kwargs: nullcontext())
             lease.start()

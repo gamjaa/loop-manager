@@ -179,12 +179,15 @@ def _reconcile_rebase_evidence_block(
                     raise RuntimeError('unchanged blocked rebase still needs user input or Git progress')
             return observation
         observation = observe()
-        runtime_state.RuntimeStateRepository(connection).resume_rebase_block(
-            plan, project, block, checkpoints, observation, expected_checkpoint=checkpoint,
-            is_plan_block=plan_block,
-            reobserve=observe,
-            dependencies_ready=lambda: not effects.unmet_execplan_dependencies(connection, repo, plan_id),
-            pending_error=REBASE_IN_PROGRESS_ERROR)
+        confirmed = observe()
+        from loop_manager_internal.recovery.plan_recovery import recovery_admission
+        with recovery_admission(connection, repo, plan_id):
+            runtime_state.RuntimeStateRepository(connection).resume_rebase_block(
+                plan, project, block, checkpoints, observation, expected_checkpoint=checkpoint,
+                is_plan_block=plan_block,
+                reobserve=lambda: confirmed,
+                dependencies_ready=lambda: not effects.unmet_execplan_dependencies(connection, repo, plan_id),
+                pending_error=REBASE_IN_PROGRESS_ERROR)
         return True
     except (RuntimeError, OSError, ValueError, sqlite3.Error) as error:
         effects.operation_log(f"관리 rebase 차단 재평가 보류 ({plan_id}): {error}", error=True)
@@ -251,12 +254,14 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
             except (RuntimeError, ValueError, TypeError, KeyError):
                 pass  # Missing legacy audit cannot make an old success reusable.
         preserve_stage |= clean_candidate and _saved_verify_matches_candidate(plan, observed.head)
-        with runtime_state._transaction(connection):
+        if not agent_scope_decision._same_local_snapshot(observe(), observed):
+            raise AgentScopeError('scope 차단 해제 중 후보가 변경됐습니다.')
+        from loop_manager_internal.recovery.plan_recovery import recovery_admission
+        with recovery_admission(connection, repo, plan_id), runtime_state._transaction(connection):
             if (dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                          (repo, plan_id)).fetchone()) != dict(plan)
                     or dict(runtime_state.project_row(connection, repo)) != dict(project)
-                    or checkpoints.get(repo, plan_id) != checkpoint
-                    or not agent_scope_decision._same_local_snapshot(observe(), observed)):
+                    or checkpoints.get(repo, plan_id) != checkpoint):
                 raise AgentScopeError('scope 차단 해제 중 소유 상태가 변경됐습니다.')
             if legacy_verify and not _legacy_verify_matches_candidate(
                     connection, plan, start, result_view, observed):

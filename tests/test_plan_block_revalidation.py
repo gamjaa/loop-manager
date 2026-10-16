@@ -33,13 +33,15 @@ class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
             "SELECT stage FROM blocked_plan_reconciliations WHERE repo=? AND plan_id='G-106'", (self.repo,)).fetchone()
         self.assertNotEqual(saved['stage'], 'refused')
 
-    def test_other_plans_pr_recovery_defers_without_mutating_owner_or_input(self):
+    def test_other_plans_independent_pr_recovery_does_not_take_the_target_slot(self):
         runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
         runtime.update_plan(self.repo, 'G-107', plan_values={'pr_conflict_recovery': 1})
         runtime.hydrate(self.repo, 'G-107')
         project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
         plan, observation = dict(self.plan()), dict(self.row())
-        self.assertEqual(self.coordinator.reconcile('G-106'), 'deferred')
+        with mock.patch.object(self.coordinator, '_reconcile', return_value='blocked') as recheck:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        recheck.assert_called_once()
         self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
         self.assertEqual(dict(self.plan()), plan)
         self.assertEqual(dict(self.row()), observation)
@@ -1365,11 +1367,11 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
         context = {'block': {'reason_code': 'user_decision_required', 'evidence': 'pending decision'},
                    'artifacts': {}, 'base_oid': self.base}
         self.assertFalse(self.coordinator._evaluate(self.plan(), context)['resolved'])
-        # Publishing that document to base is a new explicit input even when
-        # its contents match the local proposal captured at the original block.
         self.ports._revision_execplan_input_fingerprint.return_value = 'pending local proposal'
+        self.assertFalse(self.coordinator._evaluate(self.plan(), context)['resolved'])
+        self.ports._evaluate_remote_checkpoint_cause.return_value = (True, '현재 명세가 질문을 해소했습니다.', None)
         self.assertTrue(self.coordinator._evaluate(self.plan(), context)['resolved'])
-        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.assertEqual(self.ports._evaluate_remote_checkpoint_cause.call_count, 3)
 
 
     def test_uncertain_verify_process_creates_safety_block_without_publication(self):
@@ -1604,7 +1606,9 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                            'artifacts': {}, 'base_oid': self.base}
                 result = self.coordinator._evaluate(self.plan(), context)
                 self.assertFalse(result['resolved'])
-        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+        self.assertEqual(self.ports._evaluate_remote_checkpoint_cause.call_args.args[4]['blocked_reason'],
+                         'user_decision_required')
 
 
     def test_explicit_plan_selection_does_not_depend_on_another_mirror(self):

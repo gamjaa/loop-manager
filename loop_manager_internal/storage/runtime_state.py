@@ -20,15 +20,18 @@ ACTIVE_STATUSES = frozenset(
 )
 
 execution_selection: ContextVar[tuple[str, str] | None] = ContextVar("execution_selection", default=None)
+include_blocked_projection = ContextVar("include_blocked_projection", default=False)
 admitting_execution: ContextVar[bool] = ContextVar("admitting_execution", default=False)
 
 
 @contextmanager
-def selected_execution(repo: str, plan_id: str):
+def selected_execution(repo: str, plan_id: str, *, include_blocked=False):
     token = execution_selection.set((repo, plan_id))
+    blocked_token = include_blocked_projection.set(include_blocked)
     try:
         yield
     finally:
+        include_blocked_projection.reset(blocked_token)
         execution_selection.reset(token)
 
 
@@ -724,7 +727,7 @@ class RuntimeStateRepository:
     def projected_row(self, repo: str) -> sqlite3.Row | None:
         selected = execution_selection.get()
         if selected is not None and selected[0] == repo:
-            return self.active_row(repo)
+            return self._plan_row(*selected) if include_blocked_projection.get() else self.active_row(repo)
         row = self.connection.execute(
             "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
@@ -1070,7 +1073,7 @@ class RuntimeStateRepository:
 
         repo, plan_id = expected_plan['repo'], expected_plan['plan_id']
         observed, decision = observation
-        if decision.status not in {RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
+        if decision.status not in {RebaseStatus.START, RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
             raise RuntimeStateError('current rebase recovery is unsafe')
         if decision.status is RebaseStatus.COMPLETE and not valid_acceptance(decision.acceptance):
             raise RuntimeStateError('current rebase recovery acceptance is missing')
