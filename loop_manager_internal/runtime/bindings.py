@@ -144,7 +144,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('remote_base', registration_service.remote_base,
         lambda: registration_service.RemoteBaseEffects(
-            _recorded_base_fetch=assembly.callback('_recorded_base_fetch'),
+            _recorded_project_fetch=assembly.callback('_recorded_project_fetch'),
             git=assembly.callback('git'),
         ),
     )

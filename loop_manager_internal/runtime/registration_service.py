@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from loop_manager_internal.agents.agent_profiles import AGENT_PROVIDERS
 from loop_manager_internal.application.contracts import ProjectRegistrationInspection
-from loop_manager_internal.application.contracts import RemoteBranchMissingError
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.storage import execplan_catalog_state
 from loop_manager_internal.storage import maintenance_state
@@ -102,7 +101,7 @@ def validate_repository(
 @dataclass(frozen=True)
 class RemoteBaseEffects:
     """Named effects for remote_base; no entry-point/module access."""
-    _recorded_base_fetch: Callable[..., object]
+    _recorded_project_fetch: Callable[..., object]
     git: Callable[..., object]
 
 
@@ -122,23 +121,7 @@ def remote_base(
         ).stdout.strip()
         base = reference.removeprefix("origin/")
     if state_dir is not None:
-        heads = effects.git(repo, "ls-remote", "--heads", "origin").stdout.splitlines()
-        branches = []
-        for line in heads:
-            fields = line.split()
-            if len(fields) != 2 or not fields[1].startswith("refs/heads/"):
-                raise RuntimeError("project fetch 원격 branch 목록이 유효하지 않습니다.")
-            branches.append(fields[1].removeprefix("refs/heads/"))
-        if base not in branches:
-            raise RuntimeError(f"origin/{base} 원격 branch를 찾을 수 없습니다.")
-        for branch in sorted(branches):
-            try:
-                effects._recorded_base_fetch(repo, state_dir, branch, owner="project")
-            except RemoteBranchMissingError:
-                # A merged PR head may be deleted after the list query. Keep
-                # its tracking ref and stored PR head for cleanup assessment.
-                if branch == base:
-                    raise
+        effects._recorded_project_fetch(repo, state_dir, base)
     effects.git(repo, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}")
     return base
 

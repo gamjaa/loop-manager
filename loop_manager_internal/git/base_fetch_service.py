@@ -164,11 +164,22 @@ def _recorded_base_fetch(
         raise RuntimeError(f"origin/{base}의 원격 OID가 유효하지 않습니다.")
     before = {"oid": effects._tracking_ref_oid(repo, refname)}
 
-    def apply(token: str) -> None:
+    def receive() -> None:
         effects.git(repo, "fetch", "--no-tags", "--refmap=", "origin", remote_ref)
         fetched = effects.git(repo, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip()
         if fetched != selected:
             raise RuntimeError(f"origin/{base}가 fetch 중 변경됐습니다.")
+
+    _record_fetch_ref(effects, repo, state_dir, base, selected, before, owner, receive)
+    return selected
+
+
+def _record_fetch_ref(effects, repo, state_dir, base, selected, before, owner, receive):
+    """Keep the existing per-ref journal format for single and bulk receipts."""
+    refname = f"refs/remotes/origin/{base}"
+
+    def apply(token: str) -> None:
+        receive()
         effects.git(repo, "update-ref", "--create-reflog", "-m",
             f"loop-manager-base-fetch:{token}", refname, selected,
             before["oid"] or "0" * len(selected))
@@ -191,7 +202,76 @@ def _recorded_base_fetch(
         observe=lambda: {"oid": effects._tracking_ref_oid(repo, refname)},
         apply=apply, marker=marker,
     )
-    return selected
+
+
+def _remote_branch_oids(git, repo: Path) -> dict[str, str]:
+    result = git(repo, "ls-remote", "--heads", "origin")
+    branches: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if (len(fields) != 2 or not fields[1].startswith("refs/heads/")
+                or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", fields[0]) is None):
+            raise RuntimeError("project fetch 원격 branch 목록이 유효하지 않습니다.")
+        branch = fields[1].removeprefix("refs/heads/")
+        if (not branch or branch in branches or branch.endswith(("/", "."))
+                or any(part.startswith(".") or part.endswith(".lock") or not part for part in branch.split("/"))
+                or any(token in branch for token in ("..", "@{", "~", "^", ":", "?", "*", "[", "\\"))
+                or any(ord(char) < 32 or ord(char) == 127 for char in branch)):
+            raise RuntimeError("project fetch 원격 branch가 유효하지 않거나 중복됩니다.")
+        branches[branch] = fields[0]
+    return branches
+
+
+def _fetched_branch_oids(git, repo: Path) -> dict[str, str]:
+    path = Path(git(repo, "rev-parse", "--git-path", "FETCH_HEAD").stdout.strip())
+    if not path.is_absolute():
+        path = repo / path
+    branches: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(
+            r"([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\t(?:not-for-merge)?\tbranch '([^\s]+)' of .+", line,
+        )
+        if match is None or match[2] in branches:
+            raise RuntimeError("project fetch branch별 수신 결과가 유효하지 않습니다.")
+        branches[match[2]] = match[1]
+    return branches
+
+
+@fetch_resource
+def _recorded_project_fetch(
+    effects: RecordedBaseFetchEffects, repo: Path, state_dir: Path, base: str,
+) -> None:
+    """Receive branch objects together, then publish individually owned refs."""
+    branches = _remote_branch_oids(effects.git, repo)
+    for attempt in range(2):
+        if base not in branches:
+            raise RemoteBranchMissingError(f"origin/{base} 원격 branch를 찾을 수 없습니다.")
+        before = {branch: {"oid": effects._tracking_ref_oid(repo, f"refs/remotes/origin/{branch}")}
+                  for branch in branches}
+        changed = {branch: oid for branch, oid in branches.items() if before[branch]["oid"] != oid}
+        if changed:
+            result = effects.git(
+                repo, "fetch", "--no-tags", "--no-prune", "--no-prune-tags", "--refmap=",
+                "--recurse-submodules=no", "--stdin", "origin", check=False,
+                input="".join(f"refs/heads/{branch}\n" for branch in sorted(changed)),
+            )
+            received = _fetched_branch_oids(effects.git, repo) if not result.returncode else None
+            if result.returncode or received != changed:
+                if attempt == 0:
+                    refreshed = _remote_branch_oids(effects.git, repo)
+                    # Only a new remote observation can explain a failed receive.
+                    if refreshed != branches:
+                        branches = refreshed
+                        continue
+                reason = result.stdout[-2000:] if result.returncode else "branch별 원격 OID 관측 경쟁"
+                raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE if not result.returncode
+                                      else RecoveryReason.FETCH_FAILED, "project fetch 미완료: " + reason)
+            for oid in set(changed.values()):
+                effects.git(repo, "cat-file", "-e", f"{oid}^{{commit}}")
+        for branch, oid in sorted(branches.items()):
+            # Equal refs still enter the journal to finish interrupted receipts.
+            _record_fetch_ref(effects, repo, state_dir, branch, oid, before[branch], "project", lambda: None)
+        return
 
 
 @dataclass(frozen=True)

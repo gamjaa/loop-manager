@@ -1,4 +1,9 @@
 [
+  "tests.test_project_fetch_branch_deletion",
+  "tests.test_plan_block_revalidation.PlanRecoveryGateTests.test_fetch_lease_contention_keeps_same_remote_observation_retryable",
+  "tests.test_project_block_revalidation.ProjectRecoveryGateTests.test_fetch_lease_contention_keeps_same_remote_observation_retryable",
+  "tests.test_origin_isolation.OriginIsolationScopeTest.test_bulk_fetch_keeps_configured_refs_tags_and_dirty_checkout",
+  "tests.test_origin_isolation.OriginIsolationScopeTest.test_project_fetch_recovers_owned_ref_update_after_result_write_crash",
   "tests.test_verify_runtime",
   "tests.test_verify_contract",
   "tests.test_verify_windows",

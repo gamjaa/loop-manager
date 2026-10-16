@@ -382,17 +382,21 @@ def command(
     cwd: Path | None = None,
     check: bool = True,
     env: dict[str, str] | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    # Windows text pipes turn LF into CRLF; Git --stdin treats the CR as ref data.
+    transport = ({"input": input.encode("utf-8")} if input is not None else
+                 {"text": True, "encoding": "utf-8", "errors": "replace"})
     result = effects._handoff_run(
         arguments,
         cwd=cwd,
         env=env,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        **transport,
     )
+    if input is not None:
+        result.stdout = result.stdout.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     if check and result.returncode:
         output = result.stdout[-6000:].strip()
         raise RuntimeError(f"명령 실패 ({' '.join(arguments[:3])}):\n{output}")
@@ -424,8 +428,10 @@ class GitEffects:
 def git(
     effects: GitEffects, repo: Path, *arguments: str, check: bool = True,
     env: dict[str, str] | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return command_adapter.git(effects._command_adapter_effects_git(), repo, *arguments, check=check, env=env)
+    return command_adapter.git(effects._command_adapter_effects_git(), repo, *arguments, check=check, env=env,
+                               **({"input": input} if input is not None else {}))
 
 
 def github_repository(origin_url: str) -> str:

@@ -1,6 +1,7 @@
 from tests.support.lifecycle import fixture_cleanup
 import sqlite3
 from types import SimpleNamespace
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 import loop_manager
@@ -16,6 +17,13 @@ class BlockedRemoteFixture:
         self._prepare_blocked_remote()
 
     def _prepare_blocked_remote(self):
+        # These scenarios replace Git effects on /repo and /state; real lease
+        # contention belongs to the concrete fetch boundary regressions.
+        for module in ('checkpoint_recovery', 'blocked_plan_reconciliation', 'project_blocked_recovery'):
+            lease = mock.patch('loop_manager_internal.recovery.' + module + '.resource_locks',
+                               side_effect=lambda *args, **kwargs: nullcontext())
+            lease.start()
+            self.addCleanup(lease.stop)
         self.connection = sqlite3.connect(':memory:')
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)

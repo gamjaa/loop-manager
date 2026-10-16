@@ -20,6 +20,50 @@ from loop_manager_internal.runtime import bootstrap
 
 @isolated_git_test
 class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
+    def test_bulk_fetch_keeps_configured_refs_tags_and_dirty_checkout(self):
+        """Real Git proves stdin receives distinct objects without configured ref writes."""
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            renamed = Path(directory) / 'source 한글 space'
+            source.rename(renamed)
+            source = renamed
+            state_dir = Path(directory) / 'state'
+            original = git(source, 'rev-parse', 'HEAD')
+            git(source, 'branch', 'unowned')
+            git(source, 'update-ref', 'refs/remotes/origin/deleted', original)
+            selected = advance_remote(writer)
+            branch = "feature/한글's"
+            git(writer, 'checkout', '-b', branch)
+            (writer / 'feature.txt').write_text('feature\n', encoding='utf-8')
+            git(writer, 'add', 'feature.txt')
+            git(writer, 'commit', '-m', 'Feature')
+            feature = git(writer, 'rev-parse', 'HEAD')
+            git(writer, 'tag', 'remote-tag')
+            git(writer, 'push', 'origin', branch, '--tags')
+            git(source, 'config', '--replace-all', 'remote.origin.fetch',
+                '+refs/heads/*:refs/heads/unowned/*')
+            git(source, 'config', 'remote.origin.tagOpt', '--tags')
+            for name in ('fetch.prune', 'fetch.pruneTags', 'remote.origin.prune', 'remote.origin.pruneTags'):
+                git(source, 'config', name, 'true')
+            (source / 'tracked.txt').write_text('local edit\n', encoding='utf-8')
+            before_refs = dict(line.split(' ', 1) for line in git(
+                source, 'for-each-ref', '--format=%(refname) %(objectname)').splitlines())
+            before_status = git(source, 'status', '--porcelain')
+            before_symbolic_head = git(source, 'symbolic-ref', 'refs/remotes/origin/HEAD')
+            with mock.patch.object(loop_manager, 'git', wraps=loop_manager.git) as calls:
+                self.assertEqual(loop_manager.remote_base(source, 'main', state_dir=state_dir), 'main')
+            after_refs = dict(line.split(' ', 1) for line in git(
+                source, 'for-each-ref', '--format=%(refname) %(objectname)').splitlines())
+            self.assertEqual(after_refs, {**before_refs, 'refs/remotes/origin/main': selected,
+                                         'refs/remotes/origin/HEAD': selected,
+                                         'refs/remotes/origin/' + branch: feature})
+            self.assertEqual(git(source, 'symbolic-ref', 'refs/remotes/origin/HEAD'), before_symbolic_head)
+            self.assertEqual(git(source, 'status', '--porcelain'), before_status)
+            self.assertEqual(git(source, 'rev-parse', 'HEAD'), original)
+            self.assertEqual((source / 'tracked.txt').read_text(), 'local edit\n')
+            self.assertEqual(sum(call.args[1] == 'fetch' for call in calls.call_args_list), 1)
+            self.assertEqual(sum(call.args[1] == 'ls-remote' for call in calls.call_args_list), 1)
+
     def test_project_fetch_recovers_owned_ref_update_after_result_write_crash(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)

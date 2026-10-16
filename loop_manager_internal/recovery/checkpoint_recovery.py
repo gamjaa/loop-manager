@@ -1,5 +1,6 @@
 """Checkpoint successor adoption and cause-specific candidate revalidation."""
 from __future__ import annotations
+from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
 from collections.abc import Callable
@@ -248,17 +249,19 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     try:
         # Project recovery may not trust configured mappings to shared refs.
         refmap_options = ("--refmap=",)
-        fetched = effects.git(
-            repo_path, "fetch", "--no-tags", *refmap_options, "origin",
-            f"refs/heads/{branch}", check=False,
-        )
+        with resource_locks(state_dir, str(repo_path.resolve()), ['git:fetch'], owner='checkpoint-fetch'):
+            fetched = effects.git(
+                repo_path, "fetch", "--no-tags", *refmap_options, "origin",
+                f"refs/heads/{branch}", check=False,
+            )
+            fetched_result = effects.git(
+                repo_path, "rev-parse", "FETCH_HEAD^{commit}", check=False,
+            ) if not fetched.returncode else None
     except (OSError, RuntimeError) as error:
         return retry("원격 checkpoint branch fetch 미완료: " + str(error))
     if fetched.returncode:
         return retry("원격 checkpoint branch fetch 실패: " + fetched.stdout[-2000:])
-    fetched_result = effects.git(
-        repo_path, "rev-parse", "FETCH_HEAD^{commit}", check=False,
-    )
+    assert fetched_result is not None
     if fetched_result.returncode:
         return retry("fetch된 원격 checkpoint OID를 확인할 수 없습니다.")
     fetched_oid = fetched_result.stdout.strip()

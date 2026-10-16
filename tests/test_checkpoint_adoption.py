@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from contextlib import nullcontext
 
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.storage import blocked_checkpoint_state
@@ -20,6 +21,11 @@ from loop_manager_internal.git import managed_rebase_validation as rebase_policy
 
 class CheckpointRefreshFixture:
     def setUp(self):
+        for module in ('checkpoint_recovery', 'work_branch_integration'):
+            lease = mock.patch('loop_manager_internal.recovery.' + module + '.resource_locks',
+                               side_effect=lambda *args, **kwargs: nullcontext())
+            lease.start()
+            self.addCleanup(lease.stop)
         self.connection = sqlite3.connect(':memory:')
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)

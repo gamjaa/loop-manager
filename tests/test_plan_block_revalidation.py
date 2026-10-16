@@ -23,6 +23,16 @@ from tests.support.git import git_command
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_fetch_lease_contention_keeps_same_remote_observation_retryable(self):
+        with mock.patch.object(self.coordinator, '_incorporate',
+                side_effect=loop_manager.ProcessLockBusyError('git:fetch is occupied')) as incorporate:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        incorporate.assert_called_once()
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        saved = self.connection.execute(
+            "SELECT stage FROM blocked_plan_reconciliations WHERE repo=? AND plan_id='G-106'", (self.repo,)).fetchone()
+        self.assertNotEqual(saved['stage'], 'refused')
+
     def test_other_plans_pr_recovery_defers_without_mutating_owner_or_input(self):
         runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
         runtime.update_plan(self.repo, 'G-107', plan_values={'pr_conflict_recovery': 1})

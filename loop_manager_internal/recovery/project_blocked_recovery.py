@@ -8,6 +8,8 @@ from dataclasses import dataclass, replace
 from collections.abc import Callable
 import json
 from pathlib import Path
+from loop_manager_internal.runtime.resource_lock import resource_locks
+from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.recovery.blocked_checkpoint import CheckpointPushError, PreparedCheckpoint, PushMode, decide_diagnostic_push
@@ -279,11 +281,12 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                          and accepted['head'] == self.ports.git(
                              worktree, 'rev-parse', 'HEAD^{commit}').stdout.strip())
         if current.operation != 'rebase' and not completed:
-            fetched = self.ports.git(self.repo_path, 'fetch', '--no-tags', '--refmap=', 'origin', context['base_ref'], check=False)
-            if fetched.returncode:
-                raise AssessmentPending('project 복구 base fetch 실패: ' + fetched.stdout[-2000:])
-            if self.ports.git(self.repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip() != target:
-                raise InputChanged('project 복구 base 조회·fetch 사이 OID 경쟁')
+            with resource_locks(self.state_dir, str(self.repo_path.resolve()), ['git:fetch'], owner='project-recovery-fetch'):
+                fetched = self.ports.git(self.repo_path, 'fetch', '--no-tags', '--refmap=', 'origin', context['base_ref'], check=False)
+                if fetched.returncode:
+                    raise AssessmentPending('project 복구 base fetch 실패: ' + fetched.stdout[-2000:])
+                if self.ports.git(self.repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip() != target:
+                    raise InputChanged('project 복구 base 조회·fetch 사이 OID 경쟁')
             self._remote(context, allow_published=True)
         if current.operation != 'rebase' and not completed:
             # Before HEAD is a current identity, not historical replay evidence.
@@ -568,7 +571,7 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                 waiting['worktree_fingerprint'] = self.ports._worktree_state_signature(Path(context['identity']['worktree']))
                 context['waiting_input'] = observations.input_identity(waiting)
                 self._save(plan_id, key, stage, context)
-            retryable = (isinstance(error, AssessmentPending)
+            retryable = (isinstance(error, (AssessmentPending, ProcessLockBusyError))
                          or isinstance(error, RecoveryFailure)
                          and error.reason is RecoveryReason.PUBLICATION_RETRY
                          or isinstance(error, CheckpointPushError) and error.retryable)

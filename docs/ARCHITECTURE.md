@@ -1524,6 +1524,8 @@ ignored 비교 view는 시작 ignore 규칙의 blob·index·작업 상태 또는
 
 Manager fetch·worktree·rebase journal은 실제 미완료 Git 전이의 자원·현재 기대값·소유자·확정 결과를 보존한다. 재시작은 현재 소유 자원과 journal의 실제 결과를 대조해 이어가며 과거 Agent snapshot 차이를 허용하기 위한 receipt gate로 사용하지 않는다. 수행하지 않은 Git 성공이나 sandbox 격리 성공을 합성하지 않는다.
 
+프로젝트 전체 원격 동기화는 branch 목록·OID를 한 번 조회하고 변경된 branch의 객체를 하나의 `fetch --stdin`으로 받는다. 목적 ref 없는 명시적 입력과 빈 `--refmap=`을 사용하고 prune·태그·submodule 갱신을 끈다. 같은 repository의 fetch와 `FETCH_HEAD` 결과 확보는 공유 fetch 잠금으로 보호하며, Git이 알려준 `FETCH_HEAD` 경로에서 branch별 OID를 읽어 조회 결과와 대조한다. 일반 branch 삭제나 OID 경쟁은 전체 재관측·일괄 수신을 한 번만 재시도하고 필수 base 부재·관측 실패는 보존·재시도 경계로 돌린다. 수신이 확인된 뒤 기존 ref별 journal과 예상 이전 OID로 추적 ref를 반영한다. 변경 없는 ref도 미확정 journal을 먼저 처리하므로 단일 fetch로 남긴 과거 기록과 일부 ref 반영 뒤 중단을 같은 형식으로 재개한다.
+
 Codex의 `refs/codex/turn-diffs/*`와 다른 작업의 정상 공유 ref 변화를 해당 Agent에 귀속하지 않는다. 현재 게시 branch의 원격 tip은 이번 push의 통합·명시적 `--force-with-lease` 조건으로 관측한다.
 
 Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내장 쓰기 제한과 granular 자동 승인 검토를 유지한다. Codex 프로세스 전체를 감싸는 바깥 sandbox와 중첩 sandbox 호환성은 호출 조건이 아니며 정상 session·로그 저장을 Agent의 workspace 밖 쓰기 권한과 구분한다.

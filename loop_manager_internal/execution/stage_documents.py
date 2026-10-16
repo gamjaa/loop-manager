@@ -1,5 +1,6 @@
 """기존 문서 판단·PR 전 개정 게시의 복구. 새 입력은 Worker revision gate가 처리한다."""
 from __future__ import annotations
+from loop_manager_internal.runtime.resource_lock import resource_locks
 
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -376,7 +377,8 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         original = snapshot_from_dict(item["original"])
         snapshot = MutableReadySnapshot(repo, item["base"], (original,),
             mutable_snapshot_token(repo, item["base"], (original,)))
-        effects.git(identity.repo_path, "fetch", "origin")
+        with resource_locks(identity.state_dir, str(identity.repo_path.resolve()), ['git:fetch'], owner='document-fetch'):
+            effects.git(identity.repo_path, "fetch", "origin")
         remote = effects.git(identity.repo_path, "rev-parse", f"origin/{identity.base}").stdout.strip()
         published = effects.git(identity.repo_path, "merge-base", "--is-ancestor", item["commit"], remote, check=False)
         if published.returncode not in {0, 1}:
@@ -400,7 +402,8 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
                 raise PlannerValidationError("보존된 문서 게시 후보가 변경됐습니다.")
             remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace)
             effects.git(workspace, "push", "origin", f"{item['commit']}:refs/heads/{identity.base}")
-            effects.git(identity.repo_path, "fetch", "origin")
+            with resource_locks(identity.state_dir, str(identity.repo_path.resolve()), ['git:fetch'], owner='document-fetch'):
+                effects.git(identity.repo_path, "fetch", "origin")
         remote = effects.git(identity.repo_path, 'rev-parse', f'origin/{identity.base}').stdout.strip()
         if remote != item['commit']:
             delta = effects.git(identity.repo_path, 'diff', '--name-only', '-z', item['commit'], remote).stdout.split('\0')

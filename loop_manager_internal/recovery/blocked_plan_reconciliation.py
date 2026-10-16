@@ -8,6 +8,8 @@ from loop_manager_internal.storage.manual_work_state import manual_workspace_own
 
 import json
 from pathlib import Path
+from loop_manager_internal.runtime.resource_lock import resource_locks
+from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from loop_manager_internal.recovery.scoped_blocking import GUIDANCE_BLOCK_REASON, PR_CLOSED_BLOCK_REASON
@@ -307,12 +309,13 @@ class BlockedPlanReconciler:
             checkpoint, context['identity']['branch'], context['identity']['worktree'])
         if branch.oid not in allowed:
             if (refresh_pending or checkpoint.operation == 'rebase') and context['branch_oid'] and branch.oid:
-                fetched = self.ports.git(
-                    self.repo_path, 'fetch', '--no-tags', '--refmap=', 'origin',
-                    context['branch_ref'], check=False)
-                if fetched.returncode:
-                    raise AssessmentPending('진행 중인 작업 branch의 새 사용자 입력 fetch를 재시도합니다.')
-                head = self.ports.git(self.repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
+                with resource_locks(self.state_dir, str(self.repo_path.resolve()), ['git:fetch'], owner='plan-recovery-fetch'):
+                    fetched = self.ports.git(
+                        self.repo_path, 'fetch', '--no-tags', '--refmap=', 'origin',
+                        context['branch_ref'], check=False)
+                    if fetched.returncode:
+                        raise AssessmentPending('진행 중인 작업 branch의 새 사용자 입력 fetch를 재시도합니다.')
+                    head = self.ports.git(self.repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
                 relation = self.ports.git(self.repo_path, 'merge-base', '--is-ancestor',
                                           context['branch_oid'], head, check=False).returncode
                 if head != branch.oid or relation not in {0, 1}:
@@ -731,7 +734,7 @@ class BlockedPlanReconciler:
             request = self.connection.execute(
                 'SELECT phase FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
                 (self.repo, plan_id)).fetchone()
-            retry = (checkpoint.operation is not None or isinstance(error, AssessmentPending)
+            retry = (checkpoint.operation is not None or isinstance(error, (AssessmentPending, ProcessLockBusyError))
                      or isinstance(error, RecoveryFailure)
                      and error.reason in {
                          RecoveryReason.PUBLICATION_RETRY,

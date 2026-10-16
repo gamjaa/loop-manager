@@ -175,6 +175,14 @@ def register(assembly: Composition) -> None:
         ),
     )
 
+    assembly.bind('_recorded_project_fetch', base_fetch_service._recorded_project_fetch,
+        lambda: base_fetch_service.RecordedBaseFetchEffects(
+            _canonical_path=assembly.callback('_canonical_path'),
+            _tracking_ref_oid=assembly.callback('_tracking_ref_oid'),
+            git=assembly.callback('git'),
+        ),
+    )
+
     assembly.bind('_recorded_base_fetch', base_fetch_service._recorded_base_fetch,
         lambda: base_fetch_service.RecordedBaseFetchEffects(
             _canonical_path=assembly.callback('_canonical_path'),

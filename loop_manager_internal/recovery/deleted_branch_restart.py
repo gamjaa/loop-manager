@@ -1,5 +1,6 @@
 """명시적인 삭제 작업 재시작: 이전 worktree 전체를 보존하고 새 실행을 만든다."""
 from pathlib import Path
+from loop_manager_internal.runtime.resource_lock import resource_locks
 from uuid import uuid4
 
 from loop_manager_internal.git import manager_git_journal
@@ -62,9 +63,10 @@ def restart(effects, connection, repo_path, state_dir, repo, plan_id, *, complet
         before = effects.capture_git_snapshot(worktree)
         if before.operations:
             raise RuntimeError('진행 중인 Git 작업이 끝나야 재시작할 수 있습니다.')
-        effects.git(repo_path, 'fetch', '--no-tags', 'origin',
-                    f'+refs/heads/{project["base_branch"]}:refs/remotes/origin/{project["base_branch"]}')
-        base = effects.git(repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
+        with resource_locks(state_dir, str(repo_path.resolve()), ['git:fetch'], owner='restart-fetch'):
+            effects.git(repo_path, 'fetch', '--no-tags', 'origin',
+                        f'+refs/heads/{project["base_branch"]}:refs/remotes/origin/{project["base_branch"]}')
+            base = effects.git(repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
         token = uuid4().hex
         intent = {'state': 'prepared', 'base': base, 'plan': dict(plan), 'block': dict(block),
             'snapshot': before.serialize(), 'archive': str(worktree.parent / 'retired' / token),

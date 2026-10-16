@@ -27,6 +27,7 @@ class GitBytesEffects:
 def git(effects: GitEffects,
     repo: Path, *arguments: str, check: bool = True,
     env: dict[str, str] | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command_index = 0
     while command_index < len(arguments) and arguments[command_index] == "-c":
@@ -60,6 +61,7 @@ def git(effects: GitEffects,
     result = effects.command(
         ["git", "-C", str(repo), *options, *arguments], check=False,
         **({"env": env} if env is not None else {}),
+        **({"input": input} if input is not None else {}),
     )
     if check and result.returncode:
         output = result.stdout[-6000:].strip()

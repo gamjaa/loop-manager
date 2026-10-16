@@ -9,6 +9,7 @@ import json
 import hashlib
 import tempfile
 from pathlib import Path
+from loop_manager_internal.runtime.resource_lock import resource_locks
 
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
@@ -205,9 +206,10 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
             urls = effects.git(context, *args).stdout.splitlines()
             if len(urls) != 1 or effects.github_repository(urls[0]) != project['origin']:
                 raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, '현재 등록 origin과 Git 대상이 다릅니다.')
-    effects.git(repo_path, 'fetch', '--no-tags', 'origin',
-                f'+refs/heads/{branch}:refs/remotes/origin/{branch}')
-    fetched = effects.git(repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
+    with resource_locks(state_dir, str(repo_path.resolve()), ['git:fetch'], owner='work-branch-fetch'):
+        effects.git(repo_path, 'fetch', '--no-tags', 'origin',
+                    f'+refs/heads/{branch}:refs/remotes/origin/{branch}')
+        fetched = effects.git(repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
     live = effects.git(repo_path, 'ls-remote', '--heads', 'origin', f'refs/heads/{branch}').stdout.splitlines()
     if fetched != remote or [line.split() for line in live] != [[remote, f'refs/heads/{branch}']]:
         raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '작업 branch가 fetch 사이에 변경됐습니다.')

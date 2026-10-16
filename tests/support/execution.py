@@ -1,4 +1,5 @@
 from tests.support.lifecycle import fixture_cleanup
+from contextlib import nullcontext
 from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,6 +81,14 @@ class ExecutionFixture:
     """Reusable setup and adapters; no discoverable test methods."""
 
     def setUp(self):
+        # Fake Git policy scenarios have no repository lease; concrete fetch
+        # contention is covered by test_project_fetch_branch_deletion.
+        for module in ('execution.execution_latest_base_handler', 'execution.stage_documents',
+                       'recovery.checkpoint_recovery', 'recovery.work_branch_integration'):
+            lease = mock.patch('loop_manager_internal.' + module + '.resource_locks',
+                               side_effect=lambda *args, **kwargs: nullcontext())
+            lease.start()
+            self.addCleanup(lease.stop)
         # Hash fallback and later phase gates must consume the same fixed inputs.
         guidance_root = mock.patch(
             'loop_manager_internal.agents.common_guidance.RUNTIME_ROOT', PROJECT_FILES,

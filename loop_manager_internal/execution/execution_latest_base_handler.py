@@ -1,5 +1,6 @@
 """Latest Base execution policy and narrow typed ports."""
 from __future__ import annotations
+from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.runtime import operation_events as events
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome
 from dataclasses import dataclass
@@ -54,7 +55,9 @@ class LatestBaseHandler:
 
     def _fetch_latest_base(self):
         try:
-            self.ports.git(self.ports.identity.repo_path, 'fetch', 'origin')
+            with resource_locks(self.ports.identity.state_dir, str(self.ports.identity.repo_path.resolve()),
+                                ['git:fetch'], owner='latest-base-fetch'):
+                self.ports.git(self.ports.identity.repo_path, 'fetch', 'origin')
             return self.ports.git(
                 self.ports.identity.repo_path, 'rev-parse', f"origin/{self.ports.identity.base}"
             ).stdout.strip()

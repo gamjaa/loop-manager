@@ -17,6 +17,16 @@ from tests.support.blocked_remote import ProjectRemoteRecoveryFixture
 
 
 class ProjectRecoveryGateTests(ProjectRemoteRecoveryFixture, unittest.TestCase):
+    def test_fetch_lease_contention_keeps_same_remote_observation_retryable(self):
+        with mock.patch.object(self.coordinator, '_incorporate',
+                side_effect=loop_manager.ProcessLockBusyError('git:fetch is occupied')) as incorporate:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        incorporate.assert_called_once()
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        saved = self.connection.execute(
+            "SELECT stage FROM project_blocked_reconciliations WHERE repo=? AND plan_id='G-106'", (self.repo,)).fetchone()
+        self.assertNotEqual(saved['stage'], 'refused')
+
     def test_other_active_or_projected_plan_and_planning_defer_all_git_writes(self):
         for update, reset in (
                 ("UPDATE exec_plans SET status = 'IMPLEMENTING' WHERE plan_id = 'G-107'",
