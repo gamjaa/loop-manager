@@ -240,6 +240,35 @@ class TargetedRecoveryTests(TestCase):
         self.replay()
         self.assertFalse(self.tests.pending('repo', 'G-2'))
 
+    def test_directory_scan_error_preserves_unconsumed_results_until_retry(self):
+        for error_type in (PermissionError, OSError):
+            with self.subTest(error=error_type.__name__):
+                plan = error_type.__name__
+                identity, directory = self.bind(plan, plan=plan)
+                self.write(directory, (plan + '-a', plan + '-b', plan + '-c'))
+                originals = {path: path.read_bytes() for path in directory.iterdir()}
+                with mock.patch.object(targeted.os, 'scandir', side_effect=error_type('scan unavailable')):
+                    with self.assertRaises(error_type):
+                        targeted.collect(directory)
+                    self.replay()
+                row = self.connection.execute('''SELECT status, error FROM targeted_test_collections
+                    WHERE invocation_id=?''', (identity,)).fetchone()
+                self.assertEqual(tuple(row), ('error', error_type.__name__))
+                self.assertTrue(self.tests.pending('repo', plan))
+                self.assertEqual(self.tests.sequence('repo', plan), 0)
+                self.assertFalse(self.tests.repeated('repo', plan))
+                self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+                self.connection.close()
+                self.open()
+                self.replay()
+                self.assertFalse(self.tests.pending('repo', plan))
+                self.assertEqual(len(self.connection.execute('''SELECT * FROM targeted_test_results
+                    WHERE repo='repo' AND plan_id=?''', (plan,)).fetchall()), 3)
+                self.assertEqual(self.tests.repeated('repo', plan), ('tests.Sample.test_one',))
+                sequence = self.tests.sequence('repo', plan)
+                self.replay()
+                self.assertEqual(self.tests.sequence('repo', plan), sequence)
+
 
 class TargetedRunnerTests(TestCase):
     def test_unittest_records_native_results_for_each_execution(self):

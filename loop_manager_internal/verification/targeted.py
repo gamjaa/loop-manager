@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -34,7 +35,10 @@ def collect(directory):
     root = Path(directory).absolute()
     if root.resolve() != root or not root.is_dir():
         raise ValueError('targeted test 기록 폴더가 없거나 교체되었습니다.')
-    for path in sorted(root.glob('targeted-*.jsonl')):
+    with os.scandir(root) as entries:
+        paths = sorted(root / entry.name for entry in entries
+                       if fnmatch.fnmatch(entry.name, 'targeted-*.jsonl'))
+    for path in paths:
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or path.resolve().parent != root or info.st_size > 16 * 1024 * 1024:
             raise ValueError('targeted test 기록 경로·크기가 유효하지 않습니다.')
