@@ -103,7 +103,8 @@ class RebaseCorrectionRepository:
         )
 
     def observe(self, repo: str, plan_id: str, observation: ConflictObservation,
-                *, corrected: bool = False, expected_generation: int | None = None,
+                *, corrected: bool = False, count_correction: bool = True,
+                expected_generation: int | None = None,
                 worker_session: str | None = None, worker_result: str | None = None,
                 scope_marker: str | None = None,
                 persist_worker_result: bool = True) -> CorrectionRecord:
@@ -117,7 +118,7 @@ class RebaseCorrectionRepository:
         history = json.loads(row["history"]) if row else {}
         key = self._key(observation)
         seen_before = key in history
-        if corrected and seen_before:
+        if corrected and count_correction and seen_before:
             history[key] += 1
         else:
             history.setdefault(key, 0)

@@ -103,6 +103,7 @@ class WorkerHandler:
     def _targeted_test_block(self, context):
         repository = TargetedTestRepository(self.ports.state.connection)
         repo, plan_id = self.ports.identity.repo, context.plan.plan_id
+        repository.reconcile(state_dir=self.ports.identity.state_dir, repo=repo, plan_id=plan_id)
         repeated = repository.repeated(repo, plan_id)
         if not repeated:
             return None
@@ -112,6 +113,17 @@ class WorkerHandler:
                                           detail, context=context)
             repository.acknowledge(repo, plan_id)
         return outcome
+
+    def _targeted_collection_pause(self, context, detail, *, worker_result=None):
+        self.ports.state.update_project(self.ports.identity.repo, phase='WORKING', last_error=detail)
+        if context.resolving_rebase:
+            return self.ports._rebase_conflict(
+                context, detail, corrected=True, worker_result=worker_result,
+                recovery_reason=RecoveryReason.TARGETED_TEST_CORRECTION,
+                targeted_evidence_missing=True,
+            )
+        return self.ports._recover(RecoveryReason.TARGETED_TEST_CORRECTION,
+                                  detail, context=context, attempts=1)
 
     def _parse_worker_outcome(self, context, message, *, allow_legacy_ready=False):
         allowed = {context.plan.path, *context.plan.sources,
@@ -170,6 +182,8 @@ class WorkerHandler:
         if blocked is not None:
             return blocked
         targeted_tests = TargetedTestRepository(self.ports.state.connection)
+        if targeted_tests.pending(self.ports.identity.repo, context.plan.plan_id):
+            return self._targeted_collection_pause(context, 'targeted test 실행 근거의 종료 확인·재수집 대기')
         targeted_sequence = targeted_tests.sequence(self.ports.identity.repo, context.plan.plan_id)
         row = self.ports._row()
         try:
@@ -341,9 +355,15 @@ class WorkerHandler:
                 feedback_repo.bind_session(delivery.attempt_id, started_session_id)
         def worker_call(current_session_id, session_recovery, invocation):
             nonlocal delivery, active_transition
+            targeted_tests.reconcile(state_dir=self.ports.identity.state_dir,
+                                     repo=self.ports.identity.repo, plan_id=context.plan.plan_id)
             if targeted_tests.repeated(self.ports.identity.repo, context.plan.plan_id):
                 return AgentResult(1, '동일 targeted test 연속 3회 실패: 추가 CLI 재시도를 중단합니다.',
                                    current_session_id, AgentResultKind.PERMANENT_CONFIGURATION)
+            if targeted_tests.pending(self.ports.identity.repo, context.plan.plan_id):
+                return AgentResult(1, 'targeted test 실행 근거의 종료 확인·재수집 대기',
+                                   current_session_id, AgentResultKind.PERMANENT_CONFIGURATION,
+                                   targeted_collection_pending=True)
             previous_session = observed_session_id or active_session_id
             if (session_recovery and previous_session
                     and (active_transition is None
@@ -522,6 +542,9 @@ class WorkerHandler:
             return blocked
         targeted_evidence_missing = targeted_tests.sequence(
             self.ports.identity.repo, context.plan.plan_id) == targeted_sequence
+        if code and result.targeted_collection_pending:
+            return self._targeted_collection_pause(context, 'targeted test 실행 근거의 종료 확인·재수집 대기',
+                                                  worker_result=message)
         catalog_plan = self.ports.snapshot().catalog_plan
         assert catalog_plan is not None
         if restored_frontmatter:
@@ -589,6 +612,10 @@ class WorkerHandler:
                 context = checked
             self.ports.parse_worker_result(message, self.ports.snapshot().plan)
         except (WorkerOutcomeError, self.ports.contract.WorkerResultError) as error:
+            if isinstance(error, TargetedTestFailure) and targeted_tests.pending(
+                    self.ports.identity.repo, context.plan.plan_id):
+                return self._targeted_collection_pause(context, 'targeted test 실행 근거의 종료 확인·재수집 대기',
+                                                      worker_result=message)
             self.ports.clear_agent_scope(self.ports.identity.repo)
             validation_error = f"Worker 결과 검증 실패:\n{error}"
             if isinstance(error, TargetedTestFailure) and targeted_evidence_missing:
@@ -617,6 +644,9 @@ class WorkerHandler:
                 RecoveryReason.WORKER_CORRECTION, validation_error,
                 context=context,
             )
+        if result.targeted_collection_pending or targeted_tests.pending(self.ports.identity.repo, context.plan.plan_id):
+            return self._targeted_collection_pause(context, 'targeted test 실행 근거의 종료 확인·재수집 대기',
+                                                  worker_result=message)
         self.ports.clear_agent_scope(self.ports.identity.repo)
         delivered_session = result.session_id or self.ports._row()['worker_session_id']
         if feedback_repo is not None and delivery is not None and delivered_session:

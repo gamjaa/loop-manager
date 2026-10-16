@@ -24,10 +24,10 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/agents/invocation_service.py`의 `observe_launch`·finally 수집과 `agents/agent_invocation.py`의 물리 retry identity를 재사용한다. `agents/process_receipt.py`와 `storage/agent_invocation_state.py`에 직접 반영된 실행 전 receipt 경로 결합·종료 복구를 소비하며 종료 ledger를 새로 만들지 않는다. 이 증거에 targeted 기록 위치·미소비 수집을 결합해 정상/예외 종료·중단 복구에서 같은 자료를 재관측한다. receipt 부재·불확실·live writer를 폴더 존재나 result_code로 대신 확인하지 않는다. Codex 전용 launch 객체가 없는 공급자도 소비할 수 있는 최소 기록 문맥을 두되 실제 Claude 연결은 G-292에 남긴다.
-- [ ] 확인한 `loop_manager_internal/storage/agent_invocation_state.py`의 ledger·`reconcile_interrupted()`와 `storage/targeted_test_state.py`의 중복 없는 저장을 연결한다. 기존 scope·호출/프로세스 종료·수동 작업 보호를 재사용하고 필요한 비밀값 없는 결합 정보만 호환되게 보존한다. 광범위한 상태 폴더 탐색으로 경로의 repository·작업 귀속을 추측하지 않는다.
-- [ ] 확인한 `loop_manager_internal/verification/targeted.py:collect()`의 경로/크기·identity·완료 줄 검사와 `execution/execution_worker_handler.py`의 호출 전/후 차단·증거 부재 판정을 재수집 경계와 연결한다. 수집 오류를 provider 설정 실패나 rebase 완료 보고 횟수로 오인하지 않도록 `execution_rebase_handler.py`·`recovery/recovery_runtime.py`의 기존 targeted correction/pause를 사용한다. 실제 독립 오류는 숨기지 않는다.
-- [ ] 확인한 `tests/test_agent_invocation.py`·`tests/test_targeted_test_streak.py`의 임시 파일·실제 SQLite fixture와 `tests/test_execution_worker_phase.py`의 일반/rebase 경계를 확장한다. 중단 위치를 주입해 durable 재관측을 검사하고 실제 유료 Agent·Git 실행은 추가하지 않는다. PRODUCT·ARCHITECTURE에는 반영한 복구 경계만 통합한다.
+- [x] 확인한 `loop_manager_internal/agents/invocation_service.py`의 `observe_launch`·finally 수집과 `agents/agent_invocation.py`의 물리 retry identity를 재사용한다. `agents/process_receipt.py`와 `storage/agent_invocation_state.py`에 직접 반영된 실행 전 receipt 경로 결합·종료 복구를 소비하며 종료 ledger를 새로 만들지 않는다. 이 증거에 targeted 기록 위치·미소비 수집을 결합해 정상/예외 종료·중단 복구에서 같은 자료를 재관측한다. receipt 부재·불확실·live writer를 폴더 존재나 result_code로 대신 확인하지 않는다. Codex 전용 launch 객체가 없는 공급자도 소비할 수 있는 최소 기록 문맥을 두되 실제 Claude 연결은 G-292에 남긴다.
+- [x] 확인한 `loop_manager_internal/storage/agent_invocation_state.py`의 ledger·`reconcile_interrupted()`와 `storage/targeted_test_state.py`의 중복 없는 저장을 연결한다. 기존 scope·호출/프로세스 종료·수동 작업 보호를 재사용하고 필요한 비밀값 없는 결합 정보만 호환되게 보존한다. 광범위한 상태 폴더 탐색으로 경로의 repository·작업 귀속을 추측하지 않는다.
+- [x] 확인한 `loop_manager_internal/verification/targeted.py:collect()`의 경로/크기·identity·완료 줄 검사와 `execution/execution_worker_handler.py`의 호출 전/후 차단·증거 부재 판정을 재수집 경계와 연결한다. 수집 오류를 provider 설정 실패나 rebase 완료 보고 횟수로 오인하지 않도록 `execution_rebase_handler.py`·`recovery/recovery_runtime.py`의 기존 targeted correction/pause를 사용한다. 실제 독립 오류는 숨기지 않는다.
+- [x] 확인한 `tests/test_agent_invocation.py`·`tests/test_targeted_test_streak.py`의 임시 파일·실제 SQLite fixture와 `tests/test_execution_worker_phase.py`의 일반/rebase 경계를 확장한다. 중단 위치를 주입해 durable 재관측을 검사하고 실제 유료 Agent·Git 실행은 추가하지 않는다. PRODUCT·ARCHITECTURE에는 반영한 복구 경계만 통합한다.
 
 ## Validation
 
@@ -41,8 +41,8 @@ priority: high
 ## Progress
 
 - [x] delta의 invocation·runner·저장·Worker/rebase 변경 및 `agent_invocation_state.py`의 재시작 조정을 정적으로 대조했다. DB 반영 후의 재개와 Python finally 종료는 직접 구현된 것으로 구분했다.
-- [ ] 물리 호출의 기록 위치 결합·미소비 수집 복구
-- [ ] 중단·경합·중복·증거 부재의 최소 unit 회귀
+- [x] 물리 호출의 기록 위치 결합·미소비 수집 복구
+- [x] 중단·경합·중복·증거 부재의 최소 unit 회귀
 
 ## Decision Log
 
@@ -51,3 +51,19 @@ priority: high
 - complexity high: 파일 기록·물리 호출 종료·DB 반영·차단 소비 사이 중단과 살아 있는 writer의 소유권을 일관되게 연결할 판단이 남아 있다. risk high: 누락·오귀속이 필수 차단을 우회하거나 다른 작업을 잘못 차단하며 사후 수동 복구에는 원문과 호출 결합이 필요하다. 미소비 자료·기존 결과를 보존하고 정확한 identity·transaction·중단 회귀로 완화한다. priority high는 실제 실행 근거 보존이라는 필수 무인 계약 때문이다.
 - 쓰기 허용 경로·인증 저장·Git 전이·같은 프로젝트 병렬 실행을 넓히지 않는다. 비호환 DB/상태 변경이 필요하면 해당 구현을 멈추고 Architecture Change Policy의 판단을 남긴다. additive 결합의 기술 선택을 사용자 정책의 새 승인으로 만들지 않는다.
 - 선택된 unittest version 1·launcher Python 3.11–3.14·기존 필수 compile과 Agent guard를 유지한다. Planner는 구현·테스트·verify를 실행하지 않았으며 기존 KeyboardInterrupt/DB 재개 테스트의 성공을 새 중단 구간의 검증으로 주장하지 않는다.
+
+## Implementation Record
+
+- 2026-10-16 Worker: invocation ledger에 결합한 `targeted_test_collections`와 실행 ID 귀속을 additive schema로 추가했다. 실행 전에 기존 private call 디렉터리의 정규 경로·device/inode와 기존 process receipt를 저장하며, Codex launch callback과 launch 독립적인 `on_targeted_prepared` port를 제공한다. 실제 Claude 연결은 추가하지 않았다.
+- finally·`reconcile_interrupted()`·Worker/CLI retry 전후 경계가 같은 종료 receipt를 사용해 미소비 결과를 재관측한다. 결과·실행 ID 귀속·소비 완료를 같은 transaction에 저장한다. 앞선 호출이 불확실하면 같은 작업의 후속 결과를 기다리며 다른 repository·ExecPlan은 수집한다. 종료 불명·수동 writer·경로 교체·symlink·부분 줄·해석/읽기/저장 오류에서 원문과 귀속을 보존한다.
+- 수집 대기는 provider의 원래 결과·사용량·종료 감사를 유지하는 별도 표식으로 전달한다. 정상 완료가 검증돼도 미소비 기록이 있으면 targeted correction pause로 처리하며 독립 provider 거부·보고 오류·사용자 결정은 기존 경계를 따른다. 재수집된 세 번째 실패는 다음 Worker·CLI retry·verify 전에 기존 원자 차단/도달 표식 소비로 처리한다. rebase targeted correction은 일반 완료 보고 occurrence를 올리지 않는다.
+- PRODUCT의 실패/복구 보장과 ARCHITECTURE의 호출 결합·저장 형식·재수집/대기 계약을 갱신했다. source 경로는 실제 R-055 파일과 일치하며 frontmatter·Requirement·다른 ExecPlan·PLANS는 수정하지 않았다. verify 입력은 기존 `loop_manager_internal/**`·`tests/**` glob이 변경 코드를 포함하므로 목록 변경이 필요하지 않았다.
+
+## Targeted Validation Record
+
+- Linux / Python 3.12.3, `scripts/verify.json`의 unittest version 1·launcher Python과 `docs/VERIFY.md`의 Python 3.11–3.14 계약을 확인했다. 프로젝트 Python으로 `LOOP_MANAGER_TARGETED_TEST_RUNNER`를 실행해 지정된 기록 폴더에 결과를 남겼다. 실제 Agent·Git·native 프로세스 그룹 테스트는 추가 실행하지 않았고 전체 suite·verify·lint·build·type check는 실행하지 않았다.
+- `test_targeted_test_streak`의 TargetedRecoveryTests(8), TargetedRunnerTests(4), WorkerTargetedFailureTests(최초 최종 묶음 9)와 `test_agent_invocation.RunnerTests`의 수집 오류/KeyboardInterrupt/독립 provider 실패 3 case, `test_execution_worker_phase`의 rebase 수집 대기 1 case: 최종 동일 명령 재실행 25개 PASS. 최초 24개 묶음의 1개 실패는 차단 소비용 SQLite trigger가 결과 수집의 반복 표식 UPDATE에도 작동한 fixture 오류였다. trigger를 `OLD.repeated=1 AND NEW.repeated=0`으로 좁혀 동일 명령 24개 PASS 후, 반환 결과 보존 변경과 새 정상 보고 대기 회귀를 포함해 같은 명령 25개 PASS를 확인했다.
+- TargetedHistoryTests 5개, 명시적 사용자 결정/rebase 개별 이력 2 case, 기존 ProcessReceiptTest의 복구/불확실/실패 결과 불변/종료 관측 유실 4 case: 11개 PASS.
+- 물리 retry·session fallback 기록 귀속 1 case PASS. CLI retry 직전 재수집 차단 1 case는 fixture의 실행 중 state_dir 교체로 최초 실패했으며 상태 루트를 호출 전에 고정한 뒤 동일 명령 재실행 PASS. live writer의 실패 보고에서 scope·미소비 자료를 유지하는 1 case PASS. 최종 확인한 서로 다른 targeted unit test는 39개다. rebase의 소비된 turn 정리와 원문 audit를 유지하면서 occurrence만 제외하도록 저장소 경계를 보완한 뒤, 관련 rebase 2 case와 일반 수집 대기/scope 보존 2 case를 재검증해 4개 PASS를 확인했다.
+- 파일 생성·실제 SQLite 재열기와 transaction trigger로 finally 생략, collect 뒤 DB 저장 전 중단, DB 저장 실패/rollback, 저장 뒤 차단 전 재개, 차단 transaction rollback을 확인했다. 수동/live writer는 종료 관측 double을 사용하고 기존 native receipt 회귀의 의미를 유지했다. Windows 및 전체 verify 결과는 Manager 검증 대상으로 남는다.
+- 2026-10-16 결과 보고 교정: 이전 최종 응답은 두 명령 쌍에서 `FAILED_COMMAND`와 `RERUN` 사이의 최초 실행 결과를 생략하고 그 설명을 앞에 두어 기존 Worker 결과 검증에서 거부됐다. 구현·검증 정책은 유지하고 각 명령 쌍 사이에 최초 결과, 재실행 뒤에 최종 결과를 명시하도록 보고를 교정했다. 기존 `tests.test_worker_result_contract.WorkerResultContractTest.test_two_corrected_runs_keep_initial_outcomes_and_clean_final_results` 1 case를 지정된 targeted runner로 실행해 PASS했고, 실제 교정 보고문도 `parse_worker_result()`로 수용됨을 확인했다. 이번 교정은 선택 ExecPlan의 기록과 최종 보고에 한정하며 이미 통과한 구현 테스트와 전체 verify는 재실행하지 않았다.

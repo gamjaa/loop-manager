@@ -105,6 +105,7 @@ class AgentResult:
     usage: Usage = Usage()
     collection_status: str = "unknown"
     isolation_invocation_id: str | None = None
+    targeted_collection_pending: bool = False
 
     def __iter__(self):
         return iter((self.code, self.message))
@@ -144,6 +145,7 @@ class AgentRequest:
     prepared_launch: CodexLaunch | None = field(default=None, repr=False)
     on_execution_identity: Callable[[dict[str, str]], None] | None = None
     on_launch_prepared: Callable[[CodexLaunch], None] | None = None
+    on_targeted_prepared: Callable[[Path, Path], None] | None = None
 
 
 @dataclass(frozen=True)

@@ -21,16 +21,19 @@ class RunnerTests(TestCase):
     def test_invalid_targeted_evidence_still_finishes_the_physical_invocation_ledger(self):
         class Provider:
             def run(self, request):
-                request.on_launch_prepared(SimpleNamespace(attempt=self_outer.state_dir, runtime=self_outer.state_dir.parent))
-                (self_outer.state_dir / 'targeted-corrupt.jsonl').write_text('{}\n', encoding='utf-8')
+                request.on_launch_prepared(self_outer.targeted_launch())
+                (self_outer.launch.attempt / 'targeted-corrupt.jsonl').write_text('{}\n', encoding='utf-8')
                 return manager.AgentResult(0, 'done')
         self_outer = self
-        with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+             mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value={'finished_at': 'proof'}):
             result = manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
                 'worker', 'prompt', read_only=False, connection=self.connection,
                 invocation=invocation.InvocationContext('repo', 'G-1'),
                 resolved_profile=invocation.ResolvedProfile('model', 'high'))
-        self.assertNotEqual(result.code, 0)
+        self.assertEqual(result.code, 0)
+        self.assertEqual(result.message, 'done')
+        self.assertTrue(result.targeted_collection_pending)
         row = self.connection.execute('SELECT result_kind, result_code, collection_status FROM agent_invocations').fetchone()
         self.assertEqual(tuple(row), ('success', 0, 'error'))
 
@@ -40,18 +43,20 @@ class RunnerTests(TestCase):
         ensure_schema(self.connection)
         for interrupted in (False, True):
             with self.subTest(interrupted=interrupted):
-                attempt = self.state_dir / ('interrupted' if interrupted else 'completed')
-                attempt.mkdir()
+                launch = self.targeted_launch('interrupted' if interrupted else 'completed')
+                attempt = launch.attempt
                 class Provider:
                     def run(self, request):
-                        request.on_launch_prepared(SimpleNamespace(attempt=attempt, runtime=attempt.parent))
-                        writer = EventWriter(attempt / 'targeted-run.jsonl', identity={'run_id': 'run'})
+                        request.on_launch_prepared(launch)
+                        run_id = str(interrupted)
+                        writer = EventWriter(attempt / f'targeted-{run_id}.jsonl', identity={'run_id': run_id})
                         writer.emit('test_end', id='suite.test_one', result='failure')
                         writer.close()
                         if interrupted:
                             raise KeyboardInterrupt()
                         return manager.AgentResult(0, 'done')
-                with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+                with mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+                     mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value={'finished_at': 'proof'}):
                     def invoke():
                         return manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
                             'worker', 'prompt', read_only=False, connection=self.connection,
@@ -64,6 +69,64 @@ class RunnerTests(TestCase):
                         self.assertEqual(invoke().code, 0)
                 repository = TargetedTestRepository(self.connection)
                 self.assertGreater(repository.sequence('repo', str(interrupted)), 0)
+
+    def targeted_launch(self, name='call-one'):
+        runtime = self.state_dir / 'agent-runtime' / 'runtime'
+        attempt = runtime / name
+        attempt.mkdir(parents=True)
+        self.launch = SimpleNamespace(attempt=attempt, runtime=runtime)
+        return self.launch
+
+    def test_targeted_records_follow_each_physical_retry_and_session_fallback(self):
+        from tests.support.workspace import pin_common_guidance
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+        from loop_manager_internal.verification.timing import EventWriter
+        calls = []
+        class Provider:
+            def run(_, request):
+                calls.append(request.session_id)
+                run = str(len(calls))
+                launch = self.targeted_launch('call-' + run)
+                request.on_launch_prepared(launch)
+                writer = EventWriter(launch.attempt / f'targeted-{run}.jsonl', identity={'run_id': run})
+                writer.emit('test_end', id='suite.test_one', result='failure')
+                writer.close()
+                if len(calls) == 1:
+                    return manager.AgentResult(1, 'connection reset', request.session_id)
+                if len(calls) == 2:
+                    return manager.AgentResult(1, 'session not found', request.session_id)
+                return manager.AgentResult(0, 'done', 'new-session')
+        pin_common_guidance(self.connection, invocation.InvocationContext('repo', 'G-1'),
+                            Path('/worktree'), self.state_dir, sessions=('old-session',))
+        attempts = invocation.AttemptSequence('repo', 'G-1')
+        call = invocation.TrackedAgentCall(lambda session, fallback, context: manager.run_agent(
+            'codex', Path('/worktree'), self.state_dir, Path('/config'), 'worker', 'prompt',
+            read_only=False, session_id=session, connection=self.connection, invocation=context,
+            resolved_profile=invocation.ResolvedProfile('model', 'high')), attempts)
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+             mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value={'finished_at': 'proof'}):
+            self.assertEqual(manager.run_agent_with_retries(call, session_id='old-session').code, 0)
+        self.assertEqual(calls, ['old-session', 'old-session', None])
+        self.assertEqual(self.connection.execute('SELECT count(DISTINCT invocation_id) FROM targeted_test_run_owners').fetchone()[0], 3)
+        self.assertEqual(TargetedTestRepository(self.connection).sequence('repo', 'G-1'), 3)
+        self.assertTrue(TargetedTestRepository(self.connection).repeated('repo', 'G-1'))
+
+    def test_collection_pending_preserves_independent_provider_failure(self):
+        class Provider:
+            def run(_, request):
+                launch = self.targeted_launch()
+                request.on_targeted_prepared(launch.attempt, launch.runtime / (launch.attempt.name + '.process.json'))
+                return manager.AgentResult(1, 'sandbox policy denied', kind=manager.AgentResultKind.PERMANENT_CONFIGURATION)
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'worker', 'prompt', read_only=False, connection=self.connection,
+                invocation=invocation.InvocationContext('repo', 'G-1'),
+                resolved_profile=invocation.ResolvedProfile('model', 'high'))
+        self.assertEqual(result.message, 'sandbox policy denied')
+        self.assertFalse(result.targeted_collection_pending)
+        row = self.connection.execute('SELECT finished_at, result_kind, collection_status FROM agent_invocations').fetchone()
+        self.assertTrue(row[0])
+        self.assertEqual(tuple(row)[1:], ('permanent_configuration', 'error'))
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

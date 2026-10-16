@@ -1203,9 +1203,11 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 
   실행 가능한 관련 unit test가 없는 변경은 사유를 남기며 전체 검증을 생략하는 근거로 사용하지 않는다
 
-- Manager는 물리 Agent 호출 종료·중단 경계에서 개별 결과를 SQLite `targeted_test_results`·`targeted_test_streaks`에 원자 반영한다. repository·ExecPlan·실행 ID·테스트 ID로 중복과 상충 결과를 검사하며 테스트별 연속 실패를 저장한다. 수집·fixture 오류는 개별 테스트 실패로 세지 않는다. 세 번째 실패 도달은 같은 turn에서 뒤에 성공하더라도 소비 전까지 보존하고 정상 Worker 경계에서 `targeted_test_exhausted`로 차단한다.
+- 실행 전 `targeted_test_collections`에 물리 invocation과 기록 디렉터리·파일시스템 identity·process receipt 경로를 결합한다. invocation ledger가 repository·ExecPlan·Worker 역할·guidance 작업·scope와 실제 provider/model을 소유한다. 기록 경로는 기존 `state/agent-runtime/<runtime>/<call>`이고 receipt는 쓰기 허용 call 바깥의 `<call>.process.json`이다. 정규 경로·기존 디렉터리·Worker 소유권과 호출별 경로의 유일성을 확인하며 파일시스템 device/inode는 Windows의 큰 식별자도 보존하도록 십진 문자열로 저장한다. 이 additive 테이블이 없는 과거 호출의 기록 위치를 디렉터리 탐색으로 추측하지 않는다.
+- invocation 종료의 finally, Manager의 `reconcile_interrupted()`와 Worker 호출 전·CLI retry 전·호출 후 경계가 같은 미소비 기록을 재관측한다. 기존 process receipt 복구로 writer 종료가 확인되고 디렉터리 identity가 일치할 때만 읽는다. 살아 있는 수동 작업은 기존 소유권 보호를 적용한다. receipt 부재·종료 불명·경로 교체·symlink·읽기/해석/저장 오류에서는 원문·결합을 보존하고 해당 작업을 대기한다. 같은 작업의 앞선 호출이 대기하면 후속 호출도 순서를 보존하며 다른 repository·ExecPlan의 수집은 이어간다. runtime·모델 교체는 저장된 호출 귀속을 바꾸지 않는다. `AgentRequest.on_targeted_prepared`는 launch 객체 없이 같은 디렉터리·receipt를 결합하는 port이며 Claude의 실제 전달 연결은 별도 작업이다.
+- Manager는 완료된 개별 결과를 SQLite `targeted_test_results`·`targeted_test_streaks`에 반영하고, 실행 ID의 invocation 귀속(`targeted_test_run_owners`)과 collection의 `collected` 전이를 같은 transaction에서 확정한다. 미소비 상태는 `pending` 또는 오류 종류를 가진 `error`이며 저장 실패·transaction 중단 뒤에도 재시도한다. repository·ExecPlan·실행 ID·테스트 ID로 중복과 상충 결과를 검사하고 다른 호출의 실행 ID 재사용은 거부한다. JSONL의 불완전한 마지막 줄과 기록 부재에서 성공·실패를 합성하지 않으며 수집·fixture 오류도 개별 테스트 실패로 세지 않는다. 세 번째 실패 도달은 같은 turn에서 뒤에 성공하더라도 소비 전까지 보존하고 새 Worker·CLI retry·verify 전에 `targeted_test_exhausted`로 차단한다.
 
-  차단 확정과 도달 표식 소비는 같은 transaction이며 실행·실패 감사는 보존한다. Worker 최종 실패 보고는 `targeted_test_correction`으로 분리해 기존 보고 오류 한도를 소비하지 않고, 새 실행 근거가 없으면 일시 중단한다
+  차단 확정과 도달 표식 소비는 같은 transaction이며 실행·실패 감사는 보존한다. Worker 최종 실패 보고와 수집 대기는 `targeted_test_correction`으로 분리해 일반·rebase 보고 오류 한도를 소비하지 않고, 새 실행 근거가 없으면 일시 중단한다. 수집 대기는 별도 반환 표식으로 전달하며 물리 provider 결과·사용량·종료 감사를 덮지 않는다. 실제 provider 거부·완료 보고 오류·명시적 사용자 결정과 독립 안전 차단은 각 기존 경계에서 처리한다.
 
 ### 전체 verify와 Reviewer
 
