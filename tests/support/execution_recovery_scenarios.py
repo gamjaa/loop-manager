@@ -589,6 +589,8 @@ class ExecutionRecoveryScenarios:
 
 
     def _save_rebase_worker_result(self, message, *, outcome_contract_version=1):
+        if self.handler._definition_snapshot is None:
+            self.handler.guard(self.context())
         self.effects.validation.parse_worker_result.side_effect = lm.parse_worker_result
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
@@ -618,6 +620,7 @@ class ExecutionRecoveryScenarios:
             result=message,
             scope_marker=observation.progress,
             outcome_contract_version=outcome_contract_version,
+            input_snapshot=self.handler._definition_snapshot.serialize(),
         )
 
         return context
@@ -656,6 +659,8 @@ class ExecutionRecoveryScenarios:
     def _assert_staged_rebase_resume(self, rebase_metadata, *, changed=False,
                                     unstaged=False, untracked=False,
                                     clean_after_stage=False, replaced_resolution=False):
+        self.handler.guard(self.context())
+        definition = self.handler._definition_snapshot
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint,
             workspace=replace(self.effects.workspace,
@@ -685,6 +690,7 @@ class ExecutionRecoveryScenarios:
             expected_head='before-head', target_base_oid='base',
             observed_remote_oid=None,
             snapshot={'pending': 'stage', 'worker_result': 'saved correction',
+                      'rebase_worker_input': definition.serialize(),
                       **({'stash_oid': 'saved-stash-oid'} if not rebase_metadata else {}),
                       'stage_evidence': {'head': 'owned-head', 'branch': 'loop-manager/G-047',
                                          'files': accepted_files}},
@@ -722,8 +728,11 @@ class ExecutionRecoveryScenarios:
             self.assertEqual(set(call.args[4:]),
                              ({'allowed.py'} if unstaged or untracked else set())
                              | ({'extra.py'} if changed else set()))
-        self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
-        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['worker_result'], 'saved correction')
+        self.assertEqual(self.state.row()['worker_input_token'], definition.worker_token)
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.assertIsNone(self.state.row()['review_token'])
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
         self.assertIsNone(checkpoint.get('repo', 'G-047').operation)
         self.effects.agent.run_agent.assert_not_called()
@@ -828,5 +837,9 @@ class ExecutionRecoveryScenarios:
         self.dirty = False
         self.effects.workspace._rebase_in_progress_for_branch.return_value = False
         self.handler.guard(self.handler._context())
-        self.assertEqual(self.state.row()['phase'], 'WORKING')
-        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(self.state.row()['worker_input_token'], self.handler._definition_snapshot.worker_token)
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertEqual(self.effects.agent.run_agent.call_count, 1)

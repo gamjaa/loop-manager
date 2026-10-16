@@ -332,8 +332,12 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.effects.workspace._rebase_in_progress_for_branch.return_value = False
         refreshed = self.handler.guard(self.handler._context())
         self.assertEqual(refreshed.kind, ExecutionOutcomeKind.RETRY)
-        self.assertEqual(self.state.row()['phase'], 'WORKING')
-        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(self.state.row()['worker_input_token'], self.handler._definition_snapshot.worker_token)
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertEqual(self.effects.agent.run_agent.call_count, 1)
 
 
     def test_conflict_revision_scope_rejects_unapproved_metadata(self):
@@ -732,12 +736,16 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.effects.agent.validate_worker_workspace_scope.side_effect = (
             lm.ExecPlanMetadataError('catalog metadata mismatch')
         )
+
+        # Declaration errors now enter the input gate on the first result.
         outcome = self.handler.run(self.handler._context())
+
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(outcome.recovery.occurrence, 1)
         self.assertEqual(outcome.recovery.observation.reason.value, 'plan_input_invalid')
         self.assertEqual(outcome.recovery.block_reason, lm.BlockReasonCode.PLAN_INPUT_INVALID)
         self.assertEqual(self.state.row()['worker_session_id'], 'session')
-        self.assertEqual(self.effects.agent.run_agent.call_count, 1)
+        self.effects.agent.run_agent.assert_called_once()
         self.assertNotIn('verify', self.calls)
         self.effects.blocking.block_active_execplan.assert_called_once()
 
@@ -754,17 +762,28 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.effects.agent.validate_worker_workspace_scope.side_effect = (
             lm.ExecPlanMetadataError('catalog metadata mismatch')
         )
+
         context = self.handler._context()
         self.assertTrue(context.resolving_rebase)
+        self.handler.guard(context)
+        delivered = self.handler._definition_snapshot
         outcome = self.handler.run(context)
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(outcome.recovery.occurrence, 1)
         self.assertEqual(outcome.recovery.observation.reason.value, 'plan_input_invalid')
+        self.assertEqual(outcome.recovery.block_reason, lm.BlockReasonCode.PLAN_INPUT_INVALID)
         self.assertTrue(self.state.row()['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX))
         self.assertIn('catalog metadata mismatch', self.state.row()['last_error'])
         self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
         self.assertEqual(self.state.row()['worker_result'], 'saved result')
         self.assertTrue(self.effects.agent.validate_worker_workspace_scope.call_args.kwargs['allow_rebase'])
         self.assertEqual(self.effects.agent.run_agent.call_args.kwargs['session_id'], 'worker-session')
+        saved = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.assertEqual(saved.worker_result, READY_WORKER_RESULT)
+        self.assertEqual(saved.input_snapshot, delivered.serialize())
+        self.assertEqual(saved.worker_session, 'worker-session')
+        self.assertTrue(self.handler._context().resolving_rebase)
+        self.effects.agent.run_agent.assert_called_once()
         self.effects.blocking.block_active_execplan.assert_called_once()
         self.assertNotIn('verify', self.calls)
 
@@ -774,12 +793,16 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         )
         self.state.update_project('repo', phase='VERIFYING', worker_result='saved worker result')
         outcome, output = self.handler._verify_once(self.handler._context())
+
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.assertEqual(outcome.recovery.observation.reason.value, 'plan_input_invalid')
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
         self.assertEqual(self.state.row()['worker_result'], 'saved worker result')
         self.assertEqual(self.state.row()['verify_result'], output)
         self.effects.blocking.block_active_execplan.assert_called_once()
         self.effects.agent.run_agent.assert_not_called()
+        self.assertEqual(outcome.recovery.occurrence, 1)
+        self.assertEqual(outcome.recovery.block_reason, lm.BlockReasonCode.PLAN_INPUT_INVALID)
 
 
     def test_repeated_archive_mismatch_reaches_final_gate_only_at_limit(self):

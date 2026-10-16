@@ -251,7 +251,7 @@ class PublicationConflictRecoveryTests(PublicationRebaseRecoveryTestFixture, uni
                 (worktree / "src/app.py").read_text(encoding="utf-8"),
                 "VALUE = 'resolved'\n",
             )
-            self.assertEqual(roles, ["worker", "worker", "reviewer"])
+            self.assertEqual(roles, ["worker", "reviewer"])
             verify.assert_called_once()
             self.assertEqual(git_steps, [])
             self.assertEqual(len(created), 1)

@@ -284,6 +284,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
 
 
     def test_resolved_rebase_then_verify_failure_returns_to_same_worker(self):
+        self.handler.guard(self.context())
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -302,7 +303,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         self.effects.workspace.git.side_effect = self.observed_git
 
         first = self.handler.run(self.context())
-        self.assertEqual(first.context.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertEqual(first.context.phase, ExecutionPhase.VERIFYING)
         self.assertIsNone(checkpoint.get('repo', 'G-047').operation)
         self.assertEqual(checkpoint.get('repo', 'G-047').snapshot['stage_evidence'], {
             'head': 'owned-head', 'branch': 'loop-manager/G-047',
@@ -310,8 +311,10 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
             'files': {'app.py': 'accepted-content'},
         })
 
-        first = self.handler.run(first.context)
-        self.assertEqual(first.context.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.effects.agent.run_agent.call_count, 1)
+        self.assertIsNotNone(self.state.row()['worker_input_token'])
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.assertIsNone(self.state.row()['review_token'])
         self.effects.validation.verify.side_effect = lambda _: (False, 'verify failure')
 
         def fail_verify(_repo, _worktree, _stage, output):

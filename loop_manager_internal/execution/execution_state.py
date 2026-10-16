@@ -105,10 +105,10 @@ class ExecutionStatePort:
             )
 
     def retain_clean_rebase_worker(self, prior, definition, checkpoints):
-        """Bind an unchanged implementation result after a completed clean rebase.
+        """Bind proven Worker inputs to an adopted completed candidate.
 
-        Called only by the successful Manager invocation, never conflict or
-        interrupted-result adoption. Validation and Review remain invalidated.
+        Callers must check saved correction inputs before retaining their result.
+        Validation and Review remain invalidated.
         """
         if (not prior['worker_result'] or prior['worker_input_token'] != definition.worker_token
                 or prior['archive_token'] != definition.archive_token):
@@ -132,8 +132,9 @@ class ExecutionStatePort:
                 snapshot={**current.snapshot,
                           'worker_candidate_token': definition.worker_candidate_token(current.expected_head)})
             self.update_project(self.repo, preserve_transaction=True, phase='VERIFYING',
-                worker_result=prior['worker_result'], worker_input_token=prior['worker_input_token'],
-                archive_token=prior['archive_token'], revision_resume_status=None)
+                definition_snapshot=definition.serialize(), worker_result=prior['worker_result'],
+                worker_input_token=prior['worker_input_token'], archive_token=prior['archive_token'],
+                revision_resume_status=None)
 
     def confirm_existing_pr_push(self, checkpoints, head):
         """Advance the owned PR receipt and clear its push intent atomically."""

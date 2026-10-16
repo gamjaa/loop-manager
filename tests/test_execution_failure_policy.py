@@ -138,11 +138,13 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
 
         resumed = self.handler.run(context)
 
-        self.assertEqual(resumed.context.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertEqual(resumed.context.phase, ExecutionPhase.VERIFYING)
         self.effects.agent.run_agent.assert_not_called()
-        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertEqual(self.state.row()['worker_result'], legacy_result)
 
-        self.effects.validation.parse_worker_result.assert_any_call(legacy_result, self.plan)
+        self.effects.validation.parse_worker_result.assert_any_call(legacy_result, {
+            **self.plan, 'depends_on': [], 'complexity': 'low', 'risk': 'low', 'priority': 'normal',
+        })
         self.effects.blocking.block_active_execplan.assert_not_called()
 
 

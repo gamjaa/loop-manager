@@ -290,6 +290,8 @@ Manager가 생성·게시한 원격 작업 branch가 PR Merge 전에 실제 삭�
 
 반복 교정으로 해결하지 못한 충돌은 확인한 원본 revision에서 해당 파일과 index entry만 복원하고 재작업한다. 다른 파일의 내용·staging·미추적 작업과 현재 rebase target을 유지한다. 복원 전 확보할 수 있는 원형과 실패 사유를 보존하고, 중단 뒤 이미 복원한 파일이나 새 교정을 덮어쓰지 않는다. 후보 OID 변경은 필요한 verify·Review를 선택하는 입력이며 실제 명세 변경·구현 부족만 Worker 교정으로 연결한다. 진단 ref 충돌은 해당 자료 게시·삭제만 보류한다.
 
+저장된 충돌 교정 READY와 stage/continue 대기는 교정에 실제 전달한 구현 조건을 최신 조건과 대조한 뒤 소비한다. 파일 형상이 같아도 조건 충족 근거가 바뀌거나 없으면 이전 결과·교정 이력과 작업물·session·기존 target을 보존하고 같은 Worker의 재확인으로 연결한다. 유효한 입력의 완료 교정은 Worker를 반복하지 않고 필요한 전체 verify·Review로 이어가며, OID 변화나 순수 수행 기록만으로 구현 교정을 다시 요구하지 않는다. continue 뒤 다음 commit에서 충돌하면 이전 교정 승인은 종료하고 같은 session에서 새 충돌을 교정한다. 이전 READY를 반복 소비해 교정 실패로 집계하지 않는다. 실제 결과 오류·사용자 결정·dependency와 독립 차단은 기존 경계를 유지한다.
+
 현재 상태 기반 rebase 판정, checkpoint lease, 진단 ref와 중단 복구의 상세 조건은 [ARCHITECTURE.md](ARCHITECTURE.md#차단-작업의-원격-반영과-보존)를 따른다.
 
 ### 사용자 승인 및 완료

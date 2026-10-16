@@ -406,6 +406,9 @@ def validate_worker_workspace_scope(
             try:
                 observed, _ = service.require_owned(checkpoint=checkpoint)
             except RuntimeError as error:
+                from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+                if isinstance(error, RecoveryFailure):
+                    raise
                 raise WorkspaceOwnershipError(f'현재 관리 rebase를 수용할 수 없습니다: {error}') from error
             if rebase_content_pending(service.expected, observed):
                 # The owned intermediate index is not the final Worker output.
