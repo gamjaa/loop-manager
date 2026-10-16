@@ -27,24 +27,38 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/execution/execution_publication_handler.py`의 commit intent/완료와 `execution_workspace_handler.py`의 `CheckpointAction.CORRECT`를 연결한다. `execution_checkpoint.py`와 `recovery/checkpoint_ownership.py`의 기존 실제 commit·tree·부모·소유 확인을 재사용해 `document_record`와 정확한 결과 commit을 보존한다. 기존 게시 재개·문서 반영·scope 근거도 새 snapshot에서 유지한다.
-- [ ] `execution/execution_revision.py`의 `record_only_definition`, `advance_owned_record`와 `execution_revision_handler.py`의 재진입을 재사용한다. commit 완료 복구 후 기록 기준의 미완료 적용부터 수행하고 checkpoint 교체·추가 rebase가 이를 건너뛰거나 낡은 원문으로 덮지 않게 한다. 기록 반영 자체로 구현/검증 token의 성공을 만들지 않는다.
-- [ ] `storage/execution_checkpoint_state.py`, `runtime_state.py`, `planning_input_state.py`의 기존 generation·transaction·원격 문서 delta 관측을 유지한다. 기록/후속 commit의 근거가 이어지는지 확인하며 새 저장 원본·별도 캐시·범용 journal은 추가하지 않는다.
-- [ ] PRODUCT·ARCHITECTURE의 마지막 반영 기준 절에는 실제 보완한 commit 중단 복구·근거 보존만 통합한다. 현재 구현된 순수 기록 문법과 정상 원격 delta 처리는 재구현하지 않는다.
+- [x] 확인한 `loop_manager_internal/execution/execution_publication_handler.py`의 commit intent/완료와 `execution_workspace_handler.py`의 `CheckpointAction.CORRECT`를 연결한다. `execution_checkpoint.py`와 `recovery/checkpoint_ownership.py`의 기존 실제 commit·tree·부모·소유 확인을 재사용해 `document_record`와 정확한 결과 commit을 보존한다. 기존 게시 재개·문서 반영·scope 근거도 새 snapshot에서 유지한다.
+- [x] `execution/execution_revision.py`의 `record_only_definition`, `advance_owned_record`와 `execution_revision_handler.py`의 재진입을 재사용한다. commit 완료 복구 후 기록 기준의 미완료 적용부터 수행하고 checkpoint 교체·추가 rebase가 이를 건너뛰거나 낡은 원문으로 덮지 않게 한다. 기록 반영 자체로 구현/검증 token의 성공을 만들지 않는다.
+- [x] `storage/execution_checkpoint_state.py`, `runtime_state.py`, `planning_input_state.py`의 기존 generation·transaction·원격 문서 delta 관측을 유지한다. 기록/후속 commit의 근거가 이어지는지 확인하며 새 저장 원본·별도 캐시·범용 journal은 추가하지 않는다.
+- [x] PRODUCT·ARCHITECTURE의 마지막 반영 기준 절에는 실제 보완한 commit 중단 복구·근거 보존만 통합한다. 현재 구현된 순수 기록 문법과 정상 원격 delta 처리는 재구현하지 않는다.
 
 ## Validation
 
 - Worker는 `tests/test_execution_review_phase.py`의 commit 완료 복구, `tests/test_stage_documents.py`의 기록 기준 적용, `tests/test_runtime_state.py`의 원격 delta 소비에서 수정한 최소 targeted unit case만 실행한다. `tests/support/execution.py`의 Git double과 실제 checkpoint/SQLite를 재사용한다.
 - commit 전 intent→실제 commit 완료→완료 checkpoint 전 중단→새 handler 재개를 연결한다. 이전 원문·승인 tree·결과 commit·기준/적용 marker 보존, commit no-call, 재중단 뒤 동일 결과 no-op과 session/실패/검증 근거의 독립 보존을 확인한다. 미리 `after_head`를 채운 fixture만으로 완료하지 않는다.
 - tree/부모/소유/결과 commit 변경, 혼합 조건·frontmatter 변경·원문 부재, 원격 재전진·기록 제거, 연속 기록 commit과 checkpoint CAS 실패에서는 미확인 변경을 소비하지 않는다. 성공·거부 모두 실제 기준 row와 checkpoint를 검사한다.
+- 미적용 기록이 있더라도 후속 소유 correction commit은 진행하며, 기존 기록을 새 intent로 덮지 않고 미확정 상태를 보존하는 `tests/test_stage_documents.py` 회귀 case를 실행한다. `document_conditions_changed`와 commit proof 불일치 기록 각각에서 후속 교정은 허용하고, proof 불일치 기록을 baseline에 반영하지 않는 기존 회귀도 유지한다.
 - `tests/test_execution_checkpoint_recovery_phase.py`, `tests/test_execution_publication_phase.py`, `tests/test_incremental_planning.py`의 기존 복구/게시 연결을 유지한다. 실제 commit 효과가 mock으로 확인되지 않는 경우에만 기존 Git fixture의 최소 연결 사례를 보강하며 정책 조합별 전체 실행을 반복하지 않는다.
 
 ## Progress
 
-직접 구현된 기록 기준 helper와 commit 완료 복구의 snapshot 교체·기존 회귀를 정적으로 대조했다. 구현·테스트·verify는 실행하지 않았다.
+commit intent, 완료 checkpoint 복구, 기록 기준의 원자 적용과 원격 delta 소비를 연결했다. 실제 Git commit 후 completion checkpoint 저장에서 중단한 뒤 SQLite를 재개하는 회귀에서 commit 재실행 없이 적용·재진입 멱등성을 확인했다. 같은 테스트에서 연속 순수 Progress commit의 원래 planning 기준 보존도 확인했다.
+이전 targeted 실행의 첫 실패는 테스트가 `ExecutionStatePort.row()`에서 제공하지 않는 실패 이력 필드를 조회한 assertion 오류였다. assertion은 실제 `exec_plans` 행을 조회하도록 교정했고 같은 selector를 재실행해 통과했다. 이 결과는 rebase 전 후보의 기록이며, 현재 후보의 결과는 아래 HEAD 기준 재실행에 기록했다.
+Manager rebase로 갱신된 HEAD `270d89a`를 기준으로 아래 다섯 개 개별 selector를 다시 실행해 모두 통과했다.
 
-- [ ] commit 완료 복구의 기록 근거/결과 보존 연결
-- [ ] 중단·혼합 조건·연속 commit·원격 delta 회귀 검증
+- `tests.test_execution_review_phase.ExecutionReviewPhaseTests.test_interrupted_owned_commit_restores_progress_record_on_restart` — 통과. 재시작·검증 무효화·session/실패 이력 보존·연속 commit·중복 적용 방지를 확인했다.
+- `tests.test_stage_documents.DocumentPhaseTests.test_owned_progress_commit_recovers_atomically_without_consuming_new_conditions` — 통과. 순수 기록 적용과 혼합 조건/frontmatter 변경 보류를 확인했다.
+- `tests.test_stage_documents.DocumentPhaseTests.test_owned_record_keeps_baseline_when_commit_or_owner_proof_changes` — 통과. parent/tree/owner 증명 불일치와 변경 전 원문 부재에서 이전 기준 보존을 확인했다.
+- `tests.test_stage_documents.DocumentPhaseTests.test_unresolved_owned_record_blocks_followup_commit` — 통과. 미확정 기록이 후속 commit intent로 덮이지 않는 것을 확인했다.
+- `tests.test_runtime_state.RuntimeStateRepositoryTest.test_owned_progress_baseline_consumes_only_confirmed_published_delta` — 통과. 원격에서 확인한 기록 delta만 반영하고 미확정·무관한 입력을 보존했다.
+
+Manager verify의 최신 진단은 legacy `DefinitionSnapshot`의 `body_text=None` 상태에서도 commit path가 불완전한 `document_record`를 만들어, 다음 commit을 미해결 기록으로 차단하는 실패를 보였다. commit intent 생성은 변경 전 본문을 확보했을 때만 기록을 만들도록 제한했고, rebase adoption의 candidate-token 회귀에 phantom 기록이 없음을 assertion으로 추가했다. HEAD `d603899`에서 `tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_only_confirmed_worker_patch_carries_candidate_token_to_manager_commit`를 실행해 같은 selector가 통과했다.
+
+Reviewer feedback `unresolved-record-blocks-correction`에서 미적용 기록이 남으면 이후 검증 교정 commit도 영구 차단되는 경로를 확인했다. `_commit_owned()`는 기존 미적용 `document_record`를 새 intent로 덮지 않고 보존하면서 후속 correction commit을 허용한다. 혼합 본문 변경 후 verify 실패를 두고 교정 commit을 수행해 이전 commit intent·baseline·미해결 사유·verify/review 결과가 유지되는 회귀를 HEAD `5bda46d`에서 통과시켰다. proof가 다른 경우에도 기록 자체를 성공으로 소비하지 않으며 이전 기준과 미해결 이유를 보존하는 기존 회귀를 유지한다.
+
+후속 Manager verify는 빈 `document_record` 기본값 `{}`까지 미해결 증거로 오인해, 기록이 아직 없던 commit의 intent에서 새 기록 생성이 빠지는 경로를 드러냈다. `_commit_owned()`가 실제 비어 있지 않은 미적용 기록만 보존하도록 고쳤고, `document_conditions_changed`와 commit proof 불일치 각각에서 실패한 verify/review 뒤 교정 commit이 기존 미확정 근거·기준·실패 결과를 보존하는 회귀를 추가했다. 첫 상태 snapshot fallback은 원인이 아니어서 제거했다. 2026-10-16 현재 worktree에서 Manager가 전달한 다섯 selector(후보 token selector의 true/false subtest 포함)와 두 correction selector, 총 일곱 selector를 targeted runner 한 번으로 새로 실행해 모두 통과했다 (`Ran 7 tests in 1.283s`, `OK`).
+
+전체 verify는 Worker에서 실행하지 않았다.
 
 ## Decision Log
 

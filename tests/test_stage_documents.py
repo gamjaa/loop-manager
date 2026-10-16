@@ -110,24 +110,47 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
 
     def test_owned_progress_commit_recovers_atomically_without_consuming_new_conditions(self):
         from loop_manager_internal.execution.execution_revision import advance_owned_record, ExecPlanBodyHash
-        for mixed in (False, True):
-            with self.subTest(mixed=mixed):
+        for change in ('pure', 'mixed-condition', 'frontmatter'):
+            with self.subTest(change=change):
                 context = self.review_context()
                 text = '---\nid: G-047\n---\n## Purpose\nImplement safely\n## Progress\n- [ ] Run test\n'
                 previous = replace(self.handler._definition_snapshot, body_text=text, body_hash=str(ExecPlanBodyHash(text)))
                 self.handler._definition_snapshot = previous
                 self.state.update_project(self.repo, definition_snapshot=previous.serialize(),
                     worker_input_token=previous.worker_token, verify_token='saved-verify', review_token='saved-review')
-                recorded = text.replace('[ ]', '[x]') + ('- New condition: send data\n' if mixed else '')
+                recorded = text.replace('[ ]', '[x]')
+                if change == 'mixed-condition':
+                    recorded += '- New condition: send data\n'
+                elif change == 'frontmatter':
+                    recorded = recorded.replace('id: G-047', 'id: G-048')
                 checkpoints = ExecutionCheckpointRepository(self.connection)
                 current = checkpoints.get(self.repo, context.plan.plan_id)
+                tree = 'a' * 40
+                message = 'Record progress'
+                identity = self.handler._identity
                 checkpoints.record(self.repo, context.plan.plan_id, expected_generation=current.generation,
                     operation=None, expected_head='after', target_base_oid='base', observed_remote_oid=None,
-                    snapshot={'after_head': 'after', 'document_record': {
-                        'previous': previous.serialize(), 'tree': 'approved'}})
+                    snapshot={'before_head': 'before', 'after_head': 'after',
+                        'commit_message': message, 'commit_tree_oid': tree,
+                        'document_record': {
+                            'previous': previous.serialize(), 'planning_previous': previous.serialize(),
+                            'tree': tree, 'commit': 'after',
+                            'commit_intent': {'before_head': 'before', 'message': message, 'tree': tree},
+                            'repo': identity.repo, 'plan_id': context.plan.plan_id,
+                            'branch': context.branch, 'worktree': str(context.worktree)}})
                 def git(_repo, *args, **kwargs):
-                    return SimpleNamespace(returncode=0, stdout=(recorded if args[0] == 'show' else 'approved'))
+                    outputs = {
+                        ('show', '-s', '--format=%P', 'after'): 'before',
+                        ('show', '-s', '--format=%B', 'after'): message,
+                        ('rev-parse', 'after^{tree}'): tree,
+                        ('show', 'after:docs/plans/[G-047] Runtime.md'): recorded,
+                    }
+                    output = outputs.get(args, '')
+                    if args[:2] == ('merge-base', '--is-ancestor'):
+                        return SimpleNamespace(returncode=0, stdout='')
+                    return SimpleNamespace(returncode=0, stdout=output)
                 ports = replace(self.handler._publication_handler().ports, checkpoint=checkpoints, git=mock.Mock(side_effect=git))
+                mixed = change != 'pure'
                 if not mixed:
                     with mock.patch.object(checkpoints, 'record', side_effect=RuntimeError('interrupted')):
                         with self.assertRaisesRegex(RuntimeError, 'interrupted'):
@@ -138,14 +161,258 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
                 actual = self.state.row()
                 self.assertEqual(actual['verify_token'], 'saved-verify')
                 self.assertEqual(actual['review_token'], 'saved-review')
+                saved_record = checkpoints.get(self.repo, context.plan.plan_id).snapshot['document_record']
                 if mixed:
                     self.assertEqual(actual['definition_snapshot'], previous.serialize())
+                    self.assertEqual(saved_record['unresolved_reason'], 'document_conditions_changed')
+                    self.assertFalse(saved_record.get('applied', False))
                 else:
                     self.assertEqual(json.loads(actual['definition_snapshot'])['body_text'], recorded)
                     self.assertEqual(actual['worker_input_token'], previous.worker_token)
+                    self.assertEqual(saved_record['commit'], 'after')
+                    self.assertTrue(saved_record['applied'])
                     count = ports.git.call_count
                     advance_owned_record(ports, context)
                     self.assertEqual(ports.git.call_count, count)
+
+    def test_owned_record_keeps_baseline_when_commit_or_owner_proof_changes(self):
+        from loop_manager_internal.execution.execution_revision import (
+            DefinitionSnapshot, ExecPlanBodyHash, advance_owned_record,
+        )
+        context = self.review_context()
+        text = '---\nid: G-047\n---\n## Purpose\nImplement safely\n## Progress\n- [ ] Run test\n'
+        previous = replace(self.handler._definition_snapshot, body_text=text,
+                            body_hash=str(ExecPlanBodyHash(text)))
+        self.handler._definition_snapshot = previous
+        self.state.update_project(self.repo, definition_snapshot=previous.serialize(),
+                                  worker_input_token=previous.worker_token)
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        current = checkpoints.get(self.repo, context.plan.plan_id)
+        tree = 'b' * 40
+        record = {
+            'previous': previous.serialize(), 'planning_previous': previous.serialize(),
+            'tree': tree, 'commit': 'after',
+            'commit_intent': {'before_head': 'before', 'message': 'Record progress', 'tree': tree},
+            'repo': self.handler._identity.repo, 'plan_id': context.plan.plan_id,
+            'branch': context.branch, 'worktree': str(context.worktree),
+        }
+        checkpoints.record(self.repo, context.plan.plan_id, expected_generation=current.generation,
+            operation=None, expected_head='after', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'before_head': 'before', 'after_head': 'after',
+                      'commit_message': 'Record progress', 'commit_tree_oid': tree,
+                      'document_record': record})
+
+        def git_with(parent, actual_tree):
+            def git(_repo, *args, **_kwargs):
+                outputs = {
+                    ('show', '-s', '--format=%P', 'after'): parent,
+                    ('show', '-s', '--format=%B', 'after'): 'Record progress',
+                    ('rev-parse', 'after^{tree}'): actual_tree,
+                }
+                if args[:2] == ('merge-base', '--is-ancestor'):
+                    return SimpleNamespace(returncode=0, stdout='')
+                return SimpleNamespace(returncode=0, stdout=outputs.get(args, ''))
+            return git
+
+        ports = replace(self.handler._publication_handler().ports, checkpoint=checkpoints,
+                        git=mock.Mock(side_effect=git_with('different-parent', tree)))
+        advance_owned_record(ports, context)
+        saved = checkpoints.get(self.repo, context.plan.plan_id).snapshot['document_record']
+        self.assertEqual(self.state.row()['definition_snapshot'], previous.serialize())
+        self.assertEqual(saved['unresolved_reason'], 'commit_result_unconfirmed')
+        self.assertNotIn('applied', saved)
+
+        current = checkpoints.get(self.repo, context.plan.plan_id)
+        checkpoints.record(self.repo, context.plan.plan_id, expected_generation=current.generation,
+            operation=None, expected_head='after', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'before_head': 'before', 'after_head': 'after',
+                      'commit_message': 'Record progress', 'commit_tree_oid': tree,
+                      'document_record': record})
+        ports = replace(self.handler._publication_handler().ports, checkpoint=checkpoints,
+                        git=mock.Mock(side_effect=git_with('before', 'c' * 40)))
+        advance_owned_record(ports, context)
+        saved = checkpoints.get(self.repo, context.plan.plan_id).snapshot['document_record']
+        self.assertEqual(self.state.row()['definition_snapshot'], previous.serialize())
+        self.assertEqual(saved['unresolved_reason'], 'commit_result_unconfirmed')
+        self.assertNotIn('applied', saved)
+
+        current = checkpoints.get(self.repo, context.plan.plan_id)
+        wrong_commit = {**record, 'commit': 'different-commit'}
+        checkpoints.record(self.repo, context.plan.plan_id, expected_generation=current.generation,
+            operation=None, expected_head='after', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'before_head': 'before', 'after_head': 'after',
+                      'commit_message': 'Record progress', 'commit_tree_oid': tree,
+                      'document_record': wrong_commit})
+        ports = replace(self.handler._publication_handler().ports, checkpoint=checkpoints,
+                        git=mock.Mock(side_effect=git_with('before', tree)))
+        advance_owned_record(ports, context)
+        saved = checkpoints.get(self.repo, context.plan.plan_id).snapshot['document_record']
+        self.assertEqual(self.state.row()['definition_snapshot'], previous.serialize())
+        self.assertEqual(saved['unresolved_reason'], 'commit_result_unconfirmed')
+        self.assertNotIn('applied', saved)
+
+        current = checkpoints.get(self.repo, context.plan.plan_id)
+        wrong_owner = {**record, 'branch': 'other-branch'}
+        checkpoints.record(self.repo, context.plan.plan_id, expected_generation=current.generation,
+            operation=None, expected_head='after', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'before_head': 'before', 'after_head': 'after',
+                      'commit_message': 'Record progress', 'commit_tree_oid': tree,
+                      'document_record': wrong_owner})
+        ports = replace(self.handler._publication_handler().ports, checkpoint=checkpoints,
+                        git=mock.Mock(side_effect=git_with('before', tree)))
+        advance_owned_record(ports, context)
+        saved = checkpoints.get(self.repo, context.plan.plan_id).snapshot['document_record']
+        self.assertEqual(self.state.row()['definition_snapshot'], previous.serialize())
+        self.assertEqual(saved['unresolved_reason'], 'commit_owner_changed')
+        self.assertNotIn('applied', saved)
+
+        legacy = replace(previous, body_text=None)
+        self.state.update_project(self.repo, definition_snapshot=legacy.serialize(),
+                                  worker_input_token=legacy.worker_token)
+        current = checkpoints.get(self.repo, context.plan.plan_id)
+        checkpoints.record(self.repo, context.plan.plan_id, expected_generation=current.generation,
+            operation=None, expected_head='after', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'before_head': 'before', 'after_head': 'after',
+                      'commit_message': 'Record progress', 'commit_tree_oid': tree,
+                      'document_record': {**record, 'previous': legacy.serialize()}})
+        ports = replace(self.handler._publication_handler().ports, checkpoint=checkpoints,
+                        git=mock.Mock(side_effect=git_with('before', tree)))
+        advance_owned_record(ports, context)
+        saved = checkpoints.get(self.repo, context.plan.plan_id).snapshot['document_record']
+        self.assertEqual(DefinitionSnapshot.deserialize(self.state.row()['definition_snapshot']).body_text,
+                         None)
+        self.assertEqual(saved['unresolved_reason'], 'original_definition_unavailable')
+        self.assertNotIn('applied', saved)
+
+    def test_unresolved_progress_record_allows_correction_without_replacing_evidence(self):
+        from loop_manager_internal.execution.execution_revision import ExecPlanBodyHash
+        from loop_manager_internal.execution.execution_publication_handler import PublicationHandler
+
+        context = self.review_context()
+        text = '---\nid: G-047\n---\n## Purpose\nImplement safely\n## Progress\n- [ ] Run test\n'
+        previous = replace(self.handler._definition_snapshot, body_text=text,
+                            body_hash=str(ExecPlanBodyHash(text)))
+        self.handler._definition_snapshot = previous
+        self.state.update_project(self.repo, definition_snapshot=previous.serialize(),
+                                  worker_input_token=previous.worker_token,
+                                  verify_result='FAILED: correction required',
+                                  review_result='VERDICT: FAIL')
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        current = checkpoints.get(self.repo, context.plan.plan_id)
+        tree = 'd' * 40
+        message = 'Record Progress'
+        recorded_text = text + '- New implementation condition\n'
+        record = {
+            'previous': previous.serialize(), 'planning_previous': previous.serialize(),
+            'tree': tree, 'commit': 'after',
+            'commit_intent': {'before_head': 'before', 'message': message, 'tree': tree},
+            'repo': self.handler._identity.repo, 'plan_id': context.plan.plan_id,
+            'branch': context.branch, 'worktree': str(context.worktree),
+        }
+        checkpoints.record(self.repo, context.plan.plan_id, expected_generation=current.generation,
+            operation=None, expected_head='after', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'before_head': 'before', 'after_head': 'after',
+                      'commit_message': message, 'commit_tree_oid': tree,
+                      'document_record': record})
+
+        head = ['after']
+        correction_tree = 'e' * 40
+        def git(_repo, *args, **_kwargs):
+            outputs = {
+                ('write-tree',): correction_tree,
+                ('show', '-s', '--format=%P', 'after'): 'before',
+                ('show', '-s', '--format=%B', 'after'): message,
+                ('rev-parse', 'after^{tree}'): tree,
+                ('show', 'after:docs/plans/[G-047] Runtime.md'): recorded_text,
+            }
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(returncode=0, stdout=f'{head[0]}\n')
+            if args == ('commit', '-m', 'Repair verification failure'):
+                head[0] = 'corrected'
+                return SimpleNamespace(returncode=0, stdout='')
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(returncode=0, stdout='')
+            return SimpleNamespace(returncode=0, stdout=outputs.get(args, ''))
+
+        git = mock.Mock(side_effect=git)
+        publication = PublicationHandler(replace(
+            self.handler._publication_handler().ports,
+            checkpoint=checkpoints, git=git,
+        ))
+        publication._commit_owned(context, 'Repair verification failure')
+        corrected = checkpoints.get(self.repo, context.plan.plan_id)
+        self.assertIsNone(corrected.operation)
+        self.assertEqual(corrected.expected_head, 'corrected')
+        self.assertEqual(corrected.snapshot['commit_message'], 'Repair verification failure')
+        saved = checkpoints.get(self.repo, context.plan.plan_id).snapshot['document_record']
+        self.assertEqual(saved, {**record, 'unresolved_reason': 'document_conditions_changed'})
+        self.assertEqual(self.state.row()['definition_snapshot'], previous.serialize())
+        self.assertEqual(self.state.row()['verify_result'], 'FAILED: correction required')
+        self.assertEqual(self.state.row()['review_result'], 'VERDICT: FAIL')
+        self.assertEqual(sum(call.args[1] == 'commit' for call in git.call_args_list), 1)
+
+    def test_unconfirmed_record_allows_correction_without_consuming_evidence(self):
+        from loop_manager_internal.execution.execution_revision import ExecPlanBodyHash
+        from loop_manager_internal.execution.execution_publication_handler import PublicationHandler
+
+        context = self.review_context()
+        text = '---\nid: G-047\n---\n## Purpose\nImplement safely\n## Progress\n- [ ] Run test\n'
+        previous = replace(self.handler._definition_snapshot, body_text=text,
+                            body_hash=str(ExecPlanBodyHash(text)))
+        self.handler._definition_snapshot = previous
+        self.state.update_project(self.repo, definition_snapshot=previous.serialize(),
+                                  worker_input_token=previous.worker_token,
+                                  verify_result='FAILED: correction required',
+                                  review_result='VERDICT: FAIL')
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        current = checkpoints.get(self.repo, context.plan.plan_id)
+        tree = 'f' * 40
+        message = 'Record Progress'
+        record = {
+            'previous': previous.serialize(), 'planning_previous': previous.serialize(),
+            'tree': tree, 'commit': 'after',
+            'commit_intent': {'before_head': 'before', 'message': message, 'tree': tree},
+            'repo': self.handler._identity.repo, 'plan_id': context.plan.plan_id,
+            'branch': context.branch, 'worktree': str(context.worktree),
+        }
+        checkpoints.record(self.repo, context.plan.plan_id, expected_generation=current.generation,
+            operation=None, expected_head='after', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'before_head': 'before', 'after_head': 'after',
+                      'commit_message': message, 'commit_tree_oid': tree,
+                      'document_record': record})
+
+        head = ['after']
+        def git(_repo, *args, **_kwargs):
+            outputs = {
+                ('write-tree',): 'e' * 40,
+                ('show', '-s', '--format=%P', 'after'): 'different-parent',
+                ('show', '-s', '--format=%B', 'after'): message,
+                ('rev-parse', 'after^{tree}'): tree,
+            }
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(returncode=0, stdout=f'{head[0]}\n')
+            if args == ('commit', '-m', 'Repair verification failure'):
+                head[0] = 'corrected'
+                return SimpleNamespace(returncode=0, stdout='')
+            return SimpleNamespace(returncode=0, stdout=outputs.get(args, ''))
+
+        git = mock.Mock(side_effect=git)
+        publication = PublicationHandler(replace(
+            self.handler._publication_handler().ports,
+            checkpoint=checkpoints, git=git,
+        ))
+        publication._commit_owned(context, 'Repair verification failure')
+        corrected = checkpoints.get(self.repo, context.plan.plan_id)
+        self.assertIsNone(corrected.operation)
+        self.assertEqual(corrected.expected_head, 'corrected')
+        self.assertEqual(corrected.snapshot['commit_message'], 'Repair verification failure')
+        self.assertEqual(corrected.snapshot['document_record'], {
+            **record, 'unresolved_reason': 'commit_result_unconfirmed',
+        })
+        self.assertEqual(self.state.row()['definition_snapshot'], previous.serialize())
+        self.assertEqual(self.state.row()['verify_result'], 'FAILED: correction required')
+        self.assertEqual(self.state.row()['review_result'], 'VERDICT: FAIL')
+        self.assertEqual(sum(call.args[1] == 'commit' for call in git.call_args_list), 1)
 
     def setUp(self):
         super().setUp()

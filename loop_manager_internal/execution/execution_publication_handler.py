@@ -103,24 +103,55 @@ class PublicationHandler:
             approved_tree = self.ports.git(
                 context.worktree, 'write-tree',
             ).stdout.strip()
-            definition = self.ports.snapshot()._definition_snapshot
-            prior_record = (current.snapshot or {}).get('document_record') or {}
-            planning_previous = definition.serialize() if definition is not None else None
-            if definition is not None and prior_record.get('applied') and definition.body_text == prior_record.get('text'):
-                planning_previous = prior_record.get('planning_previous') or prior_record['previous']
-            checkpoint.record(
-                self.ports.identity.repo, context.plan.plan_id,
-                expected_generation=current.generation, operation='commit',
-                expected_head=before, target_base_oid=context.active_sha,
-                observed_remote_oid=current.observed_remote_oid,
-                snapshot={**(current.snapshot or {}),
-                          'commit_message': title, 'before_head': before,
-                          'commit_tree_oid': approved_tree,
-                          **({'document_record': {
-                              'previous': definition.serialize(), 'planning_previous': planning_previous,
-                              'tree': approved_tree}}
-                             if definition is not None else {})},
-            )
+            saved = current.snapshot or {}
+            if current.operation == 'commit':
+                if (current.expected_head != before
+                        or saved.get('commit_message') != title
+                        or saved.get('commit_tree_oid') != approved_tree):
+                    raise manager_git_journal.MutationEvidenceError(
+                        'pending commit intent differs from the current tree')
+            else:
+                if current.operation is not None:
+                    raise manager_git_journal.MutationEvidenceError(
+                        'cannot replace another pending Git operation with a commit')
+                from loop_manager_internal.execution.execution_revision import advance_owned_record
+                advance_owned_record(self.ports, context)
+                current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+                saved = current.snapshot or {}
+                prior_record = saved.get('document_record') or {}
+                preserve_unresolved_record = (
+                    isinstance(prior_record, dict)
+                    and bool(prior_record)
+                    and prior_record.get('applied') is not True
+                )
+                definition = self.ports.snapshot()._definition_snapshot
+                planning_previous = definition.serialize() if definition is not None else None
+                if (definition is not None and prior_record.get('applied') is True
+                        and definition.body_text == prior_record.get('text')):
+                    planning_previous = prior_record.get('planning_previous') or prior_record['previous']
+                record = ({
+                    'previous': definition.serialize(),
+                    'planning_previous': planning_previous,
+                    'tree': approved_tree,
+                    'commit_intent': {
+                        'before_head': before, 'message': title, 'tree': approved_tree,
+                    },
+                    'repo': self.ports.identity.repo,
+                    'plan_id': context.plan.plan_id,
+                    'branch': context.branch,
+                    'worktree': str(context.worktree),
+                } if (not preserve_unresolved_record and definition is not None
+                      and definition.body_text is not None) else None)
+                checkpoint.record(
+                    self.ports.identity.repo, context.plan.plan_id,
+                    expected_generation=current.generation, operation='commit',
+                    expected_head=before, target_base_oid=context.active_sha,
+                    observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**saved,
+                              'commit_message': title, 'before_head': before,
+                              'commit_tree_oid': approved_tree,
+                              **({'document_record': record} if record is not None else {})},
+                )
         result = self.ports.git(
             context.worktree, 'commit', '-m', title,
         )
@@ -129,12 +160,22 @@ class PublicationHandler:
             after = self.ports.git(
                 context.worktree, 'rev-parse', 'HEAD'
             ).stdout.strip()
+            snapshot = {**(current.snapshot or {}), 'after_head': after}
+            record = snapshot.get('document_record')
+            if isinstance(record, dict):
+                intent = record.get('commit_intent')
+                if intent == {
+                    'before_head': snapshot.get('before_head'),
+                    'message': snapshot.get('commit_message'),
+                    'tree': snapshot.get('commit_tree_oid'),
+                }:
+                    snapshot['document_record'] = {**record, 'commit': after}
             checkpoint.record(
                 self.ports.identity.repo, context.plan.plan_id,
                 expected_generation=current.generation, operation=None,
                 expected_head=after, target_base_oid=current.target_base_oid,
                 observed_remote_oid=current.observed_remote_oid,
-                snapshot={**(current.snapshot or {}), 'after_head': after,
+                snapshot={**snapshot,
                           **({'worker_candidate_token': self.ports.snapshot()._definition_snapshot.worker_candidate_token(after)}
                              if worker_confirmed and self.ports.snapshot()._definition_snapshot is not None
                              and (current.snapshot or {}).get('worker_candidate_token') ==

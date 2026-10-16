@@ -220,6 +220,187 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.effects.publication.command.assert_not_called()
 
 
+    def test_interrupted_owned_commit_restores_progress_record_on_restart(self):
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot, ExecPlanBodyHash
+        from loop_manager_internal.storage import verify_receipts
+        from loop_manager_internal.verification.inputs import InputObservation
+
+        fixture = blocked_git_fixture(self)
+        repo = str(fixture.repo.resolve())
+        branch = 'loop-manager/G-034'
+        relative = 'docs/plans/[G-034] Checkpoint.md'
+        base_plan = fixture.repo / relative
+        baseline_text = base_plan.read_text(encoding='utf-8') + (
+            '\n## Progress\n- [ ] Preserve the approved record\n'
+            '- [ ] Preserve the next approved record\n'
+        )
+        base_plan.write_text(baseline_text, encoding='utf-8')
+        fixture.run_git(fixture.repo, 'add', '--', relative)
+        fixture.run_git(fixture.repo, 'commit', '-m', 'Prepare Progress baseline')
+        fixture.run_git(fixture.repo, 'push', 'origin', 'main')
+        base = fixture.run_git(fixture.repo, 'rev-parse', 'HEAD')
+        fixture.run_git(fixture.worktree, 'merge', '--ff-only', base)
+        fixture.base_oid = base
+
+        previous = DefinitionSnapshot(
+            revision_sha=base, path=relative, title='Checkpoint',
+            sources=('docs/PRODUCT.md',), depends_on=(), complexity='high', risk='critical',
+            priority='critical', body_hash=str(ExecPlanBodyHash(baseline_text)),
+            source_fingerprint='fixture-source', archive_candidates=(), body_text=baseline_text,
+        )
+        connection = fixture.connection
+        connection.execute(
+            "UPDATE exec_plans SET plan_sha=?, active_sha=?, status='REVIEWING', "
+            "definition_snapshot=?, worker_input_token=?, archive_token=?, "
+            "worker_session_id='saved-worker', reviewer_session_id='saved-reviewer', "
+            "worker_result='saved worker result', verify_result='old verify result', "
+            "review_result='VERDICT: PASS', validated_base_sha=?, verify_failure_history=?, "
+            "review_failure_history=? WHERE repo=? AND plan_id='G-034'",
+            (base, base, previous.serialize(), previous.worker_token, previous.archive_token,
+             base, '{"prior":"verify-failure"}', '{"prior":"review-failure"}', repo),
+        )
+        connection.commit()
+        plan_row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo=? AND plan_id='G-034'", (repo,),
+        ).fetchone()
+        lm.hydrate_execplan_project(connection, repo, plan_row)
+        verify_receipts.ensure_schema(connection)
+        verify_receipts.start_cycle(connection, repo, 'G-034')
+        observation = InputObservation('interrupted-commit-fixture')
+        selection = verify_receipts.selected(connection, repo, 'G-034')
+        receipt_id, selection = verify_receipts.record(
+            connection, selection, head=base, observation=observation,
+            kind='run', reason='checkpoint-recovery fixture',
+        )
+        verify_receipts.complete(
+            connection, selection, receipt_id, passed=True, output='old verify result',
+        )
+        connection.commit()
+
+        def make_handler(connection):
+            checkpoint = ExecutionCheckpointRepository(connection)
+            state = ExecutionStatePort(
+                connection, runtime_state.RuntimeStateRepository(connection), repo,
+            )
+            git = mock.Mock(wraps=lm.git)
+            workspace = replace(
+                self.effects.workspace, git=git,
+                _rebase_in_progress_for_branch=lm._rebase_in_progress_for_branch,
+                git_operation_entries=lm._git_operation_entries,
+                validate_execplan_workspace_identity=lm.validate_execplan_workspace_identity,
+                validate_managed_worktree=lm.validate_managed_worktree,
+            )
+            effects = replace(self.effects, state=state, checkpoint=checkpoint, workspace=workspace)
+            handler = handlers.ExecutionHandlers(
+                effects, repo=repo, repo_path=fixture.repo, state_dir=fixture.state_dir,
+                base='main', base_sha=base, provider='codex',
+                config_path=Path('/config'), newly_activated=False,
+            )
+            catalog = state.active_execplan(repo)
+            handler._update_snapshot(
+                plan=handler._cached_plan(catalog), catalog_plan=catalog,
+                _definition_snapshot=previous,
+            )
+            return handler, checkpoint, state, git
+
+        handler, checkpoint, state, _git = make_handler(connection)
+        context = handler._context()
+        changed_text = baseline_text.replace('- [ ] Preserve the approved record',
+                                              '- [x] Preserve the approved record')
+        (fixture.worktree / relative).write_text(changed_text, encoding='utf-8')
+        fixture.run_git(fixture.worktree, 'add', '--', relative)
+        original_record = checkpoint.record
+
+        def interrupt_completion(*args, **kwargs):
+            if kwargs.get('operation') is None:
+                raise RuntimeError('completion checkpoint interrupted')
+            return original_record(*args, **kwargs)
+
+        with mock.patch.object(checkpoint, 'record', side_effect=interrupt_completion):
+            with self.assertRaisesRegex(RuntimeError, 'completion checkpoint interrupted'):
+                handler._commit_owned(context, 'Record Progress')
+        commit = fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD')
+        pending = checkpoint.get(repo, 'G-034')
+        self.assertEqual(pending.operation, 'commit')
+        self.assertEqual(pending.expected_head, base)
+        self.assertNotIn('commit', pending.snapshot['document_record'])
+
+        database = fixture.state_dir / 'restart.db'
+        with closing(sqlite3.connect(database)) as persisted, persisted:
+            connection.backup(persisted)
+        connection.close()
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        fixture.connection = connection
+        fixture.addCleanup(connection.close)
+        plan_row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo=? AND plan_id='G-034'", (repo,),
+        ).fetchone()
+        lm.hydrate_execplan_project(connection, repo, plan_row)
+        handler, checkpoint, state, git = make_handler(connection)
+
+        recovered = handler.recover(handler._context())
+        self.assertEqual(recovered.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD'), commit)
+        self.assertEqual(fixture.run_git(fixture.worktree, 'rev-list', '--count', f'{base}..HEAD'), '1')
+        corrected = checkpoint.get(repo, 'G-034')
+        self.assertIsNone(corrected.operation)
+        self.assertEqual(corrected.expected_head, commit)
+        self.assertEqual(corrected.snapshot['after_head'], commit)
+        record = corrected.snapshot['document_record']
+        self.assertEqual(record['commit'], commit)
+        self.assertEqual(record['previous'], previous.serialize())
+        self.assertEqual(record['tree'], corrected.snapshot['commit_tree_oid'])
+        self.assertNotIn('applied', record)
+        self.assertEqual(state.row()['worker_session_id'], 'saved-worker')
+        self.assertEqual(state.row()['reviewer_session_id'], 'saved-reviewer')
+        failures = connection.execute(
+            "SELECT verify_failure_history,review_failure_history FROM exec_plans "
+            "WHERE repo=? AND plan_id='G-034'", (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(failures), ('{"prior":"verify-failure"}', '{"prior":"review-failure"}'))
+        self.assertEqual(state.row()['verify_result'], None)
+        saved_receipt = verify_receipts.current_receipt(
+            connection, verify_receipts.selected(connection, repo, 'G-034'),
+        )
+        self.assertEqual(saved_receipt['result'], 'old verify result')
+
+        from loop_manager_internal.execution.execution_revision import advance_owned_record
+        ports = handler._revision_handler().ports
+        advance_owned_record(ports, recovered)
+        applied = checkpoint.get(repo, 'G-034')
+        self.assertTrue(applied.snapshot['document_record']['applied'])
+        self.assertEqual(applied.snapshot['document_record']['text'], changed_text)
+        self.assertEqual(DefinitionSnapshot.deserialize(state.row()['definition_snapshot']).body_text,
+                         changed_text)
+        generation = applied.generation
+        git_calls = git.call_count
+        advance_owned_record(ports, recovered)
+        self.assertEqual(checkpoint.get(repo, 'G-034').generation, generation)
+        self.assertEqual(git.call_count, git_calls)
+        self.assertFalse(any(call.args[1] == 'commit' for call in git.call_args_list))
+
+        first_applied_definition = state.row()['definition_snapshot']
+        second_text = changed_text.replace(
+            '- [ ] Preserve the next approved record',
+            '- [x] Preserve the next approved record',
+        )
+        (fixture.worktree / relative).write_text(second_text, encoding='utf-8')
+        fixture.run_git(fixture.worktree, 'add', '--', relative)
+        handler._commit_owned(handler._context(), 'Record next Progress')
+        second_commit = fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(second_commit, commit)
+        self.assertEqual(fixture.run_git(fixture.worktree, 'rev-list', '--count', f'{base}..HEAD'), '2')
+        second_record = checkpoint.get(repo, 'G-034').snapshot['document_record']
+        self.assertEqual(second_record['previous'], first_applied_definition)
+        self.assertEqual(second_record['planning_previous'], previous.serialize())
+        self.assertEqual(second_record['commit'], second_commit)
+        self.assertTrue(second_record['applied'])
+        self.assertEqual(second_record['text'], second_text)
+        self.assertEqual(DefinitionSnapshot.deserialize(state.row()['definition_snapshot']).body_text,
+                         second_text)
+
+
     def test_published_review_push_restarts_before_completion_checkpoint(self):
         live = mock.patch('loop_manager_internal.git.manager_git_journal.live_remote_branch_oid', return_value='corrected-head')
         live.start()
