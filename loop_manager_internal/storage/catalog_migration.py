@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import sqlite3
 
@@ -161,7 +161,7 @@ def _quarantine_unverified_historical_runtime(
             )
 
 
-def _migrate_execplan_catalog(
+def _apply_execplan_catalog(
     connection: sqlite3.Connection,
     *,
     effects: CatalogMigrationEffects,
@@ -377,3 +377,82 @@ def _migrate_execplan_catalog(
                     plan_sha=recovered.plan_sha,
                     pr_url=recovered.proof.pr_url,
                 )
+
+
+def _migration_state(connection, repo):
+    tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
+    state = []
+    for (name,) in tables:
+        quoted = '"' + name.replace('"', '""') + '"'
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(' + quoted + ')')}
+        if 'repo' in columns:
+            rows = connection.execute('SELECT * FROM ' + quoted + (' WHERE repo=?' if repo is not None else ''),
+                                      (repo,) if repo is not None else ()).fetchall()
+            state.append((name, sorted((tuple(row) for row in rows), key=repr)))
+    return state
+
+
+def _migrate_execplan_catalog(connection, *, effects, reconcile_history, target_repo,
+                             manage_transaction=True, pinned_catalog=None, prepare_only=False,
+                             prepared=None, registration=None):
+    """Observe legacy Git/PR effects on an independent snapshot, then CAS the live rows."""
+    if prepared is None:
+        if connection.in_transaction:
+            raise RuntimeError('legacy catalog 관측 전에 DB transaction을 종료해야 합니다.')
+        clone = sqlite3.connect(':memory:')
+        clone.row_factory = sqlite3.Row
+        try:
+            with connection:
+                connection.backup(clone)
+                for name, sql in connection.execute("SELECT name,sql FROM sqlite_temp_master WHERE type='table'"):
+                    clone.execute(sql.replace("CREATE TABLE", "CREATE TEMP TABLE", 1))
+                    quoted = '"' + name.replace('"', '""') + '"'
+                    rows = connection.execute('SELECT * FROM temp.' + quoted).fetchall()
+                    if rows:
+                        clone.executemany('INSERT INTO temp.' + quoted + ' VALUES (' + ','.join('?' for _ in rows[0]) + ')', rows)
+            if registration is not None:
+                from loop_manager_internal.runtime import project_registry
+                project_registry.add_project(clone, registration)
+            expected = _migration_state(clone, target_repo)
+            cache = {}
+            sealed = [False]
+            def memo(name, function):
+                def call(*args, **kwargs):
+                    key = (name, repr(args), repr(kwargs))
+                    if key not in cache:
+                        if sealed[0]:
+                            raise RuntimeError('legacy catalog 관측 이후 입력이 변경됐습니다.')
+                        try:
+                            cache[key] = (True, function(*args, **kwargs))
+                        except Exception as error:
+                            cache[key] = (False, error)
+                    success, value = cache[key]
+                    if not success:
+                        raise value
+                    return value
+                return call
+            class ObservedProof:
+                def __init__(self, proof):
+                    self.proof_for = memo(('proof_for', id(proof)), proof.proof_for)
+                    self.verify_stored = memo(('verify_stored', id(proof)), proof.verify_stored)
+            def proof(*args):
+                return ObservedProof(effects._LegacyCatalogMergeProof(*args))
+            observed = replace(effects,
+                revision_execplan_snapshot=memo('snapshot', effects.revision_execplan_snapshot),
+                pr_for_branch=memo('pr', effects.pr_for_branch),
+                _current_execplan_sha=memo('sha', effects._current_execplan_sha),
+                _LegacyCatalogMergeProof=memo('proof', proof))
+            _apply_execplan_catalog(clone, effects=observed, reconcile_history=reconcile_history,
+                                   target_repo=target_repo, pinned_catalog=pinned_catalog)
+            sealed[0] = True
+            prepared = (expected, observed)
+        finally:
+            clone.close()
+    if prepare_only:
+        return prepared
+    from .runtime_state import _transaction
+    with _transaction(connection):
+        if _migration_state(connection, target_repo) != prepared[0]:
+            raise RuntimeError('legacy catalog 적용 전 DB 상태가 변경됐습니다.')
+        return _apply_execplan_catalog(connection, effects=prepared[1], reconcile_history=reconcile_history,
+            target_repo=target_repo, manage_transaction=False, pinned_catalog=pinned_catalog)

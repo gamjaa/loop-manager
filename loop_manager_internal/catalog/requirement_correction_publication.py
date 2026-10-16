@@ -331,18 +331,20 @@ class RequirementCorrectionPublisher:
                     commit = self.prepare(operation_id, manifest)
                     final_hash = self._validate_commit(manifest, commit)
                     self.repository.update(repo, operation_id, commit_oid=commit)
-                # The intent was committed before editing. Hold the SQLite
-                # writer through the final relationship check and remote/DB
-                # confirmation so manual intake cannot change this snapshot.
+                self.repository.update(repo, operation_id, commit_oid=commit)
+                latest = self.git.fetch_remote_base(base_branch)
+                if latest != base or self.observe(latest) != manifest or not self.safe():
+                    raise CorrectionPending('Requirement 교정 게시 직전 원격 또는 참조가 변경됐습니다.')
+                reserved = self.repository.pending(repo)
+                if reserved is None or reserved['operation_id'] != operation_id:
+                    raise CorrectionPending('Requirement 교정 게시 소유 예약이 변경됐습니다.')
+                from loop_manager_internal.catalog.execplan_archive import PreparedArchive
+                result = self.git.push_fast_forward(PreparedArchive(operation_id, base, final_hash, commit), base_branch)
+                if not result.success or result.remote_oid != commit:
+                    raise CorrectionPending(result.error or 'Requirement 교정 push 결과를 확인할 수 없습니다.')
                 with _transaction(self.connection):
-                    self.repository.update(repo, operation_id, commit_oid=commit)
-                    latest = self.git.fetch_remote_base(base_branch)
-                    if latest != base or self.observe(latest) != manifest or not self.safe():
-                        raise CorrectionPending('Requirement 교정 게시 직전 원격 또는 참조가 변경됐습니다.')
-                    from loop_manager_internal.catalog.execplan_archive import PreparedArchive
-                    result = self.git.push_fast_forward(PreparedArchive(operation_id, base, final_hash, commit), base_branch)
-                    if not result.success or result.remote_oid != commit:
-                        raise CorrectionPending(result.error or 'Requirement 교정 push 결과를 확인할 수 없습니다.')
+                    if self.repository.pending(repo) != reserved:
+                        raise CorrectionPending('Requirement 교정 게시 후 DB 소유 예약이 변경됐습니다.')
                     self.repository.update(repo, operation_id, stage='confirmed', commit_oid=commit)
                 return commit
         except (RuntimeError, OSError, ValueError, sqlite3.Error, KeyError) as error:

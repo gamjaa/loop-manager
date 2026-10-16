@@ -240,19 +240,21 @@ class ReviewHandler:
             approved = preliminary_review.active(self.ports, context, {'review_pass', 'final_review_pending'})
             if (preliminary_review.reusable(self.ports, context, approved)
                     and preliminary_review.full_evidence(self.ports, context, approved)):
+                candidate_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+                reusable = preliminary_review.reusable(self.ports, context, approved)
+                full_evidence = preliminary_review.full_evidence(self.ports, context, approved)
                 with runtime_state._transaction(self.ports.state.connection):
                     self.ports.state.check_context(context)
                     # Entry evidence already required current full token + receipt;
                     # repeat input identity at the state transition boundary.
-                    if (not preliminary_review.reusable(self.ports, context, approved)
-                            or not preliminary_review.full_evidence(self.ports, context, approved)):
+                    if not reusable or not full_evidence:
                         return self.ports._retry('선행 Review 최종 승인 입력이 변경됐습니다.')
                     pre_review.update(self.ports.state.connection, approved, 'finalized_reuse')
                     self.ports.clear_validation_failure_history(self.ports.identity.repo, 'review')
                     self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
                         phase='PUBLISHING', last_error=None, review_result=approved['review'],
                         review_token=self.ports.snapshot()._definition_snapshot.review_token(
-                            str(row['validated_base_sha']), self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()),
+                            str(row['validated_base_sha']), candidate_head),
                         publication_token=None)
                 events.emit("선행 Review 결과 재사용: 최종 전체 verify 증거 확인 완료", next_stage="PUBLISHING")
                 return self.ports._advanced()

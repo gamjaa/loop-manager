@@ -419,10 +419,11 @@ def _complete_direct_rebase_checkpoint(
                 reobserve=lambda: service.observe()[1],
             )
         else:
+            confirmed = service.observe()[1]
             with runtime_state._transaction(connection):
                 if runtime.get(repo, plan_id) != selected or checkpoint.get(repo, plan_id) != current:
                     raise manager_git_journal.MutationEvidenceError('current blocked rebase ownership changed')
-                if service.observe()[1] != decision or runtime.projected(repo) is not None:
+                if confirmed != decision or runtime.projected(repo) is not None:
                     raise manager_git_journal.MutationEvidenceError('current blocked rebase state changed')
                 values = managed_rebase_adoption.revalidation_values(target_base_oid)
                 for field in ('phase', 'last_error', 'revision_resume_status'):

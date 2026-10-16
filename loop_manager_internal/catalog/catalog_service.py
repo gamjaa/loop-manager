@@ -499,6 +499,10 @@ def reconcile_execplan_catalog(
         # Initial migration and declaration reconciliation share a rollback
         # boundary. Validate the remote graph before recovering runtime rows.
         try:
+            pinned = port.load()
+            effects.backfill_plan_shas(connection, target_repo=repo)
+            prepared = effects.migrate_legacy_execplans(connection, reconcile_history=True, target_repo=repo,
+                ensure_schema=False, pinned_catalog=pinned, prepare_only=True)
             with execplan_catalog_state._transaction(connection):
                 pinned = port.load()
                 # Deletion reconciliation validates new declarations before
@@ -511,11 +515,10 @@ def reconcile_execplan_catalog(
                 if repository.capture(repo).plan_ids - pinned.snapshot.observed_ids:
                     result = service.reconcile(repo)
                 else:
-                    effects.backfill_plan_shas(connection, target_repo=repo, manage_transaction=False)
                     effects.migrate_legacy_execplans(
                         connection, reconcile_history=True, target_repo=repo,
                         ensure_schema=False, manage_transaction=False,
-                        pinned_catalog=pinned,
+                        pinned_catalog=pinned, prepared=prepared,
                     )
                     result = service.reconcile(repo)
                 if not result.usable:

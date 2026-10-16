@@ -71,8 +71,9 @@ def _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, pla
 
 def _complete_owned_rebase(checkpoints, repo, plan_id, current, service, observed, decision, remote, saved):
     """Accept a stable result at its original target under the fetched live lease."""
+    confirmed = service.observe()[1]
     with runtime_state._transaction(checkpoints.connection):
-        if service.observe()[1] != decision or checkpoints.get(repo, plan_id) != current:
+        if confirmed != decision or checkpoints.get(repo, plan_id) != current:
             raise RuntimeError('관리 rebase 완료 관측이 변경됐습니다.')
         return checkpoints.record(
             repo, plan_id, expected_generation=current.generation, operation=None,

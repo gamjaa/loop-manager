@@ -459,11 +459,14 @@ class BlockedCheckpointRepository:
         from loop_manager_internal.storage.runtime_state import _transaction, RuntimeStateRepository
 
         runtime = RuntimeStateRepository(self.connection)
+        plan = runtime.get(request.repo, request.plan_id)
+        confirmed = reobserve() if request.pr_url and reobserve is not None else None
         with _transaction(self.connection):
-            plan = runtime.get(request.repo, request.plan_id)
+            if runtime.get(request.repo, request.plan_id) != plan:
+                raise RuntimeError('checkpoint 작업 소유권이 변경됐습니다.')
             if request.pr_url:
                 if ((plan.branch, plan.worktree, plan.pr_url) != (request.branch, request.worktree, request.pr_url)
-                        or reobserve is None or reobserve() != remote_oid
+                        or reobserve is None or confirmed != remote_oid
                         or runtime.get(request.repo, request.plan_id) != plan):
                     raise RuntimeError('checkpoint 확정 직전 PR·작업 공간·원격 결과가 변경됐습니다.')
             self._update(

@@ -222,11 +222,13 @@ def _migrate_execplan_catalog(
     target_repo: str | None,
     manage_transaction: bool = True,
     pinned_catalog: execplan_catalog_state.PinnedCatalog | None = None,
+    prepare_only=False, prepared=None, registration=None,
 ) -> None:
     return catalog_migration._migrate_execplan_catalog(
         connection, effects=effects._catalog_migration_effects(),
         reconcile_history=reconcile_history, target_repo=target_repo,
         manage_transaction=manage_transaction, pinned_catalog=pinned_catalog,
+        prepare_only=prepare_only, prepared=prepared, registration=registration,
     )
 
 
@@ -245,18 +247,21 @@ def migrate_legacy_execplans(
     ensure_schema: bool = True,
     manage_transaction: bool = True,
     pinned_catalog: execplan_catalog_state.PinnedCatalog | None = None,
+    prepare_only=False, prepared=None, registration=None,
 ) -> None:
     """Conservatively move legacy project-owned execution state into the catalog."""
 
     if ensure_schema:
         effects._ensure_execplans_schema(connection)
-    effects._migrate_execplan_catalog(
+    result = effects._migrate_execplan_catalog(
         connection,
         reconcile_history=reconcile_history,
         target_repo=target_repo,
         manage_transaction=manage_transaction,
-        pinned_catalog=pinned_catalog,
+        pinned_catalog=pinned_catalog, prepare_only=prepare_only, prepared=prepared, registration=registration,
     )
+    if prepare_only:
+        return result
     with connection if manage_transaction else contextlib.nullcontext():
         scoped_blocking.migrate_legacy_blocks(connection)
     return

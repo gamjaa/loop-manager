@@ -25,7 +25,7 @@ def group_resources(group):
     return resources
 
 
-def preparation_gate(service, *, plan_ids=(), group=None, requirements=()):
+def preparation_gate(service, *, plan_ids=(), group=None, requirements=(), inspect_workspace=True):
     connection, repo = service.connection, service.repo
     if scoped_blocking.project_block(connection, repo):
         raise ManualConflictError('프로젝트 승인·차단 gate가 활성 상태입니다. 수락되지 않았습니다.')
@@ -98,7 +98,7 @@ def preparation_gate(service, *, plan_ids=(), group=None, requirements=()):
     path = Path(group['worktree'])
     if path.is_dir() and group['workspace_created']:
         service.effects.validate_workspace(service.repo_path, path, group['branch'])
-    if path.is_dir() and service.effects.capture_snapshot(path).operations:
+    if inspect_workspace and path.is_dir() and service.effects.capture_snapshot(path).operations:
         raise ManualConflictError(f'미완료 Git operation을 보존합니다: {path}')
 
 

@@ -204,8 +204,12 @@ class ExecutionStatePort:
         """Atomically advance the lease without approving or unblocking a candidate."""
         if checkpoints.connection is not self.connection:
             raise runtime_state.RuntimeStateError('intermediate publication database differs')
+        expected = self.check()
+        before = checkpoints.get(self.repo, self.plan_id)
+        oid, checked = reobserve()
         with runtime_state._transaction(self.connection):
-            expected = self.check()
+            if self.check() != expected or checkpoints.get(self.repo, self.plan_id) != before:
+                raise runtime_state.RuntimeStateError('intermediate publication snapshot changed')
             if (expected is None or expected.repo != intent['repo']
                     or expected.plan_id != intent['plan_id']
                     or expected.branch != intent['branch'] or expected.worktree != intent['worktree']
@@ -213,7 +217,6 @@ class ExecutionStatePort:
                     or (expected.pr_url or None) != (intent['acceptance']['remote']['pull_request'] or {}).get('identity')
                     or expected.publication_remote_oid not in (None, intent['remote_before'], intent['head'])):
                 raise runtime_state.RuntimeStateError('intermediate publication owner changed')
-            oid, checked = reobserve()
             if oid != intent['head'] or checked != acceptance:
                 raise runtime_state.RuntimeStateError('intermediate publication observation changed')
             before = checkpoints.get(self.repo, self.plan_id)

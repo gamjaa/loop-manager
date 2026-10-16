@@ -302,33 +302,31 @@ def add_registered_project(
     project_registry.ensure_registry_schema(connection)
     effects._ensure_execplans_schema(connection)
     maintenance_state.ensure_schema(connection)
+    pinned = None
+    prepared = None
+    before_project = connection.execute('SELECT * FROM projects WHERE repo=?', (project.repo,)).fetchone()
+    if inspection.root.is_dir():
+        current_sha = effects.git(inspection.root, 'rev-parse', '--verify',
+            f'refs/remotes/origin/{project.base_branch}^{{commit}}').stdout.strip()
+        source_sha = inspection.source_revision or current_sha
+        if current_sha != source_sha:
+            raise RuntimeError('등록 중 원격 source revision이 변경됐습니다.')
+        snapshot = effects.revision_execplan_snapshot(inspection.root, source_sha,
+            archive_conflict_plan_ids=effects._merged_execplan_ids(connection, project.repo))
+        pinned = execplan_catalog_state.PinnedCatalog(source_sha, snapshot)
+        prepared = effects.migrate_legacy_execplans(connection, reconcile_history=True, target_repo=project.repo,
+            ensure_schema=False, pinned_catalog=pinned, prepare_only=True, registration=project)
+        current_sha = effects.git(inspection.root, 'rev-parse', '--verify',
+            f'refs/remotes/origin/{project.base_branch}^{{commit}}').stdout.strip()
+        if current_sha != source_sha:
+            raise RuntimeError('등록 중 원격 ExecPlan catalog revision이 변경됐습니다.')
     with runtime_state._transaction(connection):
+        if connection.execute('SELECT * FROM projects WHERE repo=?', (project.repo,)).fetchone() != before_project:
+            raise RuntimeError('등록 중 프로젝트 상태가 변경됐습니다.')
         project_registry.add_project(connection, project, manage_transaction=False)
-        if inspection.root.is_dir():
-            current_sha = effects.git(
-                inspection.root, "rev-parse", "--verify",
-                f"refs/remotes/origin/{project.base_branch}^{{commit}}",
-            ).stdout.strip()
-            source_sha = inspection.source_revision or current_sha
-            if current_sha != source_sha:
-                raise RuntimeError("등록 중 원격 source revision이 변경됐습니다.")
-            effects.migrate_legacy_execplans(
-                connection,
-                reconcile_history=True,
-                target_repo=project.repo,
-                ensure_schema=False,
-                manage_transaction=False,
-            )
-            snapshot = effects.revision_execplan_snapshot(
-                inspection.root, source_sha,
-                archive_conflict_plan_ids=effects._merged_execplan_ids(connection, project.repo),
-            )
-            current_sha = effects.git(
-                inspection.root, "rev-parse", "--verify",
-                f"refs/remotes/origin/{project.base_branch}^{{commit}}",
-            ).stdout.strip()
-            if current_sha != source_sha:
-                raise RuntimeError("등록 중 원격 ExecPlan catalog revision이 변경됐습니다.")
+        if pinned is not None:
+            effects.migrate_legacy_execplans(connection, reconcile_history=True, target_repo=project.repo,
+                ensure_schema=False, manage_transaction=False, pinned_catalog=pinned, prepared=prepared)
             connection.execute(
                 "INSERT INTO execplan_catalog_revisions "
                 "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, ?) "

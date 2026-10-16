@@ -388,6 +388,7 @@ def run_verify_process(
                 stdin=subprocess.PIPE if job else subprocess.DEVNULL,
                 stdout=output, stderr=subprocess.STDOUT, **options,
             )
+            budget.active_processes += 1
             task_calls.verify_started(receipt,process)
             if job:
                 job.assign(process)
@@ -454,5 +455,7 @@ def run_verify_process(
                 confirmed_stop()
             raise
         finally:
+            if process is not None:
+                budget.active_processes -= 1
             if job:
                 job.close()

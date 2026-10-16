@@ -285,7 +285,10 @@ CREATE TABLE IF NOT EXISTS general_planning_publications (
 """
 
 
-class StateConnection(sqlite3.Connection):
+from .db_access import CoordinatedConnection, open_connection
+
+
+class StateConnection(CoordinatedConnection):
     """Keep completed schema initialization local to one database connection."""
 
     execplans_schema_ready = False
@@ -513,7 +516,7 @@ def connect_database(
         raise RuntimeError(
             "상태 DB가 없습니다. 먼저 `loop_manager.py config init`을 실행하세요."
         )
-    connection = sqlite3.connect(database, timeout=30.0, factory=StateConnection)
+    connection = open_connection(database, timeout=30.0, factory=StateConnection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 30000")
     if create:

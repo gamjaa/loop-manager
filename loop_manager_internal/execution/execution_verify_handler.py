@@ -345,11 +345,12 @@ class VerifyHandler:
         if preliminary_review.active(self.ports, context, {'review_pass', 'review_invalidated'}):
             origin = None  # General preliminary PASS always requires an actual full run.
         if origin is not None:
+            confirmed_observation = self._observe(context.worktree)
+            confirmed_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+            confirmed_dirty = self.ports.git(context.worktree, 'status', '--porcelain').stdout.strip()
             with runtime_state._transaction(connection):
                 self.ports.state.check_context(context)
-                if (self._observe(context.worktree) != observation
-                        or self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip() != candidate_head
-                        or self.ports.git(context.worktree, 'status', '--porcelain').stdout.strip()):
+                if (confirmed_observation != observation or confirmed_head != candidate_head or confirmed_dirty):
                     return self.ports._retry('verify 재사용 판정 중 입력이 변경되어 다시 확인합니다.')
                 verify_receipts.record(connection, selection, head=candidate_head,
                     observation=observation, kind='reuse', origin=origin,
@@ -472,19 +473,21 @@ class VerifyHandler:
             # Interrupted work, Review PASS/FAIL and prior fallback all proceed
             # through full verify. They cannot replay an uncompleted partial run.
             return None
+        review_identity = preliminary_review.review_identity(self.ports, context)
+        if review_identity is None:
+            from loop_manager_internal.verification import impact
+            fallback = ['review_environment_identity_unproven']
+            try:
+                declaration = self.ports.git(context.worktree, 'show', f'{head}:scripts/verify.json').stdout
+            except (OSError, RuntimeError):
+                # Legacy verification scripts need no adapter declaration.
+                # Missing fallback diagnostics must not prevent their full run.
+                declaration = None
+                fallback.append('verification_declaration_unavailable')
         with runtime_state._transaction(connection):
             self.ports.state.check_context(context)
             receipt = pre_review.begin(connection, self.ports.identity.repo, context.plan.plan_id, key)
-            if preliminary_review.review_identity(self.ports, context) is None:
-                from loop_manager_internal.verification import impact
-                fallback = ['review_environment_identity_unproven']
-                try:
-                    declaration = self.ports.git(context.worktree, 'show', f'{head}:scripts/verify.json').stdout
-                except (OSError, RuntimeError):
-                    # Legacy verification scripts need no adapter declaration.
-                    # Missing fallback diagnostics must not prevent their full run.
-                    declaration = None
-                    fallback.append('verification_declaration_unavailable')
+            if review_identity is None:
                 pre_review.update(connection, receipt, 'fallback', partial={
                     'kind': 'partial_verify', 'status': 'FALLBACK',
                     'selection': {'head': head, 'base': context.active_sha, 'modules': [], 'ids': [], 'reasons': {},

@@ -265,11 +265,12 @@ class _PlanningAgentPorts:
             current = self._effects.capture_git_snapshot(worktree)
         except (RuntimeError, OSError):
             return False
+        confirmed = self._effects.capture_git_snapshot(worktree)
         with runtime_state._transaction(self._connection):
             if (repository.planning(context.repo) != expected
                     or scoped_blocking.project_block(self._connection, context.repo) is not None
                     or not agent_scope_decision._same_local_snapshot(
-                        self._effects.capture_git_snapshot(worktree), current)):
+                        confirmed, current)):
                 return False
             if expected.planning_preserved_state:
                 repository.resume_planning(expected)

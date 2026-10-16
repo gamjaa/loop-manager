@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from loop_manager_internal.storage.db_access import open_connection
 import sqlite3
 import subprocess
 import sys
@@ -521,7 +522,7 @@ class BootstrapService:
         database = state_dir / "loop-manager.db"
         if not database.is_file():
             return "main"
-        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection, connection:
+        with closing(open_connection(database, read_only=True, timeout=5)) as connection, connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
             if not {"repo", "base_branch"} <= columns:
                 raise RuntimeError("상태 DB의 프로젝트 등록 정보를 읽을 수 없습니다.")
