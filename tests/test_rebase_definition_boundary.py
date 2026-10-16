@@ -201,6 +201,7 @@ class RebaseDefinitionBoundaryTests(TestCase):
 
     def test_replayed_header_is_restored_after_git_and_commit_restart_preserves_body(self):
         # Real Git verifies the extra commit, index contents and post-commit crash recovery.
+        from loop_manager_internal.git import rebase_documents
         body = '\n## Progress\nWorker implementation and 검증 기록 preserved.\n'.encode()
         header = self.old_text.split('---', 2)[1].replace('priority: normal', 'priority: high')
         (self.worktree / self.plan_path).write_bytes(b'---' + header.encode() + b'---\n' + body)
@@ -220,7 +221,13 @@ class RebaseDefinitionBoundaryTests(TestCase):
             return result
         crashed = build_service(replace(ports, git=interrupted), self.connection, self.repo,
             self.state_dir, self.repo_key, 'G-047', self.worktree, self.branch)
-        with self.assertRaisesRegex(RuntimeError, 'after declaration commit'):
+        real_replace = rebase_documents.os.replace
+        def replace_file(source, target):
+            self.assertEqual(Path(source).parent, self.worktree.parent,
+                             'a killed writer must not leave an untracked file inside the worktree')
+            return real_replace(source, target)
+        with mock.patch.object(rebase_documents.os, 'replace', side_effect=replace_file), \
+             self.assertRaisesRegex(RuntimeError, 'after declaration commit'):
             crashed.normalize_frontmatter()
         restored_head = git_command(self.worktree, 'rev-parse', 'HEAD')
         self.assertNotEqual(restored_head, replayed)

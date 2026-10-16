@@ -243,7 +243,7 @@ def restore_rebase_frontmatter(connection, repo, plan_id, worktree, branch, *,
         if raw != after:
             temporary = None
             try:
-                with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.frontmatter-', delete=False) as stream:
+                with tempfile.NamedTemporaryFile(dir=worktree.parent, prefix='.frontmatter-', delete=False) as stream:
                     temporary = stream.name
                     stream.write(after)
                     stream.flush()
