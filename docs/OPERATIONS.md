@@ -214,3 +214,7 @@ Add-MpPreference -ExclusionPath (Join-Path $env:USERPROFILE '.cache\loop-manager
 폴더 제외 후에도 Defender의 CPU 점유와 verify 지연이 계속되면 성능 기록으로 원인 프로세스를 확인한 뒤 실제 실행 파일의 전체 경로에 대한 프로세스 제외를 검토한다. 프로세스 제외는 그 프로세스가 여는 파일에 적용되므로 폴더 제외보다 범위가 넓다. 실행 파일 이름만으로 모든 같은 이름의 프로세스를 제외하거나 드라이브·사용자 임시 폴더 전체를 제외하지 않는다. 설정은 사용자가 선택하며 스크립트는 변경하지 않는다. [Microsoft 제외 설정 안내](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-exclusions-overview#process-exclusions)
 
 같은 사용자 계정의 checkout과 worktree는 같은 테스트 임시 폴더를 사용하므로 실행 checkout마다 제외를 등록할 필요가 없다. 진단 로그는 단독 실행의 `.cache/verify/<실행 ID>/` 또는 Manager 실행의 `<state-dir>/logs/verify/<실행 ID>/`에 계속 남는다. 제외 전후에는 같은 검증 범위와 비슷한 부하에서 시간을 비교한다.
+
+## 재시도와 배정 중단
+
+RETRY 로그는 진행 중인 작업을 수동 제출 다음, 다른 일반 작업보다 먼저 재배정한다는 뜻이다. PLAN_BLOCKED이면 독립 작업은 계속 진행한다. Planner 필요 시 해당 프로젝트, runtime handoff 시 전체 프로젝트의 새 배정이 중단되고 실행 중 호출 반환을 기다린다. verify·실행 자리 대기는 작업 전체 완료로 취급하지 않으며 대기 시간은 timeout에서 제외한다.

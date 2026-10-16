@@ -1,5 +1,6 @@
 """application project service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.application.contracts import PROJECT_STEP_TRANSIENT_PAUSE
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.runtime import operation_events as events
 from collections.abc import Callable
@@ -178,6 +179,10 @@ class ProjectService:
         raise AssertionError("execution coordinator must return a project result")
 
     def _resume_manual_work(self):
+        from loop_manager_internal.application.task_scheduling import current_scheduler
+        scheduler = current_scheduler.get()
+        if scheduler is not None and self.state.repo in scheduler.draining_projects:
+            return
         if self.effects.resume_manual_work is not None:
             self.effects.resume_manual_work(self.identity.connection, self.identity.state_dir,
                 self.state.repo_path, self.identity.config_path, self.identity.runtime_mutation)
@@ -673,6 +678,10 @@ class ProjectService:
         ).fetchone()
 
     def _resume_existing_execution(self) -> int | None:
+        from loop_manager_internal.application.task_scheduling import current_scheduler
+        scheduler = current_scheduler.get()
+        if scheduler is not None and self.state.repo in scheduler.draining_projects:
+            return None
         if (self.identity.recovery_request_id
                 and self.identity.recovery_plan_id is not None):
             active = runtime_state.RuntimeStateRepository(
@@ -826,6 +835,12 @@ class ProjectService:
 
     def _run_coordinators(self) -> int | None:
         assert self.state.row is not None
+        from loop_manager_internal.application.task_scheduling import current_scheduler
+        scheduler = current_scheduler.get()
+        if scheduler is not None and self.state.repo in scheduler.draining_projects and any(
+                scheduler.running[kind][self.state.repo] for kind in ('agent', 'verify')):
+            self.effects.operation_print('기존 호출의 종료가 확인될 때까지 프로젝트 planning을 보류합니다.')
+            return PROJECT_STEP_TRANSIENT_PAUSE
         self.effects._recorded_base_fetch(self.state.repo_path, self.identity.state_dir, self.state.base, owner="project")
         try:
             self.state.base_sha = self._refresh_catalog()
@@ -936,6 +951,8 @@ class ProjectService:
         if (current_scheduler.get() is not None and current_task.get() is None
                 and self.identity.recovery_request_id is None):
             return run_project_tasks(self, newly_activated=newly_activated)
+        if current_scheduler.get() is not None:
+            current_scheduler.get().check_project(self.state.repo)
         execution_ports = self.effects._ExecutionLifecyclePorts(
             self.identity.connection,
             runtime_repository,
@@ -960,6 +977,8 @@ class ProjectService:
         execution_context = prepared
         while True:
             self.effects._check_runtime_handoff()
+            if current_scheduler.get() is not None:
+                current_scheduler.get().check_project(self.state.repo)
             from loop_manager_internal.storage.task_calls import CallDeferred
             try:
                 execution_outcome = execution.dispatch(execution_context)

@@ -22,12 +22,17 @@ current_scheduler: ContextVar[TaskScheduler | None] = ContextVar("task_scheduler
 current_task: ContextVar[Task | None] = ContextVar("scheduled_task", default=None)
 
 
+class PlanningDrain(Exception):
+    """현재 프로젝트 호출을 비운 뒤 Planner로 돌아간다."""
+
+
 @dataclass
 class Task:
     repo: str
     plan_id: str
     connection: object
     resumed: bool = True
+    retry_order: int | None = None
 
     def rank(self, priority_reader=None):
         from loop_manager_internal.catalog.effective_priority import effective_priorities
@@ -38,6 +43,8 @@ class Task:
             "WHERE m.repo=? AND m.plan_id=? AND g.request_id IS NOT NULL",
             (self.repo, self.plan_id),
         ).fetchone()[0]
+        if manual is None and self.retry_order is not None:
+            return (1, self.retry_order, ())
         if priority_reader is not None:
             ranks=dict(priority_reader(self.connection,self.repo).priority_ranks)
             priority=ranks.get(self.plan_id,(4,int(self.plan_id[2:])))
@@ -45,7 +52,7 @@ class Task:
             rows = self.connection.execute("SELECT * FROM exec_plans WHERE repo=?", (self.repo,)).fetchall()
             value = effective_priorities(rows).get(self.plan_id)
             priority=value.sort_key(self.plan_id) if value else (4,int(self.plan_id[2:]))
-        return (0 if manual is not None else 1 if self.resumed else 2, manual or "",priority)
+        return (0 if manual is not None else 2 if self.resumed else 3, manual or "",priority)
 
 
 class TaskScheduler:
@@ -57,6 +64,8 @@ class TaskScheduler:
         self.waiters = {"agent": [], "verify": [], "management": []}
         self.running = {"agent": Counter(), "verify": Counter(), "management": Counter()}
         self.admitting = False
+        self.draining_projects = set()
+        self.retry_sequence = 0
         self.limits = {"agent": config.max_workers, "verify": config.verify_concurrency}
         self.uncertain=Counter()
         self.retained={}
@@ -69,17 +78,38 @@ class TaskScheduler:
         self.cursor = dict(connection.execute("SELECT kind,repo FROM task_scheduling_cursor"))
         connection.commit()
 
+    def pause_project(self, repo):
+        with self.condition:
+            self.draining_projects.add(repo)
+            self.condition.notify_all()
+        events.emit("프로젝트 배정 중단", project=repo, reason="planning", next_action="실행 호출 종료 후 Planner")
+
+    def check_project(self, repo):
+        from loop_manager_internal.runtime.handoff_gate import _check_runtime_handoff
+        _check_runtime_handoff()
+        with self.condition:
+            if repo in self.draining_projects:
+                raise PlanningDrain()
+
+    def requeue(self, task):
+        with self.condition:
+            self.retry_sequence += 1
+            task.retry_order = self.retry_sequence
+            task.resumed = True
+            self.condition.notify_all()
+        events.emit("작업 RETRY 우선 재배정", project=task.repo, plan=task.plan_id)
+
     @contextmanager
     def admission(self, task):
         """호출과 별개로 새 관리 배정의 선택·확정을 순서대로 수행한다."""
         entry = (task, task.rank(self.priority_reader))
         with self.condition:
+            self.check_project(task.repo)
             self.running['management'][task.repo] = managed_count(task.connection,task.repo)
             self.waiters['management'].append(entry)
             try:
                 while self.admitting or self._next('management') is not entry:
-                    from loop_manager_internal.runtime.handoff_gate import _check_runtime_handoff
-                    _check_runtime_handoff()
+                    self.check_project(task.repo)
                     self.condition.wait(0.2)
                 self.admitting = True
             finally:
@@ -104,7 +134,7 @@ class TaskScheduler:
             return None
         category = min(item[1][0] for item in waiting)
         candidates = [item for item in waiting if item[1][0] == category]
-        if category < 2:
+        if category < 3:
             return min(candidates, key=lambda item: (item[1], item[0].repo, item[0].plan_id))
         basic = [item for item in candidates if not self.running[kind][item[0].repo]]
         if basic:
@@ -125,8 +155,7 @@ class TaskScheduler:
             self.condition.notify_all()
             try:
                 while True:
-                    from loop_manager_internal.runtime.handoff_gate import _check_runtime_handoff
-                    _check_runtime_handoff()
+                    self.check_project(task.repo)
                     if ((task.repo,task.plan_id,kind) in self.retained
                             or self.uncertain[kind]>=self.limits[kind]):
                         raise task_calls.CallDeferred("기존 호출의 종료가 확인되지 않아 실제 실행 자리를 보존합니다.")
@@ -138,7 +167,7 @@ class TaskScheduler:
                         )
                         task.connection.commit()
                         self.cursor[kind] = task.repo
-                        allocation = ("manual" if entry[1][0] == 0 else "resume" if entry[1][0] == 1
+                        allocation = ("retry" if entry[1][0] == 1 else "manual" if entry[1][0] == 0 else "resume" if entry[1][0] == 2
                                       else "basic" if not self.running[kind][task.repo] else "priority")
                         self.running[kind][task.repo] += 1
                         break
@@ -183,6 +212,7 @@ class TaskScheduler:
                                 raise
                             self.running[kind][task.repo] -= 1
                         task.resumed = True
+                        task.retry_order = None
                     finally:
                         self.condition.notify_all()
             finally:
@@ -235,11 +265,15 @@ def run_project_tasks(service, *, newly_activated):
     from loop_manager_internal.application.project_service import ProjectService
     from loop_manager_internal.catalog import project_catalog_refresh
     from loop_manager_internal.runtime.contracts import PROJECT_STEP_RETRY, PROJECT_STEP_PLANNING_PENDING
+    from loop_manager_internal.application.contracts import PROJECT_STEP_TRANSIENT_PAUSE
+    from loop_manager_internal.application.project_runner import retry_pause_detail
 
     scheduler = current_scheduler.get()
     connection, repo = service.identity.connection, service.state.repo
     # 프로젝트 준비가 끝난 경계에서 TEMP session의 읽기 transaction도 닫는다.
     connection.commit()
+    with scheduler.condition:
+        scheduler.draining_projects.discard(repo)
     running, threads, visited, results = {}, [], set(), []
     initial = runtime_state.RuntimeStateRepository(connection).active(repo)
 
@@ -263,11 +297,29 @@ def run_project_tasks(service, *, newly_activated):
                 )
                 with scheduler.task(repo, plan_id, owned, resumed=resumed), notifications.immediate_delivery(
                         owned, scheduler.config.telegram_token, scheduler.config.telegram_chat_id, repo):
-                    child.state.row = runtime_state.project_row(owned, repo)
-                    code=child._dispatch_execution(
-                        runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed)
-                    notifications.flush_project_events(owned, repo)
+                    attempts = {}
+                    while True:
+                        scheduler.check_project(repo)
+                        before = {str(row['subject']): int(row['generation']) for row in owned.execute(
+                            "SELECT subject,generation FROM recovery_records WHERE repo=?", (repo,))}
+                        child.state.row = runtime_state.project_row(owned, repo)
+                        code = child._dispatch_execution(
+                            runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed)
+                        notifications.flush_project_events(owned, repo)
+                        if code == PROJECT_STEP_PLANNING_PENDING:
+                            scheduler.pause_project(repo)
+                            raise PlanningDrain()
+                        if code != PROJECT_STEP_RETRY:
+                            break
+                        scheduler.check_project(repo)
+                        if retry_pause_detail(owned, repo, before, attempts, plan_id=plan_id) is not None:
+                            code = PROJECT_STEP_TRANSIENT_PAUSE
+                            break
+                        scheduler.requeue(current_task.get())
+                        resumed = True
             result.set_result(code)
+        except PlanningDrain:
+            result.set_result(PROJECT_STEP_RETRY)
         except BaseException as error:
             result.set_exception(error)
 
@@ -284,6 +336,8 @@ def run_project_tasks(service, *, newly_activated):
 
     try:
         while True:
+            from loop_manager_internal.runtime.handoff_gate import _check_runtime_handoff
+            _check_runtime_handoff()
             for plan_id, result in tuple(running.items()):
                 if result.done():
                     results.append(result.result())
@@ -291,9 +345,9 @@ def run_project_tasks(service, *, newly_activated):
             existing = connection.execute("SELECT * FROM exec_plans WHERE repo=? "
                 "AND status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') ORDER BY plan_id", (repo,)).fetchall()
             for row in existing:
-                if str(row["plan_id"]) not in visited:
+                if repo not in scheduler.draining_projects and str(row["plan_id"]) not in visited:
                     launch(row, not (newly_activated and initial and initial.plan_id == row["plan_id"]))
-            stop_admission = any(code in {PROJECT_STEP_RETRY, PROJECT_STEP_PLANNING_PENDING} for code in results)
+            stop_admission = repo in scheduler.draining_projects or PROJECT_STEP_PLANNING_PENDING in results
             if not stop_admission:
                 _, limit, source = project_registry.task_limit(connection, repo, scheduler.config.max_tasks_per_project)
                 if managed_count(connection, repo) < limit:
@@ -317,6 +371,8 @@ def run_project_tasks(service, *, newly_activated):
             if not running:
                 break
             wait(tuple(running.values()), timeout=0.2, return_when=FIRST_COMPLETED)
+    except PlanningDrain:
+        results.append(PROJECT_STEP_RETRY)
     finally:
         for thread in threads:
             thread.join()
