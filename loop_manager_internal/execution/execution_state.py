@@ -174,10 +174,18 @@ class ExecutionStatePort:
         if self.connection.in_transaction:
             raise runtime_state.RuntimeStateError(
                 "rebase completion requires transaction ownership")
+        observed_state = None
+        if acceptance is not None and callable(reobserve):
+            observed_state = (self.check(), checkpoint_repository.get(self.repo, self.plan_id))
+            confirmed = reobserve()
+            reobserve = lambda: confirmed
         with runtime_state._transaction(self.connection):
             expected = self.check()
             if expected is None:
                 raise runtime_state.RuntimeStateError("execution projection이 없습니다.")
+            if observed_state is not None and observed_state != (
+                    expected, checkpoint_repository.get(self.repo, self.plan_id)):
+                raise runtime_state.RuntimeStateError("rebase 재관측 중 execution 또는 checkpoint가 변경되었습니다.")
             updated = self.repository.complete_rebase(
                 expected, checkpoint_repository, completion=completion,
                 project_values=project_values, published_proof=published_proof,

@@ -215,6 +215,7 @@ def register(assembly: Composition) -> None:
     assembly.bind('_checkpoint_recovery_effects_evaluate_remote_checkpoint_cause', recovery_adapter._checkpoint_recovery_effects_evaluate_remote_checkpoint_cause,
         lambda: recovery_adapter.CheckpointRecoveryEffectsEvaluateRemoteCheckpointCauseEffects(
             ROOT=assembly.value('ROOT'),
+            git=assembly.callback('git'),
             _remote_checkpoint_has_new_failure=assembly.callback('_remote_checkpoint_has_new_failure'),
             _remote_checkpoint_review_revision=assembly.callback('_remote_checkpoint_review_revision'),
             capture_git_snapshot=assembly.callback('capture_git_snapshot'),
@@ -507,6 +508,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('resume_blocked_execplan_if_inputs_changed', blocked_plan_service.resume_blocked_execplan_if_inputs_changed,
         lambda: blocked_plan_service.ResumeBlockedExecplanIfInputsChangedEffects(
+            _evaluate_remote_checkpoint_cause=assembly.callback('_evaluate_remote_checkpoint_cause'),
             _blocked_execplan_metadata_error=assembly.callback('_blocked_execplan_metadata_error'),
             _blocked_execplan_revision_metadata_error=assembly.callback('_blocked_execplan_revision_metadata_error'),
             _blocked_resume_worktree_matches=assembly.callback('_blocked_resume_worktree_matches'),

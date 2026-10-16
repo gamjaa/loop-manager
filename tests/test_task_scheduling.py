@@ -163,6 +163,53 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         with scheduler.slot('verify',scheduling.Task('B','G-003',self.connection)):
             pass
 
+    def test_blocked_work_releases_management_without_discarding_call_or_git_ownership(self):
+        from loop_manager_internal.storage import task_calls
+        scheduler = self.scheduler(max_workers=1)
+        with self.assertRaises(task_calls.CallDeferred):
+            with scheduler.slot('agent', scheduling.Task('A', 'G-001', self.connection)):
+                task_calls.bind_agent_receipt(self.directory / 'missing-process-receipt.json')
+        self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo='A'")
+        self.connection.execute("INSERT INTO execution_checkpoints(repo,plan_id,operation) VALUES ('A','G-002','rebase')")
+        self.connection.commit()
+        self.assertEqual(scheduling.managed_count(self.connection, 'A'), 0)
+        self.assertEqual(scheduling.managed_count(self.connection, 'A', 'G-002'), 0)
+        self.assertEqual(sum(scheduler.running['agent'].values()), 1)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 1)
+        self.assertEqual(self.connection.execute('SELECT operation FROM execution_checkpoints').fetchone()[0], 'rebase')
+        self._insert_plan(self.connection, 'G-004', 'READY', repo='A')
+        project_registry.set_task_limit(self.connection, 'A', 1, 3)
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            runtime.activate('A', 'G-004', activation_sha='base', branch='four', worktree='four')
+            with self.assertRaises(runtime_state.TaskLimitReached):
+                runtime.update_plan('A', 'G-002', plan_values={'status': 'VERIFYING'}, enqueue=False)
+        self.assertEqual(runtime.get('A', 'G-002').status, 'PLAN_BLOCKED')
+
+    def test_empty_management_does_not_clear_projection_with_pending_blocked_ownership(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        runtime.block_plan('A', 'G-001', reason_code='managed_worktree_conflict', evidence='pending rebase',
+                           release_fingerprint='blocked', project_values={'phase': 'PLAN_BLOCKED'})
+        self.connection.execute("INSERT INTO execution_checkpoints(repo,plan_id,operation) VALUES ('A','G-001','rebase')")
+        self.connection.commit()
+        before = tuple(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone())
+        scheduler = self.scheduler()
+        effects = SimpleNamespace(activate_ready_execplan=mock.Mock(return_value=None), resume_manual_work=None)
+        service = ProjectService(effects, ProjectIdentity(self.connection, self.directory, 'A', self.config_path,
+                                 None, False, None, True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base')
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            self.assertEqual(scheduling.run_project_tasks(service, newly_activated=False), 0)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(scheduling.managed_count(self.connection, 'A'), 0)
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()), before)
+        self.assertEqual(runtime.get('A', 'G-001').worktree, 'one')
+
     def test_limit_reduction_during_activation_preserves_ready_without_failure(self):
         with mock.patch.object(runtime_state.RuntimeStateRepository,'activate',
                                side_effect=runtime_state.TaskLimitReached('limit reduced')):
@@ -670,6 +717,255 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(calls, ['retry', 'correct', 'replacement'])
         self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
         self.assertEqual(scheduling.managed_count(self.connection, 'A'), 0)
+
+
+    def test_unexpected_task_exception_retries_before_sibling_verify_finishes(self):
+        self._assert_exception_isolation('retry')
+
+    def test_repeated_task_exceptions_pause_only_that_task_and_keep_admitting(self):
+        self._assert_exception_isolation('pause')
+
+    def test_task_setup_exception_does_not_abort_project_result_collection(self):
+        self._assert_exception_isolation('setup')
+
+    def _assert_exception_isolation(self, failure):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.application.contracts import PROJECT_STEP_TRANSIENT_PAUSE
+        from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
+        from loop_manager_internal.notifications import notifications
+        self._insert_plan(self.connection, 'G-004', 'READY', repo='A')
+        scheduler = self.scheduler(max_workers=2)
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            for plan_id in ('G-001', 'G-002'):
+                runtime.activate('A', plan_id, activation_sha='base', branch=plan_id, worktree=plan_id)
+        service = ProjectService(SimpleNamespace(activate_ready_execplan=loop_manager.activate_ready_execplan,
+                                                resume_manual_work=None),
+            ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                            True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base', provider='codex')
+        verifying, failed, replacement = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        configure_session = notifications.configure_session
+        def configure(connection, **options):
+            if failure == 'setup' and threading.current_thread().name == 'loop-task-G-001':
+                failed.set()
+                raise RuntimeError('task setup failed')
+            return configure_session(connection, **options)
+        def execute(child, repository, **options):
+            task = scheduling.current_task.get()
+            if task.plan_id == 'G-002':
+                with scheduler.slot('verify', task):
+                    verifying.set()
+                    self.assertTrue(replacement.wait(5), '작업 예외 이후 독립 작업 배정이 멈췄습니다.')
+            else:
+                with scheduler.slot('agent', task):
+                    if task.plan_id == 'G-001':
+                        self.assertTrue(verifying.wait(3))
+                        if calls:
+                            self.assertIsNotNone(task.retry_order)
+                            self.assertFalse(options['newly_activated'])
+                        calls.append(task.plan_id)
+                        if failure == 'pause':
+                            if len(calls) == 3:
+                                failed.set()
+                            raise sqlite3.OperationalError('database is locked')
+                        if len(calls) == 1:
+                            failed.set()
+                            raise MutationEvidenceError('stored rebase result differs')
+                    else:
+                        self.assertTrue(failed.wait(3))
+                        self.assertTrue(verifying.wait(3))
+                        self.assertEqual(sum(scheduler.running['verify'].values()), 1)
+                        replacement.set()
+            repository.transition_from_snapshot(repository.projected('A'), plan_values={'status': 'PR_OPEN'},
+                                                 project_values=runtime_state.clear_project_values())
+            return 0
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute), \
+                 mock.patch.object(notifications, 'configure_session', configure):
+                result = scheduling.run_project_tasks(service, newly_activated=True)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(len(calls), {'retry': 2, 'pause': 3, 'setup': 0}[failure])
+        self.assertEqual(result, {'retry': 0, 'pause': PROJECT_STEP_TRANSIENT_PAUSE, 'setup': 1}[failure])
+        self.assertEqual(runtime.get('A', 'G-004').status, 'PR_OPEN')
+        self.assertEqual(runtime.get('A', 'G-002').status, 'PR_OPEN')
+        if failure == 'pause':
+            self.assertEqual(runtime.get('A', 'G-001').status, 'IMPLEMENTING')
+            self.assertIn('OperationalError: database is locked', runtime.get('A', 'G-001').last_error)
+            self.assertIn('Traceback (most recent call last)', runtime.get('A', 'G-001').last_error)
+
+
+
+    def test_independent_block_rechecks_use_target_ownership_and_one_recovery_lease(self):
+        from loop_manager_internal.recovery.plan_recovery import recovering_plan
+        from loop_manager_internal.storage import task_calls
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            for plan_id in ('G-001', 'G-002'):
+                runtime.activate('A', plan_id, activation_sha='base', branch=plan_id, worktree=plan_id)
+        runtime.block_plan('A', 'G-001', reason_code='plan_input_invalid', evidence='declaration',
+                           release_fingerprint='old', clear_projection=False)
+        before = tuple(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone())
+        outcomes = []
+        def compete():
+            with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
+                with recovering_plan(connection, self.directory, 'A', 'G-001') as available:
+                    outcomes.append(available)
+        with recovering_plan(self.connection, self.directory, 'A', 'G-001') as available:
+            self.assertTrue(available)
+            self.assertEqual(runtime_state.project_row(self.connection, 'A')['plan_path'], runtime.get('A', 'G-001').path)
+            thread = threading.Thread(target=compete)
+            thread.start()
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(outcomes, [False])
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()), before)
+        owner = task_calls.reserve(self.connection, self.directory, 'A', 'G-001', 'verify', 'pending')
+        with recovering_plan(self.connection, self.directory, 'A', 'G-001') as available:
+            self.assertFalse(available)
+        task_calls.release(owner)
+        runtime.update_plan('A', 'G-001', plan_values={'worktree': 'G-002'}, enqueue=False)
+        with recovering_plan(self.connection, self.directory, 'A', 'G-001') as available:
+            self.assertFalse(available)
+        self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+
+    def test_rebase_start_block_is_rechecked_without_document_change_or_idle_siblings(self):
+        from loop_manager_internal.recovery.plan_recovery import recovering_plan
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from loop_manager_internal.git.managed_rebase_validation import RebaseDecision, RebaseStatus
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            for plan_id in ('G-001', 'G-002'):
+                runtime.activate('A', plan_id, activation_sha='base', branch=plan_id, worktree=plan_id)
+        runtime.block_plan('A', 'G-001', reason_code='plan_input_invalid', evidence='old declaration check',
+                           release_fingerprint='unchanged', clear_projection=False)
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        expected = checkpoint.record('A', 'G-001', expected_generation=0, operation='rebase',
+            expected_head='original', target_base_oid='new-base', observed_remote_oid='remote', snapshot={})
+        original = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+        sibling = runtime.get('A', 'G-002')
+        observed = SimpleNamespace(fingerprint='owned-original-head')
+        decision = RebaseDecision(RebaseStatus.START, 'owned_original_head_before_rebase')
+        block = scoped_blocking.plan_block(self.connection, 'A', 'G-001')
+        with fast_mode_scope(self.config), recovering_plan(self.connection, self.directory, 'A', 'G-001') as available:
+            self.assertTrue(available)
+            runtime.resume_rebase_block(original, runtime_state.project_row(self.connection, 'A'), block, checkpoint,
+                (observed, decision), expected_checkpoint=expected, is_plan_block=True,
+                reobserve=lambda: (observed, decision), dependencies_ready=lambda: True, pending_error='rebase pending')
+        self.assertEqual(runtime.get('A', 'G-001').status, 'IMPLEMENTING')
+        self.assertEqual(runtime.get('A', 'G-001').current_revision_sha, original['current_revision_sha'])
+        self.assertEqual(checkpoint.get('A', 'G-001').operation, 'rebase')
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
+        self.assertEqual(runtime.get('A', 'G-002'), sibling)
+
+    def test_block_recheck_runs_before_sibling_verify_finishes(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.recovery.plan_recovery import recovering_plan
+        self._insert_plan(self.connection, 'G-004', 'READY', repo='A')
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            runtime.activate('A', 'G-002', activation_sha='base', branch='two', worktree='two')
+        runtime.block_plan('A', 'G-001', reason_code='plan_input_invalid', evidence='recheck', release_fingerprint='old',
+            plan_values={'branch': 'one', 'worktree': 'one'}, clear_projection=False)
+        verifying, resumed, additional = threading.Event(), threading.Event(), threading.Event()
+        def recheck(connection, _repo_path, state_dir, repo, *_args, plan_id):
+            self.assertEqual(scheduling.current_task.get().plan_id, plan_id)
+            self.assertIs(scheduling.current_task.get().connection, connection)
+            self.assertTrue(verifying.wait(3))
+            self.assertTrue(additional.wait(4), '재평가가 독립 신규 작업의 배정을 막았습니다.')
+            with recovering_plan(connection, state_dir, repo, plan_id) as available:
+                self.assertTrue(available)
+                runtime_state.RuntimeStateRepository(connection).transition(repo, plan_id,
+                    plan_values={'status': 'IMPLEMENTING', 'blocked_reason': None}, project_values={'phase': 'WORKING'})
+                with connection:
+                    scoped_blocking.clear_plan_block(connection, repo, plan_id)
+            return True
+        service = ProjectService(SimpleNamespace(activate_ready_execplan=loop_manager.activate_ready_execplan,
+            resume_manual_work=None, resume_plan_blocks=recheck),
+            ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                            True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base')
+        scheduler = self.scheduler()
+        def execute(child, repository, **_options):
+            task = scheduling.current_task.get()
+            if task.plan_id == 'G-002':
+                with scheduler.slot('verify', task):
+                    verifying.set()
+                    self.assertTrue(resumed.wait(4), '독립 차단 재평가가 형제 작업 완료를 기다렸습니다.')
+            else:
+                with scheduler.slot('agent', task):
+                    if task.plan_id == 'G-004':
+                        additional.set()
+                    else:
+                        resumed.set()
+            repository.transition_from_snapshot(repository.projected('A'), plan_values={'status': 'PR_OPEN'},
+                                                 project_values=runtime_state.clear_project_values())
+            return 0
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute):
+                self.assertEqual(scheduling.run_project_tasks(service, newly_activated=False), 0)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(runtime.get('A', 'G-001').status, 'PR_OPEN')
+        self.assertEqual(runtime.get('A', 'G-002').status, 'PR_OPEN')
+        self.assertEqual(runtime.get('A', 'G-004').status, 'PR_OPEN')
+
+    def test_user_question_recheck_requires_current_cause_evidence_and_preserves_failed_assessments(self):
+        from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        for case in ('resolved', 'remaining', 'links', 'frontmatter', 'bad_evidence', 'only_plan_evidence', 'probe_failure'):
+            with self.subTest(case=case):
+                runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='question ' + case,
+                    release_fingerprint='old', clear_projection=False, plan_values={'worktree': 'one', 'active_sha': 'before'})
+                plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+                block = dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
+                saved = checkpoint.get('A', 'G-001')
+                old = 'Support policy refresh and choose an implementation.'
+                latest = 'Policy refresh is deferred; implement ordinary calls and mock checks.'
+                if case == 'links':
+                    old, latest = '[policy](old.md)', '[policy](new.md)'
+                if case == 'frontmatter':
+                    old, latest = '---\nsources: [old]\n---\nExisting goal.', '---\nsources: [new]\n---\nExisting goal.'
+                def git(_repo, *args, **_options):
+                    text = 'latest' if args[0] == 'rev-parse' else (latest if args[1].startswith('latest:') else old)
+                    return SimpleNamespace(returncode=0, stdout=text)
+                result = dict(resolved=case not in {'remaining'}, detail='cause assessment',
+                    evidence=[dict(source=plan['path'] if case == 'only_plan_evidence' else 'docs/PRODUCT.md',
+                                   quote='invented' if case == 'bad_evidence' else latest)])
+                agent = mock.Mock(return_value=(1 if case == 'probe_failure' else 0,
+                    'USER_DECISION_ASSESSMENT: ' + json.dumps(result)))
+                effects = SimpleNamespace(git=git, capture_git_snapshot=mock.Mock(), run_agent=agent,
+                                          validate_agent_scope=mock.Mock())
+                def assess():
+                    return _assess_user_decision_cause(effects, self.connection, Path('A'), self.directory,
+                                                     'A', plan, self.config_path)
+                if case in {'bad_evidence', 'only_plan_evidence', 'probe_failure'}:
+                    with self.assertRaises(RuntimeError):
+                        assess()
+                    self.assertEqual(checkpoint.get('A', 'G-001'), saved)
+                else:
+                    resolved, _detail, _stage = assess()
+                    self.assertEqual(resolved, case == 'resolved')
+                    if case in {'links', 'frontmatter'}:
+                        agent.assert_not_called()
+                        self.assertEqual(checkpoint.get('A', 'G-001'), saved)
+                    else:
+                        self.assertEqual(assess()[0], resolved)
+                        agent.assert_called_once()
+                        stored = checkpoint.get('A', 'G-001').snapshot['user_decision_assessment']
+                        self.assertEqual(stored['question'], 'question ' + case)
+                self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001')), block)
+                self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+
 
 
 class ExecutionClockTests(unittest.TestCase):

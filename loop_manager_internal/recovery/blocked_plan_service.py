@@ -45,7 +45,8 @@ def _requeue_blocked_execplan(
             "complexity": plan["current_complexity"], "risk": plan["current_risk"],
         })
     if plan is not None and int(plan["pr_conflict_recovery"]):
-        with connection:
+        from loop_manager_internal.recovery.plan_recovery import recovery_admission
+        with recovery_admission(connection, repo, plan_id), connection:
             runtime_state.RuntimeStateRepository(connection).transition(
                 repo,
                 plan_id,
@@ -242,6 +243,7 @@ def _resume_interrupted_blocked_rebase(
 @dataclass(frozen=True)
 class ResumeBlockedExecplanIfInputsChangedEffects:
     """Named effects for resume_blocked_execplan_if_inputs_changed; no entry-point/module access."""
+    _evaluate_remote_checkpoint_cause: Callable[..., object]
     _blocked_execplan_metadata_error: Callable[..., object]
     _blocked_execplan_revision_metadata_error: Callable[..., object]
     _blocked_resume_worktree_matches: Callable[..., object]
@@ -273,6 +275,28 @@ class ResumeBlockedExecplanIfInputsChangedEffects:
 
 
 def resume_blocked_execplan_if_inputs_changed(
+    effects: ResumeBlockedExecplanIfInputsChangedEffects, connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    base: str,
+    state_dir: Path,
+    *, plan_id: str | None = None,
+) -> bool:
+    from loop_manager_internal.recovery.plan_recovery import recovering_plan
+    plans = connection.execute("SELECT plan_id FROM exec_plans WHERE repo=? AND status='PLAN_BLOCKED' ORDER BY plan_id",
+                               (repo,)).fetchall()
+    for blocked in plans:
+        selected = str(blocked['plan_id'])
+        if plan_id is not None and selected != plan_id:
+            continue
+        with recovering_plan(connection, state_dir, repo, selected) as available:
+            if available and _resume_blocked_execplan_if_inputs_changed(
+                    effects, connection, repo_path, repo, base, state_dir, plan_id=selected):
+                return True
+    return False
+
+
+def _resume_blocked_execplan_if_inputs_changed(
     effects: ResumeBlockedExecplanIfInputsChangedEffects, connection: sqlite3.Connection,
     repo_path: Path,
     repo: str,
@@ -370,6 +394,13 @@ def resume_blocked_execplan_if_inputs_changed(
                 and current_review_fingerprint != blocked_review_fingerprint
             )
     remote_input_changed = execplan_input_changed or review_input_changed
+    if plan['blocked_reason'] == BlockReasonCode.USER_DECISION_REQUIRED.value:
+        if not remote_input_changed:
+            return False
+        resolved, _detail, _stage = effects._evaluate_remote_checkpoint_cause(
+            connection, repo_path, state_dir, repo, plan, None, None)
+        if not resolved:
+            return False
     if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
         if not remote_input_changed:
             return False

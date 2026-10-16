@@ -10,12 +10,14 @@ from dataclasses import dataclass
 from functools import wraps
 import threading
 import time
+import traceback
 
 from loop_manager_internal.runtime import operation_events as events
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage import task_calls
 from loop_manager_internal.storage.task_calls import managed_count
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 
 current_scheduler: ContextVar[TaskScheduler | None] = ContextVar("task_scheduler", default=None)
@@ -222,7 +224,9 @@ class TaskScheduler:
     def task(self, repo, plan_id, connection, *, resumed=True):
         token = current_task.set(Task(repo, plan_id, connection, resumed))
         try:
-            with runtime_state.selected_execution(repo, plan_id):
+            from loop_manager_internal.runtime.resource_lock import resource_locks
+            with resource_locks(self.state_dir, repo, ['plan:' + plan_id], owner='task-execution'), \
+                 runtime_state.selected_execution(repo, plan_id):
                 yield
         finally:
             current_task.reset(token)
@@ -275,6 +279,8 @@ def run_project_tasks(service, *, newly_activated):
     with scheduler.condition:
         scheduler.draining_projects.discard(repo)
     running, threads, visited, results = {}, [], set(), []
+    rechecked_blocks = set()
+    recovery_keys = {}
     initial = runtime_state.RuntimeStateRepository(connection).active(repo)
 
     def execute(plan_id, resumed, result):
@@ -298,21 +304,41 @@ def run_project_tasks(service, *, newly_activated):
                 with scheduler.task(repo, plan_id, owned, resumed=resumed), notifications.immediate_delivery(
                         owned, scheduler.config.telegram_token, scheduler.config.telegram_chat_id, repo):
                     attempts = {}
+                    exception_attempts = 0
                     while True:
                         scheduler.check_project(repo)
-                        before = {str(row['subject']): int(row['generation']) for row in owned.execute(
-                            "SELECT subject,generation FROM recovery_records WHERE repo=?", (repo,))}
-                        child.state.row = runtime_state.project_row(owned, repo)
-                        code = child._dispatch_execution(
-                            runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed)
-                        notifications.flush_project_events(owned, repo)
+                        try:
+                            before = {str(row['subject']): int(row['generation']) for row in owned.execute(
+                                "SELECT subject,generation FROM recovery_records WHERE repo=?", (repo,))}
+                            child.state.row = runtime_state.project_row(owned, repo)
+                            code = child._dispatch_execution(
+                                runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed)
+                            notifications.flush_project_events(owned, repo)
+                        except PlanningDrain:
+                            raise
+                        except Exception as error:
+                            owned.rollback()
+                            exception_attempts += 1
+                            detail = redact_secrets(traceback.format_exc())
+                            events.emit("작업 처리 예외", level="ERROR", project=repo, plan=plan_id,
+                                reason=f"{type(error).__name__}: {error}", traceback=detail, attempts=exception_attempts,
+                                next_action="작업 상태 재확인 후 재시도" if exception_attempts < 3 else "해당 작업 보류")
+                            runtime = runtime_state.RuntimeStateRepository(owned)
+                            if runtime.get(repo, plan_id).status not in runtime_state.ACTIVE_STATUSES:
+                                code = 1
+                                break
+                            runtime.update_plan(repo, plan_id, plan_values={"last_error": detail}, enqueue=False)
+                            if isinstance(error, task_calls.CallDeferred) or exception_attempts >= 3:
+                                code = PROJECT_STEP_TRANSIENT_PAUSE
+                                break
+                            before, code = None, PROJECT_STEP_RETRY
                         if code == PROJECT_STEP_PLANNING_PENDING:
                             scheduler.pause_project(repo)
                             raise PlanningDrain()
                         if code != PROJECT_STEP_RETRY:
                             break
                         scheduler.check_project(repo)
-                        if retry_pause_detail(owned, repo, before, attempts, plan_id=plan_id) is not None:
+                        if before is not None and retry_pause_detail(owned, repo, before, attempts, plan_id=plan_id) is not None:
                             code = PROJECT_STEP_TRANSIENT_PAUSE
                             break
                         scheduler.requeue(current_task.get())
@@ -323,12 +349,38 @@ def run_project_tasks(service, *, newly_activated):
         except BaseException as error:
             result.set_exception(error)
 
-    def launch(row, resumed):
+    def execute_recovery(plan_id, _resumed, result):
+        try:
+            with closing(scheduler.connect_database(service.identity.state_dir, run_migrations=False)) as owned:
+                from loop_manager_internal.notifications import notifications
+                from loop_manager_internal.storage import recovery_state
+                notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled)
+                recovery_state.begin_external_run(owned, scheduler.external_run_id)
+                owned.commit()
+                token = current_task.set(Task(repo, plan_id, owned))
+                try:
+                    with notifications.immediate_delivery(owned, scheduler.config.telegram_token,
+                            scheduler.config.telegram_chat_id, repo):
+                        service.effects.resume_plan_blocks(owned, service.state.repo_path, service.identity.state_dir,
+                            repo, service.state.base, service.identity.config_path,
+                            service.identity.verify_timeout_seconds, plan_id=plan_id)
+                finally:
+                    current_task.reset(token)
+            result.set_result(0)
+        except PlanningDrain:
+            result.set_result(PROJECT_STEP_RETRY)
+        except BaseException as error:
+            result.set_exception(error)
+
+    def launch(row, resumed, *, recovery_key=None):
         plan_id = str(row["plan_id"])
         result = Future()
         context = copy_context()
-        thread = threading.Thread(target=context.run, args=(execute, plan_id, resumed, result),
+        target = execute_recovery if recovery_key is not None else execute
+        thread = threading.Thread(target=context.run, args=(target, plan_id, resumed, result),
                                   name=f"loop-task-{plan_id}")
+        if recovery_key is not None:
+            recovery_keys[plan_id] = recovery_key
         running[plan_id] = result
         visited.add(plan_id)
         threads.append(thread)
@@ -340,7 +392,20 @@ def run_project_tasks(service, *, newly_activated):
             _check_runtime_handoff()
             for plan_id, result in tuple(running.items()):
                 if result.done():
-                    results.append(result.result())
+                    try:
+                        results.append(result.result())
+                    except Exception as error:
+                        events.emit("작업 처리 예외", level="ERROR", project=repo, plan=plan_id,
+                            reason=f"{type(error).__name__}: {error}", traceback=traceback.format_exc(),
+                            next_action="해당 작업 보존·독립 작업 계속")
+                        results.append(1)
+                    key = recovery_keys.pop(plan_id, None)
+                    if key is not None:
+                        visited.discard(plan_id)
+                        _, limit, _ = project_registry.task_limit(connection, repo, scheduler.config.max_tasks_per_project)
+                        if (managed_count(connection, repo) >= limit
+                                and runtime_state.RuntimeStateRepository(connection).get(repo, plan_id).status == 'PLAN_BLOCKED'):
+                            rechecked_blocks.discard(key)
                     del running[plan_id]
             existing = connection.execute("SELECT * FROM exec_plans WHERE repo=? "
                 "AND status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') ORDER BY plan_id", (repo,)).fetchall()
@@ -356,6 +421,28 @@ def run_project_tasks(service, *, newly_activated):
                         service._resume_manual_work()
                         if managed_count(connection, repo) > before:
                             continue
+                    recheck = getattr(service.effects, 'resume_plan_blocks', None)
+                    recovered = False
+                    if recheck is not None:
+                        blocked = connection.execute("SELECT plan_id,current_revision_sha,content_hash,blocked_reason,"
+                            "blocked_fingerprint FROM exec_plans WHERE repo=? AND status='PLAN_BLOCKED' ORDER BY plan_id",
+                            (repo,)).fetchall()
+                        for row in blocked:
+                            key = tuple(row)
+                            if key in rechecked_blocks or str(row['plan_id']) in running:
+                                continue
+                            from loop_manager_internal.recovery.plan_recovery import target_available
+                            from loop_manager_internal.runtime.resource_lock import resource_is_held
+                            if (not target_available(connection, repo, str(row['plan_id']))
+                                    or resource_is_held(service.identity.state_dir, repo, 'plan:' + str(row['plan_id']))
+                                    or resource_is_held(service.identity.state_dir, repo, 'git:fetch')):
+                                continue
+                            rechecked_blocks.add(key)
+                            launch(row, True, recovery_key=key)
+                            recovered = True
+                            break
+                    if recovered:
+                        continue
                     token = runtime_state.admitting_execution.set(True)
                     try:
                         # 기존 선택기는 dependency·draft·catalog·유지보수 gate와 우선순위를 유지한다.
@@ -379,7 +466,10 @@ def run_project_tasks(service, *, newly_activated):
         active = runtime_state.RuntimeStateRepository(connection).active(repo)
         if active is not None:
             runtime_state.RuntimeStateRepository(connection).hydrate_snapshot(repo, active)
-        elif not managed_count(connection, repo):
+        elif not managed_count(connection, repo) and connection.execute(
+                "SELECT 1 FROM task_call_reservations WHERE repo=? UNION ALL "
+                "SELECT 1 FROM execution_checkpoints WHERE repo=? AND operation IS NOT NULL LIMIT 1",
+                (repo, repo)).fetchone() is None:
             runtime_state.RuntimeStateRepository(connection).update_project(
                 repo, runtime_state.EXECUTION_CLEAR_VALUES)
     return next((code for code in results if code in {PROJECT_STEP_PLANNING_PENDING, PROJECT_STEP_RETRY}),

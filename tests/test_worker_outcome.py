@@ -1,5 +1,5 @@
 """Narrow tests for the Worker disposition contract."""
-from contextlib import closing
+from contextlib import closing, nullcontext
 from tests.support.worker import decision
 
 import sqlite3
@@ -86,7 +86,11 @@ class WorkerOutcomeTests(unittest.TestCase):
                 parse(message)
 
     def test_user_decision_release_ignores_unrelated_review_changes(self):
+        self.enterContext(mock.patch(
+            "loop_manager_internal.recovery.plan_recovery.resource_locks",
+            side_effect=lambda *args, **kwargs: nullcontext()))
         source = runtime_connection()
+        source.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
         self.addCleanup(source.close)
         source.execute(
             "UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
@@ -140,7 +144,14 @@ class WorkerOutcomeTests(unittest.TestCase):
                 mock.patch.object(loop_manager, '_blocked_execplan_revision_metadata_error',
                                   return_value=None),
                 mock.patch.object(loop_manager, '_requeue_blocked_execplan') as requeue,
+                mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                                  return_value=(False, 'decision remains', None)) as cause,
             ):
+                self.assertFalse(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                    connection, Path('/repo'), 'repo', 'main', Path('/state'),
+                ))
+                requeue.assert_not_called()
+                cause.return_value = (True, 'changed source resolves question', None)
                 self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
                     connection, Path('/repo'), 'repo', 'main', Path('/state'),
                 ))

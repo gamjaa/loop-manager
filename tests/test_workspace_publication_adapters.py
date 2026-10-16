@@ -1,7 +1,7 @@
 """Unit checks for effect boundaries; Git and GitHub are always fake ports."""
 from dataclasses import fields, replace
 from pathlib import Path
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 import os
 import subprocess
@@ -25,6 +25,9 @@ def fake_effects(contract):
 
 class CheckpointRecoveryBoundaryRegressionTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch(
+            "loop_manager_internal.recovery.plan_recovery.resource_locks",
+            side_effect=lambda *args, **kwargs: nullcontext()))
         self.connection = runtime_connection()
         self.addCleanup(self.connection.close)
         self.snapshot = loop_manager.GitSnapshot('published', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})

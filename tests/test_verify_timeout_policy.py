@@ -1,6 +1,7 @@
 """Focused state transition test for a verified insufficient timeout."""
 
 from pathlib import Path
+from contextlib import nullcontext
 import sqlite3
 import tempfile
 import unittest
@@ -13,6 +14,11 @@ from tests.support.database import runtime_connection
 
 
 class VerifyTimeoutPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch(
+            "loop_manager_internal.recovery.plan_recovery.resource_locks",
+            side_effect=lambda *args, **kwargs: nullcontext()))
+
     def test_worker_progress_evidence_blocks_only_its_plan(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)

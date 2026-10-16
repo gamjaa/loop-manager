@@ -2,6 +2,7 @@ from tests.support.runtime import runtime_rebase_fixture
 from tests.support.database import runtime_connection
 import dataclasses
 from pathlib import Path
+from contextlib import closing
 import json
 import sqlite3
 import tempfile
@@ -55,6 +56,48 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                         result, checkpoint, acceptance=decision.acceptance,
                         project_values={'phase': 'WORKING'}, reobserve=lambda: changed,
                     )
+
+    def test_rebase_reobservation_allows_another_database_writer_before_atomic_apply(self):
+        from loop_manager_internal.execution.execution_state import ExecutionStatePort
+        with tempfile.TemporaryDirectory() as directory:
+            for use_port, race in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(execution_port=use_port, race=race):
+                    seed, _runtime, _checkpoint, original, _expected, decision = runtime_rebase_fixture(self)
+                    path = Path(directory) / 'state.db'
+                    with closing(sqlite3.connect(path, timeout=0.1)) as connection, \
+                         closing(sqlite3.connect(path, timeout=0.1)) as sibling:
+                        seed.backup(connection)
+                        connection.row_factory = sqlite3.Row
+                        runtime = runtime_state.RuntimeStateRepository(connection)
+                        checkpoint = ExecutionCheckpointRepository(connection)
+                        connection.execute('CREATE TABLE IF NOT EXISTS sibling_progress(value)')
+                        connection.commit()
+                        before = checkpoint.get('repo', 'G-047')
+                        def reobserve():
+                            self.assertFalse(connection.in_transaction)
+                            with sibling:
+                                sibling.execute('INSERT INTO sibling_progress VALUES (1)')
+                                if race:
+                                    sibling.execute('UPDATE execution_checkpoints SET generation=generation+1')
+                            return decision
+                        def complete():
+                            if use_port:
+                                ExecutionStatePort(connection, runtime, 'repo').complete_rebase(
+                                    checkpoint, acceptance=decision.acceptance,
+                                    project_values={'phase': 'WORKING'}, reobserve=reobserve)
+                            else:
+                                runtime.complete_rebase(original, checkpoint, acceptance=decision.acceptance,
+                                    project_values={'phase': 'WORKING'}, reobserve=reobserve)
+                        if race:
+                            with self.assertRaises(runtime_state.RuntimeStateError):
+                                complete()
+                            self.assertEqual(checkpoint.get('repo', 'G-047').generation, before.generation + 1)
+                            self.assertIsNone(checkpoint.get('repo', 'G-047').current_rebase_acceptance())
+                            self.assertEqual(runtime.projected('repo'), original)
+                        else:
+                            complete()
+                            self.assertEqual(checkpoint.get('repo', 'G-047').current_rebase_acceptance(), decision.acceptance)
+                        self.assertEqual(connection.execute('SELECT COUNT(*) FROM sibling_progress').fetchone()[0], 1)
 
     def test_current_acceptance_rolls_back_checkpoint_plan_project_and_outbox(self):
         for stage in ('after_rebase_acceptance', 'after_execplan_update',
@@ -123,7 +166,12 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                         original, checkpoint, acceptance=decision.acceptance,
                         project_values={'phase': 'WORKING'}, reobserve=reobserve,
                     )
-                self.assertEqual(checkpoint.get('repo', 'G-047'), baseline)
+                if drift == 'recheck_checkpoint':
+                    current = checkpoint.get('repo', 'G-047')
+                    self.assertEqual(current.generation, baseline.generation + 1)
+                    self.assertIsNone(current.current_rebase_acceptance())
+                else:
+                    self.assertEqual(checkpoint.get('repo', 'G-047'), baseline)
 
     def test_current_acceptance_cannot_publish_clear_blocks_or_fake_journal(self):
         _connection, runtime, checkpoint, original, _expected, decision = runtime_rebase_fixture(self)

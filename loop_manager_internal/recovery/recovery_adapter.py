@@ -417,6 +417,7 @@ def _checkpoint_recovery_effects_reconcile_published_blocked_checkpoint(effects:
 class CheckpointRecoveryEffectsEvaluateRemoteCheckpointCauseEffects:
     """Named effects for _checkpoint_recovery_effects_evaluate_remote_checkpoint_cause; no entry-point/module access."""
     ROOT: Path
+    git: Callable[..., object]
     _remote_checkpoint_has_new_failure: Callable[..., object]
     _remote_checkpoint_review_revision: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
@@ -433,6 +434,7 @@ def _checkpoint_recovery_effects_evaluate_remote_checkpoint_cause(effects: Check
     return checkpoint_recovery.EvaluateRemoteCheckpointCauseEffects(
         MAX_REVIEWER_PROTOCOL_ATTEMPTS=MAX_REVIEWER_PROTOCOL_ATTEMPTS,
         ROOT=effects.ROOT,
+        git=effects.git,
         ReviewerProtocolError=ReviewerProtocolError,
         WorkerResultError=WorkerResultError,
         _remote_checkpoint_has_new_failure=effects._remote_checkpoint_has_new_failure,

@@ -360,6 +360,35 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
     force_timeout_recheck: bool = False,
     recovery_request_id: str | None = None,
 ) -> bool:
+    from loop_manager_internal.recovery.plan_recovery import recovering_plan
+    for blocked in effects.plan_blocked_execplans(connection, repo):
+        selected = str(blocked['plan_id'])
+        if plan_id is not None and selected != plan_id:
+            continue
+        try:
+            with recovering_plan(connection, state_dir, repo, selected) as available:
+                if available and _resume_plan_blocks(effects, connection, repo_path, state_dir, repo, base,
+                        config_path, verify_timeout_seconds, selected, force_timeout_recheck, recovery_request_id):
+                    return True
+        except RecoveryFailure:
+            raise
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+            effects._update_blocked_error(connection, repo, selected, str(error), preserve_cause=True)
+    return False
+
+
+def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    base: str,
+    config_path: Path | None = None,
+    verify_timeout_seconds: int | None = None,
+    plan_id: str | None = None,
+    force_timeout_recheck: bool = False,
+    recovery_request_id: str | None = None,
+) -> bool:
     """Reevaluate each plan block without letting one overwrite another."""
 
     if scoped_blocking.project_block(connection, repo) is not None:
@@ -367,8 +396,6 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
     if not runtime_state.RuntimeStateRepository(
         connection
     ).recovery_slot_available(repo):
-        return False
-    if runtime_state.RuntimeStateRepository(connection).active_row(repo) is not None:
         return False
     held = scoped_blocking.catalog_held_plan_ids(connection, repo)
     for blocked in effects.plan_blocked_execplans(connection, repo):
@@ -393,6 +420,11 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
             continue
         if current_reason == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
             continue
+        if current_reason == BlockReasonCode.USER_DECISION_REQUIRED.value:
+            resolved, _detail, _stage = effects.plan_recovery_effects()._evaluate_remote_checkpoint_cause(
+                connection, repo_path, state_dir, repo, blocked, config_path, verify_timeout_seconds)
+            if not resolved:
+                continue
         changed_plan_input = False
         if current_reason == BlockReasonCode.PLAN_INPUT_INVALID.value:
             checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(

@@ -767,7 +767,7 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.factory.assert_not_called()
 
 
-    def test_other_execution_and_planning_keep_projection_sessions_and_diagnostics(self):
+    def test_planning_defers_recheck_and_other_execution_preserves_management_limit(self):
         self.block()
         for values in ("planning_error = 'separate error'", "planning_attempt_fingerprint = 'pending'",
                        "planner_session_id = 'planner'"):
@@ -781,11 +781,12 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
             "depends_on, priority, content_hash, status) VALUES ('repo', 'G-048', "
             "'docs/plans/[G-048] Other.md', 'Other', '[]', '[]', 'normal', 'hash', 'IMPLEMENTING')")
+        loop_manager._ensure_execplans_schema(self.connection)
         self.connection.commit()
         before = self.snapshot()
         self.assertFalse(self.resume())
         self.assertEqual(self.snapshot(), before)
-        self.factory.assert_not_called()
+        self.factory.assert_called_once()
 
 
     def test_dependency_gate_blocks_release_without_observation(self):
@@ -836,8 +837,6 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         original = self.case.observed
         for observed in (replace(original, remote=replace(original.remote, oid='foreign')),
                          replace(original, base_is_ancestor=False),
-                         replace(original, base_is_ancestor=False, head='before', branch_ref=('before', ''),
-                                 registration=('HEAD=before', 'branch=refs/heads/loop-manager/G-047')),
                          replace(original, operations=(('MERGE_HEAD', 'foreign'),)),
                          replace(original, index=(IndexEntry('app.py', '100644', 'blob', 0, 'S', 0x40000000),)),
                          replace(original, committed=(FileChange('docs/requirements/archive/change.md',
@@ -914,7 +913,7 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.git_write.assert_not_called()
 
 
-    def test_direct_input_recovery_cannot_replace_a_different_selected_block(self):
+    def test_direct_input_recovery_preserves_a_different_selected_block(self):
         self.block()
         self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
             "depends_on, priority, content_hash, status, blocked_reason, blocked_fingerprint) "
@@ -924,8 +923,10 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.connection.commit()
         other = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-048'").fetchone()
         with mock.patch.object(loop_manager, '_plan_block_selected_for_release', return_value=None) as selected:
-            self.assertFalse(loop_manager.resume_blocked_execplan_if_inputs_changed(
+            self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
                 self.connection, Path('/repo'), 'repo', 'main', Path('/state')))
-        selected.assert_called_once()
-        self.factory.assert_not_called()
+        selected.assert_not_called()
+        self.factory.assert_called_once()
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-048'").fetchone()), dict(other))
+        self.assertEqual(self.connection.execute("SELECT status FROM exec_plans WHERE plan_id = 'G-047'").fetchone()[0], 'IMPLEMENTING')
         self.assertEqual(self.connection.execute("SELECT plan_path FROM projects").fetchone()[0], other['path'])

@@ -530,7 +530,15 @@ class BlockedPlanReconciler:
 
     def _evaluate(self, plan, context):
         reason = context['block']['reason_code']
-        assessment_plan = {**dict(plan), **context['artifacts']}
+        assessment_plan = {**dict(plan), **context['artifacts'], 'blocked_reason': reason}
+        if reason == BlockReasonCode.USER_DECISION_REQUIRED.value:
+            resolved, detail, stage = self.ports._evaluate_remote_checkpoint_cause(
+                self.connection, self.repo_path, self.state_dir, self.repo, assessment_plan,
+                self.config_path, self.timeout)
+            return dict(resolved=resolved, detail=detail, stage=stage)
+        if reason == BlockReasonCode.PLAN_INPUT_INVALID.value:
+            error = self.ports._blocked_execplan_metadata_error(self.repo_path, Path(plan['worktree']), plan)
+            return dict(resolved=not error, detail=error or '현재 ExecPlan 선언·경로·입력이 유효합니다.', stage=None)
         if reason in {BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
                       BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value,
                       BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED.value}:
@@ -605,9 +613,15 @@ class BlockedPlanReconciler:
                       blocked_worktree_fingerprint=None, blocked_review_fingerprint=None,
                       last_error='원격 차단 복구 후 현재 후보를 Worker부터 다시 확인합니다.\n'
                                  + context['evaluation']['detail'])
-        with runtime_state._transaction(self.connection):
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        expected_checkpoint = checkpoints.get(self.repo, plan['plan_id'])
+        self._check_owner(plan['plan_id'], context)
+        self._candidate_unchanged(plan, context)
+        from loop_manager_internal.recovery.plan_recovery import recovery_admission
+        with recovery_admission(self.connection, self.repo, plan['plan_id']), runtime_state._transaction(self.connection):
             self._check_owner(plan['plan_id'], context)
-            self._candidate_unchanged(plan, context)
+            if checkpoints.get(self.repo, plan['plan_id']) != expected_checkpoint:
+                raise RuntimeError('차단 해제 재관측 중 checkpoint가 변경됐습니다.')
             runtime = runtime_state.RuntimeStateRepository(self.connection)
             resumed = runtime.transition(
                 self.repo, plan['plan_id'], plan_values=values,
@@ -630,6 +644,16 @@ class BlockedPlanReconciler:
             raise RuntimeError('차단 후보가 현재 소유 범위·target base·clean index 조건을 충족하지 않습니다.')
 
     def reconcile(self, plan_id, *, local_verify_recheck=False):
+        plan = self._plan(plan_id)
+        if plan is None or plan['status'] != 'PLAN_BLOCKED':
+            return 'unhandled'
+        from loop_manager_internal.recovery.plan_recovery import recovering_plan
+        with recovering_plan(self.connection, self.state_dir, self.repo, plan_id) as available:
+            if not available:
+                return 'deferred'
+            return self._reconcile(plan_id, local_verify_recheck=local_verify_recheck)
+
+    def _reconcile(self, plan_id, *, local_verify_recheck=False):
         row = self.connection.execute('SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
                                       (self.repo, plan_id)).fetchone()
         if row is None:
