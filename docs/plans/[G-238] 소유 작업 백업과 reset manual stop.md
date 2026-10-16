@@ -3,8 +3,8 @@ id: G-238
 title: 소유 작업 백업과 reset manual stop
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-076] Read-Only Operational State CLI.md
-  - docs/requirements/[R-077] Manual Plan Work Start and Completion.md
+  - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
+  - docs/requirements/[R-077] G 계획 수동 구현과 R·코드 일괄 제출.md
   - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
 depends_on:
   - G-236

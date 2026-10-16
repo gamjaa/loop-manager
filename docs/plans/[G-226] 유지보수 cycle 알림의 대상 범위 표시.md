@@ -3,8 +3,8 @@ id: G-226
 title: 유지보수 cycle 알림의 대상 범위 표시
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-053] Timely Progress Notifications.md
-  - docs/requirements/[R-074] Single-Pass Maintenance Cycle.md
+  - docs/requirements/[R-053] 이벤트 시점에 맞춘 진행 상황 알림.md
+  - docs/requirements/[R-074] 유지보수 1회 평가와 즉시 종료.md
 depends_on:
   - G-265
   - G-266

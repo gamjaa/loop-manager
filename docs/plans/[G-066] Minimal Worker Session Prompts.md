@@ -6,7 +6,7 @@ sources:
   - docs/requirements/[R-033] Minimal Worker Session Prompts.md
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
   - docs/requirements/[R-061] Agent 역할·문서 권한과 draft ExecPlan 사용자 판단.md
-  - docs/requirements/[R-066] AGENTS 변경 사전 승인.md
+  - docs/requirements/[R-066] Agent CLI 지침의 독립성.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
 depends_on:
   - G-058

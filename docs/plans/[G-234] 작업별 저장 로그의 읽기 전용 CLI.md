@@ -3,7 +3,7 @@ id: G-234
 title: 작업별 저장 로그의 읽기 전용 CLI
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-076] Read-Only Operational State CLI.md
+  - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
 depends_on:
   - G-194
   - G-265

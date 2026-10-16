@@ -3,7 +3,7 @@ id: G-194
 title: 읽기 전용 list와 status CLI
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-076] Read-Only Operational State CLI.md
+  - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
 depends_on:
   - G-208
   - G-209

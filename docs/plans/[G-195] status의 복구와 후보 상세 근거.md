@@ -3,7 +3,7 @@ id: G-195
 title: status의 복구와 후보 상세 근거
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-076] Read-Only Operational State CLI.md
+  - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
 depends_on:
   - G-194
   - G-208

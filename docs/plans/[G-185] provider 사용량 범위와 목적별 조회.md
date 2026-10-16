@@ -3,7 +3,7 @@ id: G-185
 title: provider 사용량 범위와 목적별 조회
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-073] Invocation Purpose Usage Scope and Queries.md
+  - docs/requirements/[R-073] 호출 목적과 사용량 범위 기록 및 조회.md
 depends_on:
   - G-184
   - G-196

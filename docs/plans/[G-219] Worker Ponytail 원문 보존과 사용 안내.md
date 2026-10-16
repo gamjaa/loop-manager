@@ -3,7 +3,7 @@ id: G-219
 title: Worker Ponytail 원문 보존과 사용 안내
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-079] Worker Ponytail 지침 주입과 설치 플러그인 중복 방지.md
+  - docs/requirements/[R-079] Worker Ponytail 지침 상시 주입.md
 depends_on:
   - G-265
   - G-266

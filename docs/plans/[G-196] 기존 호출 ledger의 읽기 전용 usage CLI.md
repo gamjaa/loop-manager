@@ -3,7 +3,7 @@ id: G-196
 title: 기존 호출 ledger의 읽기 전용 usage CLI
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-076] Read-Only Operational State CLI.md
+  - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
 depends_on:
   - G-194
   - G-208

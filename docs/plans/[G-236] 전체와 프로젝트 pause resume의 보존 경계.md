@@ -3,8 +3,8 @@ id: G-236
 title: 전체와 프로젝트 pause resume의 보존 경계
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-076] Read-Only Operational State CLI.md
-  - docs/requirements/[R-077] Manual Plan Work Start and Completion.md
+  - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
+  - docs/requirements/[R-077] G 계획 수동 구현과 R·코드 일괄 제출.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
 depends_on: []
 complexity: high

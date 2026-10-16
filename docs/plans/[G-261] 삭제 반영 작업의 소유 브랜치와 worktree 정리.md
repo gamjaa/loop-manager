@@ -3,7 +3,7 @@ id: G-261
 title: 삭제 반영 작업의 소유 브랜치와 worktree 정리
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-055] Blocking Path Audit and Minimal Interruption.md
+  - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
 depends_on:
   - G-258
   - G-260
