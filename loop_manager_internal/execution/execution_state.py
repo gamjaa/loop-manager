@@ -132,8 +132,9 @@ class ExecutionStatePort:
                 snapshot={**current.snapshot,
                           'worker_candidate_token': definition.worker_candidate_token(current.expected_head)})
             self.update_project(self.repo, preserve_transaction=True, phase='VERIFYING',
-                worker_result=prior['worker_result'], worker_input_token=prior['worker_input_token'],
-                archive_token=prior['archive_token'], revision_resume_status=None)
+                definition_snapshot=definition.serialize(), worker_result=prior['worker_result'],
+                worker_input_token=prior['worker_input_token'], archive_token=prior['archive_token'],
+                revision_resume_status=None)
 
     def confirm_existing_pr_push(self, checkpoints, head):
         """Advance the owned PR receipt and clear its push intent atomically."""

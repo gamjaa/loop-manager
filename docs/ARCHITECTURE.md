@@ -942,7 +942,9 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 
 저장 교정의 입력 근거는 `rebase_corrections.input_snapshot`의 nullable JSON definition snapshot으로 결과와 함께 보존한다. 이는 Worker 호출에 전달한 definition이며 종료 뒤 갱신된 definition으로 대체하지 않는다. 기존 DB에는 nullable 열을 추가하고 과거 결과는 입력 근거가 없는 상태로 유지한다. `pending=stage/continue` checkpoint는 검증된 결과와 `rebase_worker_input`에 같은 definition을 결합한다. 저장 결과와 pending 소비는 기존 revision gate로 최신 선언·dependency를 확인하고 Worker·archive token을 비교한다. token은 순수 수행 기록과 원격 revision OID, 일반 planning에서 반영한 source 지문만의 변화를 구현 재실행 근거에서 제외하며 verify·Review의 입력은 계속 별도로 검사한다.
 
-입력 불일치·근거 부재에서는 checkpoint의 `rebase_worker_input_history`에 이전 입력·결과·turn·pending·stage 근거를 보존하고 해당 READY와 pending 승인만 무효화한다. 작업 파일·session·원래 operation·target·문서 채택/파일 복원 intent와 실패 이력은 유지한다. 같은 Worker에 최신 조건과 과거 결과를 전달해 필요한 구현·targeted test를 확인하며 새 Planner 호출은 만들지 않는다. 입력이 유효한 pending은 별도 stage/continue 결과 소비 경로 대신 기존 Worker 완료 경로로 재개한다. 완료 후보는 새 현재 상태 서비스의 전체 최종 검사와 adoption을 거친 뒤에만 검증된 Worker token을 완료 HEAD에 연결하고 verify·Review·게시 근거는 무효화한다.
+입력 불일치·근거 부재에서는 checkpoint의 `rebase_worker_input_history`에 이전 입력·결과·turn·pending·stage 근거를 보존하고 해당 READY와 pending 승인만 무효화한다. 작업 파일·session·원래 operation·target·문서 채택/파일 복원 intent와 실패 이력은 유지한다. 같은 Worker에 최신 조건과 과거 결과를 전달해 필요한 구현·targeted test를 확인하며 새 Planner 호출은 만들지 않는다. 입력이 유효한 pending은 별도 stage/continue 결과 소비 경로 대신 기존 Worker 완료 경로로 재개한다. 완료 후보는 새 현재 상태 서비스의 전체 최종 검사와 adoption을 거친 뒤에만 검증된 definition snapshot·Worker token을 같은 transaction에서 완료 HEAD에 연결하고 verify·Review·게시 근거는 무효화한다. 진행 중 A에서 B로 바뀐 조건을 충족한 교정은 B를 완료 기준으로 저장하므로 다음 revision gate도 B와 현재 조건을 비교한다.
+
+`pending=continue`는 이전 unmerged index가 모두 해소된 뒤 기록한다. 그 뒤 새 unmerged stage를 관측하면 기존 post-command 경계에서 이전 pending·Worker 결과·입력·stage 근거를 `rebase_worker_input_history`에 `reason=next_conflict`로 보존하고 해당 승인만 소비한다. Git continue 직후 중단된 경우도 recover에서 같은 관측 경계를 거쳐 새 충돌을 등록한다. 부분 stage 중단은 기존 stage 재개를 유지하며 다음 충돌은 기존 session의 새 Worker turn으로 처리한다. 원래 target·문서 채택/파일 복원 intent·교정 및 targeted 실패 이력은 보존한다.
 
 #### 현재 상태 검사와 문서 충돌
 

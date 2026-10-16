@@ -312,6 +312,13 @@ class WorkspaceHandler:
                         return self.ports._recover(RecoveryReason.WORKTREE_RECOVERY_FAILED, rebased.stdout, context=context)
                     self.ports._complete_rebase_intent(context)
                     return self.ports._context()
+                if ((current.snapshot or {}).get('pending') == 'continue'
+                        and any(entry.stage for entry in observed.index)):
+                    # Recover a continue that reached another conflict before its
+                    # post-command checkpoint, without consuming the old READY.
+                    conflict = self.ports._post_rebase_observation(
+                        context, current.target_base_oid, 'resume next rebase conflict')
+                    return conflict if conflict is not None else self.ports._context()
                 if ((current.snapshot or {}).get('pending') in {'stage', 'continue'}
                         and (current.snapshot or {}).get('worker_result')):
                     saved_result = current.snapshot['worker_result']

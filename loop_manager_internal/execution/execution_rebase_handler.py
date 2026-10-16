@@ -583,6 +583,18 @@ class RebaseHandler:
                 )
                 if resolved.returncode == 0:
                     stash_oid = resolved.stdout.strip()
+            snapshot = dict(current.snapshot or {})
+            if snapshot.get('pending') == 'continue':
+                # Continue is recorded only after all prior index stages clear.
+                # New unmerged stages consume that result, never fail it again.
+                snapshot.setdefault('rebase_worker_input_history', []).append({
+                    'input_snapshot': snapshot.get('rebase_worker_input'),
+                    'worker_result': snapshot.get('worker_result'),
+                    'stage_evidence': snapshot.get('stage_evidence'),
+                    'pending': 'continue', 'reason': 'next_conflict',
+                })
+                for key in ('pending', 'worker_result', 'stage_evidence', 'rebase_worker_input'):
+                    snapshot.pop(key, None)
             checkpoint.record(
                 self.ports.identity.repo, context.plan.plan_id,
                 expected_generation=current.generation, operation='rebase',
@@ -590,7 +602,7 @@ class RebaseHandler:
                 target_base_oid=target_oid,
                 observed_remote_oid=current.observed_remote_oid,
                 snapshot={
-                    **(current.snapshot or {}),
+                    **snapshot,
                     'after_head': self.ports.git(
                         context.worktree, 'rev-parse', 'HEAD'
                     ).stdout.strip(),

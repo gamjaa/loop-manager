@@ -904,3 +904,98 @@ class SavedRebaseInputTests(ExecutionRecoveryScenarios, ExecutionFixture, TestCa
         self.assertEqual(saved.snapshot['worker_candidate_token'],
                          current.worker_candidate_token('owned-head'))
         case.fixture.effects.agent.run_agent.assert_not_called()
+
+
+    def test_completed_changed_definition_survives_next_dispatch_without_worker(self):
+        from loop_manager_internal.execution.execution_runtime import ExecutionPhaseCoordinator
+        case = current_rebase_case(self)
+        fixture = case.fixture
+        fixture.effects.revision.body_hash.return_value = 'condition A'
+        context = replace(fixture.context(), resolving_rebase=True)
+        case.handler.guard(context)
+        original = case.handler._definition_snapshot
+        case.state.update_project('repo', definition_snapshot=original.serialize())
+        fixture.effects.revision.body_hash.return_value = 'condition B'
+        case.handler.guard(replace(case.handler._context(), resolving_rebase=True))
+        current = case.handler._definition_snapshot
+        self.assertNotEqual(original.worker_token, current.worker_token)
+        self.assertEqual(case.state.row()['definition_snapshot'], original.serialize())
+        def candidate_git(path, *args, **kwargs):
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(returncode=0, stdout='owned-head')
+            return fixture.observed_git(path, *args, **kwargs)
+        fixture.effects.workspace.git.side_effect = candidate_git
+        result = case.handler._finish_worker(
+            replace(case.handler._context(), resolving_rebase=True),
+            case.state.row(), self.message, staged=True)
+        self.assertEqual(case.state.row()['definition_snapshot'], current.serialize())
+        next_result = ExecutionPhaseCoordinator(case.handler).dispatch(result.context)
+        self.assertEqual(next_result.context.phase, ExecutionPhase.REVIEWING)
+        self.assertEqual(case.state.row()['worker_input_token'], current.worker_token)
+        fixture.effects.agent.run_agent.assert_not_called()
+        fixture.effects.validation.verify.assert_called_once()
+
+    def _assert_next_conflict_reentry(self, *, interrupted):
+        context, _ = self.saved(pending='continue')
+        checkpoint = self.handler.effects.checkpoint
+        before = checkpoint.get('repo', 'G-047')
+        pending = {'unmerged': True, 'in_progress': True}
+        def next_git(path, *args, **kwargs):
+            if args[:2] == ('ls-files', '-u'):
+                return SimpleNamespace(returncode=0, stdout=(
+                    '100644 ' + 'b' * 40 + ' 2\tapp.py\0' if pending['unmerged'] else ''))
+            if args == ('rev-parse', '--verify', 'REBASE_HEAD'):
+                return SimpleNamespace(returncode=0, stdout='second-replay')
+            if args[0] == 'add':
+                pending['unmerged'] = False
+            if args[-2:] == ('rebase', '--continue') or args == ('rebase', '--skip'):
+                pending['in_progress'] = False
+            return self.observed_git(path, *args, **kwargs)
+        self.effects.workspace.git.side_effect = next_git
+        self.effects.workspace._rebase_in_progress_for_branch.side_effect = (
+            lambda *_: pending['in_progress'])
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+        targeted = TargetedTestRepository(self.connection)
+        targeted.observe('repo', 'G-047', [{'run_id': 'prior-run',
+            'id': 'suite.prior_failure', 'result': 'failure'}])
+        audit_before = self.repository.active_row('repo')['review_level_history']
+        if interrupted:
+            # Git reached the next conflict before post-command observation persisted.
+            first = self.handler.recover(context)
+        else:
+            first = self.handler._post_rebase_observation(
+                context, 'base', 'second commit conflict', corrected=True,
+                worker_result=self.message)
+        self.assertEqual(first.kind, ExecutionOutcomeKind.RETRY)
+        current = checkpoint.get('repo', 'G-047')
+        self.assertNotIn('pending', current.snapshot)
+        self.assertNotIn('worker_result', current.snapshot)
+        self.assertEqual(current.target_base_oid, before.target_base_oid)
+        self.assertEqual(current.expected_head, before.expected_head)
+        self.assertEqual(current.snapshot['rebase_worker_input_history'][-1]['worker_result'], self.message)
+        for _ in range(3):
+            recovered = self.handler.recover(self.context())
+            self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 0)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertNotIn('add', self.calls)
+        def worker(*args, **kwargs):
+            kwargs['on_session_started']('same-session')
+            return lm.AgentResult(0, self.message, session_id='same-session')
+        self.effects.agent.run_agent.side_effect = worker
+        guarded = self.handler.guard(recovered)
+        result = self.handler.run(guarded)
+        self.assertEqual(result.context.phase, ExecutionPhase.VERIFYING)
+        self.effects.agent.run_agent.assert_called_once()
+        self.assertEqual(self.effects.agent.run_agent.call_args.kwargs['session_id'], 'same-session')
+        self.assertEqual(self.state.row()['worker_session_id'], 'same-session')
+        self.assertEqual(self.repository.active_row('repo')['review_level_history'], audit_before)
+        self.assertEqual(targeted.repeated('repo', 'G-047'), ())
+        self.assertEqual(targeted.sequence('repo', 'G-047'), 1)
+        self.assertNotIn('rebase_files', checkpoint.get('repo', 'G-047').snapshot)
+
+    def test_next_conflict_after_continue_reenters_worker_without_replaying_ready(self):
+        self._assert_next_conflict_reentry(interrupted=False)
+
+    def test_restart_after_continue_reenters_worker_without_replaying_ready(self):
+        self._assert_next_conflict_reentry(interrupted=True)
