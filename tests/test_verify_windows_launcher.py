@@ -130,8 +130,27 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertEqual(self.report()['wsl'], 'PASS')
         self.assertEqual(self.report()['windows'], 'FAIL')
         self.assertFalse(self.report()['passed'])
-        self.assertGreater(self.native.call_args.args[2], 0)
-        self.assertLess(self.native.call_args.args[2], 60)
+        self.assertEqual(self.native.call_args.args[2], 60)
+
+    def test_native_does_not_subtract_wsl_elapsed_time_twice(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        def wsl(*args):
+            now[0] = 40.0
+            return True
+        def native(*args, **kwargs):
+            budget = kwargs['execution_clock']
+            self.assertIs(execution_clock.current_execution_clock.get(), budget)
+            self.assertEqual(budget.remaining(args[2]), 20.0)
+            now[0] = 60.0
+            self.assertEqual(budget.remaining(args[2]), 0.0)
+            return True, False, verify_process.VerifyProcessOutput('core PASS', exit_code=0)
+        self.wsl.side_effect = wsl
+        self.native.side_effect = native
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])):
+            self.assertEqual(launcher.windows_main(self.root), 0)
 
     def test_partial_request_falls_back_without_executing_either_phase(self):
         os.environ.update(LOOP_MANAGER_VERIFY_PARTIAL_BASE='base', LOOP_MANAGER_VERIFY_SESSION='session')

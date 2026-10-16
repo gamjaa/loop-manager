@@ -353,7 +353,7 @@ def windows_main(root):
                 passed, timed_out, output = run_verify_process(
                     [runtime_python, '-u', str(Path(__file__).resolve()), '--native', str(root),
                      str(entrypoint), str(native_logs), str(getattr(sys, '_base_executable', sys.executable))],
-                    root, max(0.001, budget.remaining(timeout)), job_scope=True)
+                    root, timeout, job_scope=True, execution_clock=budget)
                 print(output, flush=True)
             report['windows'] = 'PASS' if passed and not timed_out else 'FAIL'
             report['windows_diagnostic'] = str(native_logs / 'summary.json')

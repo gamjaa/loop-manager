@@ -407,14 +407,13 @@ def _migrate_execplan_catalog(connection, *, effects, reconcile_history, target_
         clone = sqlite3.connect(':memory:')
         clone.row_factory = sqlite3.Row
         try:
-            with connection:
-                connection.backup(clone)
-                for name, sql in connection.execute("SELECT name,sql FROM sqlite_temp_master WHERE type='table'"):
-                    clone.execute(sql.replace("CREATE TABLE", "CREATE TEMP TABLE", 1))
-                    quoted = '"' + name.replace('"', '""') + '"'
-                    rows = connection.execute('SELECT * FROM temp.' + quoted).fetchall()
-                    if rows:
-                        clone.executemany('INSERT INTO temp.' + quoted + ' VALUES (' + ','.join('?' for _ in rows[0]) + ')', rows)
+            connection.backup(clone)
+            for name, sql in connection.execute("SELECT name,sql FROM sqlite_temp_master WHERE type='table'"):
+                clone.execute(sql.replace("CREATE TABLE", "CREATE TEMP TABLE", 1))
+                quoted = '"' + name.replace('"', '""') + '"'
+                rows = connection.execute('SELECT * FROM temp.' + quoted).fetchall()
+                if rows:
+                    clone.executemany('INSERT INTO temp.' + quoted + ' VALUES (' + ','.join('?' for _ in rows[0]) + ')', rows)
             if registration is not None:
                 from loop_manager_internal.runtime import project_registry
                 project_registry.add_project(clone, registration)

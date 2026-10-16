@@ -150,6 +150,8 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
         connection = sqlite3.connect(':memory:')
         connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
+        connection.execute('CREATE TABLE exec_plans(repo, plan_id, pr_head_oid, pr_conflict_head_oid)')
+        connection.execute("INSERT INTO exec_plans VALUES ('/repo','G-107',NULL,NULL)")
         with (mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
               mock.patch.object(loop_manager, '_owned_rebase_journal_state', return_value={'head': 'a' * 40}),
               mock.patch.object(loop_manager, 'remote_branch_oid') as tracking,

@@ -310,25 +310,11 @@ def transition_validation_failure(
     *, review_level: int | None = None, candidate_head: str | None = None,
     review_source_id: int | None = None,
 ) -> ValidationFailureDecision:
-    # Read, consume the correction identity, and advance the level in one write transaction.
-    with runtime_state._transaction(connection):
-        return _transition_validation_failure(
-            effects, connection, repo, worktree, stage, output,
-            review_level=review_level, candidate_head=candidate_head,
-            review_source_id=review_source_id,
-        )
+    """Git 관측 뒤 입력을 재검사하고 실패 이력·차단을 함께 저장한다."""
 
-
-def _transition_validation_failure(
-    effects: TransitionValidationFailureEffects, connection: sqlite3.Connection,
-    repo: str,
-    worktree: Path,
-    stage: str,
-    output: str,
-    *, review_level: int | None = None, candidate_head: str | None = None,
-    review_source_id: int | None = None,
-) -> ValidationFailureDecision:
-    """Persist stage-local failures and own their retry/BLOCKED transition."""
+    from loop_manager_internal.storage.db_access import CoordinatedConnection, DatabaseWaitTimeout
+    if isinstance(connection, CoordinatedConnection) and (connection.in_transaction or connection._depth):
+        raise DatabaseWaitTimeout('검증 실패 관측 전에 DB transaction을 종료해야 합니다.')
 
     columns = {
         "verify": "verify_failure_history",
@@ -341,6 +327,7 @@ def _transition_validation_failure(
     plan = effects.active_execplan(connection, repo)
     if plan is None:
         raise RuntimeError("검증 실패를 기록할 활성 ExecPlan을 찾을 수 없습니다.")
+    expected = dict(plan)
     failures = effects.validation_failure_fingerprints(stage, output, worktree)
     redacted = effects.redact_secrets(str(output))
     history = effects._deserialize_failure_history(plan[history_column])
@@ -465,7 +452,12 @@ def _transition_validation_failure(
             if stage == "verify"
             else BlockReasonCode.REVIEW_RETRY_EXHAUSTED
         )
-        with runtime_state._transaction(connection):
+    with runtime_state._transaction(connection):
+        current = effects.active_execplan(connection, repo)
+        if current is None or dict(current) != expected:
+            from loop_manager_internal.application.task_scheduling import TaskRecheckRequired
+            raise TaskRecheckRequired('검증 실패 관측 중 작업 상태가 변경됐습니다.')
+        if blocked:
             recovery_decision = effects._final_block_recovery_decision(
                 connection, repo, plan, stage.upper(), reason, error,
                 fingerprint, None,
@@ -479,14 +471,14 @@ def _transition_validation_failure(
                 plan_values=plan_values,
                 clear_projection=True,
             )
-    else:
-        runtime_state.RuntimeStateRepository(connection).transition(
-            repo,
-            str(plan["plan_id"]),
-            plan_values=plan_values,
-            project_values=project_values,
-            enqueue=False,
-        )
+        else:
+            runtime_state.RuntimeStateRepository(connection).transition(
+                repo,
+                str(plan["plan_id"]),
+                plan_values=plan_values,
+                project_values=project_values,
+                enqueue=False,
+            )
     return ValidationFailureDecision(
         stage,
         fingerprint,

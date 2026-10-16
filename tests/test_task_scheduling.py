@@ -79,6 +79,56 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(dict(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()), project)
         self.assertEqual(runtime.get('A', 'G-002').status, 'PLAN_BLOCKED')
 
+    def validation_failure_effects(self, observe):
+        from loop_manager_internal.recovery import block_service
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        runtime.update_plan('A', 'G-001', plan_values={'verify_failure_history': json.dumps({
+            'failure': {'occurrences': block_service.MAX_VALIDATION_FINGERPRINT_REPEATS}})}, enqueue=False)
+        def fingerprints(*args):
+            observe()
+            return 'input', 'worktree'
+        def snapshot(*args):
+            observe()
+            return SimpleNamespace(serialize=lambda: 'snapshot')
+        return SimpleNamespace(active_execplan=lambda connection, repo: runtime.active_row(repo),
+            validation_failure_fingerprints=lambda *args: (('failure', 'failure'),),
+            redact_secrets=str, _deserialize_failure_history=json.loads,
+            _blocked_validation_input_fingerprints=fingerprints, capture_git_snapshot=snapshot,
+            _final_block_recovery_decision=block_service._final_block_recovery_decision)
+
+    def test_validation_block_git_observation_releases_database_access(self):
+        from loop_manager_internal.recovery import block_service
+        observed = []
+        def observe():
+            self.assertFalse(self.connection.in_transaction)
+            self.assertFalse(self.connection._held)
+            with closing(database.connect_database(self.directory, run_migrations=False)) as other:
+                with other:
+                    other.execute("UPDATE projects SET last_error='independent' WHERE repo='B'")
+                observed.append(other.execute("SELECT last_error FROM projects WHERE repo='B'").fetchone()[0])
+        effects = self.validation_failure_effects(observe)
+        with runtime_state.selected_execution('A', 'G-001'):
+            decision = block_service.transition_validation_failure(
+                effects, self.connection, 'A', Path('one'), 'verify', 'failure')
+        self.assertTrue(decision.blocked)
+        self.assertEqual(observed, ['independent', 'independent'])
+        row = self.connection.execute("SELECT status,verify_failure_history FROM exec_plans WHERE plan_id='G-001'").fetchone()
+        self.assertEqual(row['status'], 'PLAN_BLOCKED')
+        self.assertEqual(json.loads(row['verify_failure_history'])['failure']['occurrences'], decision.occurrences)
+
+    def test_validation_observation_cannot_overwrite_changed_failure_history(self):
+        from loop_manager_internal.recovery import block_service
+        changed = json.dumps({'concurrent': {'occurrences': 2}})
+        def observe():
+            with closing(database.connect_database(self.directory, run_migrations=False)) as other, other:
+                other.execute("UPDATE exec_plans SET verify_failure_history=? WHERE repo='A' AND plan_id='G-001'", (changed,))
+        effects = self.validation_failure_effects(observe)
+        with runtime_state.selected_execution('A', 'G-001'), self.assertRaises(scheduling.TaskRecheckRequired):
+            block_service.transition_validation_failure(effects, self.connection, 'A', Path('one'), 'verify', 'failure')
+        row = self.connection.execute("SELECT status,verify_failure_history FROM exec_plans WHERE plan_id='G-001'").fetchone()
+        self.assertEqual((row['status'], row['verify_failure_history']), ('IMPLEMENTING', changed))
+
     def test_compatibility_updates_cannot_reactivate_above_management_limit(self):
         from loop_manager_internal.storage import task_calls
         runtime = runtime_state.RuntimeStateRepository(self.connection)
