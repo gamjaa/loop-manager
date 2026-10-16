@@ -4,6 +4,7 @@ title: provider 사용량 범위와 목적별 조회
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-073] 호출 목적과 사용량 범위 기록 및 조회.md
+  - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
 depends_on:
   - G-184
   - G-196
@@ -20,6 +21,7 @@ depends_on:
   - G-266
   - G-267
   - G-268
+  - G-305
 complexity: high
 risk: medium
 priority: normal
@@ -44,7 +46,7 @@ priority: normal
 - agents/agent_provider_usage.py와 기존 provider 구조화 출력 fixture·ledger summary를 확장한다. provider별 범위/포함 관계를 보존하고 raw source identity로 dedup한다.
 - G-184가 구현한 목적·target·process 시작/종료·실행 여부와 additive ledger를 재사용한다. `provider_adapters.py`에서 관측한 사용량이 `invocation_service.py`의 정상·예외 종료 저장까지 전달되는 경계를 보완하고, 누적 범위·중복 제거·부분 수집을 기존 invocation에 결합한다. 시작·종료 관측이나 목적 전달을 다시 구현하지 않고 구조화 자료가 없는 과거 로그를 추측으로 채우지 않는다.
 - [ ] 확인한 `agents/provider_adapters.py:run_codex()`·`_provider_log_path()`와 `agents/invocation_service.py:run_agent()`의 호출별 로그 복사를 실제 launch 소유 경계에 연결한다. Codex가 내부 `prepare_isolation()`에서 선택한 attempt도 예외 전 확보 원문을 기존 보존 위치에 연결하고, 이미 저장된 정상 호출은 재실행하지 않는다. 기존 `on_process_started`·`on_process_finished`와 ledger 종료 관측으로 운영 로그의 준비/실행 시간·미확인 종료를 설명한다. raw 출력·prompt·인증 자료를 운영 요약이나 ledger에 추가하지 않으며 기존 provider 상세 로그 보호를 유지한다.
-- G-196이 제공한 usage CLI와 기존 ledger 집계 경계에 기간·목적·실행 여부 필터를 확장한다. R-076의 읽기 전용 연결·snapshot·JSON/오류·미수집 계약을 재사용한다. optional 수집/조회 오류를 진단하면서 작업 성공·필수 safety·재시도 정책과 분리하고 새 측정 서비스를 만들지 않는다.
+- G-196이 제공한 usage CLI와 기존 ledger 집계 경계에 기간·목적·실행 여부 필터를 확장한다. R-076의 읽기 전용 연결·snapshot·JSON/오류·미수집 계약과 R-091의 공통 DB 경계를 재사용한다. 호출 저장의 DB 대기·필수 증거·물리 결과 보존은 G-305를 소비하고 여기서는 파싱/범위·기존 관측값의 전달·조회를 확장한다. optional 수집/조회 오류를 진단하면서 작업 성공·필수 safety·재시도 정책과 분리하고 새 측정 서비스를 만들지 않는다.
 - 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
@@ -64,6 +66,8 @@ priority: normal
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 이번 delta의 R-091 공통 DB 경합 처리는 G-305의 호출 저장 경계로 분리해 선행 연결한다. 이 작업의 사용량 범위·부분값·예외 원문 회수와 조회 목표는 유지하며 같은 DB 대기/결과 보존을 재구현하지 않는다. 기존 ID·목표·dependency·수행 기록을 보존하고 새로운 실제 호출·검증 성공을 만들지 않는다.
 
 - 2026-10-14 efc71a72f4e2ce152c9c4355e6d08bdc4ee242ac 재평가: 보존된 운영 로그 delta 계획과 이후 Worker 문서 권한·frontmatter 부분 복원 변경을 대조했다. provider 내부 launch의 예외 종료 자료 보존 누락과 기존 usage 조회 목표는 유지되며 추가 선행이나 재구현은 필요하지 않다. 이 작업의 관련 제품·설계 설명은 허용 문서에 반영하고 Requirement·다른 ExecPlan은 수정하지 않는다. 기존 ID·경로·metadata·dependency·수행 기록을 보존하며 실제 호출·검증 성공을 만들지 않았다.
 - 2026-10-14 운영 로그 delta: 호출별 상세 파일과 정상 결과 요약은 직접 구현됐으므로 중복 계획하지 않는다. 그러나 `run_codex()`의 durable copy는 정상 반환 경로에 있고 `invocation_service`의 예외 회수는 자신이 준비한 `prepared_launch`만 참조한다. 미리 전달된 profile 때문에 provider가 내부에서 준비한 launch의 예외 원문은 이 회수에 연결되지 않는다. 기존 R-073의 실패·timeout·중단 사용량/원래 로그 목표에 이 소비 경계와 실제 종료 시간 구분을 반영했다. 기존 sources 문자열·ID·경로·선행 순서·수행 기록과 high complexity/medium risk·priority를 유지하며 정적 확인을 실행·verify·최종 전문 확인 성공으로 바꾸지 않는다.

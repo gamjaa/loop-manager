@@ -5,10 +5,12 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
   - docs/requirements/[R-085] Codex·Claude 인증 전용 자동 실행 환경.md
+  - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
 depends_on:
   - G-191
   - G-264
   - G-291
+  - G-305
 complexity: medium
 risk: medium
 priority: high
@@ -22,6 +24,7 @@ Claude 지원 경계가 준비된 뒤 Worker targeted 기록을 이미 구현된
 
 - R-055: 지원 가능한 Claude Worker의 신규·재개·retry·fallback 호출마다 프로젝트 Python으로 실행할 runtime targeted runner와 현재 호출의 쓰기 허용 기록 폴더를 제공한다. 완료·중단한 개별 결과는 G-291의 동일 repository·ExecPlan·물리 invocation 문맥으로 수집·재관측한다.
 - 실제 프로세스 시작 전에 `on_targeted_prepared`로 정규 call 디렉터리·파일시스템 identity와 call 바깥 receipt를 결합한다. receipt는 그 Claude writer의 실제 시작·종료 확인과 같은 경로여야 하며 기존 invocation·작업 호출 예약의 귀속과 일치해야 한다. callback/결합 저장 실패는 launch를 시작하지 않는다. Codex launch 객체나 종료 코드만으로 Claude 종료·격리 근거를 합성하지 않는다.
+- R-091의 일시 DB 경합은 G-305의 공통 호출 준비/저장 대기로 처리한다. 결합 저장이 확정되기 전 미시작을 유지하되 이를 Claude 정책 실패·targeted 실패·교정 소진으로 바꾸지 않는다. 실제 실행 뒤의 수집 대기에서는 물리 결과·사용량·session과 미소비 자료를 보존하고 완료한 CLI를 반복하지 않는다.
 - R-085: 공통 인증 홈·개인 원본·다른 호출의 임시 폴더를 기록 쓰기 범위로 사용하지 않는다. 부모 환경·설정 source·session·실패/사용량 기록을 보존하며 provider 전환이나 권한 확대로 수집 누락을 우회하지 않는다. Reviewer·읽기 전용 Planner에는 Worker 기록 권한을 추가하지 않는다.
 - G-191/G-264의 실제 정책/환경 확인을 통과하기 전 Claude를 실행하거나 미지원 환경을 허용하지 않는다. 정책 거부·준비 실패는 테스트 실패가 아니며 결과가 없는 호출을 세 번 실패로 세지 않는다. Codex의 이미 구현된 runner 전달·기존 일반 호출 계약과 수집을 유지한다.
 - 같은 테스트의 세 실제 실패, 다른 테스트의 실패, skip/expected failure·성공에 의한 초기화와 새 실행 근거 부재 pause가 provider에 따라 달라지지 않는다. 실제 CLI/계정·OS 호환성 성공을 mock 회귀로 합성하지 않는다.
@@ -29,7 +32,7 @@ Claude 지원 경계가 준비된 뒤 Worker targeted 기록을 이미 구현된
 ## Implementation
 
 - [ ] 확인한 `loop_manager_internal/agents/provider_adapters.py:ClaudeAgentAdapter/run_claude`와 `agents/agent_adapter.py:run_claude` facade에 `AgentRequest.on_targeted_prepared`를 전달한다. `invocation_service.py:observe_targeted`의 이미 구현된 bind를 재사용하고, G-191/G-264 뒤 실제 준비 환경·허용 call 디렉터리·receipt를 프로세스 생성 전에 한 번 연결한다. 현재 logs 아래 attempt를 그대로 결합해 실패시키거나 별도 collector로 경로 검사를 우회하지 않는다.
-- [ ] 확인한 `agents/agent_codex_sandbox.py`의 Worker runner 환경 전달과 `agents/process_receipt.py`·`storage/agent_invocation_state.py`·`storage/task_calls.py`의 호출/예약 귀속을 소비한다. 선행이 준비한 Claude writer의 시작·종료 receipt와 targeted callback을 같은 문맥에 연결하고, 실제 종료 확인 뒤의 공통 재수집·pending 표식을 사용한다. 기록 누락으로 물리 provider 결과·사용량·session을 덮지 않으며 별도 streak ledger·runner·인증 정책은 만들지 않는다.
+- [ ] 확인한 `agents/agent_codex_sandbox.py`의 Worker runner 환경 전달과 `agents/process_receipt.py`·`storage/agent_invocation_state.py`·`storage/task_calls.py`의 호출/예약 귀속을 소비한다. 선행이 준비한 Claude writer의 시작·종료 receipt와 targeted callback을 같은 문맥에 연결하고, 실제 종료 확인 뒤의 공통 재수집·pending 표식을 사용한다. G-305의 DB 대기/필수 저장 처리를 재사용해 미확정 결합으로 시작하지 않으며 기록 누락으로 물리 provider 결과·사용량·session을 덮지 않는다. 별도 streak ledger·runner·인증 정책은 만들지 않는다.
 - [ ] 확인한 `tests/test_agent_invocation.py`, `tests/test_provider_runtime.py`, `tests/test_native_platform_agents.py`, `tests/test_codex_native_invocation.py`의 provider fixture에 환경·callback·거부/재개 회귀를 추가한다. G-291의 실제 파일·SQLite 수집 경계를 사용하며 Claude 결과를 단순 성공값으로 주입해 전달 검증을 대신하지 않는다. PRODUCT·ARCHITECTURE·필요한 Worker 안내에는 실제 지원 범위와 기록 연결만 정합화한다.
 
 ## Validation
@@ -38,6 +41,7 @@ Claude 지원 경계가 준비된 뒤 Worker targeted 기록을 이미 구현된
 - 신규·동일 session 재개·transient retry·session fallback의 각 호출에 고유한 허용 기록 경로가 전달되고 동일 ExecPlan의 실패 이력은 이어져야 한다. 별도 작업·역할·공급자·상태 루트의 폴더나 결과는 섞이지 않아야 한다.
 - 준비/정책 거부와 기록 없는 중단은 실패 횟수를 만들지 않아야 한다. 완료 결과 뒤 interruption과 재시작 재관측은 한 번만 반영되고 세 번째 실패 뒤 새 CLI retry·verify는 없어야 한다. 읽기 전용 역할의 쓰기 정책·부모 환경·인증/개인 설정 원본은 유지돼야 한다.
 - facade→adapter→prepared callback→실제 임시 파일→공통 collector/SQLite 연결을 확인한다. callback의 경로/receipt와 invocation·호출 예약 identity가 일치하고 저장 실패에서는 모의 process launch도 호출되지 않아야 한다. live·종료 불명과 경로 교체에서는 미소비 원문을 유지하며 종료 확인/오류 해소 뒤 재수집돼야 한다. 기존 Codex `tests/test_agent_invocation.py`의 KeyboardInterrupt·retry/fallback·독립 provider 실패 회귀를 재사용하고 지원되지 않는 Claude OS/정책 거부와 실환경 미수행 구분을 유지한다.
+- 공통 DB 대기의 일반 정책 조합은 G-305의 회귀를 재사용하고, Claude 전달 경계에서 결합 대기 해소 뒤 최초 launch 한 번·한도 초과 시 launch 0과 targeted 실패 미증가만 추가 확인한다. 실제 정책/경로 오류의 기존 거부와 구분한다.
 
 ## Progress
 
@@ -47,6 +51,8 @@ Claude 지원 경계가 준비된 뒤 Worker targeted 기록을 이미 구현된
 - [ ] provider 전달·중단·거부의 최소 unit 회귀 및 관련 설명
 
 ## Decision Log
+
+- 이번 R-091 delta는 공통 DB 저장 대기와 실제 실패의 분리를 요구하므로 G-305의 결과를 선행 소비한다. Claude callback·경로 전달이라는 기존 목표와 G-191/G-264/G-291·기존 수행 기록은 유지하며 공통 DB 기능이나 Claude 안전 거부 해제를 중복 구현하지 않는다.
 
 - snapshot token `e108f535e66d7a1ec6bbe0c12265d2b209bdfe14e05e4bc20c155efd5dc80e7c`과 원본 hash `2612b2f7871601f112a3df3795f52e69efa3a03502d3fe4734352de30701be8d`를 대조해 새 공통 port·경로·receipt 계약을 같은 ID에 반영했다. G-291의 구현은 재사용하고 기존 G-191/G-264/G-291 dependency·목표·metadata·기록을 보존한다. G-302의 검증 재개 gate와 독립 구현 경계이므로 이 연결을 기다리게 하지 않는다. 이번 delta는 프로젝트 최종 전문 확인·실계정/OS 검증이 아니다.
 

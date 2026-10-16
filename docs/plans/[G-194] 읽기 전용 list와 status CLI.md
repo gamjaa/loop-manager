@@ -22,6 +22,7 @@ depends_on:
   - G-266
   - G-267
   - G-268
+  - G-303
 complexity: medium
 risk: high
 priority: normal
@@ -42,7 +43,7 @@ priority: normal
 - 실제 진전을 증명하는 저장 사건만 마지막 진전의 시각·출처로 사용한다. invocation 시작·종료, DB 갱신·오류 관측만 있으면 진전은 미확인이다. 프로세스 존재·활동·재개 가능성·관측 신선도를 따로 표현하고 잠금이나 미종료 호출로 활동·생존을 확정하지 않는다. 조회 시각과 원본 관측 시각·출처·경과시간을 구분하며 없는 시각과 다음 실행·제한 해제 시각을 추정하지 않는다.
 - 기존 저장 결정과 순수한 선택·복구·재시도 판단을 재사용한다. 기존 유효기간이 없는 관측에 새 기준을 만들지 않고 원격 확인이나 상태 변경이 필요한 판단은 재검사 필요·미확인으로 남긴다. 다음 외부 실행의 재검사는 재개 성공을 보장하지 않는다.
 - 조회 진입은 실행 잠금, bootstrap·runtime 자식, 설정/provider 초기화, schema 초기화·migration, 중단 호출 정리와 실행 경로를 거치지 않는다. 에이전트·verify·Git·원격 API·게시·알림·복구를 호출하거나 작업·retry·관측·완료 기록을 바꾸지 않는다. DB가 없으면 directory·DB를 만들지 않는다.
-- 읽기 전용 SQLite와 유한한 busy 대기, 하나의 일관된 읽기 snapshot을 사용한다. 필수 table·column을 읽기만으로 검사하며 선택 정보 누락은 미확인이다. WAL 등 제약으로 읽을 수 없으면 쓰기 연결·migration·journal mode 변경·checkpoint·자동 복원 없이 오류를 반환한다. 실행 중인 다른 Manager의 실행 잠금을 변경하지 않는다.
+- R-091의 파일별 공통 DB 접근과 읽기 전용 SQLite를 통해 유한한 순번/busy 대기와 하나의 일관된 읽기 snapshot을 사용한다. `DatabaseWaitTimeout`과 SQLite BUSY/LOCKED는 `db_busy`이며 손상·권한·SQL/schema 오류와 구별한다. 필수 table·column을 읽기만으로 검사하며 선택 정보 누락은 미확인이다. WAL 등 제약으로 읽을 수 없으면 쓰기 연결·migration·journal mode 변경·checkpoint·자동 복원 없이 오류를 반환한다. 실행 중인 다른 Manager의 실행 잠금을 변경하지 않는다.
 - 기본 출력과 JSON은 같은 사실·미확인 의미를 제공한다. JSON은 schema_version·command·queried_at·repository·plan_id·source·data·warnings·error 및 `null`·`[]`·실측 `0`을 보존하며 stdout에는 문서 하나만 출력한다. source는 list 필터에서만 값이 있고 나머지는 null이다. 조회 성공은 저장된 작업 실패·차단이나 빈 결과에도 0, 조회 오류는 1과 `db_not_found`·`db_unreadable`·`db_busy`·`unsupported_schema`·`unknown_project`·`unknown_plan`, 인자 오류는 기존 stderr 안내와 2를 사용한다. 기존 비밀값 제거 규칙을 적용한다.
 - 기존 사용자 문서에 실제 list/status 명령·범위, 공통 JSON 필드의 자료형·단위·nullable 의미·버전 호환, 종료 코드·오류 code와 정상·미확인·오류 예시를 기록한다. G-235의 새 add/remove 이름을 사용하며 config init·나머지 유지 명령의 동작은 유지한다. G-236의 저장 pause를 읽기만 한다.
 
@@ -50,13 +51,13 @@ priority: normal
 
 - 구현 시작 시 최신 원격 코드에서 같은 조회 기능을 확인한다. 확인한 `loop_manager.py`의 조기 status dispatch와 `application/commands.py:_project_limits_status()`의 읽기 전용 연결·JSON envelope·등록/schema 오류, `runtime/project_registry.py:task_limit()`과 `storage/task_calls.py:managed_count()`를 재사용한다. parser와 초기화 이전 dispatch, 조회 연결·투영·출력의 책임을 기존 경계 안에서 나누며 새 루트 항목·별도 엔진·관측 체계·설정은 추가하지 않는다.
 - 기존 schema·프로젝트 registry·작업 상태와 `recovery/recovery_runtime.py`, 선택·알림 사유의 순수 판단을 확인해 재사용한다. schema ensure나 기록 갱신을 숨긴 Repository·복구 helper를 조회에 연결하지 않는다. 쓰기 실행과 설명이 공유할 최소 순수 경계만 분리하며 정책을 복제하지 않는다.
-- 읽기 snapshot의 수명 안에서 범위 확인·유효 priority·source 관계·선행 근거를 조회하고 같은 결과에서 두 출력을 만든다. 기존 source resolver·검증된 dependency/priority와 저장 pause를 재사용하며 조회용 정책을 복제하지 않는다. 목록과 상세의 책임을 구분하고 PRODUCT·ARCHITECTURE 및 사용자 안내의 관련 절에 Merge된 동작을 반영한다.
+- 읽기 snapshot의 수명 안에서 범위 확인·유효 priority·source 관계·선행 근거를 조회하고 같은 결과에서 두 출력을 만든다. 현재 `storage/db_access.py:open_connection(read_only=True)`와 G-303의 공통 요청 경계를 재사용하며 조회 묶음을 SQL 문장별로 분리하지 않는다. `_project_limits_status()`는 공통 대기 예외에 SQLite error code가 없어 `db_unreadable`로 분류하는 잔여 오류를 갖고 있으므로 타입으로 구분한다. 기존 source resolver·검증된 dependency/priority와 저장 pause를 재사용하며 조회용 정책을 복제하지 않는다. 목록과 상세의 책임을 구분하고 PRODUCT·ARCHITECTURE 및 사용자 안내의 관련 절에 Merge된 동작을 반영한다.
 
 ## Validation
 
 - Worker는 기존 CLI·project 서비스·SQLite fixture를 재사용한 targeted unit test로 범위 선택, 종료 작업, 다중 대기·차단 사유, 근거 없는 진전·생존·재개 시각, 오래된 관측과 JSON/기본 출력 동등성을 확인한다.
 - 실제 Git·모델을 호출하지 않는 unit case로 list 정렬·--all·직접 source 필터와 선행 없음/충족/미충족/미확인·잘못된 graph·archive/rename 대응을 검사한다. 조회 결과를 manual start 예약으로 사용하지 않는다.
-- 정상·오류·JSON 진입에서 잠금·bootstrap·runtime·provider·Git·원격·알림·verify 효과를 실패 fixture로 막고 호출이 없음을 검사한다. DB 없음·손상·읽기 접근 실패·schema 불일치·busy와 선택 column 누락에서 오류 계약 및 directory/DB 미생성을 검증한다.
+- 정상·오류·JSON 진입에서 실행 잠금·bootstrap·runtime·provider·Git·원격·알림·verify 효과를 실패 fixture로 막고 호출이 없음을 검사한다. 실제 공통 DB gate 대기와 SQLite BUSY/LOCKED·공통 대기 예외를 구분해 모두 `db_busy`와 오류 종료 1을 확인한다. DB 없음·손상·읽기 접근 실패·schema 불일치와 선택 column 누락의 기존 오류 계약 및 directory/DB 미생성을 유지한다. 조회 중 다른 writer가 요청해도 관련 읽기가 같은 snapshot에서 완료되거나 안전한 유한 오류여야 한다.
 - 확인한 `tests/test_task_scheduling.py`의 status 무변경·JSON 오류 회귀를 재사용한다. 복수 활성 G·verify 대기/실행·안정 PR·종료 불명 예약·공유 수동 묶음에서 관리 수와 저장 상태를 구분하고 저장 0/config 3→4·개별 5·0 복귀의 조회를 유지한다. 조회에서 scheduler 복구나 receipt 회수를 호출하지 않는다.
 - Manager 전체 verify는 조회 전후 schema와 작업·복구·retry·호출·검증·outbox·완료 기록 불변, WAL 및 동시 writer에서 snapshot 일관성 또는 유한 시간의 안전한 오류, 기존 실행 CLI 회귀와 문서/JSON 계약을 실제 provider 없이 확인한다.
 
@@ -68,6 +69,8 @@ priority: normal
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 이번 delta의 공통 읽기 연결은 직접 구현으로 소비한다. 남은 조회 확장에 R-091의 같은 DB 처리 경계를 적용하고 실제 대기 종료의 오류 분류를 보완한다. G-303을 선행 연결하되 읽기 전용 기능·현재 출력/JSON·기존 dependency·수행 기록은 보존한다. 단순 공통 연결 도입이나 조회 성공을 소급 구현·검증 성공으로 기록하지 않는다.
 
 - 2026-10-16 delta: 한도 조회·`config set`은 직접 구현으로 소비하고 전체 list/status의 남은 범위만 유지한다. 과거 Progress의 “status 없음”은 당시 조사 기록이며 최신 구현 판단은 이 개정이 대체한다. ID·기존 dependency·이력은 보존하고 테스트/verify 성공은 합성하지 않는다.
 
