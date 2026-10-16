@@ -34,7 +34,7 @@ priority: normal
 
 verification/core.py의 결과 수집·Windows Job 관측·unit_start와 기존 stop_worker phase, timing.py의 이벤트 집계 및 runner/manager_adapter의 metadata를 연결한다. runner의 mode·partial-result와 preliminary_reviews/verify_receipts의 기존 증거 연결, discovery·impact_selection phase를 재사용해 부분/전체 run을 구분한다. 이미 남기는 allocation·Git·fixture·시간 자료를 재사용하고 필요한 누락 시점만 보강한다. 기존 이벤트/요약 계약의 호환 확장으로 처리하고 별도 로그 저장소나 모니터링 서비스를 만들지 않는다. 실제 임시 경로의 선택·관측과 summary 연결은 G-253이 담당한다.
 
-- [ ] 확인한 `verification/manager_adapter.py:progress_observation()`의 최상위 `glob("*.jsonl")`를 현재 소유 run의 단계별 이벤트 배치와 맞춘다. 확인한 `runner.py:run()`의 `stage-N`, `unittest_adapter.py:worker_main()`·`timing.py:TimedResult`와 `scripts/verify_windows.py`의 launcher/두 형제 단계 로그·result 경로를 사용한다. 현재 실행이 확인한 단계만 읽고 경로 이름만 유사한 다른 run·과거 잔여 파일을 재귀 수집하지 않는다. 파일별 커서와 공통 phase·allocation 관측을 재사용해 단계별 진행·대기 해소를 반영하고 읽기 실패에서는 미확인 범위를 남긴다. 로그 관측 때문에 추가 Git·DB·프로세스·모델 조회를 실행하지 않는다.
+- [ ] 직접 구현된 `verification/manager_adapter.py:progress_observation()`의 단계별 `rglob("*.jsonl")`·파일별 커서·부분 행/중단 처리와 `tests/test_verify_runtime.py:ManagerAdapterTests.test_progress_reads_stage_worker_events_once_and_tracks_interruption`을 재사용한다. 탐색 자체는 다시 구현하지 않고 남은 run/stage/unit identity·단계 종료 처리, 실제 Windows 형제 로그/부모 result 연결을 보완한다. `runner.py:run()`·`unittest_adapter.py:worker_main()`·`timing.py:TimedResult`·`scripts/verify_windows.py`의 소유 실행 배치를 사용해 다른 run·과거 잔여 자료를 섞지 않으며 읽기 실패는 미확인으로 남긴다. 추가 Git·DB·프로세스·모델 조회는 하지 않는다.
 - [ ] 기존 `runtime/operation_events.py:progress()`의 reporter와 중첩 표시 억제·문맥 복사·종료를 재사용한다. 파일 관측 실패는 미확인으로 설명하며 verify 결과·timeout·예약·실패 집계에 영향을 주지 않는다. 별도 중복 reporter·새 전역 상태를 만들지 않는다.
 
 ## Validation
@@ -48,11 +48,14 @@ verification/core.py의 결과 수집·Windows Job 관측·unit_start와 기존 
 ## Progress
 
 - [x] 2026-10-10 기준 50c699c8f9c149cecb0ddf9b081527942d8e2289의 R-065/R-067·core의 Job active 대기·timing summary와 runner metadata를 정적으로 확인했다. 구현·테스트·OS 측정·verify는 실행하지 않았다.
-- [ ] 실제 단계별 이벤트의 운영 진행 표시 연결과 최소 배치 회귀
+- [x] 2026-10-16 원격 코드의 단계별 이벤트 탐색·파일 커서·중단 처리와 최소 배치 회귀를 정적으로 확인했다. 테스트 실행 성공은 확인하지 않았다.
+- [ ] 남은 실행 identity·단계 종료·Windows 형제 로그의 운영 진행 연결
 - [ ] 진단 연결·문서 정합화·targeted unit 검증
 - [ ] Manager 전체 verify·필요한 실제 Windows 자료·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 2026-10-16 delta: `1f8b97e6c04868281cd23672396f1fd3d47ee98e`의 재귀 탐색과 단계 fixture는 직접 구현으로 소비한다. 과거 reader가 루트만 읽는다는 조사 기록은 최신 상태 설명이 아니다. 결과 확인/종료/다음 배정의 시점·run identity·Windows 형제 로그 목표는 유지하며 `ExecutionClock`의 확인된 대기 누계는 진단에서 재사용한다. 시간 예산 구현은 G-295에 남기고 resource_wait 전체를 timeout 제외 시간으로 합산하지 않는다.
 
 - 최신 `bbce8cd25cdaa34a547b736cfc2f5d20f96a2a6d`의 직접 구현은 자체 Windows 결과를 부모와 WSL/native 형제 경로에 나눈다. 기존 진행·진단 소비 목표를 이 실제 배치에 맞추며 새 launcher·자원 조율·timeout은 구현하지 않는다. G-253은 실효 임시 경로, G-295는 전체 시간 상한, G-187은 실제 OS·부하 근거를 담당한다. 기존 수행 기록·분류·priority·dependency는 유지한다.
 - 2026-10-14 efc71a72f4e2ce152c9c4355e6d08bdc4ee242ac 재평가: 보존된 단계별 JSONL reader 보완과 이후 Worker 문서 권한 변경을 대조했다. 실제 writer 배치·reader·회귀 fixture의 누락은 그대로이며 관련 제품·설계 설명만 허용 문서에서 갱신한다. Requirement·다른 ExecPlan 수정이나 frontmatter 복원 기능을 추가하지 않고 ID·metadata·dependency·기존 수행 기록을 보존한다. 테스트·OS 실측·verify는 실행하지 않았다.

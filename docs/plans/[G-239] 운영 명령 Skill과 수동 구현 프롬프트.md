@@ -6,6 +6,7 @@ sources:
   - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
   - docs/requirements/[R-074] 유지보수 1회 평가와 즉시 종료.md
   - docs/requirements/[R-077] G 계획 수동 구현과 R·코드 일괄 제출.md
+  - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
 depends_on:
   - G-194
   - G-195
@@ -32,6 +33,7 @@ priority: normal
 ## Acceptance Criteria
 
 - Skill·도움말·사용 예시는 새 list/status/usage/logs·add/remove·run 범위·pause/resume·reset·manual cancel/stop 및 유지 명령의 의미·거부·결과 확인을 일치하게 안내한다. explain·제거된 config list/add/remove 호환 명령은 안내하지 않는다.
+- R-076/R-091: 이미 구현된 `config set <repo> --max-tasks-per-project <N>`과 `status <repo>`를 안내한다. DB의 0은 config 상속이고 양수는 개별값이며 config 자체의 0은 거부됨을 구분한다. 기본값은 Agent 3·관리 1·verify 1이고 세 종류의 한도·verify 내부 병렬도는 별개다. 실행/pause 중 저장·다음 안전한 배정 반영·상한 축소 시 기존 작업 보존과 조회 config/실행 config 미확인을 같은 의미로 설명한다. 수동 제출 우선은 실행 중 호출의 선점이나 즉시 실행 보장이 아니며 공유 묶음 내부만 직렬이다.
 - R-074/R-076: `maintenance-review <repo>`는 등록 프로젝트의 다음 안전한 경계에 유지보수 전환을 요청하는 기존 명령으로 안내한다. `[loop] refactoring_review_interval`의 기본값 20·0의 자동 전환 비활성화와 0·주기 도달 전의 명시적 요청 가능성을 설명한다. 요청 저장·실제 시작·pause/실행 중 작업/Open PR/프로젝트 안전 gate에 따른 대기를 구분하며 설정 변경으로 누적 Merge 기준·활성 cycle이 초기화된다고 안내하지 않는다.
 - 명령 Skill은 자체 저장소에만 남는다. 기존 copy-project-files가 `.agents` 전체를 복사하는 경계를 수정해 등록 프로젝트에는 Specification Skill과 자체 보조 파일을 함께 배포하며 다른 기존 준비/덮어쓰기 보호는 유지한다. `next_requirement_id.py`·`read_requirements.py`·`requirement_documents.py`를 포함하고 Manager 내부 모듈을 복사하거나 설치·DB·실행 상태에 의존하지 않는다.
 - R-076: start가 원격 준비를 완료한 경우에만 코드가 G ID·계획 경로·소유 branch/base·PRODUCT/Requirement/ARCHITECTURE 상대 경로·프로젝트 verify·재검증·소유 branch push까지의 지시를 포함한 프롬프트를 생성한다. 복사용 프롬프트에 PR 생성이나 Manager 명령 실행을 지시하지 않는다. 별도 사용자 출력에서 push 뒤 Manager에서 실행할 `manual complete <repo> <id>`를 안내하며 Manager 실행 위치와 다른 기기 구현 위치를 구분한다.
@@ -43,7 +45,7 @@ priority: normal
 
 기존 CLI 출력·manual start 결과와 Skill 구조를 재사용한다. 프롬프트 텍스트 생성은 준비 결과에 결합한 결정적 formatter로 두고 모델/설치 탐색을 추가하지 않는다. 복사 범위를 수정하며 G-230 배포 명령도 유지한다. PRODUCT·ARCHITECTURE의 Skill 소유/배포 책임을 반영한다.
 
-- [ ] 확인한 `loop_manager.py`의 명령 도움말, `application/commands.py`의 요청 접수 출력과 `README.md`·`docs/OPERATIONS.md`를 새 명령 Skill의 안내와 대조한다. README·운영 안내에 직접 반영된 0 설정·요청 예시는 재사용하고 도움말·Skill의 남은 설명만 맞춘다. `config/managed_config.py`·`storage/maintenance_state.py`·`maintenance/tiered_review.py`의 0 지원과 기존 요청 저장·소비는 구현돼 있으므로 다시 만들지 않는다.
+- [ ] 확인한 `loop_manager.py`의 명령 도움말, `application/commands.py`의 요청 접수·config set/status 출력과 `README.md`·`docs/OPERATIONS.md`를 새 명령 Skill의 안내와 대조한다. 직접 반영된 유지보수 0·요청 예시와 프로젝트 한도 설정/조회 설명을 재사용하고 도움말·Skill의 남은 설명만 맞춘다. `config/managed_config.py`·`runtime/project_registry.py`의 한도 저장/상속과 `storage/maintenance_state.py`·`maintenance/tiered_review.py`의 유지보수 0·기존 요청 저장/소비는 다시 만들지 않는다.
 - [ ] 예정인 자체 운영 명령 Skill의 경로는 기존 `.agents/skills/` 안에서 정한다. 확인한 `scripts/copy-project-files.sh`·`.ps1`은 현재 `.agents` 전체를 복사하므로 위 배포 조건대로 Specification Skill과 자체 보조 파일만 복사하도록 좁힌다. 사용자 프로젝트로 운영 Skill을 복사하거나 요청 명령을 실제 호출하는 예시 검증을 하지 않는다.
 - [ ] 확인한 `application/manual_work.py`의 start 성공 결과·출력과 기존 `validate_options()`·`execution/manual_candidate.py`의 생략 표시를 대조한다. 복사용 formatter는 프로젝트에서의 구현·검증·push까지만 생성하고 별도 사용자 출력이 Manager의 complete 명령을 담당하게 한다. G-254 뒤의 선택적 사유 계약을 Skill·완료 안내에 연결하되 옵션 수락·정규화·감사·Reviewer/PR 표시 구현은 재작성하지 않는다. complete/submit의 생략 안내는 실제 수행 사실을 사용자가 제공하는 절차이며 프롬프트 생성기가 사유나 성공을 합성하지 않는다.
 
@@ -61,6 +63,8 @@ priority: normal
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 2026-10-16 delta: R-091의 설정·수동 우선·병렬 한도는 직접 구현과 운영 문서를 소비한다. 남은 관리 Skill 안내를 같은 ID에 통합하며 CLI·DB·scheduler를 소급 구현하지 않는다. 기존 dependency·분류·진행 기록을 보존한다. Skill 내용은 실제 명령과 읽기 전용으로 대조하고 prose 고정 테스트를 추가하지 않는다.
 
 - 이번 full 검토의 snapshot token `e132bfba3ae59a16ffe8946cee88c634ff2fe84884991a2a7a077b51f8849b29`·revision `656432eb4c384eb1146665a87d4342f5e42712fb`와 원본 hash `29d4cd4fbea64d9826c9e886564e24adec8263d8ad0c96160047664804934444`를 확인했다. 활성 R-076의 복사용 프롬프트/별도 완료 안내·선택적 생략 사유 조건을 R-077·현재 `validate_options()` 및 G-254와 대조했다. 기존 프롬프트의 complete 포함 지시를 별도 출력으로 바로잡고, G-254가 위임한 안내 목표와 해당 선행 Merge를 같은 ID에 연결한다. G-254의 CLI 선택 입력 구현을 중복 계획하지 않으며 기존 dependency 순서·metadata·수행 기록을 보존한다. complexity medium·risk medium은 기존 formatter·여러 출력과 배포 경계를 연결하는 난도와 잘못된 실행 위치/생략 안내로 생길 진행 오류에 그대로 적용한다. 구현·테스트·전체 verify와 후보 worktree 변경은 수행하지 않았다.
 - 2026-10-15 delta: R-074의 0 지원과 R-076의 명시적 요청은 원격 코드·테스트에 직접 반영됐다. 새 CLI나 소급 구현 계획을 만들지 않고 이 작업의 도움말·Skill 범위에 남은 안내를 통합한다. 고유 R-076의 현재 활성 경로로 source를 정합화했으며 dependency와 기존 목표를 보존했다. 구현·테스트·verify를 실행하지 않았다.

@@ -54,4 +54,4 @@ priority: high
 - 이번 delta의 수동 group 보호·지문 직렬화·예약 재검사는 실제 코드와 `tests/test_incremental_planning.py`·`tests/test_manual_concurrency.py`에 있다. 하지만 게시 서비스는 intent 예약의 모든 RuntimeError를 프로젝트 planning 오류로 반환하며 혼합 batch의 독립 결과 처리 경로가 없다. 단일 개정 거부와 무관한 snapshot 항목의 무검사만으로 이 조건을 충족했다고 판단하지 않는다. 정적 검토이며 테스트·verify 성공을 만들지 않았다.
 - G-242는 DOCUMENT_RESULT 형식과 실제 PR 출현/legacy 후보 경합, G-244는 사용자 draft 답변의 출처·정리, G-278은 실패 planning에서 실행 자리를 비운 뒤 이미 게시된 독립 작업의 선택을 담당한다. 이 작업은 일반 batch의 수동 경합 뒤 미게시 독립 결과를 보존·게시하는 범위로 한정한다. 현재 G-206의 구현 후보·기록과 다른 계획을 변경하지 않는다.
 - complexity high: 목표·dependency의 독립성, 원래 결과 보존과 재검증한 후보의 identity를 Git 게시/SQLite 적용 사이 중단에도 연결해야 한다. risk high: 잘못 분리한 후보는 보호된 선언을 게시하거나 미확인 목표의 전체 성공을 기록해 수동 원문·상태 복구가 필요하다. 현재 권한 재검사·전체 graph·정확한 manifest·원자 적용과 중단 회귀로 이를 방지한다. priority high는 수동 경합 하나가 독립 자동 계획 게시까지 막는 사용자 복구 경로를 줄이는 기준이다.
-- 기존 fast-forward 게시·PR 경계·수동 gate·직렬 실행과 사용자 결정 정책 안의 누락 처리다. 사용자 선택이나 새로운 승인 경계를 작성하지 않으며 변경 검토를 최종 제품 전문 확인으로 취급하지 않는다.
+- 기존 fast-forward 게시·PR 경계·수동 gate·Planner/공유 게시의 직렬화와 사용자 결정 정책 안의 누락 처리다. R-077이 참조하는 R-091에 따라 프로젝트의 독립 구현 작업까지 단일 실행으로 제한하지 않는다. 사용자 선택이나 새로운 승인 경계를 작성하지 않으며 변경 검토를 최종 제품 전문 확인으로 취급하지 않는다.
