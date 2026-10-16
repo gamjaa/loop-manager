@@ -145,6 +145,9 @@ def _finish_owned_direct_rebase(
     service = effects._current_rebase_service(
         connection, repo_path, state_dir, repo, plan_id, worktree, branch,
     )
+    if service.normalize_frontmatter():
+        service = effects._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id, worktree, branch)
     _, decision = service.require_owned()
     if decision.status.value == 'ready_to_start':
         return False
@@ -196,6 +199,10 @@ def _journaled_direct_rebase(
     if current.operation == 'rebase':
         service = effects._current_rebase_service(connection, repo_path, state_dir, repo,
                                          plan_id, worktree, branch)
+        if service.normalize_frontmatter():
+            current = checkpoint.get(repo, plan_id)
+            service = effects._current_rebase_service(connection, repo_path, state_dir, repo,
+                                              plan_id, worktree, branch)
         _, decision = service.require_owned()
         if decision.status.value == 'complete':
             effects._complete_direct_rebase_checkpoint(
@@ -394,6 +401,10 @@ def _complete_direct_rebase_checkpoint(
     service = effects._current_rebase_service(
         connection, repo_path, state_dir, repo, plan_id, worktree, branch,
     )
+    if service.normalize_frontmatter():
+        current = checkpoint.get(repo, plan_id)
+        service = effects._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id, worktree, branch)
     runtime = runtime_state.RuntimeStateRepository(connection)
     projected = runtime.projected(repo)
     if projected is None or projected.status == 'PLAN_BLOCKED':

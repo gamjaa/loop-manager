@@ -228,6 +228,7 @@ class ExecutionFixture:
                 index=(SimpleNamespace(stage=1, path='app.py'),) if stages else ())
             decision = RebaseDecision(RebaseStatus.WAITING if in_progress or stages else RebaseStatus.COMPLETE)
             return SimpleNamespace(expected=SimpleNamespace(remote=remote),
+                normalize_frontmatter=lambda: False,
                 observe=lambda **_options: (observed, decision),
                 require_owned=lambda **_options: (observed, decision),
                 adopt=lambda *_args: fake_complete_rebase(context, project_values={'active_sha': current.target_base_oid}))

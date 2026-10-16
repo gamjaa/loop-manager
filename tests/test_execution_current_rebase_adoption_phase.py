@@ -413,6 +413,36 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
         self.handler._finish_rebase_journal.assert_not_called()
         self.fixture.effects.agent.run_agent.assert_not_called()
 
+    def test_worker_end_defers_intermediate_metadata_and_scope_but_rechecks_remote(self):
+        from loop_manager_internal.agents.scope_adapter import (
+            ValidateWorkerWorkspaceScopeEffects, validate_worker_workspace_scope)
+        from loop_manager_internal.git.managed_rebase_validation import IndexEntry
+        self.observed = replace(self.observed, head='partial', branch=None,
+            branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
+            branch_worktrees=(), operations=(('rebase-merge', 'operation'),),
+            metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
+                      ('orig-head', 'before'), ('onto', 'base')),
+            index=(IndexEntry('app.py', '100644', 'conflict', 2, 'M', 0x2000),), index_clean=False)
+        before = lm.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {})
+        final_scope = mock.Mock(side_effect=AssertionError('intermediate content is not final'))
+        final_metadata = mock.Mock(side_effect=AssertionError('declaration waits for Git completion'))
+        effects = ValidateWorkerWorkspaceScopeEffects(
+            capture_git_snapshot=lambda *_: before, _owned_rebase_state_dir=lambda *_: Path('/state'),
+            _current_rebase_service=lambda *_: self.factory(None),
+            validate_active_execplan_metadata=final_metadata, validate_agent_scope=final_scope,
+            validate_managed_worktree=mock.Mock(), git=mock.Mock())
+        def check():
+            return validate_worker_workspace_scope(effects, Path('repo'), Path('/state/G-047'),
+                'loop-manager/G-047', 'main', 'docs/plans/[G-047] Runtime.md',
+                self.state.active_execplan('repo'), before,
+                connection=self.fixture.connection, state_dir=Path('/state'), allow_rebase=True)
+        self.assertEqual(check()['id'], 'G-047')
+        self.observed = replace(self.observed, remote=replace(self.expected.remote, oid='foreign'))
+        with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+            check()
+        final_scope.assert_not_called()
+        final_metadata.assert_not_called()
+
     def test_selected_baseline_keeps_original_and_unrelated_metadata(self):
         from loop_manager_internal.git.managed_rebase_adoption import selected_baseline
         before = lm.GitSnapshot('before', 'loop-manager/G-047', {}, {},

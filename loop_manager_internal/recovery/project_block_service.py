@@ -156,6 +156,10 @@ def _reconcile_rebase_evidence_block(
     try:
         service = effects._current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch)
+        if service.normalize_frontmatter():
+            checkpoint = checkpoints.get(repo, plan_id)
+            service = effects._current_rebase_service(
+                connection, repo_path, state_dir, repo, plan_id, worktree, branch)
         def observe():
             observation = service.require_owned(checkpoint=checkpoints.get(repo, plan_id))
             effects.validate_blocked_agent_scope(

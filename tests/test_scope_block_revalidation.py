@@ -491,6 +491,30 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
 
 
 class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase):
+    def test_plan_input_block_uses_owned_rebase_before_ordinary_branch_recovery(self):
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        original = self.case.observed
+        with mock.patch.object(loop_manager, 'make_worktree',
+                               side_effect=AssertionError('detached rebase is not an ordinary worktree')):
+            self.assertTrue(self.resume())
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        self.assertEqual(self.case.observed, original)
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['status'], 'IMPLEMENTING')
+        self.assertEqual(row['worker_session_id'], 'saved-worker')
+
+    def test_plan_input_rebase_block_keeps_original_cause_if_remote_changes(self):
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        self.case.observed = replace(self.case.observed,
+            remote=replace(self.case.observed.remote, oid='external'))
+        block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        with mock.patch.object(loop_manager, 'make_worktree',
+                               side_effect=AssertionError('unsafe operation must remain preserved')):
+            self.assertFalse(self.resume())
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047')), block)
+
     def test_changed_inputs_and_session_resume_manual_completion_without_recovery_history(self):
         self.block()
         self.connection.execute("UPDATE exec_plans SET worker_session_id = 'replacement-session', "
@@ -841,7 +865,8 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
                 self.case.observed = replace(original, remote=replace(original.remote, oid='raced'))
             return observe(**kwargs)
         with mock.patch.object(loop_manager, '_current_rebase_service',
-                               return_value=SimpleNamespace(require_owned=raced)):
+                               return_value=SimpleNamespace(require_owned=raced,
+                                                            normalize_frontmatter=lambda: False)):
             self.assertFalse(self.resume())
         self.assertEqual(self.snapshot(), before)
         self.case.observed = original

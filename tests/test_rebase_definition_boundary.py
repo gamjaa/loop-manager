@@ -199,6 +199,57 @@ class RebaseDefinitionBoundaryTests(TestCase):
                     self.state.active_execplan(self.repo_key), **options)
         self.service().require_owned(checkpoint=self.checkpoints.get(self.repo_key, 'G-047'))
 
+    def test_replayed_header_is_restored_after_git_and_commit_restart_preserves_body(self):
+        # Real Git verifies the extra commit, index contents and post-commit crash recovery.
+        body = '\n## Progress\nWorker implementation and 검증 기록 preserved.\n'.encode()
+        header = self.old_text.split('---', 2)[1].replace('priority: normal', 'priority: high')
+        (self.worktree / self.plan_path).write_bytes(b'---' + header.encode() + b'---\n' + body)
+        git_command(self.worktree, 'add', self.plan_path)
+        git_command(self.worktree, 'commit', '-m', 'Replayed historical declaration')
+        replayed = git_command(self.worktree, 'rev-parse', 'HEAD')
+        self.state.update_project(self.repo_key, definition_snapshot=None)
+        prior = self.checkpoints.get(self.repo_key, 'G-047')
+        self.checkpoints.record(self.repo_key, 'G-047', expected_generation=prior.generation,
+            operation='rebase', expected_head=self.head, target_base_oid=self.base,
+            observed_remote_oid=None, snapshot={})
+        ports = lm._managed_rebase_runtime_effects()
+        def interrupted(root, *args, **kwargs):
+            result = ports.git(root, *args, **kwargs)
+            if 'commit' in args:
+                raise RuntimeError('after declaration commit')
+            return result
+        crashed = build_service(replace(ports, git=interrupted), self.connection, self.repo,
+            self.state_dir, self.repo_key, 'G-047', self.worktree, self.branch)
+        with self.assertRaisesRegex(RuntimeError, 'after declaration commit'):
+            crashed.normalize_frontmatter()
+        restored_head = git_command(self.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(restored_head, replayed)
+        self.assertEqual(git_command(self.worktree, 'rev-parse', 'HEAD^'), replayed)
+
+        self.assertTrue(self.service().normalize_frontmatter())
+        self.assertFalse(self.service().normalize_frontmatter())
+
+        self.assertEqual(git_command(self.worktree, 'rev-parse', 'HEAD'), restored_head)
+        raw = (self.worktree / self.plan_path).read_bytes()
+        self.assertEqual(raw.split(b'---', 2)[1], self.old_text.split('---', 2)[1].encode())
+        self.assertEqual(raw.split(b'---', 2)[2], b'\n' + body)
+        self.assertEqual((self.worktree / 'app.py').read_text(), 'saved_worker_change = True\n')
+        self.service().require_owned(checkpoint=self.checkpoints.get(self.repo_key, 'G-047'))
+        self.assertEqual(git_command(self.worktree, 'status', '--porcelain'), '')
+
+    def test_uncommitted_worker_body_is_not_committed_by_declaration_restore(self):
+        raw = self.old_text.replace('priority: normal', 'priority: high')
+        (self.worktree / self.plan_path).write_text(raw)
+        self.state.update_project(self.repo_key, definition_snapshot=None)
+        current = self.checkpoints.get(self.repo_key, 'G-047')
+        self.checkpoints.record(self.repo_key, 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head=self.head, target_base_oid=self.base,
+            observed_remote_oid=None, snapshot={})
+        with self.assertRaises((RecoveryFailure, journal.MutationEvidenceError)):
+            self.service().normalize_frontmatter()
+        self.assertEqual((self.worktree / self.plan_path).read_text(), raw)
+        self.assertEqual(git_command(self.worktree, 'rev-parse', 'HEAD'), self.head)
+
     def test_metadata_mismatch_is_visible_input_error_without_polling_retry(self):
         # Neither the applied nor exact target declaration permits this mixture.
         (self.worktree / self.plan_path).write_text(self.old_text.replace('risk: medium', 'risk: high'))
@@ -213,12 +264,12 @@ class RebaseDefinitionBoundaryTests(TestCase):
         (self.worktree / self.plan_path).write_text(self.new_text)
         (self.worktree / self.source).write_text('# Added source\n')
         with self.assertRaises(RecoveryFailure) as caught:
-            self.service()
+            self.service().require_owned()
         self.assertEqual(caught.exception.reason, RecoveryReason.PLAN_INPUT_INVALID)
 
     def test_unbound_target_cannot_use_historical_definition(self):
         with self.assertRaises(RecoveryFailure) as caught:
-            self.service(target=self.latest)
+            self.service(target=self.latest).require_owned()
         self.assertEqual(caught.exception.reason, RecoveryReason.PLAN_INPUT_INVALID)
 
     def test_ownership_checks_still_reject_foreign_live_lease(self):

@@ -157,3 +157,42 @@ def worktree_requirement_documents(root: Path) -> dict[str, bytes]:
             except OSError as error:
                 raise RequirementSourceLookupError(relative_path, str(error)) from error
     return documents
+
+
+def reconcile_execplan_sources(path: str, raw: bytes, documents: Mapping[str, str | bytes]) -> bytes:
+    """Update only unambiguous active source paths; preserve all other plan bytes."""
+    from loop_manager_internal.catalog import execplan_catalog
+    plan = execplan_catalog.parse_execplan_text(path, raw.decode('utf-8'), validate_sources=False)
+    if plan.get('draft') or '/archive/' in path:
+        return raw
+    replacements = {}
+    for source in plan['sources']:
+        if _ACTIVE.fullmatch(source) is None or source in documents:
+            continue
+        resolved = resolve_requirement_source(source, documents, allow_archive=False)
+        if resolved.status is ResolutionStatus.AMBIGUOUS:
+            raise RequirementSourceLookupError(source, '같은 R-ID의 source 후보가 여러 개입니다')
+        if resolved.status is ResolutionStatus.RESOLVED and resolved.path != source:
+            replacements[source.encode('utf-8')] = resolved.path.encode('utf-8')
+    if not replacements:
+        return raw
+    lines = raw.splitlines(keepends=True)
+    in_sources = False
+    for index, line in enumerate(lines[1:], 1):
+        stripped = line.rstrip(b'\r\n')
+        if stripped == b'---':
+            break
+        if stripped == b'sources:':
+            in_sources = True
+        elif in_sources and stripped.startswith(b'  - '):
+            source = stripped[4:]
+            if source in replacements:
+                lines[index] = b'  - ' + replacements[source] + line[len(stripped):]
+        elif stripped and not stripped.startswith(b' '):
+            in_sources = False
+    result = b''.join(lines)
+    updated = execplan_catalog.parse_execplan_text(path, result.decode('utf-8'), validate_sources=False)
+    if updated['sources'] != [replacements.get(source.encode(), source.encode()).decode()
+                              for source in plan['sources']]:
+        raise RequirementSourceLookupError(path, 'sources 선언 형식의 보존을 확인할 수 없습니다')
+    return result

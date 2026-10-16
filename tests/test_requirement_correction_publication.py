@@ -203,6 +203,35 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         result = self.publisher.observe('base')
         self.assertEqual(result['assignments'][0][0], A)
 
+    def test_publishes_renamed_execplan_source_and_preserves_body_and_archive(self):
+        path = 'docs/plans/[G-001] Plan.md'
+        archived = 'docs/plans/archive/[G-002] Plan.md'
+        source = 'docs/requirements/[R-001] Before.md'
+        renamed = 'docs/requirements/[R-001] After.md'
+        raw = (f'---\nid: G-001\ntitle: Plan\nsources:\n  - {source}\n'
+               'depends_on: []\ncomplexity: low\nrisk: low\npriority: normal\n---\n'
+               '\n## Progress\nKeep Worker records and literal Before.md.\n').encode().replace(b'\n', b'\r\n')
+        archive = raw.replace(b'G-001', b'G-002')
+        self.observations.add_tree('base', {renamed: requirement('After'), path: raw, archived: archive})
+
+        commit = self.publisher.dispatch('main')
+
+        tree = self.observations.trees[commit]
+        self.assertEqual(self.observations.blobs[tree[path][2]], raw.replace(source.encode(), renamed.encode()))
+        self.assertEqual(self.observations.blobs[tree[archived][2]], archive)
+        self.assertIsNone(self.publisher.dispatch('main'))
+        self.assertEqual((self.observations.commits, self.observations.pushes), (1, 1))
+
+    def test_ambiguous_renamed_execplan_source_does_not_publish(self):
+        path = 'docs/plans/[G-001] Plan.md'
+        raw = ('---\nid: G-001\ntitle: Plan\nsources:\n'
+               '  - docs/requirements/[R-001] Missing.md\ndepends_on: []\n'
+               'complexity: low\nrisk: low\npriority: normal\n---\n\nKeep body.\n').encode()
+        self.observations.add_tree('base', {A: requirement('A'), B: requirement('B'), path: raw})
+        with self.assertRaisesRegex(CorrectionPending, '후보가 여러 개'):
+            self.publisher.dispatch('main')
+        self.assertEqual((self.observations.commits, self.observations.pushes), (0, 0))
+
     def test_writer_gate_distinguishes_unstarted_failures_from_unconfirmed_writers(self):
         self.connection.execute(AGENT_INVOCATIONS_SCHEMA)
         cases = [

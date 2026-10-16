@@ -386,6 +386,22 @@ def validate_worker_workspace_scope(
         from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
         raise WorkspaceOwnershipError('Manager Git 작업 전에 index flags를 확인해야 합니다: '
                                       + ', '.join(unsafe_index[:8]))
+    if allow_rebase and connection is not None:
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from loop_manager_internal.git.managed_rebase_validation import rebase_content_pending
+        from loop_manager_internal.execution.plan_validation import _current_execplan_metadata
+        checkpoint = ExecutionCheckpointRepository(connection).get(str(repo_path), str(catalog_plan['plan_id']))
+        if checkpoint.operation == 'rebase':
+            owner_state = state_dir or effects._owned_rebase_state_dir(
+                str(repo_path), str(catalog_plan['plan_id']), worktree)
+            if owner_state is None:
+                raise RuntimeError('현재 관리 rebase의 실행 대상을 확인할 수 없습니다.')
+            service = effects._current_rebase_service(connection, repo_path, owner_state,
+                str(repo_path), str(catalog_plan['plan_id']), worktree, branch)
+            observed, _ = service.require_owned(checkpoint=checkpoint)
+            if rebase_content_pending(service.expected, observed):
+                # The owned intermediate index is not the final Worker output.
+                return _current_execplan_metadata(catalog_plan, {})
     resources = (agent_scope_decision.used_git_resources(
         role="worker", phase=scope_phase, base_branch=base_branch,
         branch=branch, worktree_key=str(worktree.resolve()),

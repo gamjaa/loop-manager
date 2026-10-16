@@ -403,11 +403,11 @@ Requirement 작성·갱신 단계에서는 PRODUCT·ARCHITECTURE를 현재 기�
 
 정확한 경로가 있으면 ID가 중복돼도 그 문서를 유지한다. 후보 부재·중복·조회 실패는 구분해 보고하고 source 관계를 확정하지 않는다. archive·ID 대체 조회는 기존 작업의 호환을 위한 것이며 새 ExecPlan은 정확한 활성 경로를 사용한다.
 
-현재 활성 Requirement 경로는 Planner 입력과 판단·이동의 경로 key다. 기존 source는 기록된 경로를 유지하면서 제목 변경 뒤에도 고유한 원본 R ID로 같은 문서를 연결한다. 구체적인 조회 계약은 [원격 원본과 source 해석](ARCHITECTURE.md#원격-원본과-source-해석)을 따른다.
+현재 활성 Requirement 경로는 Planner 입력과 판단·이동의 경로 key다. 기존 source는 고유한 원본 R ID로 같은 문서를 연결한다. Manager는 안전한 base 게시 경계에서 유일한 활성 Requirement의 파일명 변경을 비보관·비draft ExecPlan의 sources에 반영하고 게시 확인 뒤 실행 입력을 갱신한다. 구체적인 조회 계약은 [원격 원본과 source 해석](ARCHITECTURE.md#원격-원본과-source-해석)을 따른다.
 
 #### Requirement 식별 정보의 자동 교정
 
-- Manager는 실행·planning·유지보수가 원격 쓰기를 점유하지 않는 안전한 경계에서 최신 base의 활성 Requirement 중복 ID·제목·파일명과 수정 가능한 문서의 확정 상대 링크를 모델 없이 교정하고 같은 commit으로 fast-forward 게시한다. 활성·보관 작업 문서와 저장 관계의 참조를 함께 확인하며 archive·ExecPlan·sources·User Decision은 수정하지 않는다. 수동 소유·문서 draft·종료 불명 writer와 기존 게시 예약은 보존한다.
+- Manager는 실행·planning·유지보수가 원격 쓰기를 점유하지 않는 안전한 경계에서 최신 base의 활성 Requirement 중복 ID·제목·파일명과 수정 가능한 문서의 확정 상대 링크를 모델 없이 교정하고 같은 commit으로 fast-forward 게시한다. 활성·보관 작업 문서와 저장 관계의 참조를 함께 확인하며 비보관·비draft ExecPlan의 확정된 활성 source 경로도 같은 게시에 반영하며 본문·다른 선언과 archive·User Decision은 보존한다. 수동 소유·문서 draft·종료 불명 writer와 기존 게시 예약은 보존한다.
 
   교정 시작 전에 안전 gate가 닫혀 있거나 수동 작업이 Requirement source를 소유하면 교정을 보류하고 기존 수동 작업과 독립 실행을 계속한다
 
@@ -501,7 +501,7 @@ Worker의 문서 수정은 현재 작업에 필요한 범위로 제한한다.
 
 새로운 frontmatter 선언의 교정은 Planner·Manager가 검증하고 공식 선언과 DB에 반영한다.
 
-Worker 종료 후 정상 작업 경계에서 시작 선언·공식 원본·본문 경계를 확인할 수 있으면 Worker가 변경한 frontmatter만 공식 선언으로 복원하고 본문·기존 수정·실행 기록은 보존한다. 복원 사실은 Worker에게 전달해 현재 문서 보고를 갱신하며 검증 성공으로 취급하지 않는다. 확인 불가·동시 수정·진행 중 rebase는 기존 오류·복구 경계를 유지한다. 기존 source의 rename 조회 호환을 유지하며 선언 불일치를 Worker의 source 수정으로 우회하지 않는다.
+Worker 종료 후 정상 작업 경계에서 시작 선언·공식 원본·본문 경계를 확인할 수 있으면 Worker가 변경한 frontmatter만 공식 선언으로 복원하고 본문·기존 수정·실행 기록은 보존한다. 복원 사실은 Worker에게 전달해 현재 문서 보고를 갱신하며 검증 성공으로 취급하지 않는다. 확인 불가·동시 수정·진행 중 rebase는 기존 오류·복구 경계를 유지한다. 기존 source의 rename 조회 호환을 유지하며 선언 불일치를 Worker의 source 수정으로 우회하지 않는다. 충돌 해결 중에는 소유된 중간 상태의 최종 범위·선언 판정을 유예한다. Git rebase 완료 후에는 Manager가 고정된 base의 frontmatter를 반영하고 구현·검증 본문을 보존한 뒤 최종 검증을 수행한다. 동일한 선언 오류를 Worker에게 반복 전달하지 않으며 결과·원인·작업물은 보존한다.
 
 rebase로 원본 브랜치에서 유입된 다른 문서는 Worker의 범위 밖 수정으로 판단하지 않으며, 실제 범위 오류는 원본·후보 revision과 변경 경로를 함께 진단한다. 관련 수정에서는 원래 요구·Acceptance Criteria·필수 검증·실패·사용자 결정과 실행 이력을 보존한다. Requirement 완료 판단과 archive 이동은 일반 Planner·Manager의 책임이다
 

@@ -5,6 +5,7 @@ only the candidate baseline; Worker, verify, Review and publication remain
 separate boundaries.
 """
 from dataclasses import dataclass, replace
+from collections.abc import Callable
 import hashlib
 import json
 import re
@@ -43,8 +44,16 @@ def revalidation_values(target):
 class ManagedRebaseService:
     expected: RebaseExpectation
     adapters: ObservationAdapters
+    normalizer: Callable[[], bool] | None = None
+    declaration_error: RecoveryFailure | None = None
+
+    def normalize_frontmatter(self):
+        """Explicit Manager write after Git completes; observations remain read-only."""
+        return self.normalizer() if self.normalizer is not None else False
 
     def observe(self, *, checkpoint=None):
+        if self.declaration_error is not None:
+            raise self.declaration_error
         observed, scope = observe_current_rebase(self.expected, self.adapters)
         accepted = (checkpoint.snapshot or {}).get('current_rebase_acceptance') if checkpoint else None
         adopted_head = None

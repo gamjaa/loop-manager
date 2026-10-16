@@ -500,18 +500,21 @@ def validate_active_execplan_metadata(
         # Only the checkpoint-bound rebase service supplies this boundary.
         # Compare whole declarations, never a mixture of old and new fields.
         # Normal execution and final publication still compare with catalog.
-        if (rebase_definition is None or rebase_definition.path != relative_path
+        if ((rebase_definition is not None and rebase_definition.path != relative_path)
                 or relative_path != str(plan['path'])
                 or current['id'] != plan['plan_id']
                 or rebase_target_metadata['id'] != plan['plan_id']
                 or rebase_target_metadata.get('draft')):
             raise ExecPlanMetadataError('소유된 rebase ExecPlan identity가 다릅니다.')
         fields = ('title', 'sources', 'depends_on', 'complexity', 'risk', 'priority')
-        applied = {field: getattr(rebase_definition, field) for field in fields}
-        for field in ('sources', 'depends_on'):
-            applied[field] = list(applied[field])
+        declarations = [rebase_target_metadata]
+        if rebase_definition is not None:
+            applied = {field: getattr(rebase_definition, field) for field in fields}
+            for field in ('sources', 'depends_on'):
+                applied[field] = list(applied[field])
+            declarations.append(applied)
         if not any(all(current[field] == declaration[field] for field in fields)
-                   for declaration in (applied, rebase_target_metadata)):
+                   for declaration in declarations):
             raise ExecPlanMetadataError(
                 '소유된 rebase ExecPlan metadata가 적용된 선언 또는 target base와 다릅니다.')
         return current

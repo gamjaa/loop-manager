@@ -49,7 +49,7 @@ _UNSET = object()
 
 
 def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir, repo, plan_id,
-                  worktree, branch, *, target=None, remote_oid=_UNSET):
+                  worktree, branch, *, target=None, remote_oid=_UNSET, normalizing_frontmatter=False):
     """Check checkpoint-bound declarations and exact live leases before revision adoption."""
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                               (repo, plan_id)).fetchone()
@@ -95,7 +95,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                  ('repo', repo), ('repository_identity', identity), ('plan_id', plan_id),
                  ('plan_path', str(plan['path'])), ('worktree', str(worktree.resolve())),
                  ('branch', branch), ('target_base_oid', target), ('role', 'worker'))))
-    owned_definition = bool(applied is not None and target == checkpoint.target_base_oid
+    owned_definition = bool(target == checkpoint.target_base_oid
                             and (checkpoint.operation == 'rebase' or accepted_target))
 
     def current_contract():
@@ -209,6 +209,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     document_heads = {}
     document_files = set()
     start_document_paths = set()
+    starting_before_base = False
     if (expected.before_head and checkpoint.operation in {None, 'rebase'}
             and pending_metadata is None and not pending_index):
         start = ports.capture_git_snapshot(worktree)
@@ -216,6 +217,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             ancestor = ports.git(worktree, 'merge-base', '--is-ancestor',
                                  target, start.head, check=False)
             if ancestor.returncode == 1:
+                starting_before_base = True
                 base = ports.git(worktree, 'merge-base', target, start.head, check=False)
                 if base.returncode == 0 and base.stdout.strip():
                     def changed_paths(revision):
@@ -262,7 +264,8 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                     document_files.add(path)
     pending_plan_output = False
     if expected.plan_path in document_blobs:
-        approved = selected_plan_output(checkpoint, worktree, expected.plan_path)
+        approved = selected_plan_output(checkpoint, worktree, expected.plan_path,
+                                        ignore_declaration=normalizing_frontmatter)
         if not approved and metadata_owned:
             approved = selected_plan_output(checkpoint, worktree, expected.plan_path, pending=True)
             pending_plan_output = bool(approved)
@@ -270,7 +273,8 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             blob = ports.git(worktree, 'hash-object', '--no-filters', '--', expected.plan_path).stdout.strip()
             document_blobs[expected.plan_path].add((approved['mode'], blob))
             document_files.add(expected.plan_path)
-    if not content_pending:
+    declaration_error = None
+    if not content_pending and not normalizing_frontmatter:
         options = {}
         try:
             if owned_definition:
@@ -286,7 +290,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         except ExecPlanMetadataError as error:
             # Deterministic declaration failures cannot improve by polling the
             # same checkout. Preserve the diagnostic and use the input gate.
-            raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, str(error)) from error
+            declaration_error = RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, str(error))
     archive_ok = True
     archive_blobs = {}
     archive_signatures = {}
@@ -323,8 +327,21 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     adopted = saved.get('remote_adoption_scope') or {}
     user_sources.extend((adopted.get('remote', adopted.get('head')), saved.get('remote_user_input')))
     user_blobs = user_changes(ports.git, worktree, target, user_sources)
+    decision_preserved = True
+    if not content_pending:
+        from loop_manager_internal.catalog.execplan_drafts import validate_agent_change
+        try:
+            declaration_base = expected.before_head if starting_before_base else target
+            original = ports.git(repo_path, 'show', f'{declaration_base}:{expected.plan_path}').stdout
+            selected = parse_execplan_text(expected.plan_path,
+                (worktree / expected.plan_path).read_text(encoding='utf-8'), validate_sources=False)
+            validate_agent_change(selected, original)
+        except (RuntimeError, OSError, UnicodeError):
+            decision_preserved = False
 
     def contracts(observed):
+        if not decision_preserved:
+            return False
         approved = matching_user_paths(observed, user_blobs)
         observed = replace(observed,
             committed=tuple(change for change in observed.committed if change.path not in approved),
@@ -430,7 +447,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         return all(_worker_path_allowed(path, expected.plan_path, archives, (), common)
                    or path in approved for path in paths) and checked_contracts(observed)
 
-    return ManagedRebaseService(expected, ObservationAdapters(
+    service = ManagedRebaseService(expected, ObservationAdapters(
         git=ports.git, capture_snapshot=ports.capture_git_snapshot,
         validate_identity=validate_identity, read_rebase_metadata=ports._owned_rebase_metadata,
         read_remote=read_remote, read_inputs=lambda _: current_contract()[-2:],
@@ -440,4 +457,13 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             or path in document_blobs or path in document_conflicts,
         contracts_allowed=scoped_contracts,
         normalize_ignored_snapshot=ports._normalize_legacy_ignored_snapshot,
-    ))
+    ), declaration_error=declaration_error)
+    if normalizing_frontmatter:
+        return service
+    from loop_manager_internal.git.rebase_documents import restore_rebase_frontmatter
+    return replace(service, normalizer=lambda: restore_rebase_frontmatter(
+        connection, repo, plan_id, worktree, branch, git=ports.git,
+        capture_snapshot=ports.capture_git_snapshot, metadata=ports._owned_rebase_metadata,
+        service=lambda: build_service(ports, connection, repo_path, state_dir, repo,
+            plan_id, worktree, branch, target=target, remote_oid=remote_oid,
+            normalizing_frontmatter=True)))

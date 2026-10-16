@@ -138,7 +138,7 @@ run의 상대 저장소 경로는 부모 CLI의 현재 작업 디렉터리에서
 
 ExecPlan의 `Progress` 체크 항목과 본문은 구현 내용·판단·검증 기록이다. 체크가 끝났다는 이유로 `READY`, `PLAN_BLOCKED`, `MERGED` 같은 실행 상태를 바꾸지 않으며, 단계·재시도·session은 SQLite, 실제 PR Merge는 GitHub 확인을 기준으로 한다. 사용자 본문 변경과 `User Decision`은 질문 해소 판단의 입력이며, 실행 상태는 출처·근거·질문별 해소와 게시를 검증한 Manager만 바꾼다.
 
-현재 활성 Requirement 경로는 Planner 입력과 판단·이동의 경로 key이며 `docs/requirements/` 바로 아래 문서만 새 계획 입력이다. 기존 ExecPlan은 `sources` 문자열을 보존한다. Manager는 원격 revision과 worktree에서 같은 Requirement identity helper를 사용해 기록된 활성 경로, 기존 작업에 허용된 같은 파일명의 archive, source 파일명에서 확인한 R ID의 유일한 문서를 순서대로 조회한다.
+현재 활성 Requirement 경로는 Planner 입력과 판단·이동의 경로 key이며 `docs/requirements/` 바로 아래 문서만 새 계획 입력이다. Manager는 안전한 base 게시 경계에서 같은 R ID의 유일한 활성 Requirement로 확인한 파일명 변경을 비보관·비draft ExecPlan의 `sources`에 반영한다. 본문과 다른 선언은 보존하고 게시 확인 뒤 catalog를 갱신한다. 보관·draft 및 아직 정합화하지 않은 기존 ExecPlan은 조회 호환을 유지한다. Manager는 원격 revision과 worktree에서 같은 Requirement identity helper를 사용해 기록된 활성 경로, 기존 작업에 허용된 같은 파일명의 archive, source 파일명에서 확인한 R ID의 유일한 문서를 순서대로 조회한다.
 
 정확한 경로가 있으면 중복 ID여도 해당 문서를 유지한다. ID 후보가 없거나 여러 개이거나 후보를 읽고 식별할 수 없으면 누락·모호·조회 실패를 구분해 source 관계를 확정하지 않는다. 새 ExecPlan은 정확한 활성 source 경로만 사용할 수 있다. archive는 기존 ExecPlan source의 조회·검증 호환성에만 사용하며 재평가하거나 활성 경로로 자동 복원하지 않는다. FUTURE_IDEAS는 계획 입력·실행 상태가 아니다.
 
@@ -173,7 +173,7 @@ Skill의 `scripts/read_requirements.py`는 현재 작업 폴더의 미커밋·�
 
 Requirement 교정 계산은 한 원격 tree의 활성·archive 문서, 게시·보관·draft ExecPlan과 저장된 작업 관계의 source 관측, 기본 branch 반영 순서를 입력으로 받는다. 기존 identity helper와 source resolver로 선택·편집 결과와 미확인 사유를 산출하며 Git·DB·Agent 효과는 수행하지 않는다. source 관측 실패는 참조 부재로 바꾸지 않고, 선택된 각 rename 뒤에도 원래 source가 같은 문서로 유일하게 해석되는지 확인한다.
 
-편집은 활성 Requirement의 식별 표현과 확정 상대 링크만 대상으로 하고 archive·`sources`·`User Decision`을 보존한다. 코드 예제는 링크 편집에서 제외하며, 중첩 blockquote와 목록의 접두어·연속 들여쓰기·컨테이너 종료를 확인해 fenced·들여쓴 코드의 원문도 보존한다. 코드 내부의 목록 표식은 새 컨테이너로 해석하지 않으며 코드 종료 뒤 일반 링크 교정을 계속한다. 파일 적용·원격 재검사·게시와 중단 복구는 별도 Manager 경계가 소유한다.
+편집은 활성 Requirement의 식별 표현·확정 상대 링크와 비보관·비draft ExecPlan의 확정된 활성 source 경로만 대상으로 한다. ExecPlan 본문·다른 선언과 archive·`User Decision`은 보존한다. 코드 예제는 링크 편집에서 제외하며, 중첩 blockquote와 목록의 접두어·연속 들여쓰기·컨테이너 종료를 확인해 fenced·들여쓴 코드의 원문도 보존한다. 코드 내부의 목록 표식은 새 컨테이너로 해석하지 않으며 코드 종료 뒤 일반 링크 교정을 계속한다. 파일 적용·원격 재검사·게시와 중단 복구는 별도 Manager 경계가 소유한다.
 
 Requirement 최종 판단은 source로 연결된 비종료 계획·draft와 수동 제출이 없는 시점에 일반 Planner가 담당한다. 관련 계획이 있으면 모두 실제 MERGED여야 하며 연결 계획 없는 직접 구현도 코드·검증·관련 제품·설계 문서로 판단한다. Manager는 유효한 기준별 충족 판단과 입력 지문·source 관계를 확인한 원문만 내용 보존 이동으로 게시한다. 미충족이면 후속 ExecPlan을 연결하며, 원격 확인 전 입력 변경에 따른 이동 철회와 원격 확인 후 archive를 구분한다.
 
@@ -956,6 +956,8 @@ rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업�
 
 적용·stage 중단은 같은 원문으로 재개하고 뒤늦은 replay 충돌도 같은 문서 revision을 사용한다. 후속 catalog·source·rename 판정 오류의 uncertain 기록도 이전 채택 이력과 원문·blob을 유지한다. 모든 재생 위치의 채택 경로를 checkpoint 이력에서 모아 완료 직전 HEAD·index·작업 파일을 원문과 대조한다. 후속 비충돌 재생이 원문을 바꿨으면 완료 채택을 거부하고 checkpoint와 작업물을 기존 복구 경계에 보존한다.
 
+충돌 해결 Worker의 종료 검사도 소유된 중간 상태에서는 최종 변경 범위·선언 판정을 유예하고 구조·operation·원격 소유권을 확인한다. 응답은 후속 검사 전에 교정 turn에 보존한다. Git rebase가 끝나면 Manager가 고정 target base의 선택된 ExecPlan frontmatter를 복원하며 구현·검증 본문과 mode는 보존한다. 복원 전후 bytes·다른 파일의 상태·commit tree를 execution checkpoint에 기록해 쓰기·stage·commit 중단을 같은 결과로 재개한다. 복원 후 전체 최종 범위·선언 검사와 기존 verify·Review를 수행한다. 선언 불일치는 Worker 반복 교정으로 보내지 않으며 plan_input_invalid의 소유 rebase도 일반 branch 검사 전에 같은 복구 경계로 재평가한다.
+
 rebase target은 바꾸지 않으며 원격 재전진은 기존 operation 완료 후 반영한다. 문서 전용 충돌은 Manager가 continue/skip하고 혼합 충돌의 나머지 파일과 autostash 충돌은 기존 Worker 교정 경계에 남긴다. 문서 Progress는 현재 후보의 실행·검증 성공 증거가 아니며 완료 후의 입력 재평가·verify·Review·게시 gate는 유지한다
 
 완료 결과는 HEAD·branch ref·worktree 등록·target ancestry, clean index·미해결 operation 부재, 현재 역할·선택 ExecPlan 및 archive 계약에 맞는 최종 변경과 정확한 원격 lease를 확인한 뒤 현재 상태·입력 지문과 SQLite generation에 결합해 한 번만 반영한다. 원본 commit 내용·개수·순서의 변화 자체를 거부하지 않으며 Git 완료 뒤 저장 전 중단도 같은 검사로 복구한다
@@ -1327,7 +1329,7 @@ PR 관계 동기화 뒤 기존 housekeeping 안전 gate 안에서 ExecPlan archi
 
 동일 base의 일반 blob·mode, 활성·archive Requirement, 게시·draft·archive ExecPlan의 sources, SQLite 실행·취소·draft 관계와 planning intake를 모아 G-232의 `plan_requirement_corrections`를 호출한다. 기본 branch의 first-parent 반영 이력으로 순서를 관측하고 구분 불가 순서는 계산 함수의 파일명 정렬에 맡긴다. 조회 실패를 빈 관계로 대체하지 않는다.
 
-수정 가능 문서는 활성 Requirement와 예약되지 않은 PRODUCT·ARCHITECTURE·FUTURE_IDEAS로 한정하며 ExecPlan·archive·sources·User Decision은 보존한다.
+수정 가능 범위는 활성 Requirement, 예약되지 않은 PRODUCT·ARCHITECTURE·FUTURE_IDEAS와 비보관·비draft ExecPlan의 확정된 활성 source 경로다. ExecPlan 본문·다른 선언, archive·User Decision은 보존한다.
 
 `requirement_correction_publications`는 편집 전에 원문·mode·목적지·배정·최종 bytes·참조·보류 이유·operation identity를 저장한다. 같은 경로의 수동 준비·planning publication은 prepared 예약을 검사한다.
 

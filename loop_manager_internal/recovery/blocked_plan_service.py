@@ -295,9 +295,11 @@ def resume_blocked_execplan_if_inputs_changed(
             return True
     # Select rebase causes without hydrating a projection or requiring a past
     # input fingerprint. Current Git state, rather than input change, decides.
+    checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     rebase_blocks = [scoped_blocking.plan_block(connection, repo, str(block['plan_id']))
                      for block in scoped_blocking.plan_blocks(connection, repo)
-                     if rebase_block_reconciliation.could_be_rebase_evidence_block(block)
+                     if rebase_block_reconciliation.could_be_rebase_evidence_block(block,
+                         checkpoint=checkpoints.get(repo, str(block['plan_id'])))
                      and (plan_id is None or block['plan_id'] == plan_id)]
     if rebase_blocks:
         runtime = runtime_state.RuntimeStateRepository(connection)

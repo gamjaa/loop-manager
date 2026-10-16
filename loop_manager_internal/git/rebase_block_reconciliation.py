@@ -23,6 +23,7 @@ REBASE_BLOCK_REASONS = frozenset({
     BlockReasonCode.REPOSITORY_STATE_UNSAFE.value,
     BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value,
     BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value,
+    BlockReasonCode.PLAN_INPUT_INVALID.value,
 }) | SCOPE_BASELINE_REASONS
 
 
@@ -57,6 +58,8 @@ def block_matches(block, recovery, checkpoint) -> bool:
                 'current_rebase_acceptance', 'completed_rebase', 'rebase_completion',
                 'blocked_resume'))):
         return False
+    if block['reason_code'] == BlockReasonCode.PLAN_INPUT_INVALID.value:
+        return checkpoint.operation == 'rebase'
     if block['reason_code'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value:
         return True
     if block['reason_code'] in SCOPE_BASELINE_REASONS:

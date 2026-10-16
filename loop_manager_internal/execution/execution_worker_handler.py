@@ -442,6 +442,25 @@ class WorkerHandler:
             feedback_repo.bind_session(delivery.attempt_id, result.session_id)
         if result.session_id and observed_session_id != result.session_id:
             session_started(result.session_id)
+        if correction_turn is not None:
+            try:
+                marker = self.ports._rebase_observation(context).progress
+                self.ports.rebase_corrections.finish_turn(
+                    self.ports.identity.repo, context.plan.plan_id,
+                    expected_generation=correction_turn.generation,
+                    turn=correction_turn.pending_turn,
+                    session=result.session_id or self.ports._row()['worker_session_id'],
+                    result=message, scope_marker=marker, code=code,
+                    result_kind=result.result_kind.value,
+                )
+            except CorrectionRace:
+                return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                     'rebase Worker result changed', context=context)
+            except (RuntimeError, OSError, ValueError) as error:
+                return self.ports._recover(
+                    classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                    str(error), context=context,
+                )
         restored_frontmatter = []
         try:
             self.ports.update_snapshot(plan=self.ports.validate_worker_workspace_scope(
@@ -481,25 +500,6 @@ class WorkerHandler:
                 classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                 detail, context=context,
             )
-        if correction_turn is not None:
-            try:
-                marker = self.ports._rebase_observation(context).progress
-                self.ports.rebase_corrections.finish_turn(
-                    self.ports.identity.repo, context.plan.plan_id,
-                    expected_generation=correction_turn.generation,
-                    turn=correction_turn.pending_turn,
-                    session=result.session_id or self.ports._row()['worker_session_id'],
-                    result=message, scope_marker=marker, code=code,
-                    result_kind=result.result_kind.value,
-                )
-            except CorrectionRace:
-                return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                                     'rebase Worker result changed', context=context)
-            except (RuntimeError, OSError, ValueError) as error:
-                return self.ports._recover(
-                    classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                    str(error), context=context,
-                )
         guarded = self.ports._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
             self.ports.clear_agent_scope(self.ports.identity.repo)

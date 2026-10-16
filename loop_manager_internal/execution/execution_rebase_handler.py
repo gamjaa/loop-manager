@@ -375,6 +375,7 @@ class RebaseHandler:
         # is clean; do not seal it as a completed current result.
         if self.ports._unmerged_stages(context.worktree) and not self.ports._rebase_metadata(context):
             return False
+        self.ports._current_rebase_service(context).normalize_frontmatter()
         _, decision = self.ports._current_rebase_service(context).require_owned()
         return manager_git_journal.record_current_rebase_result(
             self.ports.identity.state_dir, repo=str(self.ports.identity.repo_path.resolve()),
@@ -603,6 +604,7 @@ class RebaseHandler:
                 )
         if not unmerged and not in_progress:
             if checkpoint is not None:
+                self.ports._current_rebase_service(context).normalize_frontmatter()
                 from loop_manager_internal.git.rebase_documents import validate_final
                 validate_final(context=context,
                     checkpoint=checkpoint.get(self.ports.identity.repo, context.plan.plan_id),

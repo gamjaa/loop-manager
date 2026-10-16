@@ -743,7 +743,7 @@ class RevisionHandler:
         self.ports.state.update_project(self.ports.identity.repo, **values)
         self.ports.operation_print(detail, file=sys.stderr)
         return self.ports._recover(
-            RecoveryReason.WORKER_CORRECTION, detail, context=context,
+            RecoveryReason.PLAN_INPUT_INVALID, detail, context=context,
             verify_result=verify_result,
             final_block_reason=BlockReasonCode.PLAN_INPUT_INVALID,
         )

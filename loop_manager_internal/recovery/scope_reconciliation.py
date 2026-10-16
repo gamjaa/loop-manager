@@ -400,6 +400,13 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
             continue
         changed_plan_input = False
         if current_reason == BlockReasonCode.PLAN_INPUT_INVALID.value:
+            checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+                repo, str(blocked['plan_id']))
+            if checkpoint.operation == 'rebase':
+                if effects.resume_blocked_execplan_if_inputs_changed(
+                        connection, repo_path, repo, base, state_dir, plan_id=str(blocked['plan_id'])):
+                    return True
+                continue
             original_revision = str(
                 blocked['active_sha'] or blocked['current_revision_sha']
                 or blocked['plan_sha'] or ''
@@ -1170,7 +1177,7 @@ def _resume_interrupted_blocked_rebase(effects: ResumeInterruptedBlockedRebaseEf
         repo, str(plan['plan_id']),
     )
     block = scoped_blocking.plan_block(connection, repo, str(plan['plan_id']))
-    if rebase_block_reconciliation.could_be_rebase_evidence_block(block):
+    if rebase_block_reconciliation.could_be_rebase_evidence_block(block, checkpoint=checkpoint):
         state_dir = effects._owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
         return bool(state_dir is not None and effects._reconcile_rebase_evidence_block(
             connection, repo_path, state_dir, repo, block, plan_block=True))

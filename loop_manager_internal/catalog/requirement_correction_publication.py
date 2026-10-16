@@ -9,7 +9,7 @@ import sqlite3
 import stat
 import tempfile
 
-from loop_manager_internal.catalog import execplan_catalog, requirement_corrections
+from loop_manager_internal.catalog import execplan_catalog, requirement_corrections, requirement_sources
 from loop_manager_internal.planning.requirement_retirement import _safe_parent, _sources
 from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.storage import work_claims
@@ -111,7 +111,7 @@ class RequirementCorrectionPublisher:
                 '--format=%H', base, '--', f':(literal){path}',
             ).stdout.splitlines()
             order[path] = ranks.get(added[0]) if added else None
-        # ExecPlans (including draft/PR/archive) retain their original bytes.
+        # Requirement edits and source references share one published base commit.
         editable = {path: self._read(base, tree, path) for path in
                     ('docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'docs/FUTURE_IDEAS.md')
                     if path in tree and path not in draft_paths}
@@ -125,6 +125,17 @@ class RequirementCorrectionPublisher:
             before[item.source_path] = item.before.hex()
             if item.source_path != item.target_path:
                 after[item.source_path] = None
+        corrected = {path: raw for path, raw in documents.items() if after.get(path, '') is not None}
+        corrected.update({path: bytes.fromhex(raw) for path, raw in after.items()
+                          if raw is not None and _requirement(path)})
+        for path in tree:
+            if (not path.startswith('docs/plans/') or path.count('/') != 2
+                    or not path.endswith('.md') or path in draft_paths):
+                continue
+            original = self._read(base, tree, path)
+            reconciled = requirement_sources.reconcile_execplan_sources(path, original, corrected)
+            if reconciled != original:
+                before[path], after[path] = original.hex(), reconciled.hex()
         return {
             'repo': self.git.repo, 'base_branch': self.base_branch,
             'base': base, 'before': before, 'after': after,

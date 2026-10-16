@@ -110,6 +110,8 @@ class WorkspaceHandler:
                 if catalog['current_revision_sha'] is not None else None,
             )
             current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+            if current.operation == 'rebase':
+                self.ports._current_rebase_service(context).normalize_frontmatter()
             self.ports._publish_rebased_checkpoint(context)
             row = self.ports._row()
             current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)

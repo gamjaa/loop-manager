@@ -25,6 +25,26 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_rebase_response_is_saved_before_metadata_failure_without_worker_retry(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.effects, checkpoint=checkpoint)
+        checkpoint.record('repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base', observed_remote_oid=None, snapshot={})
+        self.state.update_project('repo', phase='WORKING', last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        self.effects.agent.validate_worker_workspace_scope.side_effect = lm.ExecPlanMetadataError('sources mismatch')
+
+        outcome = self.handler.run(self.context())
+
+        saved = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.assertIn('ready_for_validation', saved.worker_result)
+        self.assertEqual(saved.worker_code, 0)
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(outcome.recovery.observation.reason, RecoveryReason.PLAN_INPUT_INVALID)
+        self.assertEqual(self.effects.agent.run_agent.call_count, 1)
+
     def test_targeted_rebase_failures_use_individual_execution_history_instead_of_report_count(self):
         from loop_manager_internal.execution.result_validation import TargetedTestFailure
         from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository

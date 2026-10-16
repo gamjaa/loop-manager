@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 
 from loop_manager_internal.catalog import catalog_service, execplan_catalog, requirement_sources
 from loop_manager_internal.catalog.frontmatter import requirement_identity
@@ -80,7 +81,7 @@ def adopted_originals(checkpoint):
     return originals
 
 
-def selected_plan_output(checkpoint, worktree, path, *, pending=False):
+def selected_plan_output(checkpoint, worktree, path, *, pending=False, ignore_declaration=False):
     """Allow the selected body, retaining its declaration and accepted Worker bytes."""
     identity = re.fullmatch(r'docs/plans/\[(G-\d{3,})\] [^/]+\.md', path)
     if checkpoint.operation != 'rebase' or identity is None:
@@ -112,17 +113,158 @@ def selected_plan_output(checkpoint, worktree, path, *, pending=False):
             return None
         declaration = execplan_catalog.parse_frontmatter(pinned.decode('utf-8'))
         current = execplan_catalog.parse_frontmatter(raw.decode('utf-8'))
-        if declaration != current or current.get('id') != identity[1]:
+        if (not ignore_declaration and declaration != current) or current.get('id') != identity[1]:
             return None
         if not pending:
             stage = saved.get('stage_evidence') or {}
             signature = hashlib.sha256(str(info.st_mode).encode('ascii') + b'\0' + raw).hexdigest()
+            restored = saved.get('rebase_frontmatter') or {}
+            if (restored.get('target') == checkpoint.target_base_oid
+                    and restored.get('before_head') == checkpoint.expected_head
+                    and restored.get('path') == path and restored.get('head')
+                    and base64.b64decode(restored['after'], validate=True) == raw):
+                prior = base64.b64decode(restored['before'], validate=True)
+                signature = hashlib.sha256(str(info.st_mode).encode('ascii') + b'\0' + prior).hexdigest()
             if (saved.get('pending') not in {'stage', 'continue'} or not saved.get('worker_result')
                     or stage.get('files', {}).get(path) != signature):
                 return None
         return {'mode': mode, 'blob': hashlib.sha256(raw).hexdigest()}
     except (OSError, KeyError, TypeError, ValueError, RuntimeError, UnicodeError):
         return None
+
+
+def _split_frontmatter(raw):
+    lines = raw.splitlines(keepends=True)
+    if lines and lines[0].rstrip(b'\r\n') == b'---':
+        for index, line in enumerate(lines[1:], 1):
+            if line.rstrip(b'\r\n') == b'---':
+                return b''.join(lines[:index + 1]), b''.join(lines[index + 1:])
+    raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, 'rebase ExecPlan frontmatter boundary unavailable')
+
+
+def restore_rebase_frontmatter(connection, repo, plan_id, worktree, branch, *,
+                               git, capture_snapshot, metadata, service):
+    """Restore the pinned base declaration after Git, preserving the Worker body.
+
+    The saved byte/tree intent also resumes a crash during write, stage or commit.
+    It remains part of the same owned rebase; no new Agent result is synthesized.
+    """
+    from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+    from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+    from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+    checkpoints = ExecutionCheckpointRepository(connection)
+    current = checkpoints.get(repo, plan_id)
+    if current.operation != 'rebase' or metadata(worktree) is not None:
+        return False
+    if git(worktree, 'ls-files', '-u', '-z').stdout:
+        return False
+    row = connection.execute('SELECT path FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
+    path = str(row['path'])
+    target = worktree / path
+    if (not document_path(path) or target.resolve() != target
+            or not stat.S_ISREG(target.lstat().st_mode)):
+        raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, 'rebase declaration target is not a regular selected file')
+    original = git(worktree, 'show', f'{current.target_base_oid}:{path}').stdout.encode('utf-8')
+    official = execplan_catalog.parse_execplan_text(path, original.decode('utf-8'), validate_sources=False)
+    if official['id'] != plan_id or official.get('draft'):
+        raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, 'rebase base declaration identity differs')
+    header, _ = _split_frontmatter(original)
+    raw = target.read_bytes()
+    candidate, body = _split_frontmatter(raw)
+    saved = current.snapshot or {}
+    record = saved.get('rebase_frontmatter') or {}
+    if record and (record.get('target'), record.get('before_head')) != (current.target_base_oid, current.expected_head):
+        record = {}
+    if not record:
+        if execplan_catalog.parse_frontmatter(candidate.decode()) == execplan_catalog.parse_frontmatter(header.decode()):
+            return False
+        _, decision = service().require_owned(checkpoint=current)
+        if decision.status is not RebaseStatus.COMPLETE:
+            return False
+        snapshot = capture_snapshot(worktree)
+        if any(set(kinds) - {'ignored'} for kinds, _signature in snapshot.dirty.values()):
+            raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, 'uncommitted Worker files precede declaration restore')
+        record = {'path': path, 'target': current.target_base_oid, 'before_head': current.expected_head,
+                  'start': snapshot.head, 'mode': target.lstat().st_mode,
+                  'index': list(snapshot.index.get(path, ())),
+                  'before': base64.b64encode(raw).decode(), 'after': base64.b64encode(header + body).decode(),
+                  'workspace': workspace_evidence(snapshot, (path,))}
+    before = base64.b64decode(record['before'], validate=True)
+    after = base64.b64decode(record['after'], validate=True)
+    if (record['path'] != path or _split_frontmatter(after)[0] != header
+            or _split_frontmatter(before)[1] != _split_frontmatter(after)[1]
+            or raw not in (before, after) or target.lstat().st_mode != record['mode']):
+        raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, 'saved rebase frontmatter bytes changed')
+    snapshot = capture_snapshot(worktree)
+    from loop_manager_internal.agents.agent_scope_decision import _non_default_index_flags
+    owner = service()
+    if ((owner.expected.repo, owner.expected.plan_id, owner.expected.plan_path,
+         owner.expected.worktree, owner.expected.branch, owner.expected.target_base_oid,
+         owner.expected.before_head, owner.expected.generation)
+            != (repo, plan_id, path, str(worktree.resolve()), branch, current.target_base_oid,
+                current.expected_head, current.generation)):
+        raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, 'rebase declaration operation identity changed')
+    owner.adapters.validate_identity(owner.expected)
+    if owner.adapters.read_remote(owner.expected) != owner.expected.remote:
+        raise RecoveryFailure(RecoveryReason.REMOTE_OID_UNCERTAIN, 'rebase declaration remote lease changed')
+    if snapshot.branch != branch or controlling_git_operation(snapshot.operations):
+        raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, 'rebase declaration workspace changed')
+    if any(_non_default_index_flags(entries) for entries in snapshot.index.values()):
+        raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, 'rebase declaration index flags changed')
+    mode = record['index'][0].split()[1]
+    approved_index = [tuple(record['index'])]
+    if record.get('blob'):
+        approved_index.append((f"H {mode} {record['blob']} 0",))
+    if tuple(snapshot.index.get(path, ())) not in approved_index:
+        raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, 'rebase declaration index changed')
+    # Only HEAD and auxiliary message files can change during this recorded commit.
+    observed = workspace_evidence(snapshot, (path,))
+    expected = dict(record['workspace'])
+    observed['head'] = expected['head']
+    observed['operations'] = expected['operations'] = {}
+    if observed != expected:
+        raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, 'files outside rebase declaration changed')
+    if snapshot.head != record['start']:
+        parent = git(worktree, 'rev-parse', 'HEAD^').stdout.strip()
+        tree = git(worktree, 'rev-parse', 'HEAD^{tree}').stdout.strip()
+        if parent != record['start'] or not record.get('tree') or tree != record['tree'] or raw != after:
+            raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, 'rebase declaration commit differs from intent')
+        if record.get('head') == snapshot.head:
+            return False
+    def save():
+        nonlocal current
+        current = checkpoints.record(repo, plan_id, expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**(current.snapshot or {}), 'rebase_frontmatter': record})
+        connection.commit()
+    save()
+    if snapshot.head == record['start']:
+        if raw != after:
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.frontmatter-', delete=False) as stream:
+                    temporary = stream.name
+                    stream.write(after)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(temporary, stat.S_IMODE(record['mode']))
+                if target.read_bytes() != before:
+                    raise RuntimeError('rebase declaration changed before replacement')
+                os.replace(temporary, target)
+            finally:
+                if temporary is not None and os.path.exists(temporary):
+                    os.unlink(temporary)
+        blob = git(worktree, 'hash-object', '-w', '--no-filters', '--', path).stdout.strip()
+        record['blob'] = blob
+        save()
+        git(worktree, '--literal-pathspecs', 'update-index', '--add', '--cacheinfo', mode, blob, path)
+        record['tree'] = git(worktree, 'write-tree').stdout.strip()
+        save()
+        git(worktree, '-c', f'core.hooksPath={os.devnull}', 'commit', '-m', f'Restore base declaration for {plan_id}')
+    record['head'] = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+    save()
+    return True
 
 
 def validate_final(*, context, checkpoint, git_bytes):
