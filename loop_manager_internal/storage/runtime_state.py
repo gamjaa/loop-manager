@@ -543,6 +543,11 @@ FaultHook = Callable[[str], None]
 def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
     """Nest safely inside caller transactions without an intermediate commit."""
 
+    from .db_access import CoordinatedConnection
+    if isinstance(connection, CoordinatedConnection):
+        with connection:
+            yield
+        return
     if not connection.in_transaction:
         # Reserve the writer before reading state. Two project workers using
         # deferred read transactions cannot both upgrade to a write lock;
@@ -862,12 +867,9 @@ class RuntimeStateRepository:
                 )
                 plan_id = match.group(1) if match else None
             if translated and plan_id is not None:
-                assignments = ", ".join(f"{field} = ?" for field in translated)
-                self.connection.execute(
-                    f"UPDATE exec_plans SET {assignments} "
-                    "WHERE repo = ? AND plan_id = ?",
-                    (*translated.values(), repo, plan_id),
-                )
+                if self.connection.execute('SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?',
+                                           (repo, plan_id)).fetchone() is not None:
+                    self._update_plan_row(repo, plan_id, translated)
                 self._fault("after_execplan_update")
             self._update_project_row(repo, values)
             self._fault("after_project_update")
@@ -1192,12 +1194,9 @@ class RuntimeStateRepository:
         if not translated:
             return
         with _transaction(self.connection):
-            assignments = ", ".join(f"{field} = ?" for field in translated)
-            self.connection.execute(
-                f"UPDATE exec_plans SET {assignments} "
-                "WHERE repo = ? AND plan_id = ?",
-                (*translated.values(), repo, match.group(1)),
-            )
+            if self.connection.execute('SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?',
+                                       (repo, match.group(1))).fetchone() is not None:
+                self._update_plan_row(repo, match.group(1), translated)
             self._fault("after_execplan_update")
 
     def update_plan(

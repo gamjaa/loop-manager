@@ -207,7 +207,12 @@ def resolve(repository: GuidanceRepository, context: InvocationContext,
         snapshot = _store_snapshot(directory, contents, ".json")
         repository.save(identity, context.repo, content_hash, revision, str(snapshot))
         return load_saved(identity, repository.get(identity), state_dir, role)
-    except (OSError, sqlite3.Error, subprocess.SubprocessError) as error:
+    except sqlite3.Error as error:
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        if isinstance(error, DatabaseWaitTimeout):
+            raise
+        raise GuidanceError("공통 지침 버전 보존 실패") from error
+    except (OSError, subprocess.SubprocessError) as error:
         raise GuidanceError("공통 지침 버전 보존 실패") from error
 
 

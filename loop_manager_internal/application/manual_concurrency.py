@@ -96,7 +96,7 @@ def preparation_gate(service, *, plan_ids=(), group=None, requirements=(), inspe
                                                        targets=targets, recoverable=recoverable):
         raise ManualConflictError('미완료 Git operation과 충돌: ' + ', '.join(sorted(targets)))
     path = Path(group['worktree'])
-    if path.is_dir() and group['workspace_created']:
+    if inspect_workspace and path.is_dir() and group['workspace_created']:
         service.effects.validate_workspace(service.repo_path, path, group['branch'])
     if inspect_workspace and path.is_dir() and service.effects.capture_snapshot(path).operations:
         raise ManualConflictError(f'미완료 Git operation을 보존합니다: {path}')

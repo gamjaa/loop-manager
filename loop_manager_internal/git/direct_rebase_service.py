@@ -214,13 +214,12 @@ def _journaled_direct_rebase(
         if current.target_base_oid != target_oid:
             raise manager_git_journal.MutationEvidenceError('current rebase target differs')
     else:
-        try:
-            row = connection.execute(
-                'SELECT pr_head_oid, pr_conflict_head_oid FROM projects WHERE repo = ?',
-                (repo,),
-            ).fetchone()
-        except sqlite3.OperationalError:
-            row = None
+        row = connection.execute(
+            'SELECT pr_head_oid, pr_conflict_head_oid FROM exec_plans WHERE repo = ? AND plan_id = ?',
+            (repo, plan_id),
+        ).fetchone()
+        if row is None:
+            raise manager_git_journal.MutationEvidenceError('direct rebase 대상 계획을 확인할 수 없습니다.')
         pr_head_oid = (str(row['pr_head_oid'] or row['pr_conflict_head_oid'] or '')
                        or None) if row is not None else None
         if pr_head_oid and pr_head_oid != remote_oid:

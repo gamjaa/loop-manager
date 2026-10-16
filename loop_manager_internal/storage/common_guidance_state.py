@@ -40,10 +40,26 @@ class GuidanceRepository:
             "SELECT task_id FROM common_guidance_sessions WHERE repo = ? AND provider = ? AND session_id = ?",
             (repo, provider, session_id),
         ).fetchone()
-        return str(row[0]) if row else None
+        if row:
+            return str(row[0])
+        columns = {item[1] for item in self.connection.execute('PRAGMA table_info(agent_invocations)')}
+        if {'guidance_task_id', 'execution_finish_evidence', 'execution_status'}.issubset(columns):
+            rows = self.connection.execute(
+                "SELECT DISTINCT guidance_task_id FROM agent_invocations "
+                "WHERE repo=? AND provider=? AND session_id=? AND finished_at IS NOT NULL "
+                "AND execution_status='executed' AND execution_finish_evidence IS NOT NULL "
+                "AND guidance_task_id IS NOT NULL", (repo, provider, session_id)).fetchall()
+            if len(rows) > 1:
+                raise RuntimeError('Agent session의 지침 작업 귀속이 일치하지 않습니다.')
+            if rows:
+                return str(rows[0][0])
+        return None
 
     def bind_session(self, repo: str, provider: str, session_id: str, task_id: str) -> None:
         with self.connection:
+            prior = self.session_task(repo, provider, session_id)
+            if prior is not None and prior != task_id:
+                raise RuntimeError('Agent session이 다른 공통 지침 작업에 결합되어 있습니다.')
             self.connection.execute(
                 "INSERT OR IGNORE INTO common_guidance_sessions VALUES (?, ?, ?, ?)",
                 (repo, provider, session_id, task_id),

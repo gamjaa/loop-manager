@@ -405,12 +405,16 @@ class ManualWorkService:
         definition_head=head if documents==candidate_documents else base_head
         previous_request=self.store.request(group)
         repaired=bool(previous_request and previous_request['source_head']!=head)
+        candidate,verify_input,review_input=candidate_input(
+            self.effects,self.repo_path,head,base_head,documents,connection=self.connection,
+            config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
+        from loop_manager_internal.execution.manual_candidate import candidate_token
         with runtime_state._transaction(self.connection):
+            if (dict(self.store.get(self.repo, group['group_id'])) != dict(group)
+                    or candidate_token(self.connection,self.repo_path,head,base_head,documents) != candidate):
+                raise ManualConflictError('수동 완료 관측 뒤 요청·지침 입력이 변경됐습니다.')
             preparation_gate(self, plan_ids=json.loads(group['members']), group=group, inspect_workspace=False)
             group=self.store.update(group,documents=json.dumps(documents,ensure_ascii=False),definition_head=definition_head)
-            candidate,verify_input,review_input=candidate_input(
-                self.effects,self.repo_path,head,base_head,json.loads(group['documents']),connection=self.connection,
-                config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
             self.store.accept(group,head=head,base=base_head,input_token=candidate,
                 verify_input_token=verify_input,review_input_token=review_input,
                 skip_verify=args.skip_verify,skip_review=args.skip_review,reason=args.skip_reason or '')
@@ -621,13 +625,18 @@ class ManualWorkService:
         return group['group_id']
 
     def _accept_submit(self, group, args, head, base):
+        group=self.store.get(self.repo, group['group_id'])
+        documents=json.loads(group['documents'])
+        candidate,verify_input,review_input=candidate_input(
+            self.effects,self.repo_path,head,base,documents,connection=self.connection,
+            config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
+        from loop_manager_internal.execution.manual_candidate import candidate_token
         with runtime_state._transaction(self.connection):
-            group=self.store.get(self.repo, group['group_id'])
+            if (dict(self.store.get(self.repo, group['group_id'])) != dict(group)
+                    or candidate_token(self.connection,self.repo_path,head,base,documents) != candidate):
+                raise ManualConflictError('수동 제출 관측 뒤 요청·지침 입력이 변경됐습니다.')
             preparation_gate(self, plan_ids=json.loads(group['members']), group=group,
                              requirements=json.loads(group['requirements']), inspect_workspace=False)
-            candidate,verify_input,review_input=candidate_input(
-                self.effects,self.repo_path,head,base,json.loads(group['documents']),connection=self.connection,
-                config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
             self.store.accept(group,head=head,base=base,input_token=candidate,
                 verify_input_token=verify_input,review_input_token=review_input,
                 skip_verify=args.skip_verify,skip_review=args.skip_review,reason=args.skip_reason or '')

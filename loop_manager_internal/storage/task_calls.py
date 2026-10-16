@@ -36,8 +36,9 @@ def ensure_schema(connection):
 
 
 def reserve(connection, state_dir, repo, plan_id, kind, run_id):
+    from .runtime_state import _transaction
     token = uuid4().hex
-    with connection:
+    with _transaction(connection):
         connection.execute("INSERT INTO task_call_reservations(token,repo,plan_id,kind,run_id) VALUES (?,?,?,?,?)",
                            (token,repo,plan_id,kind,run_id))
     return CallOwner(connection,Path(state_dir),token,kind)

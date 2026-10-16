@@ -28,6 +28,10 @@ class PlanningDrain(Exception):
     """현재 프로젝트 호출을 비운 뒤 Planner로 돌아간다."""
 
 
+class TaskRecheckRequired(Exception):
+    """대기 중 실행 입력이 바뀌어 같은 작업의 단계를 다시 준비한다."""
+
+
 @dataclass
 class Task:
     repo: str
@@ -104,10 +108,11 @@ class TaskScheduler:
     @contextmanager
     def admission(self, task):
         """호출과 별개로 새 관리 배정의 선택·확정을 순서대로 수행한다."""
-        entry = (task, task.rank(self.priority_reader))
+        entry = [task, task.rank(self.priority_reader)]
+        count = managed_count(task.connection, task.repo)
         with self.condition:
             self.check_project(task.repo)
-            self.running['management'][task.repo] = managed_count(task.connection,task.repo)
+            self.running['management'][task.repo] = count
             self.waiters['management'].append(entry)
             try:
                 while self.admitting or self._next('management') is not entry:
@@ -119,14 +124,16 @@ class TaskScheduler:
         try:
             yield
         finally:
-            with self.condition:
-                try:
-                    self.running['management'][task.repo] = managed_count(task.connection,task.repo)
-                    with task.connection:
-                        task.connection.execute("INSERT INTO task_scheduling_cursor VALUES ('management',?) "
-                            "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo",(task.repo,))
+            try:
+                count = managed_count(task.connection, task.repo)
+                with runtime_state._transaction(task.connection):
+                    task.connection.execute("INSERT INTO task_scheduling_cursor VALUES ('management',?) "
+                        "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (task.repo,))
+                with self.condition:
+                    self.running['management'][task.repo] = count
                     self.cursor['management']=task.repo
-                finally:
+            finally:
+                with self.condition:
                     self.admitting = False
                     self.condition.notify_all()
 
@@ -148,37 +155,46 @@ class TaskScheduler:
 
     @contextmanager
     def slot(self, kind, task):
-        if task.connection.in_transaction:
+        if task.connection.in_transaction or getattr(task.connection, '_depth', 0):
             raise runtime_state.RuntimeStateError("DB 쓰기 transaction을 유지한 채 호출 배정을 기다릴 수 없습니다.")
-        entry = (task, task.rank(self.priority_reader))
+        entry = [task, task.rank(self.priority_reader)]
         started = time.monotonic()
         with self.condition:
             self.waiters[kind].append(entry)
             self.condition.notify_all()
-            try:
-                while True:
+        try:
+            while True:
+                rank = task.rank(self.priority_reader)
+                with self.condition:
+                    entry[1] = rank
                     self.check_project(task.repo)
                     if ((task.repo,task.plan_id,kind) in self.retained
                             or self.uncertain[kind]>=self.limits[kind]):
                         raise task_calls.CallDeferred("기존 호출의 종료가 확인되지 않아 실제 실행 자리를 보존합니다.")
                     if sum(self.running[kind].values()) < self.limits[kind] and self._next(kind) is entry:
-                        owner=task_calls.reserve(task.connection,self.state_dir,task.repo,task.plan_id,kind,self.external_run_id)
-                        task.connection.execute(
-                            "INSERT INTO task_scheduling_cursor VALUES (?,?) "
-                            "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (kind, task.repo),
-                        )
-                        task.connection.commit()
-                        self.cursor[kind] = task.repo
                         allocation = ("retry" if entry[1][0] == 1 else "manual" if entry[1][0] == 0 else "resume" if entry[1][0] == 2
                                       else "basic" if not self.running[kind][task.repo] else "priority")
                         self.running[kind][task.repo] += 1
                         break
                     self.condition.wait(0.2)
-                self.waiters[kind].remove(entry)
-            except BaseException:
+        finally:
+            with self.condition:
                 self.waiters[kind].remove(entry)
                 self.condition.notify_all()
-                raise
+        try:
+            with runtime_state._transaction(task.connection):
+                owner = task_calls.reserve(task.connection, self.state_dir, task.repo,
+                                           task.plan_id, kind, self.external_run_id)
+                task.connection.execute(
+                    "INSERT INTO task_scheduling_cursor VALUES (?,?) "
+                    "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (kind, task.repo))
+            with self.condition:
+                self.cursor[kind] = task.repo
+        except BaseException:
+            with self.condition:
+                self.running[kind][task.repo] -= 1
+                self.condition.notify_all()
+            raise
         events.emit("작업 호출 배정", kind=kind, project=task.repo, plan=task.plan_id,
                     running=sum(self.running[kind].values()), limit=self.limits[kind],
                     waiting_seconds=round(time.monotonic()-started, 3), allocation=allocation,
@@ -198,27 +214,26 @@ class TaskScheduler:
                 uncertain = True
             raise
         finally:
+            released = False
             try:
-                with self.condition:
-                    try:
-                        if uncertain:
-                            self.uncertain[kind]+=1
-                            self.retained[(task.repo,task.plan_id,kind)]={"token":owner.token}
-                            task_calls.mark_uncertain(owner)
-                        else:
-                            try:
-                                task_calls.release(owner)
-                            except BaseException:
-                                self.uncertain[kind]+=1
-                                self.retained[(task.repo,task.plan_id,kind)]={"token":owner.token}
-                                raise
+                if uncertain:
+                    task_calls.mark_uncertain(owner)
+                else:
+                    task_calls.release(owner)
+                    released = True
+            finally:
+                try:
+                    with self.condition:
+                        if released:
                             self.running[kind][task.repo] -= 1
+                        else:
+                            self.uncertain[kind] += 1
+                            self.retained[(task.repo, task.plan_id, kind)] = {"token": owner.token}
                         task.resumed = True
                         task.retry_order = None
-                    finally:
                         self.condition.notify_all()
-            finally:
-                task_calls.current_call.reset(owner_token)
+                finally:
+                    task_calls.current_call.reset(owner_token)
 
     @contextmanager
     def task(self, repo, plan_id, connection, *, resumed=True):
@@ -255,7 +270,17 @@ def scheduled_call(kind):
                         if row is not None:
                             task = Task(row["repo"], row["plan_id"], connection)
                 if task is not None:
+                    runtime = runtime_state.RuntimeStateRepository(task.connection)
+                    expected = runtime.get(task.repo, task.plan_id)
                     stack.enter_context(scheduler.slot(kind, task))
+                    from loop_manager_internal.recovery import scoped_blocking
+                    from loop_manager_internal.storage import execplan_draft_state
+                    if runtime.get(task.repo, task.plan_id) != expected:
+                        raise TaskRecheckRequired('호출 대기 중 작업 입력이 변경됐습니다.')
+                    if (scoped_blocking.project_block(task.connection, task.repo) is not None
+                            or task.plan_id in scoped_blocking.catalog_held_plan_ids(task.connection, task.repo)
+                            or task.plan_id in execplan_draft_state.pending_ids(task.connection, task.repo)):
+                        raise task_calls.CallDeferred('호출 대기 중 차단·catalog/draft 보류가 확인됐습니다.')
                 return function(*args, **kwargs)
         return call
     return decorate
@@ -319,6 +344,9 @@ def run_project_tasks(service, *, newly_activated):
                                 code = PROJECT_STEP_TRANSIENT_PAUSE
                         except PlanningDrain:
                             raise
+                        except TaskRecheckRequired:
+                            owned.rollback()
+                            code = PROJECT_STEP_RETRY
                         except Exception as error:
                             owned.rollback()
                             from loop_manager_internal.storage.db_access import DatabaseWaitTimeout

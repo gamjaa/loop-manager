@@ -980,8 +980,12 @@ class ProjectService:
             if current_scheduler.get() is not None:
                 current_scheduler.get().check_project(self.state.repo)
             from loop_manager_internal.storage.task_calls import CallDeferred
+            from loop_manager_internal.application.task_scheduling import TaskRecheckRequired
             try:
                 execution_outcome = execution.dispatch(execution_context)
+            except TaskRecheckRequired as error:
+                return self.effects._execution_outcome_step_result(
+                    ExecutionOutcome(ExecutionOutcomeKind.RETRY, detail=str(error)))
             except CallDeferred as error:
                 self.effects.operation_print(str(error))
                 return self.effects._execution_outcome_step_result(

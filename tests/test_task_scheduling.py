@@ -54,6 +54,200 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         return scheduling.TaskScheduler(replace(self.config, **values), database.connect_database,
                                          self.directory, self.connection)
 
+    def test_parallel_block_uses_selected_plan_and_preserves_representative(self):
+        from loop_manager_internal.recovery import block_service
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason, decide
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            for key in ('G-001', 'G-002'):
+                runtime.activate('A', key, activation_sha='base', branch=key, worktree=key)
+        before = runtime.get('A', 'G-001')
+        runtime.hydrate_snapshot('A', before)
+        project = dict(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone())
+        effects = SimpleNamespace(
+            _plan_id_from_path=lambda path: 'G-001' if 'G-001' in path else 'G-002',
+            _worktree_execplan_input_fingerprint=lambda *args: 'candidate',
+            capture_git_snapshot=lambda *args: SimpleNamespace(serialize=lambda: 'snapshot'),
+            project_execplan=lambda connection, repo: runtime.projected_row(repo),
+            _final_block_recovery_decision=block_service._final_block_recovery_decision)
+        decision = decide(RecoveryObservation(RecoveryReason.PLAN_INPUT_INVALID, 'A', 'G-002',
+            'WORKING', 'plan', 'base', 'fingerprint', 'progress', 'cause'))
+        with runtime_state.selected_execution('A', 'G-002'):
+            block_service.block_active_execplan(effects, self.connection, 'A', Path('G-002'),
+                'cause', '', recovery_decision=decision)
+        self.assertEqual(runtime.get('A', 'G-001'), before)
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()), project)
+        self.assertEqual(runtime.get('A', 'G-002').status, 'PLAN_BLOCKED')
+
+    def test_compatibility_updates_cannot_reactivate_above_management_limit(self):
+        from loop_manager_internal.storage import task_calls
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        project_registry.set_task_limit(self.connection, 'A', 1, 3)
+        with fast_mode_scope(self.config):
+            runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE plan_id='G-002'")
+        self.connection.commit()
+        with runtime_state.selected_execution('A', 'G-002', include_blocked=True):
+            with self.assertRaises(runtime_state.TaskLimitReached):
+                runtime.update_project('A', {'phase': 'VERIFYING'}, enqueue=False)
+        with self.assertRaises(runtime_state.TaskLimitReached):
+            runtime.mirror_project_values('A', runtime.get('A', 'G-002').path, {'phase': 'VERIFYING'})
+        self.assertEqual(task_calls.managed_count(self.connection, 'A'), 1)
+        self.assertEqual(runtime.get('A', 'G-002').status, 'PLAN_BLOCKED')
+
+    def test_direct_rebase_uses_target_pr_head_instead_of_representative(self):
+        from loop_manager_internal.git import direct_rebase_service, manager_git_journal
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        self.connection.execute("UPDATE projects SET pr_head_oid='unrelated' WHERE repo='A'")
+        self.connection.execute("UPDATE exec_plans SET pr_head_oid='remote' WHERE repo='A' AND plan_id='G-002'")
+        self.connection.commit()
+        effects = SimpleNamespace(
+            _owned_rebase_state_dir=lambda *args: self.directory,
+            _owned_rebase_journal_state=lambda *args: {'head': 'before'},
+            _canonical_path=lambda path: Path(path).resolve(),
+            remote_branch_oid=lambda *args: 'remote',
+            git=mock.Mock(side_effect=[SimpleNamespace(returncode=1, stdout='conflict'),
+                                       SimpleNamespace(returncode=0, stdout='')]),
+            _finish_owned_direct_rebase=mock.Mock())
+        with mock.patch.object(manager_git_journal, 'live_remote_branch_oid', return_value='remote'), \
+             mock.patch.object(manager_git_journal, 'begin_current_rebase', return_value='intent'):
+            result = direct_rebase_service._journaled_direct_rebase(
+                effects, self.connection, self.directory, 'A', 'G-002', self.directory / 'worktree',
+                'two', 'base', observed_remote=('remote',))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.connection.execute("SELECT pr_head_oid FROM projects WHERE repo='A'").fetchone()[0],
+                         'unrelated')
+        execute = self.connection.execute
+        def pending(sql, *args, **kwargs):
+            if sql.startswith('SELECT pr_head_oid, pr_conflict_head_oid'):
+                raise DatabaseWaitTimeout('PR head lookup wait')
+            return execute(sql, *args, **kwargs)
+        with mock.patch.object(self.connection, 'execute', side_effect=pending), \
+             mock.patch.object(manager_git_journal, 'live_remote_branch_oid', return_value='remote'), \
+             mock.patch.object(manager_git_journal, 'begin_current_rebase') as begin:
+            with self.assertRaises(DatabaseWaitTimeout):
+                direct_rebase_service._journaled_direct_rebase(
+                    effects, self.connection, self.directory, 'A', 'G-001', self.directory / 'worktree-one',
+                    'one', 'base', observed_remote=('remote',))
+        begin.assert_not_called()
+
+    def test_reservation_and_cursor_failure_return_unstarted_capacity_atomically(self):
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        scheduler = self.scheduler(max_workers=1)
+        execute = self.connection.execute
+        def fail_cursor(sql, *args, **kwargs):
+            if 'INSERT INTO task_scheduling_cursor VALUES (?,?)' in sql:
+                raise DatabaseWaitTimeout('cursor wait')
+            return execute(sql, *args, **kwargs)
+        with mock.patch.object(self.connection, 'execute', side_effect=fail_cursor):
+            with self.assertRaises(DatabaseWaitTimeout), scheduler.slot(
+                    'agent', scheduling.Task('A', 'G-001', self.connection)):
+                self.fail('미확정 예약은 실행하면 안 됩니다.')
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+        self.assertEqual(scheduler.retained, {})
+
+    def test_reservation_db_wait_does_not_hold_scheduler_condition(self):
+        from loop_manager_internal.storage import task_calls
+        scheduler = self.scheduler(max_workers=1)
+        entered, release, progressed = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        reserve = task_calls.reserve
+        def waiting_reserve(*args):
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError('다른 작업의 배정기가 DB 대기 중 멈췄습니다.')
+            return reserve(*args)
+        def run():
+            try:
+                with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
+                    with scheduler.slot('agent', scheduling.Task('A', 'G-001', connection)):
+                        pass
+            except BaseException as error:
+                errors.append(error)
+        def progress():
+            scheduler.requeue(scheduling.Task('B', 'G-003', None))
+            progressed.set()
+        with mock.patch.object(task_calls, 'reserve', side_effect=waiting_reserve):
+            thread = threading.Thread(target=run)
+            other = threading.Thread(target=progress)
+            try:
+                thread.start()
+                self.assertTrue(entered.wait(3))
+                other.start()
+                self.assertTrue(progressed.wait(1))
+                self.assertEqual(sum(scheduler.running['agent'].values()), 1)
+            finally:
+                release.set()
+                thread.join(4)
+                if other.ident is not None:
+                    other.join(4)
+        self.assertEqual(errors, [])
+
+    def test_scheduled_effect_rechecks_input_after_reservation(self):
+        from loop_manager_internal.storage import task_calls
+        scheduler = self.scheduler(max_workers=1)
+        task = scheduling.Task('A', 'G-001', self.connection)
+        reserve = task_calls.reserve
+        def changed(*args):
+            owner = reserve(*args)
+            self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo='A' AND plan_id='G-001'")
+            return owner
+        effect = mock.Mock()
+        call = scheduling.scheduled_call('agent')(effect)
+        token = scheduling.current_scheduler.set(scheduler)
+        selected = scheduling.current_task.set(task)
+        try:
+            with mock.patch.object(task_calls, 'reserve', side_effect=changed):
+                with self.assertRaises(scheduling.TaskRecheckRequired):
+                    call(role_name='worker')
+            with mock.patch('loop_manager_internal.recovery.scoped_blocking.project_block', return_value={'cause': 'blocked'}):
+                with self.assertRaises(task_calls.CallDeferred):
+                    call(role_name='worker')
+        finally:
+            scheduling.current_task.reset(selected)
+            scheduling.current_scheduler.reset(token)
+        effect.assert_not_called()
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+
+    def test_automatic_fetch_waits_and_manual_fetch_still_rejects_contention(self):
+        from loop_manager_internal.runtime.resource_lock import resource_locks
+        from loop_manager_internal.runtime.contracts import ProcessLockBusyError
+        scheduler = self.scheduler()
+        waiting, fetched = threading.Event(), threading.Event()
+        errors = []
+        def automatic():
+            token = scheduling.current_scheduler.set(scheduler)
+            try:
+                with resource_locks(self.directory, 'A', ['git:fetch'], owner='automatic'):
+                    fetched.set()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                scheduling.current_scheduler.reset(token)
+        emit = scheduling.events.emit
+        def observe(message, **values):
+            if message == '공유 Git 자원 배정 대기':
+                waiting.set()
+            emit(message, **values)
+        thread = threading.Thread(target=automatic)
+        try:
+            with mock.patch.object(scheduling.events, 'emit', side_effect=observe):
+                with resource_locks(self.directory, 'A', ['git:fetch'], owner='existing'):
+                    with self.assertRaises(ProcessLockBusyError):
+                        with resource_locks(self.directory, 'A', ['git:fetch'], owner='manual'):
+                            pass
+                    thread.start()
+                    self.assertTrue(waiting.wait(2))
+                    self.assertFalse(fetched.is_set())
+                    scheduler.requeue(scheduling.Task('B', 'G-003', None))
+                self.assertTrue(fetched.wait(2))
+        finally:
+            if thread.ident is not None:
+                thread.join(3)
+        self.assertEqual(errors, [])
+
     def test_configuration_defaults_validation_and_project_override_inheritance(self):
         self.assertEqual((self.config.max_tasks_per_project, self.config.verify_concurrency), (3,1))
         self.assertEqual(project_registry.task_limit(self.connection,'A',3), (0,3,'config'))

@@ -342,6 +342,48 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                     service.complete(manual_tests.completion())
             self.assertEqual(dict(service.store.request(group)), before)
 
+    def test_profile_observation_returns_db_and_rejects_changed_manual_request(self):
+        from loop_manager_internal.agents.agent_invocation import ResolvedProfile
+        from loop_manager_internal.storage.db_access import open_connection
+        with tempfile.TemporaryDirectory() as directory:
+            original, _, _ = self.fixture(directory)
+            path = Path(directory) / 'manual.db'
+            with closing(open_connection(path)) as connection:
+                connection.row_factory = sqlite3.Row
+                original.connection.backup(connection)
+                service = ManualWorkService(original.effects, connection, original.state_dir,
+                                            original.repo_path, original.config_path)
+                service.start('G-012')
+                changed = [False]
+                def profile(*args):
+                    self.assertFalse(connection.in_transaction)
+                    self.assertFalse(connection._held)
+                    errors = []
+                    def write():
+                        try:
+                            with closing(open_connection(path, timeout=.5)) as other, other:
+                                if changed[0]:
+                                    other.execute("UPDATE manual_work_groups SET last_error='competing request'")
+                                else:
+                                    other.execute("UPDATE projects SET last_error='independent progress'")
+                        except BaseException as error:
+                            errors.append(error)
+                    thread = threading.Thread(target=write)
+                    thread.start()
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(errors, [])
+                    return ResolvedProfile('fixture-reviewer', 'medium')
+                service.effects.resolve_profile.side_effect = profile
+                service.complete(manual_tests.completion())
+                group = service.store.for_plan(service.repo, 'G-012')
+                accepted = dict(service.store.request(group))
+                changed[0] = True
+                with self.assertRaisesRegex(ManualWorkError, '관측 뒤 요청'):
+                    service.complete(manual_tests.completion())
+                self.assertEqual(dict(service.store.request(group)), accepted)
+                self.assertEqual(service.store.for_plan(service.repo, 'G-012')['last_error'], 'competing request')
+
     def test_submit_prepares_and_pushes_during_independent_verify(self):
         with tempfile.TemporaryDirectory() as directory:
             service, _, _ = self.fixture(directory)

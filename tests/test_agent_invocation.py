@@ -146,6 +146,49 @@ class RunnerTests(TestCase):
         self.assertEqual(result.code, 0)
         self.assertIs(run.call_args.kwargs["connection"], self.connection)
 
+    def test_session_db_wait_keeps_completed_result_and_recoverable_binding(self):
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        from tests.support.workspace import pin_common_guidance
+        context = invocation.InvocationContext('repo', 'G-1')
+        pin_common_guidance(self.connection, context, Path('/worktree'), self.state_dir, role='worker')
+        class Provider:
+            calls = 0
+            def run(self, request):
+                self.calls += 1
+                request.on_process_started()
+                request.on_process_finished()
+                return manager.AgentResult(0, 'actual result', 'completed-session',
+                                           usage=invocation.Usage(input_tokens=7))
+        provider = Provider()
+        with mock.patch.object(manager, 'agent_provider', return_value=provider), \
+             mock.patch.object(GuidanceRepository, 'bind_session', side_effect=DatabaseWaitTimeout('session wait')):
+            result = manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'worker', 'prompt', read_only=False, connection=self.connection,
+                invocation=context, resolved_profile=invocation.ResolvedProfile('model', 'high'))
+        self.assertEqual((provider.calls, result.code, result.message, result.session_id),
+                         (1, 0, 'actual result', 'completed-session'))
+        self.assertEqual(result.collection_status, 'error')
+        row = self.connection.execute('SELECT * FROM agent_invocations').fetchone()
+        self.assertEqual((row['result_kind'], row['result_code'], row['input_tokens']), ('success', 0, 7))
+        repository = GuidanceRepository(self.connection)
+        self.assertEqual(repository.session_task('repo', 'codex', 'completed-session'), row['guidance_task_id'])
+        with self.assertRaises(RuntimeError):
+            repository.bind_session('repo', 'codex', 'completed-session', 'another-task')
+
+    def test_guidance_database_wait_does_not_start_or_reclassify_provider(self):
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        with mock.patch.object(GuidanceRepository, 'get', side_effect=DatabaseWaitTimeout('guidance wait')), \
+             mock.patch.object(manager, 'agent_provider') as provider:
+            with self.assertRaises(DatabaseWaitTimeout):
+                manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                    'worker', 'prompt', read_only=False, connection=self.connection,
+                    invocation=invocation.InvocationContext('repo', 'G-1'),
+                    resolved_profile=invocation.ResolvedProfile('model', 'high'))
+        provider.assert_not_called()
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 0)
+
     def test_log_start_follows_process_callback_and_preserves_each_attempt(self):
         from loop_manager_internal.runtime import operation_events as events
         from loop_manager_internal.agents.provider_adapters import _provider_log_path

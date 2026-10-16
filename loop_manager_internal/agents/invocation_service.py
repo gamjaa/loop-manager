@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
-from loop_manager_internal.storage.db_access import open_connection
+from loop_manager_internal.storage.db_access import DatabaseWaitTimeout, open_connection
 import sqlite3
 import subprocess
 import time
@@ -80,7 +80,6 @@ def run_agent(
         if session_task is not None and session_task != guidance.task_id:
             raise common_guidance.GuidanceError("Agent session과 공통 지침 작업 identity가 다릅니다.")
     except (common_guidance.GuidanceError, sqlite3.Error, OSError) as error:
-        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
         if owned_connection is not None:
             owned_connection.close()
         if isinstance(error, DatabaseWaitTimeout):
@@ -128,19 +127,27 @@ def run_agent(
                                         resolved, session_id, scope_id=scope_id)
             ledger.bind_guidance(identity, guidance.task_id, guidance.content_hash)
             collection_status = "pending"
+        except DatabaseWaitTimeout:
+            raise
         except sqlite3.Error:
             collection_status = "error"
 
     def observe_session(started_session_id: str) -> None:
         nonlocal collection_status
-        guidance_repository.bind_session(guidance_context.repo, provider, started_session_id, guidance.task_id)
+        try:
+            guidance_repository.bind_session(guidance_context.repo, provider, started_session_id, guidance.task_id)
+        except DatabaseWaitTimeout:
+            collection_status = 'error'
         if ledger is not None and identity is not None:
             try:
                 ledger.observe_session(identity, started_session_id)
             except sqlite3.Error:
                 collection_status = "error"
         if on_session_started is not None:
-            on_session_started(started_session_id)
+            try:
+                on_session_started(started_session_id)
+            except DatabaseWaitTimeout:
+                collection_status = 'error'
 
     def observe_isolation(evidence: agent_write_isolation.IsolationEvidence) -> None:
         if ledger is None or identity is None:
@@ -149,6 +156,8 @@ def run_agent(
             )
         try:
             ledger.record_isolation(identity, evidence)
+        except DatabaseWaitTimeout:
+            raise
         except sqlite3.Error as error:
             raise agent_write_isolation.IsolationError(
                 "Agent 격리 증거 저장 실패"
@@ -159,6 +168,8 @@ def run_agent(
             raise agent_write_isolation.IsolationError('Agent 실제 실행 입력을 저장할 invocation이 없습니다.')
         try:
             ledger.record_execution_identity(identity, value)
+        except DatabaseWaitTimeout:
+            raise
         except (sqlite3.Error, ValueError) as error:
             raise agent_write_isolation.IsolationError('Agent 실제 실행 입력 증거 저장 실패') from error
 
@@ -239,6 +250,8 @@ def run_agent(
         try:
             TargetedTestRepository(connection).bind(identity, directory, receipt, state_dir=state_dir)
             ledger.bind_process_receipt(identity, str(receipt))
+        except DatabaseWaitTimeout:
+            raise
         except (OSError, ValueError, sqlite3.Error) as error:
             raise agent_write_isolation.IsolationError('targeted test 호출 결합 저장 실패') from error
 
@@ -296,8 +309,13 @@ def run_agent(
                                   AgentResultKind.PERMANENT_CONFIGURATION)
             completed = _coerce_agent_result(raw, session_id)
             if completed.session_id:
-                guidance_repository.bind_session(guidance_context.repo, provider,
-                                                 completed.session_id, guidance.task_id)
+                try:
+                    guidance_repository.bind_session(guidance_context.repo, provider,
+                                                     completed.session_id, guidance.task_id)
+                except sqlite3.Error as error:
+                    collection_status = 'error'
+                    events.emit('Agent 실제 결과 보존; session 저장 대기', level='WARN',
+                                invocation_id=identity, error_type=type(error).__name__)
     except BaseException as error:
         events.emit("Agent 호출 종료 관측", level="WARN", invocation_id=identity,
                     result=type(error).__name__, execution_status="executed" if execution_started else "not_executed",

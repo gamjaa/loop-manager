@@ -51,6 +51,27 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             run_project_result=run_project_result,
         )
 
+    def test_recover_releases_database_access_during_external_execution(self):
+        from loop_manager_internal.storage.db_access import open_connection
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        errors = []
+        def run(connection, *args, **kwargs):
+            self.assertFalse(connection.in_transaction)
+            self.assertFalse(connection._held)
+            def write():
+                try:
+                    with closing(open_connection(self.state_dir / 'loop-manager.db', timeout=.5)) as other, other:
+                        other.execute('UPDATE projects SET last_error=?', ('independent',))
+                except BaseException as error:
+                    errors.append(error)
+            thread = threading.Thread(target=write)
+            thread.start()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path)
+        self.assertEqual(errors, [])
+
     def add_recovery_plans(self, *plan_ids):
         repo = str(self.repository.resolve())
         with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:

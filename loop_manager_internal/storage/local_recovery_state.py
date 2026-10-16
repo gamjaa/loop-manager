@@ -149,8 +149,8 @@ def begin_request(
     ensure_schema(connection)
     # A short write transaction serializes intake even across independent CLI
     # processes. Different scopes queue; repeated scopes reuse the same identity.
-    with connection:
-        connection.execute("BEGIN IMMEDIATE")
+    from .runtime_state import _transaction
+    with _transaction(connection):
         pending = connection.execute(
             "SELECT request_id FROM local_environment_recovery_requests "
             "WHERE repo = ? AND plan_id IS ? AND status = 'pending'",

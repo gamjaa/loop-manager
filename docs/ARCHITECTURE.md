@@ -535,6 +535,14 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 공유 `TaskScheduler`가 관리 배정과 실제 호출 배정을 구분한다. 관리 선택은 프로젝트별 유효 상한 안에서 수동 제출·기존 작업·일반 신규 순서로 확정하며, 일반 신규는 기본 자리 없는 프로젝트부터 순환하고 이후 유효 priority를 사용한다. Worker·Reviewer 호출은 전체 `max_workers`, verify는 별도 `verify_concurrency`를 사용하고 프로젝트 조율·Planner mutex 대기는 이 호출 자리를 사용하지 않는다. 한 자동 실행의 Planner는 직렬이다.
 
+배정기의 공통 condition 안에서는 대기열·메모리 실행 자리만 갱신한다. 호출 자리를 먼저 확보하고 공통 condition을 놓은 뒤 DB에서 호출 예약과 배정 cursor를 같은 transaction으로 확정하며, 실패하면 미시작 자리를 반환한다. 종료 시 DB 예약 반환이 확인된 뒤 메모리 자리를 비우고 확인 실패는 종료 불명으로 보존한다. 호출 대기 중 rank를 갱신하고 실제 호출 직전 작업 snapshot·프로젝트 차단·catalog/draft 보류를 재검사한다. 입력 변경은 실패 횟수를 늘리지 않고 단계 재준비로 돌리며, 지속되는 차단·보류는 해당 작업의 대기로 반환한다.
+
+공통 DB 연결의 중첩 context와 runtime transaction은 savepoint를 공유하며 안쪽 helper가 바깥 변경을 commit하지 않는다. schema script도 호출자의 transaction을 암묵 commit하지 않는다. 수동 recover의 연결 수명과 transaction 수명은 분리하며, 수동 완료·제출은 외부 profile 관측 뒤 요청·지침 입력을 짧은 transaction에서 다시 확인한다.
+
+자동 실행의 `git:*` 자원 충돌은 기존 프로세스 lease를 매번 다시 획득하며 취소·Planner/runtime 중단을 확인한다. 대기는 DB transaction과 실제 Agent/verify 호출 자리를 점유하지 않으며 복구 실패로 기록하지 않는다. 수동 요청과 계획 소유권 충돌은 기존 거부 경계를 유지한다. 차단 helper와 direct rebase의 PR head 판정은 대표 `projects` 행 대신 선택된 ExecPlan의 실행 상태를 사용한다.
+
+정상 provider 반환 뒤 session 저장의 DB 오류는 실제 결과·사용량을 예외 결과로 덮지 않고 수집 오류로 기록한다. session 결합 행이 없으면 같은 session의 완료된 invocation과 실제 종료 근거에서 유일한 지침 작업 귀속을 읽을 수 있다. 귀속 충돌과 필수 실행 전 증거 저장 실패는 계속 거부한다.
+
 작업별 일반 RETRY는 프로젝트 조율로 반환하지 않고 실행 대기열의 재시도 순서로 재등록한다. RETRY마다 DB 상태를 다시 준비하고 기존 일시 복구의 같은 실행 3회 한도를 공통으로 적용한다. 단계 처리의 일반 예외는 작업별 상세 오류·traceback을 기록하고 미확정 transaction을 rollback한 뒤 같은 배정 경로로 제한 재시도한다. 예외 3회 실패는 해당 작업만 보류하며 Future의 일반 예외도 작업별 오류로 수집해 조율기의 추가 배정을 계속한다. Planner 배정 중단·runtime handoff·사용자 중단은 별도 제어 신호로 전파한다. 재시도 우선순위는 수동 제출보다 낮고 다른 일반 작업보다 높으며 재등록 순서를 유지한다. 명세 변경을 감지하면 프로젝트 배정 중단 신호로 관리 편입·실행 대기 호출·후속 단계를 반환시키고 실행 중 처리를 join한 뒤 프로젝트 조율로 돌아간다. 그 후 Planner 게시·catalog·DB 반영이 성공한 경계에서 작업 배정을 다시 연다. runtime handoff는 기존 전체 launch gate로 새 호출을 막고 진행 중 처리의 반환을 기다린다.
 
 `projects.max_tasks_per_project`는 정수 0 이상이고 migration 기본 0이다. 0이면 해당 Manager가 읽은 config 기본값을 상속하며 양수는 보존한다. 배정 경계에서 DB를 재조회한다. `task_call_reservations`는 호출 token·repo·plan·종류·실행 receipt를 보존하고, 재시작 시 미시작 또는 실제 프로세스 종료 증거가 있는 호출만 회수한다. `PLAN_BLOCKED`는 호출 예약이나 `execution_checkpoints.operation`이 남아 있어도 관리 개수에서 제외한다. 실제 호출의 실행 자리·자원 소유권·checkpoint는 삭제하지 않으며 차단 해제 후에는 관리 한도를 다시 확인한다. 차단되지 않은 작업은 미확정 호출·operation의 기존 관리 자리 보존 조건을 유지한다. Agent는 기존 group/Job 종료 receipt, verify는 소유 프로세스·WSL lifecycle receipt를 사용한다. 불확실한 종류의 호출이 상한에 도달하면 해당 단계는 보존하고 다른 종류의 적격 호출을 계속한다.

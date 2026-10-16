@@ -34,6 +34,48 @@ class DatabaseAccessTests(unittest.TestCase):
         self.assertEqual(cursor.fetchall(), [(2, 0), (3, 0)])
         self.assertEqual(self.connection.execute('SELECT value FROM sample ORDER BY id').fetchall(), [(7,), (4,), (0,)])
 
+    def test_nested_helpers_and_scripts_do_not_commit_the_outer_transaction(self):
+        from loop_manager_internal.storage.runtime_state import _transaction
+        with self.assertRaisesRegex(ValueError, 'outer'), _transaction(self.connection):
+            self.connection.execute('UPDATE sample SET value=1 WHERE id=1')
+            with _transaction(self.connection), self.connection:
+                self.connection.executescript("UPDATE sample SET value=2 WHERE id=2; -- semicolon ;\n"
+                                              "UPDATE sample SET value=3 WHERE id=3;")
+                self.connection.commit()
+            raise ValueError('outer')
+        self.assertEqual(self.connection.execute('SELECT value FROM sample').fetchall(), [(0,), (0,), (0,)])
+        self.assertFalse(self.connection._held)
+
+    def test_caught_inner_error_rolls_back_only_its_savepoint(self):
+        with self.connection:
+            self.connection.execute('UPDATE sample SET value=1 WHERE id=1')
+            with self.assertRaises(ValueError), self.connection:
+                self.connection.execute('UPDATE sample SET value=2 WHERE id=2')
+                raise ValueError('inner')
+            self.connection.execute('UPDATE sample SET value=3 WHERE id=3')
+        self.assertEqual(self.connection.execute('SELECT value FROM sample').fetchall(), [(1,), (0,), (3,)])
+
+    def test_outer_context_owns_a_preexisting_implicit_transaction(self):
+        self.connection.execute('SAVEPOINT prior_request')
+        self.connection.execute('RELEASE prior_request')
+        self.connection.execute('UPDATE sample SET value=5 WHERE id=1')
+        with self.connection:
+            self.connection.execute('UPDATE sample SET value=6 WHERE id=2')
+        self.assertFalse(self.connection.in_transaction)
+        with closing(open_connection(self.path, read_only=True)) as other:
+            self.assertEqual(other.execute('SELECT value FROM sample').fetchall(), [(5,), (6,), (0,)])
+
+    def test_explicit_transaction_survives_inner_helper_and_trigger_script(self):
+        self.connection.execute('BEGIN IMMEDIATE')
+        with self.connection:
+            self.connection.executescript('''CREATE TRIGGER sample_change AFTER UPDATE ON sample
+                WHEN NEW.id=1 BEGIN UPDATE sample SET value=8 WHERE id=2; END;
+                UPDATE sample SET value=4 WHERE id=1;''')
+        self.assertTrue(self.connection.in_transaction)
+        self.connection.rollback()
+        self.assertEqual(self.connection.execute('SELECT value FROM sample').fetchall(), [(0,), (0,), (0,)])
+        self.assertIsNone(self.connection.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchone())
+
     def test_threads_queue_and_keep_read_modify_write_atomic(self):
         errors = []
         started, finished = threading.Event(), threading.Event()

@@ -118,12 +118,7 @@ def block_active_execplan(
     release_fingerprint: str | None = None,
     worker_result: str | None = None,
 ) -> None:
-    project = connection.execute(
-        "SELECT plan_path, phase, agent_role, agent_snapshot, agent_input_fingerprint, "
-        "agent_input_plan "
-        "FROM projects WHERE repo = ?",
-        (repo,),
-    ).fetchone()
+    project = runtime_state.project_row(connection, repo)
     plan_id = effects._plan_id_from_path(str(project["plan_path"] or "")) if project else None
     plan = (
         connection.execute(
@@ -137,6 +132,8 @@ def block_active_execplan(
         plan = effects.project_execplan(connection, repo)
     if plan is None:
         raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
+    if recovery_decision is not None and recovery_decision.observation.plan_id != str(plan['plan_id']):
+        raise ValueError('recovery decision and block target disagree')
     blocked_worktree_fingerprint = effects._worktree_execplan_input_fingerprint(
         worktree, plan
     )

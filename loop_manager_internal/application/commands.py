@@ -314,7 +314,7 @@ def recover_local_environment(
     """Accept a request concurrently; drive it only under the normal process lease."""
     repository = str(Path(args.repository).expanduser().resolve())
     plan_id = args.plan
-    with closing(effects.connect_database(state_dir)) as connection, connection:
+    with closing(effects.connect_database(state_dir)) as connection:
         project = connection.execute(
             "SELECT provider, planning_error FROM projects WHERE repo = ? AND registered = 1", (repository,),
         ).fetchone()

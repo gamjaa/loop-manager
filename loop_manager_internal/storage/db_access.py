@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
+from uuid import uuid4
 
 
 @contextmanager
@@ -109,6 +110,10 @@ class _Cursor(sqlite3.Cursor):
         self._rows = deque()
         with self.connection.access():
             self.connection._call(lambda: super(_Cursor, self).execute(sql, parameters))
+            if not self.connection.in_transaction:
+                self.connection._explicit_transaction = False
+            elif not self.connection._depth and sql.lstrip().upper().startswith(('BEGIN', 'SAVEPOINT')):
+                self.connection._explicit_transaction = True
             if self.description is not None:
                 self._rows.extend(super().fetchall())
         return self
@@ -123,7 +128,15 @@ class _Cursor(sqlite3.Cursor):
     def executescript(self, script):
         self._rows = deque()
         with self.connection.access():
-            super().executescript(script)
+            # sqlite3.executescript는 호출자의 transaction을 먼저 commit한다.
+            statement = ''
+            for character in script:
+                statement += character
+                if character == ';' and sqlite3.complete_statement(statement):
+                    self.connection._call(lambda: super(_Cursor, self).execute(statement))
+                    statement = ''
+            if statement.strip():
+                self.connection._call(lambda: super(_Cursor, self).execute(statement))
         return self
 
     def fetchone(self):
@@ -157,6 +170,9 @@ class CoordinatedConnection(sqlite3.Connection):
         self._timeout = timeout
         self._held = False
         self._depth = 0
+        self._contexts = []
+        self._read_only = False
+        self._explicit_transaction = False
         self._deadline = None
         self._closed = False
         return self
@@ -225,43 +241,74 @@ class CoordinatedConnection(sqlite3.Connection):
             with _waiting():
                 self._gate.acquire(self, self._deadline)
             self._held = True
-        self._depth += 1
+        try:
+            savepoint = ('db_' + uuid4().hex if self.in_transaction
+                         and (self._depth or self._explicit_transaction) else None)
+            if savepoint:
+                self.execute(f'SAVEPOINT {savepoint}')
+            elif not self.in_transaction:
+                self.execute('BEGIN' if self._read_only else 'BEGIN IMMEDIATE')
+            self._contexts.append(savepoint)
+            self._depth += 1
+        except BaseException:
+            if not self.in_transaction and not self._depth:
+                self._release()
+            raise
         return self
 
     def __exit__(self, kind, value, traceback):
+        savepoint = self._contexts[-1]
         try:
-            if kind is None:
-                self.commit()
+            if savepoint:
+                if kind is not None:
+                    self.execute(f'ROLLBACK TO {savepoint}')
+                self.execute(f'RELEASE {savepoint}')
             else:
-                self.rollback()
+                if kind is None:
+                    self.commit()
+                else:
+                    self.rollback()
         except BaseException:
-            super().rollback()
+            if not savepoint:
+                super().rollback()
             raise
         finally:
+            self._contexts.pop()
             self._depth -= 1
             if self._closed or (not self._depth and not self.in_transaction):
                 self._release()
 
     def commit(self):
+        if self._contexts and self._contexts[-1] is not None:
+            return
         if not self.in_transaction:
             return super().commit()
         with self.access():
             while True:
                 try:
-                    return super().commit()
+                    result = super().commit()
+                    self._explicit_transaction = False
+                    return result
                 except sqlite3.OperationalError as error:
                     if getattr(error, 'sqlite_errorcode', 0) & 255 != sqlite3.SQLITE_BUSY:
                         raise
                     if time.monotonic() >= self._deadline:
                         raise DatabaseWaitTimeout('DB commit 잠금 대기 시간이 초과됐습니다.') from error
+                    from loop_manager_internal.runtime.handoff_gate import _check_runtime_handoff
+                    _check_runtime_handoff()
                     with _waiting():
                         time.sleep(min(.01, max(0, self._deadline-time.monotonic())))
 
     def rollback(self):
+        if self._contexts and self._contexts[-1] is not None:
+            self.execute(f'ROLLBACK TO {self._contexts[-1]}')
+            return
         if not self.in_transaction:
             return super().rollback()
         with self.access():
-            return super().rollback()
+            result = super().rollback()
+            self._explicit_transaction = False
+            return result
 
     def close(self):
         super().close()
@@ -274,6 +321,8 @@ class CoordinatedConnection(sqlite3.Connection):
         with self.access():
             progress = kwargs.pop('progress', None)
             def check(status, remaining, total):
+                from loop_manager_internal.runtime.handoff_gate import _check_runtime_handoff
+                _check_runtime_handoff()
                 if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) and time.monotonic() >= self._deadline:
                     raise DatabaseWaitTimeout('DB backup 잠금 대기 시간이 초과됐습니다.')
                 if progress is not None:
@@ -285,4 +334,6 @@ def open_connection(path, *, read_only=False, timeout=30.0, factory=CoordinatedC
     path = Path(path).resolve()
     database = path.as_uri() + '?mode=ro' if read_only else str(path)
     connection = sqlite3.connect(database, timeout=timeout, uri=read_only, factory=factory)
-    return connection.configure_access(path, timeout)
+    connection.configure_access(path, timeout)
+    connection._read_only = read_only
+    return connection
