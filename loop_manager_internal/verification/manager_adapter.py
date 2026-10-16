@@ -14,7 +14,7 @@ from loop_manager_internal.verification.timing import EventWriter, atomic_json, 
 
 def progress_observation(directory, positions, state):
     """추가된 진단 행만 읽어 진행량·대기를 설명하며 실행 상태는 변경하지 않는다."""
-    for path in directory.glob("*.jsonl"):
+    for path in directory.rglob("*.jsonl"):
         with path.open(encoding="utf-8") as stream:
             stream.seek(positions.get(path, 0))
             while True:

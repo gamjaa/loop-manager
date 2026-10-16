@@ -1094,6 +1094,29 @@ class ExecutionQueueTests(unittest.TestCase):
 
 
 class ManagerAdapterTests(unittest.TestCase):
+    def test_progress_reads_stage_worker_events_once_and_tracks_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / 'stage-0'
+            stage.mkdir()
+            writer = EventWriter(stage / 'worker-1.jsonl')
+            self.addCleanup(writer.close)
+            writer.emit('test_start', id='test_done')
+            writer.emit('test_end', id='test_done')
+            writer.emit('test_start', id='test_running')
+            positions, state = {}, {}
+
+            observed = manager_adapter.progress_observation(root, positions, state)
+
+            self.assertEqual(observed['observed_completed_tests'], 1)
+            self.assertEqual(observed['active_tests'], 1)
+            self.assertEqual(observed['current_test'], 'test_running')
+            self.assertEqual(manager_adapter.progress_observation(root, positions, state), observed)
+            writer.emit('test_interrupted', id='test_running')
+            observed = manager_adapter.progress_observation(root, positions, state)
+            self.assertEqual(observed['observed_completed_tests'], 1)
+            self.assertEqual(observed['active_tests'], 0)
+
     def test_context_cap_and_diagnostic_path_survive_bounded_failure_feedback(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
