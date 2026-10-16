@@ -39,8 +39,8 @@ priority: high
 ## Progress
 
 - [x] delta 원본에서 단순 최종 diff 비교, 그 앞의 소유 rebase abort와 공통 helper의 대소문자/replay 검사를 정적으로 대조했다. 코드·테스트 실행은 하지 않았다.
-- [ ] 공통 경로 보호의 원격 통합 연결과 실행 직전 검사
-- [ ] 최소 targeted unit 및 기존 통합 회귀의 보존 assertion
+- [x] 공통 경로 보호의 원격 통합 연결과 실행 직전 검사
+- [x] 최소 targeted unit 및 기존 통합 회귀의 보존 assertion
 - [ ] 관련 제품·설계 문서 반영과 Manager verify·Review·사용자 Merge
 
 ## Decision Log
@@ -50,3 +50,21 @@ priority: high
 - risk critical: index-free ignored 원문은 Git의 baseline/commit에 들어가지 않아 잘못된 checkout/rebase/abort가 덮어쓰면 코드 rollback이나 기존 Git 이력으로 복구할 수 없다. 쓰기 직전 충돌 거부·원문 보존과 실제 effect assertion이 필요하다. medium complexity와 critical risk의 최초 Worker level은 4이며 Model/Effort는 Manager의 명시 설정을 따른다.
 - priority high: 기존 자동 통합 경로의 파일 보존과 안전한 무인 실행을 위한 교정이다. 충돌하지 않는 ignored artifact의 정상 생성·변경·삭제를 제한하거나 사후 Git 변화로 권한 위반을 판정하지 않는다.
 - 선택 adapter는 `scripts/verify.json`의 unittest이며 `docs/VERIFY.md`의 Python 3.11–3.14/protocol 1 계약을 확인했다. 이 교정에는 adapter 도입이나 검증 체계 변경이 필요하지 않으므로 기존 수집·fixture·필수 compile·실제 Agent 차단과 부분/전체 검증 계약을 유지한다.
+
+## Worker 구현·검증 기록
+
+- `synchronize`의 최종 diff 문자열 검사를 제거하고 실제 쓰기 소비자인 `integrate`와 소유 abort에서 공통 helper를 사용한다. 초기 replay 경로, 보존 commit 적용의 HEAD/index, 시작 전 rebase와 재시도 경계를 검사한다. 완료한 operation의 결과 수용에는 파일 쓰기 검사를 반복하지 않는다.
+- recovery effect와 binding에 기존 공통 helper 두 개만 연결했다. 새 저장 형식·정책·의존성은 추가하지 않았다. PRODUCT와 ARCHITECTURE에 현재 보존 계약을 반영했다. sources의 두 Requirement는 정확 경로로 존재하며 선언을 변경하지 않았다.
+- targeted runner로 `tests.test_work_branch_integration.WorkBranchIntegrationUnitTests` 44개가 통과했다. 첫 실행의 경쟁 주입 테스트는 중단 뒤 재시도에서 생략되는 초기 검사를 호출 횟수에 포함해 실패했으며, 주입 시점 교정 후 동일 명령으로 통과했다. 최종 코드를 반영한 마지막 실행도 44개 통과했다.
+- 경로 동일/계층/대소문자·중간 replay·관측 실패·HEAD 적용 전/재생 전 경쟁·중단 재개·소유 abort 보존·완료 효과 비반복을 실제 공통 판정과 SQLite checkpoint로 검증했다. alias 판정은 native 파일시스템 검증으로 간주하지 않는다.
+- `tests/test_task_remote_inputs.py`에 실제 Git의 중간 추가/삭제 replay 경로와 ignored bytes·HEAD/index/dirty/operation·checkpoint 보존 회귀를 추가했다. Worker의 integration 실행 금지에 따라 실행하지 않았으며 Manager 검증으로 남긴다. 전체 verify·Windows native·Review·사용자 Merge도 미실행이다.
+
+### Worker 결과 보고 교정
+
+이전 class 실행의 최종 결과는 44개 통과였으나, 최종 응답에서 실패 설명을 `FAILED_COMMAND`와 `RERUN` 사이에 두지 않아 결과 검증기가 해결 이력을 인정하지 못했다. 검증기나 제품 코드를 변경하지 않고 명령·당시 실패·동일 명령 재실행·최종 통과 순서로 보고를 교정한다. 이번 호출에서는 당시 실패했던 `test_ignored_race_before_preservation_and_rebase_retains_checkpoint` 한 case만 기존 targeted runner로 실행하여 1개 통과했다. 전체 suite와 integration·verify는 실행하지 않았다.
+
+### 관리 rebase 수용 후 현재 후보 검증
+
+- 현재 checkout HEAD `a5b182fe2da4b40d1c50097696905a548bc82b7c` 대비 최종 변경 9개 파일과 선택 ExecPlan·R-022·R-055 T19·현재 공통 helper를 다시 대조했다. 선택 ExecPlan의 frontmatter와 모든 Requirement는 변경하지 않았다. 로컬 `main`은 현재 checkout보다 이전이므로 Worker 변경의 기준으로 사용하지 않았다.
+- 현재 unittest adapter의 launcher Python 및 protocol 1/Python 3.11–3.14 계약을 재확인했다. 이번 호출의 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 `--unittest tests.test_work_branch_integration.WorkBranchIntegrationUnitTests`를 실행하여 44개 모두 통과했다. 이전 후보의 성공은 현재 검증 근거로 재사용하지 않았다.
+- 실제 Git 통합 회귀·전체 verify·Review·Windows native 검증은 실행하지 않았으며 Manager의 후속 검증으로 남긴다. 구현 변경이나 추가 기능 확장은 없고 이번 변경은 선택 ExecPlan의 현재 후보 검증 기록뿐이다.

@@ -50,6 +50,32 @@ class TaskRemoteInputTests(TestCase):
             self.fx.state_dir, self.repo, 'G-034', lookup_pr=mock.Mock(return_value=pr),
             complete_merged=complete or mock.Mock(), unmet_dependencies=lambda *_: ())
 
+    def test_replayed_deleted_path_preserves_ignored_bytes_and_git_state(self):
+        self.push()
+        path = self.fx.worktree / 'replayed.bin'
+        path.write_bytes(b'tracked intermediate')
+        self.fx.run_git(self.fx.worktree, 'add', 'replayed.bin')
+        self.fx.run_git(self.fx.worktree, 'commit', '-m', 'intermediate path')
+        self.fx.run_git(self.fx.worktree, 'rm', 'replayed.bin')
+        self.fx.run_git(self.fx.worktree, 'commit', '-m', 'remove intermediate path')
+        exclude = self.fx.run_git(self.fx.worktree, 'rev-parse', '--git-path', 'info/exclude')
+        exclude = Path(exclude)
+        if not exclude.is_absolute():
+            exclude = self.fx.worktree / exclude
+        with exclude.open('a') as stream:
+            stream.write('\nreplayed.bin\n')
+        path.write_bytes(b'ignored original\x00')
+        remote = self.fx.user_commit('dependency.py', 'remote input\n')
+        before = lm.capture_git_snapshot(self.fx.worktree)
+        checkpoint = self.store.get(self.repo, 'G-034')
+        with self.assertRaisesRegex(RuntimeError, 'ignored'):
+            self.sync(remote)
+        after = lm.capture_git_snapshot(self.fx.worktree)
+        self.assertEqual(path.read_bytes(), b'ignored original\x00')
+        self.assertEqual((after.head, after.index, after.dirty, after.operations),
+                         (before.head, before.index, before.dirty, before.operations))
+        self.assertEqual(self.store.get(self.repo, 'G-034'), checkpoint)
+
     def test_local_ahead_accepts_current_input_without_publication_receipt(self):
         remote = self.push()
         (self.fx.worktree / 'code.py').write_text('local\n')

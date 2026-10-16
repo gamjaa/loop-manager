@@ -366,6 +366,8 @@ class CheckpointRecoveryEffectsReconcilePublishedBlockedCheckpointEffects:
     _blocked_execplan_revision_metadata_error: Callable[..., object]
     _current_rebase_service: Callable[..., object]
     _evaluate_remote_checkpoint_cause: Callable[..., object]
+    _ignored_paths_overlapping_git_update: Callable[..., object]
+    _rebase_resume_ignored_overlap: Callable[..., object]
     _nul_git_paths: Callable[..., object]
     _published_plan_allows_common_plans: Callable[..., object]
     _reclassify_remote_checkpoint_block: Callable[..., object]
@@ -388,6 +390,8 @@ class CheckpointRecoveryEffectsReconcilePublishedBlockedCheckpointEffects:
 
 def _checkpoint_recovery_effects_reconcile_published_blocked_checkpoint(effects: CheckpointRecoveryEffectsReconcilePublishedBlockedCheckpointEffects, ) -> checkpoint_recovery.ReconcilePublishedBlockedCheckpointEffects:
     return checkpoint_recovery.ReconcilePublishedBlockedCheckpointEffects(
+        _ignored_paths_overlapping_git_update=effects._ignored_paths_overlapping_git_update,
+        _rebase_resume_ignored_overlap=effects._rebase_resume_ignored_overlap,
         _BlockedCheckpointAdapter=effects._BlockedCheckpointAdapter,
         _capture_agent_baseline=effects._capture_agent_baseline,
         _git_with_index=effects._git_with_index,

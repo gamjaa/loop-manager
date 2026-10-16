@@ -187,6 +187,8 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_checkpoint_recovery_effects_reconcile_published_blocked_checkpoint', recovery_adapter._checkpoint_recovery_effects_reconcile_published_blocked_checkpoint,
         lambda: recovery_adapter.CheckpointRecoveryEffectsReconcilePublishedBlockedCheckpointEffects(
+            _ignored_paths_overlapping_git_update=assembly.callback('_ignored_paths_overlapping_git_update'),
+            _rebase_resume_ignored_overlap=assembly.callback('_rebase_resume_ignored_overlap'),
             _capture_agent_baseline=assembly.callback('_capture_agent_baseline'),
             _git_with_index=assembly.callback('_git_with_index'),
             _commit_tree=assembly.callback('_commit_tree'),

@@ -1012,7 +1012,7 @@ push 전후 및 SQLite 반영 전 중단에서는 같은 intent와 실제 원격
 
 `work_branch_integration.synchronize`는 현재 등록 origin의 fetch/push URL, 작업·worktree·ref·연결 PR을 확인하고 정확한 원격 commit을 받아온다. 로컬·원격의 차이와 현재 Git operation을 분리하며, 필요한 통합은 기존 baseline tree와 보존 commit·현재 관리 rebase 경로를 사용한다. `accepted_work_branch`는 읽고 확인한 입력이며 게시 성공 receipt가 아니다.
 
-같은 입력은 다시 통합하지 않고 실제 Git 쓰기 직전 대상·후보·원격 lease를 재확인한다.
+같은 입력은 다시 통합하지 않고 실제 Git 쓰기 직전 대상·후보·원격 lease를 재확인한다. 원격 통합은 공통 ignored 충돌 helper로 최종 diff와 로컬 replay commit의 중간 경로를 대소문자·부모/자식 관계까지 비교한다. 보존 HEAD/index 적용과 rebase 시작 직전에 재관측하고, 후속 입력의 소유 rebase abort는 현재 operation의 원래 HEAD 복원 경로 helper로 검사한다. 관측 실패·충돌은 기존 checkpoint와 baseline·restart intent를 보존한 채 쓰기를 거부한다. 이미 완료된 소유 rebase는 이 쓰기 검사 없이 기존 소유권·lease 검증으로 결과만 수용한다.
 
 #### 후보 변경과 과거 차단 재평가
 

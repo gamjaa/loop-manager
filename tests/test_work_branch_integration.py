@@ -2,6 +2,7 @@ import json
 import hashlib
 import sqlite3
 import subprocess
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,7 @@ from loop_manager_internal.agents import scope_baseline
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.git.managed_rebase_validation import FileChange, RebaseDecision, RebaseStatus
 from loop_manager_internal.git import managed_rebase_validation as rebase_policy
+from loop_manager_internal.git import git_adapter
 from loop_manager_internal.recovery import work_branch_integration as integration
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
@@ -50,6 +52,108 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
             git=mock.Mock(side_effect=self.git),
             _journaled_direct_rebase=mock.Mock(side_effect=self.rebase),
             _current_rebase_service=mock.Mock(return_value=self.service))
+
+        self.ignored, self.incoming, self.replayed = [], [], []
+        self.path_effects = SimpleNamespace(
+            _ignored_worktree_paths=mock.Mock(side_effect=lambda _: tuple(self.ignored)),
+            _nul_git_paths=self.ignored_paths, _paths_overlap=git_adapter._paths_overlap,
+            git=mock.Mock(side_effect=lambda _, *args: subprocess.CompletedProcess(
+                [], 0, 'fork' if args[0] == 'merge-base' else 'replay')))
+        self.effects._ignored_paths_overlapping_git_update = mock.Mock(
+            side_effect=lambda *args: git_adapter._ignored_paths_overlapping_git_update(self.path_effects, *args))
+        self.effects._rebase_resume_ignored_overlap = mock.Mock(return_value=None)
+
+    def ignored_paths(self, _, *args):
+        if args[0] == 'diff':
+            return list(self.incoming)
+        return list(self.replayed)
+
+    def test_ignored_overlap_uses_common_case_hierarchy_and_replay_rules(self):
+        for ignored, incoming, replayed in [
+                ('cache', ['cache'], []), ('cache/file', ['cache'], []),
+                ('cache', ['cache/file'], []), ('CACHE/File', ['cache/file'], []),
+                ('cache/file', [], ['cache/file'])]:
+            with self.subTest(ignored=ignored, incoming=incoming, replayed=replayed):
+                self.ignored[:] = [ignored]
+                self.incoming[:], self.replayed[:] = incoming, replayed
+                before = self.store.get('repo', 'G-166')
+                with self.assertRaisesRegex(RuntimeError, 'ignored'):
+                    self.run_integration()
+                self.assertEqual(self.now, self.before)
+                self.assertEqual(self.store.get('repo', 'G-166'), before)
+        self.effects._capture_agent_baseline.assert_not_called()
+        self.effects._journaled_direct_rebase.assert_not_called()
+
+    def test_abort_overlap_preserves_owned_operation_and_restart_intent(self):
+        conflict = replace(self.before, head='detached', branch=None,
+                           operations={'rebase-merge': 'owned'})
+        self.now = conflict
+        self.store.record('repo', 'G-166', expected_generation=0, operation='rebase',
+            expected_head='local', target_base_oid='base', observed_remote_oid='old', snapshot={})
+        self.ignored[:] = ['CACHE/file']
+        self.incoming[:] = ['cache/file']
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory)
+            (metadata / 'orig-head').write_text('local')
+            (metadata / 'onto').write_text('base')
+            abort_effects = SimpleNamespace(**vars(self.path_effects),
+                git_bytes=lambda *args: directory.encode())
+            self.effects._rebase_resume_ignored_overlap.side_effect = lambda *args: (
+                git_adapter._rebase_resume_ignored_overlap(abort_effects, *args))
+            with self.assertRaisesRegex(RuntimeError, 'ignored'):
+                integration.restart_base_rebase(self.effects, self.connection, Path('/repo'),
+                    Path('/state'), 'repo', self.plan, 'new', conflict)
+        saved = self.store.get('repo', 'G-166')
+        self.assertEqual(saved.operation, 'rebase')
+        self.assertEqual(saved.snapshot['base_rebase_restart']['phase'], 'preserving')
+        self.assertEqual(self.now, conflict)
+        self.effects.git.assert_not_called()
+        self.effects._rebase_resume_ignored_overlap.assert_called_once_with(
+            Path(self.plan['worktree']), '--abort')
+
+    def test_nonoverlapping_ignored_changes_do_not_replay_completed_effects(self):
+        self.ignored[:] = ['cache/output']
+        self.incoming[:] = ['code.py']
+        self.assertEqual(self.run_integration().head, 'combined')
+        calls = self.effects._ignored_paths_overlapping_git_update.call_count
+        self.ignored[:] = ['another/output']
+        self.assertEqual(self.run_integration().head, 'combined')
+        self.assertEqual(self.effects._ignored_paths_overlapping_git_update.call_count, calls)
+        self.effects._journaled_direct_rebase.assert_called_once()
+
+    def test_ignored_observation_failure_is_not_empty_overlap(self):
+        self.path_effects._ignored_worktree_paths.side_effect = RuntimeError('observation failed')
+        with self.assertRaisesRegex(RuntimeError, 'observation failed'):
+            self.run_integration()
+        self.effects._capture_agent_baseline.assert_not_called()
+        self.effects._journaled_direct_rebase.assert_not_called()
+
+    def test_ignored_race_before_preservation_and_rebase_retains_checkpoint(self):
+        original = self.effects._ignored_paths_overlapping_git_update.side_effect
+        for boundary in (2, 3):
+            with self.subTest(boundary=boundary):
+                calls = 0
+                def observe(*args):
+                    nonlocal calls
+                    calls += 1
+                    if calls == boundary:
+                        self.ignored[:] = ['CACHE/file']
+                        self.incoming[:] = ['cache/file']
+                    return original(*args)
+                self.effects._ignored_paths_overlapping_git_update.side_effect = observe
+                with self.assertRaisesRegex(RuntimeError, 'ignored'):
+                    self.run_integration()
+                saved = self.store.get('repo', 'G-166')
+                self.assertEqual(saved.snapshot['work_branch_integration']['phase'],
+                                 'preserving' if boundary == 2 else 'rebasing')
+                self.assertIsNone(saved.operation)
+                self.effects._journaled_direct_rebase.assert_not_called()
+                if boundary == 2:
+                    self.assertEqual(self.now, self.before)
+                self.ignored.clear()
+                self.incoming.clear()
+        self.effects._ignored_paths_overlapping_git_update.side_effect = original
+        self.assertEqual(self.run_integration().head, 'combined')
 
     def owned(self, **kwargs):
         current = self.store.get('repo', 'G-166')
