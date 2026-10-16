@@ -526,10 +526,7 @@ def block_active_execplan_from_revision(
     plan = effects.active_execplan(connection, repo) or effects.project_execplan(connection, repo)
     if plan is None:
         raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
-    project = connection.execute(
-        "SELECT phase, agent_input_fingerprint FROM projects WHERE repo = ?",
-        (repo,),
-    ).fetchone()
+    project = runtime_state.project_row(connection, repo)
     fingerprint = str(
         (project["agent_input_fingerprint"] if project else None)
         or effects._revision_execplan_input_fingerprint(repo_path, revision, plan)

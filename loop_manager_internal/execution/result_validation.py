@@ -245,7 +245,28 @@ def observe_verify_inputs(worktree: Path):
                           runtime_identity=None)
 
 
+from loop_manager_internal.application.task_scheduling import scheduled_call
+
+
+@scheduled_call("verify")
 def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600, *, partial_base=None) -> tuple[bool, str]:
+    from loop_manager_internal.verification.execution_clock import ExecutionClock, current_execution_clock
+    with ExecutionClock() as budget:
+        token = current_execution_clock.set(budget)
+        try:
+            passed, output = _verify(effects, worktree, timeout_seconds, partial_base=partial_base)
+            if passed and budget.remaining(timeout_seconds) <= 0:
+                failed = VerifyOutput(str(output)+f"\n전체 verify 실제 실행 시간 초과: verify_timeout_seconds={timeout_seconds}",
+                                      timed_out=True, exit_code=getattr(output, "exit_code", None))
+                if hasattr(output, "partial_result"):
+                    failed.partial_result = output.partial_result
+                return False, failed
+            return passed, output
+        finally:
+            current_execution_clock.reset(token)
+
+
+def _verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600, *, partial_base=None) -> tuple[bool, str]:
     effects._check_runtime_handoff()
     script, arguments = verify_arguments(worktree)
     if not script.is_file():

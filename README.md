@@ -2,7 +2,7 @@
 
 Loop Manager는 여러 로컬 GitHub 프로젝트의 **Planner → Worker → Verify → Reviewer → PR 생성**을 자동화한다. 사용자는 제품 문서를 게시하고, 필요한 결정을 내리고, PR을 검토·Merge한다.
 
-중단된 작업과 Agent 세션은 다음 실행에서 이어진다. 같은 프로젝트는 하나씩, 다른 프로젝트는 `max_workers` 범위에서 병렬 처리하며 PR·차단·대기·완료를 Telegram으로 알린다.
+중단된 작업과 Agent 세션은 다음 실행에서 이어진다. 구현·Review는 전체 `max_workers`, 프로젝트별 관리 대상은 `max_tasks_per_project`, verify는 별도 `verify_concurrency` 한도에서 병렬 처리하며 PR·차단·대기·완료를 Telegram으로 알린다.
 
 ## Quick Start
 

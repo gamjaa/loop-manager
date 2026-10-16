@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import re
@@ -17,6 +18,28 @@ from loop_manager_internal.storage import blocked_checkpoint_state
 ACTIVE_STATUSES = frozenset(
     {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING"}
 )
+
+execution_selection: ContextVar[tuple[str, str] | None] = ContextVar("execution_selection", default=None)
+admitting_execution: ContextVar[bool] = ContextVar("admitting_execution", default=False)
+
+
+@contextmanager
+def selected_execution(repo: str, plan_id: str):
+    token = execution_selection.set((repo, plan_id))
+    try:
+        yield
+    finally:
+        execution_selection.reset(token)
+
+
+def project_row(connection: sqlite3.Connection, repo: str):
+    """프로젝트 등록 정보와 현재 호출이 소유한 작업의 실행 상태를 읽는다."""
+    row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+    selected = execution_selection.get()
+    if row is None or selected is None or selected[0] != repo:
+        return row
+    snapshot = RuntimeStateRepository(connection).get(*selected)
+    return {**dict(row), **snapshot.project_values()}
 
 COMPATIBILITY_PHASE_BY_STATUS = {
     "IMPLEMENTING": "WORKING",
@@ -181,6 +204,10 @@ EXECUTION_CLEAR_VALUES: Mapping[str, object] = {
 
 class RuntimeStateError(RuntimeError):
     """Raised when an expected runtime row or state no longer matches."""
+
+
+class TaskLimitReached(RuntimeStateError):
+    """새 관리 배정 전에 유효 상한이 줄거나 자리가 사용됐다."""
 
 
 def project_phase_for_status(status: str) -> str:
@@ -554,12 +581,10 @@ class RuntimeStateRepository:
         if self._fault_hook is not None:
             self._fault_hook(stage)
 
-    def scope_owner(self, repo: str, plan_id: str | None = None) -> sqlite3.Row | None:
+    def scope_owner(self, repo: str, plan_id: str | None = None) -> Mapping[str, object] | sqlite3.Row | None:
         """Read saved Agent scope from its project or selected plan owner."""
         if plan_id is None:
-            return self.connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,),
-            ).fetchone()
+            return project_row(self.connection, repo)
         return self.connection.execute(
             "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?", (repo, plan_id),
         ).fetchone()
@@ -678,14 +703,18 @@ class RuntimeStateRepository:
             return active
 
     def active_row(self, repo: str) -> sqlite3.Row | None:
+        selected = execution_selection.get()
+        if selected is not None and selected[0] == repo:
+            row = self._plan_row(*selected)
+            return row if row["status"] in ACTIVE_STATUSES else None
+        if admitting_execution.get():
+            return None
         placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
         rows = self.connection.execute(
             f"SELECT * FROM exec_plans WHERE repo = ? "
             f"AND status IN ({placeholders}) ORDER BY plan_id",
             (repo, *sorted(ACTIVE_STATUSES)),
         ).fetchall()
-        if len(rows) > 1:
-            raise RuntimeStateError("활성 ExecPlan runtime row가 둘 이상입니다.")
         return rows[0] if rows else None
 
     def active(self, repo: str) -> ExecutionSnapshot | None:
@@ -693,6 +722,9 @@ class RuntimeStateRepository:
         return ExecutionSnapshot.from_row(row) if row is not None else None
 
     def projected_row(self, repo: str) -> sqlite3.Row | None:
+        selected = execution_selection.get()
+        if selected is not None and selected[0] == repo:
+            return self.active_row(repo)
         row = self.connection.execute(
             "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
@@ -710,6 +742,10 @@ class RuntimeStateRepository:
     def _update_project_row(self, repo: str, values: Mapping[str, object]) -> None:
         self._validate_fields(values, PROJECT_UPDATE_FIELDS)
         values = dict(values)
+        selected = execution_selection.get()
+        if selected is not None and selected[0] == repo:
+            # 작업은 exec_plans만 바꾼다. 투영 해제로 독립 planning 기록도 지우지 않는다.
+            return
         preserved = self.connection.execute(
             "SELECT planning_preserved_state FROM projects WHERE repo = ?", (repo,),
         ).fetchone()
@@ -759,6 +795,10 @@ class RuntimeStateRepository:
         expected_status: str | None = None,
     ) -> None:
         self._validate_fields(values, EXECPLAN_RUNTIME_FIELDS)
+        if values.get("status") in ACTIVE_STATUSES:
+            from .task_calls import management_available
+            if not management_available(self.connection,repo,plan_id):
+                raise TaskLimitReached("프로젝트 관리 대상 한도 때문에 작업을 재개할 수 없습니다.")
         if values.get("status") in ACTIVE_STATUSES or any(values.get(field) for field in (
                 "branch", "worktree", "worker_session_id", "reviewer_session_id", "pr_url", "workspace_owned")):
             from .execplan_draft_state import pending_ids
@@ -797,6 +837,9 @@ class RuntimeStateRepository:
             project = self.connection.execute(
                 "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
             ).fetchone()
+            selected = execution_selection.get()
+            if selected is not None and selected[0] == repo:
+                project = {"plan_path": self.get(*selected).path}
             translated: dict[str, object] = {}
             if not ("phase" in values and values["phase"] is None):
                 translated.update(
@@ -974,14 +1017,12 @@ class RuntimeStateRepository:
         values.update({key: None for key in invalidated})
         values['active_sha'] = acceptance['target_base_oid']
         def check_owner():
-            projection = self.connection.execute(
-                'SELECT plan_path, branch, worktree, pr_url, pr_head_oid, phase '
-                'FROM projects WHERE repo = ?', (repo,),
-            ).fetchone()
+            projection = project_row(self.connection, repo)
+            fields = ('plan_path', 'branch', 'worktree', 'pr_url', 'pr_head_oid', 'phase')
             owner = (expected.path, expected.branch, expected.worktree,
                      expected.pr_url, expected.pr_head_oid, expected.phase)
             if (self.projected(repo) != expected or self.get(repo, plan_id) != expected
-                    or projection is None or tuple(projection) != owner):
+                    or projection is None or tuple(projection[key] for key in fields) != owner):
                 raise RuntimeStateError('execution ownership or project projection changed')
         with _transaction(self.connection):
             check_owner()
@@ -1045,7 +1086,7 @@ class RuntimeStateRepository:
                     and saved.get('rebase_block_release_state') == observed.fingerprint):
                 raise RuntimeStateError('unchanged pending rebase recovery was already resumed')
             def check_owner():
-                project = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()
+                project = project_row(self.connection, repo)
                 current_block = (scoped_blocking.plan_block(self.connection, repo, plan_id)
                                  if is_plan_block else scoped_blocking.project_block(self.connection, repo))
                 active = self.active_row(repo)
@@ -1334,6 +1375,13 @@ class RuntimeStateRepository:
         if plan_id in catalog_held_plan_ids(self.connection, repo):
             raise RuntimeStateError("catalog 오류로 보류된 ExecPlan을 activate할 수 없습니다.")
         selected = self.get(repo, plan_id)
+        from loop_manager_internal.config.managed_config import fast_mode_settings
+        from loop_manager_internal.runtime.project_registry import task_limit
+        from loop_manager_internal.storage.task_calls import managed_count
+        config = fast_mode_settings.get()
+        _, limit, _ = task_limit(self.connection, repo, config.max_tasks_per_project if config else 1)
+        if managed_count(self.connection, repo) >= limit:
+            raise TaskLimitReached("프로젝트 관리 대상 한도 때문에 새 작업을 배정할 수 없습니다.")
         # Maintenance deferral resumes an owned execution; ordinary activation
         # still discards stale session state from a newly queued declaration.
         worker_session_values = {

@@ -34,6 +34,7 @@ class RegisteredProject:
     agents_hash: str | None
     agents_approved: bool
     origin: str | None = None
+    max_tasks_per_project: int = 0
 
 
 def ensure_registry_schema(connection: sqlite3.Connection) -> None:
@@ -45,6 +46,8 @@ def ensure_registry_schema(connection: sqlite3.Connection) -> None:
         "agents_hash": "TEXT",
         "agents_approved": "INTEGER NOT NULL DEFAULT 0",
         "origin": "TEXT",
+        "max_tasks_per_project": "INTEGER NOT NULL DEFAULT 0 CHECK "
+            "(typeof(max_tasks_per_project) = 'integer' AND max_tasks_per_project >= 0)",
     }
     missing = [(column, definition) for column, definition in migrations.items()
                if column not in columns]
@@ -89,7 +92,7 @@ def list_projects(connection: sqlite3.Connection) -> tuple[RegisteredProject, ..
     ensure_registry_schema(connection)
     rows = connection.execute(
         """
-        SELECT repo, base_branch, provider, agents_hash, agents_approved, origin
+        SELECT repo, base_branch, provider, agents_hash, agents_approved, origin, max_tasks_per_project
         FROM projects
         WHERE registered = 1
         ORDER BY repo
@@ -105,9 +108,31 @@ def list_projects(connection: sqlite3.Connection) -> tuple[RegisteredProject, ..
             ),
             agents_approved=bool(row["agents_approved"]),
             origin=(str(row["origin"]) if row["origin"] is not None else None),
+            max_tasks_per_project=row["max_tasks_per_project"],
         )
         for row in rows
     )
+
+
+def task_limit(connection: sqlite3.Connection, repo: str, default: int) -> tuple[int, int, str]:
+    row = connection.execute(
+        "SELECT max_tasks_per_project FROM projects WHERE repo = ? AND registered = 1", (repo,),
+    ).fetchone()
+    if row is None:
+        raise ProjectRegistryError(f"등록되지 않은 프로젝트입니다: {repo}")
+    stored = row[0]
+    if type(stored) is not int or stored < 0 or type(default) is not int or default <= 0:
+        raise ProjectRegistryError("프로젝트 관리 한도가 올바르지 않습니다.")
+    return stored, stored or default, "project" if stored else "config"
+
+
+def set_task_limit(connection: sqlite3.Connection, repo: str, value: int, default: int):
+    if type(value) is not int or value < 0:
+        raise ProjectRegistryError("max_tasks_per_project는 0 이상의 정수여야 합니다.")
+    with _transaction(connection):
+        task_limit(connection, repo, default)
+        connection.execute("UPDATE projects SET max_tasks_per_project = ? WHERE repo = ?", (value, repo))
+        return task_limit(connection, repo, default)
 
 
 def select_projects(

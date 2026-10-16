@@ -1095,12 +1095,12 @@ class ExecutionQueueTests(unittest.TestCase):
 
 class ManagerAdapterTests(unittest.TestCase):
     def test_progress_reads_stage_worker_events_once_and_tracks_interruption(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root = Path(directory)
             stage = root / 'stage-0'
             stage.mkdir()
             writer = EventWriter(stage / 'worker-1.jsonl')
-            self.addCleanup(writer.close)
+            cleanup.callback(writer.close)
             writer.emit('test_start', id='test_done')
             writer.emit('test_end', id='test_done')
             writer.emit('test_start', id='test_running')

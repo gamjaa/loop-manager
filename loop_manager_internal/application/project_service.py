@@ -1,5 +1,6 @@
 """application project service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.notifications import notifications
 from loop_manager_internal.runtime import operation_events as events
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -66,6 +67,7 @@ class RunProjectStepEffects:
     _self_runtime_project: Callable[..., object]
     _update_blocked_error: Callable[..., object]
     active_execplan: Callable[..., object]
+    activate_ready_execplan: Callable[..., object]
     backfill_plan_shas: Callable[..., object]
     block_active_execplan_from_revision: Callable[..., object]
     block_persisted_agent_scope_violation: Callable[..., object]
@@ -930,6 +932,10 @@ class ProjectService:
         )
 
     def _dispatch_execution(self, runtime_repository, *, newly_activated: bool, planning_context=None) -> int:
+        from loop_manager_internal.application.task_scheduling import current_scheduler, current_task, run_project_tasks
+        if (current_scheduler.get() is not None and current_task.get() is None
+                and self.identity.recovery_request_id is None):
+            return run_project_tasks(self, newly_activated=newly_activated)
         execution_ports = self.effects._ExecutionLifecyclePorts(
             self.identity.connection,
             runtime_repository,
@@ -954,7 +960,14 @@ class ProjectService:
         execution_context = prepared
         while True:
             self.effects._check_runtime_handoff()
-            execution_outcome = execution.dispatch(execution_context)
+            from loop_manager_internal.storage.task_calls import CallDeferred
+            try:
+                execution_outcome = execution.dispatch(execution_context)
+            except CallDeferred as error:
+                self.effects.operation_print(str(error))
+                return self.effects._execution_outcome_step_result(
+                    ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE, detail=str(error)))
+            notifications.flush_project_events(self.identity.connection, self.state.repo)
             if (
                 execution_outcome.kind is ExecutionOutcomeKind.PHASE_ADVANCED
                 and execution_outcome.context is not None

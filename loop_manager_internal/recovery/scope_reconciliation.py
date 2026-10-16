@@ -86,7 +86,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
     if block is None:
         return False
     if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value and block['plan_id']:
-        project = connection.execute('SELECT * FROM projects WHERE repo=?', (repo,)).fetchone()
+        project = runtime_state.project_row(connection, repo)
         plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                                   (repo, block['plan_id'])).fetchone()
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, str(block['plan_id']))
@@ -117,9 +117,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             and not scoped_blocking.is_scope_baseline_block(block)):
         return False
     plan_id = str(block["plan_id"] or "")
-    project = connection.execute(
-        "SELECT * FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
+    project = runtime_state.project_row(connection, repo)
     if project is None:
         return False
     planning_owns_slot = runtime_state.planning_owns_execution_slot(project)
@@ -168,8 +166,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                 except (RuntimeError, WorkspaceOwnershipError, ValueError):
                     return False
             if (not scoped_blocking.project_cause_matches(connection, block)
-                    or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
-                                               (repo,)).fetchone()) != dict(project)
+                    or dict(runtime_state.project_row(connection, repo)) != dict(project)
                     or (checked is not None and not agent_scope_decision._same_local_snapshot(
                         effects.capture_git_snapshot(worktree), checked))):
                 return False
@@ -209,8 +206,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             and plan['status'] not in {*ACTIVE_EXECPLAN_STATUSES, 'PLAN_BLOCKED'}):
         with runtime_state._transaction(connection):
             if (not scoped_blocking.project_cause_matches(connection, block)
-                    or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
-                                               (repo,)).fetchone()) != dict(project)
+                    or dict(runtime_state.project_row(connection, repo)) != dict(project)
                     or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                                (repo, plan_id)).fetchone()) != dict(plan)):
                 return False
@@ -297,8 +293,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         return False
     with runtime_state._transaction(connection):
         if (not scoped_blocking.project_cause_matches(connection, block)
-                or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
-                                           (repo,)).fetchone()) != dict(project)
+                or dict(runtime_state.project_row(connection, repo)) != dict(project)
                 or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                            (repo, plan_id)).fetchone()) != dict(plan)
                 or (checked is not None and not agent_scope_decision._same_local_snapshot(
@@ -910,8 +905,7 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
         if (not scoped_blocking.project_cause_matches(connection, block)
                 or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                            (repo, plan_id)).fetchone()) != dict(plan)
-                or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
-                                           (repo,)).fetchone()) != dict(project)
+                or dict(runtime_state.project_row(connection, repo)) != dict(project)
                 or execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
                     repo, plan_id) != checkpoint
                 or connection.execute('SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',

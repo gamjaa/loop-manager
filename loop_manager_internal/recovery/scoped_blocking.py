@@ -412,9 +412,7 @@ def migrate_legacy_blocks(connection: sqlite3.Connection) -> None:
         "JOIN projects AS r USING (repo) WHERE p.status = 'BLOCKED'"
     ).fetchall()
     for row in rows:
-        project = connection.execute(
-            "SELECT * FROM projects WHERE repo = ?", (row["repo"],)
-        ).fetchone()
+        project = runtime_state.project_row(connection, row["repo"])
         project_columns = set(project.keys()) if project is not None else set()
         agent_fields = (
             "agent_role",

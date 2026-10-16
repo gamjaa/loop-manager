@@ -367,6 +367,7 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
              mock.patch.object(loop_manager.project_registry, 'list_projects', return_value=projects), \
              mock.patch('loop_manager_internal.application.scheduler.VerifyCoordinator',
                         side_effect=lambda: nullcontext()), \
+             mock.patch('loop_manager_internal.application.scheduler.TaskScheduler'), \
              mock.patch.object(loop_manager, '_run_registered_project', side_effect=run_project):
             results = run_scheduler()
             self.assertEqual([(repo, value) for repo, value, _thread in results], [

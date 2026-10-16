@@ -292,6 +292,8 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             loop_manager, '_preflight_self_merge_handoff'
         ) as preflight, mock.patch(
             'loop_manager_internal.application.scheduler.VerifyCoordinator'
+        ), mock.patch(
+            'loop_manager_internal.application.scheduler.TaskScheduler'
         ):
             self.assertEqual(
                 loop_manager.schedule_registered_projects(

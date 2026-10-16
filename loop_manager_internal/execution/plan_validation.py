@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ExecPlanMetadataError
 from loop_manager_internal.catalog import execplan_catalog, requirement_sources
 from loop_manager_internal.execution import execution_revision
+from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.git.command_adapter import (
     ExternalObservationError, revision_document_or_none,
     revision_requirement_documents,
@@ -278,10 +279,7 @@ def _blocked_validation_base_revision(
     repo: str,
     plan: sqlite3.Row,
 ) -> str:
-    project = connection.execute(
-        "SELECT active_sha FROM projects WHERE repo = ?",
-        (repo,),
-    ).fetchone()
+    project = runtime_state.project_row(connection, repo)
     return str(
         (project["active_sha"] if project else None)
         or plan["active_sha"]

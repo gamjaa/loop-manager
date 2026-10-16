@@ -132,7 +132,7 @@ def _reconcile_rebase_evidence_block(
     plan = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?", (repo, plan_id),
     ).fetchone()
-    project = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+    project = runtime_state.project_row(connection, repo)
     if plan is None or project is None or block['repo'] != repo:
         return False
     checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
@@ -213,7 +213,7 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
     runtime = runtime_state.RuntimeStateRepository(connection)
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                               (repo, plan_id)).fetchone()
-    project = connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()
+    project = runtime_state.project_row(connection, repo)
     if (plan is None or project is None or plan['status'] != 'PLAN_BLOCKED'
             or not scoped_blocking.is_scope_baseline_block(block)
             or plan['blocked_reason'] != block['reason_code']
@@ -254,7 +254,7 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
         with runtime_state._transaction(connection):
             if (dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                          (repo, plan_id)).fetchone()) != dict(plan)
-                    or dict(connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()) != dict(project)
+                    or dict(runtime_state.project_row(connection, repo)) != dict(project)
                     or checkpoints.get(repo, plan_id) != checkpoint
                     or not agent_scope_decision._same_local_snapshot(observe(), observed)):
                 raise AgentScopeError('scope 차단 해제 중 소유 상태가 변경됐습니다.')

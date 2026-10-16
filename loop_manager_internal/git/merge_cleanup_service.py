@@ -332,9 +332,7 @@ def complete_merged_execplan_worktree(
                 workspace_owned=workspace_owned,
             )
         plan_id = str(plan["plan_id"])
-        mirrored = connection.execute(
-            "SELECT * FROM projects WHERE repo = ?", (repo,)
-        ).fetchone()
+        mirrored = runtime_state.project_row(connection, repo)
         project_values: dict[str, object] = {}
         if (mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
                 and mirrored["plan_path"] == plan["path"]):

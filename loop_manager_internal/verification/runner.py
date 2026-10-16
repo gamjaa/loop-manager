@@ -22,6 +22,7 @@ from loop_manager_internal.verification.manifest import validate_report
 from loop_manager_internal.verification.contract import VERSION, ADAPTERS, ContractError, load
 from loop_manager_internal.verification import unittest_adapter, perl_adapter
 from loop_manager_internal.verification.core import execute_command
+from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY
 from loop_manager_internal.verification.resources import DEFAULT_WORKER_BYTES, ResourceSampler, parse_parallelism, process_memory
 from loop_manager_internal.verification.timing import (
     EventWriter, TimedResult, atomic_json, bytecode_cache_changes,
@@ -123,6 +124,9 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
     run_id = os.environ.get("LOOP_MANAGER_VERIFY_SESSION", uuid.uuid4().hex)
     entrypoint = Path(__file__).with_name("entrypoint.py").resolve()
     started_at = time.monotonic()
+    budget = ExecutionClock()
+    previous_budget = os.environ.get(BUDGET_DIRECTORY)
+    os.environ[BUDGET_DIRECTORY] = str(budget.directory)
     directory.mkdir(parents=True, exist_ok=True)
     os.environ["LOOP_MANAGER_VERIFY_PROJECT_ROOT"] = str(connection.root)
     os.environ[MARKER] = "1"
@@ -140,6 +144,7 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
         else:
             coordinator = VerifyCoordinator()
             session, secret = coordinator.open(cap)
+            coordinator.track_waiting(session, budget.directory)
             class LocalClient:
                 def request(self, operation, **data):
                     return coordinator.request(session, secret, operation, **data)
@@ -172,7 +177,7 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                 partial_status = "FALLBACK"
                 return 0
             for index, stage in enumerate(connection.stages):
-                remaining = None if timeout is None else timeout - (time.monotonic() - started_at)
+                remaining = budget.remaining(timeout)
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError("verify total timeout")
                 stage_directory = directory / f"stage-{index}"
@@ -243,6 +248,13 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                 atomic_json(directory / "uncertain-reservations.json", coordinator.reservations)
             coordinator.finish(session, stopped=not coordinator.reservations)
         print(diagnostic(directory), flush=True)
+        try:
+            budget.close()
+        finally:
+            if previous_budget is None:
+                os.environ.pop(BUDGET_DIRECTORY, None)
+            else:
+                os.environ[BUDGET_DIRECTORY] = previous_budget
 
 
 def main():

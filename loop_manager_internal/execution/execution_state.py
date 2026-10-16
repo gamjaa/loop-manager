@@ -61,9 +61,7 @@ class ExecutionStatePort:
         snapshot = self.check()
         if snapshot is None:
             raise runtime_state.RuntimeStateError("execution projection이 해제됐습니다.")
-        project = self.connection.execute(
-            "SELECT * FROM projects WHERE repo = ?", (self.repo,)
-        ).fetchone()
+        project = runtime_state.project_row(self.connection, self.repo)
         # Legacy ownership helpers also consume project-owned registration fields
         # (base_branch, origin and provider). Execution fields remain authoritative
         # in the immutable plan snapshot.

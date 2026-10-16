@@ -1,5 +1,6 @@
 """execution execution ports boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage import runtime_state
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from loop_manager_internal.agents.agent_invocation import AgentResultKind
@@ -172,7 +173,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     def planning_required(revision):
         from loop_manager_internal.storage import planning_input_state
         from loop_manager_internal.agents import common_guidance
-        row = connection.execute('SELECT * FROM projects WHERE repo = ?', (identity['repo'],)).fetchone()
+        row = runtime_state.project_row(connection, identity['repo'])
         if row['planning_preserved_state']:
             from loop_manager_internal.storage.runtime_state import PlanningSnapshot
             import json

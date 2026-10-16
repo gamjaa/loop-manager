@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS projects (
     provider TEXT NOT NULL DEFAULT 'codex',
     origin TEXT,
     registered INTEGER NOT NULL DEFAULT 1,
+    max_tasks_per_project INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(max_tasks_per_project) = 'integer' AND max_tasks_per_project >= 0),
     agents_hash TEXT,
     agents_approved INTEGER NOT NULL DEFAULT 0,
     specification_fingerprint TEXT,
@@ -238,7 +240,7 @@ CREATE TABLE IF NOT EXISTS guidance_approvals (
 
 
 EXEC_PLANS_ACTIVE_INDEX = """
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_execplan_per_project
+CREATE INDEX IF NOT EXISTS active_execplans_by_project
 ON exec_plans(repo)
 WHERE status IN ('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING')
 """
@@ -491,6 +493,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         recovery_state.ensure_schema(connection)
     blocked_checkpoint_state.ensure_schema(connection)
     blocked_remote_observation.ensure_schema(connection)
+    from . import task_calls
+    task_calls.ensure_schema(connection)
     connection.execute("DROP INDEX IF EXISTS one_active_execplan_per_project")
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
     scoped_blocking.migrate_legacy_blocks(connection)

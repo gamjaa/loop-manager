@@ -174,11 +174,8 @@ def execute_command(argv, cwd, timeout, writer, client, run_id, unit_id, *, run_
     from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
     from loop_manager_internal.verification.guard import worker_environment
     run_process = run_process or run_verify_process
-    started = time.monotonic()
     with phase("resource_wait", writer=writer):
         while True:
-            if timeout is not None and time.monotonic() - started >= timeout:
-                raise TimeoutError("verify command resource wait timeout")
             reply = client.request("acquire", worker_bytes=DEFAULT_WORKER_BYTES, run_id=run_id, unit_id=unit_id)
             writer.emit("allocation", decision=reply, unit_id=unit_id)
             if reply["granted"]:
@@ -193,7 +190,7 @@ def execute_command(argv, cwd, timeout, writer, client, run_id, unit_id, *, run_
     writer.emit("unit_start", version=1, run_id=run_id, unit_id=unit_id, argv=argv, cwd=str(cwd), kind_of_unit="command")
     try:
         with phase(f"command:{unit_id}", writer=writer):
-            passed, timed_out, output = run_process(argv, cwd, None if timeout is None else max(0.001, timeout - (time.monotonic() - started)),
+            passed, timed_out, output = run_process(argv, cwd, timeout,
                 environment=worker_environment(os.environ), job_scope=True, on_started=bind)
         stopped = True
         from loop_manager_internal.execution.validation_feedback import redact_secrets

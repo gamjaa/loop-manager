@@ -24,6 +24,8 @@ class ManagedConfig:
     verify_parallelism: str | int = "auto"
     verify_partial: bool = True
     fast_mode_values: tuple[tuple[str, str], ...] = ()
+    max_tasks_per_project: int = 1
+    verify_concurrency: int = 1
 
     @property
     def telegram_enabled(self) -> bool:
@@ -116,6 +118,13 @@ def load_managed_config(path: Path) -> ManagedConfig:
     if max_workers <= 0:
         raise ManagedConfigError("[loop] max_workers는 양의 정수여야 합니다.")
 
+    task_limits = {}
+    for option in ("max_tasks_per_project", "verify_concurrency"):
+        raw = _setting(parser, "loop", option, fallback="1")
+        if not raw.isascii() or not raw.isdecimal() or int(raw) <= 0:
+            raise ManagedConfigError(f"[loop] {option}는 양의 정수여야 합니다.")
+        task_limits[option] = int(raw)
+
     raw_refactoring_review_interval = _setting(
         parser,
         "loop",
@@ -184,4 +193,5 @@ def load_managed_config(path: Path) -> ManagedConfig:
         verify_partial=configparser.ConfigParser.BOOLEAN_STATES[raw_partial],
         fast_mode_values=tuple((provider, parser._sections.get(provider, {}).get("fast_mode", ""))
                                for provider in ("codex", "claude")),
+        **task_limits,
     )

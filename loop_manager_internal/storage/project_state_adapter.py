@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import replace
+from contextlib import nullcontext
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import runtime_state
@@ -84,19 +85,26 @@ def activate_ready_execplan(
         else base_sha
     )
     try:
-        runtime_state.RuntimeStateRepository(connection).activate(
-            repo,
-            str(selected["plan_id"]),
-            activation_sha=activation_sha,
-            branch=branch,
-            worktree=str(worktree),
-            preserve_worker_session=(
-                effects.assessment_can_yield(
-                    maintenance_state.MaintenanceRepository(connection).get(repo)
-                )
-                and not effects.is_unowned_ready(selected)
-            ),
-        )
+        from loop_manager_internal.application.task_scheduling import current_scheduler, Task
+        scheduler = current_scheduler.get()
+        with (scheduler.admission(Task(repo,str(selected['plan_id']),connection,
+                                       resumed=not effects.is_unowned_ready(selected)))
+              if scheduler is not None else nullcontext()):
+            runtime_state.RuntimeStateRepository(connection).activate(
+                repo,
+                str(selected["plan_id"]),
+                activation_sha=activation_sha,
+                branch=branch,
+                worktree=str(worktree),
+                preserve_worker_session=(
+                    effects.assessment_can_yield(
+                        maintenance_state.MaintenanceRepository(connection).get(repo)
+                    )
+                    and not effects.is_unowned_ready(selected)
+                ),
+            )
+    except runtime_state.TaskLimitReached:
+        return None
     except runtime_state.RuntimeStateError as error:
         raise RuntimeError(
             "READY ExecPlan 선택 상태가 변경되었습니다."

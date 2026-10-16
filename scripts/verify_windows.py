@@ -21,6 +21,16 @@ CLEANUP_SECONDS = 10
 HEARTBEAT_SECONDS = 5
 
 
+def lifecycle(directory, state, **values):
+    if directory is None:
+        return
+    directory=Path(directory)
+    directory.mkdir(parents=True,exist_ok=True)
+    temporary=directory/'wsl-lifecycle.tmp'
+    temporary.write_text(json.dumps({'state':state,**values}),encoding='utf-8')
+    temporary.replace(directory/'wsl-lifecycle.json')
+
+
 def load_tests(loader, _suite, _pattern):
     names = json.loads(Path(__file__).with_name('verify-windows-tests.json').read_text(encoding='utf-8'))
     if (not isinstance(names, list) or not names or not all(
@@ -110,16 +120,27 @@ def run_wsl(root, bundle, directory, timeout, cap):
         capture_output=True, text=True, encoding='utf-8', timeout=min(10, timeout), env=environment, check=True).stdout.strip()
     if not translated.startswith('/') or '\n' in translated:
         raise RuntimeError('WSL 검증 경로 변환에 실패했습니다.')
+    budget_arguments = []
+    if os.environ.get('LOOP_MANAGER_VERIFY_BUDGET_DIR'):
+        budget_path = subprocess.run(['wsl.exe', '--exec', 'wslpath', '-a', '-u',
+            os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR']], capture_output=True, text=True,
+            encoding='utf-8', timeout=min(10, timeout), env=environment, check=True).stdout.strip()
+        if not budget_path.startswith('/') or '\n' in budget_path:
+            raise RuntimeError('WSL 실행 시간 기록 경로 변환에 실패했습니다.')
+        budget_arguments = [budget_path]
+        lifecycle(os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'],'starting')
     timeout -= time.monotonic() - started
     if timeout <= CLEANUP_SECONDS:
         raise TimeoutError('전체 verify 제한 안에 WSL 실행·정리 시간을 확보하지 못했습니다.')
     primary = None
     try:
         with heartbeat(bundle / 'heartbeat'):
-            passed, timed_out, output = run_verify_process(
-                ['wsl.exe', '--exec', 'python3', translated + '/driver.py', '--wsl', translated,
-                 str(timeout - CLEANUP_SECONDS), str(cap)], root, timeout - CLEANUP_SECONDS,
-                environment=environment, job_scope=True)
+            from loop_manager_internal.verification.execution_clock import ExecutionClock
+            with ExecutionClock() as budget:
+                passed, timed_out, output = run_verify_process(
+                    ['wsl.exe', '--exec', 'python3', translated + '/driver.py', '--wsl', translated,
+                     str(timeout - CLEANUP_SECONDS), str(cap), *budget_arguments], root, timeout - CLEANUP_SECONDS,
+                    environment=environment, job_scope=True, execution_clock=budget)
     except BaseException as error:
         primary = error
     # Windows Job 종료만으로 Linux 자식의 종료를 확정하지 않는다.
@@ -143,9 +164,11 @@ def run_wsl(root, bundle, directory, timeout, cap):
     return passed and not timed_out
 
 
-def wsl_main(bundle, timeout, cap):
+def wsl_main(bundle, timeout, cap, budget_directory=None):
     started = time.monotonic()
     bundle = Path(bundle)
+    if budget_directory is not None:
+        os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'] = budget_directory
     stopped = threading.Event()
     def cancel(_signum, _frame):
         raise InterruptedError('Windows 검증 모체가 종료됐습니다.')
@@ -167,6 +190,7 @@ def wsl_main(bundle, timeout, cap):
     receipt = {'root': str(run_root), 'stopped': True, 'removed': False}
     passed = False
     try:
+        lifecycle(budget_directory,'running',root=str(run_root),pid=os.getpid())
         (bundle / 'started.json').write_text(json.dumps(receipt), encoding='utf-8')
         watcher.start()
         project, runtime_root, temporary = (run_root / name for name in ('project', 'runtime', 'tmp'))
@@ -182,11 +206,14 @@ def wsl_main(bundle, timeout, cap):
         environment = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
             GIT_CONFIG_SYSTEM='/dev/null', PYTHONIOENCODING='utf-8',
             LOOP_MANAGER_VERIFY_LOG_DIR=str(run_root / 'logs'), LOOP_MANAGER_VERIFY_PARALLELISM=str(cap))
+        from loop_manager_internal.verification.execution_clock import ExecutionClock
+        budget = ExecutionClock(environment)
+        budget.started = started
         for arguments in (['git', 'init', '-q', '--initial-branch=main'], ['git', 'add', '-A'],
                           ['git', '-c', 'user.name=Verify', '-c', 'user.email=verify@example.invalid',
                            '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Windows verify snapshot']):
             subprocess.run(arguments, cwd=project, env=environment, check=True, timeout=10)
-        remaining = timeout - (time.monotonic() - started)
+        remaining = budget.remaining(timeout)
         if remaining <= 0:
             raise TimeoutError('WSL 복사 준비 중 전체 verify 시간이 만료됐습니다.')
         receipt['stopped'] = False
@@ -214,6 +241,8 @@ def wsl_main(bundle, timeout, cap):
             if receipt['stopped']:
                 shutil.rmtree(run_root)
             receipt['removed'] = not run_root.exists()
+            lifecycle(budget_directory,'stopped' if receipt['stopped'] and receipt['removed'] else 'uncertain',
+                      root=str(run_root),pid=os.getpid())
             (bundle / 'cleanup.tmp').write_text(json.dumps(receipt), encoding='utf-8')
             (bundle / 'cleanup.tmp').replace(bundle / 'cleanup.json')
             for sig, handler in previous.items():
@@ -270,6 +299,7 @@ def windows_main(root):
     from loop_manager_internal.execution.verify_process import run_verify_process
     from loop_manager_internal.verification.timing import EventWriter, atomic_json, phase
     from loop_manager_internal.config.managed_config import load_managed_config
+    from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY
     timeout = float(os.environ.get('LOOP_MANAGER_VERIFY_TIMEOUT', '600'))
     cap = os.environ.get('LOOP_MANAGER_VERIFY_PARALLELISM', 'auto')
     if (root / 'config/config.ini').is_file():
@@ -291,6 +321,9 @@ def windows_main(root):
     report = {'kind': 'loop_manager_windows_verify', 'passed': False,
               'wsl': 'NOT_RUN', 'windows': 'NOT_RUN'}
     started = time.monotonic()
+    budget = ExecutionClock()
+    previous_budget = os.environ.get(BUDGET_DIRECTORY)
+    os.environ[BUDGET_DIRECTORY] = budget.environment[BUDGET_DIRECTORY]
     try:
         writer.emit('run_start', mode='windows+wsl', cap=cap)
         with writer.activate(), phase('verify'), tempfile.TemporaryDirectory(prefix='loop-manager-verify-') as temporary:
@@ -305,7 +338,7 @@ def windows_main(root):
             report['wsl'] = 'FAIL'
             with phase('wsl-full'):
                 passed = run_wsl(root, bundle, wsl_logs,
-                                 timeout - (time.monotonic() - started), cap)
+                                 budget.remaining(timeout), cap)
             report['wsl'] = 'PASS' if passed else 'FAIL'
             report['wsl_diagnostic'] = str(wsl_logs / 'summary.json')
             if not passed:
@@ -319,7 +352,7 @@ def windows_main(root):
                 passed, timed_out, output = run_verify_process(
                     [runtime_python, '-u', str(Path(__file__).resolve()), '--native', str(root),
                      str(entrypoint), str(native_logs), str(getattr(sys, '_base_executable', sys.executable))],
-                    root, max(0.001, timeout - (time.monotonic() - started)), job_scope=True)
+                    root, max(0.001, budget.remaining(timeout)), job_scope=True)
                 print(output, flush=True)
             report['windows'] = 'PASS' if passed and not timed_out else 'FAIL'
             report['windows_diagnostic'] = str(native_logs / 'summary.json')
@@ -330,13 +363,19 @@ def windows_main(root):
         atomic_json(directory / 'result.json', report)
         writer.emit('run_end', passed=report['passed'], wsl=report['wsl'], windows=report['windows'])
         writer.close()
+        if previous_budget is None:
+            os.environ.pop(BUDGET_DIRECTORY, None)
+        else:
+            os.environ[BUDGET_DIRECTORY] = previous_budget
+        budget.__exit__(*sys.exc_info())
         print(f'Loop Manager 자체 verify: {directory / "result.json"}', flush=True)
 
 
 if __name__ == '__main__':
     try:
         if len(sys.argv) > 1 and sys.argv[1] == '--wsl':
-            raise SystemExit(wsl_main(sys.argv[2], float(sys.argv[3]), sys.argv[4]))
+            raise SystemExit(wsl_main(sys.argv[2], float(sys.argv[3]), sys.argv[4],
+                                     sys.argv[5] if len(sys.argv) > 5 else None))
         if len(sys.argv) > 1 and sys.argv[1] == '--native':
             raise SystemExit(native_main(*sys.argv[2:]))
         if os.name != 'nt':

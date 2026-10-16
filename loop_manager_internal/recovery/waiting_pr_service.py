@@ -344,10 +344,11 @@ def select_waiting_pull_request_conflict(
             int(str(item[0]["plan_id"])[2:]),
         ),
     )
+    from loop_manager_internal.storage.task_calls import management_available
+    if not management_available(connection,repo,str(plan['plan_id'])):
+        return PullRequestSyncResult(merged=observation.merged)
     effects.hydrate_execplan_project(connection, repo, plan)
-    project = connection.execute(
-        "SELECT * FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
+    project = runtime_state.project_row(connection, repo)
     assert project is not None
     recovery_options = {"config_path": config_path} if config_path is not None else {}
     result = effects.reconcile_existing_pull_request(
@@ -409,9 +410,7 @@ def _block_closed_pull_request(
     head_oid: object,
 ) -> None:
     error = "PR이 Merge 없이 닫혔습니다."
-    mirrored = connection.execute(
-        "SELECT * FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
+    mirrored = runtime_state.project_row(connection, repo)
     clear_projection = bool(
         mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
         and mirrored["plan_path"] == plan["path"]
@@ -491,6 +490,9 @@ def _resume_reopened_pull_request(
     recovery = recovery or revalidate_candidate
     phase = "WORKING" if recovery else "PUBLISHING" if confirm_publication else "PR_OPEN"
     status = "IMPLEMENTING" if recovery else phase
+    from loop_manager_internal.storage.task_calls import management_available
+    if status in runtime_state.ACTIVE_STATUSES and not management_available(connection,repo,str(plan['plan_id'])):
+        return
     last_error = REBASE_IN_PROGRESS_ERROR if recovery and not revalidate_candidate else None
     execplan_values: dict[str, object] = {
         "status": status,
@@ -526,9 +528,7 @@ def _resume_reopened_pull_request(
         project_values.update(values)
         execplan_values.update({key: value for key, value in values.items() if key != "phase"})
     with runtime_state._transaction(connection):
-        mirrored = connection.execute(
-            "SELECT * FROM projects WHERE repo = ?", (repo,)
-        ).fetchone()
+        mirrored = runtime_state.project_row(connection, repo)
         repository = runtime_state.RuntimeStateRepository(connection)
         if revalidate_candidate or confirm_publication:
             if (scoped_blocking.project_block(connection, repo) is not None
