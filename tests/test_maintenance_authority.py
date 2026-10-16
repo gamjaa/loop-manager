@@ -34,6 +34,44 @@ from tests.support.git import isolated_git_test
 
 @isolated_git_test
 class MaintenanceAuthorityTest(MaintenancePlanningCase):
+    def test_new_manager_source_maintenance_plan_requires_critical_priority(self):
+        from loop_manager_internal.catalog import manager_sources
+        from loop_manager_internal.storage import verify_input_requests
+
+        context = self._begin_barrier()
+        request = verify_input_requests.register(
+            self.connection, str(self.repo), self.base_sha,
+        )
+        path = self.repo / "docs/plans/[G-002] Verify Inputs.md"
+        text = (
+            "---\nid: G-002\ntitle: Verify Inputs\nsources:\n  - "
+            + manager_sources.SOURCE
+            + "\ndepends_on: []\ncomplexity: low\nrisk: medium\npriority: normal\n"
+            + "---\n\n## Purpose\n\n"
+            + manager_sources.RULE
+            + "\n\n## Acceptance Criteria\n\n- Preserve user behavior, public contract, and storage format at the project structure boundary.\n\n"
+            + "## Implementation\n\n- Record the actual verify inputs at the project structure boundary.\n\n"
+            + "## Validation\n\n- Run targeted unit tests and keep full verify as required.\n\n"
+            + "## Decision Log\n\n"
+            + manager_sources.PREFIX
+            + json.dumps(request, sort_keys=True)
+            + "\n"
+        )
+        path.write_text(text, encoding="utf-8", newline="\n")
+        def validate_general_plan():
+            return loop_manager.validate_maintenance_planner_result(
+                self.connection, context, self.repo, loop_manager.changed_files(self.repo),
+                allow_general_plans=True, refactoring_plan_ids=(),
+            )
+
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "priority: critical"):
+            validate_general_plan()
+
+        path.write_text(text.replace("priority: normal", "priority: critical"),
+                        encoding="utf-8", newline="\n")
+        result = validate_general_plan()
+        self.assertEqual(result.plans[0][1]["priority"], "critical")
+
     def test_combined_maintenance_batch_normalizes_manifest_and_result_references(self):
         self._begin_legacy_assessment(self.base_sha)
         self.connection.execute(

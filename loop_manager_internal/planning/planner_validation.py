@@ -1025,8 +1025,17 @@ def validate_planner_result(
         if any(str(source).startswith("manager:") for source in parsed["sources"]):
             if connection is None or repo is None:
                 raise PlannerValidationError("Manager source requires registered request context")
+            registered = connection.execute(
+                "SELECT 1 FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, parsed["id"]),
+            ).fetchone()
             try:
-                verify_input_requests.validate(connection, repo, planner_text, parsed["sources"])
+                verify_input_requests.validate(
+                    connection, repo, planner_text, parsed["sources"],
+                    is_new=(not existed and registered is None
+                            and parsed["id"] not in snapshot.by_id),
+                    metadata=parsed,
+                )
             except RuntimeError as error:
                 raise PlannerValidationError(str(error)) from error
         current_plans[changed_path] = parsed

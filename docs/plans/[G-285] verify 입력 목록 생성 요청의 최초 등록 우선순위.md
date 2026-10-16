@@ -25,10 +25,10 @@ Manager의 실제 verify 입력 목록 누락 요청에 따라 새로 만드는 
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/planning/verify_input_request.py:instruction()`의 실제 누락 요청 문구에 최초 생성 priority 조건을 추가한다. `catalog/manager_sources.py`의 `VERSION`·`PURPOSE`·`RULE`·`MANAGER_REQUEST` 선언과 기존 중복 확인을 재사용하며 등록 요청 원문을 새 형식으로 교체하지 않는다.
-- [ ] 확인한 `storage/verify_input_requests.py:validate()`의 요청 소유·범위 검증과 `planning/planner_validation.py:validate_planner_result()`의 신규/기존 snapshot 구분을 재사용한다. 신규 priority 판단을 등록 문맥에서 명시하고 재파싱·별도 priority 저장소 없이 검증된 metadata를 소비한다. `planning/validation_ports.py:validate_manager_source()`의 기존 source 소비자는 과거 요청 검증을 계속 수행할 수 있어야 한다.
-- [ ] 확인한 `storage/execplan_catalog_state.py:new_declaration_issues()`·`CatalogReconciliationService`의 신규 선언 판정, `CatalogStateRepository`의 snapshot/transaction과 `register_published_plan_row()`·`insert_published_plan_row()`의 실제 등록 경계를 대조해 게시 직전 및 최초 등록 누락을 막는다. 기존 row 재검사·멱등 등록과 archive fallback에는 신규 조건을 소급하지 않는다. 기존 source 진단·독립 선언 보류를 재사용하고 비호환 schema나 새 복구 계층을 추가하지 않는다.
-- [ ] 확인한 `tests/test_verify_input_requests.py`의 모의 원격·실제 SQLite fixture와 `tests/test_planning_publication.py`의 게시/DB 확정 경계를 확장한다. 실제 구현 범위의 요청 우선순위·이전 등록 보존을 PRODUCT·ARCHITECTURE의 관련 절에 반영하되 Requirement·다른 ExecPlan을 Worker에게 편집시키지 않는다.
+- [x] 확인한 `loop_manager_internal/planning/verify_input_request.py:instruction()`의 실제 누락 요청 문구에 최초 생성 priority 조건을 추가한다. `catalog/manager_sources.py`의 `VERSION`·`PURPOSE`·`RULE`·`MANAGER_REQUEST` 선언과 기존 중복 확인을 재사용하며 등록 요청 원문을 새 형식으로 교체하지 않는다.
+- [x] 확인한 `storage/verify_input_requests.py:validate()`의 요청 소유·범위 검증과 `planning/planner_validation.py:validate_planner_result()`의 신규/기존 snapshot 구분을 재사용한다. 신규 priority 판단을 등록 문맥에서 명시하고 재파싱·별도 priority 저장소 없이 검증된 metadata를 소비한다. `planning/validation_ports.py:validate_manager_source()`의 기존 source 소비자는 과거 요청 검증을 계속 수행할 수 있어야 한다.
+- [x] 확인한 `storage/execplan_catalog_state.py:new_declaration_issues()`·`CatalogReconciliationService`의 신규 선언 판정, `CatalogStateRepository`의 snapshot/transaction과 `register_published_plan_row()`·`insert_published_plan_row()`의 실제 등록 경계를 대조해 게시 직전 및 최초 등록 누락을 막는다. 기존 row 재검사·멱등 등록과 archive fallback에는 신규 조건을 소급하지 않는다. 기존 source 진단·독립 선언 보류를 재사용하고 비호환 schema나 새 복구 계층을 추가하지 않는다.
+- [x] 확인한 `tests/test_verify_input_requests.py`의 모의 원격·실제 SQLite fixture와 `tests/test_planning_publication.py`의 게시/DB 확정 경계를 확장한다. 실제 구현 범위의 요청 우선순위·이전 등록 보존을 PRODUCT·ARCHITECTURE의 관련 절에 반영하되 Requirement·다른 ExecPlan을 Worker에게 편집시키지 않는다.
 
 ## Validation
 
@@ -40,8 +40,8 @@ Manager의 실제 verify 입력 목록 누락 요청에 따라 새로 만드는 
 ## Progress
 
 - [x] 2026-10-14 원격 기준 `2a4c4db3c02ed9d92abee4bcf7928117cefd89bc`의 활성 명세 전문·compact catalog·허용 snapshot과 요청/등록 코드·관련 unit 원본을 정적으로 대조했다. R-072의 critical 최초 등록 조건은 prompt와 validator에 없고 기존 테스트는 신규 normal 등록을 성공으로 기대한다. 테스트 실행 결과는 아니다.
-- [ ] 요청 전달·신규 등록 검증과 기존 선언 보존 구현
-- [ ] 관련 targeted unit 검증·제품/설계 정합성
+- [x] 2026-10-16 요청 prompt, 일반/유지보수 Planner 검증, revision-pinned catalog 검증, 최초 row 삽입에 `critical` 규칙을 연결했다. 등록된 기존 row·draft·PR과 archive fallback은 새 조건으로 보류하거나 재기록하지 않도록 유지했다. PRODUCT·ARCHITECTURE에 제품 정책과 catalog 보장 경계를 반영했다.
+- [x] 2026-10-16 선택 unittest adapter의 targeted runner로 요청/Planner/catalog·실제 publication DB·maintenance 검증 8개 단위와 기존 PR 소유 상태·일반 source 등록·요청 중복 방지 4개 단위를 실행해 통과했다. 초기 실행의 fixture 오류를 수정한 뒤 같은 targeted 명령이 통과했다. 전체 verify·Review는 Worker가 실행하지 않았다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

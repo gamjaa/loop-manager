@@ -473,7 +473,10 @@ def validate_maintenance_planner_result(
                 )
             from loop_manager_internal.storage import verify_input_requests
             try:
-                verify_input_requests.validate(connection, context.repo, planned_contents[path][1], validated_plan["sources"])
+                verify_input_requests.validate(
+                    connection, context.repo, planned_contents[path][1], validated_plan["sources"],
+                    is_new=True, metadata=validated_plan,
+                )
             except RuntimeError as error:
                 raise MaintenancePlanningError(str(error)) from error
             new_plans.append((path, validated_plan))

@@ -330,10 +330,17 @@ def new_declaration_issues(
         if key in known_ids:
             continue
         try:
-            parse_execplan_text(entry.path, entry.text, require_priority=True, validate_sources=False)
+            metadata = parse_execplan_text(entry.path, entry.text, require_priority=True, validate_sources=False)
         except RuntimeError as error:
             issues.append(CatalogIssue(key, entry.path, "invalid-plan",
                                       f"신규 ExecPlan 형식이 유효하지 않습니다: {error}"))
+        else:
+            from . import verify_input_requests
+            try:
+                verify_input_requests.validate_new_priority(entry.sources, metadata["priority"])
+            except verify_input_requests.InvalidNewVerifyInputPriority as error:
+                issues.append(CatalogIssue(key, entry.path, "invalid-manager-source-priority", str(error),
+                                           "manager:verify-inputs"))
         if pinned.regular_paths is not None or root is not None:
             for source in entry.sources:
                 if not _source_exists(root, source, allow_archive_fallback=False,
@@ -529,10 +536,13 @@ def insert_published_plan_row(
     plan: Mapping[str, object],
     content_hash: str,
     revision_sha: str,
-    *, publication_content_hash: str | None = None,
+    *, publication_content_hash: str | None = None, archive_fallback: bool = False,
 ) -> None:
     """Register validated publication metadata without reading a worktree."""
 
+    if not archive_fallback:
+        from . import verify_input_requests
+        verify_input_requests.validate_new_priority(plan.get("sources", ()), plan.get("priority"))
     sources, dependencies, priority = serialize_plan_metadata(plan)
     initial_level = _worker_level(str(plan["complexity"]), str(plan["risk"]))
     connection.execute(
@@ -571,7 +581,7 @@ def insert_document_fallback(
     plan_sha = str(audit["plan_sha"] or revision_sha) if verified else revision_sha
     insert_published_plan_row(
         connection, repo, original_path, entry.metadata(), entry.content_hash,
-        plan_sha, publication_content_hash=original_hash,
+        plan_sha, publication_content_hash=original_hash, archive_fallback=entry.archived,
     )
     if not entry.archived:
         history.mark_active(repo, {entry.plan_id: entry})
@@ -908,7 +918,11 @@ class DefinitionStateRepository:
                 entries.update({entry.plan_id: entry for entry in pinned.recovery_definitions})
                 for plan_id, entry in entries.items():
                     from . import verify_input_requests
-                    verify_input_requests.validate(self.connection, repo, entry.text, entry.sources)
+                    verify_input_requests.validate(
+                        self.connection, repo, entry.text, entry.sources,
+                        is_new=(plan_id in new_plan_ids and not entry.archived),
+                        metadata=entry.metadata(),
+                    )
                     row = self.connection.execute(
                         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
                         (repo, plan_id),
@@ -1221,7 +1235,16 @@ class CatalogReconciliationService:
         from . import verify_input_requests
         for entry in pinned.snapshot.all.values():
             try:
-                verify_input_requests.validate(self.repository.connection, repo, entry.text, entry.sources)
+                verify_input_requests.validate(
+                    self.repository.connection, repo, entry.text, entry.sources,
+                    is_new=(entry.plan_id not in stored_ids and not entry.archived),
+                    metadata=entry.metadata(),
+                )
+            except verify_input_requests.InvalidNewVerifyInputPriority as error:
+                if not any(issue.plan_id == entry.plan_id
+                           and issue.code == "invalid-manager-source-priority" for issue in new_issues):
+                    new_issues.append(CatalogIssue(entry.plan_id, entry.path,
+                        "invalid-manager-source-priority", str(error), "manager:verify-inputs"))
             except RuntimeError as error:
                 new_issues.append(CatalogIssue(entry.plan_id, entry.path,
                     "unregistered-manager-source", str(error), "manager:verify-inputs"))
@@ -1827,7 +1850,7 @@ def _merged_execplan_ids(
 def register_published_plan_row(
     connection: sqlite3.Connection, repo: str, path: str,
     plan: Mapping[str, object], content_hash: str, plan_commit: str,
-    *, publication_content_hash: str | None = None,
+    *, publication_content_hash: str | None = None, archive_fallback: bool = False,
 ) -> None:
     """Apply a validated publication row without committing the caller event."""
     plan_id = str(plan["id"])
@@ -1870,7 +1893,7 @@ def register_published_plan_row(
         return
     insert_published_plan_row(
         connection, repo, path, plan, content_hash, plan_commit,
-        publication_content_hash=publication_content_hash,
+        publication_content_hash=publication_content_hash, archive_fallback=archive_fallback,
     )
 
 

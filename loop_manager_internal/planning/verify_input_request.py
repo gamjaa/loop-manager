@@ -67,6 +67,7 @@ def instruction(connection, repo: str, base: str, active_sha: str, *, git, git_b
     return ('\n\nManager가 최신 원격 base의 verify 입력 목록 부재/오류를 확인했습니다. '
             '기존 미완료 계획·draft·PR과 중복하지 않는 생성 계획 하나를 요청합니다. '
             '전체 구조와 실제 verify 스크립트를 확인하고 목록을 유지할 계획만 작성하세요. '
+            '새 계획의 priority는 critical이어야 합니다. 기존 작업을 선점하거나 dependency·유지보수 장벽을 우회하지 않습니다. '
             'sources는 [manager:verify-inputs]만 사용하고 Purpose는 다음 본문 그대로 유지하세요:\n'
             + contract.RULE + '\nDecision Log에 다음 요청을 그대로 기록하세요:\n'
             + contract.PREFIX + json.dumps(request, sort_keys=True))

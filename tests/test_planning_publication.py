@@ -45,6 +45,82 @@ from tests.support.planning_case import (
 )
 
 class PlanningPublicationTest(PlanningCase):
+    def test_new_manager_source_publication_requires_critical_before_db_confirmation(self):
+        from loop_manager_internal.catalog import execplan_catalog, manager_sources
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.storage import database, verify_input_requests
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        database._ensure_execplans_schema(connection)
+        repo = "/repo"
+        connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
+        request = verify_input_requests.register(connection, repo, "a" * 40)
+        connection.commit()
+        path = "docs/plans/[G-900] Verify Inputs.md"
+        worktree = Path("/publication")
+
+        def make_text(priority):
+            return (
+                "---\nid: G-900\ntitle: Verify Inputs\nsources:\n  - "
+                + manager_sources.SOURCE
+                + "\ndepends_on: []\ncomplexity: low\nrisk: medium\npriority: "
+                + priority
+                + "\n---\n\n## Purpose\n\n"
+                + manager_sources.RULE
+                + "\n\n## Acceptance Criteria\n\n- Keep scripts/verify-inputs.json current.\n\n"
+                + "## Decision Log\n\n"
+                + manager_sources.PREFIX
+                + json.dumps(request, sort_keys=True)
+                + "\n"
+            )
+
+        def publish(text):
+            plan = execplan_catalog.parse_execplan_text(path, text)
+            verify_input_requests.validate(connection, repo, text, plan["sources"])
+            row_effects = planner_publication.RegisterExecplanRowsEffects(
+                _ensure_execplans_schema=database._ensure_execplans_schema,
+                file_hash=lambda _path: execplan_catalog.plan_content_hash(text),
+                git=mock.Mock(),
+                git_bytes=mock.Mock(return_value=text.encode("utf-8")),
+            )
+            effects = planner_publication.RegisterExecplansEffects(
+                _register_execplan_rows=lambda db, target_repo, root, plans, commit:
+                    planner_publication._register_execplan_rows(
+                        row_effects, db, target_repo, root, plans, commit,
+                    ),
+            )
+            planner_publication.register_execplans(
+                effects, connection, repo, worktree, [(path, plan)], "published", "fingerprint",
+            )
+
+        for priority in ("high", "normal", "low"):
+            with self.subTest(priority=priority):
+                with self.assertRaisesRegex(RuntimeError, "priority: critical"):
+                    publish(make_text(priority))
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM exec_plans WHERE repo=? AND plan_id='G-900'", (repo,),
+                ).fetchone())
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM execplan_drafts WHERE repo=? AND plan_id='G-900'", (repo,),
+                ).fetchone())
+                project = connection.execute(
+                    "SELECT processed_sha FROM projects WHERE repo=?", (repo,),
+                ).fetchone()
+                self.assertIsNotNone(project)
+                self.assertIsNone(project[0])
+
+        publish(make_text("critical"))
+        row = connection.execute(
+            "SELECT priority,status FROM exec_plans WHERE repo=? AND plan_id='G-900'", (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("critical", "READY"))
+        self.assertEqual(connection.execute(
+            "SELECT processed_sha FROM projects WHERE repo=?", (repo,),
+        ).fetchone()[0], "published")
+
     def test_publication_uses_current_changes_after_manager_validation(self):
         path = "docs/plans/[G-001] Plan.md"
         for manager_changed in (True, False):
