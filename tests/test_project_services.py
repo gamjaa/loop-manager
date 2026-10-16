@@ -231,9 +231,12 @@ class ProjectServiceCompositionTests(unittest.TestCase):
         self.assertEqual(publication.commit_title, 'Compose project services through named callbacks')
         self.assertEqual(loop_manager.parse_worker_result.__wrapped__.__module__,
                          'loop_manager_internal.execution.result_validation')
-        # Keep the existing strict failure-report contract through the relocated export.
+        # Preserve both explicit zero-failure evidence and rejection of real failures.
+        clean = message + '\n이번 재검증에서 실패 없음.'
+        self.assertEqual(loop_manager.parse_worker_result(clean, plan).test_evidence,
+                         evidence + '\n이번 재검증에서 실패 없음.')
         with self.assertRaisesRegex(loop_manager.WorkerResultError, '해결되지 않은 targeted'):
-            loop_manager.parse_worker_result(message + '\n이번 재검증에서 실패 없음.', plan)
+            loop_manager.parse_worker_result(clean + '\nFAILED (failures=1)', plan)
 
     def test_project_stages_stop_at_preserved_failure_boundary(self):
         effects = project_service.RunProjectStepEffects(**{
