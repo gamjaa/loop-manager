@@ -17,6 +17,7 @@ from unittest import mock
 
 _current_writer: ContextVar[EventWriter | None] = ContextVar("verify_events", default=None)
 _fixture_timing_active: ContextVar[bool] = ContextVar("fixture_timing_active", default=False)
+_test_fixture_failures: ContextVar[dict[int, str] | None] = ContextVar("test_fixture_failures", default=None)
 _phase_names: ContextVar[tuple[str, ...]] = ContextVar("verify_phase_names", default=())
 
 
@@ -88,11 +89,23 @@ class TimedResult(unittest.TextTestResult):
 
     def addFailure(self, test, err):
         super().addFailure(test, err)
-        self._outcome(test, "failure")
+        failures = _test_fixture_failures.get()
+        fixture = failures.pop(id(test), None) if failures is not None else None
+        if fixture is None:
+            self._outcome(test, "failure")
+            return
+        self.writer.emit("fixture_result", id=test.id(), result="failure", scope=fixture)
+        self._outcome(test, "fixture_error")
 
     def addError(self, test, err):
         super().addError(test, err)
-        self._outcome(test, "error")
+        failures = _test_fixture_failures.get()
+        fixture = failures.pop(id(test), None) if failures is not None else None
+        if fixture is None:
+            self._outcome(test, "error")
+            return
+        self.writer.emit("fixture_result", id=test.id(), result="error", scope=fixture)
+        self._outcome(test, "fixture_error")
 
     def addSkip(self, test, reason):
         super().addSkip(test, reason)
@@ -136,6 +149,7 @@ def fixture_timing():
         yield
         return
     token = _fixture_timing_active.set(True)
+    fixture_failures = _test_fixture_failures.set({})
     names = ("_handleClassSetUp", "_tearDownPreviousClass", "_handleModuleFixture", "_handleModuleTearDown")
     try:
         with ExitStack() as patches:
@@ -147,6 +161,28 @@ def fixture_timing():
                 with phase(f'subtest:{test.id()}:{variants[test.id()]}'), subtest(test, *args, **kwargs):
                     yield
             patches.enter_context(mock.patch.object(unittest.TestCase, 'subTest', timed_subtest))
+            fixture_hooks = [(unittest.TestCase, "_callSetUp", "setUp"),
+                             (unittest.TestCase, "_callTearDown", "tearDown")]
+            if hasattr(unittest, "IsolatedAsyncioTestCase"):
+                fixture_hooks.extend(((unittest.IsolatedAsyncioTestCase, "_callSetUp", "setUp"),
+                                      (unittest.IsolatedAsyncioTestCase, "_callTearDown", "tearDown")))
+            for owner, name, scope in fixture_hooks:
+                original = getattr(owner, name)
+
+                def measured_test_fixture(test, *args, _original=original, _scope=scope, **kwargs):
+                    try:
+                        return _original(test, *args, **kwargs)
+                    except unittest.SkipTest:
+                        raise
+                    except KeyboardInterrupt:
+                        raise
+                    except BaseException:
+                        failures = _test_fixture_failures.get()
+                        if failures is not None:
+                            failures[id(test)] = _scope
+                        raise
+
+                patches.enter_context(mock.patch.object(owner, name, measured_test_fixture))
             for name in names:
                 original = getattr(unittest.TestSuite, name)
 
@@ -173,6 +209,7 @@ def fixture_timing():
                 patches.enter_context(mock.patch.object(unittest.TestSuite, name, measured))
             yield
     finally:
+        _test_fixture_failures.reset(fixture_failures)
         _fixture_timing_active.reset(token)
 
 

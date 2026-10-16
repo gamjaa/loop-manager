@@ -40,14 +40,43 @@ class TargetedHistoryTests(TestCase):
         self.assertEqual(self.repository.sequence('repo', 'G-1'), 3)
         self.assertFalse(self.repository.repeated('repo', 'G-2'))
 
-    def test_other_failures_are_separate_and_success_or_skip_breaks_the_streak(self):
-        for reset in ('success', 'skip', 'expected_failure', 'unexpected_success'):
+    def test_explicit_success_skip_and_expected_failure_break_the_streak(self):
+        for reset in ('success', 'skip', 'expected_failure'):
             with self.subTest(reset=reset):
-                self.repository.observe('repo', reset, [event('a'), event('b', result=reset),
-                    event('c'), event('d'), event('other', 'tests.Sample.test_other')])
+                self.repository.observe('repo', reset, [event('a')])
+                self.repository.observe('repo', reset, [event('b', result=reset)])
+                self.repository.observe('repo', reset, [event('c'), event('d')])
                 self.assertFalse(self.repository.repeated('repo', reset))
-                self.repository.observe('repo', reset, [event('e', result='error')])
+                self.repository.observe('repo', reset, [event('e')])
                 self.assertEqual(self.repository.repeated('repo', reset), ('tests.Sample.test_one',))
+
+    def test_unexpected_success_is_a_native_failure(self):
+        for run_id in ('a', 'b', 'c'):
+            self.repository.observe('repo', 'G-1', [event(run_id, result='unexpected_success')])
+        self.assertEqual(self.repository.repeated('repo', 'G-1'), ('tests.Sample.test_one',))
+
+    def test_distinct_test_ids_do_not_share_failure_counts(self):
+        first = 'tests.Sample.test_one'
+        second = 'tests.Sample.test_other'
+        self.repository.observe('repo', 'G-1', [event('a', first)])
+        self.repository.observe('repo', 'G-1', [event('b', first), event('other', second)])
+        self.assertFalse(self.repository.repeated('repo', 'G-1'))
+        self.repository.observe('repo', 'G-1', [event('c', first)])
+        self.assertEqual(self.repository.repeated('repo', 'G-1'), (first,))
+
+    def test_fixture_and_indeterminate_results_preserve_the_existing_streak(self):
+        for outcome in ('fixture_error', 'indeterminate'):
+            with self.subTest(outcome=outcome):
+                plan_id = outcome
+                self.repository.observe('repo', plan_id, [event('a'), event('b')])
+                self.repository.observe('repo', plan_id, [event('c', result=outcome)])
+                self.assertFalse(self.repository.repeated('repo', plan_id))
+                failures = self.connection.execute('''SELECT failures FROM targeted_test_streaks
+                    WHERE repo=? AND plan_id=? AND test_id=?''',
+                    ('repo', plan_id, 'tests.Sample.test_one')).fetchone()[0]
+                self.assertEqual(failures, 2)
+                self.repository.observe('repo', plan_id, [event('d')])
+                self.assertEqual(self.repository.repeated('repo', plan_id), ('tests.Sample.test_one',))
 
     def test_reaching_three_is_preserved_until_block_even_if_the_turn_later_passes(self):
         self.repository.observe('repo', 'G-1', [event('a'), event('b'), event('c'), event('d', result='success')])
@@ -303,6 +332,148 @@ class Sample(unittest.TestCase):
             self.assertEqual(targeted.main(['--unittest', 'module_that_does_not_exist']), 2)
             self.assertEqual(targeted.collect(directory), ())
 
+    def test_unittest_fixture_errors_subtests_and_unexpected_success_keep_native_meaning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project, records = root / 'project', root / 'records'
+            project.mkdir()
+            records.mkdir()
+            (project / 'case_lifecycle.py').write_text('''import unittest
+class SetUpBroken(unittest.TestCase):
+    def setUp(self): raise RuntimeError('setUp failed')
+    def test_case(self): pass
+class TearDownBroken(unittest.TestCase):
+    def tearDown(self): raise RuntimeError('tearDown failed')
+    def test_case(self): pass
+class BodyAndTearDownBroken(unittest.TestCase):
+    def tearDown(self): raise RuntimeError('tearDown failed too')
+    def test_case(self): self.fail('body assertion')
+class FixtureAssertionBroken(unittest.TestCase):
+    def setUp(self): self.fail('setUp assertion')
+    def test_case(self): pass
+class SubTests(unittest.TestCase):
+    def test_case(self):
+        with self.subTest(value=1): self.fail('subtest assertion')
+class UnexpectedSuccess(unittest.TestCase):
+    @unittest.expectedFailure
+    def test_case(self): pass
+class AsyncSetUpBroken(unittest.IsolatedAsyncioTestCase):
+    def setUp(self): raise RuntimeError('async case sync setUp failed')
+    async def test_case(self): pass
+class AsyncFixtureAssertionBroken(unittest.IsolatedAsyncioTestCase):
+    def setUp(self): self.fail('async case setUp assertion')
+    async def test_case(self): pass
+class AsyncBodyAndTearDownBroken(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self): self.fail('async case tearDown assertion')
+    async def test_case(self):
+        with self.subTest(value=1): self.fail('async body assertion')
+''', encoding='utf-8')
+            environment = dict(os.environ, LOOP_MANAGER_TARGETED_TEST_DIRECTORY=str(records),
+                               LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(project))
+            result = subprocess.run([sys.executable, str(Path(targeted.__file__).resolve()),
+                '--unittest', 'case_lifecycle'], cwd=project, env=environment,
+                capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            observed = {item['id'].split('.', 1)[1]: item['result'] for item in targeted.collect(records)}
+            self.assertEqual(observed, {
+                'AsyncBodyAndTearDownBroken.test_case': 'failure',
+                'AsyncFixtureAssertionBroken.test_case': 'fixture_error',
+                'AsyncSetUpBroken.test_case': 'fixture_error',
+                'BodyAndTearDownBroken.test_case': 'failure',
+                'FixtureAssertionBroken.test_case': 'fixture_error',
+                'SetUpBroken.test_case': 'fixture_error',
+                'SubTests.test_case': 'failure',
+                'TearDownBroken.test_case': 'fixture_error',
+                'UnexpectedSuccess.test_case': 'unexpected_success',
+            })
+            raw = next(records.glob('targeted-*.jsonl')).read_text(encoding='utf-8')
+            self.assertIn('"kind": "subtest_result"', raw)
+            self.assertIn('"scope": "tearDown"', raw)
+            self.assertIn('"scope": "setUp"', raw)
+
+    def test_module_and_class_fixture_errors_do_not_reset_test_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project, records = root / 'project', root / 'records'
+            project.mkdir()
+            records.mkdir()
+            environment = dict(os.environ, LOOP_MANAGER_TARGETED_TEST_DIRECTORY=str(records),
+                               LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(project))
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            ensure_schema(connection)
+            repository = TargetedTestRepository(connection)
+
+            (project / 'case_module_fixture.py').write_text('''import unittest
+def setUpModule(): raise RuntimeError('module fixture failed')
+class Sample(unittest.TestCase):
+    def test_case(self): pass
+''', encoding='utf-8')
+            identity = 'case_module_fixture.Sample.test_case'
+            repository.observe('repo', 'module', [event('a', identity), event('b', identity)])
+            result = subprocess.run([sys.executable, str(Path(targeted.__file__).resolve()),
+                '--unittest', 'case_module_fixture'], cwd=project, env=environment,
+                capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(targeted.collect(records), ())
+            self.assertFalse(repository.repeated('repo', 'module'))
+
+            (project / 'case_class_fixture.py').write_text('''import unittest
+class Sample(unittest.TestCase):
+    @classmethod
+    def tearDownClass(cls): raise RuntimeError('class fixture failed')
+    def test_case(self): pass
+''', encoding='utf-8')
+            identity = 'case_class_fixture.Sample.test_case'
+            repository.observe('repo', 'class', [event('a', identity), event('b', identity)])
+            result = subprocess.run([sys.executable, str(Path(targeted.__file__).resolve()),
+                '--unittest', 'case_class_fixture'], cwd=project, env=environment,
+                capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            completed = targeted.collect(records)
+            self.assertEqual([(item['id'], item['result']) for item in completed],
+                             [(identity, 'indeterminate')])
+            repository.observe('repo', 'class', completed)
+            self.assertFalse(repository.repeated('repo', 'class'))
+            raw = next(path for path in records.glob('targeted-*.jsonl')
+                       if 'case_class_fixture' in path.read_text(encoding='utf-8'))
+            self.assertIn('tearDownClass (case_class_fixture.Sample)', raw.read_text(encoding='utf-8'))
+
+    def test_class_fixture_errors_are_scoped_to_each_test_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project, records = root / 'project', root / 'records'
+            project.mkdir()
+            records.mkdir()
+            (project / 'case_owner_mismatch.py').write_text('''import unittest
+class AAffectedFirst(unittest.TestCase):
+    @classmethod
+    def tearDownClass(cls): raise RuntimeError('first class fixture failed')
+    def test_case(self): pass
+class BUnaffectedMiddle(unittest.TestCase):
+    def test_case(self): pass
+class CUnaffectedLast(unittest.TestCase):
+    def test_case(self): pass
+class ZAffectedLast(unittest.TestCase):
+    @classmethod
+    def tearDownClass(cls): raise RuntimeError('last class fixture failed')
+    def test_case(self): pass
+''', encoding='utf-8')
+            environment = dict(os.environ, LOOP_MANAGER_TARGETED_TEST_DIRECTORY=str(records),
+                               LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(project))
+            result = subprocess.run([sys.executable, str(Path(targeted.__file__).resolve()),
+                '--unittest', 'case_owner_mismatch'], cwd=project, env=environment,
+                capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            observed = {item['id'].split('.', 1)[1]: item['result']
+                        for item in targeted.collect(records)}
+            self.assertEqual(observed, {
+                'AAffectedFirst.test_case': 'indeterminate',
+                'BUnaffectedMiddle.test_case': 'success',
+                'CUnaffectedLast.test_case': 'success',
+                'ZAffectedLast.test_case': 'indeterminate',
+            })
+
     def test_junit_uses_a_fresh_report_and_preserves_parameter_identity(self):
         def execute(arguments, **_):
             Path(arguments[-1]).write_text('''<testsuite><testcase classname="suite" name="test_x[a]"><failure/></testcase>
@@ -314,6 +485,46 @@ class Sample(unittest.TestCase):
             self.assertEqual(targeted.main(['--junit', '--', 'test-tool', '{junit}']), 1)
             self.assertEqual({(item['id'], item['result']) for item in targeted.collect(directory)},
                              {('suite.test_x[a]', 'failure'), ('suite.test_x[b]', 'success')})
+
+    def test_junit_errors_and_unassigned_suite_errors_are_not_test_failures_or_successes(self):
+        def execute(arguments, **_):
+            Path(arguments[-1]).write_text('''<testsuites><testsuite tests="2" errors="2">
+                <testcase classname="suite" name="test_error"><error type="RuntimeError">details</error></testcase>
+                <testcase classname="suite" name="test_pass"/>
+            </testsuite></testsuites>''', encoding='utf-8')
+            return mock.Mock(returncode=0)
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.dict(os.environ, {'LOOP_MANAGER_TARGETED_TEST_DIRECTORY': directory}), \
+             mock.patch.object(targeted.subprocess, 'run', side_effect=execute):
+            self.assertEqual(targeted.main(['--junit', '--', 'test-tool', '{junit}']), 1)
+            self.assertEqual({item['id']: item['result'] for item in targeted.collect(directory)},
+                             {'suite.test_error': 'indeterminate', 'suite.test_pass': 'indeterminate'})
+            raw = next(Path(directory).glob('*.jsonl')).read_text()
+            self.assertIn('"native_result": "error"', raw)
+            self.assertIn('"scope": "junit_suite"', raw)
+
+    def test_junit_command_exit_does_not_change_completed_case_result(self):
+        def execute(arguments, **_):
+            Path(arguments[-1]).write_text('''<testsuite><testcase classname="suite" name="test_pass"/></testsuite>''',
+                                            encoding='utf-8')
+            return mock.Mock(returncode=9)
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.dict(os.environ, {'LOOP_MANAGER_TARGETED_TEST_DIRECTORY': directory}), \
+             mock.patch.object(targeted.subprocess, 'run', side_effect=execute):
+            self.assertEqual(targeted.main(['--junit', '--', 'test-tool', '{junit}']), 9)
+            self.assertEqual([(item['id'], item['result']) for item in targeted.collect(directory)],
+                             [('suite.test_pass', 'success')])
+
+    def test_junit_rejects_conflicting_case_outcomes_and_duplicate_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / 'report.xml'
+            for xml in (
+                '<testsuite><testcase classname="suite" name="test_x"><failure/><skipped/></testcase></testsuite>',
+                '<testsuite><testcase classname="suite" name="test_x"/><testcase classname="suite" name="test_x"/></testsuite>',
+            ):
+                report.write_text(xml, encoding='utf-8')
+                with self.subTest(xml=xml), self.assertRaises(ValueError):
+                    targeted.junit_results(report)
 
     def test_completed_events_survive_an_incomplete_final_line(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -427,6 +638,21 @@ class WorkerTargetedFailureTests(ExecutionFixture, TestCase):
         self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.assertFalse(TargetedTestRepository(self.connection).repeated('repo', 'G-047'))
         self.effects.agent.run_agent.assert_not_called()
+
+    def test_three_unexpected_successes_block_at_the_worker_boundary(self):
+        repository = TargetedTestRepository(self.connection)
+        self.effects.validation.parse_worker_result.side_effect = TargetedTestFailure('unresolved test')
+        for number in range(3):
+            def worker(*args, **kwargs):
+                repository.observe('repo', 'G-047',
+                    [event(str(number), result='unexpected_success')])
+                return self.agent(*args, **kwargs)
+            self.effects.agent.run_agent.side_effect = worker
+            outcome = self.handler.run(self.context())
+            self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK if number == 2
+                             else ExecutionOutcomeKind.RETRY)
+        self.assertEqual(outcome.recovery.observation.reason, RecoveryReason.TARGETED_TEST_EXHAUSTED)
+        self.effects.validation.verify.assert_not_called()
 
     def test_same_test_across_changed_candidates_blocks_on_the_third_execution(self):
         repository = TargetedTestRepository(self.connection)

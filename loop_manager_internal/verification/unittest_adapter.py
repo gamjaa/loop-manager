@@ -39,7 +39,7 @@ def bind_instrumentation():
     # Candidate helpers use the same context as the runtime's unittest hooks.
     candidate = sys.modules.get("loop_manager_internal.verification.timing")
     if candidate is not None and candidate is not instrumentation:
-        for name in ("_current_writer", "_fixture_timing_active", "_phase_names"):
+        for name in ("_current_writer", "_fixture_timing_active", "_test_fixture_failures", "_phase_names"):
             setattr(candidate, name, getattr(instrumentation, name))
 
 
