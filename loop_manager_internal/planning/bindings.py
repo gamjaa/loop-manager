@@ -93,6 +93,7 @@ def register(assembly: Composition) -> None:
             file_hash=assembly.callback('file_hash'),
             git=assembly.callback('git'),
             load_execplan_catalog=assembly.callback('load_execplan_catalog'),
+            _assert_mutable_ready_snapshot_current=assembly.callback('_assert_mutable_ready_snapshot_current'),
             mutable_snapshot_token=assembly.callback('mutable_snapshot_token'),
         ),
     )

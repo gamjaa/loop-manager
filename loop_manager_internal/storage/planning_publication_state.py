@@ -199,7 +199,7 @@ def apply_mutable_catalog_changes(
     for deletion in deletions:
         original = deletion.snapshot
         from . import execplan_draft_state
-        if agent and not deletion.judgment and original.plan_id in execplan_draft_state.pending_ids(connection, repo):
+        if agent and original.plan_id in execplan_draft_state.pending_ids(connection, repo):
             raise PlannerValidationError("사용자 판단 대기 draft를 삭제할 수 없습니다.")
         deletion_cas = cas
         preserved = None

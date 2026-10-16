@@ -910,6 +910,7 @@ class ValidatePlannerResultEffects:
     git: Callable[..., object]
     load_execplan_catalog: Callable[..., object]
     mutable_snapshot_token: Callable[..., object]
+    _assert_mutable_ready_snapshot_current: Callable[..., object] | None = None
 
 
 def validate_planner_result(
@@ -935,7 +936,9 @@ def validate_planner_result(
         from loop_manager_internal.catalog import draft_decisions
         resolutions = draft_decisions.prepare(connection, repo, worktree, mutable_snapshot)
         from loop_manager_internal.catalog import remote_deletions
-        withdrawals = remote_deletions.prepare_withdrawals(connection, repo, worktree, mutable_snapshot)
+        withdrawals = remote_deletions.prepare_withdrawals(
+            connection, repo, worktree, mutable_snapshot,
+            assert_current=effects._assert_mutable_ready_snapshot_current)
     # A resumed batch can still have Manager moves in the index/worktree.
     # Saved dirty paths are hints, not proof that a receipted move exists.
     observed = (set(effects.changed_files(worktree, active_sha))
@@ -1168,7 +1171,7 @@ def validate_planner_result(
             if original.execution_state and json.loads(original.execution_state)["ever_started"] and original.plan_id not in withdrawals:
                 raise RuntimeError("시작한 계획의 ID와 작업 경로를 보존해야 합니다.")
             if original.plan_id not in renamed_ids:
-                if execplan_catalog.parse_frontmatter(original.text).get("draft") == "true" and original.plan_id not in withdrawals:
+                if execplan_catalog.parse_frontmatter(original.text).get("draft") == "true":
                     raise RuntimeError("사용자 판단 대기 draft를 삭제할 수 없습니다.")
                 deletions.append(PlanDeletion(original, withdrawals.get(original.plan_id)))
 

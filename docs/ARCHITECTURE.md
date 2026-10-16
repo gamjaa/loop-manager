@@ -437,7 +437,11 @@ R-077의 수동 소유 계획과 start/submit 준비 intent 대상은 후보에�
 
 취소 이력은 원문·전체 실행 row·관련 선행 참조와 보존 자원의 정리 대기 이유를 가진다. branch·worktree는 그 증거만으로 제거하지 않는다. 최초 activation marker는 이후 READY로 돌아와도 유지한다.
 
-`remote_deletions`는 한 immutable 원격 tree에서 source resolver로 Requirement의 실제 삭제를 archive·rename과 구별하고 이전 원문·근거 revision을 catalog hold에 보존한다. 반복 관측에도 proof와 시작한 작업의 resume_status를 유지한다. Planner의 `REQUIREMENT_RECOVERY`는 source별 전체 철회·남은 목표 유지·불확실을 반환한다.
+`remote_deletions`는 한 immutable 원격 tree에서 source resolver로 Requirement의 실제 삭제를 archive·rename과 구별하고 이전 원문·근거 revision을 catalog hold에 보존한다. 과거 revision의 원문도 같은 resolver로 조회해 변경되지 않은 source 문자열이 동일 identity의 rename을 가리킬 수 있게 한다. 반복 관측에도 proof와 시작한 작업의 resume_status를 유지하고, 같은 source의 여러 hold는 영향 ID를 합친다. 원문·원문 revision·삭제 관측 revision이 다른 proof는 합치지 않는다. Planner 입력의 `deleted_goals`는 보존 원문과 `source_revision`을 전달하고 전체 recovery goal을 snapshot token에 결합한다.
+
+`REQUIREMENT_RECOVERY`는 작업 ID `id`, 삭제 경로 `source`, `outcome` (`withdrawn|retained|uncertain`), 공백이 아닌 `reason`의 배열이다. 기존 엄격한 tagged JSON parser로 중복 marker·object key와 잘못된 타입을 거부하고, 각 ID/source 쌍은 현재 snapshot의 영향 대상에 한 번만 나타나야 한다. Manager는 모든 삭제 source의 판단을 작업별로 대조하며 하나라도 전체 철회이면 나머지도 누락 없이 전체 철회여야 한다. 의미 판단은 Planner가 수행하고 일부 AC 변경은 기존 specification fingerprint·일반 개정 경계를 사용한다.
+
+Requirement 전체 철회에 따른 Manager의 문서 삭제 준비는 현재 recovery proof·실행 snapshot·실제 PR 부재와 수동 ownership fingerprint를 기존 게시 직전 검사로 재확인한다. 이 경로에서는 draft·미해결 사용자 판단을 삭제하지 않는다. 확인된 원격 ExecPlan 삭제의 catalog 취소와 구별하며 draft·피드백 표식만으로 실행·소유 이력을 추정하지 않는다. 시작한 문서 원문은 snapshot과 일치해야 하며 모든 source의 판단·원문을 CAS 영수증으로 먼저 보존한 뒤 문서를 제거한다. 보존 후 삭제 전 중단과 삭제 후 재개도 같은 영수증·현재 권한을 검증한다. 영수증과 복수 판단은 기존 withdrawal manifest·취소 감사에 포함되고, publication transaction의 rollback·재개 계약을 따른다.
 
 Manager는 유효한 남은 source·dependency와 현재 snapshot을 검증한 변경만 기존 planning manifest·publication transaction에 반영한다. 삭제된 선행 작업의 목표 판단과 대체 dependency는 기존 DEPENDENCY_RECOVERY 경계를 따른다.
 
