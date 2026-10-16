@@ -55,7 +55,6 @@ priority: high
 
 ## Progress
 
-- [x] 2026-10-20 소유 rebase의 `dc2051d0` 충돌 복구: `ff22660b`의 ExecPlan과 R-072·R-082·R-086을 대조했다. ARCHITECTURE·VERIFY는 최신 저장소 코드 입력 기준을 보존하면서 setup 입력 보완을 결합했다. 기존 목록·회귀 변경을 보존하고 자체 목록 및 setup bytes·kind·mode 무효화 unit test 2개를 지정 targeted runner로 실행해 통과했다. frontmatter·sources·사용자 결정은 수정하지 않았다. Git rebase는 진행 중이며 계속·완료와 최종 후보 검사는 Manager에 맡긴다. 일반 관측의 runtime 미확인 거부 제거·목록 밖 문서 제외 재확인·일반 성공 재사용은 아직 미구현이며 이번 충돌 복구를 해당 목표의 완료로 기록하지 않는다.
 - [x] eb797d3a의 일반 result_validation 관측은 runtime_identity=None이고 운영 증명 adapter는 고정 Linux isolated compile만 지원한다. 일반 자체 verify·목록 밖 문서의 새 제외 근거는 남은 목표다. 구현·테스트 실행 없음.
 - [x] 2026-10-09 `bac6f84e`의 공통 runner 연결을 정적으로 대조했다. `observe_verify_inputs`의 일반 관측은 계속 runtime_identity=None이며 연결된 runner는 isolated compile 관측에서도 unknown이다. 새 runner의 실행 구현과 입력 증명 미충족을 구분했고 구현·테스트·verify는 실행하지 않았다.
 - [x] 2026-10-13 `041e6ee8`에서 R-089 직접 구현의 `tests/test_execution_path.py`가 실제 setup 스크립트를 소비하지만 목록·고정 회귀·설계 설명은 여전히 제외함을 확인했다. 기존 입력 완전성 목표의 구체적 미충족으로 반영했으며 테스트 실행이나 새 verify 성공은 기록하지 않았다.
