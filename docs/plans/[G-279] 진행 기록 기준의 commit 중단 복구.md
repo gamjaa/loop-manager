@@ -37,7 +37,7 @@ priority: high
 - Worker는 `tests/test_execution_review_phase.py`의 commit 완료 복구, `tests/test_stage_documents.py`의 기록 기준 적용, `tests/test_runtime_state.py`의 원격 delta 소비에서 수정한 최소 targeted unit case만 실행한다. `tests/support/execution.py`의 Git double과 실제 checkpoint/SQLite를 재사용한다.
 - commit 전 intent→실제 commit 완료→완료 checkpoint 전 중단→새 handler 재개를 연결한다. 이전 원문·승인 tree·결과 commit·기준/적용 marker 보존, commit no-call, 재중단 뒤 동일 결과 no-op과 session/실패/검증 근거의 독립 보존을 확인한다. 미리 `after_head`를 채운 fixture만으로 완료하지 않는다.
 - tree/부모/소유/결과 commit 변경, 혼합 조건·frontmatter 변경·원문 부재, 원격 재전진·기록 제거, 연속 기록 commit과 checkpoint CAS 실패에서는 미확인 변경을 소비하지 않는다. 성공·거부 모두 실제 기준 row와 checkpoint를 검사한다.
-- 확정된 commit에서 `document_conditions_changed` 기록만 미해결 증거를 보존하며 검증 교정 commit을 허용한다. commit proof가 불일치하는 기록은 계속 차단하는 두 `tests/test_stage_documents.py` 회귀 case를 실행한다.
+- 미적용 기록이 있더라도 후속 소유 correction commit은 진행하며, 기존 기록을 새 intent로 덮지 않고 미확정 상태를 보존하는 `tests/test_stage_documents.py` 회귀 case를 실행한다. `document_conditions_changed`와 commit proof 불일치 기록 각각에서 후속 교정은 허용하고, proof 불일치 기록을 baseline에 반영하지 않는 기존 회귀도 유지한다.
 - `tests/test_execution_checkpoint_recovery_phase.py`, `tests/test_execution_publication_phase.py`, `tests/test_incremental_planning.py`의 기존 복구/게시 연결을 유지한다. 실제 commit 효과가 mock으로 확인되지 않는 경우에만 기존 Git fixture의 최소 연결 사례를 보강하며 정책 조합별 전체 실행을 반복하지 않는다.
 
 ## Progress
@@ -54,7 +54,9 @@ Manager rebase로 갱신된 HEAD `270d89a`를 기준으로 아래 다섯 개 개
 
 Manager verify의 최신 진단은 legacy `DefinitionSnapshot`의 `body_text=None` 상태에서도 commit path가 불완전한 `document_record`를 만들어, 다음 commit을 미해결 기록으로 차단하는 실패를 보였다. commit intent 생성은 변경 전 본문을 확보했을 때만 기록을 만들도록 제한했고, rebase adoption의 candidate-token 회귀에 phantom 기록이 없음을 assertion으로 추가했다. HEAD `d603899`에서 `tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_only_confirmed_worker_patch_carries_candidate_token_to_manager_commit`를 실행해 같은 selector가 통과했다.
 
-Reviewer feedback `unresolved-record-blocks-correction`에서 미적용 기록이 남으면 이후 검증 교정 commit도 영구 차단되는 경로를 확인했다. `_commit_owned()`는 proof가 확인된 `document_conditions_changed` 기록만 다음 intent로 덮지 않고 그대로 보존하며 후속 correction commit을 허용한다. 혼합 본문 변경 후 verify 실패를 두고 교정 commit을 수행해 이전 commit intent·baseline·미해결 사유·verify/review 결과가 유지되는 case와 proof 불일치에서는 교정 commit도 차단되는 case를 현재 후보 HEAD `5bda46d`에서 함께 실행해 두 개 모두 통과했다.
+Reviewer feedback `unresolved-record-blocks-correction`에서 미적용 기록이 남으면 이후 검증 교정 commit도 영구 차단되는 경로를 확인했다. `_commit_owned()`는 기존 미적용 `document_record`를 새 intent로 덮지 않고 보존하면서 후속 correction commit을 허용한다. 혼합 본문 변경 후 verify 실패를 두고 교정 commit을 수행해 이전 commit intent·baseline·미해결 사유·verify/review 결과가 유지되는 회귀를 HEAD `5bda46d`에서 통과시켰다. proof가 다른 경우에도 기록 자체를 성공으로 소비하지 않으며 이전 기준과 미해결 이유를 보존하는 기존 회귀를 유지한다.
+
+후속 Manager verify는 빈 `document_record` 기본값 `{}`까지 미해결 증거로 오인해, 기록이 아직 없던 commit의 intent에서 새 기록 생성이 빠지는 경로를 드러냈다. `_commit_owned()`가 실제 비어 있지 않은 미적용 기록만 보존하도록 고쳤고, `document_conditions_changed`와 commit proof 불일치 각각에서 실패한 verify/review 뒤 교정 commit이 기존 미확정 근거·기준·실패 결과를 보존하는 회귀를 추가했다. 첫 상태 snapshot fallback은 원인이 아니어서 제거했다. 2026-10-16 현재 worktree에서 Manager가 전달한 다섯 selector(후보 token selector의 true/false subtest 포함)와 두 correction selector, 총 일곱 selector를 targeted runner 한 번으로 새로 실행해 모두 통과했다 (`Ran 7 tests in 1.283s`, `OK`).
 
 전체 verify는 Worker에서 실행하지 않았다.
 
