@@ -557,7 +557,7 @@ class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
                     ).fetchone()
                     self.assertEqual(resumed.kind, loop_manager.ProjectRunKind.WAITING)
                     self.assertEqual(tuple(final), ("PR_OPEN", 0))
-                    self.assertEqual(roles, ["worker", "worker", "reviewer"])
+                    self.assertEqual(roles, ["worker", "reviewer"])
                     self.assertEqual(
                         self._source_checkout_snapshot(repo), source_before
                     )

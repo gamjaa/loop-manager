@@ -445,6 +445,13 @@ class WorkerHandler:
         if result.session_id and observed_session_id != result.session_id:
             session_started(result.session_id)
         if correction_turn is not None:
+            if turn_definition is not None:
+                delivered_guidance = common_guidance.worker_content_hash(
+                    self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id)
+                if delivered_guidance:
+                    # Delivery is recorded by the invocation, after its input capture.
+                    # Enrich only that evidence; never replace the invocation's conditions.
+                    turn_definition = replace(turn_definition, worker_guidance_hash=delivered_guidance)
             try:
                 marker = self.ports._rebase_observation(context).progress
                 self.ports.rebase_corrections.finish_turn(

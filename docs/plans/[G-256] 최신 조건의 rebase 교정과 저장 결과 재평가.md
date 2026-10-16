@@ -301,3 +301,48 @@ python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_rev
 결과: **PASS — 14 tests, exit 0**, 모든 test `ok`. 이전 후보의 성공을 이번 실행으로 재사용하거나 합산하지 않았다. Git/Agent는 mock, SQLite/파일은 독립 fixture다. unit 로그의 VERIFYING/REVIEWING은 mock 검증 단계 전이이며 실제 전체 verify/Review 성공이 아니다. unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집·필수 compile 선언을 확인했으며 실행 환경은 Python 3.12/Linux다.
 
 기존 수행/교정 원문을 보존하고 이번 검증 기록만 선택 계획 본문에 추가했다. frontmatter·sources·사용자 결정·Requirement·다른 ExecPlan·PLANS는 수정하지 않았다. 누적 PRODUCT·ARCHITECTURE의 보고 hash는 현재 base 대비 최종 diff에서 다시 확인했다. 전체 verify·Review·게시·Merge는 Manager의 후속 단계로 남기며 전체 suite/integration/compile·전체 lint/build/type check·scripts/verify·commit/push/PR 생성은 실행하지 않았다.
+
+
+## 전체 verify 전달 진단 교정 (2026-10-16, 1e9811cb revision 1)
+
+Manager summary `e15efee2a94ab1cb10eb470a13bed637`의 4282 success·7 skip·9 error·3 failure와 원본 worker 로그를 확인했다. 이는 전체 성공이 아니다. 현재 HEAD `12364ee`와 base `890d296`의 누적 구현·관련 테스트 및 현재 계획·검증 계약을 대조했다. 진단에서 생략된 `test_worker_conflict_scope`의 공통 fixture/오류 분류 문제도 확인했다.
+
+최초 충돌 해결 호출 전에 저장한 definition의 `worker_guidance_hash`가 비어 있고 실제 Agent 전달 뒤 invocation ledger에 hash가 생기면, 구현 조건 delta가 없어도 token이 달라 같은 Worker를 재호출했다. `WorkerHandler.run`은 응답 저장 전에 기존 `worker_content_hash()`로 실제 전달 근거만 호출 입력에 결합한다. 본문·sources·제약·고정 지침 원문은 호출 전 snapshot을 유지하고 현재 definition으로 교체하지 않는다. 새 mock/SQLite unit은 최초 전달 뒤 단일 Worker 결과가 완료 경계로 이어지고 저장 입력의 나머지 필드가 원래 호출과 같음을 검사한다. 기존 호출 중 조건 변경·근거 부재 회귀도 다시 실행했다.
+
+scope adapter의 중간 판정 전에 발생하는 일반 소유권 오류는 기존 최종 경계와 같은 `WorkspaceOwnershipError`로 전달하고, typed `RecoveryFailure`는 동일 객체로 보존해 PLAN_INPUT_INVALID/실제 범위 위반 원인을 유지한다. 완료 scope fixture에는 실제 관측 계약의 metadata/operations/staged/index를 채우고 중간 유예 검사와 완료 최종 검사 두 관측을 모두 유지했다. 실제 정책 회귀는 범위 위반의 typed 원인과 다른 소유권 오류를 각각 assertion한다. PR 철회 준비 테스트는 실제 PR 출현의 전용 `MutableReadyPRConflict`를 기대하도록 교정하며 파일 보존·최초/재개 조회 순서를 유지한다.
+
+PR 충돌 중 pause/재개와 autostash lifecycle의 역할 assertion 두 곳은 유효한 교정 뒤 불필요한 두 번째 Worker를 기대하지 않도록 `worker → reviewer`로 정합화했다. 원격·source 보존·실제 Git 효과·verify/PR assertion은 유지했다. empty conflict의 단일 Worker assertion은 여전히 유효하므로 변경하지 않았다. 이 세 실제 Git lifecycle 테스트는 Worker 실행 금지에 따라 실행하지 않았고 Manager 후속 검증에 남긴다. 초기 autostash의 중복 Worker/남은 index 증상과 empty conflict 재호출은 새 실제 전달 hash unit의 원인 교정으로 다룬다.
+
+최초 아래 targeted 실행은 신규 전달 hash 회귀 1 failure와 scope/PR 예외 16 errors로 종료했다. 첫 보완 뒤에는 실제 scope 위반의 typed 예외를 기존 일반 소유권 예외로 기대한 한 subtest error만 남았다. 해당 원인 assertion을 정확한 코드로 보완한 뒤 같은 명령의 최종 실행에서 모두 통과했다. 이전 두 실행을 통과로 집계하지 않는다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_first_worker_delivery_binds_guidance_to_saved_rebase_inputs tests.test_worker_conflict_scope.WorkerConflictScopeUnitTests tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_actual_pr_check_runs_before_any_receipt_or_unlink_and_on_resume
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_first_worker_delivery_binds_guidance_to_saved_rebase_inputs tests.test_worker_conflict_scope.WorkerConflictScopeUnitTests tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_actual_pr_check_runs_before_any_receipt_or_unlink_and_on_resume
+
+최종 재실행 결과: **PASS — 17 tests, exit 0**, 모든 test `ok`.
+
+추가로 typed 입력 오류 동일 객체 보존과 응답 선저장·호출 중 조건 변경·입력 부재·완료 다음 dispatch의 개별 unit만 확인했다.
+
+```sh
+python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_worker_conflict_scope.WorkerConflictScopeUnitTests.test_owned_rebase_preserves_typed_input_failure tests.test_execution_worker_phase.ExecutionWorkerPhaseTests.test_rebase_response_is_saved_before_metadata_failure_without_worker_retry tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_live_worker_ready_is_not_blessed_after_inputs_change_during_turn tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_saved_ready_without_definition_requires_same_session_reassessment tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_completed_changed_definition_survives_next_dispatch_without_worker
+```
+
+결과: **PASS — 5 tests, exit 0**. 현재 수정에 관련된 최종 성공 unit은 22개다. Git/Agent는 mock이고 SQLite/파일은 독립 fixture이며 mock verify 로그를 실제 전체 verify 성공으로 보고하지 않는다. unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집·필수 compile 선언과 기존 verify 입력 목록을 유지한다. 실제 실행은 Python 3.12/Linux다.
+
+ARCHITECTURE에 실제 전달 hash 결합 시점과 호출 전 조건 보존을 반영했다. PRODUCT의 기존 보장은 유지하며 누적 두 문서의 hash를 현재 base 대비로 다시 산출한다. 선택 계획 frontmatter·sources·사용자 결정·Requirement·다른 계획·PLANS는 변경하지 않았다. 전체 verify·실제 Git lifecycle/통합·Review·게시·Merge는 Manager에 남기며 commit/push/PR·scripts/verify·전체 suite/compile·전체 lint/build/type check는 실행하지 않았다.
+
+
+## 최신 완료 검사 경계와 autostash 교정 통합 (2026-10-16)
+
+지정 revision `97459737e66adb29fab32b38378d168b1129e492`의 ExecPlan·PRODUCT·R-082·R-072·R-055와 해당 코드 delta를 git show로 확인했다. 재생된 HEAD `d3f9c74` 및 stashed 교정을 대조했다. 최신 base는 replay/autostash가 실제 진행 중일 때만 앞선 검사를 유예하며 완료 형상은 기존 최종 경계의 단일 관측으로 검사한다. 이 최신 순서를 유지하고 scope adapter의 충돌 표식을 제거했다. 앞선 이력의 '완료 시 두 관측' 설명과 완료 scope 위반의 조기 typed 전달 설명은 당시 후보 기록이며 현재 적용 계약은 아니다.
+
+중간 검사에서는 stashed `RecoveryFailure` 보존을 결합해 입력 오류 등 확인된 원인을 일반 소유권 오류로 바꾸지 않는다. 완료 시에는 최신 base의 최종 검사/오류 경계를 유지한다. 완료 단일 관측 assertion과 실제 완료 정책의 소유권 오류 assertion을 최신 base에 맞추고, typed 입력 오류 동일 객체 보존 회귀는 실제 replay pending 형상에서 검사한다. 소유권·원격·index 보안·최종 범위 거부 assertion은 유지한다. 완료 관측 필드를 채운 fixture와 새 최초 전달 지침 hash unit도 보존했다.
+
+응답 저장 전에 실제 전달 지침 hash만 호출 입력에 결합하는 원인 교정, PR 충돌/자동 stash의 불필요한 후속 Worker 기대값 정합화, 공식 PR 경합 예외 기대값은 최신 base와 함께 유지된다. 기존 본문/수행 원문·문서 계약·frontmatter·sources·사용자 결정을 보존했다. Requirement·다른 계획·PLANS는 변경하지 않았다.
+
+```sh
+python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_worker_conflict_scope.WorkerConflictScopeUnitTests tests.test_execution_rebase_correction_phase.SavedRebaseInputTests.test_first_worker_delivery_binds_guidance_to_saved_rebase_inputs tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_worker_end_defers_intermediate_metadata_and_scope_but_rechecks_remote tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_actual_pr_check_runs_before_any_receipt_or_unlink_and_on_resume
+```
+
+현재 통합 후보 결과: **PASS — 20 tests, exit 0**, 모든 test `ok`. 이전 후보의 결과를 성공으로 재사용하지 않았다. Git/Agent는 mock, SQLite/파일은 독립 fixture다. unittest adapter v1·launcher Python·지원 3.11–3.14·독립 수집·필수 compile 선언을 유지하며 실제 실행은 Python 3.12/Linux다. 실제 Git lifecycle 세 개와 전체 verify/Review는 Manager의 후속 검증에 남긴다. 전체 suite/integration/compile·scripts/verify·전체 lint/build/type check는 실행하지 않았다.
+
+Worker는 파일 내용 충돌만 해결했으며 index 확정·autostash 정리·관리 Git 완료·게시·Merge는 Manager에 맡긴다. commit/push/PR 생성·rebase continue/stash·운영 SQLite 변경은 수행하지 않았다. PRODUCT·ARCHITECTURE의 누적 문서 보고 hash는 지정 base `9745973` 대비로 다시 산출했다.

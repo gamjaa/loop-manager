@@ -804,6 +804,31 @@ class SavedRebaseInputTests(ExecutionRecoveryScenarios, ExecutionFixture, TestCa
         self.assertIsNone(self.handler.rebase_corrections.get('repo', 'G-047').worker_result)
         self.assertNotIn('add', self.calls)
 
+    def test_first_worker_delivery_binds_guidance_to_saved_rebase_inputs(self):
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+        context, original = self.saved()
+        saved = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.handler.rebase_corrections.abandon_turn(
+            'repo', 'G-047', expected_generation=saved.generation)
+        delivered = {'hash': ''}
+        def worker(*args, **kwargs):
+            kwargs['on_session_started']('same-session')
+            delivered['hash'] = 'actual-worker-guidance'
+            return lm.AgentResult(0, self.message, session_id='same-session')
+        self.effects.agent.run_agent.side_effect = worker
+        with mock.patch('loop_manager_internal.agents.common_guidance.worker_content_hash',
+                        side_effect=lambda *_: delivered['hash']), \
+             mock.patch.object(self.handler, '_finish_worker', return_value='finished') as finish:
+            result = self.handler.run(context)
+        self.assertEqual(result, 'finished')
+        finish.assert_called_once()
+        self.effects.agent.run_agent.assert_called_once()
+        saved = self.handler.rebase_corrections.get('repo', 'G-047')
+        definition = DefinitionSnapshot.deserialize(saved.input_snapshot)
+        self.assertEqual(definition.worker_guidance_hash, delivered['hash'])
+        self.assertEqual(replace(definition, worker_guidance_hash=original.worker_guidance_hash), original)
+        self.assertEqual(saved.worker_result, self.message)
+
     def test_completed_pending_result_keeps_valid_worker_for_verify(self):
         context, definition = self.saved(pending='continue')
         self.effects = replace(self.effects, workspace=replace(

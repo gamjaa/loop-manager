@@ -103,6 +103,7 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
             dirty={}, operations={}, refs={'refs/heads/loop-manager/G-092': ('completed', '')},
             worktrees={str(self.worktree): ('HEAD=completed', 'branch=refs/heads/loop-manager/G-092')})
         self.completion_observation = SimpleNamespace(head='completed',
+            metadata=None, operations=(), staged=(), index=(),
             repository_state_fingerprint=loop_manager.managed_rebase_validation.fingerprint({
                 'refs': self.after.refs, 'worktrees': self.after.worktrees, 'config': self.after.config}))
         self.service.require_owned.return_value = (self.completion_observation, SimpleNamespace(
@@ -118,6 +119,16 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
         self.service.require_owned.side_effect = RuntimeError('remote or ownership differs')
         with self.assertRaises(loop_manager.WorkspaceOwnershipError):
             self.validate()
+
+    def test_owned_rebase_preserves_typed_input_failure(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        self.completed_rebase()
+        self.after = replace(self.before, index=self.after.index)
+        error = RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, 'invalid declaration')
+        self.service.require_owned.side_effect = error
+        with self.assertRaises(RecoveryFailure) as raised:
+            self.validate()
+        self.assertIs(raised.exception, error)
 
     def test_owned_completion_with_all_commits_skipped_accepts_unchanged_head(self):
         self.completed_rebase()
