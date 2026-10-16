@@ -1265,16 +1265,19 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                                  ('160000', 'current-bytes'))
         ports.git.assert_not_called()
 
-    def _user_document_service(self, document_intent=None, *, completed=False):
+    def _user_document_service(self, document_intent=None, *, completed=False, worktree=None, pending=True, worker=None):
         from tests.support.runtime import runtime_rebase_fixture
         from loop_manager_internal.git.managed_rebase_runtime import build_service
         connection, _, checkpoints, *_ = runtime_rebase_fixture(self)
+        worktree = worktree or Path('/owned')
+        if str(worktree) != '/owned':
+            connection.execute("UPDATE exec_plans SET worktree=? WHERE repo='repo' AND plan_id='G-047'", (str(worktree),))
         current = checkpoints.get('repo', 'G-047')
         checkpoints.record('repo', 'G-047', expected_generation=current.generation,
             operation='rebase', expected_head='before', target_base_oid='base',
             observed_remote_oid='remote', snapshot={**current.snapshot, 'before_head': 'before',
                 **({'rebase_documents': document_intent} if document_intent else {}),
-                'work_branch_integration': {'remote': 'remote', 'local_commit': 'local-user'}})
+                'work_branch_integration': {'remote': 'remote', 'local_commit': 'local-user'}, **(worker or {})})
         ports = mock.Mock()
         def git(_root, *args, **kwargs):
             output = ''
@@ -1283,17 +1286,19 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             elif args[0] == 'diff':
                 output = ''.join(':100644 100644 old user M\0' + path + '\0'
                     for path in ('docs/requirements/archive/UserGuidance.md', 'docs/requirements/archive/UserDesign.md'))
+            elif args[0] == 'hash-object':
+                output = 'worker-blob'
             return SimpleNamespace(stdout=output, returncode=0)
         ports.git.side_effect = git
         ports.requirement_archive_candidates.return_value = ()
         ports._published_plan_allows_common_plans.return_value = False
         ports._revision_execplan_input_fingerprint.return_value = 'published-input'
         ports._worktree_execplan_input_fingerprint.return_value = 'current-input'
-        ports._owned_rebase_metadata.return_value = {'head-name': 'refs/heads/loop-manager/G-047',
-                                                    'orig-head': 'before', 'onto': 'base'}
+        ports._owned_rebase_metadata.return_value = ({'head-name': 'refs/heads/loop-manager/G-047',
+                                                    'orig-head': 'before', 'onto': 'base'} if pending else None)
         ports._worker_path_allowed.side_effect = loop_manager._worker_path_allowed
         service = build_service(ports, connection, Path(REPO), Path('/state'),
-                                'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
+                                'repo', 'G-047', worktree, 'loop-manager/G-047')
         if completed:
             from tests.support.rebase_observations import decision_for, observation
             current = checkpoints.get('repo', 'G-047')
@@ -1306,8 +1311,41 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                     'current_rebase_acceptance': acceptance})
             ports._owned_rebase_metadata.return_value = None
             service = build_service(ports, connection, Path(REPO), Path('/state'),
-                                    'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
+                                    'repo', 'G-047', worktree, 'loop-manager/G-047')
         return ports, service
+
+    def test_selected_body_contract_accepts_worker_receipt_before_completion(self):
+        import base64
+        import hashlib
+        from tests.support.rebase_observations import observation
+        path = 'docs/plans/[G-047] Runtime.md'
+        pinned = b'---\nid: G-047\ntitle: Runtime\n---\n\nOriginal body.\n'
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            target = worktree / path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(pinned + b'Worker notes.\n')
+            digest = hashlib.sha256(pinned).hexdigest()
+            record = {'state': 'staged', 'target': 'base', 'before_head': 'before', 'paths': [path],
+                'originals': {path: {'base': {'mode': '100644', 'oid': 'pinned', 'blob': digest}}},
+                'blobs': {digest: base64.b64encode(pinned).decode()}}
+            signature = hashlib.sha256(str(target.stat().st_mode).encode() + b'\0' + target.read_bytes()).hexdigest()
+            worker = {'pending': 'continue', 'worker_result': 'accepted turn', 'stage_evidence': {'files': {path: signature}}}
+            for metadata, receipt in ((True, None), (False, worker)):
+                with self.subTest(metadata=metadata):
+                    _, service = self._user_document_service(record, worktree=worktree, pending=metadata, worker=receipt)
+                    current = observation(service.expected,
+                        metadata=(('head-name', 'refs/heads/loop-manager/G-047'), ('orig-head', 'before'), ('onto', 'base')) if metadata else None,
+                        index=(IndexEntry(path, '100644', 'worker-blob', 0, 'H', 0),),
+                        committed=(FileChange(path, '100644', '100644', 'old', 'worker-blob', 'M'),))
+                    self.assertTrue(service.adapters.contracts_allowed(current))
+                    if metadata:
+                        with self.assertRaises(journal.MutationEvidenceError):
+                            service.adapters.contracts_allowed(replace(current, metadata=None))
+            for changed in (pinned.replace(b'id: G-047', b'id: G-048'), target.read_bytes() + b'External notes.\n'):
+                target.write_bytes(changed)
+                _, service = self._user_document_service(record, worktree=worktree, pending=False, worker=worker)
+                self.assertFalse(service.adapters.contracts_allowed(current))
 
     def test_adopted_document_pin_does_not_reject_later_worker_notes(self):
         from tests.support.rebase_observations import observation

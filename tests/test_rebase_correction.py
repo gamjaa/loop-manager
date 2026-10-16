@@ -125,6 +125,78 @@ class RebaseCorrectionTests(TestCase):
 
 
 class DocumentConflictPolicyTests(TestCase):
+    def test_selected_worker_body_survives_mixed_rebase_and_restart(self):
+        from pathlib import Path
+        import base64
+        import hashlib
+        import json
+        import subprocess
+        import tempfile
+        from loop_manager_internal.git import rebase_documents
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+        path = 'docs/plans/[G-001] Goal.md'
+        header = ('---\nid: G-001\ntitle: Goal\nsources:\n  - docs/PRODUCT.md\n'
+                  'depends_on: []\ncomplexity: low\nrisk: low\npriority: normal\n---\n')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def git(*args, check=True):
+                return subprocess.run(['git', '-C', str(root), *args], check=check, capture_output=True)
+            git('init', '-b', 'main')
+            git('config', 'user.name', 'Regression')
+            git('config', 'user.email', 'regression@example.invalid')
+            target = root / path
+            target.parent.mkdir(parents=True)
+            target.write_text(header + '\n## Progress\n\nInitial.\n')
+            (root / 'app.py').write_text('initial\n')
+            git('add', '.'); git('commit', '-m', 'initial')
+            git('checkout', '-b', 'loop-manager/G-001')
+            target.write_text(header + '\n## Progress\n\nOld Worker notes.\n')
+            (root / 'app.py').write_text('worker\n')
+            git('commit', '-am', 'implementation')
+            before = git('rev-parse', 'HEAD').stdout.decode().strip()
+            git('checkout', 'main')
+            pinned = (header + '\n## Progress\n\nLatest conditions.\n').encode()
+            target.write_bytes(pinned)
+            (root / 'app.py').write_text('main\n')
+            git('commit', '-am', 'new conditions')
+            base = git('rev-parse', 'HEAD').stdout.decode().strip()
+            git('checkout', 'loop-manager/G-001')
+            self.assertEqual(git('rebase', 'main', check=False).returncode, 1)
+            self.assertIn(path.encode(), git('diff', '--name-only', '--diff-filter=U').stdout)
+            target.write_bytes(pinned)
+            git('add', '--', path)
+            original = {'mode': '100644', 'oid': git('rev-parse', f'{base}:{path}').stdout.decode().strip(),
+                        'blob': hashlib.sha256(pinned).hexdigest()}
+            item = {'state': 'staged', 'target': base, 'before_head': before,
+                    'paths': [path], 'originals': {path: {'base': original}},
+                    'blobs': {original['blob']: base64.b64encode(pinned).decode()}}
+            target.write_bytes(pinned + b'\nWorker implementation and targeted test notes.\n')
+            (root / 'app.py').write_text('main and worker\n')
+            signature = hashlib.sha256(str(target.stat().st_mode).encode() + b'\0' + target.read_bytes()).hexdigest()
+            snapshot = {'rebase_documents': item, 'pending': 'continue', 'worker_result': 'accepted Worker result',
+                        'stage_evidence': {'files': {path: signature}}}
+            git('add', '--', path, 'app.py')
+            git('-c', 'core.editor=true', 'rebase', '--continue')
+            self.assertFalse(git('status', '--porcelain').stdout)
+            self.assertEqual(git('symbolic-ref', '--short', 'HEAD').stdout.decode().strip(), 'loop-manager/G-001')
+            context = SimpleNamespace(worktree=root, plan=SimpleNamespace(path=path))
+            for saved in (snapshot, json.loads(json.dumps(snapshot))):
+                checkpoint = SimpleNamespace(operation='rebase', expected_head=before, target_base_oid=base, snapshot=saved)
+                rebase_documents.validate_final(context=context, checkpoint=checkpoint,
+                    git_bytes=lambda _root, *args: git(*args).stdout)
+            approved = target.read_bytes()
+            for changed in (approved.replace(b'risk: low', b'risk: high'), approved + b'\nExternal edit.\n'):
+                target.write_bytes(changed)
+                with self.assertRaises(RecoveryFailure):
+                    rebase_documents.validate_final(context=context, checkpoint=checkpoint,
+                        git_bytes=lambda _root, *args: git(*args).stdout)
+            target.write_bytes(approved)
+            # A clean replay alone cannot grant body permission without the accepted turn.
+            checkpoint.snapshot = {'rebase_documents': item}
+            with self.assertRaises(RecoveryFailure):
+                rebase_documents.validate_final(context=context, checkpoint=checkpoint,
+                    git_bytes=lambda _root, *args: git(*args).stdout)
+
     def test_clean_replay_after_document_adoption_is_not_accepted(self):
         from pathlib import Path
         from loop_manager_internal.execution.execution_rebase_handler import RebaseHandler

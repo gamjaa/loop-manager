@@ -383,6 +383,32 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         with self.assertRaisesRegex(CorrectionPending, 'preserve candidate'):
             service._archive_housekeeping()
 
+    def test_pending_rebase_defers_housekeeping_and_reaches_execution_recovery(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.application.project_service import ProjectService
+        from loop_manager_internal.git import manager_git_journal
+        service = ProjectService.__new__(ProjectService)
+        service.identity = SimpleNamespace(connection=self.connection, state_dir=self.root,
+            registered_only=False, refactoring_review_interval=5, recovery_request_id=None)
+        service.state = SimpleNamespace(repo='repo', repo_path=self.root, base='main', validated_agent_scope=None)
+        service.effects = SimpleNamespace(_execplan_archive_housekeeping_safe=lambda *_a, **_k: True,
+            dispatch_execplan_archive_housekeeping=mock.Mock(), operation_print=mock.Mock())
+        manager_git_journal.begin_rebase(self.root, owner='plan:G-001', repo='repo', target=str(self.root / 'owned'),
+            before={'head': 'before'}, expected={'branch': 'loop-manager/G-001', 'target_base_oid': 'base'})
+        active = next((self.root / 'manager-git-journal').glob('*/active.json'))
+        before = active.read_bytes()
+        service._prepare_repository = mock.Mock(return_value=None)
+        service._reconcile_catalog_and_cleanup = mock.Mock(return_value=None)
+        service._synchronize_pull_requests = service._archive_housekeeping
+        service._resume_manual_work = mock.Mock(return_value=None)
+        service._resume_existing_execution = mock.Mock(return_value=None)
+        service._run_coordinators = mock.Mock(return_value=0)
+        service.run()
+        service._resume_existing_execution.assert_called_once()
+        service._run_coordinators.assert_called_once()
+        service.effects.dispatch_execplan_archive_housekeeping.assert_not_called()
+        self.assertEqual(active.read_bytes(), before)
+
     def test_prepared_candidate_blocks_conflicting_manual_publication(self):
         from types import SimpleNamespace
         from loop_manager_internal.storage import work_claims

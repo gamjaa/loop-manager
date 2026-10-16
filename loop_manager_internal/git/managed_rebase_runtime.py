@@ -173,7 +173,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         if staged.returncode not in (0, 1):
             raise MutationEvidenceError('autostash index observation failed')
         content_pending = staged.returncode == 1
-    from loop_manager_internal.git.rebase_documents import document_path, adopted_originals
+    from loop_manager_internal.git.rebase_documents import document_path, adopted_originals, selected_plan_output
     metadata_owned = bool(isinstance(pending_metadata, dict) and checkpoint.operation == 'rebase'
         and pending_metadata.get('orig-head') == expected.before_head
         and pending_metadata.get('head-name') == f'refs/heads/{branch}'
@@ -260,6 +260,16 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                 mode, _ = read_file(worktree, path, desired['mode'])
                 if (mode, hashed.stdout.strip()) in document_blobs[path]:
                     document_files.add(path)
+    pending_plan_output = False
+    if expected.plan_path in document_blobs:
+        approved = selected_plan_output(checkpoint, worktree, expected.plan_path)
+        if not approved and metadata_owned:
+            approved = selected_plan_output(checkpoint, worktree, expected.plan_path, pending=True)
+            pending_plan_output = bool(approved)
+        if approved:
+            blob = ports.git(worktree, 'hash-object', '--no-filters', '--', expected.plan_path).stdout.strip()
+            document_blobs[expected.plan_path].add((approved['mode'], blob))
+            document_files.add(expected.plan_path)
     if not content_pending:
         options = {}
         try:
@@ -382,6 +392,8 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             and metadata.get('head-name') == f'refs/heads/{branch}'
             and metadata.get('orig-head') == expected.before_head
             and metadata.get('onto') == expected.target_base_oid)
+        if pending_plan_output and not owned_metadata:
+            raise MutationEvidenceError('current rebase phase changed; refresh selected plan contracts')
         conflicts = {entry.path for entry in observed.index
                      if entry.stage and entry.path in document_conflicts} if owned_metadata else set()
         if not metadata:

@@ -4,9 +4,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
+import stat
 
-from loop_manager_internal.catalog import catalog_service, requirement_sources
+from loop_manager_internal.catalog import catalog_service, execplan_catalog, requirement_sources
 from loop_manager_internal.catalog.frontmatter import requirement_identity
 from loop_manager_internal.git import rebase_file_evidence
 from loop_manager_internal.git.command_adapter import revision_requirement_documents
@@ -78,6 +80,51 @@ def adopted_originals(checkpoint):
     return originals
 
 
+def selected_plan_output(checkpoint, worktree, path, *, pending=False):
+    """Allow the selected body, retaining its declaration and accepted Worker bytes."""
+    identity = re.fullmatch(r'docs/plans/\[(G-\d{3,})\] [^/]+\.md', path)
+    if checkpoint.operation != 'rebase' or identity is None:
+        return None
+    saved = checkpoint.snapshot or {}
+    item = saved.get('rebase_documents') or {}
+    record = next((record for record in reversed([*item.get('history', []), item])
+        if record.get('state') in {'prepared', 'staged'}
+        and record.get('target') == checkpoint.target_base_oid
+        and record.get('before_head') == checkpoint.expected_head
+        and path in record.get('paths', ())), None)
+    if record is None:
+        return None
+    target = worktree / path
+    try:
+        if any(parent.is_symlink() for parent in [target, *target.parents]
+               if parent != worktree and worktree in parent.parents):
+            return None
+        info = target.lstat()
+        original = record['originals'][path]['base']
+        if not stat.S_ISREG(info.st_mode) or original.get('mode') not in {'100644', '100755'}:
+            return None
+        mode = original['mode'] if os.name == 'nt' else ('100755' if info.st_mode & stat.S_IXUSR else '100644')
+        if mode != original['mode']:
+            return None
+        raw = target.read_bytes()
+        pinned = base64.b64decode(record['blobs'][original['blob']], validate=True)
+        if hashlib.sha256(pinned).hexdigest() != original['blob']:
+            return None
+        declaration = execplan_catalog.parse_frontmatter(pinned.decode('utf-8'))
+        current = execplan_catalog.parse_frontmatter(raw.decode('utf-8'))
+        if declaration != current or current.get('id') != identity[1]:
+            return None
+        if not pending:
+            stage = saved.get('stage_evidence') or {}
+            signature = hashlib.sha256(str(info.st_mode).encode('ascii') + b'\0' + raw).hexdigest()
+            if (saved.get('pending') not in {'stage', 'continue'} or not saved.get('worker_result')
+                    or stage.get('files', {}).get(path) != signature):
+                return None
+        return {'mode': mode, 'blob': hashlib.sha256(raw).hexdigest()}
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, UnicodeError):
+        return None
+
+
 def validate_final(*, context, checkpoint, git_bytes):
     originals = adopted_originals(checkpoint)
     if not originals:
@@ -87,6 +134,11 @@ def validate_final(*, context, checkpoint, git_bytes):
     actual, _ = rebase_file_evidence.capture_originals(context.worktree, tuple(sorted(originals)),
                                                       {'head': 'HEAD'}, git_bytes)
     for path, desired in originals.items():
+        if path == getattr(getattr(context, 'plan', None), 'path', None):
+            approved = selected_plan_output(checkpoint, context.worktree, path)
+            head = actual[path]['head']
+            if approved and {key: value for key, value in head.items() if key != 'oid'} == approved:
+                desired = head
         content = {key: value for key, value in desired.items() if key != 'oid'}
         index = {} if desired.get('absent') else {'0': desired}
         if (actual[path]['head'] != desired or actual[path]['index'] != index
