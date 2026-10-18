@@ -19,6 +19,18 @@ from loop_manager_internal.git import managed_rebase_adoption
 from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 
 
+def _require_ignored_safe(effects, worktree, target=None, *, abort=False):
+    """Observe current paths only at a pending file/index write boundary."""
+    if abort:
+        detail = effects._rebase_resume_ignored_overlap(worktree, '--abort')
+    else:
+        overlaps = effects._ignored_paths_overlapping_git_update(worktree, target)
+        detail = ('원격 통합 tracked 경로와 겹치는 ignored 파일: ' + ', '.join(overlaps[:8])
+                  if overlaps else None)
+    if detail:
+        raise RuntimeError(detail)
+
+
 def normalized_tree(effects, worktree, snapshot, index_tree):
     """Build an application tree with Git attributes, retaining raw baselines."""
     with tempfile.TemporaryDirectory(prefix='loop-manager-integration-index-') as directory:
@@ -60,6 +72,7 @@ def _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, pla
         if (now.head, now.index, now.dirty, now.operations) != (
                 original.head, original.index, original.dirty, original.operations):
             raise RuntimeError('보존된 충돌 원형과 현재 작업물이 다릅니다.')
+        _require_ignored_safe(effects, worktree, abort=True)
         result = effects.git(worktree, '-c', 'core.hooksPath=/dev/null', 'rebase', '--abort', check=False)
         if result.returncode:
             raise RuntimeError('소유 rebase 재시작을 재시도합니다: ' + result.stdout[-2000:])
@@ -253,11 +266,6 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
         restart_base_rebase(effects, connection, repo_path, state_dir, repo, plan, remote, before)
         current = ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
         before = effects.capture_git_snapshot(worktree)
-    ignored = effects._nul_git_paths(worktree, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
-    changed_paths = effects._nul_git_paths(worktree, 'diff', '--no-renames', '--name-only', '-z', before.head, remote, '--')
-    if any(local == path or local.startswith(path + '/') or path.startswith(local + '/')
-           for local in ignored for path in changed_paths):
-        raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, '원격 변경과 ignored 로컬 작업물이 직접 충돌합니다.')
     if controlling_git_operation(before.operations) and current.operation != 'rebase':
         raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '사용자 Git 작업이 진행 중입니다.')
     if current.operation == 'rebase' and remote == known and not pending:
@@ -389,6 +397,7 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
     if intent is None:
         # The caller validated saved Agent output, current ownership, origin,
         # remote ancestry and ignored-path collisions before this boundary.
+        _require_ignored_safe(effects, worktree, remote)
         baseline = effects._capture_agent_baseline(repo, worktree, snapshot)
         preserved = json.loads(baseline) if baseline else None
         captured = effects.capture_git_snapshot(worktree)
@@ -418,6 +427,7 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                     or now.operations != before.operations):
                 raise RuntimeError('보존 commit 적용 전 로컬 작업물이 변경됐습니다.')
             if intent['local_commit'] != before.head:
+                _require_ignored_safe(effects, worktree, intent['local_commit'])
                 effects.git(worktree, '-c', 'core.hooksPath=/dev/null',
                             'update-ref', f'refs/heads/{branch}',
                             intent['local_commit'], before.head)
@@ -428,6 +438,7 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
         if effects.git(worktree, 'write-tree').stdout.strip() != intent['local_tree']:
             if now.index != before.index:
                 raise RuntimeError('보존 commit의 index가 사용자에 의해 변경됐습니다.')
+            _require_ignored_safe(effects, worktree, remote)
             effects.git(worktree, 'read-tree', intent['local_tree'])
             # Refresh only stat evidence for the newly pinned index. In
             # particular, binary entries may otherwise look unstaged until
@@ -442,6 +453,7 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
     if intent['phase'] == 'rebasing':
         current = checkpoints.get(repo, plan_id)
         if current.operation is None:
+            _require_ignored_safe(effects, worktree, remote)
             result = effects._journaled_direct_rebase(
                 connection, repo_path, repo, plan_id, worktree, branch, remote,
                 observed_remote=(remote,), agent_session_id=plan['worker_session_id'])
@@ -455,6 +467,7 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
             target=remote, remote_oid=remote)
         observed, decision = service.require_owned()
         if decision.status.value == 'ready_to_start':
+            _require_ignored_safe(effects, worktree, remote)
             result = effects._journaled_direct_rebase(
                 connection, repo_path, repo, plan_id, worktree, branch, remote,
                 observed_remote=(remote,), agent_session_id=plan['worker_session_id'])

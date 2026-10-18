@@ -853,6 +853,7 @@ invocation ledger는 각 호출의 목적·대상과 실제 실행 근거를 연
 
 - 시작 ignore 규칙으로 증명된 index-free ignored 파일의 생성·수정·삭제는 역할별 결과·planning·검증 입력 오류의 단독 원인이 아니다. tracked·staged·non-ignored 후보와 실제 Git 작업의 index 안전 조건·대상 연결·원격 lease는 계속 확인한다.
 - Worker targeted test → Manager verify → Reviewer는 같은 ExecPlan worktree에서 이어간다. ignored 확장자 allowlist·원상 복원 의무·별도 검증 worktree를 추가하지 않는다. 활성 ignored 파일과 들어오는 tracked 경로가 겹치면 파일을 보존하고 해당 Git 쓰기만 보류한다.
+- 원격 작업 통합은 최종 diff에서 사라진 중간 replay 경로와 대소문자·부모/자식 별칭도 보호한다. 보존 commit의 HEAD/index 적용·rebase 시작과 후속 입력의 소유 abort 직전에 현재 충돌을 다시 확인한다. 충돌이나 관측 실패에는 파일·진행 operation·보존 intent를 유지하며 완료 결과의 기록 수용은 쓰기를 반복하지 않는다.
 - 저장된 ignored-only 오탐은 시작 규칙·역사 결과·현재 소유권과 권위 상태를 검증해 기존 session·결과·단계에서 재개한다. 실제 위반·증거 부족·새로 숨긴 경로·강제 stage·독립 차단은 이 규칙으로 해제하지 않는다.
 - 정상 종료한 정확한 Manager 소유 planning/ExecPlan worktree는 ignored-only 상태에서도 전체 수명을 종료할 수 있다. 기본 checkout·소유권 불명·미게시 commit·권위 변경은 보존하며 활성 artifact를 임의로 삭제하지 않는다.
 

@@ -44,6 +44,8 @@ class ReconcilePublishedBlockedCheckpointEffects:
     _blocked_execplan_revision_metadata_error: Callable[..., object]
     _current_rebase_service: Callable[..., object]
     _evaluate_remote_checkpoint_cause: Callable[..., object]
+    _ignored_paths_overlapping_git_update: Callable[..., object]
+    _rebase_resume_ignored_overlap: Callable[..., object]
     _nul_git_paths: Callable[..., object]
     _published_plan_allows_common_plans: Callable[..., object]
     _reclassify_remote_checkpoint_block: Callable[..., object]
