@@ -47,7 +47,7 @@ priority: high
 기존 전용 홈·기본 인증 연결에 대한 정적 확인은 보존한다. 최신 원격 직접 구현에서는 `prepare_launch`가 세 OS 공통 홈을 직접 사용하고 `_read_only_link`를 제거했으며 설정 수명·과거 홈 보존·동시 역할의 임시 경로 회귀가 추가됐다.
 
 - [x] 준비 중 생성·교체된 설정을 probe 뒤와 profile/native 지침 조회 뒤 다시 검사하고, 최종 지문·정책을 현재 invocation에 결합했다. process handoff에서 설정·workspace snapshot 변경을 다시 거부하며 미시작 invocation 증거만 갱신한다.
-- [x] 관리 rebase 후 현재 후보 `61ecda6`에서 targeted runner로 configuration drift·probe 중 안전한 원자 교체·probe 중 확장 충돌·native 지침 조회 중 생성/충돌·read-only 관측의 안전한 생성·최종 검사 뒤 경쟁 변경·공통 홈 설정 수명 등 8개 unit case를 재실행해 모두 통과했다. 전체 verify는 실행하지 않았다.
+- [x] 관리 rebase 후 현재 코드 후보 `57cd72e`에서 프로젝트 Python의 targeted runner로 configuration drift·probe 중 안전한 원자 교체·probe 중 확장 충돌·native 지침 조회 중 생성/충돌·read-only 관측의 안전한 생성·최종 검사 뒤 경쟁 변경·호출 identity 결합 등 8개 unit case를 실행해 모두 통과했다. 전체 verify는 실행하지 않았다.
 - [x] PRODUCT·ARCHITECTURE·OPERATIONS에 정상 생성 수용과 검사·거부 순서를 반영했다.
 
 ## Decision Log
