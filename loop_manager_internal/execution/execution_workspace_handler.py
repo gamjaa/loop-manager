@@ -683,9 +683,6 @@ class WorkspaceHandler:
         plan_id = self.ports._plan_id_from_path(str(row['plan_path'] or ''))
         catalog_plan = self.ports.state.active_execplan(self.ports.identity.repo)
         self.ports.update_snapshot(catalog_plan=catalog_plan)
-        workspace_ownership = int(catalog_plan['workspace_owned'] if catalog_plan else 0)
-        workspace_owned = workspace_ownership == self.ports.contract.WORKSPACE_OWNED
-        workspace_reserved = workspace_ownership == self.ports.contract.WORKSPACE_RESERVED
         try:
             resolving_rebase = self.ports._resolving_rebase(row)
         except (RecoveryFailure, RuntimeError, OSError) as error:
@@ -693,6 +690,12 @@ class WorkspaceHandler:
                 classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                 str(error),
             )
+        row = self.ports._row()
+        catalog_plan = self.ports.state.active_execplan(self.ports.identity.repo)
+        self.ports.update_snapshot(catalog_plan=catalog_plan)
+        workspace_ownership = int(catalog_plan['workspace_owned'] if catalog_plan else 0)
+        workspace_owned = workspace_ownership == self.ports.contract.WORKSPACE_OWNED
+        workspace_reserved = workspace_ownership == self.ports.contract.WORKSPACE_RESERVED
         try:
             if plan_id is None:
                 raise self.ports.contract.WorkspaceOwnershipError('활성 ExecPlan 경로에서 ID를 확인할 수 없습니다.')

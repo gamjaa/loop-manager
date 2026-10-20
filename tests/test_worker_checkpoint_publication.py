@@ -133,7 +133,7 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
             "INSERT INTO exec_plans(repo, plan_id, path, title, sources, depends_on, priority, content_hash, "
             "status, plan_sha, active_sha, branch, worktree, workspace_owned) "
             "VALUES (?, 'G-001', 'docs/plans/[G-001] Resume.md', 'Resume', '[]', '[]', 'normal', 'hash', "
-            "'WORKING', ?, ?, ?, ?, 1)",
+            "'IMPLEMENTING', ?, ?, ?, ?, 1)",
             (str(repo), base, base, branch, str(repo)),
         )
         connection.commit()

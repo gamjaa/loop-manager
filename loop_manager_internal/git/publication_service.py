@@ -302,7 +302,7 @@ def push_worker_checkpoint_commits(
     """Push each already-validated linear Worker commit under an exact lease."""
     plan = effects.active_execplan(connection, repo)
     if (plan is None or plan['plan_id'] != plan_id
-            or plan['status'] not in {'WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'}
+            or plan['status'] not in {'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'}
             or int(plan['workspace_owned']) != WORKSPACE_OWNED
             or str(plan['branch'] or '') != branch
             or Path(str(plan['worktree'] or '')) != worktree
@@ -434,7 +434,7 @@ def push_worker_checkpoint_commits(
     for commit in commits:
         plan = effects.active_execplan(connection, repo)
         if (plan is None or plan['plan_id'] != plan_id
-                or plan['status'] not in {'WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'}
+                or plan['status'] not in {'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'}
                 or str(plan['branch'] or '') != branch
                 or Path(str(plan['worktree'] or '')) != worktree):
             raise PublicationSafetyError('Worker checkpoint 소유권이 push 도중 변경됐습니다.')

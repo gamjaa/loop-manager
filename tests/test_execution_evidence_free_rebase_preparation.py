@@ -24,6 +24,71 @@ class EvidenceFreeRebasePreparationTests(TestCase):
                       ('orig-head', 'before'), ('onto', 'base')),
             index=(IndexEntry('app.py', '100644', 'manual', 0, 'H', 0),), index_clean=False)
 
+    def test_missing_checkpoint_is_rebuilt_from_current_rebase_without_losing_work(self):
+        self.pending()
+        case = self.case
+        case.fixture.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        case.fixture.connection.execute("DELETE FROM execution_checkpoints")
+        case.state.update_project('repo', last_error='prior failure', publication_remote_oid='remote')
+        case.state.repository.update_plan('repo', 'G-047', plan_values={'workspace_owned': 0}, enqueue=False)
+        case.state.expected = case.state.repository.projected('repo')
+        case.handler.catalog_plan = case.state.active_execplan('repo')
+        before = dict(case.state.row())
+        self.assertTrue(case.handler._resolving_rebase(case.state.row()))
+        restored = case.checkpoint.get('repo', 'G-047')
+        self.assertEqual((restored.operation, restored.expected_head, restored.target_base_oid,
+                          restored.observed_remote_oid), ('rebase', 'before', 'base', 'remote'))
+        self.assertEqual(restored.snapshot['recovered_rebase_metadata'], dict(case.observed.metadata))
+        self.assertEqual(case.state.active_execplan('repo')['workspace_owned'], 1)
+        for field in ('worker_session_id', 'worker_result', 'verify_result', 'review_result', 'last_error'):
+            self.assertEqual(case.state.row()[field], before[field])
+        # Reentry consumes the same checkpoint instead of inventing another operation.
+        case.handler.catalog_plan = case.state.active_execplan('repo')
+        self.assertTrue(case.handler._resolving_rebase(case.state.row()))
+        self.assertEqual(case.checkpoint.get('repo', 'G-047'), restored)
+
+    def test_missing_checkpoint_rejects_unverified_remote_without_writing_recovery(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        self.pending()
+        case = self.case
+        case.fixture.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        case.fixture.connection.execute("DELETE FROM execution_checkpoints")
+        case.state.update_project('repo', publication_remote_oid='remote')
+        case.state.repository.update_plan('repo', 'G-047', plan_values={'workspace_owned': 0}, enqueue=False)
+        case.state.expected = case.state.repository.projected('repo')
+        case.handler.catalog_plan = case.state.active_execplan('repo')
+        case.observed = replace(case.observed, remote=replace(case.observed.remote, oid='foreign'))
+        with self.assertRaises(RecoveryFailure) as caught:
+            case.handler._resolving_rebase(case.state.row())
+        self.assertEqual(caught.exception.reason, RecoveryReason.OWNERSHIP_UNCERTAIN)
+        self.assertEqual(case.checkpoint.get('repo', 'G-047').generation, 0)
+        self.assertEqual(case.state.active_execplan('repo')['workspace_owned'], 0)
+
+    def test_missing_checkpoint_preserves_concurrent_runtime_change(self):
+        from unittest import mock
+        from tests.support.rebase_observations import scope_for
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        self.pending()
+        case = self.case
+        case.fixture.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        case.fixture.connection.execute('DELETE FROM execution_checkpoints')
+        case.state.update_project('repo', publication_remote_oid='remote')
+        calls = 0
+        def observe(expected, _adapters):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                case.state.repository.update_plan('repo', 'G-047',
+                    plan_values={'last_error': 'concurrent failure'}, enqueue=False)
+            return case.observed, scope_for(expected, case.observed)
+        with mock.patch('loop_manager_internal.git.managed_rebase_adoption.observe_current_rebase',
+                        side_effect=observe):
+            with self.assertRaises(RecoveryFailure) as caught:
+                case.handler._resolving_rebase(case.state.row())
+        self.assertEqual(caught.exception.reason, RecoveryReason.REMOTE_SNAPSHOT_RACE)
+        self.assertEqual(case.checkpoint.get('repo', 'G-047').generation, 0)
+        self.assertEqual(case.state.repository.get('repo', 'G-047').last_error, 'concurrent failure')
+
     def test_owned_detached_rebase_is_recognized_without_old_error_marker(self):
         self.pending()
         self.case.state.update_project('repo', last_error='different historical failure')

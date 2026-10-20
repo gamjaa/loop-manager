@@ -82,7 +82,16 @@ class RebaseHandler:
                     plan=ExecutionPlanMetadata(
                         plan_id=str(self.ports.snapshot().catalog_plan['plan_id']), title='', path='', plan_sha=None),
                     worktree=worktree, branch=str(row['branch'] or ''))
-                _, decision = self.ports._current_rebase_service(context).require_owned(checkpoint=current)
+                try:
+                    service = self.ports._current_rebase_service(context)
+                    if current.generation == 0:
+                        _, decision = self.ports.state.recover_rebase_checkpoint(checkpoint, service)
+                    else:
+                        _, decision = service.require_owned(checkpoint=current)
+                except manager_git_journal.MutationEvidenceError as error:
+                    if current.generation != 0:
+                        raise
+                    raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, str(error)) from error
                 return decision.status is RebaseStatus.WAITING
         rebase_error = str(row['last_error'] or '')
         rebase_recovery = bool(

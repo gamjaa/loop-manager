@@ -75,6 +75,38 @@ class ExecutionStatePort:
         row = self.repository.get(self.repo, self.plan_id)
         return {"last_error": row.last_error}
 
+    def recover_rebase_checkpoint(self, checkpoints, service):
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        expected = self.check()
+        current = checkpoints.get(self.repo, self.plan_id)
+        observed, decision = service.require_owned(checkpoint=current)
+        if current.generation != 0 or decision.status is not RebaseStatus.WAITING:
+            raise MutationEvidenceError('rebase recovery is no longer pending')
+        if service.require_owned(checkpoint=current) != (observed, decision):
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, 'rebase recovery observation changed')
+        with runtime_state._transaction(self.connection):
+            if (self.repository.projected(self.repo) != expected
+                    or checkpoints.get(self.repo, self.plan_id) != current):
+                raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, 'rebase recovery owner changed')
+            checkpoints.record(
+                self.repo, self.plan_id, expected_generation=0, operation='rebase',
+                expected_head=service.expected.before_head,
+                target_base_oid=service.expected.target_base_oid,
+                observed_remote_oid=observed.remote.oid,
+                snapshot={'before_head': service.expected.before_head,
+                          'target_base': service.expected.target_base_oid,
+                          'rebase_remote_oid': observed.remote.oid,
+                          'rebase_policy': 'current_state',
+                          'recovered_rebase_metadata': dict(observed.metadata)},
+            )
+            updated = self.repository.reserve_workspace(
+                self.repo, self.plan_id, reserved_value=1,
+                allowed_values=(expected.workspace_owned,))
+        self.expected = updated
+        return observed, decision
+
     def update_project(self, repo, *, preserve_transaction=False, **values):
         if repo != self.repo:
             raise runtime_state.RuntimeStateError("execution repository identity 불일치")

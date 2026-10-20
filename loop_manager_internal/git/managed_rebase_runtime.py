@@ -58,7 +58,12 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     checkpoint = ExecutionCheckpointRepository(connection).get(repo, plan_id)
     saved = checkpoint.snapshot or {}
     proof = saved.get('current_rebase_acceptance') or saved.get('completed_rebase') or saved.get('blocked_resume') or {}
+    recovered_metadata = None
     target = target or checkpoint.target_base_oid or proof.get('target_base_oid')
+    if not target and checkpoint.generation == 0:
+        recovered_metadata = ports._owned_rebase_metadata(worktree)
+        if recovered_metadata is not None:
+            target = recovered_metadata.get('onto')
     if not target:
         raise MutationEvidenceError('current rebase target is missing')
     expected_oid = (saved.get('rebase_remote_oid', checkpoint.observed_remote_oid)
@@ -80,9 +85,18 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                       str(expected_oid or ''), 'OPEN')
           if plan['pr_url'] else None)
     remote = Remote(repo, branch, expected_oid, pr)
+    if recovered_metadata is not None:
+        # Missing local history grants no lease: observe the current ref and PR.
+        expected_oid = ports.live_remote_branch_oid(ports.git, repo_path, branch)
+        live_pr = ports.pr_for_branch(repo_path, branch, str(plan['pr_url'] or '') or None)
+        if plan['pr_url'] and (live_pr is None or live_pr['url'] != plan['pr_url']):
+            raise MutationEvidenceError('recovered rebase PR identity differs')
+        pr = (PullRequest(str(live_pr['url']), repo, str(live_pr['headRefName']),
+                          str(live_pr['headRefOid']), str(live_pr['state'])) if live_pr else None)
+        remote = Remote(repo, branch, expected_oid, pr)
     if (str(plan['branch'] or '') != branch
             or str(plan['worktree'] or '') != str(worktree)
-            or int(plan['workspace_owned']) != WORKSPACE_OWNED):
+            or (int(plan['workspace_owned']) != WORKSPACE_OWNED and recovered_metadata is None)):
         raise MutationEvidenceError('current rebase reservation differs')
     project = connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()
     common_dir = ports.git(repo_path, 'rev-parse', '--git-common-dir').stdout.strip()
@@ -118,10 +132,11 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         repo=repo, repository_identity=identity, plan_id=plan_id,
         plan_path=str(plan['path']), worktree=str(worktree.resolve()), branch=branch,
         target_base_oid=target, generation=checkpoint.generation,
-        workspace_owned=int(plan['workspace_owned']) == WORKSPACE_OWNED,
+        workspace_owned=int(plan['workspace_owned']) == WORKSPACE_OWNED or recovered_metadata is not None,
         input_fingerprint=inputs, scope_fingerprint=policy, remote=remote,
         autostash_oid=saved.get('stash_oid') if checkpoint.operation == 'rebase' else None,
-        before_head=(checkpoint.expected_head if checkpoint.operation == 'rebase' else
+        before_head=(recovered_metadata.get('orig-head') if recovered_metadata is not None else
+                     checkpoint.expected_head if checkpoint.operation == 'rebase' else
                      proof.get('before_head') or saved.get('before_head')),
     )
 
@@ -130,7 +145,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         ports.validate_managed_worktree(repo_path, worktree, branch, allow_rebase=True)
         current = connection.execute('SELECT branch, worktree, workspace_owned FROM exec_plans '
                                      'WHERE repo = ? AND plan_id = ?', (repo, plan_id)).fetchone()
-        if tuple(current) != (branch, str(worktree), WORKSPACE_OWNED):
+        if tuple(current) != (branch, str(worktree), plan['workspace_owned']):
             raise MutationEvidenceError('current rebase reservation changed')
 
     def read_remote(_expected):

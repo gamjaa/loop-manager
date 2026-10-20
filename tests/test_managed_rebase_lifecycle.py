@@ -229,6 +229,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_legacy_checkpoint_restart_before_journal_seal(self):
         self._lifecycle(with_pr=False, legacy=True, sealed_restart=(False, True))
 
+    def test_missing_checkpoint_recovers_detached_rebase_and_continues(self):
+        self._lifecycle(with_pr=False, missing_checkpoint=True)
+
     def test_manual_checkpoint_completion_without_journal_reconfirms_candidate(self):
         self._lifecycle(with_pr=False, manual=True, missing_journal=True)
 
@@ -291,7 +294,8 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
 
     def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False,
                    manual=False, missing_journal=False, latest_base_advanced=False,
-                   publication_interruption=None, cumulative=False, definition_change=None, documents=None):
+                   publication_interruption=None, cumulative=False, definition_change=None, documents=None,
+                   missing_checkpoint=False):
         # Reuse only the deterministic service bundle, not the policy fixture's
         # substituted Manager rebase methods or its substituted journal writer.
         real_begin = journal.begin_rebase
@@ -698,11 +702,29 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             else:
                 handler._rebase_latest(handler._context(), handler._row(), target, publishing=with_pr)
                 self.assertTrue(lm._rebase_in_progress_for_branch(worktree, branch))
+            if missing_checkpoint:
+                connection.execute('DELETE FROM execution_checkpoints WHERE repo=? AND plan_id=?',
+                                   (repo_key, 'G-047'))
+                effects.state.repository.update_plan(repo_key, 'G-047',
+                    plan_values={'workspace_owned': 0}, enqueue=False)
+                effects.state.expected = effects.state.repository.projected(repo_key)
+                effects.state.update_project(repo_key, last_error='older failure')
+                preserved = (git(worktree, 'rev-parse', 'HEAD').stdout,
+                             git(worktree, 'ls-files', '--stage', '-z').stdout,
+                             (worktree / 'app.txt').read_bytes())
             handler = restart()
             if not publication_interruption:
                 conflict_context = handler.recover(handler._context())
                 self.assertNotIsInstance(conflict_context, ExecutionOutcome)
                 self.assertTrue(conflict_context.resolving_rebase)
+                if missing_checkpoint:
+                    self.assertEqual((git(worktree, 'rev-parse', 'HEAD').stdout,
+                                      git(worktree, 'ls-files', '--stage', '-z').stdout,
+                                      (worktree / 'app.txt').read_bytes()), preserved)
+                    restored = effects.checkpoint.get(repo_key, 'G-047')
+                    self.assertEqual(restored.operation, 'rebase')
+                    self.assertEqual(restored.target_base_oid, target)
+                    self.assertEqual(restored.expected_head, original)
             self.assertEqual(events, [])
             if definition_change:
                 # Manager-only integration boundary: real conflict/index and

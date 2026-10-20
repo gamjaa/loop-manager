@@ -1219,6 +1219,24 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     _plan_text = ('---\nid: G-047\ntitle: Runtime\nsources:\n  - docs/PRODUCT.md\n'
                   'depends_on: []\ncomplexity: medium\nrisk: medium\n---\n\nOriginal body.\n')
 
+    def test_missing_checkpoint_uses_current_metadata_and_live_remote_for_validation(self):
+        from loop_manager_internal.git.managed_rebase_runtime import build_service
+        from tests.support.runtime import runtime_rebase_fixture
+        ports, previous = self._user_document_service()
+        connection, runtime, checkpoints, *_ = runtime_rebase_fixture(self, legacy=True)
+        runtime.update_plan('repo', 'G-047', plan_values={
+            'workspace_owned': 0, 'worktree': previous.expected.worktree,
+            'publication_remote_oid': 'obsolete'}, enqueue=False)
+        service = build_service(ports, connection, Path(REPO), Path('/state'),
+            'repo', 'G-047', Path(previous.expected.worktree), 'loop-manager/G-047')
+        self.assertEqual(service.expected.target_base_oid, 'base')
+        self.assertEqual(service.expected.before_head, 'before')
+        self.assertEqual(service.expected.remote.oid, 'remote')
+        self.assertTrue(service.expected.workspace_owned)
+        service.adapters.validate_identity(service.expected)
+        self.assertEqual(checkpoints.get('repo', 'G-047').generation, 0)
+        self.assertEqual(runtime.get('repo', 'G-047').workspace_owned, 0)
+
     def test_auxiliary_markers_defer_final_document_scope_before_start(self):
         from loop_manager_internal.git.managed_rebase_runtime import build_service
         from tests.support.runtime import runtime_rebase_fixture
