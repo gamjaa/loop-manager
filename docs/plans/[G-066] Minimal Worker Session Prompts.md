@@ -8,6 +8,7 @@ sources:
   - docs/requirements/[R-061] Agent 역할·문서 권한과 draft ExecPlan 사용자 판단.md
   - docs/requirements/[R-066] Agent CLI 지침의 독립성.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
+  - docs/requirements/[R-093] 원격 작업 브랜치로 새 환경에서 이어하기.md
 depends_on:
   - G-058
   - G-065
@@ -45,6 +46,7 @@ depends_on:
   - G-266
   - G-267
   - G-268
+  - G-306
 complexity: high
 risk: medium
 priority: low
@@ -63,6 +65,7 @@ priority: low
 - 축약 뒤에도 Worker 권한, 일반 draft·User Decision 보호, 고정 원본 묶음과 역할별 실제 instruction, 결과 protocol, targeted test 범위와 전체 verify 분리, 비밀값 가림 및 세션·작업 공간 복구 계약은 유지된다. R-082의 선택된 ExecPlan 본문만 수정·frontmatter와 다른 ExecPlan 및 활성/archive의 모든 Requirement 변경 금지, 관련 PRODUCT·ARCHITECTURE·FUTURE_IDEAS 허용, source 문자열 보존·Planner/Manager 선언 교정 책임은 정합화된 Worker instruction에 유지한다. Manager가 선택 frontmatter를 부분 복원한 새 사실과 현재 diff·문서 보고 갱신 피드백은 같은 세션 또는 fallback의 미완료 문맥에 전달하고, 이를 권한 확대·검증 성공으로 표시하지 않는다. 과거 파일 승인 감사·작업물·session은 보존한다. 전송 도중 중단·재시작해도 새 정보를 누락하지 않는다.
 - 수동 complete/submit 수락 뒤 자동 Worker 교정에도 같은 초기·delta·복구 계약을 적용한다. 수동 문맥을 덧붙이는 경로가 이미 전달한 결과나 verify·Review 원문을 다시 넣지 않는다. verify 성공 출력은 Worker에게 전달하지 않으며 미해결 실패는 기존 진단 helper의 필요한 피드백으로 전달한다. 수동 제출의 전체 G·후보 R·미확인 외부 테스트와 사용자 생략을 보존하고 실제 Worker 성공으로 합성하지 않는다.
 - R-082의 프로젝트 일반 planning·개정 게시·DB 적용과 필요한 rebase를 마친 최신 ExecPlan을 최초·재개 Worker의 기준으로 전달한다. 상위 명세의 관련성·개정을 작업별 prompt에서 다시 판단시키지 않는다. 유효한 planning 결과가 작업 조건 유지를 확인했다면 source 지문·SHA 전진이나 순수 진행 기록만으로 Worker 호출·문맥 재전송을 만들지 않는다. 실제 조건 변경·미완료 보완과 기존 역할의 검증 입력은 보존하고 확인된 전달 cursor만 전진시킨다.
+- R-093/G-306의 checkpoint 요청·실제 로컬 commit·게시 결과를 완료 후보와 구분해 초기·delta·fallback 문맥에 연결한다. 고정 instruction에는 제한 실행·게시 대기·기존 Git 권한을 유지하고 사용자 메시지에는 새로 확인한 복구점·미해결 게시 결과·미완료 작업만 전달한다. 게시 대기 중 prompt 축약을 이유로 새 Worker 호출을 만들거나 checkpoint를 검증·Review 성공으로 표시하지 않는다.
 
 ## Implementation
 
@@ -72,6 +75,7 @@ priority: low
 - 교체 세션에는 저장 상태의 미완료 요점과 G-065의 미해결 진단만 구성하고 이전 `worker_result`·검증 원문은 넣지 않는다. 정적 코드 조회 안내의 초기 전달과 현재 rebase 후보·ExecPlan 변경에 필요한 재확인 지시는 기존 경계에 연결한다. Manager의 선택 frontmatter 복원은 기존 handler 피드백의 새 사실로 전달하며 반복되지 않은 동일 사실을 누락하지 않는다. 축약을 후보 검증 성공 재사용으로 취급하지 않으며 Requirement 완료 판단·이동은 현재 Planner·Manager 경계를 유지한다. archive 후보 변경 전달을 이유로 Worker의 Requirement 수정·이동을 다시 요구하지 않는다. 다른 문서의 파일·index 복원이나 사용자 판단 해소를 이 prompt 작업에서 구현하지 않는다.
 
 - `execution/manual_candidate.py`의 최종 Worker prompt도 같은 전달 경계에서 확인한다. 저장된 원문·지문·단계 결과는 보존하고 기존 focused feedback과 delta를 재사용한다. Reviewer의 최종 후보 근거 전달은 G-197에 남기며 생략 identity나 Review 성공 재사용을 새로 설계하지 않는다.
+- 확인한 `execution/worker_outcome.py`·`execution/execution_worker_handler.py`·`agents/agent_prompts.py`의 결과/전달 경계는 G-306이 정합화한 checkpoint protocol을 소비한다. 고정된 과거 instruction·session은 보존하고 같은 세션의 게시 확인과 새 세션의 미완료 요점만 기존 cursor에 연결한다. checkpoint 실행·게시·범위 검사와 재시작 intent 자체는 G-306/G-307에서 구현하며 이 계획에서 다시 만들지 않는다.
 
 ## Validation
 
@@ -83,6 +87,7 @@ priority: low
 
 - 기존 manual fixture로 수동 Worker prompt의 최소 unit case를 확인한다. Review 실패 뒤 저장된 verify PASS 출력, verify 실패 뒤 raw 출력 재추가, 동일 session 재개와 새 session fallback에서 중복·원문 복제가 없고 필요한 실패 진단·전체 G·후보 R은 남는지 검증한다. Manager 전체 verify는 생략 무효화·실제 Worker 교정·원문 및 실패 지문 보존과 수동/일반 Reviewer 입력의 회귀를 확인한다.
 - `tests/test_planning_selection.py`·`tests/test_stage_documents.py`의 최신 문서 진입 fixture와 실제 Worker prompt 구성을 연결한다. 프로젝트 planning 후 ExecPlan 조건 유지/변경, source 지문만 변경, 순수 기록·미확인 조건이 섞인 변경, 동일 session·fallback·전달 중 중단에서 필요한 새 조건은 전달하고 확인된 동일 문맥은 반복하지 않는지 최소 unit으로 확인한다. planning 미완료를 조건 무변경으로 대신 확정하거나 전달 cursor를 전진시키지 않는다. 필요한 Worker 호출의 prompt만 검사하며 전체 planning을 각 세션 조합마다 다시 실행하지 않는다.
+- G-306의 `tests/test_worker_result_contract.py`·`tests/test_execution_worker_phase.py` 회귀를 재사용해 checkpoint 이후 같은 session 재개·fallback에 새 복구점/미해결 결과만 전달하는지 확인한다. 게시 대기 중 호출 수는 0이어야 하며, 동일 게시 확인의 반복 전송·원문 전체 복사·성공 token 합성이 없어야 한다. 게시·로컬 commit의 실제 Git 효과를 각 prompt 조합에서 다시 실행하지 않는다.
 
 ## Progress
 
@@ -94,6 +99,8 @@ priority: low
 - [ ] 관련 targeted 회귀 사례 추가
 
 ## Decision Log
+
+- 5903c5aa full 검토와 snapshot token `3b4661249971e356420adeb51ba3837ed6a09b8da1b3fdafddbc451cba17844f`에서 R-093의 직접 구현과 남은 checkpoint 결과 경계를 대조했다. 원본 hash `8acf2fbe100d4ae785955d787befc138200885f1db2b3478584b9dd15223326d`·ID·경로·기존 수행 기록과 초기/delta/fallback 목표를 보존한다. G-306의 protocol을 선행으로 소비하며 checkpoint 기능을 중복 구현하지 않는다. complexity high는 기존 전달 cursor·session 전이의 판단, risk medium은 누락/중복 문맥과 기존 재전송 복구에 근거하며 분류·priority는 유지한다. 구현·테스트·verify 성공은 기록하지 않는다.
 
 - 삭제 목표 복구: snapshot token `c3fa67aed6ff2152c384831c025ad1d2eeace6e2345a52b1828144d3ce2392bb`의 취소 근거와 과거 revision `a285186a04ba87ffd504f61fc03580d8beefd38e`의 원문을 최신 R-061·R-064·R-082 및 Worker instruction·범위 검사와 대조했다. 남았던 사용자 명세 정합화는 직접 반영됐으므로 별도 선행 구현이 필요하지 않다. 이 개정은 기존 복구 문구의 존재만으로 보류 해소를 추정하지 않고 현재 취소 근거에 대한 판단을 게시하기 위한 것이다. 초기/delta/fallback 전달·권한 보존 회귀와 나머지 dependency·수행 기록은 유지한다. 취소·보류 해제는 Manager의 원격 게시·catalog 적용에서 확정하며 삭제 작업을 복원하거나 MERGED로 간주하지 않는다.
 DEPENDENCY_RECOVERY: {"deleted_id":"G-281","outcome":"obsolete","replacement_ids":[],"sources":["docs/PRODUCT.md","docs/requirements/[R-061] Agent 역할·문서 권한과 draft ExecPlan 사용자 판단.md","docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md","docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md"],"reason":"c126f5fc178a77f5add384949940d7cde0c0554e의 취소 근거에 보존된 원문은 R-061의 Worker 문서 권한 정합화만 남겼다. 최신 R-061은 선택 본문만 허용하고 모든 Requirement·다른 ExecPlan 변경을 금지하는 R-082 및 현재 instruction·검사와 일치하므로 대체 선행 구현이 필요하지 않다. 최소 prompt·권한 보존 회귀와 다른 선행 목표는 유지하며 취소를 구현·검증·Merge 성공으로 바꾸지 않는다."}
