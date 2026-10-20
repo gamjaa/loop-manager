@@ -40,6 +40,31 @@ class RemoteWorkAdoptionDatabaseTests(unittest.TestCase):
 
 
 class PullRequestHistoryTests(unittest.TestCase):
+    def test_production_ports_forward_history_and_preserve_default_lookup(self):
+        import loop_manager
+        from tests.support.execution import execution_fixture
+
+        fixture = execution_fixture(self)
+        repo_path = Path('/repo')
+        branch = 'loop-manager/G-047'
+        pull_request = {'url': 'existing-pr', 'state': 'OPEN'}
+        with mock.patch.object(loop_manager, 'pr_for_branch', return_value=pull_request) as lookup:
+            ports = loop_manager._ExecutionLifecyclePorts(
+                fixture.connection, fixture.repository,
+                repo='repo', repo_path=repo_path, state_dir=Path('/state'),
+                base='main', base_sha='base', provider='codex',
+                config_path=Path('/config'), newly_activated=False,
+            )
+            for url in (None, 'existing-pr'):
+                for history in (False, True):
+                    with self.subTest(url=url, history=history):
+                        args = (repo_path, branch, url) if url else (repo_path, branch)
+                        options = {'history': True} if history else {}
+                        result = ports.effects.publication.pr_for_branch(*args, **options)
+                        self.assertEqual(result, pull_request)
+                        lookup.assert_called_once_with(*args, **options)
+                        lookup.reset_mock()
+
     def test_merged_history_wins_over_an_open_pr_for_the_same_branch(self):
         effects = github_observation.PrForBranchEffects(command=mock.Mock(return_value=subprocess.CompletedProcess(
             [], 0, json.dumps([

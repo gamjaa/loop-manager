@@ -206,10 +206,11 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     verify_timeout_seconds = identity.pop("verify_timeout_seconds", 600)
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     lookup_pr = dependencies.pr_for_branch
-    def execution_pr(repo_path, branch, url=None):
+    def execution_pr(repo_path, branch, url=None, *, history=False):
         from loop_manager_internal.recovery.deleted_branch_restart import current_pr
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
-        pr = lookup_pr(repo_path, branch, url) if url else lookup_pr(repo_path, branch)
+        options = {'history': True} if history else {}
+        pr = lookup_pr(repo_path, branch, url, **options) if url else lookup_pr(repo_path, branch, **options)
         plan = state.active_execplan(identity['repo'])
         if plan is not None and plan['branch'] == branch:
             pr = current_pr(ExecutionCheckpointRepository(connection).get(identity['repo'], str(plan['plan_id'])), pr)
