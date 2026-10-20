@@ -43,6 +43,7 @@ Manager의 실제 verify 입력 목록 누락 요청에 따라 새로 만드는 
 - [x] 2026-10-16 요청 prompt, 일반/유지보수 Planner 검증, revision-pinned catalog 검증, 최초 row 삽입에 `critical` 규칙을 연결했다. 등록된 기존 row·draft·PR과 archive fallback은 새 조건으로 보류하거나 재기록하지 않도록 유지했다. PRODUCT·ARCHITECTURE에 제품 정책과 catalog 보장 경계를 반영했다.
 - [x] 2026-10-16 선택 unittest adapter의 targeted runner로 요청/Planner/catalog·실제 publication DB·maintenance 검증 8개 단위와 기존 PR 소유 상태·일반 source 등록·요청 중복 방지 4개 단위를 실행해 통과했다. 초기 실행의 fixture 오류를 수정한 뒤 같은 targeted 명령이 통과했다. 전체 verify·Review는 Worker가 실행하지 않았다.
 - [x] 2026-10-20 Manager checkpoint에서 3회 실패로 기록된 신규 maintenance source priority 단위를 targeted runner로 다시 실행해 통과했다. 요청·catalog 21개, 게시 직전 SQLite 등록 1개, 일반/유지보수 prompt 2개도 targeted runner로 통과했다. 전체 verify·Review는 Worker가 실행하지 않았다.
+- [x] 2026-10-20 관리 rebase 수용 뒤 현재 HEAD `af280298`과 base `ff22660`의 최종 diff 11개 파일을 다시 검토했다. `scripts/verify.json`의 unittest version 1·launcher Python과 `docs/VERIFY.md`의 Python 3.11–3.14 지원 계약을 확인하고 이전 후보 결과를 재사용하지 않았다. 지정 targeted runner로 `tests.test_verify_input_requests.VerifyInputRequestTest`, `ManagerSourceCatalogGateTest`, `VerifyInputPlanningPromptTest`, `PlanningPublicationTest.test_new_manager_source_publication_requires_critical_before_db_confirmation`, `MaintenanceAuthorityTest.test_new_manager_source_maintenance_plan_requires_critical_priority`를 실행해 25개 모두 통과했다. 전체 verify·Review는 Manager가 수행한다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
