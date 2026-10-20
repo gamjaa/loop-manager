@@ -1626,7 +1626,7 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 | 실행 | 목록 자체·선택한 저장소 verify 진입점·코드/테스트/의존성·검증 선언의 파일 입력을 결합 |
 | 생성물·의존성 | Git 내부·bytecode·`.venv` 등 설치 환경은 비교 대상 밖이다. 저장소 의존성 선언·lock 파일과 테스트 고정 자료는 코드 입력이다. |
 
-다음은 R-072에서 채택한 코드 입력 관측 계약이며 기존 환경 완전성 adapter를 이 기준으로 전환하는 구현이 필요하다. `InputObservation.proven`은 유효 목록·저장소 코드 입력 관측·목록 밖 코드 누락 확인과 `fingerprint`/`reason`으로 판단한다. 파일을 읽거나 비교할 수 없는 경우는 미확인이며 runtime·Git/외부 identity의 `None`은 그 자체로 미확인이 아니다. 기존 환경 관측 자료는 감사로 보존할 수 있으나 코드 기준 재사용 gate로 사용하지 않는다. 목록 밖 제외 근거는 아래 completeness token의 코드 입력에 결합한다.
+관측은 R-072의 저장소 코드 입력 기준을 사용한다. `InputObservation.proven`은 유효 목록·저장소 코드 입력 관측·목록 밖 코드 누락 확인과 `fingerprint`/`reason`으로 판단한다. 파일을 읽거나 비교할 수 없는 경우는 미확인이며 runtime·Git/외부 identity의 `None`은 그 자체로 미확인이 아니다. 기존 환경 관측 자료는 감사로 보존할 수 있으나 코드 기준 재사용 gate로 사용하지 않는다. 목록 밖 제외 근거는 아래 completeness token의 코드 입력에 결합한다.
 
 입력 목록의 부재·오류는 관측을 미확인으로 만들어 전체 verify를 유지한다. 공통 runner 연결 선언 `scripts/verify.json`의 형식·지원 오류는 [공통 verify 실행 경계](#공통-verify-실행-경계)에 따라 실행 실패이며 두 파일의 오류 처리를 혼동하지 않는다.
 
@@ -1717,7 +1717,11 @@ source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 �
 | 범위 밖 | 설치 Python/Git/Bash/Perl·native library·환경변수·사용자/시스템 설정·외부 파일/동적 입력·Git HEAD/이력/revision 값은 지문·완전성의 필수 조건이 아니다. |
 | 전체 실행 | 목록/코드 관측 오류·코드 입력 누락 의심·변경·유효한 실제 전체 성공 부재에서는 전체 verify를 실행한다. |
 
-현재 구현은 일반 경로에서 `runtime_identity=None`을 미확인으로 취급하며 고정 Linux isolated compile에만 환경·runtime 측정을 결합한 증명을 제공한다. 이는 새 정책의 완료 조건이 아니라 전환할 기존 구현이다. 일반 runner가 외부 의존성을 모두 증명하거나 고정 toolchain·통제된 Linux 환경을 도입해야 코드 기준 재사용을 구현할 수 있다고 판단하지 않는다. 기존 runtime 측정 자료·receipt는 보존하되 새 판정에서 불필요한 환경 증명은 제외한다.
+일반 경로와 isolated compile의 입력 관측은 같은 코드 기준을 사용하며 `runtime_identity=None`·환경·Git/외부 identity의 미확인이나 변경만으로 재사용을 거부하지 않는다. 선택한 저장소 진입점과 연결 선언이 목록에서 빠지면 미확인이다. fingerprint는 선택 파일과 진입점의 상대경로, 목록 bytes·해석 규칙, 실행 중인 관측·runner/adapter·receipt 판정 코드 bytes를 결합한다. 예전 환경 지문을 현재 값으로 합성하지 않으며 기존 receipt와 실패 감사는 그대로 보존한다. compile 실행 fast path는 유지하지만 더 이상 설치 runtime을 측정하지 않는다.
+
+현재 문서 제외 재확인은 배포된 POSIX launcher의 고정 bytes 계약과 unittest 선언에서만 자동 수행한다. `impact_analysis.review_document`의 기존 문서 역할·정상 텍스트·명령 단계·소비 관계 검사를 현재 작업 파일에 적용한다. 관련 Python 원본과 문서가 최초 관측 bytes와 같아야 하며, 최종 관측에서 전체 completeness token을 다시 대조한다. 지원하는 stdlib 계약 밖 라이브러리·native 호출·동적/미해결 관계·새 코드·문서 소비는 재사용을 막는다. 문서 bytes·mode가 바뀌어도 코드 소비가 없음을 현재 확인하면 새 completeness와 원래 전체 run을 연결한다.
+
+이 확인은 범용 shell 분석이나 자체 저장소 전체의 제외 증명이 아니다. 다른 launcher·Windows snapshot/native 소비·일반 안내 문서/운영 설정 등 기존 검사로 확인할 수 없는 목록 밖 파일은 전체 verify 경로를 유지한다. 따라서 목록 밖 파일이 많은 자체 저장소의 일반 성공 재사용과 모든 문서-only/rebase 조건은 아직 완전히 충족하지 않는다. 환경 증명 부재를 이유로 새 infrastructure나 사용자 판단을 요구하지 않는다.
 
 실행 전후·reuse 확정 직전과 Review/게시 revision gate에서 코드 입력을 재관측한다. 외부 입력 관측은 DB 처리 밖에서 수행하고 짧은 확정 transaction에서 같은 실행 상태·소유 identity를 재확인한다. 코드가 달라졌거나 읽기·비교를 확정할 수 없으면 필요한 verify로 돌아간다. 과거 receipt는 새 기준의 코드 입력·원래 run·작업 주기·후보 연결을 확인할 수 있는 경우만 재평가하고 과거 입력을 현재 값으로 합성하지 않는다. reuse는 새 verify 실행·성공 감사·사용량을 만들거나 새 실패를 지우지 않는다. Reviewer의 명세·diff·실제 지침·승인과 publication token·원격 lease는 별도 조건이다. 일반 선행 Review PASS 뒤 실제 전체 run과 수동 면제의 별도 후보/설정 계약은 유지한다.
 

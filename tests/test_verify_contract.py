@@ -96,16 +96,15 @@ class VerifyContractTests(unittest.TestCase):
         (self.root / 'scripts/verify.json').write_text(json.dumps(self.declaration))
 
     def test_invalid_connection_observation_stays_unknown_until_execution_reports_failure(self):
-        from loop_manager_internal.verification import manager_adapter
-        (self.root / 'src').mkdir()
+        self.enterContext(mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix')))
+        (self.root / 'scripts/verify-inputs.json').write_text(json.dumps(
+            {'version': 1, 'paths': ['scripts/**']}))
+        (self.root / 'scripts/verify.sh').write_text('#!/bin/sh\nexit 0\n')
         self.declaration['version'] = 99
         self.declare_error()
-        with mock.patch.object(manager_adapter, 'isolated_compile_arguments', return_value=['compile']),                 mock.patch.object(manager_adapter.subprocess, 'run') as probe:
-            observation = manager_adapter.observe_isolated_compile(self.root,
-                self.root / 'scripts/verify.sh', ['compile'], {})
+        observation = result_validation.observe_verify_inputs(self.root)
         self.assertIsNone(observation.fingerprint)
         self.assertIn('invalid verify connection', observation.reason)
-        probe.assert_not_called()
 
     def test_schema_rejects_versions_duplicate_keys_stages_paths_and_shell_commands(self):
         valid = json.loads(json.dumps(self.declaration))

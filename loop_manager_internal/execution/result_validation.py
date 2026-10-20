@@ -230,19 +230,26 @@ def verify_arguments(worktree: Path):
 
 
 def observe_verify_inputs(worktree: Path):
-    """Arbitrary scripts have unmeasured dynamic/Git/external dependencies.
-
-    Never infer their absence from source spelling or a passing invocation.
-    The exact isolated compile contract has a bounded, measured adapter.
-    Everything else keeps the existing full verify fallback.
-    """
-    from loop_manager_internal.verification.manager_adapter import (
-        observe_inputs, observe_isolated_compile, isolated_compile_arguments)
-    script, arguments = verify_arguments(worktree)
-    if arguments == isolated_compile_arguments(script, worktree):
-        return observe_isolated_compile(worktree, script, arguments, dict(os.environ))
-    return observe_inputs(worktree, arguments, environment=dict(os.environ),
-                          runtime_identity=None)
+    """Observe repository inputs; missing code or exclusion evidence stays unknown."""
+    from dataclasses import replace
+    from loop_manager_internal.verification.manager_adapter import observe_inputs, reconfirm_documents
+    script, _arguments = verify_arguments(worktree)
+    # Observe the selected script even when execution uses the compile fast path.
+    # Absolute tool/worktree locations are not repository-code identities.
+    relative = script.relative_to(worktree).as_posix()
+    observation = observe_inputs(worktree, (relative,), environment={}, runtime_identity=None)
+    selected = {item[0] for item in observation.files}
+    if observation.fingerprint is not None and relative not in selected:
+        return replace(observation, reason='selected verify entrypoint outside manifest: ' + relative)
+    connection = worktree / 'scripts/verify.json'
+    if connection.is_file() and 'scripts/verify.json' not in selected:
+        return replace(observation, reason='verify connection outside manifest')
+    from loop_manager_internal.verification.contract import load, ContractError
+    try:
+        connection = load(worktree)
+    except ContractError as error:
+        return replace(observation, fingerprint=None, reason='invalid verify connection: ' + str(error))
+    return reconfirm_documents(worktree, observation, connection, script)
 
 
 from loop_manager_internal.application.task_scheduling import scheduled_call

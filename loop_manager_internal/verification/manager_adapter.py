@@ -1,10 +1,11 @@
 """기존 verify 실행 경계에 인스턴스 조율과 상태 디렉터리 진단을 전달한다."""
+from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
 import shutil
-import subprocess
 import sys
 from loop_manager_internal.runtime import operation_events as events
 
@@ -131,8 +132,8 @@ def observe_inputs(worktree, arguments, *, environment, runtime_identity,
                    git_inputs=None, external_inputs=None, completeness=None):
     """Provide candidate observations independently of execution/request creation.
 
-    The caller must supply the actual effective command/environment and measured
-    identities. Unconfirmed Git or external inputs remain unusable for reuse.
+    The command identifies the selected repository execution path. Environment,
+    runtime, Git and external identities do not gate repository-code reuse.
     """
     from loop_manager_internal.verification.inputs import observe
     return observe(Path(worktree), command=tuple(arguments), environment=environment,
@@ -169,72 +170,76 @@ def isolated_compile_arguments(script, worktree):
             _ISOLATED_COMPILE_PROGRAM]
 
 
-_COMPILE_RUNTIME_PROBE = r'''
-import hashlib, json, os, pathlib, sys
-if sys.platform != 'linux':
-    raise RuntimeError('native library measurement unavailable')
-files = {pathlib.Path(sys.executable).resolve()}
-def walk_error(error):
-    raise error
-for entry in sys.path:
-    root = pathlib.Path(entry)
-    if root.is_file():
-        files.add(root.resolve())
-    elif root.is_dir():
-        for directory, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
-            dirs[:] = sorted(d for d in dirs if d not in {'site-packages', 'dist-packages'})
-            if any((pathlib.Path(directory) / d).is_symlink() for d in dirs):
-                raise RuntimeError('external runtime directory')
-            files.update(pathlib.Path(directory) / name for name in names)
-for line in pathlib.Path('/proc/self/maps').read_text().splitlines():
-    parts = line.split(maxsplit=5)
-    if len(parts) == 6 and parts[5].startswith('/'):
-        files.add(pathlib.Path(parts[5]))
-entries = []
-for path in sorted(files):
-    before = path.stat()
-    data = path.read_bytes()
-    after = path.stat()
-    if any(getattr(before, key) != getattr(after, key) for key in (
-        'st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
-        raise RuntimeError('runtime changed during observation')
-    entries.append((str(path), str(path.resolve()), before.st_mode, hashlib.sha256(data).hexdigest()))
-value = (sys.version, sys.path, tuple(sys.flags), sys.getfilesystemencoding(),
-         os.geteuid(), os.getegid(), os.getgroups(), tuple(os.uname()), entries)
-print(hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest())
-'''
+def reconfirm_documents(worktree, observation, connection, script):
+    """Renew bounded document exclusions from current code and current bytes.
 
-
-def observe_isolated_compile(worktree, script, arguments, environment):
-    from loop_manager_internal.verification.inputs import InputObservation, digest
-    if arguments != isolated_compile_arguments(script, worktree):
-        return InputObservation(None, reason='unconfirmed script contract')
-    if not (worktree / 'src').is_dir() or (worktree / 'src').is_symlink():
-        return InputObservation(None, reason='unconfirmed source directory')
-    from loop_manager_internal.verification.contract import load, ContractError
+    Unsupported launchers, native consumers or uncertain Python reads retain the
+    full-run fallback. A passing run is never evidence for an exclusion.
+    """
+    if (observation.reason != 'unconfirmed inputs outside manifest'
+            or connection is None or connection.adapter != 'unittest'):
+        return observation
+    from loop_manager_internal.verification import impact_analysis
+    from loop_manager_internal.verification.inputs import observe
     try:
-        connected = load(worktree) is not None
-    except ContractError as error:
-        return InputObservation(None, reason=f"invalid verify connection: {error}")
-    if connected:
-        return InputObservation(None, reason='unconfirmed coordinated runtime environment')
-    # Native loader hooks would add executable dependencies outside this probe.
-    if any(key.startswith(('LD_', 'DYLD_')) for key in environment):
-        return InputObservation(None, reason='unconfirmed native loader inputs')
-    try:
-        # ponytail: Hash the isolated runtime on every observation. Reuse a
-        # runtime digest only after an immutable external identity is available.
-        result = subprocess.run([arguments[0], '-I', '-S', '-B', '-c', _COMPILE_RUNTIME_PROBE],
-            cwd=worktree, env=dict(environment), capture_output=True, text=True,
-            timeout=30, check=True)
-        identity = result.stdout.strip()
-        if len(identity) != 64 or any(char not in '0123456789abcdef' for char in identity):
-            raise ValueError('invalid runtime measurement')
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        return InputObservation(None, reason=str(error))
-    # -I -S excludes project imports/site packages; UTF-8 compilation does not
-    # execute source code or write bytecode. Its runtime is measured above; src bytes,
-    # types and modes still require a complete manifest observation below.
-    return observe_inputs(worktree, arguments, environment=environment,
-        runtime_identity=digest((_COMPILE_RUNTIME_PROBE, identity)),
-        git_inputs={}, external_inputs={'cwd': str(worktree.resolve())})
+        # ponytail: only the shipped launcher has an audited no-document contract.
+        # Extend with explicit launcher contracts; do not infer arbitrary shell IO.
+        launcher = '35a1b9a32849f1da31b25c0ecb780a2599664394e095f56fbfce535342bd2578'
+        if script.name != 'verify.sh' or hashlib.sha256(script.read_bytes()).hexdigest() != launcher:
+            return replace(observation, reason='unconfirmed document launcher contract')
+        selected = {item[0]: item for item in observation.files}
+        if selected[script.relative_to(worktree).as_posix()][3] != launcher:
+            return replace(observation, reason='document launcher changed during observation')
+        documents = {}
+        # Reject unsupported roles before parsing the project. These preliminary
+        # checks never authorize reuse; the code consumption proof follows below.
+        for path, kind, mode, expected in observation.uncovered:
+            if kind != 'file':
+                return observation
+            content = (worktree / path).read_bytes()
+            if hashlib.sha256(content).hexdigest() != expected:
+                return replace(observation, reason='document changed during exclusion review')
+            # The shared proof consumes Git modes; the final observation retains
+            # actual permissions, including a restrictive process umask.
+            versions = {label: ('100755' if mode & 0o111 else '100644', content)
+                        for label in ('base', 'head')}
+            proof, reason = impact_analysis.review_document(path, ({}, {}),
+                {'stages': connection.stages}, {path: versions}, (), {})
+            if proof is None:
+                return replace(observation, reason=reason)
+            documents[path] = versions
+        facts = {}
+        for path, kind, _mode, expected in observation.files:
+            if not path.endswith('.py') or kind != 'file':
+                continue
+            content = (worktree / path).read_bytes()
+            if hashlib.sha256(content).hexdigest() != expected:
+                return replace(observation, reason='code changed during exclusion review')
+            facts[path] = impact_analysis.analyze(path, content)
+        graph = impact_analysis.resolve(facts)
+        # Unknown libraries/native APIs may consume repository documents too.
+        # Only bounded project references and these stdlib contracts are audited.
+        local = {path.split('/')[0].removesuffix('.py') for path in facts}
+        safe = {'unittest', 'pathlib', 'json', 'math', 'typing', 'dataclasses',
+                'collections', 'functools', 'hashlib', 're', 'enum'}
+        if any(name.split('.')[0] not in local | safe
+               for item in facts.values() for declaration in item['imports']
+               for name in ([declaration['module']] if declaration['module'] else declaration['names'])
+               if not declaration['level']):
+            return replace(observation, reason='unconfirmed document library consumption')
+        if not graph or any(item.get('selection_uncertainties') for item in graph.values()):
+            return replace(observation, reason='unconfirmed document code consumption')
+        inventory = {path: {'base': '100755' if mode & 0o111 else '100644',
+                            'head': '100755' if mode & 0o111 else '100644'}
+                     for path, kind, mode, _sha in (*observation.files, *observation.uncovered)
+                     if kind == 'file'}
+        for path in documents:
+            proof, reason = impact_analysis.review_document(path, (graph, graph),
+                {'stages': connection.stages}, documents, tuple(graph), inventory)
+            if proof is None:
+                return replace(observation, reason=reason)
+        # Re-read all code/doc inputs and bind the proof to this exact observation.
+        return observe(worktree, command=(script.relative_to(worktree).as_posix(),),
+            environment={}, runtime=None, completeness=observation.completeness_token)
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        return replace(observation, reason='document exclusion observation failed: ' + str(error))

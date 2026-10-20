@@ -17,7 +17,7 @@ import stat
 from typing import Mapping
 
 MANIFEST = "scripts/verify-inputs.json"
-RULES = "verify-inputs-v1:posix-case-sensitive-segments-star-question-globstar-dotfiles;kinds-modes;no-symlink-follow;git-venv-bytecode-separate;exclusions-bound-selected-inputs"
+RULES = "verify-inputs-v1:posix-case-sensitive-segments-star-question-globstar-dotfiles;kinds-modes;no-symlink-follow;git-venv-bytecode-excluded;code-inputs-only;exclusions-bound-selected-inputs"
 
 
 def digest(value) -> str:
@@ -81,10 +81,10 @@ def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, s
             completeness: str | None = None) -> InputObservation:
     """Observe working bytes including untracked inputs, never a verify success.
 
-    Caller supplies a measured executable/runtime identity and complete effective
-    environment plus Git/external identities. None means unknown, {} means no
-    such dependencies. A bounded exclusion review can authorize only the exact
-    completeness_token, bound to uncovered path/content/kind/mode and settings.
+    Environment/runtime/Git/external identities are accepted for API compatibility
+    but are outside the repository-code reuse contract. Exclusion review can
+    authorize only the exact completeness_token, bound to current uncovered
+    path/content/kind/mode, selected code, command and interpretation rules.
     """
     try:
         manifest = root / MANIFEST
@@ -96,8 +96,8 @@ def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, s
         def walk_error(error):
             raise error
         for directory, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
-            # Git internals/bytecode are generated. The venv is represented by
-            # the measured runtime and external dependency identities.
+            # Git internals/bytecode are generated; the installed venv is outside
+            # the repository-code comparison contract.
             dirs[:] = sorted(d for d in dirs if d not in {".git", "__pycache__", ".venv"})
             for name in sorted(names + [d for d in dirs if (Path(directory) / d).is_symlink()]):
                 if name == ".git":
@@ -126,14 +126,25 @@ def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, s
         # All unmatched files require a bounded exclusion proof. This includes
         # new code/config and moves, without guessing their language or purpose.
         uncovered = tuple(sorted(item for item in inventory if item not in selected))
-        context = {"rules": RULES, "manifest": hashlib.sha256(raw).hexdigest(),
-                   "command": command, "environment": dict(environment), "runtime": runtime,
-                   "git": git_inputs, "external": external_inputs}
+        # Bind to the running observer/runner rules as well as project files.
+        # These are repository implementation bytes, not installed tool identity.
+        package = Path(__file__).resolve().parents[1]
+        rules = sorted(path for path in (package / 'verification').iterdir()
+                       if path.suffix in {'.py', '.pl', '.pm'})
+        rules += [package / 'execution' / name for name in (
+            'result_validation.py', 'verify_process.py', 'windows_job.py',
+            'execution_verify_handler.py')]
+        rules.extend((package / 'storage/verify_receipts.py',
+                      package / 'maintenance/code_index.py'))
+        context = {"rules": RULES,
+                   "implementation": [(path.relative_to(package).as_posix(),
+                       hashlib.sha256(path.read_bytes()).hexdigest()) for path in rules],
+                   "manifest": hashlib.sha256(raw).hexdigest(), "command": command}
         token = digest((context, selected, uncovered))
         fingerprint = digest((context, selected))
         reason = None
-        if not command or not runtime or git_inputs is None or external_inputs is None:
-            reason = "unconfirmed command/runtime/Git/external inputs"
+        if not command:
+            reason = "unconfirmed verify command"
         elif any(item[1] != "file" for item in selected):
             reason = "non-regular or external verify input"
         elif uncovered and completeness != token:

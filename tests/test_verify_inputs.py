@@ -24,47 +24,9 @@ class VerifyInputObservationTest(unittest.TestCase):
             with self.assertRaises(SyntaxError):
                 exec(_ISOLATED_COMPILE_PROGRAM, {})
 
-    def test_measured_compile_runtime_hashes_interpreter_stdlib_and_native_libraries(self):
-        import contextlib
-        import io
-        import sys
-        from loop_manager_internal.verification.manager_adapter import _COMPILE_RUNTIME_PROBE
-        interpreter = self.root / 'python'
-        interpreter.write_bytes(b'interpreter')
-        library = self.root / 'native.so'
-        library.write_bytes(b'native')
-        original_read = Path.read_text
-        def read(path, *args, **kwargs):
-            if path == Path('/proc/self/maps'):
-                return '001-002 r-xp 000 00:00 0 /mapped-library.so\n'
-            return original_read(path, *args, **kwargs)
-        def identity():
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                exec(_COMPILE_RUNTIME_PROBE, {})
-            return output.getvalue().strip()
-        with mock.patch.object(sys, 'executable', str(interpreter)), \
-                mock.patch.object(sys, 'path', [str(self.root / 'src')]), \
-                mock.patch.object(sys, 'platform', 'linux'), \
-                mock.patch.object(os, 'geteuid', return_value=1000, create=True), \
-                mock.patch.object(os, 'getegid', return_value=1000, create=True), \
-                mock.patch.object(os, 'getgroups', return_value=[1000], create=True), \
-                mock.patch.object(os, 'uname', return_value=('Linux', 'fixture', '1', '1', 'x86_64'), create=True), \
-                mock.patch('pathlib.Path', side_effect=lambda path: (
-                    library if path == '/mapped-library.so' else Path(path))), \
-                mock.patch.object(Path, 'read_text', read):
-            first = identity()
-            self.assertEqual(len(first), 64)
-            self.assertEqual(identity(), first)
-            for file in (interpreter, self.root / 'src/app.py', library):
-                before = identity()
-                file.write_bytes(file.read_bytes() + b'changed')
-                self.assertNotEqual(identity(), before)
-
-    def test_measured_compile_command_and_uncertainty_use_real_execution_boundary(self):
+    def test_compile_execution_keeps_fast_path_without_runtime_reuse_gate(self):
         from loop_manager_internal.verification import manager_adapter
         from loop_manager_internal.execution import result_validation
-        import subprocess
         script = self.root / 'scripts/verify.sh'
         script.write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT)
         self.manifest(['src/**', 'scripts/**'])
@@ -73,19 +35,16 @@ class VerifyInputObservationTest(unittest.TestCase):
         with mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix', environ={})), \
                 mock.patch.object(manager_adapter, 'os', SimpleNamespace(name='posix')), \
                 mock.patch.object(manager_adapter.shutil, 'which', return_value=str(self.root / 'python')), \
-                mock.patch.object(manager_adapter.subprocess, 'run',
-                    return_value=SimpleNamespace(stdout='a' * 64)) as probe:
+                mock.patch('subprocess.run') as probe:
             observed = result_validation.observe_verify_inputs(self.root)
             self.assertTrue(observed.proven, observed.reason)
             self.assertTrue(result_validation.verify(effects, self.root)[0])
             arguments = effects.run_verify_process.call_args.args[0]
             self.assertEqual(arguments, result_validation.verify_arguments(self.root)[1])
             self.assertEqual(arguments[1:5], ['-I', '-S', '-B', '-c'])
-            probe.side_effect = subprocess.TimeoutExpired('measurement', 30)
-            self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
-            probe.side_effect = None
             with mock.patch.dict(result_validation.os.environ, {'LD_PRELOAD': 'unmeasured'}):
-                self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
+                self.assertTrue(result_validation.observe_verify_inputs(self.root).proven)
+            probe.assert_not_called()
             (self.root / inputs.MANIFEST).write_text('invalid')
             self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
 
@@ -100,8 +59,8 @@ class VerifyInputObservationTest(unittest.TestCase):
         with mock.patch.object(result_validation, 'os', SimpleNamespace(name='nt', environ={})), \
                 mock.patch.object(manager_adapter, 'os', SimpleNamespace(name='nt')), \
                 mock.patch.object(result_validation.shutil, 'which', return_value=None), \
-                mock.patch.object(manager_adapter.subprocess, 'run') as probe:
-            self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
+                mock.patch('subprocess.run') as probe:
+            self.assertTrue(result_validation.observe_verify_inputs(self.root).proven)
             self.assertTrue(result_validation.verify(effects, self.root)[0])
             self.assertEqual(effects.run_verify_process.call_args.args[0],
                 ['pwsh', '-NoProfile', '-File', str(script)])
@@ -226,8 +185,8 @@ class VerifyInputObservationTest(unittest.TestCase):
         outside.rename(self.root / 'moved.json')
         self.assertFalse(self.observe(completeness=first.completeness_token).proven)
         current = self.observe()
-        self.assertFalse(self.observe(completeness=current.completeness_token,
-                                      environment={'MODE': 'changed'}).proven)
+        self.assertTrue(self.observe(completeness=current.completeness_token,
+                                     environment={'MODE': 'changed'}).proven)
 
     def test_exclusion_proof_expires_when_selected_script_or_settings_change(self):
         self.manifest(['src/**', 'scripts/**', 'verify-config.json'])
@@ -246,17 +205,17 @@ class VerifyInputObservationTest(unittest.TestCase):
                 self.assertNotEqual(initial.completeness_token, changed.completeness_token)
                 self.assertTrue(self.observe(completeness=changed.completeness_token).proven)
 
-    def test_command_environment_runtime_git_external_and_unknown(self):
+    def test_environment_runtime_git_and_external_identity_do_not_gate_code_inputs(self):
         first = self.observe()
         for context in (dict(environment={'MODE': 'changed'}), dict(runtime_identity='other-python'),
                         dict(git_inputs={'HEAD': 'different'}), dict(external_inputs={'library': 'new'})):
             with self.subTest(context=context):
-                self.assertNotEqual(first.fingerprint, self.observe(**context).fingerprint)
+                self.assertEqual(first.fingerprint, self.observe(**context).fingerprint)
         other = manager_adapter.observe_inputs(self.root, ['other'], environment={}, runtime_identity='python',
                                                git_inputs={}, external_inputs={})
         self.assertNotEqual(first.fingerprint, other.fingerprint)
         for context in (dict(runtime_identity=None), dict(git_inputs=None), dict(external_inputs=None)):
-            self.assertFalse(self.observe(**context).proven)
+            self.assertTrue(self.observe(**context).proven)
 
     def test_missing_and_invalid_manifest_preserve_full_verify_execution(self):
         from types import SimpleNamespace
@@ -349,3 +308,93 @@ class VerifyInputObservationTest(unittest.TestCase):
                 self.assertNotEqual(before.fingerprint, after.fingerprint)
                 self.assertNotEqual(before.completeness_token, after.completeness_token)
                 self.assertFalse(after.proven)
+
+    def test_selected_entrypoint_and_connection_require_manifest_coverage(self):
+        from loop_manager_internal.execution import result_validation
+        self.enterContext(mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix')))
+        script = self.root / 'scripts/verify.sh'
+        script.write_text('#!/bin/sh\nexit 0\n')
+        self.assertIn('entrypoint outside manifest',
+                      result_validation.observe_verify_inputs(self.root).reason)
+        self.manifest(['src/**', 'scripts/verify.sh'])
+        self.assertTrue(result_validation.observe_verify_inputs(self.root).proven)
+        (self.root / 'scripts/verify.json').write_text('{}')
+        self.assertIn('connection outside manifest',
+                      result_validation.observe_verify_inputs(self.root).reason)
+
+    def test_changed_observation_rules_invalidate_fingerprint_and_exclusion(self):
+        (self.root / 'notes.md').write_text('reviewed document')
+        original = self.observe()
+        with mock.patch.object(inputs, 'RULES', inputs.RULES + ';changed'):
+            changed = self.observe(completeness=original.completeness_token)
+        self.assertNotEqual(original.fingerprint, changed.fingerprint)
+        self.assertFalse(changed.proven)
+
+    def test_current_documents_are_reconfirmed_and_consumption_or_new_code_blocks_reuse(self):
+        from loop_manager_internal.execution import result_validation
+        from loop_manager_internal.execution.result_validation import observe_verify_inputs
+        self.enterContext(mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix')))
+        repository = Path(__file__).resolve().parents[1]
+        (self.root / 'scripts/verify.sh').write_bytes((repository / 'scripts/verify.sh').read_bytes())
+        self.manifest(['src/**', 'scripts/**', 'tests/**'])
+        (self.root / 'tests').mkdir()
+        (self.root / 'tests/test_app.py').write_text('import unittest\n')
+        (self.root / 'scripts/verify.json').write_text(json.dumps({
+            'version': 1, 'adapter': 'unittest', 'environment': {'python': 'launcher'},
+            'stages': [{'id': 'tests', 'kind': 'tests', 'cwd': '.',
+                        'collection': {'directory': 'tests', 'pattern': 'test*.py'},
+                        'execution': 'independent'}]}))
+        (self.root / 'docs').mkdir()
+        document = self.root / 'docs/PRODUCT.md'
+        document.write_text('# Original product')
+        initial = observe_verify_inputs(self.root)
+        self.assertTrue(initial.proven, initial.reason)
+        actions = [lambda: document.write_text('# Changed product')]
+        if os.name != 'nt':
+            actions.append(lambda: document.chmod(0o755))
+        for action in actions:
+            action()
+            current = observe_verify_inputs(self.root)
+            self.assertTrue(current.proven, current.reason)
+            self.assertEqual(current.fingerprint, initial.fingerprint)
+            self.assertNotEqual(current.completeness_token, initial.completeness_token)
+        original_read = Path.read_bytes
+        reads = 0
+        def changed_read(path):
+            nonlocal reads
+            if path == self.root / 'src/app.py':
+                reads += 1
+                if reads == 2:
+                    return b'changed during proof'
+            return original_read(path)
+        with mock.patch.object(Path, 'read_bytes', changed_read):
+            changed = observe_verify_inputs(self.root)
+        self.assertFalse(changed.proven)
+        self.assertIn('code changed during exclusion review', changed.reason)
+        (self.root / 'src/app.py').write_text("from pathlib import Path\nPath('docs/PRODUCT.md').read_text()\n")
+        self.assertFalse(observe_verify_inputs(self.root).proven)
+        (self.root / 'src/app.py').write_text('pass\n')
+        (self.root / 'new.py').write_text('new code')
+        self.assertFalse(observe_verify_inputs(self.root).proven)
+
+        (self.root / 'new.py').unlink()
+        (self.root / 'src/app.py').write_text('open(input()).read()\n')
+        self.assertFalse(observe_verify_inputs(self.root).proven)
+        (self.root / 'src/app.py').write_text('import ctypes\n')
+        self.assertFalse(observe_verify_inputs(self.root).proven)
+        (self.root / 'src/app.py').write_text('pass\n')
+        script = self.root / 'scripts/verify.sh'
+        script.write_bytes(script.read_bytes() + b'\ncat docs/PRODUCT.md\n')
+        self.assertFalse(observe_verify_inputs(self.root).proven)
+
+    def test_shared_code_index_bytes_invalidate_exclusion_and_fingerprint(self):
+        from loop_manager_internal.maintenance import code_index
+        target = Path(code_index.__file__).resolve()
+        (self.root / 'notes.md').write_text('reviewed document')
+        original = self.observe()
+        read_bytes = Path.read_bytes
+        with mock.patch.object(Path, 'read_bytes', lambda path: (
+                read_bytes(path) + b'\n# changed index rules\n' if path == target else read_bytes(path))):
+            changed = self.observe(completeness=original.completeness_token)
+        self.assertNotEqual(original.fingerprint, changed.fingerprint)
+        self.assertFalse(changed.proven)
