@@ -245,6 +245,11 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.agent_write_isolation.assert_current",
             ), mock.patch(
+                "loop_manager.agent_write_isolation.assert_current_configuration",
+            ), mock.patch(
+                "loop_manager.agent_write_isolation.refresh_configuration_evidence",
+                side_effect=lambda evidence, *_args, **_kwargs: evidence,
+            ), mock.patch(
                 "loop_manager.validate_provider_runtime",
             ), mock.patch(
                 "loop_manager_internal.agents.agent_codex_sandbox.CodexLaunch.stop",
