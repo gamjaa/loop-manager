@@ -93,6 +93,7 @@ class WorkerHandlerPorts:
     _run_document: Callable[..., ExecutionOutcome]
     _stage_rebase_correction: Callable[..., Any]
     _unmerged_stages: Callable[..., Any]
+    publish_worker_checkpoints: Callable[..., Any] | None = None
 
 
 class WorkerHandler:
@@ -178,6 +179,25 @@ class WorkerHandler:
 
     def run(self, context: ExecutionContext) -> ExecutionOutcome:
         self.ports.state.check_context(context)
+        if self.ports.publish_worker_checkpoints is not None and not context.resolving_rebase:
+            try:
+                checkpoint_result = self.ports.publish_worker_checkpoints(
+                    context,
+                    allowed_requirement_archives=self.ports.snapshot().archive_scope_sources,
+                )
+                if isinstance(checkpoint_result, ExecutionOutcome):
+                    return checkpoint_result
+                if checkpoint_result is not None and checkpoint_result.get('candidate_changed'):
+                    return self.ports._retry(
+                        '원격 작업 branch 통합으로 후보가 변경되어 기존 Worker 결과를 폐기했습니다.'
+                    )
+            except RecoveryFailure as error:
+                return self.ports._recover(error.reason, str(error), context=context)
+            except (RuntimeError, OSError) as error:
+                return self.ports._recover(
+                    classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
+                    str(error), context=context,
+                )
         blocked = self._targeted_test_block(context)
         if blocked is not None:
             return blocked
@@ -530,6 +550,29 @@ class WorkerHandler:
                 classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                 detail, context=context,
             )
+        if self.ports.publish_worker_checkpoints is not None and not context.resolving_rebase:
+            try:
+                self.ports._fetch_latest_base()
+                checkpoint_result = self.ports.publish_worker_checkpoints(
+                    context,
+                    allowed_requirement_archives=self.ports.snapshot().archive_scope_sources,
+                    worker_start_head=getattr(worker_scope_before, 'head', None),
+                )
+                if isinstance(checkpoint_result, ExecutionOutcome):
+                    self.ports.clear_agent_scope(self.ports.identity.repo)
+                    return checkpoint_result
+                if checkpoint_result is not None and checkpoint_result.get('candidate_changed'):
+                    self.ports.clear_agent_scope(self.ports.identity.repo)
+                    return self.ports._retry(
+                        'Worker 실행 중 원격 작업 branch가 통합되어 현재 Worker 결과를 폐기했습니다.'
+                    )
+            except RecoveryFailure as error:
+                return self.ports._recover(error.reason, str(error), context=context)
+            except (RuntimeError, OSError) as error:
+                return self.ports._recover(
+                    classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
+                    str(error), context=context,
+                )
         guarded = self.ports._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
             self.ports.clear_agent_scope(self.ports.identity.repo)

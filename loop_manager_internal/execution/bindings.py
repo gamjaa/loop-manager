@@ -180,6 +180,7 @@ def register(assembly: Composition) -> None:
             _specification_input_fingerprint=assembly.callback('_specification_input_fingerprint'),
             plan_declarations=assembly.callback('plan_declarations'),
             _is_requirement_archive_only_change=assembly.callback('_is_requirement_archive_only_change'),
+            github_repository=assembly.callback('github_repository'),
             _revision_execplan_body_hash=assembly.callback('_revision_execplan_body_hash'),
             _revision_execplan_input_fingerprint=assembly.callback('_revision_execplan_input_fingerprint'),
             _revision_execplan_source_fingerprint=assembly.callback('_revision_execplan_source_fingerprint'),

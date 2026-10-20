@@ -510,8 +510,10 @@ def connect_database(
     *,
     create: bool = False,
     run_migrations: bool = True,
+    mark_created_from_absence: bool = False,
 ) -> sqlite3.Connection:
     database = state_dir / "loop-manager.db"
+    created_from_absence = mark_created_from_absence and not database.is_file()
     if not create and not database.is_file():
         raise RuntimeError(
             "상태 DB가 없습니다. 먼저 `loop_manager.py config init`을 실행하세요."
@@ -528,6 +530,9 @@ def connect_database(
         notifications.ensure_schema(connection)
         blocked_checkpoint_state.ensure_schema(connection)
         blocked_remote_observation.ensure_schema(connection)
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
         connection.commit()
     else:
         try:
@@ -538,6 +543,15 @@ def connect_database(
         except sqlite3.DatabaseError as error:
             connection.close()
             raise RuntimeError("상태 DB를 읽을 수 없습니다. 백업을 복원하거나 다시 초기화하세요.") from error
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.commit()
+    if created_from_absence:
+        connection.execute(
+            "INSERT OR IGNORE INTO manager_metadata(key, value) VALUES ('created_from_absence', '1')"
+        )
+        connection.commit()
     if not run_migrations:
         # Scheduler workers inherit the schema initialized by the parent.
         connection.execplans_schema_ready = True
@@ -613,6 +627,35 @@ def connect_database(
     # Repository-aware migrations belong in run_project, after persisted Agent
     # config has been checked against its pre-invocation snapshot.
     return connection
+
+
+def remote_work_adoption_allowed(connection: sqlite3.Connection, repo: str, plan_id: str) -> bool:
+    """Allow only first-workspace adoption in a database initialized from absence."""
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_metadata'"
+    ).fetchone() is None:
+        return False
+    created = connection.execute(
+        "SELECT value FROM manager_metadata WHERE key='created_from_absence'"
+    ).fetchone()
+    if created is None or created[0] != "1":
+        return False
+    seen = connection.execute(
+        "SELECT 1 FROM manager_metadata WHERE key=?",
+        (f"workspace_seen:{repo}:{plan_id}",),
+    ).fetchone()
+    return seen is None
+
+
+def record_execplan_workspace_seen(connection: sqlite3.Connection, repo: str, plan_id: str) -> None:
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO manager_metadata(key, value) VALUES (?, '1')",
+        (f"workspace_seen:{repo}:{plan_id}",),
+    )
+    connection.commit()
 
 
 def _ensure_cleanup_pending_schema(connection: sqlite3.Connection) -> None:

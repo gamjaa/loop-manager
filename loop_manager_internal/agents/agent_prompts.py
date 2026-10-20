@@ -217,7 +217,7 @@ def worker_prompt(
 {saved_feedback}
 {failure}
 {recovery}
-관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
+관련 targeted test를 작성하고, 선택된 관리 작업 branch에 의미 있는 작업 단위의 로컬 checkpoint commit을 만들 수 있다. commit은 복구점이며 검증·Review 성공 근거가 아니다. commit을 만든 뒤에는 추가 변경 없이 결과를 반환하라. fetch, rebase, push, PR 조작과 scripts/verify 실행은 하지 마라. Manager가 checkpoint 게시를 보류하면 새 변경을 추가하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
 ExecPlan의 사용자 판단 대기 draft 표시와 User Decision은 사용자를 대신해 해제·작성·변경하지 마라.
 선택된 ExecPlan은 구현·검증 기록 등 본문만 수정하고 frontmatter는 직접 변경하지 마라. 활성·archive를 포함한 모든 Requirement와 다른 ExecPlan은 수정하지 마라. PRODUCT·ARCHITECTURE·FUTURE_IDEAS는 현재 작업에 필요한 범위에서 수정할 수 있다.

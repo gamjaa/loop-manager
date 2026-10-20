@@ -67,6 +67,11 @@ def dummy_worker_context(*, roles=("worker",), fixed_guidance=True):
     def command(arguments, **kwargs):
         # Legacy Git scenarios mock branch PR observations, not a second body
         # query. Model that read while keeping every mutation at its old boundary.
+        if (arguments[:3] == ['gh', 'pr', 'list'] and '--head' in arguments
+                and '--limit' in arguments
+                and arguments[arguments.index('--limit') + 1] == '1000'):
+            import subprocess
+            return subprocess.CompletedProcess(arguments, 0, stdout='[]', stderr='')
         if (arguments[:3] == ['gh', 'pr', 'view'] and '--json' in arguments
                 and arguments[arguments.index('--json') + 1] == 'body,headRefOid,state'):
             import subprocess

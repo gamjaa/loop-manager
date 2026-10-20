@@ -102,6 +102,50 @@ class TaskRemoteInputTests(TestCase):
         self.assertEqual((self.fx.worktree / 'dependency.py').read_text(), 'remote dependency\n')
         self.assertFalse(self.sync(remote))
 
+    def test_stale_observation_integrates_a_fast_forwarded_remote_branch(self):
+        observed = self.push()
+        advanced = self.fx.user_commit('dependency.py', 'remote dependency\n')
+
+        self.assertTrue(self.sync(observed))
+
+        self.assertEqual(self.fx.run_git(self.fx.worktree, 'rev-parse', 'HEAD'), advanced)
+        self.assertEqual((self.fx.worktree / 'dependency.py').read_text(), 'remote dependency\n')
+        self.assertEqual(self.store.get(self.repo, 'G-034').snapshot['accepted_work_branch'], advanced)
+        self.assertFalse(self.sync(advanced))
+
+    def test_non_fast_forward_remote_rewrite_is_preserved_and_blocked(self):
+        self.push()
+        accepted = self.fx.user_commit('dependency.py', 'accepted remote input\n')
+        self.fx.run_git(self.fx.repo, 'fetch', 'origin', 'refs/heads/loop-manager/G-034')
+        current = self.store.get(self.repo, 'G-034')
+        self.store.record(self.repo, 'G-034', expected_generation=current.generation,
+            operation=None, expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={**(current.snapshot or {}), 'accepted_work_branch': accepted})
+        rewrite = Path(self.fx.temporary.name) / 'rewrite'
+        subprocess.run(['git', 'clone', str(self.fx.remote), str(rewrite)], check=True,
+                       capture_output=True)
+        self.fx.run_git(rewrite, 'config', 'user.name', 'Other Environment')
+        self.fx.run_git(rewrite, 'config', 'user.email', 'other@example.com')
+        (rewrite / 'rewrite.py').write_text('rewritten\n', encoding='utf-8')
+        self.fx.run_git(rewrite, 'add', 'rewrite.py')
+        self.fx.run_git(rewrite, 'commit', '-m', 'Rewrite remote work branch')
+        self.fx.run_git(rewrite, 'push', '--force', 'origin', 'HEAD:refs/heads/loop-manager/G-034')
+        remote = self.fx.run_git(rewrite, 'rev-parse', 'HEAD')
+        before = lm.capture_git_snapshot(self.fx.worktree)
+
+        with self.assertRaises(RecoveryFailure) as caught:
+            self.sync(remote)
+
+        self.assertIs(caught.exception.reason, RecoveryReason.REMOTE_SNAPSHOT_RACE)
+        after = lm.capture_git_snapshot(self.fx.worktree)
+        self.assertEqual((after.head, after.branch, after.index, after.dirty, after.operations),
+                         (before.head, before.branch, before.index, before.dirty, before.operations))
+        self.assertEqual(self.fx.run_git(self.fx.worktree, 'rev-parse', 'HEAD'), before.head)
+        self.fx.run_git(self.fx.repo, 'cat-file', '-e', accepted)
+        self.assertEqual(self.fx.run_git(
+            rewrite, 'ls-remote', 'origin', 'refs/heads/loop-manager/G-034').split()[0], remote)
+
     def test_same_pr_head_advance_is_input_but_wrong_pr_identity_is_refused(self):
         remote = self.push()
         RuntimeStateRepository(self.connection).update_project(self.repo, {'pr_url': 'https://example/pr/1', 'pr_head_oid': 'old'})

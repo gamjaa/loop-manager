@@ -12,7 +12,7 @@ from tests.support.worker import dummy_worker_sessions
 @isolated_git_test
 class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
-    def test_external_remote_head_change_enters_normal_recovery(self):
+    def test_non_fast_forward_remote_head_pauses_before_worker_or_push(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -68,11 +68,11 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertNotEqual(external_head, head_oid)
-            self.assertEqual(result, 1)
+            self.assertEqual(result, 0)
             self.assertNotEqual(stored["phase"], "PROJECT_BLOCKED")
-            self.assertEqual(stored["pr_conflict_recovery"], 1)
+            self.assertEqual(stored["pr_conflict_recovery"], 0)
             self.assertEqual(pushes, [])
-            agent.assert_called()
+            agent.assert_not_called()
 
     @dummy_worker_sessions(fixed_guidance=True)
     def test_lease_competition_reobserves_without_overwriting_remote_head(self):

@@ -18,6 +18,7 @@ from loop_manager_internal.application.contracts import USAGE_LIMIT_ERROR_PREFIX
 from loop_manager_internal.application.contracts import WorkerResultError
 from loop_manager_internal.execution import execution_handlers, result_validation
 from loop_manager_internal.execution.execution_state import ExecutionStatePort as _ExecutionStatePort
+from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.recovery import recovery_runtime
@@ -166,6 +167,7 @@ class ExecutionLifecyclePortsEffects:
     _specification_input_fingerprint: Callable[..., object] | None = None
     plan_declarations: Callable[..., object] | None = None
     _is_requirement_archive_only_change: Callable[..., object] | None = None
+    github_repository: Callable[..., object] | None = None
 
 
 def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, connection, runtime_repository, **identity):
@@ -279,6 +281,131 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         return work_branch_integration.synchronize(dependencies.remote_integration_effects(),
             connection, identity['repo_path'], identity['state_dir'], identity['repo'],
             plan, remote, pull_request)
+    def publish_worker_checkpoints(context, *, allowed_requirement_archives=(), worker_start_head=None):
+        from loop_manager_internal.git import publication_service
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        if context.resolving_rebase:
+            return {'candidate_changed': False, 'pushed': 0}
+        if dependencies.github_repository is None:
+            raise recovery_runtime.RecoveryFailure(
+                recovery_runtime.RecoveryReason.OWNERSHIP_UNCERTAIN,
+                'Worker checkpoint의 등록 원격 identity 검증을 사용할 수 없습니다.',
+            )
+        plan = state.active_execplan(identity['repo'])
+        row = state.row()
+        if plan is None or plan['plan_id'] != context.plan.plan_id:
+            raise recovery_runtime.RecoveryFailure(
+                recovery_runtime.RecoveryReason.OWNERSHIP_UNCERTAIN,
+                'Worker checkpoint의 활성 ExecPlan을 확인할 수 없습니다.',
+            )
+        checkpoints = ExecutionCheckpointRepository(connection)
+        current = checkpoints.get(identity['repo'], context.plan.plan_id)
+        remote = dependencies.remote_branch_oid(identity['repo_path'], context.branch)
+        head = dependencies.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        pending = (current.snapshot or {}).get('worker_checkpoint_pending')
+        if pending is None:
+            established_heads = {
+                str(value) for value in (
+                    row['active_sha'], row['publication_remote_oid'],
+                    (current.snapshot or {}).get('accepted_work_branch'),
+                ) if value
+            }
+            if head in established_heads:
+                return {'candidate_changed': False, 'pushed': 0}
+            start_head = worker_start_head
+            if start_head is None and row['agent_snapshot']:
+                from loop_manager_internal.agents.scope_contracts import GitSnapshot
+                try:
+                    saved_scope = GitSnapshot.deserialize(str(row['agent_snapshot']))
+                except (TypeError, ValueError, KeyError) as error:
+                    raise recovery_runtime.RecoveryFailure(
+                        recovery_runtime.RecoveryReason.OWNERSHIP_UNCERTAIN,
+                        'Worker checkpoint의 저장된 실행 시작 HEAD가 유효하지 않습니다.',
+                    ) from error
+                if (current.operation is None and saved_scope.branch == context.branch
+                        and saved_scope.head != head):
+                    follows_scope = dependencies.git(
+                        context.worktree, 'merge-base', '--is-ancestor', saved_scope.head, head,
+                        check=False,
+                    )
+                    if follows_scope.returncode == 0:
+                        start_head = saved_scope.head
+                    elif follows_scope.returncode != 1:
+                        raise recovery_runtime.RecoveryFailure(
+                            recovery_runtime.RecoveryReason.STATUS_FAILED,
+                            'Worker checkpoint의 저장된 실행 HEAD 관계를 확인할 수 없습니다.',
+                        )
+            if current.operation is not None:
+                return {'candidate_changed': False, 'pushed': 0}
+            if not start_head or head == start_head:
+                return {'candidate_changed': False, 'pushed': 0}
+            follows_scope = dependencies.git(
+                context.worktree, 'merge-base', '--is-ancestor', start_head, head,
+                check=False,
+            )
+            if follows_scope.returncode != 0:
+                raise recovery_runtime.RecoveryFailure(
+                    recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                    'Worker checkpoint HEAD가 실행 시작점의 후손이 아닙니다.',
+                )
+        pull_request = dependencies.pr_for_branch(
+            identity['repo_path'], context.branch, str(row['pr_url'] or '') or None,
+        )
+        if pull_request is not None and (
+                str(pull_request.get('state') or '').upper() in {'CLOSED', 'MERGED'}
+                or pull_request.get('mergedAt')):
+            result = reconcile_existing_pull_request(
+                connection, identity['repo_path'], identity['state_dir'], identity['repo'], row,
+                pull_request,
+            )
+            if result == PROJECT_STEP_PLANNING_PENDING:
+                return ExecutionOutcome(
+                    ExecutionOutcomeKind.PLANNING_PENDING,
+                    detail='기존 PR 병합 완료를 반영하고 base/catalog 동기화를 예약했습니다.',
+                )
+            return ExecutionOutcome(
+                ExecutionOutcomeKind.FINAL_BLOCK,
+                detail='닫힌 PR의 명시적 재개 결정을 기다립니다.', error=True,
+            )
+        candidate_changed = False
+        if remote is not None and dependencies.remote_integration_effects is not None:
+            candidate_changed = bool(reconcile_remote(context, remote, pull_request))
+            if candidate_changed:
+                plan = state.active_execplan(identity['repo'])
+                row = state.row()
+                if plan is None or plan['plan_id'] != context.plan.plan_id:
+                    raise recovery_runtime.RecoveryFailure(
+                        recovery_runtime.RecoveryReason.OWNERSHIP_UNCERTAIN,
+                        '원격 통합 뒤 Worker checkpoint의 ExecPlan이 변경됐습니다.',
+                    )
+                before = dependencies.capture_git_snapshot(context.worktree)
+                dependencies.validate_worker_workspace_scope(
+                    identity['repo_path'], context.worktree, context.branch, identity['base'],
+                    str(row['plan_path']), plan, before,
+                    scope_phase='IMPLEMENTING', connection=connection,
+                    state_dir=identity['state_dir'],
+                    allowed_requirement_archives=allowed_requirement_archives,
+                    allow_common_plans=dependencies._published_plan_allows_common_plans(
+                        identity['repo_path'], plan),
+                )
+                remote = dependencies.remote_branch_oid(identity['repo_path'], context.branch)
+                pull_request = dependencies.pr_for_branch(identity['repo_path'], context.branch)
+        service_effects = publication_service.WorkerCheckpointPublicationEffects(
+            active_execplan=lambda _connection, repo: state.active_execplan(repo),
+            git=dependencies.git,
+            remote_branch_oid=dependencies.remote_branch_oid,
+            pr_for_branch=dependencies.pr_for_branch,
+            github_repository=dependencies.github_repository,
+            validate_execplan_workspace_identity=dependencies.validate_execplan_workspace_identity,
+            validate_managed_worktree=dependencies.validate_managed_worktree,
+            update_project=lambda _connection, repo, **values: state.update_project(repo, **values),
+        )
+        _, pushed = publication_service.push_worker_checkpoint_commits(
+            service_effects, connection, identity['repo_path'], identity['state_dir'],
+            identity['repo'], context.plan.plan_id, context.branch, context.worktree,
+            identity['base'], remote, pull_request,
+        )
+        return {'candidate_changed': candidate_changed, 'pushed': pushed}
     effects = execution_handlers.ExecutionEffects(
         state=state,
         checkpoint=execution_checkpoint_state.ExecutionCheckpointRepository(connection),
@@ -378,6 +505,11 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             published_execplan=state.bind(dependencies.published_execplan, name="published_execplan", connected=False, mutates=False),
             build_pr_body=state.bind(lambda *a, **kw: manual.decorate_body(dependencies.build_pr_body(*a, **kw)), name="build_pr_body", connected=False, mutates=False),
             command=state.bind(dependencies._typed_execution_command, name="command", connected=False, mutates=False),
+            github_repository=dependencies.github_repository,
+            publish_worker_checkpoints=state.bind(
+                publish_worker_checkpoints, name="publish_worker_checkpoints",
+                mutates=True,
+            ),
         ),
         blocking=execution_handlers.BlockingEffects(
             block_active_execplan=state.bind(dependencies.block_active_execplan, name="block_active_execplan", connected=True, mutates=True),

@@ -206,27 +206,53 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
     current = ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
     acceptance = (current.snapshot or {}).get('current_rebase_acceptance') or {}
     known = (plan['publication_remote_oid'] or published_branch(connection, repo, plan)
+             or (current.snapshot or {}).get('accepted_work_branch')
              or (acceptance.get('remote') or {}).get('oid'))
     integration = (current.snapshot or {}).get('work_branch_integration') or {}
     pending = bool(integration and integration.get('phase') != 'complete')
     if remote == (current.snapshot or {}).get('accepted_work_branch') and not pending:
         return False
-    effects.validate_execplan_workspace_identity(state_dir, repo,
-        manual_workspace_owner(connection, repo, str(plan['plan_id'])), branch, worktree)
-    effects.validate_managed_worktree(repo_path, worktree, branch, allow_rebase=current.operation == 'rebase')
     project = connection.execute('SELECT origin FROM projects WHERE repo=?', (repo,)).fetchone()
-    for context in (repo_path, worktree):
-        for args in (('remote', 'get-url', '--all', 'origin'), ('remote', 'get-url', '--push', '--all', 'origin')):
-            urls = effects.git(context, *args).stdout.splitlines()
-            if len(urls) != 1 or effects.github_repository(urls[0]) != project['origin']:
-                raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, '현재 등록 origin과 Git 대상이 다릅니다.')
+    for args in (('remote', 'get-url', '--all', 'origin'), ('remote', 'get-url', '--push', '--all', 'origin')):
+        urls = effects.git(repo_path, *args).stdout.splitlines()
+        if len(urls) != 1 or effects.github_repository(urls[0]) != project['origin']:
+            raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, '현재 등록 origin과 Git 대상이 다릅니다.')
     with resource_locks(state_dir, str(repo_path.resolve()), ['git:fetch'], owner='work-branch-fetch'):
         effects.git(repo_path, 'fetch', '--no-tags', 'origin',
                     f'+refs/heads/{branch}:refs/remotes/origin/{branch}')
         fetched = effects.git(repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
     live = effects.git(repo_path, 'ls-remote', '--heads', 'origin', f'refs/heads/{branch}').stdout.splitlines()
-    if fetched != remote or [line.split() for line in live] != [[remote, f'refs/heads/{branch}']]:
+    if [line.split() for line in live] != [[fetched, f'refs/heads/{branch}']]:
         raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '작업 branch가 fetch 사이에 변경됐습니다.')
+    anchor = known or plan['active_sha']
+    if not anchor:
+        raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
+                              '전진한 원격 branch와 저장된 작업 이력을 연결할 수 없습니다.')
+    relation = effects.git(repo_path, 'merge-base', '--is-ancestor', anchor, fetched, check=False)
+    if relation.returncode == 1:
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                              '원격 작업 branch가 마지막으로 확인한 commit에서 전진하지 않았습니다.')
+    if relation.returncode:
+        raise RecoveryFailure(RecoveryReason.STATUS_FAILED,
+                              '원격 작업 branch의 fast-forward 관계를 확인할 수 없습니다.')
+    if pull_request and pull_request.get('headRefOid') != fetched:
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '원격 branch와 PR head 관측 시점이 다릅니다.')
+    worktree_validated = False
+    if fetched != remote:
+        effects.validate_execplan_workspace_identity(state_dir, repo,
+            manual_workspace_owner(connection, repo, str(plan['plan_id'])), branch, worktree)
+        effects.validate_managed_worktree(repo_path, worktree, branch,
+                                          allow_rebase=current.operation == 'rebase')
+        worktree_validated = True
+        remote = fetched
+    if not worktree_validated:
+        effects.validate_execplan_workspace_identity(state_dir, repo,
+            manual_workspace_owner(connection, repo, str(plan['plan_id'])), branch, worktree)
+        effects.validate_managed_worktree(repo_path, worktree, branch, allow_rebase=current.operation == 'rebase')
+    for args in (('remote', 'get-url', '--all', 'origin'), ('remote', 'get-url', '--push', '--all', 'origin')):
+        urls = effects.git(worktree, *args).stdout.splitlines()
+        if len(urls) != 1 or effects.github_repository(urls[0]) != project['origin']:
+            raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, '현재 등록 origin과 Git 대상이 다릅니다.')
     metadata_error = effects._blocked_execplan_revision_metadata_error(repo_path, remote, plan)
     if metadata_error:
         raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, metadata_error)

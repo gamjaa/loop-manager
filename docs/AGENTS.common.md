@@ -18,7 +18,8 @@ mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서�
 - 사용자의 승인·거절·대체 결정은 Agent가 작성하거나 변경하지 않는다. draft 표시를
   해제하거나 요구사항·필수 검증을 삭제해 사용자 판단이나 실패를 우회하지 않는다.
 - Manager의 SQLite 상태·실행 기록·Git 소유권을 직접 변경하거나 수행하지 않은 검증의
-  성공을 기록하지 않는다. commit·fetch·rebase·push·PR 생성은 Manager가 담당한다.
+  성공을 기록하지 않는다. 선택된 Worker 작업 branch의 로컬 checkpoint commit만 Worker가
+  만들 수 있으며, 그 외 commit·fetch·rebase·push·PR 생성은 Manager가 담당한다.
 
 소유 rebase의 시작에는 Manager가 대상·소유권·target·원격·writer 경합·보존 조건을 확인한다.
 최신 frontmatter 일치·전체 diff·최종 문서/archive 검사는 시작 조건이 아니다.

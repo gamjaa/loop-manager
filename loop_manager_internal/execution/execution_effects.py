@@ -127,6 +127,8 @@ class PublicationEffects:
     published_execplan: Callable[..., Any]
     build_pr_body: Callable[..., Any]
     command: Callable[..., Any]
+    github_repository: Callable[..., Any] | None = None
+    publish_worker_checkpoints: Callable[..., Any] | None = None
 
 @dataclass(frozen=True)
 class BlockingEffects:

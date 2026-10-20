@@ -639,8 +639,11 @@ class PrForBranchEffects:
     _github_observation_effects_pr_for_branch: Callable[..., object]
 
 
-def pr_for_branch(effects: PrForBranchEffects, repo: Path, branch: str, url: str | None = None) -> dict[str, object] | None:
-    return github_observation.pr_for_branch(effects._github_observation_effects_pr_for_branch(), repo, branch, url)
+def pr_for_branch(effects: PrForBranchEffects, repo: Path, branch: str,
+                  url: str | None = None, *, history: bool = False) -> dict[str, object] | None:
+    return github_observation.pr_for_branch(
+        effects._github_observation_effects_pr_for_branch(), repo, branch, url, history=history,
+    )
 
 
 def _targeted_test_failure_matches(evidence: str) -> list[re.Match[str]]:

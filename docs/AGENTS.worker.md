@@ -23,6 +23,10 @@
   결정을 대신 작성·변경하지 않는다.
 - Requirement의 완료 판단·archive 이동은 Manager의 책임이며 Worker가 수행하지 않는다.
   `docs/PLANS.md` 수정은 게시된 ExecPlan이 해당 변경을 명시한 경우에만 허용한다.
+- 선택된 관리 작업 branch에서 의미 있는 작업 단위의 로컬 checkpoint commit을 만들 수 있다.
+  commit은 코드 보존점일 뿐 검증·Review 성공을 뜻하지 않는다. fetch·rebase·push·PR 조작과
+  다른 branch의 변경은 금지한다. commit 뒤에는 결과를 반환하고, Manager의 게시가 확인되기
+  전에는 새 변경을 추가하지 않는다.
 
 ## 설계 문서 갱신
 

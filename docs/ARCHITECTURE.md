@@ -750,7 +750,7 @@ Reviewer는 파일을 수정하거나 테스트·verify를 다시 실행하지 �
 ### 프로그램이 소유하는 실행 효과
 
 - 상태 분류, 설정 검증, Git/GitHub 명령과 verify 실행은 프로그램 코드가 담당한다
-- Worker는 commit, fetch, pull, rebase, push, worktree 등록과 PR 생성을 수행하지 않는다. Worker 반환 뒤의 모든 Git 쓰기는 Agent 호출 밖의 프로그램 코드가 소유한다
+- Worker는 선택된 관리 작업 branch에 로컬 checkpoint commit을 만들 수 있다. Manager는 반환 직후 범위·소유권·PR·원격 OID를 다시 확인하고 각 commit을 순서대로 push한다. 그 밖의 commit, fetch, pull, rebase, push, worktree 등록과 PR 생성은 Manager 코드가 소유한다. 게시 대기 중에는 다음 Worker 호출 전에 기존 commit 게시를 해결한다.
 - AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다. provider 환경 필터는 비밀이 아닌 `PYTHONDONTWRITEBYTECODE`와 `PYTHONPYCACHEPREFIX`도 보존한다. verify 조율 endpoint·secret·session은 runner 자체 조율에 필요해 runner에만 전달한다.
 
   runner의 자식 subprocess에는 해당 세 값을 뺀 환경 복사본을 넘기며 부모 환경과 호출자 mapping은 변경하지 않는다. 명령행 Python에서 선택한 bytecode 정책과 prefix도 자식 Python에 반영한다. 기존 marker·`PYTHONPATH`와 필요한 일반 환경은 자식에서 유지한다
@@ -1305,7 +1305,17 @@ Git 외의 subprocess도 같은 기준을 적용한다. 최초 import의 의존�
 
 ## GitHub와 PR
 
-branch·commit·push·PR 생성은 Manager 코드가 수행한다. 게시 대상과 최종 승인 경계를 구분한다.
+PR 생성과 Worker checkpoint 게시·최종 후보 게시의 원격 쓰기는 Manager 코드가 수행한다. Worker의 로컬 checkpoint commit은 선택된 관리 branch에만 허용한다. 게시 대상과 최종 승인 경계를 구분한다.
+
+#### Worker checkpoint 게시와 새 환경 인수
+
+Worker checkpoint commit은 선택된 ExecPlan branch에서만 허용한다. Agent 종료 후 Manager가 현재 active ExecPlan·branch·worktree 소유권, origin identity, 관리 branch와 HEAD, 파일 범위, Git operation, PR identity/head를 검사한다. 현재 remote가 마지막으로 수용한 OID와 같고 local history가 그 후속인 선형 commit이면 commit마다 직전 원격 OID 또는 원격 부재에 결합한 `--force-with-lease`로 순서대로 게시한다. 작업 범위를 통과하지 못하거나 ancestry가 선형이 아니면 push하지 않는다.
+
+게시 전 checkpoint의 `worker_checkpoint_pending`은 `{branch, from, target}`이다. `branch`는 정확한 관리 branch 이름, `from`은 직전 원격 전체 OID 또는 branch 부재를 나타내는 `null`, `target`은 게시할 전체 commit OID다. Manager는 push 전에 이 intent를 저장하고 live 원격 OID를 다시 확인한다. 재시작에서 원격이 `target`이면 이미 성공한 push를 인정하고 반복하지 않는다. 원격이 `from`이면 같은 local commit을 재시도한다. 원격이 둘 다 아니면 Manager가 원격 입력 통합을 완료해 `accepted_work_branch`를 현재 OID로 갱신한 경우만 intent를 정리하고 새 후보를 게시할 수 있으며, 그 외에는 보존·보류한다. push 성공은 `accepted_work_branch`와 `publication_remote_oid`를 갱신하지만 Worker·verify·Review receipt를 생성하지 않는다.
+
+DB 없는 원격 branch 인수 표식은 두 단계로 저장한다. `manager_metadata.created_from_absence=1`은 DB 파일이 없던 초기화에서만 생성되고, `workspace_seen:{repo}:{plan_id}`는 해당 계획의 관리 worktree 준비가 완료되면 저장된다. 기존·손상 DB와 일부 행의 부재는 이 경로로 전환하지 않는다. worktree 생성 전 `execution_checkpoints.snapshot.remote_adoption`에는 version 1과 repository·plan ID·정확한 branch·등록 base·전체 head OID를 저장한다. 재시작은 표식의 모든 identity를 다시 대조하며 기존 local branch/worktree가 있을 때 저장된 HEAD와 일치하지 않으면 연결하거나 덮어쓰지 않는다. 새 worktree는 저장한 전체 OID에서 생성한다.
+
+원격 인수 시 `gh pr list --head <branch> --state all`로 branch의 전체 PR 이력을 확인한다. 목록이 상한에 도달하거나 조회가 실패하면 PR 부재로 추정하지 않는다. 해당 branch의 실제 MERGED 기록은 merge commit의 현재 base 조상 여부와 원격 branch 존속에 관계없이 완료로 넘기고 Worker를 시작하지 않는다. 정확히 일치하는 OPEN PR 하나는 기존 URL과 branch를 재연결하며 여러 OPEN PR·repository/base/head 불일치·불명 상태는 보류한다. CLOSED unmerged만 있으면 기존 PR의 reopen 또는 명시적 재개 판단을 기다린다. 새 환경은 DB 검증 증거를 승계하지 않으므로 검증·Review gate에서 현재 후보에 필요한 단계를 다시 수행한다. 원격 OID·lease는 동시 환경 조율을 제공하지 않으며 이전 환경의 writer 종료 뒤 순차 인수만 지원한다.
 
 | 게시 대상 | 원격 반영과 PR |
 |---|---|

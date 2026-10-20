@@ -99,7 +99,8 @@ def configure_registry(
         return 0
     if command == "init":
         effects.load_managed_config(config_path)
-        with closing(effects.connect_database(state_dir, create=True)) as connection, connection:
+        with closing(effects.connect_database(
+                state_dir, create=True, mark_created_from_absence=True)) as connection, connection:
             pass
         effects.operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
         return 0
@@ -561,7 +562,8 @@ def execute_runtime_command(
     config = effects.load_managed_config(config_path)
     with fast_mode_scope(config):
         if args.command == "init":
-            with closing(effects.connect_database(state_dir, create=True)) as connection, connection:
+            with closing(effects.connect_database(
+                    state_dir, create=True, mark_created_from_absence=True)) as connection, connection:
                 pass
             effects.operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
             return 0

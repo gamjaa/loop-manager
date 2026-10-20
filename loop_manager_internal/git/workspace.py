@@ -8,6 +8,7 @@ from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from pathlib import Path
 import hashlib
+import re
 import secrets
 
 
@@ -137,6 +138,7 @@ def make_worktree(effects: MakeWorktreeEffects,
     allow_create_branch: bool = True,
     ownership_reserved: bool = False,
     expected_head: str | None = None,
+    start_point: str | None = None,
     before_create: Callable[[], None] | None = None,
     journal_state_dir: Path | None = None,
     journal_owner: str | None = None,
@@ -147,6 +149,11 @@ def make_worktree(effects: MakeWorktreeEffects,
         raise WorkspaceOwnershipError(
             "예약 ExecPlan workspace의 기준 commit SHA가 없습니다."
         )
+    if start_point is not None and (
+        ownership_reserved or expected_head is not None
+        or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", start_point)
+    ):
+        raise WorkspaceOwnershipError("원격 작업 branch 시작 commit이 유효하지 않습니다.")
     if worktree.exists() and not worktree.is_dir():
         raise WorkspaceOwnershipError(
             f"관리 worktree 경로가 디렉터리가 아닙니다: {worktree}"
@@ -220,8 +227,12 @@ def make_worktree(effects: MakeWorktreeEffects,
     elif allow_create_branch or ownership_reserved:
         if before_create is not None:
             before_create()
-        start_point = expected_head or f"origin/{base}"
-        arguments = ("worktree", "add", "-b", branch, str(worktree), start_point)
+        selected_start = start_point or expected_head or f"origin/{base}"
+        if start_point is not None:
+            resolved = effects.git(repo, "rev-parse", "--verify", f"{start_point}^{{commit}}")
+            if resolved.stdout.strip() != start_point:
+                raise WorkspaceOwnershipError("원격 작업 branch 시작 commit이 관측값과 다릅니다.")
+        arguments = ("worktree", "add", "-b", branch, str(worktree), selected_start)
         outcome = "created"
     else:
         raise WorkspaceOwnershipError(
@@ -236,7 +247,7 @@ def make_worktree(effects: MakeWorktreeEffects,
             raise WorkspaceOwnershipError("관리 worktree 생성 직전 등록 상태가 변경됐습니다.")
         head = effects.git(
             repo, "rev-parse", "--verify",
-            start_point if outcome == "created" else branch,
+            selected_start if outcome == "created" else branch,
         ).stdout.strip()
         tree = effects.git(repo, "rev-parse", "--verify", f"{head}^{{tree}}").stdout.strip()
         mutation_id = secrets.token_hex(16)

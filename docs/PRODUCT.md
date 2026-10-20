@@ -849,6 +849,12 @@ invocation ledger는 각 호출의 목적·대상과 실제 실행 근거를 연
 
 게시할 변경이 없으면 빈 PR을 만들지 않고 계획 입력 오류로 보존한다. 검증과 결과 재사용의 구체적인 조건은 아래 절을 따른다.
 
+Worker는 선택된 관리 작업 branch에 의미 있는 작업 단위의 로컬 checkpoint commit을 만들 수 있다. Worker가 결과를 반환하면 Manager는 작업·branch·worktree와 허용 변경 범위를 확인하고, 원격 branch의 정확한 현재 OID에 결합한 lease로 commit들을 순서대로 게시한다. push된 commit은 복구점이며 Worker 완료·verify 성공·Review 승인을 증명하지 않는다. 게시 실패에는 commit과 작업물을 보존하고, 해결되기 전 새 Worker 작업을 진행하지 않는다.
+
+원격 작업 branch가 먼저 전진하면 Manager는 저장소·작업·branch 소유권과 정확한 원격 OID를 재확인한다. 안전한 충돌 없는 rebase를 할 수 있으면 원격 commit을 보존해 통합한 뒤 변경된 후보의 검증·Review 근거를 다시 판단한다. 충돌·lease 경쟁·소유권 불명에서는 양쪽 commit을 보존하고 작업을 보류한다.
+
+전체 프로젝트 DB가 없는 새 환경만 기존 원격 branch를 인수할 수 있다. 활성 ExecPlan 선언·작업 ID·등록 저장소·base·정확한 `loop-manager/{G ID}` branch와 원격 HEAD가 일치해야 하며 PR이 있으면 저장소·base·head도 일치해야 한다. 열린 PR은 같은 PR과 branch를 이어가고 검증 근거가 없으면 필요한 검증과 Review를 다시 수행한다. MERGED PR은 merge 결과가 현재 base에 포함됐는지와 무관하게 완료 처리하고 Worker를 실행하지 않는다. 닫혔지만 merge되지 않은 PR은 자동 재사용하지 않고 명시적인 재개 결정을 기다린다. 이 인수는 이전 환경의 Worker가 멈춘 순차 전환을 전제로 하며 동시 개발을 지원하지 않는다.
+
 #### 작업 공간과 ignored 파일 보존
 
 - 시작 ignore 규칙으로 증명된 index-free ignored 파일의 생성·수정·삭제는 역할별 결과·planning·검증 입력 오류의 단독 원인이 아니다. tracked·staged·non-ignored 후보와 실제 Git 작업의 index 안전 조건·대상 연결·원격 lease는 계속 확인한다.

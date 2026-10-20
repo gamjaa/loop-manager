@@ -182,11 +182,12 @@ def make_worktree(
     allow_create_branch: bool = True,
     ownership_reserved: bool = False,
     expected_head: str | None = None,
+    start_point: str | None = None,
     before_create: Callable[[], None] | None = None,
     journal_state_dir: Path | None = None,
     journal_owner: str | None = None,
 ) -> str:
-    return workspace.make_worktree(effects._workspace_effects_make_worktree(), repo, worktree, branch, base, allow_recovery=allow_recovery, allow_existing=allow_existing, allow_rebase=allow_rebase, allow_create_branch=allow_create_branch, ownership_reserved=ownership_reserved, expected_head=expected_head, before_create=before_create, journal_state_dir=journal_state_dir, journal_owner=journal_owner)
+    return workspace.make_worktree(effects._workspace_effects_make_worktree(), repo, worktree, branch, base, allow_recovery=allow_recovery, allow_existing=allow_existing, allow_rebase=allow_rebase, allow_create_branch=allow_create_branch, ownership_reserved=ownership_reserved, expected_head=expected_head, start_point=start_point, before_create=before_create, journal_state_dir=journal_state_dir, journal_owner=journal_owner)
 
 
 @dataclass(frozen=True)
