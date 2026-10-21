@@ -27,11 +27,11 @@ PRODUCT 없이 활성 Requirement와 ARCHITECTURE로 등록한 프로젝트도 R
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/recovery/checkpoint_recovery.py:_assess_user_decision_cause()`의 이전/현재 source 읽기를 검증된 revision의 파일 존재와 연결한다. `catalog/execplan_drafts.py:input_digests()`의 선택 PRODUCT 부재 표현과 `catalog/draft_decisions.py:user_changes()`의 실제 원격 파일 구분을 참고하되 draft 승인 처리 자체는 변경하지 않는다. 일반 `git show` 실패를 빈 본문으로 대체하지 않는다.
-- [ ] 확인한 `catalog/requirement_sources.py`·`git/command_adapter.py:revision_requirement_documents()`의 R-ID resolver와 기존 Git 관측 port를 재사용한다. 필수 ARCHITECTURE·선언 sources·선택 PRODUCT의 경계를 유지하고, 새로 생기거나 사라진 선택 문서는 존재 변화까지 기존 의미 비교·prompt·identity·인용 검사에 연결한다. 공통 문서 loader나 새 상태 저장소는 필요하지 않으면 추가하지 않는다.
-- [ ] 기존 `user_decision_assessment`·이력·generation CAS와 `scope_reconciliation.py`·`blocked_plan_reconciliation.py`·`blocked_plan_service.py`의 호출을 대조해 같은 수집 계약을 적용한다. 의미 판단 Reviewer·원인별 재개·대상 lease는 직접 구현을 소비하며 G-297의 배정 재검사·G-298의 차단/rebase 귀속을 중복 구현하지 않는다.
-- [ ] 확인한 `tests/test_task_scheduling.py:TaskSchedulingTests.test_user_question_recheck_requires_current_cause_evidence_and_preserves_failed_assessments`의 실제 SQLite/checkpoint와 모의 Git·Agent를 재사용한다. path/revision별 서로 다른 원문·명시적 부재/오류를 제공하고, 상위 명세 인용과 실제 차단 보존을 검사한다. 필요한 상위 호출 연결은 `tests/test_plan_block_revalidation.py`·`tests/test_worker_outcome.py`의 기존 fixture에 최소 사례로 추가한다.
-- [ ] PRODUCT·ARCHITECTURE의 사용자 질문 재평가 설명에 실제 보완한 선택 문서 수집 경계만 필요한 경우 통합한다. 등록 정책·Requirement·다른 ExecPlan과 사용자 결정은 수정하지 않는다.
+- [x] 확인한 `loop_manager_internal/recovery/checkpoint_recovery.py:_assess_user_decision_cause()`의 이전/현재 source 읽기를 `revision_document_or_none()`의 검증된 revision 파일 관측에 연결했다. PRODUCT가 선언되지 않았을 때만 성공한 tree 조회로 확인한 부재를 선택 입력 `null`로 다루며, 일반 Git 오류를 빈 본문으로 대체하지 않는다. draft 승인 경로는 변경하지 않았다.
+- [x] `catalog/requirement_sources.py`·`git/command_adapter.py:revision_requirement_documents()`의 기존 R-ID resolver와 Git 관측 port를 재사용했다. 필수 ARCHITECTURE·선언 source와 선택 PRODUCT의 경계를 유지하고, 선택 문서의 존재/내용 변화와 현재 존재 상태를 의미 diff·Reviewer 입력·cache identity·현재 인용 검증에 연결했다.
+- [x] 기존 `user_decision_assessment`·이력·generation CAS 및 차단 재평가 호출을 유지했다. 원인별 재개·대상 lease와 G-297/G-298의 배정·차단 귀속 동작은 변경하지 않았다.
+- [x] `tests/test_task_scheduling.py`의 실제 SQLite/checkpoint와 모의 revision별 Git·Agent를 확장했다. PRODUCT 부재의 해소/재사용, 추가·삭제 및 identity, 필수 source·tree 조회 실패, R-ID rename, 정확한 현재 인용과 PLAN_BLOCKED/checkpoint 보존을 확인한다.
+- [x] ARCHITECTURE의 사용자 질문 재평가 절에 확인된 선택 PRODUCT 부재와 필수 source 실패 경계를 통합했다. PRODUCT 등록 정책·Requirement·다른 ExecPlan과 사용자 결정은 수정하지 않았다.
 
 ## Validation
 
@@ -44,8 +44,9 @@ PRODUCT 없이 활성 Requirement와 ARCHITECTURE로 등록한 프로젝트도 R
 ## Progress
 
 - [x] revision `41f8c16d78f203701a1cdd5cba1cebd6c04be465`의 등록 계약·새 재평가 reader·기존 선택 문서 수집/resolver·관련 테스트를 정적으로 대조했다. PRODUCT 없는 등록 가능 형상이 새 reader의 필수 조회와 충돌함을 확인했으며 구현·테스트·verify는 실행하지 않았다.
-- [ ] 선택 문서의 확인된 부재와 필수 source/조회 실패 구분
-- [ ] 의미 판단·재사용·경쟁 및 상위 복구 호출의 최소 회귀
+- [x] 선택 문서의 확인된 부재와 필수 source/조회 실패 구분
+- [x] 의미 판단·재사용·차단 보존의 최소 회귀
+- [x] `test_user_question_recheck_requires_current_cause_evidence_and_preserves_failed_assessments`, 선택 PRODUCT 추가/삭제, 필수 입력 오류·모호한 R-ID 및 R-ID rename의 5개 targeted unit test 통과
 
 ## Decision Log
 

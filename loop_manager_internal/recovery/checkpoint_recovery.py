@@ -626,25 +626,32 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
     project = runtime_state.project_row(connection, repo)
     revision = effects.git(repo_path, 'rev-parse', f"refs/remotes/origin/{project['base_branch']}").stdout.strip()
     prior_revision = blocked['active_sha'] or blocked['plan_sha']
-    paths = sorted(set(json.loads(blocked['sources'])) | {blocked['path'], 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'})
+    declared_sources = set(json.loads(blocked['sources']))
+    paths = sorted(declared_sources | {blocked['path'], 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'})
     current, changes = {}, {}
     requirement_documents = {}
-    def source(revision, path):
+    optional_product = 'docs/PRODUCT.md' not in declared_sources and blocked['path'] != 'docs/PRODUCT.md'
+    def source(revision, path, *, optional=False):
         from loop_manager_internal.catalog.manager_sources import SOURCE, source_content
         if path == SOURCE:
             return source_content(path)
-        result = effects.git(repo_path, 'show', f'{revision}:{path}', check=False)
-        if result.returncode == 0:
-            return result.stdout
+        from loop_manager_internal.git.command_adapter import revision_document_or_none
+        contents = revision_document_or_none(effects.git, repo_path, revision, path)
+        if contents is not None:
+            return contents
         from loop_manager_internal.catalog import requirement_sources
-        from loop_manager_internal.git.command_adapter import revision_requirement_documents
         if requirement_sources.source_requirement_id(path) is not None:
+            from loop_manager_internal.git.command_adapter import revision_requirement_documents
             if revision not in requirement_documents:
                 requirement_documents[revision] = revision_requirement_documents(
                     lambda repo, *args: effects.git(repo, *args).stdout.encode('utf-8'), repo_path, revision)
             resolved = requirement_sources.resolve_requirement_source(path, requirement_documents[revision], allow_archive=True)
             if resolved.status is requirement_sources.ResolutionStatus.RESOLVED:
                 return resolved.contents
+            if resolved.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                raise RuntimeError('차단 재평가의 Requirement source가 모호합니다: ' + path)
+        if optional:
+            return None
         raise RuntimeError('차단 재평가의 이전·현재 source를 읽을 수 없습니다: ' + path)
     def meaning(text):
         text = re.sub(r'\A---\r?\n.*?\r?\n---\r?\n', '', text, count=1, flags=re.S)
@@ -653,17 +660,27 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         from loop_manager_internal.catalog.manager_sources import SOURCE
         if path != SOURCE and not _safe_path(path):
             raise RuntimeError('차단 재평가 source 경로가 유효하지 않습니다.')
-        old, latest = source(prior_revision, path), source(revision, path)
+        is_optional_product = path == 'docs/PRODUCT.md' and optional_product
+        old = source(prior_revision, path, optional=is_optional_product)
+        latest = source(revision, path, optional=is_optional_product)
         current[path] = latest
-        if meaning(old) != meaning(latest):
-            changes[path] = ''.join(difflib.unified_diff(old.splitlines(True), latest.splitlines(True)))
+        if old is None and latest is None:
+            continue
+        if old is not None and latest is not None and meaning(old) == meaning(latest):
+            continue
+        changes[path] = ''.join(difflib.unified_diff(
+            old.splitlines(True) if old is not None else [],
+            latest.splitlines(True) if latest is not None else [],
+            fromfile=f'a/{path}' if old is not None else '/dev/null',
+            tofile=f'b/{path}' if latest is not None else '/dev/null',
+        ))
     if not changes:
         return False, '기존 사용자 질문을 다시 판단할 명세·계획 본문 변경이 없습니다.', None
     block = scoped_blocking.plan_block(connection, repo, str(blocked['plan_id']))
     if block is None or block['reason_code'] != BlockReasonCode.USER_DECISION_REQUIRED.value:
         raise RuntimeError('사용자 질문의 현재 차단 원인이 변경됐습니다.')
     question = str(block['evidence'])
-    identity = hashlib.sha256(json.dumps([question, current], sort_keys=True).encode()).hexdigest()
+    identity = hashlib.sha256(json.dumps([question, current, changes], sort_keys=True).encode()).hexdigest()
     checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     checkpoint = checkpoints.get(repo, str(blocked['plan_id']))
     saved = (checkpoint.snapshot or {}).get('user_decision_assessment', {})
@@ -673,12 +690,13 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         "문서 수정·질문 삭제·Planner 판단을 사용자 승인으로 간주하지 마라. "
         "최신 Requirement와 ExecPlan에서 기존 질문이 더는 필요 없거나 이미 명시적으로 결정된 경우만 resolved=true다. "
         "실제 선택이 남거나 두 문서가 충돌하면 false로 유지하라. 새 사용자 승인·답변을 추론하지 마라. "
-        "링크·표현 변화나 무관한 변경은 해소 근거가 아니다. "
+        "링크·표현 변화나 무관한 변경은 해소 근거가 아니다. 선택 문서의 삭제·부재 사실만으로 해소하지 마라. "
         "필요하면 Git의 지정 revision에서 source 원문을 읽어라. 파일을 수정하지 마라. "
         "한 줄 USER_DECISION_ASSESSMENT: JSON 객체를 반환하라. 필드는 resolved(bool), detail(이유), "
         "evidence(근거별 source·quote 배열)다. true에는 변경된 source의 현재 원문 인용과 "
         "ExecPlan 이외의 상위 명세가 질문 해소를 뒷받침하는 인용이 모두 필요하다.\n"
         + json.dumps(dict(question=question, revision=revision, sources=paths,
+                         source_presence={path: value is not None for path, value in current.items()},
                          execplan=current[blocked['path']], changes=changes,
                          manager_inputs={path: current[path] for path in paths if path.startswith('manager:')}), ensure_ascii=False))
     worktree = Path(blocked['worktree'])
@@ -701,8 +719,10 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
     if result['resolved'] and (not result['evidence'] or any(
             not isinstance(item, dict) or item.get('source') not in current
             or not isinstance(item.get('quote'), str) or not item['quote'].strip()
+            or not isinstance(current[item['source']], str)
             or item['quote'] not in current[item['source']] for item in result['evidence'])
-            or not any(item['source'] in changes for item in result['evidence'])
+            or not any(item['source'] in changes and isinstance(current[item['source']], str)
+                       for item in result['evidence'])
             or not any(item['source'] != blocked['path'] for item in result['evidence'])):
         raise RuntimeError('사용자 질문 해소의 현재 명세 근거를 확인할 수 없습니다.')
     if effects.git(repo_path, 'rev-parse', f"refs/remotes/origin/{project['base_branch']}").stdout.strip() != revision:

@@ -1252,6 +1252,10 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
         runtime = runtime_state.RuntimeStateRepository(self.connection)
         checkpoint = ExecutionCheckpointRepository(self.connection)
+        requirement = 'docs/requirements/[R-001] Shared.md'
+        self.connection.execute("UPDATE exec_plans SET sources=? WHERE repo='A' AND plan_id='G-001'",
+                                (json.dumps([requirement]),))
+        self.connection.commit()
         for case in ('resolved', 'remaining', 'links', 'frontmatter', 'bad_evidence', 'only_plan_evidence', 'probe_failure'):
             with self.subTest(case=case):
                 runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='question ' + case,
@@ -1266,10 +1270,22 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 if case == 'frontmatter':
                     old, latest = '---\nsources: [old]\n---\nExisting goal.', '---\nsources: [new]\n---\nExisting goal.'
                 def git(_repo, *args, **_options):
-                    text = 'latest' if args[0] == 'rev-parse' else (latest if args[1].startswith('latest:') else old)
-                    return SimpleNamespace(returncode=0, stdout=text)
+                    if args[0] == 'rev-parse':
+                        return SimpleNamespace(returncode=0, stdout='latest')
+                    if args[0] == 'show':
+                        revision, path = args[1].split(':', 1)
+                        if path == requirement:
+                            return SimpleNamespace(returncode=0, stdout=latest if revision == 'latest' else old)
+                        if path == 'docs/ARCHITECTURE.md':
+                            return SimpleNamespace(returncode=0, stdout='Architecture: retain the safety boundary.')
+                        if path == plan['path']:
+                            return SimpleNamespace(returncode=0, stdout='Plan body remains unchanged.')
+                        return SimpleNamespace(returncode=1, stdout='')
+                    if args[0] == 'ls-tree':
+                        return SimpleNamespace(returncode=0, stdout='')
+                    raise AssertionError(args)
                 result = dict(resolved=case not in {'remaining'}, detail='cause assessment',
-                    evidence=[dict(source=plan['path'] if case == 'only_plan_evidence' else 'docs/PRODUCT.md',
+                    evidence=[dict(source=plan['path'] if case == 'only_plan_evidence' else requirement,
                                    quote='invented' if case == 'bad_evidence' else latest)])
                 agent = mock.Mock(return_value=(1 if case == 'probe_failure' else 0,
                     'USER_DECISION_ASSESSMENT: ' + json.dumps(result)))
@@ -1291,10 +1307,242 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                     else:
                         self.assertEqual(assess()[0], resolved)
                         agent.assert_called_once()
+                        payload = json.loads(agent.call_args.args[5].splitlines()[-1])
+                        self.assertFalse(payload['source_presence']['docs/PRODUCT.md'])
                         stored = checkpoint.get('A', 'G-001').snapshot['user_decision_assessment']
                         self.assertEqual(stored['question'], 'question ' + case)
                 self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001')), block)
                 self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+
+    def test_user_question_recheck_tracks_optional_product_presence_in_identity(self):
+        from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        requirement = 'docs/requirements/[R-001] Shared.md'
+        self.connection.execute("UPDATE exec_plans SET sources=? WHERE repo='A' AND plan_id='G-001'",
+                                (json.dumps([requirement]),))
+        self.connection.commit()
+        runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='existing question',
+            release_fingerprint='old', clear_projection=False, plan_values={'worktree': 'one', 'active_sha': 'before'})
+        plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+        product = 'Product policy: defer the optional integration.'
+        requirement_text = 'Requirement: ordinary calls are sufficient.'
+        architecture_text = 'Architecture: preserve read-only assessment.'
+        def git(_repo, *args, **_options):
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(returncode=0, stdout='current')
+            if args[0] == 'show':
+                revision, path = args[1].split(':', 1)
+                if path == 'docs/PRODUCT.md' and revision == 'before':
+                    return SimpleNamespace(returncode=1, stdout='')
+                if path == 'docs/PRODUCT.md':
+                    return SimpleNamespace(returncode=0, stdout=product)
+                if path == requirement:
+                    return SimpleNamespace(returncode=0, stdout=requirement_text)
+                if path == 'docs/ARCHITECTURE.md':
+                    return SimpleNamespace(returncode=0, stdout=architecture_text)
+                if path == plan['path']:
+                    return SimpleNamespace(returncode=0, stdout='Plan body unchanged.')
+                return SimpleNamespace(returncode=1, stdout='')
+            if args[0] == 'ls-tree':
+                return SimpleNamespace(returncode=0, stdout='')
+            raise AssertionError(args)
+        decision = dict(resolved=True, detail='current sources resolve the question', evidence=[
+            {'source': 'docs/PRODUCT.md', 'quote': product},
+            {'source': 'docs/ARCHITECTURE.md', 'quote': architecture_text},
+        ])
+        agent = mock.Mock(return_value=(0, 'USER_DECISION_ASSESSMENT: ' + json.dumps(decision)))
+        effects = SimpleNamespace(git=git, capture_git_snapshot=mock.Mock(), run_agent=agent,
+                                  validate_agent_scope=mock.Mock())
+        first = _assess_user_decision_cause(effects, self.connection, Path('A'), self.directory,
+                                            'A', plan, self.config_path)
+        self.assertTrue(first[0])
+        prompt = agent.call_args.args[5]
+        payload = json.loads(prompt.splitlines()[-1])
+        self.assertTrue(payload['source_presence']['docs/PRODUCT.md'])
+        self.assertTrue(payload['source_presence'][requirement])
+        self.assertIn('+Product policy: defer the optional integration.', payload['changes']['docs/PRODUCT.md'])
+        first_assessment = checkpoint.get('A', 'G-001').snapshot['user_decision_assessment']
+        self.assertEqual(_assess_user_decision_cause(effects, self.connection, Path('A'), self.directory,
+                         'A', plan, self.config_path), first)
+        agent.assert_called_once()
+
+        self.connection.execute("UPDATE exec_plans SET active_sha='prior-with-product' WHERE repo='A' AND plan_id='G-001'")
+        self.connection.commit()
+        prior_product = 'Old product policy.'
+        original_git = git
+        def changed_prior_git(_repo, *args, **_options):
+            if args[0] == 'show' and args[1] == 'prior-with-product:docs/PRODUCT.md':
+                return SimpleNamespace(returncode=0, stdout=prior_product)
+            return original_git(_repo, *args, **_options)
+        effects.git = changed_prior_git
+        changed_plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+        self.assertTrue(_assess_user_decision_cause(effects, self.connection, Path('A'), self.directory,
+                         'A', changed_plan, self.config_path)[0])
+        self.assertEqual(agent.call_count, 2)
+        second_assessment = checkpoint.get('A', 'G-001').snapshot['user_decision_assessment']
+        self.assertNotEqual(first_assessment['identity'], second_assessment['identity'])
+
+    def test_user_question_recheck_keeps_deleted_product_from_becoming_evidence(self):
+        from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        requirement = 'docs/requirements/[R-001] Shared.md'
+        self.connection.execute("UPDATE exec_plans SET sources=? WHERE repo='A' AND plan_id='G-001'",
+                                (json.dumps([requirement]),))
+        self.connection.commit()
+        runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='existing question',
+            release_fingerprint='old', clear_projection=False, plan_values={'worktree': 'one', 'active_sha': 'before'})
+        plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+        saved = checkpoint.get('A', 'G-001')
+        product = 'Prior product wording.'
+        requirement_text = 'Same requirement content.'
+        architecture_text = 'Same architecture content.'
+        def git(_repo, *args, **_options):
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(returncode=0, stdout='current')
+            if args[0] == 'show':
+                revision, path = args[1].split(':', 1)
+                if path == 'docs/PRODUCT.md' and revision == 'current':
+                    return SimpleNamespace(returncode=1, stdout='')
+                if path == 'docs/PRODUCT.md':
+                    return SimpleNamespace(returncode=0, stdout=product)
+                if path == requirement:
+                    return SimpleNamespace(returncode=0, stdout=requirement_text)
+                if path == 'docs/ARCHITECTURE.md':
+                    return SimpleNamespace(returncode=0, stdout=architecture_text)
+                if path == plan['path']:
+                    return SimpleNamespace(returncode=0, stdout='Plan body unchanged.')
+                return SimpleNamespace(returncode=1, stdout='')
+            if args[0] == 'ls-tree':
+                return SimpleNamespace(returncode=0, stdout='')
+            raise AssertionError(args)
+        resolved = dict(resolved=True, detail='deletion is not an approval', evidence=[
+            {'source': 'docs/PRODUCT.md', 'quote': product},
+        ])
+        agent = mock.Mock(return_value=(0, 'USER_DECISION_ASSESSMENT: ' + json.dumps(resolved)))
+        effects = SimpleNamespace(git=git, capture_git_snapshot=mock.Mock(), run_agent=agent,
+                                  validate_agent_scope=mock.Mock())
+        with self.assertRaises(RuntimeError):
+            _assess_user_decision_cause(effects, self.connection, Path('A'), self.directory,
+                                        'A', plan, self.config_path)
+        payload = json.loads(agent.call_args.args[5].splitlines()[-1])
+        self.assertFalse(payload['source_presence']['docs/PRODUCT.md'])
+        self.assertIn('-Prior product wording.', payload['changes']['docs/PRODUCT.md'])
+        self.assertEqual(checkpoint.get('A', 'G-001'), saved)
+        self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))['evidence'],
+                         'existing question')
+
+    def test_user_question_recheck_does_not_hide_required_sources_or_git_tree_failures(self):
+        from loop_manager_internal.git import command_adapter
+        from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        requirement = 'docs/requirements/[R-001] Shared.md'
+        cases = ('declared_product_missing', 'architecture_missing', 'requirement_missing',
+                 'ambiguous_requirement', 'product_tree_failure')
+        for case in cases:
+            with self.subTest(case=case):
+                sources = ['docs/PRODUCT.md'] if case == 'declared_product_missing' else [requirement]
+                self.connection.execute("UPDATE exec_plans SET sources=? WHERE repo='A' AND plan_id='G-001'",
+                                        (json.dumps(sources),))
+                self.connection.commit()
+                runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='question ' + case,
+                    release_fingerprint='old', clear_projection=False,
+                    plan_values={'worktree': 'one', 'active_sha': 'before'})
+                plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+                saved = checkpoint.get('A', 'G-001')
+                def git(_repo, *args, **_options):
+                    if args[0] == 'rev-parse':
+                        return SimpleNamespace(returncode=0, stdout='latest')
+                    if args[0] == 'show':
+                        revision, path = args[1].split(':', 1)
+                        missing = (
+                            (case == 'declared_product_missing' and path == 'docs/PRODUCT.md')
+                            or (case == 'architecture_missing' and path == 'docs/ARCHITECTURE.md')
+                            or (case in {'requirement_missing', 'ambiguous_requirement'} and path == requirement)
+                            or (case == 'product_tree_failure' and path == 'docs/PRODUCT.md')
+                        )
+                        if missing:
+                            return SimpleNamespace(returncode=1, stdout='')
+                        if path == requirement:
+                            return SimpleNamespace(returncode=0, stdout='Requirement: source is present.')
+                        if path == 'docs/ARCHITECTURE.md':
+                            return SimpleNamespace(returncode=0, stdout='Architecture: source is present.')
+                        if path == plan['path']:
+                            return SimpleNamespace(returncode=0, stdout='Plan body unchanged.')
+                        return SimpleNamespace(returncode=1, stdout='')
+                    if args[0] == 'ls-tree':
+                        failed_product_probe = case == 'product_tree_failure' and args[-1] == 'docs/PRODUCT.md'
+                        return SimpleNamespace(returncode=1 if failed_product_probe else 0, stdout='')
+                    raise AssertionError(args)
+                agent = mock.Mock()
+                effects = SimpleNamespace(git=git, capture_git_snapshot=mock.Mock(), run_agent=agent,
+                                          validate_agent_scope=mock.Mock())
+                lookup_documents = ({
+                    'docs/requirements/[R-001] First.md': '# [R-001] First\nFirst candidate.\n',
+                    'docs/requirements/[R-001] Second.md': '# [R-001] Second\nSecond candidate.\n',
+                } if case == 'ambiguous_requirement' else {})
+                with mock.patch.object(command_adapter, 'revision_requirement_documents',
+                                       return_value=lookup_documents):
+                    with self.assertRaises(RuntimeError):
+                        _assess_user_decision_cause(effects, self.connection, Path('A'), self.directory,
+                                                    'A', plan, self.config_path)
+                self.assertEqual(checkpoint.get('A', 'G-001'), saved)
+                self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+                agent.assert_not_called()
+
+    def test_user_question_recheck_resolves_renamed_requirement_by_existing_r_id(self):
+        from loop_manager_internal.git import command_adapter
+        from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
+        requirement = 'docs/requirements/[R-001] Shared.md'
+        renamed = 'docs/requirements/[R-001] Renamed.md'
+        requirement_text = '# [R-001] Renamed\n\nThe current policy explicitly keeps ordinary calls available.\n'
+        self.connection.execute("UPDATE exec_plans SET sources=? WHERE repo='A' AND plan_id='G-001'",
+                                (json.dumps([requirement]),))
+        self.connection.commit()
+        runtime_state.RuntimeStateRepository(self.connection).block_plan(
+            'A', 'G-001', reason_code='user_decision_required', evidence='existing question',
+            release_fingerprint='old', clear_projection=False,
+            plan_values={'worktree': 'one', 'active_sha': 'before'})
+        plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+        architecture_text = 'Architecture: preserve the existing assessment gate.'
+        def git(_repo, *args, **_options):
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(returncode=0, stdout='latest')
+            if args[0] == 'show':
+                revision, path = args[1].split(':', 1)
+                if path == requirement and revision == 'before':
+                    return SimpleNamespace(returncode=0, stdout='Old requirement wording.')
+                if path == requirement or path == 'docs/PRODUCT.md':
+                    return SimpleNamespace(returncode=1, stdout='')
+                if path == 'docs/ARCHITECTURE.md':
+                    return SimpleNamespace(returncode=0, stdout=architecture_text)
+                if path == plan['path']:
+                    return SimpleNamespace(returncode=0, stdout='Plan body unchanged.')
+                return SimpleNamespace(returncode=1, stdout='')
+            if args[0] == 'ls-tree':
+                return SimpleNamespace(returncode=0, stdout='')
+            raise AssertionError(args)
+        result = dict(resolved=True, detail='the renamed active Requirement resolves the question', evidence=[
+            {'source': requirement, 'quote': 'The current policy explicitly keeps ordinary calls available.'},
+            {'source': 'docs/ARCHITECTURE.md', 'quote': architecture_text},
+        ])
+        effects = SimpleNamespace(git=git, capture_git_snapshot=mock.Mock(),
+            run_agent=mock.Mock(return_value=(0, 'USER_DECISION_ASSESSMENT: ' + json.dumps(result))),
+            validate_agent_scope=mock.Mock())
+        with mock.patch.object(command_adapter, 'revision_requirement_documents',
+                               return_value={renamed: requirement_text}) as documents:
+            resolved, _detail, _stage = _assess_user_decision_cause(
+                effects, self.connection, Path('A'), self.directory, 'A', plan, self.config_path)
+        self.assertTrue(resolved)
+        documents.assert_called_once()
+        self.assertEqual(documents.call_args.args[2], 'latest')
 
 
 
