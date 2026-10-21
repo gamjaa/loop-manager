@@ -115,8 +115,13 @@ Perl native case만 명시적으로 skip하고 Python 예제와 플랫폼 독립
 [test_verify_perl_adapter.py](../tests/test_verify_perl_adapter.py)는 native assertion·plan·skip·TODO·
 subtest·오류, 수집/결과 identity·범위·부분 결과·통신 실패·guard·serial 예산을 검사한다.
 [test_verify_language_examples.py](../tests/test_verify_language_examples.py)는 실제 두 예제의
-단독/Manager 성공·실패와 공통 manifest·예약 회수를 확인하는 Manager 전용 통합 회귀다.
-Worker는 이를 실행하지 않는다. 로컬 targeted 근거는 Linux/Perl 5.38.2이며 실제 강제 종료,
+단독/Manager 성공·실패와 실제 조율 모드·session/run identity·공통 manifest·예약 회수를 확인한다.
+단독/Manager 호출 fixture는 guard가 자식 환경에서 제거한 테스트 예산 경로를 임시 파일로
+runner 진입점에 전달하며 Manager 호출에는 해당 fixture의 session도 전달한다.
+같은 wrapper에서 중첩 runner의 자원 관측도 고정해 호스트 부하와 분리한다.
+프로젝트 test worker의 인증값 제거와 Agent guard는 유지한다.
+이 전달 계약은 subprocess를 mock한 unit test로 확인하며 native 통합 회귀는 Worker가 실행하지 않는다.
+로컬 native targeted 근거는 Linux/Perl 5.38.2이며 실제 강제 종료,
 Windows/Linux 격리와 동시 실행 실측은 전체 verify·후속 Manager 검증으로 남는다.
 
 ## 영향 기반 부분 실행
