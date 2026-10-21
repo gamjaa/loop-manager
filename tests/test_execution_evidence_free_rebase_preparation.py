@@ -47,6 +47,36 @@ class EvidenceFreeRebasePreparationTests(TestCase):
         self.assertTrue(case.handler._resolving_rebase(case.state.row()))
         self.assertEqual(case.checkpoint.get('repo', 'G-047'), restored)
 
+    def test_recovered_rebase_prepares_owned_workspace_without_fresh_remote_adoption(self):
+        from unittest import mock
+        from loop_manager_internal.execution.execution_runtime import ExecutionContext
+        self.pending()
+        case = self.case
+        connection = case.fixture.connection
+        connection.execute('CREATE TABLE manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        connection.execute("INSERT INTO manager_metadata VALUES ('created_from_absence', '1')")
+        connection.execute('DELETE FROM execution_checkpoints')
+        case.state.update_project('repo', last_error='prior failure', publication_remote_oid='remote')
+        case.state.repository.update_plan('repo', 'G-047', plan_values={'workspace_owned': 0}, enqueue=False)
+        case.state.expected = case.state.repository.projected('repo')
+        workspace = case.fixture.effects.workspace
+        workspace._plan_id_from_path.return_value = 'G-047'
+        workspace._rebase_in_progress_for_branch.return_value = True
+        workspace.make_worktree.return_value = case.fixture.context().worktree
+        case.handler._fetch_latest_base = mock.Mock(
+            side_effect=AssertionError('owned rebase must not enter fresh adoption'))
+
+        result = case.handler._workspace_handler().prepare()
+
+        self.assertIsInstance(result, ExecutionContext)
+        self.assertTrue(result.resolving_rebase)
+        workspace.make_worktree.assert_called_once()
+        self.assertTrue(workspace.make_worktree.call_args.kwargs['allow_rebase'])
+        self.assertTrue(workspace.make_worktree.call_args.kwargs['allow_recovery'])
+        self.assertEqual(case.checkpoint.get('repo', 'G-047').operation, 'rebase')
+        self.assertEqual(case.state.row()['worker_session_id'], 'saved-worker')
+        case.fixture.effects.blocking.block_active_execplan_from_revision.assert_not_called()
+
     def test_missing_checkpoint_rejects_unverified_remote_without_writing_recovery(self):
         from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
         self.pending()

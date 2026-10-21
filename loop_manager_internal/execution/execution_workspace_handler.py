@@ -718,6 +718,7 @@ class WorkspaceHandler:
             local_branch_exists = False
             can_adopt = (
                 self.ports.checkpoint is not None
+                and not workspace_owned
                 and database.remote_work_adoption_allowed(
                     self.ports.state.connection, self.ports.identity.repo, plan_id)
             )
