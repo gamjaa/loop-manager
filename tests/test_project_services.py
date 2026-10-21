@@ -82,17 +82,19 @@ class ProjectServiceCompositionTests(unittest.TestCase):
                     execution.assert_called_once_with(mock.ANY, newly_activated=False)
                     planning.assert_not_called()
 
-    def test_execution_planning_waits_only_for_controlling_git_operations(self):
+    def test_execution_planning_preserves_rebase_and_waits_for_other_git_operations(self):
         effects = git_ports.PlanningGitPortsEffects(**{field.name: mock.Mock()
             for field in fields(git_ports.PlanningGitPortsEffects)})
         port = git_ports._PlanningGitPorts(effects, None, Path('/repo'), Path('/state'))
         with tempfile.TemporaryDirectory() as directory:
             for markers, pending in (({}, False), ({'MERGE_MSG': 'old'}, False),
-                                     ({'rebase-merge': 'active'}, True), ({'MERGE_HEAD': 'active'}, True)):
+                                     ({'rebase-merge': 'active'}, False), ({'rebase-apply': 'active'}, False),
+                                     ({'rebase-merge': 'active', 'sequencer': 'active'}, True),
+                                     ({'MERGE_HEAD': 'active'}, True)):
                 with self.subTest(markers=markers):
                     effects._git_operation_entries.return_value = markers
-                    self.assertEqual(port.execution_operation_pending(Path(directory)), pending)
-            self.assertTrue(port.execution_operation_pending(Path(directory) / 'missing'))
+                    self.assertEqual(port.execution_blocks_planning(Path(directory)), pending)
+            self.assertTrue(port.execution_blocks_planning(Path(directory) / 'missing'))
 
     def test_relocated_workspace_boundary_accepts_owned_path_and_rejects_mismatch(self):
         with tempfile.TemporaryDirectory() as temporary:

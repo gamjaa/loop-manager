@@ -130,11 +130,14 @@ class _PlanningGitPorts:
     def plan_declarations(self, repo_path: Path, sha: str) -> dict[str, tuple[str, str]]:
         return self._effects.plan_declarations(repo_path, sha)
 
-    def execution_operation_pending(self, worktree: Path) -> bool:
+    def execution_blocks_planning(self, worktree: Path) -> bool:
         from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
         if not worktree.is_dir():
             return True
-        return controlling_git_operation(self._effects._git_operation_entries(worktree)) is not None
+        # 별도 planning worktree의 게시를 먼저 끝내고 보존한 rebase를 재개한다.
+        operations = self._effects._git_operation_entries(worktree)
+        return controlling_git_operation({name: value for name, value in operations.items()
+            if name not in {'rebase-merge', 'rebase-apply'}}) is not None
 
     def specification_fingerprint(self, repo_path: Path, sha: str) -> str:
         return self._effects._specification_input_fingerprint(repo_path, sha, **self._guidance_argument(repo_path))

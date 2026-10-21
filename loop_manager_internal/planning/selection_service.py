@@ -173,7 +173,7 @@ class PlanningSelectionService(PlanningService):
                 decision = self._ports.state.schedule(run.context.repo)
                 if getattr(decision, 'active', None) is None:
                     return PlanningOutcome(PlanningOutcomeKind.WAITING)
-                if self._ports.git.execution_operation_pending(Path(str(row.worktree))):
+                if self._ports.git.execution_blocks_planning(Path(str(row.worktree))):
                     return PlanningOutcome(PlanningOutcomeKind.WAITING)
                 self._ports.state.pause_execution_for_planning(row, str(decision.active['plan_id']))
                 row = self._ports.state.planning(run.context.repo)
@@ -335,7 +335,7 @@ class PlanningSelectionService(PlanningService):
                         return None
                     if self._ports.state.planning_release_pending(context.repo):
                         return PlanningOutcome(PlanningOutcomeKind.WAITING)
-                    if self._ports.git.execution_operation_pending(Path(str(row.worktree))):
+                    if self._ports.git.execution_blocks_planning(Path(str(row.worktree))):
                         return None
                     self._ports.state.pause_execution_for_planning(row, str(active['plan_id']))
                 run.row = self._ports.state.planning(context.repo)

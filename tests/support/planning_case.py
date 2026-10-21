@@ -415,7 +415,7 @@ class FakeStatePort:
 
 
 class FakeGitPort:
-    def execution_operation_pending(self, _worktree):
+    def execution_blocks_planning(self, _worktree):
         return False
 
     def __init__(self):

@@ -268,6 +268,10 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
             "last_error='old failure' WHERE repo='repo'")
         connection.commit()
         original = runtime.hydrate('repo', 'G-047')
+        checkpoints = ExecutionCheckpointRepository(connection)
+        checkpoint = checkpoints.record('repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='saved-head', target_base_oid='original-target', observed_remote_oid='remote',
+            snapshot={'pending': 'stage', 'stash_oid': 'saved-stash', 'staged_paths': ['src.py']})
         expected = runtime.planning('repo')
         def fail(stage):
             if stage == 'after_execution_planning_pause':
@@ -278,6 +282,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         runtime.pause_execution_for_planning(expected, 'G-047')
         self.assertEqual(runtime.active('repo'), original)
         self.assertIsNone(runtime.projected('repo'))
+        self.assertEqual(checkpoints.get('repo', 'G-047'), checkpoint)
         self.assertFalse(runtime.recovery_slot_available('repo'))
         runtime.update_project('repo', {'phase': 'PLANNING', 'worktree': '/planning',
             'planning_error': 'failed', 'planning_error_fingerprint': 'same'})
@@ -290,6 +295,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         restarted = runtime_state.RuntimeStateRepository(connection)
         self.assertEqual(restarted.resume_execution_after_planning('repo'), original)
         self.assertEqual(restarted.projected('repo'), original)
+        self.assertEqual(checkpoints.get('repo', 'G-047'), checkpoint)
         self.assertEqual(restarted.planning('repo').processed_sha, 'published')
         self.assertIsNone(restarted.planning('repo').planning_resume_plan_id)
 

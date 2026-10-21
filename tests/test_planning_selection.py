@@ -239,6 +239,43 @@ class PlanningSelectionTest(PlanningCase):
         self.assertEqual(run.row.phase, 'PLANNING')
         self.assertEqual(run.row.planning_resume_plan_id, 'G-001')
 
+    def test_specification_planning_completes_before_parked_rebase_resumes(self):
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+        with tempfile.TemporaryDirectory() as directory:
+            original = planning_snapshot(phase='WORKING', active_sha='old-base', worktree=directory,
+                processed_sha='old-base', planning_fingerprint='old-full', specification_fingerprint='old-spec')
+            ports = FakePorts(original)
+            ports.git.specification_fingerprints['old-base'] = 'old-spec'
+            ports.state.schedule_result.active = {'plan_id': 'G-001', 'pr_url': None, 'pr_conflict_recovery': 0, 'worktree': directory}
+            ports.git.advance_remote_on_push = True
+            markers = {'rebase-merge': 'active'}
+            effects = SimpleNamespace(git=mock.Mock(), _nul_git_paths=mock.Mock(),
+                _git_operation_entries=mock.Mock(return_value=markers))
+            git = _PlanningGitPorts(effects, None, self.context.repo_path, self.context.state_dir)
+            ports.git.execution_blocks_planning = git.execution_blocks_planning
+
+            planner = ports.agent.run_planner
+            def write_plan(*args, **kwargs):
+                result = planner(*args, **kwargs)
+                ports.git.dirty_files = ['docs/plans/[G-001] Plan.md']
+                return result
+            with mock.patch.object(ports.agent, 'run_planner', side_effect=write_plan):
+                outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+            self.assertEqual(ports.agent.run_count, 1)
+            self.assertEqual(outcome.base_sha, 'plan-commit')
+            self.assertEqual(ports.git.remote, 'plan-commit')
+            self.assertEqual(ports.state.paused_execution, original)
+            self.assertEqual(ports.state.snapshot.phase, original.phase)
+            self.assertEqual(ports.state.snapshot.worktree, directory)
+            self.assertEqual(ports.state.snapshot.processed_sha, outcome.base_sha)
+            self.assertEqual(ports.state.snapshot.specification_fingerprint, 'specification')
+            self.assertIsNone(ports.state.snapshot.planning_resume_plan_id)
+            self.assertEqual(markers, {'rebase-merge': 'active'})
+            PlanningLifecycleCoordinator(ports).run(replace(self.context, base_sha=outcome.base_sha))
+            self.assertEqual(ports.agent.run_count, 1)
+
     def test_changed_specification_waits_for_running_agent_without_parking_execution(self):
         original = planning_snapshot(phase='VERIFYING', active_sha='old-base', worktree='/saved',
             processed_sha='old-base', planning_fingerprint='old-full', specification_fingerprint='old-spec')
