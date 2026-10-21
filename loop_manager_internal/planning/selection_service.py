@@ -481,9 +481,21 @@ class PlanningSelectionService(PlanningService):
                 "Merge 대기 PR 종료 전 유지보수 평가를 보류합니다."
             )
             return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        maintenance_specification_changed = False
+        if decision.runnable_ready is not None and cycle.phase in {
+            maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+            maintenance_state.MaintenancePhase.REFACTORING,
+        }:
+            maintenance_specification_changed = (
+                self._user_decision_pending(context, run.base_sha)
+                or self._general_planning_required(
+                    row, context, run.base_sha,
+                    self._ports.git.input_fingerprint(context.repo_path, run.base_sha),
+                )
+            )
         if cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
             run.maintenance_planning = True
-        elif not run.retirement_pending and cycle.phase in {
+        elif not (run.retirement_pending or maintenance_specification_changed) and cycle.phase in {
             maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
             maintenance_state.MaintenancePhase.REFACTORING,
             maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
