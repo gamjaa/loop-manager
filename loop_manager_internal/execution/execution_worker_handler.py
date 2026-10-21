@@ -105,11 +105,13 @@ class WorkerHandler:
         repository = TargetedTestRepository(self.ports.state.connection)
         repo, plan_id = self.ports.identity.repo, context.plan.plan_id
         repository.reconcile(state_dir=self.ports.identity.state_dir, repo=repo, plan_id=plan_id)
+        self.ports.state.check_context(context)
         repeated = repository.repeated(repo, plan_id)
         if not repeated:
             return None
         detail = '동일 targeted unit test가 연속 3회 실패했습니다: ' + ', '.join(repeated)
         with runtime_state._transaction(self.ports.state.connection):
+            self.ports.state.check_context(context)
             outcome = self.ports._recover(RecoveryReason.TARGETED_TEST_EXHAUSTED,
                                           detail, context=context)
             repository.acknowledge(repo, plan_id)

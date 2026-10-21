@@ -21,6 +21,28 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def _bound_targeted_record(self, state_dir, name, run_id, result):
+        import json
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository, ensure_schema
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository, ensure_schema as targeted_schema
+
+        ensure_schema(self.connection)
+        targeted_schema(self.connection)
+        directory = state_dir / 'agent-runtime' / 'previous-runtime' / name
+        directory.mkdir(parents=True)
+        calls = InvocationRepository(self.connection)
+        invocation = calls.start(InvocationContext('repo', 'G-047'), 'worker', 'codex',
+                                 ResolvedProfile('old-model', 'low'), None)
+        receipt = directory.parent / (directory.name + '.process.json')
+        repository = TargetedTestRepository(self.connection)
+        repository.bind(invocation, directory, receipt, state_dir=state_dir)
+        calls.bind_process_receipt(invocation, str(receipt))
+        event = {'run_id': run_id, 'id': 'tests.Sample.test_failure', 'result': result,
+                 'kind': 'test_end', 'version': 1, 'utc': '2026-10-15T00:00:00'}
+        (directory / f'targeted-{run_id}.jsonl').write_text(json.dumps(event) + '\n', encoding='utf-8')
+        return repository, directory, receipt
+
     def test_successful_verify_saves_candidate_proof_before_scope_block(self):
         self.review_context()
         self.dirty = False
@@ -218,6 +240,171 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         self.effects.validation.parse_worker_result.assert_not_called()
         self.effects.validation.verify.assert_not_called()
         self.assertNotIn('add', self.calls)
+
+    def test_reconciled_third_targeted_failure_blocks_before_saved_verify_reuse(self):
+        import tempfile
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+
+        self.review_context()
+        self.state.update_project('repo', phase='VERIFYING', worker_session_id='worker-session')
+        context = self.handler._context()
+        repository = TargetedTestRepository(self.connection)
+        for run in ('first', 'second'):
+            repository.observe('repo', 'G-047', [{
+                'run_id': run, 'id': 'tests.Sample.test_failure', 'result': 'failure',
+            }])
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.handler.state_dir = Path(temporary.name)
+        repository, _directory, _receipt = self._bound_targeted_record(
+            self.handler.state_dir, 'call-one', 'third', 'failure',
+        )
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        previous = verify_receipts.latest_decision(self.connection, selection)
+
+        with mock.patch('loop_manager_internal.agents.process_receipt.recover',
+                        return_value={'finished_at': 'proof'}), \
+             mock.patch.object(self.handler, '_fetch_latest_base', return_value='base') as fetch:
+            outcome = self.handler.verify(context, None)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(outcome.recovery.observation.reason, handlers.RecoveryReason.TARGETED_TEST_EXHAUSTED)
+        self.assertEqual(repository.sequence('repo', 'G-047'), 3)
+        self.assertFalse(repository.repeated('repo', 'G-047'))
+        self.assertFalse(repository.pending('repo', 'G-047'))
+        self.assertEqual(verify_receipts.latest_decision(
+            self.connection, verify_receipts.selected(self.connection, 'repo', 'G-047'),
+        )['id'], previous['id'])
+        self.assertEqual(self.state.row()['worker_result'], 'worker result')
+        self.effects.validation.verify.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+        fetch.assert_not_called()
+
+    def test_pending_targeted_writer_pauses_verify_and_resumes_saved_work_after_collection(self):
+        import tempfile
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+
+        self.review_context()
+        self.state.update_project('repo', phase='VERIFYING', worker_session_id='worker-session')
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.handler.state_dir = Path(temporary.name)
+        repository, _directory, _receipt = self._bound_targeted_record(
+            self.handler.state_dir, 'call-one', 'pending', 'success',
+        )
+
+        verify_handler = self.handler._verify_handler()
+        previous_context = self.handler._context()
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        previous_receipt = verify_receipts.latest_decision(self.connection, selection)
+        latest_base = SimpleNamespace(reconcile=mock.Mock(return_value=None))
+        with mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value=None):
+            paused = verify_handler.verify(previous_context, latest_base)
+
+        self.assertEqual(paused.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(paused.recovery.observation.reason, handlers.RecoveryReason.TARGETED_TEST_CORRECTION)
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], 'worker result')
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        self.assertTrue(repository.pending('repo', 'G-047'))
+        self.assertEqual(verify_receipts.latest_decision(self.connection,
+            verify_receipts.selected(self.connection, 'repo', 'G-047'))['id'], previous_receipt['id'])
+        self.effects.validation.verify.assert_not_called()
+
+        self.dirty = False
+        sentinel = ExecutionOutcome(ExecutionOutcomeKind.PHASE_ADVANCED, context=self.handler._context())
+        with mock.patch('loop_manager_internal.agents.process_receipt.recover',
+                        return_value={'finished_at': 'proof'}), \
+             mock.patch.object(self.handler, '_fetch_latest_base', return_value='base'), \
+             mock.patch.object(self.handler, '_post_effect_guard', side_effect=lambda _context: self.handler._context()), \
+             mock.patch('loop_manager_internal.execution.execution_verify_handler.common_guidance_report'), \
+             mock.patch.object(verify_handler, '_finish_verified', return_value=sentinel):
+            resumed = verify_handler.verify(self.handler._context(), latest_base)
+
+        self.assertIs(resumed, sentinel)
+        self.assertFalse(repository.pending('repo', 'G-047'))
+        self.assertEqual(repository.sequence('repo', 'G-047'), 1)
+        self.assertEqual(verify_receipts.latest_decision(self.connection,
+            verify_receipts.selected(self.connection, 'repo', 'G-047'))['kind'], 'reuse')
+        self.effects.validation.verify.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_verify_rechecks_after_slot_and_releases_unstarted_call_on_new_evidence(self):
+        import tempfile
+        from contextlib import contextmanager
+        from loop_manager_internal.application import task_scheduling
+        from loop_manager_internal.application.task_scheduling import Task, TaskScheduler, scheduled_call
+
+        self.review_context()
+        self.state.update_project('repo', phase='VERIFYING')
+        self.dirty = False
+        self.effects.validation.observe_verify_inputs.return_value = InputObservation(
+            None, reason='unproven inputs for launch-boundary test',
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        state_dir = Path(temporary.name)
+        self.handler.state_dir = state_dir
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        previous_receipt = verify_receipts.latest_decision(self.connection, selection)
+        launches = []
+
+        @scheduled_call('verify')
+        def scheduled_verify(_worktree):
+            launches.append(True)
+            return True, 'verify output'
+
+        self.handler.effects = replace(
+            self.handler.effects,
+            validation=replace(self.handler.effects.validation, verify=scheduled_verify),
+        )
+        verify_handler = self.handler._verify_handler()
+        latest_base = SimpleNamespace(reconcile=mock.Mock(return_value=None))
+        self.connection.commit()
+        scheduler = TaskScheduler(
+            SimpleNamespace(max_workers=1, verify_concurrency=1),
+            lambda *_args, **_kwargs: self.connection,
+            state_dir,
+            self.connection,
+        )
+        original_slot = scheduler.slot
+        inserted = []
+
+        @contextmanager
+        def slot_with_new_targeted_writer(kind, task):
+            with original_slot(kind, task):
+                if kind == 'verify' and task.plan_id == 'G-047':
+                    inserted.append(self._bound_targeted_record(
+                        state_dir, 'arrived-during-slot', 'arrived', 'success',
+                    )[0])
+                yield
+
+        scheduler.slot = slot_with_new_targeted_writer
+        scheduler_token = task_scheduling.current_scheduler.set(scheduler)
+        task_token = task_scheduling.current_task.set(Task('repo', 'G-047', self.connection))
+        try:
+            with mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value=None), \
+                 mock.patch.object(self.handler, '_fetch_latest_base', return_value='base'), \
+                 mock.patch.object(self.handler, '_post_effect_guard', side_effect=lambda _context: self.handler._context()), \
+                 mock.patch('loop_manager_internal.execution.execution_verify_handler.common_guidance_report'):
+                outcome = verify_handler.verify(self.handler._context(), latest_base)
+        finally:
+            task_scheduling.current_task.reset(task_token)
+            task_scheduling.current_scheduler.reset(scheduler_token)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(outcome.recovery.observation.reason, handlers.RecoveryReason.TARGETED_TEST_CORRECTION)
+        self.assertEqual(len(inserted), 1)
+        self.assertTrue(inserted[0].pending('repo', 'G-047'))
+        self.assertEqual(launches, [])
+        self.assertEqual(verify_receipts.latest_decision(self.connection,
+            verify_receipts.selected(self.connection, 'repo', 'G-047'))['id'], previous_receipt['id'])
+        self.assertEqual(self.connection.execute(
+            'SELECT COUNT(*) FROM task_call_reservations WHERE repo=? AND plan_id=? AND kind=?',
+            ('repo', 'G-047', 'verify'),
+        ).fetchone()[0], 0)
+        self.assertEqual(scheduler.running['verify']['repo'], 0)
 
 
     def test_preparation_recovery_corrects_owned_stale_markers_before_verify(self):

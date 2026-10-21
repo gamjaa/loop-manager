@@ -591,6 +591,7 @@ class ExecutionHandlers:
                 "_recover": lambda *a, **kw: self._recover(*a, **kw),
                 "_retry": lambda *a, **kw: self._retry(*a, **kw),
                 "_row": lambda *a, **kw: self._row(*a, **kw),
+                "_targeted_test_block": lambda context: self._worker_handler()._targeted_test_block(context),
             },
         )
 

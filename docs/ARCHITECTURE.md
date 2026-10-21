@@ -1223,6 +1223,8 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 
   차단 확정과 도달 표식 소비는 같은 transaction이며 실행·실패 감사는 보존한다. Worker 최종 실패 보고와 수집 대기는 `targeted_test_correction`으로 분리해 일반·rebase 보고 오류 한도를 소비하지 않고, 새 실행 근거가 없으면 일시 중단한다. 수집 대기는 별도 반환 표식으로 전달하며 물리 provider 결과·사용량·종료 감사를 덮지 않는다. 실제 provider 거부·완료 보고 오류·명시적 사용자 결정과 독립 안전 차단은 각 기존 경계에서 처리한다.
 
+- 저장된 VERIFYING 진입은 선택된 repository·ExecPlan의 자료를 Worker 결과·사용자 결정 gate 뒤, 부분 실행·전체 실행·성공 receipt 재사용 전에 다시 관측한다. 기존 Worker 차단 경계가 세 번째 실패와 도달 표식 소비를 원자 처리하며, 미수집 자료는 `targeted_test_correction` 일시 중단으로 VERIFYING·Worker 결과·session·후보를 보존한다. 부분·전체 실행은 `scheduled_call("verify")`가 실제 verify slot을 배정한 뒤 process receipt 준비 전에 같은 자료를 재확인한다. 이 경계에서 차단·대기가 생기면 아직 자식 receipt가 없어 기존 task-call 확인 규칙이 미시작 verify 자리만 반환하고 새 verify 실행·실패 receipt를 만들지 않는다. 작업별 repository·ExecPlan 필터를 유지해 다른 작업의 기록·예약은 건드리지 않는다.
+
 ### 전체 verify와 Reviewer
 
 - Worker는 현재 운영체제용 verify 스크립트가 없으면 생성하고 테스트 명령이 바뀌면 갱신한다

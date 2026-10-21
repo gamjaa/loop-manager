@@ -28,10 +28,10 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/execution/execution_verify_handler.py:verify()`·`_maybe_partial()`·receipt 선택 흐름에 작업별 targeted 확인을 연결한다. 초기 진입과 실제 검증 효과 직전의 배정 경계를 대조하며 모든 부분/전체/재사용 분기가 이를 소비하게 한다. `application/task_scheduling.py:scheduled_call()`·`slot()`과 `storage/task_calls.py`의 확인된 미시작/종료 자리 반환을 재사용한다. 검증 launch receipt 준비 전 확인과 미시작 반환을 연결하되 공정 배정·한도·일반 상태 재검사 자체는 G-297의 기존 목표에 남긴다.
-- [ ] 확인한 `execution/execution_worker_handler.py:_targeted_test_block()`의 재관측·원자 차단/표식 소비와 `storage/targeted_test_state.py`의 `reconcile`·`pending`을 재사용한다. `execution/execution_handlers.py`·`execution_assembly.py`의 좁은 port 조립으로 필요한 책임만 공유한다. 새로운 상태 테이블·runner·범용 복구 계층은 만들지 않으며 수집 대기에서 검증 재개 단계와 물리 provider 결과를 보존한다.
-- [ ] 확인한 `storage/agent_invocation_state.py:reconcile_interrupted()`·`agents/process_receipt.py`와 `recovery/recovery_runtime.py`의 기존 종료·대기·소진 처리를 소비한다. 파일/프로세스 관측은 DB 쓰기 transaction 밖에서 수행하고 현재 작업 identity·상태의 경쟁 변경은 적용 전에 다시 확인한다. 살아 있는 writer와 독립 안전·사용자 결정은 기존 경계에 남긴다.
-- [ ] 확인한 `tests/test_execution_verify_phase.py`·`tests/test_targeted_test_streak.py`·`tests/support/execution.py`의 실제 SQLite/단계 fixture를 확장한다. 이미 구현된 수집/Worker 회귀는 재사용하고 저장된 검증 진입과 실제 효과의 연결만 추가한다. PRODUCT·ARCHITECTURE에는 실제 보완한 검증 진입 책임만 필요한 경우 통합한다.
+- [x] `VerifyHandler.verify()`의 Worker 결과·사용자 결정 gate 뒤에서 작업별 targeted 자료를 재관측하고, 전체 receipt 재사용·부분/전체 verify보다 먼저 기존 Worker 경계의 원자 차단과 `targeted_test_correction` 대기를 적용했다. `_maybe_partial()`과 최종 verify 진입 모두 같은 gate를 통과한다.
+- [x] verify 효과는 `scheduled_call("verify")`가 실제 자리를 배정한 뒤 process receipt 준비 전에 다시 확인한다. 차단·대기 시 기존 호출 확인 규칙으로 미시작 자리만 반환하고 새 verify 실패 receipt를 만들지 않으며, Worker 결과·session·후보와 다른 작업 상태를 보존한다. 공정 배정·한도·일반 상태 재검사는 기존 경계에 남겼다.
+- [x] 기존 `_targeted_test_block()`·`TargetedTestRepository.reconcile()`·`pending()` 및 좁은 port 조립을 재사용했다. 파일/프로세스 관측은 쓰기 transaction 밖에서 수행하고 적용 전에 작업 context를 재확인한다. 새 저장소·runner·복구 계층은 추가하지 않았다.
+- [x] 실제 SQLite·JSONL·호출 receipt fixture로 저장 VERIFYING의 세 번째 실패 차단, 미수집 자료의 대기/재개, slot 배정 뒤 새 자료가 도착하는 경계를 회귀 검증했다.
 
 ## Validation
 
@@ -44,9 +44,9 @@ priority: high
 
 ## Progress
 
-- [x] revision `937b03f1dd9e182e0e48e565ea093dc560f2de5b`의 호출 결합·재수집·Worker gate와 저장된 verify dispatch·관련 테스트를 정적으로 대조했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 저장된 검증 진입의 작업별 재관측·차단·대기 연결
-- [ ] 부분/전체/재사용·중단·경쟁·독립 작업의 최소 unit 회귀
+- [x] revision `937b03f1dd9e182e0e48e565ea093dc560f2de5b`의 호출 결합·재수집·Worker gate와 저장된 verify dispatch·관련 테스트를 정적으로 대조했다.
+- [x] 저장된 검증 진입의 작업별 재관측·차단·대기를 연결하고 부분/전체 실행 및 receipt 재사용보다 먼저 검사한다.
+- [x] verify slot 배정 뒤 새 자료가 도착하는 경우를 포함한 targeted unit test 4개를 실행했다. 네 테스트 모두 통과했으며 전체 verify는 실행하지 않았다.
 
 ## Decision Log
 
