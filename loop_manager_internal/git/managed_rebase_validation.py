@@ -116,8 +116,7 @@ class RebaseObservation:
     remote: Remote | None
     input_fingerprint: str
     scope_fingerprint: str
-    # Includes shared refs/worktrees/config so drift invalidates acceptance.
-    # It grants no exemption from their independent Agent scope checks.
+    # Only the selected reservation and consumed origin/ignore inputs affect stability.
     repository_state_fingerprint: str
 
     @property
@@ -151,9 +150,7 @@ def rebase_content_pending(expected: RebaseExpectation, observed: RebaseObservat
     """The reserved start and replay/restoration bytes are not a final candidate."""
     return bool(observed.metadata is not None
                 or {'rebase-merge', 'rebase-apply'}.intersection(dict(observed.operations))
-                or (observed.head == expected.before_head
-                    and observed.base_is_ancestor is False
-                    and not controlling_git_operation(dict(observed.operations)))
+                or observed.base_is_ancestor is False
                 or (expected.autostash_oid
                     and (observed.staged or any(entry.stage for entry in observed.index))))
 
@@ -339,8 +336,7 @@ def assess_current_rebase(
     if observed.base_is_ancestor is None:
         return RebaseDecision(RebaseStatus.UNAVAILABLE, 'ancestry_missing')
     if observed.base_is_ancestor is not True:
-        if (observed.head == expected.before_head
-                and not controlling_git_operation(operations)
+        if (not controlling_git_operation(operations)
                 and observed.index_clean and not observed.staged
                 and not any(entry.stage for entry in observed.index)):
             return RebaseDecision(RebaseStatus.START, 'owned_original_head_before_rebase')

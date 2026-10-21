@@ -812,13 +812,13 @@ class PersistedScopeServiceTests(TestCase):
             )
             with mock.patch.object(manager, 'capture_git_snapshot', return_value=current):
                 preserved = manager.preserve_blocked_agent_changes(
-                    connection, 'repo', worktree, 'G-047', accept_current_input=True,
+                    connection, 'repo', worktree, 'G-047',
                     validated_snapshot=current,
                 )
                 self.assertEqual(preserved, current)
-                with self.assertRaises(AgentScopeError):
+                with self.assertRaisesRegex(AgentScopeError, '검증 snapshot'):
                     manager.preserve_blocked_agent_changes(
-                        connection, 'repo', worktree, 'G-047',
+                        connection, 'repo', worktree, 'G-047', validated_snapshot=None,
                     )
             self.assertEqual(tuple(connection.execute(
                 "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo='repo'",
@@ -828,7 +828,7 @@ class PersistedScopeServiceTests(TestCase):
         before = snapshot()
         result = replace(before, dirty={'agent.py': (('unstaged',), 'saved Agent output')})
         validated = replace(before, head='user-head')
-        changed = replace(validated, config={'local:remote.origin.url': ('foreign',)})
+        changed = replace(validated, dirty={'user.py': (('unstaged',), 'changed input')})
         connection = runtime_connection()
         self.addCleanup(connection.close)
         connection.execute(
@@ -843,7 +843,7 @@ class PersistedScopeServiceTests(TestCase):
             with self.assertRaisesRegex(AgentScopeError, '검증 이후 변경'):
                 manager.preserve_blocked_agent_changes(
                     connection, 'repo', Path('/managed'), 'G-047',
-                    accept_current_input=True, validated_snapshot=validated,
+                    validated_snapshot=validated,
                 )
 
         baseline.assert_not_called()
@@ -851,7 +851,21 @@ class PersistedScopeServiceTests(TestCase):
             "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo='repo'",
         ).fetchone()), (before.serialize(), result.serialize()))
 
-    def test_blocked_agent_preservation_resumes_pending_recovery_for_current_input(self):
+    def test_blocked_agent_preservation_ignores_shared_git_changes_and_scope_serialization(self):
+        before = snapshot(scope_id='a' * 32, scope_start_digest='b' * 64)
+        current = replace(before, scope_id=None, scope_start_digest=None,
+            refs={'refs/heads/other-task': ('new', '')},
+            worktrees={'/other-task': ('HEAD=new',)}, config={'local:user.name': ('changed',)})
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        with mock.patch.object(manager, 'capture_git_snapshot', return_value=current), \
+             mock.patch.object(manager, '_complete_blocked_agent_recovery') as restore:
+            self.assertEqual(manager.preserve_blocked_agent_changes(
+                connection, 'repo', Path('/managed'), 'G-047', validated_snapshot=before,
+            ), current)
+        restore.assert_not_called()
+
+    def test_blocked_agent_preservation_does_not_replay_historical_recovery(self):
         before = snapshot()
         recovery = {
             "version": 1,
@@ -876,12 +890,13 @@ class PersistedScopeServiceTests(TestCase):
              mock.patch.object(manager, "_complete_blocked_agent_recovery") as complete:
             preserved = manager.preserve_blocked_agent_changes(
                 connection, "repo", Path("/managed"), "G-047",
-                accept_current_input=True,
                 validated_snapshot=before,
             )
 
         self.assertEqual(preserved, before)
-        complete.assert_called_once_with(connection, "repo", Path("/managed"))
+        complete.assert_not_called()
+        self.assertEqual(connection.execute("SELECT agent_recovery FROM projects WHERE repo='repo'").fetchone()[0],
+                         json.dumps(recovery))
 
     def test_blocked_plan_resume_detects_code_only_committed_candidate(self):
         from types import SimpleNamespace
@@ -972,9 +987,7 @@ class PersistedScopeServiceTests(TestCase):
             validate.assert_called_once()
             self.assertTrue(validate.call_args.kwargs['changed_candidate'])
             preserve.assert_called_once()
-            self.assertTrue(preserve.call_args.kwargs['accept_current_input'])
             self.assertEqual(preserve.call_args.kwargs['validated_snapshot'], current)
-            self.assertIsNone(preserve.call_args.kwargs['preserved_input_path'])
 
     def test_dirty_blocked_baseline_and_security_flags_are_not_absorbed(self):
         before = snapshot(worktrees={str(Path('/managed').resolve()): ('HEAD=head', 'branch=refs/heads/loop-manager/G-047')})

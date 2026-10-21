@@ -588,8 +588,6 @@ def _resume_blocked_execplan_if_inputs_changed(
             repo,
             worktree,
             str(plan["plan_id"]),
-            preserved_input_path=(str(plan["path"]) if worktree_changed else None),
-            accept_current_input=True,
             validated_snapshot=validated_snapshot,
         )
     except recovery_runtime.RecoveryFailure:

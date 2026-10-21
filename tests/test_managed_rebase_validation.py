@@ -145,6 +145,13 @@ class CurrentRebasePolicyTests(unittest.TestCase):
         scope = scope_for(expected, current, contracts_allowed=contract)
         self.assertEqual(assess_current_rebase(expected, current, scope).status, RebaseStatus.START)
         contract.assert_not_called()
+        for before_head in (None, 'older-checkpoint'):
+            with self.subTest(before_head=before_head):
+                prior = replace(expected, before_head=before_head)
+                self.assertEqual(assess_current_rebase(
+                    prior, current, scope_for(prior, current, contracts_allowed=contract),
+                ).status, RebaseStatus.START)
+        contract.assert_not_called()
         for changes in (
             {'committed': (replace(protected, path='../outside'),)},
             {'index': (replace(current.index[0], flags=0x8000),)},
@@ -211,7 +218,7 @@ class CurrentRebasePolicyTests(unittest.TestCase):
             {'registration': ('HEAD=after', f'branch=refs/heads/{expected.branch}',
                               'detached=True')},
             {'branch_worktrees': ('/owned', '/other')},
-            {'base_is_ancestor': False}, {'index_clean': False},
+            {'index_clean': False},
             {'operations': (('CHERRY_PICK_HEAD', 'commit'),)},
             {'input_fingerprint': 'new-inputs'}, {'scope_fingerprint': 'new-approval'},
             {'remote': replace(expected.remote, oid='racing-remote')},
@@ -435,7 +442,8 @@ class CurrentRebaseObservationTests(unittest.TestCase):
                         self.assertIsNone(scope)
 
     def test_other_tasks_refs_and_worktrees_do_not_invalidate_owned_rebase(self):
-        for mutation in ('other_ref', 'other_worktree', 'owned_ref', 'owned_worktree', 'duplicate_binding', 'config'):
+        for mutation in ('other_ref', 'other_worktree', 'owned_ref', 'owned_worktree',
+                         'duplicate_binding', 'config', 'origin'):
             with self.subTest(mutation=mutation):
                 adapters = self.adapters()
                 first = adapters.capture_snapshot.return_value
@@ -451,11 +459,13 @@ class CurrentRebaseObservationTests(unittest.TestCase):
                     second.worktrees[self.expected.worktree] = ('HEAD=unexpected-head',)
                 elif mutation == 'duplicate_binding':
                     second.worktrees['/other-task'] = (f'branch=refs/heads/{self.expected.branch}',)
-                else:
+                elif mutation == 'config':
                     second.config['core.hooksPath'] = ('changed',)
+                else:
+                    second.config['local:remote.origin.url'] = ('changed',)
                 adapters.capture_snapshot.side_effect = (first, second)
                 actual, scope = observe_current_rebase(self.expected, adapters)
-                if mutation in {'other_ref', 'other_worktree'}:
+                if mutation in {'other_ref', 'other_worktree', 'config'}:
                     self.assertIsInstance(actual, RebaseObservation)
                     self.assertEqual(assess_current_rebase(self.expected, actual, scope).status, RebaseStatus.COMPLETE)
                 else:
@@ -507,11 +517,11 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         self.assertIsNone(scope)
 
     def test_new_base_observation_uses_common_ancestor_with_retained_auxiliary_files(self):
-        expected, adapters = self.expected, self.adapters()
+        expected, adapters = replace(self.expected, before_head=None), self.adapters()
         snapshot = adapters.capture_snapshot.return_value
-        snapshot.head = expected.before_head
-        snapshot.refs[f'refs/heads/{expected.branch}'] = (expected.before_head, '')
-        snapshot.worktrees[expected.worktree] = (f'HEAD={expected.before_head}',
+        snapshot.head = 'current-worker-head'
+        snapshot.refs[f'refs/heads/{expected.branch}'] = ('current-worker-head', '')
+        snapshot.worktrees[expected.worktree] = ('HEAD=current-worker-head',
                                                f'branch=refs/heads/{expected.branch}')
         snapshot.operations = {'REBASE_HEAD': 'last-commit', 'MERGE_MSG': 'retained-message'}
         original_git = adapters.git.side_effect
@@ -519,7 +529,7 @@ class CurrentRebaseObservationTests(unittest.TestCase):
             result = original_git(context, *args, **kwargs)
             if args[:2] == ('merge-base', '--is-ancestor'):
                 result.returncode = 1
-            elif args == ('merge-base', expected.target_base_oid, expected.before_head):
+            elif args == ('merge-base', expected.target_base_oid, 'current-worker-head'):
                 result.stdout = 'common-base'
             elif args[0] == 'diff' and '--raw' in args and '--cached' not in args:
                 if args[-3] != 'common-base':
@@ -532,7 +542,7 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         self.assertEqual([change.path for change in actual.committed], ['app.py'])
         self.assertEqual(assess_current_rebase(expected, actual, scope).status, RebaseStatus.START)
         adapters.git.assert_any_call(Path(expected.worktree), 'merge-base',
-                                    expected.target_base_oid, expected.before_head, check=False)
+                                    expected.target_base_oid, 'current-worker-head', check=False)
         self.assertEqual(snapshot.operations,
                          {'REBASE_HEAD': 'last-commit', 'MERGE_MSG': 'retained-message'})
 

@@ -470,13 +470,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('preserve_blocked_agent_changes', blocked_agent_service.preserve_blocked_agent_changes,
         lambda: blocked_agent_service.PreserveBlockedAgentChangesEffects(
-            _blocked_agent_local_baseline=assembly.callback('_blocked_agent_local_baseline'),
-            _complete_blocked_agent_recovery=assembly.callback('_complete_blocked_agent_recovery'),
-            _deserialize_blocked_agent_recovery=assembly.callback('_deserialize_blocked_agent_recovery'),
-            _reconcile_blocked_reviewer_plan=assembly.callback('_reconcile_blocked_reviewer_plan'),
-            _serialize_blocked_agent_recovery=assembly.callback('_serialize_blocked_agent_recovery'),
             capture_git_snapshot=assembly.callback('capture_git_snapshot'),
-            update_project=assembly.callback('update_project'),
         ),
     )
 

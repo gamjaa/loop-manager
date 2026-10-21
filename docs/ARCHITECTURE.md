@@ -976,7 +976,7 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 
 진행 중 rebase의 execution checkpoint가 없으면 현재 Git의 `head-name`·`orig-head`·`onto`와 실제 관리 ref·worktree 등록, 원격 branch·PR을 기존 현재 상태 검사로 대조한다. 확인된 같은 작업의 중간 형상에서는 원격의 현재 OID에 결합한 rebase checkpoint와 workspace 소유권만 복구한다. `recovered_rebase_metadata`는 이때 확인한 세 Git 메타데이터 값의 감사 사본이며 새 성공 근거가 아니다. 외부 관측은 DB 쓰기 transaction 밖에서 반복 확인하고, 작업 snapshot·checkpoint 부재가 그대로인 짧은 transaction에서 함께 저장한다. 파일·index·HEAD·session·실패 이력과 기존 검증 결과는 보존하며 완료·검증·게시 성공을 합성하지 않는다. 관측 경쟁은 재조회하고, 실제 작업·소유권을 확인할 수 없는 경우는 해당 작업에 한정해 보존·보류한다.
 
-rebase의 검사 시점은 [R-055](requirements/%5BR-055%5D%20차단%20경로%20전수%20조사와%20불필요한%20작업%20중단%20축소.md#불필요한-중단의-수정)를 따른다. 시작에는 repository·계획·worktree·branch·시작 HEAD·고정 target·원격/PR·writer·index 안전·작업물 보존 조건만 확인하고 파일·선언을 비교·복구 기준으로 기록한다. 최신 target 선언과의 일치·역할별 전체 diff·문서/archive 최종 내용·과거 definition snapshot 존재는 시작 gate가 아니다. 공통 현재 상태 서비스는 checkpoint에 고정한 시작 HEAD가 아직 target을 포함하지 않는 형상을 시작 입력으로 구분한다. target 자체의 유효한 작업 identity·비draft 선언은 확인하고 현재 worktree의 최종 선언 검사는 유예한다. 시작·중간 형상에서 구성한 서비스가 완료 형상을 관측하면 최종 계약을 새로 구성하도록 요구하며 유예한 검사를 완료 승인으로 재사용하지 않는다.
+rebase의 검사 시점은 [R-055](requirements/%5BR-055%5D%20차단%20경로%20전수%20조사와%20불필요한%20작업%20중단%20축소.md#불필요한-중단의-수정)를 따른다. 시작에는 repository·계획·worktree·branch·시작 HEAD·고정 target·원격/PR·writer·index 안전·작업물 보존 조건만 확인하고 파일·선언을 비교·복구 기준으로 기록한다. 최신 target 선언과의 일치·역할별 전체 diff·문서/archive 최종 내용·과거 definition snapshot 존재는 시작 gate가 아니다. 공통 현재 상태 서비스는 현재 소유 branch가 아직 target을 포함하지 않는 형상을 시작 입력으로 구분한다. 시작 HEAD의 누락·노후화는 최종 범위 위반이 아니며, 실제 새 rebase를 시작할 때 현재 HEAD를 checkpoint와 journal에 결합하고 이전 시작 근거는 감사로 보존한다. 진행 중 operation의 `orig-head`·`head-name`·`onto` 검사는 유지한다. rebase 전 변경 관측은 target과 현재 HEAD의 merge-base를 사용하므로 base에만 추가된 문서·archive를 작업 branch의 삭제·되돌림으로 읽지 않는다. target 자체의 유효한 작업 identity·비draft 선언은 확인하고 현재 worktree의 최종 선언 검사는 유예한다. 시작·중간 형상에서 구성한 서비스가 완료 형상을 관측하면 최종 계약을 새로 구성하도록 요구하며 유예한 검사를 완료 승인으로 재사용하지 않는다.
 
 Worker 종료 후에는 해당 호출이 만든 변경의 역할별 허용 범위를 검사한다. commit 재생·일부 stage·autostash 복원 중간 형상은 전체 최종 후보로 검사하지 않는다. Git 완료 후 고정 target의 선택 ExecPlan frontmatter를 본문·mode·다른 작업물 보존 하에 복원하고 갱신한 checkpoint·서비스·HEAD에서 최종 선언·전체 diff·보호 문서·archive를 검사한 뒤 채택한다. 최종 금지 변경·잘못된 선언은 거부한다. 충돌 해결 Agent의 sandbox는 계속 적용하며 Git 전후 차이를 접근 권한 위반으로 추정하지 않는다. 관측 중 단계가 바뀌면 재관측하고 최종 archive 계약을 새로 구성한다. `REBASE_HEAD`·`MERGE_MSG`·`MERGE_MODE`만 남은 상태는 controlling operation이나 autostash 복원 대기로 취급하지 않는다.
 
@@ -1019,6 +1019,8 @@ push 전후 및 SQLite 반영 전 중단에서는 같은 intent와 실제 원격
 #### 후보 변경과 과거 차단 재평가
 
 rebase나 사용자 입력으로 후보 HEAD가 바뀌면 후보에 결합된 verify·Review·publication 근거를 다시 판단한다. 구현 목표의 Worker 입력 token이 유효한 OID 변화는 필요한 verify·Review로 이어가며 Worker 재실행을 강제하지 않는다. 필요한 검증 단계의 후보 기준선을 저장해 같은 차이로 단계 무효화를 반복하지 않는다. 명세 변화의 planning 필요 여부는 프로젝트 조율기에서 판단·반영한다. 작업 revision gate는 전체 명세 지문으로 planning을 재요청하지 않고, 최신 베이스의 rebase와 선택된 ExecPlan의 변경·의존성·입력 및 기존 결과의 유효성을 확인해 필요한 단계부터 이어간다. 작업 조건 변화·실제 구현 부족은 Worker·Manager의 기존 단계에서 처리하며 별도 작업별 영향 Planner를 호출하지 않는다.
+
+관측의 안정성 비교에는 선택 branch/worktree, 실제 origin 연결과 ignored 판정에 소비한 입력만 포함한다. 다른 ref·worktree·무관한 Git 설정의 변화는 현재 후보를 무효화하지 않는다. BLOCKED 작업물 보존은 현재 후보의 HEAD·branch·index·파일·operation을 재확인하며 전체 snapshot 직렬화 비교나 과거 Agent 기준선으로의 stash·reset·복원을 수행하지 않는다. 과거 snapshot과 복구 intent는 감사로 보존한다.
 
 현재 결과는 선택 branch/worktree의 비교 기준선에만 반영한다. Agent 원본 snapshot·session·허용 범위와 과거 감사를 보존하고 수동 복구를 Manager 실행·Agent 격리 증거로 표시하지 않는다. 실제 sandbox 정책 오류, 다른 Manager Git 작업의 증거와 별도 Review·사용자 결정·planning 차단은 기존 경계를 유지한다
 

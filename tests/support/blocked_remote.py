@@ -274,9 +274,8 @@ class PlanRemoteRecoveryFixture(PublishedSuccessorPreparation, BlockedRemoteFixt
             repository.record(self.repo, 'G-106', expected_generation=current.generation,
                 operation=None, expected_head=original.head, target_base_oid=self.base,
                 observed_remote_oid=original.head,
-                snapshot={**(current.snapshot or {}), 'current_rebase_acceptance': acceptance})
-            loop_manager.managed_rebase_adoption.remember_agent_baseline(
-                repository, self.repo, 'G-106', original, original, 'worker')
+                snapshot={**(current.snapshot or {}), 'current_rebase_acceptance': acceptance,
+                    'current_rebase_agent_baseline': {'snapshot': 'legacy comparison audit'}})
             saved.update(repository.get(self.repo, 'G-106').snapshot)
             return original
         with mock.patch.object(self, 'published_successor', side_effect=prepare):

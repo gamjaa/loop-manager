@@ -12,7 +12,6 @@ import re
 from typing import Callable
 
 from loop_manager_internal.agents.scope_observation import RAW_DIFF_OPTIONS
-from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.git.managed_rebase_validation import (
     FileChange, IndexEntry, ObservationFailure, RebaseExpectation,
     RebaseObservation, Remote, ScopeResult, WorktreeFile, assess_scope, fingerprint,
@@ -139,8 +138,7 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters, *, start=N
     index = parse_index(snapshot.index, debug)
     diff_options = RAW_DIFF_OPTIONS
     diff_base = expected.target_base_oid
-    if (ancestor.returncode == 1 and snapshot.head == expected.before_head
-            and metadata is None and not controlling_git_operation(snapshot.operations)):
+    if ancestor.returncode == 1 and metadata is None:
         diff_base = _stdout(adapters, worktree, 'merge-base',
                             expected.target_base_oid, snapshot.head).strip()
         if not diff_base:
@@ -207,7 +205,9 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters, *, start=N
         input_fingerprint=inputs, scope_fingerprint=scope_policy,
         repository_state_fingerprint=fingerprint({
             'refs': {f'refs/heads/{expected.branch}': snapshot.refs.get(f'refs/heads/{expected.branch}')},
-            'worktrees': {expected.worktree: registration}, 'config': snapshot.config,
+            'worktrees': {expected.worktree: registration},
+            'config': {key: value for key, value in snapshot.config.items()
+                       if key.startswith('ignore-source:') or ':remote.origin.' in key},
         }),
     )
     return observed, snapshot

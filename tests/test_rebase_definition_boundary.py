@@ -301,10 +301,13 @@ class RebaseDefinitionBoundaryTests(TestCase):
             self.service().require_owned()
         self.assertEqual(caught.exception.reason, RecoveryReason.PLAN_INPUT_INVALID)
 
-    def test_unbound_target_cannot_use_historical_definition(self):
-        with self.assertRaises(RecoveryFailure) as caught:
-            self.service(target=self.latest).require_owned()
-        self.assertEqual(caught.exception.reason, RecoveryReason.PLAN_INPUT_INVALID)
+    def test_new_target_does_not_require_final_worktree_definition_before_rebase(self):
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        before = git_command(self.worktree, 'rev-parse', 'HEAD')
+        self.assertEqual(self.service(target=self.latest).require_owned()[1].status,
+                         RebaseStatus.START)
+        self.assertEqual((self.worktree / self.plan_path).read_text(), self.old_text)
+        self.assertEqual(git_command(self.worktree, 'rev-parse', 'HEAD'), before)
 
     def test_ownership_checks_still_reject_foreign_live_lease(self):
         git_command(self.worktree, 'push', 'origin', self.branch)

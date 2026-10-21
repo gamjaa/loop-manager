@@ -203,7 +203,7 @@ def _journaled_direct_rebase(
             current = checkpoint.get(repo, plan_id)
             service = effects._current_rebase_service(connection, repo_path, state_dir, repo,
                                               plan_id, worktree, branch)
-        _, decision = service.require_owned()
+        observed, decision = service.require_owned()
         if decision.status.value == 'complete':
             effects._complete_direct_rebase_checkpoint(
                 connection, repo, plan_id, worktree, current.target_base_oid,
@@ -213,6 +213,19 @@ def _journaled_direct_rebase(
             return subprocess.CompletedProcess([], 1, 'owned rebase is waiting for resolution')
         if current.target_base_oid != target_oid:
             raise manager_git_journal.MutationEvidenceError('current rebase target differs')
+        if observed.head != before['head']:
+            raise manager_git_journal.MutationEvidenceError('current rebase start candidate changed')
+        if current.expected_head != before['head']:
+            checkpoint.record(
+                repo, plan_id, expected_generation=current.generation,
+                operation='rebase', expected_head=before['head'],
+                target_base_oid=target_oid, observed_remote_oid=remote_oid,
+                snapshot={**(current.snapshot or {}), 'before_head': before['head'],
+                    'rebase_operation_history': [
+                        *(current.snapshot or {}).get('rebase_operation_history', ()),
+                        {'before_head': current.expected_head,
+                         'target_base': current.target_base_oid}]},
+            )
     else:
         row = connection.execute(
             'SELECT pr_head_oid, pr_conflict_head_oid FROM exec_plans WHERE repo = ? AND plan_id = ?',

@@ -240,6 +240,18 @@ class RebaseHandler:
             # Reentry observes the saved operation before deciding another step.
             observed, decision = self.ports._current_rebase_service(context).require_owned()
             if decision.status is RebaseStatus.START:
+                if current.expected_head != observed.head:
+                    current = checkpoint.record(
+                        self.ports.identity.repo, context.plan.plan_id,
+                        expected_generation=current.generation, operation='rebase',
+                        expected_head=observed.head, target_base_oid=current.target_base_oid,
+                        observed_remote_oid=observed.remote.oid,
+                        snapshot={**(current.snapshot or {}), 'before_head': observed.head,
+                            'rebase_operation_history': [
+                                *(current.snapshot or {}).get('rebase_operation_history', ()),
+                                {'before_head': current.expected_head,
+                                 'target_base': current.target_base_oid}]},
+                    )
                 manager_git_journal.begin_current_rebase(
                     self.ports.identity.state_dir, owner=f'plan:{context.plan.plan_id}',
                     repo=str(self.ports.identity.repo_path.resolve()), target=str(context.worktree.resolve()),

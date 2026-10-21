@@ -11,65 +11,17 @@ import loop_manager as lm
 
 
 class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
-    def test_damaged_saved_comparison_snapshot_uses_evidence_error(self):
-        from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline
-        from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
-        import hashlib
-        saved = {'current_rebase_agent_baseline': {
-            'kind': 'current_rebase_comparison_baseline', 'role': 'worker',
-            'original': hashlib.sha256(self.original.serialize().encode()).hexdigest(),
-            'snapshot': '{"version":4,"head":"valid","index":[]}',
-        }}
-        with self.assertRaises(MutationEvidenceError):
-            agent_comparison_baseline(self.original, saved, 'worker')
-
-    def test_legacy_saved_comparison_snapshot_remains_readable(self):
-        from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline
-        import hashlib
-        import json
-        parsed = json.loads(self.original.serialize())
-        parsed['version'] = 3
-        for key in ('refs', 'worktrees', 'config', 'operations'):
-            parsed.pop(key)
-        saved = {'current_rebase_agent_baseline': {
-            'kind': 'current_rebase_comparison_baseline', 'role': 'worker',
-            'original': hashlib.sha256(self.original.serialize().encode()).hexdigest(),
-            'snapshot': json.dumps(parsed),
-        }}
-        restored = agent_comparison_baseline(self.original, saved, 'worker')
-        self.assertEqual(restored.head, self.original.head)
-        self.assertFalse(restored.shared_metadata_complete)
-
-    def test_version_five_comparison_requires_scope_identity(self):
-        from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline
-        from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
-        import hashlib
-        import json
-        original = replace(self.original, scope_id='a' * 32,
-                           scope_start_digest='b' * 64)
-        valid = json.loads(original.serialize())
-        saved = {'current_rebase_agent_baseline': {
-            'kind': 'current_rebase_comparison_baseline', 'role': 'worker',
-            'original': hashlib.sha256(original.serialize().encode()).hexdigest(),
-            'snapshot': original.serialize(),
-        }}
-        self.assertEqual(agent_comparison_baseline(original, saved, 'worker'), original)
-        for field, invalid in (('scope_id', None), ('scope_id', 'not-a-token'),
-                               ('scope_id', 'c' * 32),
-                               ('scope_start_digest', None), ('scope_start_digest', 'bad'),
-                               ('scope_start_digest', 'd' * 64)):
-            with self.subTest(field=field, invalid=invalid):
-                damaged = {**valid, field: invalid}
-                saved['current_rebase_agent_baseline']['snapshot'] = json.dumps(damaged)
-                with self.assertRaises(MutationEvidenceError):
-                    agent_comparison_baseline(original, saved, 'worker')
-        saved['current_rebase_agent_baseline']['snapshot'] = json.dumps({
-            key: value for key, value in valid.items()
-            if key not in ('scope_id', 'scope_start_digest')
-        } | {'version': 4})
-        with self.assertRaises(MutationEvidenceError):
-            agent_comparison_baseline(original, saved, 'worker')
-
+    def test_obsolete_comparison_records_are_preserved_without_becoming_a_resume_gate(self):
+        repository = self.case.checkpoint
+        current = repository.get('repo', 'G-047')
+        legacy = {'kind': 'current_rebase_comparison_baseline', 'snapshot': 'incomplete legacy audit'}
+        repository.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'current_rebase_agent_baseline': legacy})
+        self.assertEqual(lm.begin_agent_scope(
+            self.case.fixture.connection, 'repo', Path('/state/G-047'), 'worker'), self.current)
+        self.assertEqual(repository.get('repo', 'G-047').snapshot['current_rebase_agent_baseline'], legacy)
 
     def test_resumed_scope_returns_current_candidate_and_preserves_original_audit(self):
         connection = self.case.fixture.connection
@@ -84,10 +36,6 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         connection = self.case.fixture.connection
         lm.begin_agent_scope(connection, 'repo', Path('/state/G-047'), 'worker')
         accepted_start = self.current
-        from loop_manager_internal.git.managed_rebase_adoption import needs_agent_comparison
-        self.assertFalse(needs_agent_comparison(
-            replace(self.case.checkpoint.get('repo', 'G-047'), operation='commit'),
-            self.original, accepted_start))
         self.current = replace(self.current, head='later-head',
             refs={**self.current.refs, 'refs/heads/loop-manager/G-047': ('later-head', '')},
             worktrees={str(Path('/state/G-047').resolve()): ('HEAD=later-head', 'branch=refs/heads/loop-manager/G-047')})

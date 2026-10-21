@@ -20,7 +20,6 @@ from loop_manager_internal.recovery.work_branch_integration import user_changes,
 from loop_manager_internal.agents.agent_scope_decision import _worker_path_allowed
 from dataclasses import replace
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
-from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 
 
 @dataclass(frozen=True)
@@ -224,14 +223,12 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     document_heads = {}
     document_files = set()
     starting_before_base = False
-    if (owned_definition and expected.before_head and checkpoint.operation == 'rebase'
-            and pending_metadata is None and not pending_index):
-        start = ports.capture_git_snapshot(worktree)
-        if start.head == expected.before_head and not controlling_git_operation(start.operations):
-            ancestor = ports.git(worktree, 'merge-base', '--is-ancestor',
-                                 target, start.head, check=False)
-            if ancestor.returncode == 1:
-                starting_before_base = True
+    if pending_metadata is None and not pending_index:
+        head = ports.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+        ancestor = ports.git(worktree, 'merge-base', '--is-ancestor', target, head, check=False)
+        if ancestor.returncode not in (0, 1):
+            raise MutationEvidenceError('rebase ancestry observation failed')
+        starting_before_base = ancestor.returncode == 1
     content_pending = content_pending or starting_before_base
     originals = {} if documents_adopted else adopted_originals(checkpoint)
     for path, desired in originals.items():
@@ -277,7 +274,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     if (not content_pending or starting_before_base) and not normalizing_frontmatter:
         options = {}
         try:
-            if owned_definition:
+            if owned_definition or starting_before_base:
                 target_text = ports.git(repo_path, 'show', f"{target}:{row['path']}").stdout
                 try:
                     options['rebase_target_metadata'] = parse_execplan_text(

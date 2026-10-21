@@ -6,9 +6,6 @@ separate boundaries.
 """
 from dataclasses import dataclass, replace
 from collections.abc import Callable
-import hashlib
-import json
-import re
 
 from loop_manager_internal.git.managed_rebase_observation import ObservationAdapters, observe_current_rebase
 from loop_manager_internal.git.managed_rebase_validation import (
@@ -101,17 +98,6 @@ class ManagedRebaseService:
         return observed
 
 
-def needs_agent_comparison(checkpoint, original, current):
-    """Only absorb a rebase across a saved scope, not a fresh Agent's work."""
-    accepted = (checkpoint.snapshot or {}).get('current_rebase_acceptance')
-    intent = checkpoint.rebase_publication_intent() if checkpoint.operation == 'rebase_publish' else None
-    return bool(checkpoint.operation == 'rebase'
-        or (intent is not None and intent['head'] == current.head) or (
-        checkpoint.operation is None and isinstance(accepted, dict)
-        and accepted.get('head') == current.head
-        and original.head != current.head))
-
-
 def selected_baseline(snapshot, current, branch, worktree, *, publication=None):
     """Replace only accepted selected state, keeping other refs/config intact.
 
@@ -149,75 +135,3 @@ def selected_baseline(snapshot, current, branch, worktree, *, publication=None):
     return replace(snapshot, head=current.head, branch=current.branch,
                    index=current.index, dirty=current.dirty,
                    operations=current.operations, refs=refs, worktrees=worktrees)
-
-
-def remember_agent_baseline(checkpoints, repo, plan_id, original, effective, role):
-    """Keep the observed start of a resumed Agent separate from its old snapshot."""
-    current = checkpoints.get(repo, plan_id)
-    baseline = {
-        'kind': 'current_rebase_comparison_baseline', 'role': role,
-        'original': hashlib.sha256(original.serialize().encode()).hexdigest(),
-        'snapshot': effective.serialize(),
-    }
-    saved = dict(current.snapshot or {})
-    if saved.get('current_rebase_agent_baseline') is not None:
-        saved['current_rebase_agent_baseline_history'] = [
-            *saved.get('current_rebase_agent_baseline_history', ()), saved['current_rebase_agent_baseline']]
-    checkpoints.record(repo, plan_id, expected_generation=current.generation,
-        operation=current.operation, expected_head=current.expected_head,
-        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
-        snapshot={**saved, 'current_rebase_agent_baseline': baseline})
-
-
-def agent_comparison_baseline(original, saved, role):
-    """Read a comparison start, never infer Agent execution from manual progress."""
-    baseline = saved.get('current_rebase_agent_baseline')
-    if baseline is None:
-        return original
-    if not isinstance(baseline, dict) or baseline.get('kind') != 'current_rebase_comparison_baseline':
-        raise MutationEvidenceError('current rebase Agent comparison is malformed')
-    if (baseline.get('role') != role
-            or baseline.get('original') != hashlib.sha256(original.serialize().encode()).hexdigest()):
-        # A later Agent scope has its own original start. Retain old comparison
-        # records as audit instead of making them a historical gate.
-        return original
-    raw = baseline.get('snapshot')
-    try:
-        parsed = json.loads(raw) if isinstance(raw, str) else None
-        if (not isinstance(parsed, dict)
-                or (bool(original.scope_id) != (parsed.get('version') == 5))
-                or (parsed.get('version') == 5 and (
-                    not isinstance(parsed.get('scope_id'), str)
-                    or re.fullmatch(r'[0-9a-f]{32}', parsed['scope_id']) is None
-                    or not isinstance(parsed.get('scope_start_digest'), str)
-                    or re.fullmatch(r'[0-9a-f]{64}', parsed['scope_start_digest']) is None
-                    or parsed['scope_id'] != original.scope_id
-                    or parsed['scope_start_digest'] != original.scope_start_digest))
-                or not isinstance(parsed.get('head'), str)
-                or not parsed['head']
-                or parsed.get('branch') is not None and not isinstance(parsed['branch'], str)
-                or any(not isinstance(parsed.get(key), dict) for key in ('index', 'dirty'))
-                or any(not isinstance(parsed.get(key, {} if parsed.get('version') in
-                                      (1, 2, 3) else None), dict)
-                       for key in ('refs', 'worktrees', 'config', 'operations'))
-                or any(not isinstance(entries, list)
-                       or any(not isinstance(entry, str) for entry in entries)
-                       for entries in parsed['index'].values())
-                or any(not isinstance(state, list) or len(state) != 2
-                       or not isinstance(state[0], list)
-                       or any(not isinstance(kind, str) for kind in state[0])
-                       or not isinstance(state[1], str)
-                       for state in parsed['dirty'].values())
-                or any(not isinstance(state, list) or len(state) != 2
-                       or any(not isinstance(entry, str) for entry in state)
-                       for state in parsed.get('refs', {}).values())
-                or any(not isinstance(entries, list)
-                       or any(not isinstance(entry, str) for entry in entries)
-                       for key in ('worktrees', 'config')
-                       for entries in parsed.get(key, {}).values())
-                or any(not isinstance(value, str) for value in
-                       parsed.get('operations', {}).values())):
-            raise ValueError('invalid snapshot fields')
-        return type(original).deserialize(raw)
-    except (TypeError, ValueError, KeyError, RuntimeError) as error:
-        raise MutationEvidenceError('current rebase Agent comparison is malformed') from error

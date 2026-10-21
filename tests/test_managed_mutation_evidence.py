@@ -978,6 +978,58 @@ class ManagedTransitionTests(unittest.TestCase):
 
 
 class DetachedRebaseOwnershipTests(unittest.TestCase):
+    def test_direct_rebase_binds_current_start_and_rejects_a_racing_candidate(self):
+        from loop_manager_internal.git import direct_rebase_service
+        case = current_rebase_case(self)
+        case.observed = replace(case.observed, head='user-candidate', branch_ref=('user-candidate', ''),
+            registration=('HEAD=user-candidate', 'branch=refs/heads/loop-manager/G-047'),
+            base_is_ancestor=False)
+        ports = direct_rebase_service.JournaledDirectRebaseEffects(
+            _canonical_path=lambda path: path.resolve(),
+            _complete_direct_rebase_checkpoint=mock.Mock(),
+            _current_rebase_service=lambda *_args: case.factory(None),
+            _finish_owned_direct_rebase=mock.Mock(),
+            _owned_rebase_journal_state=lambda *_args: {'head': 'user-candidate'},
+            _owned_rebase_metadata=mock.Mock(return_value=None),
+            _owned_rebase_state_dir=lambda *_args: Path('/state'),
+            git=mock.Mock(side_effect=lambda _path, *args, **_kwargs:
+                SimpleNamespace(returncode=1 if args[0] == 'rebase' else 0, stdout='')),
+            remote_branch_oid=lambda *_args: 'remote',
+        )
+        args = (case.fixture.connection, Path(REPO), 'repo', 'G-047',
+                Path(case.expected.worktree), case.expected.branch, 'base')
+        with mock.patch.object(journal, 'live_remote_branch_oid', return_value='remote'), \
+             mock.patch.object(journal, 'begin_current_rebase') as begin:
+            result = direct_rebase_service._journaled_direct_rebase(ports, *args)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(case.checkpoint.get('repo', 'G-047').expected_head, 'user-candidate')
+            self.assertEqual(begin.call_args.kwargs['expected']['before_head'], 'user-candidate')
+            begin.reset_mock()
+            case.observed = replace(case.observed, head='racing-candidate',
+                branch_ref=('racing-candidate', ''),
+                registration=('HEAD=racing-candidate', 'branch=refs/heads/loop-manager/G-047'))
+            with self.assertRaisesRegex(journal.MutationEvidenceError, 'candidate changed'):
+                direct_rebase_service._journaled_direct_rebase(ports, *args)
+            begin.assert_not_called()
+
+    def test_rebase_start_refreshes_stale_head_without_approving_final_document_changes(self):
+        case = current_rebase_case(self)
+        case.observed = replace(case.observed, head='user-candidate', branch_ref=('user-candidate', ''),
+            registration=('HEAD=user-candidate', 'branch=refs/heads/loop-manager/G-047'),
+            base_is_ancestor=False,
+            committed=(FileChange('docs/requirements/Upstream.md', '100644', '000000', 'old', '0', 'D'),))
+        prior = case.checkpoint.get('repo', 'G-047')
+        with mock.patch.object(journal, 'begin_current_rebase') as begin:
+            case.handler._record_rebase_intent(case.fixture.context(), 'base')
+        current = case.checkpoint.get('repo', 'G-047')
+        self.assertEqual(current.expected_head, 'user-candidate')
+        self.assertIn({'before_head': prior.expected_head, 'target_base': prior.target_base_oid},
+                      current.snapshot['rebase_operation_history'])
+        self.assertEqual(begin.call_args.kwargs['expected']['before_head'], 'user-candidate')
+        case.observed = replace(case.observed, base_is_ancestor=True)
+        with self.assertRaises(RecoveryFailure):
+            case.factory(None).require_owned()
+
     def test_rebase_start_retry_reuses_frozen_run_and_generation(self):
         case = current_rebase_case(self)
         case.observed = replace(case.observed, head='before', branch_ref=('before', ''),
@@ -1532,7 +1584,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         cases = (
             ('before', None, '', 1, True),
             ('before', None, '', 0, False),
-            ('after', None, '', 1, False),
+            ('after', None, '', 1, True),
             ('before', 'rebase-metadata', '', 1, False),
             ('before', None, 'unmerged-index', 1, False),
         )
