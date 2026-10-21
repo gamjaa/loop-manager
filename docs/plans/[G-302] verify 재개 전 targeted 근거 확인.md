@@ -46,7 +46,8 @@ priority: high
 
 - [x] revision `937b03f1dd9e182e0e48e565ea093dc560f2de5b`의 호출 결합·재수집·Worker gate와 저장된 verify dispatch·관련 테스트를 정적으로 대조했다.
 - [x] 저장된 검증 진입의 작업별 재관측·차단·대기를 연결하고 부분/전체 실행 및 receipt 재사용보다 먼저 검사한다.
-- [x] verify slot 배정 뒤 새 자료가 도착하는 경우를 포함한 targeted unit test 4개를 실행했다. 네 테스트 모두 통과했으며 전체 verify는 실행하지 않았다.
+- [x] 초기 후보에서 verify slot 배정 뒤 새 자료 도착을 포함한 targeted unit test 4개를 실행했다. 네 테스트 모두 통과했다.
+- [x] 현재 후보 `1120bd4d8d132e3ca33a50985f05c701d43adb6d`의 Manager verify delta 7개 case는 모두 Worker session 시작으로 projection이 갱신된 뒤 직접 호출용 `_post_effect_guard()`가 이전 context를 반환해 실패했다. guard의 직접 호출 경로도 저장된 최신 context를 다시 구성하고 회귀 case를 추가했다. 동일한 7개 case, 새 context 회귀 case, 저장된 verify 재개 관련 4개 case가 현재 후보에서 모두 통과했으며 전체 verify는 실행하지 않았다.
 
 ## Decision Log
 

@@ -726,7 +726,7 @@ class RevisionHandler:
         # Direct policy unit tests can still exercise a handler without the
         # coordinator. Real execution always installs this snapshot first.
         if self.ports.snapshot()._definition_snapshot is None:
-            return context
+            return self.ports._context()
         return self.ports.guard(self.ports._context())
 
     def _metadata_correction(self, context, error, *, verify_result=None):
