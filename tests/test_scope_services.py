@@ -824,13 +824,15 @@ class PersistedScopeServiceTests(TestCase):
                 "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo='repo'",
             ).fetchone()), (before.serialize(), result.serialize()))
 
-    def test_blocked_agent_recovery_uses_selected_plan_under_another_representative(self):
+    def test_blocked_agent_recovery_and_restart_use_selected_plan_under_another_representative(self):
         from types import SimpleNamespace
-        from loop_manager_internal.recovery import blocked_agent_service
+        from loop_manager_internal.recovery import blocked_agent_service, scoped_blocking
         from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 
         connection = runtime_connection()
         self.addCleanup(connection.close)
+        scoped_blocking.ensure_schema(connection)
+        blocked_checkpoint_state.ensure_schema(connection)
         worktree_a = Path('/managed/G-046')
         worktree_b = Path('/managed/G-047')
         before_a = snapshot(branch='loop-manager/G-046', head='a-before')
@@ -856,10 +858,29 @@ class PersistedScopeServiceTests(TestCase):
             (before_a.branch, str(worktree_a), before_a.serialize(), result_a.serialize()),
         )
         connection.execute(
+            "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+            "VALUES ('repo', 'G-047', 'plan', 'verify_retry_exhausted', 'saved cause')"
+        )
+        connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence) "
+            "VALUES ('repo', 'G-047', 'request-b', 'requested', "
+            "'verify_retry_exhausted', 'saved cause')"
+        )
+        owner_block = dict(scoped_blocking.plan_block(connection, 'repo', 'G-047'))
+        recovery_b.update(
+            owner_plan_id='G-047', owner_block=owner_block,
+            owner_request_identity='request-b',
+            checkpoint_generation=execution_checkpoint_state.ExecutionCheckpointRepository(
+                connection,
+            ).get('repo', 'G-047').generation,
+        )
+        connection.execute(
             "UPDATE projects SET plan_path='docs/plans/[G-046] Alpha.md', phase='WORKING', "
             "branch=?, worktree=?, agent_role='worker', agent_snapshot=?, "
-            "agent_result_snapshot=? WHERE repo='repo'",
-            (before_a.branch, str(worktree_a), before_a.serialize(), result_a.serialize()),
+            "agent_result_snapshot=?, agent_recovery=? WHERE repo='repo'",
+            (before_a.branch, str(worktree_a), before_a.serialize(), result_a.serialize(),
+             json.dumps(recovery_b)),
         )
         connection.execute(
             "UPDATE exec_plans SET status='PLAN_BLOCKED', branch=?, worktree=?, "
@@ -913,6 +934,33 @@ class PersistedScopeServiceTests(TestCase):
         self.assertIsNone(target['agent_result_snapshot'])
         self.assertEqual(recovery['state'], 'isolated')
         self.assertEqual(recovery['baseline_snapshot'], before_b.serialize())
+
+        projected_plan = RuntimeStateRepository(connection).projected_row('repo')
+        self.assertEqual(projected_plan['plan_id'], 'G-046')
+        resume_effects = blocked_agent_service.ResumeInterruptedBlockedAgentRecoveryEffects(
+            _complete_blocked_agent_recovery=mock.Mock(),
+            _config_entries=mock.Mock(return_value=before_b.config),
+            _deserialize_blocked_agent_recovery=blocked_agent_service._deserialize_blocked_agent_recovery,
+            _rebase_in_progress_for_branch=mock.Mock(return_value=False),
+            make_worktree=mock.Mock(),
+            project_execplan=mock.Mock(return_value=projected_plan),
+            validate_execplan_workspace_identity=mock.Mock(),
+        )
+
+        self.assertTrue(blocked_agent_service.resume_interrupted_blocked_agent_recovery(
+            resume_effects, connection, Path('/repo'), Path('/state'), 'repo',
+        ))
+
+        resume_effects.project_execplan.assert_not_called()
+        resume_effects._complete_blocked_agent_recovery.assert_not_called()
+        self.assertEqual(resume_effects.make_worktree.call_args.args[1:3],
+                         (worktree_b, before_b.branch))
+        self.assertEqual(resume_effects.make_worktree.call_args.kwargs['journal_owner'],
+                         'plan:G-047')
+        self.assertEqual(
+            connection.execute("SELECT agent_recovery FROM projects WHERE repo='repo'").fetchone()[0],
+            json.dumps(recovery_b),
+        )
 
     def test_blocked_agent_preservation_rejects_git_snapshot_change_after_validation(self):
         before = snapshot()

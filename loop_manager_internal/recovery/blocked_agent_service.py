@@ -632,16 +632,59 @@ def resume_interrupted_blocked_agent_recovery(
 ) -> bool:
     """Finish a persisted violation isolation before normal repository work."""
 
-    project = connection.execute(
-        "SELECT phase, base_branch, branch, worktree, agent_snapshot, "
-        "agent_recovery FROM projects WHERE repo = ?",
-        (repo,),
+    projected = connection.execute(
+        "SELECT agent_recovery FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
+    if projected is None or not projected["agent_recovery"]:
+        return False
+
+    projected_recovery = effects._deserialize_blocked_agent_recovery(
+        str(projected["agent_recovery"])
+    )
+    owner_plan_id = projected_recovery.get("owner_plan_id")
+    if owner_plan_id is None:
+        project = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,),
+        ).fetchone()
+        plan = effects.project_execplan(connection, repo)
+        return _resume_interrupted_blocked_agent_recovery_state(
+            effects, connection, repo_path, state_dir, repo, project, plan,
+        )
+
+    with runtime_state.selected_execution(repo, str(owner_plan_id), include_blocked=True):
+        plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, owner_plan_id),
+        ).fetchone()
+        if plan is None:
+            raise AgentScopeError("BLOCKED Agent 복구의 대상 ExecPlan을 찾을 수 없습니다.")
+        project = runtime_state.project_row(connection, repo)
+        if project is None or not project["agent_recovery"]:
+            return False
+        recovery = effects._deserialize_blocked_agent_recovery(
+            str(project["agent_recovery"])
+        )
+        if recovery.get("owner_plan_id") != owner_plan_id:
+            raise AgentScopeError("BLOCKED Agent 복구 대상이 선택한 ExecPlan과 일치하지 않습니다.")
+        return _resume_interrupted_blocked_agent_recovery_state(
+            effects, connection, repo_path, state_dir, repo, project, plan,
+        )
+
+
+def _resume_interrupted_blocked_agent_recovery_state(
+    effects: ResumeInterruptedBlockedAgentRecoveryEffects,
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project,
+    plan,
+) -> bool:
     if project is None or not project["agent_recovery"]:
         return False
-    plan = effects.project_execplan(connection, repo)
+    plan_id = str(plan["plan_id"]) if plan is not None else None
     block = (scoped_blocking.plan_block(connection, repo, str(plan['plan_id']))
-             if plan is not None else None)
+             if plan_id is not None else None)
     retired = (scoped_blocking.is_scope_baseline_block(block)
                or scoped_blocking.is_scope_baseline_block(scoped_blocking.project_block(connection, repo)))
     if retired:
@@ -697,7 +740,6 @@ def resume_interrupted_blocked_agent_recovery(
     if effects._config_entries(config_context) != before.config:
         raise AgentScopeError("BLOCKED Agent 복구 전 Git config가 변경됐습니다.")
 
-    plan = effects.project_execplan(connection, repo)
     if (
         plan is None
         or int(plan["workspace_owned"]) != WORKSPACE_OWNED

@@ -33,7 +33,7 @@ R-091의 작업별 실행 원본을 차단·rebase의 남은 소비자까지 연
 - [x] 확인한 `loop_manager_internal/recovery/block_service.py:block_active_execplan()`의 선택 작업 읽기·decision ID 대조를 재사용한다. 지문·Git snapshot·Reviewer 원문 관측 뒤 짧은 transaction에서 같은 작업 snapshot·소유권을 다시 확인해 낡은 차단 적용을 거부한다. 이번 delta의 `transition_validation_failure()`가 구현한 외부 관측 후 상태 비교·실패 이력/차단 원자 적용을 재사용하고 같은 관측 이동을 반복하지 않는다. `RuntimeStateRepository.block_plan()`·기존 원인별 결정·알림 경계를 유지한다.
 - [x] 확인한 `loop_manager_internal/git/direct_rebase_service.py:_complete_direct_rebase_checkpoint()`의 명시 plan·선택 context와 phase/투영 판단을 해당 작업 snapshot에 연결한다. 새 rebase의 `pr_head_oid`·`pr_conflict_head_oid` 조회 교정은 재사용하고 대표 투영을 B로 바꾸어 문제를 숨기지 않는다. 프로젝트 원본의 phase를 보존할 경우와 B의 phase를 적용할 경우를 기존 전이 의미에 맞게 구분하며 checkpoint generation·정확한 원격 OID·게시 후 확인을 유지한다.
 - [x] 같은 파일의 `_complete_direct_rebase_checkpoint()`에 직접 구현된 transaction 밖 관측과 대상/현재 checkpoint 비교를 소비한다. 작업 귀속 변경에서도 `storage/runtime_state.py:complete_rebase()`·`execution/execution_state.py:complete_rebase()`의 관측 후 소유권/checkpoint 비교와 원자 적용을 유지한다. 시작·대기·완료의 실제 Git 판정과 사용자 operation 보호를 유지하며 과거 관측을 새로운 완료 증거로 만들지 않는다.
-- [x] `storage/runtime_state.py`의 `execution_selection`·`projected()`·`scope_owner()`·`transition_from_snapshot()`과 실행 포트 경계를 재사용한다. Review에서 `recovery/blocked_agent_service.py`의 보존·완료 경로가 선택 plan ID 대신 `projects`의 대표 Agent snapshot을 읽는 누락을 확인했다. 두 helper가 명시 plan의 선택 context에서 상태를 읽고 갱신하도록 연결했으며, checkpoint_adapter·merge_cleanup의 프로젝트 등록·planning/coordination 조회는 그대로 두었다.
+- [x] `storage/runtime_state.py`의 `execution_selection`·`projected()`·`scope_owner()`·`transition_from_snapshot()`과 실행 포트 경계를 재사용한다. Review에서 `recovery/blocked_agent_service.py`의 보존·완료 경로가 선택 plan ID 대신 `projects`의 대표 Agent snapshot을 읽는 누락을 확인했다. 보존·완료와 중단 복구 재진입이 명시 plan의 선택 context에서 최신 상태를 읽고 갱신하도록 연결했다. 재진입은 대표 복구 payload의 `owner_plan_id`를 선택 근거로만 사용하고 대상 ExecPlan의 현재 recovery를 읽으며, checkpoint_adapter·merge_cleanup의 프로젝트 등록·planning/coordination 조회는 그대로 두었다.
 - [x] 병렬 snapshot fixture와 기존 실제 정책/SQLite fixture에 회귀를 연결했다. 대표 A와 선택 B의 branch·Agent snapshot·복구가 다를 때 B의 BLOCKED Agent 복구가 B 상태로 완료되고 A의 대표 투영이 보존되는 사례를 추가했다. ARCHITECTURE에 snapshot CAS, 명시 target rebase 완료 및 BLOCKED Agent 복구의 대상별 상태 귀속을 반영했다. 사용자에게 보이는 차단·재개 정책은 바꾸지 않아 PRODUCT는 수정하지 않았다.
 
 ## Validation
@@ -43,6 +43,7 @@ R-091의 작업별 실행 원본을 차단·rebase의 남은 소비자까지 연
 - B의 정상 원격 일치·B 자체의 불일치, 차단 rebase 완료·현재 generation 경쟁·재시작에서 대상별 OID·phase·이력 보존과 필요한 재검증을 확인한다. 다른 후보의 verify/Review/게시 token 재사용은 거부하며 종료 불명 writer와 실제 공유 Git operation 보호는 유지한다.
 - `tests/test_runtime_state.py:CurrentRebaseRuntimeTests.test_rebase_reobservation_allows_another_database_writer_before_atomic_apply`의 repository/port 회귀는 재사용하고, `tests/test_execution_current_rebase_adoption_phase.py`·`tests/test_scope_block_revalidation.py`의 기존 fixture로 실제 direct-rebase 완료 소비자에 빠진 경우만 보강한다. 투영 없음·A 투영/선택 B에서 외부 재관측 도중 별도 SQLite 연결의 쓰기가 완료되고, checkpoint/소유 identity 경쟁 시 B의 acceptance·차단 해제만 거부되며 A와 경쟁 변경·미확정 근거가 보존돼야 한다.
 - 기존 단일 작업·명시적 차단 복구·대표 투영과 작업 원본 분리 회귀를 유지한다. 정책 조합마다 실제 Git lifecycle을 추가하지 않으며 기존 최소 Git 효과 회귀는 Manager 검증에 남긴다.
+- BLOCKED Agent 완료 뒤 `projects`에 `prepared` 값이 남아도 재시작 진입은 owner plan의 최신 `isolated` 상태를 읽어 workspace를 확인하고 완료 helper를 중복 호출하지 않아야 한다. 대표 A·대상 B의 차단 사유, branch, snapshot이 달라도 A 투영은 보존하고 B의 복구 상태만 소비한다.
 
 ## Progress
 
@@ -52,6 +53,7 @@ R-091의 작업별 실행 원본을 차단·rebase의 남은 소비자까지 연
 - [x] 차단 관측 후 현재 상태 재검사, direct-rebase 완료 귀속과 BLOCKED Agent 보존·완료의 선택 plan 상태 귀속을 교정했다.
 - [x] 현재 revision의 direct rebase 완료가 외부 재관측을 transaction 밖에서 수행하고 대상/checkpoint를 비교하는 직접 구현을 정적으로 확인했다. 과거 조사 기록은 당시 상태로 보존하며 실행 성공을 뜻하지 않는다.
 - [x] Review에서 대표 A와 선택 B의 branch·snapshot이 다른 BLOCKED Agent 복구 실패를 재현했다. preserve/completion을 명시 plan context의 상태 읽기·갱신으로 연결하고, 기존 대표 투영 보존과 선택 recovery 완료를 targeted 회귀로 확인했다.
+- [x] Review에서 완료 이후 재시작 진입이 `projects`의 오래된 `prepared` 복구를 다시 소비하는 누락을 확인했다. `owner_plan_id`로 대상 선택 뒤 최신 plan recovery를 읽도록 연결하고, 비폐기 차단 사유에서 A 대표 투영·B의 `isolated` 상태를 보존하며 완료를 반복하지 않는 회귀를 추가했다.
 - [x] 작업 귀속 교정 뒤 복수 작업의 차단·rebase·복구 상태와 기존 외부 관측/DB 반영 회귀를 targeted 검증했다.
 
 ## Decision Log
@@ -69,3 +71,5 @@ R-091의 작업별 실행 원본을 차단·rebase의 남은 소비자까지 연
 - verify 선언의 adapter는 `unittest`, Python은 launcher 선택이며 docs/VERIFY.md 계약은 stdlib unittest 3.11–3.14다. 프로젝트 Python의 targeted runner로 차단 CAS·PR head 선택·선택 불일치·대표 투영 아래 활성/차단 대상 완료·checkpoint 경합·상위 rebase 재관측의 10개 targeted test를 실행했고 모두 통과했다. 전체 verify는 실행하지 않았다.
 - Review 회귀와 변경한 completion 호출 assertion을 프로젝트 Python targeted runner로 각각 실행해 수정 후 통과했다. 전체 verify와 기존 10개 targeted test는 재실행하지 않았다.
 - 새 A/B BLOCKED Agent 복구 회귀와 `test_blocked_agent_preservation_resumes_pending_recovery_for_current_input`이 수정 후 각각 통과했다. 대표 project의 branch·snapshot·planning projection은 보존됐고 B의 recovery만 격리 상태로 완료됐다.
+- 현재 후보에서 비폐기 차단 사유의 A/B 복구 완료 후 재진입과 기존 격리 recovery 재시작 targeted case를 실행했다. 대표 `projects`에 남은 오래된 recovery가 완료 재호출의 근거가 되지 않고, 대상 plan의 현재 상태가 재진입 결과를 결정함을 확인했다.
+- 완료 후 중단 복구 재진입도 대표 projection을 다시 사용하면 이미 `isolated`인 대상 plan에 stale `prepared` snapshot을 적용해 실패할 수 있다. 새 복구는 owner ID로 plan을 선택해 최신 recovery를 소비하며 representative `projects` 값은 그대로 두어 선택 외 작업을 덮지 않는다.
