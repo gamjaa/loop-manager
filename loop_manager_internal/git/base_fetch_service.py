@@ -162,7 +162,7 @@ def _recorded_base_fetch(
     selected = rows[0][0]
     if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", selected) is None:
         raise RuntimeError(f"origin/{base}의 원격 OID가 유효하지 않습니다.")
-    before = {"oid": effects._tracking_ref_oid(repo, refname)}
+    before = _fetch_ref_state(effects, repo, refname)
 
     def receive() -> None:
         effects.git(repo, "fetch", "--no-tags", "--refmap=", "origin", remote_ref)
@@ -174,17 +174,39 @@ def _recorded_base_fetch(
     return selected
 
 
+def _ensure_direct_fetch_ref(git, repo, refname):
+    """Reject aliases even when they resolve to the expected OID or are dangling."""
+    symbolic = git(repo, "symbolic-ref", "--quiet", "--no-recurse", refname, check=False)
+    if symbolic.returncode != 1:
+        raise manager_git_journal.MutationEvidenceError(
+            f"fetch 대상의 직접 ref 형상을 확정할 수 없습니다: {refname}: {symbolic.stdout.strip()}")
+
+
+def _fetch_ref_state(effects, repo, refname):
+    """Keep version 1 OID-only receipts; observe their raw shape at every use."""
+    _ensure_direct_fetch_ref(effects.git, repo, refname)
+    return {"oid": effects._tracking_ref_oid(repo, refname)}
+
+
+def _update_fetch_ref(git, repo, refname, selected, old, token):
+    # no-deref pins the lock/write to the journal target; prepare keeps that
+    # lock while we reject aliases, including same-OID replacements.
+    git(repo, "update-ref", "--create-reflog", "-m",
+        f"loop-manager-base-fetch:{token}", "--no-deref", "--stdin",
+        input=f"start\nupdate {refname} {selected} {old or '0' * len(selected)}\nprepare\n",
+        before_commit=lambda: _ensure_direct_fetch_ref(git, repo, refname))
+
+
 def _record_fetch_ref(effects, repo, state_dir, base, selected, before, owner, receive):
     """Keep the existing per-ref journal format for single and bulk receipts."""
     refname = f"refs/remotes/origin/{base}"
 
     def apply(token: str) -> None:
         receive()
-        effects.git(repo, "update-ref", "--create-reflog", "-m",
-            f"loop-manager-base-fetch:{token}", refname, selected,
-            before["oid"] or "0" * len(selected))
+        _update_fetch_ref(effects.git, repo, refname, selected, before["oid"], token)
 
     def marker(intent: Mapping[str, object]) -> bool:
+        _ensure_direct_fetch_ref(effects.git, repo, refname)
         token = intent["id"]
         result = effects.git(repo, "reflog", "show", "-1", "--format=%H%x00%gs", refname,
                      check=False)
@@ -199,7 +221,7 @@ def _record_fetch_ref(effects, repo, state_dir, base, selected, before, owner, r
                                       else "project_fetch"),
         repo=str(effects._canonical_path(repo)), target=refname,
         before=before, expected={"oid": selected},
-        observe=lambda: {"oid": effects._tracking_ref_oid(repo, refname)},
+        observe=lambda: _fetch_ref_state(effects, repo, refname),
         apply=apply, marker=marker,
     )
 
@@ -246,7 +268,7 @@ def _recorded_project_fetch(
     for attempt in range(2):
         if base not in branches:
             raise RemoteBranchMissingError(f"origin/{base} 원격 branch를 찾을 수 없습니다.")
-        before = {branch: {"oid": effects._tracking_ref_oid(repo, f"refs/remotes/origin/{branch}")}
+        before = {branch: _fetch_ref_state(effects, repo, f"refs/remotes/origin/{branch}")
                   for branch in branches}
         changed = {branch: oid for branch, oid in branches.items() if before[branch]["oid"] != oid}
         if changed:
@@ -471,11 +493,8 @@ def _perform_manager_base_fetch(
     fetched = effects.git(repo_path, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip()
     if fetched != target:
         raise RuntimeError("Manager base fetch 원격 OID가 저장된 intent와 다릅니다.")
-    effects.git(
-        repo_path, "update-ref", "--create-reflog", "-m",
-        f"loop-manager-base-fetch:{token}", str(row["refname"]), target,
-        previous[0] if previous is not None else "0" * len(target),
-    )
+    _update_fetch_ref(effects.git, repo_path, str(row["refname"]), target,
+                      previous[0] if previous is not None else None, token)
     return base
 
 
@@ -495,6 +514,8 @@ def _finish_manager_base_fetch(
         "SELECT * FROM manager_base_fetches WHERE id = ?",
         (intent_id,),
     ).fetchone()
+    if row is not None:
+        _ensure_direct_fetch_ref(effects.git, repo_path, str(row["refname"]))
     if row is None or effects.git(repo_path, "rev-parse", str(row["refname"])).stdout.strip() != row["target_oid"]:
         raise RuntimeError("Manager base fetch 결과가 저장된 원격 OID와 다릅니다.")
     try:
@@ -518,6 +539,7 @@ class JournaledManagerBaseFetchEffects:
     _manager_base_fetch_applied: Callable[..., object]
     _perform_manager_base_fetch: Callable[..., object]
     _tracking_ref_oid: Callable[..., object]
+    git: Callable[..., object]
 
 
 @fetch_resource
@@ -537,21 +559,22 @@ def _journaled_manager_base_fetch(
     target = str(row["target_oid"])
 
     def marker(_intent: Mapping[str, object]) -> bool:
+        _ensure_direct_fetch_ref(effects.git, repo_path, refname)
         return before_oid == target or effects._manager_base_fetch_applied(repo_path, row)
 
     manager_git_journal.recover_active(
         state_dir, repo=str(effects._canonical_path(repo_path)),
         kind="project_fetch", target=refname,
-        observe=lambda: {"oid": effects._tracking_ref_oid(repo_path, refname)},
+        observe=lambda: _fetch_ref_state(effects, repo_path, refname),
         marker=marker,
     )
-    current = effects._tracking_ref_oid(repo_path, refname)
+    current = _fetch_ref_state(effects, repo_path, refname)["oid"]
     if current != target:
         manager_git_journal.execute(
             state_dir, owner=f"guidance:{plan_id}", kind="project_fetch",
             repo=str(effects._canonical_path(repo_path)), target=refname,
             before={"oid": before_oid}, expected={"oid": target},
-            observe=lambda: {"oid": effects._tracking_ref_oid(repo_path, refname)},
+            observe=lambda: _fetch_ref_state(effects, repo_path, refname),
             apply=lambda _token: effects._perform_manager_base_fetch(
                 connection, repo_path, intent_id, base,
             ),

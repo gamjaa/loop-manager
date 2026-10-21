@@ -1942,6 +1942,10 @@ Manager fetch·worktree·rebase journal은 실제 미완료 Git 전이의 자원
 
 프로젝트 전체 원격 동기화는 branch 목록·OID를 한 번 조회하고 변경된 branch의 객체를 하나의 `fetch --stdin`으로 받는다. 목적 ref 없는 명시적 입력과 빈 `--refmap=`을 사용하고 prune·태그·submodule 갱신을 끈다. 같은 repository의 fetch와 `FETCH_HEAD` 결과 확보는 공유 fetch 잠금으로 보호하며, Git이 알려준 `FETCH_HEAD` 경로에서 branch별 OID를 읽어 조회 결과와 대조한다. 일반 branch 삭제나 OID 경쟁은 전체 재관측·일괄 수신을 한 번만 재시도하고 필수 base 부재·관측 실패는 보존·재시도 경계로 돌린다. 수신이 확인된 뒤 기존 ref별 journal과 예상 이전 OID로 추적 ref를 반영한다. 변경 없는 ref도 미확정 journal을 먼저 처리하므로 단일 fetch로 남긴 과거 기록과 일부 ref 반영 뒤 중단을 같은 형식으로 재개한다.
 
+fetch의 관측·완료·복구 경계는 `symbolic-ref --quiet --no-recurse`로 정확한 추적 ref의 심볼릭 형상을 거부한다. dangling alias와 관측 실패도 부재로 대체하지 않는다. 공용 commit OID helper의 역참조 의미와 journal version 1의 `before`·`expected` OID 형식은 유지하되, 실제 갱신은 직접 ref인 현재 관측과 기존 소유 reflog가 함께 있어야 완료한다. 변경 없는 직접 ref는 기존 equal 관측 계약을 유지한다. 과거 receipt나 같은 referent OID는 새 alias를 승인하는 근거가 아니다. 심볼릭 형상을 만나면 원래 intent·실패 감사·완료한 다른 ref 전이를 보존한다.
+
+실제 쓰기는 프로젝트 Git FIFO 보호 안에서 수행하며, prepare·raw 형상 검사·commit 또는 중단과 자식 회수까지 같은 순번을 유지한다. 일괄·단일·안내용 fetch가 공유하는 helper는 `update-ref --no-deref --stdin`의 `start` → `update <정확한 ref> <새 OID> <이전 OID 또는 0>` → `prepare`로 수행한다. Git이 정확한 대상의 잠금을 잡고 OID CAS를 검증한 응답을 받은 뒤, 그 잠금 안에서 raw 형상을 다시 확인하고 같은 프로세스에 `commit`을 보낸다. 확인 실패·중단 시 commit 없이 stdin을 닫고 자식을 회수해 prepared transaction을 중단한다. 사전 심볼릭 검사만으로 경쟁을 막거나 `--no-deref`만으로 alias를 보존한다고 가정하지 않는다. 이 조합은 관측 뒤 같은 OID의 alias로 바뀐 경우에도 referent를 따라 쓰거나 alias 자체를 치환하지 않으며 ref별 lease·journal과 실제 쓰기 대상을 일치시킨다. 기존 Git transaction 계약을 사용하고, 새 `symref-*` 명령이나 저장소 파일 형식에 의존하지 않는다. [Git update-ref 계약](https://git-scm.com/docs/git-update-ref)의 prepare 잠금·명시적 commit·EOF 중단을 따르며 Git 2.43에서도 제공하는 transaction을 사용한다.
+
 Codex의 `refs/codex/turn-diffs/*`와 다른 작업의 정상 공유 ref 변화를 해당 Agent에 귀속하지 않는다. 현재 게시 branch의 원격 tip은 이번 push의 통합·명시적 `--force-with-lease` 조건으로 관측한다.
 
 Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내장 쓰기 제한과 granular 자동 승인 검토를 유지한다. Codex 프로세스 전체를 감싸는 바깥 sandbox와 중첩 sandbox 호환성은 호출 조건이 아니며 정상 session·로그 저장을 Agent의 workspace 밖 쓰기 권한과 구분한다.

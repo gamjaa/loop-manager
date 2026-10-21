@@ -274,6 +274,36 @@ class ManagerGitTransitionTests(unittest.TestCase):
             {"refs": {REF: NEW}, "worktrees": {}},
         )
 
+    def test_fetch_raw_shape_failure_preserves_pending_and_sealed_evidence(self):
+        from loop_manager_internal.git.base_fetch_service import _fetch_ref_state
+        from types import SimpleNamespace
+        for sealed in (False, True):
+            with self.subTest(sealed=sealed), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                current = {'oid': OLD}
+                arguments = dict(owner='project', repo='/repo', kind='project_fetch', target=REF,
+                                 before={'oid': OLD}, expected={'oid': NEW},
+                                 observe=lambda: current.copy(),
+                                 apply=lambda _: current.update(oid=NEW), marker=lambda _: True)
+                if sealed:
+                    journal.execute(state, **arguments)
+                else:
+                    with mock.patch.object(journal, '_finish', side_effect=RuntimeError('crash')):
+                        with self.assertRaisesRegex(RuntimeError, 'crash'):
+                            journal.execute(state, **arguments)
+                slot = journal._slot(state, '/repo', 'project_fetch', REF)
+                if sealed:
+                    (slot / 'active.json').write_bytes(next(slot.glob('*.intent.json')).read_bytes())
+                saved = {path.name: path.read_bytes() for path in slot.iterdir()}
+                effects = SimpleNamespace(
+                    git=lambda *a, **kw: SimpleNamespace(returncode=0, stdout='refs/heads/user-work'),
+                    _tracking_ref_oid=mock.Mock(return_value=NEW))
+                with self.assertRaises(journal.MutationEvidenceError):
+                    journal.recover_active(state, repo='/repo', kind='project_fetch', target=REF,
+                        observe=lambda: _fetch_ref_state(effects, Path('/repo'), REF), marker=lambda _: True)
+                effects._tracking_ref_oid.assert_not_called()
+                self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, saved)
+
     def test_source_local_delta_cannot_become_agent_baseline(self):
         before = {
             "head": OLD, "branch": "main", "changes": [["untracked", "user.txt", "sig"]],

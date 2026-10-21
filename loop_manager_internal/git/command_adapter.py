@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from loop_manager_internal.runtime.handoff_gate import _handoff_popen
 from loop_manager_internal.runtime.contracts import GitLockError
 from loop_manager_internal.runtime.contracts import ManagedWorktreeConflictError
 from pathlib import Path
@@ -28,6 +29,7 @@ def git(effects: GitEffects,
     repo: Path, *arguments: str, check: bool = True,
     env: dict[str, str] | None = None,
     input: str | None = None,
+    before_commit: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command_index = 0
     while command_index < len(arguments) and arguments[command_index].startswith('-'):
@@ -65,6 +67,7 @@ def git(effects: GitEffects,
             ["git", "-C", str(repo), *options, *arguments], check=False,
             **({"env": env} if env is not None else {}),
             **({"input": input} if input is not None else {}),
+            **({"before_commit": before_commit} if before_commit is not None else {}),
         )
     if check and result.returncode:
         output = result.stdout[-6000:].strip()
@@ -73,6 +76,37 @@ def git(effects: GitEffects,
             raise GitLockError(message)
         raise RuntimeError(message)
     return result
+
+
+def commit_ref_transaction(arguments, *, input, before_commit, cwd=None, env=None):
+    """Keep Git's exact ref lock from prepare through the caller's raw-ref check.
+
+    EOF aborts a started transaction. Never send commit after a failed check.
+    Binary pipes preserve LF on Windows as well as UTF-8 ref names.
+    """
+    with _handoff_popen(arguments, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+        try:
+            process.stdin.write(input.encode("utf-8"))
+            process.stdin.flush()
+            output = process.stdout.readline().replace(b"\r\n", b"\n")
+            if output == b"start: ok\n":
+                output += process.stdout.readline().replace(b"\r\n", b"\n")
+            if output != b"start: ok\nprepare: ok\n":
+                remainder, _ = process.communicate()
+                return subprocess.CompletedProcess(
+                    arguments, process.returncode or 1,
+                    (output + remainder).decode("utf-8", errors="replace"))
+            before_commit()
+            remainder, _ = process.communicate(b"commit\n")
+            output += remainder
+        except BaseException:
+            # Closing stdin aborts even a prepared transaction and releases its
+            # lock. Reap the child before returning the original failure.
+            process.communicate()
+            raise
+    return subprocess.CompletedProcess(arguments, process.returncode,
+                                       output.decode("utf-8", errors="replace"))
 
 
 def git_bytes(effects: GitBytesEffects, repo: Path, *arguments: str) -> bytes:

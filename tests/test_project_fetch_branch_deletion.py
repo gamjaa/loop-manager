@@ -25,6 +25,8 @@ class ProjectFetchBranchDeletionTest(unittest.TestCase):
         self.remote = {'main': self.oid}
         self.tracking = {'main': self.old}
         self.reflogs = {}
+        self.symbolic = {}
+        self.on_prepare = None
         self.on_fetch = None
         self.fetches = []
         self.updates = []
@@ -40,6 +42,9 @@ class ProjectFetchBranchDeletionTest(unittest.TestCase):
             branches = self.remote if len(args) == 3 else {
                 name: oid for name, oid in self.remote.items() if args[3] == 'refs/heads/' + name}
             return self.result(''.join(f'{oid}\trefs/heads/{branch}\n' for branch, oid in branches.items()))
+        if args[:1] == ('symbolic-ref',):
+            target = self.symbolic.get(args[-1])
+            return self.result(target or '', 0 if target else 1)
         if args[0] == 'fetch':
             names = ([ref.removeprefix('refs/heads/') for ref in input.splitlines()]
                      if input is not None else [args[-1].removeprefix('refs/heads/')])
@@ -62,10 +67,17 @@ class ProjectFetchBranchDeletionTest(unittest.TestCase):
         if args[:2] == ('cat-file', '-e'):
             return self.result()
         if args[0] == 'update-ref':
-            branch = args[4].removeprefix('refs/remotes/origin/')
-            self.assertEqual(self.tracking.get(branch) or '0' * 40, args[6])
-            self.tracking[branch] = args[5]
-            self.reflogs[branch] = f'{args[5]}\0{args[3]}\n'
+            self.assertEqual(args[-2:], ('--no-deref', '--stdin'))
+            start, update, prepare = input.splitlines()
+            self.assertEqual((start, prepare), ('start', 'prepare'))
+            _, ref, selected, old = update.split()
+            branch = ref.removeprefix('refs/remotes/origin/')
+            if self.on_prepare:
+                self.on_prepare()
+            self.assertEqual(self.tracking.get(branch) or '0' * 40, old)
+            kwargs['before_commit']()
+            self.tracking[branch] = selected
+            self.reflogs[branch] = f'{selected}\0{args[3]}\n'
             self.updates.append(branch)
             return self.result()
         if args[:2] == ('reflog', 'show'):
@@ -232,3 +244,134 @@ class ProjectFetchBranchDeletionTest(unittest.TestCase):
         self.assertNotIn('text', run.call_args.kwargs)
         self.assertNotIn('encoding', run.call_args.kwargs)
         self.assertEqual(result.stdout, 'received\n')
+
+    def test_symbolic_targets_and_dangling_aliases_are_preserved(self):
+        ref = 'refs/remotes/origin/main'
+        for target in ('refs/heads/user-work', 'refs/remotes/origin/other',
+                       'refs/shared/user', 'refs/heads/missing'):
+            with self.subTest(target=target):
+                self.symbolic[ref] = target
+                with self.assertRaises(loop_manager.manager_git_journal.MutationEvidenceError):
+                    self.run_fetch()
+                self.assertEqual(self.symbolic[ref], target)
+                self.assertEqual(self.updates, [])
+                self.assertEqual(self.fetches, [])
+        with self.assertRaises(loop_manager.manager_git_journal.MutationEvidenceError):
+            loop_manager._recorded_base_fetch(self.repo, self.state_dir, 'main', owner='project')
+
+    def test_same_oid_alias_race_keeps_intent_and_completed_ref(self):
+        self.remote = {'a-direct': self.oid, 'main': self.oid}
+        self.tracking['a-direct'] = self.old
+        ref = 'refs/remotes/origin/main'
+        def race():
+            if self.updates:
+                self.symbolic[ref] = 'refs/heads/user-work'
+        self.on_prepare = race
+        with self.assertRaises(loop_manager.manager_git_journal.MutationEvidenceError):
+            self.run_fetch()
+        self.assertEqual(self.updates, ['a-direct'])
+        self.assertEqual(self.tracking, {'a-direct': self.oid, 'main': self.old})
+        active = next((self.state_dir / 'manager-git-journal').glob('*/active.json'))
+        saved = active.read_bytes()
+        with self.assertRaises(loop_manager.manager_git_journal.MutationEvidenceError):
+            self.run_fetch()
+        self.assertEqual(active.read_bytes(), saved)
+        self.assertEqual(self.symbolic[ref], 'refs/heads/user-work')
+
+    def test_pending_legacy_receipt_does_not_accept_same_oid_alias(self):
+        with mock.patch.object(loop_manager.manager_git_journal, '_finish', side_effect=RuntimeError('crash')):
+            with self.assertRaisesRegex(RuntimeError, 'crash'):
+                loop_manager._recorded_base_fetch(self.repo, self.state_dir, 'main', owner='project')
+        active = next((self.state_dir / 'manager-git-journal').glob('*/active.json'))
+        saved = active.read_bytes()
+        self.symbolic['refs/remotes/origin/main'] = 'refs/heads/user-work'
+        with self.assertRaises(loop_manager.manager_git_journal.MutationEvidenceError):
+            self.run_fetch()
+        self.assertEqual(active.read_bytes(), saved)
+        self.assertEqual(self.updates, ['main'])
+
+    def test_transaction_protocol_commits_only_after_the_locked_check(self):
+        import io
+        from loop_manager_internal.git import command_adapter
+        for response, failure in ((b'start: ok\nprepare: ok\n', None),
+                                  (b'start: ok\r\nprepare: ok\r\n', None),
+                                  (b'start: ok\nfatal: cannot lock ref\n', None),
+                                  (b'start: ok\nprepare: ok\n', RuntimeError('raw alias'))):
+            with self.subTest(response=response, failure=failure):
+                process = mock.MagicMock()
+                process.__enter__.return_value = process
+                process.stdin = io.BytesIO()
+                process.stdout = io.BytesIO(response)
+                process.communicate.return_value = (b'commit: ok\n', None)
+                process.returncode = 0
+                checked = mock.Mock(side_effect=failure)
+                with mock.patch.object(command_adapter, '_handoff_popen', return_value=process):
+                    if failure:
+                        with self.assertRaisesRegex(RuntimeError, 'raw alias'):
+                            loop_manager.command(['git', 'update-ref', '--stdin'],
+                                input='start\nprepare\n', before_commit=checked)
+                        process.communicate.assert_called_once_with()
+                    elif b'fatal' in response:
+                        with self.assertRaisesRegex(RuntimeError, 'cannot lock ref'):
+                            loop_manager.command(['git', 'update-ref', '--stdin'],
+                                input='start\nprepare\n', before_commit=checked)
+                        checked.assert_not_called()
+                        process.communicate.assert_called_once_with()
+                    else:
+                        loop_manager.command(['git', 'update-ref', '--stdin'],
+                            input='start\nprepare\n', before_commit=checked)
+                        checked.assert_called_once_with()
+                        process.communicate.assert_called_once_with(b'commit\n')
+                self.assertEqual(process.stdin.getvalue(), b'start\nprepare\n')
+
+    def test_raw_ref_query_failure_is_not_treated_as_absence(self):
+        original = self.command
+        def broken(repo, *args, **kwargs):
+            if args[:1] == ('symbolic-ref',):
+                return self.result('fatal: invalid reference', 128)
+            return original(repo, *args, **kwargs)
+        self.git.side_effect = broken
+        with self.assertRaisesRegex(loop_manager.manager_git_journal.MutationEvidenceError, 'invalid reference'):
+            self.run_fetch()
+        self.assertEqual(self.fetches, [])
+        self.assertEqual(self.updates, [])
+
+    def test_prepared_ref_check_stays_inside_project_git_turn(self):
+        from contextlib import contextmanager
+        from loop_manager_internal.git import command_adapter
+        for rejected in (False, True):
+            with self.subTest(rejected=rejected):
+                events = []
+                @contextmanager
+                def turn(repo, command, arguments):
+                    self.assertEqual((repo, command, arguments),
+                        (self.repo, 'update-ref', ('--no-deref', '--stdin')))
+                    events.append('enter')
+                    try:
+                        yield
+                    finally:
+                        events.append('exit')
+                def check():
+                    self.assertEqual(events, ['enter', 'command'])
+                    events.append('check')
+                    if rejected:
+                        raise RuntimeError('raw alias')
+                def command(arguments, **kwargs):
+                    self.assertEqual(arguments,
+                        ['git', '-C', str(self.repo), 'update-ref', '--no-deref', '--stdin'])
+                    self.assertEqual(kwargs['input'], 'start\nprepare\n')
+                    events.append('command')
+                    kwargs['before_commit']()
+                    events.append('commit')
+                    return self.result()
+                effects = SimpleNamespace(command=command)
+                with mock.patch('loop_manager_internal.runtime.resource_lock.git_command_turn', turn):
+                    if rejected:
+                        with self.assertRaisesRegex(RuntimeError, 'raw alias'):
+                            command_adapter.git(effects, self.repo, 'update-ref', '--no-deref', '--stdin',
+                                input='start\nprepare\n', before_commit=check)
+                    else:
+                        command_adapter.git(effects, self.repo, 'update-ref', '--no-deref', '--stdin',
+                            input='start\nprepare\n', before_commit=check)
+                self.assertEqual(events,
+                    ['enter', 'command', 'check'] + ([] if rejected else ['commit']) + ['exit'])

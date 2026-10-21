@@ -540,6 +540,7 @@ def register(assembly: Composition) -> None:
             _manager_base_fetch_applied=assembly.callback('_manager_base_fetch_applied'),
             _perform_manager_base_fetch=assembly.callback('_perform_manager_base_fetch'),
             _tracking_ref_oid=assembly.callback('_tracking_ref_oid'),
+            git=assembly.callback('git'),
         ),
     )
 

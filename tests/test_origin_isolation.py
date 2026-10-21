@@ -64,6 +64,57 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
             self.assertEqual(sum(call.args[1] == 'fetch' for call in calls.call_args_list), 1)
             self.assertEqual(sum(call.args[1] == 'ls-remote' for call in calls.call_args_list), 1)
 
+    def test_prepared_fetch_rejects_same_oid_alias_without_touching_user_work(self):
+        """Only real Git proves no-deref prepare holds the alias's exact lock."""
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state = Path(directory) / 'state'
+            original = git(source, 'rev-parse', 'HEAD')
+            selected = advance_remote(writer)
+            git(writer, 'branch', 'z-race')
+            git(writer, 'push', 'origin', 'z-race')
+            ref = 'refs/remotes/origin/z-race'
+            git(source, 'update-ref', ref, original)
+            git(source, 'branch', 'user-work')
+            (source / 'tracked.txt').write_text('local edit\n', encoding='utf-8')
+            index = (source / '.git/index').read_bytes()
+            status = git(source, 'status', '--porcelain')
+            derived_head = git(source, 'symbolic-ref', 'refs/remotes/origin/HEAD')
+            real_git = loop_manager.git
+            locked = []
+
+            def race(repo, *args, **kwargs):
+                if args[:1] == ('update-ref',) and f'update {ref} ' in kwargs.get('input', ''):
+                    git(source, 'symbolic-ref', ref, 'refs/heads/user-work')
+                    check = kwargs['before_commit']
+                    def while_locked():
+                        # A competing Git writer cannot replace the prepared alias.
+                        attempt = real_git(source, 'symbolic-ref', ref, 'refs/heads/main', check=False)
+                        locked.append(attempt.returncode != 0)
+                        check()
+                    kwargs['before_commit'] = while_locked
+                return real_git(repo, *args, **kwargs)
+
+            with mock.patch.object(loop_manager, 'git', side_effect=race):
+                with self.assertRaises(manager_git_journal.MutationEvidenceError):
+                    loop_manager.remote_base(source, 'main', state_dir=state)
+            self.assertEqual(locked, [True])
+            self.assertEqual(git(source, 'symbolic-ref', ref), 'refs/heads/user-work')
+            self.assertEqual(git(source, 'rev-parse', 'refs/heads/user-work'), original)
+            self.assertEqual(git(source, 'rev-parse', 'origin/main'), selected)
+            self.assertEqual(git(source, 'symbolic-ref', 'refs/remotes/origin/HEAD'), derived_head)
+            self.assertEqual(git(source, 'rev-parse', 'HEAD'), original)
+            self.assertEqual((source / '.git/index').read_bytes(), index)
+            self.assertEqual(git(source, 'status', '--porcelain'), status)
+            self.assertEqual((source / 'tracked.txt').read_text(), 'local edit\n')
+            active = next((state / 'manager-git-journal').glob('*/active.json'))
+            saved = active.read_bytes()
+            with self.assertRaises(manager_git_journal.MutationEvidenceError):
+                loop_manager.remote_base(source, 'main', state_dir=state)
+            self.assertEqual(active.read_bytes(), saved)
+            # The failed transaction has released the Git lock as well.
+            self.assertFalse((source / '.git' / (ref + '.lock')).exists())
+
     def test_project_fetch_recovers_owned_ref_update_after_result_write_crash(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)
@@ -84,7 +135,7 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
                 )
             self.assertEqual(git(source, "rev-parse", "origin/z-extra"), selected)
             self.assertFalse(any(call.args[1:3] == ("update-ref", "--create-reflog")
-                                 and call.args[5] == "refs/remotes/origin/main"
+                                 and "update refs/remotes/origin/main " in call.kwargs.get("input", "")
                                  for call in calls.call_args_list))
             self.assertEqual(
                 manager_git_journal.verified_candidates(
@@ -630,12 +681,15 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
             from types import SimpleNamespace
             loop_manager._ensure_cleanup_pending_schema(self.connection)
             def git(_repo, *args, **kwargs):
+                if args[:1] == ('symbolic-ref',):
+                    return SimpleNamespace(stdout='', returncode=1)
                 if args[:1] == ('ls-remote',):
                     output = target_oid + '\trefs/heads/main\n'
                 elif args[:1] == ('rev-parse',):
                     output = target_oid if args[-1] == 'FETCH_HEAD^{commit}' else current['oid']
                 elif args[:1] == ('update-ref',):
-                    self.assertEqual(args[-3:], (self.ref, target_oid, before_oid))
+                    self.assertEqual(kwargs['input'], f'start\nupdate {self.ref} {target_oid} {before_oid}\nprepare\n')
+                    kwargs['before_commit']()
                     current['oid'] = target_oid
                     self.reflog = target_oid + '\0' + args[3] + '\n' + self.reflog
                     output = ''
@@ -851,6 +905,8 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         def git(_repo, *args, **kwargs):
             nonlocal remote, fetched
             output = ''
+            if args[:1] == ('symbolic-ref',):
+                return SimpleNamespace(stdout='', returncode=1)
             if args == ('remote', 'get-url', '--push', '--all', 'origin'):
                 output = url
             elif args[:1] == ('push',):
@@ -866,7 +922,8 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
             elif args == ('rev-parse', '--verify', self.ref + '^{commit}'):
                 output = self.current.refs[self.ref][0]
             elif args[:1] == ('update-ref',):
-                self.assertEqual(args[-3:], (self.ref, commit, 'b' * 40))
+                self.assertEqual(kwargs['input'], f"start\nupdate {self.ref} {commit} {'b' * 40}\nprepare\n")
+                kwargs['before_commit']()
                 self.current = replace(self.current, refs={self.ref: (commit, '')})
                 self.reflog = commit + '\0' + args[3] + '\n' + self.reflog
             elif args[:2] == ('reflog', 'show'):
