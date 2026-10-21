@@ -385,6 +385,54 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertNotEqual(json.loads(run['observation'])['completeness_token'],
                             json.loads(reused['observation'])['completeness_token'])
 
+    def test_worker_review_through_production_ports_reuses_original_run_after_document_rebase(self):
+        import loop_manager
+        from loop_manager_internal.execution import result_validation
+        from types import SimpleNamespace
+        self.enterContext(mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix')))
+        (self.root / 'scripts/verify.sh').write_text('custom native verify')
+        (self.root / inputs.MANIFEST).write_text(json.dumps(
+            {'version': 1, 'paths': ['src/**', 'scripts/**']}))
+        document = self.root / 'README.md'
+        document.write_text('not consumed')
+        review = inputs.exclusion_request(self.root, ('scripts/verify.sh',))
+        review['basis'] = 'Custom script consumes src only, never README contents.'
+        message = READY_WORKER_RESULT + '\n' + inputs.EXCLUSION_MARKER + json.dumps(review)
+        self.state.update_project('repo', worktree=str(self.root), worker_result=message)
+        production = loop_manager._ExecutionLifecyclePorts(
+            self.connection, self.repository, repo='repo', repo_path=Path('/repo'),
+            state_dir=Path('/state'), base='main', base_sha='base', provider='codex',
+            config_path=Path('/config'), newly_activated=False)
+        self.state = production.effects.state
+        self.handler.effects = replace(self.handler.effects, state=self.state,
+            validation=replace(self.handler.effects.validation,
+                observe_verify_inputs=production.effects.validation.observe_verify_inputs))
+        self.assertEqual(production.effects.agent.worker_prompt('plan', None, session_resume=True),
+                         loop_manager.worker_prompt('plan', None, session_resume=True))
+        prompt = production.effects.agent.reviewer_prompt('main', verify_evidence='Manager receipt')
+        self.assertIn(review['basis'], prompt)
+        self.assertIn(inputs.EXCLUSION_MARKER, prompt)
+        self.assertIn('Manager receipt', prompt)
+        self.assertEqual(self.state.row()['worker_result'], message)
+        self.verify()
+        document.write_text('changed after rebase')
+        original_git = self.effects.workspace.git.side_effect
+        self.effects.workspace.git.side_effect = lambda path, *args, **kwargs: (
+            type('Result', (), {'stdout': 'new-head', 'returncode': 0})()
+            if args == ('rev-parse', 'HEAD') else original_git(path, *args, **kwargs))
+        self.ready()
+        self.state.update_project('repo', worker_result=message)
+        self.verify()
+        run, reused = self.receipts()
+        self.assertEqual(self.calls.count('verify'), 1)
+        self.assertEqual((reused['kind'], reused['origin_id'], reused['head']),
+                         ('reuse', run['id'], 'new-head'))
+        (self.root / 'scripts/verify.sh').write_text('now consumes README')
+        self.ready()
+        self.state.update_project('repo', worker_result=message)
+        self.verify()
+        self.assertEqual(self.calls.count('verify'), 2)
+
     def test_later_completeness_proof_does_not_promote_an_unproven_original_run(self):
         (self.root / 'excluded.json').write_text('outside')
         self.verify()

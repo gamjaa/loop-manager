@@ -398,3 +398,134 @@ class VerifyInputObservationTest(unittest.TestCase):
             changed = self.observe(completeness=original.completeness_token)
         self.assertNotEqual(original.fingerprint, changed.fingerprint)
         self.assertFalse(changed.proven)
+
+
+class WorkerExclusionReviewTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / 'scripts').mkdir()
+        (self.root / 'src').mkdir()
+        (self.root / 'src/app.py').write_text('VALUE = 1')
+        for name in ('verify.sh', 'verify.ps1'):
+            (self.root / 'scripts' / name).write_text('custom native verify')
+        (self.root / inputs.MANIFEST).write_text(json.dumps(
+            dict(version=1, paths=['src/**', 'scripts/**'])))
+        self.document = self.root / 'README.md'
+        self.document.write_text('unused guidance')
+        self.review = inputs.exclusion_request(self.root, ('scripts/verify.sh', 'scripts/verify.ps1'),
+                                                ('config/operating.ini',))
+        self.review['basis'] = 'Both custom scripts consume only src; README and operating config are never read.'
+
+    def observe(self, review=None, entrypoint='scripts/verify.sh'):
+        return inputs.reconfirm_worker_exclusions(self.root, (entrypoint,), review or self.review)
+
+    def test_current_document_bytes_and_mode_reconfirm_without_environment_proof(self):
+        before = self.observe()
+        self.assertTrue(before.proven, before.reason)
+        self.document.write_text('changed after rebase')
+        self.document.chmod(0o755)
+        after = self.observe()
+        self.assertTrue(after.proven, after.reason)
+        self.assertEqual(before.fingerprint, after.fingerprint)
+        self.assertNotEqual(before.completeness_token, after.completeness_token)
+        self.assertNotEqual(before.uncovered, after.uncovered)
+        self.assertTrue(self.observe(entrypoint='scripts/verify.ps1').proven)
+        (self.root / 'config').mkdir()
+        config = self.root / 'config/operating.ini'
+        for content in ('first', 'second'):
+            config.write_text(content)
+            self.assertEqual(after, self.observe())
+        config.unlink()
+        self.assertEqual(after, self.observe())
+
+    def test_code_manifest_entrypoint_and_outside_path_changes_reject_old_review(self):
+        for target in (self.root / 'src/app.py', self.root / inputs.MANIFEST,
+                       self.root / 'scripts/verify.sh'):
+            original = target.read_bytes()
+            target.write_bytes(original + b'\n')
+            self.assertFalse(self.observe().proven)
+            target.write_bytes(original)
+            mode = target.stat().st_mode & 0o777
+            target.chmod(mode ^ 0o111)
+            self.assertFalse(self.observe().proven)
+            target.chmod(mode)
+        new = self.root / 'missing-code.py'
+        new.write_text('untracked code')
+        self.assertFalse(self.observe().proven)
+        new.unlink()
+        moved = self.root / 'moved.md'
+        self.document.rename(moved)
+        self.assertFalse(self.observe().proven)
+        moved.rename(self.document)
+        self.document.unlink()
+        self.assertFalse(self.observe().proven)
+        self.document.symlink_to(self.root / 'src/app.py')
+        self.assertFalse(self.observe().proven)
+        self.assertFalse(self.observe(entrypoint='scripts/other.sh').proven)
+
+    def test_manifest_selected_fixed_configuration_overrides_operating_exclusion(self):
+        (self.root / 'config').mkdir()
+        config = self.root / 'config/operating.ini'
+        config.write_text('fixed fixture')
+        manifest = self.root / inputs.MANIFEST
+        manifest.write_text(json.dumps(dict(version=1, paths=['src/**', 'scripts/**', 'config/**'])))
+        review = inputs.exclusion_request(self.root, ('scripts/verify.sh',), ('config/operating.ini',))
+        review['basis'] = 'README only is unconsumed; configuration is selected.'
+        current = self.observe(review)
+        self.assertTrue(current.proven, current.reason)
+        self.assertIn('config/operating.ini', {item[0] for item in current.files})
+        config.write_text('changed fixed fixture')
+        self.assertFalse(self.observe(review).proven)
+        config.unlink()
+        self.assertFalse(self.observe(review).proven)
+
+    def test_review_parser_requires_explicit_unique_complete_declaration(self):
+        line = inputs.EXCLUSION_MARKER + json.dumps(self.review)
+        self.assertEqual(inputs.worker_exclusions('PASS\n' + line), self.review)
+        request = dict(self.review)
+        del request['basis']
+        for message in ('PASS', inputs.EXCLUSION_MARKER + json.dumps(request), line + '\n' + line,
+                        inputs.EXCLUSION_MARKER + '{"version":1,"version":1}',
+                        inputs.EXCLUSION_MARKER + json.dumps(dict(self.review, version=True)),
+                        inputs.EXCLUSION_MARKER + json.dumps(dict(self.review, operating_paths=['../escape'])),
+                        inputs.EXCLUSION_MARKER + json.dumps(dict(self.review, operating_paths=['docs/**']))):
+            self.assertIsNone(inputs.worker_exclusions(message), message)
+
+    def test_read_errors_and_mutation_between_observations_never_confirm(self):
+        read_bytes = Path.read_bytes
+        def unreadable(path):
+            if path == self.document:
+                raise PermissionError('cannot read exclusion')
+            return read_bytes(path)
+        with mock.patch.object(Path, 'read_bytes', unreadable):
+            self.assertFalse(self.observe().proven)
+        observe = inputs.observe
+        def mutate(*args, **kwargs):
+            result = observe(*args, **kwargs)
+            if 'completeness' not in kwargs:
+                self.document.write_text('racing mutation')
+            return result
+        with mock.patch.object(inputs, 'observe', side_effect=mutate):
+            self.assertFalse(self.observe().proven)
+
+    def test_production_observer_and_prompt_accept_explicit_review_for_custom_entrypoints(self):
+        from loop_manager_internal.execution import result_validation
+        from loop_manager_internal.agents.agent_prompts import worker_prompt
+        message = inputs.EXCLUSION_MARKER + json.dumps(self.review)
+        for platform, script in (('posix', 'verify.sh'), ('nt', 'verify.ps1')):
+            with mock.patch.object(result_validation, 'os', SimpleNamespace(name=platform)):
+                self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
+                observed = result_validation.observe_verify_inputs(self.root, worker_result=message)
+                self.assertTrue(observed.proven, observed.reason)
+                (self.root / 'scripts' / script).write_text('now consumes README.md')
+                self.assertFalse(result_validation.observe_verify_inputs(self.root, worker_result=message).proven)
+                (self.root / 'scripts' / script).write_text('custom native verify')
+        prompt = worker_prompt('plan', None)
+        self.assertIn(inputs.EXCLUSION_MARKER, prompt)
+        self.assertIn('--review-request .', prompt)
+        self.assertIn('어떤 내용이어도 소비되지 않음', prompt)
+        self.assertNotIn(inputs.EXCLUSION_MARKER, worker_prompt('plan', None, session_resume=True))
+        self.assertIn(inputs.EXCLUSION_MARKER, worker_prompt('plan', None,
+            session_resume=True, session_recovery=True))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningContext, MaintenancePlanMode
@@ -195,6 +196,10 @@ def worker_prompt(
                      '정상 진행했고 상한만 부족한 구체적 근거가 있으면 '
                      'PR_SUMMARY 안에 VERIFY_TIMEOUT_LIMIT_INSUFFICIENT: <진행 근거와 필요한 설정 조정>을 보고하라.')
     if not session_resume or session_recovery:
+        input_observer = Path(__file__).resolve().parents[1] / "verification/inputs.py"
+        parts.append(f"""목록 밖 파일의 제외 근거는 verify PASS와 별도로 확인하라. 최종 코드에서 실제 verify 진입점·수집·테스트·native/동적 소비를 검토해 특정 목록 밖 경로가 어떤 내용이어도 소비되지 않음을 확인한 경우에만 다음 읽기 전용 명령으로 identity를 얻어라:
+프로젝트 Python으로 `{input_observer}`를 실행하고 --review-request . --entrypoint scripts/verify.sh 인수를 전달하라 (Windows 진입점도 확인했다면 --entrypoint scripts/verify.ps1 추가).
+내용·존재와 무관한 운영 설정만 --operating-path <정확한 상대경로>로 지정한다. 실제 고정 설정/자료는 목록에 포함하라. 출력은 승인 근거가 아니며 최종 코드 변경 뒤 다시 얻어야 한다. 확인했다면 출력 JSON에 basis 문자열로 실제 소비 검토 근거를 추가하고 최종 응답 WORKER_OUTCOME 앞에 VERIFY_INPUT_EXCLUSIONS: <JSON> 한 줄을 적어라. 미확인·누락 의심이면 선언하지 말고 전체 verify와 기존 Worker 확인 경계를 유지하라. Reviewer는 이 근거와 실제 소비 누락을 검토한다.""")
         parts.append(worker_outcome_instruction())
     if not parts:
         parts.append('미완료 작업을 이어가라.')

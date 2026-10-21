@@ -177,9 +177,23 @@ kind·mode를 비교하고 미커밋/untracked·목록 밖 코드 누락도 확�
 
 일반 스크립트와 연결 runner는 코드 기준으로 관측하며 runtime identity 부재는 재사용을 막지 않는다.
 선택 진입점·연결 선언이 목록에 포함돼야 하고 관측/실행/receipt 판정 코드 bytes도 결합한다.
-문서 제외는 고정된 POSIX launcher·unittest 선언과 기존 정적 소비 분석으로 확인 가능한 문서 역할에서
-현재 bytes·kind·mode를 다시 확인한다. 다른 launcher·native/동적 소비·지원 밖 파일은 미확인으로 남는다.
-자체 저장소 전체의 문서/운영 설정 제외 증명은 아직 완료되지 않았다. 코드 입력 변경·목록/비교 오류·누락 의심·
+문서 제외는 현재 bytes·kind·mode와 실제 코드 소비 관계를 다시 확인한다. 고정 POSIX launcher·unittest의
+제한된 정적 증명 외에, 일반/native 진입점은 Worker가 실제 소비를 검토한 명시적 제외 근거를
+기존 Worker 결과에 제출한다. 최종 코드에서 프로젝트 Python으로 다음 읽기 전용 명령을 사용한다.
+
+```sh
+python /manager/runtime/loop_manager_internal/verification/inputs.py --review-request . --entrypoint scripts/verify.sh --operating-path config/config.ini --operating-path config/config.ini.example
+```
+
+실제로 검토한 경우에만 Windows 진입점도 `--entrypoint scripts/verify.ps1`로 추가한다. 출력 JSON은
+identity 요청 자료이며 승인이나 verify 성공이 아니다. 소비하지 않는 정확한 목록 밖 경로가 어떤 내용이어도
+검증에 영향을 주지 않는다는 실제 소비 검토 근거 `basis`를 추가해 최종 결과에
+`VERIFY_INPUT_EXCLUSIONS: <JSON>` 한 줄을 제출한다. 형식은
+[ARCHITECTURE의 관측 계약](ARCHITECTURE.md#운영-입력-관측-adapter)을 따른다.
+운영/예제 설정만 정확 경로로 제외하며 검증이 소비하는 고정 자료는 manifest에 포함한다.
+현재 코드/진입점/규칙·경로 집합과 근거가 맞을 때 문서 내용·mode를 재관측해 completeness를 갱신한다.
+새 코드·경로·실제 소비·불명확한 관계·비정상 kind·비교 오류는 기존 Worker 확인과 전체 실행을 유지한다.
+코드 입력 변경·목록/비교 오류·누락 의심·
 유효한 전체 성공 부재에는 전체 실행을 유지한다. 새 실패·중단을 과거 성공으로 덮지 않으며,
 부분 PASS·선행 Review·수동 면제와 실제 전체 run은 구분한다. 일반 선행 PASS 뒤 실제 전체 실행과
 Windows의 WSL 전체 검증+native 핵심 회귀 계약은 유지한다.

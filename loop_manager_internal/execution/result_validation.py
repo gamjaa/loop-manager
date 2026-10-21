@@ -229,7 +229,7 @@ def verify_arguments(worktree: Path):
     return script, arguments
 
 
-def observe_verify_inputs(worktree: Path):
+def observe_verify_inputs(worktree: Path, *, worker_result: str | None = None):
     """Observe repository inputs; missing code or exclusion evidence stays unknown."""
     from dataclasses import replace
     from loop_manager_internal.verification.manager_adapter import observe_inputs, reconfirm_documents
@@ -237,7 +237,10 @@ def observe_verify_inputs(worktree: Path):
     # Observe the selected script even when execution uses the compile fast path.
     # Absolute tool/worktree locations are not repository-code identities.
     relative = script.relative_to(worktree).as_posix()
-    observation = observe_inputs(worktree, (relative,), environment={}, runtime_identity=None)
+    from loop_manager_internal.verification.inputs import worker_exclusions, reconfirm_worker_exclusions
+    review = worker_exclusions(worker_result)
+    observation = (reconfirm_worker_exclusions(worktree, (relative,), review) if review else
+                   observe_inputs(worktree, (relative,), environment={}, runtime_identity=None))
     selected = {item[0] for item in observation.files}
     if observation.fingerprint is not None and relative not in selected:
         return replace(observation, reason='selected verify entrypoint outside manifest: ' + relative)
@@ -249,7 +252,8 @@ def observe_verify_inputs(worktree: Path):
         connection = load(worktree)
     except ContractError as error:
         return replace(observation, fingerprint=None, reason='invalid verify connection: ' + str(error))
-    return reconfirm_documents(worktree, observation, connection, script)
+    # A stale explicit review must not silently fall through to another proof.
+    return observation if review else reconfirm_documents(worktree, observation, connection, script)
 
 
 from loop_manager_internal.application.task_scheduling import scheduled_call
@@ -761,6 +765,8 @@ class ParseWorkerResultEffects:
 
 def parse_worker_result(effects: ParseWorkerResultEffects, message: str, plan: dict[str, object]) -> WorkerPublication:
     """Parse and validate the Worker final-result contract before publishing."""
+    from loop_manager_internal.verification.inputs import EXCLUSION_MARKER
+    message = "\n".join(line for line in message.splitlines() if not line.startswith(EXCLUSION_MARKER))
     markers = ("COMMIT_TITLE", "PR_SUMMARY", "TARGETED_TESTS", "WORKER_OUTCOME")
     message = normalize_markers(message, markers)
     labels = list(re.finditer(r"(?m)^(COMMIT_TITLE|PR_SUMMARY|TARGETED_TESTS|WORKER_OUTCOME): *", message))

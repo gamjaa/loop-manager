@@ -78,7 +78,7 @@ class InputObservation:
 def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, str],
             runtime: str | None, git_inputs: Mapping[str, str] | None = None,
             external_inputs: Mapping[str, str] | None = None,
-            completeness: str | None = None) -> InputObservation:
+            completeness: str | None = None, operating_paths: tuple[str, ...] = ()) -> InputObservation:
     """Observe working bytes including untracked inputs, never a verify success.
 
     Environment/runtime/Git/external identities are accepted for API compatibility
@@ -87,6 +87,10 @@ def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, s
     path/content/kind/mode, selected code, command and interpretation rules.
     """
     try:
+        if operating_paths:
+            parse(json.dumps({'version': 1, 'paths': list(operating_paths)}).encode())
+            if any('*' in path or '?' in path for path in operating_paths):
+                raise ValueError('operating exclusions must be literal paths')
         manifest = root / MANIFEST
         if not stat.S_ISREG(manifest.lstat().st_mode) or manifest.parent.is_symlink():
             raise ValueError("manifest must be a regular file")
@@ -104,6 +108,9 @@ def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, s
                     continue
                 target = Path(directory) / name
                 path = target.relative_to(root).as_posix()
+                if (path in operating_paths and path != MANIFEST
+                        and not any(matches(path, pattern) for pattern in patterns)):
+                    continue
                 before = target.lstat()
                 mode = before.st_mode
                 kind = "file" if stat.S_ISREG(mode) else "symlink" if stat.S_ISLNK(mode) else "special"
@@ -133,13 +140,14 @@ def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, s
                        if path.suffix in {'.py', '.pl', '.pm'})
         rules += [package / 'execution' / name for name in (
             'result_validation.py', 'verify_process.py', 'windows_job.py',
-            'execution_verify_handler.py')]
+            'execution_verify_handler.py', 'execution_ports.py')]
         rules.extend((package / 'storage/verify_receipts.py',
                       package / 'maintenance/code_index.py'))
         context = {"rules": RULES,
                    "implementation": [(path.relative_to(package).as_posix(),
                        hashlib.sha256(path.read_bytes()).hexdigest()) for path in rules],
-                   "manifest": hashlib.sha256(raw).hexdigest(), "command": command}
+                   "manifest": hashlib.sha256(raw).hexdigest(), "command": command,
+                   "operating_paths": sorted(operating_paths)}
         token = digest((context, selected, uncovered))
         fingerprint = digest((context, selected))
         reason = None
@@ -147,8 +155,97 @@ def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, s
             reason = "unconfirmed verify command"
         elif any(item[1] != "file" for item in selected):
             reason = "non-regular or external verify input"
-        elif uncovered and completeness != token:
+        elif (uncovered or operating_paths) and completeness != token:
             reason = "unconfirmed inputs outside manifest"
         return InputObservation(fingerprint, selected, uncovered, token, reason)
     except (OSError, ValueError, UnicodeError, RecursionError) as error:
         return InputObservation(None, reason=str(error))
+
+
+EXCLUSION_MARKER = "VERIFY_INPUT_EXCLUSIONS:"
+
+
+def exclusion_request(root: Path, entrypoints: tuple[str, ...],
+                      operating_paths: tuple[str, ...] = ()) -> dict:
+    """Read-only identities for a Worker consumption review, never an approval."""
+    observations = [observe(root, command=(entrypoint,), environment={}, runtime=None,
+                            operating_paths=operating_paths) for entrypoint in entrypoints]
+    if not observations or any(item.fingerprint is None for item in observations):
+        raise ValueError('cannot observe exclusion review inputs')
+    for entrypoint, observation in zip(entrypoints, observations):
+        if entrypoint not in {item[0] for item in observation.files}:
+            raise ValueError('selected verify entrypoint outside manifest: ' + entrypoint)
+    return dict(version=1, codes=[item.fingerprint for item in observations],
+                outside=digest([item[0] for item in observations[0].uncovered]),
+                operating_paths=list(operating_paths))
+
+
+def worker_exclusions(message: str | None) -> dict | None:
+    """Only an explicit, single Worker review is authority; PASS is not evidence."""
+    lines = [line[len(EXCLUSION_MARKER):].strip() for line in (message or '').splitlines()
+             if line.startswith(EXCLUSION_MARKER)]
+    if len(lines) != 1 or len(lines[0]) > 65536:
+        return None
+    try:
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('duplicate exclusion key')
+                result[key] = value
+            return result
+        value = json.loads(lines[0], object_pairs_hook=unique)
+        if (not isinstance(value, dict)
+                or set(value) != {'version', 'codes', 'outside', 'operating_paths', 'basis'}
+                or type(value['version']) is not int or value['version'] != 1
+                or not isinstance(value['codes'], list) or not value['codes']
+                or not all(isinstance(code, str) and len(code) == 64 for code in value['codes'])
+                or not isinstance(value['outside'], str) or len(value['outside']) != 64
+                or not isinstance(value['basis'], str) or not value['basis'].strip()
+                or not isinstance(value['operating_paths'], list)):
+            return None
+        if value['operating_paths']:
+            parse(json.dumps({'version': 1, 'paths': value['operating_paths']}).encode())
+            if any('*' in path or '?' in path for path in value['operating_paths']):
+                return None
+        return value
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+
+
+def reconfirm_worker_exclusions(root: Path, command: tuple[str, ...],
+                                review: dict) -> InputObservation:
+    """Recheck the reviewed no-consumption relation against current file states.
+
+    The Worker must review consumers, including native/dynamic entrypoints, and
+    assert that these exact outside paths are never consumed for ANY contents.
+    Changed code or outside paths require a new review. Current bytes/kind/mode
+    are observed twice; neither old completeness nor a successful run authorizes
+    exclusion. Operating paths are explicit presence-independent exclusions;
+    manifest selection always wins over them.
+    """
+    from dataclasses import replace
+    options = dict(command=command, environment={}, runtime=None,
+                   operating_paths=tuple(review['operating_paths']))
+    current = observe(root, **options)
+    if (current.fingerprint not in review['codes']
+            or digest([item[0] for item in current.uncovered]) != review['outside']
+            or any(item[1] != 'file' for item in current.uncovered)
+            or current.reason not in (None, 'unconfirmed inputs outside manifest')):
+        return replace(current, reason='stale or inapplicable Worker exclusion review')
+    confirmed = observe(root, **options, completeness=current.completeness_token)
+    if (confirmed.completeness_token != current.completeness_token
+            or confirmed.fingerprint != current.fingerprint):
+        return replace(confirmed, reason='verify inputs changed during exclusion confirmation')
+    return confirmed
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Read-only identities; consumption review still required')
+    parser.add_argument('--review-request', type=Path, required=True)
+    parser.add_argument('--entrypoint', action='append', required=True)
+    parser.add_argument('--operating-path', action='append', default=[])
+    args = parser.parse_args()
+    print(json.dumps(exclusion_request(args.review_request, tuple(args.entrypoint),
+                                       tuple(args.operating_path)), ensure_ascii=False))
