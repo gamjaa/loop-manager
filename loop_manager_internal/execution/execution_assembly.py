@@ -200,7 +200,6 @@ def revision(effects: ExecutionEffects, identity: ExecutionIdentity,
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> RevisionHandler:
     return RevisionHandler(RevisionHandlerPorts(
         refresh_documents=effects.revision.refresh_documents,
-        planning_required=effects.revision.planning_required,
         observe_verify_inputs=effects.validation.observe_verify_inputs,
         identity=identity,
         snapshot=snapshot,

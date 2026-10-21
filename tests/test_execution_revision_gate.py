@@ -199,6 +199,26 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertEqual(completed.review_token, snapshot.review_token('base', 'base'))
 
 
+    def test_global_specification_change_does_not_interrupt_task_revision(self):
+        from loop_manager_internal.application import task_scheduling
+        planning_check = mock.Mock(return_value=True)
+        self.handler.effects = replace(self.effects, revision=SimpleNamespace(
+            **{**vars(self.effects.revision), 'planning_required': planning_check}))
+        scheduler = mock.Mock()
+        token = task_scheduling.current_scheduler.set(scheduler)
+        try:
+            self.remote = 'new-base'
+            self.handler._refresh_revision_base = mock.Mock(
+                return_value=ExecutionOutcome(ExecutionOutcomeKind.RETRY))
+            outcome = self.handler.guard(self.context())
+            self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+            self.effects.revision.reconcile_catalog.assert_called()
+            self.handler._refresh_revision_base.assert_called_once()
+            planning_check.assert_not_called()
+            scheduler.pause_project.assert_not_called()
+        finally:
+            task_scheduling.current_scheduler.reset(token)
+
     def test_source_revision_without_execplan_change_keeps_worker_and_rechecks_verification(self):
         guarded = self.handler.guard(self.context())
         self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)

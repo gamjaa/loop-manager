@@ -865,26 +865,6 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(repository.row('A', 'G-001')['pending_action'], 'pause')
         self.assertEqual(repository.row('A', 'G-002')['disposition'], 'transient_retry')
 
-    def test_requirement_revision_guard_requests_project_drain_before_next_phase(self):
-        from loop_manager_internal.execution.execution_revision_handler import RevisionHandler
-        from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind, ExecutionPhase
-        scheduler = self.scheduler()
-        ports = SimpleNamespace(
-            state=mock.Mock(), identity=SimpleNamespace(repo='A'),
-            _publish_rebased_checkpoint=mock.Mock(), _fetch_latest_base=mock.Mock(return_value='new-base'),
-            planning_required=mock.Mock(return_value=True),
-            _retry=lambda detail: ExecutionOutcome(ExecutionOutcomeKind.RETRY, detail=detail))
-        token = scheduling.current_scheduler.set(scheduler)
-        try:
-            with mock.patch('loop_manager_internal.execution.execution_revision.advance_owned_record'), \
-                 mock.patch('loop_manager_internal.execution.manual_candidate.get_manual', return_value=None):
-                outcome = RevisionHandler(ports).guard(SimpleNamespace(repo='A', phase=ExecutionPhase.IMPLEMENTING, resolving_rebase=False))
-            self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
-            self.assertEqual(scheduler.draining_projects, {'A'})
-            ports.planning_required.assert_called_once_with('new-base')
-        finally:
-            scheduling.current_scheduler.reset(token)
-
     def test_phase_completion_yields_to_planner_before_starting_next_phase(self):
         from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
         from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionPhase

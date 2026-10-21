@@ -66,7 +66,6 @@ class RevisionHandlerPorts:
     guard: Callable[[ExecutionContext], ExecutionContext | ExecutionOutcome]
     observe_verify_inputs: Callable[..., Any] | None = None
     refresh_documents: Callable[..., Any] | None = None
-    planning_required: Callable[..., bool] | None = None
 
 
 class RevisionHandler:
@@ -366,13 +365,6 @@ class RevisionHandler:
         self.ports._publish_rebased_checkpoint(context)
         latest_sha = self.ports._fetch_latest_base()
         try:
-            if (not context.resolving_rebase and self.ports.planning_required is not None
-                    and self.ports.planning_required(latest_sha)):
-                from loop_manager_internal.application.task_scheduling import current_scheduler
-                scheduler = current_scheduler.get()
-                if scheduler is not None:
-                    scheduler.pause_project(self.ports.identity.repo)
-                return self.ports._retry('명세 변경의 프로젝트 planning을 현재 작업 재개 전에 반영합니다.')
             result = self.ports.reconcile_catalog(
                 self.ports.identity.repo_path, self.ports.identity.repo, self.ports.identity.base
             )

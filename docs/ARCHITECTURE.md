@@ -543,7 +543,7 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 정상 provider 반환 뒤 session 저장의 DB 오류는 실제 결과·사용량을 예외 결과로 덮지 않고 수집 오류로 기록한다. session 결합 행이 없으면 같은 session의 완료된 invocation과 실제 종료 근거에서 유일한 지침 작업 귀속을 읽을 수 있다. 귀속 충돌과 필수 실행 전 증거 저장 실패는 계속 거부한다.
 
-작업별 일반 RETRY는 프로젝트 조율로 반환하지 않고 실행 대기열의 재시도 순서로 재등록한다. RETRY마다 DB 상태를 다시 준비하고 기존 일시 복구의 같은 실행 3회 한도를 공통으로 적용한다. 단계 처리의 일반 예외는 작업별 상세 오류·traceback을 기록하고 미확정 transaction을 rollback한 뒤 같은 배정 경로로 제한 재시도한다. 예외 3회 실패는 해당 작업만 보류하며 Future의 일반 예외도 작업별 오류로 수집해 조율기의 추가 배정을 계속한다. Planner 배정 중단·runtime handoff·사용자 중단은 별도 제어 신호로 전파한다. 재시도 우선순위는 수동 제출보다 낮고 다른 일반 작업보다 높으며 재등록 순서를 유지한다. 명세 변경을 감지하면 프로젝트 배정 중단 신호로 관리 편입·실행 대기 호출·후속 단계를 반환시키고 실행 중 처리를 join한 뒤 프로젝트 조율로 돌아간다. 진행 중 rebase의 작업물·index·checkpoint·원래 target은 보존하고 별도 planning worktree에서 Planner 게시·catalog·DB 반영을 먼저 완료한 뒤 작업 배정을 다시 연다. 재개한 실행은 갱신된 베이스와 명세를 기존 revision gate로 확인하며, 보존된 rebase를 완료로 간주하거나 강제로 중단하지 않는다. 다른 진행 중 Git operation과 미종료 호출의 안전 gate는 유지한다. runtime handoff는 기존 전체 launch gate로 새 호출을 막고 진행 중 처리의 반환을 기다린다.
+작업별 일반 RETRY는 프로젝트 조율로 반환하지 않고 실행 대기열의 재시도 순서로 재등록한다. RETRY마다 DB 상태를 다시 준비하고 기존 일시 복구의 같은 실행 3회 한도를 공통으로 적용한다. 단계 처리의 일반 예외는 작업별 상세 오류·traceback을 기록하고 미확정 transaction을 rollback한 뒤 같은 배정 경로로 제한 재시도한다. 예외 3회 실패는 해당 작업만 보류하며 Future의 일반 예외도 작업별 오류로 수집해 조율기의 추가 배정을 계속한다. Planner 배정 중단·runtime handoff·사용자 중단은 별도 제어 신호로 전파한다. 재시도 우선순위는 수동 제출보다 낮고 다른 일반 작업보다 높으며 재등록 순서를 유지한다. 프로젝트 조율기가 명세 변경으로 planning이 필요하다고 판단하면 프로젝트 배정 중단 신호로 관리 편입·실행 대기 호출·후속 단계를 반환시키고 실행 중 처리를 join한 뒤 프로젝트 조율로 돌아간다. 진행 중 rebase의 작업물·index·checkpoint·원래 target은 보존하고 별도 planning worktree에서 Planner 게시·catalog·DB 반영을 먼저 완료한 뒤 작업 배정을 다시 연다. 재개한 실행은 갱신된 베이스와 명세를 기존 revision gate로 확인하며, 보존된 rebase를 완료로 간주하거나 강제로 중단하지 않는다. 다른 진행 중 Git operation과 미종료 호출의 안전 gate는 유지한다. runtime handoff는 기존 전체 launch gate로 새 호출을 막고 진행 중 처리의 반환을 기다린다.
 
 `projects.max_tasks_per_project`는 정수 0 이상이고 migration 기본 0이다. 0이면 해당 Manager가 읽은 config 기본값을 상속하며 양수는 보존한다. 배정 경계에서 DB를 재조회한다. `task_call_reservations`는 호출 token·repo·plan·종류·실행 receipt를 보존하고, 재시작 시 미시작 또는 실제 프로세스 종료 증거가 있는 호출만 회수한다. `PLAN_BLOCKED`는 호출 예약이나 `execution_checkpoints.operation`이 남아 있어도 관리 개수에서 제외한다. 실제 호출의 실행 자리·자원 소유권·checkpoint는 삭제하지 않으며 차단 해제 후에는 관리 한도를 다시 확인한다. 차단되지 않은 작업은 미확정 호출·operation의 기존 관리 자리 보존 조건을 유지한다. Agent는 기존 group/Job 종료 receipt, verify는 소유 프로세스·WSL lifecycle receipt를 사용한다. 불확실한 종류의 호출이 상한에 도달하면 해당 단계는 보존하고 다른 종류의 적격 호출을 계속한다.
 
@@ -1018,7 +1018,7 @@ push 전후 및 SQLite 반영 전 중단에서는 같은 intent와 실제 원격
 
 #### 후보 변경과 과거 차단 재평가
 
-rebase나 사용자 입력으로 후보 HEAD가 바뀌면 후보에 결합된 verify·Review·publication 근거를 다시 판단한다. 구현 목표의 Worker 입력 token이 유효한 OID 변화는 필요한 verify·Review로 이어가며 Worker 재실행을 강제하지 않는다. 필요한 검증 단계의 후보 기준선을 저장해 같은 차이로 단계 무효화를 반복하지 않는다. 명세 변화는 프로젝트 일반 planning에서 반영하고 작업 조건 변화·실제 구현 부족은 Worker·Manager의 기존 단계에서 처리한다. 별도 작업별 영향 Planner를 호출하지 않는다.
+rebase나 사용자 입력으로 후보 HEAD가 바뀌면 후보에 결합된 verify·Review·publication 근거를 다시 판단한다. 구현 목표의 Worker 입력 token이 유효한 OID 변화는 필요한 verify·Review로 이어가며 Worker 재실행을 강제하지 않는다. 필요한 검증 단계의 후보 기준선을 저장해 같은 차이로 단계 무효화를 반복하지 않는다. 명세 변화의 planning 필요 여부는 프로젝트 조율기에서 판단·반영한다. 작업 revision gate는 전체 명세 지문으로 planning을 재요청하지 않고, 최신 베이스의 rebase와 선택된 ExecPlan의 변경·의존성·입력 및 기존 결과의 유효성을 확인해 필요한 단계부터 이어간다. 작업 조건 변화·실제 구현 부족은 Worker·Manager의 기존 단계에서 처리하며 별도 작업별 영향 Planner를 호출하지 않는다.
 
 현재 결과는 선택 branch/worktree의 비교 기준선에만 반영한다. Agent 원본 snapshot·session·허용 범위와 과거 감사를 보존하고 수동 복구를 Manager 실행·Agent 격리 증거로 표시하지 않는다. 실제 sandbox 정책 오류, 다른 Manager Git 작업의 증거와 별도 Review·사용자 결정·planning 차단은 기존 경계를 유지한다
 
