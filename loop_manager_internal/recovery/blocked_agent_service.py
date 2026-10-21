@@ -779,7 +779,11 @@ def _resume_interrupted_blocked_agent_recovery_state(
         ) from error
 
     if recovery["state"] != "isolated":
+        recovery_owner_plan_id = recovery.get("owner_plan_id")
         effects._complete_blocked_agent_recovery(
-            connection, repo, worktree, str(plan["plan_id"]),
+            connection,
+            repo,
+            worktree,
+            str(recovery_owner_plan_id) if recovery_owner_plan_id is not None else None,
         )
     return True
