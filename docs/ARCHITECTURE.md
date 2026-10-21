@@ -539,7 +539,7 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 공통 DB 연결의 중첩 context와 runtime transaction은 savepoint를 공유하며 안쪽 helper가 바깥 변경을 commit하지 않는다. schema script도 호출자의 transaction을 암묵 commit하지 않는다. 수동 recover의 연결 수명과 transaction 수명은 분리하며, 수동 완료·제출은 외부 profile 관측 뒤 요청·지침 입력을 짧은 transaction에서 다시 확인한다.
 
-자동 실행의 `git:*` 자원 충돌은 기존 프로세스 lease를 매번 다시 획득하며 취소·Planner/runtime 중단을 확인한다. 대기는 DB transaction과 실제 Agent/verify 호출 자리를 점유하지 않으며 복구 실패로 기록하지 않는다. 수동 요청과 계획 소유권 충돌은 기존 거부 경계를 유지한다. 차단 helper와 direct rebase의 PR head 판정은 대표 `projects` 행 대신 선택된 ExecPlan의 실행 상태를 사용한다.
+자동 실행의 `git:*` 자원 충돌은 기존 프로세스 lease를 매번 다시 획득하며 취소·Planner/runtime 중단을 확인한다. 대기는 DB transaction과 실제 Agent/verify 호출 자리를 점유하지 않으며 복구 실패로 기록하지 않는다. 수동 요청과 계획 소유권 충돌은 기존 거부 경계를 유지한다. 일반 차단은 선택된 ExecPlan 전체 row를 관측 기준으로 삼고 지문·Git·Reviewer 자료를 읽은 뒤 짧은 transaction에서 다시 비교한다. 그 사이 row가 바뀌면 오래된 상태를 차단에 적용하지 않고 재검사를 요구한다. direct rebase 시작·완료는 명시된 plan ID와 실행 선택 context가 함께 있으면 둘의 일치를 효과 전에 확인한다. 완료 처리는 명시된 작업을 선택해 해당 작업의 phase·checkpoint·candidate를 소비하며 다른 plan의 대표 `projects` 투영과 planning 기록은 보존한다. PR head는 선택된 ExecPlan의 실행 상태에서 읽고 프로젝트 등록 origin·base와 안전 gate는 프로젝트 원본을 따른다.
 
 정상 provider 반환 뒤 session 저장의 DB 오류는 실제 결과·사용량을 예외 결과로 덮지 않고 수집 오류로 기록한다. session 결합 행이 없으면 같은 session의 완료된 invocation과 실제 종료 근거에서 유일한 지침 작업 귀속을 읽을 수 있다. 귀속 충돌과 필수 실행 전 증거 저장 실패는 계속 거부한다.
 
@@ -547,7 +547,7 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 `projects.max_tasks_per_project`는 정수 0 이상이고 migration 기본 0이다. 0이면 해당 Manager가 읽은 config 기본값을 상속하며 양수는 보존한다. 배정 경계에서 DB를 재조회한다. `task_call_reservations`는 호출 token·repo·plan·종류·실행 receipt를 보존하고, 재시작 시 미시작 또는 실제 프로세스 종료 증거가 있는 호출만 회수한다. `PLAN_BLOCKED`는 호출 예약이나 `execution_checkpoints.operation`이 남아 있어도 관리 개수에서 제외한다. 실제 호출의 실행 자리·자원 소유권·checkpoint는 삭제하지 않으며 차단 해제 후에는 관리 한도를 다시 확인한다. 차단되지 않은 작업은 미확정 호출·operation의 기존 관리 자리 보존 조건을 유지한다. Agent는 기존 group/Job 종료 receipt, verify는 소유 프로세스·WSL lifecycle receipt를 사용한다. 불확실한 종류의 호출이 상한에 도달하면 해당 단계는 보존하고 다른 종류의 적격 호출을 계속한다.
 
-rebase 관측의 안정성 지문에는 해당 branch·worktree의 등록과 공유 config만 포함하고 무관한 작업의 ref·worktree 변화는 제외한다. 해당 branch의 중복 등록·현재 후보·index·입력·원격 PR의 검증은 유지한다. rebase 완료·차단 해제의 Git·원격 재관측은 쓰기 transaction 전에 마치고, 짧은 DB transaction 안에서 작업 소유권·projection·checkpoint를 다시 비교해 acceptance와 상태·outbox를 함께 적용한다. 상위 execution 포트도 외부 재관측 전에 writer를 예약하지 않는다.
+rebase 관측의 안정성 지문에는 해당 branch·worktree의 등록과 공유 config만 포함하고 무관한 작업의 ref·worktree 변화는 제외한다. 해당 branch의 중복 등록·현재 후보·index·입력·원격 PR의 검증은 유지한다. rebase 완료·차단 해제의 Git·원격 재관측은 쓰기 transaction 전에 마치고, 짧은 DB transaction 안에서 대상 실행 snapshot·현재 투영·checkpoint generation을 다시 비교해 acceptance와 상태·outbox를 함께 적용한다. 대표 투영이 비어 있거나 다른 plan을 가리켜도 명시 대상의 원본과 일치하면 해당 plan만 갱신하고, 대상 자체의 identity·generation·원격 OID 불일치는 계속 거부한다. 상위 execution 포트도 외부 재관측 전에 writer를 예약하지 않는다.
 
 차단 재평가는 대상 plan·branch·worktree의 자원 lease와 `selected_execution`으로 기존 복구 경로를 실행한다. 복구 컨텍스트에서만 PLAN_BLOCKED의 투영을 읽을 수 있고 일반 단계 실행의 활성 상태 조건은 유지한다. 실행 스레드도 계획 lease를 보유해 종료 정리와 재평가가 겹치지 않으며, 대상 호출 예약·미종료 invocation·같은 소유 자원의 다른 활성 계획을 확인한다. 복구 뒤 다른 계획의 대표 투영을 덮지 않고, 원래 투영이 비어 있거나 대상인 경우에만 기존 단일 작업 호출의 재개 투영을 연결한다. 병렬 조율은 관리 여유에서 변경된 차단 입력을 별도 Future·DB 연결의 재평가로 보낸다. 재평가가 의미 판단을 기다리는 동안에도 다른 신규 배정은 계속하며, 해소 뒤의 짧은 재개 확정은 기존 관리 배정 순서를 사용한다. 코드 수정 뒤의 첫 실행도 원인별 검사를 수행한다.
 

@@ -134,6 +134,7 @@ def block_active_execplan(
         raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
     if recovery_decision is not None and recovery_decision.observation.plan_id != str(plan['plan_id']):
         raise ValueError('recovery decision and block target disagree')
+    expected_plan = dict(plan)
     blocked_worktree_fingerprint = effects._worktree_execplan_input_fingerprint(
         worktree, plan
     )
@@ -178,6 +179,13 @@ def block_active_execplan(
         plan_values["worker_result"] = worker_result
     plan_id = str(plan["plan_id"])
     with runtime_state._transaction(connection):
+        current = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        if current is None or dict(current) != expected_plan:
+            from loop_manager_internal.application.task_scheduling import TaskRecheckRequired
+            raise TaskRecheckRequired('차단 관측 중 작업 상태가 변경됐습니다.')
         decision = effects._final_block_recovery_decision(
             connection, repo, plan, str(project["phase"] or "") if project else "",
             reason, error, fingerprint, recovery_decision,
