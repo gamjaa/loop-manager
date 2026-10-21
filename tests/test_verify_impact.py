@@ -98,6 +98,18 @@ class ImpactTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(self.choose([('M', path, path)]).fallback)
 
+    def test_database_expansion_handles_relative_imports(self):
+        cases = ((b'from . import sqlite3\n', False),
+                 (b'from .sqlite3 import connect\n', False),
+                 (b'import sqlite3\n', True),
+                 (b'from sqlite3 import connect\n', True))
+        for source, expected in cases:
+            with self.subTest(source=source):
+                after = dict(self.sources, **{'pkg/value.py': source})
+                result = self.choose([('M', 'pkg/value.py', 'pkg/value.py')], after=after)
+                self.assertEqual('database_code:pkg/value.py' in result.analysis['expansions'], expected)
+                self.assertEqual(result.modules, ('test_direct', 'test_indirect'))
+
     def test_public_contract_change_expands_known_consumers(self):
         after = dict(self.sources, **{'pkg/value.py': b'def public(value):\n    return value\n'})
         result = self.choose(after=after)

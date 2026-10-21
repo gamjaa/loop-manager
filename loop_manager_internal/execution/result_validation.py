@@ -517,8 +517,13 @@ def normalize_validation_failure(
     normalized = _DURATION_NOISE.sub("<DURATION>", normalized)
     if stage == "review":
         return "\n".join(effects._normalize_review_issue_ids(normalized))
+    # Execution telemetry is retained in raw evidence, not failure identity.
     lines = []
     for line in normalized.splitlines():
+        if re.match(r"^(?:<TIMESTAMP> (?:INFO|WARN|ERROR) \[run=|"
+                    r"verify 시간 진단: |완료 결과: |fixture 결과: |Python bytecode: |"
+                    r"느린 테스트 |미완료 |\[VERIFY_DIAGNOSTIC\] )", line):
+            continue
         line = " ".join(line.split())
         if not line:
             continue

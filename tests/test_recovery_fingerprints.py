@@ -84,6 +84,23 @@ class RecoveryFingerprintsTest(BoundedRecoveryFixture, unittest.TestCase):
         self.assertNotEqual(extensionless_file_first, extensionless_file_second)
         self.assertNotEqual(prefixed_file_first, prefixed_file_second)
 
+    def test_verify_fingerprint_ignores_execution_telemetry(self):
+        failure = "Traceback (most recent call last):\nAttributeError: 'NoneType' object has no attribute 'split'"
+        outputs = []
+        for run, elapsed in (("first", 12.3), ("second", 98.7)):
+            outputs.append(f"2026-10-21 11:34:14+00:00 WARN [run={run} project=repo] verify ended\n"
+                f"verify 시간 진단: /state/logs/verify/{run}/summary.json\n"
+                "완료 결과: {}\nfixture 결과: {}\n"
+                f"미완료 {elapsed}s: verify_process\n{failure}\n"
+                f"Python bytecode: enabled, created={elapsed}\n"
+                f"느린 테스트 {elapsed}s: test_{run}\n"
+                f"[VERIFY_DIAGNOSTIC] /state/logs/verify/{run}/summary.json")
+        fingerprints = [loop_manager.validation_failure_fingerprint("verify", output)[0]
+                        for output in outputs]
+        self.assertEqual(fingerprints[0], fingerprints[1])
+        self.assertNotEqual(fingerprints[0], loop_manager.validation_failure_fingerprint(
+            "verify", outputs[1].replace("AttributeError", "ValueError"))[0])
+
     def test_review_fingerprints_use_stable_issue_ids_not_explanatory_prose(self):
         first = "\n".join(
             (

@@ -193,8 +193,10 @@ def select_records(before, after, changed, modules, *, head, base, configuration
                 analysis['expansions'].append("boundary_code:" + str(new or old))
             if facts and any(item["name"] == "load_tests" for item in facts["symbols"]):
                 fallback.add("custom_collection:" + str(new or old))
-            if facts and any(item["module"].split(".")[0] == 'sqlite3'
-                    or 'sqlite3' in item["names"] for item in facts["imports"]):
+            if facts and any(item.get("level", 0) == 0 and (
+                    (item.get("module") or "").split(".")[0] == 'sqlite3'
+                    or (not item.get("module") and 'sqlite3' in item["names"])
+                    ) for item in facts["imports"]):
                 analysis['expansions'].append("database_code:" + str(new or old))
         if implementation and (previous is None or current is None) and any(facts and facts["contracts"] for facts in (previous, current)):
             analysis['expansions'].append("public_module_added_or_deleted:" + str(new or old))
