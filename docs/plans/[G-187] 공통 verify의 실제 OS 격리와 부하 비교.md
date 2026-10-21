@@ -24,6 +24,7 @@ depends_on:
   - G-268
   - G-295
   - G-297
+  - G-309
 complexity: medium
 risk: high
 priority: normal
@@ -31,10 +32,11 @@ priority: normal
 
 ## Purpose
 
-이미 구현된 자원 coordinator와 unittest/Perl TAP 공통 runner를 실제 프로젝트·OS·부하에서 검증할 Manager 실행 자료를 제공한다. 두 언어 예제·native 결과 변환과 자체 Windows의 WSL 전체 → Windows 핵심 회귀 launcher는 재구현하지 않고 남은 OS 종료/격리·동시 부하·동일 범위 실측을 담당한다.
+이미 구현된 자원 coordinator와 unittest/Perl TAP 공통 runner를 실제 프로젝트·OS·부하에서 검증할 Manager 실행 자료를 제공한다. G-309의 신뢰된 필수 통합 단계·상하위 실행 예산을 소비해 남은 OS 종료/격리·동시 부하·동일 범위 실측을 담당한다. 두 언어 예제·native 결과 변환과 자체 Windows의 WSL 전체 → Windows 핵심 회귀 launcher는 재구현하지 않는다.
 
 ## Acceptance Criteria
 
+- R-067/R-091: G-309 뒤 Manager·단독 전체 verify의 별도 필수 통합 단계에서 두 언어의 standalone/coordinated 정상·native 실패와 실제 session·예약·PID 연결/해제를 확인한다. 일반 unittest 자식에서 중첩 runner를 다시 실행하지 않으며 Agent/API 거부·인증값/예산 제어값 격리를 유지한다. 단계 누락·timeout·인프라 실패를 전체 성공이나 의도된 native 실패로 처리하지 않는다.
 - Windows·Linux의 실제 공통 프로세스/예약 경계와 지원되는 두 언어 예제에서 auto와 1이 같은 수집·테스트/compile 범위를 수행한다. Python은 선언한 프로젝트 interpreter를 사용하고 Perl native 실행은 현재 VERIFY의 Linux/Perl 5.38.2·Test::More 1.302194·TAP::Parser 3.44 범위에서 확인한다. Windows에는 Python 실제 실행과 플랫폼 독립 Perl 계약/IPC 회귀를 유지하며 이 결과를 Windows native Perl 지원으로 표시하지 않는다. 고부하 대기·동시 두 프로젝트·새 작업 진입에서 실제 관측과 미반영 예약을 함께 계산한다.
 - R-086이 지원하는 자체 unittest 부분 실행에서도 기존 자식/예약 격리·timeout·취소·종료 불명 보호를 확인한다. 현재 Windows launcher의 부분 요청은 `self_windows_requires_full` FALLBACK이며 두 단계를 실행하지 않는다. 이를 Linux 부분 실행의 성공이나 Windows 부분 지원으로 표시하지 않고 이후 실제 전체 경로와 연결한다. 부분 실행의 미선택 상태와 실행 없는 fallback을 전체 필수 검증 완료와 구분하며 Python/비Python의 기존 전체 적합성 범위는 유지한다.
 - timeout·취소·시작/통신/결과 오류·강제 종료에서 해당 자식 종료와 예약 해제를 확인한다. 종료 미확인 예약은 함부로 풀지 않고 다른 프로젝트의 자식/예약/작업을 변경하지 않는다.
@@ -45,7 +47,7 @@ priority: normal
 
 ## Implementation
 
-- [ ] 기존 `loop_manager_internal/verification/resources.py`·`coordination.py`·`timing.py`의 진단과 확인한 `tests/support/verify_examples/python/`·`perl/`의 선언/launcher를 재사용해 bounded 실제 검증/비교 진입을 기존 verify 경계에 연결한다. `tests/test_verify_language_examples.py`의 단독/Manager 성공·실패 회귀를 중복 생성하지 않는다. 별도 상시 benchmark 서비스나 새 루트 launcher를 만들지 않는다.
+- [ ] 기존 `loop_manager_internal/verification/resources.py`·`coordination.py`·`timing.py`의 진단과 확인한 `tests/support/verify_examples/python/`·`perl/`의 선언/launcher를 재사용해 bounded 실제 검증/비교 진입을 기존 verify 경계에 연결한다. `tests/test_verify_language_examples.py`에서 G-309의 필수 통합 단계로 이전한 단독/Manager 성공·native 실패 assertion을 실측 범위와 대조하고 중복 실행하지 않는다. 통합 단계·상하위 시간 계산 구현은 G-309를 소비하며 별도 상시 benchmark 서비스나 새 루트 launcher를 만들지 않는다.
 - [ ] 확인한 `loop_manager_internal/verification/contract.py`·`runner.py`·`perl_adapter.py`의 version 1 dispatch·파일 suite/동적 TAP assertion·serial/independent·부분 FALLBACK을 실제 실행 자료에 연결한다. `perl_reporter.pl`·`LoopManagerVerifyGuard.pm`의 native 로그/TAP spool·BEGIN 이전 Agent/fork/network 거부를 보존한다. Perl의 미지원 AST 부분 선정·시간 큐 재사용이나 Windows native 지원을 새 목표로 추가하지 않는다.
 - [ ] 확인한 `scripts/verify.ps1`·`scripts/verify_windows.py`·`scripts/verify-windows-tests.json`, `tests/test_verify_windows_launcher.py`·`tests/test_verify_windows.py`를 실제 Windows 자료 수집의 기존 진입으로 사용한다. WSL의 독립 Linux coordinator와 native의 Manager Windows 예약 조율을 구분하고, WSL 프로젝트 snapshot bytes·원래 후보 revision과 재구성한 Linux Git revision의 관계를 보존한다. 두 단계/정리의 전체 시간 상한 보완은 G-295를 소비하며 timeout 구현을 이 실측 작업에서 중복하지 않는다.
 - 시간 비교는 G-216의 `git_fixture_seconds` 중첩 집계를 재사용한다. phase event·개별 duration을 보존하고, 같은 PID의 완전히 포함된 하위 구간만 fixture 총계에서 제외한다.
@@ -57,9 +59,9 @@ priority: normal
 
 - Worker는 resource reservation·process cleanup·diagnostic aggregation에서 변경한 경계의 최소 unit case만 실행한다. `tests/test_verify_runtime.py`·`test_verify_contract.py`·`test_verify_perl_adapter.py`의 기존 fixture를 재사용하고 결과 확인/배정 진단은 G-248, Windows 부하 관측은 G-249의 목표와 중복하지 않는다.
 - 선택기 버전 안내는 위 구현의 선언·선택 직렬화·이전 algorithm 거부·runner 결과 기록과 정적으로 대조한다. `tests/test_verify_impact.py`의 기존 계약 변경·삭제/rename·algorithm identity 회귀와 `tests/test_partial_verify_runner.py`의 실행 없는 FALLBACK·NOT_SELECTED 회귀를 보존하며, 안내 문구만의 교정에 고정 prose assertion을 추가하지 않는다.
-- Manager의 실제 실행에서 Windows·Linux timeout/취소·시작 실패·강제 종료 뒤 해당 자식/예약만 정리하고 다른 실행을 보존하는지 확인한다. Linux Perl reporter·테스트 자식의 부분 NDJSON/TAP spool과 suite 미완료, Windows 공통 Job 종료 불명·예약 보존을 실제 효과에 연결한다. Windows native는 이 효과를 확인할 최소 실행과 경로·인자·중첩 Python guard 회귀로 한정하고 자체 전체 verify·대규모 Git/CLI 통합은 WSL에서 수행한다. `tests/test_verify_language_examples.py`의 통합 회귀는 Manager 전용이며 Worker targeted command에 넣지 않는다. WSL 실행은 AGENTS.md의 실행별 `/tmp/` 복사본·유효한 Git 메타데이터·임시 환경 변수·종료 후 정리 기준을 따른다. WSL 전체 PASS와 Windows 핵심 회귀를 Windows 전체 verify PASS로 합치지 않는다.
+- Manager의 실제 실행에서 Windows·Linux timeout/취소·시작 실패·강제 종료 뒤 해당 자식/예약만 정리하고 다른 실행을 보존하는지 확인한다. Linux Perl reporter·테스트 자식의 부분 NDJSON/TAP spool과 suite 미완료, Windows 공통 Job 종료 불명·예약 보존을 실제 효과에 연결한다. Windows native는 이 효과를 확인할 최소 실행과 경로·인자·중첩 Python guard 회귀로 한정하고 자체 전체 verify·대규모 Git/CLI 통합은 WSL에서 수행한다. G-309의 별도 필수 통합 단계가 Manager·단독 전체 실행에서 같은 범위를 확인하며 Worker targeted command에는 넣지 않는다. WSL 실행은 AGENTS.md의 실행별 `/tmp/` 복사본·유효한 Git 메타데이터·임시 환경 변수·종료 후 정리 기준을 따른다. WSL 전체 PASS와 Windows 핵심 회귀를 Windows 전체 verify PASS로 합치지 않는다.
 - 동일 revision·도구/환경·수집/fixture/필수 compile·계측으로 직렬/auto 및 단일/동시 자료를 비교한다. 두 언어 결과·부분 FALLBACK/NOT_SELECTED·비교 범위·실제 자식 종료를 대조하며 미실행 플랫폼은 한계와 잔여 필수 확인으로 남긴다. 해당 자료 없이 R-065/R-067의 실측 완료를 선언하지 않는다.
-- G-297의 작업별 대기·종류별 실행 한도와 G-295의 launcher 예산을 재사용해 실제 Manager 연결에서 기본 직렬·명시적 동시 2·세 번째 대기와 독립 구현/Review 진행을 확인한다. 상한 10초의 대기 30초·실제 2초는 대기만으로 timeout되지 않고 실제 초과는 실패해야 한다. 같은 예산의 Windows 두 단계/정리와 종료 불명 예약 보존을 실제 OS 근거로 구분한다.
+- G-297의 작업별 대기·종류별 실행 한도와 G-295의 launcher 예산, G-309의 상하위 대기 관측을 재사용해 실제 Manager 연결에서 기본 직렬·명시적 동시 2·세 번째 대기와 독립 구현/Review 진행을 확인한다. 상한 10초의 대기 30초·실제 2초는 하위 runner 생존 중에도 확인된 순수 대기만 제외하고 실제 12초 처리는 실패해야 한다. 상위 처리·형제 실행의 겹침·heartbeat 단절·종료 불명과 중복 공제 거부, 단계/재개 뒤 소비 예산 보존을 실제 진단과 대조한다. 같은 예산의 Windows 두 단계/정리와 종료 불명 예약 보존을 실제 OS 근거로 구분한다.
 - Windows 실제 실행은 현재 launcher의 원본 snapshot·WSL 전체 manifest/필수 compile·native 선택 manifest와 두 결과를 각각 확인한다. `test_real_launcher_runs_both_phases_and_preserves_native_failure`·`test_killed_windows_launcher_stops_linux_children_and_removes_its_copy`의 실제 OS 근거를 재사용하되 테스트 존재나 mock PASS를 실행 근거로 채택하지 않는다. WSL 부재·실패·native 실패·정리 불명은 전체 조합 성공이 아니며 해당 실행의 `/tmp/`·자식/예약만 정리되고 다른 실행은 보존돼야 한다. 이 조합과 Windows native 전체 suite의 범위를 구분한다.
 
 ## Progress
@@ -71,6 +73,7 @@ priority: normal
 
 ## Decision Log
 
+- 이번 delta의 R-067/R-091은 기존 예제 assertion의 실행 경계와 상하위 시간 판정을 바꾼다. G-309를 선행으로 연결해 이 계획은 구현을 반복하지 않고 실제 OS/부하/동일 범위 자료를 수집한다. 제공 snapshot의 원본 hash를 확인했으며 기존 ID·경로·metadata·dependency·수행 기록을 보존한다. 정적 대조를 새 실행 성공으로 기록하지 않는다.
 - 2026-10-16 delta: R-091의 직접 구현된 기본 verify 직렬·설정 가능한 동시 호출과 대기 제외 시간 기준을 실측 조건에 연결한다. G-297의 조율 보완 뒤 실제 연결을 확인하고 기존 OS/언어/부하 목표·수행 이력은 보존한다. 부분 unit/mock 근거를 실측이나 최종 전문 확인으로 확대하지 않는다.
 - 이번 변경 검토에서 G-274의 두 프로세스 경로 감지·선택기 버전 5와 관련 회귀를 정적으로 확인했다. 남은 VERIFY의 버전 4 표기는 이 계획의 기존 지원 문서 정합화 범위에 통합하며 G-274를 중복 계획하거나 수정하지 않는다. ID·경로·sources·dependency·complexity·risk·priority와 수행 기록을 보존한다. 국소 안내 교정은 기존 OS 격리·실측의 난도·위험을 바꾸지 않으며 테스트·verify·Review 성공을 새로 확정하지 않는다.
 
