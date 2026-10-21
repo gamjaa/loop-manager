@@ -265,6 +265,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         from loop_manager_internal.runtime.resource_lock import resource_locks
         from loop_manager_internal.runtime.contracts import ProcessLockBusyError
         scheduler = self.scheduler()
+        scheduler.pause_project('A')
         waiting, fetched = threading.Event(), threading.Event()
         errors = []
         def automatic():
@@ -297,6 +298,27 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             if thread.ident is not None:
                 thread.join(3)
         self.assertEqual(errors, [])
+
+    def test_planning_drain_allows_project_fetch_but_keeps_task_and_handoff_gates(self):
+        from loop_manager_internal.runtime.resource_lock import resource_locks
+        from loop_manager_internal.runtime.handoff_gate import RuntimeHandoffGate, _runtime_handoff_signal, SelfMergeRuntimeHandoff
+        scheduler = self.scheduler()
+        scheduler.pause_project('A')
+        token = scheduling.current_scheduler.set(scheduler)
+        gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
+        handoff = _runtime_handoff_signal.set(gate)
+        try:
+            with resource_locks(self.directory, 'A', ['git:fetch'], owner='base-fetch'):
+                self.assertIn('A', scheduler.draining_projects)
+            with self.assertRaises(scheduling.PlanningDrain), scheduler.task('A', 'G-001', self.connection):
+                self.fail('Planner 대기 중 작업이 재개됐습니다.')
+            gate.stop()
+            with self.assertRaises(SelfMergeRuntimeHandoff), resource_locks(
+                    self.directory, 'A', ['git:fetch'], owner='base-fetch'):
+                self.fail('runtime 교체 중 프로젝트 fetch가 시작됐습니다.')
+        finally:
+            _runtime_handoff_signal.reset(handoff)
+            scheduling.current_scheduler.reset(token)
 
     def test_configuration_defaults_validation_and_project_override_inheritance(self):
         self.assertEqual((self.config.max_tasks_per_project, self.config.verify_concurrency), (3,1))

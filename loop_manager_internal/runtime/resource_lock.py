@@ -30,6 +30,7 @@ def resource_locks(state_dir: Path, repo: str, resources, *, owner: str):
     """자동 Git 경합은 기다리고 수동 요청·계획 소유권 충돌은 거부한다."""
     from loop_manager_internal.application.task_scheduling import current_scheduler, current_task
     from loop_manager_internal.storage.db_access import DatabaseWaitTimeout, _waiting
+    from .handoff_gate import _check_runtime_handoff
     scheduler = current_scheduler.get()
     resources = sorted(set(resources))
     waiting = False
@@ -46,7 +47,9 @@ def resource_locks(state_dir: Path, repo: str, resources, *, owner: str):
                 task = current_task.get()
                 if task is not None and (task.connection.in_transaction or getattr(task.connection, '_depth', 0)):
                     raise DatabaseWaitTimeout('Git 자원 대기 전에 DB 처리를 종료해야 합니다.') from error
-                scheduler.check_project(repo)
+                _check_runtime_handoff()
+                if task is not None:
+                    scheduler.check_project(repo)
                 if not waiting:
                     from . import operation_events as events
                     events.emit('공유 Git 자원 배정 대기', project=repo, resource=resource, owner=owner)
@@ -66,7 +69,10 @@ def resource_locks(state_dir: Path, repo: str, resources, *, owner: str):
             raise
     with stack:
         if scheduler is not None:
-            scheduler.check_project(repo)
+            _check_runtime_handoff()
+            # 프로젝트 준비·planning의 Git 접근은 작업 배정 중단 중에도 필요하다.
+            if current_task.get() is not None:
+                scheduler.check_project(repo)
         yield
 
 
