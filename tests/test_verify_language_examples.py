@@ -14,8 +14,26 @@ from loop_manager_internal.execution.verify_process import run_verify_process
 from loop_manager_internal.execution.result_validation import verify_arguments
 from loop_manager_internal.verification import manager_adapter, runner
 from loop_manager_internal.verification.coordination import VerifyCoordinator, settings
-from loop_manager_internal.verification.resources import Snapshot
+from loop_manager_internal.verification.resources import MIB, Snapshot
 from tests.support.verify_fixture import nested_runner_source
+
+
+def _example_test_coordinator():
+    sampler = SimpleNamespace(sample=lambda: Snapshot(
+        time.monotonic(), 8, 0, 4 * 1024 * MIB, 'language-example-test'))
+    return VerifyCoordinator(sampler=sampler)
+
+
+class LanguageExampleCoordinatorTests(unittest.TestCase):
+    def test_nested_example_coordinator_uses_available_fixture_capacity(self):
+        coordinator = _example_test_coordinator()
+        session, secret = coordinator.open(1)
+        try:
+            reservation = coordinator.request(session, secret, 'acquire')
+            self.assertTrue(reservation['granted'])
+            coordinator.request(session, secret, 'not_started', token=reservation['token'])
+        finally:
+            coordinator.finish(session, stopped=True)
 
 
 class LanguageExampleIntegrationTests(unittest.TestCase):
@@ -27,10 +45,9 @@ class LanguageExampleIntegrationTests(unittest.TestCase):
         entrypoint = Path(runner.__file__).with_name('entrypoint.py').resolve()
         git_file = repository / '.git'
         git_dir = (repository / git_file.read_text().strip().removeprefix('gitdir: ')).resolve() if git_file.is_file() else git_file
-        # Native result/manifest checks use real processes with controlled capacity.
-        sampler = SimpleNamespace(sample=lambda: Snapshot(
-            time.monotonic(), 2, 0, 4 * 1024 ** 3, 'native example fixture'))
-        with tempfile.TemporaryDirectory() as temporary, VerifyCoordinator(sampler=sampler) as coordinator:
+        # This Manager integration test runs inside the verify resource pool.
+        # Give its nested coordinator stable capacity under unrelated suite load.
+        with tempfile.TemporaryDirectory() as temporary, _example_test_coordinator() as coordinator:
             root = Path(temporary)
             bootstrap = root / 'nested-runner.py'
             bootstrap.write_text(nested_runner_source(entrypoint))
