@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from loop_manager_internal.agents import scope_baseline
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
@@ -365,16 +366,12 @@ class CompleteBlockedAgentRecoveryEffects:
     update_project: Callable[..., object]
 
 
-def _complete_blocked_agent_recovery(
+def _complete_blocked_agent_recovery_selected(
     effects: CompleteBlockedAgentRecoveryEffects, connection: sqlite3.Connection,
     repo: str,
     worktree: Path,
+    project,
 ) -> None:
-    project = connection.execute(
-        "SELECT agent_snapshot, agent_baseline, agent_recovery "
-        "FROM projects WHERE repo = ?",
-        (repo,),
-    ).fetchone()
     if project is None or not project["agent_recovery"]:
         return
     if not project["agent_snapshot"]:
@@ -578,6 +575,24 @@ def _complete_blocked_agent_recovery(
     effects._mark_blocked_agent_isolated(connection, repo, recovery, before)
 
 
+def _complete_blocked_agent_recovery(
+    effects: CompleteBlockedAgentRecoveryEffects, connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    plan_id: str | None = None,
+) -> None:
+    if plan_id is None:
+        project = runtime_state.project_row(connection, repo)
+        return _complete_blocked_agent_recovery_selected(
+            effects, connection, repo, worktree, project,
+        )
+    with runtime_state.selected_execution(repo, plan_id, include_blocked=True):
+        project = runtime_state.project_row(connection, repo)
+        return _complete_blocked_agent_recovery_selected(
+            effects, connection, repo, worktree, project,
+        )
+
+
 @dataclass(frozen=True)
 class PreserveBlockedAgentChangesEffects:
     capture_git_snapshot: Callable[..., object]
@@ -587,13 +602,14 @@ def preserve_blocked_agent_changes(
     effects: PreserveBlockedAgentChangesEffects, connection: sqlite3.Connection,
     repo: str, worktree: Path, plan_id: str, *, validated_snapshot: GitSnapshot,
 ) -> GitSnapshot:
-    """Keep current input intact; historical Agent snapshots are audit only."""
-    if not isinstance(validated_snapshot, GitSnapshot):
-        raise AgentScopeError("BLOCKED 현재 작업물의 검증 snapshot이 없습니다.")
-    current = effects.capture_git_snapshot(worktree)
-    if not agent_scope_decision._same_local_snapshot(current, validated_snapshot):
-        raise AgentScopeError("BLOCKED 현재 작업물이 검증 이후 변경되어 재관측이 필요합니다.")
-    return current
+    """Keep validated current input intact; historical Agent snapshots are audit only."""
+    with runtime_state.selected_execution(repo, plan_id, include_blocked=True):
+        if not isinstance(validated_snapshot, GitSnapshot):
+            raise AgentScopeError("BLOCKED 현재 작업물의 검증 snapshot이 없습니다.")
+        current = effects.capture_git_snapshot(worktree)
+        if not agent_scope_decision._same_local_snapshot(current, validated_snapshot):
+            raise AgentScopeError("BLOCKED 현재 작업물이 검증 이후 변경되어 재관측이 필요합니다.")
+        return current
 
 
 @dataclass(frozen=True)
@@ -721,5 +737,7 @@ def resume_interrupted_blocked_agent_recovery(
         ) from error
 
     if recovery["state"] != "isolated":
-        effects._complete_blocked_agent_recovery(connection, repo, worktree)
+        effects._complete_blocked_agent_recovery(
+            connection, repo, worktree, str(plan["plan_id"]),
+        )
     return True
