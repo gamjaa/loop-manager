@@ -2,7 +2,7 @@
 
 ## Summary
 
-로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 새 self PR Merge 뒤 원격이 실행 runtime의 후속이면 상태를 보존해 종료하고 다음 외부 실행으로 넘긴다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 구성한다. Claude는 일반적인 호출을 공식 문서·모의 테스트로 개발하며 실환경 완전 지원과 실행 중 managed 정책 변경 대응은 완료 조건에서 제외한다. 정상 Git 변화의 오탐 복구와 호출별 실제 실패 처리는 유지한다. runtime 교체의 전체 배정 중단과 안전한 호출 반환은 R-091을 따른다.
+로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 각 단계 경계에서 최신 원격 runtime을 확인하고 변경됐으면 진행 중 단계의 반환·상태 보존 뒤 자동으로 갱신·재시작한다. 새 self PR Merge 관측 여부와 관계없이 적용한다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 구성한다. Claude는 일반적인 호출을 공식 문서·모의 테스트로 개발하며 실환경 완전 지원과 실행 중 managed 정책 변경 대응은 완료 조건에서 제외한다. 정상 Git 변화의 오탐 복구와 호출별 실제 실패 처리는 유지한다. runtime 교체의 전체 배정 중단과 안전한 호출 반환은 R-091을 따른다.
 
 ## Context
 
@@ -70,13 +70,13 @@ runtime 자식은 bootstrap이 전달하고 검증한 canonical source checkout,
 
 self 프로젝트에 저장된 `<base-branch>`는 PR의 base, Merge 뒤 fetch·source checkout 갱신과 다음 runtime 선택에 동일하게 사용한다. 현재 기본값이 `main`이라는 이유로 handoff code나 로그에 `origin/main`을 고정하지 않으며, self 등록이 없는 bootstrap의 기존 기본 branch 선택은 이 Requirement에서 변경하지 않는다.
 
-현재 실행이 자기 프로젝트의 PR Merge를 새로 확인하면 Merge 결과를 포함한 `origin/<base-branch>`를 fetch하고, PR·ExecPlan 상태 전이, worktree cleanup 결과와 알림 outbox를 먼저 영속화한다. 이어서 dirty 허용 조건을 포함한 source checkout safe fast-forward를 평가하고 그 결과를 기록한 뒤, fetch된 원격 base SHA와 현재 runtime SHA를 비교한다. 원격 base가 현재 runtime과 같으면 이미 최신 프로그램으로 실행 중이므로 종료하지 않고 정상 처리를 계속한다. 원격 base가 현재 runtime의 fast-forward 후속 commit이면 현재 runtime에서 새 Planner, Worker, Reviewer, 전체 verify, publication 또는 다른 프로젝트의 상태 변경 작업을 시작하지 않고 성공 코드로 종료한다. 다음 외부 스케줄 실행은 같은 `<base-branch>`를 기준으로 다시 fetch한 최신 원격 SHA의 clean detached runtime을 선택하고 저장된 상태부터 작업을 재개한다.
+Planner·Worker·부분/전체 verify·Reviewer·게시·복구 등 각 단계의 시작 전과 성공·실패 종료 후, 다음 단계를 배정하기 전에 등록된 self `origin/<base-branch>`의 최신 원격 SHA와 현재 runtime SHA를 확인한다. 새 self PR Merge를 관측하지 않았어도 Planner 직접 게시·외부 push를 포함한 원격 전진을 갱신 대상으로 삼는다. 실제 PR Merge를 관측했다면 PR·ExecPlan 상태 전이, cleanup 결과와 알림 outbox를 먼저 영속화한다. source checkout 동기화의 성공 여부는 runtime 갱신 조건이 아니다.
 
 runtime handoff 여부는 source checkout의 fast-forward 성공에는 의존하지 않지만, 현재 runtime SHA와 fetch된 `origin/<base-branch>` SHA의 관계에는 의존한다. source checkout 갱신이 overlap, ahead·diverged 또는 다른 안전 사유로 skipped·failed여도 원격 base가 현재 runtime보다 앞서면 정상 종료한다. bootstrap이 같은 Merge commit을 이미 runtime으로 선택한 상태에서 뒤늦게 SQLite의 Merge를 확인한 경우에는 상태와 source sync 결과만 반영하고 같은 최신 runtime에서 계속한다. 두 SHA의 fast-forward 관계를 증명할 수 없으면 자동 handoff로 취급하지 않고 기존 repository safety 정책에 따라 상태를 보존한다.
 
-self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을 새로 배정하기 전의 안전한 scheduling boundary에서 이루어져야 한다. handoff가 필요하다는 사실을 확인한 뒤 새 Agent subprocess나 검증 작업을 시작하지 않으며, 이미 영속화된 세션·retry·workspace 상태를 지우지 않는다. Merge 뒤 최신 원격 fetch가 실패하거나 repository identity를 검증할 수 없으면 최신 version을 확보했다고 간주하거나 성공 종료하지 않고, 기존 일시 오류 또는 repository safety 정책에 따라 상태를 보존한 채 다음 실행에서 다시 확인한다.
+self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을 새로 배정하기 전의 안전한 scheduling boundary에서 이루어져야 한다. handoff가 필요하다는 사실을 확인한 뒤 새 Agent subprocess나 검증 작업을 시작하지 않으며, 이미 영속화된 세션·retry·workspace 상태를 지우지 않는다. 단계 경계의 최신 원격 fetch가 실패하거나 repository identity를 검증할 수 없으면 최신 version을 확보했다고 간주하거나 성공 종료하지 않고, 기존 일시 오류 또는 repository safety 정책에 따라 상태를 보존한 채 R-091의 비차단 재개 경로에서 다시 확인한다.
 
-일반적인 self `origin/<base-branch>` 변경만으로는 이 handoff를 시작하지 않는다. Planner가 ExecPlan 문서 commit을 직접 게시했거나 외부 push를 관측했지만 현재 실행에서 self PR의 새 Merge 완료를 확인하지 않았다면 기존 실행 흐름을 유지한다. 다른 등록 프로젝트의 PR Merge도 그 프로젝트의 상태와 기본 worktree만 갱신하며 Loop Manager 프로세스 전체를 종료하지 않는다.
+원격 SHA가 현재 runtime과 같으면 계속 실행한다. 검증된 fast-forward 후속이면 R-091대로 전체 신규·후속 배정을 멈추고 이미 실행 중인 단계만 반환·정리한 뒤 저장된 상태를 보존한다. 작업 전체 완료·PR 게시·Merge나 주기 실행을 기다리지 않고 bootstrap으로 제어를 넘겨 최신 원격을 다시 확인하고 새 runtime을 자동 시작한다. 실행 중 runtime 파일을 교체하거나 진행 중 Agent·verify를 강제로 종료하지 않으며, 재시작 후 같은 작업을 중복 실행하거나 실패·교정 이력을 초기화하지 않는다. 다른 등록 프로젝트의 원격 변경은 self runtime 변경 근거가 아니다.
 
 ## Acceptance Criteria
 
@@ -101,13 +101,14 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - `MERGEABLE` 또는 `UNKNOWN`인 Open PR만 있고 새 Merge 완료가 없으면 기존 PR 대기 및 충돌 복구 권한을 변경하지 않는다. `CONFLICTING` 판정도 기존 소유권, worktree와 explicit lease 조건을 유지한다.
 - runtime source와 같은 canonical repository path이며 실제 repository 및 origin identity가 일치하는 등록 프로젝트만 self로 판정한다. 같은 이름, 같은 origin만 가진 다른 clone, source 하위 경로, symlink alias 또는 state directory 아래 runtime 경로를 self source로 오인하지 않는다.
 - 현재 실행이 self 프로젝트의 새 PR Merge 완료를 확인하면 Merge 결과를 포함한 최신 `origin/<base-branch>` fetch, 관련 SQLite와 outbox 영속화 및 source checkout 동기화 시도를 완료하고 fetch된 SHA를 현재 runtime SHA와 비교한다.
-- source checkout fast-forward가 로컬 안전 조건 때문에 skipped 또는 failed여도 self Merge 뒤 원격 base가 현재 runtime SHA의 fast-forward 후속이면 handoff는 정상 종료한다. 다음 bootstrap은 source local `<base-branch>`가 아니라 fetch된 `origin/<base-branch>`를 다시 조회해 runtime을 선택한다.
+- source checkout fast-forward가 로컬 안전 조건 때문에 skipped 또는 failed여도 self Merge 뒤 원격 base가 현재 runtime SHA의 fast-forward 후속이면 정상 handoff 후 자동 재시작한다. 다음 bootstrap은 source local `<base-branch>`가 아니라 fetch된 `origin/<base-branch>`를 다시 조회해 runtime을 선택한다.
 - 현재 runtime HEAD가 이미 fetch된 self `origin/<base-branch>`와 같으면 Merge 완료와 source sync 결과를 반영한 뒤 종료하지 않고 정상 처리를 계속한다.
 - fetch된 self `origin/<base-branch>`와 현재 runtime SHA의 fast-forward 관계를 증명할 수 없거나 최신 원격 fetch·repository identity 검증이 실패하면 성공 handoff나 강제 동기화를 수행하지 않고 기존 일시 오류 또는 안전 오류와 재개 가능한 상태를 유지한다.
-- self Planner의 직접 planning commit이나 일반 외부 push만 관측했고 self PR Merge 완료를 새로 확인하지 않은 경우에는 runtime handoff를 시작하지 않는다.
+- self Planner 직접 게시·일반 외부 push로 등록 base가 전진한 경우에도 각 단계 경계에서 변경을 발견해 갱신하며 self PR Merge 관측을 요구하지 않는다.
 - 다른 등록 프로젝트의 PR Merge는 해당 프로젝트 상태와 기본 worktree를 정상 갱신하지만 Loop Manager 프로세스 전체의 runtime handoff를 만들지 않는다.
-- runtime handoff는 해석한 `<base-branch>`, 현재 runtime SHA, fetch된 원격 SHA, self repository, Merge된 PR과 source sync 결과를 비밀값 없이 로그에 남기며 오류나 BLOCKED 알림으로 취급하지 않는다.
-- 자동 테스트는 main·대체 base, 모든 로컬 source 상태의 원격 revision 선택·비차단 동기화, PR 상태 선반영, runtime보다 앞선 새 self Merge의 handoff와 이미 최신 runtime의 계속 실행을 확인한다. Planner push·다른 프로젝트 Merge·일반 외부 fetch는 handoff를 만들지 않는다. origin/source identity 오류·fetch 실패·non-fast-forward 관계·handoff 뒤 새 작업 미시작과 중단·재시작도 검증한다.
+- Worker·verify·Review의 성공과 실패 경계 모두 runtime 변경을 확인한다. 변경 발견 후 대기 중 호출·다음 단계는 시작하지 않고 이미 실행 중인 단계의 반환만 기다리며, 다음 주기 실행 없이 새 runtime에서 저장된 작업을 재개한다. 같은 원격 revision에는 재시작을 반복하지 않고 fetch·identity·ancestry 확인 실패를 성공 갱신으로 기록하지 않는다.
+- runtime handoff는 해석한 `<base-branch>`, 현재 runtime SHA, fetch된 원격 SHA, self repository, Merge 관측 시 해당 PR과 source sync 결과를 비밀값 없이 로그에 남기며 오류나 BLOCKED 알림으로 취급하지 않는다.
+- 자동 테스트는 main·대체 base, 모든 로컬 source 상태의 원격 revision 선택·비차단 동기화, PR 상태 선반영, runtime보다 앞선 새 self Merge의 handoff와 이미 최신 runtime의 계속 실행을 확인한다. Planner push·외부 push의 self base 전진은 갱신 대상이며 다른 프로젝트 Merge·원격 전진 없는 fetch는 handoff를 만들지 않는다. origin/source identity 오류·fetch 실패·non-fast-forward 관계·handoff 뒤 새 작업 미시작과 중단·재시작도 검증한다.
 - 접근 정책·Manager Git 작업·재개 테스트는 R-055의 T01–T06·T10–T14·T16–T17·T22·T25–T26에 대응한다. sandbox 적용, 호출 실패·단계 전환 뒤 Git 범위 검사 미재활성화, 원격 동기화·게시와 기존 오탐 자동 해제를 실제 소비자에 연결한다.
 - 각 역할의 신규 호출과 session 재개에서 workspace 및 허용 파일 쓰기와 source checkout·다른 worktree·shared Git metadata 쓰기 거부를 검증한다. Reviewer의 worktree 쓰기도 거부한다. Codex는 R-050의 직접 실행과 내장 정책 확인 범위를 적용하며, 파일 쓰기 제한과 R-064의 common+Reviewer 역할 instruction에 담긴 테스트 재실행 금지를 구분한다. Claude는 문서에 대응한 호출 구성·역할별 정책을 모의 검증하고 실제 호출 결과와 구분해 기록한다. Codex와 동등한 실환경 검증을 요구하지 않는다.
 - Codex·Claude의 지원 환경에서 쓰기 경계 확대와 격리 밖 재실행은 거부하면서 나머지 승인 검토 대상의 자동 검토가 유지됨을 검증한다. 단순 편집 자동 승인으로 대체하거나 자동 검토를 전부 비활성화한 설정은 실패로 판정한다. 기존 Loop Manager Reviewer 흐름도 유지한다.
@@ -120,7 +121,7 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 
 - PR의 실제 완료 상태가 source checkout 동기화 판단보다 먼저 반영되며, 종료된 PR의 낡은 상태 때문에 기본 worktree 갱신이 불필요하게 지연되지 않는다.
 - source bootstrap이 뒤처져도 검증한 최신 원격 bootstrap·runtime으로 실행을 넘기고, 로컬 동기화는 실행과 분리한다.
-- Loop Manager가 자기 저장소의 PR Merge를 새로 확인하면 해석한 `origin/<base-branch>`를 가져오고, 현재 runtime보다 새로운 경우에만 현재 실행을 끝내 다음 외부 실행에 제어를 넘긴다.
+- 단계 경계에서 self 원격 base의 runtime 변경을 확인하면 현재 단계만 마치고 상태를 보존해 자동 갱신·재시작한다.
 - non-overlap dirty source checkout은 로컬 변경을 유지한 채 원격 base로 전진할 수 있다.
 - source checkout을 갱신할 수 없는 로컬 상태는 시작·복구 시점 모두 원격 bootstrap·runtime과 관리 worktree 작업을 막지 않는다.
 - bootstrap이 이미 원격 base revision이면 dirty 상태를 정리하지 않고 실행하며, Agent 실행 중 bootstrap 파일 상태가 바뀌어도 관리 worktree 위반으로 오인하거나 과거 signature에 프로젝트를 영구 차단하지 않는다.

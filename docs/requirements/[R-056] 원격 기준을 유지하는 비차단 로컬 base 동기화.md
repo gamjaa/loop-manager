@@ -2,7 +2,7 @@
 
 ## Summary
 
-자동 planning·구현·runtime은 검증한 원격 OID를 사용하고 로컬 base 동기화는 별도 부수 처리로 둔다. equal은 유지, ahead는 보존·skip, behind는 변경 보존 가능한 FF-only, clean diverged는 안전한 rebase, dirty diverged는 skip하며 실패가 원격 기준 작업을 막지 않게 한다. 사용자 operation·파일·index를 보호하고 Manager 소유 rebase만 확인된 조건에서 복구한다. 작업의 실행·관리 한도와 배정은 R-091을 따르며 공유 Git 자원 보호는 유지한다.
+자동 planning·구현·runtime은 검증한 원격 OID를 사용하고 로컬 base 동기화는 별도 부수 처리로 둔다. 단계 경계의 runtime 갱신은 R-023을 따른다. equal은 유지, ahead는 보존·skip, behind는 변경 보존 가능한 FF-only, clean diverged는 안전한 rebase, dirty diverged는 skip하며 실패가 원격 기준 작업을 막지 않게 한다. 사용자 operation·파일·index를 보호하고 Manager 소유 rebase만 확인된 조건에서 복구한다. 작업의 실행·관리 한도와 배정은 R-091을 따르며 공유 Git 자원 보호는 유지한다.
 
 ## Context
 
@@ -14,7 +14,7 @@
 
 ### 원격 기준과 로컬 처리
 
-계획 입력, 관리 작업 공간의 시작·rebase 기준과 catalog는 검증한 최신 `origin/<base-branch>`의 immutable OID를 사용한다. runtime은 실행 시작에 선택한 revision을 유지하고 다음 실행에서 원격을 다시 확인한다. 로컬 base의 전용 commit, 미커밋 문서·코드와 파일을 자동 작업 또는 실행 코드의 입력으로 사용하지 않는다.
+계획 입력, 관리 작업 공간의 시작·rebase 기준과 catalog는 검증한 최신 `origin/<base-branch>`의 immutable OID를 사용한다. 실행 중 runtime 파일은 선택 revision으로 유지하며, 단계 경계의 원격 변경 확인과 자동 갱신·재시작은 R-023을 따른다. 로컬 base의 전용 commit, 미커밋 문서·코드와 파일을 자동 작업 또는 실행 코드의 입력으로 사용하지 않는다.
 
 로컬 base와 기본 checkout의 상태 변화는 입력·Agent 범위·차단 해제의 비교 조건에서 제외한다. R-060에 따라 원격 base와 원격·로컬 관리 작업 branch의 현재 상태로 작업을 판단하며, 과거 snapshot·차단 기록 때문에 기본 checkout을 이전 상태로 복원하도록 요구하지 않는다.
 
