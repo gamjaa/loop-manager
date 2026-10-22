@@ -45,8 +45,16 @@ def _block_action(connection, repo, payload):
     if recovery is not None:
         # Pending recovery and inconsistent observations are insufficient even
         # when a still-visible block carries an explicit-looking question.
-        if (recovery['pending_action'] != 'final_block' or recovery['detail'] != block[1]
-                or block[2] is not None and recovery['fingerprint'] != block[2]):
+        if recovery['pending_action'] != 'final_block' or recovery['detail'] != block[1]:
+            return None
+        # Recovery fingerprints identify the failure; block release fingerprints
+        # identify the input/configuration to recheck. Native Worker decisions
+        # intentionally use different values, so validate the recovery's own identity.
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        observed = RecoveryObservation(RecoveryReason(recovery['reason_code']), repo, plan_id,
+            recovery['phase'], recovery['plan_revision'], recovery['base_revision'],
+            recovery['fingerprint'], recovery['progress_marker'], recovery['detail'])
+        if observed.identity != recovery['identity']:
             return None
         evidence = json.loads(recovery['final_evidence'] or 'null')
         if (not isinstance(evidence, dict) or evidence.get('block_reason_code') != block[0]

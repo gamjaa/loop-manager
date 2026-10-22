@@ -399,10 +399,14 @@ class PreservationBoundaryTests(unittest.TestCase):
             payload = checkpoint_service.preserve_blocked_diagnostics(effects, self.connection,
                 Path('/repo'), Path('/state'), request)
             self.assertEqual(payload['result'], 'local_only')
+            self.assertIn('ownership unavailable', str(payload))
+            self.assertIsNotNone(self.connection.execute(
+                "SELECT payload FROM diagnostic_preservations WHERE repo='repo'"
+            ).fetchone())
             self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox "
-                "WHERE event_type='blocked' AND canceled_at IS NULL").fetchone()[0], 1)
+                "WHERE event_type='blocked' AND canceled_at IS NULL").fetchone()[0], 0)
             self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox "
-                "WHERE event_type='blocked'").fetchone()[0], 2)
+                "WHERE event_type='blocked'").fetchone()[0], 0)
         effects.preservation_effects.assert_not_called()
         self.assertEqual(self.connection.execute(
             "SELECT unpublished_reason FROM blocked_checkpoints WHERE repo='repo' AND plan_id='G-047'"

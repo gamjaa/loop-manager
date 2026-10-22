@@ -283,23 +283,32 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         notifications.configure_session(self.connection, enabled=True)
         with self.connection:
             notifications._insert(self.connection, 'legacy-worker-failure', 'repo', 'stage_failed', {'project': 'repo', 'cause': 'usage exhausted', 'silent': True})
+            self.connection.execute("UPDATE notification_outbox SET rendered_text='original frozen body', "
+                "confirmed_pieces=1, attempts=2, last_error='offline' WHERE event_key='legacy-worker-failure'")
+        before = dict(self.connection.execute("SELECT * FROM notification_outbox WHERE event_key='legacy-worker-failure'").fetchone())
         self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(1, 'usage exhausted', kind=lm.AgentResultKind.USAGE_LIMIT)
-        with mock.patch('loop_manager_internal.notifications.delivery.send_telegram', side_effect=OSError('offline')), notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+        with mock.patch('loop_manager_internal.notifications.delivery.send_telegram', side_effect=OSError('offline')) as transport, notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
             outcome = self.handler.run(self.context())
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.USAGE_PAUSE)
+        transport.assert_not_called()
         original = self.connection.execute("SELECT event_key, payload, sent_at FROM notification_outbox WHERE event_type='stage_failed'").fetchone()
         self.assertIsNone(original['sent_at'])
         self.handler.run(self.context())
         from loop_manager_internal.notifications import delivery
         with mock.patch.object(delivery, 'send_telegram') as sent:
             notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=sent)
-        sent.assert_called_once()
-        self.assertTrue(sent.call_args.kwargs['disable_notification'])
-        self.assertIn(json.loads(original['payload'])['occurred_at'], sent.call_args.args[2])
+        sent.assert_not_called()
         rows = self.connection.execute("SELECT event_key, payload, sent_at FROM notification_outbox WHERE event_type='stage_failed'").fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['payload'], original['payload'])
-        self.assertIsNotNone(rows[0]['sent_at'])
+        self.assertIsNone(rows[0]['sent_at'])
+        self.assertIsNotNone(self.connection.execute(
+            "SELECT canceled_at FROM notification_outbox WHERE event_key='legacy-worker-failure'"
+        ).fetchone()[0])
+        self.assertIn('usage exhausted', self.state.row()['last_error'])
+        after = dict(self.connection.execute("SELECT * FROM notification_outbox WHERE event_key='legacy-worker-failure'").fetchone())
+        for key in before.keys() - {'canceled_at', 'delivery_started_at'}:
+            self.assertEqual(after[key], before[key], key)
 
     def test_worker_return_with_disabled_notifications_preserves_outcome(self):
         from loop_manager_internal.notifications import notifications

@@ -294,13 +294,14 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             'loop_manager_internal.application.scheduler.VerifyCoordinator'
         ), mock.patch(
             'loop_manager_internal.application.scheduler.TaskScheduler'
-        ):
+        ), mock.patch('loop_manager_internal.application.scheduler.notifications.configure_session') as configure:
             self.assertEqual(
                 loop_manager.schedule_registered_projects(
                     mock.Mock(), Path('/state'), config, runtime_mutation=mutation,
                 ),
                 (result,),
             )
+        configure.assert_called_once_with(mock.ANY, enabled=False, verify_timeout_seconds=42)
         self.assertIs(preflight.call_args.args[3], mutation)
         self.assertEqual(preflight.call_args.kwargs['config_path'], config.path)
         self.assertEqual(worker.call_args.args[-1], 42)

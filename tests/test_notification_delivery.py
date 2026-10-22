@@ -1416,13 +1416,15 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(self.events(connection)[0]['attempts'], 0)
 
     def test_invalid_recovery_evidence_and_changed_revision_preserve_unsent_audit(self):
-        for mutation in ('not-json', 'null', '[]', 'changed-revision'):
+        for mutation in ('not-json', 'null', '[]', 'changed-revision', 'changed-fingerprint'):
             with self.subTest(mutation=mutation):
                 connection = self.connection()
                 with connection:
                     self.decision_block(connection)
                     before = dict(self.events(connection)[0])
-                    if mutation == 'changed-revision':
+                    if mutation == 'changed-fingerprint':
+                        connection.execute("UPDATE recovery_records SET fingerprint='unbound'")
+                    elif mutation == 'changed-revision':
                         connection.execute("UPDATE recovery_records SET plan_revision='previous'")
                         connection.execute("UPDATE exec_plans SET current_revision_sha='latest'")
                     else:

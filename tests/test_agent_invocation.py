@@ -1126,6 +1126,8 @@ class ProcessStartNotificationTests(TestCase):
         )
         self.connection.commit()
         manager.update_project(self.connection, 'repo', planning_error='original planning cause')
+        from tests.support.notification import NotificationFixture
+        NotificationFixture.legacy_planning_notice(self.connection, 'original planning cause', repo='repo', confirmed=1, sent=True)
         self.connection.execute(
             "UPDATE notification_outbox SET sent_at = CURRENT_TIMESTAMP, "
             "confirmed_pieces = 1 WHERE event_type = 'blocked'"
@@ -1143,7 +1145,10 @@ class ProcessStartNotificationTests(TestCase):
                 request.on_process_started()
                 outer.assertEqual(outer.connection.execute(
                     "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'resumed'"
-                ).fetchone()[0], 1)
+                ).fetchone()[0], 0)
+                outer.assertIsNotNone(outer.connection.execute(
+                    "SELECT started_at FROM notified_block_incidents WHERE subject='planning'"
+                ).fetchone()[0])
                 return manager.AgentResult(0, 'checked')
 
         with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
@@ -1155,11 +1160,12 @@ class ProcessStartNotificationTests(TestCase):
                 resolved_profile=invocation.ResolvedProfile('check-model', 'low'),
             )
         self.assertEqual(result.code, 0)
-        resumed = self.connection.execute(
-            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        incident = self.connection.execute(
+            "SELECT payload, started_operation, resumed_at FROM notified_block_incidents WHERE subject='planning'"
         ).fetchone()
-        self.assertEqual(json.loads(resumed[0])['operation'], 'Planner')
-        self.assertEqual(json.loads(resumed[0])['cause'], 'original planning cause')
+        self.assertEqual(incident['started_operation'], 'Planner')
+        self.assertIsNotNone(incident['resumed_at'])
+        self.assertEqual(json.loads(incident['payload'])['cause'], 'original planning cause')
         ledger_row = self.connection.execute(
             "SELECT role, model, effort, scope_id FROM agent_invocations"
         ).fetchone()
@@ -1182,9 +1188,12 @@ class ProcessStartNotificationTests(TestCase):
         outer = self
         class Provider:
             def run(self, request):
-                outer.assertEqual(outer.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0 if request.prompt == 'first' else 1)
+                outer.assertEqual(outer.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0)
                 request.on_process_started()
-                outer.assertEqual(outer.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 1)
+                outer.assertEqual(outer.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0)
+                outer.assertIsNotNone(outer.connection.execute(
+                    "SELECT execution_started_at FROM agent_invocations ORDER BY rowid DESC LIMIT 1"
+                ).fetchone()[0])
                 return manager.AgentResult(0, 'done')
         with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
             for attempt in (1, 2):

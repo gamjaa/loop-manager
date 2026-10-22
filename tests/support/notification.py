@@ -47,7 +47,8 @@ class NotificationFixture:
             self.addCleanup(connection.close)
         return connection
 
-    def decision_block(self, connection, *, question='Which permission should be granted?',
+    @staticmethod
+    def decision_block(connection, *, repo="/projects/alpha", plan_id="G-018", question='Which permission should be granted?',
                        problem='The required repository permission is unavailable.',
                        proposal='Grant the documented permission or choose a supported alternative.',
                        detail=None, fingerprint=None, record_block=True):
@@ -59,7 +60,6 @@ class NotificationFixture:
         from loop_manager_internal.storage.recovery_state import RecoveryRepository
         from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
         from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
-        repo, plan_id = '/projects/alpha', 'G-018'
         plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
         declaration = {'kind': 'needs_user_decision', 'problem': problem, 'proposal': proposal,
                        'question': question, 'locations': [{'path': plan['path'], 'section': 'Scope'}]}
@@ -89,9 +89,10 @@ class NotificationFixture:
         if block is not None:
             self.decision_block(connection, detail=block[0], fingerprint=block[1], record_block=False)
 
-    def legacy_planning_notice(self, connection, cause='old planning error', *, confirmed=0, sent=False):
+    @staticmethod
+    def legacy_planning_notice(connection, cause='old planning error', *, confirmed=0, sent=False, repo='/projects/alpha'):
         """Seed a persisted old-policy notice, rather than generate a current event."""
-        repo = '/projects/alpha'
+        notifications.ensure_schema(connection)
         connection.execute('UPDATE projects SET planning_error=? WHERE repo=?', (cause, repo))
         key = notifications._key('blocked', repo, 'project\0planning_error\0')
         notifications._insert(connection, key, repo, 'blocked',
@@ -101,9 +102,9 @@ class NotificationFixture:
         notifications.adopt_legacy_block_notices(connection)
         return key
 
-    def legacy_project_notice(self, connection):
+    @staticmethod
+    def legacy_project_notice(connection, *, repo='/projects/alpha'):
         """Seed an already confirmed safety notice from the former policy."""
-        repo = '/projects/alpha'
         block = connection.execute('SELECT * FROM project_blocks WHERE repo=?', (repo,)).fetchone()
         assert block is not None
         from loop_manager_internal.notifications.incidents import _project_block_key
