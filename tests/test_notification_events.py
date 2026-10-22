@@ -550,7 +550,9 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 "workspace가 아직 생성되지 않았습니다.",
                 retryable=False,
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
 
         events = self.events(connection)
@@ -630,7 +632,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
         }
         self.assertEqual(
             causes,
-            {"Initial user action"},
+            set(),
         )
 
     def test_blocked_event_waits_for_checkpoint_and_includes_published_commit(self):
@@ -666,6 +668,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 "User decision required",
                 "decision-fingerprint",
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         self.assertEqual(self.events(connection), [])
 
@@ -694,11 +697,13 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(pending[0].phase.value, "retry_pending")
             self.assertEqual(pending[0].local_oid, oid)
             with connection:
+                self.confirm_worker_question(connection)
                 notifications.enqueue_current_project_events(connection, repo)
             self.assertEqual(self.events(connection), [])
         repository.finish_published(repository.get(repo, "G-018"), oid)
         repository.finish_published(repository.get(repo, "G-018"), oid)
         with connection:
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         self.assertEqual(len(self.events(connection)), 1)
         self.assertEqual(self.events(connection)[0]["event_type"], "blocked")
@@ -728,13 +733,8 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             plan_path=None,
             planning_error="Planner output remained invalid",
         )
-        row = self.events(connection)[0]
-        payload = json.loads(row["payload"])
-        self.assertEqual(row["event_type"], "blocked")
-        self.assertEqual(payload["stage"], "planning")
-        self.assertIn("docs/PRODUCT.md", payload["paths"])
-        self.assertIn("docs/requirements/*.md", payload["paths"])
-        self.assertIn("docs/ARCHITECTURE.md", payload["paths"])
+        self.assertEqual(self.events(connection), [])
+        self.assertEqual(connection.execute('SELECT planning_error FROM projects').fetchone()[0], 'Planner output remained invalid')
 
 
 class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
@@ -753,11 +753,15 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
     def test_progress_cause_redaction_preserves_identity_and_payload(self):
         from loop_manager_internal.execution.validation_feedback import redact_secrets
         connection = self.connection()
+        from loop_manager_internal.storage import execplan_draft_state
+        execplan_draft_state.ensure_schema(connection)
+        connection.execute("INSERT INTO execplan_drafts VALUES (?, 'G-018', 1, ?)",
+            ('/projects/alpha', json.dumps({'pending': True, 'question': 'Which retention policy?', 'revision': 'question-revision'})))
         cause = 'request rejected\n{"password": "first-private\\nsecond-private"}\nBearer bearer-private\n' + 'sk-' + 'a' * 24
         for identity in ('first-error', 'first-error', 'second-error'):
             with connection:
                 notifications.enqueue_progress(connection, '/projects/alpha', 'draft_decision', identity,
-                    execplan_id='G-018', operation='Planner', cause=cause,
+                    execplan_id='G-018', decision_revision='question-revision', operation='Planner', cause=cause,
                     status='자동 교정 대기', silent=True)
         events = self.events(connection)
         self.assertEqual(len(events), 2)

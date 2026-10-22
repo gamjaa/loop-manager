@@ -1479,12 +1479,15 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 조각 claim은 `blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision` 외 사건의 잔여 전송을 취소한다. 구정책 진행·완료·대기·재개 사건에도 적용하며 payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim을 사용한다. `policy.is_current`를 생성과 각 claim의 공통 판정으로 사용한다. PR은 현재 같은 계획·URL의 PR_OPEN 투영을, draft는 기존 질문 목록·판단 identity/revision을 재사용한다. PR 검토 후보·draft 링크의 세부 identity 확장은 별도 후속 작업이며 이 경계는 추가 외부 호출이나 Git 쓰기를 수행하지 않는다.
 
-`policy.block_action`은 현재 block의 scope·대상·원문 원인과 복구 기록의 fingerprint·최종 원문 근거·현재 계획 revision을 대조한다. 복구가 pending이거나 근거가 손상·누락되면 보류한다. 허용 근거는 이미 검증한 Worker 결정의 질문/위치, 파싱·허용 문서 검사를 통과한 SPEC_DEADLOCK, 현재 pending 지침 승인, 같은 닫힌 PR·게시 branch 삭제에 연결된 조치, 기록된 verify 상한과 실제 timeout 결과다. 최종 disposition·예산 소진·user_targets만으로 복구 불가능성을 추론하지 않는다. 원인이 일반 진행/복구/불충분 근거이면 outbox 없이 원본 상태와 진단을 유지한다.
+`policy.block_action`은 현재 block의 scope·대상·원문 원인과 복구 기록의 fingerprint·최종 원문 근거·현재 계획 revision을 대조한다. 복구가 pending이거나 근거가 손상·누락되면 보류한다. 허용 근거는 이미 검증한 Worker 결정의 질문/위치, 파싱·허용 문서 검사를 통과한 SPEC_DEADLOCK, 현재 pending 지침 승인, 같은 닫힌 PR·게시 branch 삭제에 연결된 조치, 기록된 verify 상한과 실제 timeout 결과다. 최종 disposition·예산 소진·user_targets만으로 복구 불가능성을 추론하지 않는다. 조치 없는 최종 중단은 아래 명시적 복구 경로 근거 계약을 만족해야 한다. 원인이 일반 진행/복구/불충분 근거이면 outbox 없이 원본 상태와 진단을 유지한다.
 
-새 blocked payload의 선택적 `action` object는 현재 조치의 snapshot이다. `kind`는 `decision`·`specification`·`guidance`·`reopen_pr`·`restart`·`verify_timeout`이며 질문은 `decision`, 승인 목록은 `proposals`, PR은 `pr_url`, 재시작은 `branch`, 상한은 양의 정수 `seconds`에 결합한다. `guidance.proposals`는 승인 순서대로 `[proposal_id, proposal_hash, target_path, proposal_line, decision_line]` 배열을 보존한다. 기존 payload에 action이 없더라도 현재 원본으로 유효성을 확인할 수 있으면 그대로 전송한다. action이 있으면 현재 조치와 정확히 비교하며 원래 payload·고정 본문을 소급 갱신하지 않는다. 변경된 조치는 기존 incident의 다음 version으로 연결하고 취소·전송 감사를 남긴다.
+새 blocked payload의 선택적 `action` object는 현재 조치의 snapshot이다. `kind`는 `decision`·`specification`·`guidance`·`reopen_pr`·`restart`·`verify_timeout`·`unrecoverable`이며 질문은 `decision`, 승인 목록은 `proposals`, PR은 `pr_url`, 재시작은 `branch`, 상한은 양의 정수 `seconds`에 결합한다. `guidance.proposals`는 승인 순서대로 `[proposal_id, proposal_hash, target_path, proposal_line, decision_line]` 배열을 보존한다. `unrecoverable`은 원래 recovery의 `identity`를 `recovery_identity`로 보존하며 이 action이 없는 구정책 payload를 복구 불가 통지로 소급 해석하지 않는다. 나머지 기존 payload에 action이 없더라도 현재 원본으로 유효성을 확인할 수 있으면 그대로 전송한다. action이 있으면 현재 조치와 정확히 비교하며 원래 payload·고정 본문을 소급 갱신하지 않는다. 변경된 조치는 기존 incident의 다음 version으로 연결하고 취소·전송 감사를 남긴다. 중복 판정은 현재 outbox payload와 비교하며 incident에 남긴 첫 확인 원문은 감사용으로 보존한다.
+
+`RecoveryObservation.unavailable_recovery_routes`는 복구 소유자가 이미 확인한 복구 불가 사실만 전달하는 선택적 JSON object다. 최종 판단일 때 `final_evidence`에 보존하며 기존 복구 결정·예산·재개 정책은 바꾸지 않는다. 허용 키는 `reobservation`·`retry`·`correction`·`condition_wait`·`next_run`·`safe_recovery`의 정확한 여섯 개이며 값은 각 경로를 사용할 수 없는 근거인 비어 있지 않은 문자열이다. 현재 원인·지문·revision과 일치하는 최종 기록에 이 근거가 모두 있고 사용자 조치가 없을 때만 `unrecoverable`을 선택한다. 기존 기록의 필드 부재·부분 근거는 보류하며 일반 final 분류에서 자동 생성하지 않는다. 본문에는 원래 원인·보존 결과·경로별 근거를 표시하고 가짜 질문·조치 안내를 붙이지 않는다.
+
+`configure_session`은 credential 없이 연결별 TEMP 상태에 활성 여부와 현재 양의 정수 `verify_timeout_seconds`를 묶는다. scheduler·수동 recover·독립 task 연결은 transaction 밖에서 읽은 설정을 전달한다. 미확인 값은 NULL로 처리하며, 상한 조치는 현재 값·block 지문·실제 verify timeout 결과가 모두 같은 상한일 때만 허용한다. 값 변경·누락은 이전 통지의 잔여 조각을 취소하며 기존 설정·오류·감사를 덮지 않는다.
 
 사건 투영은 Telegram 설정과 독립적으로 오래된 미전송 사건을 취소한 뒤 새 사건을 선택한다. planning_error enqueue와 과거 planning 사건의 released_at/canceled_at을 해제하던 복원 경로는 제거했다. legacy 통지 채택과 첫 확인 원인·확인 조각의 연결은 감사용으로 유지한다. 원격 관측과 설정 확인의 소유자는 transaction 밖에서 사실을 확보하고 현재 DB에 반영하며, 공통 판정은 전송 transaction에서 해당 현재 원인을 다시 대조한다.
-
 
 지속 실행 실패 집계는 복구 진단으로 보존하고 독립 outbox 사건을 만들지 않는다. 같은 대상·원인의 실제 `PLAN_BLOCKED`·`PROJECT_BLOCKED`와 checkpoint 결과가 확정되면 기존 BLOCKED outbox만 사용한다.
 

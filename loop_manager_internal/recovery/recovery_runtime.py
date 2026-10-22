@@ -171,6 +171,9 @@ class RecoveryObservation:
     operation: str | None = None
     user_targets: tuple[str, ...] = ()
     worker_decision: dict[str, object] | None = None
+    # Notification evidence supplied by the recovery owner, never inferred
+    # from the disposition or the number of exhausted attempts.
+    unavailable_recovery_routes: dict[str, str] | None = None
 
     @property
     def identity(self) -> str:

@@ -96,10 +96,15 @@ def _queue_block(
     action = block_action(connection, repo, payload)
     if action is None:
         return
-    payload = _event_payload("blocked", {**payload, "action": action})
+    payload = {**payload, "action": action}
+    if action['kind'] == 'unrecoverable':
+        payload['status'] = '자동 복구 불가'
+    payload = _event_payload("blocked", payload)
 
     active = connection.execute(
-        "SELECT id, block_key, event_key, confirmed_before, version, payload FROM "
+        "SELECT id, block_key, event_key, confirmed_before, version, "
+        "COALESCE((SELECT payload FROM notification_outbox o WHERE "
+        "o.event_key=notified_block_incidents.event_key), payload) FROM "
         "notified_block_incidents "
         "WHERE repo = ? AND subject = ? AND released_at IS NULL "
         "ORDER BY id DESC LIMIT 1", (repo, subject),

@@ -2,16 +2,12 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
 import loop_manager
 from loop_manager_internal.storage import blocked_checkpoint_state
-from loop_manager_internal.config.managed_config import ManagedConfigError, load_managed_config
 from loop_manager_internal.notifications import notifications
-from loop_manager_internal.notifications import work_exhaustion
-from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
 from loop_manager_internal.storage.recovery_state import RecoveryRepository, begin_external_run
@@ -63,24 +59,21 @@ class ProjectCheckpointNotificationUnitTests(NotificationFixture, unittest.TestC
                        commit_oid='a' * 40, original_branch=self.branch, base_oid='b' * 40)
         self.repository.result(self.repo, 'G-018', self.cause, payload, intent=intent)
         self.repository.result(self.repo, 'G-018', self.cause, payload, intent=intent)
-        notices = self.events(self.db)
-        self.assertEqual(len(notices), 1)
-        decoded = json.loads(notices[0]['payload'])
-        text = notifications._message('blocked', decoded)
-        self.assertIn(intent['ref'], text)
-        self.assertIn('Original branch: loop-manager/G-018', text)
-        self.assertIn('a' * 40, text)
-        self.assertEqual(decoded['cause'], 'original cause')
-        self.assertEqual(notifications._current_block_key(self.db, self.repo, decoded),
-                         self.db.execute('SELECT block_key FROM notified_block_incidents').fetchone()[0])
+        self.assertEqual(self.events(self.db), [])
+        decoded = notifications._project_checkpoint(self.db, self.repo, 'G-018')
+        self.assertEqual(decoded['branch'], intent['ref'])
+        self.assertEqual(decoded['original_branch'], self.branch)
+        self.assertEqual(decoded['commit_oid'], 'a' * 40)
+        self.assertIn('a' * 40, decoded['branch_url'])
 
     def test_local_only_notice_reports_actual_reason_and_ignores_stale_cause_result(self):
         self.repository.result(self.repo, 'G-018', self.cause,
                                dict(result='local_only', reason='unresolved rebase conflict',
                                     original_branch=self.branch, worktree=self.worktree))
-        decoded = json.loads(self.events(self.db)[0]['payload'])
-        self.assertIn('unresolved rebase conflict', notifications._message('blocked', decoded))
-        self.assertIn('/state/G-018', notifications._message('blocked', decoded))
+        self.assertEqual(self.events(self.db), [])
+        decoded = notifications._project_checkpoint(self.db, self.repo, 'G-018')
+        self.assertEqual(decoded['reason'], 'unresolved rebase conflict')
+        self.assertEqual(decoded['worktree'], '/state/G-018')
         self.db.execute("UPDATE project_blocks SET evidence = 'new independent cause'")
         self.assertIsNone(notifications._project_checkpoint(self.db, self.repo, 'G-018'))
 
@@ -137,6 +130,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
                 "User decision required", "decision-fingerprint",
             )
+        self.confirm_worker_question(connection)
         checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
         checkpoint.finish_unpublished(
             checkpoint.get(repo, "G-018"), "local only", retryable=False,
@@ -175,353 +169,6 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertIn("[alpha] BLOCKED", delivered[0])
         self.assertIn("사용자 조치 대기", delivered[0])
 
-    def test_inflight_planning_piece_confirmed_after_start_still_resumes(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        loop_manager.update_project(connection, repo, planning_error="x" * 9000)
-        incident_id = connection.execute(
-            "SELECT id FROM notified_block_incidents "
-            "WHERE repo = ? AND subject = 'planning'", (repo,),
-        ).fetchone()[0]
-
-        def release_during_first_piece(_token, _chat, _text):
-            loop_manager.update_project(connection, repo, planning_error=None)
-            with connection:
-                self.assertEqual(notifications.record_work_start(
-                    connection, repo, "Planner",
-                ), 0)
-            incident = connection.execute(
-                "SELECT started_operation, resumed_at "
-                "FROM notified_block_incidents WHERE id = ?", (incident_id,),
-            ).fetchone()
-            self.assertEqual(incident["started_operation"], "Planner")
-            self.assertIsNone(incident["resumed_at"])
-
-        self.assertEqual(notifications.dispatch_pending(
-            connection, "token", "chat", adapter=release_during_first_piece,
-        ), 0)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox "
-            "WHERE repo = ? AND event_type = 'resumed'", (repo,),
-        ).fetchone()[0], 0)
-        self.assertIsNotNone(connection.execute(
-            "SELECT resumed_at FROM notified_block_incidents WHERE id = ?",
-            (incident_id,),
-        ).fetchone()[0])
-
-        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
-
-    def test_released_partial_planning_notice_retries_original_remaining_piece(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        loop_manager.update_project(connection, repo, planning_error="owner mismatch")
-        first = connection.execute(
-            "SELECT block_key, event_key, payload FROM notified_block_incidents "
-            "WHERE repo = ? AND subject = 'planning'", (repo,),
-        ).fetchone()
-        latest_key = first["event_key"] + ":unsent"
-        with connection:
-            connection.execute(
-                "UPDATE notified_block_incidents SET released_at = CURRENT_TIMESTAMP "
-                "WHERE event_key = ?", (first["event_key"],),
-            )
-            connection.execute(
-                "UPDATE notification_outbox SET rendered_text = ?, "
-                "confirmed_pieces = 1, canceled_at = CURRENT_TIMESTAMP "
-                "WHERE event_key = ?", ("x" * 5000, first["event_key"]),
-            )
-            connection.execute(
-                "INSERT INTO notified_block_incidents "
-                "(repo, subject, block_key, event_key, payload, released_at) "
-                "VALUES (?, 'planning', ?, ?, ?, CURRENT_TIMESTAMP)",
-                (repo, first["block_key"], latest_key, first["payload"]),
-            )
-            connection.execute(
-                "INSERT INTO notification_outbox "
-                "(event_key, repo, event_type, payload, canceled_at) "
-                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP)",
-                (latest_key, repo, first["payload"]),
-            )
-
-        with connection:
-            notifications.enqueue_current_project_events(connection, repo)
-        original = connection.execute(
-            "SELECT canceled_at, confirmed_pieces FROM notification_outbox "
-            "WHERE event_key = ?", (first["event_key"],),
-        ).fetchone()
-        self.assertIsNone(original["canceled_at"])
-        self.assertEqual(original["confirmed_pieces"], 1)
-        self.assertIsNotNone(connection.execute(
-            "SELECT canceled_at FROM notification_outbox WHERE event_key = ?",
-            (latest_key,),
-        ).fetchone()[0])
-        delivered = []
-        self.assertEqual(notifications.dispatch_pending(
-            connection, "token", "chat",
-            adapter=lambda _t, _c, piece: delivered.append(piece),
-        ), 1)
-        self.assertEqual(delivered, ["x" * 904])
-
-        loop_manager.update_project(connection, repo, planning_error=None)
-        with connection:
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Planner",
-            ), 1)
-
-    def test_same_second_planner_start_closes_unsent_planning_episode(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        loop_manager.update_project(connection, repo, planning_error="same cause")
-        first_id = connection.execute(
-            "SELECT id FROM notified_block_incidents "
-            "WHERE repo = ? AND subject = 'planning'", (repo,),
-        ).fetchone()[0]
-        loop_manager.update_project(connection, repo, planning_error=None)
-        with connection:
-            notifications.record_process_start(
-                connection, repo, "planner", "same-second-planner",
-            )
-        started = connection.execute(
-            "SELECT started_operation, resumed_at FROM notified_block_incidents "
-            "WHERE id = ?", (first_id,),
-        ).fetchone()
-        self.assertEqual(started["started_operation"], "Planner")
-        self.assertIsNone(started["resumed_at"])
-        self.assertEqual(len([row for row in self.events(connection)
-                              if row["event_type"] == "work_started"]), 0)
-        notice_created_at = connection.execute(
-            "SELECT o.created_at FROM notification_outbox o "
-            "JOIN notified_block_incidents i ON i.event_key = o.event_key "
-            "WHERE i.id = ?", (first_id,),
-        ).fetchone()[0]
-        with connection:
-            connection.execute(
-                "INSERT INTO agent_invocations "
-                "(invocation_id, repo, role, provider, model, effort, "
-                "transition, attempt, started_at) "
-                "VALUES ('same-second-planner', ?, 'planner', 'codex', "
-                "'model', 'high', 'start', 1, ?)",
-                (repo, notice_created_at),
-            )
-
-        loop_manager.update_project(connection, repo, planning_error="same cause")
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notified_block_incidents "
-            "WHERE repo = ? AND subject = 'planning'", (repo,),
-        ).fetchone()[0], 2)
-        self.assertIsNotNone(connection.execute(
-            "SELECT released_at FROM notified_block_incidents WHERE id = ?",
-            (first_id,),
-        ).fetchone()[0])
-
-    def test_released_planning_duplicates_keep_delivered_notice_not_unsent_latest(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        loop_manager.update_project(connection, repo, planning_error="owner mismatch")
-        first = connection.execute(
-            "SELECT block_key, event_key, payload FROM notified_block_incidents "
-            "WHERE repo = ? AND subject = 'planning'", (repo,),
-        ).fetchone()
-        latest_key = first["event_key"] + ":unsent"
-        with connection:
-            connection.execute(
-                "UPDATE notification_outbox SET sent_at = CURRENT_TIMESTAMP, "
-                "confirmed_pieces = 1 WHERE event_key = ?",
-                (first["event_key"],),
-            )
-            connection.execute(
-                "UPDATE notified_block_incidents SET released_at = CURRENT_TIMESTAMP "
-                "WHERE event_key = ?", (first["event_key"],),
-            )
-            connection.execute(
-                "INSERT INTO notified_block_incidents "
-                "(repo, subject, block_key, event_key, payload, released_at) "
-                "VALUES (?, 'planning', ?, ?, ?, CURRENT_TIMESTAMP)",
-                (repo, first["block_key"], latest_key, first["payload"]),
-            )
-            connection.execute(
-                "INSERT INTO notification_outbox "
-                "(event_key, repo, event_type, payload, canceled_at) "
-                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP)",
-                (latest_key, repo, first["payload"]),
-            )
-
-        for _ in range(3):
-            with connection:
-                notifications.enqueue_current_project_events(connection, repo)
-            self.assertIsNotNone(connection.execute(
-                "SELECT canceled_at FROM notification_outbox WHERE event_key = ?",
-                (latest_key,),
-            ).fetchone()[0])
-        self.assertEqual(notifications.dispatch_pending(
-            connection, "token", "chat", adapter=mock.Mock(),
-        ), 0)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notified_block_incidents "
-            "WHERE repo = ? AND subject = 'planning'", (repo,),
-        ).fetchone()[0], 2)
-
-        loop_manager.update_project(connection, repo, planning_error=None)
-        with connection:
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Planner",
-            ), 1)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox "
-            "WHERE repo = ? AND event_type = 'resumed'", (repo,),
-        ).fetchone()[0], 0)
-
-        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
-
-    def test_release_of_duplicate_active_planning_incidents_resumes_once(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        loop_manager.update_project(connection, repo, planning_error="owner mismatch")
-        first = connection.execute(
-            "SELECT block_key, event_key, payload FROM notified_block_incidents "
-            "WHERE repo = ? AND subject = 'planning'", (repo,),
-        ).fetchone()
-        with connection:
-            connection.execute(
-                "UPDATE notification_outbox SET confirmed_pieces = 1 "
-                "WHERE event_key = ?", (first["event_key"],),
-            )
-            connection.execute(
-                "INSERT INTO notified_block_incidents "
-                "(repo, subject, block_key, event_key, payload) "
-                "VALUES (?, 'planning', ?, ?, ?)",
-                (repo, first["block_key"], first["event_key"] + ":duplicate",
-                 first["payload"]),
-            )
-            connection.execute(
-                "INSERT INTO notification_outbox "
-                "(event_key, repo, event_type, payload) VALUES (?, ?, 'blocked', ?)",
-                (first["event_key"] + ":duplicate", repo, first["payload"]),
-            )
-        loop_manager.update_project(connection, repo, planning_error=None)
-        with connection:
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Planner",
-            ), 1)
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Planner",
-            ), 0)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox "
-            "WHERE repo = ? AND event_type = 'resumed'", (repo,),
-        ).fetchone()[0], 0)
-
-        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
-
-    def test_planning_incident_survives_database_reopen_and_repeated_observation(self):
-        repo = "/projects/alpha"
-        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
-            database = Path(directory) / "state.db"
-            connection = self.connection(database=database)
-            cleanup.callback(connection.close)
-            with connection:
-                connection.execute(
-                    "UPDATE projects SET planning_error = 'owner mismatch' "
-                    "WHERE repo = ?", (repo,),
-                )
-                notifications.enqueue_current_project_events(connection, repo)
-            incident_id = connection.execute(
-                "SELECT id FROM notified_block_incidents "
-                "WHERE repo = ? AND subject = 'planning'", (repo,),
-            ).fetchone()[0]
-            connection.close()
-
-            connection = sqlite3.connect(database)
-            cleanup.callback(connection.close)
-            connection.row_factory = sqlite3.Row
-            for _ in range(3):
-                with connection:
-                    notifications.enqueue_current_project_events(connection, repo)
-            self.assertEqual(connection.execute(
-                "SELECT id FROM notified_block_incidents "
-                "WHERE repo = ? AND subject = 'planning'", (repo,),
-            ).fetchall()[0][0], incident_id)
-            self.assertEqual(connection.execute(
-                "SELECT COUNT(*) FROM notification_outbox "
-                "WHERE repo = ? AND event_type = 'blocked'", (repo,),
-            ).fetchone()[0], 1)
-            connection.close()
-
-    def test_historical_planning_duplicates_keep_one_incident_until_real_restart(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        with connection:
-            connection.execute(
-                "UPDATE projects SET planning_error = 'owner mismatch' WHERE repo = ?",
-                (repo,),
-            )
-            notifications.enqueue_current_project_events(connection, repo)
-            first = connection.execute(
-                "SELECT id, block_key, event_key, payload FROM "
-                "notified_block_incidents WHERE subject = 'planning'",
-            ).fetchone()
-            connection.execute(
-                "UPDATE notification_outbox SET sent_at = CURRENT_TIMESTAMP, "
-                "confirmed_pieces = 1 "
-                "WHERE event_key = ?", (first["event_key"],),
-            )
-            duplicate_key = first["event_key"] + ":historical"
-            connection.execute(
-                "INSERT INTO notified_block_incidents "
-                "(repo, subject, block_key, event_key, payload, released_at) "
-                "VALUES (?, 'planning', ?, ?, ?, CURRENT_TIMESTAMP)",
-                (repo, first["block_key"], duplicate_key, first["payload"]),
-            )
-            connection.execute(
-                "INSERT INTO notification_outbox "
-                "(event_key, repo, event_type, payload, sent_at, confirmed_pieces) "
-                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP, 1)",
-                (duplicate_key, repo, first["payload"]),
-            )
-            # Simulate the old false release of the latest incident.
-            connection.execute(
-                "UPDATE notified_block_incidents SET released_at = CURRENT_TIMESTAMP "
-                "WHERE id = ?", (first["id"],),
-            )
-
-        for _ in range(3):
-            with connection:
-                notifications.enqueue_current_project_events(connection, repo)
-                self.assertEqual(notifications.record_work_start(
-                    connection, repo, "Worker", plan_id="G-018",
-                ), 0)
-            self.assertEqual(connection.execute(
-                "SELECT COUNT(*) FROM notified_block_incidents "
-                "WHERE repo = ? AND subject = 'planning'", (repo,),
-            ).fetchone()[0], 2)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notified_block_incidents "
-            "WHERE repo = ? AND subject = 'planning' AND released_at IS NULL",
-            (repo,),
-        ).fetchone()[0], 1)
-
-        loop_manager.update_project(connection, repo, planning_error=None)
-        with connection:
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Worker", plan_id="G-018",
-            ), 0)
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Planner",
-            ), 1)
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Planner",
-            ), 0)
-        loop_manager.update_project(connection, repo, planning_error="owner mismatch")
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notified_block_incidents "
-            "WHERE repo = ? AND subject = 'planning'", (repo,),
-        ).fetchone()[0], 3)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox "
-            "WHERE repo = ? AND event_type = 'resumed'", (repo,),
-        ).fetchone()[0], 0)
-
-        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_existing_delivered_plan_notice_is_adopted_without_duplicate_delivery(self):
         connection = self.connection()
@@ -616,143 +263,6 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
         ).fetchone()[0], 1)
 
-    def test_prior_planning_notice_does_not_notify_new_error_with_reused_key(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        old_key = notifications._key("blocked", repo, "project\0planning_error\0")
-        old_payload = {
-            "project": "alpha", "stage": "planning", "scope": "project",
-            "reason_code": "planning_error", "execplan_id": None,
-            "cause": "previous resolved error", "paths": [],
-        }
-        with connection:
-            connection.execute("DROP TABLE block_notice_events")
-            connection.execute("DROP TABLE notified_block_incidents")
-            connection.execute(
-                "UPDATE projects SET planning_error = 'new undelivered error' "
-                "WHERE repo = ?", (repo,),
-            )
-            connection.execute(
-                "INSERT INTO notification_outbox "
-                "(event_key, repo, event_type, payload, sent_at) "
-                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP)",
-                (old_key, repo, json.dumps(old_payload)),
-            )
-        with connection:
-            notifications.enqueue_current_project_events(connection, repo)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
-        ).fetchone()[0], 2)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notified_block_incidents WHERE repo = ?",
-            (repo,),
-        ).fetchone()[0], 1)
-        loop_manager.update_project(connection, repo, planning_error=None)
-        with connection:
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Planner",
-            ), 0)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'resumed'"
-        ).fetchone()[0], 0)
-
-    def test_unsent_legacy_planning_notice_is_canceled_before_new_error_dispatch(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        old_key = notifications._key("blocked", repo, "project\0planning_error\0")
-        old_payload = {
-            "project": "alpha", "stage": "planning", "scope": "project",
-            "reason_code": "planning_error", "execplan_id": None,
-            "cause": "resolved error", "paths": [],
-        }
-        with connection:
-            connection.execute("DROP TABLE block_notice_events")
-            connection.execute("DROP TABLE notified_block_incidents")
-            connection.execute(
-                "UPDATE projects SET planning_error = 'resolved error' WHERE repo = ?",
-                (repo,),
-            )
-            connection.execute(
-                "INSERT INTO notification_outbox "
-                "(event_key, repo, event_type, payload) VALUES (?, ?, 'blocked', ?)",
-                (old_key, repo, json.dumps(old_payload)),
-            )
-            # The earlier error clears without dispatch before another error.
-            connection.execute(
-                "UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,),
-            )
-            connection.execute(
-                "UPDATE projects SET planning_error = 'new error' WHERE repo = ?",
-                (repo,),
-            )
-        with connection:
-            notifications.enqueue_current_project_events(connection, repo)
-        delivered = []
-        self.assertEqual(notifications.dispatch_pending(
-            connection, "token", "chat",
-            adapter=lambda _token, _chat, message: delivered.append(message),
-        ), 1)
-        self.assertEqual(len(delivered), 1)
-        self.assertIn("new error", delivered[0])
-        self.assertNotIn("resolved error", delivered[0])
-        old_notice = connection.execute(
-            "SELECT canceled_at, sent_at FROM notification_outbox WHERE event_key = ?",
-            (old_key,),
-        ).fetchone()
-        self.assertIsNotNone(old_notice[0])
-        self.assertIsNone(old_notice[1])
-        loop_manager.update_project(connection, repo, planning_error=None)
-        with connection:
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Planner",
-            ), 1)
-        resumed = connection.execute(
-            "SELECT payload FROM notified_block_incidents ORDER BY id DESC LIMIT 1",
-        ).fetchone()
-        self.assertEqual(json.loads(resumed[0])["cause"], "new error")
-
-        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
-
-    def test_identical_planning_error_after_later_planner_start_is_new_incident(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        key = notifications._key("blocked", repo, "project\0planning_error\0")
-        payload = {
-            "project": "alpha", "stage": "planning", "scope": "project",
-            "reason_code": "planning_error", "execplan_id": None,
-            "cause": "repeated error", "paths": [],
-        }
-        with connection:
-            connection.execute("DROP TABLE block_notice_events")
-            connection.execute("DROP TABLE notified_block_incidents")
-            connection.execute(
-                "UPDATE projects SET planning_error = 'repeated error' WHERE repo = ?",
-                (repo,),
-            )
-            connection.execute(
-                "INSERT INTO notification_outbox "
-                "(event_key, repo, event_type, payload, sent_at, created_at) "
-                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP, '2000-01-01 00:00:00')",
-                (key, repo, json.dumps(payload)),
-            )
-            connection.execute(
-                "INSERT INTO agent_invocations "
-                "(invocation_id, repo, role, provider, model, effort, transition, "
-                "attempt, started_at) VALUES "
-                "('later-planner', ?, 'planner', 'codex', 'model', 'high', "
-                "'start', 1, '2000-01-02T00:00:00+00:00')",
-                (repo,),
-            )
-        with connection:
-            notifications.enqueue_current_project_events(connection, repo)
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
-        ).fetchone()[0], 2)
-        loop_manager.update_project(connection, repo, planning_error=None)
-        with connection:
-            self.assertEqual(notifications.record_work_start(
-                connection, repo, "Planner",
-            ), 0)
 
     def test_legacy_partial_project_notice_cancels_remaining_piece_on_release(self):
         connection = self.connection()
@@ -881,6 +391,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 (old_key, repo, json.dumps(payload)),
             )
         with connection:
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
             scoped_blocking.clear_plan_block(connection, repo, "G-018")
             self.assertEqual(notifications.record_work_start(
@@ -904,6 +415,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                     "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'Decision pending')",
                     (repo,),
                 )
+                self.confirm_worker_question(connection)
                 notifications.enqueue_current_project_events(connection, repo)
 
         block()
@@ -944,6 +456,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'G-018', 'plan', 'user_decision_required', ?)",
                 (repo, "x" * 9000),
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         sent = []
 
@@ -987,6 +500,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'project', 'repository_state_unsafe', 'unsafe worktree')",
                 (repo,),
             )
+            self.legacy_project_notice(connection)
             notifications.enqueue_current_project_events(connection, repo)
         notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
         with connection:
@@ -994,7 +508,8 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(notifications.record_work_start(
                 connection, repo, "Planner",
             ), 1)
-        loop_manager.update_project(connection, repo, planning_error="invalid plan")
+        with connection:
+            self.legacy_planning_notice(connection, "invalid plan", confirmed=1, sent=True)
         notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
         loop_manager.update_project(connection, repo, planning_error=None)
         with connection:
@@ -1020,6 +535,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'decision')",
                 (repo,),
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
             scoped_blocking.clear_plan_block(connection, repo, "G-018")
             self.assertEqual(notifications.record_work_start(
@@ -1036,6 +552,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'decision')",
                 (repo,),
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
         with connection:
@@ -1068,6 +585,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'original cause')",
                 (repo,),
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         notifications.dispatch_pending(
             connection, "token", "chat", adapter=mock.Mock(),
@@ -1089,6 +607,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'new cause')",
                 (repo,),
             )
+            self.confirm_worker_question(restarted)
             notifications.enqueue_current_project_events(restarted, repo)
             scoped_blocking.clear_plan_block(restarted, repo, "G-018")
             self.assertEqual(notifications.record_work_start(
@@ -1115,6 +634,10 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'G-018', 'plan', 'pull_request_closed', 'PR closed')",
                 (repo,),
             )
+            connection.execute("UPDATE exec_plans SET pr_url='https://example.test/pr/18'")
+            scoped_blocking.record_plan_block(connection, repo, 'G-018', scoped_blocking.BlockReasonCode.PULL_REQUEST_CLOSED, 'PR closed', 'closed-head')
+            checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            checkpoints.finish_unpublished(checkpoints.get(repo, 'G-018'), 'local-only', retryable=False)
             notifications.enqueue_current_project_events(connection, repo)
         notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
         plan = connection.execute(
@@ -1145,6 +668,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'decision')",
                 (repo,),
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
 
         def release_during_send(_token, _chat, _text):
@@ -1172,6 +696,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'first cause')",
                 (repo,),
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
         with connection:
@@ -1180,6 +705,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "evidence = 'updated cause' WHERE repo = ? AND plan_id = 'G-018'",
                 (repo,),
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
         with connection:
@@ -1205,6 +731,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'first cause')",
                 (repo,),
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
 
         def update_during_send(_token, _chat, _text):
@@ -1214,6 +741,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                     "evidence = 'later cause' WHERE repo = ? AND plan_id = 'G-018'",
                     (repo,),
                 )
+                self.confirm_worker_question(connection)
                 notifications.enqueue_current_project_events(connection, repo)
 
         notifications.dispatch_pending(
@@ -1239,6 +767,7 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
         with connection:
             connection.execute("INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
                                "VALUES (?, 'project', 'repository_state_unsafe', 'unsafe')", (repo,))
+            self.legacy_project_notice(connection)
             notifications.enqueue_current_project_events(connection, repo)
         notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock())
         with connection:
@@ -1254,7 +783,8 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
     def test_unsent_planner_start_keeps_new_episode_without_generic_notice(self):
         connection = self.connection()
         repo = '/projects/alpha'
-        loop_manager.update_project(connection, repo, planning_error='same cause')
+        with connection:
+            self.legacy_planning_notice(connection, 'same cause')
         loop_manager.update_project(connection, repo, planning_error=None)
         with connection:
             notifications.record_process_start(connection, repo, 'planner', 'planner-start')
@@ -1262,7 +792,7 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
         loop_manager.update_project(connection, repo, planning_error='same cause')
         self.assertEqual(connection.execute(
             "SELECT COUNT(*) FROM notified_block_incidents WHERE subject = 'planning'"
-        ).fetchone()[0], 2)
+        ).fetchone()[0], 1)
         self.assertFalse(any(row['event_type'] in {'work_started', 'resumed'} for row in self.events(connection)))
 
     def test_unsent_released_block_does_not_suppress_physical_starts(self):
@@ -1273,6 +803,7 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
                 with connection:
                     connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
                                        "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+                    self.confirm_worker_question(connection)
                     notifications.enqueue_current_project_events(connection, repo)
                 if failed_send:
                     notifications.dispatch_pending(connection, 'token', 'chat',
@@ -1295,6 +826,7 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
         with connection:
             connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
                                "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         def failed_send(_token, _chat, _text):
             with connection:
@@ -1323,7 +855,8 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
                 with connection:
                     connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
                                        "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'original cause')", (repo,))
-                    connection.execute("UPDATE projects SET planning_error = 'independent planning error' WHERE repo = ?", (repo,))
+                    self.legacy_planning_notice(connection, 'independent planning error')
+                    self.confirm_worker_question(connection)
                     notifications.enqueue_current_project_events(connection, repo)
                 notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock())
                 planning = dict(connection.execute("SELECT * FROM notified_block_incidents WHERE subject = 'planning'").fetchone())
@@ -1357,6 +890,7 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
             connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
                                "VALUES (?, 'G-018', 'plan', 'user_decision_required', ?)", (repo, 'x' * 5000))
             connection.execute("UPDATE projects SET planning_error = 'preserved error' WHERE repo = ?", (repo,))
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         def start_during_send(_token, _chat, _text):
             if "BLOCKED" not in _text or "작업: plan: G-018" not in _text:
@@ -1389,6 +923,7 @@ class UnsentBlockStartTest(NotificationFixture, unittest.TestCase):
         repo = '/projects/alpha'
         with connection:
             connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         def resume_then_fail(*_args):
             with connection:
@@ -1410,6 +945,7 @@ class UnsentBlockStartTest(NotificationFixture, unittest.TestCase):
                 repo = '/projects/alpha'
                 with connection:
                     connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+                    self.confirm_worker_question(connection)
                     notifications.enqueue_current_project_events(connection, repo)
                 if attempted:
                     notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock(side_effect=OSError('offline')))
@@ -1429,6 +965,7 @@ class UnsentBlockStartTest(NotificationFixture, unittest.TestCase):
         repo = '/projects/alpha'
         with connection:
             connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         def start_then_fail(*_args):
             with connection:
@@ -1447,3 +984,85 @@ class UnsentBlockStartTest(NotificationFixture, unittest.TestCase):
         self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
 
         self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
+
+
+class LegacyPlanningPolicyTest(NotificationFixture, unittest.TestCase):
+    def test_saved_notices_keep_audit_through_restart_and_changed_or_cleared_cause(self):
+        for cursor, sent in ((0, False), (1, False), (1, True), (0, True)):
+            for cause in ('old planning error', 'new planning error', None):
+                with self.subTest(cursor=cursor, sent=sent, cause=cause), tempfile.TemporaryDirectory() as directory:
+                    database = Path(directory) / 'state.db'
+                    connection = self.connection(database=database)
+                    try:
+                        with connection:
+                            self.legacy_planning_notice(connection, confirmed=cursor, sent=sent)
+                            connection.execute("UPDATE notification_outbox SET rendered_text=?, attempts=2, last_error='saved error', delivery_started_at=CURRENT_TIMESTAMP", ('frozen text ' * 500,))
+                        before = dict(self.events(connection)[0])
+                        loop_manager.update_project(connection, '/projects/alpha', planning_error=cause)
+                        with connection:
+                            notifications.record_process_start(connection, '/projects/alpha', 'planner', 'physical-start')
+                            notifications.recover_interrupted_starts(connection)
+                    finally:
+                        connection.close()
+                    restarted = sqlite3.connect(database)
+                    restarted.row_factory = sqlite3.Row
+                    try:
+                        notifications.configure_session(restarted, enabled=True)
+                        for _ in range(2):
+                            with restarted:
+                                notifications.enqueue_current_project_events(restarted, '/projects/alpha')
+                                notifications.recover_interrupted_starts(restarted)
+                        adapter = mock.Mock()
+                        self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=adapter), 0)
+                        adapter.assert_not_called()
+                        after = dict(self.events(restarted)[0])
+                        self.assertEqual(len(self.events(restarted)), 1)
+                        for field in before.keys() - {'canceled_at', 'delivery_started_at'}:
+                            self.assertEqual(after[field], before[field], field)
+                        if not sent:
+                            self.assertIsNotNone(after['canceled_at'])
+                        self.assertEqual(restarted.execute('SELECT planning_error FROM projects').fetchone()[0], cause)
+                        incident = restarted.execute('SELECT * FROM notified_block_incidents').fetchone()
+                        self.assertEqual(json.loads(incident['payload'])['cause'], 'old planning error')
+                        if cause is None:
+                            self.assertEqual(incident['start_identity'], 'physical-start')
+                            self.assertIsNotNone(incident['started_at'])
+                        else:
+                            self.assertIsNone(incident['started_at'])
+                    finally:
+                        restarted.close()
+
+    def test_duplicate_history_keeps_first_confirmation_and_never_reactivates_on_projection(self):
+        for released in (False, True):
+            connection = self.connection()
+            repo = '/projects/alpha'
+            with self.subTest(released=released), connection:
+                key = self.legacy_planning_notice(connection, confirmed=1)
+                first = connection.execute('SELECT * FROM notified_block_incidents').fetchone()
+                duplicate = key + ':duplicate'
+                connection.execute('INSERT INTO notification_outbox (event_key, repo, event_type, payload) VALUES (?, ?, \'blocked\', ?)',
+                                   (duplicate, repo, first['payload']))
+                cursor = connection.execute('INSERT INTO notified_block_incidents (repo, subject, block_key, event_key, payload) VALUES (?, \'planning\', ?, ?, ?)',
+                                   (repo, first['block_key'], duplicate, first['payload']))
+                connection.execute('INSERT INTO block_notice_events VALUES (?, ?)', (duplicate, cursor.lastrowid))
+                connection.execute('UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP, rendered_text=?, last_error=\'prior error\', attempts=2', ('frozen ' * 900,))
+                if released:
+                    connection.execute('UPDATE notified_block_incidents SET released_at=CURRENT_TIMESTAMP')
+                before = [dict(row) for row in self.events(connection)]
+                prior = [dict(row) for row in connection.execute('SELECT * FROM notified_block_incidents ORDER BY id')]
+                for _ in range(2):
+                    notifications.enqueue_current_project_events(connection, repo)
+                self.assertEqual([dict(row) for row in self.events(connection)], before)
+                self.assertEqual([dict(row) for row in connection.execute('SELECT * FROM notified_block_incidents ORDER BY id')], prior)
+            loop_manager.update_project(connection, repo, planning_error=None)
+            with connection:
+                notifications.record_work_start(connection, repo, 'Planner', start_identity='planner')
+                notifications.recover_interrupted_starts(connection)
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM notified_block_incidents WHERE released_at IS NULL').fetchone()[0], 0)
+            self.assertEqual(len(self.events(connection)), 2)
+            for old, row in zip(before, self.events(connection)):
+                for field in old.keys() - {'delivery_started_at'}:
+                    self.assertEqual(row[field], old[field], field)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed','work_started')").fetchone()[0], 0)
+            confirmed = connection.execute('SELECT MAX(confirmed_before) FROM notified_block_incidents').fetchone()[0]
+            self.assertEqual(confirmed, 1)

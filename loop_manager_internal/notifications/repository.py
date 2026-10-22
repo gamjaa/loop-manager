@@ -265,17 +265,23 @@ def _planner_started_after_notice(
     ).fetchone() is not None
 
 
-def configure_session(connection: sqlite3.Connection, *, enabled: bool) -> None:
-    """Store only a connection-local enabled bit, never credentials."""
+def configure_session(connection: sqlite3.Connection, *, enabled: bool,
+                      verify_timeout_seconds: int | None = None) -> None:
+    """Bind non-secret notification settings to this connection, never credentials."""
 
+    if type(verify_timeout_seconds) is not int or verify_timeout_seconds <= 0:
+        verify_timeout_seconds = None
     connection.execute(
         "CREATE TEMP TABLE IF NOT EXISTS notification_session "
-        "(enabled INTEGER NOT NULL)"
+        "(enabled INTEGER NOT NULL, verify_timeout_seconds INTEGER)"
     )
+    columns = {str(row[1]) for row in connection.execute('PRAGMA table_info(notification_session)')}
+    if 'verify_timeout_seconds' not in columns:
+        connection.execute('ALTER TABLE notification_session ADD COLUMN verify_timeout_seconds INTEGER')
     connection.execute("DELETE FROM notification_session")
     connection.execute(
-        "INSERT INTO notification_session (enabled) VALUES (?)",
-        (int(enabled),),
+        "INSERT INTO notification_session (enabled, verify_timeout_seconds) VALUES (?, ?)",
+        (int(enabled), verify_timeout_seconds),
     )
 
 

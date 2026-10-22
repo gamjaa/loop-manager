@@ -20,7 +20,7 @@ priority: high
 
 Telegram 생성과 조각 전송을 현재 필요한 사용자 행동 또는 실제 자동 복구 불가 최종 중단으로 제한한다. 기존 G-226의 유지보수 시작·종료 무통지를 포함해 공통 판정과 오래된 큐 정리를 이 작업이 맡고, PR 검토 후보 identity는 G-247, draft 질문·링크 중복 방지는 G-294, 전체 후속 소비 감사는 G-189가 맡는다.
 
-현재 `notifications/events.py`는 계획·시작·완료·대기와 상태 코드 기반 blocked 사건을 생성한다. `incidents.py`의 시작/재개 및 전송 확인 후 재개 생성도 남아 있다. `delivery.py`는 지속 실행 실패·targeted 실패 등 일부 사건만 취소하며 일반 진행 사건과 복구 가능한 blocked를 공통으로 배제하지 않는다. 기존 outbox·부분 전송·감사와 운영 상태를 재사용한다.
+구현은 `notifications/policy.py`의 공통 현재성 판정을 생성과 각 조각 claim에 연결한다. 진행·완료·대기·시작/재개 생성과 취소 사건 복원을 제거하고, 기존 outbox·부분 전송·감사와 알림에 독립적인 운영 상태를 보존한다. PR 검토 후보와 draft 세부 identity 확장은 위 후속 작업의 범위를 유지한다.
 
 ## Acceptance Criteria
 
@@ -32,10 +32,10 @@ Telegram 생성과 조각 전송을 현재 필요한 사용자 행동 또는 실
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/notifications/events.py`·`repository.py`의 사건 선택과 `recovery/recovery_runtime.py`·`recovery/project_blocked_recovery.py`의 실제 원인/남은 복구 상태를 대조한다. 현재 사용자 행동의 구체적 근거를 기존 사건 payload/원인에 연결하고 status나 FINAL_BLOCK 이름만으로 판정하는 분기를 교정한다. 실행 복구 정책 자체는 G-313/G-189와 중복 구현하지 않는다.
-- [ ] 확인한 `notifications/delivery.py:_claim_piece()`와 `_deliver_rows()`의 조각별 현재 판정·취소/confirm 경계에 공통 정책을 적용한다. `dispatch_pending`·새 PR 즉시 전송·오류 재시도 모두 같은 기준을 거치게 하고 전송 중 해소/취소와 확인 callback의 경합에도 이미 전송한 기록을 보존한다.
-- [ ] 확인한 `notifications/incidents.py`의 `record_work_start`·`recover_interrupted_starts`·`_materialize_resumption`, `events.py`의 `record_process_start`·`record_planning_publication`·`enqueue_completion_if_ready`·`enqueue_waiting_reason`, `storage/maintenance_state.py`의 cycle 사건을 교정한다. Telegram enqueue만 제거하고 실제 시작·대기 episode·완료 및 cycle 범위/선행/Merge/종료 상태와 감사는 유지한다. 과거 outbox 조회로 통지 여부를 결정하던 경로도 새 사건을 재생성하지 않게 한다.
-- [ ] 확인한 `notifications/work_exhaustion.py`·`rendering.py`와 `tests/support/notification.py`의 기존 원인 표현·fixture를 재사용한다. 사용자의 실제 다음 행동과 근거를 정확히 표시하며 추정 권한 요청·가짜 해결 안내를 만들지 않는다. PRODUCT·ARCHITECTURE의 소유 알림 절에 구현한 생성/전송 계약만 통합한다.
+- [x] 확인한 `loop_manager_internal/notifications/events.py`·`repository.py`의 사건 선택과 `recovery/recovery_runtime.py`·`recovery/project_blocked_recovery.py`의 실제 원인/남은 복구 상태를 대조한다. 현재 사용자 행동의 구체적 근거를 기존 사건 payload/원인에 연결하고 status나 FINAL_BLOCK 이름만으로 판정하는 분기를 교정한다. 실행 복구 정책 자체는 G-313/G-189와 중복 구현하지 않는다.
+- [x] 확인한 `notifications/delivery.py:_claim_piece()`와 `_deliver_rows()`의 조각별 현재 판정·취소/confirm 경계에 공통 정책을 적용한다. `dispatch_pending`·새 PR 즉시 전송·오류 재시도 모두 같은 기준을 거치게 하고 전송 중 해소/취소와 확인 callback의 경합에도 이미 전송한 기록을 보존한다.
+- [x] 확인한 `notifications/incidents.py`의 `record_work_start`·`recover_interrupted_starts`·`_materialize_resumption`, `events.py`의 `record_process_start`·`record_planning_publication`·`enqueue_completion_if_ready`·`enqueue_waiting_reason`, `storage/maintenance_state.py`의 cycle 사건을 교정한다. Telegram enqueue만 제거하고 실제 시작·대기 episode·완료 및 cycle 범위/선행/Merge/종료 상태와 감사는 유지한다. 과거 outbox 조회로 통지 여부를 결정하던 경로도 새 사건을 재생성하지 않게 한다.
+- [x] 확인한 `notifications/work_exhaustion.py`·`rendering.py`와 `tests/support/notification.py`의 기존 원인 표현·fixture를 재사용한다. 사용자의 실제 다음 행동과 근거를 정확히 표시하며 추정 권한 요청·가짜 해결 안내를 만들지 않는다. PRODUCT·ARCHITECTURE의 소유 알림 절에 구현한 생성/전송 계약만 통합한다.
 
 ## Validation
 
@@ -49,8 +49,8 @@ Telegram 생성과 조각 전송을 현재 필요한 사용자 행동 또는 실
 
 - [x] 2026-10-08 기준 0e887794의 R-053·R-074, cycle 사건 작성·selection·종료·rendering과 신규 유지보수 알림 테스트를 정적으로 대조했다. 현재 payload/rendering의 범위 누락을 확인했으며 구현·테스트 실행은 하지 않았다.
 - [x] revision `4aafffa5b3af1b3a378a93750c7d86292891b5df`의 활성 명세 전문과 생성·incident·delivery/maintenance 경로를 정적으로 대조했다. 기존 유지보수 범위 표시 대신 현행 무통지와 공통 조치 판정의 남은 작업을 확정했다. 실행 검증은 하지 않았다.
-- [ ] 공통 생성/조각 전송 판정과 구정책 큐·callback 정리
-- [ ] 운영 상태/감사 보존과 최소 targeted 회귀
+- [x] 공통 생성/조각 전송 판정과 구정책 큐·callback 정리
+- [x] 운영 상태/감사 보존과 최소 targeted 회귀
 
 ### 구정책 조각 전송 정리 checkpoint
 
@@ -119,9 +119,44 @@ PRODUCT의 완료·대기와 Telegram 절, ARCHITECTURE의 완료 저장·Telegr
 
 남은 작업은 기존 notification events/delivery/incidents 테스트의 상태명-only/일반 planning_error 생성 fixture와 assertion을 현행 구체적 조치·legacy 감사 fixture로 전환하고 필요한 최소 회귀를 실행하는 것이다. 해당 기존 모듈 전체는 이번 호출에서 실행하지 않았으며 통과로 간주하지 않는다. 조치가 없는 실제 복구 불가 중단을 확정하는 근거 경로와 1회 통지 검증도 아직 확인하지 않았다. 현재 저장된 일반 final disposition만으로는 이를 증명하지 못하므로 보류하며 가짜 사용자 행동이나 복구 불가 선언을 만들지 않는다. 최종 원인별 정책·외부 관측/현재 설정 연결의 충분성을 점검하고 문서·최종 diff 보고를 통합해야 한다. 이번 결과는 구현 완료 후보가 아닌 보존점이다.
 
+### 최종 구현 후보와 targeted 검증
+
+실제 Worker 질문·명세 교착·지침 승인·PR 재개·게시 branch 재시작·현재 verify 상한 조치를 기존 원본에 연결했다. 상한은 scheduler·recover·독립 task 연결이 전달한 현재 비밀값 없는 TEMP 설정과 대조하며, 미확인/변경 값에서는 과거 요청을 취소한다. 복구 소유자가 `RecoveryObservation.unavailable_recovery_routes`로 재관측·재시도·교정·조건 대기·다음 실행·안전 복구 각각의 불가 근거를 명시할 수 있게 했다. 기존 final 분류·실패 횟수로 이 근거를 합성하지 않고 필드가 없는 기존 기록은 보류한다. 실제 SQLite에서 완전한 근거가 있는 프로젝트 최종 중단 1회 전송과 retry/next_run 근거 누락 시 0회 전송을 확인했다. 조치 없는 중단에는 가짜 사용자 질문을 만들지 않는다. 복구 정책·예산·DB schema와 외부 실행은 변경하지 않았다.
+
+첫 확인 incident 원문을 보존한 채 질문이 바뀌는 경우의 중복 판정은 현재 outbox payload를 사용한다. 재투영·전송 후에도 새 질문을 다시 생성하지 않으며 첫 통지 원문은 유지한다. PRODUCT의 목표·불변식·완료/대기·Telegram 절과 ARCHITECTURE의 완료 저장·공통 판정·선택적 근거/설정·전송/시작 계약을 구현과 대조했다.
+
+일반 planning_error 통지 생성·재활성화만 요구하던 10개 테스트는 제거하고 `LegacyPlanningPolicyTest` 두 case로 통합했다. 기존 planning notice를 명시적으로 seed해 미전송/부분 전송/이미 전송, 같은·변경·해소된 원인, 실제 SQLite 재연결, 중복 active/released incident·첫 확인 원문·실제 Planner 시작을 검사한다. payload·frozen text·cursor·시각·attempt/error·취소/확인 감사 assertion은 유지한다. 삭제 대상은 `test_inflight_planning_piece_confirmed_after_start_still_resumes`, `test_released_partial_planning_notice_retries_original_remaining_piece`, `test_same_second_planner_start_closes_unsent_planning_episode`, `test_released_planning_duplicates_keep_delivered_notice_not_unsent_latest`, `test_release_of_duplicate_active_planning_incidents_resumes_once`, `test_planning_incident_survives_database_reopen_and_repeated_observation`, `test_historical_planning_duplicates_keep_one_incident_until_real_restart`, `test_prior_planning_notice_does_not_notify_new_error_with_reused_key`, `test_unsent_legacy_planning_notice_is_canceled_before_new_error_dispatch`, `test_identical_planning_error_after_later_planner_start_is_new_incident`이다. 일반 project safety 알림을 요구하던 테스트는 통지 0건과 실제 diagnostic ref/OID/local-only 이유·worktree 보존 검사로 전환했다. 전송·incident의 유효 조치 fixture는 실제 Worker 결과 파서와 recovery/block/checkpoint 저장소를 사용하며 PR·draft 역시 현재 관측을 설정한다. 고정 본문 재시도는 identity를 유지한 표시 변경으로 검증한다. 관계가 없어진 import도 제거했다.
+
+이번 호출의 실행 기록(모두 공통 targeted runner 사용):
+
+- FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_events tests.test_notification_delivery tests.test_notification_incidents > /tmp/g226-notification-regressions.log 2>&1`
+- 원인/수정: 초기 123개에서 폐기된 정책/fixture 기대 failures 27·errors 23. 위 fixture 전환과 legacy 통합 뒤.
+- RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_events tests.test_notification_delivery tests.test_notification_incidents > /tmp/g226-notification-regressions.log 2>&1`
+- 재실행 결과: 116개 통과.
+- FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_events tests.test_notification_delivery.SegmentedDeliveryTest tests.test_notification_delivery.InterruptedBlockStartupTest tests.test_notification_incidents.LegacyPlanningPolicyTest > /tmp/g226-migrated-fixtures.log 2>&1`
+- 원인/수정: 53개에서 failure 1·error 1: frozen payload의 identity 삭제와 게시 전 질문 근거 누락을 수정한 뒤.
+- RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_events tests.test_notification_delivery.SegmentedDeliveryTest tests.test_notification_delivery.InterruptedBlockStartupTest tests.test_notification_incidents.LegacyPlanningPolicyTest > /tmp/g226-migrated-fixtures.log 2>&1`
+- 재실행 결과: 53개 통과.
+- FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_explicit_route_assessment_allows_unrecoverable_stop_without_fake_user_action tests.test_notification_incidents > /tmp/g226-incidents-migrated.log 2>&1`
+- 원인/수정: 31개에서 failures 4·errors 2: 남은 legacy/질문/PR 관측 fixture 및 내부 key import를 수정한 뒤.
+- RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_explicit_route_assessment_allows_unrecoverable_stop_without_fake_user_action tests.test_notification_incidents > /tmp/g226-incidents-migrated.log 2>&1`
+- 재실행 결과: 31개 통과.
+- FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_current_limit_change_or_missing_settings_cancel_old_configuration_action tests.test_notification_delivery.CurrentActionPolicyTest.test_closed_pr_and_recorded_verify_limit_expose_only_their_current_action tests.test_notification_delivery.NotificationDeliveryTest.test_registered_project_wires_immediate_delivery_after_commit tests.test_notification_delivery.NotificationDeliveryTest.test_scheduler_retries_pending_when_project_processing_is_skipped`
+- 원인/수정: 4개에서 failure 1: Mock 설정값이 SQLite에 전달돼 scheduler dispatch가 생략됨. 세션 경계에서 양의 정수 외에는 미확인 NULL로 정규화한 뒤.
+- RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_current_limit_change_or_missing_settings_cancel_old_configuration_action tests.test_notification_delivery.CurrentActionPolicyTest.test_closed_pr_and_recorded_verify_limit_expose_only_their_current_action tests.test_notification_delivery.NotificationDeliveryTest.test_registered_project_wires_immediate_delivery_after_commit tests.test_notification_delivery.NotificationDeliveryTest.test_scheduler_retries_pending_when_project_processing_is_skipped`
+- 재실행 결과: 4개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_work_cycles`: 8개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_task_scheduling.TaskSchedulingTests.test_project_dispatch_overlaps_independent_workers_and_keeps_verify_serial tests.test_task_scheduling.TaskSchedulingTests.test_independent_block_rechecks_use_target_ownership_and_one_recovery_lease`: 독립 실행/차단 재검사 연결의 2개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest tests.test_local_environment_recovery.LocalEnvironmentRecoveryCommandTests.test_recovery_run_reaches_timeout_recheck_without_pr_sync`: 최종 조치 정책 13개와 recover 경로 1개, 총 14개 통과. 첫 확인 후 질문 교체 중복 제거도 포함한다.
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_incidents > /tmp/g226-final-incidents.log 2>&1`: 현재 outbox 기반 중복 판정 변경 뒤 incident/legacy/시작·확인 경합 30개 통과.
+- 최종 `git diff --check` 통과.
+
+앞선 checkpoint의 유지보수 cycle/실제 Merge/완료 시각 검증은 유지한다. 전체 suite·integration·전체 verify는 Worker에서 실행하지 않았다. `scripts/verify-inputs.json`의 기존 입력 glob이 변경 코드·테스트·문서를 포함한다. Manager의 전체 verify·독립 Review·사용자 Merge가 남아 있으며 이 기록은 구현 완료 후보의 targeted 검증만 뜻한다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.
 - G-247/G-294는 이 공통 경계를 선행으로 소비한다. G-189에 중복된 공통 구현은 후속 감사로 정리하며 새 알림 엔진·설정·제품 목표는 추가하지 않는다. 과거 G-221 정리와 G-225의 별도 Planner 목표를 복원하지 않는다.
 - complexity high(최초 level 5): 사건 생성·부분 전송·확인 후 callback·재시작을 같은 현재 조치에 연결해야 한다. risk medium: 중복/누락 통지가 사용자 판단을 지연할 수 있으므로 원문·cursor·attempt/취소 감사와 조각별 재검사를 유지한다. priority high는 최신 알림 정책의 공통 선행이기 때문이다. Model·Effort는 Manager 설정을 따른다.
-- 이번 결과는 full planning의 미충족 작업 구성이다. 구현·테스트·전체 verify 성공, 사용자 승인·Merge 또는 프로젝트 최종 완료를 기록하지 않는다.
+- 계획 수립 당시 결과는 full planning의 미충족 작업 구성이었으며 구현·검증 완료를 선언하지 않았다. 아래 구현 기록은 Worker targeted 결과이며 전체 verify·Review·사용자 Merge 또는 프로젝트 최종 완료를 대신하지 않는다.

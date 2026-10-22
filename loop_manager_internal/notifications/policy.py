@@ -28,12 +28,14 @@ def _block_action(connection, repo, payload):
         return None
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                               (repo, plan_id)).fetchone()
-    if plan is None or plan['status'] == 'MERGED':
+    if (plan is None and scope == 'plan') or (plan is not None and plan['status'] == 'MERGED'):
         return None
-    sources = json.loads(plan['sources'])
+    sources = json.loads(plan['sources']) if plan is not None else []
     if not isinstance(sources, list) or not all(isinstance(item, str) for item in sources):
         return None
-    allowed = {plan['path'], *sources, 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'}
+    allowed = {*sources, 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'}
+    if plan is not None:
+        allowed.add(plan['path'])
     recovery_exists = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone()
     recovery = (connection.execute(
@@ -51,12 +53,12 @@ def _block_action(connection, repo, payload):
                 or evidence.get('reason_code') != recovery['reason_code']
                 or evidence.get('unresolved') != block[1]):
             return None
-        revision = plan['current_revision_sha'] or plan['plan_sha']
+        revision = (plan['current_revision_sha'] or plan['plan_sha']) if plan is not None else None
         if revision and recovery['plan_revision'] and revision != recovery['plan_revision']:
             return None
     reason = block[0]
     action = None
-    if (reason == 'user_decision_required' and evidence is not None
+    if (plan is not None and reason == 'user_decision_required' and evidence is not None
             and recovery['reason_code'] == 'user_decision'):
         decision = evidence.get('worker_decision')
         if (isinstance(decision, dict) and decision.get('kind') == 'needs_user_decision'
@@ -68,7 +70,7 @@ def _block_action(connection, repo, payload):
                         for item in decision['locations'])
                 and payload.get('worker_decision', decision) == decision):
             action = {'kind': 'decision', 'decision': decision}
-    elif reason == 'review_specification_deadlock':
+    elif plan is not None and reason == 'review_specification_deadlock':
         deadlock = reviewer_specification.parse_evidence(block[1])
         reviewer_specification.validate_locations(deadlock, plan['path'], tuple(sources))
         decision = {'kind': deadlock.kind, 'question': deadlock.question,
@@ -77,18 +79,18 @@ def _block_action(connection, repo, payload):
         if payload.get('specification_deadlock', decision) != decision:
             return None
         action = {'kind': 'specification', 'decision': decision}
-    elif reason == 'guidance_approval_required':
+    elif plan is not None and reason == 'guidance_approval_required':
         rows = connection.execute(
             "SELECT proposal_id, proposal_hash, target_path, proposal_line, decision_line "
             "FROM guidance_approvals WHERE repo=? AND plan_id=? AND applied=0 "
             "AND decision='pending' ORDER BY sequence, proposal_id", (repo, plan_id)).fetchall()
         if rows and all(row[0] and row[1] and row[3] > 0 and row[4] > 0 for row in rows):
             action = {'kind': 'guidance', 'proposals': [list(row) for row in rows]}
-    elif recovery is not None and reason == 'pull_request_closed':
+    elif plan is not None and recovery is not None and reason == 'pull_request_closed':
         if (recovery['reason_code'] == 'pull_request_closed' and plan['pr_url']
                 and plan['status'] == 'PLAN_BLOCKED' and plan['blocked_reason'] == reason):
             action = {'kind': 'reopen_pr', 'pr_url': plan['pr_url']}
-    elif recovery is not None and reason == 'remote_branch_deleted':
+    elif plan is not None and recovery is not None and reason == 'remote_branch_deleted':
         from loop_manager_internal.recovery.work_branch_integration import published_branch
         saved = connection.execute('SELECT snapshot FROM execution_checkpoints WHERE repo=? AND plan_id=?',
                                    (repo, plan_id)).fetchone()
@@ -106,12 +108,23 @@ def _block_action(connection, repo, payload):
                 and published_branch(connection, repo, plan)
                 and not consumed):
             action = {'kind': 'restart', 'branch': plan['branch']}
-    elif recovery is not None and reason == 'verify_timeout_limit_insufficient':
+    elif plan is not None and recovery is not None and reason == 'verify_timeout_limit_insufficient':
         limit = str(block[2] or '')
-        if (recovery['reason_code'] == reason and limit.isascii() and limit.isdecimal()
-                and int(limit) > 0 and plan['verify_result']
+        configured = None
+        if any(row[1] == 'verify_timeout_seconds' for row in connection.execute('PRAGMA table_info(notification_session)')):
+            current = connection.execute('SELECT verify_timeout_seconds FROM notification_session LIMIT 1').fetchone()
+            configured = current[0] if current else None
+        if (type(configured) is int and configured > 0
+                and recovery['reason_code'] == reason and limit.isascii() and limit.isdecimal()
+                and 0 < int(limit) == configured and plan['verify_result']
                 and f'verify_timeout_seconds={limit}' in plan['verify_result']):
             action = {'kind': 'verify_timeout', 'seconds': int(limit)}
+    elif evidence is not None and not evidence.get('user_targets') and not evidence.get('worker_decision'):
+        routes = evidence.get('unavailable_recovery_routes')
+        if (isinstance(routes, dict) and set(routes) == {
+                'reobservation', 'retry', 'correction', 'condition_wait', 'next_run', 'safe_recovery'}
+                and all(isinstance(value, str) and value.strip() for value in routes.values())):
+            action = {'kind': 'unrecoverable', 'recovery_identity': recovery['identity']}
     if payload.get('action', action) != action:
         return None
     return action
@@ -128,7 +141,8 @@ def is_current(connection, repo, kind, payload):
     """Shared creation/claim boundary; callers provide already recorded facts."""
     try:
         if kind == 'blocked':
-            return block_action(connection, repo, payload) is not None
+            action = block_action(connection, repo, payload)
+            return action is not None and (action['kind'] != 'unrecoverable' or payload.get('action') == action)
         if kind == 'pr_created':
             row = connection.execute('SELECT status, pr_url FROM exec_plans WHERE repo=? AND plan_id=?',
                                      (repo, payload.get('execplan_id'))).fetchone()

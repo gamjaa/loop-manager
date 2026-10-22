@@ -337,6 +337,7 @@ def recover_local_environment(
             ) from error
         notifications.configure_session(
             connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
+            verify_timeout_seconds=getattr(config, 'verify_timeout_seconds', None),
         )
         connection.commit()
         # Only request intake may overlap automatic execution. Commit its

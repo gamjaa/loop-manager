@@ -128,7 +128,9 @@ def _event_message(kind: str, payload: dict[str, object]) -> str:
         recovery = payload.get("recovery")
         action = ""
         current_action = payload.get('action') or {}
-        if current_action.get('kind') == 'restart':
+        if current_action.get('kind') == 'unrecoverable':
+            action = '자동 복구 불가: 확인된 자동 복구 경로가 남아 있지 않습니다.\n'
+        elif current_action.get('kind') == 'restart':
             action = "사용자 조치: 보존된 작업물을 확인하고 이 작업의 명시적 재시작을 요청해 주세요.\n"
         elif current_action.get('kind') == 'verify_timeout':
             action = ("사용자 조치: [loop] verify_timeout_seconds를 확인된 상한 "
@@ -145,6 +147,10 @@ def _event_message(kind: str, payload: dict[str, object]) -> str:
         if isinstance(recovery, dict):
             if recovery.get("recovery_disposition"):
                 recovery_text = "\nRecovery status: " + str(recovery["recovery_disposition"])
+            if current_action.get('kind') == 'unrecoverable':
+                recovery_text += '\n복구 불가 근거:' + ''.join(
+                    f'\n- {route}: {detail}'
+                    for route, detail in sorted(recovery['unavailable_recovery_routes'].items()))
             if recovery.get("unresolved"):
                 recovery_text += "\nUnresolved: " + str(recovery["unresolved"])
             counts = recovery.get("recovery_attempts")

@@ -458,6 +458,7 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
             "execplan_title": body, "pr_url": "https://example.test/pr/18",
             "occurred_at": "2000-01-01T00:00:00Z", "status": "PR Merge 대기", "silent": False,
         }
+        connection.execute("UPDATE exec_plans SET status='PR_OPEN', pr_url=? WHERE repo='/projects/alpha' AND plan_id='G-018'", (payload['pr_url'],))
         notifications._insert(connection, "test-event", "/projects/alpha", kind, payload)
         connection.commit()
         return notifications._message(kind, payload)
@@ -511,7 +512,7 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
                 self.assertNotIn(secret, row["last_error"])
             connection.execute(
                 "UPDATE notification_outbox SET payload = ? WHERE event_key = ?",
-                ('{"project":"changed"}', "test-event"),
+                (json.dumps({**json.loads(row['payload']), 'project': 'changed'}), "test-event"),
             )
             connection.commit()
             connection.close()
@@ -759,6 +760,7 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
             checkpoint.finish_unpublished(
                 checkpoint.get(repo, "G-018"), "local only", retryable=False,
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         calls = []
 
@@ -788,6 +790,7 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
                 scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
                 "Decision still required", "fingerprint",
             )
+            self.confirm_worker_question(connection)
         checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
         request = checkpoint.get(repo, "G-018")
         checkpoint.finish_published(request, "a" * 40)
@@ -814,9 +817,8 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
     def test_cleared_planning_error_cancels_only_its_unsent_notice(self):
         connection = self.connection()
         repo = "/projects/alpha"
-        loop_manager.update_project(
-            connection, repo, phase="PLANNING", planning_error="Old failure",
-        )
+        with connection:
+            self.legacy_planning_notice(connection, 'Old failure')
         pr_message = self.add_event(connection, body="Unrelated PR")
         connection.execute(
             "UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,),
@@ -893,6 +895,7 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
                 repo = '/projects/alpha'
                 with connection:
                     connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', ?)", (repo, 'x' * 6000))
+                    self.confirm_worker_question(connection)
                     notifications.enqueue_current_project_events(connection, repo)
                     if confirmed:
                         connection.execute("UPDATE notification_outbox SET confirmed_pieces=1")
@@ -942,6 +945,7 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
         repo = '/projects/alpha'
         with connection:
             connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         key = self.events(connection)[0]['event_key']
         delivery._claim_piece(connection, key, first_attempt_only=False)
@@ -1319,6 +1323,28 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
         self.assertNotIn('Choose permission A?', adapter.call_args.args[2])
         self.assertEqual(connection.execute('SELECT COUNT(*) FROM notified_block_incidents').fetchone()[0], 1)
 
+    def test_changed_question_after_confirmation_is_not_regenerated_from_first_incident_payload(self):
+        connection = self.connection()
+        with connection:
+            self.decision_block(connection, question='Choose permission A?',
+                                detail='permission choice', fingerprint='permission')
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        original = connection.execute('SELECT payload FROM notified_block_incidents').fetchone()[0]
+        with connection:
+            self.decision_block(connection, question='Choose permission B?',
+                                detail='permission choice', fingerprint='permission')
+            notifications.enqueue_current_project_events(connection, self.repo)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 2)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        with connection:
+            notifications.enqueue_current_project_events(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 2)
+        self.assertEqual(adapter.call_count, 2)
+        self.assertIn('Choose permission B?', adapter.call_args.args[2])
+        self.assertEqual(connection.execute('SELECT payload FROM notified_block_incidents').fetchone()[0], original)
+
     def test_old_planning_partial_queue_is_canceled_without_incident_reactivation(self):
         connection = self.connection()
         payload = {'project': 'alpha', 'stage': 'planning', 'scope': 'project',
@@ -1417,6 +1443,7 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
             with self.subTest(reason=reason):
                 connection = self.connection()
                 with connection:
+                    notifications.configure_session(connection, enabled=True, verify_timeout_seconds=90)
                     connection.execute("UPDATE exec_plans SET pr_url='https://example.test/pr/18', verify_result='전체 verify 시간 초과: verify_timeout_seconds=90'")
                     scoped_blocking.record_plan_block(connection, self.repo, 'G-018', reason,
                         'Observed native result requires this specific user action.', fingerprint)
@@ -1435,3 +1462,69 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                 else:
                     self.assertIn('다시 열어', adapter.call_args.args[2])
                 self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+
+    def test_explicit_route_assessment_allows_unrecoverable_stop_without_fake_user_action(self):
+        routes = {
+            'reobservation': 'The immutable source inventory has been rechecked; no source copy exists.',
+            'retry': 'The required original bytes are absent rather than temporarily unavailable.',
+            'correction': 'No valid input remains for a correction task.',
+            'condition_wait': 'There is no pending resource or condition that can restore those bytes.',
+            'next_run': 'The saved source inventory is permanent and unchanged by restarting.',
+            'safe_recovery': 'No owned checkpoint, backup or alternate source contains the original bytes.',
+        }
+        for missing in (None, 'retry', 'next_run'):
+            with self.subTest(missing=missing):
+                connection = self.connection()
+                facts = {key: value for key, value in routes.items() if key != missing}
+                with connection:
+                    record = RecoveryRepository(connection).observe(RecoveryObservation(
+                        RecoveryReason.STATE_UNSAFE, self.repo, None, 'PROJECT_BLOCKED', None, None,
+                        'confirmed-source-inventory', 'inventory-v1', 'Required original artifacts are unavailable.',
+                        unavailable_recovery_routes=facts), attempts=0 if missing is None else 50)
+                    scoped_blocking.record_project_block(connection, self.repo,
+                        scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                        record.decision.observation.detail, 'confirmed-source-inventory',
+                        plan_id=None, previous_phase=None, recovery_decision=record.decision)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                adapter = mock.Mock()
+                expected = 1 if missing is None else 0
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), expected)
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                if missing is None:
+                    adapter.assert_called_once()
+                    text = adapter.call_args.args[2]
+                    self.assertIn('자동 복구 불가', text)
+                    self.assertIn(routes['safe_recovery'], text)
+                    self.assertNotIn('사용자 조치', text)
+                    self.assertNotIn('Question:', text)
+                    self.assertEqual(len(self.events(connection)), 1)
+                else:
+                    adapter.assert_not_called()
+                    self.assertEqual(self.events(connection), [])
+                saved = connection.execute('SELECT final_evidence FROM recovery_records').fetchone()[0]
+                self.assertEqual(json.loads(saved)['unavailable_recovery_routes'], facts)
+                self.assertEqual(connection.execute('SELECT evidence FROM project_blocks').fetchone()[0], record.decision.observation.detail)
+
+    def test_current_limit_change_or_missing_settings_cancel_old_configuration_action(self):
+        for current_limit in (None, 120):
+            with self.subTest(current_limit=current_limit):
+                connection = self.connection()
+                with connection:
+                    notifications.configure_session(connection, enabled=True, verify_timeout_seconds=90)
+                    connection.execute("UPDATE exec_plans SET verify_result='전체 verify 시간 초과: verify_timeout_seconds=90'")
+                    scoped_blocking.record_plan_block(connection, self.repo, 'G-018',
+                        scoped_blocking.BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT, 'native timeout limit insufficient', '90')
+                    checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+                    checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+                original = dict(self.events(connection)[0])
+                with connection:
+                    notifications.configure_session(connection, enabled=True, verify_timeout_seconds=current_limit)
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                adapter.assert_not_called()
+                after = dict(self.events(connection)[0])
+                self.assertIsNotNone(after['canceled_at'])
+                for field in original.keys() - {'canceled_at', 'delivery_started_at'}:
+                    self.assertEqual(after[field], original[field], field)
+                self.assertEqual(connection.execute('SELECT release_fingerprint FROM execplan_blocks').fetchone()[0], '90')
