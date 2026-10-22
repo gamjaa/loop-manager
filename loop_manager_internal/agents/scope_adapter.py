@@ -388,13 +388,9 @@ def validate_worker_workspace_scope(
                                       + ', '.join(unsafe_index[:8]))
     if allow_rebase and connection is not None:
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
-        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, rebase_content_pending
+        from loop_manager_internal.git.managed_rebase_validation import ObservationFailure, RebaseStatus, rebase_content_pending
         from loop_manager_internal.execution.plan_validation import _current_execplan_metadata
         checkpoint = ExecutionCheckpointRepository(connection).get(str(repo_path), str(catalog_plan['plan_id']))
-        replay_pending = bool({'rebase-merge', 'rebase-apply'} & set(after.operations))
-        stash_pending = bool((checkpoint.snapshot or {}).get('stash_oid') and (
-            any(entry.split()[-1] != '0' for entries in after.index.values() for entry in entries)
-            or any('staged' in kinds for kinds, _signature in after.dirty.values())))
         if checkpoint.operation == 'rebase':
             from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
             owner_state = state_dir or effects._owned_rebase_state_dir(
@@ -410,6 +406,13 @@ def validate_worker_workspace_scope(
                 if isinstance(error, RecoveryFailure):
                     raise
                 raise WorkspaceOwnershipError(f'현재 관리 rebase를 수용할 수 없습니다: {error}') from error
+            if isinstance(observed, ObservationFailure):
+                raise WorkspaceOwnershipError(
+                    f'현재 관리 rebase를 관측할 수 없습니다: {decision.reason}: '
+                    f'{observed.area}: {observed.detail}')
+            if decision.status is RebaseStatus.UNAVAILABLE:
+                raise WorkspaceOwnershipError(
+                    f'현재 관리 rebase를 관측할 수 없습니다: {decision.reason}')
             if decision.status is RebaseStatus.START:
                 raise WorkspaceOwnershipError('완료된 Worker 결과에 현재 관리 rebase 시작 상태가 남아 있습니다.')
             content_pending = rebase_content_pending(service.expected, observed)
