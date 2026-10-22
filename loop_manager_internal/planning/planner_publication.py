@@ -631,10 +631,15 @@ def _apply_general_planning_batch(
             content_hash=lambda path: effects.file_hash(worktree / path),
             draft_inputs=lambda plan: execplan_drafts.input_digests(worktree, plan),
         )
-        effects._register_execplan_rows(
-            connection, repo, worktree, list(result.plans), plan_commit,
-            allow_legacy_priority=allow_legacy_priority,
-        )
+        if allow_legacy_priority:
+            effects._register_execplan_rows(
+                connection, repo, worktree, list(result.plans), plan_commit,
+                allow_legacy_priority=True,
+            )
+        else:
+            effects._register_execplan_rows(
+                connection, repo, worktree, list(result.plans), plan_commit,
+            )
         from loop_manager_internal.notifications import notifications
         notifications.record_planning_publication(connection, repo, result.plans, plan_commit)
         from loop_manager_internal.catalog.remote_deletions import resolve_recovery
