@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -13,6 +14,8 @@ from loop_manager_internal.execution.verify_process import run_verify_process
 from loop_manager_internal.execution.result_validation import verify_arguments
 from loop_manager_internal.verification import manager_adapter, runner
 from loop_manager_internal.verification.coordination import VerifyCoordinator, settings
+from loop_manager_internal.verification.resources import Snapshot
+from tests.support.verify_fixture import nested_runner_source
 
 
 class LanguageExampleIntegrationTests(unittest.TestCase):
@@ -24,8 +27,13 @@ class LanguageExampleIntegrationTests(unittest.TestCase):
         entrypoint = Path(runner.__file__).with_name('entrypoint.py').resolve()
         git_file = repository / '.git'
         git_dir = (repository / git_file.read_text().strip().removeprefix('gitdir: ')).resolve() if git_file.is_file() else git_file
-        with tempfile.TemporaryDirectory() as temporary, VerifyCoordinator() as coordinator:
+        # Native result/manifest checks use real processes with controlled capacity.
+        sampler = SimpleNamespace(sample=lambda: Snapshot(
+            time.monotonic(), 2, 0, 4 * 1024 ** 3, 'native example fixture'))
+        with tempfile.TemporaryDirectory() as temporary, VerifyCoordinator(sampler=sampler) as coordinator:
             root = Path(temporary)
+            bootstrap = root / 'nested-runner.py'
+            bootstrap.write_text(nested_runner_source(entrypoint))
             token = settings.set(SimpleNamespace(coordinator=coordinator, cap=1, state_dir=root / 'state'))
             try:
                 project = root / language
@@ -49,7 +57,7 @@ class LanguageExampleIntegrationTests(unittest.TestCase):
                         for key in ('LOOP_MANAGER_VERIFY_ENDPOINT', 'LOOP_MANAGER_VERIFY_SESSION',
                                 'LOOP_MANAGER_VERIFY_SECRET', 'LOOP_MANAGER_VERIFY_PARTIAL_BASE'):
                             environment.pop(key, None)
-                        argv = [sys.executable, str(entrypoint), '--protocol-version', '1',
+                        argv = [sys.executable, str(bootstrap), '--protocol-version', '1',
                             '--project-python', sys.executable, '--parallelism', '1', '--timeout', str(verify_timeout)]
                         with mock.patch.dict(os.environ, environment, clear=True):
                             if coordinated:
@@ -61,8 +69,11 @@ class LanguageExampleIntegrationTests(unittest.TestCase):
                             else:
                                 passed, timed_out, output = run_verify_process(argv, project, process_timeout, environment=environment, job_scope=True)
                                 manifest_path = logs / 'manifest.json'
-                        self.assertFalse(timed_out, str(output))
-                        self.assertEqual(passed, not failing, str(output))
+                        diagnostic = str(output) + '\n' + '\n'.join(
+                            path.read_text(encoding='utf-8', errors='replace')[-3000:]
+                            for path in manifest_path.parent.rglob('*.jsonl'))
+                        self.assertFalse(timed_out, diagnostic)
+                        self.assertEqual(passed, not failing, diagnostic)
                         manifest = json.loads(manifest_path.read_text())
                         self.assertEqual([stage['kind'] for stage in manifest['stages']], ['command', 'tests'])
                         self.assertEqual(manifest['adapter'], 'perl-tap' if language == 'perl' else 'unittest')

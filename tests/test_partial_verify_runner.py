@@ -19,20 +19,7 @@ from types import SimpleNamespace
 import threading
 from loop_manager_internal.verification.timing import comparison
 from tests.support.git import isolated_git_test
-
-
-def _nested_runner_source(entrypoint):
-    # Manifest/result integration must not wait on the enclosing suite's CPU load.
-    return f"""import runpy
-import sys
-import time
-from unittest.mock import patch
-sys.path.insert(0, {str(Path(entrypoint).resolve().parents[2])!r})
-from loop_manager_internal.verification.resources import ResourceSampler, Snapshot
-with patch.object(ResourceSampler, 'sample',
-        lambda self: Snapshot(time.monotonic(), 2, 0, 4 * 1024 ** 3, 'manifest fixture')):
-    runpy.run_path({str(entrypoint)!r}, run_name='__main__')
-"""
+from tests.support.verify_fixture import nested_runner_source
 
 
 @isolated_git_test
@@ -214,7 +201,7 @@ class PartialRunnerTests(unittest.TestCase):
         try:
             with mock.patch('runpy.run_path', side_effect=inspect) as run:
                 with self.assertRaises(SystemExit) as stopped:
-                    exec(compile(_nested_runner_source(entrypoint), '<nested runner>', 'exec'), {})
+                    exec(compile(nested_runner_source(entrypoint), '<nested runner>', 'exec'), {})
                 self.assertEqual(stopped.exception.code, 0)
                 run.assert_called_once()
         finally:
@@ -268,7 +255,7 @@ class PartialRunnerTests(unittest.TestCase):
             git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'candidate')
             entrypoint = Path(runner.__file__).with_name('entrypoint.py')
             bootstrap = Path(temporary) / 'nested-runner.py'
-            bootstrap.write_text(_nested_runner_source(entrypoint))
+            bootstrap.write_text(nested_runner_source(entrypoint))
             reports = []
             for mode in ('partial', 'full'):
                 logs = Path(temporary) / mode
