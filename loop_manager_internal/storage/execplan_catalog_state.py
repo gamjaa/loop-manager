@@ -537,10 +537,11 @@ def insert_published_plan_row(
     content_hash: str,
     revision_sha: str,
     *, publication_content_hash: str | None = None, archive_fallback: bool = False,
+    allow_legacy_priority: bool = False,
 ) -> None:
     """Register validated publication metadata without reading a worktree."""
 
-    if not archive_fallback:
+    if not archive_fallback and not allow_legacy_priority:
         from . import verify_input_requests
         verify_input_requests.validate_new_priority(plan.get("sources", ()), plan.get("priority"))
     sources, dependencies, priority = serialize_plan_metadata(plan)
@@ -1851,6 +1852,7 @@ def register_published_plan_row(
     connection: sqlite3.Connection, repo: str, path: str,
     plan: Mapping[str, object], content_hash: str, plan_commit: str,
     *, publication_content_hash: str | None = None, archive_fallback: bool = False,
+    allow_legacy_priority: bool = False,
 ) -> None:
     """Apply a validated publication row without committing the caller event."""
     plan_id = str(plan["id"])
@@ -1894,6 +1896,7 @@ def register_published_plan_row(
     insert_published_plan_row(
         connection, repo, path, plan, content_hash, plan_commit,
         publication_content_hash=publication_content_hash, archive_fallback=archive_fallback,
+        allow_legacy_priority=allow_legacy_priority,
     )
 
 

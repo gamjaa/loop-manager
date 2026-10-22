@@ -36,6 +36,7 @@ def _register_execplan_rows(
     worktree: Path,
     plans: list[tuple[str, dict[str, object]]],
     plan_commit: str,
+    *, allow_legacy_priority: bool = False,
 ) -> None:
     """Apply the new-row part shared by normal and maintenance batches."""
 
@@ -52,6 +53,7 @@ def _register_execplan_rows(
             publication_content_hash=hashlib.sha256(
                 effects.git_bytes(worktree, "show", f"{plan_commit}:{path}")
             ).hexdigest(),
+            allow_legacy_priority=allow_legacy_priority,
         )
         if plan.get("draft"):
             execplan_draft_state.observe(connection, repo, path, plan,
@@ -583,6 +585,7 @@ def _apply_general_planning_batch(
     plan_commit: str,
     specification_fingerprint: str,
     planning_fingerprint: str,
+    *, allow_legacy_priority: bool = False,
 ) -> None:
     snapshot = result.mutable_snapshot
     if snapshot is None or snapshot.repo != repo:
@@ -629,7 +632,8 @@ def _apply_general_planning_batch(
             draft_inputs=lambda plan: execplan_drafts.input_digests(worktree, plan),
         )
         effects._register_execplan_rows(
-            connection, repo, worktree, list(result.plans), plan_commit
+            connection, repo, worktree, list(result.plans), plan_commit,
+            allow_legacy_priority=allow_legacy_priority,
         )
         from loop_manager_internal.notifications import notifications
         notifications.record_planning_publication(connection, repo, result.plans, plan_commit)
@@ -777,6 +781,7 @@ def recover_general_planning_batch(
             intent.commit_sha,
             intent.specification_fingerprint,
             intent.planning_fingerprint,
+            allow_legacy_priority=True,
         )
         return "applied"
     if not effects._git_commit_is_ancestor(worktree, intent.base_sha, remote):

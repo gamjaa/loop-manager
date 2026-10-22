@@ -1674,7 +1674,7 @@ verify 기록은 실행 시 Python의 bytecode write 정책·cache tag·prefix�
 
 실제 누락 요청에는 새 계획의 `priority: critical`을 명시한다. 신규 Manager source 선언은 요청 ID·revision·목적·규칙 원문·단독 source 범위와 이미 파싱된 metadata의 priority를 모두 검증해야 등록한다. 최초 등록은 `critical`만 허용하며 `high`·`normal`·`low`·priority 생략은 거부한다. 다른 source 계획의 우선순위 해석은 바꾸지 않는다.
 
-신규 판정은 현재 등록 row·게시 intent와 revision-pinned catalog 근거로 수행한다. 등록된 계획·draft·PR의 기존 선언은 재검사로 보류하지 않고 멱등 재개도 새 등록으로 취급하지 않는다. 신규 선언은 catalog 사전 검사와 transaction 내 request 검증을 거친 뒤 최초 row 삽입에서도 다시 확인한다. priority가 잘못된 신규 계획은 격리되며 SQLite 실행 row나 draft 대기 증거를 만들지 않는다. archive fallback은 과거 선언을 보존하고 이 조건을 소급하지 않는다.
+신규 판정은 현재 등록 row·게시 intent와 revision-pinned catalog 근거로 수행한다. 등록된 계획·draft·PR의 기존 선언은 재검사로 보류하지 않고 멱등 재개도 새 등록으로 취급하지 않는다. 일반적인 신규 publication은 catalog 사전 검사와 transaction 내 request 검증을 거친 뒤 최초 row 삽입에서도 priority를 확인한다. 단, durable publication intent의 manifest 검증과 원격 commit 포함이 확인된 복구는 이미 게시된 batch의 재개이므로 보존된 metadata로 등록을 마치며 priority를 소급 적용하지 않는다. priority가 잘못된 신규 계획은 격리되며 SQLite 실행 row나 draft 대기 증거를 만들지 않는다. archive fallback은 과거 선언을 보존하고 이 조건을 소급하지 않는다.
 
 예약어는 수동 완료 후보를 포함한 문서 조회와 Requirement retirement에서 제외하고 규칙 내용을
 source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 요청 검증을 통과한 예약 source를

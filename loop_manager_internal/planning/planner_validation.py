@@ -1148,6 +1148,17 @@ def validate_planner_result(
                     PlanRevision(revision.path, parsed, revision.snapshot)
                 )
             revisions = normalized_revisions
+        if connection is not None:
+            from loop_manager_internal.storage import verify_input_requests
+            for _path, plan in plans:
+                sources = plan.get("sources", ())
+                if any(str(source).startswith("manager:") for source in sources):
+                    try:
+                        verify_input_requests.validate_new_priority(
+                            sources, plan.get("priority"),
+                        )
+                    except RuntimeError as error:
+                        raise PlannerValidationError(str(error)) from error
         if held_ids:
             project_catalog_refresh.assert_planning_dependencies_unheld(
                 {}, current_plans.items(), held_ids,

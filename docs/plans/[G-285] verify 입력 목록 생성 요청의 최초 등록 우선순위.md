@@ -26,22 +26,23 @@ Manager의 실제 verify 입력 목록 누락 요청에 따라 새로 만드는 
 ## Implementation
 
 - [x] 확인한 `loop_manager_internal/planning/verify_input_request.py:instruction()`의 실제 누락 요청 문구에 최초 생성 priority 조건을 추가한다. `catalog/manager_sources.py`의 `VERSION`·`PURPOSE`·`RULE`·`MANAGER_REQUEST` 선언과 기존 중복 확인을 재사용하며 등록 요청 원문을 새 형식으로 교체하지 않는다.
-- [x] 확인한 `storage/verify_input_requests.py:validate()`의 요청 소유·범위 검증과 `planning/planner_validation.py:validate_planner_result()`의 신규/기존 snapshot 구분을 재사용한다. 신규 priority 판단을 등록 문맥에서 명시하고 재파싱·별도 priority 저장소 없이 검증된 metadata를 소비한다. `planning/validation_ports.py:validate_manager_source()`의 기존 source 소비자는 과거 요청 검증을 계속 수행할 수 있어야 한다.
-- [x] 확인한 `storage/execplan_catalog_state.py:new_declaration_issues()`·`CatalogReconciliationService`의 신규 선언 판정, `CatalogStateRepository`의 snapshot/transaction과 `register_published_plan_row()`·`insert_published_plan_row()`의 실제 등록 경계를 대조해 게시 직전 및 최초 등록 누락을 막는다. 기존 row 재검사·멱등 등록과 archive fallback에는 신규 조건을 소급하지 않는다. 기존 source 진단·독립 선언 보류를 재사용하고 비호환 schema나 새 복구 계층을 추가하지 않는다.
+- [x] 확인한 `storage/verify_input_requests.py:validate()`의 요청 소유·범위 검증과 `planning/planner_validation.py:validate_planner_result()`의 신규/기존 snapshot 구분을 재사용한다. 신규 계획의 최종 분류와 ID 정규화 뒤에도 priority를 확인하고 재파싱·별도 priority 저장소 없이 검증된 metadata를 소비한다. `planning/validation_ports.py:validate_manager_source()`의 기존 source 소비자는 과거 요청 검증을 계속 수행할 수 있어야 한다.
+- [x] 확인한 `storage/execplan_catalog_state.py:new_declaration_issues()`·`CatalogReconciliationService`의 신규 선언 판정, `CatalogStateRepository`의 snapshot/transaction과 `register_published_plan_row()`·`insert_published_plan_row()`의 실제 등록 경계를 대조해 게시 직전 및 최초 등록 누락을 막는다. 기존 row 재검사·멱등 등록과 archive fallback에는 신규 조건을 소급하지 않는다. 원격 게시가 확인된 기존 durable intent의 복구만 legacy priority를 보존해 반복 실패를 막는다. 기존 source 진단·독립 선언 보류를 재사용하고 비호환 schema나 새 복구 계층을 추가하지 않는다.
 - [x] 확인한 `tests/test_verify_input_requests.py`의 모의 원격·실제 SQLite fixture와 `tests/test_planning_publication.py`의 게시/DB 확정 경계를 확장한다. 실제 구현 범위의 요청 우선순위·이전 등록 보존을 PRODUCT·ARCHITECTURE의 관련 절에 반영하되 Requirement·다른 ExecPlan을 Worker에게 편집시키지 않는다.
 
 ## Validation
 
-- Worker는 변경에 직접 관련된 `python -m unittest tests.test_verify_input_requests.VerifyInputRequestTest tests.test_verify_input_requests.ManagerSourceCatalogGateTest`와 추가한 게시 등록 unit case만 실행한다. prompt의 조건뿐 아니라 실제 검증·SQLite 행·실패 결과를 확인한다. Git 관측은 기존 mock으로 제공한다.
+- Worker는 변경에 직접 관련된 targeted unittest만 실행한다. prompt의 조건뿐 아니라 실제 검증·SQLite 행·실패 결과를 확인한다. Git 관측은 기존 mock으로 제공한다.
 - 같은 등록 요청에서 신규 critical의 성공, 나머지 priority/생략의 실패, 일반 source 계획의 정상 등록, 기존 normal READY·draft·PR 및 archive 선언의 읽기/재동기화 보존을 구분한다. 새 priority 조건이 기존 요청 deduplication과 규칙·Purpose·미등록 요청 거부를 약화하지 않아야 한다.
 - 게시 후 DB 적용 중단·같은 등록 재개·등록 직전 row/snapshot 변경에서 중복 행·새 요청·소급 priority 변경·거짓 성공 기준이 없음을 확인한다. 거부된 신규 계획 밖의 유효한 독립 catalog와 현재 작업의 상태는 보존한다.
-- Manager의 전체 verify·Review는 기존 priority 전파·선택, dependency/유지보수 장벽, 현재 작업 비선점과 목록 부재의 전체 실행 회귀를 유지한다. 이번 Planner는 구현·테스트·verify를 실행하지 않았다.
+- Manager의 전체 verify·Review는 기존 priority 전파·선택, dependency/유지보수 장벽, 현재 작업 비선점과 목록 부재의 전체 실행 회귀를 유지한다. Worker는 직접 관련 targeted unit test만 실행한다.
 
 ## Progress
 
 - [x] 요청 문구, 일반·유지보수 Planner 검증, revision-pinned catalog 검사와 최초 row 삽입에 `critical` 조건을 연결했다. 신규 계획의 거부·row/draft 미생성, 기존 priority·PR 소유 상태와 archive fallback 보존을 포함한 요청·catalog·prompt·publication·maintenance unit test를 추가했다. PRODUCT와 ARCHITECTURE에 제품 규칙과 등록 경계를 반영했다.
 - [x] 2026-10-22 관리 rebase 뒤 base `origin/main` (`5e7d4465`) 대비 현재 후보 `c6b973bf`의 전체 11개 파일 diff를 확인했다. `scripts/verify.json` unittest adapter version 1·launcher Python, `docs/VERIFY.md`의 Python 3.11–3.14 계약과 R-072 source 경로를 재확인했다. Python 3.12.3 targeted runner로 이 계획이 지정한 다섯 단위 ID를 실행해 25개 모두 통과했다. 이전 후보 결과는 재사용하지 않았다.
 - [x] 전달된 미해결 verify feedback `verify:69c1bd7d869db40da5e13b85cf557e8211e720e44dcd4310e81e4cff38bdeb64`의 artifact `a3818e5813c4ae5e26381aae315ac10a`는 revision `b6e883e`에서 4,436개 성공·2개 실패를 기록했다. partial-runner는 30.060초에 exit -9·빈 결과였고, coordinated Python language subtest는 테스트를 시작하기 전 `resource_wait`에 29.455초 머물러 30초 timeout을 넘었다. nested runner는 `CPU 부하/미반영 예약 대기`를 보고했지만 어느 자원/예약 조건이 계속 막았는지와 partial-runner의 내부 대기 지점은 확인되지 않았다. 실패한 테스트와 공통 verify 실행기는 G-285 diff 밖이다. 전체 verify·integration 재실행은 Worker 범위에서 금지되어 있으므로 관련 코드를 임의로 바꾸지 않았고 Manager의 재판정이 남아 있다.
+- [x] 2026-10-22 관리 rebase 결과의 base 대비 전체 diff와 현재 후보 수정사항, adapter·R-072 source를 다시 확인했다. ID가 기존 등록 계획과 충돌하는 새 `manager:verify-inputs` 파일은 정규화 후 최종 신규 계획으로 priority를 재확인한다. 원격 게시가 확인된 durable intent 복구는 legacy priority를 보존하고 신규 publication의 critical 검사는 유지한다. Python targeted runner로 `test_new_manager_plan_id_collision_rechecks_priority_after_normalization`, `test_recovery_applies_legacy_manager_plan_from_published_intent`, `test_new_manager_source_publication_requires_critical_before_db_confirmation`을 실행해 통과했다. 첫 회 실행은 recovery test mock 경로 오류로 실패했으며 수정 후 동일 명령은 통과했다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
