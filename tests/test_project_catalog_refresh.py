@@ -1164,6 +1164,68 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 planner_validation.validate_planner_result(effects, root, self.sha, [],
                     connection=self.connection, repo=self.repo)
 
+    def test_independent_planning_reuses_missing_manager_priority_hold_cause(self):
+        import tempfile
+        from loop_manager_internal.catalog import manager_sources
+        from loop_manager_internal.planning import planner_validation
+        from loop_manager_internal.storage import verify_input_requests
+
+        request = verify_input_requests.register(self.connection, self.repo, self.sha)
+        broken_path = 'docs/plans/[G-006] Missing verify priority.md'
+        self.documents[broken_path] = (
+            '---\nid: G-006\ntitle: Missing verify priority\nsources:\n  - '
+            + manager_sources.SOURCE
+            + '\ndepends_on: []\ncomplexity: low\nrisk: low\n---\n\n'
+            + '## Purpose\n\n' + manager_sources.RULE + '\n\n'
+            + '## Acceptance Criteria\n\n- Keep the declared verify inputs complete.\n\n'
+            + '## Implementation\n\n- Record the complete input list.\n\n'
+            + '## Validation\n\n- Run the targeted unit tests.\n\n'
+            + '## Decision Log\n\n' + manager_sources.PREFIX
+            + json.dumps(request, sort_keys=True) + '\n'
+        )
+        self.paths |= {broken_path}
+        self.boundary.refresh()
+        self.assertIn('G-006', self.held())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            independent_path = 'docs/plans/[G-007] Independent.md'
+            documents = {
+                **self.documents,
+                'docs/PRODUCT.md': 'Product.',
+                independent_path: self.fixture._text('G-007', 'Independent'),
+            }
+            for relative, contents in documents.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(contents, encoding='utf-8', newline='\n')
+
+            def git(_root, command, *args, **kwargs):
+                item = args[-1]
+                tree = f'100644 blob abc\t{item}\0' if item in self.documents else ''
+                return SimpleNamespace(returncode=0, stdout=tree if command == 'ls-tree' else '')
+
+            effects = SimpleNamespace(
+                changed_files=lambda *args: [independent_path],
+                mutable_snapshot_token=lambda *args: 'token',
+                git=git,
+                _parse_execplan=catalog.parse_execplan_file,
+                load_execplan_catalog=manager.load_execplan_catalog,
+                _validate_future_idea_separation=mock.Mock(),
+                file_hash=lambda target: catalog.plan_content_hash(target.read_bytes()),
+                _stored_string_list=planner_validation._stored_string_list,
+            )
+            result = planner_validation.validate_planner_result(
+                effects, root, self.sha, [], connection=self.connection, repo=self.repo,
+            )
+
+        self.assertEqual([plan['id'] for _path, plan in result.plans], ['G-007'])
+        held_evidence = json.loads(self.connection.execute(
+            'SELECT evidence FROM execplan_catalog_holds WHERE repo=? AND plan_id=?',
+            (self.repo, 'G-006'),
+        ).fetchone()[0])
+        self.assertEqual({cause['code'] for cause in held_evidence['causes']}, {'invalid-plan'})
+
     def test_new_planner_error_preserves_catalog_diagnostic_without_existing_holds(self):
         import tempfile
         from loop_manager_internal.planning import planner_validation

@@ -45,6 +45,189 @@ from tests.support.planning_case import (
 )
 
 class PlanningPublicationTest(PlanningCase):
+    def test_new_manager_source_publication_requires_critical_before_db_confirmation(self):
+        from loop_manager_internal.catalog import execplan_catalog, manager_sources
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.storage import database, verify_input_requests
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        database._ensure_execplans_schema(connection)
+        repo = "/repo"
+        connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
+        request = verify_input_requests.register(connection, repo, "a" * 40)
+        connection.commit()
+        path = "docs/plans/[G-900] Verify Inputs.md"
+        worktree = Path("/publication")
+
+        def make_text(priority):
+            return (
+                "---\nid: G-900\ntitle: Verify Inputs\nsources:\n  - "
+                + manager_sources.SOURCE
+                + "\ndepends_on: []\ncomplexity: low\nrisk: medium\npriority: "
+                + priority
+                + "\n---\n\n## Purpose\n\n"
+                + manager_sources.RULE
+                + "\n\n## Acceptance Criteria\n\n- Keep scripts/verify-inputs.json current.\n\n"
+                + "## Decision Log\n\n"
+                + manager_sources.PREFIX
+                + json.dumps(request, sort_keys=True)
+                + "\n"
+            )
+
+        def publish(text):
+            plan = execplan_catalog.parse_execplan_text(path, text)
+            verify_input_requests.validate(connection, repo, text, plan["sources"])
+            row_effects = planner_publication.RegisterExecplanRowsEffects(
+                _ensure_execplans_schema=database._ensure_execplans_schema,
+                file_hash=lambda _path: execplan_catalog.plan_content_hash(text),
+                git=mock.Mock(),
+                git_bytes=mock.Mock(return_value=text.encode("utf-8")),
+            )
+            effects = planner_publication.RegisterExecplansEffects(
+                _register_execplan_rows=lambda db, target_repo, root, plans, commit:
+                    planner_publication._register_execplan_rows(
+                        row_effects, db, target_repo, root, plans, commit,
+                    ),
+            )
+            planner_publication.register_execplans(
+                effects, connection, repo, worktree, [(path, plan)], "published", "fingerprint",
+            )
+
+        for priority in ("high", "normal", "low"):
+            with self.subTest(priority=priority):
+                with self.assertRaisesRegex(RuntimeError, "priority: critical"):
+                    publish(make_text(priority))
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM exec_plans WHERE repo=? AND plan_id='G-900'", (repo,),
+                ).fetchone())
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM execplan_drafts WHERE repo=? AND plan_id='G-900'", (repo,),
+                ).fetchone())
+                project = connection.execute(
+                    "SELECT processed_sha FROM projects WHERE repo=?", (repo,),
+                ).fetchone()
+                self.assertIsNotNone(project)
+                self.assertIsNone(project[0])
+
+        publish(make_text("critical"))
+        row = connection.execute(
+            "SELECT priority,status FROM exec_plans WHERE repo=? AND plan_id='G-900'", (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("critical", "READY"))
+        self.assertEqual(connection.execute(
+            "SELECT processed_sha FROM projects WHERE repo=?", (repo,),
+        ).fetchone()[0], "published")
+
+    def test_recovery_applies_legacy_manager_plan_from_published_intent(self):
+        from loop_manager_internal.catalog import execplan_catalog, manager_sources
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.planning.planning_catalog import (
+            mutable_snapshot_token, snapshot_from_dict, snapshot_to_dict,
+        )
+        from loop_manager_internal.storage import database, planning_publication_state, verify_input_requests
+        from loop_manager_internal.storage.database import GENERAL_PLANNING_PUBLICATIONS_SCHEMA
+        from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+        database._ensure_execplans_schema(connection)
+        repo = "/repo"
+        connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
+        request = verify_input_requests.register(connection, repo, "a" * 40)
+        path = "docs/plans/[G-900] Legacy Verify Inputs.md"
+        text = (
+            "---\nid: G-900\ntitle: Legacy Verify Inputs\nsources:\n  - "
+            + manager_sources.SOURCE
+            + "\ndepends_on: []\ncomplexity: low\nrisk: medium\npriority: normal\n"
+            + "---\n\n## Purpose\n\n"
+            + manager_sources.RULE
+            + "\n\n## Decision Log\n\n"
+            + manager_sources.PREFIX
+            + json.dumps(request, sort_keys=True)
+            + "\n"
+        )
+        plan = execplan_catalog.parse_execplan_text(path, text)
+        verify_input_requests.validate(connection, repo, text, plan["sources"])
+        content_hash = execplan_catalog.plan_content_hash(text)
+        snapshot = MutableReadySnapshot(
+            repo, "base", (), mutable_snapshot_token(repo, "base", ()),
+        )
+        result = loop_manager.ValidatedPlanningResult(
+            plans=((path, plan),), publication_paths=(path,),
+            publication_hashes=((path, content_hash),), mutable_snapshot=snapshot,
+        )
+        manifest = planner_publication._planning_result_manifest(
+            planner_publication.PlanningResultManifestEffects(
+                snapshot_to_dict=snapshot_to_dict,
+            ),
+            result,
+        )
+        commit = "published"
+        publication = GeneralPlanningPublication(
+            repo, "prepared", "base", commit, snapshot.token, "spec", "planning",
+            manifest, hashlib.sha256(manifest.encode("utf-8")).hexdigest(),
+        )
+        planning_publication_state.record_general_planning_publication(connection, publication)
+
+        worktree = Path("/published")
+        row_effects = planner_publication.RegisterExecplanRowsEffects(
+            _ensure_execplans_schema=database._ensure_execplans_schema,
+            file_hash=lambda _path: content_hash,
+            git=mock.Mock(),
+            git_bytes=lambda *_args: text.encode("utf-8"),
+        )
+        apply_effects = planner_publication.ApplyGeneralPlanningBatchEffects(
+            _assert_mutable_ready_snapshot_current=mock.Mock(),
+            _clear_active_in_current_transaction=mock.Mock(),
+            _general_planning_batch_already_applied=mock.Mock(return_value=False),
+            _register_execplan_rows=lambda db, *args, **kwargs:
+                planner_publication._register_execplan_rows(row_effects, db, *args, **kwargs),
+            file_hash=lambda _path: content_hash,
+            general_planning_publication=planning_publication_state.general_planning_publication,
+            is_loop_manager_repository=mock.Mock(return_value=False),
+            plan_declarations=mock.Mock(return_value={}),
+        )
+        manifest_effects = planner_publication.PlanningResultFromManifestEffects(
+            mutable_snapshot_token=mutable_snapshot_token,
+            snapshot_from_dict=snapshot_from_dict,
+        )
+        recovery_effects = planner_publication.RecoverGeneralPlanningBatchEffects(
+            _apply_general_planning_batch=lambda db, *args, **kwargs:
+                planner_publication._apply_general_planning_batch(apply_effects, db, *args, **kwargs),
+            _assert_remote_preserves_maintenance_batch=mock.Mock(),
+            _clear_active_in_current_transaction=mock.Mock(),
+            _git_commit_is_ancestor=lambda _root, ancestor, descendant:
+                (ancestor, descendant) == (commit, "remote"),
+            _planning_result_from_manifest=lambda value:
+                planner_publication._planning_result_from_manifest(manifest_effects, value),
+            _validate_general_planning_commit=mock.Mock(),
+            general_planning_publication=planning_publication_state.general_planning_publication,
+            git=lambda *_args: SimpleNamespace(stdout="remote"),
+        )
+
+        with mock.patch.object(planner_publication.planning_publication_state,
+                               "apply_mutable_catalog_changes"), \
+             mock.patch("loop_manager_internal.notifications.notifications.record_planning_publication"), \
+             mock.patch.object(planner_publication.planning_input_state,
+                               "record_general"), \
+             mock.patch("loop_manager_internal.catalog.remote_deletions.resolve_recovery"):
+            outcome = planner_publication.recover_general_planning_batch(
+                recovery_effects, connection, repo, worktree, "main",
+            )
+
+        row = connection.execute(
+            "SELECT priority, status FROM exec_plans WHERE repo=? AND plan_id='G-900'", (repo,),
+        ).fetchone()
+        self.assertEqual(outcome, "applied")
+        self.assertEqual(tuple(row), ("normal", "READY"))
+        self.assertIsNone(planning_publication_state.general_planning_publication(connection, repo))
+
     def test_publication_uses_current_changes_after_manager_validation(self):
         path = "docs/plans/[G-001] Plan.md"
         for manager_changed in (True, False):

@@ -441,6 +441,60 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
             )
             self.assertFalse(execplan_draft_state.evidence(connection, str(repo), "G-010")["decision_ready"])
 
+    def test_new_manager_plan_id_collision_rechecks_priority_after_normalization(self):
+        from loop_manager_internal.catalog import manager_sources
+        from loop_manager_internal.storage import verify_input_requests
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            existing_text = existing.read_text(encoding="utf-8")
+            connection = self._connection(str(repo))
+            self._insert_plan(connection, "G-001", "READY", repo=str(repo), title="Existing")
+            request = verify_input_requests.register(connection, str(repo), "b" * 40)
+            candidate = repo / "docs/plans/[G-001] Verify Inputs.md"
+            candidate.write_text(
+                "---\nid: G-001\ntitle: Verify Inputs\nsources:\n  - "
+                + manager_sources.SOURCE
+                + "\ndepends_on: []\ncomplexity: low\nrisk: medium\npriority: normal\n"
+                + "---\n\n## Purpose\n\n"
+                + manager_sources.RULE
+                + "\n\n## Acceptance Criteria\n\n- Keep the input list complete.\n"
+                + "\n## Implementation\n\n- Record all declared verify inputs.\n"
+                + "\n## Validation\n\n- Run targeted unit tests.\n"
+                + "\n## Decision Log\n\n"
+                + manager_sources.PREFIX
+                + json.dumps(request, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            existing_path = existing.relative_to(repo).as_posix()
+            snapshot_plan = ReadyPlanSnapshot(
+                "G-001", existing_path, "Existing", ("docs/PRODUCT.md",), (),
+                "low", "low", "normal",
+                hashlib.sha256(existing_text.encode("utf-8")).hexdigest(),
+                "a" * 40, existing_text,
+            )
+            snapshot = MutableReadySnapshot(
+                str(repo), "base", (snapshot_plan,),
+                mutable_snapshot_token(str(repo), "base", (snapshot_plan,)),
+            )
+
+            with planner_git_observations({existing_path: existing_text}), self.assertRaisesRegex(
+                loop_manager.PlannerValidationError, "priority: critical",
+            ):
+                loop_manager.validate_planner_result(
+                    repo, "base", [candidate.relative_to(repo).as_posix()],
+                    connection=connection, repo=str(repo), mutable_snapshot=snapshot,
+                )
+
+            target = repo / "docs/plans/[G-002] Verify Inputs.md"
+            self.assertTrue(target.is_file())
+            self.assertEqual(loop_manager._parse_execplan(repo, target)["id"], "G-002")
+            self.assertIsNone(connection.execute(
+                "SELECT 1 FROM exec_plans WHERE repo=? AND plan_id='G-002'", (str(repo),),
+            ).fetchone())
+
     def test_unknown_dependency_cannot_be_captured_by_reallocated_plan_id(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_catalog_root(directory)

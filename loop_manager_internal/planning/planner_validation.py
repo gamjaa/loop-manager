@@ -1025,8 +1025,17 @@ def validate_planner_result(
         if any(str(source).startswith("manager:") for source in parsed["sources"]):
             if connection is None or repo is None:
                 raise PlannerValidationError("Manager source requires registered request context")
+            registered = connection.execute(
+                "SELECT 1 FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, parsed["id"]),
+            ).fetchone()
             try:
-                verify_input_requests.validate(connection, repo, planner_text, parsed["sources"])
+                verify_input_requests.validate(
+                    connection, repo, planner_text, parsed["sources"],
+                    is_new=(not existed and registered is None
+                            and parsed["id"] not in snapshot.by_id),
+                    metadata=parsed,
+                )
             except RuntimeError as error:
                 raise PlannerValidationError(str(error)) from error
         current_plans[changed_path] = parsed
@@ -1139,6 +1148,17 @@ def validate_planner_result(
                     PlanRevision(revision.path, parsed, revision.snapshot)
                 )
             revisions = normalized_revisions
+        if connection is not None:
+            from loop_manager_internal.storage import verify_input_requests
+            for _path, plan in plans:
+                sources = plan.get("sources", ())
+                if any(str(source).startswith("manager:") for source in sources):
+                    try:
+                        verify_input_requests.validate_new_priority(
+                            sources, plan.get("priority"),
+                        )
+                    except RuntimeError as error:
+                        raise PlannerValidationError(str(error)) from error
         if held_ids:
             project_catalog_refresh.assert_planning_dependencies_unheld(
                 {}, current_plans.items(), held_ids,

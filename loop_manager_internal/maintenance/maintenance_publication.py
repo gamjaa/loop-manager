@@ -532,6 +532,7 @@ def publish_maintenance_planning_batch(
     base_branch: str,
     result: ValidatedPlanningResult,
     plan_commit: str,
+    *, allow_legacy_priority: bool = False,
 ) -> maintenance_state.MaintenanceCycle:
     """Atomically publish catalog revisions after a confirmed remote push.
 
@@ -547,6 +548,11 @@ def publish_maintenance_planning_batch(
     effects._validate_maintenance_publication_commit(
         worktree, base_branch, result, plan_commit, connection=connection
     )
+    if allow_legacy_priority:
+        return effects._apply_maintenance_planning_batch(
+            connection, repo, worktree, base_branch, result, plan_commit,
+            allow_legacy_priority=True,
+        )
     return effects._apply_maintenance_planning_batch(
         connection, repo, worktree, base_branch, result, plan_commit
     )
@@ -576,6 +582,7 @@ def _apply_maintenance_planning_batch(
     result: ValidatedPlanningResult,
     plan_commit: str,
     *, current_remote: str | None = None,
+    allow_legacy_priority: bool = False,
 ) -> maintenance_state.MaintenanceCycle:
     """Apply one already-confirmed maintenance batch in a SQLite transaction."""
 
@@ -595,9 +602,15 @@ def _apply_maintenance_planning_batch(
             connection, repo, context, plan_commit, result
         )
         effects._assert_maintenance_context_current(connection, context)
-        effects._register_execplan_rows(
-            connection, repo, worktree, list(result.plans), plan_commit
-        )
+        if allow_legacy_priority:
+            effects._register_execplan_rows(
+                connection, repo, worktree, list(result.plans), plan_commit,
+                allow_legacy_priority=True,
+            )
+        else:
+            effects._register_execplan_rows(
+                connection, repo, worktree, list(result.plans), plan_commit
+            )
         from loop_manager_internal.notifications import notifications
         notifications.record_planning_publication(connection, repo, result.plans, plan_commit)
         for revision in result.revisions:
@@ -924,6 +937,7 @@ def recover_maintenance_planning_batch(
                 tuple(PlanIdAllocation(*item) for item in cycle.publication_id_allocations)
                 or None
             ),
+            allow_legacy_priority=True,
         )
     except PlannerValidationError as error:
         raise MaintenancePlanningError(
@@ -940,6 +954,7 @@ def recover_maintenance_planning_batch(
         return effects._apply_maintenance_planning_batch(
             connection, repo, worktree, base_branch, result, plan_commit,
             current_remote=current_remote,
+            allow_legacy_priority=True,
         )
     return effects.publish_maintenance_planning_batch(
         connection,
@@ -948,4 +963,5 @@ def recover_maintenance_planning_batch(
         base_branch,
         result,
         plan_commit,
+        allow_legacy_priority=True,
     )

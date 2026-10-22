@@ -17,9 +17,11 @@ from loop_manager_internal.storage import verify_input_requests
 SHA = 'a' * 40
 
 
-def plan_text(request, *, plan_id='G-001', purpose=None, source=None):
+def plan_text(request, *, plan_id='G-001', purpose=None, source=None, priority='normal'):
     return ('---\nid: ' + plan_id + '\ntitle: Inputs\nsources:\n  - ' + (source or manager_sources.SOURCE)
-            + '\ndepends_on: []\ncomplexity: low\nrisk: medium\npriority: normal\n---\n\n## Purpose\n\n'
+            + '\ndepends_on: []\ncomplexity: low\nrisk: medium\n'
+            + ('' if priority is None else 'priority: ' + priority + '\n')
+            + '---\n\n## Purpose\n\n'
             + (purpose or manager_sources.RULE) + '\n\n## Decision Log\n\n'
             + manager_sources.PREFIX + json.dumps(request) + '\n')
 
@@ -69,6 +71,48 @@ class VerifyInputRequestTest(unittest.TestCase):
         verify_input_requests.validate(self.connection, self.repo, plan_text(first), [manager_sources.SOURCE])
         with self.assertRaisesRegex(RuntimeError, 'unregistered'):
             verify_input_requests.validate(self.connection, '/other', plan_text(first), [manager_sources.SOURCE])
+
+    def test_new_request_requires_critical_after_request_identity_and_scope_validation(self):
+        request = self.request()
+        for priority in ('critical', 'high', 'normal', 'low'):
+            with self.subTest(priority=priority):
+                text = plan_text(request, priority=priority)
+                metadata = catalog.parse_execplan_text('docs/plans/[G-001] Inputs.md', text)
+                if priority == 'critical':
+                    verify_input_requests.validate(
+                        self.connection, self.repo, text, metadata['sources'],
+                        is_new=True, metadata=metadata,
+                    )
+                else:
+                    with self.assertRaises(verify_input_requests.InvalidNewVerifyInputPriority):
+                        verify_input_requests.validate(
+                            self.connection, self.repo, text, metadata['sources'],
+                            is_new=True, metadata=metadata,
+                        )
+
+        with self.assertRaises(verify_input_requests.InvalidNewVerifyInputPriority):
+            verify_input_requests.validate_new_priority([manager_sources.SOURCE], None)
+        with self.assertRaisesRegex(RuntimeError, '새 ExecPlan에는 priority가 필요합니다'):
+            catalog.parse_execplan_text(
+                'docs/plans/[G-001] Inputs.md', plan_text(request, priority=None),
+                require_priority=True,
+            )
+
+        invalid = dict(request, id='f' * 64)
+        invalid_text = plan_text(invalid, priority='normal')
+        invalid_metadata = catalog.parse_execplan_text('docs/plans/[G-001] Inputs.md', invalid_text)
+        with self.assertRaisesRegex(RuntimeError, 'unregistered'):
+            verify_input_requests.validate(
+                self.connection, self.repo, invalid_text, invalid_metadata['sources'],
+                is_new=True, metadata=invalid_metadata,
+            )
+        wrong_scope = plan_text(request, priority='normal', purpose='unrelated product work')
+        wrong_scope_metadata = {'sources': [manager_sources.SOURCE], 'priority': 'normal'}
+        with self.assertRaisesRegex(RuntimeError, 'Purpose exceeds'):
+            verify_input_requests.validate(
+                self.connection, self.repo, wrong_scope, wrong_scope_metadata['sources'],
+                is_new=True, metadata=wrong_scope_metadata,
+            )
 
     def test_latest_remote_manifest_prevents_old_branch_request(self):
         self.remote_file('scripts/verify-inputs.json', b'{"version":1,"paths":["src/**"]}')
@@ -167,12 +211,18 @@ class VerifyInputRequestTest(unittest.TestCase):
             # The upstream effects contract removed contains_guidance_sections.
             # A registered source must reach the next gate with that contract.
             request = verify_input_requests.register(self.connection, self.repo, SHA)
-            (root / path).write_text(plan_text(request))
+            (root / path).write_text(plan_text(request, priority='critical'))
             with mock.patch.object(execplan_drafts, 'validate_agent_change',
                                    side_effect=RuntimeError('next validation gate')) as next_gate:
                 with self.assertRaisesRegex(PlannerValidationError, 'next validation gate'):
                     validate_planner_result(effects, root, SHA, [path], connection=self.connection, repo=self.repo)
             next_gate.assert_called_once()
+            (root / path).write_text(plan_text(request, priority='normal'))
+            with mock.patch.object(execplan_drafts, 'validate_agent_change') as next_gate:
+                with self.assertRaises(PlannerValidationError) as raised:
+                    validate_planner_result(effects, root, SHA, [path], connection=self.connection, repo=self.repo)
+            self.assertIsInstance(raised.exception.__cause__, verify_input_requests.InvalidNewVerifyInputPriority)
+            next_gate.assert_not_called()
 
     def test_duplicate_request_catalog_is_rejected(self):
         request = self.request()
@@ -255,7 +305,7 @@ class ManagerSourceCatalogGateTest(unittest.TestCase):
         self.documents = {
             'docs/plans/[G-001] Old.md': self.fixture._text('G-001', 'Old'),
             'docs/plans/[G-002] Dependency.md': self.fixture._text('G-002', 'Dependency'),
-            'docs/plans/[G-003] Inputs.md': plan_text(self.request, plan_id='G-003'),
+            'docs/plans/[G-003] Inputs.md': plan_text(self.request, plan_id='G-003', priority='critical'),
         }
 
     def reconcile(self, isolated=False):
@@ -270,6 +320,116 @@ class ManagerSourceCatalogGateTest(unittest.TestCase):
         self.assertTrue(result.usable)
         row = self.connection.execute("SELECT sources,status FROM exec_plans WHERE plan_id='G-003'").fetchone()
         self.assertEqual(tuple(row), (json.dumps([manager_sources.SOURCE]), 'READY'))
+
+    def test_new_noncritical_manager_plan_is_withheld_without_row_or_draft(self):
+        for priority in ('high', 'normal', 'low'):
+            with self.subTest(priority=priority):
+                text = plan_text(
+                    self.request, plan_id='G-003', priority=priority,
+                )
+                if priority == 'normal':
+                    text = text.replace('priority: normal', 'priority: normal\ndraft: true')
+                    text += ('\n## Acceptance Criteria\n\n- Keep the input list complete.\n'
+                             '\n## Draft Decision\n\nQuestion: Which inputs are in scope?\n'
+                             'Facts: The current list is incomplete.\nOptions: Update or defer.\n'
+                             'Impact: The verify input list changes.\n')
+                self.documents['docs/plans/[G-003] Inputs.md'] = text
+                result = self.reconcile(isolated=True)
+                self.assertTrue(result.usable)
+                self.assertIn('G-003', result.withheld_plan_ids)
+                self.assertIsNone(self.connection.execute(
+                    "SELECT 1 FROM exec_plans WHERE repo='/repo' AND plan_id='G-003'"
+                ).fetchone())
+                self.assertIsNone(self.connection.execute(
+                    "SELECT 1 FROM execplan_drafts WHERE repo='/repo' AND plan_id='G-003'"
+                ).fetchone())
+
+    def test_existing_normal_manager_plan_and_archive_fallback_are_preserved(self):
+        from loop_manager_internal.storage import execplan_catalog_state as state
+
+        path = 'docs/plans/[G-003] Inputs.md'
+        current_text = self.documents[path]
+        current_plan = catalog.parse_execplan_text(path, current_text)
+        current_hash = catalog.plan_content_hash(current_text)
+        state.insert_published_plan_row(
+            self.connection, '/repo', path, current_plan, current_hash, SHA,
+        )
+        legacy_text = plan_text(self.request, plan_id='G-003', priority='normal')
+        legacy_hash = catalog.plan_content_hash(legacy_text)
+        self.connection.execute(
+            "UPDATE exec_plans SET priority='normal', content_hash=?, publication_content_hash=? "
+            "WHERE repo='/repo' AND plan_id='G-003'",
+            (legacy_hash, legacy_hash),
+        )
+        self.documents[path] = legacy_text
+        self.assertTrue(self.reconcile().usable)
+        row = self.connection.execute(
+            "SELECT priority,status FROM exec_plans WHERE repo='/repo' AND plan_id='G-003'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ('normal', 'READY'))
+
+        from loop_manager_internal.storage import execplan_draft_state
+        draft_text = legacy_text.replace('priority: normal', 'priority: normal\ndraft: true')
+        draft_text += ('\n## Acceptance Criteria\n\n- Keep the input list complete.\n'
+                       '\n## Draft Decision\n\nQuestion: Which inputs are in scope?\n'
+                       'Facts: The current list is incomplete.\nOptions: Update or defer.\n'
+                       'Impact: The verify input list changes.\n')
+        draft_metadata = catalog.parse_execplan_text(path, draft_text)
+        draft_hash = catalog.plan_content_hash(draft_text)
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash=?, publication_content_hash=? "
+            "WHERE repo='/repo' AND plan_id='G-003'",
+            (draft_hash, draft_hash),
+        )
+        execplan_draft_state.observe(
+            self.connection, '/repo', path, draft_metadata, draft_hash, SHA, agent=True,
+        )
+        self.documents[path] = draft_text
+        self.assertTrue(self.reconcile().usable)
+        self.assertIn('G-003', execplan_draft_state.pending_ids(self.connection, '/repo'))
+        draft_row = self.connection.execute(
+            "SELECT priority,status FROM exec_plans WHERE repo='/repo' AND plan_id='G-003'"
+        ).fetchone()
+        self.assertEqual(tuple(draft_row), ('normal', 'READY'))
+
+        archive_path = 'docs/plans/archive/[G-004] Inputs.md'
+        archive_text = plan_text(self.request, plan_id='G-004', priority='normal')
+        archived = catalog.snapshot_from_documents({archive_path: archive_text}).archived['G-004']
+        state.insert_document_fallback(self.connection, '/repo', archived, SHA)
+        archive_row = self.connection.execute(
+            "SELECT priority,status FROM exec_plans WHERE repo='/repo' AND plan_id='G-004'"
+        ).fetchone()
+        self.assertEqual(tuple(archive_row), ('normal', 'MERGED'))
+
+    def test_existing_normal_manager_pr_row_preserves_owned_state(self):
+        from loop_manager_internal.storage import execplan_catalog_state as state
+
+        path = 'docs/plans/[G-003] Inputs.md'
+        text = self.documents[path]
+        metadata = catalog.parse_execplan_text(path, text)
+        state.insert_published_plan_row(
+            self.connection, '/repo', path, metadata, catalog.plan_content_hash(text), SHA,
+        )
+        legacy_text = plan_text(self.request, plan_id='G-003', priority='normal')
+        legacy_hash = catalog.plan_content_hash(legacy_text)
+        self.connection.execute(
+            "UPDATE exec_plans SET priority='normal',content_hash=?,publication_content_hash=?,"
+            "status='PR_OPEN',branch='feature/old-inputs',worktree='/old-worktree',"
+            "pr_url='https://example.invalid/pr/285',worker_session_id='old-session',workspace_owned=1 "
+            "WHERE repo='/repo' AND plan_id='G-003'",
+            (legacy_hash, legacy_hash),
+        )
+        self.documents[path] = legacy_text
+
+        self.assertTrue(self.reconcile().usable)
+        row = self.connection.execute(
+            "SELECT priority,status,branch,worktree,pr_url,worker_session_id,workspace_owned "
+            "FROM exec_plans WHERE repo='/repo' AND plan_id='G-003'"
+        ).fetchone()
+        self.assertEqual(tuple(row), (
+            'normal', 'PR_OPEN', 'feature/old-inputs', '/old-worktree',
+            'https://example.invalid/pr/285', 'old-session', 1,
+        ))
 
     def test_unregistered_request_is_held_without_registering(self):
         self.connection.execute('DELETE FROM verify_input_requests')
@@ -324,6 +484,7 @@ class VerifyInputPlanningPromptTest(unittest.TestCase):
         port = _PlanningValidationPorts(effects, self.connection)
         snapshot = MutableReadySnapshot(self.repo, SHA, (), 'token')
         self.assertIn(manager_sources.PREFIX, port.planner_prompt(None, 'catalog', snapshot))
+        self.assertIn('priority는 critical', port.planner_prompt(None, 'catalog', snapshot))
         context = SimpleNamespace(repo=self.repo, active_sha=SHA)
         calls = len(self.git_calls)
         self.assertEqual(port.maintenance_prompt(context, 'catalog', '', None, include_general_planning=False),
@@ -331,6 +492,9 @@ class VerifyInputPlanningPromptTest(unittest.TestCase):
         self.assertEqual(len(self.git_calls), calls)
         self.assertIn(manager_sources.PREFIX, port.maintenance_prompt(context, 'catalog', '', None,
                                                                     include_general_planning=True))
+        self.assertIn('priority는 critical', port.maintenance_prompt(
+            context, 'catalog', '', None, include_general_planning=True,
+        ))
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM verify_input_requests').fetchone()[0], 1)
 
 
