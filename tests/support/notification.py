@@ -47,6 +47,38 @@ class NotificationFixture:
             self.addCleanup(connection.close)
         return connection
 
+    def decision_block(self, connection, *, question='Which permission should be granted?',
+                       problem='The required repository permission is unavailable.',
+                       proposal='Grant the documented permission or choose a supported alternative.'):
+        """Persist a parsed Worker question through the real recovery/block repositories."""
+        import hashlib
+        import json
+        from loop_manager_internal.execution.worker_outcome import parse_worker_outcome
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
+        repo, plan_id = '/projects/alpha', 'G-018'
+        plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
+        declaration = {'kind': 'needs_user_decision', 'problem': problem, 'proposal': proposal,
+                       'question': question, 'locations': [{'path': plan['path'], 'section': 'Scope'}]}
+        outcome = parse_worker_outcome('WORKER_OUTCOME: ' + json.dumps(declaration),
+            plan_path=plan['path'], sources=tuple(json.loads(plan['sources'])),
+            documents={plan['path']: '## Scope\nPermission decision.'})
+        detail = f'{problem}\n{proposal}\n{question}'
+        fingerprint = hashlib.sha256(json.dumps(declaration, sort_keys=True).encode()).hexdigest()
+        RecoveryRepository(connection).observe(RecoveryObservation(
+            RecoveryReason.USER_DECISION, repo, plan_id, str(plan['status']),
+            str(plan['current_revision_sha'] or plan['plan_sha'] or ''), str(plan['active_sha'] or ''),
+            fingerprint, 'worker-question', detail, worker_decision=outcome.evidence()))
+        RuntimeStateRepository(connection).block_plan(repo, plan_id,
+            reason_code='user_decision_required', evidence=detail,
+            release_fingerprint=fingerprint, enqueue=False)
+        checkpoints = BlockedCheckpointRepository(connection)
+        checkpoints.finish_unpublished(checkpoints.get(repo, plan_id), 'local-only test artifact', retryable=False)
+        notifications.enqueue_current_project_events(connection, repo)
+        return detail
+
     @staticmethod
     def events(connection: sqlite3.Connection) -> list[sqlite3.Row]:
         return connection.execute(

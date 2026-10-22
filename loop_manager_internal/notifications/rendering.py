@@ -127,7 +127,13 @@ def _event_message(kind: str, payload: dict[str, object]) -> str:
         paths = "\n".join(f"- {path}" for path in payload["paths"])
         recovery = payload.get("recovery")
         action = ""
-        if payload.get("specification_deadlock") or payload.get("worker_decision"):
+        current_action = payload.get('action') or {}
+        if current_action.get('kind') == 'restart':
+            action = "사용자 조치: 보존된 작업물을 확인하고 이 작업의 명시적 재시작을 요청해 주세요.\n"
+        elif current_action.get('kind') == 'verify_timeout':
+            action = ("사용자 조치: [loop] verify_timeout_seconds를 확인된 상한 "
+                      + str(current_action['seconds']) + "초보다 늘려 주세요.\n")
+        elif payload.get("specification_deadlock") or payload.get("worker_decision"):
             action = "사용자 조치: 아래 질문의 결정을 관련 문서에 반영해 주세요.\n"
         elif payload.get("guidance_locations"):
             action = "사용자 조치: 지침 제안과 User Decision을 확인해 주세요.\n"

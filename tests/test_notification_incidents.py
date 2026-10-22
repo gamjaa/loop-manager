@@ -23,15 +23,16 @@ class IncidentPayloadEncodingTest(NotificationFixture, unittest.TestCase):
     def test_incident_and_outbox_share_unicode_payload_encoding(self):
         connection = self.connection()
         self.addCleanup(connection.close)
-        loop_manager.update_project(connection, "/projects/alpha", planning_error="원인 \U0001f642")
+        with connection:
+            self.decision_block(connection, problem="원인 \U0001f642")
         incident = connection.execute(
-            "SELECT payload FROM notified_block_incidents WHERE subject = 'planning'"
+            "SELECT payload FROM notified_block_incidents WHERE subject = 'plan:G-018'"
         ).fetchone()[0]
         outbox = connection.execute(
             "SELECT payload FROM notification_outbox WHERE event_type = 'blocked'"
         ).fetchone()[0]
         self.assertEqual(incident, outbox)
-        self.assertEqual(json.loads(outbox)["cause"], "원인 \U0001f642")
+        self.assertIn("원인 \U0001f642", json.loads(outbox)["cause"])
         self.assertIn("원인", outbox)
 
 

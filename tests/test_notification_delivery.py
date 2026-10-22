@@ -1194,3 +1194,244 @@ class TelegramEntityTransportTest(unittest.TestCase):
         payload = json.loads(open_url.call_args.args[0].data)
         self.assertEqual(payload["entities"], entities)
         self.assertEqual(payload["text"], "G-018 · 작업")
+
+
+class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
+    repo = '/projects/alpha'
+
+    def test_same_status_needs_concrete_current_question_before_one_notice(self):
+        connection = self.connection()
+        with connection:
+            scoped_blocking.record_plan_block(connection, self.repo, 'G-018',
+                scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
+                'Permission denied; retry budget exhausted', 'unconfirmed')
+            checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_not_called()
+        self.assertEqual(self.events(connection), [])
+        with connection:
+            detail = self.decision_block(connection)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_called_once()
+        self.assertIn('Which permission should be granted?', adapter.call_args.args[2])
+        self.assertIn(detail, adapter.call_args.args[2])
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+
+    def test_final_block_and_user_targets_do_not_prove_user_action(self):
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryAction
+        for reason, block_reason in (
+            (RecoveryReason.VERIFY_EXHAUSTED, 'verify_retry_exhausted'),
+            (RecoveryReason.REVIEW_EXHAUSTED, 'review_retry_exhausted'),
+            (RecoveryReason.WORKER_OUTPUT_EXHAUSTED, 'worker_output_invalid'),
+            (RecoveryReason.PLAN_INPUT_INVALID, 'plan_input_invalid'),
+            (RecoveryReason.STATE_UNSAFE, 'repository_state_unsafe'),
+        ):
+            with self.subTest(reason=reason):
+                connection = self.connection()
+                with connection:
+                    record = RecoveryRepository(connection).observe(RecoveryObservation(
+                        reason, self.repo, 'G-018', 'WORKING', '', '', 'failure', 'head',
+                        'CPU/DB/Git/resource/usage wait or next-run correction remains possible',
+                        user_targets=('docs/PRODUCT.md',)), attempts=3)
+                    self.assertEqual(record.decision.action, RecoveryAction.FINAL_BLOCK)
+                    if block_reason == 'repository_state_unsafe':
+                        connection.execute("INSERT INTO project_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'project', ?, ?)",
+                            (self.repo, block_reason, record.decision.observation.detail))
+                    else:
+                        RuntimeStateRepository(connection).block_plan(self.repo, 'G-018',
+                            reason_code=block_reason, evidence=record.decision.observation.detail,
+                            release_fingerprint='failure', enqueue=False)
+                        checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+                        checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                adapter.assert_not_called()
+                self.assertEqual(self.events(connection), [])
+                self.assertEqual(connection.execute('SELECT attempts FROM recovery_records').fetchone()[0], 3)
+
+    def test_pending_recovery_cancels_partial_question_without_rewriting_audit(self):
+        connection = self.connection()
+        with connection:
+            self.decision_block(connection)
+            connection.execute("UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=1, attempts=2, last_error='original failure'", ('frozen ' * 1000,))
+            before = dict(self.events(connection)[0])
+            RecoveryRepository(connection).observe(RecoveryObservation(
+                RecoveryReason.GIT_LOCK, self.repo, 'G-018', 'WORKING', '', '', 'lock', 'head', 'lock busy'), attempts=3)
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_not_called()
+        after = dict(self.events(connection)[0])
+        self.assertIsNotNone(after['canceled_at'])
+        for key in before.keys() - {'canceled_at', 'delivery_started_at'}:
+            self.assertEqual(after[key], before[key], key)
+        self.assertEqual(connection.execute('SELECT pending_action FROM recovery_records').fetchone()[0], 'pause')
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+
+    def test_next_piece_rechecks_resolved_action_and_confirmation_never_recreates_notice(self):
+        connection = self.connection()
+        with connection:
+            self.decision_block(connection, question='q' * 1900, problem='p' * 1900, proposal='r' * 1900)
+        original = dict(self.events(connection)[0])
+        calls = []
+        def clear_during_send(_token, _chat, text):
+            self.assertFalse(connection.in_transaction)
+            calls.append(text)
+            with connection:
+                scoped_blocking.clear_plan_block(connection, self.repo, 'G-018')
+                notifications.record_process_start(connection, self.repo, 'worker', 'process', plan_id='G-018')
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=clear_during_send), 0)
+        self.assertEqual(len(calls), 1)
+        row = self.events(connection)[0]
+        self.assertEqual(row['confirmed_pieces'], 1)
+        self.assertEqual(row['attempts'], 1)
+        self.assertIsNotNone(row['canceled_at'])
+        self.assertEqual(row['payload'], original['payload'])
+        self.assertIsNotNone(row['rendered_text'])
+        with connection:
+            notifications.recover_interrupted_starts(connection)
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(connection.execute('SELECT start_identity FROM notified_block_incidents').fetchone()[0], 'process')
+
+    def test_latest_question_replaces_pending_action_in_same_incident(self):
+        connection = self.connection()
+        with connection:
+            self.decision_block(connection, question='Choose permission A?')
+        first = dict(self.events(connection)[0])
+        with connection:
+            self.decision_block(connection, question='Choose permission B?')
+        rows = self.events(connection)
+        self.assertEqual(len(rows), 2)
+        old = next(row for row in rows if row['event_key'] == first['event_key'])
+        self.assertIsNotNone(old['canceled_at'])
+        self.assertEqual(old['payload'], first['payload'])
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        adapter.assert_called_once()
+        self.assertIn('Choose permission B?', adapter.call_args.args[2])
+        self.assertNotIn('Choose permission A?', adapter.call_args.args[2])
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM notified_block_incidents').fetchone()[0], 1)
+
+    def test_old_planning_partial_queue_is_canceled_without_incident_reactivation(self):
+        connection = self.connection()
+        payload = {'project': 'alpha', 'stage': 'planning', 'scope': 'project',
+                   'reason_code': 'planning_error', 'cause': 'old planning failure', 'execplan_id': None}
+        key = notifications._key('blocked', self.repo, 'project\0planning_error\0')
+        with connection:
+            connection.execute("UPDATE projects SET planning_error='old planning failure'")
+            notifications._insert(connection, key, self.repo, 'blocked', payload)
+            notifications.adopt_legacy_block_notices(connection)
+            connection.execute("UPDATE notification_outbox SET rendered_text='frozen', confirmed_pieces=1, attempts=2, last_error='old error', canceled_at=CURRENT_TIMESTAMP")
+            connection.execute('UPDATE notified_block_incidents SET released_at=CURRENT_TIMESTAMP')
+            before = dict(self.events(connection)[0])
+            incident = dict(connection.execute('SELECT * FROM notified_block_incidents').fetchone())
+            for _ in range(2):
+                notifications.enqueue_current_project_events(connection, self.repo)
+                notifications.recover_interrupted_starts(connection)
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_not_called()
+        self.assertEqual(dict(self.events(connection)[0]), before)
+        self.assertEqual(dict(connection.execute('SELECT * FROM notified_block_incidents').fetchone()), incident)
+        self.assertEqual(connection.execute('SELECT planning_error FROM projects').fetchone()[0], 'old planning failure')
+
+    def test_pr_claim_requires_current_merge_wait_for_same_pr(self):
+        connection = self.connection()
+        loop_manager.update_project(connection, self.repo, phase='PR_OPEN', pr_url='https://example.test/pr/18')
+        before = dict(self.events(connection)[0])
+        with connection:
+            connection.execute("UPDATE exec_plans SET status='MERGED'")
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_new_pr_notifications(connection, 'token', 'chat', self.repo, adapter=adapter), 0)
+        adapter.assert_not_called()
+        row = self.events(connection)[0]
+        self.assertIsNotNone(row['canceled_at'])
+        self.assertEqual(row['payload'], before['payload'])
+        self.assertEqual(row['attempts'], 0)
+
+    def test_deleted_published_branch_requires_restart_until_request_is_recorded(self):
+        from loop_manager_internal.recovery.work_branch_integration import require_remote_present
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+        connection = self.connection()
+        with connection:
+            connection.execute("UPDATE exec_plans SET branch='loop-manager/G-018', publication_remote_oid=?", ('a' * 40,))
+            plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+            with self.assertRaises(RecoveryFailure) as failure:
+                require_remote_present(connection, self.repo, plan, None, None)
+            self.assertEqual(failure.exception.reason, RecoveryReason.REMOTE_BRANCH_DELETED)
+            scoped_blocking.record_plan_block(connection, self.repo, 'G-018',
+                scoped_blocking.BlockReasonCode.REMOTE_BRANCH_DELETED, str(failure.exception), 'deleted-published-branch')
+            checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'preserved locally', retryable=False)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        row = self.events(connection)[0]
+        self.assertEqual(json.loads(row['payload'])['action']['kind'], 'restart')
+        self.assertIn('명시적 재시작', notifications._message('blocked', json.loads(row['payload'])))
+        with connection:
+            current = dict(connection.execute('SELECT * FROM execplan_blocks').fetchone())
+            from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+            store = ExecutionCheckpointRepository(connection)
+            saved = store.get(self.repo, 'G-018')
+            store.record(self.repo, 'G-018', expected_generation=saved.generation,
+                operation=saved.operation, expected_head=saved.expected_head,
+                target_base_oid=saved.target_base_oid, observed_remote_oid=saved.observed_remote_oid,
+                snapshot={'deleted_branch_restart': {'state': 'complete', 'block': current}})
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_not_called()
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+        self.assertEqual(self.events(connection)[0]['attempts'], 0)
+
+    def test_invalid_recovery_evidence_and_changed_revision_preserve_unsent_audit(self):
+        for mutation in ('not-json', 'null', '[]', 'changed-revision'):
+            with self.subTest(mutation=mutation):
+                connection = self.connection()
+                with connection:
+                    self.decision_block(connection)
+                    before = dict(self.events(connection)[0])
+                    if mutation == 'changed-revision':
+                        connection.execute("UPDATE recovery_records SET plan_revision='previous'")
+                        connection.execute("UPDATE exec_plans SET current_revision_sha='latest'")
+                    else:
+                        connection.execute('UPDATE recovery_records SET final_evidence=?', (mutation,))
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                adapter.assert_not_called()
+                after = dict(self.events(connection)[0])
+                self.assertIsNotNone(after['canceled_at'])
+                for key in before.keys() - {'canceled_at', 'delivery_started_at'}:
+                    self.assertEqual(after[key], before[key], key)
+
+    def test_closed_pr_and_recorded_verify_limit_expose_only_their_current_action(self):
+        for reason, fingerprint, expected_kind in (
+            (scoped_blocking.BlockReasonCode.PULL_REQUEST_CLOSED, 'closed-head', 'reopen_pr'),
+            (scoped_blocking.BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT, '90', 'verify_timeout'),
+        ):
+            with self.subTest(reason=reason):
+                connection = self.connection()
+                with connection:
+                    connection.execute("UPDATE exec_plans SET pr_url='https://example.test/pr/18', verify_result='전체 verify 시간 초과: verify_timeout_seconds=90'")
+                    scoped_blocking.record_plan_block(connection, self.repo, 'G-018', reason,
+                        'Observed native result requires this specific user action.', fingerprint)
+                    checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+                    checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                row = self.events(connection)[0]
+                payload = json.loads(row['payload'])
+                self.assertEqual(payload['action']['kind'], expected_kind)
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+                adapter.assert_called_once()
+                if expected_kind == 'verify_timeout':
+                    self.assertIn('verify_timeout_seconds', adapter.call_args.args[2])
+                    self.assertIn('90초보다', adapter.call_args.args[2])
+                else:
+                    self.assertIn('다시 열어', adapter.call_args.args[2])
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)

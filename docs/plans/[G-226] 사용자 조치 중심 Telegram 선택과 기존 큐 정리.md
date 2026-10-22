@@ -97,6 +97,28 @@ PRODUCT의 완료·대기와 Telegram 절, ARCHITECTURE의 완료 저장·Telegr
 
 남은 작업은 blocked의 최신 원인·구체적 사용자 행동/실제 복구 불가 근거를 생성과 각 claim에 연결하는 공통 정책, PR·draft의 기존 관측과 공통 현재성 경계, planning 취소 사건을 되살리는 `_carry_planning_delivery`·`_queue_block`의 구정책 복원 제거, 해당 생성/조각 검증 및 최종 설계 문서 통합이다. 현재 원인별 action 근거가 없는 일반 block/planning_error도 여전히 생성될 수 있으며, 해당 상태 이름·final_evidence의 분류만으로는 실제 조치/복구 불가를 입증하지 못한다. 이 checkpoint는 전체 구현 완료 후보가 아니다.
 
+
+### 공통 현재 조치 판정과 planning 복원 제거 checkpoint
+
+`notifications/policy.py`를 생성·각 조각 claim의 공통 경계로 연결했다. 현재 block 대상·원인·release fingerprint와 recovery의 pending action·최종 근거·현재 revision을 대조하고, 실제 Worker 질문·허용 문서의 SPEC_DEADLOCK·현재 pending 지침 승인·같은 닫힌 PR·게시 branch 삭제의 명시적 재시작·기록된 verify 상한 변경 근거만 선택한다. 새로운 blocked payload의 선택적 action snapshot은 현재 조치와 다시 비교한다. 기존 payload는 현재 원본으로 확인할 수 있으면 재작성 없이 사용한다. PR·draft도 같은 경계에서 기존 상태/질문 관측을 재사용하며 Git 쓰기·외부 호출을 추가하지 않았다.
+
+사건 생성은 이전 pending을 취소한 뒤 실행하며, 조각 전송은 남은 조치가 없거나 복구가 pending이면 원문·고정 본문·cursor·attempt/error를 보존하고 취소한다. planning_error 생성, `_queue_block`의 과거 planning 재활성화와 missing outbox 재생성, `_carry_planning_delivery`의 canceled/released 복원은 제거했다. 첫 확인 원인과 legacy 감사 연결은 유지한다. 폐기된 stage_failed hook은 호환용 무통지 함수로 남기고 불필요한 실패 투영 조회를 없앴다. PRODUCT·ARCHITECTURE에는 현재 판정과 action 저장 계약을 반영했다.
+
+공유 `NotificationFixture.decision_block`는 실제 Worker 결과 파서와 recovery·block·checkpoint 저장소를 통해 구체적 질문을 만든다. 새 CurrentActionPolicyTest는 같은 상태의 근거 유무, retry/targets만 있는 최종 분류의 무통지, 부분 전송 중 pending 복구/조치 해소, 질문 대체, planning 취소 보존, PR 완료, 재시작 소비, 손상 근거/revision 변경과 구체적 PR/상한 조치를 실제 SQLite로 검사한다. 외부 전송만 double로 제공한다. 기존 Unicode incident/payload 보존 case도 이 실제 질문 fixture로 전환했다.
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest`: 당시 7개 통과. 이후 추가 case는 아래 최소 단위로 실행했다.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_events.NotificationEventTest.test_guidance_block_reports_exact_decision_lines_and_recovery_attempts tests.test_notification_events.NotificationEventTest.test_specification_deadlock_notification_names_documents_and_question tests.test_notification_delivery.DraftListNotificationTest`: 12개 통과.
+- FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_deleted_published_branch_requires_restart_until_request_is_recorded tests.test_notification_delivery.CurrentActionPolicyTest.test_invalid_recovery_evidence_and_changed_revision_preserve_unsent_audit tests.test_notification_delivery.CurrentActionPolicyTest.test_same_status_needs_concrete_current_question_before_one_notice tests.test_notification_delivery.CurrentActionPolicyTest.test_pr_claim_requires_current_merge_wait_for_same_pr`
+- 첫 결과: 4개 실행 중 재시작 소비 fixture 1개 실패. checkpoint 행이 없는데 UPDATE만 수행해 소비 사실을 저장하지 못했다. 실제 ExecutionCheckpointRepository.record로 수정했다.
+- RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_deleted_published_branch_requires_restart_until_request_is_recorded tests.test_notification_delivery.CurrentActionPolicyTest.test_invalid_recovery_evidence_and_changed_revision_preserve_unsent_audit tests.test_notification_delivery.CurrentActionPolicyTest.test_same_status_needs_concrete_current_question_before_one_notice tests.test_notification_delivery.CurrentActionPolicyTest.test_pr_claim_requires_current_merge_wait_for_same_pr`
+- 재실행 결과: 4개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_closed_pr_and_recorded_verify_limit_expose_only_their_current_action`: 1개 통과(두 조치 subcase).
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_events.NotificationEventTest.test_targeted_worker_failure_retains_recovery_history_without_notifications tests.test_notification_events.TimelyProgressEventTest.test_review_failure_preserves_state_without_notification tests.test_notification_events.TimelyProgressEventTest.test_review_protocol_failure_and_candidate_changes_do_not_notify`: 3개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_incidents.IncidentPayloadEncodingTest tests.test_notification_delivery.CurrentActionPolicyTest.test_invalid_recovery_evidence_and_changed_revision_preserve_unsent_audit`: 2개 통과.
+- `scripts/verify-inputs.json`의 기존 loop_manager_internal/**·tests/**가 새 policy와 변경 테스트를 포함한다. 전체 verify는 실행하지 않았다.
+
+남은 작업은 기존 notification events/delivery/incidents 테스트의 상태명-only/일반 planning_error 생성 fixture와 assertion을 현행 구체적 조치·legacy 감사 fixture로 전환하고 필요한 최소 회귀를 실행하는 것이다. 해당 기존 모듈 전체는 이번 호출에서 실행하지 않았으며 통과로 간주하지 않는다. 조치가 없는 실제 복구 불가 중단을 확정하는 근거 경로와 1회 통지 검증도 아직 확인하지 않았다. 현재 저장된 일반 final disposition만으로는 이를 증명하지 못하므로 보류하며 가짜 사용자 행동이나 복구 불가 선언을 만들지 않는다. 최종 원인별 정책·외부 관측/현재 설정 연결의 충분성을 점검하고 문서·최종 diff 보고를 통합해야 한다. 이번 결과는 구현 완료 후보가 아닌 보존점이다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.
