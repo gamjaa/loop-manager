@@ -59,3 +59,15 @@ priority: high
   RERUN: export LOOP_MANAGER_TARGETED_TEST_RUNNER=/home/ubuntu/.local/state/loop-manager/worktrees/e1b66bcef2ec3ace/G-290/loop_manager_internal/verification/targeted.py; export LOOP_MANAGER_TARGETED_TEST_DIRECTORY=/tmp/loop-manager-targeted-g290-review-q9l8v7tf; /usr/bin/python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_targeted_test_streak.TargetedRunnerTests
 
   재실행 결과: 10개 테스트 통과. 이어서 두 새 회귀 case만 지정한 targeted 실행은 2개 테스트 통과했다.
+- 후속 Review에서 `IsolatedAsyncioTestCase`가 표준 `_callSetUp`·`_callTearDown`을 재정의해 `TestCase` hook 계측을 우회하는 것을 확인했다. 두 표준 testcase 경로를 모두 계측하고, 동기 `setUp()`의 RuntimeError 뒤 기존 streak가 두 실패로 유지되며 다음 실제 본문 실패에서만 세 번째 실패가 되는 회귀를 추가했다.
+
+  FAILED_COMMAND: LOOP_MANAGER_TARGETED_TEST_RUNNER=/home/ubuntu/.local/state/loop-manager/worktrees/e1b66bcef2ec3ace/G-290/loop_manager_internal/verification/targeted.py LOOP_MANAGER_TARGETED_TEST_DIRECTORY=/tmp/loop-manager-targeted-g290-async-20261022 /usr/bin/python3 /home/ubuntu/.local/state/loop-manager/worktrees/e1b66bcef2ec3ace/G-290/loop_manager_internal/verification/targeted.py --unittest tests.test_targeted_test_streak.TargetedRunnerTests.test_isolated_asyncio_sync_setup_fixture_preserves_existing_failure_streak
+
+  RERUN: LOOP_MANAGER_TARGETED_TEST_RUNNER=/home/ubuntu/.local/state/loop-manager/worktrees/e1b66bcef2ec3ace/G-290/loop_manager_internal/verification/targeted.py LOOP_MANAGER_TARGETED_TEST_DIRECTORY=/tmp/loop-manager-targeted-g290-async-20261022 /usr/bin/python3 /home/ubuntu/.local/state/loop-manager/worktrees/e1b66bcef2ec3ace/G-290/loop_manager_internal/verification/targeted.py --unittest tests.test_targeted_test_streak.TargetedRunnerTests.test_isolated_asyncio_sync_setup_fixture_preserves_existing_failure_streak
+
+  재실행 결과: 1개 테스트 통과. 수정 전 실행에서는 결과가 `fixture_error` 대신 `error`로 기록되어 기존 두 실패에 잘못 누적되는 것을 확인했다. 전체 `scripts/verify`는 실행하지 않았다.
+- 후속으로 같은 `IsolatedAsyncioTestCase` 회귀와 일반 `TestCase`의 setup·teardown assertion 및 본문+teardown assertion 회귀를 함께 현재 후보에서 실행해 2개 테스트가 통과했다. launcher Python 3.12.3과 제공된 runner를 사용했으며 전체 verify는 실행하지 않았다.
+
+## Rebase 충돌 검증 (2026-10-23)
+
+- 마지막 rebase commit의 `IsolatedAsyncioTestCase` fixture hook 계측을 예외 identity 분류와 병합하고, 동기 `setUp()` 오류 뒤 기존 실패 streak가 보존되는 회귀를 추가했다. 별도 class-fixture 회귀는 앞/중간/끝 클래스와 각 테스트 streak를 함께 확인하는 기존 회귀가 더 넓게 검증하므로 중복 추가하지 않았다. 현재 후보에서 fixture assertion·subTest/teardown assertion·async setup streak·class/module fixture·streak 보존의 targeted 5개 case가 통과했다. 전체 `scripts/verify`는 실행하지 않았다.

@@ -1219,7 +1219,7 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 ### targeted test와 실패 수집
 
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다
-- targeted unit test 실패는 Worker가 같은 세션에서 수정하고 재실행한다. 프로젝트 Python과 Manager runtime의 `verification/targeted.py`는 실행별 ID·기록 폴더와 JUnit의 안정적인 classname·name·파라미터 ID를 결합해 native 개별 결과를 보존한다. unittest subTest는 상위 `test.id()`의 최종 결과 하나로 집계한다. unittest 본문의 failure·error와 `unexpected_success`는 실패이며, 성공·skip·expected failure만 명시된 초기화 결과다. `TestCase`와 `IsolatedAsyncioTestCase`의 동기·비동기 `setUp`·`tearDown` 오류는 callback에서 발생한 원래 예외 identity로 본문 결과와 구분해 `fixture_error`로 남긴다. 따라서 fixture assertion이 `addFailure()`로 전달되어도 본문 failure를 오분류하지 않으며, 본문과 teardown이 모두 실패하면 본문 failure를 한 번 보존한다. class/module teardown과 같이 테스트 identity에 안전하게 귀속할 수 없는 fixture 오류가 동반된 성공 결과는 `indeterminate`로 관측한다. 수집·중단에는 개별 결과를 만들지 않는다.
+- targeted unit test 실패는 Worker가 같은 세션에서 수정하고 재실행한다. 프로젝트 Python과 Manager runtime의 `verification/targeted.py`는 실행별 ID·기록 폴더와 JUnit의 안정적인 classname·name·파라미터 ID를 결합해 native 개별 결과를 보존한다. unittest subTest는 상위 `test.id()`의 최종 결과 하나로 집계한다. unittest 본문의 failure·error와 `unexpected_success`는 실패이며, 성공·skip·expected failure만 명시된 초기화 결과다. `TestCase`와 `IsolatedAsyncioTestCase`의 표준 `_callSetUp`·`_callTearDown` lifecycle 경로에서 callback의 원래 예외 identity를 대응시켜 동기·비동기 fixture 오류를 `fixture_error`로 남긴다. 따라서 fixture assertion이 unittest에서 `addFailure()`로 전달되어도 본문 failure와 구분하며, 본문과 teardown이 모두 실패하면 본문 failure를 한 번 보존한다. class/module teardown과 같이 테스트 identity에 안전하게 귀속할 수 없는 fixture 오류가 동반된 성공 결과는 `indeterminate`로 관측한다. 수집·중단에는 개별 결과를 만들지 않는다.
 
   실행 가능한 관련 unit test가 없는 변경은 사유를 남기며 전체 검증을 생략하는 근거로 사용하지 않는다
 

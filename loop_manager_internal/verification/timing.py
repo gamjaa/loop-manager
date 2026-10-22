@@ -176,28 +176,28 @@ def fixture_timing():
                 with phase(f'subtest:{test.id()}:{variants[test.id()]}'), subtest(test, *args, **kwargs):
                     yield
             patches.enter_context(mock.patch.object(unittest.TestCase, 'subTest', timed_subtest))
-            fixture_hooks = [(unittest.TestCase, "_callSetUp", "setUp"),
-                             (unittest.TestCase, "_callTearDown", "tearDown")]
-            if hasattr(unittest, "IsolatedAsyncioTestCase"):
-                fixture_hooks.extend(((unittest.IsolatedAsyncioTestCase, "_callSetUp", "setUp"),
-                                      (unittest.IsolatedAsyncioTestCase, "_callTearDown", "tearDown")))
-            for owner, name, scope in fixture_hooks:
-                original = getattr(owner, name)
+            test_case_types = [unittest.TestCase]
+            isolated_async_case = getattr(unittest, "IsolatedAsyncioTestCase", None)
+            if isolated_async_case is not None:
+                test_case_types.append(isolated_async_case)
+            for case_type in test_case_types:
+                for name, scope in (("_callSetUp", "setUp"), ("_callTearDown", "tearDown")):
+                    original = getattr(case_type, name)
 
-                def measured_test_fixture(test, *args, _original=original, _scope=scope, **kwargs):
-                    try:
-                        return _original(test, *args, **kwargs)
-                    except unittest.SkipTest:
-                        raise
-                    except KeyboardInterrupt:
-                        raise
-                    except BaseException as error:
-                        failures = _test_fixture_failures.get()
-                        if failures is not None:
-                            failures[id(test)] = (_scope, error)
-                        raise
+                    def measured_test_fixture(test, *args, _original=original, _scope=scope, **kwargs):
+                        try:
+                            return _original(test, *args, **kwargs)
+                        except unittest.SkipTest:
+                            raise
+                        except KeyboardInterrupt:
+                            raise
+                        except BaseException as error:
+                            failures = _test_fixture_failures.get()
+                            if failures is not None:
+                                failures[id(test)] = (_scope, error)
+                            raise
 
-                patches.enter_context(mock.patch.object(owner, name, measured_test_fixture))
+                    patches.enter_context(mock.patch.object(case_type, name, measured_test_fixture))
             for name in names:
                 original = getattr(unittest.TestSuite, name)
 

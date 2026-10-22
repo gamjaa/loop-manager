@@ -402,6 +402,42 @@ class AsyncBodyAndTearDownBroken(unittest.IsolatedAsyncioTestCase):
                              [('fixture_result', 'error', 'tearDown'),
                               ('test_end', 'failure', None)])
 
+    def test_isolated_asyncio_sync_setup_fixture_preserves_existing_failure_streak(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project, records = root / 'project', root / 'records'
+            project.mkdir()
+            records.mkdir()
+            (project / 'case_async_fixture.py').write_text('''import unittest
+class BrokenSetup(unittest.IsolatedAsyncioTestCase):
+    def setUp(self): raise RuntimeError('sync setUp failed')
+    async def test_case(self): self.fail('the body must not run')
+''', encoding='utf-8')
+            environment = dict(os.environ, LOOP_MANAGER_TARGETED_TEST_DIRECTORY=str(records),
+                               LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(project))
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            ensure_schema(connection)
+            repository = TargetedTestRepository(connection)
+            identity = 'case_async_fixture.BrokenSetup.test_case'
+            repository.observe('repo', 'G-290', [event('prior-a', identity), event('prior-b', identity)])
+
+            result = subprocess.run([sys.executable, str(Path(targeted.__file__).resolve()),
+                '--unittest', 'case_async_fixture'], cwd=project, env=environment,
+                capture_output=True, text=True, check=False)
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            completed = targeted.collect(records)
+            self.assertEqual([(item['id'], item['result']) for item in completed],
+                             [(identity, 'fixture_error')])
+            repository.observe('repo', 'G-290', completed)
+            self.assertFalse(repository.repeated('repo', 'G-290'))
+            failures = connection.execute('''SELECT failures FROM targeted_test_streaks
+                WHERE repo='repo' AND plan_id='G-290' AND test_id=?''', (identity,)).fetchone()[0]
+            self.assertEqual(failures, 2)
+            repository.observe('repo', 'G-290', [event('after-fixture', identity)])
+            self.assertEqual(repository.repeated('repo', 'G-290'), (identity,))
+
     def test_module_and_class_fixture_errors_do_not_reset_test_history(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
