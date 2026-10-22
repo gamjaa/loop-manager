@@ -163,79 +163,42 @@ def worker_prompt(
     archive_candidates: tuple[str, ...] = (),
     session_recovery: bool = False,
     allow_common_plans: bool = False,
+    session_resume: bool = False,
+    task_changed: bool = False,
+    context_delta: str = '',
 ) -> str:
-    failure = (
-        "\n현재 교정할 오류:\n"
-        f"{redact_secrets(error)[-6000:]}\n"
-        if error else ""
-    )
-    saved_feedback = (
-        "\n미해결 검증 피드백 delta (identity, occurrence, revision):\n"
-        f"{validation_feedback}\n"
-        if validation_feedback
-        else ""
-    )
-    correction = (
-        "\n미해결 검증 실패와 아래 오류의 원인에 관련된 변경부터 처리하라. "
-        "이미 성공한 작업을 불필요하게 반복하거나 범위 밖 기능으로 확대하지 마라.\n"
-        if error or validation_feedback else ""
-    )
-    if "전체 verify 시간 초과:" in (error or "") or "전체 verify 시간 초과:" in (validation_feedback or ""):
-        failure += (
-            "검증 출력과 진행 위치, 실행된 테스트 및 verify 스크립트를 확인해 "
-            "무한 반복·교착·중복 검증을 먼저 점검하라. 필요한 검증을 삭제하거나 "
-            "시간 상한을 임의로 올리지 마라. 필요한 검증이 정상 진행했고 현재 "
-            "상한만 부족하다는 구체적 근거가 확인되면 PR_SUMMARY 안에 "
-            "VERIFY_TIMEOUT_LIMIT_INSUFFICIENT: <진행 근거와 필요한 설정 조정> "
-            "한 줄을 적어라.\n"
-        )
-    archive_instruction = (
-        "\nRequirement 완료 판단과 내용 보존 이동은 관련 계획이 Merge된 뒤 "
-        "일반 Planner와 Manager가 처리한다. Worker의 연관 문서 수정은 "
-        "Requirement 완료 판단이나 archive 이동 권한을 포함하지 않는다.\n"
-    )
-    recovery = ""
+    """Task input and unacknowledged changes; static rules live in instructions."""
+    parts = []
+    if not session_resume or session_recovery or task_changed:
+        parts.append(f'선택된 ExecPlan: {plan_path}')
+        if task_changed and session_resume and not session_recovery:
+            parts.append('게시된 최신 ExecPlan의 구현 조건이 변경됐다. 현재 계획을 다시 읽고 '
+                         '기존 구현과 대조해 남은 보완을 수행하라.')
+        if allow_common_plans:
+            parts.append('게시된 작업 범위: docs/PLANS.md 변경 포함.')
     if session_recovery:
-        recovery = (
-            "\n저장된 Worker 세션을 재개할 수 없어 새 세션에서 이어간다. "
-            "선택된 최신 ExecPlan과 현재 worktree를 다시 확인하라. "
-            "계획 목표와 실제 diff를 아래 이전 Worker 결과·미해결 피드백과 대조해 "
-            "이미 수행한 변경과 남은 작업을 확인하고 다음 필요한 작업부터 이어가라. "
-            "이전 결과만으로 검증 성공을 주장하지 마라:\n"
-            f"{redact_secrets(previous_result or '이전 Worker 결과 없음')[-6000:]}\n"
-        )
-    plans_scope = (
-        "게시된 ExecPlan이 공통 docs/PLANS.md 변경을 명시했으므로 그 파일 변경도 허용된다."
-        if allow_common_plans
-        else "docs/PLANS.md는 이번 Worker 변경 범위가 아니다."
-    )
-    return f"""
-당신은 Loop Manager의 Worker다.
-검증 adapter 문맥: scripts/verify.json의 선택 adapter·프로젝트 환경, docs/VERIFY.md의 지원 버전·참조 계약을 확인하라.
-{plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
-{correction}
-{saved_feedback}
-{failure}
-{recovery}
-관련 targeted test를 작성하고, 선택된 관리 작업 branch에 의미 있는 작업 단위의 로컬 checkpoint commit을 만들 수 있다. commit은 복구점이며 검증·Review 성공 근거가 아니다. commit을 만든 뒤에는 추가 변경 없이 결과를 반환하라. fetch, rebase, push, PR 조작과 scripts/verify 실행은 하지 마라. Manager가 checkpoint 게시를 보류하면 새 변경을 추가하지 마라.
-docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
-ExecPlan의 사용자 판단 대기 draft 표시와 User Decision은 사용자를 대신해 해제·작성·변경하지 마라.
-선택된 ExecPlan은 구현·검증 기록 등 본문만 수정하고 frontmatter는 직접 변경하지 마라. 활성·archive를 포함한 모든 Requirement와 다른 ExecPlan은 수정하지 마라. PRODUCT·ARCHITECTURE·FUTURE_IDEAS는 현재 작업에 필요한 범위에서 수정할 수 있다.
-source 경로가 실제 파일명과 다르면 기존 정확 경로·동일 파일명 archive·고유 R-ID 조회로 근거를 확인하되 sources 문자열은 보존하라. 누락·모호함이나 선언 교정이 필요하면 원인과 대상 경로를 보고하고 Planner·Manager의 검증·공식 선언·DB 반영에 맡겨라. Manager가 frontmatter만 복원했다고 전달하면 보존된 본문·최종 diff로 문서 보고를 갱신하고 선언을 다시 수정하지 마라.
-소유된 rebase 충돌 해결 중에는 frontmatter를 복원하지 마라. 코드 충돌 해결과 관련 targeted 검증을 마쳤고 고유 R-ID로 확인되는 source 파일명 차이만 남았다면 ready_for_validation으로 인계하라. Manager가 Git rebase 완료 후 고정 base의 frontmatter를 복원한다. 실제 source 누락·모호함이나 해결되지 않은 구현·사용자 판단 문제는 그대로 보고하라.
-{plans_scope}
-구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.
-targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행하라. 문서·설정 전용 변경이거나 실행 가능한 관련 unit test가 없으면 테스트 범위를 확대하지 말고, 실행하지 못한 구체적인 사유를 최종 결과에 남겨라.
-실패 이력을 보고할 때는 실패한 명령만 적은 `FAILED_COMMAND:` 줄과 수정 후 동일 명령만 적은 `RERUN:` 줄을 각각 두고, 재실행의 실패가 없는 최종 결과를 그 뒤에 명시하라. 두 명령은 공백을 정규화한 뒤 정확히 같아야 하며 하나의 실행에서 성공·실패가 섞인 요약은 통과로 보고하지 마라.
-전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check 및 scripts/verify 실행은 절대 실행하지 마라. 전체 verify는 Worker 종료 뒤 Loop Manager가 실행하며, 실패한 경우에만 이 세션으로 진단을 전달한다.
-작업이 완료되면 최종 응답 마지막에 아래 형식을 정확히 포함하라. 제목과 Summary는 최종 diff 전체를 설명해야 하며 ExecPlan 제목이나 일반적인 변경 문구를 쓰지 마라:
-COMMIT_TITLE: 한 줄의 구체적인 변경 제목
-PR_SUMMARY: 실제 변경을 간결히 설명하는 Summary
-TARGETED_TESTS:
-실행한 최소 범위 targeted unit test와 결과, 또는 실행하지 못한 구체적인 사유
-{worker_outcome_instruction()}
-{archive_instruction}
-""".strip()
+        parts.append('새 세션에서 이어간다. 선택된 최신 ExecPlan과 현재 worktree의 실제 diff에서 '
+                     '이미 수행한 변경과 남은 작업을 확인하고 다음 필요한 작업부터 이어가라. '
+                     '미해결 피드백은 아래에 있다.')
+    if validation_feedback:
+        parts.append('미해결 검증 피드백 delta (identity, occurrence, revision):\n' + validation_feedback)
+    if error:
+        parts.append('현재 교정할 오류:\n' + redact_secrets(error)[-6000:])
+    if context_delta:
+        parts.append(context_delta)
+    if archive_candidates:
+        parts.append('현재 archive 후보: ' + ', '.join(archive_candidates))
+    if error or validation_feedback:
+        parts.append('미해결 원인에 관련된 변경부터 처리하라.')
+    if '전체 verify 시간 초과:' in (error or '') + (validation_feedback or ''):
+        parts.append('검증 출력과 진행 위치에서 무한 반복·교착·중복 검증을 먼저 점검하라. '
+                     '정상 진행했고 상한만 부족한 구체적 근거가 있으면 '
+                     'PR_SUMMARY 안에 VERIFY_TIMEOUT_LIMIT_INSUFFICIENT: <진행 근거와 필요한 설정 조정>을 보고하라.')
+    if not session_resume or session_recovery:
+        parts.append(worker_outcome_instruction())
+    if not parts:
+        parts.append('미완료 작업을 이어가라.')
+    return '\n\n'.join(parts)
 
 
 def reviewer_prompt(

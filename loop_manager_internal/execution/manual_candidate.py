@@ -491,37 +491,58 @@ class ManualCandidate:
             group,head,base,_token,_setting,stage_token,_known=self.inputs(context,stage)
             self.store.record(group,stage,head,base,stage_token,'PASS' if passed else 'FAIL',detail,plan_ids=plan_ids)
 
+    def worker_context(self):
+        """Separate stable intake documents from each changed stage observation."""
+        if not self.enabled():
+            return {}
+        group = self.group()
+        documents = json.loads(group['documents'])
+        context = {'manual_documents': (
+            '수동 제출입니다. 외부 targeted test 결과는 확인되지 않았으며 PASS로 가정하지 마세요.\n'
+            '현재 후보의 R 원문과 아래 모든 G를 함께 확인하세요. 한 G도 누락하지 마세요.\n'
+            + '\n\n'.join(f"### {item['path']}\n{item['text']}" for item in documents))}
+        rows = self.connection.execute(
+            'SELECT plan_id,stage,result,head,detail FROM manual_work_results '
+            'WHERE repo=? AND group_id=? ORDER BY created_at,rowid',
+            (self.repo, group['group_id'])).fetchall()
+        for row in rows:
+            detail = ''
+            if row['result'] == 'SKIPPED_BY_USER' and ';' in row['detail']:
+                detail = '; ' + redact_secrets(row['detail'].split(';', 1)[1].strip())
+            # A later result replaces only this plan/stage's observation. Raw
+            # verify/Review logs stay in their audit and feedback repositories.
+            context[f"manual_stage:{row['plan_id']}:{row['stage']}"] = (
+                f"수동 단계 결과: {row['plan_id']} {row['stage']}: {row['result']} @{row['head']}{detail}")
+        if group['pending_source_head'] and group['source_update_conflict']:
+            incoming = group['pending_source_head']
+            source_diff = self.git(Path(self.repo), 'diff', group['initial_source_head'], incoming).stdout
+            context['manual_source'] = (
+                f'반복 source 제출 {incoming}의 Merge 충돌로 자동 교정 중입니다. '
+                '두 이력을 보존·통합하고 미해결 R 의미는 사용자 판단으로 넘기세요.\n' + source_diff)
+        return context
+
     def prompt(self, prompt, *, review=False):
         if not self.enabled():
             return prompt
         group=self.group()
         docs=json.loads(group['documents'])
         content='\n\n'.join(f"### {item['path']}\n{item['text']}" for item in docs)
-        row=self.connection.execute('SELECT verify_result FROM exec_plans WHERE repo=? AND plan_id=?',
-                                    (self.repo,self.plan_id)).fetchone()
         instruction='\n수동 제출입니다. 외부 targeted test 결과는 확인되지 않았으며 PASS로 가정하지 마세요.\n'
         if review:
             instruction += (
                 '아래는 모든 G의 실제 verify/Review 단계 상태와 후보 identity입니다. '
                 '상태가 SKIPPED_BY_USER이면 실행 성공으로 취급하지 마세요.\n'
             )
-        else:
-            instruction += f"전체 verify 근거: {row['verify_result'] or 'NOT_RUN'}\n"
         instruction += '현재 후보의 R 원문과 아래 모든 G를 함께 확인하세요. 한 G도 누락하지 마세요.\n'
         result_rows=self.connection.execute('SELECT plan_id,stage,result,head,detail FROM manual_work_results '
             'WHERE repo=? AND group_id=? ORDER BY created_at', (self.repo,group['group_id'])).fetchall()
-        if review:
-            rows=[]
-            for item in result_rows:
-                detail = ''
-                if item['result']=='SKIPPED_BY_USER' and ';' in item['detail']:
-                    detail='; '+redact_secrets(item['detail'].split(';',1)[1].strip())
-                rows.append(f"- {item['plan_id']} {item['stage']}: {item['result']} @{item['head']}{detail}")
-            instruction += '\n수동 단계 결과 (로그 본문 생략):\n'+'\n'.join(rows)+'\n'
-        else:
-            rows='\n'.join(f"- {item['plan_id']} {item['stage']}: {item['result']} @{item['head']} "
-                           f"{item['detail'][:1000]}" for item in result_rows)
-            instruction += '\n수동 단계 결과:\n'+rows+'\n'
+        rows=[]
+        for item in result_rows:
+            detail = ''
+            if item['result']=='SKIPPED_BY_USER' and ';' in item['detail']:
+                detail='; '+redact_secrets(item['detail'].split(';',1)[1].strip())
+            rows.append(f"- {item['plan_id']} {item['stage']}: {item['result']} @{item['head']}{detail}")
+        instruction += '\n수동 단계 결과 (로그 본문 생략):\n'+'\n'.join(rows)+'\n'
         if group['pending_source_head'] and group['source_update_conflict']:
             incoming=group['pending_source_head']
             source_diff=self.git(Path(self.repo),'diff',group['initial_source_head'],incoming).stdout

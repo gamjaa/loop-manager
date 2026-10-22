@@ -456,7 +456,13 @@ def validate_worker_workspace_scope(
                 publication_head = before.head
     if on_frontmatter_restored is not None and not allow_rebase:
         if after.head != before.head:
-            raise RuntimeError('Worker 종료 전후 HEAD가 달라 frontmatter 복원을 보류합니다.')
+            from loop_manager_internal.recovery.checkpoint_ownership import committed_tree_matches_intent
+            from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+            saved = (ExecutionCheckpointRepository(connection).get(str(repo_path), str(catalog_plan['plan_id'])).snapshot
+                     if connection is not None else None) or {}
+            if not committed_tree_matches_intent(worktree, before.head, after.head, saved, effects.git):
+                from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
+                raise WorkspaceOwnershipError('Worker 직접 HEAD 변경 또는 미확인 commit을 보존하고 인계를 거부합니다.')
         effects.validate_managed_worktree(repo_path, worktree, branch)
         if effects.git_bytes is None:
             raise RuntimeError('frontmatter 복원의 원본 byte reader가 없습니다.')

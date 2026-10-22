@@ -27,6 +27,9 @@ class WorkerOutcome:
     proposal: str = ""
     locations: tuple[DecisionLocation, ...] = ()
     question: str = ""
+    plan_id: str = ""
+    start_head: str = ""
+    commit_title: str = ""
 
     def evidence(self) -> dict[str, object]:
         return {
@@ -83,6 +86,19 @@ def parse_worker_outcome(
         if set(value) != {"kind"}:
             raise WorkerOutcomeError("완료 후보 결과 선언에 결정 대기 필드가 섞였습니다.")
         return WorkerOutcome(kind)
+    if kind == "checkpoint":
+        if set(value) != {"kind", "plan_id", "start_head"}:
+            raise WorkerOutcomeError("checkpoint 요청의 작업·시작 HEAD 필드가 유효하지 않습니다.")
+        if (not isinstance(value['plan_id'], str) or re.fullmatch(r'G-\d{3,}', value['plan_id']) is None
+                or not isinstance(value['start_head'], str)
+                or re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', value['start_head']) is None):
+            raise WorkerOutcomeError("checkpoint 요청의 작업·시작 HEAD가 유효하지 않습니다.")
+        labels = _PUBLICATION.findall(message)
+        titles = re.findall(r'(?m)^COMMIT_TITLE:[ \t]*(\S[^\r\n]*)$', message)
+        if len(labels) != 1 or len(titles) != 1 or len(titles[0]) > 200 or any(ord(c) < 32 for c in titles[0]):
+            raise WorkerOutcomeError("checkpoint는 COMMIT_TITLE 하나만 보고하며 완료 선언과 혼합할 수 없습니다.")
+        return WorkerOutcome(kind, plan_id=value['plan_id'], start_head=value['start_head'],
+                             commit_title=titles[0].strip())
     if kind != "needs_user_decision":
         raise WorkerOutcomeError("알 수 없는 Worker 결과 kind입니다.")
     if set(value) != {"kind", "problem", "proposal", "locations", "question"}:
@@ -119,7 +135,8 @@ def worker_outcome_instruction() -> str:
     return (
         "최종 결과에 한 줄 JSON 선언을 정확히 하나 포함하라. 구현이 완료됐다면 "
         'WORKER_OUTCOME: {"kind":"ready_for_validation"} 을 쓰고 뒤에 '
-        "COMMIT_TITLE, PR_SUMMARY, TARGETED_TESTS를 보고하라. 사용자 결정이 필요해 "
+        "COMMIT_TITLE: 구체적 변경 제목, PR_SUMMARY: 최종 변경 설명, "
+        "TARGETED_TESTS: 실제 실행 결과 또는 미실행 사유를 보고하라. 사용자 결정이 필요해 "
         "구현을 중단한다면 WORKER_OUTCOME: "
         '{"kind":"needs_user_decision","problem":"구체적 문제",'
         '"proposal":"필요한 변경과 영향","locations":'
@@ -128,4 +145,8 @@ def worker_outcome_instruction() -> str:
         "결정 대기에는 완료 제목이나 성공한 targeted test를 요구하지 않는다. "
         "locations는 선택된 ExecPlan, 해당 sources, PRODUCT, ARCHITECTURE의 "
         "실제로 존재하는 경로·절만 사용하라."
+        ' 중간 보존점만 요청한다면 WORKER_OUTCOME: {"kind":"checkpoint",'
+        '"plan_id":"선택 G-ID","start_head":"이번 호출 시작 HEAD"} 와 '
+        'COMMIT_TITLE: 구체적인 보존점 제목만 반환하라. PR_SUMMARY·TARGETED_TESTS와 '
+        '완료 성공을 합성하지 마라. Manager가 종료·범위 검사 후 commit·게시한다.'
     )

@@ -293,6 +293,8 @@ class VerifyInputObservationTest(unittest.TestCase):
         patterns = inputs.parse((root / inputs.MANIFEST).read_bytes())
         for path in ('loop_manager.py', 'loop_manager_internal/verification/runner.py',
                      'loop_manager_internal/catalog/frontmatter.py',
+                     'docs/AGENTS.common.md', 'docs/AGENTS.planner.md', 'docs/AGENTS.planner_check.md',
+                     'docs/AGENTS.worker.md', 'docs/AGENTS.reviewer.md', 'docs/AGENTS.ponytail.md',
                      'tests/support/origin.py', 'tests/fixtures/project-files/AGENTS.md',
                      'tests/fixtures/project-files/docs/AGENTS.common.md',
                      'tests/fixtures/project-files/docs/AGENTS.planner.md',
@@ -315,7 +317,7 @@ class VerifyInputObservationTest(unittest.TestCase):
                      'docs/PLANS.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md',
                      'docs/FUTURE_IDEAS.md', 'docs/VERIFY.md',
                      'docs/PRODUCT.template.md', 'docs/ARCHITECTURE.template.md',
-                     'docs/REQUIREMENT.template.md', 'docs/AGENTS.worker.md',
+                     'docs/REQUIREMENT.template.md',
                      '.agents/skills/specification-docs/SKILL.md',
                      'scripts/setup.sh', '.gitignore', '.gitattributes'):
             with self.subTest(path=path):

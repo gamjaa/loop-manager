@@ -25,6 +25,92 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_checkpoint_response_uses_manager_request_without_completion_fields(self):
+        from loop_manager_internal.execution import worker_checkpoint
+        before = SimpleNamespace(head='a' * 40)
+        self.effects.agent.begin_agent_scope.return_value = before
+        message = ('WORKER_OUTCOME: {"kind":"checkpoint","plan_id":"G-047",'
+                   '"start_head":"' + 'a' * 40 + '"}\nCOMMIT_TITLE: Preserve partial implementation')
+        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(0, message, 'session')
+        expected = SimpleNamespace(kind='checkpoint')
+        with mock.patch.object(worker_checkpoint, 'save_request', return_value=expected) as request, \
+             mock.patch.object(self.handler, '_finish_worker') as complete:
+            outcome = self.handler.run(self.context())
+        self.assertIs(outcome, expected)
+        self.assertEqual(request.call_args.args[2].kind, 'checkpoint')
+        self.assertEqual(request.call_args.args[3], message)
+        self.assertIs(request.call_args.args[4], before)
+        self.assertEqual(request.call_args.kwargs['session'], 'session')
+        complete.assert_not_called()
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.assertIsNone(self.state.row()['worker_input_token'])
+
+    def test_pending_checkpoint_request_prevents_a_new_worker_turn(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.effects, checkpoint=checkpoint)
+        checkpoint.record('repo', 'G-047', expected_generation=0, operation=None,
+            expected_head='head', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'worker_checkpoint_request': {'plan_id': 'other-task'}})
+        outcome = self.handler.run(self.context())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.assertEqual(checkpoint.get('repo', 'G-047').snapshot['worker_checkpoint_request'],
+                         {'plan_id': 'other-task'})
+
+    def test_checkpoint_pending_targeted_collection_does_not_commit_or_complete(self):
+        self.effects.agent.run_agent.side_effect = lambda *args, **kwargs: lm.AgentResult(
+            0, 'WORKER_OUTCOME: {"kind":"checkpoint","plan_id":"G-047",'
+               '"start_head":"' + 'a' * 40 + '"}\nCOMMIT_TITLE: Preserve partial implementation',
+            targeted_collection_pending=True)
+        with mock.patch.object(self.handler, '_commit_owned') as commit:
+            outcome = self.handler.run(self.context())
+        commit.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertIsNone(self.state.row()['worker_input_token'])
+
+    def test_same_session_sends_only_changed_task_context_after_valid_return(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
+        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(
+            0, VALID_WORKER_RESULT, 'same-session')
+        self.state.update_project('repo', worker_session_id='same-session', last_error='first error')
+        self.handler._update_snapshot(archive_candidates=('R-001',))
+        with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
+            self.handler.run(self.context())
+            first = self.effects.agent.run_agent.call_args.args[5]
+            self.handler.run(self.context())
+            second = self.effects.agent.run_agent.call_args.args[5]
+            self.state.update_project('repo', last_error='second error')
+            self.handler._update_snapshot(archive_candidates=('R-002',))
+            self.handler.run(self.context())
+            delta = self.effects.agent.run_agent.call_args.args[5]
+        self.assertIn('R-001', first)
+        self.assertIn('first error', first)
+        self.assertIn('docs/plans/', first)
+        for old in ('R-001', 'first error', 'WORKER_OUTCOME:', 'docs/plans/', '작업 공간:', 'code_index.py'):
+            self.assertNotIn(old, second)
+            self.assertNotIn(old, delta)
+        self.assertIn('R-002', delta)
+        self.assertIn('second error', delta)
+
+    def test_invalid_return_does_not_acknowledge_archive_or_error_context(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
+        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(0, 'invalid', 'same-session')
+        self.state.update_project('repo', worker_session_id='same-session', last_error='first error')
+        self.handler._update_snapshot(archive_candidates=('R-001',))
+        self.handler.run(self.context())
+        self.handler.run(self.context())
+        repeated = self.effects.agent.run_agent.call_args.args[5]
+        self.assertIn('R-001', repeated)
+        self.assertIn('WORKER_OUTCOME:', repeated)
+        self.assertIsNone(self.connection.execute('SELECT * FROM validation_delivery_cursors').fetchone())
+
     def test_collection_pending_keeps_explicit_user_decision(self):
         from tests.support.worker import decision
         self._decision_workspace()
@@ -304,7 +390,8 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             second_prompt = self.effects.agent.run_agent.call_args.args[5]
         self.assertIn('verify:fingerprint occurrence=1 revision=1', first_prompt)
         self.assertIn('WORKER_OUTCOME:', first_prompt)
-        self.assertIn('needs_user_decision', second_prompt)
+        self.assertNotIn('WORKER_OUTCOME:', second_prompt)
+        self.assertNotIn('docs/plans/', second_prompt)
         self.assertEqual(first_prompt.count('first failure'), 1)
         self.assertNotIn('private raw prelude', first_prompt)
         self.assertNotIn('first failure', second_prompt)
@@ -353,7 +440,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             self.handler.run(self.context())
         self.assertEqual(len(prompts), 2)
         self.assertIn('선택된 최신 ExecPlan과 현재 worktree', prompts[1])
-        self.assertIn('previous result', prompts[1])
+        self.assertNotIn('previous result', prompts[1])
         self.assertIn('review:a.py::f::bug occurrence=1 revision=1', prompts[1])
         self.assertIn('Fix the assertion', prompts[1])
         self.assertNotIn('raw Review detail omitted from prompt', prompts[1])
@@ -411,7 +498,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             )
             self.assertEqual((pending.kind, pending.previous_session),
                              ('fallback', 'old-session'))
-            self.assertIn('saved result', args[5])
+            self.assertNotIn('saved result', args[5])
             raise RuntimeError('new session interrupted')
 
         self.effects.agent.run_agent.side_effect = interrupted
@@ -426,7 +513,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
 
         def recovered(*args, **kwargs):
             self.assertIsNone(kwargs['session_id'])
-            self.assertIn('saved result', args[5])
+            self.assertNotIn('saved result', args[5])
             self.assertEqual(kwargs['invocation'].transition_id, pending.identity)
             kwargs['on_session_started']('replacement-session')
             return lm.AgentResult(0, VALID_WORKER_RESULT,
@@ -781,7 +868,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
             self.handler.run(self.context())
         self.assertIn('선택된 최신 ExecPlan과 현재 worktree', prompts[-1])
-        self.assertIn('previous result', prompts[-1])
+        self.assertNotIn('previous result', prompts[-1])
         self.assertIn('verify:fingerprint occurrence=1 revision=1', prompts[-1])
         self.assertNotIn('raw full failure', prompts[-1])
 

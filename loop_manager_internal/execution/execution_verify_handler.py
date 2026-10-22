@@ -36,6 +36,8 @@ class VerifyHandlerPorts:
     state: ExecutionStatePort
     _worktree_execplan_input_fingerprint: Callable[..., Any]
     begin_agent_scope: Callable[..., Any]
+    capture_git_snapshot: Callable[..., Any]
+    _published_plan_allows_common_plans: Callable[..., Any]
     branch_has_changes: Callable[..., Any]
     clear_agent_scope: Callable[..., Any]
     clear_validation_failure_history: Callable[..., Any]
@@ -376,13 +378,14 @@ class VerifyHandler:
             self.ports.operation_print(no_change_error, file=sys.stderr)
             return self.ports._final(no_change_error)
         if dirty:
-            self.ports.git(context.worktree, 'add', '-A')
             self.ports.update_snapshot(plan=self.ports.validate_active_execplan_metadata(
                 self.ports.identity.repo_path,
                 context.worktree,
                 context.plan.path,
                 self.ports.snapshot().catalog_plan,
             ))
+            from loop_manager_internal.execution.worker_checkpoint import stage_candidate
+            stage_candidate(self.ports, context)
             self.ports._commit_owned(context, worker_publication.commit_title, worker_confirmed=True)
         guarded = self.ports._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
@@ -516,7 +519,8 @@ class VerifyHandler:
                 self.ports.identity.repo_path, context.worktree, context.plan.path,
                 self.ports.snapshot().catalog_plan,
             ))
-            self.ports.git(context.worktree, 'add', '-A')
+            from loop_manager_internal.execution.worker_checkpoint import stage_candidate
+            stage_candidate(self.ports, context)
             self.ports._commit_owned(context, worker_publication.commit_title)
             return self.ports._retry('전체 verify 중 허용된 변경을 commit했습니다. 새 후보를 다시 검증합니다.')
         with runtime_state._transaction(self.ports.state.connection):

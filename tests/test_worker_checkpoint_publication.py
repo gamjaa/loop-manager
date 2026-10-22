@@ -3,7 +3,9 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from loop_manager_internal.git import github_observation, publication_service
@@ -107,6 +109,171 @@ class PullRequestHistoryTests(unittest.TestCase):
 
 
 class WorkerCheckpointPublicationTests(unittest.TestCase):
+    def test_confirmed_push_and_later_remote_input_are_separate_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin, branch, base, connection = self._repository(directory)
+            self.addCleanup(connection.close)
+            target = git_command(repo, 'rev-parse', 'HEAD~1')
+            successor = git_command(repo, 'rev-parse', 'HEAD')
+            git_command(repo, 'push', 'origin', f'{successor}:refs/heads/{branch}')
+            checkpoints = ExecutionCheckpointRepository(connection)
+            checkpoints.record(str(repo), 'G-001', expected_generation=0, operation=None,
+                expected_head=target, target_base_oid=base, observed_remote_oid=None,
+                snapshot={'worker_checkpoint_pending': {'branch': branch, 'from': None, 'target': target}})
+            effects = self._effects(repo, origin, connection)
+            observed = mock.Mock(wraps=effects.git)
+            effects = publication_service.WorkerCheckpointPublicationEffects(**{**effects.__dict__, 'git': observed})
+            _, count = publication_service.push_worker_checkpoint_commits(effects, connection,
+                repo, Path(directory), str(repo), 'G-001', branch, repo, 'main', successor, None)
+            self.assertEqual(count, 0)
+            self.assertFalse(any(call.args[1] == 'push' for call in observed.call_args_list))
+            self.assertEqual(git_command(repo.parent / 'remote.git', 'rev-parse', f'refs/heads/{branch}'), successor)
+            # Only our target is confirmed. The caller still has to accept the
+            # successor as a new remote input before continuing implementation.
+            self.assertEqual(connection.execute('SELECT publication_remote_oid FROM exec_plans').fetchone()[0], target)
+            saved = checkpoints.get(str(repo), 'G-001').snapshot
+            self.assertEqual(saved['accepted_work_branch'], target)
+            self.assertNotIn('worker_checkpoint_pending', saved)
+
+    def _effects(self, repo, origin, connection, *, git=None, update=None):
+        return publication_service.WorkerCheckpointPublicationEffects(
+            active_execplan=lambda _connection, selected_repo: connection.execute(
+                'SELECT * FROM exec_plans WHERE repo=?', (selected_repo,)).fetchone(),
+            git=git or self._git,
+            remote_branch_oid=lambda path, branch: publication_service.remote_branch_oid(
+                publication_service.RemoteBranchOidEffects(git=self._git), path, branch),
+            pr_for_branch=lambda *_: None, github_repository=lambda _: origin,
+            validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+            update_project=update or (lambda _connection, selected_repo, **values: connection.execute(
+                'UPDATE exec_plans SET ' + ', '.join(f'{key}=?' for key in values) + ' WHERE repo=?',
+                (*values.values(), selected_repo))),
+        )
+
+    def test_intermediate_forbidden_document_is_never_pushed_after_its_revert(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin, branch, base, connection = self._repository(directory)
+            self.addCleanup(connection.close)
+            safe = git_command(repo, 'rev-parse', 'HEAD')
+            target = repo / 'docs/requirements/Active.md'
+            original = target.read_bytes()
+            target.write_text('# [R-001] Forbidden temporary change\n', encoding='utf-8')
+            git_command(repo, 'add', str(target))
+            git_command(repo, 'commit', '-m', 'Forbidden intermediate requirement')
+            forbidden = git_command(repo, 'rev-parse', 'HEAD')
+            target.write_bytes(original)
+            git_command(repo, 'add', str(target))
+            git_command(repo, 'commit', '-m', 'Restore final requirement')
+            final = git_command(repo, 'rev-parse', 'HEAD')
+            effects = self._effects(repo, origin, connection)
+            with self.assertRaisesRegex(RuntimeError, '금지 문서'):
+                publication_service.push_worker_checkpoint_commits(effects, connection, repo, Path(directory),
+                    str(repo), 'G-001', branch, repo, 'main', None, None)
+            self.assertEqual(git_command(repo.parent / 'remote.git', 'rev-parse', f'refs/heads/{branch}'), safe)
+            self.assertEqual(git_command(repo, 'rev-parse', 'HEAD'), final)
+            self.assertNotEqual(safe, forbidden)
+            self.assertEqual(ExecutionCheckpointRepository(connection).get(str(repo), 'G-001')
+                             .snapshot['accepted_work_branch'], safe)
+            # The restart entrance must apply the same immutable policy.
+            with self.assertRaisesRegex(RuntimeError, '금지 문서'):
+                publication_service.push_worker_checkpoint_commits(effects, connection, repo, Path(directory),
+                    str(repo), 'G-001', branch, repo, 'main', safe, None)
+
+    def test_publication_completion_rolls_back_both_rows_and_does_not_repeat_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin, branch, base, connection = self._repository(directory)
+            self.addCleanup(connection.close)
+            first = git_command(repo, 'rev-parse', 'HEAD~1')
+            real = self._effects(repo, origin, connection)
+            pushes = []
+            def git(path, *args, **kwargs):
+                self.assertFalse(connection.in_transaction, args)
+                if args[0] == 'push':
+                    pushes.append(args[-1].split(':')[0])
+                return self._git(path, *args, **kwargs)
+            def interrupted(*args, **kwargs):
+                real.update_project(*args, **kwargs)
+                raise sqlite3.OperationalError('completion interrupted')
+            effects = publication_service.WorkerCheckpointPublicationEffects(
+                **{**real.__dict__, 'git': git, 'update_project': interrupted})
+            with self.assertRaisesRegex(sqlite3.OperationalError, 'completion interrupted'):
+                publication_service.push_worker_checkpoint_commits(effects, connection, repo, Path(directory),
+                    str(repo), 'G-001', branch, repo, 'main', None, None)
+            saved = ExecutionCheckpointRepository(connection).get(str(repo), 'G-001')
+            self.assertEqual(saved.snapshot['worker_checkpoint_pending']['target'], first)
+            self.assertNotIn('accepted_work_branch', saved.snapshot)
+            self.assertIsNone(connection.execute('SELECT publication_remote_oid FROM exec_plans').fetchone()[0])
+            effects = publication_service.WorkerCheckpointPublicationEffects(**{**real.__dict__, 'git': git})
+            head, count = publication_service.push_worker_checkpoint_commits(effects, connection, repo, Path(directory),
+                str(repo), 'G-001', branch, repo, 'main', first, None)
+            self.assertEqual(pushes, [first, head])
+            self.assertEqual(count, 1)
+            self.assertEqual(connection.execute('SELECT publication_remote_oid FROM exec_plans').fetchone()[0], head)
+
+    def test_manager_request_survives_commit_completion_interruption_without_new_commit(self):
+        import loop_manager as manager
+        from loop_manager_internal.execution import worker_checkpoint
+        from loop_manager_internal.execution.execution_publication_handler import PublicationHandler
+        from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionPhase, ExecutionPlanMetadata
+        from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
+        from loop_manager_internal.execution.execution_state import ExecutionStatePort
+        from loop_manager_internal.execution.worker_outcome import WorkerOutcome
+        from loop_manager_internal.storage import runtime_state
+        from loop_manager_internal.notifications import notifications
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin, branch, base, connection = self._repository(directory)
+            self.addCleanup(connection.close)
+            notifications.ensure_schema(connection)
+            connection.commit()
+            state = ExecutionStatePort(connection, runtime_state.RuntimeStateRepository(connection), str(repo))
+            state.update_project(str(repo), worker_session_id='same-session',
+                                 verify_result='existing verify failure', last_error='existing diagnostic')
+            identity = ExecutionIdentity(repo=str(repo), repo_path=repo, state_dir=Path(directory), base='main')
+            checkpoint = ExecutionCheckpointRepository(connection)
+            context = ExecutionContext(str(repo), repo, Path(directory), 'main', base, 'codex', repo / 'config.ini',
+                ExecutionPlanMetadata('G-001', 'Resume', 'docs/plans/[G-001] Resume.md', base),
+                ExecutionPhase.IMPLEMENTING, branch, repo, base, None, worker_session_id='same-session')
+            ports = SimpleNamespace(identity=identity, checkpoint=checkpoint, state=state, git=self._git,
+                capture_git_snapshot=manager.capture_git_snapshot, snapshot=lambda: PreparationSnapshot(),
+                _published_plan_allows_common_plans=lambda *_: False, _row=state.row, feedback=None,
+                validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+                _retry=lambda detail: detail, _fetch_latest_base=lambda: base)
+            handler = PublicationHandler(ports)
+            ports._commit_owned = handler._commit_owned
+            publication = self._effects(repo, origin, connection,
+                update=lambda _c, r, **values: state.update_project(r, preserve_transaction=True, **values))
+            def publish(ctx, **kwargs):
+                remote = publication.remote_branch_oid(repo, branch)
+                _, count = publication_service.push_worker_checkpoint_commits(publication, connection,
+                    repo, Path(directory), str(repo), 'G-001', branch, repo, 'main', remote, None)
+                return {'pushed': count, 'candidate_changed': False}
+            ports.publish_worker_checkpoints = publish
+            before = manager.capture_git_snapshot(repo)
+            (repo / 'src/app.py').write_text('VALUE = 123\n', encoding='utf-8')
+            request = WorkerOutcome('checkpoint', plan_id='G-001', start_head=before.head,
+                                    commit_title='Preserve the new implementation')
+            original_record = checkpoint.record
+            def interrupt_completion(*args, **kwargs):
+                if kwargs['operation'] is None and kwargs['snapshot'].get('after_head'):
+                    raise sqlite3.OperationalError('commit completion interrupted')
+                return original_record(*args, **kwargs)
+            with mock.patch.object(checkpoint, 'record', side_effect=interrupt_completion):
+                with self.assertRaisesRegex(sqlite3.OperationalError, 'commit completion interrupted'):
+                    worker_checkpoint.save_request(ports, context, request, 'checkpoint only', before,
+                                                   session='same-session')
+            head = git_command(repo, 'rev-parse', 'HEAD')
+            self.assertEqual(git_command(repo, 'show', '-s', '--format=%P', head), before.head)
+            worker_checkpoint.resume_request(ports, context)
+            self.assertEqual(git_command(repo, 'rev-parse', 'HEAD'), head)
+            self.assertEqual(git_command(repo.parent / 'remote.git', 'rev-parse', f'refs/heads/{branch}'), head)
+            self.assertIsNone(worker_checkpoint.resume_request(ports, context))
+            row = state.row()
+            self.assertEqual(row['worker_session_id'], 'same-session')
+            self.assertEqual(row['verify_result'], 'existing verify failure')
+            self.assertEqual(row['last_error'], 'existing diagnostic')
+            for field in ('worker_result', 'worker_input_token', 'verify_token', 'review_token', 'publication_token'):
+                self.assertIsNone(row[field])
+
     def _repository(self, directory):
         repo = make_remote_repository(directory)
         origin = local_github_origin(self, repo)
@@ -274,3 +441,166 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
                 )
             self.assertEqual(git_command(upstream, 'rev-parse', 'HEAD'), remote_head)
             self.assertEqual(git_command(repo, 'rev-parse', 'HEAD'), local_head)
+
+
+class WorkerCheckpointPolicyTests(unittest.TestCase):
+    def test_final_candidate_uses_literal_owned_paths_and_preserves_unsafe_index(self):
+        from dataclasses import replace
+        from loop_manager_internal.agents.scope_contracts import GitSnapshot
+        from loop_manager_internal.execution.worker_checkpoint import stage_candidate
+        selected = 'docs/plans/[G-001] Resume.md'
+        snapshot = GitSnapshot('head', 'loop-manager/G-001', {}, {}, {}, {}, {}, {})
+        good = replace(snapshot, dirty={'src/app.py': (('unstaged',), 'content')})
+        git = mock.Mock()
+        ports = SimpleNamespace(capture_git_snapshot=lambda _: good, git=git,
+            _published_plan_allows_common_plans=lambda *_: False,
+            snapshot=lambda: SimpleNamespace(catalog_plan=None),
+            identity=SimpleNamespace(repo_path=Path('/source')))
+        context = SimpleNamespace(worktree=Path('/managed'), branch=snapshot.branch,
+                                  plan=SimpleNamespace(path=selected))
+        stage_candidate(ports, context)
+        git.assert_called_once_with(context.worktree, '--literal-pathspecs', 'add', '--', 'src/app.py')
+        git.reset_mock()
+        for unsafe in (replace(good, branch='other'),
+                       replace(good, operations={'MERGE_HEAD': 'operation'}),
+                       replace(good, index={'src/app.py': ('h 100644 blob 0',)}),
+                       replace(good, index={'src/app.py': ('M 100644 blob 2',)}),
+                       replace(good, dirty={'docs/requirements/Active.md': (('staged',), 'content')})):
+            with self.subTest(unsafe=unsafe), self.assertRaises(RuntimeError):
+                ports.capture_git_snapshot = lambda _, value=unsafe: value
+                stage_candidate(ports, context)
+        git.assert_not_called()
+
+    def test_immutable_scope_preserves_base_changes_and_rejects_protected_intermediate_trees(self):
+        from loop_manager_internal.agents.scope_validation import validate_worker_commit
+        from tests.support.catalog import execplan_header
+        path = 'docs/plans/[G-001] Resume.md'
+        previous = execplan_header('G-001', 'Resume') + '\n## Progress\n- pending\n'
+        current = previous + '\n- implementation preserved\n'
+        changed = [path, 'src/app.py', 'docs/PRODUCT.md']
+        inherited = False
+        mode = '100644'
+        def git(_path, *args, **kwargs):
+            if args[:3] == ('show', '-s', '--format=%P'):
+                return SimpleNamespace(stdout='parent', returncode=0)
+            if args[0] == 'merge-base':
+                return SimpleNamespace(returncode=0 if inherited else 1)
+            if args[0] == 'diff':
+                return SimpleNamespace(stdout='\0'.join(changed) + '\0', returncode=0)
+            if args[0] == 'ls-tree':
+                return SimpleNamespace(stdout=f'{mode if args[1] == "commit" else "100644"} blob oid\t{path}', returncode=0)
+            if args[0] == 'show':
+                return SimpleNamespace(stdout=previous if args[1].startswith('parent:') else current, returncode=0)
+            raise AssertionError(args)
+        def validate():
+            validate_worker_commit(git, Path('/managed'), 'parent', 'commit', path, base_branch='main')
+        validate()
+        for forbidden in ('docs/requirements/Active.md', 'docs/requirements/archive/Old.md',
+                          'docs/plans/[G-002] Other.md'):
+            changed[:] = [forbidden]
+            with self.subTest(path=forbidden), self.assertRaisesRegex(RuntimeError, '금지 문서'):
+                validate()
+        inherited = True
+        validate()  # An immutable commit from the registered base retains its author.
+        inherited = False
+        changed[:] = [path]
+        for candidate in (current.replace('priority: normal', 'priority: high'),
+                          current.replace('sources:', '# Changed declaration\nsources:'),
+                          current + '\n## User Decision\nDecision: Approved\n'):
+            with self.subTest(candidate=candidate), self.assertRaises(RuntimeError):
+                current = candidate
+                validate()
+        current = previous
+        mode = '100755'
+        with self.assertRaisesRegex(RuntimeError, 'mode'):
+            validate()
+
+    def test_pr_wait_releases_database_and_checkpoint_race_prevents_push(self):
+        from loop_manager_internal.storage.db_access import open_connection
+        from tests.support.database import runtime_connection
+        for race in (False, True):
+            with self.subTest(race=race), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'state.db'
+                source = runtime_connection()
+                base, head, tree = 'a' * 40, 'b' * 40, 'c' * 40
+                branch = 'loop-manager/G-047'
+                source.execute("UPDATE projects SET origin='owner/repo'")
+                source.execute("UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, "
+                               "branch=?, worktree='/managed'", (base, branch))
+                source.commit()
+                with sqlite3.connect(path) as destination:
+                    source.backup(destination)
+                source.close()
+                waiting, released = threading.Event(), threading.Event()
+                failures, pushes = [], []
+                live = None
+                def git(_path, *args, **kwargs):
+                    nonlocal live
+                    if args[0] == 'remote': value = 'https://github.com/owner/repo.git'
+                    elif args[0] == 'symbolic-ref': value = branch
+                    elif args[0] == 'rev-parse': value = tree if args[-1].endswith('^{tree}') else head
+                    elif args[0] == 'ls-remote': value = f'{live}\trefs/heads/{branch}' if live else ''
+                    elif args[0] == 'rev-list': value = f'{head} {base}'
+                    elif args[0] == 'show': value = base
+                    elif args[0] == 'diff': value = 'app.py\0'
+                    elif args[0] == 'merge-base':
+                        return SimpleNamespace(returncode=1 if args[-1] == 'refs/remotes/origin/main' else 0)
+                    elif args[0] == 'push':
+                        pushes.append(args)
+                        live, value = head, ''
+                    else: raise AssertionError(args)
+                    return SimpleNamespace(stdout=value, returncode=0)
+                def run():
+                    connection = open_connection(path, timeout=2)
+                    connection.row_factory = sqlite3.Row
+                    try:
+                        def pr(*args):
+                            waiting.set()
+                            if not released.wait(3):
+                                raise AssertionError('other DB connection was blocked by PR wait')
+                            return None
+                        effects = publication_service.WorkerCheckpointPublicationEffects(
+                            active_execplan=lambda c, r: c.execute('SELECT * FROM exec_plans').fetchone(),
+                            git=git, remote_branch_oid=lambda *_: None, pr_for_branch=pr,
+                            github_repository=lambda _: 'owner/repo',
+                            validate_execplan_workspace_identity=lambda *_: None,
+                            validate_managed_worktree=lambda *_: None,
+                            update_project=lambda c, r, **values: c.execute(
+                                'UPDATE exec_plans SET publication_remote_oid=?', (values['publication_remote_oid'],)))
+                        publication_service.push_worker_checkpoint_commits(effects, connection,
+                            Path('/source'), Path(directory), 'repo', 'G-047', branch,
+                            Path('/managed'), 'main', None, None)
+                    except BaseException as error:
+                        failures.append(error)
+                    finally:
+                        connection.close()
+                worker = threading.Thread(target=run)
+                worker.start()
+                try:
+                    self.assertTrue(waiting.wait(3), repr(failures))
+                    other = open_connection(path, timeout=1)
+                    other.row_factory = sqlite3.Row
+                    try:
+                        self.assertEqual(other.execute('SELECT count(*) FROM exec_plans').fetchone()[0], 1)
+                        with other:
+                            other.execute("UPDATE projects SET planning_fingerprint='other writer'")
+                            if race:
+                                checkpoints = ExecutionCheckpointRepository(other)
+                                checkpoints.record('repo', 'G-047', expected_generation=0, operation=None,
+                                    expected_head=base, target_base_oid=base, observed_remote_oid=None,
+                                    snapshot={'competing': True})
+                    finally:
+                        other.close()
+                finally:
+                    released.set()
+                    worker.join(4)
+                self.assertFalse(worker.is_alive())
+                if race:
+                    self.assertEqual(len(failures), 1)
+                    self.assertIsInstance(failures[0], RuntimeError)
+                    self.assertEqual(pushes, [])
+                    with sqlite3.connect(path) as observed:
+                        self.assertIn('competing', observed.execute('SELECT snapshot FROM execution_checkpoints').fetchone()[0])
+                else:
+                    self.assertEqual(failures, [])
+                    self.assertEqual(len(pushes), 1)

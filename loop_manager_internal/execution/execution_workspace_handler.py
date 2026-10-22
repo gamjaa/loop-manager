@@ -157,6 +157,10 @@ class WorkspaceHandler:
                 if catalog['current_revision_sha'] is not None else None,
             )
             current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+            if (current.snapshot or {}).get('worker_checkpoint_request'):
+                # Its stopped result and exact local effect must resume before
+                # normal fetch/rebase recovery can change the candidate.
+                return context
             if current.operation == 'rebase':
                 self.ports._current_rebase_service(context).normalize_frontmatter()
             self.ports._publish_rebased_checkpoint(context)
@@ -264,6 +268,13 @@ class WorkspaceHandler:
                 return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                                      'checkpoint observation changed', context=context)
             from loop_manager_internal.execution import stage_documents
+            if ((current.snapshot or {}).get('worker_checkpoint_pending')
+                    and self.ports.publish_worker_checkpoints is not None):
+                published = self.ports.publish_worker_checkpoints(context,
+                    allowed_requirement_archives=self.ports.snapshot().archive_scope_sources)
+                if isinstance(published, ExecutionOutcome):
+                    return published
+                return self.ports._context()
             if self.ports.reconcile_remote is not None:
                 if self.ports.reconcile_remote(context, remote_oid, pull_request):
                     context = self.ports._context()
@@ -294,7 +305,8 @@ class WorkspaceHandler:
             pending_worker_push = bool((current.snapshot or {}).get('worker_checkpoint_pending'))
             if (self.ports.publish_worker_checkpoints is not None
                     and not (manual and manual.enabled())
-                    and (context.phase.value == 'IMPLEMENTING' or pending_worker_push)):
+                    and (context.phase.value == 'IMPLEMENTING' or pending_worker_push
+                         or (current.snapshot or {}).get('after_head') == snapshot.local_head)):
                 published = self.ports.publish_worker_checkpoints(
                     context,
                     allowed_requirement_archives=self.ports.snapshot().archive_scope_sources,
@@ -305,6 +317,9 @@ class WorkspaceHandler:
                     return self.ports._context()
                 row = self.ports._row()
                 current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+                if published is not None and published.get('pushed'):
+                    # The following ownership decision must observe the completed push.
+                    return self.ports._context()
             current_catalog = self.ports.state.active_execplan(self.ports.identity.repo)
             if (
                 int(current_catalog['catalog_generation']),

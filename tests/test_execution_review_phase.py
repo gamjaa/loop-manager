@@ -115,6 +115,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         context = SimpleNamespace(
             plan=SimpleNamespace(plan_id='G-034'), branch=branch,
             worktree=fixture.worktree, active_sha=fixture.base_oid,
+            phase=ExecutionPhase.IMPLEMENTING, resolving_rebase=False,
         )
 
         def assert_owned(expected):

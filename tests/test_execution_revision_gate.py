@@ -344,10 +344,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.effects.blocking.block_active_execplan.assert_not_called()
         self.assertEqual(self.handler.plan['priority'], 'high')
-        self.assertEqual(
-            self.effects.agent.worker_prompt.call_args.args[2],
-            'previous worker result',
-        )
+        self.assertIsNone(self.effects.agent.worker_prompt.call_args.args[2])
         self.dirty = False
         self.effects.workspace._rebase_in_progress_for_branch.return_value = False
         refreshed = self.handler.guard(self.handler._context())

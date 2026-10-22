@@ -12,7 +12,8 @@
   구현·검증 기록 등 본문만 수정하며 frontmatter는 직접 변경하지 않는다. 활성·archive를
   포함한 모든 Requirement는 추가·수정·삭제·rename·이동하지 않는다. 연관 문서 수정은 호출에서
   제공된 권한 안에서 수행하고
-  목표·실행 이력·dependency·사용자 결정을 보존한다.
+  목표·실행 이력·dependency·사용자 결정을 보존한다. ExecPlan의 사용자 판단 대기 draft 표시와
+  User Decision은 사용자를 대신해 해제·작성·변경하지 않는다.
 - source 경로와 실제 파일명이 다르면 정확 경로·동일 파일명 archive·고유 R-ID 조회로 근거를
   확인하되 sources 문자열은 보존한다. 누락·모호함이나 선언 교정이 필요하면 원인과 대상 경로를
   보고하고 Planner·Manager의 검증·공식 선언·DB 반영에 맡긴다. Manager가 종료 후
@@ -23,10 +24,32 @@
   결정을 대신 작성·변경하지 않는다.
 - Requirement의 완료 판단·archive 이동은 Manager의 책임이며 Worker가 수행하지 않는다.
   `docs/PLANS.md` 수정은 게시된 ExecPlan이 해당 변경을 명시한 경우에만 허용한다.
-- 선택된 관리 작업 branch에서 의미 있는 작업 단위의 로컬 checkpoint commit을 만들 수 있다.
-  commit은 코드 보존점일 뿐 검증·Review 성공을 뜻하지 않는다. fetch·rebase·push·PR 조작과
-  다른 branch의 변경은 금지한다. commit 뒤에는 결과를 반환하고, Manager의 게시가 확인되기
-  전에는 새 변경을 추가하지 않는다.
+- Worker는 Git add·commit·fetch·rebase·push·PR 조작을 직접 실행하지 않는다. 의미 있는 작업
+  단위의 보존점은 `WORKER_OUTCOME: {"kind":"checkpoint","plan_id":"선택 G-ID",
+  "start_head":"이번 호출 시작 HEAD"}`와 `COMMIT_TITLE: 구체적인 보존점 제목`으로 요청하고 종료한다.
+  checkpoint 결과에는 PR_SUMMARY·TARGETED_TESTS나 구현 완료·검증 성공을 합성하지 않는다.
+  Manager가 종료·범위·선언·index 확인 후 허용 파일만 commit하고 게시한다. 게시가 확인되거나
+  보존된 대기가 해결되기 전에는 새 Worker 작업을 시작하지 않는다. commit은 복구점이며
+  Worker 완료·targeted test·verify·Review 성공 근거가 아니다.
+- 소유된 rebase 충돌 해결 중에는 frontmatter를 복원하지 않는다. 코드·targeted 검증을 마쳤고
+  고유 R-ID로 확인되는 source 파일명 차이만 남았다면 ready_for_validation으로 인계한다.
+  Manager가 Git rebase 완료 후 고정 base의 frontmatter를 복원한다. 실제 source 누락·모호함이나
+  구현·사용자 판단 문제는 그대로 보고한다. rebase 중 checkpoint 요청은 하지 않는다.
+
+## 결과 protocol
+
+최종 결과에는 WORKER_OUTCOME 한 줄 JSON을 정확히 하나 포함한다. 구현 완료 후보는
+`WORKER_OUTCOME: {"kind":"ready_for_validation"}`과 COMMIT_TITLE·PR_SUMMARY·TARGETED_TESTS를
+보고한다. COMMIT_TITLE은 최종 diff 전체를 설명하는 구체적 한 줄 제목이며 ExecPlan 제목이나
+일반적인 변경 문구를 사용하지 않는다. TARGETED_TESTS는 실제 최소 범위 실행과 결과 또는
+실행하지 못한 구체적 사유를 담는다.
+사용자 결정이 필요하면 `WORKER_OUTCOME: {"kind":"needs_user_decision","problem":"구체적 문제",
+"proposal":"필요한 변경과 영향","locations":[{"path":"실제 문서 경로","section":"실제 절 제목"}],
+"question":"사용자가 답해야 할 질문"}`을 보고한다. locations는 선택된 ExecPlan, 그 sources,
+PRODUCT·ARCHITECTURE의 실제 경로·절만 사용하고 완료 publication 선언과 혼합하지 않는다.
+checkpoint·판단 대기는 완료 후보와 구분하며 Manager의 검증·Review를 대신하지 않는다.
+검증 adapter 문맥은 scripts/verify.json의 선택 adapter·환경과 docs/VERIFY.md에서 확인한다.
+
 
 ## 설계 문서 갱신
 
@@ -57,7 +80,7 @@
   기록 폴더는 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`다. 같은 테스트의 연속 3회 실패를 확인하면
   추가 수정을 멈추고 실패를 보고한다. 실행·수집 중단이나 기록 부재를 테스트 실패 횟수로 보고하지 않는다.
 - 실패 명령은 `FAILED_COMMAND:`, 수정 후 동일 명령은 `RERUN:` 줄로 보고하고
-  재실행 결과를 그 뒤에 명시한다. 성공·실패가 섞인 요약을 통과로 보고하지 않는다.
+  재실행 결과를 그 뒤에 명시한다. 두 명령은 공백을 정규화한 뒤 정확히 같아야 한다. 성공·실패가 섞인 요약을 통과로 보고하지 않는다.
 - 전체 verify의 실제 입력을 `scripts/verify-inputs.json` version 1 상대 경로/glob 목록으로
   스크립트와 함께 유지한다. 코드·테스트·fixture·의존성 선언·저장소 검증 스크립트/선언과
   실제로 읽는 문서·`.agents/`를 반영한다. 재사용은 저장소 코드 입력 기준이며 실행 머신의 환경·

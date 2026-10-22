@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -98,6 +98,15 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE validation_delivery_attempts "
             "ADD COLUMN recovery INTEGER NOT NULL DEFAULT 0"
         )
+    for table, fields in {
+        'validation_delivery_attempts': {'context': "TEXT NOT NULL DEFAULT '{}'"},
+        'validation_delivery_cursors': {'context': "TEXT NOT NULL DEFAULT '{}'",
+                                        'context_order': 'INTEGER NOT NULL DEFAULT 0'},
+    }.items():
+        available = {row[1] for row in connection.execute(f'PRAGMA table_info({table})')}
+        for name, declaration in fields.items():
+            if name not in available:
+                connection.execute(f'ALTER TABLE {table} ADD COLUMN {name} {declaration}')
     connection.execute(
         "CREATE INDEX IF NOT EXISTS validation_feedback_events_identity "
         "ON validation_feedback_events(repo,plan_id,identity,sequence)"
@@ -120,6 +129,8 @@ class Delivery:
     attempt_id: str
     rows: tuple[dict[str, object], ...]
     recovery: bool
+    context: dict[str, str] = field(default_factory=dict)
+    initial: bool = False
 
 
 class ValidationFeedbackRepository:
@@ -210,7 +221,7 @@ class ValidationFeedbackRepository:
         )
 
     def prepare(self, repo: str, plan_id: str, session_id: str | None,
-                *, recovery: bool = False) -> Delivery:
+                *, recovery: bool = False, context: dict[str, str] | None = None) -> Delivery:
         """Persist an invocation snapshot before a provider can receive it."""
         with _transaction(self.connection):
             interrupted_recovery = bool(session_id and self.connection.execute(
@@ -220,11 +231,15 @@ class ValidationFeedbackRepository:
             ).fetchone())
             recovery = recovery or interrupted_recovery
             cursor = self.connection.execute(
-                "SELECT sequence FROM validation_delivery_cursors "
+                "SELECT sequence,context FROM validation_delivery_cursors "
                 "WHERE repo=? AND plan_id=? AND session_id=?",
                 (repo, plan_id, session_id),
             ).fetchone() if session_id and not recovery else None
             since = int(cursor["sequence"]) if cursor else 0
+            prior_context = json.loads(cursor['context']) if cursor else {}
+            context = {key: redact_secrets(value) for key, value in (context if context is not None else prior_context).items()}
+            delta = {key: value for key, value in context.items() if prior_context.get(key) != value}
+            initial = 'task' not in prior_context
             rows = self.connection.execute(
                 "SELECT stage,identity,occurrence,revision,diagnostic,sequence "
                 "FROM validation_feedback_current WHERE repo=? AND plan_id=? "
@@ -262,17 +277,21 @@ class ValidationFeedbackRepository:
                 "INSERT INTO validation_delivery_items (attempt_id,sequence) VALUES (?,?)",
                 [(attempt_id, row["sequence"]) for row in rows],
             )
-            return Delivery(attempt_id, tuple(rendered), recovery)
+            self.connection.execute('UPDATE validation_delivery_attempts SET context=? WHERE id=?',
+                                    (json.dumps(context, sort_keys=True), attempt_id))
+            return Delivery(attempt_id, tuple(rendered), recovery, delta, initial)
 
     def bind_session(self, attempt_id: str, session_id: str) -> None:
         """Attach a newly started session before exposing it to runtime state."""
         with _transaction(self.connection):
             attempt = self.connection.execute(
-                "SELECT repo,plan_id,recovery FROM validation_delivery_attempts "
+                "SELECT repo,plan_id,recovery,session_id FROM validation_delivery_attempts "
                 "WHERE id=? AND status='pending'", (attempt_id,),
             ).fetchone()
             if attempt is None:
                 raise ValueError("pending validation delivery was not found")
+            if attempt['session_id'] is not None and attempt['session_id'] != session_id:
+                raise ValueError('validation delivery session identity changed')
             self.connection.execute(
                 "UPDATE validation_delivery_attempts SET session_id=? "
                 "WHERE id=? AND status='pending'",
@@ -290,11 +309,13 @@ class ValidationFeedbackRepository:
         """Advance the cursor only for the successfully validated invocation."""
         with _transaction(self.connection):
             attempt = self.connection.execute(
-                "SELECT * FROM validation_delivery_attempts WHERE id=? AND status='pending'",
+                "SELECT rowid AS delivery_order,* FROM validation_delivery_attempts WHERE id=? AND status='pending'",
                 (attempt_id,),
             ).fetchone()
             if attempt is None:
                 raise ValueError("pending validation delivery was not found")
+            if attempt['session_id'] is not None and attempt['session_id'] != session_id:
+                raise ValueError('validation delivery session identity changed')
             self.connection.execute(
                 "INSERT INTO validation_delivery_cursors (repo,plan_id,session_id,sequence) "
                 "VALUES (?,?,?,?) ON CONFLICT(repo,plan_id,session_id) DO UPDATE SET "
@@ -302,6 +323,11 @@ class ValidationFeedbackRepository:
                 (attempt["repo"], attempt["plan_id"], session_id,
                  attempt["sequence"]),
             )
+            self.connection.execute(
+                "UPDATE validation_delivery_cursors SET context=?,context_order=? "
+                "WHERE repo=? AND plan_id=? AND session_id=? AND context_order<?",
+                (attempt['context'], attempt['delivery_order'], attempt['repo'], attempt['plan_id'],
+                 session_id, attempt['delivery_order']))
             self.connection.execute(
                 "UPDATE validation_delivery_attempts SET status='delivered',session_id=? WHERE id=?",
                 (session_id, attempt_id),

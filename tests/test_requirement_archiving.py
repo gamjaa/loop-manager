@@ -699,11 +699,10 @@ Test fallback.
             archive_candidates=(source,),
         )
         self.assertNotIn("이동하라", prompt)
-        self.assertIn("관련 계획이 Merge된 뒤", prompt)
-        self.assertIn(
-            "Requirement 완료 판단이나 archive 이동 권한을 포함하지 않는다",
-            loop_manager.worker_prompt("docs/plans/[G-001] Plan.md", None),
-        )
+        self.assertIn(source, prompt)
+        instruction = (Path(__file__).resolve().parents[1] / 'docs/AGENTS.worker.md').read_text(encoding='utf-8')
+        self.assertIn('Requirement의 완료 판단·archive 이동은 Manager의 책임', instruction)
+        self.assertNotIn('Requirement의 완료 판단·archive 이동', prompt)
 
     def test_unknown_status_is_rejected(self):
         source = self.requirement("Unknown Status")

@@ -51,6 +51,10 @@ class WorkerHandlerPorts:
     _rebase_in_progress_for_branch: Callable[..., Any]
     _revision_execplan_input_fingerprint: Callable[..., Any]
     begin_agent_scope: Callable[..., Any]
+    capture_git_snapshot: Callable[..., Any]
+    validate_managed_worktree: Callable[..., Any]
+    validate_execplan_workspace_identity: Callable[..., Any]
+    _commit_owned: Callable[..., Any]
     block_verify_timeout_limit: Callable[..., Any]
     branch_has_changes: Callable[..., Any]
     clear_agent_scope: Callable[..., Any]
@@ -181,6 +185,15 @@ class WorkerHandler:
 
     def run(self, context: ExecutionContext) -> ExecutionOutcome:
         self.ports.state.check_context(context)
+        if self.ports.checkpoint is not None:
+            from loop_manager_internal.execution import worker_checkpoint
+            try:
+                resumed = worker_checkpoint.resume_request(self.ports, context)
+                if resumed is not None:
+                    return resumed
+            except (RuntimeError, OSError) as error:
+                return self.ports._recover(classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
+                                           str(error), context=context)
         if self.ports.publish_worker_checkpoints is not None and not context.resolving_rebase:
             try:
                 checkpoint_result = self.ports.publish_worker_checkpoints(
@@ -412,42 +425,78 @@ class WorkerHandler:
             recovering = bool(session_recovery or (
                 active_transition is not None and current_session_id is None
             ))
-            if feedback_repo is not None:
-                delivery = feedback_repo.prepare(
-                    self.ports.identity.repo, str(plan['id']), current_session_id,
-                    recovery=recovering,
-                )
-                recovering = delivery.recovery
-                validation_feedback = render_delta(delivery.rows)
-            else:
-                validation_feedback = ''
             prompt_error = row['last_error']
             if is_validation_error(prompt_error, row['verify_result'], row['review_result']):
                 prompt_error = None
-            prompt = self.ports.worker_prompt(
-                row['plan_path'], prompt_error, row['worker_result'], validation_feedback,
-                archive_candidates=self.ports.snapshot().archive_candidates, session_recovery=recovering,
-                allow_common_plans=allow_common_plans)
-            if not current_session_id or recovering:
-                prompt = (prompt or '') + query_context
             definition = self.ports.snapshot()._definition_snapshot
-            if context.resolving_rebase and definition is not None:
-                prompt = (prompt or '') + (
-                    '\nrebase 충돌 복구의 최신 구현 조건: '
+            checkpoint = self.ports.checkpoint
+            saved = (checkpoint.get(self.ports.identity.repo, str(plan['id'])).snapshot or {}) if checkpoint else {}
+            accepted = saved.get('current_rebase_acceptance')
+            context_values = {
+                'task': json.dumps({'path': row['plan_path'], 'worktree': str(context.worktree),
+                    'conditions': replace(definition, archive_candidates=(), worker_guidance_hash='').worker_token
+                        if definition is not None else None,
+                    'allow_common_plans': allow_common_plans}, sort_keys=True),
+                'archives': json.dumps(self.ports.snapshot().archive_candidates),
+                'error': str(prompt_error or ''),
+                'start_head': str(getattr(worker_scope_before, 'head', '')),
+                'checkpoint': json.dumps(saved.get('worker_checkpoint_result'), ensure_ascii=False),
+                'frontmatter': json.dumps([{key: item.get(key) for key in ('path', 'revision', 'body_sha256')}
+                    for item in saved.get('worker_frontmatter_restores', [])[-1:]], ensure_ascii=False),
+                'rebase': json.dumps(accepted, ensure_ascii=False, sort_keys=True),
+            }
+            from loop_manager_internal.execution.manual_candidate import get_manual
+            manual = get_manual(self.ports.state)
+            if manual and manual.enabled():
+                context_values.update(manual.worker_context())
+            if feedback_repo is not None:
+                delivery = feedback_repo.prepare(
+                    self.ports.identity.repo, str(plan['id']), current_session_id,
+                    recovery=recovering, context=context_values,
+                )
+                recovering = delivery.recovery
+                validation_feedback = render_delta(delivery.rows)
+                changed = delivery.context
+                initial = delivery.initial
+            else:
+                validation_feedback = ''
+                changed = context_values
+                initial = not current_session_id or recovering
+            extras = []
+            if 'task' in changed:
+                extras.append('작업 공간: ' + str(context.worktree))
+            if 'archives' in changed and not self.ports.snapshot().archive_candidates:
+                extras.append('현재 archive 후보: 없음.')
+            if 'start_head' in changed:
+                extras.append('checkpoint 요청의 이번 호출 시작 HEAD: ' + context_values['start_head'])
+            if 'checkpoint' in changed and saved.get('worker_checkpoint_result'):
+                result_info = saved['worker_checkpoint_result']
+                extras.append('Manager가 확인한 복구점: ' + result_info['head'] + ' ' + result_info['title']
+                              + '. 미완료 작업을 이어가라.')
+            if ('frontmatter' in changed and saved.get('worker_frontmatter_restores')
+                    and 'frontmatter' not in str(prompt_error or '')):
+                extras.append('Manager가 선택된 ExecPlan의 frontmatter만 공식 선언으로 복원했다. '
+                              '보존된 본문·현재 diff로 문서 보고를 갱신하라.')
+            extras.extend(value for key, value in changed.items() if key.startswith('manual_'))
+            if context.resolving_rebase and definition is not None and ('task' in changed or initial):
+                extras.append('rebase 충돌 복구의 최신 구현 조건: '
                     + json.dumps({'revision': definition.revision_sha,
                                   'path': definition.path, 'sources': definition.sources}, ensure_ascii=False)
                     + '\n이 revision의 ExecPlan·연결 명세를 git show로 확인하고 현재 작업 형상과 '
-                    '대조해 충돌을 해결하라. 작업 파일의 이전 조건이나 진행 표시만으로 성공을 '
-                    '판단하지 말고 필요한 구현 보완·targeted test를 수행하라. '
-                    '기존 변경을 보존하며 rebase의 계속 진행·완료는 Manager에 맡겨라.\n')
-            checkpoint = self.ports.checkpoint
-            accepted = (checkpoint.get(self.ports.identity.repo, str(plan['id'])).snapshot or {}).get('current_rebase_acceptance') if checkpoint else None
-            if accepted and not context.resolving_rebase:
-                prompt = (prompt or '') + (
-                    '\n관리 rebase 결과를 현재 상태로 수용했다. 현재 ExecPlan과 근거 입력을 다시 읽고 '
+                    '대조해 충돌을 해결하라. 기존 변경을 보존하며 rebase의 계속 진행·완료는 Manager에 맡겨라.')
+            if accepted and not context.resolving_rebase and 'rebase' in changed:
+                extras.append('관리 rebase 결과를 현재 상태로 수용했다. 현재 ExecPlan과 근거 입력을 다시 읽고 '
                     '현재 HEAD의 base 대비 최종 diff 전체를 확인하라. 이전 후보의 성공을 재사용하지 말고 '
-                    '관련 최소 범위 targeted unit test를 실행해 현재 후보의 결과를 보고하라. '
-                    '전체 verify와 Review는 이후 Manager가 수행한다.\n')
+                    '관련 최소 범위 targeted unit test로 현재 후보를 확인하라.')
+            prompt = self.ports.worker_prompt(
+                row['plan_path'], prompt_error if 'error' in changed else None,
+                None, validation_feedback,
+                archive_candidates=(self.ports.snapshot().archive_candidates if 'archives' in changed else ()),
+                session_recovery=recovering, allow_common_plans=allow_common_plans,
+                session_resume=not initial and not recovering,
+                task_changed='task' in changed, context_delta='\n'.join(extras))
+            if initial or recovering:
+                prompt = (prompt or '') + query_context
             try:
                 recovery_state.start_review_correction(
                     self.ports.state.connection, self.ports.identity.repo, str(plan['id']),
@@ -552,29 +601,6 @@ class WorkerHandler:
                 classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                 detail, context=context,
             )
-        if self.ports.publish_worker_checkpoints is not None and not context.resolving_rebase:
-            try:
-                self.ports._fetch_latest_base()
-                checkpoint_result = self.ports.publish_worker_checkpoints(
-                    context,
-                    allowed_requirement_archives=self.ports.snapshot().archive_scope_sources,
-                    worker_start_head=getattr(worker_scope_before, 'head', None),
-                )
-                if isinstance(checkpoint_result, ExecutionOutcome):
-                    self.ports.clear_agent_scope(self.ports.identity.repo)
-                    return checkpoint_result
-                if checkpoint_result is not None and checkpoint_result.get('candidate_changed'):
-                    self.ports.clear_agent_scope(self.ports.identity.repo)
-                    return self.ports._retry(
-                        'Worker 실행 중 원격 작업 branch가 통합되어 현재 Worker 결과를 폐기했습니다.'
-                    )
-            except RecoveryFailure as error:
-                return self.ports._recover(error.reason, str(error), context=context)
-            except (RuntimeError, OSError) as error:
-                return self.ports._recover(
-                    classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
-                    str(error), context=context,
-                )
         guarded = self.ports._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
             self.ports.clear_agent_scope(self.ports.identity.repo)
@@ -648,6 +674,19 @@ class WorkerHandler:
             disposition = self._parse_worker_outcome(context, message)
             if disposition.kind == 'needs_user_decision':
                 return self._block_worker_decision(context, message, disposition)
+            if disposition.kind == 'checkpoint':
+                if result.targeted_collection_pending or targeted_tests.pending(self.ports.identity.repo, context.plan.plan_id):
+                    return self._targeted_collection_pause(context, 'targeted test 실행 근거의 종료 확인·재수집 대기')
+                from loop_manager_internal.execution import worker_checkpoint
+                try:
+                    return worker_checkpoint.save_request(self.ports, context, disposition, message,
+                        worker_scope_before, delivery=delivery,
+                        session=result.session_id or self.ports._row()['worker_session_id'],
+                        invocation_id=result.isolation_invocation_id)
+                except (RuntimeError, OSError) as error:
+                    return self.ports._recover(
+                        classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
+                        str(error), context=context)
             if context.resolving_rebase:
                 checked = self._guard_rebase_worker_result(
                     context, turn_definition.serialize() if turn_definition else None, refresh=False,
@@ -689,6 +728,29 @@ class WorkerHandler:
                 RecoveryReason.WORKER_CORRECTION, validation_error,
                 context=context,
             )
+        if self.ports.publish_worker_checkpoints is not None and not context.resolving_rebase:
+            try:
+                self.ports._fetch_latest_base()
+                checkpoint_result = self.ports.publish_worker_checkpoints(
+                    context,
+                    allowed_requirement_archives=self.ports.snapshot().archive_scope_sources,
+                    worker_start_head=getattr(worker_scope_before, 'head', None),
+                )
+                if isinstance(checkpoint_result, ExecutionOutcome):
+                    self.ports.clear_agent_scope(self.ports.identity.repo)
+                    return checkpoint_result
+                if checkpoint_result is not None and checkpoint_result.get('candidate_changed'):
+                    self.ports.clear_agent_scope(self.ports.identity.repo)
+                    return self.ports._retry(
+                        'Worker 실행 중 원격 작업 branch가 통합되어 현재 Worker 결과를 폐기했습니다.'
+                    )
+            except RecoveryFailure as error:
+                return self.ports._recover(error.reason, str(error), context=context)
+            except (RuntimeError, OSError) as error:
+                return self.ports._recover(
+                    classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
+                    str(error), context=context,
+                )
         if result.targeted_collection_pending or targeted_tests.pending(self.ports.identity.repo, context.plan.plan_id):
             return self._targeted_collection_pause(context, 'targeted test 실행 근거의 종료 확인·재수집 대기',
                                                   worker_result=message)

@@ -169,7 +169,8 @@ class BoundedRecoveryFixture:
                 return {"url": "https://example.test/pr/13"}
             return None
 
-        with ExitStack() as preparation, mock.patch.object(
+        with mock.patch('loop_manager_internal.git.publication_service.push_worker_checkpoint_commits',
+                        return_value=(None, 0)), ExitStack() as preparation, mock.patch.object(
             ExecutionHandlers, 'review', save_review_entry
         ), mock.patch(
             "loop_manager.validate_repository", return_value=repo
