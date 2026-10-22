@@ -909,26 +909,30 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
                 self.addCleanup(restarted.close)
                 restarted.row_factory = sqlite3.Row
                 config = SimpleNamespace(telegram_token='token', telegram_chat_id='chat')
-                expected = 'resumed' if confirmed else 'work_started'
+                before = dict(self.events(restarted)[0])
                 sent = mock.Mock()
                 dispatch = notifications.dispatch_pending
                 def worker(*a, **kw):
-                    self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type=? AND sent_at IS NOT NULL", (expected,)).fetchone()[0], 1)
+                    self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
+                    self.assertEqual(restarted.execute('SELECT started_at FROM notified_block_incidents').fetchone()[0], started_at)
                     return ()
                 with mock.patch('loop_manager.schedule_registered_projects', side_effect=worker), \
                         mock.patch.object(delivery, 'send_telegram', sent), \
                         mock.patch.object(notifications, 'dispatch_pending', side_effect=lambda conn, token, chat: dispatch(conn, token, chat, adapter=sent)):
                     self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
                     self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
-                self.assertEqual(sent.call_count, 2 if confirmed else 1)
-                self.assertTrue(all(call.kwargs['disable_notification'] for call in sent.call_args_list))
-                event = restarted.execute("SELECT payload FROM notification_outbox WHERE event_type=?", (expected,)).fetchone()[0]
-                self.assertEqual(json.loads(event)['occurred_at'], started_at)
+                sent.assert_not_called()
                 self.assertIsNotNone(restarted.execute('SELECT canceled_at FROM notification_outbox WHERE event_key=?', (key,)).fetchone()[0])
                 with restarted:
                     notifications.record_process_start(restarted, repo, 'worker', 'saved-start', plan_id='G-018')
                     notifications.record_process_start(restarted, repo, 'worker', 'new-start', plan_id='G-018')
-                self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='work_started'").fetchone()[0], 0 if confirmed else 1)
+                self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
+                incident = restarted.execute('SELECT start_identity, started_at FROM notified_block_incidents').fetchone()
+                self.assertEqual(tuple(incident), ('saved-start', started_at))
+                after = dict(self.events(restarted)[0])
+                self.assertEqual(after['confirmed_pieces'], int(confirmed))
+                for field in before.keys() - {'delivery_started_at'}:
+                    self.assertEqual(after[field], before[field], field)
                 restarted.close()
 
     def test_disabled_startup_preserves_abandoned_record_without_notice(self):

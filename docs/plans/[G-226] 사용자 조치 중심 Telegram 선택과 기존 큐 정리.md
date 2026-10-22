@@ -80,6 +80,23 @@ PRODUCT의 완료·대기와 Telegram 절, ARCHITECTURE의 완료 저장·Telegr
 
 남은 구현은 blocked의 최신 원인·구체적 조치/실제 복구 불가 근거를 생성·각 claim에 연결하는 공통 판정, PR·draft의 기존 관측과 공통 현재성 경계, planning 취소 사건 부활 및 시작/재개 callback enqueue 제거와 해당 incident·전송 경합 테스트 전환이다. 기존 final_evidence는 retry/교정 소진도 USER_ACTION_REQUIRED/FINAL_BLOCK로 분류하므로 그 이름이나 user_targets의 존재만으로 통지를 허용하지 않아야 한다. 현재 PRODUCT의 최종 차단 규칙과 ARCHITECTURE의 기존 차단 검사 설명은 이 남은 구현 뒤 최종 계약으로 다시 통합해야 한다. 이번 checkpoint는 완료 후보가 아니다.
 
+
+### 시작·재개 callback 무통지 checkpoint
+
+`record_work_start`는 Telegram 활성 여부와 무관하게 기존 incident의 실제 operation·첫 시작 시각·identity·대상 계획을 보존한다. `_materialize_resumption`은 기존 통지 확인·원인 해제·실제 시작의 연결과 `resumed_at`만 확정하고, 반환값은 PR 재개 운영 로그가 사용하는 새 확정 수로 유지했다. 재개 payload와 무통지 차단의 시작 payload를 생성하던 경로를 제거했다. 실패 callback과 시작 복구는 새 메시지를 만들지 않으며 늦은 전송 확인은 기존 조각 cursor·확인 감사만 전진시킨다. PRODUCT·ARCHITECTURE의 시작/재개 계약을 실제 구현에 맞춰 갱신했다.
+
+기존 사건 테스트는 메시지 payload·건수를 요구하던 assertion을 해당 원본 incident payload·operation·첫 시작 시각과 새 시작/재개 outbox 0건으로 전환했다. 확인된 차단·미확인 차단·일부 전송·동일 원인 재발·기존 legacy 통지 채택·계획/프로젝트/planning 구분·다른 계획/독립 planning/안전 gate·PR 재개·재시작의 실제 SQLite 시나리오는 유지한다. 초기 재시작 검사는 scheduler·transport만 double로 제공하며 취소 전후 payload·고정 본문·cursor·attempt/error와 시작 identity·시각 보존을 확인한다. 테스트·fixture를 삭제하거나 skip하지 않았다.
+
+- FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_incidents`
+- 첫 실행 결과: 38개 실행, 구정책 재개/시작 메시지 기대 및 전환 중인 반환값 계약으로 failures 24·errors 7. callback 내부 assertion 오류도 원래 transport 실패 기록으로 남았다. 실제 조각·incident 검사를 보존해 무통지 기대를 반영하고 반환값을 통지 enqueue와 독립적인 기존 확정 수로 정리했다.
+- RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_incidents`
+- 재실행 결과: 38개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.InterruptedBlockStartupTest tests.test_notification_events.TimelyProgressEventTest.test_selection_is_silent_and_actual_start_is_durable_and_deduplicated`: 3개 통과.
+- 이후 최종 확정 수를 Telegram 활성 여부와 독립화한 변경은 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_incidents.NotificationOutboxTest.test_disabling_telegram_after_notice_suppresses_late_resumption tests.test_notification_incidents.NotificationOutboxTest.test_reopened_pr_records_resumption_in_transition`로 확인했다: 2개 통과.
+- `git diff --check` 통과. 전체 verify는 실행하지 않았다.
+
+남은 작업은 blocked의 최신 원인·구체적 사용자 행동/실제 복구 불가 근거를 생성과 각 claim에 연결하는 공통 정책, PR·draft의 기존 관측과 공통 현재성 경계, planning 취소 사건을 되살리는 `_carry_planning_delivery`·`_queue_block`의 구정책 복원 제거, 해당 생성/조각 검증 및 최종 설계 문서 통합이다. 현재 원인별 action 근거가 없는 일반 block/planning_error도 여전히 생성될 수 있으며, 해당 상태 이름·final_evidence의 분류만으로는 실제 조치/복구 불가를 입증하지 못한다. 이 checkpoint는 전체 구현 완료 후보가 아니다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.

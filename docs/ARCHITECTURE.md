@@ -1477,7 +1477,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 일반 계획 게시·Worker 최초 시작·유지보수 cycle 시작/종료는 outbox 사건을 만들지 않는다. `enqueue_progress`는 draft 판단·PR 사건 종류만 허용한다. `record_process_start`는 실제 시작을 기존 incident 기록에 연결하며 일반 시작 알림을 위한 과거 outbox 조회는 수행하지 않는다. 유지보수 저장소는 알림용 계획 목록 조회·enqueue 없이 기존 cycle 상태·범위·Merge 확인·종료를 기록한다. 현재 draft 판단 목록은 `draft_decisions`로 저장한다. 미해결 targeted test와 단순 단계 실패는 별도 단순/지속 실패 사건을 만들지 않는다. 실제 최종 차단은 원인별 기존 경계를 따른다.
 
-조각 claim은 `blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision` 외 사건의 잔여 전송을 취소한다. 구정책 진행·완료·대기·재개와 아직 시작/재개 callback에서 생성되는 과거 사건에도 적용하며 payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim을 사용한다. 사건 종류 허용 뒤에는 각 사건의 기존 현재성 검사를 적용한다.
+조각 claim은 `blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision` 외 사건의 잔여 전송을 취소한다. 구정책 진행·완료·대기·재개 사건에도 적용하며 payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim을 사용한다. 사건 종류 허용 뒤에는 각 사건의 기존 현재성 검사를 적용한다.
 
 지속 실행 실패 집계는 복구 진단으로 보존하고 독립 outbox 사건을 만들지 않는다. 같은 대상·원인의 실제 `PLAN_BLOCKED`·`PROJECT_BLOCKED`와 checkpoint 결과가 확정되면 기존 BLOCKED outbox만 사용한다.
 
@@ -1504,7 +1504,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 전송할 조각은 transaction에서 선택하고 HTTP 전송 뒤 현재 조각 위치를 대조해 확인 수를 전진시킨다. 고유 사건 키의 중복 삽입 방지와 외부 수신의 중복 방지는 별도다. 수신 후 확인 저장 전 중단·불명확한 실패는 같은 미확인 조각을 재시도하므로 외부 수신의 정확히 한 번을 보장하지 않는다.
 
-차단 해제와 해당 사건 해제·미전송 조각 취소는 같은 transaction에 반영한다. incident의 실제 시작은 기존 원인 해제·작업 identity와 연결해 보존한다. 과거 시작/재개 callback이 outbox에 기록한 행도 조각 claim에서 취소하므로 Telegram으로 보내지 않는다. 과거 planning 중복 사건의 확인 이력은 현재 사건에 연결하고 과거 행을 삭제하지 않는다. 안정적 작업 소진은 draft·계획 차단을 포함하되 프로젝트 차단을 제외하며 완료·대기 상태는 [프로젝트 최종 확인과 완료 판정](#프로젝트-최종-확인과-완료-판정)을 따른다. 새 PRODUCT·ARCHITECTURE·Requirement 변경 등으로 갱신된 완료 주기와 내용 보존 archive를 구분한다.
+차단 해제와 해당 사건 해제·미전송 조각 취소는 같은 transaction에 반영한다. incident의 실제 시작은 기존 원인 해제·작업 identity·첫 시작 시각과 연결해 Telegram 설정과 독립적으로 보존한다. `record_work_start`는 처음 확정한 통지 확인·실제 시작 연결 수를 반환하므로 PR 재개 운영 로그는 메시지 생성에 의존하지 않는다. `resumed_at`은 기존 `confirmed_before` 또는 현재 outbox의 확인된 조각이 있고 해당 작업이 시작됐을 때 한 번 기록한다. 전송 확인 callback은 원래 조각 cursor와 incident 확인 감사를 전진시키고 이 연결만 확정하며 새 메시지는 만들지 않는다. 실패 callback과 시작 복구도 시작/재개 outbox를 만들지 않고, 시작 복구는 취소 사건의 중단된 claim 표식과 저장된 시작만 정리한다. 과거 planning 중복 사건의 확인 이력은 현재 사건에 연결하고 과거 행을 삭제하지 않는다. 안정적 작업 소진은 draft·계획 차단을 포함하되 프로젝트 차단을 제외하며 완료·대기 상태는 [프로젝트 최종 확인과 완료 판정](#프로젝트-최종-확인과-완료-판정)을 따른다. 새 PRODUCT·ARCHITECTURE·Requirement 변경 등으로 갱신된 완료 주기와 내용 보존 archive를 구분한다.
 
 `notifications/rendering.py`는 저장된 payload만으로 텍스트를 결정적으로 생성하며 모델을 호출하지 않는다. 확인된 질문·수정 대상·PR 상태 순으로 정보를 구성하고 원인·복구 시도·Checkpoint 근거를 보존한다. 공통 payload와 `draft_decisions` 목록의 계약은 다음과 같다.
 

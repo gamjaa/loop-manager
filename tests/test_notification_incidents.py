@@ -202,11 +202,13 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(connection.execute(
             "SELECT COUNT(*) FROM notification_outbox "
             "WHERE repo = ? AND event_type = 'resumed'", (repo,),
-        ).fetchone()[0], 1)
+        ).fetchone()[0], 0)
         self.assertIsNotNone(connection.execute(
             "SELECT resumed_at FROM notified_block_incidents WHERE id = ?",
             (incident_id,),
         ).fetchone()[0])
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_released_partial_planning_notice_retries_original_remaining_piece(self):
         connection = self.connection()
@@ -366,7 +368,9 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(connection.execute(
             "SELECT COUNT(*) FROM notification_outbox "
             "WHERE repo = ? AND event_type = 'resumed'", (repo,),
-        ).fetchone()[0], 1)
+        ).fetchone()[0], 0)
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_release_of_duplicate_active_planning_incidents_resumes_once(self):
         connection = self.connection()
@@ -404,7 +408,9 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(connection.execute(
             "SELECT COUNT(*) FROM notification_outbox "
             "WHERE repo = ? AND event_type = 'resumed'", (repo,),
-        ).fetchone()[0], 1)
+        ).fetchone()[0], 0)
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_planning_incident_survives_database_reopen_and_repeated_observation(self):
         repo = "/projects/alpha"
@@ -512,7 +518,9 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(connection.execute(
             "SELECT COUNT(*) FROM notification_outbox "
             "WHERE repo = ? AND event_type = 'resumed'", (repo,),
-        ).fetchone()[0], 1)
+        ).fetchone()[0], 0)
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_existing_delivered_plan_notice_is_adopted_without_duplicate_delivery(self):
         connection = self.connection()
@@ -570,9 +578,11 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 connection, repo, "Worker", plan_id="G-018",
             ), 1)
         resumed = connection.execute(
-            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+            "SELECT payload FROM notified_block_incidents ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertEqual(json.loads(resumed[0])["cause"], "old notified cause")
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_legacy_planning_notice_is_adopted_before_release_without_reenqueue(self):
         connection = self.connection()
@@ -696,9 +706,11 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 connection, repo, "Planner",
             ), 1)
         resumed = connection.execute(
-            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'",
+            "SELECT payload FROM notified_block_incidents ORDER BY id DESC LIMIT 1",
         ).fetchone()
         self.assertEqual(json.loads(resumed[0])["cause"], "new error")
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_identical_planning_error_after_later_planner_start_is_new_incident(self):
         connection = self.connection()
@@ -778,10 +790,12 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(old[1], 1)
         self.assertEqual(notifications.dispatch_pending(
             connection, "token", "chat", adapter=mock.Mock(),
-        ), 1)
+        ), 0)
         self.assertEqual(connection.execute(
             "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'resumed'"
-        ).fetchone()[0], 1)
+        ).fetchone()[0], 0)
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_legacy_changed_checkpoint_notices_share_one_active_incident(self):
         connection = self.connection()
@@ -835,9 +849,11 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 connection, repo, "Worker", plan_id="G-018",
             ), 1)
         resumed = connection.execute(
-            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+            "SELECT payload FROM notified_block_incidents ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertEqual(json.loads(resumed[0])["cause"], "first notified cause")
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_older_legacy_notice_does_not_notify_new_undelivered_same_reason_block(self):
         connection = self.connection()
@@ -908,13 +924,15 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             ), 0)
         resumed = [row for row in self.events(connection)
                    if row["event_type"] == "resumed"]
-        self.assertEqual(len(resumed), 1)
-        self.assertEqual(json.loads(resumed[0]["payload"])["cause"], "Decision pending")
+        self.assertEqual(len(resumed), 0)
+        self.assertEqual(json.loads(connection.execute("SELECT payload FROM notified_block_incidents").fetchone()[0])["cause"], "Decision pending")
         block()
         second_key = next(row["event_key"] for row in self.events(connection)
                           if row["event_type"] == "blocked"
                           and row["event_key"] != first_key)
         self.assertNotEqual(first_key, second_key)
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_partial_block_release_cancels_stale_piece_and_retries_resumption(self):
         connection = self.connection()
@@ -953,9 +971,11 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         delivered = []
         self.assertEqual(notifications.dispatch_pending(
             connection, "token", "chat", adapter=lambda _t, _c, text: delivered.append(text),
-        ), 1)
-        self.assertEqual(len(delivered), 3)
-        self.assertIn("작업 재개", delivered[0])
+        ), 0)
+        self.assertEqual(delivered, [])
+        self.assertEqual(json.loads(connection.execute('SELECT payload FROM notified_block_incidents').fetchone()[0])['cause'], 'x' * 9000)
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_project_and_planning_release_wait_for_matching_work(self):
         connection = self.connection()
@@ -983,10 +1003,12 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(notifications.record_work_start(
                 connection, repo, "Planner",
             ), 1)
-        payloads = [json.loads(row["payload"]) for row in self.events(connection)
-                    if row["event_type"] == "resumed"]
+        payloads = [json.loads(row[0]) for row in connection.execute(
+            "SELECT payload FROM notified_block_incidents WHERE started_operation IS NOT NULL ORDER BY id")]
         self.assertEqual([item["reason_code"] for item in payloads],
                          ["repository_state_unsafe", "planning_error"])
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_disabled_telegram_never_creates_resumption(self):
         connection = self.connection(enabled=False)
@@ -1021,7 +1043,10 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         with connection:
             self.assertEqual(notifications.record_work_start(
                 connection, repo, "Worker", plan_id="G-018",
-            ), 0)
+            ), 1)
+        incident = connection.execute('SELECT started_operation, resumed_at FROM notified_block_incidents').fetchone()
+        self.assertEqual(incident[0], 'Worker')
+        self.assertIsNotNone(incident[1])
         notifications.configure_session(connection, enabled=True)
         with connection:
             self.assertEqual(notifications.record_work_start(
@@ -1069,7 +1094,9 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 restarted, repo, "Worker", plan_id="G-018",
             ), 0)
         self.assertEqual(len([row for row in self.events(restarted)
-                              if row["event_type"] == "resumed"]), 1)
+                              if row["event_type"] == "resumed"]), 0)
+
+        self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_reopened_pr_records_resumption_in_transition(self):
         connection = self.connection()
@@ -1098,10 +1125,15 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             recovery=False,
         )
         payload = connection.execute(
-            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+            "SELECT payload FROM notified_block_incidents ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertIsNotNone(payload)
-        self.assertEqual(json.loads(payload[0])["operation"], "PR handling")
+        incident = connection.execute('SELECT started_operation, resumed_at FROM notified_block_incidents').fetchone()
+        self.assertEqual(incident[0], 'PR handling')
+        self.assertIsNotNone(incident[1])
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PR_OPEN')
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_inflight_block_piece_confirmed_after_release_still_resumes(self):
         connection = self.connection()
@@ -1126,7 +1158,9 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         )
         resumed = [row for row in self.events(connection)
                    if row["event_type"] == "resumed"]
-        self.assertEqual(len(resumed), 1)
+        self.assertEqual(len(resumed), 0)
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_updated_notice_during_one_block_has_one_resumption_incident(self):
         connection = self.connection()
@@ -1156,9 +1190,10 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             "SELECT * FROM notified_block_incidents WHERE repo = ?", (repo,),
         ).fetchall()
         self.assertEqual(len(incidents), 1)
-        resumed = next(row for row in self.events(connection)
-                       if row["event_type"] == "resumed")
+        resumed = connection.execute('SELECT * FROM notified_block_incidents ORDER BY id DESC LIMIT 1').fetchone()
         self.assertEqual(json.loads(resumed["payload"])["cause"], "first cause")
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_inflight_earlier_notice_keeps_first_confirmed_cause_after_update(self):
         connection = self.connection()
@@ -1189,9 +1224,11 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 connection, repo, "Worker", plan_id="G-018",
             ), 1)
         payload = connection.execute(
-            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+            "SELECT payload FROM notified_block_incidents ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertEqual(json.loads(payload[0])["cause"], "first cause")
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
 
 class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
@@ -1207,9 +1244,11 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
             scoped_blocking.clear_project_block(connection, repo)
             notifications.record_process_start(connection, repo, 'worker', 'resume', plan_id='G-018', resumed=True)
             notifications.record_process_start(connection, repo, 'worker', 'correction', plan_id='G-018')
-        resumed = next(row for row in self.events(connection) if row['event_type'] == 'resumed')
-        self.assertEqual(json.loads(resumed['payload'])['execplan_id'], 'G-018')
+        resumed = connection.execute('SELECT * FROM notified_block_incidents ORDER BY id DESC LIMIT 1').fetchone()
+        self.assertEqual(json.loads(resumed['payload'])['started_execplan_id'], 'G-018')
         self.assertFalse(any(row['event_type'] == 'work_started' for row in self.events(connection)))
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_unsent_planner_start_keeps_new_episode_without_generic_notice(self):
         connection = self.connection()
@@ -1242,10 +1281,12 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
                     for identity in ('first-start', 'first-start', 'second-start'):
                         notifications.record_process_start(connection, repo, 'worker', identity, plan_id='G-018')
                 starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
-                self.assertEqual(len(starts), 1)
+                self.assertEqual(len(starts), 0)
                 self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
                 incident = connection.execute('SELECT started_operation FROM notified_block_incidents').fetchone()
                 self.assertEqual(incident[0], 'Worker')
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_failed_inflight_block_send_materializes_start_without_resume(self):
         connection = self.connection()
@@ -1262,14 +1303,16 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
             raise OSError('offline')
         notifications.dispatch_pending(connection, 'token', 'chat', adapter=failed_send)
         starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
-        self.assertEqual(len(starts), 1)
+        self.assertEqual(len(starts), 0)
         incident = connection.execute('SELECT started_at FROM notified_block_incidents').fetchone()
-        self.assertEqual(json.loads(starts[0]['payload'])['occurred_at'], incident[0])
+        self.assertIsNotNone(incident[0])
         with connection:
             notifications.record_process_start(connection, repo, 'worker', 'first-start', plan_id='G-018')
             notifications.record_process_start(connection, repo, 'worker', 'second-start', plan_id='G-018')
-        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'work_started']), 1)
+        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'work_started']), 0)
         self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_matching_worker_and_pr_resume_preserve_planning_incident_and_safety_gates(self):
         for operation in ('Worker', 'PR handling'):
@@ -1293,13 +1336,16 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
                     notifications.record_process_start(connection, repo, 'worker', 'actual-process', plan_id='G-018') if operation == 'Worker' else notifications.record_work_start(connection, repo, operation, plan_id='G-018')
                     self.assertEqual(notifications.record_work_start(connection, repo, operation, plan_id='G-018'), 0)
                 resumes = [row for row in self.events(connection) if row['event_type'] == 'resumed']
-                self.assertEqual(len(resumes), 1)
-                payload = json.loads(resumes[0]['payload'])
-                self.assertEqual((payload['scope'], payload['execplan_id'], payload['cause'], payload['operation']),
+                self.assertEqual(len(resumes), 0)
+                started = connection.execute("SELECT payload, started_operation FROM notified_block_incidents WHERE subject='plan:G-018'").fetchone()
+                payload = json.loads(started[0])
+                self.assertEqual((payload['scope'], payload['execplan_id'], payload['cause'], started[1]),
                                  ('plan', 'G-018', 'original cause', operation))
                 self.assertFalse(any(row['event_type'] == 'work_started' for row in self.events(connection)))
                 self.assertEqual(dict(connection.execute("SELECT * FROM notified_block_incidents WHERE subject = 'planning'").fetchone()), planning)
                 self.assertEqual(connection.execute('SELECT planning_error FROM projects').fetchone()[0], 'independent planning error')
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_partial_notice_confirmation_after_start_and_restart_keeps_start_time(self):
         directory = self.enterContext(tempfile.TemporaryDirectory())
@@ -1318,9 +1364,9 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
                 scoped_blocking.clear_plan_block(connection, repo, 'G-018')
                 notifications.record_process_start(connection, repo, 'worker', 'process-1', plan_id='G-018')
         notifications.dispatch_pending(connection, 'token', 'chat', adapter=start_during_send)
-        resume = connection.execute("SELECT payload FROM notification_outbox WHERE event_type = 'resumed'").fetchone()[0]
+        resume = connection.execute("SELECT payload FROM notified_block_incidents WHERE subject = 'plan:G-018'").fetchone()[0]
         incident = connection.execute("SELECT started_at FROM notified_block_incidents WHERE subject = 'plan:G-018'").fetchone()[0]
-        self.assertEqual(json.loads(resume)['occurred_at'], incident)
+        self.assertIsNotNone(incident)
         connection.close()
         restarted = sqlite3.connect(database)
         self.addCleanup(restarted.close)
@@ -1328,9 +1374,12 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
         notifications.configure_session(restarted, enabled=True)
         with restarted:
             notifications.record_process_start(restarted, repo, 'worker', 'process-1', plan_id='G-018')
-        self.assertEqual(len([row for row in self.events(restarted) if row['event_type'] == 'resumed']), 1)
+        self.assertEqual(len([row for row in self.events(restarted) if row['event_type'] == 'resumed']), 0)
         self.assertFalse(any(row['event_type'] == 'work_started' for row in self.events(restarted)))
-        self.assertEqual(restarted.execute("SELECT payload FROM notification_outbox WHERE event_type = 'resumed'").fetchone()[0], resume)
+        self.assertEqual(restarted.execute("SELECT started_at FROM notified_block_incidents WHERE subject = 'plan:G-018'").fetchone()[0], incident)
+        self.assertEqual(restarted.execute("SELECT payload FROM notified_block_incidents WHERE subject = 'plan:G-018'").fetchone()[0], resume)
+
+        self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
 
 class UnsentBlockStartTest(NotificationFixture, unittest.TestCase):
@@ -1369,8 +1418,10 @@ class UnsentBlockStartTest(NotificationFixture, unittest.TestCase):
                     notifications.record_process_start(connection, repo, 'worker', 'first', plan_id='G-018')
                     notifications.record_process_start(connection, repo, 'worker', 'second', plan_id='G-018')
                 starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
-                self.assertEqual(len(starts), 1)
+                self.assertEqual(len(starts), 0)
                 self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
 
     def test_in_flight_failure_falls_back_to_saved_start_without_duplicate(self):
         connection = self.connection()
@@ -1388,9 +1439,10 @@ class UnsentBlockStartTest(NotificationFixture, unittest.TestCase):
         with connection:
             notifications.record_process_start(connection, repo, 'worker', 'first', plan_id='G-018')
         starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
-        self.assertEqual(len(starts), 1)
-        payload = json.loads(starts[0]['payload'])
+        self.assertEqual(len(starts), 0)
         incident = connection.execute('SELECT started_at FROM notified_block_incidents').fetchone()
-        self.assertEqual(payload['occurred_at'], incident[0])
-        self.assertTrue(payload['silent'])
+        self.assertIsNotNone(incident[0])
+        self.assertEqual(connection.execute('SELECT start_identity FROM notified_block_incidents').fetchone()[0], 'first')
         self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
+
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
