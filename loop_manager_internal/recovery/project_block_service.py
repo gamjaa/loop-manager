@@ -162,6 +162,9 @@ def _reconcile_rebase_evidence_block(
                 connection, repo_path, state_dir, repo, plan_id, worktree, branch)
         def observe():
             observation = service.require_owned(checkpoint=checkpoints.get(repo, plan_id))
+            if (block['reason_code'] == scoped_blocking.BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
+                    and observation[1].status is managed_rebase_validation.RebaseStatus.START):
+                raise RuntimeError('managed worktree conflict has not reached a rebase-owned state')
             effects.validate_blocked_agent_scope(
                 connection, repo_path, repo, str(project['base_branch']), worktree,
                 str(plan['path']), accepted_rebase=True, saved_plan=plan)
