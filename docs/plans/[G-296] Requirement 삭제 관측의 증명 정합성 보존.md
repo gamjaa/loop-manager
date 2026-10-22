@@ -52,6 +52,9 @@ TARGETED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.
 
 - [x] 2026-10-16 관리 rebase target이자 현재 HEAD `a5b182fe2da4b40d1c50097696905a548bc82b7c`를 기준으로 전체 Worker diff를 다시 검토했다. 변경은 이 ExecPlan 본문, `remote_deletions.py`, `execplan_catalog_state.py`, 관련 recovery test에 한정된다. R-055와 R-082 source 경로는 활성 파일과 일치하며 frontmatter·Requirement·다른 ExecPlan은 수정하지 않았다.
 - [x] 2026-10-16 재검증에서 이전 HEAD의 성공을 재사용하지 않고 현재 후보의 위 다섯 `RequirementRecoveryUnitTests` case를 실행해 PASS (5 tests, OK)를 확인했다. 환경은 `scripts/verify.json`의 unittest adapter version 1과 launcher Python 3.12.3/Linux이며 `docs/VERIFY.md`의 Python 3.11–3.14 지원 범위에 든다. 전체 verify는 실행하지 않았다.
+- [x] 2026-10-22 Manager가 수용한 rebase 결과 HEAD `886ceeef321cd60b803cfcf39f34395b238318f4`의 base `d0ed33bb77ab1cabfc2c397780851c4e9f5f7e22` 대비 전체 diff를 다시 검토했다. 변경은 이 ExecPlan, 삭제 proof 집계·hold 저장 코드와 관련 recovery 및 verify 회귀 test에 한정되며 선택 선언과 source 경로는 유효하다.
+- [x] 현재 HEAD에서 proof/recovery 5개, 이전 verify 피드백의 partial/full runner와 Perl standalone/Manager 통합, coordinator fixture를 포함한 targeted test 8개를 실행해 PASS (8 tests, OK)로 확인했다. 이전 후보의 결과는 재사용하지 않았고 전체 verify는 Worker가 실행하지 않았다.
+- [x] 2026-10-22 이번 Worker 호출에서도 HEAD `886ceeef321cd60b803cfcf39f34395b238318f4`의 base 대비 전체 diff를 다시 검토하고 같은 8개 관련 case를 targeted runner로 새 실행해 PASS (8 tests, OK) 및 현재 호출의 개별 test 기록을 확인했다. 전체 verify는 실행하지 않았다.
 
 ## Decision Log
 
