@@ -183,6 +183,21 @@ Manager verify `40c823a82a0f6b805073d22232c0f7ee4ce0458c541f080c042a1b981f8f0555
 
 이전 호출 `call-1k8for6q/targeted-*.jsonl`의 실제 test_end를 ID별 마지막 관측 시각으로 집계해 최신 개별 결과 33개 모두 success임을 확인했다. 현재 파일에 추가 코드 수정은 없으며 이미 통과한 검사를 반복하지 않았다. 기존 `_has_unresolved_targeted_test_failure`에 이전 문구를 넣으면 True, 실제 통과 결과만 적은 교정 문구는 False임을 직접 호출과 assertion으로 확인했다. 이것은 publication 보고 판정 확인이며 새 unit 실행·전체 verify 통과를 뜻하지 않는다. Manager의 전체 verify 재실행·Review·Merge는 계속 대기한다.
 
+### Review 교정: 취소 조치 재확인과 독립 scope
+
+시작 HEAD 8ace07b83787cbdf722dfddc5a0fe0965d6447c4의 Review 피드백 `incidents.py::_queue_block::canceled-action-dedup`, `policy.py::_block_action::cross-scope-recovery-shadowing`(각 occurrence=1/revision=1)을 교정했다. 전달된 해당 후보의 Manager 전체 verify PASS는 이전 후보 근거이며 이번 수정의 전체 verify 결과로 간주하지 않는다.
+
+`_queue_block`의 같은 block/action 중복 판정은 현재 outbox의 취소·전송 완료 상태도 확인한다. 유효한 조치를 재확인했고 이전 행은 취소됐지만 전체 전송이 확인되지 않았으면 기존 incident의 다음 version에 새 사건을 기록한다. 이전 canceled_at·payload·고정 본문·cursor·attempt/error는 그대로 유지한다. 같은 조치의 부분 전송은 새 사건에 기존 고정 본문·cursor를 승계해 확인된 조각을 반복하지 않으며, 전송 완료·미취소·이력 누락은 이 재생성 대상에서 제외한다. 구정책 planning 생성이나 canceled/released 행의 재활성화는 복원하지 않는다.
+
+`block_recovery`는 최종 evidence의 코드 소유 차단 원인으로 scope를 판별해 다른 scope의 final recovery를 분리한다. 생성·정책·claim의 키 계산이 같은 관측 경계를 사용한다. 지침 승인·명세 교착의 사건 identity는 자체 승인/파싱 원문에 연결하고 공유 recovery identity를 제외해 독립 프로젝트 차단·해제에 따른 중복도 방지한다. 같은 대상의 pending recovery와 손상 근거는 기존 검증을 유지한다. Worker 질문 등 별도 최종 recovery 근거가 필요한 조치를 상태명만으로 허용하지 않는다. 복구 기록·실행 정책·schema를 바꾸거나 프로젝트 차단 해제 시 과거 recovery를 합성하지 않았다.
+
+추가 회귀는 실제 SQLite와 질문·지침 파서를 사용하며 외부 Telegram만 double로 제공한다. 취소 질문의 미전송·부분 전송·이미 전송 완료를 비교하고 SQLite 파일을 닫아 재연결한 뒤 동일 recovery identity의 재확인, 기존 취소 행 전체 불변, 잔여 조각의 정확한 내용·건수와 반복 projection/dispatch 중복 방지를 검사한다. 승인 회귀는 pending·이미 통지·최초 비활성화 세 경우에서 같은 계획에 독립 프로젝트 안전 차단을 기록·해제한 뒤 승인 1회 전송을 확인한다. 승인 원본·계획 차단은 유지되고 공유 recovery에는 프로젝트 원인이 그대로 남아 있음을 확인한다. PRODUCT·ARCHITECTURE의 소유 절에 재확인·scope 분리 계약을 통합했다.
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest > /tmp/g226-review-actions.log 2>&1`: 15개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_incidents.NotificationOutboxTest tests.test_notification_events.NotificationEventTest > /tmp/g226-review-incidents-events.log 2>&1`: 사건 생성·incident·시작/확인 관련 29개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_reconfirmed_canceled_action_gets_new_event_without_rewriting_old_delivery tests.test_notification_delivery.CurrentActionPolicyTest.test_guidance_action_survives_other_scope_recovery_and_project_release > /tmp/g226-review-restoration.log 2>&1`: SQLite 재연결과 최초 비활성화 subcase 보강 뒤 2개 통과.
+- `git diff --check` 통과. 전체 verify는 Worker에서 재실행하지 않았다. Manager의 새 후보 전체 verify·독립 Review·Merge를 기다린다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.

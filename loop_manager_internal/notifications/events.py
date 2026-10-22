@@ -8,7 +8,7 @@ import sqlite3
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
-from .policy import is_current, cancel_stale_events
+from .policy import is_current, cancel_stale_events, block_recovery, SOURCE_ACTION_REASONS
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
@@ -76,24 +76,15 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
     if project is None:
         return
     name = Path(repo).name or repo
-    recovery_available = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recovery_records'"
-    ).fetchone() is not None
-
-    def final_recovery(subject: str) -> tuple[str | None, dict | None]:
-        if not recovery_available:
-            return None, None
-        row = connection.execute(
-            "SELECT identity, final_evidence FROM recovery_records "
-            "WHERE repo = ? AND subject = ?", (repo, subject),
-        ).fetchone()
-        if row is None or row[1] is None:
+    def final_recovery(plan_id, scope):
+        row = block_recovery(connection, repo, plan_id, scope)
+        if row is None or row['final_evidence'] is None:
             return None, None
         try:
-            evidence = json.loads(str(row[1]))
+            evidence = json.loads(row['final_evidence'])
         except (TypeError, ValueError):
             return None, None
-        return (str(row[0]), evidence) if isinstance(evidence, dict) else (None, None)
+        return (str(row['identity']), evidence) if isinstance(evidence, dict) else (None, None)
 
     enqueue_draft_decisions(connection, repo)
 
@@ -140,7 +131,9 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         stage = "ExecPlan"
         plan_id = plan.plan_id
         plan_title = plan.title
-        recovery_identity, recovery_evidence = final_recovery(plan_id)
+        recovery_identity, recovery_evidence = final_recovery(plan_id, 'plan')
+        if plan.reason_code in SOURCE_ACTION_REASONS:
+            recovery_identity = None
         paths = (
             list(recovery_evidence.get("user_targets", []))
             if recovery_evidence is not None
@@ -249,7 +242,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         checkpoint = (_preservation_checkpoint(connection, repo, 'project', project_block[1])
                       or _project_checkpoint(connection, repo, project_block[1]))
         recovery_identity, recovery_evidence = final_recovery(
-            str(project_block[1] or "__project__")
+            project_block[1], "project"
         )
         try:
             project_sources = json.loads(str(project_block[5])) if project_block[5] else []

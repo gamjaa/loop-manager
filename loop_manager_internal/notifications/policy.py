@@ -7,6 +7,27 @@ from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.storage import execplan_draft_state
 
 
+SOURCE_ACTION_REASONS = frozenset({'guidance_approval_required', 'review_specification_deadlock'})
+
+
+def block_recovery(connection, repo, plan_id, scope):
+    """Read shared recovery only when its final block belongs to this scope."""
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone() is None:
+        return None
+    row = connection.execute('SELECT * FROM recovery_records WHERE repo=? AND subject=?',
+                             (repo, plan_id or '__project__')).fetchone()
+    if row is not None and row['pending_action'] == 'final_block':
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, reason_scope
+        try:
+            evidence = json.loads(row['final_evidence'])
+            recorded_scope = reason_scope(BlockReasonCode(evidence['block_reason_code'])).value
+        except (KeyError, TypeError, ValueError):
+            return row  # Malformed evidence must still fail the action validation.
+        if recorded_scope != scope:
+            return None
+    return row
+
+
 def _block_action(connection, repo, payload):
     """Return concrete remaining action evidence, never infer it from BLOCKED."""
     if payload.get('stage') == 'planning':
@@ -36,11 +57,7 @@ def _block_action(connection, repo, payload):
     allowed = {*sources, 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'}
     if plan is not None:
         allowed.add(plan['path'])
-    recovery_exists = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone()
-    recovery = (connection.execute(
-        'SELECT * FROM recovery_records WHERE repo=? AND subject=?',
-        (repo, plan_id or '__project__')).fetchone() if recovery_exists else None)
+    recovery = block_recovery(connection, repo, plan_id, scope)
     evidence = None
     if recovery is not None:
         # Pending recovery and inconsistent observations are insufficient even

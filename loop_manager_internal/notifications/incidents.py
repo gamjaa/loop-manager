@@ -6,7 +6,7 @@ import sqlite3
 from .repository import (adopt_legacy_block_notices, ensure_schema,
                          _insert, _encode_payload, _event_payload, _planner_started_after_notice)
 from .rendering import _checkpoint_link
-from .policy import block_action
+from .policy import block_action, block_recovery, SOURCE_ACTION_REASONS
 
 def _key(kind: str, repo: str, identity: str) -> str:
     digest = hashlib.sha256(f"{repo}\0{identity}".encode()).hexdigest()
@@ -116,14 +116,15 @@ def _queue_block(
             saved = {}
         if not isinstance(saved, dict):
             saved = {}
-        if active[1] == block_key and (
-            saved.get('action') == action or block_action(connection, repo, saved) == action
-        ):
-            return
         previous = connection.execute(
-            "SELECT confirmed_pieces FROM notification_outbox "
+            "SELECT confirmed_pieces, canceled_at, sent_at, rendered_text FROM notification_outbox "
             "WHERE event_key = ?", (active[2],),
         ).fetchone()
+        same_action = active[1] == block_key and (
+            saved.get('action') == action or block_action(connection, repo, saved) == action
+        )
+        if same_action and (previous is None or previous[1] is None or previous[2] is not None):
+            return
         confirmed = max(int(active[3]), int(previous[0]) if previous else 0)
         connection.execute(
             "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
@@ -141,6 +142,10 @@ def _queue_block(
              _encode_payload(payload), active[0]),
         )
         _insert(connection, event_key, repo, "blocked", payload)
+        if same_action:
+            connection.execute(
+                'UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=? WHERE event_key=?',
+                (previous[3], previous[0], event_key))
         connection.execute(
             "INSERT INTO block_notice_events (event_key, incident_id) "
             "VALUES (?, ?)", (event_key, active[0]),
@@ -398,7 +403,6 @@ def _current_block_key(
         ).fetchone()
         if block is None or block[0] != reason:
             return None
-        recovery_subject = str(subject)
         remote = _remote_inspection_suffix(block[1], block[2], block[3])
         remote += _project_checkpoint_suffix(_preservation_checkpoint(connection, repo, 'plan', str(subject)))
     elif payload.get("scope") == "project":
@@ -408,24 +412,15 @@ def _current_block_key(
         ).fetchone()
         if block is None or block[0] != reason or block[1] != subject:
             return None
-        recovery_subject = str(subject or "__project__")
         remote = _project_checkpoint_suffix(_preservation_checkpoint(connection, repo, 'project', subject)
                                              or _project_checkpoint(connection, repo, subject))
     else:
         return None
-    recovery_table = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'recovery_records'"
-    ).fetchone()
-    recovery_identity = None
-    if recovery_table:
-        recovery = connection.execute(
-            "SELECT identity FROM recovery_records WHERE repo = ? "
-            "AND subject = ? AND final_evidence IS NOT NULL",
-            (repo, recovery_subject),
-        ).fetchone()
-        if recovery:
-            recovery_identity = recovery[0]
+    recovery = block_recovery(connection, repo, subject, payload.get('scope'))
+    recovery_identity = (recovery['identity'] if recovery is not None
+                         and recovery['final_evidence'] is not None else None)
+    if reason in SOURCE_ACTION_REASONS:
+        recovery_identity = None
     if payload.get("scope") == "plan":
         return _plan_block_key(repo, reason, subject, recovery_identity, remote)
     return _project_block_key(repo, reason, subject, recovery_identity, remote)
