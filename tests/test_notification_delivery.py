@@ -856,16 +856,17 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
-    def test_immediate_delivery_waits_for_commit_and_preserves_silent_pieces(self):
-        from loop_manager_internal.notifications import delivery
+    def test_action_delivery_waits_for_commit_and_preserves_legacy_silent_pieces(self):
         connection = self.connection()
         repo = '/projects/alpha'
         sent = []
         with notifications.immediate_delivery(connection, 'token', 'chat', repo), \
              mock.patch.object(delivery, 'send_telegram', side_effect=lambda *args, **kw: sent.append((args, kw))):
             with connection:
-                notifications.enqueue_progress(connection, repo, 'maintenance_started', 'failure',
-                    cause='x' * 6000, status='자동 교정 대기', silent=True)
+                connection.execute("UPDATE exec_plans SET status='PR_OPEN', pr_url='https://example.test/pr/18'")
+                notifications._insert(connection, 'legacy-pr', repo, 'pr_created',
+                    {'project': 'alpha', 'execplan_id': 'G-018', 'execplan_title': 'x' * 6000,
+                     'pr_url': 'https://example.test/pr/18', 'silent': True})
                 self.assertEqual(notifications.flush_project_events(connection, repo), 0)
             self.assertEqual(sent, [])
             self.assertEqual(notifications.flush_project_events(connection, repo), 1)
@@ -873,34 +874,12 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
             self.assertTrue(all(kw['disable_notification'] for _args, kw in sent))
             self.assertEqual(notifications.flush_project_events(connection, repo), 0)
 
-    def test_silent_transport_and_partial_restart_keep_original_payload(self):
+    def test_transport_preserves_explicit_silent_flag(self):
         response = mock.MagicMock()
         response.__enter__.return_value.status = 200
         with mock.patch.object(transport, 'urlopen', return_value=response) as open_url:
             transport.send_telegram('token', 'chat', 'notice', disable_notification=True)
         self.assertTrue(json.loads(open_url.call_args.args[0].data)['disable_notification'])
-        directory = self.enterContext(tempfile.TemporaryDirectory())
-        database = Path(directory) / 'state.db'
-        connection = self.connection(database=database)
-        with connection:
-            notifications._insert(connection, 'legacy-failure', '/projects/alpha', 'stage_failed',
-                {'project': 'alpha', 'cause': 'x' * 6000, 'status': '자동 교정 대기', 'silent': True})
-        original = self.events(connection)[0]['payload']
-        send = mock.Mock(side_effect=[None, RuntimeError('secret token')])
-        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
-        self.assertEqual(self.events(connection)[0]['confirmed_pieces'], 1)
-        connection.close()
-        restarted = sqlite3.connect(database)
-        self.addCleanup(restarted.close)
-        restarted.row_factory = sqlite3.Row
-        notifications.configure_session(restarted, enabled=True)
-        with restarted:
-            notifications.enqueue_progress(restarted, '/projects/alpha', 'stage_failed', 'failure',
-                cause='changed observation', status='automatic', silent=True)
-        self.assertEqual(self.events(restarted)[0]['payload'], original)
-        delivered = mock.Mock()
-        self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=delivered), 1)
-        delivered.assert_called_once()
 
 
 class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
@@ -1007,7 +986,7 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
                            "reason": "사용자 판단 대기", "question": "Question: Choose?"},), (), None, None))
         rows = self.events(connection)
         self.assertEqual([row["event_type"] for row in rows],
-                         ["draft_decisions", "plans_published", "work_waiting"])
+                         ["draft_decisions"])
         payload = json.loads(rows[0]["payload"])
         self.assertEqual([plan["id"] for plan in payload["plans"]], ["G-018", "G-019"])
         self.assertFalse(payload["silent"])
@@ -1016,7 +995,7 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
         self.assertIn("각 작업 문서에서 질문을 확인", message)
         self.assertNotIn("Which storage policy", message)
         self.assertNotIn("https://", message)
-        self.assertEqual(json.loads(rows[1]["payload"])["plans"], [{"id": "G-020", "title": "구현"}])
+        self.assertEqual(connection.execute("SELECT generation FROM work_reason_episodes").fetchone()[0], 1)
 
     def test_disabled_and_empty_lists_do_not_create_notices(self):
         connection = self.connection()

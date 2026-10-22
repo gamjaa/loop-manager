@@ -407,7 +407,7 @@ Planner의 표준 결과는 `FINAL_SPECIFICATION_REVIEW: <JSON object>` 하나�
 
 최종 확인의 `work_cycle`은 MERGED 수·유지보수 revision·Merge된 작업의 검증 identity에 결합한다. 재사용은 확정된 `fulfilled`의 현재 입력·명세 지문·주기 일치를 요구하며, 원문 보존 archive-only 이동은 유효한 계획 선언과 정확한 이동을 검증한 예외로만 허용한다. 상태 공백·catalog 부재·일반 검토의 추가 계획 없음이나 검토 파일명만으로 완료를 합성하지 않는다.
 
-안정적 완료·작업 소진의 원본은 현재 원격 입력·catalog·SQLite 상태다. 완료 알림의 사건 키는 프로젝트의 유효 planning 입력 지문으로 관리하며 최종 확인의 `work_cycle`과 구분한다. 대기 사건은 현재 계획·Requirement·차단 원인 snapshot의 지문과 세대로 중복 제거한다. Merge 후 worktree cleanup·ExecPlan archive pending은 완료를 막지 않지만 미완료 planning publication·활성 writer·안전 gate를 우회하는 근거로 사용하지 않는다.
+안정적 완료·작업 소진의 원본은 현재 원격 입력·catalog·SQLite 상태다. 완료 기록의 `cycle_key`는 프로젝트의 유효 planning 입력 지문으로 관리하며 최종 확인의 `work_cycle`과 구분한다. `project_completion_cycles`의 완료 시각·마지막 Merge 계획과 `work_reason_episodes`의 snapshot 지문·세대는 Telegram 활성 여부와 독립적으로 유지한다. 완료·대기 outbox는 만들지 않는다. Merge 후 worktree cleanup·ExecPlan archive pending은 완료를 막지 않지만 미완료 planning publication·활성 writer·안전 gate를 우회하는 근거로 사용하지 않는다.
 
 ### 계획 게시와 작업 공간
 
@@ -1475,7 +1475,9 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 사건 선택·주의 수준·해제·완료·대기 정책은 [PRODUCT의 Telegram 알림 조건](PRODUCT.md#telegram-알림-조건)을 따른다. token·chat ID가 모두 있을 때만 outbox에 새 사건을 저장하고 전송한다. 모두 없으면 생성·전송하지 않으며 일부만 있으면 설정 오류다. 상태 소유 경계가 같은 SQLite transaction에 사건을 기록하고 commit 뒤 즉시 전송 경계가 새 건을 시도한다. 실패한 건은 다음 실행의 미확정 전송 처리로 이어가며 작업 상태와 전송 결과를 분리한다.
 
-새 일반 계획의 원격 게시·catalog 반영은 `plans_published`, 현재 draft 판단 목록은 `draft_decisions`로 기록한다. 단순 `planning_result`·`stage_failed`는 새 사건 선택에서 제외한다. Planner 실제 시작은 차단 후 재개 판단에 사용하며 일반 시작 알림을 만들지 않는다. Worker 최초 시작은 해당 계획의 실제 프로세스 시작과 저장된 시작·재개 이력으로 중복 제거한다. 유지보수 시작·종료는 cycle identity·상태 전이에 연결한다. 미해결 targeted test 보고는 별도 단순/지속 실패 사건을 만들지 않으며 기존 outbox의 해당 미전송 진단도 취소하되 실패·전송 감사를 보존한다. 실제 최종 차단은 원인별 기존 경계를 따른다.
+일반 계획 게시·Worker 최초 시작·유지보수 cycle 시작/종료는 outbox 사건을 만들지 않는다. `enqueue_progress`는 draft 판단·PR 사건 종류만 허용한다. `record_process_start`는 실제 시작을 기존 incident 기록에 연결하며 일반 시작 알림을 위한 과거 outbox 조회는 수행하지 않는다. 유지보수 저장소는 알림용 계획 목록 조회·enqueue 없이 기존 cycle 상태·범위·Merge 확인·종료를 기록한다. 현재 draft 판단 목록은 `draft_decisions`로 저장한다. 미해결 targeted test와 단순 단계 실패는 별도 단순/지속 실패 사건을 만들지 않는다. 실제 최종 차단은 원인별 기존 경계를 따른다.
+
+조각 claim은 `blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision` 외 사건의 잔여 전송을 취소한다. 구정책 진행·완료·대기·재개와 아직 시작/재개 callback에서 생성되는 과거 사건에도 적용하며 payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim을 사용한다. 사건 종류 허용 뒤에는 각 사건의 기존 현재성 검사를 적용한다.
 
 지속 실행 실패 집계는 복구 진단으로 보존하고 독립 outbox 사건을 만들지 않는다. 같은 대상·원인의 실제 `PLAN_BLOCKED`·`PROJECT_BLOCKED`와 checkpoint 결과가 확정되면 기존 BLOCKED outbox만 사용한다.
 
@@ -1502,7 +1504,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 전송할 조각은 transaction에서 선택하고 HTTP 전송 뒤 현재 조각 위치를 대조해 확인 수를 전진시킨다. 고유 사건 키의 중복 삽입 방지와 외부 수신의 중복 방지는 별도다. 수신 후 확인 저장 전 중단·불명확한 실패는 같은 미확인 조각을 재시도하므로 외부 수신의 정확히 한 번을 보장하지 않는다.
 
-차단 해제와 해당 사건 해제·미전송 조각 취소는 같은 transaction에 반영한다. 재개는 한 조각 이상의 통지 확인과 원인 해제, 해당 작업의 실제 시작이 연결돼야 하며 시작 중 전송 확인이 늦게 도착해도 같은 사건·시작 identity로 한 번만 기록한다. 과거 planning 중복 사건의 확인 이력은 현재 사건에 연결하고 과거 행을 삭제하지 않는다. 안정적 작업 소진은 draft·계획 차단을 포함하되 프로젝트 차단을 제외하며 완료·대기 사건 키는 [프로젝트 최종 확인과 완료 판정](#프로젝트-최종-확인과-완료-판정)을 따른다. 새 PRODUCT·ARCHITECTURE·Requirement 변경 등으로 갱신된 완료 주기와 내용 보존 archive를 구분한다.
+차단 해제와 해당 사건 해제·미전송 조각 취소는 같은 transaction에 반영한다. incident의 실제 시작은 기존 원인 해제·작업 identity와 연결해 보존한다. 과거 시작/재개 callback이 outbox에 기록한 행도 조각 claim에서 취소하므로 Telegram으로 보내지 않는다. 과거 planning 중복 사건의 확인 이력은 현재 사건에 연결하고 과거 행을 삭제하지 않는다. 안정적 작업 소진은 draft·계획 차단을 포함하되 프로젝트 차단을 제외하며 완료·대기 상태는 [프로젝트 최종 확인과 완료 판정](#프로젝트-최종-확인과-완료-판정)을 따른다. 새 PRODUCT·ARCHITECTURE·Requirement 변경 등으로 갱신된 완료 주기와 내용 보존 archive를 구분한다.
 
 `notifications/rendering.py`는 저장된 payload만으로 텍스트를 결정적으로 생성하며 모델을 호출하지 않는다. 확인된 질문·수정 대상·PR 상태 순으로 정보를 구성하고 원인·복구 시도·Checkpoint 근거를 보존한다. 공통 payload와 `draft_decisions` 목록의 계약은 다음과 같다.
 

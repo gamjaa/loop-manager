@@ -60,6 +60,26 @@ Telegram 생성과 조각 전송을 현재 필요한 사용자 행동 또는 실
 - 결과: 4개 test 통과. 첫 test는 구정책 사건 9종의 미전송/부분 전송을 실제 SQLite 재연결 뒤 확인한다. `git diff --check`도 통과했다. 전체 verify는 실행하지 않았다.
 - 남은 작업: 생성 단계 무통지, blocked의 최신 원인·실제 조치/복구 불가 근거 판정, PR·draft 공통 현재성 경계, 취소 사건을 부활시키는 planning/시작/재개 callback 정리, 알림과 독립적인 완료·cycle·시작 상태 보존, PRODUCT·ARCHITECTURE 반영과 기존 진행/재개 전송 테스트의 명세 전환. 이번 변경만으로 사건 종류가 허용된 block의 실제 조치 필요성을 보장하지 않는다. 과거 진행·재개 전송을 기대하는 기존 테스트는 아직 전환하거나 실행하지 않았다.
 
+
+### 진행 생성 제거와 운영 상태 보존 checkpoint
+
+`events.enqueue_progress`는 draft·PR 종류만 허용하며 일반 계획 게시와 Worker 최초 시작의 enqueue 및 시작 알림용 과거 outbox 조회를 제거했다. 완료 gate를 통과하면 Telegram 설정과 독립적으로 완료 cycle·시각을 기록하고 마지막 Merge 계획은 보존한다. 같은 완료 cycle의 시각은 덮지 않으며 누락된 시각은 채운다. 대기 snapshot 지문·세대·작업 가능 전이는 유지하고 기존 대기 잔여 조각만 취소한다. 유지보수의 알림 전용 helper·목록 조회·enqueue를 제거하되 cycle 요청·범위·실제 Merge·종료와 rollback 조건은 유지한다.
+
+PRODUCT의 완료·대기와 Telegram 절, ARCHITECTURE의 완료 저장·Telegram 계약을 실제 변경에 맞췄다. 아직 남은 시작/재개 callback의 과거 사건 생성과 사건 종류 허용 뒤의 기존 현재성 검사도 ARCHITECTURE에 구분했다. 기존 진행 메시지 본문을 요구하던 테스트는 무통지와 실제 상태·snapshot·재시작·감사 assertion으로 전환했다. `TimelyProgressDeliveryTest`의 폐기된 stage_failed 부분 전송 재시도 시나리오는 제거했다. 같은 감사 보존 조건은 첫 checkpoint의 `test_legacy_progress_pieces_are_canceled_with_original_audit_after_restart`가 stage_failed를 포함한 9종에 대해 실제 재연결·payload·text·cursor·attempts·last_error를 검사하며, transport의 명시적 무음 flag 검사는 유지한다.
+
+실행 기록:
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_events tests.test_notification_work_cycles`: 46개 통과. 이후 수정한 생성 종류 행렬·시작·완료 시각 검사는 아래 최소 case로 추가 확인했다.
+- FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.TimelyProgressDeliveryTest tests.test_notification_delivery.DraftListNotificationTest.test_publication_current_and_waiting_share_one_sorted_list tests.test_notification_work_cycles.WorkReasonOutboxTest.test_waiting_snapshot_and_episode_survive_restart_without_notice`
+- 원인: draft 목록 테스트에 남은 `rows[1]`의 구정책 plans_published 기대가 IndexError를 발생시켰다. 현재 단일 draft 목록과 대기 episode 기록 검사로 수정했다.
+- RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.TimelyProgressDeliveryTest tests.test_notification_delivery.DraftListNotificationTest.test_publication_current_and_waiting_share_one_sorted_list tests.test_notification_work_cycles.WorkReasonOutboxTest.test_waiting_snapshot_and_episode_survive_restart_without_notice`
+- 재실행 결과: 4개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_events.TimelyProgressEventTest.test_progress_kinds_never_create_even_silent_outbox_rows tests.test_notification_events.TimelyProgressEventTest.test_selection_is_silent_and_actual_start_is_durable_and_deduplicated tests.test_notification_work_cycles.CompletionCycleTest.test_same_and_archive_only_cycle_preserve_completion_and_new_input_updates_it`: 3개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_maintenance_state.MaintenanceStateRepositoryTest.test_due_is_project_scoped_and_success_baseline_advances_only_on_success tests.test_maintenance_state.MaintenanceStateRepositoryTest.test_legacy_post_completion_requires_merge_and_preserves_review_source tests.test_notification_work_cycles.CompletionCycleTest.test_same_and_archive_only_cycle_preserve_completion_and_new_input_updates_it`: 3개 통과. 마지막 case는 누락 시각 채움도 확인했다.
+- 전체 verify와 전체 suite는 실행하지 않았다.
+
+남은 구현은 blocked의 최신 원인·구체적 조치/실제 복구 불가 근거를 생성·각 claim에 연결하는 공통 판정, PR·draft의 기존 관측과 공통 현재성 경계, planning 취소 사건 부활 및 시작/재개 callback enqueue 제거와 해당 incident·전송 경합 테스트 전환이다. 기존 final_evidence는 retry/교정 소진도 USER_ACTION_REQUIRED/FINAL_BLOCK로 분류하므로 그 이름이나 user_targets의 존재만으로 통지를 허용하지 않아야 한다. 현재 PRODUCT의 최종 차단 규칙과 ARCHITECTURE의 기존 차단 검사 설명은 이 남은 구현 뒤 최종 계약으로 다시 통합해야 한다. 이번 checkpoint는 완료 후보가 아니다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.

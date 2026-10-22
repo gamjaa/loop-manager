@@ -501,34 +501,8 @@ def enqueue_completion_if_ready(
         return False
 
     cycle_key = str(project[1])
-    completion = connection.execute(
-        "SELECT last_completed_plan_id, last_completed_title "
-        "FROM project_completion_cycles WHERE repo = ?",
-        (repo,),
-    ).fetchone()
-    last_id = str(completion[0]) if completion and completion[0] else None
-    last_title = str(completion[1]) if completion and completion[1] else None
-    if last_id is None:
-        merged = connection.execute(
-            "SELECT plan_id, title FROM exec_plans "
-            "WHERE repo = ? AND status = 'MERGED'",
-            (repo,),
-        ).fetchall()
-        if merged:
-            def plan_order(row: sqlite3.Row) -> tuple[int, str]:
-                value = str(row[0])
-                try:
-                    return int(value.removeprefix("G-")), value
-                except ValueError:
-                    return -1, value
-
-            latest = max(merged, key=plan_order)
-            last_id, last_title = str(latest[0]), str(latest[1])
-    last_title = last_title or "Planner confirmed no additional work"
     with connection:
         _cancel_pending_waiting(connection, repo)
-        if not _enabled(connection):
-            return False
         connection.execute(
             """
             INSERT INTO project_completion_cycles (repo, cycle_key, completed_at)
@@ -536,20 +510,10 @@ def enqueue_completion_if_ready(
             ON CONFLICT(repo) DO UPDATE SET
                 cycle_key = excluded.cycle_key,
                 completed_at = excluded.completed_at
+            WHERE project_completion_cycles.cycle_key IS NOT excluded.cycle_key
+                OR project_completion_cycles.completed_at IS NULL
             """,
             (repo, cycle_key),
-        )
-        _insert(
-            connection,
-            _key("completed", repo, cycle_key),
-            repo,
-            "project_completed",
-            {
-                "project": Path(repo).name or repo,
-                "reason": snapshot.describe(),
-                "last_completed_plan_id": last_id,
-                "last_completed_title": last_title,
-            },
         )
     return True
 
@@ -578,7 +542,7 @@ def mark_work_available(connection: sqlite3.Connection, repo: str) -> None:
 def enqueue_waiting_reason(
     connection: sqlite3.Connection, repo: str, snapshot: WorkReasonSnapshot,
 ) -> bool:
-    """Create one waiting incident per stable cause and cause transition."""
+    """Record stable waiting episodes without creating a Telegram notice."""
 
     if snapshot.completed:
         return False
@@ -604,27 +568,13 @@ def enqueue_waiting_reason(
             "signature = excluded.signature, generation = excluded.generation",
             (repo, signature, generation),
         )
-        if not snapshot.has_distinct_wait or not (payload["plans"] or payload["requirements"]):
-            _cancel_pending_waiting(connection, repo)
-            return False
-        event_key = _key("waiting", repo, f"{generation}\0{signature}")
-        connection.execute(
-            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
-            "WHERE repo = ? AND event_type = 'work_waiting' "
-            "AND event_key != ? AND sent_at IS NULL AND canceled_at IS NULL",
-            (repo, event_key),
-        )
-        if not _enabled(connection):
-            return False
-        payload["silent"] = False
-        payload["status"] = "다음 작업 대기"
-        _insert(connection, event_key, repo, "work_waiting", payload)
-    return True
+        _cancel_pending_waiting(connection, repo)
+    return False
 
 
 def enqueue_progress(connection, repo, kind, identity, **payload):
     """Persist a boundary observation in the owning state transaction."""
-    if kind in {"stage_failed", "planning_result"} or not _enabled(connection):
+    if kind not in {"draft_decisions", "draft_decision", "pr_created"} or not _enabled(connection):
         return
     ensure_schema(connection)
     plan_id = payload.get("execplan_id")
@@ -676,8 +626,6 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
     from loop_manager_internal.storage import execplan_draft_state
     ensure_schema(connection)
     if connection.execute(
-        "SELECT 1 FROM notification_outbox WHERE event_key = ?", (_key("work_started", repo, identity),),
-    ).fetchone() or connection.execute(
         "SELECT 1 FROM notified_block_incidents WHERE repo = ? AND start_identity = ?", (repo, identity),
     ).fetchone():
         return
@@ -688,44 +636,14 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
     ).fetchone()):
         return
     operation = "Worker" if role == "worker" else "Planner"
-    blocked_resume = record_work_start(connection, repo, operation, plan_id=plan_id,
-                                      start_identity=identity, resumed=resumed)
-    # Delivery of a BLOCKED piece may still be in flight. The incident will
-    # materialize its resumption when confirmation arrives; suppress the generic start too.
-    pending_resume = connection.execute(
-        "SELECT 1 FROM notified_block_incidents i WHERE repo = ? AND started_operation = ? "
-        "AND start_identity = ? AND released_at IS NOT NULL AND resumed_at IS NULL "
-        "AND subject IN (?, 'project') AND EXISTS (SELECT 1 FROM block_notice_events b "
-        "JOIN notification_outbox o ON o.event_key = b.event_key "
-        "WHERE b.incident_id = i.id AND o.delivery_started_at IS NOT NULL "
-        "AND o.sent_at IS NULL) LIMIT 1",
-        (repo, operation, identity, f"plan:{plan_id}" if plan_id else "planning"),
-    ).fetchone()
-    already_started = plan_id and connection.execute(
-        "SELECT 1 FROM notification_outbox WHERE repo = ? "
-        "AND event_type IN ('work_started', 'resumed') "
-        "AND json_extract(payload, '$.execplan_id') = ? LIMIT 1", (repo, plan_id),
-    ).fetchone()
-    if role == "worker" and not resumed and not already_started and not blocked_resume and not pending_resume:
-        enqueue_progress(connection, repo, "work_started", identity,
-                         execplan_id=plan_id, operation=operation,
-                         status="작업 중", silent=True)
+    record_work_start(connection, repo, operation, plan_id=plan_id,
+                      start_identity=identity, resumed=resumed)
 
 
 def record_planning_publication(connection, repo, plans, revision):
     if not _enabled(connection):
         return
-    from loop_manager_internal.storage import execplan_draft_state
-    ordinary = []
-    drafts = execplan_draft_state.pending_ids(connection, repo)
-    for path, plan in plans:
-        plan_id = str(plan["id"])
-        if plan_id not in drafts:
-            ordinary.append({"id": plan_id, "title": str(plan["title"])})
     enqueue_draft_decisions(connection, repo)
-    if ordinary:
-        enqueue_progress(connection, repo, "plans_published", revision,
-                         plans=ordinary, status="실행 또는 dependency 대기", silent=True)
 
 
 def enqueue_draft_decisions(connection, repo):
