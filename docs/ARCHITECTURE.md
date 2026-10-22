@@ -945,6 +945,8 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 | Worker 구현 결과 | 구현 조건·sources·dependency·archive·고정 지침과 완료 결과를 대조한다. 원본 명세 지문만의 변경은 Worker 입력 token을 바꾸지 않으며 실제 구현 조건 변경·부족은 기존 Worker 판단·교정으로 연결한다. |
 | verify·Review·게시 | 원본 명세·전체 본문·base·후보와 단계별 입력 증명을 유지한다. 후보 변경 후 각 성공 근거의 유효성·재사용 조건을 다시 판단하고 정확한 원격 lease·PR gate를 통과한다. |
 
+현재 상태가 새 rebase를 시작할 수 있다는 판단은 저장된 게시 lease의 소유 증거나 기존 rebase 차단의 해제 근거가 아니다. 이 재평가에는 확인된 소유 operation 또는 수용 가능한 완료 결과가 필요하다.
+
 
 #### 충돌 없는 rebase와 Worker 결과 연결
 
