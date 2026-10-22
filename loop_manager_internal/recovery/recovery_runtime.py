@@ -43,6 +43,7 @@ class RecoveryReason(str, Enum):
     REBASE_CONFLICT = "rebase_conflict"
     WORKER_CORRECTION = "worker_correction"
     TARGETED_TEST_CORRECTION = "targeted_test_correction"
+    TARGETED_COLLECTION_PENDING = "targeted_collection_pending"
     TARGETED_TEST_EXHAUSTED = "targeted_test_exhausted"
     REVIEW_FEEDBACK_CORRECTION = "review_feedback_correction"
     REVIEW_CORRECTION_BUDGET = "review_correction_budget"
@@ -239,6 +240,9 @@ def decide(
     elif reason is RecoveryReason.REVIEW_FEEDBACK_CORRECTION:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.CORRECT
+    elif reason is RecoveryReason.TARGETED_COLLECTION_PENDING:
+        disposition = RecoveryDisposition.STATE_RECONCILE
+        action = RecoveryAction.PAUSE
     elif reason is RecoveryReason.TARGETED_TEST_CORRECTION:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.PAUSE if attempts else RecoveryAction.CORRECT

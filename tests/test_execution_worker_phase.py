@@ -50,7 +50,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             targeted_collection_pending=True)
         result = self.handler.run(self.context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
-        self.assertEqual(result.recovery.observation.reason, RecoveryReason.TARGETED_TEST_CORRECTION)
+        self.assertEqual(result.recovery.observation.reason, RecoveryReason.TARGETED_COLLECTION_PENDING)
         self.effects.blocking.block_active_execplan.assert_not_called()
         self.effects.validation.verify.assert_not_called()
         self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 0)

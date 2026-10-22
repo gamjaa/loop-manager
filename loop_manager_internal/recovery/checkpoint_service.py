@@ -1,5 +1,6 @@
 """recovery checkpoint service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.runtime.handoff_gate import runtime_boundary
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents.agent_invocation import MAX_TRANSIENT_AGENT_RETRIES
@@ -402,6 +403,7 @@ class ResumePlanBlocksEffects:
     _scope_reconciliation_effects_resume_plan_blocks: Callable[..., object]
 
 
+@runtime_boundary
 def resume_plan_blocks(
     effects: ResumePlanBlocksEffects, connection: sqlite3.Connection,
     repo_path: Path,
@@ -565,6 +567,7 @@ class DispatchBlockedCheckpointsEffects:
     preserve_blocked_diagnostics: Callable[..., object] | None = None
 
 
+@runtime_boundary
 def dispatch_blocked_checkpoints(
     effects: DispatchBlockedCheckpointsEffects, connection: sqlite3.Connection,
     repo_path: Path,

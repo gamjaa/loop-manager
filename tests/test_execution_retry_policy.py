@@ -239,7 +239,7 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
         self.assertEqual(json.loads(plan["review_failure_history"]), {})
 
     @dummy_worker_sessions
-    def test_distinct_review_issues_pause_before_fourth_worker_correction(self):
+    def test_distinct_review_issues_wait_before_fourth_and_resume_in_same_run(self):
         messages = (
             "ISSUE_ID: app.py::issue-a::blocking\nissue A\nVERDICT: FAIL",
             "ISSUE_ID: app.py::issue-b::blocking\nissue B\nVERDICT: FAIL",
@@ -249,20 +249,20 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             data = self._run_review_sequence(
-                directory, messages, publish=True
+                directory, messages, publish=True, retry_waits=True
             )
 
         result = data["result"]
         transitions = data["transitions"]
         project = data["project"]
         plan = data["plan"]
-        self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
         self.assertEqual(result.exit_code, 0)
-        self.assertEqual(data["verify_calls"], 4)
-        self.assertEqual(data["roles"], ["worker", "reviewer"] * 4)
+        self.assertEqual(data["verify_calls"], 5)
+        self.assertEqual(data["roles"], ["worker", "reviewer"] * 5)
         self.assertEqual(
             data["reviewer_sessions"],
-            [None] + ["reviewer-session"] * 3,
+            [None] + ["reviewer-session"] * 4,
         )
         self.assertEqual(
             [
@@ -280,14 +280,16 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
             ),
             4,
         )
-        self.assertEqual(project["phase"], "WORKING")
-        self.assertEqual(plan["status"], "IMPLEMENTING")
-        self.assertEqual(len(json.loads(plan["review_failure_history"])), 4)
+        self.assertIsNone(project["phase"])
+        self.assertEqual(plan["status"], "PR_OPEN")
+        self.assertEqual(len(data["review_histories"][-1]), 4)
+        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+        self.assertAlmostEqual(sum(data["retry_delays"]), 30, places=3)
         self.assertEqual(plan['effective_worker_level'], 2)
         self.assertEqual(set(json.loads(plan['review_level_history'])), {'1'})
 
     @dummy_worker_sessions
-    def test_review_issue_in_changing_sets_pauses_after_three_corrections(self):
+    def test_review_issue_in_changing_sets_keeps_history_across_same_run_wait(self):
         messages = (
             "ISSUE_ID: app.py::a-shared-issue::blocking\n"
             "ISSUE_ID: app.py::z-extra-a::blocking\nVERDICT: FAIL",
@@ -297,24 +299,27 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
             "ISSUE_ID: app.py::z-extra-c::blocking\nVERDICT: FAIL",
             "ISSUE_ID: app.py::a-shared-issue::blocking\n"
             "ISSUE_ID: app.py::z-extra-d::blocking\nVERDICT: FAIL",
+            "VERDICT: PASS",
         )
         with tempfile.TemporaryDirectory() as directory:
             data = self._run_review_sequence(
-                directory, messages, publish=False
+                directory, messages, publish=True, retry_waits=True
             )
 
         result = data["result"]
         transitions = data["transitions"]
         project = data["project"]
         plan = data["plan"]
-        history = json.loads(plan["review_failure_history"])
-        self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+        history = data["review_histories"][-1]
+        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+        self.assertAlmostEqual(sum(data["retry_delays"]), 30, places=3)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
         self.assertEqual(result.exit_code, 0)
-        self.assertEqual(data["verify_calls"], 4)
-        self.assertEqual(data["roles"], ["worker", "reviewer"] * 4)
+        self.assertEqual(data["verify_calls"], 5)
+        self.assertEqual(data["roles"], ["worker", "reviewer"] * 5)
         self.assertEqual(
             data["reviewer_sessions"],
-            [None] + ["reviewer-session"] * 3,
+            [None] + ["reviewer-session"] * 4,
         )
         self.assertEqual(
             [
@@ -337,8 +342,8 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
             ),
             1,
         )
-        self.assertEqual(project["phase"], "WORKING")
-        self.assertEqual(plan["status"], "IMPLEMENTING")
+        self.assertIsNone(project["phase"])
+        self.assertEqual(plan["status"], "PR_OPEN")
         self.assertEqual(
             sorted(record["occurrences"] for record in history.values()),
             [1, 1, 1, 1, 4],

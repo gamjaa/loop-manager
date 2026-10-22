@@ -122,10 +122,10 @@ class WorkerHandler:
         if context.resolving_rebase:
             return self.ports._rebase_conflict(
                 context, detail, corrected=True, worker_result=worker_result,
-                recovery_reason=RecoveryReason.TARGETED_TEST_CORRECTION,
+                recovery_reason=RecoveryReason.TARGETED_COLLECTION_PENDING,
                 targeted_evidence_missing=True,
             )
-        return self.ports._recover(RecoveryReason.TARGETED_TEST_CORRECTION,
+        return self.ports._recover(RecoveryReason.TARGETED_COLLECTION_PENDING,
                                   detail, context=context, attempts=1)
 
     def _parse_worker_outcome(self, context, message, *, allow_legacy_ready=False):
@@ -298,12 +298,12 @@ class WorkerHandler:
                 )
                 if not allowed:
                     from loop_manager_internal.runtime.operation_events import emit
-                    emit("Review 교정 한도 도달: 다음 외부 실행에서 재개", used=used, limit=recovery_state.MAX_REVIEW_CORRECTIONS_PER_RUN)
+                    emit("Review 교정 묶음 한도 도달: 재시도 대기", used=used, limit=recovery_state.MAX_REVIEW_CORRECTIONS_PER_RUN)
                     detail = (
                         f"Review 교정 실행 한도 도달: run={review_turn_run_id}, "
                         f"plan={plan['id']}, used={used}/"
                         f"{recovery_state.MAX_REVIEW_CORRECTIONS_PER_RUN}. "
-                        "다음 외부 실행에서 저장된 Review 피드백으로 재개합니다.\n"
+                        "재시도 대기 뒤 저장된 Review 피드백으로 재개합니다.\n"
                         + str(row['review_result'] or '')[-8000:]
                     )
                     return self.ports._recover(

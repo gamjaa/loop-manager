@@ -182,6 +182,7 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
                     connection, 'repo', 'G-047', result_id,
                 ), (True, index + 1, run_id),
             )
+            loop_manager.recovery_state.start_review_correction(connection, 'repo', 'G-047', run_id, result_id)
 
         new_review = 'ISSUE_ID: app.py::new::blocking\nNew issue\nVERDICT: FAIL'
         with (

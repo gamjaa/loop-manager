@@ -24,7 +24,7 @@ class SelfMergeHandoffTest(PrRecoveryFixture, unittest.TestCase):
         return values
 
     def test_local_sync_status_never_gates_verified_self_merge_handoff(self):
-        project = RegisteredProject('/source', 'develop', 'codex', None, False)
+        project = RegisteredProject('/source', 'develop', 'codex', None, False, origin='owner/repo')
         old, remote = 'a' * 40, 'b' * 40
         runtime = loop_manager.RuntimeMutation(Path('/source'), Path('/runtime'), old, 'c' * 32)
         observation = WaitingPullRequestObservation((), True, ('https://example.test/pr/1',))
@@ -33,19 +33,19 @@ class SelfMergeHandoffTest(PrRecoveryFixture, unittest.TestCase):
                 sync = loop_manager.BaseWorktreeSyncResult(status, 'local checkout preserved', remote)
                 effects = self_runtime.FinishSelfMergeHandoffEffects(
                     _registered_self_runtime_project=mock.Mock(return_value=True),
-                    ensure_safe_base_worktree=mock.Mock(return_value=sync),
-                    git=mock.Mock(side_effect=[SimpleNamespace(stdout=remote), SimpleNamespace(stdout=remote), SimpleNamespace(returncode=0)]),
-                    log_base_worktree_sync=mock.Mock(), operation_log=mock.Mock(),
+                    _recorded_base_fetch=mock.Mock(return_value=remote),
+                    git=mock.Mock(return_value=SimpleNamespace(returncode=0)),
+                    git_bytes=mock.Mock(), operation_log=mock.Mock(),
                 )
-                with mock.patch.object(self_runtime.scoped_blocking, 'project_block', return_value=None):
+                with mock.patch('loop_manager.ensure_safe_base_worktree') as synchronize, mock.patch.object(
+                        self_runtime.runtime_inputs, 'changed', return_value=True):
                     with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
                         self_runtime._finish_self_merge_handoff(effects, None, project, Path('/state'), runtime, observation)
-                effects.ensure_safe_base_worktree.assert_called_once_with(
-                    Path('/source'), 'develop', remote_sha=remote, state_dir=Path('/state'))
+                synchronize.assert_not_called()
                 effects.git.assert_called_with(Path('/source'), 'merge-base', '--is-ancestor', old, remote, check=False)
-                self.assertIn('source_sync=' + status, effects.operation_log.call_args.args[0])
+                self.assertIn('code_changed=True', effects.operation_log.call_args.args[0])
 
-    def test_self_merge_handoff_persists_merge_before_parallel_submission(self):
+    def test_code_handoff_precedes_pr_observation_and_preserves_parallel_state(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection, branch, worktree, url, head = (
                 self._pr_open_state(directory)
@@ -87,9 +87,9 @@ class SelfMergeHandoffTest(PrRecoveryFixture, unittest.TestCase):
                         "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
                         (str(repo),),
                     ).fetchone()["status"],
-                    "MERGED",
+                    "PR_OPEN",
                 )
-                self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head)
+                self.assertEqual(git_command(repo, "rev-parse", "HEAD"), old_sha)
                 self.assertEqual(
                     connection.execute(
                         "SELECT enabled FROM notification_session"
@@ -139,9 +139,9 @@ class SelfMergeHandoffTest(PrRecoveryFixture, unittest.TestCase):
                             "loop_manager.pr_for_branch", return_value=merged
                         ), mock.patch("loop_manager.run_project_result") as run_project:
                             with self.assertRaises(loop_manager.PublicationSafetyError):
-                                loop_manager.schedule_registered_projects(
-                                    connection, state_dir, config,
-                                    runtime_mutation=runtime,
+                                loop_manager.observe_waiting_pull_requests(
+                                    connection, repo, state_dir, str(repo),
+                                    require_base_identity=True,
                                 )
                         run_project.assert_not_called()
                         self.assertEqual(

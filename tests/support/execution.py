@@ -448,7 +448,7 @@ def execution_policy_fixture(test, *, pr_conflict=False):
     return fixture
 
 
-def run_execution_policy(fixture):
+def run_execution_policy(fixture, *, retry_waits=False):
     """Use the production phase coordinator, retry loop and run budget storage."""
     # ponytail: This fixture starts at an activated plan. Keep discovery,
     # workspace preparation and process wiring in the real-Git regressions;
@@ -457,6 +457,14 @@ def run_execution_policy(fixture):
     from loop_manager_internal.execution.execution_runtime import (
         ExecutionPhaseCoordinator, ExecutionOutcomeKind,
     )
+    from loop_manager_internal.application.task_scheduling import TaskScheduler
+    from loop_manager_internal.config.managed_config import ManagedConfig
+    from loop_manager_internal.storage import recovery_state
+    import time
+    fixture.retry_delays = []
+    scheduler = (TaskScheduler(ManagedConfig(path=Path('/config'), max_workers=1,
+                                           telegram_token='', telegram_chat_id=''), mock.Mock(), Path('/state'),
+                              fixture.connection) if retry_waits else None)
 
     def step(*_args, **_kwargs):
         # Planning after a block is outside this activated-execution fixture.
@@ -466,6 +474,12 @@ def run_execution_policy(fixture):
         context = fixture.context()
         while True:
             outcome = ExecutionPhaseCoordinator(fixture.handler).dispatch(context)
+            if retry_waits and outcome.kind is ExecutionOutcomeKind.TRANSIENT_PAUSE:
+                with mock.patch.object(scheduler.condition, 'wait', side_effect=lambda delay: (
+                        fixture.retry_delays.append(delay), clock.__setitem__(0, clock[0] + delay))):
+                    if scheduler.wait_retry(fixture.connection, fixture.repo, context.plan.plan_id):
+                        context = fixture.context()
+                        continue
             if outcome.kind is not ExecutionOutcomeKind.PHASE_ADVANCED:
                 return lm._execution_outcome_step_result(outcome)
             context = outcome.context
@@ -485,7 +499,9 @@ def run_execution_policy(fixture):
             effects, *args, **kwargs),
     )
     # Every unexpected process call fails instead of silently returning success.
-    with mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected policy process')):
+    clock = [time.time()]
+    with mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected policy process')), \
+         (mock.patch.object(recovery_state.time, 'time', side_effect=lambda:clock[0]) if retry_waits else nullcontext()):
         return project_runner.run_project_result(
             outer, fixture.connection, Path('/state'), fixture.repo,
             Path('/config'), 'main', False,

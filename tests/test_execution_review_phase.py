@@ -583,6 +583,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
                         self.connection, 'repo', 'G-047', result_id,
                     ), (True, index + 1, run_id),
                 )
+                handlers.recovery_state.start_review_correction(self.connection, 'repo', 'G-047', run_id, result_id)
         self.state.update_project(
             'repo', phase='WORKING', review_result=review,
             last_error='Review 실패:\n' + review,
@@ -615,6 +616,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
                     self.connection, 'repo', 'G-047', result_id,
                 ), (True, result_id, run_id),
             )
+            handlers.recovery_state.start_review_correction(self.connection, 'repo', 'G-047', run_id, result_id)
         self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
         self.effects.agent.run_agent.side_effect = [lm.AgentResult(
             0, 'VERDICT: PASS', session_id='review-session',
@@ -637,6 +639,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
                         self.connection, 'repo', 'G-047', result_id,
                     ), (True, result_id, run_id),
                 )
+                handlers.recovery_state.start_review_correction(self.connection, 'repo', 'G-047', run_id, result_id)
         self.state.update_project(
             'repo', phase='WORKING', review_result=review,
             last_error='Worker 결과 검증 실패: format',

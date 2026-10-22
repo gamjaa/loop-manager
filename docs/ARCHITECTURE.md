@@ -349,11 +349,13 @@ source journal의 원본 intent·invocation·관측과 완료 감사는 비교 v
 
 runtime 경로가 존재하지만 소유권, repository, detached HEAD, SHA 또는 clean 상태를 증명할 수 없으면 reset, clean, 제거 또는 덮어쓰기 없이 중단한다. 별도 clone은 만들지 않으며 SHA별 runtime 정리는 활성 실행과 분리된 검증된 관리 작업으로만 수행한다.
 
-runtime 자식은 병렬 프로젝트 작업을 제출하기 전에 등록된 self source checkout의 대기 PR을 동기화한다. PR의 실제 base branch가 등록 base와 같음을 확인한 새 self PR Merge만 handoff 근거로 삼는다. Merge 전이·cleanup·알림 outbox를 영속화하고 등록 base의 최신 fetch와 source checkout 안전 동기화를 평가한다.
+runtime 자식은 등록된 canonical source·repository/origin·base·실제 runtime 경로/SHA를 검증하고, 선택된 프로젝트 목록과 별도로 self를 찾는다. `application/self_runtime.py`의 원격 관측은 기존 fetch journal·자원 잠금을 사용하며 PR 조회나 source 동기화를 수행하지 않는다. 일반 PR 수명주기의 base identity 검증·Merge 반영은 별도로 유지한다.
 
-원격 SHA가 현재 runtime SHA와 같으면 계속 실행하고 fast-forward 후속이면 source 동기화 결과와 관계없이 정상 종료해 다음 외부 실행의 bootstrap에 제어를 넘긴다. handoff 판정 뒤에는 새 Agent·verify·publication 또는 다른 프로젝트 작업을 시작하지 않는다. self Merge가 없거나 다른 프로젝트의 Merge 또는 일반 push만 있으면 handoff하지 않는다.
+단계 시작 전과 영속 결과 반환 뒤 `RuntimeHandoffGate.observe()`가 관측을 직렬화한다. 실행·planning·복구 coordinator와 실제 Agent/verify 배정 경계가 이를 호출한다. 관측 잠금을 기다리기 전에 완료한 단계의 implicit DB 요청을 확정하고 명시적 transaction 내부 관측은 거부하므로 DB 쓰기 transaction·scheduler condition·launch lock 안에서 원격 관측하지 않는다. 실제 실행 SHA와 원격 commit의 raw diff 및 blob을 비교해 추가·삭제·이동·mode/kind 변경을 포함한다. 알려진 문서 위치의 일반 UTF-8 prose만 제외하고 실행 bit·symlink·shebang·Python 구문과 문서 아래 실행 코드는 포함한다. 알 수 없는 경로와 비교 실패는 문서 전용 성공이 아니다.
 
-repository·origin·PR base identity, fetch 또는 ancestry를 확인할 수 없으면 성공 handoff로 처리하지 않고 기존 작업 상태를 보존한다
+원격 SHA/코드가 같으면 실행을 계속한다. 코드가 다른 fast-forward 후속이면 원자 launch gate에 source/origin/base·실행/목표 SHA·mutation identity를 결합해 신규 관리·Agent·verify·게시를 막고 진행 중 호출은 반환·저장을 기다린다. 부모는 자식별 일회용 channel token과 논리 run ID에 결합한 `runtime-handoffs/<mutation>-<token>.json` 및 전용 반환 코드 75를 함께 검증한다. 임의 파일·출력·일반 종료 코드는 재시작 근거가 아니다. 확인한 자료는 consumed로 남기고 재소비하지 않는다. 미확정 반환은 별도 보존 코드 76으로 부모에 전달하며 새 runtime이나 기존 runtime 제거를 허용하지 않는다.
+
+부모는 동일 process lock 아래 최신 등록 base를 다시 fetch·선택하고 관측 목표의 후속인지와 코드 진전을 검증해 최신 revision의 bootstrap 진입점·runtime을 시작한다. 자식별 mutation ID는 새로 만들고 절대 config·interpreter·PATH·인자·bytecode 정책·논리 run ID는 유지한다. scheduler의 external run marker도 이 논리 ID를 사용하므로 물리 runtime 교체가 실패 감사를 새 실행으로 만들지 않는다. 전체 pause의 원본은 G-236의 `pause.db/pauses(scope)`이며 bootstrap 전·재선택 전·새 자식 전과 실행 gate에서 확인한다. 프로젝트 pause는 대상만 제외한다. pause 제어 명령·진행 중 호출 종료 제어는 해당 pause 수명주기가 소유한다.
 
 ### 선택 전 상태 동기화
 
@@ -1223,9 +1225,9 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 - invocation 종료의 finally, Manager의 `reconcile_interrupted()`와 Worker 호출 전·CLI retry 전·호출 후 경계가 같은 미소비 기록을 재관측한다. 기존 process receipt 복구로 writer 종료가 확인되고 디렉터리 identity가 일치할 때만 읽는다. 살아 있는 수동 작업은 기존 소유권 보호를 적용한다. receipt 부재·종료 불명·경로 교체·symlink·읽기/해석/저장 오류에서는 원문·결합을 보존하고 해당 작업을 대기한다. 같은 작업의 앞선 호출이 대기하면 후속 호출도 순서를 보존하며 다른 repository·ExecPlan의 수집은 이어간다. runtime·모델 교체는 저장된 호출 귀속을 바꾸지 않는다. `AgentRequest.on_targeted_prepared`는 launch 객체 없이 같은 디렉터리·receipt를 결합하는 port이며 Claude의 실제 전달 연결은 별도 작업이다.
 - Manager는 완료된 개별 결과를 SQLite `targeted_test_results`·`targeted_test_streaks`에 반영하고, 실행 ID의 invocation 귀속(`targeted_test_run_owners`)과 collection의 `collected` 전이를 같은 transaction에서 확정한다. 미소비 상태는 `pending` 또는 오류 종류를 가진 `error`이며 저장 실패·transaction 중단 뒤에도 재시도한다. repository·ExecPlan·실행 ID·테스트 ID로 중복과 상충 결과를 검사하고 다른 호출의 실행 ID 재사용은 거부한다. JSONL의 불완전한 마지막 줄과 기록 부재에서 성공·실패를 합성하지 않으며 수집·fixture 오류도 개별 테스트 실패로 세지 않는다. 세 번째 실패 도달은 같은 turn에서 뒤에 성공하더라도 소비 전까지 보존하고 새 Worker·CLI retry·verify 전에 `targeted_test_exhausted`로 차단한다.
 
-  차단 확정과 도달 표식 소비는 같은 transaction이며 실행·실패 감사는 보존한다. Worker 최종 실패 보고와 수집 대기는 `targeted_test_correction`으로 분리해 일반·rebase 보고 오류 한도를 소비하지 않고, 새 실행 근거가 없으면 일시 중단한다. 수집 대기는 별도 반환 표식으로 전달하며 물리 provider 결과·사용량·종료 감사를 덮지 않는다. 실제 provider 거부·완료 보고 오류·명시적 사용자 결정과 독립 안전 차단은 각 기존 경계에서 처리한다.
+  차단 확정과 도달 표식 소비는 같은 transaction이며 실행·실패 감사는 보존한다. Worker 최종 실패 보고는 `targeted_test_correction`, 수집 대기는 `targeted_collection_pending`으로 구별해 일반·rebase 보고 오류 한도를 소비하지 않는다. 근거 없는 실패 보고는 작업별 재시도 대기 뒤 재검증하고 수집 대기는 기존 자료를 먼저 재수집한다. 수집 대기는 별도 반환 표식으로 전달하며 물리 provider 결과·사용량·종료 감사를 덮지 않는다. 실제 provider 거부·완료 보고 오류·명시적 사용자 결정과 독립 안전 차단은 각 기존 경계에서 처리한다.
 
-- 저장된 VERIFYING 진입은 선택된 repository·ExecPlan의 자료를 Worker 결과·사용자 결정 gate 뒤, 부분 실행·전체 실행·성공 receipt 재사용 전에 다시 관측한다. 기존 Worker 차단 경계가 세 번째 실패와 도달 표식 소비를 원자 처리하며, 미수집 자료는 `targeted_test_correction` 일시 중단으로 VERIFYING·Worker 결과·session·후보를 보존한다. 부분·전체 실행은 `scheduled_call("verify")`가 실제 verify slot을 배정한 뒤 process receipt 준비 전에 같은 자료를 재확인한다. 이 경계에서 차단·대기가 생기면 아직 자식 receipt가 없어 기존 task-call 확인 규칙이 미시작 verify 자리만 반환하고 새 verify 실행·실패 receipt를 만들지 않는다. 작업별 repository·ExecPlan 필터를 유지해 다른 작업의 기록·예약은 건드리지 않는다.
+- 저장된 VERIFYING 진입은 선택된 repository·ExecPlan의 자료를 Worker 결과·사용자 결정 gate 뒤, 부분 실행·전체 실행·성공 receipt 재사용 전에 다시 관측한다. 기존 Worker 차단 경계가 세 번째 실패와 도달 표식 소비를 원자 처리하며, 미수집 자료는 `targeted_collection_pending` 조건 대기로 VERIFYING·Worker 결과·session·후보를 보존한다. 부분·전체 실행은 `scheduled_call("verify")`가 실제 verify slot을 배정한 뒤 process receipt 준비 전에 같은 자료를 재확인한다. 이 경계에서 차단·대기가 생기면 아직 자식 receipt가 없어 기존 task-call 확인 규칙이 미시작 verify 자리만 반환하고 새 verify 실행·실패 receipt를 만들지 않는다. 작업별 repository·ExecPlan 필터를 유지해 다른 작업의 기록·예약은 건드리지 않는다.
 
 ### 전체 verify와 Reviewer
 
@@ -1249,12 +1251,12 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 |---|---|
 | [targeted unit test](PRODUCT.md#worker-targeted-unit-test-실패) | 실제 실행·테스트 ID별 연속 결과다. 후보·session 변화로 초기화하지 않으며 세 번째 실패 도달 표식은 차단 확정까지 보존한다. |
 | [전체 verify](PRODUCT.md#전체-verify-실패) | 정규화한 verify 실패 지문별 발생 이력이다. 전체 verify 성공은 이 이력만 초기화한다. |
-| [Review 교정](PRODUCT.md#review-교정과-level-승격) | Review 지문·level 승격 이력과 외부 실행별 Worker 교정 횟수를 별도로 저장한다. 유효 Review PASS는 Review 이력·진행 중 교정 집계만 끝내며 effective level·과거 승격 감사는 유지한다. |
+| [Review 교정](PRODUCT.md#review-교정과-level-승격) | Review 지문·level 승격 이력과 실제 시작한 Worker 교정 turn과 세 번씩의 묶음 대기를 별도로 저장한다. 유효 Review PASS는 Review 이력·진행 중 교정 집계만 끝내며 effective level·과거 승격 감사는 유지한다. |
 | Worker 완료·문서 보고 교정 | 기존 보고 오류 한도를 사용한다. targeted test 교정은 `targeted_test_correction`으로 분리하고 동일 후보·명세·base의 보고 오류 집계는 검증 출력·session 변화로 초기화하지 않는다. |
 
 [Agent CLI 실패](PRODUCT.md#외부-cli-실패)는 위 구현·검증 실패와 별도로 처리한다.
 
-Agent CLI 실행 실패·timeout·일시적 서비스 오류는 한 호출 요청에서 최초 실행 외 최대 3회 재시도한다. 세션 재개 불가로 새 세션을 한 번 시작하는 복구는 별도로 집계한다. 모두 실패하면 현재 상태를 유지하고 해당 프로젝트 처리를 이번 실행에서 중단하며 다음 실행에서 저장 단계부터 재개한다. AI 사용 한도 소진이 확인되면 현재 실행에서는 재시도하지 않는다.
+Agent CLI 실행 실패·timeout·일시적 서비스 오류는 한 호출 요청에서 최초 실행 외 최대 3회 재시도한다. 세션 재개 불가로 새 세션을 한 번 시작하는 복구는 별도로 집계한다. 묶음이 소진되면 recovery record의 identity/generation에 결합한 `retry_after`를 저장한다. 작업별 30초 대기는 호출 자리를 점유하지 않고 runtime 확인을 계속하며 같은 실행에서 저장 단계를 다시 배정한다. runtime 교체 후에도 저장된 시각과 누적 감사를 유지한다. Review 교정은 시작한 turn만 세며 같은 피드백 turn의 예약·재처리는 중복 집계하지 않는다. AI 사용 한도는 실제 종료가 확인된 같은 provider/model의 독립 성공 기록 이후에만 재개하고 유료 probe·새 session·provider 전환으로 우회하지 않는다. 종료 불명 예약은 해당 token의 기존 receipt로 종료를 재확인한 뒤에만 회수한다.
 
 ### 자체 테스트의 Git 경계
 

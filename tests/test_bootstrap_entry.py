@@ -27,6 +27,60 @@ from loop_manager_internal.runtime import bootstrap
 
 @isolated_git_test
 class BootstrapEntryTests(unittest.TestCase):
+    def test_owned_refresh_restarts_latest_remote_in_one_parent_invocation(self):
+        from loop_manager_internal.runtime import refresh
+        from loop_manager_internal.runtime.contracts import RuntimeRefresh
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state = Path(directory) / 'state'
+            first = advance_remote(writer, path='loop_manager.py', value="VALUE = 'A'\n")
+            (source / 'loop_manager.py').write_text('local dirty source\n')
+            seen, paths = [], []
+            real_run = subprocess.run
+            def child(command, **options):
+                if command[0] == 'git':
+                    return real_run(command, **options)
+                if '-c' in command:
+                    return subprocess.CompletedProcess(command, 0, stdout='{"created":1,"reused":0,"replaced":0,"unavailable":0,"missing":0}')
+                path = Path(command[command.index('-u')+1])
+                sha = command[command.index('--runtime-sha')+1]
+                mutation = command[command.index('--runtime-mutation-id')+1]
+                token = options['env']['LOOP_MANAGER_RUNTIME_HANDOFF_TOKEN']
+                run_id = options['env']['LOOP_MANAGER_RUN_ID']
+                paths.append(path.parent)
+                seen.append((sha, run_id, mutation, path.read_text()))
+                with self.assertRaises(loop_manager.ProcessLockBusyError):
+                    with loop_manager.process_lock(state):
+                        pass
+                if len(seen) == 1:
+                    target = advance_remote(writer, path='loop_manager.py', value="VALUE = 'B'\n")
+                    loop_manager._recorded_base_fetch(source, state, 'main', owner='runtime-observation')
+                    runtime = loop_manager.RuntimeMutation(source, path.parent, sha, mutation)
+                    request = RuntimeRefresh(str(source), 'owner/repo', 'main', sha, target, mutation)
+                    with closing(loop_manager.connect_database(state, create=True)) as connection:
+                        channel = refresh.channel.set((token, run_id))
+                        try:
+                            code = refresh.request_restart(connection, state, runtime, request)
+                        finally:
+                            refresh.channel.reset(channel)
+                    # The parent must choose C, even though the child observed B.
+                    advance_remote(writer, path='loop_manager.py', value="VALUE = 'C'\n")
+                    return subprocess.CompletedProcess(command, code)
+                return subprocess.CompletedProcess(command, 0)
+            with mock.patch.object(loop_manager, 'ROOT', source), mock.patch.object(loop_manager.sys, 'argv',
+                    ['loop_manager.py', '--state-dir', str(state), 'run']), \
+                    mock.patch('loop_manager.github_repository', return_value='owner/repo'), \
+                    mock.patch('loop_manager.subprocess.run', side_effect=child):
+                self.assertEqual(loop_manager.main(), 0)
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(seen[0][0], first)
+            self.assertEqual([row[3] for row in seen], ["VALUE = 'A'\n", "VALUE = 'C'\n"])
+            self.assertEqual(seen[0][1], seen[1][1])
+            self.assertNotEqual(seen[0][2], seen[1][2])
+            self.assertTrue(all(not path.exists() for path in paths))
+            self.assertEqual((source/'loop_manager.py').read_text(), 'local dirty source\n')
+            self.assertEqual(len(list((state/'runtime-handoffs').glob('*.consumed.json'))), 1)
+
     def test_remote_child_handoff_preserves_source_config_interpreter_arguments_and_real_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)

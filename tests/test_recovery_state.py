@@ -88,17 +88,18 @@ class RecoveryRepositoryTests(unittest.TestCase):
                         connection, 'repo', 'G-042', result_id,
                     ), (True, expected, 'same-scheduler-run'),
                 )
+                start_review_correction(connection, 'repo', 'G-042', 'same-scheduler-run', result_id)
                 connection.close()
             connection = sqlite3.connect(database)
             connection.row_factory = sqlite3.Row
             begin_external_run(connection, 'next-scheduler-run')
             self.assertEqual(
                 reserve_review_correction(connection, 'repo', 'G-042', 2),
-                (True, 1, 'next-scheduler-run'),
+                (True, 2, 'same-scheduler-run'),
             )
             connection.close()
 
-    def test_review_budget_counts_distinct_review_results_once_per_external_run(self):
+    def test_review_budget_counts_started_turns_and_keeps_wait_across_external_runs(self):
         self.connection.execute(
             "CREATE TABLE validation_results (id INTEGER PRIMARY KEY, repo TEXT, "
             "plan_id TEXT, stage TEXT, classification TEXT, raw_output TEXT)"
@@ -143,8 +144,14 @@ class RecoveryRepositoryTests(unittest.TestCase):
         self.assertNotEqual(next_run, run)
         self.assertEqual(
             reserve_review_correction(self.connection, 'repo', 'G-042', 4),
-            (True, 1, next_run),
+            (False, 3, next_run),
         )
+        due = self.connection.execute('SELECT MAX(retry_after) FROM review_correction_turns').fetchone()[0]
+        with mock.patch('loop_manager_internal.storage.recovery_state.time.time', return_value=due + 1):
+            self.assertEqual(reserve_review_correction(self.connection, 'repo', 'G-042', 4), (True, 4, next_run))
+            start_review_correction(self.connection, 'repo', 'G-042', next_run, 4)
+        self.assertEqual(self.connection.execute(
+            'SELECT COUNT(*) FROM review_correction_turns WHERE started_at IS NOT NULL').fetchone()[0], 4)
 
     def test_review_correction_matches_the_redacted_audit_result(self):
         self.connection.execute(

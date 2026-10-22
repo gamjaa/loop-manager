@@ -905,6 +905,156 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         finally:
             scheduling.current_scheduler.reset(token)
 
+    def test_missing_targeted_evidence_waits_and_retries_before_sibling_verify_returns(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.execution.result_validation import TargetedTestFailure
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
+        from loop_manager_internal.recovery.checkpoint_service import _execution_outcome_step_result
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+        from tests.support.worker import worker_result
+        scheduler = self.scheduler(max_workers=1, max_tasks_per_project=2)
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            for plan in ('G-001', 'G-002'):
+                runtime.activate('A', plan, activation_sha='base', branch=plan, worktree=plan)
+            runtime.update_plan('A', 'G-001', plan_values={'worker_session_id':'saved-worker'}, enqueue=False)
+        service = ProjectService(SimpleNamespace(activate_ready_execplan=mock.Mock(return_value=None), resume_manual_work=None),
+            ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                            True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base', provider='codex')
+        verifying, retried = threading.Event(), threading.Event()
+        calls = []
+        def execute(child, repository, **options):
+            task = scheduling.current_task.get()
+            if task.plan_id == 'G-002':
+                with scheduler.slot('verify', task):
+                    verifying.set()
+                    self.assertTrue(retried.wait(3))
+            else:
+                self.assertTrue(verifying.wait(2))
+                with scheduler.slot('agent', task):
+                    calls.append(task.plan_id)
+                    self.assertEqual(repository.get('A', task.plan_id).worker_session_id, 'saved-worker')
+                    if len(calls) == 1:
+                        report = worker_result(tests='targeted test: FAIL; tests.Sample.test_one')
+                        with self.assertRaises(TargetedTestFailure):
+                            loop_manager.parse_worker_result(report, {'id':task.plan_id, 'title':'targeted retry'})
+                        decision = RecoveryRepository(task.connection).observe(RecoveryObservation(
+                            RecoveryReason.TARGETED_TEST_CORRECTION, 'A', task.plan_id, 'WORKING',
+                            'revision', 'base', 'no-new-evidence', 'same-work', report), attempts=1).decision
+                        task.connection.commit()
+                        return _execution_outcome_step_result(ExecutionOutcome(
+                            ExecutionOutcomeKind.TRANSIENT_PAUSE, recovery=decision))
+                    self.assertIsNotNone(task.retry_order)
+                    self.assertEqual(sum(scheduler.running['verify'].values()), 1)
+                    self.assertEqual(TargetedTestRepository(task.connection).sequence('A', task.plan_id), 0)
+                    retried.set()
+            repository.transition_from_snapshot(repository.projected('A'), plan_values={'status':'PR_OPEN'},
+                                                 project_values=runtime_state.clear_project_values())
+            return 0
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with fast_mode_scope(replace(self.config, max_tasks_per_project=2)), \
+                 mock.patch.object(ProjectService, '_dispatch_execution', execute), \
+                 mock.patch('loop_manager_internal.storage.recovery_state.RETRY_DELAY_SECONDS', .05):
+                self.assertEqual(scheduling.run_project_tasks(service, newly_activated=False), 0)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(calls, ['G-001', 'G-001'])
+        saved = RecoveryRepository(self.connection).row('A', 'G-001')
+        self.assertIsNone(saved['retry_after'])
+        self.assertEqual(saved['occurrence'], 1)
+        self.assertEqual(runtime.get('A', 'G-001').worker_session_id, 'saved-worker')
+
+    def test_review_correction_batches_wait_without_resetting_started_turns_on_new_run(self):
+        from loop_manager_internal.storage import recovery_state
+        now = time.time()
+        with mock.patch.object(recovery_state.time, 'time', return_value=now) as clock:
+            recovery_state.begin_external_run(self.connection, 'logical-A')
+            self.connection.commit()
+            for source in (1, 2, 3):
+                allowed, used, run = recovery_state.reserve_review_correction(self.connection, 'A', 'G-001', source)
+                self.assertTrue(allowed)
+                recovery_state.start_review_correction(self.connection, 'A', 'G-001', run, source)
+            self.assertFalse(recovery_state.reserve_review_correction(self.connection, 'A', 'G-001', 4)[0])
+            recovery_state.begin_external_run(self.connection, 'logical-B')
+            self.connection.commit()
+            self.assertFalse(recovery_state.reserve_review_correction(self.connection, 'A', 'G-001', 4)[0])
+            self.assertEqual(recovery_state.reserve_review_correction(self.connection, 'A', 'G-001', 3),
+                             (True, 3, 'logical-A'))
+            clock.return_value += recovery_state.RETRY_DELAY_SECONDS + 1
+            allowed, used, run = recovery_state.reserve_review_correction(self.connection, 'A', 'G-001', 4)
+            self.assertTrue(allowed)
+            self.assertEqual(used, 4)
+            recovery_state.start_review_correction(self.connection, 'A', 'G-001', run, 4)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM review_correction_turns WHERE started_at IS NOT NULL').fetchone()[0], 4)
+
+    def test_usage_wait_never_probes_and_requires_same_provider_model_success_evidence(self):
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
+        scheduler = self.scheduler()
+        ledger = InvocationRepository(self.connection)
+        def result(plan, provider, model, kind):
+            identity = ledger.start(InvocationContext('A', plan), 'worker', provider, ResolvedProfile(model, 'low'), 'same-session')
+            ledger.mark_execution_started(identity)
+            ledger.mark_execution_finished(identity, 2)
+            ledger.finish(identity, kind, 0 if kind == 'success' else 1, 2, 'same-session', Usage())
+            return identity
+        failed = result('G-001', 'codex', 'model-A', 'usage_limit')
+        checks = []
+        def wait(_seconds):
+            checks.append('wait')
+            result('G-002', 'claude' if len(checks) == 1 else 'codex', 'model-A', 'success')
+            self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+        with mock.patch.object(scheduler.condition, 'wait', side_effect=wait):
+            self.assertTrue(scheduler.wait_usage(self.connection, 'A', 'G-001'))
+        self.assertEqual(checks, ['wait', 'wait'])
+        self.assertEqual(self.connection.execute('SELECT result_kind FROM agent_invocations WHERE invocation_id=?', (failed,)).fetchone()[0], 'usage_limit')
+
+    def test_retry_due_time_survives_runtime_replacement_and_no_early_dispatch(self):
+        from loop_manager_internal.storage import recovery_state
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        scheduler = self.scheduler()
+        repository = recovery_state.RecoveryRepository(self.connection)
+        repository.observe(RecoveryObservation(RecoveryReason.SERVICE_UNAVAILABLE, 'A', 'G-001',
+            'WORKING', 'revision', 'base', 'cli', 'same-session', 'original failure'), attempts=3)
+        self.connection.commit()
+        clock = [100.0]
+        with mock.patch.object(recovery_state.time, 'time', side_effect=lambda:clock[0]):
+            saved = repository.defer_retry('A', 'G-001')
+            self.assertEqual(saved['retry_after'], 130)
+            replacement = self.scheduler()
+            observed = []
+            def wait(seconds):
+                observed.append(clock[0])
+                clock[0] += 10
+            with mock.patch.object(replacement.condition, 'wait', side_effect=wait):
+                self.assertTrue(replacement.wait_retry(self.connection, 'A', 'G-001', resume=True))
+        self.assertEqual(observed, [100, 110, 120])
+        current = repository.row('A', 'G-001')
+        self.assertIsNone(current['retry_after'])
+        self.assertEqual(current['generation'], saved['generation'])
+        self.assertEqual(current['recovery_counts'], saved['recovery_counts'])
+        self.assertEqual(current['detail'], 'original failure')
+
+    def test_call_condition_wait_reclaims_only_its_confirmed_reservation(self):
+        from loop_manager_internal.storage import task_calls
+        target = task_calls.reserve(self.connection, self.directory, 'A', 'G-001', 'verify', 'run')
+        other = task_calls.reserve(self.connection, self.directory, 'B', 'G-003', 'agent', 'run')
+        confirmed = [False]
+        with mock.patch.object(task_calls, '_confirmed', side_effect=lambda _c, row, _s:
+                row['token'] == target.token and confirmed[0]):
+            scheduler = self.scheduler()
+            with mock.patch.object(scheduler.condition, 'wait', side_effect=lambda _:confirmed.__setitem__(0, True)) as wait:
+                self.assertTrue(scheduler.wait_existing_call(self.connection, 'A', 'G-001'))
+            wait.assert_called_once()
+        self.assertEqual([row[0] for row in self.connection.execute('SELECT token FROM task_call_reservations')], [other.token])
+        self.assertEqual(scheduler.running['verify']['A'], 0)
+        self.assertEqual(scheduler.running['agent']['B'], 1)
+        self.assertIn(('B', 'G-003', 'agent'), scheduler.retained)
+
     def test_local_transient_retry_preserves_three_attempt_pause_and_other_plan_records(self):
         from loop_manager_internal.application.project_runner import retry_pause_detail
         from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason

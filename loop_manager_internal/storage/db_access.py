@@ -101,6 +101,17 @@ def _gate(path):
         return _gates.setdefault(key, _Gate(Path(key)))
 
 
+def finish_implicit_request(path):
+    """Close a completed stage's implicit write before observing external input."""
+    gate = _gate(path)
+    with gate.condition:
+        owner = gate.owner if gate.thread == threading.get_ident() else None
+    if owner is not None:
+        if owner._depth or owner._explicit_transaction:
+            raise RuntimeError('명시적 DB transaction 안에서 runtime 원격을 관측할 수 없습니다.')
+        owner.commit()
+
+
 class _Cursor(sqlite3.Cursor):
     def __init__(self, connection):
         super().__init__(connection)

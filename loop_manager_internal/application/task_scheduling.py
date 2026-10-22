@@ -14,6 +14,7 @@ import time
 import traceback
 
 from loop_manager_internal.runtime import operation_events as events
+from loop_manager_internal.runtime.handoff_gate import observe_runtime
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage import task_calls
@@ -115,6 +116,77 @@ class TaskScheduler:
             task.resumed = True
             self.condition.notify_all()
         events.emit("작업 RETRY 우선 재배정", project=task.repo, plan=task.plan_id)
+
+    def wait_retry(self, connection, repo, plan_id=None, *, resume=False):
+        from loop_manager_internal.storage import recovery_state
+        from loop_manager_internal.recovery.recovery_runtime import TRANSIENT, RECONCILE, RecoveryReason
+        repository = recovery_state.RecoveryRepository(connection)
+        saved = repository.row(repo, plan_id)
+        eligible = {reason.value for reason in TRANSIENT | RECONCILE} | {
+            RecoveryReason.TARGETED_TEST_CORRECTION.value,
+            RecoveryReason.TARGETED_COLLECTION_PENDING.value,
+        }
+        if (saved is None or saved['reason_code'] not in eligible or saved['pending_action'] == 'final_block'
+                or resume and saved['retry_after'] is None):
+            return False
+        saved = repository.defer_retry(repo, plan_id)
+        events.emit('작업 재시도 대기', project=repo, plan=plan_id, reason_code=saved['reason_code'],
+                    retry_after=saved['retry_after'])
+        observed = 0
+        while True:
+            self.check_project(repo)
+            if time.monotonic() >= observed:
+                observe_runtime()
+                observed = time.monotonic() + 1
+            remaining = saved['retry_after'] - time.time()
+            if remaining <= 0:
+                break
+            with self.condition:
+                self.condition.wait(min(remaining, .2))
+        repository.finish_retry_wait(saved)
+        return True
+
+    def wait_usage(self, connection, repo, plan_id):
+        """Only an independently recorded successful call can clear a quota wait."""
+        saved = connection.execute(
+            'SELECT result_kind, provider, model, finished_at FROM agent_invocations '
+            'WHERE repo=? AND plan_id=? ORDER BY started_at DESC, rowid DESC LIMIT 1', (repo, plan_id)).fetchone()
+        if saved is None or saved['result_kind'] != 'usage_limit':
+            return False
+        events.emit('사용 한도 조건 대기', project=repo, plan=plan_id)
+        while True:
+            self.check_project(repo)
+            observe_runtime()
+            if saved['finished_at'] and connection.execute(
+                "SELECT 1 FROM agent_invocations WHERE repo=? AND provider=? AND model=? "
+                "AND finished_at>? AND result_kind='success' AND result_code=0 "
+                "AND execution_status='executed' AND execution_finished_at IS NOT NULL LIMIT 1",
+                (repo, saved['provider'], saved['model'], saved['finished_at'])).fetchone():
+                return True
+            with self.condition:
+                self.condition.wait(1)
+
+    def wait_existing_call(self, connection, repo, plan_id):
+        with self.condition:
+            keys = {key: value for key, value in self.retained.items() if key[:2] == (repo, plan_id)}
+        if not keys:
+            return False
+        while keys:
+            self.check_project(repo)
+            observe_runtime()
+            live = {row['token'] for row in task_calls.recover(
+                connection, self.state_dir, tokens={value['token'] for value in keys.values()})}
+            with self.condition:
+                for key, value in tuple(keys.items()):
+                    if value['token'] not in live:
+                        self.retained.pop(key, None)
+                        self.running[key[2]][key[0]] -= 1
+                        self.uncertain[key[2]] -= 1
+                        del keys[key]
+                if keys:
+                    self.condition.wait(1)
+                self.condition.notify_all()
+        return True
 
     @contextmanager
     def admission(self, task):
@@ -262,12 +334,14 @@ def scheduled_call(kind):
     def decorate(function):
         @wraps(function)
         def call(*args, **kwargs):
+            observe_runtime()
             scheduler, task = current_scheduler.get(), current_task.get()
             role = kwargs.get("role_name", args[4] if len(args) > 4 else None)
             preflight = current_verify_preflight.get() if kind == "verify" else None
             if scheduler is None:
                 if preflight is not None:
                     preflight()
+                observe_runtime()
                 return function(*args, **kwargs)
             if kind == "agent" and role not in {"worker", "reviewer"}:
                 return function(*args, **kwargs)
@@ -299,6 +373,7 @@ def scheduled_call(kind):
                         raise task_calls.CallDeferred('호출 대기 중 차단·catalog/draft 보류가 확인됐습니다.')
                 if preflight is not None:
                     preflight()
+                observe_runtime()
                 return function(*args, **kwargs)
         return call
     return decorate
@@ -350,6 +425,9 @@ def run_project_tasks(service, *, newly_activated):
                     exception_attempts = 0
                     while True:
                         scheduler.check_project(repo)
+                        scheduler.wait_usage(owned, repo, plan_id)
+                        scheduler.wait_existing_call(owned, repo, plan_id)
+                        scheduler.wait_retry(owned, repo, plan_id, resume=True)
                         try:
                             before = {str(row['subject']): int(row['generation']) for row in owned.execute(
                                 "SELECT subject,generation FROM recovery_records WHERE repo=?", (repo,))}
@@ -383,16 +461,29 @@ def run_project_tasks(service, *, newly_activated):
                                 code = 1
                                 break
                             runtime.update_plan(repo, plan_id, plan_values={"last_error": detail}, enqueue=False)
-                            if isinstance(error, task_calls.CallDeferred) or exception_attempts >= 3:
+                            if isinstance(error, task_calls.CallDeferred) and scheduler.wait_existing_call(owned, repo, plan_id):
+                                code = PROJECT_STEP_RETRY
+                            elif isinstance(error, task_calls.CallDeferred) or exception_attempts >= 3:
                                 code = PROJECT_STEP_TRANSIENT_PAUSE
                                 break
-                            before, code = None, PROJECT_STEP_RETRY
+                            else:
+                                before, code = None, PROJECT_STEP_RETRY
                         if code == PROJECT_STEP_PLANNING_PENDING:
                             scheduler.pause_project(repo)
                             raise PlanningDrain()
+                        if code == PROJECT_STEP_TRANSIENT_PAUSE:
+                            if (scheduler.wait_existing_call(owned, repo, plan_id)
+                                    or scheduler.wait_retry(owned, repo, plan_id)):
+                                code = PROJECT_STEP_RETRY
+                                attempts.clear()
+                        from loop_manager_internal.application.contracts import PROJECT_STEP_USAGE_PAUSE
+                        if code == PROJECT_STEP_USAGE_PAUSE:
+                            if scheduler.wait_usage(owned, repo, plan_id):
+                                code = PROJECT_STEP_RETRY
                         if code != PROJECT_STEP_RETRY:
                             break
                         scheduler.check_project(repo)
+                        observe_runtime()
                         scheduler.requeue(current_task.get())
                         resumed = True
             result.set_result(code)

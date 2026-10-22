@@ -75,7 +75,9 @@ class BootstrapSavedScopeFixture(unittest.TestCase):
                                     'runtime': str(ROOT),
                                     'sha': git(ROOT, 'rev-parse', 'HEAD').stdout.strip(),
                                     'worktree': str(worktree)}))
-        return CodexResult(1, 'usage limit reached', options.get('session_id'))
+        # Scope restoration is the asserted effect; quota policy is tested separately.
+        from loop_manager_internal.runtime.refresh import RuntimePaused
+        raise RuntimePaused()
     if '--runtime-child' not in sys.argv:
         stop_file = Path(sys.argv[sys.argv.index('--state-dir') + 1]) / 'stop-after-registration'
         if stop_file.exists():

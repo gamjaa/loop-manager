@@ -177,7 +177,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
         finally:
             loop_manager._runtime_handoff_signal.reset(token)
 
-    def test_preflight_handoff_returns_success_without_post_dispatch(self):
+    def test_unowned_preflight_handoff_is_rejected_without_post_dispatch(self):
         with tempfile.TemporaryDirectory() as directory:
             _state_dir, connection, config, _repos = self._scheduler_state(
                 directory, ("manager",), max_workers=1,
@@ -189,12 +189,8 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 ), mock.patch(
                     "loop_manager.notifications.dispatch_pending",
                 ) as dispatch:
-                    self.assertEqual(
-                        loop_manager.run_registered_projects(
-                            connection, Path(directory) / "state", config,
-                        ),
-                        0,
-                    )
+                    with self.assertRaisesRegex(RuntimeError, '소유'):
+                        loop_manager.run_registered_projects(connection, Path(directory) / 'state', config)
                     dispatch.assert_called_once()
             finally:
                 connection.close()
@@ -292,124 +288,54 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
         after_source.assert_not_called()
         conflict.assert_not_called()
 
-    def test_self_merge_handoff_uses_registered_base_after_skipped_or_failed_sync(self):
+    def test_runtime_preflight_uses_registered_base_even_when_self_not_selected(self):
         with tempfile.TemporaryDirectory() as directory:
-            state_dir, connection, _config, repos = self._scheduler_state(
-                directory, ("manager",), max_workers=1,
-            )
+            state, connection, config, repos = self._scheduler_state(directory, ('manager', 'peer'), max_workers=1)
             with connection:
-                connection.execute(
-                    "UPDATE projects SET base_branch = 'develop' WHERE repo = ?",
-                    (repos[0],),
-                )
-            project = loop_manager.project_registry.list_projects(connection)[0]
-            runtime = loop_manager.RuntimeMutation(
-                Path(repos[0]), state_dir / "runtime", "a" * 40, "b" * 32,
-            )
-            observation = loop_manager.WaitingPullRequestObservation(
-                (), True, ("https://example.test/pr/1",),
-            )
+                connection.execute("UPDATE projects SET base_branch='develop', origin='owner/repo' WHERE repo=?", (repos[0],))
+            projects = loop_manager.project_registry.list_projects(connection)
+            runtime = loop_manager.RuntimeMutation(Path(repos[0]), state/'runtime', 'a'*40, 'b'*32)
             try:
-                for status in ("skipped", "failed"):
-                    with self.subTest(status=status), mock.patch(
-                        "loop_manager._registered_self_runtime_project", return_value=True
-                    ), mock.patch(
-                        "loop_manager.observe_waiting_pull_requests",
-                        return_value=observation,
-                    ), mock.patch(
-                        "loop_manager.ensure_safe_base_worktree",
-                        return_value=loop_manager.BaseWorktreeSyncResult(
-                            status, "local checkout preserved", "c" * 40,
-                        ),
-                    ) as synchronize, mock.patch(
-                        "loop_manager.git",
-                        side_effect=lambda _repo, command, *args, **_kwargs: subprocess.CompletedProcess(
-                            [command, *args], 0, stdout=("c" * 40 + "\n")
-                            if command == "rev-parse" else "",
-                        ),
-                    ):
-                        with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
-                            loop_manager._preflight_self_merge_handoff(
-                                connection, (project,), state_dir, runtime,
-                            )
-                        self.assertEqual(synchronize.call_args.args[1], "develop")
-                        self.assertEqual(
-                            synchronize.call_args.kwargs["remote_sha"], "c" * 40,
-                        )
+                with mock.patch('loop_manager._registered_self_runtime_project', side_effect=lambda project, *_: project.repo == repos[0]), \
+                     mock.patch('loop_manager._finish_self_merge_handoff') as finish, \
+                     mock.patch('loop_manager.observe_waiting_pull_requests') as observe:
+                    loop_manager._preflight_self_merge_handoff(connection, (projects[1],), state, runtime)
+                self.assertEqual(finish.call_args.args[1].base_branch, 'develop')
+                self.assertEqual(finish.call_args.args[1].repo, repos[0])
+                observe.assert_not_called()
             finally:
                 connection.close()
 
-    def test_self_preflight_keeps_running_without_new_merge_and_rejects_uncertain_fetch(self):
+    def test_runtime_preflight_same_code_and_uncertain_fetch_do_not_use_pr_or_source_sync(self):
         with tempfile.TemporaryDirectory() as directory:
-            state_dir, connection, _config, repos = self._scheduler_state(
-                directory, ("manager",), max_workers=1,
-            )
+            state, connection, config, repos = self._scheduler_state(directory, ('manager',), max_workers=1)
             project = loop_manager.project_registry.list_projects(connection)[0]
-            runtime = loop_manager.RuntimeMutation(
-                Path(repos[0]), state_dir / "runtime", "a" * 40, "b" * 32,
-            )
-            config_path = Path('/managed/config.ini')
+            runtime = loop_manager.RuntimeMutation(Path(repos[0]), state/'runtime', 'a'*40, 'b'*32)
             try:
-                with mock.patch(
-                    "loop_manager._registered_self_runtime_project", return_value=True
-                ), mock.patch(
-                    "loop_manager.observe_waiting_pull_requests",
-                    return_value=loop_manager.WaitingPullRequestObservation((), False),
-                ) as observe, mock.patch("loop_manager.ensure_safe_base_worktree") as synchronize:
-                    self.assertIsNone(loop_manager._preflight_self_merge_handoff(
-                        connection, (project,), state_dir, runtime, config_path=config_path,
-                    ))
-                    synchronize.assert_not_called()
-                    self.assertEqual(observe.call_args.kwargs['config_path'], config_path)
-                with mock.patch(
-                    "loop_manager._registered_self_runtime_project", return_value=True
-                ), mock.patch(
-                    "loop_manager.observe_waiting_pull_requests",
-                    side_effect=RuntimeError("fetch failed"),
-                ), mock.patch("loop_manager.ensure_safe_base_worktree") as synchronize:
-                    with self.assertRaisesRegex(RuntimeError, "fetch failed"):
-                        loop_manager._preflight_self_merge_handoff(
-                            connection, (project,), state_dir, runtime, config_path=config_path,
-                        )
-                    synchronize.assert_not_called()
+                with mock.patch('loop_manager._registered_self_runtime_project', return_value=True), \
+                     mock.patch('loop_manager._recorded_base_fetch', return_value=runtime.commit_sha) as fetch, \
+                     mock.patch('loop_manager.observe_waiting_pull_requests') as observe, \
+                     mock.patch('loop_manager.ensure_safe_base_worktree') as sync:
+                    loop_manager._preflight_self_merge_handoff(connection, (project,), state, runtime)
+                    fetch.side_effect = RuntimeError('fetch failed')
+                    with self.assertRaisesRegex(RuntimeError, 'fetch failed'):
+                        loop_manager._preflight_self_merge_handoff(connection, (project,), state, runtime)
+                    observe.assert_not_called()
+                    sync.assert_not_called()
             finally:
                 connection.close()
 
-    def test_self_merge_rejects_non_fast_forward_runtime_relation(self):
+    def test_runtime_refresh_rejects_non_fast_forward_relation(self):
         with tempfile.TemporaryDirectory() as directory:
-            state_dir, connection, _config, repos = self._scheduler_state(
-                directory, ("manager",), max_workers=1,
-            )
+            state, connection, config, repos = self._scheduler_state(directory, ('manager',), max_workers=1)
             project = loop_manager.project_registry.list_projects(connection)[0]
-            runtime = loop_manager.RuntimeMutation(
-                Path(repos[0]), state_dir / "runtime", "a" * 40, "b" * 32,
-            )
-            observation = loop_manager.WaitingPullRequestObservation(
-                (), True, ("https://example.test/pr/1",),
-            )
-            def git_result(_repo, command, *arguments, **_kwargs):
-                if command == "merge-base":
-                    return subprocess.CompletedProcess(
-                        [command, *arguments], 1, stdout="",
-                    )
-                return subprocess.CompletedProcess(
-                    [command, *arguments], 0, stdout="c" * 40 + "\n",
-                )
+            runtime = loop_manager.RuntimeMutation(Path(repos[0]), state/'runtime', 'a'*40, 'b'*32)
             try:
-                with mock.patch(
-                    "loop_manager._registered_self_runtime_project", return_value=True
-                ), mock.patch(
-                    "loop_manager.git", side_effect=git_result,
-                ), mock.patch(
-                    "loop_manager.ensure_safe_base_worktree",
-                    return_value=loop_manager.BaseWorktreeSyncResult(
-                        "skipped", "local checkout preserved", "c" * 40,
-                    ),
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "fast-forward"):
-                        loop_manager._finish_self_merge_handoff(
-                            connection, project, state_dir, runtime, observation,
-                        )
+                with mock.patch('loop_manager._registered_self_runtime_project', return_value=True), \
+                     mock.patch('loop_manager._recorded_base_fetch', return_value='c'*40), \
+                     mock.patch('loop_manager.git', return_value=subprocess.CompletedProcess([], 1, stdout='')):
+                    with self.assertRaisesRegex(RuntimeError, 'fast-forward'):
+                        loop_manager._finish_self_merge_handoff(connection, project, state, runtime)
             finally:
                 connection.close()
 
