@@ -59,6 +59,9 @@ R-091의 작업별 실행 원본을 차단·rebase의 남은 소비자까지 연
 
 - 결과 검증 교정 호출에서 현재 worktree의 기존 timeout 조정을 재확인하고 `tests.test_partial_verify_runner.PartialRunnerTests.test_timeout_normalization_preserves_partial_diagnostic_report`와 `tests.test_partial_verify_runner.PartialRunnerTests.test_manager_partial_timeout_and_unknown_termination_keep_normal_policy`를 targeted runner로 실행했다. 이번 호출은 2 tests, OK, exit code 0이며 미해결 targeted unit test 실패는 없다. 테스트 내부에 의도적으로 주입한 TIMEOUT·종료 불명 로그는 unit test 실패가 아니다. 전달된 실제 통합 실패의 재실행은 Worker 실행 범위 밖이므로 Manager 검증 대상으로 유지하며 unit 결과와 분리한다. 코드 추가 변경은 하지 않았다.
 
+- Manager 후속 진단 `ea1fae569d6c8bfcac38436c1bba5b01`에서 partial fixture가 바깥 120초 상한에도 종료돼 이전 예산 확대만으로 충분하지 않음을 확인했다. 현재 HEAD `5bbbfb2f`의 기존 구현과 base 대비 diff·선택 계획을 재확인했고 제품 차단/rebase 코드는 추가 변경하지 않았다. 해당 fixture는 실제 runner 시작용 임시 bootstrap에서 자원 관측만 2 CPU·idle·4 GiB로 고정한다. manifest/결과 분리 검증이 바깥 전체 suite의 실시간 부하를 기다리지 않게 하며 실제 Git·수집·worker subprocess·report·종료 확인은 그대로 수행한다. bootstrap은 임시 프로젝트 밖에 두어 impact 입력에 포함되지 않고 제품 adapter/배정 정책도 변경하지 않는다. 실패 메시지에 runner JSONL 끝부분도 포함해 이후 배정 대기 원인을 보존한다. 이번 partial 실패의 내부 로그가 없어 구체적 배정 거부 원인은 확정하지 않았다.
+- 이번 호출에서 `tests.test_partial_verify_runner.PartialRunnerTests.test_nested_runner_fixes_resource_observation_and_restores_sampler`를 프로젝트 Python targeted runner로 실행해 1 test, OK, exit code 0을 확인했다. 이 unit test는 실제 bootstrap 본문을 실행하고 runner 호출 경계에서 고정 관측·배정 허용·SystemExit 뒤 원래 sampler 복원을 검사한다. 실제 partial/full integration은 Worker 금지 범위이므로 실행하지 않았으며 Manager가 최종 후보에서 재검증한다. 이번 호출의 targeted unit test 실패는 없다.
+
 ## Progress
 
 - [x] revision `1f8b97e6c04868281cd23672396f1fd3d47ee98e`에서 대표 투영 직접 읽기와 새 작업별 선택 경계, 관련 SQLite/handler 회귀를 정적으로 확인했다. 이 정적 감사에서 차단 Agent 복구 소비자의 직접 대표 상태 읽기를 놓쳤다. 구현·테스트·verify는 실행하지 않았다.

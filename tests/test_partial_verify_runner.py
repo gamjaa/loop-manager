@@ -21,6 +21,20 @@ from loop_manager_internal.verification.timing import comparison
 from tests.support.git import isolated_git_test
 
 
+def _nested_runner_source(entrypoint):
+    # Manifest/result integration must not wait on the enclosing suite's CPU load.
+    return f"""import runpy
+import sys
+import time
+from unittest.mock import patch
+sys.path.insert(0, {str(Path(entrypoint).resolve().parents[2])!r})
+from loop_manager_internal.verification.resources import ResourceSampler, Snapshot
+with patch.object(ResourceSampler, 'sample',
+        lambda self: Snapshot(time.monotonic(), 2, 0, 4 * 1024 ** 3, 'manifest fixture')):
+    runpy.run_path({str(entrypoint)!r}, run_name='__main__')
+"""
+
+
 @isolated_git_test
 class PartialRunnerTests(unittest.TestCase):
     def test_fresh_import_unselected_and_fallback_shards_never_count_as_completed(self):
@@ -178,6 +192,36 @@ class PartialRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'identity'):
                     validate(unit, {'version': 1, 'run_id': 'other', 'unit_id': unit.name, 'stage_id': 'tests'})
 
+    def test_nested_runner_fixes_resource_observation_and_restores_sampler(self):
+        from loop_manager_internal.verification.resources import ResourceSampler, decide
+        entrypoint = Path(runner.__file__).with_name('entrypoint.py')
+        original = ResourceSampler.sample
+        observations = []
+
+        def inspect(path, *, run_name):
+            self.assertEqual(path, str(entrypoint))
+            self.assertEqual(run_name, '__main__')
+            sampler = ResourceSampler()
+            for _ in range(2):
+                observed = sampler.sample()
+                self.assertEqual((observed.cpus, observed.busy, observed.available),
+                                 (2, 0, 4 * 1024 ** 3))
+                self.assertTrue(decide(observed, now=observed.at, running=0, cap=1).granted)
+                observations.append(observed)
+            raise SystemExit(0)
+
+        before = list(sys.path)
+        try:
+            with mock.patch('runpy.run_path', side_effect=inspect) as run:
+                with self.assertRaises(SystemExit) as stopped:
+                    exec(compile(_nested_runner_source(entrypoint), '<nested runner>', 'exec'), {})
+                self.assertEqual(stopped.exception.code, 0)
+                run.assert_called_once()
+        finally:
+            sys.path[:] = before
+        self.assertEqual(len(observations), 2)
+        self.assertIs(ResourceSampler.sample, original)
+
     def test_actual_partial_and_full_runs_preserve_manifest_and_separate_results(self):
         # Two actual runs prove subprocess discovery/execution and partial/full
         # separation. Policy combinations use existing unit adapters above.
@@ -223,6 +267,8 @@ class PartialRunnerTests(unittest.TestCase):
             git('add', '.')
             git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'candidate')
             entrypoint = Path(runner.__file__).with_name('entrypoint.py')
+            bootstrap = Path(temporary) / 'nested-runner.py'
+            bootstrap.write_text(_nested_runner_source(entrypoint))
             reports = []
             for mode in ('partial', 'full'):
                 logs = Path(temporary) / mode
@@ -231,14 +277,15 @@ class PartialRunnerTests(unittest.TestCase):
                 for name in ('LOOP_MANAGER_VERIFY_ENDPOINT', 'LOOP_MANAGER_VERIFY_SESSION', 'LOOP_MANAGER_VERIFY_SECRET'):
                     environment.pop(name, None)
                 # Nested real-process runs need startup/shutdown room under full-suite load.
-                arguments = [sys.executable, str(entrypoint), '--execute', '--parallelism', '1', '--timeout', '90']
+                arguments = [sys.executable, str(bootstrap), '--execute', '--parallelism', '1', '--timeout', '90']
                 if mode == 'partial':
                     arguments += ['--partial-base', base]
                 passed, timed_out, output = run_verify_process(arguments, root, 120, environment=environment, job_scope=True)
                 self.assertTrue(passed, f'{mode}: timed_out={timed_out}, '
                                 f'exit_code={getattr(output, "exit_code", None)}; {output}; '
                                 + '\n'.join(path.read_text(encoding='utf-8', errors='replace')[-3000:]
-                                            for path in logs.rglob('*.log')))
+                                            for path in logs.rglob('*')
+                                            if path.suffix in {'.log', '.jsonl'}))
                 self.assertFalse(timed_out)
                 reports.append(json.loads((logs / 'manifest.json').read_text()))
                 if mode == 'partial':
