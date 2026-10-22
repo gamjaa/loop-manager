@@ -85,6 +85,37 @@ class StateFoundationTests(AutomationCatalogFixture, unittest.TestCase):
         self.connection.rollback()
         self.assertIsNone(self.connection.execute('SELECT processed_sha FROM projects').fetchone()[0])
 
+    def test_retried_intake_reuses_the_competing_request_and_preserves_schema(self):
+        from contextlib import closing
+        from loop_manager_internal.storage import db_access, local_recovery_state
+        with tempfile.TemporaryDirectory() as directory, \
+                closing(database.connect_database(Path(directory), create=True)) as connection:
+            with connection:
+                connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')")
+            with closing(sqlite3.connect(Path(directory) / 'loop-manager.db')) as competitor:
+                competitor.execute('BEGIN')
+                competitor.execute('SELECT * FROM projects').fetchall()
+                observed, accepted = [], []
+                def intake(current):
+                    request = current.run_request(lambda nested: local_recovery_state.begin_request(nested, 'repo', None))
+                    observed.append(request)
+                    return request
+                def hand_over(deadline, interval=.01):
+                    self.assertFalse(connection.in_transaction)
+                    self.assertFalse(connection._held)
+                    competitor.rollback()
+                    accepted.append(local_recovery_state.begin_request(competitor, 'repo', None))
+                with mock.patch.object(db_access, '_pause', side_effect=hand_over):
+                    result = connection.run_request(intake)
+                self.assertEqual(len(observed), 2)
+                self.assertEqual(len(accepted), 1)
+                self.assertNotEqual(observed[0].request_id, result.request_id)
+                self.assertEqual(result.request_id, accepted[0].request_id)
+                self.assertTrue(result.resumed)
+                self.assertEqual(connection.execute('SELECT request_id FROM local_environment_recovery_requests').fetchone()[0],
+                                 result.request_id)
+                self.assertEqual(connection.execute('SELECT count(*) FROM local_environment_recovery_requests').fetchone()[0], 1)
+
     def test_schema_backfill_failure_rolls_back_only_its_savepoint(self):
         self._insert_plan(self.connection, 'G-001', 'READY')
         self.connection.execute("UPDATE exec_plans SET publication_path = NULL")
