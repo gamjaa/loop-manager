@@ -52,6 +52,14 @@ Telegram 생성과 조각 전송을 현재 필요한 사용자 행동 또는 실
 - [ ] 공통 생성/조각 전송 판정과 구정책 큐·callback 정리
 - [ ] 운영 상태/감사 보존과 최소 targeted 회귀
 
+### 구정책 조각 전송 정리 checkpoint
+
+`delivery._claim_piece`는 진행·완료·대기 등 허용 사건 종류 밖의 기존 outbox 잔여 조각을 취소한다. 일반 dispatch와 즉시 전송, 재시작 뒤 재시도 및 이미 조회한 행의 재사용에도 같은 경계를 적용한다. 취소 시 payload·고정 본문·확인 cursor·attempts·last_error와 작업 상태는 보존하고 claim 표식만 해제한다. 기존 persistent failure의 현재 block 대조·진단 억제 처리는 유지한다.
+
+- 실행: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.NotificationDeliveryTest.test_legacy_progress_pieces_are_canceled_with_original_audit_after_restart tests.test_notification_delivery.NotificationDeliveryTest.test_immediate_progress_delivery_uses_same_cancellation_policy tests.test_notification_delivery.NotificationDeliveryTest.test_stale_selection_cannot_claim_canceled_progress tests.test_notification_delivery.NotificationDeliveryTest.test_pending_targeted_failure_notices_are_canceled_without_losing_sent_piece_audit`
+- 결과: 4개 test 통과. 첫 test는 구정책 사건 9종의 미전송/부분 전송을 실제 SQLite 재연결 뒤 확인한다. `git diff --check`도 통과했다. 전체 verify는 실행하지 않았다.
+- 남은 작업: 생성 단계 무통지, blocked의 최신 원인·실제 조치/복구 불가 근거 판정, PR·draft 공통 현재성 경계, 취소 사건을 부활시키는 planning/시작/재개 callback 정리, 알림과 독립적인 완료·cycle·시작 상태 보존, PRODUCT·ARCHITECTURE 반영과 기존 진행/재개 전송 테스트의 명세 전환. 이번 변경만으로 사건 종류가 허용된 block의 실제 조치 필요성을 보장하지 않는다. 과거 진행·재개 전송을 기대하는 기존 테스트는 아직 전환하거나 실행하지 않았다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.

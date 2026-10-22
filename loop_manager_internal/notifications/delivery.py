@@ -59,13 +59,16 @@ def _claim_piece(
                 (event_key,),
             )
             return None
-        from .events import worker_targeted_failure
-        reason = ('worker_correction' if row[1] == 'stage_failed' and payload.get('operation') == 'Worker'
-                  else payload.get('reason_code') if row[1] == 'persistent_execution_failure' else None)
-        if worker_targeted_failure(reason, payload.get('cause')):
-            connection.execute("UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP, "
-                               "delivery_started_at=NULL WHERE event_key=? AND sent_at IS NULL", (event_key,))
-            return None  # Sent pieces and original diagnostics remain auditable.
+        # Old policy queued progress, completion and waiting notices, including
+        # silent ones. Retire their remaining pieces on every delivery path;
+        # the stored message, confirmed cursor and failure audit stay intact.
+        if row[1] not in {"blocked", "pr_created", "draft_decisions", "draft_decision"}:
+            connection.execute(
+                "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
+                "delivery_started_at = NULL WHERE event_key = ? "
+                "AND sent_at IS NULL AND canceled_at IS NULL", (event_key,),
+            )
+            return None
         if row[1] == "draft_decisions":
             from loop_manager_internal.storage import execplan_draft_state
             current = execplan_draft_state.user_question_ids(connection, str(row[0]))

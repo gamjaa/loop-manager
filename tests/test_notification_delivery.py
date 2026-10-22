@@ -44,6 +44,75 @@ class TelegramTransportTest(unittest.TestCase):
 
 
 class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_legacy_progress_pieces_are_canceled_with_original_audit_after_restart(self):
+        kinds = (
+            'plans_published', 'planning_result', 'work_started', 'resumed',
+            'stage_failed', 'maintenance_started', 'maintenance_completed',
+            'project_completed', 'work_waiting',
+        )
+        for kind in kinds:
+            for cursor in (0, 1):
+                with self.subTest(kind=kind, cursor=cursor), tempfile.TemporaryDirectory() as directory:
+                    database = Path(directory) / 'state.db'
+                    connection = self.connection(database=database)
+                    try:
+                        notifications._insert(connection, 'legacy-progress', '/projects/alpha', kind,
+                                              {'project': 'alpha', 'silent': True, 'cause': 'original cause'})
+                        text = 'frozen progress ' * 700
+                        connection.execute(
+                            'UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=?, '
+                            'attempts=3, last_error=?, delivery_started_at=CURRENT_TIMESTAMP',
+                            (text, cursor, 'original delivery error'))
+                        connection.commit()
+                        before = dict(self.events(connection)[0])
+                    finally:
+                        connection.close()
+                    connection = sqlite3.connect(database)
+                    connection.row_factory = sqlite3.Row
+                    try:
+                        adapter = mock.Mock()
+                        for _ in range(2):
+                            self.assertEqual(notifications.dispatch_pending(
+                                connection, 'token', 'chat', adapter=adapter), 0)
+                        adapter.assert_not_called()
+                        after = dict(self.events(connection)[0])
+                        self.assertIsNotNone(after['canceled_at'])
+                        self.assertIsNone(after['delivery_started_at'])
+                        for field in before.keys() - {'canceled_at', 'delivery_started_at'}:
+                            self.assertEqual(after[field], before[field], field)
+                        plan = connection.execute('SELECT status FROM exec_plans').fetchone()
+                        self.assertEqual(plan[0], 'READY')
+                    finally:
+                        connection.close()
+
+    def test_immediate_progress_delivery_uses_same_cancellation_policy(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with notifications.immediate_delivery(connection, 'token', 'chat', repo):
+            with connection:
+                notifications._insert(connection, 'progress', repo, 'work_started',
+                                      {'project': 'alpha', 'silent': True})
+            with mock.patch.object(delivery, 'send_telegram') as adapter:
+                self.assertEqual(notifications.flush_project_events(connection, repo), 0)
+            adapter.assert_not_called()
+        row = self.events(connection)[0]
+        self.assertIsNotNone(row['canceled_at'])
+        self.assertEqual(row['attempts'], 0)
+        self.assertIsNone(row['rendered_text'])
+
+    def test_stale_selection_cannot_claim_canceled_progress(self):
+        connection = self.connection()
+        with connection:
+            notifications._insert(connection, 'progress', '/projects/alpha', 'work_waiting',
+                                  {'project': 'alpha'})
+        rows = connection.execute(
+            'SELECT event_key, event_type, payload, repo FROM notification_outbox').fetchall()
+        adapter = mock.Mock()
+        self.assertEqual(delivery._deliver_rows(connection, 'token', 'chat', rows, adapter), 0)
+        self.assertEqual(delivery._deliver_rows(connection, 'token', 'chat', rows, adapter), 0)
+        adapter.assert_not_called()
+        self.assertEqual(self.events(connection)[0]['attempts'], 0)
+
     def test_pending_targeted_failure_notices_are_canceled_without_losing_sent_piece_audit(self):
         for kind in ('persistent_execution_failure', 'stage_failed'):
             for attempts, pieces in ((0, 0), (1, 0), (1, 1)):
