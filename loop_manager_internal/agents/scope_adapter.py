@@ -507,9 +507,12 @@ def validate_worker_workspace_scope(
         if state_dir is None or connection is None:
             raise WorkspaceOwnershipError('현재 관리 rebase의 실행 대상을 확인할 수 없습니다.')
         try:
-            effects._current_rebase_service(
+            _observed, decision = effects._current_rebase_service(
                 connection, repo_path, state_dir, str(repo_path),
                 plan_id, worktree, branch).require_owned(checkpoint=checkpoint)
         except RuntimeError as error:
             raise WorkspaceOwnershipError(f'현재 관리 rebase를 수용할 수 없습니다: {error}') from error
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        if decision.status is RebaseStatus.START:
+            raise WorkspaceOwnershipError('현재 관리 rebase의 진행 또는 완료 근거가 없습니다.')
     return plan

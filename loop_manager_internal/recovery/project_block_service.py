@@ -182,6 +182,9 @@ def _reconcile_rebase_evidence_block(
                     raise RuntimeError('unchanged blocked rebase still needs user input or Git progress')
             return observation
         observation = observe()
+        if (observation[1].status is managed_rebase_validation.RebaseStatus.START
+                and block['reason_code'] != scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value):
+            return False
         confirmed = observe()
         from loop_manager_internal.recovery.plan_recovery import recovery_admission
         with recovery_admission(connection, repo, plan_id):

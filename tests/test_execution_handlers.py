@@ -90,3 +90,12 @@ class ExecutionCompositionTests(ExecutionFixture, TestCase):
             coordinator.dispatch(context)
         self.effects.agent.run_agent.assert_called_once()
         self.effects.validation.verify.assert_not_called()
+
+    def test_post_effect_guard_refreshes_uncoordinated_context_after_session_start(self):
+        context = self.context()
+        self.state.update_project('repo', worker_session_id='started-session')
+
+        refreshed = self.handler._post_effect_guard(context)
+
+        self.assertEqual(refreshed.worker_session_id, 'started-session')
+        self.state.check_context(refreshed)

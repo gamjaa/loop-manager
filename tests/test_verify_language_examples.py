@@ -45,6 +45,8 @@ class LanguageExampleIntegrationTests(unittest.TestCase):
                     data = json.loads(declaration.read_text())
                     data['environment']['perl'] = str(Path(executable).absolute())
                     declaration.write_text(json.dumps(data))
+                # The full suite can run another module beside this nested runner
+                # on 2-CPU hosts; keep the behavior checks past that wait.
                 for coordinated, failing in ((False, False), (True, False), (False, True), (True, True)):
                     with self.subTest(language=language, coordinated=coordinated, failing=failing):
                         if failing:

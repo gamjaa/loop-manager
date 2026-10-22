@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextlib import ExitStack, closing
 from contextvars import ContextVar
@@ -22,6 +23,16 @@ from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 current_scheduler: ContextVar[TaskScheduler | None] = ContextVar("task_scheduler", default=None)
 current_task: ContextVar[Task | None] = ContextVar("scheduled_task", default=None)
+current_verify_preflight: ContextVar[Callable[[], None] | None] = ContextVar("verify_preflight", default=None)
+
+
+@contextmanager
+def verify_preflight(callback: Callable[[], None]):
+    token = current_verify_preflight.set(callback)
+    try:
+        yield
+    finally:
+        current_verify_preflight.reset(token)
 
 
 class PlanningDrain(Exception):
@@ -253,7 +264,12 @@ def scheduled_call(kind):
         def call(*args, **kwargs):
             scheduler, task = current_scheduler.get(), current_task.get()
             role = kwargs.get("role_name", args[4] if len(args) > 4 else None)
-            if scheduler is None or kind == "agent" and role not in {"worker", "reviewer"}:
+            preflight = current_verify_preflight.get() if kind == "verify" else None
+            if scheduler is None:
+                if preflight is not None:
+                    preflight()
+                return function(*args, **kwargs)
+            if kind == "agent" and role not in {"worker", "reviewer"}:
                 return function(*args, **kwargs)
             with ExitStack() as stack:
                 if task is None:
@@ -281,6 +297,8 @@ def scheduled_call(kind):
                             or task.plan_id in scoped_blocking.catalog_held_plan_ids(task.connection, task.repo)
                             or task.plan_id in execplan_draft_state.pending_ids(task.connection, task.repo)):
                         raise task_calls.CallDeferred('호출 대기 중 차단·catalog/draft 보류가 확인됐습니다.')
+                if preflight is not None:
+                    preflight()
                 return function(*args, **kwargs)
         return call
     return decorate

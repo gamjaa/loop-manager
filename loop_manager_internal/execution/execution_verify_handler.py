@@ -8,6 +8,7 @@ from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents.pr_description import DocumentReportError, common_guidance_report
 import sys
 import json
+import sqlite3
 import time
 from loop_manager_internal.storage import review_correction_state, runtime_state
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -67,12 +68,63 @@ class VerifyHandlerPorts:
     partial_verify: Callable[..., Any] | None = None
     pre_review_identity: Callable[..., Any] | None = None
     checkpoint: Any = None
+    _targeted_test_block: Callable[..., Any] | None = None
+
+
+class VerifyLaunchDeferred(Exception):
+    """A targeted evidence gate stopped verify before its process launch."""
+
+    def __init__(self, outcome: ExecutionOutcome):
+        self.outcome = outcome
+        super().__init__(outcome.detail or 'targeted test evidence is pending')
 
 
 class VerifyHandler:
     """Verify policy; durable transitions stay in the existing repositories."""
     def __init__(self, ports: VerifyHandlerPorts):
         self.ports = ports
+
+    def _targeted_test_gate(self, context):
+        if self.ports._targeted_test_block is None:
+            return None
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+        repo, plan_id = self.ports.identity.repo, context.plan.plan_id
+        try:
+            blocked = self.ports._targeted_test_block(context)
+            if blocked is not None:
+                return blocked
+            pending = TargetedTestRepository(self.ports.state.connection).pending(repo, plan_id)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            detail = 'targeted test 실행 근거의 종료 확인·재수집 대기 (' + type(error).__name__ + ')'
+            with runtime_state._transaction(self.ports.state.connection):
+                self.ports.state.check_context(context)
+                return self.ports._recover(
+                    RecoveryReason.TARGETED_TEST_CORRECTION, detail,
+                    context=context, attempts=1,
+                )
+        self.ports.state.check_context(context)
+        if not pending:
+            return None
+        detail = 'targeted test 실행 근거의 종료 확인·재수집 대기'
+        with runtime_state._transaction(self.ports.state.connection):
+            self.ports.state.check_context(context)
+            return self.ports._recover(
+                RecoveryReason.TARGETED_TEST_CORRECTION, detail,
+                context=context, attempts=1,
+            )
+
+    def _defer_targeted_verify(self, context):
+        outcome = self._targeted_test_gate(context)
+        if outcome is not None:
+            raise VerifyLaunchDeferred(outcome)
+
+    @staticmethod
+    def _is_targeted_gate_outcome(outcome):
+        return bool(outcome is not None and outcome.recovery is not None
+                    and outcome.recovery.observation.reason in {
+                        RecoveryReason.TARGETED_TEST_CORRECTION,
+                        RecoveryReason.TARGETED_TEST_EXHAUSTED,
+                    })
 
     def _observe(self, worktree):
         observer = self.ports.observe_verify_inputs
@@ -84,7 +136,8 @@ class VerifyHandler:
         except (OSError, RuntimeError, ValueError) as error:
             return InputObservation(None, reason=str(error))
 
-    def _verify_once(self, context, candidate_head: str | None = None, *, partial=False):
+    def _verify_once(self, context, candidate_head: str | None = None, *, partial=False,
+                     before_launch=None):
         self._verify_executed = False
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
         from loop_manager_internal.execution.manual_candidate import get_manual
@@ -104,10 +157,31 @@ class VerifyHandler:
             'worker',
             input_fingerprint=self.ports._worktree_execplan_input_fingerprint(context.worktree, self.ports.snapshot().catalog_plan),
         )
+
+        def invoke_verify(function):
+            if before_launch is None:
+                return function()
+            from loop_manager_internal.application import task_scheduling
+            started = False
+
+            def run_preflight():
+                nonlocal started
+                if not started:
+                    started = True
+                    before_launch(context)
+
+            with task_scheduling.verify_preflight(run_preflight):
+                if (task_scheduling.current_scheduler.get() is None
+                        or task_scheduling.current_task.get() is None):
+                    run_preflight()
+                return function()
+
         try:
             self._verify_executed = not partial
             if partial:
-                passed, output = self.ports.partial_verify(context.worktree, context.active_sha)
+                passed, output = invoke_verify(
+                    lambda: self.ports.partial_verify(context.worktree, context.active_sha),
+                )
                 self._partial_report = getattr(output, 'partial_result', None)
                 report = self._partial_report
                 if (not isinstance(report, dict) or report.get('kind') != 'partial_verify'
@@ -124,7 +198,11 @@ class VerifyHandler:
                 elif report['status'] != 'FALLBACK':
                     passed = False
             else:
-                passed, output = self.ports.verify(context.worktree)
+                passed, output = invoke_verify(lambda: self.ports.verify(context.worktree))
+        except VerifyLaunchDeferred as deferred:
+            self._verify_executed = False
+            self.ports.clear_agent_scope(self.ports.identity.repo)
+            return deferred.outcome, deferred.outcome.detail or str(deferred)
         except self.ports.contract.VerifyTerminationUncertain as error:
             detail = str(error)
             self.ports._block_final(
@@ -280,6 +358,9 @@ class VerifyHandler:
                 RecoveryReason.WORKER_CORRECTION, validation_error,
                 context=context,
             )
+        targeted_outcome = self._targeted_test_gate(context)
+        if targeted_outcome is not None:
+            return targeted_outcome
         latest_sha = self.ports._fetch_latest_base()
         dirty = bool(self.ports.git(context.worktree, 'status', '--porcelain').stdout.strip())
         if not dirty and (not self.ports.branch_has_changes(context.worktree, self.ports.identity.base)):
@@ -328,6 +409,10 @@ class VerifyHandler:
         partial_outcome = self._maybe_partial(context, candidate_head)
         if partial_outcome is not None:
             return partial_outcome
+        targeted_outcome = self._targeted_test_gate(self.ports._context())
+        if targeted_outcome is not None:
+            return targeted_outcome
+        context = self.ports._context()
         observation = self._observe(context.worktree)
         waived = bool(manual and manual.waive(context, 'verify', record=False))
         connection = self.ports.state.connection
@@ -369,17 +454,34 @@ class VerifyHandler:
         # A new invocation invalidates any previous success marker first. If
         # this run fails before replacing its output, stale evidence cannot be
         # paired with the new candidate or a later scope block.
-        with runtime_state._transaction(connection):
-            self.ports.state.check()
-            identifier, selection = verify_receipts.record(connection, selection,
-                head=candidate_head, observation=observation, kind='run',
-                reason=observation.reason or 'no matching successful verify receipt')
-            self.ports.state.update_project(
-                repo, preserve_transaction=True, validated_base_sha=None,
-                verify_token=None, review_result=None, review_token=None, publication_token=None,
-            )
+        identifier = None
+
+        def prepare_full_verify():
+            nonlocal identifier, selection
+            self._defer_targeted_verify(context)
+            with runtime_state._transaction(connection):
+                self.ports.state.check_context(context)
+                identifier, selection = verify_receipts.record(connection, selection,
+                    head=candidate_head, observation=observation, kind='run',
+                    reason=observation.reason or 'no matching successful verify receipt')
+                self.ports.state.update_project(
+                    repo, preserve_transaction=True, validated_base_sha=None,
+                    verify_token=None, review_result=None, review_token=None, publication_token=None,
+                )
+
+        if waived:
+            # A manual waiver has no process launch or scheduling wait.
+            try:
+                prepare_full_verify()
+            except VerifyLaunchDeferred as deferred:
+                return deferred.outcome
         full_started = time.monotonic()
-        outcome, output = self._verify_once(context, candidate_head)
+        outcome, output = self._verify_once(
+            context, candidate_head,
+            before_launch=None if waived else lambda _context: prepare_full_verify(),
+        )
+        if identifier is None:
+            return outcome
         preliminary = preliminary_review.active(self.ports, context, {'review_pass', 'review_invalidated'})
         if preliminary:
             details = json.loads(preliminary['partial'])
@@ -501,7 +603,13 @@ class VerifyHandler:
             self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
                 validated_base_sha=None, verify_token=None, review_token=None, publication_token=None)
         self._partial_report = None
-        outcome, output = self._verify_once(context, head, partial=True)
+        outcome, output = self._verify_once(
+            context, head, partial=True,
+            before_launch=(self._defer_targeted_verify
+                           if self.ports._targeted_test_block is not None else None),
+        )
+        if self._is_targeted_gate_outcome(outcome):
+            return outcome
         report = self._partial_report or {'kind': 'partial_verify', 'status': 'ERROR'}
         status = report['status']
         if key != preliminary_review.candidate(self.ports, context):

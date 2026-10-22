@@ -515,6 +515,32 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.assertEqual(recovery.row('repo', 'G-047')['pending_action'], 'reconcile')
         self.assertEqual(recovery.row('repo', 'G-047')['detail'], 'original sources metadata failure')
 
+    def test_plan_input_rebase_block_resumes_from_owned_original_head(self):
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        self.block(reason='plan_input_invalid')
+        self.case.observed = replace(self.case.observed, base_is_ancestor=False)
+        block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        checkpoint_before = self.checkpoints.get('repo', 'G-047')
+        decision = self.case.factory(None).require_owned(checkpoint=checkpoint_before)
+        self.assertIs(decision[1].status, RebaseStatus.START)
+        original = self.case.observed
+
+        with mock.patch.object(loop_manager, 'make_worktree',
+                               side_effect=AssertionError('resume must continue the saved rebase intent')):
+            self.assertTrue(self.resume())
+
+        self.assertEqual(self.case.observed, original)
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((row['status'], row['last_error'], row['worker_session_id']),
+                         ('IMPLEMENTING', loop_manager.REBASE_IN_PROGRESS_ERROR, 'saved-worker'))
+        checkpoint_after = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(checkpoint_after.operation, 'rebase')
+        self.assertEqual(checkpoint_after.snapshot['rebase_block_release'], block)
+        self.assertEqual(checkpoint_after.snapshot['rebase_block_release_state'], original.fingerprint)
+        self.assertIsNone(checkpoint_after.current_rebase_acceptance())
+        self.git_write.assert_not_called()
+
     def test_plan_input_rebase_block_keeps_original_cause_if_remote_changes(self):
         self.block(reason='plan_input_invalid')
         self.pending()

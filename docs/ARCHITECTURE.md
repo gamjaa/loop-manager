@@ -945,6 +945,8 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 | Worker 구현 결과 | 구현 조건·sources·dependency·archive·고정 지침과 완료 결과를 대조한다. 원본 명세 지문만의 변경은 Worker 입력 token을 바꾸지 않으며 실제 구현 조건 변경·부족은 기존 Worker 판단·교정으로 연결한다. |
 | verify·Review·게시 | 원본 명세·전체 본문·base·후보와 단계별 입력 증명을 유지한다. 후보 변경 후 각 성공 근거의 유효성·재사용 조건을 다시 판단하고 정확한 원격 lease·PR gate를 통과한다. |
 
+재평가는 입력 차단과 충돌·완료 근거 부족을 구분한다. `plan_input_invalid`에 저장된 rebase intent가 연결되면 현재 선언·경로·catalog, 선택 worktree·branch와 원래 HEAD, target·원격, index 상태를 다시 확인한다. 소유한 원래 HEAD에서 안전하게 시작할 수 있으면 입력 차단만 해제하고 intent를 보존해 기존 rebase 시작으로 잇는다. 이 START 판단은 rebase 완료, 검증 성공 또는 게시 lease의 소유 증거가 아니다. 관리 worktree 충돌이나 완료 근거가 부족한 차단은 START만으로 해제하지 않으며 확인된 소유 operation 또는 수용 가능한 완료 결과를 요구한다.
+
 
 #### 충돌 없는 rebase와 Worker 결과 연결
 
@@ -1222,6 +1224,8 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 - Manager는 완료된 개별 결과를 SQLite `targeted_test_results`·`targeted_test_streaks`에 반영하고, 실행 ID의 invocation 귀속(`targeted_test_run_owners`)과 collection의 `collected` 전이를 같은 transaction에서 확정한다. 미소비 상태는 `pending` 또는 오류 종류를 가진 `error`이며 저장 실패·transaction 중단 뒤에도 재시도한다. repository·ExecPlan·실행 ID·테스트 ID로 중복과 상충 결과를 검사하고 다른 호출의 실행 ID 재사용은 거부한다. JSONL의 불완전한 마지막 줄과 기록 부재에서 성공·실패를 합성하지 않으며 수집·fixture 오류도 개별 테스트 실패로 세지 않는다. 세 번째 실패 도달은 같은 turn에서 뒤에 성공하더라도 소비 전까지 보존하고 새 Worker·CLI retry·verify 전에 `targeted_test_exhausted`로 차단한다.
 
   차단 확정과 도달 표식 소비는 같은 transaction이며 실행·실패 감사는 보존한다. Worker 최종 실패 보고와 수집 대기는 `targeted_test_correction`으로 분리해 일반·rebase 보고 오류 한도를 소비하지 않고, 새 실행 근거가 없으면 일시 중단한다. 수집 대기는 별도 반환 표식으로 전달하며 물리 provider 결과·사용량·종료 감사를 덮지 않는다. 실제 provider 거부·완료 보고 오류·명시적 사용자 결정과 독립 안전 차단은 각 기존 경계에서 처리한다.
+
+- 저장된 VERIFYING 진입은 선택된 repository·ExecPlan의 자료를 Worker 결과·사용자 결정 gate 뒤, 부분 실행·전체 실행·성공 receipt 재사용 전에 다시 관측한다. 기존 Worker 차단 경계가 세 번째 실패와 도달 표식 소비를 원자 처리하며, 미수집 자료는 `targeted_test_correction` 일시 중단으로 VERIFYING·Worker 결과·session·후보를 보존한다. 부분·전체 실행은 `scheduled_call("verify")`가 실제 verify slot을 배정한 뒤 process receipt 준비 전에 같은 자료를 재확인한다. 이 경계에서 차단·대기가 생기면 아직 자식 receipt가 없어 기존 task-call 확인 규칙이 미시작 verify 자리만 반환하고 새 verify 실행·실패 receipt를 만들지 않는다. 작업별 repository·ExecPlan 필터를 유지해 다른 작업의 기록·예약은 건드리지 않는다.
 
 ### 전체 verify와 Reviewer
 
