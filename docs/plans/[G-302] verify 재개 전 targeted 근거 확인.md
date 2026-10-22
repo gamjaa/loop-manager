@@ -51,6 +51,7 @@ priority: high
 - [x] 관리 rebase 반영 뒤 현재 후보에서 저장 verify 재개 관련 targeted case 4개와 `_post_effect_guard()`의 직접 호출 context 회귀 1개를 다시 실행했고 모두 통과했다. 전체 verify는 실행하지 않았다.
 - [x] 이전 후보의 Manager verify에서 2 CPU 환경의 nested runner 통합 회귀 두 건이 30초 제한에 도달했다. 현재 고정 base에는 bootstrap runner와 verify 90초·외부 process 120초 예산이 이미 포함되어 있으므로 더 큰 예산과 진단을 보존하고, full-suite 동시 작업이 2 CPU에서 기다릴 수 있다는 설명을 테스트에 추가했다. 실제 nested verify·Manager integration인 두 case는 Worker에서 실행하지 않았으며 Manager 재검증이 필요하다.
 - [x] 현재 HEAD `f61d872387a7fdb28362211254ae882a0b525d05`에서 rebase 소유·차단 관련 unit case 3개와 저장 verify 재개·직접 호출 context 관련 unit case 4개를 targeted 실행해 모두 통과했다. nested verify 통합 case와 전체 verify·Review는 Worker에서 실행하지 않았다.
+- [x] 현재 후보에서 `plan_input_invalid`와 저장 rebase intent가 소유한 원래 HEAD의 안전한 START 상태를 다시 확인하면 입력 차단만 해제하고 intent를 보존해 재개하도록 했다. START의 완료·검증·게시 증거 오용은 막고 `managed_worktree_conflict` 거부는 유지한다. 새 `plan_input_invalid → START → resume` unit case가 통과했다.
 
 ## Decision Log
 
