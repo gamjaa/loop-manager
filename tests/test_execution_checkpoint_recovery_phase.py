@@ -330,8 +330,15 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
             self.assertTrue(case.handler._owned_persisted_rebase(case.handler._context(), row, 'remote',
                             case.checkpoint.get('repo', 'G-047'), checkpoint, None))
             original = case.observed
+            saved = case.checkpoint.get('repo', 'G-047')
+            self.assertEqual(saved.operation, 'rebase')
+            self.assertNotIn('current_rebase_acceptance', saved.snapshot or {})
+            # An unsealed pre-rebase START result cannot keep the published lease.
+            case.observed = replace(original, base_is_ancestor=False)
+            self.assertFalse(case.handler._owned_persisted_rebase(context, row, 'remote',
+                             saved, checkpoint, None))
             for change in ({'remote': replace(original.remote, oid='foreign')},
-                           {'base_is_ancestor': False}, {'branch_ref': ('foreign', '')},
+                           {'branch_ref': ('foreign', '')},
                            {'operations': (('MERGE_HEAD', 'foreign'),)}):
                 with self.subTest(change=change):
                     case.observed = replace(original, **change)

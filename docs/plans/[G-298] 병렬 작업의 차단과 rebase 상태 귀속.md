@@ -45,6 +45,11 @@ R-091의 작업별 실행 원본을 차단·rebase의 남은 소비자까지 연
 - 기존 단일 작업·명시적 차단 복구·대표 투영과 작업 원본 분리 회귀를 유지한다. 정책 조합마다 실제 Git lifecycle을 추가하지 않으며 기존 최소 Git 효과 회귀는 Manager 검증에 남긴다.
 - BLOCKED Agent 완료 뒤 `projects`에 `prepared` 값이 남아도 재시작 진입은 owner plan의 최신 `isolated` 상태를 읽어 workspace를 확인하고 완료 helper를 중복 호출하지 않아야 한다. 대표 A·대상 B의 차단 사유, branch, snapshot이 달라도 A 투영은 보존하고 B의 복구 상태만 소비한다.
 - owner 필드 없는 기존 `prepared` 기록은 대상 plan recovery가 없거나 양쪽에 있어도 `projects` 상태를 기준으로 완료해 호환 projection이 `isolated`로 바뀌어야 한다. `plan_path`가 ExecPlan을 가리키면 기존 mirror 규칙에 따라 대상 행도 함께 바꾸며, 재시작은 시작 snapshot 누락이나 완료 helper 재호출 없이 격리된 baseline으로 재개해야 한다.
+- unittest adapter의 launcher Python과 docs/VERIFY.md의 Python 3.11–3.14 계약을 확인했다. 현재 verify가 보고한 게시 rebase lease 회귀를 재현한 뒤, persisted ownership이 `START`를 소유 근거로 받아들이지 않도록 수정하고 sealed acceptance 없는 상태를 명시하는 단일 case를 검증했다.
+
+  FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_checkpoint_recovery_phase.ExecutionCheckpointRecoveryPhaseTests.test_completed_published_rebase_keeps_remote_lease_only_with_sealed_owner
+  RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_checkpoint_recovery_phase.ExecutionCheckpointRecoveryPhaseTests.test_completed_published_rebase_keeps_remote_lease_only_with_sealed_owner
+  최종 동일 명령 PASS — 1 test, OK. 전체 verify는 실행하지 않았으며 Manager가 별도로 실행한다.
 
 ## Progress
 
@@ -75,3 +80,4 @@ R-091의 작업별 실행 원본을 차단·rebase의 남은 소비자까지 연
 - 새 A/B BLOCKED Agent 복구 회귀와 `test_blocked_agent_preservation_resumes_pending_recovery_for_current_input`이 수정 후 각각 통과했다. 대표 project의 branch·snapshot·planning projection은 보존됐고 B의 recovery만 격리 상태로 완료됐다.
 - 현재 후보에서 비폐기 차단 사유의 A/B 복구 완료 후 재진입과 기존 격리 recovery 재시작 targeted case를 실행했다. 대표 `projects`에 남은 오래된 recovery가 완료 재호출의 근거가 되지 않고, 대상 plan의 현재 상태가 재진입 결과를 결정함을 확인했다.
 - 완료 후 중단 복구 재진입도 대표 projection을 다시 사용하면 이미 `isolated`인 대상 plan에 stale `prepared` snapshot을 적용해 실패할 수 있다. 새 복구는 owner ID로 plan을 선택해 최신 recovery를 소비하며 representative `projects` 값은 그대로 두어 선택 외 작업을 덮지 않는다.
+- 현재 후보의 verify에서 게시 rebase lease 확인이 `base_is_ancestor=False`인 `START` 상태를 소유 완료로 허용하는 회귀를 받았다. persisted rebase ownership은 `WAITING`·`COMPLETE`만 인정하고, sealed acceptance가 없는 시작 가능 상태로 게시 lease를 유지하지 않도록 했다. 해당 조건을 명시한 단일 targeted case의 결과는 아래 검증 기록에 남긴다.
