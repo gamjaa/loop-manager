@@ -1,0 +1,60 @@
+---
+id: G-226
+title: 사용자 조치 중심 Telegram 선택과 기존 큐 정리
+sources:
+  - docs/PRODUCT.md
+  - docs/requirements/[R-053] 이벤트 시점에 맞춘 진행 상황 알림.md
+  - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
+  - docs/requirements/[R-074] 유지보수 1회 평가와 즉시 종료.md
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
+complexity: high
+risk: medium
+priority: high
+---
+
+## Purpose
+
+Telegram 생성과 조각 전송을 현재 필요한 사용자 행동 또는 실제 자동 복구 불가 최종 중단으로 제한한다. 기존 G-226의 유지보수 시작·종료 무통지를 포함해 공통 판정과 오래된 큐 정리를 이 작업이 맡고, PR 검토 후보 identity는 G-247, draft 질문·링크 중복 방지는 G-294, 전체 후속 소비 감사는 G-189가 맡는다.
+
+현재 `notifications/events.py`는 계획·시작·완료·대기와 상태 코드 기반 blocked 사건을 생성한다. `incidents.py`의 시작/재개 및 전송 확인 후 재개 생성도 남아 있다. `delivery.py`는 지속 실행 실패·targeted 실패 등 일부 사건만 취소하며 일반 진행 사건과 복구 가능한 blocked를 공통으로 배제하지 않는다. 기존 outbox·부분 전송·감사와 운영 상태를 재사용한다.
+
+## Acceptance Criteria
+
+- R-053/R-055: 명시적 미해결 판단·인증/권한·설정·reset 등 현재 사용자 조치, 실제 새 PR 검토/Merge 요청 또는 자동 복구가 불가능하다고 확인한 최종 중단만 생성·전송한다. 상태 코드·오류 문구·retry/교정 묶음 소진·다음 실행 재개 가능 상태만으로 조치 필요를 확정하지 않는다. 근거가 불충분하면 기존 오류·상태를 보존하고 통지를 보류한다.
+- planning·Worker·verify·Review·유지보수·프로젝트의 진행/완료, 일반 시작/재개·자동 교정·일시 실패·자원/사용량 대기·checkpoint에는 무음 메시지도 만들거나 보내지 않는다. 기존 cycle 범위·실제 Merge 확인·종료와 프로젝트 완료 상태 기록은 알림 여부와 독립적으로 유지한다.
+- 생성 시와 각 미전송 조각을 claim할 때 최신 원인·남은 조치·자동 복구 가능성을 재검사한다. 해소/대체된 원인과 구정책의 pending 사건·부분 전송 잔여 조각을 취소한다. frozen payload/text·확인된 전송 cursor·attempt/error·기존 incident와 취소 감사는 덮거나 삭제하지 않는다. 실패 재시도·시작 복구·전송 확인 callback이 취소 사건을 부활시키지 않는다.
+- 같은 현재 조치의 기존 중복 제거를 유지하며 알림 실패가 실제 작업 결과·재시도 횟수·소유권을 바꾸지 않는다. 조치의 사실 확인을 위해 추가 Agent 호출이나 Git 쓰기·새 전송 서비스를 만들지 않는다. 외부 관측은 DB transaction 밖에서 수행하고 적용 때 현재 원인/identity를 다시 비교한다.
+- PR과 draft의 현재 유효성은 기존 관측·질문 상태에 연결할 수 있는 공통 경계를 제공한다. 이 작업만으로도 기존의 유효한 사용자 조치는 계속 전송되며 G-247/G-294의 세부 identity 보완을 기다려 전체 알림을 끄지 않는다.
+
+## Implementation
+
+- [ ] 확인한 `loop_manager_internal/notifications/events.py`·`repository.py`의 사건 선택과 `recovery/recovery_runtime.py`·`recovery/project_blocked_recovery.py`의 실제 원인/남은 복구 상태를 대조한다. 현재 사용자 행동의 구체적 근거를 기존 사건 payload/원인에 연결하고 status나 FINAL_BLOCK 이름만으로 판정하는 분기를 교정한다. 실행 복구 정책 자체는 G-313/G-189와 중복 구현하지 않는다.
+- [ ] 확인한 `notifications/delivery.py:_claim_piece()`와 `_deliver_rows()`의 조각별 현재 판정·취소/confirm 경계에 공통 정책을 적용한다. `dispatch_pending`·새 PR 즉시 전송·오류 재시도 모두 같은 기준을 거치게 하고 전송 중 해소/취소와 확인 callback의 경합에도 이미 전송한 기록을 보존한다.
+- [ ] 확인한 `notifications/incidents.py`의 `record_work_start`·`recover_interrupted_starts`·`_materialize_resumption`, `events.py`의 `record_process_start`·`record_planning_publication`·`enqueue_completion_if_ready`·`enqueue_waiting_reason`, `storage/maintenance_state.py`의 cycle 사건을 교정한다. Telegram enqueue만 제거하고 실제 시작·대기 episode·완료 및 cycle 범위/선행/Merge/종료 상태와 감사는 유지한다. 과거 outbox 조회로 통지 여부를 결정하던 경로도 새 사건을 재생성하지 않게 한다.
+- [ ] 확인한 `notifications/work_exhaustion.py`·`rendering.py`와 `tests/support/notification.py`의 기존 원인 표현·fixture를 재사용한다. 사용자의 실제 다음 행동과 근거를 정확히 표시하며 추정 권한 요청·가짜 해결 안내를 만들지 않는다. PRODUCT·ARCHITECTURE의 소유 알림 절에 구현한 생성/전송 계약만 통합한다.
+
+## Validation
+
+- Worker는 `tests/test_notification_events.py`·`test_notification_delivery.py`·`test_notification_incidents.py`·`test_notification_work_cycles.py`·`test_maintenance_state.py`의 변경 관련 최소 unit case를 실행한다. 실제 SQLite·사건 선택·claim/confirm을 사용하고 Telegram 응답과 외부 관측만 double로 제공한다.
+- 현재 미해결 질문/인증 조치/실제 복구 불가 중단은 1회 전송하고, retry 소진·다음 실행 재개·CPU/Git/DB/사용량 대기·자동 교정·정상 진행/완료는 0회인지 확인한다. 동일 상태 코드에서 원인과 남은 조치가 다른 경우를 비교하며 enum 반환값만 mock해 판정을 대신하지 않는다.
+- 구정책 pending·이미 일부 조각 전송·claim 뒤 원인 해소·전송 실패 뒤 재시작·confirm callback 뒤 재개 생성 사례에서 미전송분 취소와 cursor/payload/attempt/error 보존을 확인한다. 다음 조각 직전 최신 근거가 없으면 전송하지 않아야 한다.
+- 과거 시작/재개/maintenance 메시지만 요구하던 assertion은 현재 무통지로 교체한다. 실제 process 시작·cycle 범위·Merge 반영·종료·프로젝트 완료와 outbox 감사의 assertion은 유지한다. 대체 없는 fixture/보존 검증 삭제나 전체 테스트 skip은 하지 않는다.
+- 알림 비활성/실패·DB/전송 경합에서도 작업 상태·외부 효과 수·필수 성공 근거가 달라지지 않아야 한다. 선택 adapter는 unittest version 1·launcher Python 3.11–3.14이며 기존 수집·필수 compile·Agent 호출 차단을 유지한다.
+
+## Progress
+
+- [x] 2026-10-08 기준 0e887794의 R-053·R-074, cycle 사건 작성·selection·종료·rendering과 신규 유지보수 알림 테스트를 정적으로 대조했다. 현재 payload/rendering의 범위 누락을 확인했으며 구현·테스트 실행은 하지 않았다.
+- [x] revision `4aafffa5b3af1b3a378a93750c7d86292891b5df`의 활성 명세 전문과 생성·incident·delivery/maintenance 경로를 정적으로 대조했다. 기존 유지보수 범위 표시 대신 현행 무통지와 공통 조치 판정의 남은 작업을 확정했다. 실행 검증은 하지 않았다.
+- [ ] 공통 생성/조각 전송 판정과 구정책 큐·callback 정리
+- [ ] 운영 상태/감사 보존과 최소 targeted 회귀
+
+## Decision Log
+
+- snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.
+- G-247/G-294는 이 공통 경계를 선행으로 소비한다. G-189에 중복된 공통 구현은 후속 감사로 정리하며 새 알림 엔진·설정·제품 목표는 추가하지 않는다. 과거 G-221 정리와 G-225의 별도 Planner 목표를 복원하지 않는다.
+- complexity high(최초 level 5): 사건 생성·부분 전송·확인 후 callback·재시작을 같은 현재 조치에 연결해야 한다. risk medium: 중복/누락 통지가 사용자 판단을 지연할 수 있으므로 원문·cursor·attempt/취소 감사와 조각별 재검사를 유지한다. priority high는 최신 알림 정책의 공통 선행이기 때문이다. Model·Effort는 Manager 설정을 따른다.
+- 이번 결과는 full planning의 미충족 작업 구성이다. 구현·테스트·전체 verify 성공, 사용자 승인·Merge 또는 프로젝트 최종 완료를 기록하지 않는다.

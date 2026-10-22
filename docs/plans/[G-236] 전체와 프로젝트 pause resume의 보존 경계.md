@@ -9,6 +9,7 @@ sources:
   - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
   - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
+  - docs/requirements/[R-093] 원격 작업 브랜치로 새 환경에서 이어하기.md
 depends_on: []
 complexity: high
 risk: high
@@ -31,6 +32,8 @@ priority: high
 - R-055/PRODUCT의 targeted 기록 수명도 pause·resume에서 보존한다. 호출별 JSONL·디렉터리 identity·process receipt·미소비 결합은 종료/수집·저장이 불확실해도 남긴다. 저장된 VERIFYING의 초기 gate와 verify slot 배정 뒤 재확인 사이에서도 사용자 pause는 새 검증을 막고 Worker 결과·session·후보·미소비 자료를 보존한다. 배정 후 preflight에서 시작을 보류한 검증은 기존 미시작 호출 자리만 반환하고 새 검증 실행·실패·성공 receipt를 만들지 않는다. 이미 시작했거나 종료 불명인 검증에는 기존 종료 확인을 적용한다. resume 자체는 기록을 소비하거나 도달 표식·실패 이력을 초기화하지 않는다. 다음 자동 실행은 기존 호출 재수집을 거치며 세 번째 실패와 수집 대기는 해당 작업의 기존 차단/대기 경계로 이어진다. 다른 작업의 자료와 살아 있는 수동 writer는 변경하지 않는다.
 - R-023/R-091의 코드 변경 handoff·비차단 재시도 대기와 사용자 pause를 구별한다. pause 요청은 대기 중에도 처리하며 전체 pause가 저장되면 새 원격 효과·runtime/단계 호출을 시작하지 않는다. pause는 진행 중 호출의 기존 종료/보존 경계를 적용하고, 정상 handoff는 안전 반환을 기다린다. 사용자 resume가 실패/교정/테스트 이력·재시도 대기·독립 조건을 초기화하거나 handoff 승인·자동 작업 시작을 뜻하지 않는다.
 
+- R-093의 Manager checkpoint 요청·commit·push·결과 저장 사이 pause에서도 요청/intent·이미 생성한 commit·실제 게시/종료 근거·session과 미확인 prompt 전달 cursor를 보존한다. pause/재시작 자체로 요청을 완료하거나 문맥을 전달 확인하지 않으며, 미확정 게시가 해결되기 전 새 Worker는 시작하지 않는다. Worker의 직접 Git 쓰기 금지와 완료 후보/복구점 구분을 유지한다.
+
 ## Implementation
 
 기존 process/resource lock·subprocess 종료/verify 자식 조율·실행 checkpoint·수동 요청 저장을 재사용한다. bootstrap 이전의 pause 조회와 실행 중 요청 접수는 실행 잠금 소유자의 작업을 탈취하지 않는다. 필요한 호환 저장·요청/확인 전이는 기존 runtime/storage 경계에 두고 PRODUCT·ARCHITECTURE와 운영 안내에 반영한다. 새 daemon·실행 엔진·자동 병렬 Worker를 만들지 않는다.
@@ -40,6 +43,8 @@ priority: high
 - [ ] 확인한 `runtime/resource_lock.py:resource_locks()`의 대기/획득 뒤 `_check_runtime_handoff()`와 보존 후보의 `runtime/handoff_gate.py`·`runtime/pause.py`를 통합한다. `current_task`가 없는 프로젝트 준비·planning의 Git 접근 허용과 사용자 pause 검사를 함께 유지한다. task의 `PlanningDrain`과 runtime 전체 handoff도 보존하며 같은 scope·프로세스 종료 근거를 재사용한다.
 - [ ] 보존 후보에 이미 있는 `loop_manager_internal/runtime/pause.py`·`tests/test_pause.py`와 최신 base의 `agents/invocation_service.py`·`agents/process_receipt.py`·`storage/agent_invocation_state.py`·`storage/targeted_test_state.py`를 통합해 pause 예외 전후에도 호출 결합과 미소비 기록을 유지한다. 후보의 과거 finally 수집과 새 durable 수집·별도 pending 표식을 대조해 필요한 차이만 보완한다. `execution/execution_verify_handler.py:_targeted_test_gate()`·`_verify_once()`와 `application/task_scheduling.py:verify_preflight()`·`scheduled_call()`의 배정 후 확인을 재사용해 pause 검사를 연결하고, 기존 callback·ContextVar 복원과 미시작 자리 반환을 유지한다. G-302의 재수집·원자 차단을 별도 pause gate로 복제하거나 수집·receipt 경로를 옮기지 않는다. `execution/execution_revision_handler.py:_post_effect_guard()`의 최신 context 재구성도 유지한다. 보존 후보의 코드·기록은 현재 Planner가 수정하지 않는다.
 - [ ] 기존 bootstrap 전 pause·handoff launch gate·작업 대기에서 사용자 요청을 확인하는 경계를 보존한다. 최신 R-023의 코드 변경 확인/부모 자동 재시작은 G-311/G-312가, R-091의 비차단 재배정은 G-297/G-313이 담당한다. 이 작업은 그 기능을 선구현하지 않고 pause의 중단·무효과·재개 범위가 후속 통합에서도 소비될 수 있게 기존 경계를 유지한다. 후보의 self-merge 전용 preflight 대응표는 당시 기록으로 보존하며 일반 원격 runtime 판정의 성공으로 사용하지 않는다.
+
+- [ ] 현재 base에 직접 구현된 `execution/worker_checkpoint.py`·`execution_ports.py:publish_worker_checkpoints()`·`execution_worker_handler.py`와 `storage/validation_feedback_state.py`의 요청/게시/실제 session 전달 확인 경계를 pause에 연결한다. 원래 후보의 pause 구현·종료/receipt를 재사용해 중단 후 같은 요청/commit/session으로 관측/저장을 재개하고 새 checkpoint/모델 호출이나 cursor 조기 확정을 만들지 않는다. 기존 pending 요청 회수·literal staging·scope 검사와 prompt 축약 자체는 재구현하지 않는다.
 
 ## Validation
 
@@ -51,8 +56,12 @@ priority: high
 - `tests/test_execution_verify_phase.py:test_verify_rechecks_after_slot_and_releases_unstarted_call_on_new_evidence`의 실제 scheduler·SQLite·결합 자료 fixture를 재사용해 부분/전체 verify의 slot 대기 또는 배정 직후 pause 요청을 저장한다. 실제 verify 자식은 시작하지 않고 effect 0회·새 process/실패 receipt 없음·현재 작업의 미시작 자리 반환과 Worker 결과/session/후보·미소비 자료 보존을 확인한다. 제어 신호가 일반 verify 실패나 targeted 교정으로 바뀌지 않고 preflight context가 다음 독립 호출로 누출되지 않아야 한다. 사용자 resume 자체는 수집하지 않으며 다음 자동 진입만 기존 gate를 소비한다. 실행 중/종료 불명 자식은 기존 pause 회귀를 재사용한다.
 - handoff gate 또는 작업 재시도/자원 대기 중 실제 pause 요청을 저장해 새 effect 0회·원래 단계/대기/실패 보존·대상 격리를 확인한다. 사용자 resume의 외부 효과도 0회여야 한다. 실제 최신 원격 재선택/자동 runtime 재시작의 연결 회귀는 G-312가 이 pause 계약을 소비해 수행하며 이 작업의 새 선행 조건으로 만들지 않는다.
 
+- `tests/test_pause.py`의 실제 pause DB/종료 fixture와 `test_worker_checkpoint_publication.py:test_manager_request_survives_commit_completion_interruption_without_new_commit`, `test_execution_worker_phase.py:test_pending_checkpoint_request_prevents_a_new_worker_turn`, `test_validation_feedback_state.py:test_context_delivery_write_failure_keeps_both_channels_pending`을 재사용한다. 요청 저장 후·commit 후·push 확인 후 DB 미확정·전달 확인 전 pause에서 실제 효과/미확인 cursor·session/intent가 보존되고 resume 자체의 commit/push/Worker 호출은 0회인지 최소 연결만 확인한다. 기존 중단 시나리오 전체를 반복하지 않는다.
+
 ## Progress
 
+- [x] 현재 revision의 #294 Manager checkpoint·최소 prompt/전달 cursor를 정적으로 대조했다. 보존 후보 HEAD `bc5adea909fce7602607c811ee443aac115c1112`의 충돌 상태와 기존 기록을 읽기 전용으로 유지하며 새 조건의 pause 통합만 미충족으로 추가했다. 후보 파일/index/Git operation과 실행 기록은 변경하지 않았고 테스트·verify 성공을 확정하지 않았다.
+- [ ] Manager checkpoint·미확인 prompt 전달과 pause의 보존 연결/최소 회귀
 - [x] eb797d3a에는 pause/resume 명령과 저장 gate가 없다. 기존 잠금·자식 종료·checkpoint를 정적으로 확인했다. 실행 없음.
 - [ ] 요청·중단 확인·재개 구현과 targeted unit 검증
 - [x] 보존 후보 HEAD `26f1ec771c73393083f67d53a7fe08c69c5f579d`를 읽기 전용으로 확인했다. 후보에는 pause 구현·회귀와 기존 실행 기록이 있으며 tracked 변경은 없다. 후보 본문의 31개·개별 7개 PASS 기록과 앞선 실패/교정·metadata 인계 기록은 그대로 보존한다. 이 확인을 최신 base·새 targeted 수집 조건의 검증 성공으로 사용하지 않는다.
@@ -64,6 +73,8 @@ priority: high
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 현재 full planning은 snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 started G-236 ID·경로·기존 구현/검증 기록과 무dependency를 보존한다. #293/#294 직접 구현을 다시 계획하지 않고 R-093을 source로 추가해 새 checkpoint 수명의 pause 보존만 같은 작업에 연결한다. G-312는 실제 Merge 뒤 부모 재선택/재시작 통합을 소비하며 역방향 선행을 만들지 않는다. 현재 rebase 중간 형상을 최종 후보/검증 성공으로 사용하지 않는다.
 
 - `f7909364` → `202e1e1c` delta와 snapshot token `067cc668687813e0e98183af0ecf867cdfd1029ce4db884168056b439e121114`의 원본 hash를 대조했다. 저장 VERIFYING·slot 배정 뒤 targeted 확인과 안전한 START의 입력 차단 해제는 직접 구현으로 소비하고 남은 pause 통합만 구체화한다. 보존 후보 HEAD `bc5adea909fce7602607c811ee443aac115c1112`의 미해결 rebase·구현/교정 기록을 읽기 전용으로 확인했다. ID·경로·metadata·dependency·기존 수행 기록과 후보 파일/index/operation을 보존하며 G-302 재구현이나 새 선행 조건을 만들지 않는다. 구현·테스트·verify는 실행하지 않았고 delta 검토를 프로젝트 최종 전문 확인으로 사용하지 않는다.
 
