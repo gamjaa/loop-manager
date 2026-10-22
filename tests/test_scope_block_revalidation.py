@@ -836,7 +836,6 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.block()
         original = self.case.observed
         for observed in (replace(original, remote=replace(original.remote, oid='foreign')),
-                         replace(original, base_is_ancestor=False),
                          replace(original, operations=(('MERGE_HEAD', 'foreign'),)),
                          replace(original, index=(IndexEntry('app.py', '100644', 'blob', 0, 'S', 0x40000000),)),
                          replace(original, committed=(FileChange('docs/requirements/archive/change.md',
@@ -846,6 +845,14 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
                 before = self.snapshot()
                 self.assertFalse(self.resume())
                 self.assertEqual(self.snapshot(), before)
+
+    def test_unstarted_rebase_state_preserves_managed_conflict_block(self):
+        from dataclasses import replace
+        self.block()
+        self.case.observed = replace(self.case.observed, base_is_ancestor=False)
+        before = self.snapshot()
+        self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
 
 
     def test_target_and_original_head_mismatch_reject_detached_recovery(self):

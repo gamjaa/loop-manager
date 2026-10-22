@@ -335,6 +335,142 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
             self.assertFalse(self.handler._owned_current_checkpoint_rebase(
                 self.fixture.context(), row, 'external', self.checkpoint.get('repo', 'G-047'), checkpoint, None))
 
+    def _set_representative_plan(self):
+        connection = self.fixture.connection
+        connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, "
+            "content_hash, status, plan_sha, active_sha, branch, worktree, workspace_owned, "
+            "worker_session_id, worker_result, verify_result, verify_token) "
+            "VALUES ('repo', 'G-001', 'docs/plans/[G-001] Representative.md', 'Representative', "
+            "'[]', '[]', 'high', 'representative-hash', 'IMPLEMENTING', 'representative-plan', "
+            "'representative-base', 'loop-manager/G-001', '/state/G-001', 1, "
+            "'representative-session', 'representative worker', 'representative verify', "
+            "'representative verify token')"
+        )
+        connection.execute(
+            "UPDATE projects SET plan_path='docs/plans/[G-001] Representative.md', "
+            "plan_sha='representative-plan', active_sha='representative-base', phase='WORKING', "
+            "branch='loop-manager/G-001', worktree='/state/G-001', "
+            "worker_session_id='representative-session', worker_result='representative worker', "
+            "verify_result='representative verify', verify_token='representative verify token' "
+            "WHERE repo='repo'"
+        )
+        connection.commit()
+        return (
+            dict(connection.execute("SELECT * FROM projects WHERE repo='repo'").fetchone()),
+            dict(connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()),
+        )
+
+    def test_direct_rebase_completion_uses_explicit_target_with_representative_projection(self):
+        from loop_manager_internal.storage import runtime_state
+        project, representative = self._set_representative_plan()
+        target_before = dict(self.fixture.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-047'").fetchone())
+        with mock.patch.object(lm, '_owned_rebase_state_dir', return_value=Path('/state')), \
+             mock.patch.object(lm, '_current_rebase_service', side_effect=lambda *_a, **_k: self.factory(None)), \
+             mock.patch.object(lm, '_publish_direct_rebase_checkpoint') as publish:
+            self.assertIsNone(runtime_state.execution_selection.get())
+            lm._complete_direct_rebase_checkpoint(
+                self.fixture.connection, 'repo', 'G-047', Path('/state/G-047'), 'base',
+                repo_path=Path('/repo'), branch='loop-manager/G-047', agent_session_id=None)
+
+        self.assertEqual(dict(self.fixture.connection.execute(
+            "SELECT * FROM projects WHERE repo='repo'").fetchone()), project)
+        self.assertEqual(dict(self.fixture.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()), representative)
+        target = dict(self.fixture.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-047'").fetchone())
+        self.assertEqual(target['status'], target_before['status'])
+        self.assertEqual(target['active_sha'], 'base')
+        self.assertIsNone(target['verify_result'])
+        self.assertIsNotNone(self.checkpoint.get('repo', 'G-047').current_rebase_acceptance())
+        publish.assert_called_once()
+
+    def test_blocked_direct_rebase_completion_uses_target_and_preserves_block(self):
+        project, representative = self._set_representative_plan()
+        with self.fixture.connection:
+            self.fixture.connection.execute(
+                "UPDATE exec_plans SET status='PLAN_BLOCKED', last_error='preserved block', "
+                "blocked_fingerprint='blocked-input' WHERE repo='repo' AND plan_id='G-047'"
+            )
+        with mock.patch.object(lm, '_owned_rebase_state_dir', return_value=Path('/state')), \
+             mock.patch.object(lm, '_current_rebase_service', side_effect=lambda *_a, **_k: self.factory(None)), \
+             mock.patch.object(lm, '_publish_direct_rebase_checkpoint') as publish:
+            lm._complete_direct_rebase_checkpoint(
+                self.fixture.connection, 'repo', 'G-047', Path('/state/G-047'), 'base',
+                repo_path=Path('/repo'), branch='loop-manager/G-047', agent_session_id=None)
+
+        blocked = self.fixture.connection.execute(
+            "SELECT status, last_error, blocked_fingerprint, active_sha FROM exec_plans "
+            "WHERE repo='repo' AND plan_id='G-047'").fetchone()
+        self.assertEqual(tuple(blocked), ('PLAN_BLOCKED', 'preserved block', 'blocked-input', 'base'))
+        self.assertIsNotNone(self.checkpoint.get('repo', 'G-047').current_rebase_acceptance())
+        self.assertEqual(dict(self.fixture.connection.execute(
+            "SELECT * FROM projects WHERE repo='repo'").fetchone()), project)
+        self.assertEqual(dict(self.fixture.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()), representative)
+        publish.assert_called_once()
+
+    def test_direct_rebase_completion_rejects_mismatched_selection_before_effects(self):
+        from loop_manager_internal.git import manager_git_journal
+        from loop_manager_internal.storage import runtime_state
+        checkpoint = self.checkpoint.get('repo', 'G-047')
+        state_dir = mock.Mock(return_value=Path('/state'))
+        with mock.patch.object(lm, '_owned_rebase_state_dir', state_dir), \
+             runtime_state.selected_execution('repo', 'G-001'), \
+             self.assertRaises(manager_git_journal.MutationEvidenceError):
+            lm._complete_direct_rebase_checkpoint(
+                self.fixture.connection, 'repo', 'G-047', Path('/state/G-047'), 'base',
+                repo_path=Path('/repo'), branch='loop-manager/G-047', agent_session_id=None)
+        state_dir.assert_not_called()
+        self.assertEqual(self.checkpoint.get('repo', 'G-047'), checkpoint)
+
+    def test_direct_rebase_completion_preserves_checkpoint_race_and_representative(self):
+        from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
+        from loop_manager_internal.storage.runtime_state import RuntimeStateError
+        project, representative = self._set_representative_plan()
+        target_before = dict(self.fixture.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-047'").fetchone())
+        original_observe = ManagedRebaseService.observe
+        observations = 0
+
+        def compete(service, *, checkpoint=None):
+            nonlocal observations
+            self.assertFalse(self.fixture.connection.in_transaction)
+            result = original_observe(service, checkpoint=checkpoint)
+            observations += 1
+            if observations == 2:
+                current = self.checkpoint.get('repo', 'G-047')
+                self.checkpoint.record(
+                    'repo', 'G-047', expected_generation=current.generation,
+                    operation=current.operation, expected_head=current.expected_head,
+                    target_base_oid=current.target_base_oid,
+                    observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**current.snapshot, 'competing_writer': 'preserved'},
+                )
+            return result
+
+        with mock.patch.object(lm, '_owned_rebase_state_dir', return_value=Path('/state')), \
+             mock.patch.object(lm, '_current_rebase_service', side_effect=lambda *_a, **_k: self.factory(None)), \
+             mock.patch.object(lm, '_publish_direct_rebase_checkpoint') as publish, \
+             mock.patch.object(ManagedRebaseService, 'observe', autospec=True, side_effect=compete):
+            with self.assertRaisesRegex(RuntimeStateError, 'checkpoint가 변경되었습니다'):
+                lm._complete_direct_rebase_checkpoint(
+                    self.fixture.connection, 'repo', 'G-047', Path('/state/G-047'), 'base',
+                    repo_path=Path('/repo'), branch='loop-manager/G-047', agent_session_id=None)
+
+        self.assertEqual(observations, 2)
+        self.assertEqual(dict(self.fixture.connection.execute(
+            "SELECT * FROM projects WHERE repo='repo'").fetchone()), project)
+        self.assertEqual(dict(self.fixture.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()), representative)
+        self.assertEqual(dict(self.fixture.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-047'").fetchone()), target_before)
+        raced = self.checkpoint.get('repo', 'G-047')
+        self.assertEqual(raced.snapshot['competing_writer'], 'preserved')
+        self.assertIsNone(raced.current_rebase_acceptance())
+        publish.assert_not_called()
+
     def test_direct_and_handler_paths_share_current_result_without_session_receipts(self):
         with mock.patch.object(lm, '_owned_rebase_state_dir', return_value=Path('/state')), \
              mock.patch.object(lm, '_current_rebase_service', side_effect=lambda *_a, **_k: self.factory(None)), \

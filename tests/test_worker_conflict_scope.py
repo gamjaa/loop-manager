@@ -28,7 +28,11 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
             {str(self.worktree): ('HEAD=partial', 'detached=True')}, {}, {'rebase-merge': 'owned'})
         self.after = replace(self.before, index={'app.py': ('H 100644 resolved 0',)},
                              dirty={'app.py': (('staged',), 'resolved-file')})
+        from tests.support.rebase_observations import expectation, observation
         self.service = mock.Mock()
+        self.service.expected = expectation()
+        self.service.observe.return_value = (observation(self.service.expected, metadata={'onto': 'base'}),
+            SimpleNamespace(status=loop_manager.managed_rebase_validation.RebaseStatus.WAITING))
         self.service.require_owned.return_value = (None, SimpleNamespace(
             status=loop_manager.managed_rebase_validation.RebaseStatus.WAITING))
         for patcher in (
@@ -55,12 +59,24 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
         ExecutionCheckpointRepository(self.connection).record(
             str(self.repo), 'G-092', expected_generation=0, operation='rebase',
             expected_head='before', target_base_oid='base', observed_remote_oid='remote', snapshot={})
-        self.service.require_owned.return_value = (SimpleNamespace(metadata={'onto': 'base'}), None)
+        self.service.observe.reset_mock()
         self.assertEqual(self.validate()['id'], 'G-092')
         loop_manager.validate_active_execplan_metadata.assert_not_called()
-        self.service.require_owned.side_effect = RuntimeError('foreign remote')
+        self.service.observe.side_effect = RuntimeError('foreign remote')
         with self.assertRaises(loop_manager.WorkspaceOwnershipError):
             self.validate()
+
+    def test_unavailable_observation_preserves_diagnostic_before_content_checks(self):
+        from loop_manager_internal.git.managed_rebase_validation import ObservationFailure, RebaseStatus
+        self.completed_rebase()
+        for area, detail in (('git', 'git query failed'), ('stability', 'observation raced')):
+            with self.subTest(area=area):
+                self.service.observe.return_value = (ObservationFailure(area, detail),
+                    SimpleNamespace(status=RebaseStatus.UNAVAILABLE, reason='observation_unavailable'))
+                with self.assertRaisesRegex(loop_manager.WorkspaceOwnershipError, detail):
+                    self.validate()
+        self.service.require_owned.assert_not_called()
+        loop_manager.validate_active_execplan_metadata.assert_not_called()
 
     def test_normal_stage_resolution_requires_and_uses_current_owned_rebase(self):
         self.assertEqual(self.validate(), {'id': 'G-092'})
@@ -103,11 +119,12 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
             dirty={}, operations={}, refs={'refs/heads/loop-manager/G-092': ('completed', '')},
             worktrees={str(self.worktree): ('HEAD=completed', 'branch=refs/heads/loop-manager/G-092')})
         self.completion_observation = SimpleNamespace(head='completed',
-            metadata=None, operations=(), staged=(), index=(),
+            metadata=None, operations=(), base_is_ancestor=True, staged=(), index=(),
             repository_state_fingerprint=loop_manager.managed_rebase_validation.fingerprint({
                 'refs': self.after.refs, 'worktrees': self.after.worktrees, 'config': self.after.config}))
         self.service.require_owned.return_value = (self.completion_observation, SimpleNamespace(
             status=loop_manager.managed_rebase_validation.RebaseStatus.COMPLETE))
+        self.service.observe.return_value = self.service.require_owned.return_value
 
     def test_worker_completed_owned_rebase_accepts_head_ref_index_and_operation_transition(self):
         self.completed_rebase()
@@ -125,7 +142,7 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
         self.completed_rebase()
         self.after = replace(self.before, index=self.after.index)
         error = RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, 'invalid declaration')
-        self.service.require_owned.side_effect = error
+        self.service.observe.side_effect = error
         with self.assertRaises(RecoveryFailure) as raised:
             self.validate()
         self.assertIs(raised.exception, error)

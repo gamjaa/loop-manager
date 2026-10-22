@@ -79,6 +79,50 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(dict(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()), project)
         self.assertEqual(runtime.get('A', 'G-002').status, 'PLAN_BLOCKED')
 
+    def test_parallel_block_rechecks_target_snapshot_after_observation(self):
+        from loop_manager_internal.application.task_scheduling import TaskRecheckRequired
+        from loop_manager_internal.recovery import block_service
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            for key in ('G-001', 'G-002'):
+                runtime.activate('A', key, activation_sha='base', branch=key, worktree=key)
+        representative = runtime.get('A', 'G-001')
+        runtime.hydrate_snapshot('A', representative)
+        representative_project = dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo='A'").fetchone())
+        concurrent_result = 'concurrent B result'
+
+        def capture():
+            self.assertFalse(self.connection.in_transaction)
+            with closing(database.connect_database(self.directory, run_migrations=False)) as other:
+                with other:
+                    other.execute(
+                        "UPDATE exec_plans SET worker_result=? WHERE repo='A' AND plan_id='G-002'",
+                        (concurrent_result,),
+                    )
+            return SimpleNamespace(serialize=lambda: 'observed snapshot')
+
+        effects = SimpleNamespace(
+            _plan_id_from_path=lambda _path: 'G-002',
+            _worktree_execplan_input_fingerprint=lambda *_args: 'candidate',
+            capture_git_snapshot=lambda *_args: capture(),
+            project_execplan=lambda connection, repo: runtime.projected_row(repo),
+            _final_block_recovery_decision=block_service._final_block_recovery_decision,
+        )
+        with runtime_state.selected_execution('A', 'G-002'), self.assertRaises(TaskRecheckRequired):
+            block_service.block_active_execplan(
+                effects, self.connection, 'A', Path('G-002'), 'stale cause', '',
+            )
+
+        self.assertEqual(runtime.get('A', 'G-001'), representative)
+        blocked = runtime.get('A', 'G-002')
+        self.assertEqual(blocked.status, 'IMPLEMENTING')
+        self.assertEqual(blocked.worker_result, concurrent_result)
+        self.assertEqual(dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo='A'").fetchone()), representative_project)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM execplan_blocks WHERE repo='A' AND plan_id='G-002'").fetchone())
+
     def validation_failure_effects(self, observe):
         from loop_manager_internal.recovery import block_service
         runtime = runtime_state.RuntimeStateRepository(self.connection)
@@ -180,6 +224,22 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                     effects, self.connection, self.directory, 'A', 'G-001', self.directory / 'worktree-one',
                     'one', 'base', observed_remote=('remote',))
         begin.assert_not_called()
+
+    def test_direct_rebase_rejects_mismatched_selection_before_observation(self):
+        from loop_manager_internal.git import direct_rebase_service, manager_git_journal
+        before = tuple(tuple(row) for row in self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='A' ORDER BY plan_id").fetchall())
+        state_dir = mock.Mock(return_value=self.directory)
+        effects = SimpleNamespace(_owned_rebase_state_dir=state_dir)
+        with runtime_state.selected_execution('A', 'G-001'), \
+             self.assertRaises(manager_git_journal.MutationEvidenceError):
+            direct_rebase_service._journaled_direct_rebase(
+                effects, self.connection, self.directory, 'A', 'G-002',
+                self.directory / 'worktree-two', 'two', 'base',
+            )
+        state_dir.assert_not_called()
+        self.assertEqual(tuple(tuple(row) for row in self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='A' ORDER BY plan_id").fetchall()), before)
 
     def test_reservation_and_cursor_failure_return_unstarted_capacity_atomically(self):
         from loop_manager_internal.storage.db_access import DatabaseWaitTimeout

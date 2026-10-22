@@ -172,12 +172,21 @@ class JournaledDirectRebaseEffects:
     remote_branch_oid: Callable[..., object]
 
 
+def _require_direct_rebase_selection(repo: str, plan_id: str) -> None:
+    selected = runtime_state.execution_selection.get()
+    if selected is not None and selected != (repo, plan_id):
+        raise manager_git_journal.MutationEvidenceError(
+            'direct rebase selected execution differs from explicit plan'
+        )
+
+
 def _journaled_direct_rebase(
     effects: JournaledDirectRebaseEffects, connection: sqlite3.Connection, repo_path: Path, repo: str, plan_id: str,
     worktree: Path, branch: str, target_oid: str, *, autostash: bool = False,
     agent_session_id: str | None = None,
     observed_remote: tuple[str | None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    _require_direct_rebase_selection(repo, plan_id)
     state_dir = effects._owned_rebase_state_dir(repo, plan_id, worktree)
     if state_dir is None:
         raise manager_git_journal.MutationEvidenceError(
@@ -386,6 +395,21 @@ def _complete_direct_rebase_checkpoint(
     branch, agent_session_id, preserved_worktree=False, preserved_marker=None,
     preserved_observation=None,
 ):
+    _require_direct_rebase_selection(repo, plan_id)
+    with runtime_state.selected_execution(repo, plan_id, include_blocked=True):
+        return _complete_direct_rebase_checkpoint_selected(
+            effects, connection, repo, plan_id, worktree, target_base_oid,
+            repo_path=repo_path, branch=branch, agent_session_id=agent_session_id,
+            preserved_worktree=preserved_worktree, preserved_marker=preserved_marker,
+            preserved_observation=preserved_observation,
+        )
+
+
+def _complete_direct_rebase_checkpoint_selected(
+    effects: CompleteDirectRebaseCheckpointEffects, connection, repo, plan_id, worktree, target_base_oid, *, repo_path,
+    branch, agent_session_id, preserved_worktree=False, preserved_marker=None,
+    preserved_observation=None,
+):
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = checkpoint.get(repo, plan_id)
     saved = current.snapshot or {}
@@ -418,41 +442,20 @@ def _complete_direct_rebase_checkpoint(
         service = effects._current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch)
     runtime = runtime_state.RuntimeStateRepository(connection)
-    projected = runtime.projected(repo)
-    if projected is None or projected.status == 'PLAN_BLOCKED':
-        selected = runtime.get(repo, plan_id)
-        observed, decision = service.require_owned()
-        if selected is None or selected.status != 'PLAN_BLOCKED' or decision.status.value != 'complete':
+    selected = runtime.get(repo, plan_id)
+    if selected.status == 'PLAN_BLOCKED':
+        _observed, decision = service.require_owned()
+        if decision.status.value != 'complete':
             raise manager_git_journal.MutationEvidenceError('current rebase execution is not selected')
-        if projected is not None:
-            runtime.complete_rebase(
-                selected, checkpoint, acceptance=decision.acceptance,
-                project_values={'phase': selected.phase},
-                reobserve=lambda: service.observe()[1],
-            )
-        else:
-            confirmed = service.observe()[1]
-            with runtime_state._transaction(connection):
-                if runtime.get(repo, plan_id) != selected or checkpoint.get(repo, plan_id) != current:
-                    raise manager_git_journal.MutationEvidenceError('current blocked rebase ownership changed')
-                if confirmed != decision or runtime.projected(repo) is not None:
-                    raise manager_git_journal.MutationEvidenceError('current blocked rebase state changed')
-                values = managed_rebase_adoption.revalidation_values(target_base_oid)
-                for field in ('phase', 'last_error', 'revision_resume_status'):
-                    values.pop(field)
-                checkpoint.accept_current_rebase(
-                    repo, plan_id, acceptance=decision.acceptance,
-                    prior_artifacts={field: getattr(selected, field) for field in values},
-                )
-                runtime.transition(repo, plan_id, plan_values=values,
-                                   project_values={'phase': connection.execute(
-                                       'SELECT phase FROM projects WHERE repo = ?', (repo,)
-                                   ).fetchone()[0]},
-                                   expected_status='PLAN_BLOCKED', enqueue=False)
-    else:
-        if projected.plan_id != plan_id:
-            raise manager_git_journal.MutationEvidenceError('current rebase execution is not selected')
+        runtime.complete_rebase(
+            selected, checkpoint, acceptance=decision.acceptance,
+            project_values={'phase': selected.phase},
+            reobserve=lambda: service.observe()[1],
+        )
+    elif selected.status in runtime_state.ACTIVE_STATUSES:
         service.adopt(_ExecutionStatePort(connection, runtime, repo), checkpoint)
+    else:
+        raise manager_git_journal.MutationEvidenceError('current rebase execution is not selected')
     # Preserve the clean-index publication boundary before a blocked release
     # restores its original staging for the next Worker turn.
     effects._publish_direct_rebase_checkpoint(

@@ -401,7 +401,9 @@ class OwnershipHandler:
             if decision.status is RebaseStatus.UNAVAILABLE:
                 raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
                                       'checkpoint rebase observation unavailable')
-            if decision.status not in {RebaseStatus.START, RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
+            # START only means the saved target could be applied; it does not
+            # seal ownership of a published rebase whose base is not an ancestor.
+            if decision.status not in {RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
                 return False
             if current.operation == 'commit' and observed.head != current.expected_head:
                 return checkpoint_ownership.committed_tree_matches_intent(

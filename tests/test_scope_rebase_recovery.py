@@ -274,6 +274,9 @@ class BlockedAgentBaselineResumeUnitTests(unittest.TestCase):
                         owner_request_identity='owned-request', checkpoint_generation=0)
         connection.execute("UPDATE projects SET agent_recovery = ? WHERE repo = 'repo'",
                            (json.dumps(recovery),))
+        connection.execute("UPDATE exec_plans SET agent_recovery = ? "
+                           "WHERE repo = 'repo' AND plan_id = 'G-001'",
+                           (json.dumps(recovery),))
         ExecutionCheckpointRepository(connection).record(
             'repo', 'G-001', expected_generation=0, operation='rebase',
             expected_head=before.head, target_base_oid='b' * 40,
@@ -291,8 +294,13 @@ class BlockedAgentBaselineResumeUnitTests(unittest.TestCase):
         self.assertTrue(effects.make_worktree.call_args.kwargs['allow_rebase'])
         effects._complete_blocked_agent_recovery.assert_not_called()
 
+        self.assertEqual(connection.execute(
+            "SELECT agent_recovery FROM projects WHERE repo = 'repo'").fetchone()[0],
+            json.dumps(recovery),
+        )
         self.assertIsNone(connection.execute(
-            "SELECT agent_recovery FROM projects WHERE repo = 'repo'").fetchone()[0])
+            "SELECT agent_recovery FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-001'"
+        ).fetchone()[0])
         checkpoint = ExecutionCheckpointRepository(connection).get('repo', 'G-001')
         self.assertEqual(checkpoint.snapshot['retired_agent_recoveries'], [json.dumps(recovery)])
         effects._config_entries.assert_not_called()
