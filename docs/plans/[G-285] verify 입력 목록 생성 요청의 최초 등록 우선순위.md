@@ -46,6 +46,7 @@ Manager의 실제 verify 입력 목록 누락 요청에 따라 새로 만드는 
 - [x] 2026-10-22 추가 verify 실패에서 일반 publication effect callback에 기본값 `allow_legacy_priority=False`까지 전달해 기존 positional callback이 깨지는 것을 확인했다. legacy 복구 경로에서만 keyword를 전달하도록 수정했다. `test_remote_confirmed_move_marks_receipt_and_preserves_old_audit`는 수정 전 해당 TypeError로 실패했고 수정 후 통과했으며, `test_recovery_applies_legacy_manager_plan_from_published_intent`도 현재 후보에서 통과했다.
 - [x] 2026-10-22 maintenance prepared intent 복구도 새 priority를 소급하지 않도록 복구 재검증과 row 등록에 legacy 예외를 연결했다. request identity/scope 검증은 유지한다. 과거 `normal` manager 계획을 포함한 게시 intent가 restart 뒤 SQLite row로 등록되고 maintenance cycle이 성공 기준선을 갱신하는 targeted 회귀를 추가했다. 수정 뒤 targeted recovery test 통과.
 - [x] 2026-10-22 현재 후보 HEAD `ee08fcc8`와 base `d0ed33bb`의 15개 파일 diff를 확인했다. 선택 adapter unittest v1·launcher Python과 Python 3.11–3.14 계약, R-072 source를 재확인했다. Python targeted runner로 `test_legacy_manager_plan_recovers_from_published_maintenance_intent`와 신규 maintenance 계획의 critical priority 검사를 실행해 2개 모두 통과했다.
+- [x] 2026-10-22 현재 호출 시작 HEAD `e04c2660`에서 priority 누락 신규 Manager source가 reconciliation·후속 planning에 서로 다른 hold 원인을 만들던 경로를 수정했다. 신규 선언 검사를 priority 판정의 단일 경계로 사용하고 재조정의 별도 요청 검증은 identity/scope만 확인한다. priority 누락 뒤 독립 계획을 허용하는 회귀와 명시적 noncritical 차단 테스트를 targeted runner로 실행해 각각 통과했다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

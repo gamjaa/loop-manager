@@ -1231,21 +1231,17 @@ class CatalogReconciliationService:
                 path=current.path,
             )
         # Validate new declarations before deletion-goal holds remove them from
-        # the executable catalog. Recovery registration uses the same rules.
+        # the executable catalog. new_declaration_issues owns priority checks;
+        # this pass checks Manager request identity and scope for every entry.
         new_issues = list(new_declaration_issues(pinned, stored_ids))
         from . import verify_input_requests
         for entry in pinned.snapshot.all.values():
             try:
                 verify_input_requests.validate(
                     self.repository.connection, repo, entry.text, entry.sources,
-                    is_new=(entry.plan_id not in stored_ids and not entry.archived),
+                    is_new=False,
                     metadata=entry.metadata(),
                 )
-            except verify_input_requests.InvalidNewVerifyInputPriority as error:
-                if not any(issue.plan_id == entry.plan_id
-                           and issue.code == "invalid-manager-source-priority" for issue in new_issues):
-                    new_issues.append(CatalogIssue(entry.plan_id, entry.path,
-                        "invalid-manager-source-priority", str(error), "manager:verify-inputs"))
             except RuntimeError as error:
                 new_issues.append(CatalogIssue(entry.plan_id, entry.path,
                     "unregistered-manager-source", str(error), "manager:verify-inputs"))

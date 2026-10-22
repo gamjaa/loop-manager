@@ -1676,6 +1676,8 @@ verify 기록은 실행 시 Python의 bytecode write 정책·cache tag·prefix�
 
 신규 판정은 현재 등록 row·게시 intent와 revision-pinned catalog 근거로 수행한다. 등록된 계획·draft·PR의 기존 선언은 재검사로 보류하지 않고 멱등 재개도 새 등록으로 취급하지 않는다. 일반·유지보수 planning의 신규 publication은 catalog 사전 검사와 transaction 내 request 검증을 거친 뒤 최초 row 삽입에서도 priority를 확인한다. 단, 저장된 일반·유지보수 publication intent의 batch/manifest와 원격 commit 포함이 확인된 복구는 이미 게시된 batch의 재개이므로 request identity·scope 검증은 유지하면서 priority를 소급 적용하지 않고 보존된 metadata로 등록을 마친다. priority가 잘못된 신규 계획은 격리되며 SQLite 실행 row나 draft 대기 증거를 만들지 않는다. archive fallback은 과거 선언을 보존하고 이 조건을 소급하지 않는다.
 
+원격 재조정과 후속 planning은 같은 신규 선언 priority 검사로 hold 원인을 구성한다. priority 생략에서 파서가 기록한 오류에 metadata의 기본값으로 별도 priority 원인을 덧붙이지 않아, 변경되지 않은 hold가 후속 planning의 원인 비교를 통과하고 독립 유효 계획을 보존한다.
+
 예약어는 수동 완료 후보를 포함한 문서 조회와 Requirement retirement에서 제외하고 규칙 내용을
 source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 요청 검증을 통과한 예약 source를
 허용하며 활성 명세 전문·구현 근거 및 draft 조건은 유지한다.
