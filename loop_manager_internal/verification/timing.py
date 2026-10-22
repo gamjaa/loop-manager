@@ -17,7 +17,7 @@ from unittest import mock
 
 _current_writer: ContextVar[EventWriter | None] = ContextVar("verify_events", default=None)
 _fixture_timing_active: ContextVar[bool] = ContextVar("fixture_timing_active", default=False)
-_test_fixture_failures: ContextVar[dict[int, str] | None] = ContextVar("test_fixture_failures", default=None)
+_test_fixture_failures: ContextVar[dict[int, tuple[str, BaseException]] | None] = ContextVar("test_fixture_failures", default=None)
 _phase_names: ContextVar[tuple[str, ...]] = ContextVar("verify_phase_names", default=())
 
 
@@ -88,6 +88,11 @@ class TimedResult(unittest.TextTestResult):
         self._outcome(test, "success")
 
     def addFailure(self, test, err):
+        fixture = self._fixture_scope(test, err)
+        if fixture is not None:
+            super().addError(test, err)
+            self._record_fixture_error(test, fixture)
+            return
         super().addFailure(test, err)
         failures = _test_fixture_failures.get()
         fixture = failures.pop(id(test), None) if failures is not None else None
@@ -98,12 +103,22 @@ class TimedResult(unittest.TextTestResult):
         self._outcome(test, "fixture_error")
 
     def addError(self, test, err):
+        fixture = self._fixture_scope(test, err)
         super().addError(test, err)
-        failures = _test_fixture_failures.get()
-        fixture = failures.pop(id(test), None) if failures is not None else None
         if fixture is None:
             self._outcome(test, "error")
             return
+        self._record_fixture_error(test, fixture)
+
+    def _fixture_scope(self, test, err):
+        failures = _test_fixture_failures.get()
+        fixture = failures.get(id(test)) if failures is not None else None
+        if fixture is None or err[1] is not fixture[1]:
+            return None
+        del failures[id(test)]
+        return fixture[0]
+
+    def _record_fixture_error(self, test, fixture):
         self.writer.emit("fixture_result", id=test.id(), result="error", scope=fixture)
         self._outcome(test, "fixture_error")
 
@@ -176,10 +191,10 @@ def fixture_timing():
                         raise
                     except KeyboardInterrupt:
                         raise
-                    except BaseException:
+                    except BaseException as error:
                         failures = _test_fixture_failures.get()
                         if failures is not None:
-                            failures[id(test)] = _scope
+                            failures[id(test)] = (_scope, error)
                         raise
 
                 patches.enter_context(mock.patch.object(owner, name, measured_test_fixture))

@@ -342,15 +342,18 @@ class Sample(unittest.TestCase):
 class SetUpBroken(unittest.TestCase):
     def setUp(self): raise RuntimeError('setUp failed')
     def test_case(self): pass
+class SetUpAssertionBroken(unittest.TestCase):
+    def setUp(self): self.fail('setUp assertion failed')
+    def test_case(self): pass
 class TearDownBroken(unittest.TestCase):
     def tearDown(self): raise RuntimeError('tearDown failed')
+    def test_case(self): pass
+class TearDownAssertionBroken(unittest.TestCase):
+    def tearDown(self): self.fail('tearDown assertion failed')
     def test_case(self): pass
 class BodyAndTearDownBroken(unittest.TestCase):
     def tearDown(self): raise RuntimeError('tearDown failed too')
     def test_case(self): self.fail('body assertion')
-class FixtureAssertionBroken(unittest.TestCase):
-    def setUp(self): self.fail('setUp assertion')
-    def test_case(self): pass
 class SubTests(unittest.TestCase):
     def test_case(self):
         with self.subTest(value=1): self.fail('subtest assertion')
@@ -380,16 +383,24 @@ class AsyncBodyAndTearDownBroken(unittest.IsolatedAsyncioTestCase):
                 'AsyncFixtureAssertionBroken.test_case': 'fixture_error',
                 'AsyncSetUpBroken.test_case': 'fixture_error',
                 'BodyAndTearDownBroken.test_case': 'failure',
-                'FixtureAssertionBroken.test_case': 'fixture_error',
                 'SetUpBroken.test_case': 'fixture_error',
+                'SetUpAssertionBroken.test_case': 'fixture_error',
                 'SubTests.test_case': 'failure',
                 'TearDownBroken.test_case': 'fixture_error',
+                'TearDownAssertionBroken.test_case': 'fixture_error',
                 'UnexpectedSuccess.test_case': 'unexpected_success',
             })
             raw = next(records.glob('targeted-*.jsonl')).read_text(encoding='utf-8')
+            events = [json.loads(line) for line in raw.splitlines()]
             self.assertIn('"kind": "subtest_result"', raw)
             self.assertIn('"scope": "tearDown"', raw)
             self.assertIn('"scope": "setUp"', raw)
+            combined_id = 'case_lifecycle.AsyncBodyAndTearDownBroken.test_case'
+            self.assertEqual([(item['kind'], item.get('result'), item.get('scope'))
+                              for item in events if item.get('id') == combined_id
+                              and item['kind'] in {'fixture_result', 'test_end'}],
+                             [('fixture_result', 'error', 'tearDown'),
+                              ('test_end', 'failure', None)])
 
     def test_module_and_class_fixture_errors_do_not_reset_test_history(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -445,6 +456,10 @@ class Sample(unittest.TestCase):
             project, records = root / 'project', root / 'records'
             project.mkdir()
             records.mkdir()
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            ensure_schema(connection)
+            repository = TargetedTestRepository(connection)
             (project / 'case_owner_mismatch.py').write_text('''import unittest
 class AAffectedFirst(unittest.TestCase):
     @classmethod
@@ -461,6 +476,13 @@ class ZAffectedLast(unittest.TestCase):
 ''', encoding='utf-8')
             environment = dict(os.environ, LOOP_MANAGER_TARGETED_TEST_DIRECTORY=str(records),
                                LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(project))
+            identities = [f'case_owner_mismatch.{name}.test_case'
+                          for name in ('AAffectedFirst', 'BUnaffectedMiddle',
+                                       'CUnaffectedLast', 'ZAffectedLast')]
+            repository.observe('repo', 'mixed', [
+                *(event('prior-a', identity) for identity in identities),
+                *(event('prior-b', identity) for identity in identities),
+            ])
             result = subprocess.run([sys.executable, str(Path(targeted.__file__).resolve()),
                 '--unittest', 'case_owner_mismatch'], cwd=project, env=environment,
                 capture_output=True, text=True, check=False)
@@ -473,6 +495,12 @@ class ZAffectedLast(unittest.TestCase):
                 'CUnaffectedLast.test_case': 'success',
                 'ZAffectedLast.test_case': 'indeterminate',
             })
+            repository.observe('repo', 'mixed', targeted.collect(records))
+            self.assertFalse(repository.repeated('repo', 'mixed'))
+            repository.observe('repo', 'mixed',
+                               [event('after', identities[0]), event('after', identities[3])])
+            self.assertEqual(set(repository.repeated('repo', 'mixed')),
+                             {identities[0], identities[3]})
 
     def test_junit_uses_a_fresh_report_and_preserves_parameter_identity(self):
         def execute(arguments, **_):

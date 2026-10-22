@@ -47,3 +47,15 @@ priority: high
 - 기존 비종료 G-189는 후속 소비자까지의 전수 감사이며 이 native 분류 교정은 별도 Merge 가능한 구현이다. G-291의 호출 기록 복구, G-292의 Claude 연결과 책임을 나눈다. 기존 테스트가 현재 동작을 요구한다는 사실을 R-055 충족 근거로 사용하지 않는다.
 - complexity medium: reporter의 발생 경계와 저장 결과 의미를 함께 맞추는 작업이다. risk medium: 잘못된 분류가 한 작업을 부당하게 차단하거나 실패 한도를 놓치지만 원본·저장 감사와 기존 실행 gate를 보존해 재평가할 수 있다. 불확실 결과를 실패로 합성하지 않는 회귀로 완화한다. priority high는 새 무인 차단 정책의 정확성을 위한 필수 교정이다.
 - 선택 verify는 `unittest` version 1·launcher Python 3.11–3.14와 독립 모듈 수집·필수 compile이다. 이 작업은 adapter·전체 검증 범위를 바꾸지 않는다. 현재 Planner는 구현·테스트·verify를 실행하지 않았으며 직접 구현의 성공 기록을 소급 생성하지 않는다.
+
+## Review 보완 결과 (2026-10-22)
+
+- Review에서 확인한 교차 클래스 귀속 오류는 `collect()`가 결과별 ID 대신 마지막으로 읽은 ID를 fixture 영향 판정에 재사용한 것이었다. 판정 입력을 각 `test_end` 이벤트 ID로 바꾸고, 한 모듈에 클래스 fixture 오류가 있는 성공과 무관한 클래스의 성공을 함께 실행하는 회귀를 추가했다. 두 테스트 ID에 각각 두 번의 기존 실패를 시드해 fixture 대상의 이력이 보존되고 무관한 성공만 초기화하는지 확인한다.
+- 개별 setup/teardown의 assertion은 `addFailure()`로 전달되므로 callback 경계에서 fixture의 scope와 원래 exception identity를 함께 보존한다. 대응하는 callback 결과만 `fixture_error`로 기록하고, 앞선 본문 assertion과 뒤이은 teardown assertion이 함께 발생하면 본문 `failure`와 fixture 오류를 각각 한 번 남긴다. RuntimeError fixture 회귀도 유지한다.
+- 새 회귀를 추가한 뒤 `TargetedRunnerTests` 실행은 위 두 누락 조건에서 실패했다. 수정 후 동일 명령으로 10개 테스트가 통과했으며, 마지막으로 두 회귀 case만 지정한 실행에서도 2개가 통과했다. `/usr/bin/python3` 3.12.3과 현재 후보의 `targeted.py`를 `LOOP_MANAGER_TARGETED_TEST_RUNNER`에 지정해 실행했다. 전체 `scripts/verify`는 실행하지 않았다.
+
+  FAILED_COMMAND: export LOOP_MANAGER_TARGETED_TEST_RUNNER=/home/ubuntu/.local/state/loop-manager/worktrees/e1b66bcef2ec3ace/G-290/loop_manager_internal/verification/targeted.py; export LOOP_MANAGER_TARGETED_TEST_DIRECTORY=/tmp/loop-manager-targeted-g290-review-q9l8v7tf; /usr/bin/python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_targeted_test_streak.TargetedRunnerTests
+
+  RERUN: export LOOP_MANAGER_TARGETED_TEST_RUNNER=/home/ubuntu/.local/state/loop-manager/worktrees/e1b66bcef2ec3ace/G-290/loop_manager_internal/verification/targeted.py; export LOOP_MANAGER_TARGETED_TEST_DIRECTORY=/tmp/loop-manager-targeted-g290-review-q9l8v7tf; /usr/bin/python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_targeted_test_streak.TargetedRunnerTests
+
+  재실행 결과: 10개 테스트 통과. 이어서 두 새 회귀 case만 지정한 targeted 실행은 2개 테스트 통과했다.
