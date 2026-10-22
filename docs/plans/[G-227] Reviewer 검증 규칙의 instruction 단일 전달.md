@@ -31,7 +31,7 @@ Reviewer의 정적 검증 책임은 고정된 common+reviewer instruction으로 
 
 - `agents/agent_prompts.py`와 실제 Review/checkpoint 호출의 기존 prompt 조합을 확인해 instruction에 이미 있는 검증 규칙의 반복을 제거한다. 결과 형식과 후보별 사실은 사용자 메시지에 유지하고, 기존 common_guidance/provider 전달·snapshot·read_only 경계를 재사용한다.
 - `docs/AGENTS.common.md`·`docs/AGENTS.reviewer.md`의 현재 책임을 보존한다. 결과 전달을 위해 원본을 재작성하거나 진행 작업의 고정 버전을 교체하지 않는다. 대응 테스트에서 사용자 메시지에 금지 문구를 요구하던 기대값을 실제 instruction과 결과 문맥 검사로 분리한다.
-- Worker의 초기/delta/복구 prompt는 기존 G-066의 범위다. 이 계획은 Worker session cursor, Review 성공 재사용, receipt 정책과 알림을 추가 구현하지 않는다. PRODUCT·ARCHITECTURE의 현재 단일 전달 계약은 유지하고 필요한 관련 설명만 정합하게 갱신한다.
+- Worker의 초기/delta/복구 prompt는 현재 `worker_prompt`·`execution_worker_handler.py`와 `storage/validation_feedback_state.py`의 직접 구현을 유지한다. 이 계획은 Worker session cursor, Review 성공 재사용, receipt 정책과 알림을 추가 구현하지 않는다. PRODUCT·ARCHITECTURE의 현재 단일 전달 계약은 유지하고 필요한 관련 설명만 정합하게 갱신한다.
 
 ## Validation
 
@@ -47,10 +47,13 @@ Reviewer의 정적 검증 책임은 고정된 common+reviewer instruction으로 
 
 ## Decision Log
 
+- 지정 delta revision `16115a547319c40aab74e67094536c43bdae7fce`와 snapshot token `41c4344480fa2e611f329b73b10ee282021edebf66ec448d2eb1623329109377`에서 삭제 원문과 현재 Worker 전달·session·수동 문맥을 대조했다. 기존 ID·경로·metadata·dependency·수행 기록을 보존하며 Reviewer의 정적 규칙 중복 제거만 미충족으로 유지한다. 아래 판단은 현재 취소 근거에 대한 개정이며 과거 복구 문구나 삭제 자체를 성공 근거로 사용하지 않는다.
+DEPENDENCY_RECOVERY: {"deleted_id":"G-066","outcome":"obsolete","replacement_ids":[],"sources":["docs/PRODUCT.md","docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md","docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md"],"reason":"보존된 최소 Worker prompt 목표는 현재 worker_prompt의 초기/재개/복구 분리, WorkerHandler의 실제 session별 context delta, validation_feedback_state의 고정 attempt/전달 확인, manual_candidate.worker_context의 원문 없는 단계 요약에 직접 구현돼 있다. tests/test_execution_worker_phase.py의 같은 session 변경분/잘못된 반환 미확인 회귀, tests/test_validation_feedback_state.py의 호출 중 변경/저장 실패 회귀와 tests/test_agent_invocation.py의 실제 Worker prompt·고정 instruction 검사를 정적으로 대조했다. Worker 기능의 대체 선행 구현은 필요하지 않으며 이 계획의 독립적인 Reviewer 전달 교정과 기존 dependency는 유지한다. 구현·테스트 실행·자동 검증·Merge 성공을 새로 기록하지 않는다."}
+
 - 2026-10-12 사용자 요청의 문서 정합화: 기본·문서 선행·일반 선행 경로의 전달 사실과 승인 gate를 구분했다. R-086 상태/receipt를 다시 구현하지 않으며 instruction 단일 전달 목표·metadata·dependency·기존 수행 기록을 보존한다.
 
 - 2026-10-09 full 기준 eb797d3a와 mutable token 324c039278646b522a5cbad59f1ba7ad5c4d543c36002cf4bdc2efc2bd0e05ed, 원본 hash b213723241bb50c4b4dea40490620c5a35925fea614a4c5a7762c1257734be02를 확인했다. R-082의 직접 구현으로 생긴 선행 Review 예외를 기존 전달 목표에 반영한다. 고정 instruction 단일 전달·최종 후보 gate·low complexity/risk·기존 기록을 유지하며 Review 단계 판단을 재구현하지 않는다. 구현·테스트 실행 없음.
 
 - complexity low: 기존 instruction과 호출 경계를 재사용하는 국소 prompt·assertion 교정이며 새 상태 전이 판단이 없다. risk low: 잘못된 문맥 제거는 검토 입력 누락을 만들 수 있으나 기존 결과/후보 gate와 읽기 전용 권한을 보존하고 해당 prompt를 교정해 복구할 수 있다. 필수 명세 정합화로 priority normal이다.
-- G-197의 검증 근거 전달을 중복 계획하지 않는다. 기존 G-066은 Worker prompt만 담당하므로 Reviewer의 확인된 중복과 실제 전달 회귀를 독립 범위로 둔다. Merge된 계획·archive·사용자 결정은 변경하지 않는다. 이 delta 검토는 프로젝트 최종 전문 확인이 아니다.
+- G-197의 검증 근거 전달을 중복 계획하지 않는다. Worker prompt와 Reviewer prompt의 책임을 분리해 Reviewer의 확인된 중복과 실제 전달 회귀를 독립 범위로 둔다. Merge된 계획·archive·사용자 결정은 변경하지 않는다. 이 delta 검토는 프로젝트 최종 전문 확인이 아니다.
 

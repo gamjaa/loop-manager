@@ -50,6 +50,7 @@ priority: high
 
 ## Decision Log
 
-- 제공된 snapshot의 같은 ID·경로·sources·G-303 dependency와 조사 기록을 보존한다. 직접 구현된 기능에 소급 ExecPlan이나 새 성공 기록을 만들지 않으며 G-306의 남은 구현이 없어도 Manager checkpoint 경계는 현행 코드로 유지한다.
+- snapshot token `41c4344480fa2e611f329b73b10ee282021edebf66ec448d2eb1623329109377`과 지정 revision `16115a547319c40aab74e67094536c43bdae7fce`의 원문 hash를 대조했다. 같은 ID·경로·sources·G-303 dependency와 조사 기록을 보존한다. Manager checkpoint 요청·로컬 효과·게시 경계는 현재 직접 구현을 사용하고 남은 intent/완료 DB 요청 재시도만 이 계획에서 보완한다.
+DEPENDENCY_RECOVERY: {"deleted_id":"G-306","outcome":"obsolete","replacement_ids":[],"sources":["docs/PRODUCT.md","docs/requirements/[R-093] 원격 작업 브랜치로 새 환경에서 이어하기.md","docs/requirements/[R-061] Agent 역할·문서 권한과 draft ExecPlan 사용자 판단.md","docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md"],"reason":"보존 원문의 제한 checkpoint 요청·완료 구분·Worker 종료/범위/index 검사·Manager commit·게시 대기·중단 재개는 worker_outcome.py, WorkerHandler와 worker_checkpoint.py의 save_request/resume_request에 직접 구현돼 있다. 현재 지침의 Worker 직접 Git 쓰기 금지와 tests/test_worker_outcome.py, tests/test_execution_worker_phase.py의 pending no-call 및 tests/test_worker_checkpoint_publication.py의 commit 저장 중단/immutable 범위/literal staging 회귀를 정적으로 대조했다. 별도 선행 구현은 필요하지 않다. G-303의 DB 요청 API를 소비하는 이 계획의 남은 재준비·공통 예산·취소/원자 완료와 기존 회귀는 보존하며 삭제를 구현·검증·Merge 성공으로 사용하지 않는다."}
 - Worker의 Git 쓰기 권한을 넓히지 않는다. 신규 Manager 요청과 legacy immutable 이력 검사는 현재 구현을 사용하며 G-284의 별도 보호 파일/index 복원과 G-308의 인수/terminal을 중복 구현하지 않는다.
 - complexity high(최초 level 5): 비가역 원격 효과 사이의 DB 재준비·generation/소유권·공통 예산을 연결한다. risk high: 잘못된 callback replay/완료 적용은 중복 게시나 경쟁 상태 훼손을 만들 수 있어 DB 전용 callback·정확한 intent/lease·원자 CAS·실제 경합 회귀를 유지한다. priority high와 Manager의 Model·Effort 설정을 유지한다. Planner는 구현·테스트·verify를 실행하지 않았다.
