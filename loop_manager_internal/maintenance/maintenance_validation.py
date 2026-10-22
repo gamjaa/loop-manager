@@ -354,6 +354,7 @@ def validate_maintenance_planner_result(
     refactoring_plan_ids: tuple[str, ...] | None = None,
     allow_general_plans: bool = False,
     expected_id_allocations: tuple[PlanIdAllocation, ...] | None = None,
+    allow_legacy_priority: bool = False,
 ) -> ValidatedPlanningResult | None:
     """Validate output without consuming correction retries on Git failures."""
 
@@ -475,7 +476,7 @@ def validate_maintenance_planner_result(
             try:
                 verify_input_requests.validate(
                     connection, context.repo, planned_contents[path][1], validated_plan["sources"],
-                    is_new=True, metadata=validated_plan,
+                    is_new=not allow_legacy_priority, metadata=validated_plan,
                 )
             except RuntimeError as error:
                 raise MaintenancePlanningError(str(error)) from error

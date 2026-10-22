@@ -31,6 +31,81 @@ from tests.support.git import isolated_git_test
 
 @isolated_git_test
 class MaintenancePublicationTest(MaintenancePlanningCase):
+    def test_legacy_manager_plan_recovers_from_published_maintenance_intent(self):
+        from loop_manager_internal.catalog import manager_sources
+        from loop_manager_internal.storage import verify_input_requests
+
+        self._begin_legacy_assessment(self.base_sha)
+        self.connection.execute(
+            "UPDATE maintenance_cycles SET include_general_planning = 1 WHERE repo = ?",
+            (str(self.repo),),
+        )
+        context = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, self.base_sha,
+        )
+        request = verify_input_requests.register(
+            self.connection, str(self.repo), context.active_sha,
+        )
+        path = self.repo / "docs/plans/[G-002] Verify Inputs.md"
+        path.write_text(
+            "---\nid: G-002\ntitle: Verify Inputs\nsources:\n  - "
+            + manager_sources.SOURCE
+            + "\ndepends_on: []\ncomplexity: low\nrisk: medium\npriority: normal\n"
+            + "---\n\n## Purpose\n\n"
+            + manager_sources.RULE
+            + "\n\n## Acceptance Criteria\n\n- Keep scripts/verify-inputs.json current.\n"
+            + "\n## Implementation\n\n- Record the declared verify inputs.\n"
+            + "\n## Validation\n\n- Keep full verify required.\n"
+            + "\n## Decision Log\n\n"
+            + manager_sources.PREFIX
+            + json.dumps(request, sort_keys=True)
+            + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        # Model a durable batch accepted before the critical-only policy existed.
+        with mock.patch.object(verify_input_requests, "validate_new_priority", return_value=None):
+            result = loop_manager.validate_maintenance_planner_result(
+                self.connection, context, self.repo, loop_manager.changed_files(self.repo),
+                refactoring_plan_ids=(), allow_general_plans=True,
+            )
+        self.assertIsNotNone(result)
+
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Prepare legacy verify-input maintenance plan")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), self.repo, "main", result, plan_commit,
+        )
+        self.assertEqual(intent.publication_stage, "prepared")
+        git(self.repo, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE repo = ? AND plan_id = 'G-002'",
+            (str(self.repo),),
+        ).fetchone())
+
+        self.connection.commit()
+        restarted = sqlite3.connect(":memory:")
+        self.addCleanup(restarted.close)
+        self.connection.backup(restarted)
+        restarted.row_factory = sqlite3.Row
+        recovered = loop_manager.recover_maintenance_planning_batch(
+            restarted, str(self.repo), self.repo, "main",
+        )
+
+        row = restarted.execute(
+            "SELECT priority, status FROM exec_plans WHERE repo = ? AND plan_id = 'G-002'",
+            (str(self.repo),),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("normal", "READY"))
+        self.assertEqual(recovered.phase, maintenance_state.MaintenancePhase.IDLE)
+        self.assertEqual(recovered.last_cycle_commit, plan_commit)
+        self.assertIsNone(recovered.publication_stage)
+        self.assertEqual(restarted.execute(
+            "SELECT COUNT(*) FROM exec_plans WHERE repo = ? AND plan_id = 'G-002'",
+            (str(self.repo),),
+        ).fetchone()[0], 1)
+
     def test_publication_requires_latest_single_commit_and_is_atomic_and_idempotent(self):
         context = self._begin_barrier()
         self._write_barrier_batch()
