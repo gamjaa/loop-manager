@@ -17,12 +17,17 @@ draft 목록 알림의 원격 링크를 현재 저장된 판단 근거와 대조
 
 ## Acceptance Criteria
 
+- 실제 사용자 판단이 이미 자동 해소됐거나 질문이 유효하지 않으면 링크 변경만으로 목록을 다시 보내지 않으며 기존 미전송·잔여 조각을 취소한다. 보존된 decision·전송 감사는 유지한다.
+- 기존 `draft_decision` 개별 legacy 알림도 pending/revision 일치만으로 계속 전달하지 않고 현재 미해결 질문·사용자 행동 필요성을 재확인한다. 자동 복구로 더는 사용자 질문이 없으면 오래된 미전송 메시지를 취소한다.
+
 - R-053/R-061: 현재 실제 사용자 질문 목록의 ID·질문 identity·판단 revision이 같아도 저장된 원격 링크가 달라지면 오래된 목록의 미전송 조각을 취소한다. 현재 확인한 링크를 가진 목록을 한 번 생성하고, 같은 목록·같은 근거의 재관측과 재시작은 중복 전송하지 않는다.
 - 목록 생성 뒤 전송 직전 또는 조각 사이에 링크가 바뀌어도 다음 조각을 보내기 전에 재검사한다. 이전 payload·고정 텍스트·이미 확인된 전송 위치와 전송/취소 감사를 보존하고, 현재 목록은 기존 ID 링크·UTF-16 entity 처리로 전달한다. 전송 완료된 과거 알림을 수정하거나 취소하지 않는다.
 - 링크가 없는 항목도 ID·제목을 표시하는 기존 계약을 유지한다. 비교에는 Manager가 이미 관측해 저장한 링크만 사용하며 링크를 추측하거나 GitHub 조회·외부 전송을 새로 수행하지 않는다. 링크 표현 변화가 사용자 답변·새 질문·판단 revision 변경이나 실행 대기 해제의 근거가 되지 않는다.
-- 자동 유효성 재평가는 목록과 건수에서 계속 제외하고 다른 실제 질문은 유지한다. 기존 개별 `draft_decision` 알림은 원래 pending/revision 재검사·payload·고정 텍스트·재시작 위치로 이어 보내며 이번 목록 정책 때문에 다시 만들거나 취소하지 않는다.
+- 자동 유효성 재평가는 목록과 건수에서 계속 제외하고 다른 실제 질문은 유지한다. 기존 개별 `draft_decision` 알림도 현재 실제 미해결 사용자 질문이 남아 있는 경우에만 pending/revision·판단 근거를 재검사해 전달한다. 이미 해결된 질문이나 새 정책에서 불필요한 미전송 조각은 취소하며 전송된 과거 조각·payload·감사는 유지한다.
 
 ## Implementation
+
+- [ ] `notifications/delivery.py:_claim_piece()`의 legacy `draft_decision`에도 현재 미해결 질문과 R-053의 사용자 행동 필요성 검사를 적용한다. 링크 재검사·목록 dedup은 기존 구현 경계로 유지한다.
 
 - [ ] 확인한 `loop_manager_internal/notifications/events.py:enqueue_draft_decisions()`의 목록 중복 판정과 event identity를 현재 목록의 저장된 URL에도 연결한다. 기존 `decisions()`의 ID·질문 identity·revision 비교와 outbox 취소/생성 경계를 재사용하고 동일 입력의 반복 생성과 링크 변경 누락을 함께 막는다. 새 notification 종류·DB schema·공통 상태 저장소를 추가하지 않는다.
 - [ ] 확인한 `loop_manager_internal/notifications/delivery.py:_claim_piece()`의 `draft_decisions` 분기에서 payload의 링크와 현재 evidence의 링크를 대조한다. 기존 `user_question_ids()`와 pending·revision·identity 검사를 유지하고 stale 목록의 남은 조각만 취소한다. 같은 파일의 legacy `draft_decision` 분기와 전송 확인·재시도·entity 경계를 보존한다.
@@ -43,6 +48,8 @@ draft 목록 알림의 원격 링크를 현재 저장된 판단 근거와 대조
 - [ ] 링크만 변경된 조건·중단 재시도·기존 알림 보존의 최소 unit 검증
 
 ## Decision Log
+
+- 2026-10-22 정책 변경: 실제 미해결 사용자 판단이 없으면 draft 목록/개별 알림을 보내지 않는다. 단순 링크 교체는 새로운 질문·승인·중복 메시지가 아니다. 부분 전송과 과거 결정 감사의 보존 계약은 유지한다.
 
 - 이번 검토는 delta이며 프로젝트 최종 전문 확인이 아니다. 같은 변경의 답변 출처·공통 diff·부분 정리·자동 재평가 제외·단일 의미 검토는 현재 코드와 회귀에 이미 반영됐다. G-244의 같은 ID archive 이동을 목표 삭제로 해석하거나 소급 계획·검증 성공을 만들지 않는다. 이 계획은 그 구현 이후 남은 목록 URL 비교만 담당하며 catalog의 실패 알림·유지보수 알림·차단 전수 감사 작업을 중복 구현하지 않는다.
 - 새 ID는 활성/archive 파일의 최대 293 다음 번호다. 선행 구현은 현재 base에 반영돼 있어 `depends_on`은 비어 있다. mutable snapshot 밖의 계획·사용자 결정·실행 기록을 변경하지 않으며 `docs/FUTURE_IDEAS.md` 항목을 작업 근거로 쓰지 않았다.

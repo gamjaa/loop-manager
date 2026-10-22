@@ -2,7 +2,7 @@
 
 ## Summary
 
-Planner·Worker·Reviewer의 저장소 접근과 문서 수정·PR 보고 책임을 정리한다. Worker는 Requirement·다른 ExecPlan·선택 ExecPlan의 frontmatter를 수정하지 않으며 PR 문서 보고는 파일명·요약·이유·영향만 표시한다. 선택된 ExecPlan은 문서 보고·DOCUMENT_CHANGE 제출 대상에서 제외하되 기존 diff 검토·범위 검증은 유지한다. 모호한 작업은 원격 draft로 게시하고, 사용자 본문 변경이나 User Decision의 출처·revision·현재 소유권을 검증해 결과를 본문에 통합하고 임시 판단 입력을 정리한다. 게시·DB 반영·감사·dependency를 보존하며 독립 작업은 계속한다.
+Planner·Worker·Reviewer의 저장소 접근과 문서 수정·PR 보고 책임을 정리한다. Worker는 Git staging·commit·push를 직접 수행하지 않고 Manager에게 checkpoint 생성을 요청한다. Worker는 Requirement·다른 ExecPlan·선택 ExecPlan의 frontmatter를 수정하지 않으며 PR 문서 보고는 파일명·요약·이유·영향만 표시한다. 선택된 ExecPlan은 문서 보고·DOCUMENT_CHANGE 제출 대상에서 제외하되 기존 diff 검토·범위 검증은 유지한다. 모호한 작업은 원격 draft로 게시하고, 사용자 본문 변경이나 User Decision의 출처·revision·현재 소유권을 검증해 결과를 본문에 통합하고 임시 판단 입력을 정리한다. 게시·DB 반영·감사·dependency를 보존하며 독립 작업은 계속한다.
 
 ## Context
 
@@ -28,7 +28,7 @@ Planner의 기존 계획 개정은 Manager가 제공한 snapshot·mode와 R-082�
 
 일반 Planner는 현재 PRODUCT·Requirement 범위 밖이지만 보존 가치가 있는 아이디어를 `docs/FUTURE_IDEAS.md`에 생성·수정할 수 있다. 유지보수 Planner는 일반 계획 작성을 허용한 mode에서만 같은 권한을 가진다. 파일 삭제는 허용하지 않으며, 그 항목을 같은 계획 주기의 ExecPlan 범위나 현재 미충족 작업의 근거로 사용하거나 자동 승격하지 않는다.
 
-파일 수정 권한과 제품 목표를 구분한다. Worker는 합의된 목표와 현재 작업을 구현하기 위해 관련 문서를 수정할 수 있지만, 무관한 새 기능이나 다른 계획의 목표를 추가 구현하지 않는다. 별도 사용자 승인이 필요한 목표·Non-Goal·비가역 변경 등의 결정을 문서 수정으로 대신 승인하지 않는다. [R-093](%5BR-093%5D%20원격%20작업%20브랜치로%20새%20환경에서%20이어하기.md)에 따른 선택된 관리 작업 branch의 로컬 checkpoint commit만 예외로 허용하며, 나머지 commit과 fetch·rebase·push·PR 생성은 계속 Manager가 담당한다.
+파일 수정 권한과 제품 목표를 구분한다. Worker는 합의된 목표와 현재 작업을 구현하기 위해 관련 문서를 수정할 수 있지만, 무관한 새 기능이나 다른 계획의 목표를 추가 구현하지 않는다. 별도 사용자 승인이 필요한 목표·Non-Goal·비가역 변경 등의 결정을 문서 수정으로 대신 승인하지 않는다. [R-093](%5BR-093%5D%20원격%20작업%20브랜치로%20새%20환경에서%20이어하기.md)에 따라 Worker는 checkpoint 생성 요청과 COMMIT_TITLE만 제공하며 Git add·commit·fetch·rebase·push·PR 조작은 직접 수행하지 않는다. Manager는 Worker 종료·허용 범위·index·소유권을 확인한 후 commit·게시를 전담한다. 이전 Worker 직접 commit 이력은 복구점으로 보존하고 신규 Git 쓰기 권한의 근거로 사용하지 않는다.
 
 코드·설계·계획 변경 때문에 다른 문서의 경로·계약·dependency·구현·검증 설명도 달라져야 하면 Worker는 허용된 문서를 함께 갱신하고 변경 이유·영향을 남긴다. 직접 수정할 수 없는 Requirement·다른 ExecPlan·선택 ExecPlan 선언의 변경 필요성은 근거와 함께 보고한다. Planner는 영향받는 ExecPlan을 위 snapshot·PR 경계에서 개정하며 제품·설계 문서까지 수정하지 않는다. 다른 실행 작업·미해결 사용자 결정·기존 목표를 덮어쓰지 않고, 변경된 문서·구현·관계의 정합성을 검증한다.
 
@@ -85,6 +85,8 @@ Reviewer는 현재 작업의 목표·승인된 사용자 결정·근거 문서, 
 Worker가 수정한 허용 문서도 검토 대상이다. 수정 전 요청과 목표, 수정 이유·새 문서·구현의 정합성 및 PR의 문서별 파일명·요약·이유·영향을 함께 확인한다. 허용된 문서 수정 자체를 blocking issue로 삼지 않고 실제 목표 불충족·회귀·잘못된 설계·검증 약화를 판단한다. Reviewer는 문서·코드를 수정하거나 테스트·전체 verify를 재실행하지 않으며 기존 Worker targeted test와 Manager 전체 verify 결과로 검토한다.
 
 ## Acceptance Criteria
+
+- Worker는 관리 worktree에서 허용 파일만 수정하고 관련 targeted test를 수행한다. checkpoint 요청 후 Manager가 보호 문서·index·소유권을 검사해 staging·commit·게시한 뒤 같은 Worker 세션을 재개하며, Worker의 직접 Git add/commit/fetch/rebase/push/PR 및 shared metadata 쓰기는 허용하지 않는다.
 
 - 일반·유지보수 Planner와 Reviewer는 저장소 전체를 읽을 수 있다. Planner는 허용된 ExecPlan을 작성·개정하고, 일반 Planner와 일반 계획 작성을 허용한 유지보수 mode는 `docs/FUTURE_IDEAS.md`도 생성·수정할 수 있다. FUTURE_IDEAS 삭제·자동 작업 승격과 제품·설계 문서 쓰기는 거부된다. ExecPlan·코드·테스트·설정 변경만으로 새 점검 Planner를 호출하지 않고 기존 읽기 전용 호출의 결과·감사는 보존한다.
 - 설계·계획의 판단이 필요한 경우 유효한 draft에 목표·근거·질문·선택 영향을 기록하고 Planner 종료 시 다른 게시 대상과 함께 원격에 게시한다. 이 draft 때문에 독립 계획 batch를 거부하거나 프로젝트를 차단하지 않는다.

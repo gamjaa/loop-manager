@@ -58,6 +58,8 @@ priority: low
 
 ## Acceptance Criteria
 
+- Worker 최초·동일 session 재개·fallback instruction에 Git 직접 쓰기 금지, checkpoint 요청과 COMMIT_TITLE 반환, Manager의 종료 후 commit/게시 확정 뒤 기존 세션 재개의 동일 계약을 유지한다. 과거 직접 commit 이력은 신규 Worker의 Git 권한으로 소개하지 않는다.
+
 - 최초 Worker turn에는 고정된 공통·Worker 역할 instruction과 작업별 결과 형식·선택된 ExecPlan·worktree·범위·승인 문맥을 완전하게 전달한다. 역할·권한·targeted test와 전체 verify 책임은 instruction에 유지하고 사용자 메시지에 복사하지 않는다. 같은 provider·Model 세션의 일반 수정, effort 변경, verify·Review 교정에서는 변경되지 않은 작업 문맥과 이미 전달한 결과를 반복하지 않고 새 사실과 교정만 보낸다.
 - archive 후보 또는 비검증 오류가 새로 생기거나 바뀌면 해당 세션에 한 번 전달한다. 변화가 없으면 재전송하지 않고 validation feedback delta와 비검증 오류로 동일 내용을 두 번 보내지 않는다. 폐지된 CLI 파일 승인 요청·patch 대조를 복원하지 않는다.
 - provider·Model 교체 또는 session-unavailable fallback으로 새 세션이 시작되면 같은 작업에 고정된 공통·Worker 역할 instruction을 재사용하고 사용자 메시지에는 결과 형식·계획·작업 공간·미완료 작업·미해결 피드백만 간결히 재구성한다. 이전 대화, Worker 결과와 verify·Review 원문 전체는 보내지 않는다.
@@ -65,7 +67,7 @@ priority: low
 - 축약 뒤에도 Worker 권한, 일반 draft·User Decision 보호, 고정 원본 묶음과 역할별 실제 instruction, 결과 protocol, targeted test 범위와 전체 verify 분리, 비밀값 가림 및 세션·작업 공간 복구 계약은 유지된다. R-082의 선택된 ExecPlan 본문만 수정·frontmatter와 다른 ExecPlan 및 활성/archive의 모든 Requirement 변경 금지, 관련 PRODUCT·ARCHITECTURE·FUTURE_IDEAS 허용, source 문자열 보존·Planner/Manager 선언 교정 책임은 정합화된 Worker instruction에 유지한다. Manager가 선택 frontmatter를 부분 복원한 새 사실과 현재 diff·문서 보고 갱신 피드백은 같은 세션 또는 fallback의 미완료 문맥에 전달하고, 이를 권한 확대·검증 성공으로 표시하지 않는다. 과거 파일 승인 감사·작업물·session은 보존한다. 전송 도중 중단·재시작해도 새 정보를 누락하지 않는다.
 - 수동 complete/submit 수락 뒤 자동 Worker 교정에도 같은 초기·delta·복구 계약을 적용한다. 수동 문맥을 덧붙이는 경로가 이미 전달한 결과나 verify·Review 원문을 다시 넣지 않는다. verify 성공 출력은 Worker에게 전달하지 않으며 미해결 실패는 기존 진단 helper의 필요한 피드백으로 전달한다. 수동 제출의 전체 G·후보 R·미확인 외부 테스트와 사용자 생략을 보존하고 실제 Worker 성공으로 합성하지 않는다.
 - R-082의 프로젝트 일반 planning·개정 게시·DB 적용과 필요한 rebase를 마친 최신 ExecPlan을 최초·재개 Worker의 기준으로 전달한다. 상위 명세의 관련성·개정을 작업별 prompt에서 다시 판단시키지 않는다. 유효한 planning 결과가 작업 조건 유지를 확인했다면 source 지문·SHA 전진이나 순수 진행 기록만으로 Worker 호출·문맥 재전송을 만들지 않는다. 실제 조건 변경·미완료 보완과 기존 역할의 검증 입력은 보존하고 확인된 전달 cursor만 전진시킨다.
-- R-093/G-306의 checkpoint 요청·실제 로컬 commit·게시 결과를 완료 후보와 구분해 초기·delta·fallback 문맥에 연결한다. 고정 instruction에는 제한 실행·게시 대기·기존 Git 권한을 유지하고 사용자 메시지에는 새로 확인한 복구점·미해결 게시 결과·미완료 작업만 전달한다. 게시 대기 중 prompt 축약을 이유로 새 Worker 호출을 만들거나 checkpoint를 검증·Review 성공으로 표시하지 않는다.
+- R-093/G-306의 Worker checkpoint 요청·Manager 생성 로컬 commit·원격 게시 결과를 완료 후보와 구분해 초기·delta·fallback 문맥에 연결한다. 고정 instruction에는 Worker의 직접 Git add/commit/fetch/rebase/push/PR 금지, Manager 전담 commit·게시 대기 책임을 유지하고 사용자 메시지에는 새로 확인한 복구점·미해결 게시 결과·미완료 작업만 전달한다. 게시 대기 중 prompt 축약을 이유로 새 Worker 호출을 만들거나 checkpoint를 검증·Review 성공으로 표시하지 않는다.
 
 ## Implementation
 
@@ -99,6 +101,8 @@ priority: low
 - [ ] 관련 targeted 회귀 사례 추가
 
 ## Decision Log
+
+- 2026-10-22 정책 정합화: 본 계획은 G-306의 Manager 전담 checkpoint 요청·결과를 최소 prompt에 연결한다. 실제 Git 효과와 legacy commit 검사는 G-306/G-307에 남기고 현재 고정 Worker instruction은 Git 쓰기 금지로 명확히 한다.
 
 - 5903c5aa full 검토와 snapshot token `3b4661249971e356420adeb51ba3837ed6a09b8da1b3fdafddbc451cba17844f`에서 R-093의 직접 구현과 남은 checkpoint 결과 경계를 대조했다. 원본 hash `8acf2fbe100d4ae785955d787befc138200885f1db2b3478584b9dd15223326d`·ID·경로·기존 수행 기록과 초기/delta/fallback 목표를 보존한다. G-306의 protocol을 선행으로 소비하며 checkpoint 기능을 중복 구현하지 않는다. complexity high는 기존 전달 cursor·session 전이의 판단, risk medium은 누락/중복 문맥과 기존 재전송 복구에 근거하며 분류·priority는 유지한다. 구현·테스트·verify 성공은 기록하지 않는다.
 
