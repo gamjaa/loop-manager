@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import sqlite3
 import uuid
+import time
 
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS recovery_records (
     progress_marker TEXT NOT NULL,
     occurrence INTEGER NOT NULL,
     attempts INTEGER NOT NULL,
+    retry_after REAL,
     recovery_counts TEXT NOT NULL DEFAULT '{}',
     occurrence_index TEXT NOT NULL DEFAULT '{}',
     detail TEXT NOT NULL,
@@ -72,11 +74,13 @@ CREATE TABLE IF NOT EXISTS review_correction_turns (
     review_result_id INTEGER NOT NULL,
     reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     started_at TEXT,
+    retry_after REAL,
     PRIMARY KEY (repo, plan_id, run_id, review_result_id)
 )
 """
 
 MAX_REVIEW_CORRECTIONS_PER_RUN = 3
+RETRY_DELAY_SECONDS = 30
 
 
 def block_user_targets(
@@ -112,7 +116,12 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
     connection.execute(PERSISTENT_FAILURE_SCHEMA)
     connection.execute(REVIEW_CORRECTION_SCHEMA)
+    turn_columns = {str(row[1]) for row in connection.execute('PRAGMA table_info(review_correction_turns)')}
+    if 'retry_after' not in turn_columns:
+        connection.execute('ALTER TABLE review_correction_turns ADD COLUMN retry_after REAL')
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(recovery_records)")}
+    if 'retry_after' not in columns:
+        connection.execute('ALTER TABLE recovery_records ADD COLUMN retry_after REAL')
     if "notification_episode" not in columns:
         connection.execute("ALTER TABLE recovery_records ADD COLUMN notification_episode TEXT")
     if "recovery_counts" not in columns:
@@ -207,19 +216,27 @@ def reserve_review_correction(
         return True, 0, None
     with connection:
         existing = connection.execute(
-            "SELECT 1 FROM review_correction_turns WHERE repo = ? AND plan_id = ? "
-            "AND run_id = ? AND review_result_id = ?",
-            (repo, plan_id, run_id, review_result_id),
+            "SELECT run_id FROM review_correction_turns WHERE repo = ? AND plan_id = ? "
+            "AND review_result_id = ?",
+            (repo, plan_id, review_result_id),
         ).fetchone()
-        used = int(connection.execute(
+        used = connection.execute(
             "SELECT COUNT(*) FROM review_correction_turns "
-            "WHERE repo = ? AND plan_id = ? AND run_id = ?",
-            (repo, plan_id, run_id),
-        ).fetchone()[0])
+            "WHERE repo = ? AND plan_id = ? AND started_at IS NOT NULL",
+            (repo, plan_id),
+        ).fetchone()[0]
         if existing is not None:
-            return True, used, run_id
-        if used >= MAX_REVIEW_CORRECTIONS_PER_RUN:
-            return False, used, run_id
+            return True, used, str(existing[0])
+        if used and used % MAX_REVIEW_CORRECTIONS_PER_RUN == 0:
+            last = connection.execute(
+                'SELECT rowid, retry_after FROM review_correction_turns WHERE repo=? AND plan_id=? '
+                'AND started_at IS NOT NULL ORDER BY started_at DESC, rowid DESC LIMIT 1', (repo, plan_id)).fetchone()
+            if last['retry_after'] is None:
+                connection.execute('UPDATE review_correction_turns SET retry_after=? WHERE rowid=?',
+                                   (time.time() + RETRY_DELAY_SECONDS, last['rowid']))
+                return False, used, run_id
+            if time.time() < last['retry_after']:
+                return False, used, run_id
         connection.execute(
             "INSERT INTO review_correction_turns "
             "(repo, plan_id, run_id, review_result_id) VALUES (?, ?, ?, ?)",
@@ -756,3 +773,26 @@ class RecoveryRepository:
         )
         if changed.rowcount != 1:
             raise RecoveryStateConflict("recovery pause target changed")
+
+    def defer_retry(self, repo: str, plan_id: str | None):
+        """Preserve the due time and audit across physical runtime replacements."""
+        saved = self.row(repo, plan_id)
+        if saved is None or saved['pending_action'] == 'final_block':
+            return None
+        if saved['retry_after'] is None:
+            with self.connection:
+                changed = self.connection.execute(
+                    'UPDATE recovery_records SET retry_after=? WHERE repo=? AND subject=? AND generation=?',
+                    (time.time() + RETRY_DELAY_SECONDS, repo, self._subject(plan_id), saved['generation']))
+                if changed.rowcount != 1:
+                    raise RecoveryStateConflict('retry wait target changed')
+            saved = self.row(repo, plan_id)
+        return dict(saved)
+
+    def finish_retry_wait(self, saved):
+        with self.connection:
+            changed = self.connection.execute(
+                'UPDATE recovery_records SET retry_after=NULL WHERE repo=? AND subject=? AND generation=? AND identity=?',
+                (saved['repo'], saved['subject'], saved['generation'], saved['identity']))
+            if changed.rowcount != 1:
+                raise RecoveryStateConflict('retry wait target changed')

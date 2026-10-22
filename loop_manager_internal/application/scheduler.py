@@ -16,8 +16,9 @@ from loop_manager_internal.config.managed_config import ManagedConfig, fast_mode
 from loop_manager_internal.config.managed_config import ManagedConfigError
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.runtime import project_registry
+from loop_manager_internal.runtime import refresh
 from loop_manager_internal.storage.runtime_state import TaskLimitReached
-from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+from loop_manager_internal.storage.db_access import DatabaseWaitTimeout, finish_implicit_request
 from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.handoff_gate import RuntimeHandoffGate
 from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
@@ -119,6 +120,8 @@ def _run_registered_project(
             if handoff_gate is not None:
                 handoff_gate.stop()
             result = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
+        except refresh.RuntimePaused:
+            result = ProjectRunResult(ProjectRunKind.WAITING, 0, '사용자 pause; 실행 상태 보존')
         except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
             result = ProjectRunResult(
                 ProjectRunKind.CONFIGURATION_ERROR,
@@ -168,6 +171,7 @@ def schedule_registered_projects(
 
     projects = (project_registry.list_projects(connection) if selected_projects is None
                 else selected_projects)
+    projects = tuple(project for project in projects if not refresh.paused(state_dir, project.repo))
     if not projects:
         return ()
 
@@ -176,19 +180,29 @@ def schedule_registered_projects(
             connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
         )
         connection.commit()
-    effects._preflight_self_merge_handoff(
-        connection, projects, state_dir, runtime_mutation, config_path=config.path,
-    )
-
     planner_mutex = threading.Lock()
     handoff_gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
-    external_run_id = secrets.token_hex(16)
+    def check_pause():
+        if refresh.paused(state_dir, events.current_context().get('project')):
+            raise refresh.RuntimePaused()
+    handoff_gate.pause_check = check_pause
+    def observe():
+        with closing(effects.connect_database(state_dir, run_migrations=False)) as observed:
+            effects._preflight_self_merge_handoff(
+                observed, projects, state_dir, runtime_mutation, config_path=config.path)
+    if runtime_mutation is not None:
+        handoff_gate.observer = observe
+        handoff_gate.before_observe = lambda: finish_implicit_request(state_dir / 'loop-manager.db')
+    external_run_id = events.current_context().get('run') or secrets.token_hex(16)
     # 프로젝트 조율과 대기는 실제 Agent 호출 자리를 소비하지 않는다.
     worker_count = len(projects)
     task_scheduler = TaskScheduler(config, effects.connect_database, state_dir, connection, external_run_id=external_run_id,
                                    priority_reader=effects.catalog_schedule_decision)
     scheduler_token = current_scheduler.set(task_scheduler)
+    handoff_token = _runtime_handoff_signal.set(handoff_gate)
     try:
+        effects._preflight_self_merge_handoff(
+            connection, projects, state_dir, runtime_mutation, config_path=config.path)
         with VerifyCoordinator() as verify_coordinator, ThreadPoolExecutor(
             max_workers=worker_count,
             thread_name_prefix="loop-project",
@@ -214,8 +228,14 @@ def schedule_registered_projects(
                 )
                 for project in projects
             )
-            return tuple(future.result() for future in futures)
+            results = tuple(future.result() for future in futures)
+            if handoff_gate.request is not None:
+                if any(item.result.kind is ProjectRunKind.OPERATIONAL_ERROR for item in results):
+                    raise refresh.RuntimeDrainUncertain('runtime 반환 중 실패한 작업의 저장·정리 확인이 필요합니다.')
+                raise SelfMergeRuntimeHandoff(handoff_gate.request)
+            return results
     finally:
+        _runtime_handoff_signal.reset(handoff_token)
         current_scheduler.reset(scheduler_token)
 
 
@@ -236,6 +256,8 @@ def run_registered_projects(
     """Run all registered projects and aggregate outcomes after every worker exits."""
 
     with events.log_context(run=events.current_context().get("run") or secrets.token_hex(16), stage="RUN"), events.activity("전체 실행") as report:
+        if refresh.paused(state_dir):
+            raise refresh.RuntimePaused()
         try:
             with connection:
                 notifications.configure_session(
@@ -255,12 +277,17 @@ def run_registered_projects(
                 **({"selected_projects": selected_projects} if selected_projects is not None else {}),
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
-        except SelfMergeRuntimeHandoff:
-            report.update(result="runtime_handoff", next_action="다음 외부 실행에서 최신 runtime으로 재개")
-            return 0
+        except SelfMergeRuntimeHandoff as error:
+            report.update(result="runtime_handoff", next_action="부모에서 최신 runtime으로 재개")
+            try:
+                return refresh.request_restart(connection, state_dir, runtime_mutation, error.request)
+            except Exception as failure:
+                raise refresh.RuntimeDrainUncertain(str(failure)) from failure
         if any(item.result.kind is ProjectRunKind.RUNTIME_HANDOFF for item in results):
-            report.update(result="runtime_handoff", next_action="다음 외부 실행에서 최신 runtime으로 재개")
+            report.update(result="runtime_handoff", next_action="소유 인계 자료 확인 필요")
             return 0
+        if refresh.paused(state_dir):
+            raise refresh.RuntimePaused()
         try:
             notifications.dispatch_pending(
                 connection, config.telegram_token, config.telegram_chat_id

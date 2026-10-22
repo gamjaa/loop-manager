@@ -77,7 +77,7 @@ def run_project_result(
                 } if recovery_request_id is not None else {}),
             )
             report.update(result=outcome.kind.value, next_action=(
-                "다음 외부 실행에서 재검사" if outcome.kind in {ProjectRunKind.TRANSIENT_PAUSE, ProjectRunKind.USAGE_LIMIT_PAUSE}
+                "작업별 재시도·조건 대기" if outcome.kind in {ProjectRunKind.TRANSIENT_PAUSE, ProjectRunKind.USAGE_LIMIT_PAUSE}
                 else "대기 조건 확인" if outcome.kind is ProjectRunKind.WAITING else "이번 프로젝트 처리 종료"),
                 reason=events.summary(outcome.detail), level="ERROR" if outcome.exit_code else "INFO")
             return outcome
@@ -177,6 +177,12 @@ def _run_project_result(
         return True, recovery_plan_id
 
     while True:
+        from loop_manager_internal.application.task_scheduling import current_scheduler
+        from loop_manager_internal.runtime.handoff_gate import observe_runtime
+        scheduler = current_scheduler.get()
+        if scheduler is not None:
+            scheduler.wait_retry(connection, repo, resume=True)
+        observe_runtime()
         dispatch_checkpoints, checkpoint_plan_id = checkpoint_dispatch_scope()
         if dispatch_checkpoints and effects._checkpoint_dispatch_ready(connection, repo):
             project_before = connection.execute(
@@ -310,6 +316,10 @@ def _run_project_result(
                     step_result = PROJECT_STEP_RETRY
         if recovery_request_id is not None and step_result == PROJECT_STEP_RETRY:
             step_result = PROJECT_STEP_TRANSIENT_PAUSE
+        if (scheduler is not None and step_result == PROJECT_STEP_TRANSIENT_PAUSE
+                and scheduler.wait_retry(connection, repo)):
+            recovery_attempts.clear()
+            step_result = PROJECT_STEP_RETRY
         if step_result != PROJECT_STEP_RETRY:
             break
 

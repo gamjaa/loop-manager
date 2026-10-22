@@ -7,7 +7,7 @@ from loop_manager_internal.application.contracts import CleanupAssessment
 from loop_manager_internal.git import cleanup_service, manager_git_journal
 from loop_manager_internal.runtime import bootstrap
 from loop_manager_internal.runtime.contracts import RuntimeMutation
-from loop_manager_internal.runtime.contracts import RuntimeWorktree
+from loop_manager_internal.runtime.contracts import RuntimeWorktree, RuntimeRefresh
 from loop_manager_internal.storage import catalog_migration
 from pathlib import Path
 
@@ -22,6 +22,7 @@ class BootstrapServiceEffects:
     _validate_managed_path_boundary: Callable[..., object]
     _worktree_catalog: Callable[..., object]
     git: Callable[..., object]
+    git_bytes: Callable[..., bytes]
     github_repository: Callable[..., object]
     operation_log: Callable[..., object]
     repository_origin: Callable[..., object]
@@ -33,6 +34,7 @@ def _bootstrap_service(effects: BootstrapServiceEffects, ) -> bootstrap.Bootstra
     return bootstrap.BootstrapService(
         bootstrap.BootstrapGitEffects(
             git=effects.git,
+            git_bytes=effects.git_bytes,
             _git_operation_entries=effects._git_operation_entries,
             _validate_managed_path_boundary=effects._validate_managed_path_boundary,
             validate_managed_worktree=effects.validate_managed_worktree,
@@ -314,7 +316,7 @@ def run_runtime_child(
     config_path: Path,
     runtime: RuntimeWorktree,
     arguments: list[str],
-) -> int:
+) -> int | RuntimeRefresh:
     return effects._bootstrap_service().run_runtime_child(source, state_dir, config_path, runtime, arguments)
 
 

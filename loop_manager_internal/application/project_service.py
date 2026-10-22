@@ -190,6 +190,8 @@ class ProjectService:
                 (self.state.repo,)).fetchone()
 
     def _prepare_repository(self) -> int | None:
+        from loop_manager_internal.runtime.handoff_gate import observe_runtime
+        observe_runtime()
         self.effects._check_runtime_handoff()
         # Resolve the persisted project key without consulting repository config.
         # An interrupted Agent may have changed origin or hooksPath, so the saved

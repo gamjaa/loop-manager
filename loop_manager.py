@@ -8,6 +8,8 @@ import os
 from loop_manager_internal.runtime import operation_events
 from loop_manager_internal.application.compatibility import install_exports as _install_exports
 from loop_manager_internal.config import execution_path
+from loop_manager_internal.runtime import refresh
+from loop_manager_internal.runtime.contracts import RuntimeRefresh
 
 ROOT = Path(__file__).resolve().parent
 _install_exports(__name__, ROOT)
@@ -140,6 +142,9 @@ def main() -> int:
         state_dir = state_directory(args.state_dir)
         config_path = source_config_path(ROOT, args.config)
         try:
+            if args.command == 'run' and refresh.paused(state_dir):
+                operation_log('전체 pause: 실행 상태를 보존합니다.')
+                return 0
             if args.command == "status" or args.command == "config" and args.config_command == "set":
                 return configure_registry(args, state_dir, config_path)
             if args.command == "run" and not args.runtime_child:
@@ -167,9 +172,13 @@ def main() -> int:
                 )
                 # Mutation validation binds the selected revision and verifies any
                 # later live base advance; equality here would reject that proof.
-                return execute_runtime_command(
-                    args, state_dir, config_path, runtime_mutation,
-                )
+                handoff_token = os.environ.get('LOOP_MANAGER_RUNTIME_HANDOFF_TOKEN')
+                channel_token = refresh.channel.set((handoff_token, operation_events.current_context()['run'])
+                    if handoff_token else None)
+                try:
+                    return execute_runtime_command(args, state_dir, config_path, runtime_mutation)
+                finally:
+                    refresh.channel.reset(channel_token)
 
             source = ROOT
             mutation_id = secrets.token_hex(16)
@@ -177,22 +186,39 @@ def main() -> int:
             lock_options = {"name": f"manual-{mutation_id}.lock"} if concurrent else {}
             runtime_options = {"concurrent": True} if concurrent else {}
             with process_lock(state_dir, identity=f"bootstrap:{mutation_id}", **lock_options) as lock_handle:
-                with operation_events.log_context(stage="BOOTSTRAP"), operation_events.activity("runtime 준비", heartbeat=True) as report:
-                    runtime = prepare_bootstrap_runtime(source, state_dir, mutation_id, **runtime_options)
-                    report.update(result="준비 완료", runtime_sha=runtime.commit_sha)
-                _write_process_lock_identity(lock_handle, f"runtime:{mutation_id}")
-                return run_runtime_child(
-                    source,
-                    state_dir,
-                    config_path,
-                    runtime,
-                    raw_arguments,
-                )
+                request = None
+                seen = set()
+                while True:
+                    if args.command == 'run' and refresh.paused(state_dir):
+                        return 0
+                    with operation_events.log_context(stage="BOOTSTRAP"), operation_events.activity("runtime 준비", heartbeat=True) as report:
+                        runtime = prepare_bootstrap_runtime(source, state_dir, mutation_id, **runtime_options)
+                        report.update(result="준비 완료", runtime_sha=runtime.commit_sha)
+                    if request is not None:
+                        _bootstrap_service().validate_refresh(source, state_dir, request, runtime.commit_sha)
+                        if runtime.commit_sha in seen:
+                            raise RuntimeError('같은 revision의 runtime 재시작을 거부합니다.')
+                    if args.command == 'run' and refresh.paused(state_dir):
+                        return 0
+                    seen.add(runtime.commit_sha)
+                    _write_process_lock_identity(lock_handle, f"runtime:{mutation_id}")
+                    result = run_runtime_child(source, state_dir, config_path, runtime, raw_arguments)
+                    if not isinstance(result, RuntimeRefresh):
+                        return result
+                    request = result
+                    mutation_id = secrets.token_hex(16)
+                    _write_process_lock_identity(lock_handle, f"bootstrap:{mutation_id}")
         except ProcessLockBusyError as error:
             if args.command == "run" and getattr(args, "skip_if_running", False):
                 return 0
             operation_log(f"오류: {error}", error=True)
             return 1
+        except refresh.RuntimePaused:
+            operation_log('사용자 pause: 실행 상태를 보존합니다.')
+            return 0
+        except refresh.RuntimeDrainUncertain as error:
+            operation_log(str(error), error=True)
+            return refresh.UNSETTLED_EXIT
         except (
             ManagedConfigError,
             project_registry.ProjectRegistryError,

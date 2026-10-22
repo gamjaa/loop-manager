@@ -303,7 +303,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
             paused = verify_handler.verify(previous_context, latest_base)
 
         self.assertEqual(paused.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
-        self.assertEqual(paused.recovery.observation.reason, handlers.RecoveryReason.TARGETED_TEST_CORRECTION)
+        self.assertEqual(paused.recovery.observation.reason, handlers.RecoveryReason.TARGETED_COLLECTION_PENDING)
         self.assertEqual(self.state.row()['phase'], 'VERIFYING')
         self.assertEqual(self.state.row()['worker_result'], 'worker result')
         self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
@@ -394,7 +394,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
             task_scheduling.current_scheduler.reset(scheduler_token)
 
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
-        self.assertEqual(outcome.recovery.observation.reason, handlers.RecoveryReason.TARGETED_TEST_CORRECTION)
+        self.assertEqual(outcome.recovery.observation.reason, handlers.RecoveryReason.TARGETED_COLLECTION_PENDING)
         self.assertEqual(len(inserted), 1)
         self.assertTrue(inserted[0].pending('repo', 'G-047'))
         self.assertEqual(launches, [])

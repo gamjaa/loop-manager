@@ -363,7 +363,7 @@ class WorkerTargetedFailureTests(ExecutionFixture, TestCase):
             self.agent(*a, **kw), targeted_collection_pending=True)
         result = self.handler.run(self.context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
-        self.assertEqual(result.recovery.observation.reason, RecoveryReason.TARGETED_TEST_CORRECTION)
+        self.assertEqual(result.recovery.observation.reason, RecoveryReason.TARGETED_COLLECTION_PENDING)
         self.effects.validation.verify.assert_not_called()
         self.effects.blocking.block_active_execplan.assert_not_called()
 
@@ -404,7 +404,7 @@ class WorkerTargetedFailureTests(ExecutionFixture, TestCase):
         with mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value=None):
             result = self.handler.run(self.context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
-        self.assertEqual(result.recovery.observation.reason, RecoveryReason.TARGETED_TEST_CORRECTION)
+        self.assertEqual(result.recovery.observation.reason, RecoveryReason.TARGETED_COLLECTION_PENDING)
         self.effects.agent.run_agent.assert_not_called()
         self.effects.validation.verify.assert_not_called()
         self.effects.blocking.block_active_execplan.assert_not_called()

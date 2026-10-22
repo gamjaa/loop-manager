@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from loop_manager_internal.runtime import operation_events as events
+from loop_manager_internal.runtime.handoff_gate import runtime_boundary
 
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -195,6 +196,7 @@ class ExecutionPhaseCoordinator:
     def __init__(self, ports: ExecutionLifecyclePorts):
         self._ports = ports
 
+    @runtime_boundary
     def prepare(self) -> ExecutionContext | ExecutionOutcome:
         try:
             prepared = self._ports.prepare()
@@ -209,6 +211,7 @@ class ExecutionPhaseCoordinator:
         except RecoveryFailure as error:
             return self._recovery_outcome(self._ports.recover_failure(None, error))
 
+    @runtime_boundary
     def dispatch(self, context: ExecutionContext) -> ExecutionOutcome:
         with events.log_context(project=getattr(context, "repo", events.current_context().get("project")),
                                 plan=getattr(getattr(context, "plan", None), "plan_id", events.current_context().get("plan")),
@@ -234,8 +237,8 @@ class ExecutionPhaseCoordinator:
                 outcome = self._recovery_outcome(self._ports.recover_failure(context, error))
             next_action = {
                 ExecutionOutcomeKind.RETRY: "같은 실행에서 재시도·교정",
-                ExecutionOutcomeKind.TRANSIENT_PAUSE: "다음 외부 실행에서 재검사",
-                ExecutionOutcomeKind.USAGE_PAUSE: "다음 외부 실행에서 사용 한도 재검사",
+                ExecutionOutcomeKind.TRANSIENT_PAUSE: "작업별 재시도·조건 대기",
+                ExecutionOutcomeKind.USAGE_PAUSE: "사용 한도 해소 근거 대기",
                 ExecutionOutcomeKind.STABLE_WAIT: "대기 조건 확인",
                 ExecutionOutcomeKind.FINAL_BLOCK: "차단 원인 확인",
                 ExecutionOutcomeKind.PLANNING_PENDING: "planning 결과 반영 대기",

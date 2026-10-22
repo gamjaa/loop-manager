@@ -2,6 +2,7 @@
 from __future__ import annotations
 from loop_manager_internal.runtime import operation_events as events
 import time
+from loop_manager_internal.runtime.handoff_gate import runtime_boundary, observe_runtime
 from loop_manager_internal.planning.planning_contracts import (
     MAX_PLANNER_VALIDATION_RETRIES, PlanningAgentResult, PlanningAgentResultKind,
     PlanningAgentPort, PlanningContext, PlanningDecision, PlanningDecisionKind,
@@ -54,14 +55,17 @@ class PlanningLifecycleCoordinator:
         return _PlanningRun(context=context, row=row, maintenance_cycle=cycle,
                             base_sha=context.base_sha, maintenance_planning=maintenance_planning)
 
+    @runtime_boundary
     def run(self, context: PlanningContext) -> PlanningOutcome:
         started, completed = time.monotonic(), 0
         while True:
             # Reload state and pass the normal input/workspace gates between batches.
             snapshot = snapshot_run(self._new_run(context))
             for service, phase in self._handlers:
+                observe_runtime()
                 with events.log_context(project=context.repo, plan=None, stage="PLANNING"):
                     step = service.step(phase, snapshot)
+                observe_runtime()
                 flush = getattr(self._ports.state, "flush_notifications", None)
                 if flush is not None:
                     flush(context.repo)

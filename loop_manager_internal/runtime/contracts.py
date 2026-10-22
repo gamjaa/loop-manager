@@ -45,6 +45,16 @@ class RuntimeMutation:
     concurrent: bool = False
 
 
+@dataclass(frozen=True)
+class RuntimeRefresh:
+    source: str
+    origin: str
+    base: str
+    running_sha: str
+    target_sha: str
+    mutation_id: str
+
+
 class GitLockError(RuntimeError):
     """A concurrent Git process owns a repository lock."""
 

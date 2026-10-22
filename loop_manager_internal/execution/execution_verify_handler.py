@@ -99,7 +99,7 @@ class VerifyHandler:
             with runtime_state._transaction(self.ports.state.connection):
                 self.ports.state.check_context(context)
                 return self.ports._recover(
-                    RecoveryReason.TARGETED_TEST_CORRECTION, detail,
+                    RecoveryReason.TARGETED_COLLECTION_PENDING, detail,
                     context=context, attempts=1,
                 )
         self.ports.state.check_context(context)
@@ -109,7 +109,7 @@ class VerifyHandler:
         with runtime_state._transaction(self.ports.state.connection):
             self.ports.state.check_context(context)
             return self.ports._recover(
-                RecoveryReason.TARGETED_TEST_CORRECTION, detail,
+                RecoveryReason.TARGETED_COLLECTION_PENDING, detail,
                 context=context, attempts=1,
             )
 
@@ -122,7 +122,7 @@ class VerifyHandler:
     def _is_targeted_gate_outcome(outcome):
         return bool(outcome is not None and outcome.recovery is not None
                     and outcome.recovery.observation.reason in {
-                        RecoveryReason.TARGETED_TEST_CORRECTION,
+                        RecoveryReason.TARGETED_COLLECTION_PENDING,
                         RecoveryReason.TARGETED_TEST_EXHAUSTED,
                     })
 

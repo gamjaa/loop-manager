@@ -149,10 +149,11 @@ def register(assembly: Composition) -> None:
     assembly.bind('_finish_self_merge_handoff', self_runtime._finish_self_merge_handoff,
         lambda: self_runtime.FinishSelfMergeHandoffEffects(
             _registered_self_runtime_project=assembly.callback('_registered_self_runtime_project'),
-            ensure_safe_base_worktree=assembly.callback('ensure_safe_base_worktree'),
+            _recorded_base_fetch=assembly.callback('_recorded_base_fetch'),
             git=assembly.callback('git'),
-            log_base_worktree_sync=assembly.callback('log_base_worktree_sync'),
+            git_bytes=assembly.callback('git_bytes'),
             operation_log=assembly.callback('operation_log'),
+            repository_origin=assembly.callback('repository_origin'),
         ),
     )
 
@@ -160,7 +161,6 @@ def register(assembly: Composition) -> None:
         lambda: self_runtime.PreflightSelfMergeHandoffEffects(
             _finish_self_merge_handoff=assembly.callback('_finish_self_merge_handoff'),
             _registered_self_runtime_project=assembly.callback('_registered_self_runtime_project'),
-            observe_waiting_pull_requests=assembly.callback('observe_waiting_pull_requests'),
         ),
     )
 

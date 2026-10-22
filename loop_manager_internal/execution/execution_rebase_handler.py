@@ -159,7 +159,8 @@ class RebaseHandler:
             saved = self.ports.rebase_corrections.observe(
                 self.ports.identity.repo, context.plan.plan_id, observation,
                 corrected=corrected,
-                count_correction=recovery_reason is not RecoveryReason.TARGETED_TEST_CORRECTION,
+                count_correction=recovery_reason not in {
+                    RecoveryReason.TARGETED_TEST_CORRECTION, RecoveryReason.TARGETED_COLLECTION_PENDING},
                 expected_generation=current.generation if current else None,
                 worker_session=self.ports._row()['worker_session_id'],
                 worker_result=worker_result,
@@ -175,7 +176,7 @@ class RebaseHandler:
                 classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                 str(error), context=context,
             )
-        if recovery_reason is RecoveryReason.TARGETED_TEST_CORRECTION:
+        if recovery_reason in {RecoveryReason.TARGETED_TEST_CORRECTION, RecoveryReason.TARGETED_COLLECTION_PENDING}:
             return self.ports._recover(recovery_reason, detail, context=context,
                 attempts=int(targeted_evidence_missing), fingerprint=saved.fingerprint,
                 progress_marker=saved.progress)

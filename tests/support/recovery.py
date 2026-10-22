@@ -84,9 +84,10 @@ class BoundedRecoveryFixture:
         *,
         publish: bool,
         boundary=None,
+        retry_waits=False,
     ) -> dict[str, object]:
         if boundary is None:
-            return self._mock_review_sequence(review_messages, publish=publish)
+            return self._mock_review_sequence(review_messages, publish=publish, retry_waits=retry_waits)
         # This explicit boundary variant verifies restoration of the same real
         # Git/index evidence and SQLite preparation, not just Review policy.
         if boundary is not None and Path(directory).resolve() != Path(boundary.directory).resolve():
@@ -219,9 +220,10 @@ class BoundedRecoveryFixture:
             "verify_calls": verify.call_count,
         }
 
-    def _mock_review_sequence(self, review_messages, *, publish):
+    def _mock_review_sequence(self, review_messages, *, publish, retry_waits=False):
         fixture = execution_policy_fixture(self)
         roles, sessions, prompts, transitions = [], [], [], []
+        histories = []
         responses = iter(review_messages)
         original = fixture.effects.validation.transition_validation_failure
 
@@ -245,10 +247,12 @@ class BoundedRecoveryFixture:
                     f'Record review sequence {len(roles)}'), session_id='worker-session')
             sessions.append(kwargs['session_id'])
             prompts.append(prompt)
+            histories.append(json.loads(fixture.connection.execute(
+                'SELECT review_failure_history FROM exec_plans WHERE repo=?', (fixture.repo,)).fetchone()[0] or '{}'))
             return loop_manager.AgentResult(0, next(responses), session_id='reviewer-session')
 
         fixture.effects.agent.run_agent.side_effect = agent
-        result = run_execution_policy(fixture)
+        result = run_execution_policy(fixture, retry_waits=retry_waits)
         if not publish:
             fixture.effects.publication.command.assert_not_called()
             fixture.effects.publication.push_managed_publication_branch.assert_not_called()
@@ -262,4 +266,5 @@ class BoundedRecoveryFixture:
         return dict(result=result, roles=roles, reviewer_sessions=sessions,
                     reviewer_prompts=prompts, transitions=transitions,
                     project=project, plan=plan, blocked_checkpoint=checkpoint,
-                    verify_calls=fixture.effects.validation.verify.call_count)
+                    verify_calls=fixture.effects.validation.verify.call_count,
+                    retry_delays=fixture.retry_delays, review_histories=histories)

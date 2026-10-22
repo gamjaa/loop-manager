@@ -25,6 +25,7 @@ def register(assembly: Composition) -> None:
             _validate_managed_path_boundary=assembly.callback('_validate_managed_path_boundary'),
             _worktree_catalog=assembly.callback('_worktree_catalog'),
             git=assembly.callback('git'),
+            git_bytes=assembly.callback('git_bytes'),
             github_repository=assembly.callback('github_repository'),
             operation_log=assembly.callback('operation_log'),
             repository_origin=assembly.callback('repository_origin'),

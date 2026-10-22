@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import secrets
 from pathlib import Path
 from loop_manager_internal.storage.db_access import open_connection
 import sqlite3
@@ -21,7 +22,9 @@ import tempfile
 import time
 
 from loop_manager_internal.git import manager_git_journal
-from .contracts import RuntimeMutation, RuntimeWorktree, WorkspaceOwnershipError
+from .contracts import RuntimeMutation, RuntimeWorktree, RuntimeRefresh, WorkspaceOwnershipError
+from . import refresh
+from loop_manager_internal.application import runtime_inputs
 from .process_lock import _held_process_lock_identity
 from .runtime_identity import (
     _canonical_path, _read_runtime_intent, _record_legacy_runtime_adoption,
@@ -92,6 +95,7 @@ _DEFAULT_BYTECODE_PREFIX_MARKER = "LOOP_MANAGER_RUNTIME_DEFAULT_PYCACHEPREFIX"
 class BootstrapGitEffects:
     """Named existing effects; no entry-point or process-global lookup."""
     git: Callable
+    git_bytes: Callable
     _git_operation_entries: Callable
     _validate_managed_path_boundary: Callable
     validate_managed_worktree: Callable
@@ -610,7 +614,9 @@ class BootstrapService:
         config_path: Path,
         runtime: RuntimeWorktree,
         arguments: list[str],
-    ) -> int:
+    ) -> int | RuntimeRefresh:
+        if arguments and arguments[0] == 'run' and refresh.paused(state_dir):
+            raise refresh.RuntimePaused()
         child_arguments = runtime_child_arguments(
             arguments,
             source=source,
@@ -618,7 +624,11 @@ class BootstrapService:
             config_path=config_path,
             runtime=runtime,
         )
+        token = secrets.token_hex(16)
         environment = self._runtime_child_environment()
+        environment.pop('LOOP_MANAGER_RUNTIME_HANDOFF_TOKEN', None)
+        if runtime.mutation_id is not None:
+            environment['LOOP_MANAGER_RUNTIME_HANDOFF_TOKEN'] = token
         if events.current_context().get("run"):
             environment["LOOP_MANAGER_RUN_ID"] = events.current_context()["run"]
         cache_prefix = self._runtime_cache_prefix(source, state_dir, runtime)
@@ -641,6 +651,8 @@ class BootstrapService:
                 "runtime Python bytecode cache: 검증되지 않은 cache를 피하기 위해 임시 prefix 사용"
             )
         try:
+            if arguments and arguments[0] == 'run' and refresh.paused(state_dir):
+                raise refresh.RuntimePaused()
             completed = subprocess.run(
                 [
                     self.interpreter,
@@ -663,12 +675,39 @@ class BootstrapService:
                     self.effects.operation_log(
                         f"runtime Python bytecode 임시 cache 정리 보류: {error}", error=True,
                     )
+        result = completed.returncode
+        if result == refresh.UNSETTLED_EXIT:
+            return 1
+        if result == refresh.RESTART_EXIT:
+            if runtime.mutation_id is None:
+                raise RuntimeError('소유 identity 없는 runtime 재시작을 거부합니다.')
+            path = refresh.receipt_path(state_dir, runtime.mutation_id, token)
+            request = refresh.read_request(path, token, source, runtime, events.current_context().get('run'))
+            if _held_process_lock_identity(state_dir) != 'runtime:' + runtime.mutation_id:
+                raise RuntimeError('runtime 인계 부모 잠금이 변경됐습니다.')
+            self.validate_runtime_worktree(source, state_dir, runtime.path, runtime.commit_sha)
+            self.validate_refresh(source, state_dir, request, request.target_sha)
+            path.rename(path.with_suffix('.consumed.json'))
+            result = request
         if runtime.mutation_id is not None:
             try:
                 self.remove_runtime_worktree(source, state_dir, runtime)
             except (RuntimeError, OSError) as error:
                 self.effects.operation_log(f"runtime 정리 보류: {error}", error=True)
-        return completed.returncode
+        return result
+
+
+    def validate_refresh(self, source, state_dir, request, selected_sha):
+        origin = self.effects.repository_origin(source)
+        if (request.source != str(_canonical_path(source)) or origin != request.origin
+                or self.bootstrap_base_branch(source, state_dir, origin) != request.base):
+            raise RuntimeError('runtime 인계 source/origin/base가 변경됐습니다.')
+        for ancestor in (request.running_sha, request.target_sha):
+            if self.effects.git(source, 'merge-base', '--is-ancestor', ancestor, selected_sha,
+                                check=False).returncode:
+                raise RuntimeError('runtime 인계 revision의 fast-forward 관계가 다릅니다.')
+        if not runtime_inputs.changed(self.effects.git_bytes, source, request.running_sha, selected_sha):
+            raise RuntimeError('runtime 재시작에 코드 진전이 없습니다.')
 
 
     def validate_runtime_child(self,
