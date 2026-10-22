@@ -17,6 +17,9 @@ from loop_manager_internal.verification.coordination import VerifyCoordinator, s
 
 class LanguageExampleIntegrationTests(unittest.TestCase):
     def _check_language(self, language):
+        # Nested native runs need startup/shutdown room under full-suite load.
+        verify_timeout = 90
+        process_timeout = 120
         repository = Path(__file__).resolve().parents[1]
         entrypoint = Path(runner.__file__).with_name('entrypoint.py').resolve()
         git_file = repository / '.git'
@@ -47,16 +50,16 @@ class LanguageExampleIntegrationTests(unittest.TestCase):
                                 'LOOP_MANAGER_VERIFY_SECRET', 'LOOP_MANAGER_VERIFY_PARTIAL_BASE'):
                             environment.pop(key, None)
                         argv = [sys.executable, str(entrypoint), '--protocol-version', '1',
-                            '--project-python', sys.executable, '--parallelism', '1', '--timeout', '30']
+                            '--project-python', sys.executable, '--parallelism', '1', '--timeout', str(verify_timeout)]
                         with mock.patch.dict(os.environ, environment, clear=True):
                             if coordinated:
                                 passed, timed_out, output = manager_adapter.run(
                                     SimpleNamespace(run_verify_process=run_verify_process),
-                                    verify_arguments(project)[1], project, 30)
+                                    verify_arguments(project)[1], project, verify_timeout)
                                 candidates = list((root / 'state/logs/verify').glob('*/manifest.json'))
                                 manifest_path = max(candidates, key=lambda path: path.stat().st_mtime_ns)
                             else:
-                                passed, timed_out, output = run_verify_process(argv, project, 30, environment=environment, job_scope=True)
+                                passed, timed_out, output = run_verify_process(argv, project, process_timeout, environment=environment, job_scope=True)
                                 manifest_path = logs / 'manifest.json'
                         self.assertFalse(timed_out, str(output))
                         self.assertEqual(passed, not failing, str(output))

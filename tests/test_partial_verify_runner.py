@@ -230,10 +230,11 @@ class PartialRunnerTests(unittest.TestCase):
                 environment.pop('LOOP_MANAGER_VERIFY_PARTIAL_BASE', None)
                 for name in ('LOOP_MANAGER_VERIFY_ENDPOINT', 'LOOP_MANAGER_VERIFY_SESSION', 'LOOP_MANAGER_VERIFY_SECRET'):
                     environment.pop(name, None)
-                arguments = [sys.executable, str(entrypoint), '--execute', '--parallelism', '1', '--timeout', '30']
+                # Nested real-process runs need startup/shutdown room under full-suite load.
+                arguments = [sys.executable, str(entrypoint), '--execute', '--parallelism', '1', '--timeout', '90']
                 if mode == 'partial':
                     arguments += ['--partial-base', base]
-                passed, timed_out, output = run_verify_process(arguments, root, 30, environment=environment, job_scope=True)
+                passed, timed_out, output = run_verify_process(arguments, root, 120, environment=environment, job_scope=True)
                 self.assertTrue(passed, f'{mode}: timed_out={timed_out}, '
                                 f'exit_code={getattr(output, "exit_code", None)}; {output}; '
                                 + '\n'.join(path.read_text(encoding='utf-8', errors='replace')[-3000:]

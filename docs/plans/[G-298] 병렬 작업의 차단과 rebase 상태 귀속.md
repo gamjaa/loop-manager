@@ -51,6 +51,14 @@ R-091의 작업별 실행 원본을 차단·rebase의 남은 소비자까지 연
   RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_checkpoint_recovery_phase.ExecutionCheckpointRecoveryPhaseTests.test_completed_published_rebase_keeps_remote_lease_only_with_sealed_owner
   최종 동일 명령 PASS — 1 test, OK. 전체 verify는 실행하지 않았으며 Manager가 별도로 실행한다.
 
+### 현재 후보의 중첩 verify timeout 교정
+
+- HEAD `98bb4e60`와 base `2464194a`의 전체 diff·선택 계획·PRODUCT/ARCHITECTURE 및 source 계약을 다시 확인했다. adapter는 `unittest`, Python은 launcher 선택이며 지원 계약은 3.11–3.14다. Manager 진단 `2b4e2b3904f7a598702cddaeb8d639e8`은 4,451 success·7 skip·2 failure를 기록했고, 두 실패는 중첩 실제 runner의 30초 상한 종료였다. timeout 뒤 내부 임시 로그는 정리되어 세부 대기 원인까지 확정할 수 없으며, 제품 rebase 판정 실패의 근거는 관측되지 않았다.
+- 동일 테스트에 대한 기존 `5491eab8`의 timeout 조정 패턴을 재사용했다. partial/full fixture와 언어 예제의 내부 예산을 90초로, 독립 subprocess의 바깥 상한을 120초로 조정해 준비·종료 여유를 둔다. coordinated 예제는 기존 Manager timeout 전달 경계에 90초를 전달한다. manifest·성공/실패·native report·예약 반환 assertion과 timeout/종료 불명 정책은 유지했다. 제품 timeout, adapter, verify 입력 목록은 변경하지 않았다.
+- 이번 후보에서 targeted runner로 partial timeout 진단 보존·종료 불명 정책 unit case 2개, 관측 실패 진단 보존 case, 대표 A 아래 명시 B direct rebase 완료 case를 실행해 4개 모두 PASS했다. 변경한 두 테스트 파일의 Python 구문도 확인했다. Worker의 integration 실행 금지에 따라 실제 partial/full subprocess case와 언어 예제 integration case는 실행하지 않았다. 이 두 실패의 실제 해소 확인과 전체 verify·Review는 Manager가 수행해야 하며, 이번 unit PASS를 통합 PASS로 보고하지 않는다.
+
+- 결과 검증 교정 호출에서 현재 worktree의 기존 timeout 조정을 재확인하고 `tests.test_partial_verify_runner.PartialRunnerTests.test_timeout_normalization_preserves_partial_diagnostic_report`와 `tests.test_partial_verify_runner.PartialRunnerTests.test_manager_partial_timeout_and_unknown_termination_keep_normal_policy`를 targeted runner로 실행했다. 이번 호출은 2 tests, OK, exit code 0이며 미해결 targeted unit test 실패는 없다. 테스트 내부에 의도적으로 주입한 TIMEOUT·종료 불명 로그는 unit test 실패가 아니다. 전달된 실제 통합 실패의 재실행은 Worker 실행 범위 밖이므로 Manager 검증 대상으로 유지하며 unit 결과와 분리한다. 코드 추가 변경은 하지 않았다.
+
 ## Progress
 
 - [x] revision `1f8b97e6c04868281cd23672396f1fd3d47ee98e`에서 대표 투영 직접 읽기와 새 작업별 선택 경계, 관련 SQLite/handler 회귀를 정적으로 확인했다. 이 정적 감사에서 차단 Agent 복구 소비자의 직접 대표 상태 읽기를 놓쳤다. 구현·테스트·verify는 실행하지 않았다.
