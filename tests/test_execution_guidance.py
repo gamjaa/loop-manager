@@ -1,7 +1,9 @@
 """The Manager leaves project CLI guidance to the Agent."""
 from pathlib import Path
+import json
+import sqlite3
 import tempfile
-from unittest import TestCase
+from unittest import TestCase, mock
 
 import loop_manager as lm
 from tests.support.execution import ExecutionFixture
@@ -42,6 +44,46 @@ class ExecutionGuidanceTests(ExecutionFixture, TestCase):
 
 
 class WorkerPromptFocusTests(TestCase):
+    def test_manual_correction_context_omits_raw_results_and_does_not_repeat_documents(self):
+        from loop_manager_internal.execution.manual_candidate import ManualCandidate
+        from loop_manager_internal.storage.manual_work_state import ensure_schema
+        from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository, ensure_schema as feedback_schema
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        ensure_schema(connection)
+        feedback_schema(connection)
+        manual = ManualCandidate(connection, 'repo', 'G-001', mock.Mock(), mock.Mock())
+        group = {'group_id': 'group', 'pending_source_head': None, 'source_update_conflict': False,
+                 'documents': json.dumps([{'path': 'G-001.md', 'text': 'first G'},
+                                          {'path': 'G-002.md', 'text': 'second G'}])}
+        def stage(name, result, raw, revision):
+            connection.execute('INSERT INTO manual_work_results VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                ('repo', 'group', 'G-001', name, 'head', 'base', revision,
+                 result, raw, 'request', revision))
+            connection.commit()
+        stage('verify', 'PASS', 'PRIVATE VERIFY PASS LOG', '1')
+        stage('review', 'SKIPPED_BY_USER', 'skip; user requested omission', '2')
+        feedback = ValidationFeedbackRepository(connection)
+        with mock.patch.object(manual, 'enabled', return_value=True), mock.patch.object(manual, 'group', return_value=group):
+            context = manual.worker_context()
+            first = feedback.prepare('repo', 'G-001', 'session', context=context)
+            text = '\n'.join(first.context.values())
+            self.assertIn('first G', text)
+            self.assertIn('second G', text)
+            self.assertIn('SKIPPED_BY_USER', text)
+            self.assertIn('user requested omission', text)
+            self.assertIn('외부 targeted test 결과는 확인되지 않았으며', text)
+            self.assertNotIn('PRIVATE VERIFY PASS LOG', text)
+            feedback.delivered(first.attempt_id, 'session')
+            stage('verify', 'FAIL', 'PRIVATE VERIFY FAILURE LOG', '3')
+            delta = feedback.prepare('repo', 'G-001', 'session', context=manual.worker_context())
+            self.assertEqual(set(delta.context), {'manual_stage:G-001:verify'})
+            self.assertIn('FAIL', '\n'.join(delta.context.values()))
+            self.assertNotIn('PRIVATE VERIFY FAILURE LOG', '\n'.join(delta.context.values()))
+            replacement = feedback.prepare('repo', 'G-001', None, recovery=True, context=manual.worker_context())
+            self.assertIn('manual_documents', replacement.context)
+
     def test_retry_puts_unresolved_feedback_before_protocol_and_ignores_previous_result(self):
         feedback = 'verify:digest occurrence=2 revision=1\nFix the failing assertion'
         prompt = lm.worker_prompt(
@@ -51,13 +93,14 @@ class WorkerPromptFocusTests(TestCase):
         self.assertEqual(prompt.count(feedback), 1)
         self.assertLess(prompt.index(feedback), prompt.index('COMMIT_TITLE:'))
         self.assertLess(prompt.index('missing title'), prompt.index('COMMIT_TITLE:'))
-        self.assertIn('이미 성공한 작업을 불필요하게 반복', prompt)
+        self.assertIn('미해결 원인에 관련된 변경', prompt)
         self.assertNotIn('already successful work', prompt)
         self.assertNotIn('실제 diff를', prompt)
         for marker in ('WORKER_OUTCOME:', 'COMMIT_TITLE:', 'PR_SUMMARY:',
-                       'TARGETED_TESTS:', 'FAILED_COMMAND:', 'RERUN:'):
+                       'TARGETED_TESTS:'):
             self.assertIn(marker, prompt)
-        self.assertIn('전체 verify는 Worker 종료 뒤 Loop Manager가 실행', prompt)
+        self.assertNotIn('전체 verify는 Worker 종료 뒤 Loop Manager가 실행', prompt)
+        self.assertNotIn('FAILED_COMMAND:', prompt)
 
     def test_recovery_reconciles_plan_diff_and_feedback_without_claiming_verification(self):
         feedback = 'review:src/work.py::save::retention occurrence=1 revision=1'
@@ -66,23 +109,21 @@ class WorkerPromptFocusTests(TestCase):
             validation_feedback=feedback, session_recovery=True,
         )
         self.assertIn('선택된 최신 ExecPlan과 현재 worktree', prompt)
-        self.assertIn('계획 목표와 실제 diff를', prompt)
+        self.assertIn('현재 worktree의 실제 diff', prompt)
         self.assertIn('이미 수행한 변경과 남은 작업', prompt)
         self.assertIn('다음 필요한 작업부터', prompt)
-        self.assertIn('이전 결과만으로 검증 성공을 주장하지 마라', prompt)
+        self.assertNotIn('이전 결과', prompt)
         self.assertEqual(prompt.count(feedback), 1)
-        self.assertIn('Saved partial implementation', prompt)
+        self.assertNotIn('Saved partial implementation', prompt)
 
-    def test_worker_prompt_forbids_all_requirements_and_allows_product_documents(self):
+    def test_worker_user_message_keeps_task_input_separate_from_static_instruction(self):
         prompt = lm.worker_prompt('docs/plans/plan.md', None)
-        self.assertIn('Requirement 완료 판단이나 archive 이동 권한을 포함하지 않는다', prompt)
-        self.assertIn('User Decision은 사용자를 대신해', prompt)
-        self.assertIn('본문만 수정하고 frontmatter는 직접 변경하지 마라', prompt)
-        self.assertIn('활성·archive를 포함한 모든 Requirement와 다른 ExecPlan은 수정하지 마라', prompt)
-        self.assertIn('PRODUCT·ARCHITECTURE·FUTURE_IDEAS는 현재 작업에 필요한 범위에서 수정할 수 있다', prompt)
-        self.assertIn('sources 문자열은 보존하라', prompt)
-        self.assertIn('Planner·Manager의 검증·공식 선언·DB 반영', prompt)
-        self.assertIn('docs/PLANS.md는 이번 Worker 변경 범위가 아니다', prompt)
+        for phrase in ('frontmatter', 'sources 문자열', 'scripts/verify', 'User Decision',
+                       'Requirement 완료 판단', '당신은 Loop Manager의 Worker'):
+            self.assertNotIn(phrase, prompt)
+        self.assertIn('docs/plans/plan.md', prompt)
+        self.assertIn('WORKER_OUTCOME:', prompt)
+
 
     def test_normal_turn_has_no_recovery_summary_or_correction_instruction(self):
         prompt = lm.worker_prompt('docs/plans/plan.md', None)

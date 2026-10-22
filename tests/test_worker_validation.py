@@ -423,7 +423,8 @@ class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
                         )
                     )
 
-            with mock.patch(
+            with mock.patch('loop_manager_internal.git.publication_service.push_worker_checkpoint_commits',
+                            return_value=(None, 0)), mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
                 "loop_manager.remote_base", return_value="main"
@@ -509,7 +510,8 @@ class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
                 artifact.write_bytes(b'verify artifact')
                 return True, 'verify: PASS'
 
-            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+            with mock.patch('loop_manager_internal.git.publication_service.push_worker_checkpoint_commits',
+                            return_value=(None, 0)), mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
                 "loop_manager.pr_for_branch", side_effect=publishing_branch_pr_lookup(

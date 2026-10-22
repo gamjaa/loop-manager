@@ -388,7 +388,8 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
                     )
                 return True, f"verify pass {len(verify_calls)}"
 
-            with mock.patch(
+            with mock.patch('loop_manager_internal.git.publication_service.push_worker_checkpoint_commits',
+                            return_value=(None, 0)), mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
                 "loop_manager.remote_base", return_value="main"

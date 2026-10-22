@@ -143,7 +143,7 @@ class ExecutionFixture:
         self.effects.agent.validate_worker_workspace_scope.return_value = self.plan
         self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
             head='owned-head', branch='loop-manager/G-047',
-            index={},
+            index={}, operations={},
             dirty={'app.py': (('staged',), 'accepted-content')},
         )
         self.effects.validation.validate_active_execplan_metadata.return_value = self.plan
@@ -162,6 +162,7 @@ class ExecutionFixture:
         self.effects.validation.ensure_worker_level_state.return_value = 1
         self.effects.agent.run_agent_with_retries.side_effect = lambda call, session_id: call(session_id, False)
         self.effects.agent.run_agent.side_effect = self.agent
+        self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
         self.effects.agent.resolve_worker_profile.return_value = lm.ResolvedProfile(
             'model', 'high',
         )

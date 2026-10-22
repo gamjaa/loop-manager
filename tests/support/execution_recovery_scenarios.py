@@ -828,8 +828,7 @@ class ExecutionRecoveryScenarios:
         self.assertEqual(call.kwargs['level'], selected)
         self.assertEqual(self.handler.plan['complexity'], new_profile[0])
         self.assertEqual(self.handler.plan['risk'], new_profile[1])
-        self.assertEqual(self.effects.agent.worker_prompt.call_args.args[2],
-                         'previous worker result')
+        self.assertIsNone(self.effects.agent.worker_prompt.call_args.args[2])
         row = self.repository.active_row('repo')
         self.assertEqual(row['initial_worker_level'], initial)
         self.assertEqual(row['effective_worker_level'], selected)

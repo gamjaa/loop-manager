@@ -733,14 +733,41 @@ class CommonGuidanceInvocationTests(TestCase):
         self.provider = Provider()
         self.provider_mock = mock.patch.object(manager, 'agent_provider', return_value=self.provider).start()
 
-    def invoke(self, role='worker', plan='G-147', session=None, task=None, provider='codex'):
+    def invoke(self, role='worker', plan='G-147', session=None, task=None, provider='codex', prompt='delta only'):
         return manager.run_agent(
             provider, self.worktree, self.state_dir, self.root / 'config.ini', role,
-            'delta only', read_only=role in {'reviewer', 'planner_check'},
+            prompt, read_only=role in {'reviewer', 'planner_check'},
             persist_session=True, session_id=session, connection=self.connection,
             invocation=invocation.InvocationContext('repo', plan, task_id=task),
             resolved_profile=invocation.ResolvedProfile('model', 'high'),
         )
+
+    def test_real_worker_prompts_deliver_static_rules_only_in_pinned_instruction(self):
+        root = Path(__file__).resolve().parents[1]
+        for filename in self.guidance_module.GUIDANCE_PATHS:
+            (self.runtime / filename).write_bytes((root / filename).read_bytes())
+        path = 'docs/plans/[G-147] Instruction.md'
+        prompts = (
+            manager.worker_prompt(path, None),
+            manager.worker_prompt(path, 'new correction', session_resume=True),
+            manager.worker_prompt(path, None, 'PRIVATE OLD WORKER RESULT', session_recovery=True),
+        )
+        for prompt in prompts:
+            result = self.invoke(prompt=prompt)
+            self.assertEqual(result.code, 0)
+            request = self.requests[-1]
+            instruction = request.common_guidance.content
+            self.assertEqual(request.prompt, prompt)
+            for rule in ('최소 범위의 targeted unit test만', '개별 test case·class·module',
+                         '공백을 정규화한 뒤 정확히 같아야', 'Worker는 Git add·commit·fetch·rebase·push·PR',
+                         'frontmatter는 직접 변경하지', 'sources 문자열은 보존',
+                         '모든 Requirement', 'Ponytail', 'User Decision'):
+                self.assertIn(rule, instruction)
+                self.assertNotIn(rule, prompt)
+            self.assertNotIn('PRIVATE OLD WORKER RESULT', prompt)
+            self.assertNotIn('AGENTS.md', prompt)
+        self.assertNotIn(path, prompts[1])
+        self.assertEqual(len({r.common_guidance.content_hash for r in self.requests}), 1)
 
     def test_always_adds_ponytail_only_to_worker_without_plugin_queries_and_records_hash(self):
         self.assertEqual(self.invoke().code, 0)

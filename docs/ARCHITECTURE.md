@@ -658,6 +658,8 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 
 - 원본 묶음 snapshot은 저장소 밖 Manager 상태 디렉터리의 JSON으로 보존하고 역할별 합친 Markdown은 같은 디렉터리의 실행용 파일로만 생성하며 커밋하지 않는다. 합친 파일은 고정 원본에서 재생성하지만 원본 누락·손상은 최신 내용으로 대체하지 않는다. 기존 단일 Markdown snapshot은 원래 내용으로 재개하며 최신 역할 지침을 덧붙이지 않는다. 관련 planning·성공 결과 재사용에는 모든 역할 원본을 포함한 묶음 해시를 사용한다
 - Planner, Worker와 Reviewer의 작업별 prompt는 Loop Manager에 내장하며 목표·snapshot·승인 사실·피드백·결과 형식 등의 문맥을 구성한다. 정적 공통·역할 규칙을 이 사용자 메시지에 중복하지 않는다
+- Worker 사용자 메시지는 최초·교체 session에 선택 계획·worktree·결과 형식과 미완료 문맥을 보내고 같은 provider/Model session에는 확인되지 않은 새 조건·archive 후보·비검증 오류·checkpoint/선언 복원 사실·검증 피드백 delta만 보낸다. effort 변경은 같은 session의 재개다. 이전 Worker 결과와 verify/Review 원문은 복사하지 않으며 수동 교정도 전체 G·후보 R·사용자 생략과 미확인 외부 테스트만 유지한다.
+- 기존 validation delivery attempt/cursor에 작업 문맥 JSON과 attempt 순서를 결합한다. 호출 전 revision을 고정하고 실제 session에 결합하되 정상 scope·결과 검증 뒤에만 두 채널의 전달을 확인한다. timeout·손상 결과·저장 실패는 미확인 문맥을 재전송하고 호출 중 발생한 새 revision은 확인하지 않는다. 늦게 도착한 과거 attempt가 최신 문맥 cursor를 되돌리지 않는다. source 지문·revision이나 순수 수행 기록만의 변화는 작업 조건 재전송을 만들지 않는다.
 - 프로젝트별 prompt 재정의는 지원하지 않으며 프로젝트 파일이나 작업 prompt로 자동 역할 권한을 확대하지 않는다
 
 ### 호출 관측과 ledger
@@ -750,7 +752,7 @@ Reviewer는 파일을 수정하거나 테스트·verify를 다시 실행하지 �
 ### 프로그램이 소유하는 실행 효과
 
 - 상태 분류, 설정 검증, Git/GitHub 명령과 verify 실행은 프로그램 코드가 담당한다
-- Worker는 선택된 관리 작업 branch에 로컬 checkpoint commit을 만들 수 있다. Manager는 반환 직후 범위·소유권·PR·원격 OID를 다시 확인하고 각 commit을 순서대로 push한다. 그 밖의 commit, fetch, pull, rebase, push, worktree 등록과 PR 생성은 Manager 코드가 소유한다. 게시 대기 중에는 다음 Worker 호출 전에 기존 commit 게시를 해결한다.
+- Worker는 checkpoint 요청과 완료 후보를 구분해 반환한다. Git add·commit·fetch·pull·rebase·push·worktree 등록·PR 생성은 Manager가 수행한다. 종료한 Worker의 범위·index·소유권을 확인한 제한 commit과 commit별 게시의 복구 계약은 [Worker checkpoint 게시와 새 환경 인수](#worker-checkpoint-게시와-새-환경-인수)에 둔다. 게시 대기에는 새 Worker를 호출하지 않는다.
 - AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다. provider 환경 필터는 비밀이 아닌 `PYTHONDONTWRITEBYTECODE`와 `PYTHONPYCACHEPREFIX`도 보존한다. verify 조율 endpoint·secret·session은 runner 자체 조율에 필요해 runner에만 전달한다.
 
   runner의 자식 subprocess에는 해당 세 값을 뺀 환경 복사본을 넘기며 부모 환경과 호출자 mapping은 변경하지 않는다. 명령행 Python에서 선택한 bytecode 정책과 prefix도 자식 Python에 반영한다. 기존 marker·`PYTHONPATH`와 필요한 일반 환경은 자식에서 유지한다
@@ -1313,13 +1315,19 @@ Git 외의 subprocess도 같은 기준을 적용한다. 최초 import의 의존�
 
 ## GitHub와 PR
 
-PR 생성과 Worker checkpoint 게시·최종 후보 게시의 원격 쓰기는 Manager 코드가 수행한다. Worker의 로컬 checkpoint commit은 선택된 관리 branch에만 허용한다. 게시 대상과 최종 승인 경계를 구분한다.
+Worker 요청의 로컬 commit·checkpoint 게시·PR 생성과 최종 후보 게시의 Git 쓰기는 Manager 코드가 수행한다. Worker와 Reviewer의 sandbox에 shared Git·인증 저장소 쓰기 권한을 추가하지 않는다. 게시 대상과 최종 승인 경계를 구분한다.
 
 #### Worker checkpoint 게시와 새 환경 인수
 
-Worker checkpoint commit은 선택된 ExecPlan branch에서만 허용한다. Agent 종료 후 Manager가 현재 active ExecPlan·branch·worktree 소유권, origin identity, 관리 branch와 HEAD, 파일 범위, Git operation, PR identity/head를 검사한다. 현재 remote가 마지막으로 수용한 OID와 같고 local history가 그 후속인 선형 commit이면 commit마다 직전 원격 OID 또는 원격 부재에 결합한 `--force-with-lease`로 순서대로 게시한다. 작업 범위를 통과하지 못하거나 ancestry가 선형이 아니면 push하지 않는다.
+Worker의 `WORKER_OUTCOME`은 `ready_for_validation`, `needs_user_decision`, `checkpoint`를 구분한다. checkpoint JSON의 필수 필드는 `kind`, 선택된 `plan_id`, 해당 호출의 전체 `start_head` OID이며 별도 `COMMIT_TITLE` 한 줄만 받는다. 중복·손상·다른 작업/HEAD·임의 명령 필드와 완료 publication 선언의 혼합은 거부한다. 완료 후보의 기존 COMMIT_TITLE·PR_SUMMARY·TARGETED_TESTS 계약과 사용자 판단 대기·legacy 완료 결과는 유지한다.
 
-게시 전 checkpoint의 `worker_checkpoint_pending`은 `{branch, from, target}`이다. `branch`는 정확한 관리 branch 이름, `from`은 직전 원격 전체 OID 또는 branch 부재를 나타내는 `null`, `target`은 게시할 전체 commit OID다. Manager는 push 전에 이 intent를 저장하고 live 원격 OID를 다시 확인한다. 재시작에서 원격이 `target`이면 이미 성공한 push를 인정하고 반복하지 않는다. 원격이 `from`이면 같은 local commit을 재시도한다. 원격이 둘 다 아니면 Manager가 원격 입력 통합을 완료해 `accepted_work_branch`를 현재 OID로 갱신한 경우만 intent를 정리하고 새 후보를 게시할 수 있으며, 그 외에는 보존·보류한다. push 성공은 `accepted_work_branch`와 `publication_remote_oid`를 갱신하지만 Worker·verify·Review receipt를 생성하지 않는다.
+Worker가 종료하면 기존 scope 검사와 선택 frontmatter의 부분 복원 뒤 허용된 호출 변경 경로를 결정한다. 요청 밖 staged entry와 index flags·미확정 operation은 보존하고 commit하지 않는다. `execution_checkpoints.snapshot.worker_checkpoint_request`는 repository·작업·branch·worktree·시작 HEAD·요청 원문·제목·파일별 mode/content 지문·실제 session·호출 ID와 전달 attempt를 고정한다. 실제 호출의 writer 종료 근거를 확인하고 명시적 literal pathspec만 staging한다. 기존 Manager commit intent의 parent/tree/message와 실제 commit을 대조하며 저장 중단 뒤 commit이나 모델 호출을 반복하지 않는다. 원격 게시 확인 뒤 같은 transaction에서 요청 완료·scope 정리·전달 확인을 적용한다. 보존점은 Worker/targeted/verify/Review 성공 token을 만들지 않으며 기존 실패·session을 유지한다. 완료 후보를 Manager가 commit한 때도 다음 Worker 변경 전에 같은 게시 경계를 적용한다.
+
+게시 직전 active ExecPlan·branch·worktree 소유권, origin identity, 관리 branch와 HEAD, Git operation, PR identity/head와 live 원격 OID를 검사한다. 과거 직접 Worker commit·부분 게시·인수 이력은 checkout이나 새 검증 worktree 없이 immutable parent/tree의 경로와 선택 선언·User Decision·mode를 commit별로 검사한다. 등록 base에 실제 포함된 commit은 원본 유입으로 구분한다. 나중에 되돌린 금지 중간 tree도 게시하지 않고 이미 확인한 선행 복구점과 미게시 로컬 이력을 보존한다.
+
+`worker_checkpoint_pending`의 필수 호환 필드는 `{branch, from, target}`이다. `from`은 전체 OID 또는 정확한 부재 `null`, `target`은 게시할 전체 commit OID다. 신규 intent에는 repository·작업·worktree·origin·PR identity와 정확한 parent/tree도 결합한다. Manager는 짧은 generation/실행 snapshot CAS에서 intent를 durable하게 저장하고 그 고정 lease로 target 하나만 push한다. Git·PR·원격 관측에는 DB 차례나 writer transaction을 유지하지 않는다. 완료는 같은 짧은 transaction에서 checkpoint의 accepted OID·intent 감사와 execution의 publication_remote_oid·PR head를 함께 갱신한다. 관측 중 owner/generation 변경이나 저장 실패는 일부 완료를 남기지 않으며 DB 재시도가 외부 효과를 replay하지 않는다.
+
+재시작에서 원격이 target이면 push 없이 확인을 마치고 from이면 동일 commit을 재시도한다. target의 후속 원격 전진은 자기 push 확인과 새 원격 입력 통합을 분리한다. 타인의 commit을 덮거나 낡은 intent에 새 lease만 끼워 넣지 않는다. 게시 직후의 소유권 판단은 완료한 DB·원격 관측에서 다시 시작하며 `pushed`와 후보 통합의 `candidate_changed`를 별개 사실로 소비한다. 불명확한 원격·다른 PR·충돌은 요청·양쪽 commit·index·실패를 보존한 대기이며 새 Worker 호출을 허가하지 않는다.
 
 최초 원격 인수는 아직 소유하지 않은 worktree에만 적용한다. 기존 소유 worktree와 현재 Git·원격 근거로 checkpoint 및 소유권을 복구한 rebase는 `workspace_seen` 표식이 없어도 기존 작업 재개 경로를 사용한다.
 

@@ -61,6 +61,7 @@ class PublicationHandlerPorts:
     _retry: Callable[..., ExecutionOutcome]
     _row: Callable[[], Mapping[str, object]]
     _step_outcome: Callable[..., Any]
+    publish_worker_checkpoints: Callable[..., Any] | None = None
     pre_review_identity: Callable[..., Any] | None = None
     observe_verify_inputs: Callable[..., Any] | None = None
     update_snapshot: Callable[..., None] | None = None
@@ -93,7 +94,7 @@ class PublicationHandler:
                       'head': head, 'remote_before': remote_oid},
         )
 
-    def _commit_owned(self, context, title, *, worker_confirmed=False):
+    def _commit_owned(self, context, title, *, worker_confirmed=False, expected_tree=None):
         checkpoint = self.ports.checkpoint
         if checkpoint is not None:
             current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
@@ -103,6 +104,8 @@ class PublicationHandler:
             approved_tree = self.ports.git(
                 context.worktree, 'write-tree',
             ).stdout.strip()
+            if expected_tree is not None and approved_tree != expected_tree:
+                raise manager_git_journal.MutationEvidenceError('requested checkpoint index tree changed')
             saved = current.snapshot or {}
             if current.operation == 'commit':
                 if (current.expected_head != before
@@ -183,6 +186,13 @@ class PublicationHandler:
             )
         from loop_manager_internal.execution.execution_revision import advance_owned_record
         advance_owned_record(self.ports, context)
+        if (checkpoint is not None and context.phase.value == 'VERIFYING'
+                and self.ports.publish_worker_checkpoints is not None
+                and not context.resolving_rebase):
+            published = self.ports.publish_worker_checkpoints(context, worker_start_head=before)
+            if isinstance(published, ExecutionOutcome) or (published or {}).get('candidate_changed'):
+                raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                      'Manager commit 게시 중 작업 입력이 변경되어 후보를 다시 확인합니다.')
         return result
 
     def _commit_rebase_resolution(self, context, title):

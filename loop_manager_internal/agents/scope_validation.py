@@ -17,6 +17,53 @@ from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
 
 
+def validate_worker_commit(git, worktree, parent, commit, selected_plan_path, *,
+                           base_branch, allow_common_plans=False):
+    """Check immutable publication inputs without changing a worktree or index."""
+    from loop_manager_internal.catalog import execplan_catalog, execplan_drafts
+    from loop_manager_internal.runtime.contracts import PublicationSafetyError
+
+    parents = git(worktree, 'show', '-s', '--format=%P', commit).stdout.strip()
+    if parents != parent:
+        raise PublicationSafetyError('Worker checkpoint parent가 게시 intent와 다릅니다.')
+    inherited = git(worktree, 'merge-base', '--is-ancestor', commit,
+                    f'refs/remotes/origin/{base_branch}', check=False)
+    if inherited.returncode == 0:
+        return  # Changes authored on the registered base retain their provenance.
+    if inherited.returncode != 1:
+        raise PublicationSafetyError('Worker checkpoint의 base 유입 여부를 확인할 수 없습니다.')
+    paths = git(worktree, 'diff', '--no-ext-diff', '--no-renames', '--name-only',
+                '-z', parent, commit, '--').stdout.split('\0')
+    for path in filter(None, paths):
+        if not _worker_path_allowed(path, selected_plan_path, allow_common_plans=allow_common_plans):
+            raise PublicationSafetyError(f'Worker checkpoint의 금지 문서 변경: {path}')
+        if path != selected_plan_path:
+            continue
+        previous = git(worktree, 'show', f'{parent}:{path}').stdout
+        candidate = git(worktree, 'show', f'{commit}:{path}', check=False)
+        if candidate.returncode:
+            raise PublicationSafetyError('Worker checkpoint가 선택된 ExecPlan을 삭제했습니다.')
+        old_mode = git(worktree, 'ls-tree', parent, '--', path).stdout.split()[0]
+        new_entry = git(worktree, 'ls-tree', commit, '--', path).stdout.split()
+        if not new_entry or new_entry[0] != old_mode or old_mode not in {'100644', '100755'}:
+            raise PublicationSafetyError('Worker checkpoint의 ExecPlan mode가 변경됐습니다.')
+        try:
+            def declaration(text):
+                lines = text.replace('\r\n', '\n').splitlines(keepends=True)
+                if not lines or lines[0].strip() != '---':
+                    raise RuntimeError('ExecPlan frontmatter 경계가 없습니다.')
+                for index, line in enumerate(lines[1:], 1):
+                    if line.strip() == '---':
+                        return ''.join(lines[:index + 1])
+                raise RuntimeError('ExecPlan frontmatter 종료 경계가 없습니다.')
+            if declaration(previous) != declaration(candidate.stdout):
+                raise RuntimeError('Worker는 선택된 ExecPlan frontmatter를 변경할 수 없습니다.')
+            parsed = execplan_catalog.parse_execplan_text(path, candidate.stdout, validate_sources=False)
+            execplan_drafts.validate_agent_change(parsed, previous)
+        except (RuntimeError, ValueError) as error:
+            raise PublicationSafetyError(f'Worker checkpoint의 선택 선언·사용자 결정 오류: {error}') from error
+
+
 @dataclass(frozen=True)
 class ScopeValidationEffects:
     """Explicit effects supplied by the composition boundary."""

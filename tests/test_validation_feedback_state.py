@@ -7,6 +7,52 @@ from loop_manager_internal.storage.validation_feedback_state import ValidationFe
 
 
 class ValidationFeedbackStateTests(unittest.TestCase):
+    def test_delivery_cannot_be_acknowledged_by_another_session(self):
+        attempt = self.repo.prepare('repo', 'G-040', 'first', context={'task': 'plan'})
+        for action in (self.repo.bind_session, self.repo.delivered):
+            with self.assertRaisesRegex(ValueError, 'session identity'):
+                action(attempt.attempt_id, 'other')
+        self.assertIsNone(self.connection.execute('SELECT * FROM validation_delivery_cursors').fetchone())
+        self.repo.delivered(attempt.attempt_id, 'first')
+
+    def test_context_acknowledges_only_the_frozen_attempt_and_actual_session(self):
+        context = {'task': 'selected plan', 'archives': '[R-001]', 'error': 'first error'}
+        first = self.repo.prepare('repo', 'G-040', None, context=context)
+        self.assertTrue(first.initial)
+        self.assertEqual(first.context, context)
+        self.repo.bind_session(first.attempt_id, 'session')
+        # Starting a session alone cannot acknowledge its prompt.
+        interrupted = self.repo.prepare('repo', 'G-040', 'session', context=context)
+        self.assertEqual(interrupted.context, context)
+        latest = {**context, 'archives': '[R-002]', 'error': 'new error'}
+        during_call = self.repo.prepare('repo', 'G-040', 'session', context=latest)
+        self.repo.delivered(first.attempt_id, 'session')
+        pending = self.repo.prepare('repo', 'G-040', 'session', context=latest)
+        self.assertFalse(pending.initial)
+        self.assertEqual(pending.context, {'archives': '[R-002]', 'error': 'new error'})
+        self.repo.delivered(during_call.attempt_id, 'session')
+        self.repo.delivered(interrupted.attempt_id, 'session')
+        self.assertEqual(self.repo.prepare('repo', 'G-040', 'session', context=latest).context, {})
+        recovered = self.repo.prepare('repo', 'G-040', None, recovery=True, context=latest)
+        self.repo.bind_session(recovered.attempt_id, 'replacement')
+        self.assertEqual(recovered.context, latest)
+        self.assertTrue(recovered.initial)
+        self.repo.delivered(recovered.attempt_id, 'replacement')
+        self.assertEqual(self.repo.prepare('repo', 'G-040', 'replacement', context=latest).context, {})
+
+    def test_context_delivery_write_failure_keeps_both_channels_pending(self):
+        self.observe('verify', 'raw', (Feedback('verify', 'verify:one', 'failure'),))
+        attempt = self.repo.prepare('repo', 'G-040', 'session', context={'task': 'plan'})
+        self.connection.execute("CREATE TRIGGER fail_delivery BEFORE UPDATE OF status ON validation_delivery_attempts "
+                                "BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+        self.connection.commit()
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'disk full'):
+            self.repo.delivered(attempt.attempt_id, 'session')
+        self.assertIsNone(self.connection.execute('SELECT * FROM validation_delivery_cursors').fetchone())
+        pending = self.repo.prepare('repo', 'G-040', 'session', context={'task': 'plan'})
+        self.assertEqual(pending.context, {'task': 'plan'})
+        self.assertEqual(len(pending.rows), 1)
+
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row

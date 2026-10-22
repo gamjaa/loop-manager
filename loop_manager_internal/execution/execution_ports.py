@@ -270,6 +270,9 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         remote = dependencies.remote_branch_oid(identity['repo_path'], context.branch)
         head = dependencies.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
         pending = (current.snapshot or {}).get('worker_checkpoint_pending')
+        if current.operation is not None:
+            raise recovery_runtime.RecoveryFailure(recovery_runtime.RecoveryReason.PUBLICATION_RETRY,
+                '진행 중 Manager Git operation의 완료 확인을 기다립니다.')
         if pending is None:
             established_heads = {
                 str(value) for value in (
@@ -280,6 +283,12 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             if head in established_heads:
                 return {'candidate_changed': False, 'pushed': 0}
             start_head = worker_start_head
+            saved = current.snapshot or {}
+            if start_head is None and saved.get('after_head') == head:
+                from loop_manager_internal.recovery.checkpoint_ownership import committed_tree_matches_intent
+                if committed_tree_matches_intent(context.worktree, saved.get('before_head'), head,
+                                                  saved, dependencies.git, strict_observation=True):
+                    start_head = saved['before_head']
             if start_head is None and row['agent_snapshot']:
                 from loop_manager_internal.agents.scope_contracts import GitSnapshot
                 try:
@@ -302,8 +311,6 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                             recovery_runtime.RecoveryReason.STATUS_FAILED,
                             'Worker checkpoint의 저장된 실행 HEAD 관계를 확인할 수 없습니다.',
                         )
-            if current.operation is not None:
-                return {'candidate_changed': False, 'pushed': 0}
             if not start_head or head == start_head:
                 return {'candidate_changed': False, 'pushed': 0}
             follows_scope = dependencies.git(
@@ -334,6 +341,27 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                 ExecutionOutcomeKind.FINAL_BLOCK,
                 detail='닫힌 PR의 명시적 재개 결정을 기다립니다.', error=True,
             )
+        service_effects = publication_service.WorkerCheckpointPublicationEffects(
+            active_execplan=lambda _connection, repo: state.active_execplan(repo),
+            git=dependencies.git,
+            remote_branch_oid=dependencies.remote_branch_oid,
+            pr_for_branch=dependencies.pr_for_branch,
+            github_repository=dependencies.github_repository,
+            validate_execplan_workspace_identity=dependencies.validate_execplan_workspace_identity,
+            validate_managed_worktree=dependencies.validate_managed_worktree,
+            update_project=lambda _connection, repo, **values: state.update_project(repo, preserve_transaction=True, **values),
+        )
+        pushed = 0
+        if pending is not None:
+            confirmed_head, pushed = publication_service.push_worker_checkpoint_commits(
+                service_effects, connection, identity['repo_path'], identity['state_dir'],
+                identity['repo'], context.plan.plan_id, context.branch, context.worktree,
+                identity['base'], remote, pull_request,
+                allow_common_plans=dependencies._published_plan_allows_common_plans(identity['repo_path'], plan))
+            remote = dependencies.remote_branch_oid(identity['repo_path'], context.branch)
+            pull_request = dependencies.pr_for_branch(identity['repo_path'], context.branch)
+            if remote == confirmed_head and state.row()['publication_remote_oid'] == remote:
+                return {'candidate_changed': False, 'pushed': pushed}
         candidate_changed = False
         if remote is not None and dependencies.remote_integration_effects is not None:
             candidate_changed = bool(reconcile_remote(context, remote, pull_request))
@@ -357,22 +385,13 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                 )
                 remote = dependencies.remote_branch_oid(identity['repo_path'], context.branch)
                 pull_request = dependencies.pr_for_branch(identity['repo_path'], context.branch)
-        service_effects = publication_service.WorkerCheckpointPublicationEffects(
-            active_execplan=lambda _connection, repo: state.active_execplan(repo),
-            git=dependencies.git,
-            remote_branch_oid=dependencies.remote_branch_oid,
-            pr_for_branch=dependencies.pr_for_branch,
-            github_repository=dependencies.github_repository,
-            validate_execplan_workspace_identity=dependencies.validate_execplan_workspace_identity,
-            validate_managed_worktree=dependencies.validate_managed_worktree,
-            update_project=lambda _connection, repo, **values: state.update_project(repo, **values),
-        )
-        _, pushed = publication_service.push_worker_checkpoint_commits(
+        _, newly_pushed = publication_service.push_worker_checkpoint_commits(
             service_effects, connection, identity['repo_path'], identity['state_dir'],
             identity['repo'], context.plan.plan_id, context.branch, context.worktree,
             identity['base'], remote, pull_request,
+            allow_common_plans=dependencies._published_plan_allows_common_plans(identity['repo_path'], plan),
         )
-        return {'candidate_changed': candidate_changed, 'pushed': pushed}
+        return {'candidate_changed': candidate_changed, 'pushed': pushed + newly_pushed}
     effects = execution_handlers.ExecutionEffects(
         state=state,
         checkpoint=execution_checkpoint_state.ExecutionCheckpointRepository(connection),
@@ -418,7 +437,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             is_loop_manager_repository=state.bind(dependencies.is_loop_manager_repository, name="is_loop_manager_repository", connected=False, mutates=False),
             run_agent=state.bind(dependencies._run_agent_with_connection, name="run_agent", connected=True, mutates=False),
             run_agent_with_retries=state.bind(dependencies.run_agent_with_retries, name="run_agent_with_retries", connected=False, mutates=False),
-            worker_prompt=state.bind(lambda *a, **kw: manual.prompt(dependencies.worker_prompt(*a, **kw)), name="worker_prompt", connected=False, mutates=False),
+            worker_prompt=state.bind(lambda *a, **kw: dependencies.worker_prompt(*a, **kw), name="worker_prompt", connected=False, mutates=False),
             reviewer_prompt=state.bind(lambda *a, **kw: manual.prompt(dependencies.reviewer_prompt(*a, **kw), review=True), name="reviewer_prompt", connected=False, mutates=False),
             resolve_worker_profile=lambda config_path, provider, level, worktree: dependencies._agent_profile(
                 config_path, provider, "worker", level, worktree,

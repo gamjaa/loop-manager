@@ -522,6 +522,7 @@ class ExecutionHandlers:
             self.effects, getattr(self, "_identity", ExecutionIdentity()),
             self._snapshot, self._update_snapshot,
             {
+                "_commit_owned": lambda *a, **kw: self._commit_owned(*a, **kw),
                 "guard": lambda *a, **kw: self.guard(*a, **kw),
                 "_advanced": lambda *a, **kw: self._advanced(*a, **kw),
                 "_archive_candidates_at": lambda *a, **kw: self._archive_candidates_at(*a, **kw),
@@ -699,8 +700,9 @@ class ExecutionHandlers:
     def _publication_intent(self, context, operation, remote_oid):
         return self._publication_handler()._publication_intent(context, operation, remote_oid)
 
-    def _commit_owned(self, context, title, *, worker_confirmed=False):
-        return self._publication_handler()._commit_owned(context, title, worker_confirmed=worker_confirmed)
+    def _commit_owned(self, context, title, *, worker_confirmed=False, expected_tree=None):
+        return self._publication_handler()._commit_owned(context, title, worker_confirmed=worker_confirmed,
+                                                        expected_tree=expected_tree)
 
     def _commit_rebase_resolution(self, context, title):
         return self._publication_handler()._commit_rebase_resolution(context, title)

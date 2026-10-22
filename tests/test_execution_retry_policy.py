@@ -135,8 +135,8 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
             "verify failure output",
             session_recovery=True,
         )
-        self.assertIn("이전 Worker 결과", recovered_prompt)
-        self.assertIn("previous Worker result", recovered_prompt)
+        self.assertNotIn("이전 Worker 결과", recovered_prompt)
+        self.assertNotIn("previous Worker result", recovered_prompt)
         self.assertIn("verify failure output", recovered_prompt)
 
     @dummy_worker_sessions

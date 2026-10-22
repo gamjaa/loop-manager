@@ -32,6 +32,22 @@ def parse(message):
 
 
 class WorkerOutcomeTests(unittest.TestCase):
+    def test_checkpoint_is_a_bounded_request_and_never_a_completion(self):
+        raw = ('WORKER_OUTCOME: {"kind":"checkpoint","plan_id":"G-096",'
+               '"start_head":"' + 'a' * 40 + '"}\nCOMMIT_TITLE: Preserve request parser')
+        outcome = parse(raw)
+        self.assertEqual((outcome.kind, outcome.plan_id, outcome.start_head, outcome.commit_title),
+                         ('checkpoint', 'G-096', 'a' * 40, 'Preserve request parser'))
+        for invalid in (raw + '\nPR_SUMMARY: unfinished', raw + '\nTARGETED_TESTS: PASS',
+                        raw + '\nCOMMIT_TITLE: duplicate', raw + '\n' + raw,
+                        raw.replace('a' * 40, '../HEAD'), raw.replace('G-096', '../G-096'),
+                        raw.replace('"kind":"checkpoint"', '"kind":"checkpoint","command":"git push"'),
+                        raw.replace('"kind":"checkpoint"', '"kind":"checkpoint","question":"x"')):
+            with self.subTest(invalid=invalid), self.assertRaises(WorkerOutcomeError):
+                parse(invalid)
+        with self.assertRaises(loop_manager.WorkerResultError):
+            loop_manager.parse_worker_result(raw, {'id': 'G-096', 'title': 'Decision'})
+
     def test_ready_and_legacy_completion_remain_distinct_from_decision_words(self):
         with self.assertRaisesRegex(WorkerOutcomeError, 'WORKER_OUTCOME'):
             parse('승인 대기 BLOCKED 중단')

@@ -617,6 +617,7 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 역할별 원본을 포함한 내용 해시로 planning 입력과 성공 결과의 재사용을 판단하며 내용이 같으면 runtime SHA 변경만으로 재계획하지 않는다. 저장 원본·전달 해시의 상세 계약은 [지침 원본과 작업별 고정](ARCHITECTURE.md#지침-원본과-작업별-고정)을 따른다.
 
 - 지침 전달은 기본·기존 추가 지침·프로젝트 규칙과 실행 경계를 보존한다. 버전 없는 과거 세션은 기존 작업물·session·실패 기록을 남기고 최소 문맥의 새 세션으로 복구한다.
+- Worker 사용자 메시지는 최초·교체 session에 현재 계획·작업 공간·결과 형식·미완료 작업을 전달하고, 같은 session에는 확인되지 않은 새 조건·오류·검증 피드백·복구점만 보낸다. 변하지 않은 archive 후보·범위와 이전 결과·verify/Review 원문은 반복하지 않는다. 전달 시작만으로 확인 처리하지 않으며 실패·중단에는 미확인 문맥을 보존해 재전송한다. prompt 축약은 권한·검증 성공의 재사용이나 게시 대기 해소를 뜻하지 않는다.
 
 Loop Manager 자체 작업 worktree의 공통·역할별 지침 원본은 현재 역할·목표의 일반 파일 권한으로 수정한다. 후보 편집이나 Reviewer의 diff 읽기로 실행 snapshot을 바꾸지 않는다. 변경 PR의 보고는 [PR 문서 보고](#pr-문서-보고)를 따르며 Manager가 누락을 보완한다.
 
@@ -849,7 +850,7 @@ invocation ledger는 각 호출의 목적·대상과 실제 실행 근거를 연
 
 게시할 변경이 없으면 빈 PR을 만들지 않고 계획 입력 오류로 보존한다. 검증과 결과 재사용의 구체적인 조건은 아래 절을 따른다.
 
-Worker는 선택된 관리 작업 branch에 의미 있는 작업 단위의 로컬 checkpoint commit을 만들 수 있다. Worker가 결과를 반환하면 Manager는 작업·branch·worktree와 허용 변경 범위를 확인하고, 원격 branch의 정확한 현재 OID에 결합한 lease로 commit들을 순서대로 게시한다. push된 commit은 복구점이며 Worker 완료·verify 성공·Review 승인을 증명하지 않는다. 게시 실패에는 commit과 작업물을 보존하고, 해결되기 전 새 Worker 작업을 진행하지 않는다.
+Worker는 의미 있는 작업 단위의 checkpoint를 요청하고 종료한다. Git add·commit·fetch·rebase·push·PR 조작은 Manager가 전담한다. Manager는 종료한 호출의 작업·branch·worktree·시작 HEAD와 보호 문서·선언·index를 확인하고 허용 파일만 commit해 정확한 원격 OID 또는 branch 부재에 결합한 lease로 게시한다. 중간 보존점과 완료 후보는 별도 결과이며 checkpoint만으로 Worker 완료·targeted test·verify·Review 성공을 기록하지 않는다. 과거 직접 commit도 각 중간 commit의 실제 변경 범위를 확인해 게시하며 최종 diff에서 되돌린 금지 변경은 게시하지 않는다. 생성·게시·결과 저장 중단에는 같은 요청·commit·session을 재관측해 완료한 효과를 반복하지 않는다. 게시 실패에는 commit·index·작업물·실패 근거를 보존하고 해결되기 전 새 Worker 작업을 진행하지 않는다.
 
 원격 작업 branch가 먼저 전진하면 Manager는 저장소·작업·branch 소유권과 정확한 원격 OID를 재확인한다. 안전한 충돌 없는 rebase를 할 수 있으면 원격 commit을 보존해 통합한 뒤 변경된 후보의 검증·Review 근거를 다시 판단한다. 충돌·lease 경쟁·소유권 불명에서는 양쪽 commit을 보존하고 작업을 보류한다.
 

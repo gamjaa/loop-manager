@@ -14,6 +14,7 @@ from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
 import re
+from copy import deepcopy
 import sqlite3
 
 
@@ -298,8 +299,11 @@ def push_worker_checkpoint_commits(
     base: str,
     remote_oid: str | None,
     pull_request: Mapping[str, object] | None,
+    *, allow_common_plans: bool = False,
 ) -> tuple[str, int]:
     """Push each already-validated linear Worker commit under an exact lease."""
+    if connection.in_transaction:
+        raise PublicationSafetyError('Worker checkpoint 게시 전에 DB transaction을 종료해야 합니다.')
     plan = effects.active_execplan(connection, repo)
     if (plan is None or plan['plan_id'] != plan_id
             or plan['status'] not in {'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'}
@@ -313,16 +317,20 @@ def push_worker_checkpoint_commits(
     ).fetchone()
     if project is None or project['base_branch'] != base or not project['origin']:
         raise PublicationSafetyError('Worker checkpoint의 등록 저장소·base를 확인할 수 없습니다.')
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    current = checkpoint.get(repo, plan_id)
     effects.validate_execplan_workspace_identity(
         state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree,
     )
     effects.validate_managed_worktree(repo_path, worktree, branch)
-    for location in (repo_path, worktree):
-        for arguments in (('remote', 'get-url', '--all', 'origin'),
-                          ('remote', 'get-url', '--push', '--all', 'origin')):
-            urls = effects.git(location, *arguments).stdout.splitlines()
-            if (len(urls) != 1 or effects.github_repository(urls[0]) != project['origin']):
-                raise PublicationSafetyError('등록 origin과 Worker checkpoint 대상이 다릅니다.')
+    def validate_origin():
+        for location in (repo_path, worktree):
+            for arguments in (('remote', 'get-url', '--all', 'origin'),
+                              ('remote', 'get-url', '--push', '--all', 'origin')):
+                urls = effects.git(location, *arguments).stdout.splitlines()
+                if len(urls) != 1 or effects.github_repository(urls[0]) != project['origin']:
+                    raise PublicationSafetyError('등록 origin과 Worker checkpoint 대상이 다릅니다.')
+    validate_origin()
     branch_head = effects.git(worktree, 'symbolic-ref', '--quiet', '--short', 'HEAD', check=False)
     head = effects.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
     local_ref = effects.git(repo_path, 'rev-parse', '--verify', f'refs/heads/{branch}').stdout.strip()
@@ -337,11 +345,36 @@ def push_worker_checkpoint_commits(
         raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                               'Worker checkpoint 게시 전 원격 branch가 전진했습니다.')
 
-    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
-    current = checkpoint.get(repo, plan_id)
     if current.operation is not None:
         raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
                               'Worker checkpoint 게시 전에 진행 중인 Manager Git operation을 끝내야 합니다.')
+    owner = dict(plan)
+
+    def persist(expected, snapshot, *, head, remote, values=None):
+        nonlocal owner
+        # Observe Git/PR outside this short CAS. A DB retry never repeats a push.
+        with runtime_state._transaction(connection):
+            selected = effects.active_execplan(connection, repo)
+            registration = connection.execute('SELECT origin, base_branch FROM projects WHERE repo=?', (repo,)).fetchone()
+            if (registration is None or dict(registration) != dict(project)
+                    or selected is None or dict(selected) != owner
+                    or checkpoint.get(repo, plan_id) != expected):
+                raise execution_checkpoint_state.CheckpointRace('Worker checkpoint publication owner changed')
+            result = checkpoint.record(
+                repo, plan_id, expected_generation=expected.generation,
+                operation=expected.operation, expected_head=head,
+                target_base_oid=expected.target_base_oid or str(plan['active_sha'] or ''),
+                observed_remote_oid=remote, snapshot=snapshot)
+            if values:
+                effects.update_project(connection, repo, **values)
+            owner = dict(effects.active_execplan(connection, repo))
+        return result
+
+    def validate_commit(parent, target):
+        from loop_manager_internal.agents.scope_validation import validate_worker_commit
+        validate_worker_commit(effects.git, worktree, parent, target, str(plan['path']),
+                               base_branch=base, allow_common_plans=allow_common_plans)
+
     accepted = (current.snapshot or {}).get('accepted_work_branch')
     pending = (current.snapshot or {}).get('worker_checkpoint_pending')
     pending_integrated = False
@@ -353,8 +386,20 @@ def push_worker_checkpoint_commits(
                 or (pending.get('from') is not None and not valid_oid(pending.get('from')))):
             raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
                                   '저장된 Worker checkpoint 게시 intent가 유효하지 않습니다.')
+        for key, value in {'repo': repo, 'plan_id': plan_id, 'worktree': str(worktree),
+                           'origin': project['origin'],
+                           'pr_url': pull_request.get('url') if pull_request else None}.items():
+            if key in pending and pending[key] != value:
+                raise PublicationSafetyError('Worker checkpoint intent identity가 변경됐습니다.')
+        pending_parent = effects.git(worktree, 'show', '-s', '--format=%P', pending['target']).stdout.strip()
+        validate_commit(pending_parent, pending['target'])
+        if ('parent' in pending and pending['parent'] != pending_parent
+                or 'tree' in pending and pending['tree'] != effects.git(
+                    worktree, 'rev-parse', f"{pending['target']}^{{tree}}").stdout.strip()):
+            raise PublicationSafetyError('Worker checkpoint intent parent/tree가 변경됐습니다.')
         if remote_oid not in {pending.get('from'), pending['target']}:
-            if accepted == remote_oid and remote_oid is not None:
+            if remote_oid is not None and effects.git(worktree, 'merge-base', '--is-ancestor',
+                    pending['target'], remote_oid, check=False).returncode == 0:
                 pending_integrated = True
             else:
                 raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
@@ -364,7 +409,7 @@ def push_worker_checkpoint_commits(
         if accepted or recorded_remote or plan['pr_url']:
             raise RecoveryFailure(RecoveryReason.REMOTE_BRANCH_DELETED,
                                   '게시한 Worker checkpoint branch가 원격에서 삭제됐습니다.')
-    elif remote_oid not in {accepted, recorded_remote,
+    elif not pending_integrated and remote_oid not in {accepted, recorded_remote,
                             *({pending.get('from'), pending['target']} if pending else set())}:
         raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
                               '현재 원격 Worker branch가 저장된 관리 소유권과 일치하지 않습니다.')
@@ -381,9 +426,7 @@ def push_worker_checkpoint_commits(
                 or (plan['pr_url'] and observed.get('url') != plan['pr_url'])):
             raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                                   'Worker checkpoint push 직전 기존 PR identity 또는 head가 변경됐습니다.')
-        if not plan['pr_url']:
-            effects.update_project(connection, repo, pr_url=str(observed['url']),
-                                   pr_head_oid=str(expected_head))
+
 
     validate_pr(pull_request, remote_oid)
     if pending is not None and remote_oid in {pending.get('from'), pending['target']}:
@@ -393,20 +436,17 @@ def push_worker_checkpoint_commits(
             raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
                                   '미완료 Worker checkpoint commit이 현재 작업 이력에 없습니다.')
     if pending is not None and (remote_oid == pending['target'] or pending_integrated):
-        current = checkpoint.get(repo, plan_id)
-        snapshot = dict(current.snapshot or {})
+        confirmed = pending['target']
+        snapshot = deepcopy(current.snapshot or {})
+        snapshot.setdefault('worker_checkpoint_history', []).append(pending)
         snapshot.pop('worker_checkpoint_pending', None)
-        snapshot['accepted_work_branch'] = remote_oid
-        checkpoint.record(
-            repo, plan_id, expected_generation=current.generation,
-            operation=current.operation, expected_head=remote_oid,
-            target_base_oid=str(plan['active_sha'] or ''), observed_remote_oid=remote_oid,
-            snapshot=snapshot,
-        )
-        effects.update_project(
-            connection, repo, publication_remote_oid=remote_oid,
-            **({'pr_head_oid': remote_oid} if plan['pr_url'] or pull_request else {}),
-        )
+        snapshot['accepted_work_branch'] = confirmed
+        current = persist(current, snapshot, head=confirmed, remote=confirmed,
+            values={'publication_remote_oid': confirmed,
+                    **({'pr_head_oid': confirmed} if plan['pr_url'] or pull_request else {}),
+                    **({'pr_url': str(pull_request['url'])} if pull_request and not plan['pr_url'] else {})})
+        if pending_integrated:
+            return head, 0  # The caller integrates the later remote input separately.
     root = remote_oid or str(plan['active_sha'] or '')
     if not root:
         raise PublicationSafetyError('Worker checkpoint의 시작 commit을 확인할 수 없습니다.')
@@ -432,6 +472,9 @@ def push_worker_checkpoint_commits(
 
     expected = remote_oid
     for commit in commits:
+        if effects.active_execplan(connection, repo) is None or dict(effects.active_execplan(connection, repo)) != owner:
+            raise execution_checkpoint_state.CheckpointRace('Worker checkpoint publication owner changed')
+        validate_commit(expected or str(plan['active_sha']), commit)
         plan = effects.active_execplan(connection, repo)
         if (plan is None or plan['plan_id'] != plan_id
                 or plan['status'] not in {'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'}
@@ -443,18 +486,18 @@ def push_worker_checkpoint_commits(
             raise PublicationSafetyError('Worker checkpoint push 도중 관리 branch HEAD가 변경됐습니다.')
         current_pr = effects.pr_for_branch(repo_path, branch)
         validate_pr(current_pr, expected)
+        validate_origin()
         live = manager_git_journal.live_remote_branch_oid(effects.git, repo_path, branch)
         if live != expected:
             raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                                   'Worker checkpoint의 정확한 lease OID가 push 전에 변경됐습니다.')
-        current = checkpoint.get(repo, plan_id)
-        pending = {'branch': branch, 'from': expected, 'target': commit}
-        checkpoint.record(
-            repo, plan_id, expected_generation=current.generation,
-            operation=current.operation, expected_head=current.expected_head,
-            target_base_oid=current.target_base_oid, observed_remote_oid=expected,
-            snapshot={**(current.snapshot or {}), 'worker_checkpoint_pending': pending},
-        )
+        pending = {'branch': branch, 'from': expected, 'target': commit,
+                   'repo': repo, 'plan_id': plan_id, 'worktree': str(worktree),
+                   'origin': project['origin'], 'pr_url': current_pr.get('url') if current_pr else None,
+                   'parent': effects.git(worktree, 'show', '-s', '--format=%P', commit).stdout.strip(),
+                   'tree': effects.git(worktree, 'rev-parse', f'{commit}^{{tree}}').stdout.strip()}
+        current = persist(current, {**(current.snapshot or {}), 'worker_checkpoint_pending': pending},
+                          head=current.expected_head, remote=expected)
         pushed = effects.git(
             worktree, 'push', manager_git_journal.exact_branch_lease(branch, expected),
             'origin', f'{commit}:refs/heads/{branch}', check=False,
@@ -465,18 +508,14 @@ def push_worker_checkpoint_commits(
                 raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                                       'Worker checkpoint push 중 예상하지 않은 원격 commit이 나타났습니다.')
             raise RuntimeError(f'Worker checkpoint push 실패:\n{pushed.stdout[-8000:]}')
-        current = checkpoint.get(repo, plan_id)
-        snapshot = dict(current.snapshot or {})
+        snapshot = deepcopy(current.snapshot or {})
+        snapshot.setdefault('worker_checkpoint_history', []).append(pending)
         snapshot.pop('worker_checkpoint_pending', None)
         snapshot['accepted_work_branch'] = commit
-        checkpoint.record(
-            repo, plan_id, expected_generation=current.generation,
-            operation=current.operation, expected_head=commit,
-            target_base_oid=str(plan['active_sha'] or ''), observed_remote_oid=commit,
-            snapshot=snapshot,
-        )
-        effects.update_project(connection, repo, publication_remote_oid=commit,
-                               **({'pr_head_oid': commit} if plan['pr_url'] or current_pr else {}))
+        current = persist(current, snapshot, head=commit, remote=commit,
+            values={'publication_remote_oid': commit,
+                    **({'pr_head_oid': commit} if plan['pr_url'] or current_pr else {}),
+                    **({'pr_url': str(current_pr['url'])} if current_pr and not plan['pr_url'] else {})})
         expected = commit
     return head, len(commits)
 

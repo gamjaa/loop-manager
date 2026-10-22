@@ -166,6 +166,38 @@ class ScopeObservationTests(TestCase):
 
 
 class ScopeValidationTests(TestCase):
+    def test_recorded_manager_commit_can_advance_head_before_frontmatter_check(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+        tree = 'b' * 40
+        saved = checkpoints.record('/source', 'G-047', expected_generation=0, operation=None,
+            expected_head='after', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'before_head': 'before', 'after_head': 'after',
+                      'commit_message': 'Manager checkpoint', 'commit_tree_oid': tree})
+        def git(_repo, *args, **kwargs):
+            values = {('show', '-s', '--format=%P', 'after'): 'before',
+                      ('show', '-s', '--format=%B', 'after'): 'Manager checkpoint',
+                      ('rev-parse', 'after^{tree}'): tree}
+            return subprocess.CompletedProcess(args, 0, values[args])
+        effects = scope_adapter.ValidateWorkerWorkspaceScopeEffects(
+            capture_git_snapshot=lambda _: snapshot(head='after'), git=git, git_bytes=mock.Mock(),
+            _owned_rebase_state_dir=mock.Mock(), _current_rebase_service=mock.Mock(),
+            validate_active_execplan_metadata=mock.Mock(return_value={}),
+            validate_agent_scope=mock.Mock(), validate_managed_worktree=mock.Mock())
+        args = (Path('/source'), Path('/managed'), 'loop-manager/G-047', 'main',
+                'docs/plans/[G-047] Runtime.md',
+                {'plan_id': 'G-047', 'active_sha': 'base', 'current_revision_sha': 'official'},
+                snapshot(head='before'))
+        with mock.patch('loop_manager_internal.execution.plan_validation.restore_worker_frontmatter', return_value=False):
+            self.assertEqual(scope_adapter.validate_worker_workspace_scope(effects, *args,
+                connection=connection, on_frontmatter_restored=mock.Mock()), {})
+            checkpoints.record('/source', 'G-047', expected_generation=saved.generation, operation=None,
+                expected_head='after', target_base_oid='base', observed_remote_oid=None, snapshot={})
+            with self.assertRaisesRegex(manager.WorkspaceOwnershipError, '직접 HEAD 변경'):
+                scope_adapter.validate_worker_workspace_scope(effects, *args,
+                    connection=connection, on_frontmatter_restored=mock.Mock())
+
     def setUp(self):
         self.effects = replace(manager._scope_validation_effects(),
             _scope_snapshot_with_start_ignore_rules=lambda _path, _before, after: after,
