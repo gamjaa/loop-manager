@@ -49,6 +49,7 @@ priority: high
 - [x] 초기 후보에서 verify slot 배정 뒤 새 자료 도착을 포함한 targeted unit test 4개를 실행했다. 네 테스트 모두 통과했다.
 - [x] 현재 후보 `1120bd4d8d132e3ca33a50985f05c701d43adb6d`의 Manager verify delta 7개 case는 모두 Worker session 시작으로 projection이 갱신된 뒤 직접 호출용 `_post_effect_guard()`가 이전 context를 반환해 실패했다. guard의 직접 호출 경로도 저장된 최신 context를 다시 구성하고 회귀 case를 추가했다. 동일한 7개 case, 새 context 회귀 case, 저장된 verify 재개 관련 4개 case가 현재 후보에서 모두 통과했으며 전체 verify는 실행하지 않았다.
 - [x] 관리 rebase 반영 뒤 현재 후보에서 저장 verify 재개 관련 targeted case 4개와 `_post_effect_guard()`의 직접 호출 context 회귀 1개를 다시 실행했고 모두 통과했다. 전체 verify는 실행하지 않았다.
+- [x] 이전 후보의 Manager verify에서 2 CPU 환경의 nested runner 통합 회귀 두 건이 30초 제한에 도달했다. 현재 고정 base에는 bootstrap runner와 verify 90초·외부 process 120초 예산이 이미 포함되어 있으므로 더 큰 예산과 진단을 보존하고, full-suite 동시 작업이 2 CPU에서 기다릴 수 있다는 설명을 테스트에 추가했다. 실제 nested verify·Manager integration인 두 case는 Worker에서 실행하지 않았으며 Manager 재검증이 필요하다.
 
 ## Decision Log
 

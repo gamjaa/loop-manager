@@ -257,6 +257,8 @@ class PartialRunnerTests(unittest.TestCase):
             bootstrap = Path(temporary) / 'nested-runner.py'
             bootstrap.write_text(nested_runner_source(entrypoint))
             reports = []
+            # The full suite can run another module beside this nested runner
+            # on 2-CPU hosts; keep the behavioral assertions past that wait.
             for mode in ('partial', 'full'):
                 logs = Path(temporary) / mode
                 environment = dict(os.environ, LOOP_MANAGER_VERIFY_LOG_DIR=str(logs))
