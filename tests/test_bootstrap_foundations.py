@@ -120,6 +120,14 @@ class BootstrapFoundationTests(unittest.TestCase):
             self.assertEqual(
                 sum('created=0 reused=2 replaced=1' in line for line in logs), 2, logs,
             )
+            child_runs = [line for line in logs if line.startswith('runtime Python child:')]
+            self.assertEqual(len(child_runs), 4, logs)
+            for line in child_runs:
+                self.assertIn(f'revision={runtime.commit_sha}', line)
+                self.assertIn(f'interpreter={sys.executable}', line)
+                self.assertIn(f'cache_tag={sys.implementation.cache_tag}', line)
+                self.assertIn('returncode=7', line)
+                self.assertGreaterEqual(float(line.split('seconds=', 1)[1].split()[0]), 0)
 
 
     def test_runtime_child_propagates_command_line_cache_prefix_to_environment(self):

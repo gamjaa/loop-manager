@@ -650,6 +650,8 @@ class BootstrapService:
             self.effects.operation_log(
                 "runtime Python bytecode cache: 검증되지 않은 cache를 피하기 위해 임시 prefix 사용"
             )
+        child_started = time.perf_counter()
+        completed = None
         try:
             if arguments and arguments[0] == 'run' and refresh.paused(state_dir):
                 raise refresh.RuntimePaused()
@@ -668,6 +670,13 @@ class BootstrapService:
                 env=environment,
             )
         finally:
+            self.effects.operation_log(
+                "runtime Python child: "
+                f"revision={runtime.commit_sha} interpreter={self.interpreter} "
+                f"cache_tag={sys.implementation.cache_tag or 'untagged'} "
+                f"seconds={time.perf_counter() - child_started:.3f} "
+                f"returncode={getattr(completed, 'returncode', 'unavailable')}"
+            )
             if fallback_cache is not None:
                 try:
                     fallback_cache.cleanup()
