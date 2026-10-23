@@ -63,6 +63,43 @@ class RuntimeInputTests(unittest.TestCase):
 
 
 class RuntimeObservationTests(unittest.TestCase):
+    def test_pause_database_wait_does_not_reenter_pause_check(self):
+        from loop_manager_internal.runtime import handoff_gate
+        for paused in (False, True):
+            with self.subTest(paused=paused), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                with closing(sqlite3.connect(state/'pause.db')) as writer:
+                    writer.execute('CREATE TABLE pauses(scope TEXT PRIMARY KEY)')
+                    if paused:
+                        writer.execute("INSERT INTO pauses VALUES ('')")
+                    writer.commit()
+                    writer.execute('BEGIN EXCLUSIVE')
+                    def check_pause():
+                        if refresh.paused(state):
+                            raise refresh.RuntimePaused()
+                    check = mock.Mock(side_effect=check_pause)
+                    gate = RuntimeHandoffGate(threading.Event(), threading.Lock(), pause_check=check)
+                    token = _runtime_handoff_signal.set(gate)
+                    original = handoff_gate._check_runtime_handoff
+                    def release_and_check():
+                        writer.rollback()
+                        original()
+                    try:
+                        with mock.patch.object(handoff_gate, '_check_runtime_handoff', side_effect=release_and_check) as waiting:
+                            if paused:
+                                with self.assertRaises(refresh.RuntimePaused):
+                                    gate.check()
+                            else:
+                                gate.check()
+                        self.assertTrue(waiting.called)
+                        check.assert_called_once()
+                        gate.stop()
+                        gate.pause_check = lambda: handoff_gate._check_runtime_handoff()
+                        with self.assertRaises(SelfMergeRuntimeHandoff):
+                            gate.check()
+                    finally:
+                        _runtime_handoff_signal.reset(token)
+
     def test_observation_commits_completed_implicit_state_and_rejects_explicit_transaction(self):
         from loop_manager_internal.storage.db_access import open_connection, finish_implicit_request
         with tempfile.TemporaryDirectory() as directory:

@@ -222,7 +222,7 @@ ExecPlan은 [PLANS.md](PLANS.md)의 고정 key/value와 `sources`·`depends_on` 
 | PR Open·Closed·Merged 상태 | GitHub |
 | Model·Effort·동시 실행 수·Telegram 설정 | `config/config.ini` |
 
-SQLite는 `<state-dir>/loop-manager.db`에 저장하고 상태 변경은 transaction으로 기록한다. bootstrap의 등록 조회는 읽기 전용으로 시작하며 `SQLITE_READONLY_ROLLBACK`일 때만 기존 DB를 쓰기 연결로 한 번 다시 열어 SQLite의 미완료 트랜잭션 복구를 허용한다. 같은 DB 접근 조율을 유지하고 schema migration·등록 변경·다른 오류의 우회는 하지 않는다. 현재 문서의 원본은 Git이며 경로·내용 해시로 연결한다. 복구·사용자 결정·문서 수정본 검증에 필요한 원문·snapshot은 별도 증거로 SQLite에 보존할 수 있으며 현재 문서의 원본을 대신하지 않는다.
+SQLite는 `<state-dir>/loop-manager.db`에 저장하고 상태 변경은 transaction으로 기록한다. bootstrap의 등록 조회는 읽기 전용으로 시작하며 `SQLITE_READONLY_ROLLBACK`일 때만 기존 DB를 쓰기 연결로 한 번 다시 열어 SQLite의 미완료 트랜잭션 복구를 허용한다. 같은 DB 접근 조율을 유지하고 schema migration·등록 변경·다른 오류의 우회는 하지 않는다. runtime gate의 pause 조회가 DB를 기다리는 동안 같은 실행 context의 pause 재진입만 억제하며 확정된 runtime 종료 결정은 중첩 확인에서도 적용한다. 현재 문서의 원본은 Git이며 경로·내용 해시로 연결한다. 복구·사용자 결정·문서 수정본 검증에 필요한 원문·snapshot은 별도 증거로 SQLite에 보존할 수 있으며 현재 문서의 원본을 대신하지 않는다.
 
 SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 과거 등록·승인 감사, 마지막 성공 Planner의 명세·전체 계획 입력 지문과 `planning_error`, 복구 가능한 planning publication intent, ExecPlan 메타데이터와 의존성, 최초 실행 여부, 실행 상태와 재시도 횟수, AI Agent 세션, worktree, branch, PR, 삭제된 미착수 ExecPlan의 ID 예약·감사 기록, `cleanup_pending`, 알림과 프로젝트 완료 주기를 저장한다.
 

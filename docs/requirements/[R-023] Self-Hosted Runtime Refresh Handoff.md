@@ -22,7 +22,7 @@ runtime handoff의 배정 중단 범위는 R-091대로 현재 runtime 전체다.
 
 bootstrap은 process lock을 획득한 뒤 runtime worktree를 선택·생성하거나 runtime 자식 및 프로젝트 PR 동기화를 시작하기 전에 self `<base-branch>`를 해석하고 `origin/<base-branch>`를 fetch해야 한다. 최신으로 검증한 원격 revision의 bootstrap·runtime으로 실행을 넘기며, source checkout의 commit·파일·동기화 성공은 그 revision의 선택과 실행 조건으로 사용하지 않는다. source에 있는 로컬 전용 코드·문서는 자동 실행 입력에 포함하지 않는다.
 
-self base 조회는 정상 상태에서 읽기 전용으로 수행한다. 비정상 종료 뒤 hot rollback journal 때문에 SQLite가 `SQLITE_READONLY_ROLLBACK`을 반환한 경우에만 쓰기 가능한 연결로 한 번 다시 열어 SQLite의 미완료 트랜잭션 롤백과 기존 등록 정보 조회를 허용한다. 새 DB 생성·schema migration·등록 내용 변경은 수행하지 않으며, 다른 읽기 전용·권한·손상 오류나 재시도 실패는 원래 오류로 보존한다. 이 복구는 기존 실행·DB 접근 조율 안에서 수행한다.
+self base 조회는 정상 상태에서 읽기 전용으로 수행한다. 비정상 종료 뒤 hot rollback journal 때문에 SQLite가 `SQLITE_READONLY_ROLLBACK`을 반환한 경우에만 쓰기 가능한 연결로 한 번 다시 열어 SQLite의 미완료 트랜잭션 롤백과 기존 등록 정보 조회를 허용한다. 새 DB 생성·schema migration·등록 내용 변경은 수행하지 않으며, 다른 읽기 전용·권한·손상 오류나 재시도 실패는 원래 오류로 보존한다. 이 복구는 기존 실행·DB 접근 조율 안에서 수행한다. pause 조회 자체의 DB 대기에서는 같은 pause 조회를 다시 진입하지 않는다. 실제 pause·runtime 종료 결정과 DB 대기 제한은 계속 적용한다.
 
 source bootstrap이 원격 base보다 뒤처졌거나 로컬 동기화를 할 수 없어도 검증한 원격 bootstrap·runtime을 실행할 수 있어야 한다. 원격 실행 revision·소유권 자체를 확인할 수 없는 오류는 상태를 보존해 재시도하며, 로컬 갱신 실패와 구분한다. 원격 실행 코드와 fetch된 원격 SHA는 일치해야 하지만 source checkout의 HEAD까지 일치하도록 요구하지 않는다.
 

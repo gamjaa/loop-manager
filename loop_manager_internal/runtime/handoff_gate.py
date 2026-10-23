@@ -8,6 +8,8 @@ from .contracts import RuntimeRefresh
 import subprocess
 import threading
 
+_pause_check_active = ContextVar('runtime_pause_check_active', default=False)
+
 
 class SelfMergeRuntimeHandoff(BaseException):
     """A verified remote code change requires a drained runtime replacement."""
@@ -31,8 +33,12 @@ class RuntimeHandoffGate:
     before_observe: Callable[[], None] | None = None
 
     def check(self) -> None:
-        if self.pause_check is not None:
-            self.pause_check()
+        if self.pause_check is not None and not _pause_check_active.get():
+            token = _pause_check_active.set(True)
+            try:
+                self.pause_check()
+            finally:
+                _pause_check_active.reset(token)
         if self.event.is_set():
             raise SelfMergeRuntimeHandoff(self.request)
 
