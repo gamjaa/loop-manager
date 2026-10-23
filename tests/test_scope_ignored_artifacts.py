@@ -1,5 +1,5 @@
 from tests.support.git import isolated_git_test
-from tests.support.scope import AgentScopeFixture
+from tests.support.scope import AgentScopeFixture, snapshot
 from tests.support.git import prepare_manager_import_fixture
 import sqlite3
 import os
@@ -19,33 +19,44 @@ from tests.support.git import git_command, commit_and_push
 class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
     def test_ignored_untracked_creation_change_and_deletion_are_allowed(self):
         scenarios = tuple(
-            (role, before, after)
-            for role in ('planner', 'worker', 'reviewer')
-            for before, after in ((None, 'created\n'), ('old\n', 'changed\n'), ('old\n', None))
+            (role, action, before, after)
+            for role in ('planner', 'worker')
+            for action, before, after in (
+                ('create', None, 'created\n'),
+                ('change', 'old\n', 'changed\n'),
+                ('delete', 'old\n', None),
+            )
         )
-        for role_name, before_contents, after_contents in scenarios:
-            with self.subTest(role=role_name), tempfile.TemporaryDirectory() as directory:
-                repo, _plan_path = self._repository_with_plan(directory)
-                (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
-                commit_and_push(repo, "Ignore diagnostic fixture")
+        for role_name, action, before_contents, after_contents in scenarios:
+            with self.subTest(role=role_name, action=action), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
                 ignored = repo / "ignored.txt"
+                # Git rule collection is covered below; keep this result-policy matrix process-free.
+                before = snapshot()
+                after = before
                 if before_contents is not None:
                     ignored.write_text(before_contents, encoding="utf-8")
-                before = loop_manager.capture_git_snapshot(repo)
-
                 if after_contents is None:
                     ignored.unlink()
                 else:
                     ignored.write_text(after_contents, encoding="utf-8")
-                after = loop_manager.capture_git_snapshot(repo)
-
-                self.assertNotIn("ignored.txt", before.dirty)
-                self.assertNotIn("ignored.txt", after.dirty)
-                loop_manager.validate_agent_scope(
-                    role_name, repo, before, after,
-                    selected_plan_path="docs/plans/[G-001] Scope Safety.md"
-                    if role_name == "worker" else None,
-                )
+                with (mock.patch.object(loop_manager, "capture_git_snapshot",
+                                        side_effect=(before, after)) as observe,
+                      mock.patch("subprocess.Popen",
+                                 side_effect=AssertionError("예상 밖 Git process 실행"))):
+                    self.assertEqual(loop_manager.capture_git_snapshot(repo), before)
+                    self.assertEqual(loop_manager.capture_git_snapshot(repo), after)
+                    self.assertNotIn("ignored.txt", before.dirty)
+                    self.assertNotIn("ignored.txt", after.dirty)
+                    loop_manager.validate_agent_scope(
+                        role_name, repo, before, after,
+                        selected_plan_path="docs/plans/[G-001] Scope Safety.md"
+                        if role_name == "worker" else None,
+                    )
+                    self.assertEqual(observe.call_count, 2)
+                self.assertEqual(ignored.exists(), after_contents is not None)
+                if after_contents is not None:
+                    self.assertEqual(ignored.read_text(encoding="utf-8"), after_contents)
 
     def test_legacy_ignored_snapshot_requires_unchanged_tracked_rule(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -111,16 +122,27 @@ class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
             for action in ('create', 'modify', 'delete'):
                 with self.subTest(role=role, action=action), tempfile.TemporaryDirectory() as directory:
                     repo, plan_path = self._repository_with_plan(directory)
-                    exclude = repo / '.git/legacy-empty-exclude'
-                    exclude.write_bytes(b'')
-                    git_command(repo, 'config', 'core.excludesFile', str(exclude))
                     (repo / '.gitignore').write_text('cache.bin\n', encoding='utf-8')
                     commit_and_push(repo, 'Ignore cache')
                     git_command(repo, 'switch', '-c', 'loop-manager/G-001')
                     cache = repo / 'cache.bin'
                     if action != 'create':
                         cache.write_bytes(b'old')
-                    current = loop_manager.capture_git_snapshot(repo)
+                    head = 'a' * 40
+                    current = snapshot(
+                        head=head,
+                        branch='loop-manager/G-001',
+                        index={'.gitignore': ('H 100644 ignore-rule-blob 0',)},
+                        refs={'refs/heads/loop-manager/G-001': (head, '')},
+                        worktrees={str(repo): (
+                            f'HEAD={head}', 'branch=refs/heads/loop-manager/G-001')},
+                        config={
+                            'ignore-source:repository-exclude': (
+                                str(Path(directory) / 'missing-repository-exclude'), 'missing'),
+                            'ignore-source:global-exclude': (
+                                str(Path(directory) / 'missing-global-exclude'), 'missing'),
+                        },
+                    )
                     start = replace(current, dirty=({'cache.bin': (('untracked',), 'old')}
                                                     if action != 'create' else {}))
                     result = replace(current, dirty=({'cache.bin': (('untracked',), 'result')}
@@ -145,48 +167,97 @@ class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
                             connection.execute("UPDATE exec_plans SET agent_role = ?, agent_snapshot = ?, "
                                                "agent_result_snapshot = ?, worker_session_id = 'saved', retry_count = 3",
                                                (role, start.serialize(), result.serialize()))
-                        loop_manager.validate_persisted_agent_scope(connection, repo, state, str(repo))
-                        manager = loop_manager.ManagerGitCheckpoint(result, frozenset()).serialize()
-                        with connection:
-                            connection.execute('UPDATE projects SET agent_manager_snapshot = ?', (manager,))
-                            connection.execute('UPDATE exec_plans SET agent_manager_snapshot = ?', (manager,))
-                        loop_manager.validate_persisted_agent_scope(connection, repo, state, str(repo))
-                        with connection:
-                            connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED'")
-                            connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED'")
-                        loop_manager.validate_persisted_agent_scope(connection, repo, state, str(repo))
-                        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
-                        loop_manager.validate_blocked_agent_scope(connection, repo, str(repo), 'main',
-                            repo, plan_path, saved_plan=plan, require_safe_result=True)
-                        saved = connection.execute('SELECT * FROM exec_plans').fetchone()
-                        self.assertEqual(saved['agent_snapshot'], start.serialize())
-                        self.assertEqual(saved['agent_result_snapshot'], result.serialize())
-                        self.assertEqual(saved['agent_manager_snapshot'], manager)
-                        self.assertEqual((saved['worker_session_id'], saved['retry_count']), ('saved', 3))
-                        if role == 'reviewer':
+                        def check_ignored_rule(command, *, input, **kwargs):
+                            paths = [path for path in input.split(b'\0') if path]
+                            self.assertEqual(paths, [b'cache.bin'])
+                            output = b''.join(
+                                b'.gitignore\0' + b'1\0' + b'cache.bin\0' + path + b'\0'
+                                for path in paths
+                            )
+                            return subprocess.CompletedProcess(
+                                command, 0 if paths else 1, output, b'')
+
+                        def observed_rule(_worktree, *arguments, **kwargs):
+                            if (arguments[0:1] == ('rev-parse',)
+                                    and arguments[1:] == (f'{head}:.gitignore',)):
+                                return subprocess.CompletedProcess(
+                                    ['git', *arguments], 0, 'ignore-rule-blob\n', '')
+                            raise AssertionError(f'예상 밖 Git observation: {arguments}')
+
+                        worktree_record = [{
+                            'worktree': str(repo),
+                            'branch': 'refs/heads/loop-manager/G-001',
+                        }]
+                        # Recovery and legacy normalization stay live; only Git observations are doubled.
+                        with (mock.patch.object(loop_manager, 'capture_git_snapshot',
+                                                return_value=current),
+                              mock.patch.object(loop_manager, '_worktree_catalog',
+                                                return_value=worktree_record),
+                              mock.patch.object(loop_manager, '_handoff_run',
+                                                side_effect=check_ignored_rule) as ignore_observation,
+                              mock.patch.object(loop_manager, 'git',
+                                                side_effect=observed_rule) as rule_observation,
+                              mock.patch.object(loop_manager, '_rebase_in_progress_for_branch',
+                                                return_value=False),
+                              mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+                              mock.patch('subprocess.Popen',
+                                         side_effect=AssertionError('예상 밖 Git process 실행'))):
+                            self.assertEqual(loop_manager.validate_persisted_agent_scope(
+                                connection, repo, state, str(repo)), current)
+                            manager = loop_manager.ManagerGitCheckpoint(result, frozenset()).serialize()
                             with connection:
-                                connection.execute("UPDATE exec_plans SET status = 'REVIEWING', "
-                                    "worker_result = 'saved worker', verify_result = 'saved verify', "
-                                    "worker_input_token = 'worker-token', verify_token = 'verify-token'")
-                                loop_manager._clear_active_in_current_transaction(connection, str(repo))
-                            runtime = loop_manager.runtime_state.RuntimeStateRepository(connection)
-                            runtime.block_plan(str(repo), 'G-001',
-                                reason_code='managed_worktree_scope_violation', evidence='legacy cache',
-                                release_fingerprint='same')
-                            from loop_manager_internal.recovery import scoped_blocking
-                            block = scoped_blocking.plan_block(connection, str(repo), 'G-001')
-                            with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'):
+                                connection.execute('UPDATE projects SET agent_manager_snapshot = ?', (manager,))
+                                connection.execute('UPDATE exec_plans SET agent_manager_snapshot = ?', (manager,))
+                            self.assertEqual(loop_manager.validate_persisted_agent_scope(
+                                connection, repo, state, str(repo)), current)
+                            with connection:
+                                connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED'")
+                                connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED'")
+                            self.assertEqual(loop_manager.validate_persisted_agent_scope(
+                                connection, repo, state, str(repo)), current)
+                            plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+                            self.assertEqual(loop_manager.validate_blocked_agent_scope(
+                                connection, repo, str(repo), 'main', repo, plan_path,
+                                saved_plan=plan, require_safe_result=True), current)
+                            saved = connection.execute('SELECT * FROM exec_plans').fetchone()
+                            self.assertEqual(saved['agent_snapshot'], start.serialize())
+                            self.assertEqual(saved['agent_result_snapshot'], result.serialize())
+                            self.assertEqual(saved['agent_manager_snapshot'], manager)
+                            self.assertEqual((saved['worker_session_id'], saved['retry_count']), ('saved', 3))
+                            if role == 'reviewer':
+                                with connection:
+                                    connection.execute("UPDATE exec_plans SET status = 'REVIEWING', "
+                                        "worker_result = 'saved worker', verify_result = 'saved verify', "
+                                        "worker_input_token = 'worker-token', verify_token = 'verify-token'")
+                                    loop_manager._clear_active_in_current_transaction(connection, str(repo))
+                                runtime = loop_manager.runtime_state.RuntimeStateRepository(connection)
+                                runtime.block_plan(str(repo), 'G-001',
+                                    reason_code='managed_worktree_scope_violation', evidence='legacy cache',
+                                    release_fingerprint='same')
+                                from loop_manager_internal.recovery import scoped_blocking
+                                block = scoped_blocking.plan_block(connection, str(repo), 'G-001')
                                 self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
                                     connection, repo, state, str(repo), block))
                                 self.assertFalse(loop_manager._reconcile_scope_baseline_plan_block(
                                     connection, repo, state, str(repo), block))
-                            resumed = connection.execute('SELECT * FROM exec_plans').fetchone()
-                            self.assertEqual(resumed['status'], 'REVIEWING')
-                            self.assertEqual((resumed['worker_result'], resumed['verify_result'],
-                                              resumed['worker_input_token'], resumed['verify_token']),
-                                             ('saved worker', 'saved verify', 'worker-token', 'verify-token'))
+                                self.assertEqual(ignore_observation.call_count,
+                                                 1 if action != 'delete' else 0)
+                                self.assertEqual(rule_observation.call_count,
+                                                 2 if action != 'delete' else 0)
+                                resumed = connection.execute('SELECT * FROM exec_plans').fetchone()
+                                self.assertEqual(resumed['status'], 'REVIEWING')
+                                self.assertEqual((resumed['worker_result'], resumed['verify_result'],
+                                                  resumed['worker_input_token'], resumed['verify_token']),
+                                                 ('saved worker', 'saved verify', 'worker-token', 'verify-token'))
+                                self.assertEqual(resumed['agent_snapshot'], start.serialize())
+                                self.assertEqual(resumed['agent_result_snapshot'], result.serialize())
+                                self.assertEqual(resumed['agent_manager_snapshot'], manager)
+                                self.assertEqual((resumed['worker_session_id'], resumed['retry_count']),
+                                                 ('saved', 3))
                         if action != 'delete':
                             self.assertEqual(cache.read_bytes(), b'changed')
+                        else:
+                            self.assertFalse(cache.exists())
                     finally:
                         connection.close()
 
