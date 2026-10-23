@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
+from loop_manager_internal.application.manual_work import validate_options
 from loop_manager_internal.agents.agent_invocation import ResolvedProfile
 from loop_manager_internal.execution.manual_candidate import ManualCandidate
 from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
@@ -23,7 +24,7 @@ class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
             resolve_profile=service.effects.resolve_profile)
 
 
-    def submitted(self, directory, *, count=2, skip=False):
+    def submitted(self, directory, *, count=2, skip=False, skip_reason='External checks'):
         service,_,_=self.fixture(directory)
         user=Path(directory)/'source-worktree'
         git_command(service.repo_path,'worktree','add','-b','source',str(user),'origin/main')
@@ -39,7 +40,8 @@ class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
         if skip:
             args.skip_verify=args.skip_review=True
             args.expected_head=git_command(user,'rev-parse','HEAD')
-            args.skip_reason='External checks'
+            args.skip_reason=skip_reason
+        validate_options(args)
         service.submit(args)
         return service,service.store.for_source(service.repo,'source',args.requirement),user
 
@@ -126,7 +128,7 @@ class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
         return service,branch,worktree,head,base,project,pull_request
 
 
-    def _verify_fixture_with_manual_skip(self):
+    def _verify_fixture_with_manual_skip(self, *, reason='external verify'):
         from tests.support.execution import execution_fixture
         from loop_manager_internal.execution.manual_candidate import candidate_token, stage_input_tokens
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
@@ -159,7 +161,7 @@ class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
         verify_input,review_input=stage_input_tokens(config_path,'codex',context.worktree,resolve_profile)
         store.accept(group,head=head,base=base,input_token=candidate_input,
                      verify_input_token=verify_input,review_input_token=review_input,
-                     skip_verify=True,reason='external verify')
+                     skip_verify=True,reason=reason)
         fixture.state.manual=candidate
         return fixture,context,candidate,config_path
 

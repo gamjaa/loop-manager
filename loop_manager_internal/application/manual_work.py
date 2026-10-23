@@ -65,10 +65,14 @@ def validate_options(args):
     skipping = args.skip_verify or args.skip_review
     if args.expected_head and not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', args.expected_head):
         raise ValueError('--expected-head는 commit 전체 SHA여야 합니다.')
-    if skipping and (not args.expected_head or not (args.skip_reason or '').strip()):
-        raise ValueError('생략에는 --expected-head와 비어 있지 않은 --skip-reason이 필요합니다.')
+    if skipping and not args.expected_head:
+        raise ValueError('생략에는 --expected-head가 필요합니다.')
     if args.skip_reason is not None and not skipping:
         raise ValueError('--skip-reason은 생략 옵션과 함께 사용해야 합니다.')
+
+
+def normalize_skip_reason(reason):
+    return reason if isinstance(reason, str) and reason.strip() else ''
 
 
 def validate_group_dependencies(documents):
@@ -417,7 +421,8 @@ class ManualWorkService:
             group=self.store.update(group,documents=json.dumps(documents,ensure_ascii=False),definition_head=definition_head)
             self.store.accept(group,head=head,base=base_head,input_token=candidate,
                 verify_input_token=verify_input,review_input_token=review_input,
-                skip_verify=args.skip_verify,skip_review=args.skip_review,reason=args.skip_reason or '')
+                skip_verify=args.skip_verify,skip_review=args.skip_review,
+                reason=normalize_skip_reason(args.skip_reason))
             self.store.update(group,state='AUTOMATIC',base_sha=base_head,last_error=None)
             for member in json.loads(group['members']):
                 current = self.runtime.get(self.repo,member)
@@ -639,7 +644,8 @@ class ManualWorkService:
                              requirements=json.loads(group['requirements']), inspect_workspace=False)
             self.store.accept(group,head=head,base=base,input_token=candidate,
                 verify_input_token=verify_input,review_input_token=review_input,
-                skip_verify=args.skip_verify,skip_review=args.skip_review,reason=args.skip_reason or '')
+                skip_verify=args.skip_verify,skip_review=args.skip_review,
+                reason=normalize_skip_reason(args.skip_reason))
 
     def generate(self, group):
         if group['attempts'] >= 3:

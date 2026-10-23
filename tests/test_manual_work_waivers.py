@@ -170,6 +170,7 @@ class ManualWorkTest(ManualWorkCase):
         self.assertIn('Worker targeted unit test는 실행되지 않았고 외부 targeted test 결과도', prompt)
         self.assertIn('유효한 사용자 verify 생략 (SKIPPED_BY_USER', prompt)
         self.assertIn('전체 verify PASS가 아닙니다', prompt)
+        self.assertIn('제공 사유:', prompt)
         self.assertIn('<REDACTED>', prompt)
         self.assertNotIn('waiver-secret-value', prompt)
         self.assertNotIn('Manager 확인: 전체 verify PASS', prompt)
@@ -183,7 +184,47 @@ class ManualWorkTest(ManualWorkCase):
             'manual candidate should not use Worker publication data'))
         self.assertEqual(publication.test_evidence, MANUAL_TEST_EVIDENCE)
         self.assertNotIn('targeted test: PASS', publication.summary)
+        self.assertIn('제공 사유:', publication.summary)
+        self.assertIn('<REDACTED>', publication.summary)
+        self.assertNotIn('waiver-secret-value', publication.summary)
+        body=candidate.decorate_body('PR body')
+        self.assertIn('제공 사유:', body)
+        self.assertIn('<REDACTED>', body)
+        self.assertNotIn('waiver-secret-value', body)
         self.assertIsNone(fixture.state.row()['worker_result'])
+
+
+    def test_missing_and_legacy_waiver_reasons_are_explicit_without_rewriting_audit(self):
+        fixture,context,candidate,_config_path=self._verify_fixture_with_manual_skip(reason='')
+        waiver=candidate.waive(context,'verify')
+        self.assertEqual(waiver,'SKIPPED_BY_USER @candidate-head; 사유 미입력')
+        request=fixture.connection.execute('SELECT reason FROM manual_work_requests').fetchone()
+        saved=fixture.connection.execute("SELECT detail FROM manual_work_results "
+            "WHERE stage='verify' AND result='SKIPPED_BY_USER'").fetchone()
+        self.assertEqual(request['reason'],'')
+        self.assertEqual(saved['detail'],waiver)
+
+        prompt=candidate.prompt('Reviewer input',review=True)
+        publication=candidate.publication('',fixture.plan,lambda *_: self.fail(
+            'manual candidate should not use Worker publication data'))
+        body=candidate.decorate_body('PR body')
+        for rendered in (prompt,publication.summary,body):
+            self.assertIn('사유 미입력',rendered)
+            self.assertNotIn('제공 사유:',rendered)
+
+        legacy_detail='SKIPPED_BY_USER @candidate-head; '
+        with fixture.connection:
+            fixture.connection.execute("UPDATE manual_work_results SET detail=? "
+                "WHERE stage='verify' AND result='SKIPPED_BY_USER'",(legacy_detail,))
+        prompt=candidate.prompt('Reviewer input',review=True)
+        publication=candidate.publication('',fixture.plan,lambda *_: self.fail(
+            'manual candidate should not use Worker publication data'))
+        body=candidate.decorate_body('PR body')
+        for rendered in (prompt,publication.summary,body):
+            self.assertIn('사유 미입력',rendered)
+        saved=fixture.connection.execute("SELECT detail FROM manual_work_results "
+            "WHERE stage='verify' AND result='SKIPPED_BY_USER'").fetchone()
+        self.assertEqual(saved['detail'],legacy_detail)
 
 
     def test_grant_expires_for_environment_new_sha_and_new_default_request(self):

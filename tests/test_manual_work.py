@@ -18,19 +18,59 @@ from tests.support.manual_work_case import ManualWorkCase
 
 @isolated_git_test
 class ManualWorkTest(ManualWorkCase):
-    def test_options_require_exact_head_and_reason_independently(self):
+    def test_options_require_exact_head_and_allow_optional_skip_reason(self):
         for values in ({'skip_verify':True},{'skip_review':True},{'skip_reason':'external'},
+                       {'skip_reason':'   '},
                        {'expected_head':'main'},{'expected_head':'a'*12}):
             args=completion()
             for key,value in values.items():
                 setattr(args,key,value)
             with self.assertRaises(ValueError):
                 validate_options(args)
-        args=completion()
-        args.skip_review=True
-        args.expected_head='a'*40
-        args.skip_reason='external review'
-        validate_options(args)
+        for skip_verify,skip_review in ((False,False),(True,False),(False,True),(True,True)):
+            for reason in (None,'','   ','external review'):
+                args=completion()
+                args.skip_verify=skip_verify
+                args.skip_review=skip_review
+                args.expected_head='a'*40 if skip_verify or skip_review else None
+                args.skip_reason=reason
+                if not (skip_verify or skip_review) and reason is not None:
+                    with self.assertRaises(ValueError):
+                        validate_options(args)
+                else:
+                    validate_options(args)
+
+
+    def test_complete_normalizes_blank_skip_reason_in_request_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service,branch,worktree=self.fixture(directory)
+            service.start('G-012')
+            args=completion()
+            args.skip_verify=True
+            args.expected_head=git_command(worktree,'rev-parse','HEAD')
+            args.skip_reason='   '
+            validate_options(args)
+            service.complete(args)
+            group=service.store.for_plan(service.repo,'G-012')
+            request=service.store.request(group)
+            self.assertEqual(request['reason'],'')
+            self.assertEqual((request['skip_verify'],request['skip_review']),(1,0))
+            candidate=self.candidate(service,'G-012')
+            context=SimpleNamespace(worktree=worktree,base_branch='main')
+            self.assertIn('사유 미입력',candidate.waive(context,'verify'))
+            service.effects.operation_print.reset_mock()
+            service.display(group,accepted=True)
+            output='\n'.join(str(call.args[0]) for call in service.effects.operation_print.call_args_list)
+            self.assertIn('SKIPPED_BY_USER',output)
+            self.assertIn('사유 미입력',output)
+
+
+    def test_submit_normalizes_blank_skip_reason_in_request_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service,group,_user=self.submitted(directory,skip=True,skip_reason='   ')
+            request=service.store.request(group)
+            self.assertEqual(request['reason'],'')
+            self.assertEqual((request['skip_verify'],request['skip_review']),(1,1))
 
 
     def test_legacy_manual_requests_keep_unknown_stage_inputs_null(self):

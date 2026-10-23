@@ -96,10 +96,10 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             command.add_argument('plan_id', help='정확한 G ID')
         if name != 'start':
-            command.add_argument('--skip-verify', action='store_true')
-            command.add_argument('--skip-review', action='store_true')
-            command.add_argument('--expected-head')
-            command.add_argument('--skip-reason')
+            command.add_argument('--skip-verify', action='store_true', help='대상 후보의 verify 생략')
+            command.add_argument('--skip-review', action='store_true', help='대상 후보의 Reviewer 검토 생략')
+            command.add_argument('--expected-head', help='생략 시 필요한 원격 commit 전체 SHA')
+            command.add_argument('--skip-reason', help='생략 옵션의 선택 사유. 생략·빈 값·공백은 결과에 사유 미입력으로 표시')
 
     maintenance = subcommands.add_parser("maintenance-review", help="등록 프로젝트의 전체 정밀 점검을 다음 안전한 경계에 요청")
     maintenance.add_argument("repository", help="등록된 Git 저장소 루트")
