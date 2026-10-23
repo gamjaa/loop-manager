@@ -2,7 +2,7 @@
 
 ## Summary
 
-로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 각 단계 경계에서 최신 원격의 코드 입력을 현재 runtime과 비교하고 코드가 변경됐으면 진행 중 단계의 반환·상태 보존 뒤 자동으로 갱신·재시작한다. runtime 갱신은 PR 조회·Merge 판정과 독립적으로 코드 입력 차이만으로 결정한다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 구성한다. Claude는 일반적인 호출을 공식 문서·모의 테스트로 개발하며 실환경 완전 지원과 실행 중 managed 정책 변경 대응은 완료 조건에서 제외한다. 정상 Git 변화의 오탐 복구와 호출별 실제 실패 처리는 유지한다. runtime 교체의 전체 배정 중단과 안전한 호출 반환은 R-091을 따른다.
+로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 실제 단계 진행 경계에서 최초 즉시, 이후 성공 관측으로부터 최소 30초 간격으로 최신 원격의 코드 입력을 현재 runtime과 비교한다. 대기 중에는 조회하지 않고, 코드 변경이 확인되면 종료 결정을 메모리에 유지해 추가 비교 없이 새 단계 진입을 막고 진행 중 호출의 안전한 반환·상태 보존 뒤 자동으로 갱신·재시작한다. runtime 갱신은 PR 조회·Merge 판정과 독립적으로 코드 입력 차이만으로 결정한다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 구성한다. Claude는 일반적인 호출을 공식 문서·모의 테스트로 개발하며 실환경 완전 지원과 실행 중 managed 정책 변경 대응은 완료 조건에서 제외한다. 정상 Git 변화의 오탐 복구와 호출별 실제 실패 처리는 유지한다. runtime 교체의 전체 배정 중단과 안전한 호출 반환은 R-091을 따른다.
 
 ## Context
 
@@ -70,13 +70,15 @@ runtime 자식은 bootstrap이 전달하고 검증한 canonical source checkout,
 
 self 프로젝트에 저장된 `<base-branch>`는 PR의 base, Merge 뒤 fetch·source checkout 갱신과 다음 runtime 선택에 동일하게 사용한다. 현재 기본값이 `main`이라는 이유로 handoff code나 로그에 `origin/main`을 고정하지 않으며, self 등록이 없는 bootstrap의 기존 기본 branch 선택은 이 Requirement에서 변경하지 않는다.
 
-Planner·Worker·부분/전체 verify·Reviewer·게시·복구 등 각 단계의 시작 전과 성공·실패 종료 후, 다음 단계를 배정하기 전에 등록된 self `origin/<base-branch>`의 최신 원격 SHA와 현재 runtime SHA를 확인한다. 원격 변경의 게시 경로나 PR 존재·Merge 여부를 조회·판정하지 않고 코드 입력이 달라진 원격 전진만 갱신 대상으로 삼는다. 문서만 바뀐 원격 SHA 전진은 runtime 교체 사유가 아니다. 일반 PR 상태 반영은 기존 작업 수명주기에서 수행하며 runtime 변경 확인·갱신의 선행 조건으로 두지 않는다. source checkout 동기화의 성공 여부는 runtime 갱신 조건이 아니다.
+Planner·Worker·부분/전체 verify·Reviewer·게시·복구 등의 **실제 다음 단계 진입 경계**에서 등록된 self `origin/<base-branch>`의 최신 원격 SHA와 현재 runtime SHA를 확인한다. runtime 최초 실행의 단계 진입에서는 즉시 관측하고, 이후에는 같은 runtime에서 마지막 **성공한 관측**으로부터 30초가 지나기 전이면 원격 조회와 코드 입력 비교를 생략한다. 30초는 검사 간 최소 간격이며 시간만 지나거나 단계가 진행되지 않았다는 이유로 검사를 실행하지 않는다. 병렬 프로젝트·작업은 같은 runtime의 관측 시각과 종료 결정을 공유하고 동시에 도달한 경계의 중복 원격 조회를 억제한다. 단계 종료는 다음 단계 진입 없이 별도의 원격 재검사를 만들지 않는다.
+
+재시도 시점·Agent/verify 자리·사용량·종료 불명 호출·공유 자원 등의 **대기 중에는 runtime 원격 조회·입력 비교를 수행하지 않는다**. 대기 중에도 사용자 pause·취소와 이미 확정된 runtime 종료 결정을 확인하며, 대기 해소 후 실제 다음 단계로 진입할 때 위 관측 조건을 적용한다. 원격 변경의 게시 경로나 PR 존재·Merge 여부를 조회·판정하지 않고 코드 입력이 달라진 원격 전진만 갱신 대상으로 삼는다. 문서만 바뀐 원격 SHA 전진은 runtime 교체 사유가 아니다. 일반 PR 상태 반영은 기존 작업 수명주기에서 수행하며 runtime 변경 확인·갱신의 선행 조건으로 두지 않는다. source checkout 동기화의 성공 여부는 runtime 갱신 조건이 아니다.
 
 runtime 갱신 비교는 현재 실행 중인 runtime과 최신 원격 revision 사이의 코드 입력을 기준으로 한다. 소스 코드·실행 스크립트의 추가·수정·삭제·이동과 실행 코드의 해석·로딩을 바꾸는 의존성 선언·실행 설정 변경을 감지한다. Requirement·ExecPlan·PRODUCT·ARCHITECTURE·README·Agent 지침·템플릿 등 문서 변경은 재시작 판정에서 제외한다. 문서 경로 아래라도 실제 실행 코드인 파일은 코드 입력으로 취급한다. 문서와 코드가 함께 바뀌면 갱신하며, 문서만 바뀌어 계속 실행한 뒤에도 비교 기준은 실제 실행 runtime으로 유지해 누적된 코드 변경을 놓치지 않는다. 변경 비교 실패를 문서 전용 변경으로 간주하지 않는다. 문서의 planning·단계별 반영·지침 snapshot 규칙은 유지하며 이 제외는 runtime 재시작 판정에만 적용한다.
 
 runtime handoff 여부는 source checkout의 fast-forward 성공에는 의존하지 않지만, 현재 runtime SHA와 fetch된 `origin/<base-branch>` SHA의 관계에는 의존한다. source checkout 갱신이 overlap, ahead·diverged 또는 다른 안전 사유로 skipped·failed여도 원격 base가 현재 runtime보다 앞서고 코드 입력도 달라졌으면 자동 갱신·재시작한다. bootstrap이 이미 같은 코드 입력을 선택한 경우에는 원격 SHA나 PR 상태가 달라도 같은 runtime에서 계속한다. 두 SHA의 fast-forward 관계를 증명할 수 없으면 자동 handoff로 취급하지 않고 기존 repository safety 정책에 따라 상태를 보존한다.
 
-self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을 새로 배정하기 전의 안전한 scheduling boundary에서 이루어져야 한다. handoff가 필요하다는 사실을 확인한 뒤 새 Agent subprocess나 검증 작업을 시작하지 않으며, 이미 영속화된 세션·retry·workspace 상태를 지우지 않는다. 단계 경계의 최신 원격 fetch가 실패하거나 repository identity를 검증할 수 없으면 최신 version을 확보했다고 간주하거나 성공 종료하지 않고, 기존 일시 오류 또는 repository safety 정책에 따라 상태를 보존한 채 R-091의 비차단 재개 경로에서 다시 확인한다.
+self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을 새로 배정하기 전의 안전한 단계 진입 경계에서 이루어져야 한다. 검증된 코드 변경으로 종료 필요가 확정되면 대상 원격 SHA와 인계 요청을 현재 runtime의 메모리에 한 번 고정하고, 그 이후에는 TTL과 무관하게 추가 원격 조회·입력 비교 없이 해당 결정을 사용한다. 새 관리 편입·Agent subprocess·verify·후속 단계를 시작하지 않으며, 이미 영속화된 세션·retry·workspace 상태를 지우지 않는다. 진행 중인 호출의 결과 수집·checkpoint 확정·안전한 반환은 신규 단계 진입과 구분해 허용하고, 대기 중 호출은 시작하지 않은 채 반환한다. 원격 fetch·입력 비교 또는 repository identity 검증이 실패하면 이를 성공 관측이나 무변경으로 캐싱하지 않고, 기존 일시 오류 또는 repository safety 정책에 따라 상태를 보존한 채 R-091의 비차단 재개 경로에서 실제 단계 진입 시 다시 확인한다.
 
 원격 SHA가 같거나 코드 입력이 동일하면 기존 runtime에서 계속 실행한다. 코드 입력이 달라진 검증된 fast-forward 후속이면 R-091대로 전체 신규·후속 배정을 멈추고 이미 실행 중인 단계만 반환·정리한 뒤 저장된 상태를 보존한다. 작업 전체 완료·PR 게시·Merge나 주기 실행을 기다리지 않고 bootstrap으로 제어를 넘겨 최신 원격을 다시 확인하고 새 runtime을 자동 시작한다. 실행 중 runtime 파일을 교체하거나 진행 중 Agent·verify를 강제로 종료하지 않으며, 재시작 후 같은 작업을 중복 실행하거나 실패·교정 이력을 초기화하지 않는다. 다른 등록 프로젝트의 원격 변경은 self runtime 변경 근거가 아니다.
 
@@ -106,10 +108,12 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - source checkout fast-forward가 로컬 안전 조건 때문에 skipped 또는 failed여도 원격 base가 현재 runtime SHA의 fast-forward 후속이고 코드 입력이 달라졌으면 정상 handoff 후 자동 재시작한다. 다음 bootstrap은 source local `<base-branch>`가 아니라 fetch된 `origin/<base-branch>`를 다시 조회해 runtime을 선택한다.
 - 현재 runtime과 원격 코드 입력이 같으면 PR Merge 상태·원격 SHA 전진과 관계없이 runtime 재시작 없이 정상 처리를 계속한다.
 - fetch된 self `origin/<base-branch>`와 현재 runtime SHA의 fast-forward 관계를 증명할 수 없거나 최신 원격 fetch·repository identity 검증이 실패하면 성공 handoff나 강제 동기화를 수행하지 않고 기존 일시 오류 또는 안전 오류와 재개 가능한 상태를 유지한다.
-- self Planner 직접 게시·일반 외부 push로 등록 base의 코드 입력이 바뀐 경우에도 각 단계 경계에서 변경을 발견해 갱신하며 PR 조회·Merge 관측을 요구하지 않는다.
+- self Planner 직접 게시·일반 외부 push로 등록 base의 코드 입력이 바뀐 경우에도 최초·30초 경과 후 다음 실제 단계 진입 경계에서 변경을 발견해 갱신하며 PR 조회·Merge 관측을 요구하지 않는다.
 - 다른 등록 프로젝트의 PR Merge는 해당 프로젝트 상태와 기본 worktree를 정상 갱신하지만 Loop Manager 프로세스 전체의 runtime handoff를 만들지 않는다.
 - 문서만 변경된 self PR Merge·Planner 게시·외부 push에는 단계 배정 중단·runtime 재시작이 없다. 코드만 변경되거나 문서와 코드가 함께 변경되면 갱신한다. 코드 파일의 추가·삭제·이동, 의존성·실행 설정 변경, 여러 문서 전용 revision 뒤의 코드 변경을 실제 runtime과 비교해 감지하며 비교 실패를 변경 없음으로 처리하지 않는다.
-- Worker·verify·Review의 성공과 실패 경계 모두 runtime 변경을 확인한다. 변경 발견 후 대기 중 호출·다음 단계는 시작하지 않고 이미 실행 중인 단계의 반환만 기다리며, 다음 주기 실행 없이 새 runtime에서 저장된 작업을 재개한다. 같은 원격 revision에는 재시작을 반복하지 않고 fetch·identity·ancestry 확인 실패를 성공 갱신으로 기록하지 않는다.
+- 최초 실제 단계 진입에서는 runtime 원격 코드를 즉시 확인한다. 성공 관측 후 30초 미만의 다른 단계 진입·성공/실패 종료·병렬 작업 경계와 30초 이상 진행 없는 구간에서는 추가 fetch·입력 비교가 없다. 30초 이상 경과한 뒤 실제 단계에 진입할 때만 다시 관측하며 같은 runtime의 병렬 진입에서 중복 조회를 수행하지 않는다.
+- 재시도·사용량·기존 호출 종료·Agent/verify 자리·Git 자원 대기 중에는 runtime 원격 조회를 하지 않고 pause·취소·메모리에 확정된 종료 신호를 처리한다. 기다림 해소 뒤 실제 단계로 재진입할 때는 TTL에 따라 확인하며, 원격 관측 실패는 성공 검사 시각을 갱신하거나 변경 없음으로 판정하지 않는다.
+- 코드 변경이 확정되면 현재 runtime 전체가 하나의 종료 결정과 확인한 인계 요청을 공유하고 이후 fetch·입력 비교·반복 로그 없이 새 관리 편입·Agent·verify·후속 단계를 중단한다. 이미 시작한 호출은 강제 종료하지 않고 결과·checkpoint·종료 근거를 안전하게 보존한 뒤 다음 주기 실행 없이 최신 runtime에서 재개한다. 종료 불명 호출을 빈 자리로 간주하지 않으며 같은 원격 revision에는 재시작을 반복하지 않고 fetch·identity·ancestry 확인 실패를 성공 갱신으로 기록하지 않는다.
 - runtime handoff는 해석한 `<base-branch>`, 현재 runtime SHA, fetch된 원격 SHA, self repository와 코드 입력 비교 결과를 비밀값 없이 로그에 남기며 오류나 BLOCKED 알림으로 취급하지 않는다.
 - 자동 테스트는 main·대체 base, 모든 로컬 source 상태의 원격 revision 선택·비차단 동기화, PR 조회와 독립적인 코드 변경 감지·handoff와 이미 최신 runtime의 계속 실행을 확인한다. Planner push·외부 push의 self base 전진에 코드 입력 변경이 있으면 갱신 대상이며 다른 프로젝트 Merge·원격 전진 없는 fetch는 handoff를 만들지 않는다. origin/source identity 오류·fetch 실패·non-fast-forward 관계·handoff 뒤 새 작업 미시작과 중단·재시작도 검증한다.
 - 접근 정책·Manager Git 작업·재개 테스트는 R-055의 T01–T06·T10–T14·T16–T17·T22·T25–T26에 대응한다. sandbox 적용, 호출 실패·단계 전환 뒤 Git 범위 검사 미재활성화, 원격 동기화·게시와 기존 오탐 자동 해제를 실제 소비자에 연결한다.
