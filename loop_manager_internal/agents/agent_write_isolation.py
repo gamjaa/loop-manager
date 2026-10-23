@@ -338,6 +338,8 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         if result.returncode or not result.stdout.strip():
             raise IsolationError("Codex CLI 버전을 확인할 수 없습니다.")
         version = result.stdout.strip()
+        configuration = _checked_codex_configuration_digest(
+            boundary.worktree, state_dir, config_path, selected_environment)
         # The installed 0.159.3 baseline supports granular auto-review. Older
         # CLIs may ignore unknown overrides, so a filesystem probe alone is
         # insufficient. Direct exec still validates merged settings itself.
@@ -345,7 +347,8 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         if not match or tuple(map(int, match.groups())) < (0, 159, 3):
             raise IsolationError("Codex CLI가 지원되는 granular 자동 검토 버전이 아닙니다.")
         try:
-            launch.probe()
+            launch.probe(on_features_checked=lambda: _checked_codex_configuration_digest(
+                boundary.worktree, state_dir, config_path, selected_environment))
             args = launch.arguments
         except RuntimeError as error:
             raise IsolationError(str(error)) from error

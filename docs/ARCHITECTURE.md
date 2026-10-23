@@ -801,7 +801,7 @@ CLI·OS별 실행 전제는 [인증과 실행 조건](OPERATIONS.md#인증과-�
 | 경계 | 확인·저장하는 근거 |
 |---|---|
 | 실행 환경 준비 | `AgentRequest.prepared_launch`가 worktree·repository·role의 공통 홈과 호출별 임시 저장을 provider 조회 전에 선택한다. legacy profile callback도 `prepared_environment`의 같은 필터된 mapping을 사용하며 부모 `os.environ`·호출자 mapping은 바꾸지 않는다. |
-| 모델 호출 없는 사전 검사 | 현재 CLI·설정·확장·역할 정책과 별도 `codex sandbox` 안의 파일 도구 경계를 검사한다. version·feature·sandbox 조회가 끝난 뒤 설정 정책을 다시 확인하고 안정된 설정 지문을 계산한다. 실제 Agent 실행을 감싸는 wrapper나 모델 호출·중첩 도구 시연과 구분한다. |
+| 모델 호출 없는 사전 검사 | 현재 CLI·설정·확장·역할 정책과 별도 `codex sandbox` 안의 파일 도구 경계를 검사한다. version 조회 뒤와 feature 조회 뒤 sandbox probe 전에 설정 정책을 다시 확인하고, sandbox probe 뒤에도 안정된 최종 설정 지문을 계산한다. 조회 사이 설정이 충돌 상태로 바뀌면 다음 Codex 조회 전에 중단한다. 실제 Agent 실행을 감싸는 wrapper나 모델 호출·중첩 도구 시연과 구분한다. |
 | 실행 직전 | 같은 환경의 인증·Model/Effort·Fast·native 지침을 확인하고 workspace·설정·CLI와 인증 링크를 재검사한다. 준비 조회가 안전한 설정을 바꿨으면 새 내용을 다시 검사해 최종 격리·실행 지문에 결합한다. 최종 증거를 invocation에 저장한 뒤 process handoff에서도 설정·workspace snapshot을 확인하고 실제 `codex exec`를 시작한다. |
 | 종료 | 프로세스 그룹 또는 Windows Job의 정리·wait 성공 뒤에만 종료 콜백을 호출한다. 시작·writer 종료·결과 성공·검증 성공은 별도 사실로 기록한다. |
 

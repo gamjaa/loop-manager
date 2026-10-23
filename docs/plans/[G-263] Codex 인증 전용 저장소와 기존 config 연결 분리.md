@@ -30,7 +30,7 @@ priority: high
 
 ## Implementation
 
-- [x] `prepare_isolation`은 CLI version/features/sandbox 조회 전에 현재 설정을 검사하고, 조회 뒤 정책을 다시 검사해 안정된 최종 지문을 저장한다. `assert_current`와 process handoff 재검사로 이후 변경을 거부하며, 설정 생성·교체와 검사 뒤 경쟁을 구분한다. 불안정한 설정은 기존 보존/재시도 경계로 반환한다.
+- [x] `prepare_isolation`은 CLI version/features/sandbox 조회 전에 현재 설정을 검사하고, version 조회 뒤와 features 조회 뒤 sandbox probe 전에 설정 정책을 다시 검사한다. sandbox probe·실제 소비자 조회 뒤에는 안정된 최종 지문을 저장하며 `assert_current`와 process handoff 재검사로 이후 변경을 거부한다. 설정 생성·교체와 검사 뒤 경쟁을 구분하고 불안정한 설정은 기존 보존/재시도 경계로 반환한다.
 - [x] `provider_adapters.py`의 `run_codex`, `provider_execution.py`의 읽기 전용 `observe`와 G-262의 준비 환경을 대조한다. profile·native 지침 조회 등 실제 소비자에 같은 공통 홈과 최종 검사 기준을 적용하고, 최종 설정 변화에서는 실행/Review 동일성 증거를 만들지 않는다. 신규·재개·retry·fallback의 기존 session·ledger 관계를 바꾸지 않는다.
 - [x] 확인한 `provider_home.py`, `agent_profiles.py`, `agent_codex_sandbox.py`의 공통 홈·인증 링크·호출별 attempt 구조를 유지한다. 삭제된 `_read_only_link`나 역할별 config 제거를 복원하지 않는다. `tests/test_provider_home.py`의 설정 수명/과거 홈 보존 fixture와 `tests/test_codex_native_invocation.py`·`test_agent_write_isolation.py`·`test_provider_runtime.py`의 실제 판단/모의 CLI 경계를 재사용한다.
 - [x] PRODUCT·ARCHITECTURE·`docs/OPERATIONS.md`의 관련 절을 검사 시점·정상 생성·경쟁 거부에 맞춰 통합한다. 공통 홈의 직접 사용과 과거 자료 보존은 이미 반영됐으므로 재구현 목표로 쓰지 않는다.
@@ -53,6 +53,7 @@ priority: high
 - [x] 2026-10-21 현재 HEAD `e8dba98`에서 프로젝트 Python의 targeted runner로 설정 drift, probe 중 안전한 생성·충돌, 지침 조회 후 설정 수명, 실제 호출 관측 identity를 확인하는 8개 unit test를 새로 실행해 모두 통과했다. 전달된 현재 verify 실패는 G-263 diff에 없는 Perl 예제의 Manager 전용 통합 테스트가 단독 하위 실행 중 timeout된 건이며, 해당 통합 테스트는 Worker가 실행하지 않는다.
 - [x] 2026-10-23 관리 rebase 후 현재 HEAD `8c0f36c`에서 프로젝트 Python targeted runner로 설정 drift, probe 중 생성·충돌, 지침 조회 후 설정 수명, process handoff 경쟁, 호출 관측 identity를 확인하는 8개 unit test를 새로 실행해 모두 통과했다. 전달된 Perl 예제 실패 요약은 이전 revision `e8dba988`에 해당하며 세 번째 standalone/failing 하위 사례가 약 30초 뒤 timeout됐다. 해당 Manager 전용 통합 테스트는 G-263 diff에 없고 `docs/VERIFY.md`에 따라 Worker는 실행하지 않았다.
 - [x] 2026-10-23 현재 HEAD `81e1718`에서 프로젝트 Python targeted runner로 위 설정 수명·검사 순서·process handoff 관련 8개 unit test를 다시 실행해 모두 통과했다. 전달된 base `7621566` 대비 최종 diff와 PRODUCT·ARCHITECTURE·OPERATIONS 설명을 재확인했다. 이전 Perl 통합 테스트 진단은 이 HEAD의 verify 결과가 아니므로 전체 verify는 Manager에게 맡긴다.
+- [x] 2026-10-23 현재 HEAD `a2e5aee`의 최신 계획 조건을 코드와 대조해, version 조회와 features 조회 사이에 안전한 설정을 재검사하는 절차가 빠진 것을 확인했다. version 조회 뒤와 features 조회 뒤 sandbox probe 전에 정책을 검사하도록 보완했다. 프로젝트 Python targeted runner로 두 중간 충돌 거부 회귀와 기존 안전한 probe 생성 회귀를 실행해 3개 모두 통과했다.
 - [x] PRODUCT·ARCHITECTURE·OPERATIONS에 정상 생성 수용과 검사·거부 순서를 반영했다.
 
 ## Decision Log

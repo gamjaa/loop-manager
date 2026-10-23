@@ -71,7 +71,7 @@ class CodexLaunch:
             if on_process_finished is not None:
                 on_process_finished()
 
-    def probe(self) -> None:
+    def probe(self, *, on_features_checked: Callable[[], None] | None = None) -> None:
         feature_result = subprocess.run(
             ('codex', *CODEX_EXTENSION_ARGUMENTS, 'features', 'list'),
             cwd=json.loads(self.specification)['worktree'], env=self.environment,
@@ -85,6 +85,8 @@ class CodexLaunch:
                 feature_states[fields[0]] = fields[-1]
         if feature_result.returncode or feature_states != {'plugins': 'false', 'apps': 'false'}:
             raise RuntimeError('Codex 확장 도구 비활성화 결과를 확인할 수 없습니다.')
+        if on_features_checked is not None:
+            on_features_checked()
         result = subprocess.run(self.probe_arguments, cwd=json.loads(self.specification)['worktree'],
                                 env=self.environment,
                                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=False)

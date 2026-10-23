@@ -1,5 +1,6 @@
 """Provider write policy, configuration isolation and invocation evidence."""
 
+import json
 import sqlite3
 from pathlib import Path
 import tempfile
@@ -282,21 +283,25 @@ class WriteIsolationTests(TestCase):
                                environment={'CODEX_HOME': str(provider_home)})
             probe_count = 0
 
-            def probe():
+            def probe(**_kwargs):
                 nonlocal probe_count
                 probe_count += 1
                 replacement = config.with_suffix('.replacement')
                 replacement.write_text(f'model = "created-{probe_count}"\n', encoding='utf-8')
                 replacement.replace(config)
 
+            def version_lookup(*_args, **_kwargs):
+                if not config.exists():
+                    config.write_text('model = "created-during-version-lookup"\n', encoding='utf-8')
+                return manager.subprocess.CompletedProcess(
+                    ['codex', '--version'], 0, 'codex-cli 0.159.3\n', '')
+
             launch.probe.side_effect = probe
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
                  mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
-                 mock.patch.object(isolation.subprocess, 'run', return_value=
-                                   manager.subprocess.CompletedProcess(
-                                       ['codex', '--version'], 0, 'codex-cli 0.159.3\n', '')):
+                 mock.patch.object(isolation.subprocess, 'run', side_effect=version_lookup):
                 for session in (None, 'resume-session'):
                     result = isolation.prepare_isolation(
                         'codex', 'worker', root, root, False, records.append,
@@ -325,7 +330,7 @@ class WriteIsolationTests(TestCase):
             records = []
             launch = mock.Mock(probe_arguments=('standalone',), arguments=('inner',),
                                environment={'CODEX_HOME': str(provider_home)})
-            launch.probe.side_effect = lambda: config.write_text('hooks=["unsafe"]\n')
+            launch.probe.side_effect = lambda **_kwargs: config.write_text('hooks=["unsafe"]\n')
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
@@ -338,6 +343,80 @@ class WriteIsolationTests(TestCase):
                         'codex', 'worker', root, root, False, records.append,
                         lambda: 'snapshot', expected_repository=str(root / 'source'),
                         environment_variables={})
+            self.assertEqual(records[0].status, 'rejected')
+            self.assertIn('hooks', config.read_text(encoding='utf-8'))
+
+    def test_configuration_created_during_version_lookup_is_rechecked_before_features(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider_home = root / 'codex-home'
+            provider_home.mkdir()
+            config = provider_home / 'config.toml'
+            boundary = isolation.WorktreeBoundary(root, root / 'source', (),
+                                                   root / 'git', root / 'common', 'repository')
+            launch = mock.Mock(probe_arguments=('sandbox',), arguments=('exec',),
+                               environment={'CODEX_HOME': str(provider_home)})
+            records = []
+
+            def version_lookup(*_args, **_kwargs):
+                config.write_text('hooks=["unsafe"]\n', encoding='utf-8')
+                return manager.subprocess.CompletedProcess(
+                    ['codex', '--version'], 0, 'codex-cli 0.159.3\n', '')
+
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
+                 mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                 mock.patch.object(isolation.subprocess, 'run', side_effect=version_lookup) as run:
+                with self.assertRaisesRegex(isolation.IsolationError, 'hook'):
+                    isolation.prepare_isolation(
+                        'codex', 'worker', root, root, False, records.append,
+                        lambda: 'snapshot', expected_repository=str(root / 'source'),
+                        environment_variables={}, prepared_launch=launch)
+
+            self.assertEqual(run.call_count, 1)
+            launch.probe.assert_not_called()
+            self.assertEqual(records[0].status, 'rejected')
+            self.assertIn('hooks', config.read_text(encoding='utf-8'))
+
+    def test_configuration_created_during_feature_lookup_is_checked_before_sandbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider_home = root / 'codex-home'
+            provider_home.mkdir()
+            config = provider_home / 'config.toml'
+            boundary = isolation.WorktreeBoundary(root, root / 'source', (),
+                                                   root / 'git', root / 'common', 'repository')
+            launch = isolation.CodexLaunch(
+                arguments=('exec',), probe_arguments=('codex', 'sandbox'),
+                environment={'CODEX_HOME': str(provider_home)}, runtime=root,
+                attempt=root, specification=json.dumps({'worktree': str(root)}))
+            records = []
+            commands = []
+
+            def lookup(arguments, **_kwargs):
+                commands.append(tuple(arguments))
+                if arguments[-2:] == ('features', 'list'):
+                    config.write_text('hooks=["unsafe"]\n', encoding='utf-8')
+                    return manager.subprocess.CompletedProcess(arguments, 0,
+                        'plugins stable false\napps stable false\n', '')
+                if arguments[:2] == ('codex', 'sandbox'):
+                    return manager.subprocess.CompletedProcess(
+                        arguments, 0, 'agent-tool-boundary-v2\n', '')
+                return manager.subprocess.CompletedProcess(
+                    arguments, 0, 'codex-cli 0.159.3\n', '')
+
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
+                 mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                 mock.patch.object(isolation.subprocess, 'run', side_effect=lookup):
+                with self.assertRaisesRegex(isolation.IsolationError, 'hook'):
+                    isolation.prepare_isolation(
+                        'codex', 'worker', root, root, False, records.append,
+                        lambda: 'snapshot', expected_repository=str(root / 'source'),
+                        environment_variables={}, prepared_launch=launch)
+
+            self.assertEqual(len(commands), 2)
+            self.assertEqual(commands[1][-2:], ('features', 'list'))
             self.assertEqual(records[0].status, 'rejected')
             self.assertIn('hooks', config.read_text(encoding='utf-8'))
 
