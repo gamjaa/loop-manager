@@ -596,3 +596,46 @@ class CancelledCheckpointTests(unittest.TestCase):
         self.assertIsNone(blocked.reconcile_cause(self.request))
         for table, receipt in self.receipts.items():
             self.assertEqual(dict(self.connection.execute(f'SELECT * FROM {table}').fetchone()), receipt)
+
+    def test_pending_call_reservation_preserves_plan_and_cannot_be_recreated_after_cancel(self):
+        from pathlib import Path
+        from loop_manager_internal.storage import task_calls
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        task_calls.ensure_schema(self.connection)
+        target = task_calls.reserve(self.connection, Path('/unused'), 'repo', 'G-047', 'verify', 'run')
+        other = task_calls.reserve(self.connection, Path('/unused'), 'repo', 'G-999', 'agent', 'other')
+        with self.assertRaisesRegex(PlannerValidationError, '호출 예약'):
+            self.cancel()
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        for table, receipt in self.receipts.items():
+            self.assertEqual(dict(self.connection.execute(f'SELECT * FROM {table}').fetchone()), receipt)
+        task_calls.release(target)
+        self.cancel()
+        with self.assertRaises(task_calls.CallDeferred):
+            task_calls.reserve(self.connection, Path('/unused'), 'repo', 'G-047', 'verify', 'late')
+        self.assertEqual([row[0] for row in self.connection.execute('SELECT token FROM task_call_reservations')], [other.token])
+
+    def test_collected_agent_result_requires_physical_finish_before_cancellation(self):
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        repository = InvocationRepository(self.connection)
+        context = InvocationContext('repo', 'G-047')
+        profile = ResolvedProfile('model', 'high')
+        invocation = repository.start(context, 'worker', 'codex', profile, 'saved-session')
+        repository.mark_execution_started(invocation)
+        self.connection.execute("UPDATE agent_invocations SET finished_at='collected', result_kind='success', "
+                                "result_code=0 WHERE invocation_id=?", (invocation,))
+        self.connection.commit()
+        with self.assertRaisesRegex(PlannerValidationError, 'writer 종료'):
+            self.cancel()
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.connection.execute("UPDATE agent_invocations SET execution_finished_at='stopped', "
+                                "execution_finish_evidence='receipt' WHERE invocation_id=?", (invocation,))
+        self.connection.commit()
+        audit = dict(self.connection.execute('SELECT * FROM agent_invocations').fetchone())
+        self.cancel()
+        with self.assertRaises(CallDeferred):
+            repository.start(context, 'worker', 'codex', profile, 'saved-session')
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM agent_invocations').fetchone()), audit)

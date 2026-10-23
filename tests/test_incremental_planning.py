@@ -389,6 +389,31 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         ).fetchone()[0])['checkpoints'], history['checkpoints'])
         self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
 
+    def test_remote_deletion_waits_for_physical_writer_finish_after_result_collection(self):
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile
+        self._remote_deletion(started=True, new_plan=True)
+        self.connection.execute("UPDATE exec_plans SET worker_result='saved result' WHERE plan_id='G-001'")
+        invocations = InvocationRepository(self.connection)
+        identity = invocations.start(InvocationContext(str(self.repo), 'G-001'),
+                                     'worker', 'codex', ResolvedProfile('model', 'high'), 'saved')
+        invocations.mark_execution_started(identity)
+        self.connection.execute("UPDATE agent_invocations SET finished_at='collected', result_kind='success', "
+                                "result_code=0 WHERE invocation_id=?", (identity,))
+        self.connection.commit()
+        deferred = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertIn('G-001', deferred.withheld_plan_ids)
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+        self.connection.execute("UPDATE agent_invocations SET execution_finished_at='stopped', "
+                                "execution_finish_evidence='receipt' WHERE invocation_id=?", (identity,))
+        self.connection.commit()
+        resumed = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertNotIn('G-001', resumed.withheld_plan_ids)
+        self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM agent_invocations WHERE invocation_id=?', (identity,)).fetchone())
+
     def test_requirement_deletion_cancels_only_withdrawn_and_preserves_shared_goal(self):
         self._requirement_deletion_recovers()
 

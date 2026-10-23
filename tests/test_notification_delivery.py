@@ -2926,3 +2926,194 @@ class RecoveryResultNoticeTests(NotificationFixture, unittest.TestCase):
         sender.assert_called_once()
         connection.execute("UPDATE exec_plans SET status='IMPLEMENTING'")
         self.assertFalse(is_current(connection,repo,'recovery_unresolved',payload))
+
+
+class CancelledPlanNotificationTests(NotificationFixture, unittest.TestCase):
+    def setUp(self):
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        self.db = self.connection()
+        self.repo = '/projects/alpha'
+        self.db.execute("UPDATE exec_plans SET plan_sha='plan'")
+        self.db.commit()
+        self.plan = ReadyPlanSnapshot(
+            'G-018', 'docs/plans/[G-018] Reliable notices.md', 'Reliable notices',
+            ('docs/PRODUCT.md',), (), 'low', 'low', 'high', 'hash', 'plan',
+            '---\nid: G-018\n---\nSaved plan', current_metadata_recorded=True,
+        )
+        self.payload = dict(project='alpha', execplan_id='G-018', scope='plan',
+                            reason_code='worker_failed', cause='saved failure', operation='Worker')
+
+    def legacy_incident(self, *, subject='plan:G-018', event_key='plan-block', payload=None):
+        """Retain an old runtime's incident without authorizing a new notice."""
+        payload = self.payload if payload is None else payload
+        notifications._insert(self.db, event_key, self.repo, 'blocked', payload)
+        incident = self.db.execute('INSERT INTO notified_block_incidents '
+            '(repo,subject,block_key,event_key,payload) VALUES (?,?,?,?,?)',
+            (self.repo, subject, event_key, event_key, json.dumps(payload)))
+        self.db.execute('INSERT INTO block_notice_events VALUES (?,?)', (event_key, incident.lastrowid))
+
+    def test_malformed_legacy_payload_preserves_audit_without_claiming_piece(self):
+        for index, payload in enumerate(('broken JSON', '[]', '{}', '{"plans":[null]}')):
+            self.db.execute('INSERT INTO notification_outbox (event_key,repo,event_type,payload,last_error) '
+                'VALUES (?,?,?,?,?)', (f'invalid-{index}', self.repo, 'draft_decisions', payload, 'old error'))
+        self.db.commit()
+        adapter = mock.Mock()
+        notifications.dispatch_pending(self.db, 'token', 'chat', adapter=adapter)
+        adapter.assert_not_called()
+        for row in self.events(self.db):
+            self.assertIsNotNone(row['canceled_at'])
+            self.assertEqual(row['last_error'], 'old error')
+            self.assertEqual(row['confirmed_pieces'], 0)
+
+    def cancel(self):
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
+        from loop_manager_internal.storage.runtime_state import _transaction
+        with _transaction(self.db):
+            apply_mutable_catalog_changes(
+                self.db, self.repo, deletions=(PlanDeletion(self.plan),), revisions=(),
+                snapshot_token='snapshot', plan_commit='deletion', content_hash=lambda _: '', agent=False,
+            )
+
+    def test_cancel_closes_plan_notices_and_incident_atomically_preserving_independent_audit(self):
+        from loop_manager_internal.notifications import incidents
+        for kind in ('work_started', 'resumed', 'draft_decision', 'pr_created', 'stage_failed'):
+            notifications._insert(self.db, kind, self.repo, kind, self.payload)
+        self.legacy_incident()
+        notifications._insert(self.db, 'sent', self.repo, 'work_started', self.payload)
+        self.db.execute("UPDATE notification_outbox SET sent_at='sent', attempts=2, confirmed_pieces=1, "
+                        "last_error='original error' WHERE event_key='sent'")
+        for key, kind, payload in (
+            ('independent', 'work_started', {**self.payload, 'execplan_id': 'G-019'}),
+            ('project', 'blocked', {**self.payload, 'scope': 'project'}),
+            ('project-failure', 'stage_failed', {**self.payload, 'scope': 'project'}),
+            ('completed', 'project_completed', self.payload),
+            ('publication', 'plans_published', {'project': 'alpha', 'plans': [{'id': 'G-018'}]}),
+        ):
+            notifications._insert(self.db, key, self.repo, kind, payload)
+        self.db.commit()
+        before = {row['event_key']: dict(row) for row in self.events(self.db)}
+        self.db.execute("CREATE TRIGGER interrupt_cancel BEFORE UPDATE OF canceled_at ON notification_outbox "
+                        "BEGIN SELECT RAISE(ABORT, 'notification interrupted'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'notification interrupted'):
+            self.cancel()
+        self.assertIsNotNone(self.db.execute('SELECT * FROM exec_plans').fetchone())
+        self.assertIsNone(self.db.execute('SELECT * FROM execplan_cancellations').fetchone())
+        self.assertEqual({row['event_key']: dict(row) for row in self.events(self.db)}, before)
+        self.assertIsNone(self.db.execute('SELECT released_at FROM notified_block_incidents').fetchone()[0])
+        self.db.execute('DROP TRIGGER interrupt_cancel')
+        self.cancel()
+        preserved = {'sent', 'independent', 'project', 'project-failure', 'completed', 'publication'}
+        for row in self.events(self.db):
+            if row['event_key'] in preserved:
+                self.assertEqual(dict(row), before[row['event_key']])
+            else:
+                self.assertIsNotNone(row['canceled_at'])
+                self.assertEqual(row['payload'], before[row['event_key']]['payload'])
+        incident = dict(self.db.execute('SELECT * FROM notified_block_incidents').fetchone())
+        self.assertIsNotNone(incident['released_at'])
+        self.assertIsNone(incident['resumed_at'])
+        incidents.cancel_plan_notifications(self.db, self.repo, 'G-018')
+        self.assertEqual(dict(self.db.execute('SELECT * FROM notified_block_incidents').fetchone()), incident)
+
+    def test_inflight_confirmation_preserves_piece_and_error_without_sending_more(self):
+        self.db.execute('INSERT INTO execplan_drafts VALUES (?,?,1,?)',
+            (self.repo, 'G-018', json.dumps(dict(pending=True, question='Choose',
+                identity='question', revision='revision', path=self.plan.path))))
+        notifications._insert(self.db, 'long-question', self.repo, 'draft_decision',
+                              {**self.payload, 'decision_identity': 'question', 'decision_revision': 'revision',
+                               'question': 'Choose', 'source_path': self.plan.path, 'url': None})
+        self.db.execute("UPDATE notification_outbox SET rendered_text=?, last_error='old error'",
+                        ('long notice\n' * 800,))
+        self.db.commit()
+        calls = []
+        def send(_token, _chat, piece):
+            calls.append(piece)
+            self.cancel()
+            # An older error stays auditable even when confirmation races with cancellation.
+            self.db.execute("UPDATE notification_outbox SET last_error='old error'")
+            self.db.commit()
+        notifications.dispatch_pending(self.db, 'token', 'chat', adapter=send)
+        self.assertEqual(len(calls), 1)
+        row = self.events(self.db)[0]
+        self.assertEqual((row['attempts'], row['confirmed_pieces']), (1, 1))
+        self.assertIsNotNone(row['canceled_at'])
+        self.assertIsNone(row['sent_at'])
+        self.assertEqual(row['last_error'], 'old error')
+        adapter = mock.Mock()
+        notifications.dispatch_pending(self.db, 'token', 'chat', adapter=adapter)
+        adapter.assert_not_called()
+
+    def test_restart_and_stale_start_cannot_recreate_canceled_plan_notices(self):
+        from loop_manager_internal.notifications import incidents, events
+        self.legacy_incident()
+        self.db.execute("UPDATE notification_outbox SET confirmed_pieces=1")
+        self.db.execute("UPDATE notified_block_incidents SET started_operation='Worker', "
+                        "start_identity='old-start', started_at='earlier'")
+        self.db.commit()
+        self.cancel()
+        self.db.execute("INSERT INTO notification_outbox (event_key,repo,event_type,payload) VALUES (?,?,?,?)",
+                        ('legacy-start', self.repo, 'work_started', json.dumps(self.payload)))
+        self.db.commit()
+        count = len(self.events(self.db))
+        notifications.configure_session(self.db, enabled=False)
+        incident_id = self.db.execute('SELECT id FROM notified_block_incidents').fetchone()[0]
+        self.assertEqual(incidents._materialize_resumption(self.db, incident_id), 0)
+        self.assertIsNone(self.db.execute('SELECT resumed_at FROM notified_block_incidents').fetchone()[0])
+        notifications.configure_session(self.db, enabled=True)
+        incidents.recover_interrupted_starts(self.db)
+        events.record_process_start(self.db, self.repo, 'worker', 'late-start', plan_id='G-018')
+        notifications._insert(self.db, 'stale-start', self.repo, 'work_started', self.payload)
+        incidents._queue_block(self.db, self.repo, 'plan:G-018', 'stale-block', self.payload)
+        self.assertEqual(incidents.record_work_start(self.db, self.repo, 'Worker',
+                         plan_id='G-018', start_identity='stale-start'), 0)
+        self.assertEqual(len(self.events(self.db)), count)
+        self.assertIsNone(self.db.execute('SELECT resumed_at FROM notified_block_incidents').fetchone()[0])
+        adapter = mock.Mock()
+        notifications.dispatch_pending(self.db, 'token', 'chat', adapter=adapter)
+        adapter.assert_not_called()
+        self.assertIsNotNone(self.db.execute(
+            "SELECT canceled_at FROM notification_outbox WHERE event_key='legacy-start'").fetchone()[0])
+
+    def test_draft_list_is_rebuilt_for_independent_questions(self):
+        from loop_manager_internal.notifications import events
+        self.db.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+                        "VALUES (?, 'G-019','docs/plans/[G-019] Independent.md','Independent',"
+                        "'[\"docs/PRODUCT.md\"]','[]','normal','hash2','READY')", (self.repo,))
+        for plan_id in ('G-018', 'G-019'):
+            self.db.execute('INSERT INTO execplan_drafts VALUES (?,?,1,?)',
+                            (self.repo, plan_id, json.dumps(dict(pending=True, question='Choose',
+                                identity=plan_id, revision='revision',
+                                path=self.db.execute('SELECT path FROM exec_plans WHERE repo=? AND plan_id=?',
+                                                     (self.repo, plan_id)).fetchone()[0]))))
+        events.enqueue_draft_decisions(self.db, self.repo)
+        self.db.commit()
+        original = self.events(self.db)[0]
+        self.cancel()
+        rows = self.events(self.db)
+        self.assertEqual(len(rows), 2)
+        current = next(row for row in rows if row['canceled_at'] is None)
+        self.assertEqual([plan['id'] for plan in json.loads(current['payload'])['plans']], ['G-019'])
+        old = next(row for row in rows if row['event_key'] == original['event_key'])
+        self.assertIsNotNone(old['canceled_at'])
+        self.assertEqual(old['payload'], original['payload'])
+
+    def test_project_incident_keeps_independent_start_when_cause_plan_is_canceled(self):
+        from loop_manager_internal.notifications import incidents
+        project_payload = {**self.payload, 'scope': 'project', 'started_execplan_id': 'G-019'}
+        self.legacy_incident(subject='project', event_key='project-block', payload=project_payload)
+        self.db.execute("UPDATE notification_outbox SET confirmed_pieces=1")
+        self.db.execute("UPDATE notified_block_incidents SET released_at='released', "
+                        "started_operation='Worker', start_identity='independent', started_at='earlier'")
+        self.db.commit()
+        self.cancel()
+        incident_id = self.db.execute('SELECT id FROM notified_block_incidents').fetchone()[0]
+        self.assertEqual(incidents._materialize_resumption(self.db, incident_id), 1)
+        incident = self.db.execute('SELECT payload,resumed_at FROM notified_block_incidents').fetchone()
+        self.assertEqual(json.loads(incident['payload'])['started_execplan_id'], 'G-019')
+        self.assertIsNotNone(incident['resumed_at'])
+        self.assertIsNone(self.db.execute("SELECT * FROM notification_outbox WHERE event_type='resumed'").fetchone())
+        from loop_manager_internal.notifications.repository import cancelled_plan_event
+        self.assertFalse(cancelled_plan_event(self.db, self.repo, 'resumed', project_payload))
+        self.assertTrue(cancelled_plan_event(self.db, self.repo, 'resumed',
+                        {**project_payload, 'started_execplan_id': 'G-018'}))

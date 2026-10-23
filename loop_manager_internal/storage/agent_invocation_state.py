@@ -129,6 +129,12 @@ class InvocationRepository:
               scope_id: str | None = None) -> str:
         identity = uuid4().hex
         with self.connection:
+            from .execplan_catalog_state import is_cancelled
+            from .task_calls import CallDeferred
+            if not self.connection.in_transaction:
+                self.connection.execute('BEGIN IMMEDIATE')
+            if context.plan_id and is_cancelled(self.connection, context.repo, context.plan_id):
+                raise CallDeferred(f'취소된 작업의 Agent 호출을 시작할 수 없습니다: {context.plan_id}')
             self.connection.execute("""INSERT INTO agent_invocations
                 (invocation_id, repo, plan_id, task_id, purpose, target, definition_revision, role, provider,
                  model, effort, session_id, transition, transition_cause,

@@ -404,6 +404,9 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, ref
     manual = {str(row[0]) for row in connection.execute("SELECT plan_id FROM manual_work_members WHERE repo=?", (repo,))}
     for row in rows:
         key = str(row["plan_id"])
+        from loop_manager_internal.storage.task_calls import pending_for_plan
+        if pending_for_plan(connection, repo, key):
+            continue
         completed = any(row[field] is not None for field in ("worker_result", "verify_result", "review_result", "agent_result_snapshot"))
         started = bool(row["ever_started"] and completed and key not in manual and revisable_row(row) and row["agent_role"] is None)
         if started and row["branch"]:
@@ -755,6 +758,9 @@ def prepare_withdrawals(connection, repo, worktree, snapshot, *, assert_current=
     prepared = {}
     for key, judgment in withdrawals.items():
         original = snapshot.by_id[key]
+        from loop_manager_internal.storage.task_calls import pending_for_plan
+        if pending_for_plan(connection, repo, key):
+            raise PlannerValidationError("호출 예약·writer 종료가 미확정인 작업의 철회를 보류합니다.")
         from loop_manager_internal.storage import execplan_draft_state, work_claims
         if original.draft or key in execplan_draft_state.pending_ids(connection, repo):
             raise PlannerValidationError("사용자 판단 대기 draft를 철회할 수 없습니다.")

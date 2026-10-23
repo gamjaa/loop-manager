@@ -198,6 +198,9 @@ def apply_mutable_catalog_changes(
     cas = _mutable_ready_cas_where()
     for deletion in deletions:
         original = deletion.snapshot
+        from .task_calls import pending_for_plan
+        if pending_for_plan(connection, repo, original.plan_id):
+            raise PlannerValidationError("취소 전에 호출 예약·writer 종료가 확인되지 않았습니다.")
         from . import execplan_draft_state
         if agent and original.plan_id in execplan_draft_state.pending_ids(connection, repo):
             raise PlannerValidationError("사용자 판단 대기 draft를 삭제할 수 없습니다.")
@@ -285,6 +288,8 @@ def apply_mutable_catalog_changes(
             ),
         )
         execplan_draft_state.cancel(connection, repo, original.plan_id, plan_commit)
+        from loop_manager_internal.notifications.incidents import cancel_plan_notifications
+        cancel_plan_notifications(connection, repo, original.plan_id)
         if preserved or deletion.judgment or checkpoint_audit:
             audit = preserved or {"text": original.text, "row": json.loads(original.execution_state or "{}"),
                                   "affected": [], "resolved": {}, "judgment": deletion.judgment}

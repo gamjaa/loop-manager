@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from contextlib import contextmanager
 import json
 import sqlite3
-from .repository import adopt_legacy_block_notices, ensure_schema
+from .repository import adopt_legacy_block_notices, ensure_schema, cancelled_plan_event
 from .incidents import _current_block_key, _materialize_resumption
 from .rendering import _message, _pieces, _draft_entities, MESSAGE_LIMIT
 from .transport import send_telegram
@@ -76,6 +76,9 @@ def _claim_piece(
                             for item in payload['plans'])):
                 from .events import enqueue_draft_decisions
                 enqueue_draft_decisions(connection, str(row[0]))
+            cancel_event(connection, event_key)
+            return None
+        if cancelled_plan_event(connection, str(row[0]), str(row[1]), payload):
             cancel_event(connection, event_key)
             return None
         if row[1] == "blocked":

@@ -329,6 +329,8 @@ def _insert(
     kind: str,
     payload: dict[str, object],
 ) -> None:
+    if cancelled_plan_event(connection, repo, kind, payload):
+        return
     payload = _event_payload(kind, payload)
     if kind != "pr_created":
         connection.execute(
@@ -371,6 +373,26 @@ def _insert(
         (f"{key}:v{len(versions)}", repo, kind, _encode_payload(payload),
          previous[2], previous[3], previous[4], previous[5]),
     )
+
+
+def cancelled_plan_event(connection, repo, kind, payload):
+    """Retire plan actions while keeping independent project/publication history."""
+    from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
+    if kind == 'draft_decisions':
+        return any(is_cancelled(connection, repo, str(plan['id'])) for plan in payload['plans'])
+    if kind in {'blocked', 'stage_failed', 'persistent_execution_failure'} and payload.get('scope') == 'project':
+        return False
+    if kind == 'resumed' and payload.get('scope') != 'plan':
+        return (payload.get('operation') in {'Worker', 'PR handling'}
+                and bool(payload.get('started_execplan_id') or payload.get('execplan_id'))
+                and is_cancelled(connection, repo, str(
+                    payload.get('started_execplan_id') or payload['execplan_id'])))
+    if kind == 'blocked' and payload.get('scope') != 'plan':
+        return False
+    return (kind in {'blocked', 'resumed', 'work_started', 'draft_decision',
+                     'persistent_execution_failure', 'stage_failed', 'pr_created'}
+            and bool(payload.get('execplan_id'))
+            and is_cancelled(connection, repo, str(payload['execplan_id'])))
 
 
 def _encode_payload(payload: dict[str, object]) -> str:

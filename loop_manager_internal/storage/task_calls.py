@@ -43,11 +43,29 @@ def ensure_schema(connection):
 
 def reserve(connection, state_dir, repo, plan_id, kind, run_id):
     from .runtime_state import _transaction
+    from .execplan_catalog_state import is_cancelled
     token = uuid4().hex
     with _transaction(connection):
+        if is_cancelled(connection, repo, plan_id):
+            raise CallDeferred(f'취소된 작업의 호출을 예약할 수 없습니다: {plan_id}')
         connection.execute("INSERT INTO task_call_reservations(token,repo,plan_id,kind,run_id) VALUES (?,?,?,?,?)",
                            (token,repo,plan_id,kind,run_id))
     return CallOwner(connection,Path(state_dir),token,kind)
+
+
+def pending_for_plan(connection, repo, plan_id):
+    """A collected result cannot release an unconfirmed physical call."""
+    for table, pending in (
+        ('task_call_reservations', '1'),
+        ('agent_invocations', "finished_at IS NULL OR (execution_finished_at IS NULL AND execution_status != 'not_executed')"),
+    ):
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+            if connection.execute(
+                f'SELECT 1 FROM {table} WHERE repo=? AND plan_id=? AND ({pending}) LIMIT 1',
+                (repo, plan_id),
+            ).fetchone():
+                return True
+    return False
 
 
 def release(owner):
