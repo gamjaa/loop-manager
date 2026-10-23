@@ -35,7 +35,7 @@ def generate(effects, connection, repo, state_dir, config_path, provider, group,
         'sources에는 제출한 R만 연결하세요. id는 초안 내 고유 식별자이며 외부 dependency는 실제 G ID입니다. '
         'body에는 PLANS의 Purpose, Acceptance Criteria, Implementation, Validation, Progress, Decision Log '
         '모든 절을 작성하세요. complexity와 risk 판단의 근거는 제출 본문에서 찾아 계획에 기록하세요. '
-        '작성 기준과 판정 rubric은 고정된 Planner 지침과 PLANS를 따르세요. '
+        '작성 기준과 판정 rubric은 전달된 Planner 지침과 PLANS를 따르세요. '
         '구체적인 완료 조건과 targeted unit test/Manager verify 조건도 작성하세요. '
         'PASS/상태/branch/session을 frontmatter에 기록하지 마세요. '
         '출력은 설명이나 markdown fence 없는 JSON 하나입니다: '

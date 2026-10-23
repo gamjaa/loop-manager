@@ -686,7 +686,7 @@ class ManualBootstrapConcurrencyTests(OriginScopeFixture, unittest.TestCase):
             self.assertTrue(captured['kwargs']['read_only'])
             prompt = captured['prompt']
             self.assertIn('제출 본문에서 찾아', prompt)
-            self.assertIn('고정된 Planner 지침과 PLANS', prompt)
+            self.assertIn('전달된 Planner 지침과 PLANS', prompt)
             self.assertIn('"status": "READY"', prompt)
             self.assertNotIn('reserved', prompt)
             self.assertNotIn('high 또는 critical', prompt)
@@ -697,7 +697,7 @@ class ManualBootstrapConcurrencyTests(OriginScopeFixture, unittest.TestCase):
 
 
 class ManualGenerationProviderGuidanceTests(ProviderExecutionFixture, unittest.TestCase):
-    def test_generation_provider_request_reuses_pinned_common_and_planner_instruction(self):
+    def test_generation_provider_request_uses_current_runtime_common_and_planner_instruction(self):
         from types import SimpleNamespace
         from loop_manager_internal.agents import common_guidance, invocation_service
         from loop_manager_internal.agents.agent_invocation import InvocationContext
@@ -740,23 +740,18 @@ class ManualGenerationProviderGuidanceTests(ProviderExecutionFixture, unittest.T
             target.write_bytes((PROJECT_FILES / relative).read_bytes())
         for relative in ('docs/AGENTS.common.md', 'docs/AGENTS.planner.md'):
             (changed_root / relative).write_text('changed instruction: ' + relative, encoding='utf-8')
-        def subprocess_run(arguments, **_kwargs):
-            output = 'codex-cli 0.159.3' if arguments[:2] == ['codex', '--version'] else 'a' * 40
-            return SimpleNamespace(returncode=0, stdout=output)
-
-        with mock.patch.object(common_guidance.subprocess, 'run', side_effect=subprocess_run), \
-             mock.patch.object(common_guidance, 'RUNTIME_ROOT', changed_root):
+        with mock.patch.object(common_guidance, 'RUNTIME_ROOT', changed_root):
             for _ in range(2):
                 self.assertEqual(manual_plan_generation.generate(effects, self.connection, self.source,
                     self.state, self.config, 'codex', group, {}), '{"plans": []}')
 
         self.assertEqual(len(requests), 2)
         self.assertEqual(requests[0].common_guidance.content, requests[1].common_guidance.content)
-        common = (PROJECT_FILES / 'docs/AGENTS.common.md').read_text(encoding='utf-8').strip()
-        planner = (PROJECT_FILES / 'docs/AGENTS.planner.md').read_text(encoding='utf-8').strip()
+        common = (changed_root / 'docs/AGENTS.common.md').read_text(encoding='utf-8').strip()
+        planner = (changed_root / 'docs/AGENTS.planner.md').read_text(encoding='utf-8').strip()
         delivered = requests[0].common_guidance.content
         self.assertEqual(requests[0].role_name, 'planner')
         self.assertTrue(requests[0].read_only)
         self.assertIn(common, delivered)
         self.assertIn(planner, delivered)
-        self.assertNotIn('changed instruction:', delivered)
+        self.assertIn('changed instruction:', delivered)

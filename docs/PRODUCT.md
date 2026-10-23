@@ -471,7 +471,7 @@ Planner는 다음 목적별 조건으로 호출하며 재사용·통합 기준�
 | Requirement 완료 | 마지막 연결 작업 Merge 등 [완료 재확인 조건](#requirement-완료-확인과-archive) 충족 |
 | 프로젝트 완료 | [최종 전문 확인](#최종-전문-확인)이 필요한 완료 후보 |
 
-실행 지침 변경은 고정 runtime의 공통·역할별 원본 내용 해시로 비교한다. 내용이 같은 runtime SHA 전진이나 코드·설정만의 변경은 그 자체로 일반 Planner 호출 조건이 아니다.
+실행 지침 변경은 현재 runtime의 공통·역할별 원본 내용 해시로 비교한다. 내용이 같은 runtime SHA 전진이나 코드·설정만의 변경은 그 자체로 일반 Planner 호출 조건이 아니다.
 
 일반 Planner는 비종료 compact catalog와 PR 전 계획 snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다. 실행 이력이 있어도 PR 전이면 같은 ID로 개정하며 작업물·세션·실패·Worker level 이력을 보존한다. PR 등록 후 Merge 대기 작업의 추가·변경 요구사항은 새 ExecPlan으로 작성한다.
 
@@ -592,28 +592,17 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 
 ### 공통 Agent 지침과 직접 작업
 
-#### 지침 원본과 작업별 고정
+#### 지침 원본과 호출별 적용
 
-자동 Agent는 작업을 시작할 때 고정한 공통·역할별 지침을 사용한다. 원본을 편집하거나 runtime이 갱신돼도 진행 중인 작업의 지침과 권한은 바뀌지 않는다.
+자동 Agent는 신규·재개·재시도·fallback마다 현재 실행이 선택한 최신 immutable runtime의 공통·역할별 지침을 읽는다. 진행 중인 작업도 과거 runtime 지침에 고정하지 않으며, runtime 갱신 뒤 다음 호출부터 개선된 규칙을 적용한다. 실행 중인 호출은 기존 안전한 반환 경계까지 유지한다.
 
-- 실행 원본은 bootstrap이 선택한 immutable runtime의 `docs/AGENTS.common.md`와 역할별 `docs/AGENTS.*.md`다. 공통·역할별 파일에는 등록 프로젝트 전반에 적용되는 자동 실행 규칙을 기록한다. Manager 예약 경로·필수 문서·verify 경로 보존은 공통 실행 규칙이다. Loop Manager 자체 개발의 새 루트 항목 제한·instruction 원본 수정 지침은 이 저장소 루트 `AGENTS.md`에 둔다.
+- 실행 원본은 runtime의 `docs/AGENTS.common.md`와 역할별 `docs/AGENTS.*.md`다. 등록 프로젝트 전반의 자동 규칙만 두며 Loop Manager 자체 개발 규칙은 이 저장소 루트 `AGENTS.md`에 둔다. 후보 worktree의 동명 파일 편집·diff 검토는 실행 지침을 바꾸지 않는다.
+- Worker는 현재 runtime의 `docs/AGENTS.ponytail.md`를 정확히 한 번 추가로 전달받는다. 다른 역할·사용자 prompt에는 추가하지 않으며 Plugin 조회·캐시·설치 판정과 사용자 설정 변경을 하지 않는다. 기존 확장 차단·쓰기 경계·필수 요구·검증 조건을 유지한다.
+- 작업별 원본 snapshot은 생성하거나 실행 입력으로 재사용하지 않는다. 과거 snapshot·DB·session·실패 이력은 감사로 보존하고 누락·손상도 현재 원본 선택을 막지 않는다. provider 전달에 필요한 합친 파일만 저장소 밖 실행용으로 생성한다.
+- 호출별 실제 전달 내용 해시를 보존하며 과거 호출을 최신 지침으로 소급 변경하지 않는다. session의 작업 귀속은 유지하고 같은 작업의 재개에도 현재 지침을 전달한다.
+- 현재 runtime의 공통·모든 역할·Ponytail 내용 해시를 planning·관련 성공 결과 재사용에 반영한다. 내용이 같으면 runtime SHA·위치 변경만으로 재계획하지 않는다. 현재 원본·실행용 파일 오류·전달 기능 미지원은 해당 모델 실행 전에 거부하며 과거 snapshot으로 대체하지 않는다.
 
-  공통에는 모든 역할의 기준을, 역할별 파일에는 권한·금지사항과 절차를 기록하며 파일 구성·합성·버전 관리에 대한 설명은 넣지 않는다. Planner·유지보수 Planner는 `AGENTS.planner.md`, Worker와 Reviewer는 각각 `AGENTS.worker.md`, `AGENTS.reviewer.md`를 사용한다. 기존 점검 원본 `AGENTS.planner_check.md`와 저장 snapshot은 호환·감사에 보존하며, R-082의 변경 목표에서는 새 코드 전용 점검을 시작하지 않는다
-
-- Manager는 고정 원본과 실제 전달 내용을 작업·호출 기록에 결합해 보존한다. 원본 저장·합성·해시의 형식은 [지침 원본과 작업별 고정](ARCHITECTURE.md#지침-원본과-작업별-고정)을 따른다.
-- Worker는 고정된 `docs/AGENTS.ponytail.md` 코딩 스타일 지침을 provider·Plugin 설치 여부·활성 상태와 관계없이 항상 한 번 추가해 전달받는다. 다른 역할·사용자 prompt에는 추가하지 않는다. Plugin 설치 목록 조회·캐시·설치 판정은 하지 않는다. 기존 Codex Plugin·App 비활성화와 실행 경계를 유지하고 사용자 설치·설정을 변경하지 않는다. Ponytail이 없는 과거 snapshot은 기존 내용으로 재개하며 명시된 요구사항·안전·필수 검증·역할·게시 조건은 유지한다
-지침 적용 시점은 다음과 같이 구분한다.
-
-| 상황 | 지침 선택·보존 |
-|---|---|
-| 원본 파일 편집·변경 PR 검토 | 현재 역할·목표의 일반 파일 권한과 PR 보고 규칙으로 수정·검토한다. 현재 실행 snapshot은 바꾸지 않는다. |
-| 변경을 포함한 원격 revision으로 새 runtime 시작 | 이후 새 작업이 선택할 원본이 갱신된다. 진행 중인 작업은 기존 snapshot을 유지한다. |
-| 새 작업 시작 | 해당 실행이 선택한 runtime의 모든 원본을 하나의 묶음으로 고정한다. 독립 planning·유지보수·점검도 각 작업의 버전을 고정한다. |
-| 같은 ExecPlan의 Worker·Reviewer·재시도·fallback·새 세션 | 같은 원본 묶음에서 각 역할의 지침을 사용한다. 새 지침이 기존 작업을 선점하지 않는다. |
-| 과거 단일 Markdown 또는 Ponytail 없는 snapshot | 저장된 원래 내용으로 재개하고 새 역할 지침·Ponytail을 소급 추가하지 않는다. |
-| 원본·snapshot 누락·손상, 저장 실패·미지원 전달 기능·설정 충돌 | 모델 실행 전에 거부하고 작업물·진단을 보존한다. 저장 원본을 최신 지침으로 대체하지 않는다. |
-
-역할별 원본을 포함한 내용 해시로 planning 입력과 성공 결과의 재사용을 판단하며 내용이 같으면 runtime SHA 변경만으로 재계획하지 않는다. 저장 원본·전달 해시의 상세 계약은 [지침 원본과 작업별 고정](ARCHITECTURE.md#지침-원본과-작업별-고정)을 따른다.
+runtime 지침만 변경돼도 안전한 runtime 갱신 대상이다. 원본·전달 해시와 호환 기록은 [지침 원본과 호출별 적용](ARCHITECTURE.md#지침-원본과-호출별-적용)을 따른다.
 
 - 지침 전달은 기본·기존 추가 지침·프로젝트 규칙과 실행 경계를 보존한다. 버전 없는 과거 세션은 기존 작업물·session·실패 기록을 남기고 최소 문맥의 새 세션으로 복구한다.
 - Worker 사용자 메시지는 최초·교체 session에 현재 계획·작업 공간·결과 형식·미완료 작업을 전달하고, 같은 session에는 확인되지 않은 새 조건·오류·검증 피드백·복구점만 보낸다. 변하지 않은 archive 후보·범위와 이전 결과·verify/Review 원문은 반복하지 않는다. 전달 시작만으로 확인 처리하지 않으며 실패·중단에는 미확인 문맥을 보존해 재전송한다. prompt 축약은 권한·검증 성공의 재사용이나 게시 대기 해소를 뜻하지 않는다.
@@ -656,7 +645,7 @@ submit의 복수 G는 같은 최종 후보와 PR을 공유한다. 묶음 안에�
 
 complete/submit에서 검증을 생략하려면 해당 단계의 `--skip-verify`·`--skip-review`와 원격 commit 전체 SHA인 `--expected-head`, 비어 있지 않은 `--skip-reason`을 함께 지정한다. 수락 시 원격 HEAD가 다르면 거부한다. 생략은 `SKIPPED_BY_USER`로 기록해 실제 PASS와 구분하며, 같은 후보·단계의 실제 실패를 생략 옵션으로 지우거나 성공으로 바꾸지 않는다.
 
-complete/submit의 verify와 Review 생략 근거는 후보·base·환경·고정 지침과 각 단계의 실제 운영 입력에 결합한다. verify 입력은 설정된 timeout·parallelism을 포함하고, Review 입력은 Reviewer provider·Model·Effort와 현재 verify 근거를 포함한다. 수락, 단계 실행, 최종 게시와 PR 대기 재평가는 같은 기준을 다시 관측한다.
+complete/submit의 verify와 Review 생략 근거는 후보·base·환경·현재 runtime 지침과 각 단계의 실제 운영 입력에 결합한다. verify 입력은 설정된 timeout·parallelism을 포함하고, Review 입력은 Reviewer provider·Model·Effort와 현재 verify 근거를 포함한다. 수락, 단계 실행, 최종 게시와 PR 대기 재평가는 같은 기준을 다시 관측한다.
 
 설정이나 profile을 읽거나 유효성을 확인할 수 없거나 요청에 당시 지문이 없으면 생략을 적용하지 않고 해당 기본 단계를 실행한다. 설정 변경으로 PR 대기 근거가 무효화되면 제출을 자동 재검증 대상으로 되돌린다. 저장·출력에는 설정 원문이나 비밀값을 포함하지 않는다.
 
@@ -740,9 +729,9 @@ Planner는 priority를 선언할 때 안전한 무인 실행을 막거나 반복
 
 #### 자체 runtime handoff
 
-- Planner·Worker·부분/전체 verify·Reviewer·게시·복구의 단계 경계와 비차단 재개 전에, 현재 runtime의 등록 self base 원격 코드를 실제 실행 SHA와 비교한다. self가 실행 선택 범위 밖이어도 확인하며 PR 상태·조회와 로컬 source 동기화는 교체 조건이 아니다.
-- 일반 문서만 전진하면 계속 실행한다. 실행 소스·스크립트·의존성·설정이 바뀐 검증된 fast-forward 후속은 전체 launch gate를 닫고 이미 시작한 호출의 반환·정리·저장을 기다린다. 문서 경로 안의 실행 코드와 불명확한 입력은 제외하지 않는다.
-- 부모는 소유 인계 자료와 실제 종료를 검증한 뒤 process lock을 유지하며 최신 원격을 다시 선택해 같은 논리 실행을 재시작한다. session·실패/교정·targeted 이력·예약·재시도 대기를 보존하고 동일 코드의 무진전 재시작을 거부한다. 전체 pause는 재선택·새 runtime 시작을 막는다. identity·fetch·ancestry·비교 또는 종료·저장 미확인은 성공으로 처리하지 않고 자료와 기존 작업 상태를 보존한다.
+- Planner·Worker·부분/전체 verify·Reviewer·게시·복구의 단계 경계와 비차단 재개 전에, 현재 runtime의 등록 self base 원격의 실행 입력을 실제 실행 SHA와 비교한다. self가 실행 선택 범위 밖이어도 확인하며 PR 상태·조회와 로컬 source 동기화는 교체 조건이 아니다.
+- 일반 문서만 전진하면 계속 실행한다. 실행 소스·스크립트·의존성·설정·공통 및 역할 지침이 바뀐 검증된 fast-forward 후속은 전체 launch gate를 닫고 이미 시작한 호출의 반환·정리·저장을 기다린다. 문서 경로 안의 실행 코드와 불명확한 입력은 제외하지 않는다.
+- 부모는 소유 인계 자료와 실제 종료를 검증한 뒤 process lock을 유지하며 최신 원격을 다시 선택해 같은 논리 실행을 재시작한다. session·실패/교정·targeted 이력·예약·재시도 대기를 보존하고 동일 실행 입력의 무진전 재시작을 거부한다. 전체 pause는 재선택·새 runtime 시작을 막는다. identity·fetch·ancestry·비교 또는 종료·저장 미확인은 성공으로 처리하지 않고 자료와 기존 작업 상태를 보존한다.
 
 ### 유지보수 평가
 

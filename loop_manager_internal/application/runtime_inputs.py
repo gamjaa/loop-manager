@@ -5,6 +5,8 @@ import ast
 
 def prose(path: str, mode: str, content: bytes) -> bool:
     name = PurePosixPath(path)
+    if path.startswith('docs/AGENTS.') and name.suffix.lower() == '.md':
+        return False
     documented = (
         name.suffix.lower() in {'.md', '.rst', '.txt'}
         and (path.startswith(('docs/', '.agents/skills/'))

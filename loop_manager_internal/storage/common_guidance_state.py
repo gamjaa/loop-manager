@@ -1,4 +1,4 @@
-"""Durable, additive bindings between work identities and common instructions."""
+"""Session ownership bindings; legacy instruction versions remain audit-only."""
 from __future__ import annotations
 
 import sqlite3
@@ -11,8 +11,18 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
     connection.execute("""CREATE TABLE IF NOT EXISTS common_guidance_sessions (
         repo TEXT NOT NULL, provider TEXT NOT NULL, session_id TEXT NOT NULL,
-        task_id TEXT NOT NULL REFERENCES common_guidance_versions(task_id),
+        task_id TEXT NOT NULL,
         PRIMARY KEY (repo, provider, session_id))""")
+    if connection.execute('PRAGMA foreign_key_list(common_guidance_sessions)').fetchall():
+        # Existing sessions keep their task identity without requiring a saved instruction version.
+        with connection:
+            connection.execute("ALTER TABLE common_guidance_sessions RENAME TO legacy_guidance_sessions")
+            connection.execute("""CREATE TABLE common_guidance_sessions (
+                repo TEXT NOT NULL, provider TEXT NOT NULL, session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL, PRIMARY KEY (repo, provider, session_id))""")
+            connection.execute("INSERT INTO common_guidance_sessions SELECT * FROM legacy_guidance_sessions")
+            connection.execute("DROP TABLE legacy_guidance_sessions")
+
 
 
 class GuidanceRepository:

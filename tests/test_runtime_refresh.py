@@ -23,6 +23,9 @@ class RuntimeInputTests(unittest.TestCase):
     def test_prose_requires_regular_nonexecutable_document_and_noncode_bytes(self):
         for path, mode, content, expected in (
             ('docs/requirements/change.md', '100644', b'# Requirement\n\nThe next step.', True),
+            ('docs/AGENTS.common.md', '100644', b'# Rules', False),
+            ('docs/AGENTS.worker.md', '100644', b'# Rules', False),
+            ('docs/AGENTS.ponytail.md', '100644', b'# Style', False),
             ('README.md', '100644', b'# Usage\n\nRun the program.', True),
             ('docs/example.py', '100644', b'print(1)', False),
             ('docs/guide.md', '100755', b'# Guide', False),
@@ -43,6 +46,9 @@ class RuntimeInputTests(unittest.TestCase):
             ([('100644', '000000', 'D', 'docs/old.md')], False),
             ([('100644', '100644', 'M', 'docs/update.md')], False),
             ([('100644', '100755', 'M', 'docs/update.md')], True),
+            ([('100644', '100644', 'M', 'docs/AGENTS.worker.md')], True),
+            ([('000000', '100644', 'A', 'docs/AGENTS.ponytail.md')], True),
+            ([('100644', '000000', 'D', 'docs/AGENTS.reviewer.md')], True),
             ([('100644', '000000', 'D', 'docs/old.md'), ('000000', '100644', 'A', 'loader.py')], True),
             ([('100644', '100644', 'M', 'docs/update.md'), ('100644', '100644', 'M', 'scripts/run.sh')], True),
         ):

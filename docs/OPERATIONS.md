@@ -181,7 +181,7 @@ Windows에서는 `.\.venv\Scripts\python.exe`와 `D:\repo\my-project` 같은 경
 | Windows | `%LOCALAPPDATA%\loop-manager\` |
 | Linux·macOS | `${XDG_STATE_HOME:-~/.local/state}/loop-manager/` |
 
-**SQLite와 `agent-guidance/`의 원본 snapshot을 함께 백업한다.** 원본은 `agent-guidance/<내용 SHA-256>.json`에 저장하며 작업·session 관계는 SQLite에 결합된다. 역할별 실행용 Markdown은 원본에서 재생성할 수 있지만 누락·손상된 원본을 최신 지침으로 바꿔 재개하지 않는다. 과거 단일 Markdown snapshot도 원래 내용으로 유지한다. [snapshot 계약](ARCHITECTURE.md#ai-agent-실행)
+**SQLite와 기존 감사 자료를 함께 백업한다.** 과거 `agent-guidance/` snapshot은 감사에만 보존하며 재개 지침은 매 호출 현재 runtime에서 읽는다. `agent-instructions/`의 실행용 파일은 현재 원본으로 재생성할 수 있다. [지침 적용 계약](ARCHITECTURE.md#지침-원본과-호출별-적용)
 
 SQLite가 없거나 손상되면 일반 `run`은 자동 초기화하지 않는다. 백업을 복원하거나 손상 DB를 별도 보관한 뒤 명시적으로 `config init`·재등록한다. 자동 상태 재구성은 지원하지 않는다.
 

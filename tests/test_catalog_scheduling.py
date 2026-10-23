@@ -722,9 +722,9 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                         )
                 return result
 
-            def record_fingerprint(path, revision):
+            def record_fingerprint(path, revision, **kwargs):
                 fingerprint_revisions.append(revision)
-                return real_fingerprint(path, revision)
+                return real_fingerprint(path, revision, **kwargs)
 
             roles = []
 

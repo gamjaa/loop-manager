@@ -112,8 +112,8 @@ class SupportFixtureTests(unittest.TestCase):
             result = fixture._pr_open_state(directory)
             connection = result[2]
             patches.callback(connection.close)
-            with mock.patch.object(common_guidance, 'runtime_content_hash',
-                                   side_effect=AssertionError('runtime fallback')):
+            from tests.support.fixed_samples import PROJECT_FILES
+            with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES):
                 saved_hash = common_guidance.plan_content_hash(connection, str(repo), 'G-026')
             snapshot = connection.execute('SELECT definition_snapshot FROM exec_plans').fetchone()[0]
             self.assertEqual(json.loads(snapshot)['guidance_hash'], saved_hash)

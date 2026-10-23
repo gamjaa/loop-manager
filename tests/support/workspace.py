@@ -135,19 +135,16 @@ class CleanupFixture:
 
 def pin_common_guidance(connection, context, worktree: Path, state_dir: Path, *, sessions=(), provider='codex',
                         role='worker'):
-    """Seed known versions before native-policy unit doubles replace subprocess.
+    """Bind known sessions before native-policy unit doubles run.
 
     Real instruction resolution/session fallback is covered by invocation tests;
     these fixtures isolate the provider's sandbox and handoff contract.
     """
-    from types import SimpleNamespace
     from unittest import mock
     from loop_manager_internal.agents import common_guidance
     from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
     repository = GuidanceRepository(connection)
-    with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
-         mock.patch.object(common_guidance.subprocess, 'run',
-                           return_value=SimpleNamespace(returncode=0, stdout='a' * 40)):
+    with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES):
         guidance = common_guidance.resolve(repository, context, role, worktree, state_dir)
     for session in sessions:
         repository.bind_session(context.repo, provider, session, guidance.task_id)

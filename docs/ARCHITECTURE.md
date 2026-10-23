@@ -100,7 +100,7 @@ provider adapter는 모델·Effort·지침·권한·sandbox를 보존하며 Fast
 | 전역 운영 설정 | runtime 실행 시작에 `ManagedConfig`로 읽어 동시 실행·유지보수·verify·Telegram 실행 문맥에 전달한다. |
 | Fast 요청 | 실행 시작 snapshot을 신규·재개·재시도에 유지한다. |
 | Model·Effort profile | 역할·Worker level의 호출 준비에서 운영 INI를 해석·검증한다. 실행 시작 설정 전체가 영구 고정된 것으로 취급하지 않으며 진행 중 Worker 세션 전환은 저장 target을 우선한다. |
-| 공통·역할별 지침 | [작업별 고정](#지침-원본과-작업별-고정)의 원본 묶음·전달 해시를 따른다. 설정 profile과 수명을 혼동하지 않는다. |
+| 공통·역할별 지침 | [호출별 적용](#지침-원본과-호출별-적용)의 원본 묶음·전달 해시를 따른다. 설정 profile과 수명을 혼동하지 않는다. |
 
 운영 INI는 현재 사용자만 읽을 수 있도록 권장하며 비밀값을 자식 명령행·로그·AI prompt·오류 메시지에 포함하지 않는다. ignored 상태 자체를 runtime 전달 근거로 삼지 않는다. `.venv`는 선택 interpreter 경로로 재사용하고 source의 `__pycache__`·도구 cache 같은 파생 파일은 전달하지 않는다.
 
@@ -283,7 +283,7 @@ ExecPlan ID만 Git 선언과 SQLite 실행 이력을 잇는 안정적인 identit
 | 전체 계획 입력 지문 | 명세 입력·활성 ExecPlan과 `docs/` 밖의 파일(소스·테스트·설정 등). 실패 입력·게시·성공 기준의 동일성 판단에 사용하며 이 지문의 변경만으로 일반 Planner를 호출하지 않는다. |
 | 계획 선언 비교 | 활성 ExecPlan의 경로·Git object 종류·내용 hash를 비교해 계획 개정과 입력 변경을 구분한다. 현재 선언의 유효성은 별도 catalog 검증을 거친다. |
 
-두 지문에는 runtime에 고정된 공통·역할별 실행 지침의 내용 hash도 포함한다. 프로젝트 루트 `AGENTS.md`는 파일 입력에서 제외하며 `docs/`에서는 명세 입력과 활성 ExecPlan만 포함한다. 따라서 archive·PLANS·템플릿·FUTURE_IDEAS는 전체 계획 입력 파일에 포함하지 않는다. 경계와 계산은 `catalog/catalog_service.py`·`planning/input_fingerprints.py`가 소유한다.
+두 지문에는 현재 runtime의 공통·역할별 실행 지침의 내용 hash도 포함한다. 프로젝트 루트 `AGENTS.md`는 파일 입력에서 제외하며 `docs/`에서는 명세 입력과 활성 ExecPlan만 포함한다. 따라서 archive·PLANS·템플릿·FUTURE_IDEAS는 전체 계획 입력 파일에 포함하지 않는다. 경계와 계산은 `catalog/catalog_service.py`·`planning/input_fingerprints.py`가 소유한다.
 
 성공한 일반 Planner 주기는 새 계획 게시, PR 전 계획 개정·미착수 계획 삭제 게시, FUTURE_IDEAS-only 게시와 추가 계획 없음 판단을 포함하며, 완료할 때 관측한 명세 지문과 전체 계획 입력 지문을 함께 저장한다. 현재 작업의 단계별 문서 반영은 전체 미충족 작업의 일반 planning 성공으로 기록하지 않는다. 자동 Requirement archive의 내용 보존 이동만으로는 두 기준을 무효화하거나 새 작업 주기와 프로젝트 완료 알림을 활성화하지 않는다.
 
@@ -601,7 +601,7 @@ Manager는 최신 원격 추적 파일의 경로·내용 hash·mode와 분석 �
 
 모듈 의미 검토는 읽기 전용 Planner 호출로 필요한 원본과 보존 조건을 확인한다. Manager는 묶음 범위·판단·발견과 실제 원본 인용을 검증해 잠정 결과로 보존한다. 모듈 발견과 루트 이동 후보가 모두 없고 일반 계획도 필요하지 않으면 추가 종합·계획 호출 없이 no-change 결과를 준비한다. 모듈 발견은 새 계획·기존 비종료 계획·근거 있는 제외에, 루트 이동 후보는 새 계획 또는 해당 목표를 포함한 비종료 계획에 연결한다. 저장된 검토를 사용하며 파일별 검토·관계 확인·종합 페이지를 다시 기본 단계로 실행하지 않는다.
 
-같은 tiered assessment에는 별도 `.` 루트 조사 unit을 둔다. unit identity는 `root_review_source`의 원격 tree hash·mode·revision, 모든 root placement와 고정 지침에 결합하고, 기존 `parse_review`·`validate_root_reviews` 계약으로 제외 분류된 문서·자산·manifest·설정까지 실제 인용을 검증한다.
+같은 tiered assessment에는 별도 `.` 루트 조사 unit을 둔다. unit identity는 `root_review_source`의 원격 tree hash·mode·revision, 모든 root placement와 현재 runtime 지침에 결합하고, 기존 `parse_review`·`validate_root_reviews` 계약으로 제외 분류된 문서·자산·manifest·설정까지 실제 인용을 검증한다.
 
 루트 protocol·scope audit는 모듈 receipt와 분리되며, 정적 inventory나 모듈 결과만으로 루트 완료를 만들지 않는다. 같은 guidance·revision의 검증된 파일별 root review 또는 이전 tiered 성공 결과만 재사용한다. 이전 tiered 성공의 root review는 성공 row에 보존된 guidance hash가 현재 지침 identity와 같고 source revision도 일치할 때만 재사용한다.
 
@@ -642,23 +642,21 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 | Reviewer | 최신 후보·명세·diff와 전달된 구현·검증 근거 | 읽기 전용 판정·blocking issue·해당 경로의 검증 보완 요청. 파일 수정과 테스트·verify 재실행은 하지 않는다. |
 | Manager | 검증한 역할 결과·원격 상태·SQLite 실행 및 소유 증거 | 상태 전이·Git/GitHub·전체 verify·게시·복구를 수행하고 결과의 범위·identity·재사용 조건을 검증한다. |
 
-세부 문서·결과 형식과 고정 지침·호출 기록·session 경계는 아래 절을 따른다.
+세부 문서·결과 형식과 현재 runtime 지침·호출 기록·session 경계는 아래 절을 따른다.
 
-### 지침 원본과 작업별 고정
+### 지침 원본과 호출별 적용
 
 - 사용자 요청의 새 기능·정책 변경은 대화형 Agent가 관련 Requirement를 먼저 작성·갱신하거나 충분한 기존 활성 Requirement를 재사용한다. 최초 설계 작성·현행 문서 정리는 Skill의 작성 대상 판단을 따른다. 프로젝트로 복제하는 Specification Skill은 제품 명세 작성·검토만 안내하고 Manager 내부 실행 절차를 설명하지 않는다. 이 저장소 루트 AGENTS는 Skill을 참조하며 문서 작성 기준을 반복하지 않는다. 직접 대화형 작업에는 ExecPlan 작성을 요구하지 않으며 생성·계획 작성은 매니저가 호출하는 자동 Planner 흐름에서 수행한다. Manager의 `manual` 명령은 직접 대화형 작업과 구분하고 별도 소유권·검증·게시 계약을 적용한다
 - 정적 자동 실행 규칙은 선택 runtime의 `docs/AGENTS.common.md`와 `docs/AGENTS.planner.md`·`docs/AGENTS.planner_check.md`·`docs/AGENTS.worker.md`·`docs/AGENTS.reviewer.md`에 둔다. common에는 모든 역할의 기준만, 역할 파일에는 해당 역할의 권한·금지사항·절차만 남긴다.
 
   Skill과 Manager가 프로젝트에서 쓰는 예약 경로는 PRODUCT의 프로젝트 예약 경로 목록을 따르며 공통 지침과 명세 작성 Skill에 위치 보존을 명시한다. runtime 전용 `docs/AGENTS.*.md`는 프로젝트 예약 경로가 아니다. Loop Manager 전용 새 루트 항목 제한·instruction 원본 수정 지침은 이 저장소 루트에 두며 runtime 공통·역할별 합성 대상에 포함하지 않는다
 
-- Manager는 작업 시작 시 해당 실행이 선택한 runtime의 모든 원본을 묶음으로 고정하고 내용 해시·source revision·snapshot과 작업·session 관계를 상태 디렉터리와 SQLite에 보존한다. 일반·유지보수·수동 제출 Planner는 common+planner, 점검은 common+planner_check, Worker와 Reviewer는 common+각 역할을 사용한다. 원본 편집·새 runtime·새 작업·기존 작업 재개의 적용 시점은 [PRODUCT의 지침 선택·보존 규칙](PRODUCT.md#지침-원본과-작업별-고정)을 따른다. 재시도·새 세션·runtime 갱신에도 같은 작업의 원본 버전을 유지한다
-- 실제 합친 내용을 Codex의 추가 developer instruction 또는 Claude의 append system prompt로 전달하고 실제 내용 해시를 호출 기록에 남긴다. 기본·기존 추가 지침·프로젝트 규칙과 실행 경계를 보존하며 원본·snapshot 오류, 미지원 전달 기능·설정 충돌·알 수 없는 역할은 모델 실행 전에 거부한다
-- Ponytail 원문은 runtime의 `docs/AGENTS.ponytail.md`에 두고 version 2 원본 묶음에 함께 고정한다. Worker는 common+worker+ponytail을 항상 합성하고 다른 역할은 common+역할 지침만 사용한다. version 1 묶음·과거 Markdown snapshot에는 새 원문을 덧붙이지 않는다. Plugin 조회·캐시·설치 판정 없이 기존 provider 전달 경로를 사용한다. Codex의 기존 Plugin·App 비활성화와 쓰기 경계는 유지한다
-- Worker의 실제 합성 내용 해시는 기존 invocation ledger에 결합한다. definition snapshot의 `guidance_hash`는 고정 원본 묶음, `worker_guidance_hash`는 해당 작업의 마지막 Worker 전달 내용을 나타낸다. Worker 완료 시 전달 지문과 성공 token을 갱신하고 검증·Review·게시 및 수동 제출 결과 재사용에도 반영한다. 전달 내용 변화는 원본·명세 변경으로 분류하지 않아 진행 중인 rebase 계약을 바꾸지 않는다.
+- `agents/common_guidance.py`는 매 호출 현재 `RUNTIME_ROOT`의 공통·역할·Ponytail 원본을 읽고 common+해당 역할을 합성한다. Worker만 Ponytail을 정확히 한 번 포함한다. 작업별 snapshot 선택·저장·복원은 없으며 재시도·재개·새 세션·provider 변경도 현재 runtime을 사용한다. 적용 시점은 [PRODUCT](PRODUCT.md#지침-원본과-호출별-적용)를 따른다.
+- Codex의 추가 developer instruction 또는 Claude의 append system prompt로 전달하며 기본·기존 추가 지침·프로젝트 규칙·실행 경계를 보존한다. 역할별 합친 Markdown은 저장소 밖 `agent-instructions/`의 실행용 파일이며 원본 묶음 JSON은 새로 저장하지 않는다. 현재 runtime 원본 오류·실행용 파일 변조·미지원 전달 기능·설정 충돌·알 수 없는 역할은 실행 전에 거부한다.
+- 기존 `common_guidance_versions`와 `agent-guidance/`는 감사 자료로 보존하고 실행 입력으로 읽지 않는다. 기존 session의 작업 귀속은 유지하되 snapshot 버전 참조와 분리한다. 과거 snapshot 누락·손상으로 현재 호출을 막지 않으며 현재 원본 오류를 옛 지침으로 우회하지 않는다.
+- definition의 `guidance_hash`와 planning 입력은 현재 runtime 전체 원본 내용 해시를 사용한다. `worker_guidance_hash`와 invocation ledger는 마지막 Worker와 각 호출에 실제 전달한 내용의 해시를 보존한다. Reviewer 호출은 Worker 전달 해시를 바꾸지 않는다. 현재 지침과 다른 과거 성공은 동일 입력의 성공으로 재사용하지 않으며 내용이 같으면 runtime SHA·위치 변경만으로 무효화하지 않는다.
+- runtime 갱신 비교는 `docs/AGENTS.*.md`를 일반 문서 prose 제외 대상에서 빼므로 지침만 바뀌어도 기존 안전한 handoff로 새 runtime을 선택한다. 실행 중인 호출의 내용은 도중에 바꾸지 않는다.
 
-  Reviewer 호출이 Worker의 전달 해시를 바꾸지 않으며 다른 실제 전달 내용의 결과를 같은 지침의 성공으로 재사용하지 않는다
-
-- 원본 묶음 snapshot은 저장소 밖 Manager 상태 디렉터리의 JSON으로 보존하고 역할별 합친 Markdown은 같은 디렉터리의 실행용 파일로만 생성하며 커밋하지 않는다. 합친 파일은 고정 원본에서 재생성하지만 원본 누락·손상은 최신 내용으로 대체하지 않는다. 기존 단일 Markdown snapshot은 원래 내용으로 재개하며 최신 역할 지침을 덧붙이지 않는다. 관련 planning·성공 결과 재사용에는 모든 역할 원본을 포함한 묶음 해시를 사용한다
 - Planner, Worker와 Reviewer의 작업별 prompt는 Loop Manager에 내장하며 목표·snapshot·승인 사실·피드백·결과 형식 등의 문맥을 구성한다. 정적 공통·역할 규칙을 이 사용자 메시지에 중복하지 않는다
 - Worker 사용자 메시지는 최초·교체 session에 선택 계획·worktree·결과 형식과 미완료 문맥을 보내고 같은 provider/Model session에는 확인되지 않은 새 조건·archive 후보·비검증 오류·checkpoint/선언 복원 사실·검증 피드백 delta만 보낸다. effort 변경은 같은 session의 재개다. 이전 Worker 결과와 verify/Review 원문은 복사하지 않으며 수동 교정도 전체 G·후보 R·사용자 생략과 미확인 외부 테스트만 유지한다.
 - 기존 validation delivery attempt/cursor에 작업 문맥 JSON과 attempt 순서를 결합한다. 호출 전 revision을 고정하고 실제 session에 결합하되 정상 scope·결과 검증 뒤에만 두 채널의 전달을 확인한다. timeout·손상 결과·저장 실패는 미확인 문맥을 재전송하고 호출 중 발생한 새 revision은 확인하지 않는다. 늦게 도착한 과거 attempt가 최신 문맥 cursor를 되돌리지 않는다. source 지문·revision이나 순수 수행 기록만의 변화는 작업 조건 재전송을 만들지 않는다.
@@ -749,7 +747,7 @@ Reviewer는 파일을 수정하거나 테스트·verify를 다시 실행하지 �
 
 - Worker와 Reviewer는 ExecPlan이 PR 생성 준비를 마칠 때까지 각자의 세션을 재사용한다
 - `run_agent_with_retries`는 실패 결과의 세션 부재·재개 불가 문구를 `session_resume_unavailable`로 판별한다. `no rollout found for thread id`와 `No conversation found with session ID`도 포함하며 오류 코드 `-32600`만으로 세션 부재를 판정하지 않는다. 현재 CLI 오류 문구에 의존하므로 공급자 문구가 바뀌면 판별과 회귀 테스트를 함께 갱신한다
-- 세션 복구는 현재 세션 ID를 비워 한 번만 새 세션을 시작하고, 같은 worktree와 고정 지침·작업 문맥·저장된 실패 내용을 전달한다. 기존 `AttemptSequence`는 이 호출을 `fallback`·`session_unavailable`로 기록한다. 승인·격리 정책 실패와 사용 한도 소진은 복구 대상에서 제외하고 새 세션도 실패하면 기존 실패·일시 오류 재시도 경계를 따른다
+- 세션 복구는 현재 세션 ID를 비워 한 번만 새 세션을 시작하고, 같은 worktree와 현재 runtime 지침·작업 문맥·저장된 실패 내용을 전달한다. 기존 `AttemptSequence`는 이 호출을 `fallback`·`session_unavailable`로 기록한다. 승인·격리 정책 실패와 사용 한도 소진은 복구 대상에서 제외하고 새 세션도 실패하면 기존 실패·일시 오류 재시도 경계를 따른다
 
 ### 프로그램이 소유하는 실행 효과
 
@@ -946,7 +944,7 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 | 판단 경계 | 수용 근거와 후속 처리 |
 |---|---|
 | Git rebase 결과 수용 | 현재 repository·작업·worktree·branch·target·원격·PR과 최종 변경을 검증하고 checkpoint generation에 결합한다. Git 완료는 구현·검증·게시 성공을 뜻하지 않는다. |
-| Worker 구현 결과 | 구현 조건·sources·dependency·archive·고정 지침과 완료 결과를 대조한다. 원본 명세 지문만의 변경은 Worker 입력 token을 바꾸지 않으며 실제 구현 조건 변경·부족은 기존 Worker 판단·교정으로 연결한다. |
+| Worker 구현 결과 | 구현 조건·sources·dependency·archive·현재 runtime 지침과 완료 결과를 대조한다. 원본 명세 지문만의 변경은 Worker 입력 token을 바꾸지 않으며 실제 구현 조건 변경·부족은 기존 Worker 판단·교정으로 연결한다. |
 | verify·Review·게시 | 원본 명세·전체 본문·base·후보와 단계별 입력 증명을 유지한다. 후보 변경 후 각 성공 근거의 유효성·재사용 조건을 다시 판단하고 정확한 원격 lease·PR gate를 통과한다. |
 
 재평가는 입력 차단과 충돌·완료 근거 부족을 구분한다. `plan_input_invalid`에 저장된 rebase intent가 연결되면 현재 선언·경로·catalog, 선택 worktree·branch와 원래 HEAD, target·원격, index 상태를 다시 확인한다. 소유한 원래 HEAD에서 안전하게 시작할 수 있으면 입력 차단만 해제하고 intent를 보존해 기존 rebase 시작으로 잇는다. 이 START 판단은 rebase 완료, 검증 성공 또는 게시 lease의 소유 증거가 아니다. 관리 worktree 충돌이나 완료 근거가 부족한 차단은 START만으로 해제하지 않으며 확인된 소유 operation 또는 수용 가능한 완료 결과를 요구한다.
@@ -954,7 +952,7 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 
 #### 충돌 없는 rebase와 Worker 결과 연결
 
-Worker 결과와 작업 범위를 확인한 뒤 최신 `origin/<base-branch>`를 fetch하고 소유 변경을 commit하여 필요한 rebase를 완료한 다음 게시 후보 HEAD에서 검증 근거와 Review를 판단한다. `RevisionHandler`·`LatestBaseHandler`의 정상 rebase 호출이 충돌 없이 완료되면 기존 Worker 구현 입력 token·archive token·완료 결과를 대조한다. Worker 입력은 구현 조건·sources·dependency·archive·고정 지침에 결합하며 원본 명세의 내용 지문만의 변화는 제외한다. 명세 지문은 verify·Review의 입력 증명에 별도로 유지한다.
+Worker 결과와 작업 범위를 확인한 뒤 최신 `origin/<base-branch>`를 fetch하고 소유 변경을 commit하여 필요한 rebase를 완료한 다음 게시 후보 HEAD에서 검증 근거와 Review를 판단한다. `RevisionHandler`·`LatestBaseHandler`의 정상 rebase 호출이 충돌 없이 완료되면 기존 Worker 구현 입력 token·archive token·완료 결과를 대조한다. Worker 입력은 구현 조건·sources·dependency·archive·현재 runtime 지침에 결합하며 원본 명세의 내용 지문만의 변화는 제외한다. 명세 지문은 verify·Review의 입력 증명에 별도로 유지한다.
 
 일치하는 결과만 현재 수용 HEAD의 `worker_candidate_token`에 checkpoint CAS와 runtime transaction으로 연결해 VERIFYING으로 이어간다. `decide_revision_gate()`가 현재 후보 확인 불일치 등으로 IMPLEMENTING을 요구하면 clean 완료도 그 판정을 유지한다. 구현 교정 중인 작업, 실제 조건 변경, 충돌·미완료·중단 뒤 수용에는 이 예외를 적용하지 않는다.
 
@@ -1198,7 +1196,7 @@ manifest·이벤트·결과는 version·run·단계·단위/테스트 identity�
 
 상세 호출은 [실행 계약](VERIFY.md#실행), 도구별 지원·적합성은 [unittest](VERIFY.md#unittest-지원과-적합성)·[Perl TAP](VERIFY.md#perl-tap-지원과-두-언어-예제), 새 도구 연결은 [adapter 추가 경계](VERIFY.md#adapter-추가-경계)를 따른다. 지원 계약과 검증된 환경의 범위를 구분하며 미확인 연결을 검증 완료로 간주하지 않는다.
 
-역할별 정적 규칙은 기존 common+해당 역할의 고정 원본 묶음으로 전달하고, 작업 prompt는 선택 선언·지원 버전·참조 문맥만 연결한다. 언어별 지침 사본이나 새로운 배포·snapshot 경계는 만들지 않는다.
+역할별 정적 규칙은 현재 runtime의 common+해당 역할 원본으로 전달하고, 작업 prompt는 선택 선언·지원 버전·참조 문맥만 연결한다. 언어별 지침 사본이나 새로운 배포·snapshot 경계는 만들지 않는다.
 
 ## 검증과 재시도
 

@@ -115,14 +115,14 @@ Windows:
 | SQLite 없음·손상 | 백업을 복원하거나 손상 DB를 별도 보관한 뒤 명시적으로 `config init`·재등록한다. 일반 `run`은 자동 초기화하지 않는다. |
 | `cleanup_pending` | 미커밋·미게시 작업 또는 불확실한 worktree가 보존돼 있다. 안전 조건 충족·경로 부재 시 자동 해제되며 다음 작업·완료를 막지 않는다. |
 
-PR 생성은 완료가 아니다. 같은 PR의 실제 Merge를 확인한 뒤 완료 처리하며 clean하고 PR head에 없는 로컬 commit이 없는 worktree만 정리한다. 안전성을 확인할 수 없으면 보존한다. **SQLite와 같은 상태 디렉터리의 지침 snapshot을 함께 백업한다.** [상태 보존·복원](docs/OPERATIONS.md#상태-보존과-복원)
+PR 생성은 완료가 아니다. 같은 PR의 실제 Merge를 확인한 뒤 완료 처리하며 clean하고 PR head에 없는 로컬 commit이 없는 worktree만 정리한다. 안전성을 확인할 수 없으면 보존한다. **SQLite와 기존 상태 디렉터리의 감사 자료를 함께 백업한다.** [상태 보존·복원](docs/OPERATIONS.md#상태-보존과-복원)
 
 ## 상세 문서
 
 - [공통 verify](docs/VERIFY.md): 선택 선언·단독 호출·unittest 지원과 adapter 계약
 - [운영 안내](docs/OPERATIONS.md): 인증·설정·등록·수동 제출·복구·verify 진단
 - [PRODUCT](docs/PRODUCT.md): 제품 동작·상태·완료 조건
-- [ARCHITECTURE](docs/ARCHITECTURE.md): 책임·저장·실행 격리·복구·지침 snapshot
+- [ARCHITECTURE](docs/ARCHITECTURE.md): 책임·저장·실행 격리·복구·호출별 runtime 지침
 - [PLANS](docs/PLANS.md): 공통 ExecPlan 형식
 - [Specification Skill](.agents/skills/specification-docs/SKILL.md): 문서 작성·검토
 
