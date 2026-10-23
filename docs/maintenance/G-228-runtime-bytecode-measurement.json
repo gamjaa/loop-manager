@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "measured_at_utc": "2026-10-23T17:42:48.693265+00:00",
+  "source_revision": "34fab09fa48016e7d0288b8c518a06ea477c6402",
+  "runtime_revision": "34fab09fa48016e7d0288b8c518a06ea477c6402",
+  "revision_scope": "source checkout HEAD and its disposable clone; remote freshness was not fetched or verified",
+  "runtime_worktree_registered_in_disposable_clone": true,
+  "workload": {
+    "command": "loop_manager.py --help",
+    "bootstrap_arguments": [
+      "--runtime-child",
+      "--runtime-source <source checkout>",
+      "--runtime-sha <source revision>",
+      "--state-dir <isolated temporary state>",
+      "--config config.ini (absent; help exits before config load)",
+      "--help"
+    ],
+    "config_exists": false,
+    "selected_tracked_python_sources": 308,
+    "result_meaning": "CLI startup/import path completed with exit code 0; no project operation or Agent call"
+  },
+  "environment": {
+    "interpreter": "/usr/bin/python3",
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+    "cache_tag": "cpython-312",
+    "platform": "Linux-7.0.0-1013-oracle-aarch64-with-glibc2.39",
+    "machine": "aarch64",
+    "cpu_count": 2,
+    "parent_bytecode_writes_enabled": true,
+    "parent_pycache_prefix": null,
+    "optimization": 0
+  },
+  "cache_policy": {
+    "cold_warm": "bytecode writes enabled; BootstrapService default external runtime-bytecode prefix; same source, revision and interpreter",
+    "after_runtime_cleanup": "same disposable Git worktree path removed and re-registered at the same revision; cache prefix retained",
+    "no_cache": "PYTHONDONTWRITEBYTECODE=1 and a separate initially absent cache prefix"
+  },
+  "runs": [
+    {
+      "name": "cold",
+      "result": 0,
+      "total_elapsed_seconds": 3.067632430989761,
+      "cache_preparation": "runtime Python bytecode cache: checked-hash created=308 reused=0 replaced=0 unavailable=0 missing=0 write_enabled=True seconds=1.490",
+      "runtime_child": "runtime Python child: revision=34fab09fa48016e7d0288b8c518a06ea477c6402 interpreter=/usr/bin/python3 cache_tag=cpython-312 seconds=1.577 returncode=0",
+      "cache_prefix_pyc_files_after_run": 469
+    },
+    {
+      "name": "warm",
+      "result": 0,
+      "total_elapsed_seconds": 0.9793297690339386,
+      "cache_preparation": "runtime Python bytecode cache: checked-hash created=0 reused=308 replaced=0 unavailable=0 missing=0 write_enabled=True seconds=0.121",
+      "runtime_child": "runtime Python child: revision=34fab09fa48016e7d0288b8c518a06ea477c6402 interpreter=/usr/bin/python3 cache_tag=cpython-312 seconds=0.857 returncode=0",
+      "cache_prefix_pyc_files_after_run": 469
+    },
+    {
+      "name": "warm_after_runtime_recreate",
+      "result": 0,
+      "total_elapsed_seconds": 1.029108114016708,
+      "cache_preparation": "runtime Python bytecode cache: checked-hash created=0 reused=308 replaced=0 unavailable=0 missing=0 write_enabled=True seconds=0.127",
+      "runtime_child": "runtime Python child: revision=34fab09fa48016e7d0288b8c518a06ea477c6402 interpreter=/usr/bin/python3 cache_tag=cpython-312 seconds=0.901 returncode=0",
+      "cache_prefix_pyc_files_after_run": 469
+    },
+    {
+      "name": "no_cache_disabled",
+      "result": 0,
+      "total_elapsed_seconds": 2.3478645489667542,
+      "cache_preparation": "runtime Python bytecode cache: checked-hash created=0 reused=0 replaced=0 unavailable=0 missing=308 write_enabled=False seconds=0.184",
+      "runtime_child": "runtime Python child: revision=34fab09fa48016e7d0288b8c518a06ea477c6402 interpreter=/usr/bin/python3 cache_tag=cpython-312 seconds=2.163 returncode=0",
+      "cache_prefix_pyc_files_after_run": 0
+    }
+  ],
+  "runtime_cleanup_reuse": {
+    "runtime_clean_before_remove": true,
+    "runtime_removed": true,
+    "same_path_registered_after_recreate": true,
+    "cache_prefix_pyc_files_before_remove": 469,
+    "cache_prefix_pyc_files_after_recreate_before_run": 469,
+    "runtime_revision_after_runs": "34fab09fa48016e7d0288b8c518a06ea477c6402",
+    "runtime_clean_after_runs": true
+  },
+  "source_checkout_clean_before_and_after": true,
+  "limitations": [
+    "The disposable clone and registered worktree used the source checkout HEAD; remote freshness was not fetched or verified.",
+    "The workload is CLI startup/help, not a full Manager run or full verify.",
+    "Total elapsed includes cache preparation and child execution, but excludes clone/worktree creation/removal and temporary cache cleanup.",
+    "Created/reused counts are the bootstrap checked-hash preparation counts for tracked Manager Python sources; individual imported-module cache hits are not traced.",
+    "The 469 cache-file count includes Python interpreter startup caches under the prefix; the 308 created/reused counts identify tracked Manager sources.",
+    "These sequential fixture measurements on one Linux host are descriptive only; they do not establish an operating speedup or guaranteed improvement."
+  ]
+}

@@ -42,7 +42,7 @@ R-059의 같은 revision 첫 실행·재실행에서 실제 캐시 사용, 실�
 
 - [x] 2026-10-09 최신 원격 기준의 bootstrap·timing·관련 테스트와 G-162의 남은 측정 계약을 정적으로 대조했다. 제공된 검토 근거와 조회한 저장 기록에서는 동일 입력의 실행 시간/관리 비용을 연결한 cold/warm 산출물을 확인하지 못했다. 구현·테스트·측정은 실행하지 않았다.
 - [x] bootstrap runtime 자식 실행의 elapsed·revision·interpreter·cache tag·return code를 기존 operation log에 연결했다. 실제 Python cold/warm cache 준비 로그와 실행 결과를 확인하는 fixture 및 명시적 무캐시 실행을 확인하는 fixture를 targeted 실행했다.
-- [ ] Manager가 동일 입력 cold/warm 및 무캐시 실행의 실제 수치·제한을 측정해 `docs/maintenance/` 근거로 보존
+- [x] 2026-10-23 현재 checkout HEAD의 disposable clone에 등록한 runtime worktree로 실제 CLI startup cold/warm·무캐시 실행과 runtime worktree 재생성 후 warm 재사용을 측정해 [`G-228-runtime-bytecode-measurement.json`](../maintenance/G-228-runtime-bytecode-measurement.json)에 입력·수치·제한을 보존했다. 원격 최신성은 fetch하지 않아 확인하지 않았다.
 - [ ] Manager 실제 비교 근거·전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
