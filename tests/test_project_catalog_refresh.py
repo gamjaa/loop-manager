@@ -1240,6 +1240,115 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id=?", (merged,))
             self.assertEqual(manager.select_ready_execplan(self.connection, self.repo)['plan_id'], selected)
 
+    def test_planner_rejects_cycle_joining_registered_held_dependency_and_preserves_rows(self):
+        import tempfile
+        from loop_manager_internal.planning import planner_validation
+
+        held_path = 'docs/plans/[G-006] Held predecessor.md'
+        self.fixture._insert('G-006', 'Held predecessor', status='READY', retry_count=3)
+        self.connection.execute(
+            "UPDATE exec_plans SET depends_on='[\"G-001\"]', repo=? WHERE plan_id='G-006'",
+            (self.repo,),
+        )
+        self.connection.commit()
+        self.documents[held_path] = self.fixture._text(
+            'G-006', 'Held predecessor', depends_on=('G-001',), risk='invalid',
+        )
+        self.paths |= {held_path}
+        self.boundary.refresh()
+        self.assertIn('G-006', self.held())
+        before_rows = {
+            plan_id: dict(self.row(plan_id)) for plan_id in ('G-001', 'G-006')
+        }
+        before_holds = [tuple(row) for row in self.connection.execute(
+            'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
+            (self.repo,),
+        )]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = 'docs/plans/[G-001] Updated.md'
+            from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+            from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
+            original = catalog.parse_execplan_text(path, self.documents[path], validate_sources=False)
+            mutable = MutableReadySnapshot(self.repo, self.sha, (ReadyPlanSnapshot(
+                plan_id='G-001', path=path, title='Updated',
+                sources=tuple(original['sources']), depends_on=tuple(original['depends_on']),
+                complexity=original['complexity'], risk=original['risk'],
+                priority=original['priority'],
+                content_hash=catalog.plan_content_hash(self.documents[path]),
+                plan_sha=self.sha, text=self.documents[path], current_metadata_recorded=True,
+            ),), 'token')
+            documents = {**self.documents, 'docs/PRODUCT.md': 'Product.'}
+            for relative, text in documents.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding='utf-8', newline='\n')
+            (root / path).write_text(
+                self.fixture._text('G-001', 'Updated', depends_on=('G-006',)),
+                encoding='utf-8', newline='\n',
+            )
+
+            def git(_root, command, *args, **kwargs):
+                item = args[-1]
+                tree = f'100644 blob abc\t{item}\0' if item in self.documents else ''
+                return SimpleNamespace(returncode=0, stdout=tree if command == 'ls-tree' else '')
+
+            effects = SimpleNamespace(
+                changed_files=lambda *args: [path],
+                mutable_snapshot_token=lambda *args: 'token',
+                git=git,
+                _parse_execplan=catalog.parse_execplan_file,
+                load_execplan_catalog=manager.load_execplan_catalog,
+                _validate_future_idea_separation=mock.Mock(),
+                file_hash=lambda target: catalog.plan_content_hash(target.read_bytes()),
+                _stored_string_list=planner_validation._stored_string_list,
+                _assert_mutable_ready_snapshot_current=None,
+            )
+            with self.assertRaisesRegex(planner_validation.PlannerValidationError, '순환'):
+                planner_validation.validate_planner_result(
+                    effects, root, self.sha, [], connection=self.connection, repo=self.repo,
+                    mutable_snapshot=mutable,
+                )
+
+        self.assertEqual({key: dict(self.row(key)) for key in before_rows}, before_rows)
+        self.assertEqual([tuple(row) for row in self.connection.execute(
+            'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
+            (self.repo,),
+        )], before_holds)
+
+    def test_dependency_cycle_check_uses_batch_overlay_and_ignores_existing_held_cycle(self):
+        held_ids = {'G-006', 'G-010', 'G-011'}
+        original = {
+            'G-006': ('G-007',),
+            'G-010': ('G-011',),
+            'G-011': ('G-010',),
+        }
+
+        with self.assertRaisesRegex(
+            catalog.ExecPlanCatalogError,
+            'G-007 -> G-008 -> G-001 -> G-006 -> G-007',
+        ):
+            refresh.assert_planning_dependency_references(
+                {
+                    'G-007': {'depends_on': []},
+                    'G-008': {'depends_on': []},
+                    'G-001': {'depends_on': []},
+                },
+                [
+                    ('u.md', {'id': 'G-007', 'depends_on': ['G-008']}),
+                    ('t.md', {'id': 'G-008', 'depends_on': ['G-001']}),
+                    ('revision.md', {'id': 'G-001', 'depends_on': ['G-006']}),
+                ],
+                held_ids,
+                original_dependencies=original,
+            )
+
+        refresh.assert_planning_dependency_references(
+            {}, [('new.md', {'id': 'G-012', 'depends_on': ['G-010']})],
+            {'G-010', 'G-011'}, original_dependencies=original,
+        )
+
     def test_independent_planning_reuses_missing_manager_priority_hold_cause(self):
         import tempfile
         from loop_manager_internal.catalog import manager_sources
@@ -1508,7 +1617,7 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             maintenance_validation._maintenance_mode_and_rows(effects, self.connection, self.repo, cycle, self.sha)
 
     @contextlib.contextmanager
-    def _scoped_maintenance_publication(self):
+    def _scoped_maintenance_publication(self, *, registered_hold=False, revalidation=False):
         import hashlib
         import tempfile
         from loop_manager_internal.storage import maintenance_state
@@ -1516,7 +1625,19 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                                 "reviewer_session_id=NULL, retry_count=0, ever_started=0 WHERE plan_id='G-001'")
         self.documents['docs/plans/[G-001] Updated.md'] = fixtures.plan_text('G-001', 'Updated')
         broken = 'docs/plans/[G-006] New invalid.md'
-        self.documents[broken] = self.fixture._text('G-006', 'New invalid').replace('priority: normal\n', '')
+        if registered_hold:
+            self.fixture._insert('G-006', 'New invalid', status='READY', retry_count=2)
+            self.connection.execute(
+                "UPDATE exec_plans SET depends_on='[\"G-001\"]', repo=? WHERE plan_id='G-006'",
+                (self.repo,),
+            )
+            self.documents[broken] = self.fixture._text(
+                'G-006', 'New invalid', depends_on=('G-001',), risk='invalid',
+            )
+        else:
+            self.documents[broken] = self.fixture._text('G-006', 'New invalid').replace(
+                'priority: normal\n', '',
+            )
         self.paths |= {broken}
         self.connection.commit()
         self.boundary.refresh()
@@ -1524,6 +1645,20 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
         self.connection.execute("INSERT INTO maintenance_cycles (repo, phase, cycle_base_sha) VALUES (?, 'assessment', ?)",
                                 (self.repo, self.sha))
         self.connection.commit()
+        if revalidation:
+            cycle_store = maintenance_state.MaintenanceRepository(self.connection)
+            cycle = cycle_store.get(self.repo)
+            cycle = cycle_store.transition(
+                self.repo, expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                expected_revision=cycle.revision,
+                next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+            )
+            cycle_store.transition(
+                self.repo, expected_phase=maintenance_state.MaintenancePhase.REFACTORING,
+                expected_revision=cycle.revision,
+                next_phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+                revalidation_plan_ids=('G-001',),
+            )
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as ports:
             root = Path(directory)
             baseline = {**self.documents, 'docs/PRODUCT.md': 'Product.'}
@@ -1536,13 +1671,26 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             ports.enter_context(mock.patch.object(manager, '_ready_plan_snapshot', side_effect=snapshot_at))
             ports.enter_context(mock.patch.object(manager, '_ready_plan_snapshot_at_revision', side_effect=snapshot_at))
             context = manager.prepare_maintenance_planning_context(self.connection, self.repo, root, self.sha)
-            path = 'docs/plans/[G-007] Refactor.md'
-            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor').replace(
-                'depends_on: []', 'depends_on:\n  - G-002'), encoding='utf-8', newline='\n')
             ready = context.eligible_plans[0]
-            (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8', newline='\n')
+            if revalidation:
+                path = None
+                (root / ready.path).write_text(
+                    ready.text.replace('Keep the boundary explicit.',
+                                       'Keep the boundary explicit and verifiable.'),
+                    encoding='utf-8', newline='\n',
+                )
+                publication_paths = (ready.path,)
+            else:
+                path = 'docs/plans/[G-007] Refactor.md'
+                (root / path).write_text(fixtures.plan_text('G-007', 'Refactor').replace(
+                    'depends_on: []', 'depends_on:\n  - G-002'), encoding='utf-8', newline='\n')
+                (root / ready.path).write_text(ready.text.replace(
+                    'depends_on: []', 'depends_on:\n  - G-007'),
+                    encoding='utf-8', newline='\n',
+                )
+                publication_paths = (ready.path, path)
             batch = SimpleNamespace(root=root, context=context, commit='e' * 40, remote=self.sha,
-                                    publication_paths=(ready.path, path), broken=broken)
+                                    publication_paths=publication_paths, broken=broken)
             committed = {relative: (root / relative).read_bytes() for relative in batch.publication_paths}
             base_tree = {relative.encode(): (b'blob', hashlib.sha1(text.encode()).hexdigest().encode())
                          for relative, text in baseline.items()}
@@ -1608,6 +1756,78 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
 
     def test_maintenance_intent_recovers_scoped_batch_after_remote_advances(self):
         self._assert_scoped_maintenance_recovery(remote_advances=True)
+
+    def test_maintenance_validation_and_publication_recheck_held_cycle(self):
+        import hashlib
+        from loop_manager_internal.maintenance import maintenance_publication
+
+        with self._scoped_maintenance_publication(
+            registered_hold=True, revalidation=True,
+        ) as batch:
+            self.assertIn('G-006', self.held())
+            held_before = dict(self.row('G-006'))
+            ready_before = dict(self.row('G-001'))
+            holds_before = [tuple(row) for row in self.connection.execute(
+                'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
+                (self.repo,),
+            )]
+            ready = batch.context.eligible_plans[0]
+            (batch.root / ready.path).write_text(
+                ready.text.replace('depends_on: []', 'depends_on:\n  - G-006'),
+                encoding='utf-8', newline='\n',
+            )
+            with self.assertRaisesRegex(manager.PlannerValidationError, '순환'):
+                manager.validate_maintenance_planner_result(
+                    self.connection, batch.context, batch.root, [ready.path],
+                )
+            self.assertEqual(dict(self.row('G-006')), held_before)
+            self.assertEqual(dict(self.row('G-001')), ready_before)
+            self.assertEqual([tuple(row) for row in self.connection.execute(
+                'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
+                (self.repo,),
+            )], holds_before)
+
+            cycle_plan = catalog.parse_execplan_file(
+                batch.root, batch.root / ready.path, validate_sources=False,
+            )
+            revised = replace(batch.result.revisions[0], plan=cycle_plan)
+            hashes = tuple(
+                (path, hashlib.sha256((batch.root / path).read_bytes()).hexdigest())
+                for path in batch.result.publication_paths
+            )
+            cycle_result = replace(
+                batch.result, revisions=(revised,), publication_hashes=hashes,
+            )
+            committed = {
+                path: (batch.root / path).read_bytes()
+                for path in cycle_result.publication_paths
+            }
+            batch.remote = batch.commit
+            planning_effects = maintenance_publication.ValidateMaintenancePlanningCommitEffects(
+                _parse_execplan=catalog.parse_execplan_file,
+                git=manager.git,
+                git_bytes=lambda _root, _command, spec: committed[spec.split(':', 1)[1]],
+                load_execplan_catalog=manager.load_execplan_catalog,
+                load_execplan_snapshot=manager.load_execplan_snapshot,
+            )
+            publication_effects = maintenance_publication.ValidateMaintenancePublicationCommitEffects(
+                _validate_maintenance_planning_commit=lambda root, result, commit, **kwargs:
+                    maintenance_publication._validate_maintenance_planning_commit(
+                        planning_effects, root, result, commit, **kwargs,
+                    ),
+                git=manager.git,
+            )
+            with self.assertRaisesRegex(manager.MaintenancePlanningError, '순환'):
+                maintenance_publication._validate_maintenance_publication_commit(
+                    publication_effects, batch.root, 'main', cycle_result, batch.commit,
+                    connection=self.connection,
+                )
+            self.assertEqual(dict(self.row('G-006')), held_before)
+            self.assertEqual(dict(self.row('G-001')), ready_before)
+            self.assertEqual([tuple(row) for row in self.connection.execute(
+                'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
+                (self.repo,),
+            )], holds_before)
 
     def test_maintenance_publication_rejects_changed_hold_and_preserves_intent(self):
         from loop_manager_internal.storage import maintenance_state

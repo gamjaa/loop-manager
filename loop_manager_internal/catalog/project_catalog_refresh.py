@@ -87,10 +87,11 @@ def validated_held_planning_snapshot(
 
 
 def assert_planning_dependency_references(
-    catalog, plans, held_ids, *, original_dependencies=None,
+    catalog, plans, held_ids, *, original_dependencies=None, check_cycles=True,
 ) -> None:
     """A registered held prerequisite is a valid reference, not permission to run."""
     original_dependencies = original_dependencies or {}
+    plans = tuple(plans)
     for path, plan in plans:
         pending = list(plan["depends_on"])
         visited = set()
@@ -108,6 +109,36 @@ def assert_planning_dependency_references(
             if dependencies is None:
                 dependencies = original_dependencies.get(dependency, ())
             pending.extend(dependencies)
+
+    if not check_cycles:
+        return
+
+    dependencies = {
+        str(plan_id): tuple(str(item) for item in metadata.get("depends_on", ()))
+        for plan_id, metadata in catalog.items()
+    }
+    changed_ids = frozenset(str(plan["id"]) for _, plan in plans)
+    for _, plan in plans:
+        dependencies[str(plan["id"])] = tuple(str(item) for item in plan["depends_on"])
+    # Only quarantined plans need their registered relationship snapshot to
+    # complete the graph. A current planning declaration always takes priority.
+    for plan_id in held_ids:
+        if plan_id not in dependencies and plan_id in original_dependencies:
+            dependencies[str(plan_id)] = tuple(
+                str(item) for item in original_dependencies[plan_id]
+            )
+    cycles = execplan_catalog.dependency_cycle_paths(
+        dependencies, relevant_ids=changed_ids,
+    )
+    if cycles:
+        cycle = cycles[0]
+        changed_id = next(item for item in cycle if item in changed_ids)
+        path = next(path for path, plan in plans if str(plan["id"]) == changed_id)
+        raise execplan_catalog.ExecPlanCatalogError(
+            "이번 planning 선언이 순환 ExecPlan 의존성을 만듭니다: "
+            + " -> ".join(cycle),
+            code="dependency-cycle", path=path,
+        )
 
 
 class CatalogRefreshStopped(RuntimeError):

@@ -1161,9 +1161,12 @@ def validate_planner_result(
                         raise PlannerValidationError(str(error)) from error
         planned_ids = frozenset(str(plan["id"]) for plan in current_plans.values())
         if held_ids:
+            # Validate references first; the held snapshot below pins the
+            # registered edges before the final combined graph is checked.
             project_catalog_refresh.assert_planning_dependency_references(
                 {}, current_plans.items(), held_ids,
                 original_dependencies=original_dependencies,
+                check_cycles=False,
             )
 
         if held_ids:

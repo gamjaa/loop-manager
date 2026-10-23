@@ -504,6 +504,37 @@ def _entry(relative_path: str, text: str, values: Mapping[str, object]) -> ExecP
     )
 
 
+def dependency_cycle_paths(
+    dependencies: Mapping[str, Iterable[str]],
+    *,
+    relevant_ids: AbstractSet[str] | None = None,
+) -> tuple[tuple[str, ...], ...]:
+    """Return dependency cycles, optionally limiting reports to changed nodes."""
+    visited: set[str] = set()
+    stack: list[str] = []
+    cycles: list[tuple[str, ...]] = []
+
+    def visit(plan_id: str) -> None:
+        if plan_id in stack:
+            cycle = tuple(stack[stack.index(plan_id):])
+            if relevant_ids is None or relevant_ids.intersection(cycle):
+                rendered = (*cycle, plan_id)
+                if rendered not in cycles:
+                    cycles.append(rendered)
+            return
+        if plan_id in visited or plan_id not in dependencies:
+            return
+        stack.append(plan_id)
+        for dependency in sorted(str(item) for item in dependencies[plan_id]):
+            visit(dependency)
+        stack.pop()
+        visited.add(plan_id)
+
+    for plan_id in dependencies:
+        visit(plan_id)
+    return tuple(cycles)
+
+
 def _graph_issues(entries: Mapping[str, ExecPlanCatalogEntry],
                   observed_ids: AbstractSet[str],
                   satisfied_dependencies: AbstractSet[str] = frozenset()) -> tuple[CatalogIssue, ...]:
@@ -514,26 +545,11 @@ def _graph_issues(entries: Mapping[str, ExecPlanCatalogEntry],
         if missing:
             issues.append(CatalogIssue(plan_id, entry.path, "missing-dependency",
                 f"ExecPlan {plan_id}의 존재하지 않는 depends_on ID입니다: " + ", ".join(missing)))
-    visited: set[str] = set()
-    stack: list[str] = []
-
-    def visit(plan_id: str) -> None:
-        if plan_id in stack:
-            cycle = stack[stack.index(plan_id):]
-            message = "순환 ExecPlan 의존성입니다: " + " -> ".join([*cycle, plan_id])
-            issues.extend(CatalogIssue(member, entries[member].path, "dependency-cycle", message)
-                          for member in cycle)
-            return
-        if plan_id in visited or plan_id not in entries:
-            return
-        stack.append(plan_id)
-        for dependency in sorted(entries[plan_id].depends_on):
-            visit(dependency)
-        stack.pop()
-        visited.add(plan_id)
-
-    for plan_id in entries:
-        visit(plan_id)
+    dependencies = {plan_id: entry.depends_on for plan_id, entry in entries.items()}
+    for cycle in dependency_cycle_paths(dependencies):
+        message = "순환 ExecPlan 의존성입니다: " + " -> ".join(cycle)
+        issues.extend(CatalogIssue(member, entries[member].path, "dependency-cycle", message)
+                      for member in cycle[:-1])
     return tuple(issues)
 
 

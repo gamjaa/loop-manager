@@ -26,9 +26,9 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/catalog/project_catalog_refresh.py`의 두 planning helper와 `catalog/execplan_catalog.py`의 graph 검증을 재사용한다. 검증한 변경 선언과 보류 선행의 근거 있는 관계를 결합해 이번 변경으로 생기는 순환을 판정한다. 단순 방문 중복과 현재 탐색 경로의 순환을 구별하고, 기존 오류를 격리하는 규칙을 전역 정상 catalog 요구로 되돌리지 않는다. 새 graph 저장소·범용 엔진·설정은 만들지 않는다.
-- [ ] 확인한 `planning/planner_validation.py`의 변경 선언 overlay·`original_dependencies` 구성과 `maintenance/maintenance_validation.py`·`maintenance/maintenance_publication.py`의 동일 helper 호출을 대조해 최종 관계·등록 identity·고정 revision 검사를 일치시킨다. `storage/execplan_catalog_state.py:new_declaration_issues()`의 신규 선언 검사와 기존 보류 원문 보존은 유지한다. 일반 게시의 검증 결과 소비는 확인한 `planning/planner_publication.py`·`storage/planning_publication_state.py`의 기존 intent/CAS 경계를 사용한다.
-- [ ] 확인한 `tests/test_project_catalog_refresh.py:ScopedCatalogRefreshTests`의 실제 SQLite·문서·모의 Git fixture와 `tests/test_incremental_planning.py`의 허용 개정/삭제 복구 fixture를 재사용해 빠진 결합 순환 사례만 보강한다. PRODUCT·ARCHITECTURE에는 실제 보완한 graph 검증 경계만 소유 절에 통합하고 Requirement·다른 ExecPlan은 Worker가 수정하지 않는다.
+- [x] 확인한 `loop_manager_internal/catalog/project_catalog_refresh.py`의 두 planning helper와 `catalog/execplan_catalog.py`의 graph 검증을 재사용한다. 검증한 변경 선언과 보류 선행의 근거 있는 관계를 결합해 이번 변경으로 생기는 순환을 판정한다. 단순 방문 중복과 현재 탐색 경로의 순환을 구별하고, 기존 오류를 격리하는 규칙을 전역 정상 catalog 요구로 되돌리지 않는다. 새 graph 저장소·범용 엔진·설정은 만들지 않는다.
+- [x] 확인한 `planning/planner_validation.py`의 변경 선언 overlay·`original_dependencies` 구성과 `maintenance/maintenance_validation.py`·`maintenance/maintenance_publication.py`의 동일 helper 호출을 대조해 최종 관계·등록 identity·고정 revision 검사를 일치시킨다. `storage/execplan_catalog_state.py:new_declaration_issues()`의 신규 선언 검사와 기존 보류 원문 보존은 유지한다. 일반 게시의 검증 결과 소비는 확인한 `planning/planner_publication.py`·`storage/planning_publication_state.py`의 기존 intent/CAS 경계를 사용한다.
+- [x] 확인한 `tests/test_project_catalog_refresh.py:ScopedCatalogRefreshTests`의 실제 SQLite·문서·모의 Git fixture와 `tests/test_incremental_planning.py`의 허용 개정/삭제 복구 fixture를 재사용해 빠진 결합 순환 사례만 보강한다. PRODUCT·ARCHITECTURE에는 실제 보완한 graph 검증 경계만 소유 절에 통합하고 Requirement·다른 ExecPlan은 Worker가 수정하지 않는다.
 
 ## Validation
 
@@ -40,8 +40,9 @@ priority: high
 ## Progress
 
 - [x] 지정 revision `4a7f03fff00251bd3b021acac8206178d8e5e293`의 R-082 delta, 공통 helper·일반/유지보수 소비자와 기존 회귀를 정적으로 대조했다. 보류 선행 허용·등록·실제 Merge gate는 직접 구현으로 제외했다.
-- [ ] 보류 선행과 변경 선언의 결합 순환 검사
-- [ ] 결과/게시 검증·중단 보존의 최소 targeted 회귀
+- [x] 보류 선행과 변경 선언의 결합 순환 검사
+- [x] 결과/게시 검증·중단 보존의 최소 targeted 회귀
+- [x] 2026-10-23: direct held-to-revision cycle, indirect same-batch overlay, unrelated existing held cycle, maintenance result/publication recheck와 deleted-goal recovery preservation의 targeted unit cases 통과. Existing valid held dependency publication과 parseable multi-step catalog cycle 회귀도 통과.
 
 ## Decision Log
 
