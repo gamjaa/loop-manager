@@ -288,6 +288,22 @@ base 대비 전체 35개 파일의 추가/삭제 내용을 이전 후보의 feat
 
 base 대비 전체 diff와 이번 기록의 `git diff --check` 통과. 최종 문서 변경은 PRODUCT·ARCHITECTURE·선택 ExecPlan뿐이며 보고 해시는 현재 base로 다시 계산했다. 전체 verify·독립 Review·Merge는 Manager의 현재 후보 검증을 기다린다.
 
+### Review 교정: 프로젝트 복구 완료 후 Worker 질문 보존
+
+시작 HEAD 910ac271b38b4aff7792c8dd16d18d2b54f4312c에서 cross-scope-recovery-shadowing occurrence=3/revision=3을 확인했다. `resolve_rebase_block()`의 모든 호출과 `_resolve_rebase_failure()`를 추적한 결과 실제 완료 전이는 공유 recovery의 final_evidence를 보존한 채 pending_action을 reconcile로 바꾼다. 기존 block_recovery는 final_block만 scope를 구분해 독립 프로젝트 복구 완료를 계획의 pending으로 잘못 해석했다.
+
+공통 block_recovery가 final_block과 reconcile 모두 보존된 최종 근거의 scope를 확인하도록 한 줄 교정했다. 다른 scope면 기존 계획 snapshot을 재검증하고, 같은 scope의 pending/손상 기록은 여전히 우선한다. 생성·incident 사건 키·조각 claim의 모든 호출이 이 공통 helper를 사용한다. 복구 상태 전이·예산·원문·감사는 변경하지 않았다. ARCHITECTURE의 기존 snapshot 계약에 다른 scope의 복구 완료 기록도 명시했다.
+
+기존 Worker 질문 scope 회귀를 clear_project_block만 호출하던 경로에서 실제 RecoveryRepository.resolve_rebase_block을 먼저 호출하도록 보완했다. 완료 시점과 SQLite 재연결 뒤 모두 reconcile이 보존됨을 확인한다. 미전송·최초 비활성·이미 전송·계획 revision 변경의 네 경우에서 유효 질문 1회·이미 전송 중복 제거·교체된 revision 억제와 계획 snapshot/독립 프로젝트 recovery 보존 assertion을 유지한다.
+
+- FAILED_COMMAND: `TMPDIR="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" TMP="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" TEMP="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_worker_question_survives_project_recovery_without_restoring_shared_record > "$LOOP_MANAGER_TARGETED_TEST_DIRECTORY/project-resolution.log" 2>&1`
+- 교정 전 재현: 1개 test의 미전송/최초 비활성 두 subtest에서 0 != 1. 실제 복구 완료 후 질문 누락을 확인했다.
+- RERUN: `TMPDIR="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" TMP="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" TEMP="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest.test_worker_question_survives_project_recovery_without_restoring_shared_record > "$LOOP_MANAGER_TARGETED_TEST_DIRECTORY/project-resolution.log" 2>&1`
+- 교정 후 동일 명령: 1개 통과, 3.147초.
+- `TMPDIR="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" TMP="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" TEMP="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest > "$LOOP_MANAGER_TARGETED_TEST_DIRECTORY/action-policy.log" 2>&1`: 18개 통과, 6.065초. 같은 scope의 pending 억제·취소 감사·늦은 확인·질문 현재성을 포함한다.
+
+최종 diff의 `git diff --check` 통과. frontmatter·Requirement·다른 ExecPlan·verify·지침 원본은 변경하지 않았다. 전체 verify·독립 Review는 Manager의 현재 후보 검증을 기다린다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.

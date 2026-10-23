@@ -1435,6 +1435,10 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                         scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
                         'independent project safety observation', 'safety-input', plan_id='G-018', previous_phase=None)
                     notifications.enqueue_current_project_events(connection, self.repo)
+                    project_block = scoped_blocking.project_block(connection, self.repo)
+                    RecoveryRepository(connection).resolve_rebase_block(self.repo, 'G-018', project_block)
+                    self.assertEqual(RecoveryRepository(connection).row(self.repo, 'G-018')['pending_action'],
+                                     'reconcile')
                     scoped_blocking.clear_project_block(connection, self.repo)
                 connection.close()
                 connection = sqlite3.connect(database)
@@ -1453,6 +1457,7 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                     self.assertIn('Which permission should be granted?', adapter.call_args.args[2])
                 self.assertEqual(len(self.events(connection)), original_count or 1)
                 self.assertEqual(connection.execute('SELECT reason_code FROM recovery_records').fetchone()[0], 'state_unsafe')
+                self.assertEqual(RecoveryRepository(connection).row(self.repo, 'G-018')['pending_action'], 'reconcile')
                 block = connection.execute('SELECT * FROM execplan_blocks').fetchone()
                 self.assertEqual(block['reason_code'], 'user_decision_required')
                 self.assertEqual(json.loads(block['recovery_snapshot'])['reason_code'], 'user_decision')

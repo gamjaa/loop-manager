@@ -15,7 +15,7 @@ def block_recovery(connection, repo, plan_id, scope):
     exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone()
     row = (connection.execute('SELECT * FROM recovery_records WHERE repo=? AND subject=?',
                               (repo, plan_id or '__project__')).fetchone() if exists else None)
-    if row is not None and row['pending_action'] == 'final_block':
+    if row is not None and row['pending_action'] in {'final_block', 'reconcile'}:
         from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, reason_scope
         try:
             evidence = json.loads(row['final_evidence'])
