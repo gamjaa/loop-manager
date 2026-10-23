@@ -21,6 +21,8 @@ Windows에서도 Python과 `entrypoint.py`의 절대 경로로 같은 인수를 
 
 Manager의 verify 호출 대기는 `verify_concurrency` 자리 배정 뒤 시간 측정을 시작한다. runner의 내부 자원 대기는 같은 coordinator와 예산 디렉터리에 연결된 모든 session이 배정을 기다리고, 각 session의 heartbeat 간격이 1초 이내이며 실행 중·종료 불명 예약이 없는 구간만 공통 누계로 남긴다. 겹친 session 대기는 한 번만 공제한다. 한 session이 준비·처리 중이거나 heartbeat가 끊기면 공제하지 않으며 다른 예산 디렉터리의 session은 이 판정에 포함하지 않는다. session 종료·다음 session 시작에도 같은 coordinator의 누계를 유지한다. 부모의 경과 시간에서 확인된 대기만 빼며 병렬 자식 시간을 더하지 않는다. 이 집계는 살아 있는 하위 runner를 순수 대기로 인정하는 상하위 실행 관계를 아직 제공하지 않는다.
 
+대기 JSON의 `waiting_seconds`는 0 이상의 유한한 숫자이며 같은 기록에서 감소하거나 사라질 수 없다. 잘못된 JSON·필드/타입·음수·비유한 값·합계 범위 초과·관측한 기록의 역행/소실·누계 디렉터리 읽기 실패는 상한이 없는 호출에서도 `VerifyBudgetError`로 실패한다. 실패 시점의 파일과 직전 관측값을 누계 디렉터리의 `error-*/`에 즉시 보존하며 이후 정상 기록이 써져도 같은 clock의 오류를 해제하지 않는다. WSL의 `wsl-lifecycle.json`은 대기 합산 대신 기존 종료 확인 경계가 검증한다. runner는 session 정리 전에 실패한 누계 원본을 진단 디렉터리의 `budget-error/`에 복사하고, 예산 오류가 발생한 clock의 소유 임시 누계 디렉터리를 보존한다. 마지막 단계·결과 처리와 프로세스 종료 확인 뒤에도 예산을 다시 검사하므로 종료 코드 0만으로 timeout을 성공 처리하지 않는다. 최종 검사 실패 뒤 부분 결과는 ERROR이며 PASS를 남기지 않는다.
+
 `LOOP_MANAGER_VERIFY_BUDGET_DIR`는 같은 검증의 Manager·launcher·runner가 누계를 공유하는 내부 환경값이다. 단계 사이에서 예산을 초기화하지 않고, 테스트 worker에는 이 조율 환경을 제거해 검증 대상이 부모 시간을 조작하지 않도록 한다. Windows·WSL 두 단계도 같은 실제 시간 예산을 사용하며 Windows Job 종료와 Linux 자식 종료·복사본 정리 근거를 함께 확인한다. WSL 종료가 불명이면 lifecycle receipt와 소유 예약을 보존하고 실행 자리를 임의로 회수하지 않는다.
 
 ## 선언 version 1

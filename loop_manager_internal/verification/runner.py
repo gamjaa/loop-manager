@@ -8,6 +8,7 @@ import os
 import platform
 from pathlib import Path
 import py_compile
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,7 @@ from loop_manager_internal.verification.manifest import validate_report
 from loop_manager_internal.verification.contract import VERSION, ADAPTERS, ContractError, load
 from loop_manager_internal.verification import unittest_adapter, perl_adapter
 from loop_manager_internal.verification.core import execute_command
-from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY
+from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
 from loop_manager_internal.verification.resources import DEFAULT_WORKER_BYTES, ResourceSampler, parse_parallelism, process_memory
 from loop_manager_internal.verification.timing import (
     EventWriter, TimedResult, atomic_json, bytecode_cache_changes,
@@ -140,6 +141,7 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
     session = None
     partial = None
     partial_status = "ERROR"
+    preserve_budget = False
     try:
         if "LOOP_MANAGER_VERIFY_ENDPOINT" in os.environ:
             client = CoordinatorClient(json.loads(os.environ["LOOP_MANAGER_VERIFY_ENDPOINT"]),
@@ -237,9 +239,21 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                     break
             with phase("bytecode_cache_snapshot_after", writer=writer):
                 bytecode_after = bytecode_cache_snapshot(Path.cwd())
+            remaining = budget.remaining(timeout)
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("verify total timeout")
             writer.emit("run_end", version=VERSION, run_id=run_id, passed=passed, memory=process_memory(),
                         bytecode_cache=bytecode_cache_changes(bytecode_before, bytecode_after))
             return 0 if passed else 1
+    except BaseException as error:
+        if partial_base:
+            partial_status = "ERROR"
+        if isinstance(error, VerifyBudgetError):
+            preserve_budget = True
+            # session 종료가 누계 파일을 갱신하기 전에 실패한 원본을 남긴다.
+            if error.diagnostic_directory is not None:
+                shutil.copytree(error.diagnostic_directory, directory / "budget-error", symlinks=True)
+        raise
     finally:
         writer.close()
         if partial_base:
@@ -253,7 +267,8 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
             coordinator.finish(session, stopped=not coordinator.reservations)
         print(diagnostic(directory), flush=True)
         try:
-            budget.close()
+            if not preserve_budget:
+                budget.close()
         finally:
             if previous_budget is None:
                 os.environ.pop(BUDGET_DIRECTORY, None)

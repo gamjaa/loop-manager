@@ -351,6 +351,7 @@ def run_verify_process(
     """Confirm owned descendants; None inherits an enclosing Manager deadline."""
     job = None
     assigned = False
+    stopped = False
     process = None
     from contextlib import nullcontext
     from loop_manager_internal.verification.execution_clock import ExecutionClock, current_execution_clock, BUDGET_DIRECTORY
@@ -375,12 +376,14 @@ def run_verify_process(
         from loop_manager_internal.storage import task_calls
         receipt=None
         def confirmed_stop():
+            nonlocal stopped
             try:
                 budget.require_stopped()
             except VerifyTerminationUncertain:
                 task_calls.verify_waiting_for_wsl(receipt,budget.directory)
                 raise
             task_calls.verify_stopped(receipt)
+            stopped = True
         try:
             receipt=task_calls.prepare_verify_receipt()
             process = (launch_process or subprocess.Popen)(
@@ -414,8 +417,10 @@ def run_verify_process(
             elif sys.platform.startswith("linux") and code != 0:
                 _confirm_posix_group_stopped(process.pid)
             confirmed_stop()
+            remaining = active_clock.remaining(timeout_seconds)
+            timed_out = remaining is not None and remaining <= 0
             output.seek(0)
-            return code == 0, False, VerifyProcessOutput(
+            return code == 0 and not timed_out, timed_out, VerifyProcessOutput(
                 output.read().decode("utf-8", errors="replace"), exit_code=code,
             )
         except (subprocess.TimeoutExpired, TimeoutError) as primary:
@@ -436,7 +441,7 @@ def run_verify_process(
             confirmed_stop()
             return False, True, VerifyProcessOutput(_tail(output), exit_code=process.returncode)
         except BaseException as primary:
-            if process is not None and (assigned or process.poll() is None):
+            if not stopped and process is not None and (assigned or process.poll() is None):
                 if job and assigned:
                     errors = _terminate_windows_job(job, process)
                     if errors:
@@ -451,7 +456,7 @@ def run_verify_process(
                         raise VerifyTerminationUncertain(
                             f"verify 실패 ({primary}); {cleanup_error}"
                         ) from primary
-            if not isinstance(primary,VerifyTerminationUncertain):
+            if not stopped and not isinstance(primary,VerifyTerminationUncertain):
                 confirmed_stop()
             raise
         finally:

@@ -1349,6 +1349,8 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 
 실제 시간은 `ExecutionClock`이 동일 검증의 누계 디렉터리에서 확인한 순번 대기만 제외해 계산한다. coordinator는 정규화한 예산 디렉터리별로 소속 session 전체의 공통 배정 대기를 집계하고, 해당 coordinator의 파일 하나에 `waiting_seconds` 누계를 기록한다. 모든 소속 session의 대기 상태와 1초 이내 heartbeat, 실행 중·종료 불명 예약 부재를 확인한 구간만 더하므로 겹친 session 시간이 중복 공제되지 않는다. 준비 중인 session·heartbeat 단절·활성 또는 종료 불명 예약은 공제를 막으며 다른 예산의 session은 분리한다. session을 종료해도 누계는 유지해 같은 coordinator의 다음 단계와 중첩 clock이 이전 대기를 다시 계산하거나 소비 예산을 초기화하지 않는다. 살아 있는 하위 runner의 순수 대기를 판정할 상하위 실행 관계 연결은 아직 미구현이다. Manager·launcher·runner와 Windows/WSL 단계가 이 누계를 공유하고 단계별 남은 예산을 전달하며 테스트 worker에는 조율 환경을 전달하지 않는다. 준비·수집·복사·I/O·실행·결과 처리·정리 시간은 그대로 계산한다. 상세 연결은 [시간 예산](VERIFY.md#순번-대기와-시간-예산)을 따른다.
 
+`ExecutionClock`은 대기 JSON별 유한한 비음수 `waiting_seconds`를 관측하고 같은 파일 이름의 누계 감소·소실과 읽기/형식 오류·합계 overflow를 거부한다. 상한이 없어도 검증하며 `wsl-lifecycle.json`은 별도 종료 계약으로 분리한다. `VerifyBudgetError`는 파일 원본과 직전 관측값을 누계 디렉터리의 `error-*/`에 즉시 복사하고 같은 clock에서 오류를 유지한다. clock의 소유 누계 디렉터리를 보존하며 runner는 coordinator의 session 종료 갱신 전에 해당 오류 snapshot을 `budget-error/` 진단 경로로 복사한다. 진단 복사 실패도 원래 예산 오류와 함께 보고하고 소유 누계를 정리하지 않는다. runner의 최종 결과 처리와 외부 프로세스 트리 종료 확인 뒤에 남은 예산을 다시 검사하며, 최종 오류는 부분 PASS를 ERROR로 바꾼다. 외부 프로세스 경계는 이미 확인한 종료를 기억하므로 최종 예산 오류로 정지한 자식이나 Job에 종료 명령을 반복하지 않는다.
+
 시간 상한을 전달하지 않는 구형 조율 호출은 runner·명령·프로세스/Windows Job 대기에서 바깥 Manager의 상한을 상속하며 새 기본 상한을 중첩하지 않는다. 명시적 상한과 단독 실행의 설정·기본 상한은 유지한다.
 
 `perl_reporter.pl`은 공식 TAP::Parser로 테스트를 실행하고 즉시 flush하는 native JSON Lines(`*.native.ndjson`) 및 원본 TAP spool을 제공한다.

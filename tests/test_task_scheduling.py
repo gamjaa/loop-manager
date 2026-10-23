@@ -17,7 +17,7 @@ from loop_manager_internal.application import task_scheduling as scheduling
 from loop_manager_internal.config.managed_config import ManagedConfig, ManagedConfigError, load_managed_config, fast_mode_scope
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.storage import database, runtime_state
-from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY
+from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
 from loop_manager_internal.verification.coordination import VerifyCoordinator
 from loop_manager_internal.verification.resources import Snapshot, MIB
 from tests.support.database import AutomationCatalogFixture
@@ -3430,6 +3430,77 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
 
 
 class ExecutionClockTests(unittest.TestCase):
+    def test_invalid_wait_records_reject_even_an_unlimited_budget(self):
+        records = ('{', '[]', '{}', '{"waiting_seconds": true}',
+                   '{"waiting_seconds": -1}', '{"waiting_seconds": NaN}',
+                   '{"waiting_seconds": Infinity}', '{"waiting_seconds": "30"}',
+                   '{"waiting_seconds": ' + '9' * 400 + '}')
+        for content in records:
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                budget = ExecutionClock({BUDGET_DIRECTORY: directory}, clock=lambda: 0)
+                path = Path(directory) / 'session.json'
+                path.write_text(content)
+                with self.assertRaisesRegex(VerifyBudgetError, 'session.json'):
+                    budget.remaining(None)
+                self.assertEqual(path.read_text(), content)
+                evidence, = Path(directory).glob('error-*')
+                self.assertEqual((evidence / 'session.json').read_text(), content)
+                # A later coordinator write cannot repair this clock's failed
+                # observation or replace the retained failure evidence.
+                path.write_text('{"waiting_seconds": 0}')
+                with self.assertRaises(VerifyBudgetError):
+                    budget.remaining(10)
+                self.assertEqual((evidence / 'session.json').read_text(), content)
+
+    def test_wait_record_regression_disappearance_and_overflow_reject_success(self):
+        for change in ('regress', 'remove', 'overflow'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                now = [0.0]
+                budget = ExecutionClock({BUDGET_DIRECTORY: directory}, clock=lambda: now[0])
+                path = Path(directory) / 'session.json'
+                path.write_text(json.dumps({'waiting_seconds': 30}))
+                now[0] = 32
+                self.assertEqual(budget.remaining(10), 8)
+                if change == 'remove':
+                    path.unlink()
+                elif change == 'regress':
+                    path.write_text(json.dumps({'waiting_seconds': 29}))
+                else:
+                    path.write_text(json.dumps({'waiting_seconds': 1e308}))
+                    (Path(directory) / 'second.json').write_text(json.dumps({'waiting_seconds': 1e308}))
+                with self.assertRaises(VerifyBudgetError):
+                    budget.remaining(10)
+                evidence, = Path(directory).glob('error-*')
+                self.assertEqual(json.loads((evidence / 'observed-records').read_text()), {'session.json': 30})
+
+    def test_budget_error_preserves_owned_records_and_restores_clock_context(self):
+        from loop_manager_internal.verification.execution_clock import current_execution_clock
+        previous = current_execution_clock.get()
+        budget = ExecutionClock({})
+        path = budget.directory / 'session.json'
+        try:
+            with self.assertRaises(VerifyBudgetError):
+                with budget:
+                    path.write_text('{')
+                    budget.remaining(10)
+            self.assertEqual(path.read_text(), '{')
+            self.assertIs(current_execution_clock.get(), previous)
+        finally:
+            budget.close()
+
+    def test_wsl_lifecycle_is_not_a_wait_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / 'wsl-lifecycle.json').write_text('{"state": "running"}')
+            budget = ExecutionClock({BUDGET_DIRECTORY: directory}, clock=lambda: 0)
+            self.assertEqual(budget.remaining(10), 10)
+
+    def test_missing_budget_directory_rejects_success_even_without_prior_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            budget = ExecutionClock({BUDGET_DIRECTORY: str(Path(directory) / 'budget')})
+            budget.directory.rmdir()
+            with self.assertRaisesRegex(VerifyBudgetError, '디렉터리를 읽지 못했습니다'):
+                budget.remaining(None)
+
     def test_shared_budget_counts_overlapping_session_wait_once_and_keeps_execution(self):
         now = [0.0]
         sampler = mock.Mock()

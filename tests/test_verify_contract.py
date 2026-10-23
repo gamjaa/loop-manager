@@ -499,6 +499,46 @@ class EntrypointAndGuidanceTests(unittest.TestCase):
 
 
 class ManagerDeadlineHandoffTests(unittest.TestCase):
+    def test_final_stage_budget_failure_cannot_emit_full_or_partial_success(self):
+        from loop_manager_internal.verification import impact
+        from loop_manager_internal.verification.execution_clock import BUDGET_DIRECTORY, VerifyBudgetError
+        for mode in ('tests', 'command', 'partial', 'corrupt'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                now = [0.0]
+                stage = {'id': 'tests', 'kind': 'tests', 'cwd': '.', 'execution': 'independent',
+                         'collection': {'directory': 'tests', 'pattern': 'test*.py'}}
+                stages = (stage, {'id': 'compile', 'kind': 'command', 'cwd': '.', 'argv': ['compile']}) if mode == 'command' else (stage,)
+                connection = contract.Connection(root, 'unittest', Path(sys.executable), stages)
+                unit = manifest.Module('unit', ('a',))
+                selection = impact.Selection('head', 'base', ('unit',), ('a',), {}, (), 1, 1,
+                                             impact.digest([asdict(unit)]), 'configuration')
+                def finish(*_args):
+                    if mode == 'corrupt':
+                        (Path(os.environ[BUDGET_DIRECTORY]) / 'session.json').write_text('{')
+                    else:
+                        now[0] = 12
+                    return True
+                with mock.patch.dict(os.environ, {BUDGET_DIRECTORY: str(root if mode == 'corrupt' else root / 'budget')}, clear=True), \
+                        mock.patch.object(runner, 'load', return_value=connection), \
+                        mock.patch.object(runner, 'install_guard'), \
+                        mock.patch.object(runner.time, 'monotonic', side_effect=lambda: now[0]), \
+                        mock.patch.object(runner.subprocess, 'run', return_value=SimpleNamespace(stdout='head')), \
+                        mock.patch.object(unittest_adapter, 'collect_project', return_value=([unit], sys.version)), \
+                        mock.patch.object(unittest_adapter, 'execute', side_effect=finish if mode != 'command' else None, return_value=True), \
+                        mock.patch.object(runner, 'execute_command', side_effect=finish), \
+                        mock.patch.object(impact, 'select', return_value=selection), \
+                        mock.patch.object(impact, 'assert_candidate'), \
+                        mock.patch.object(sys, 'stdout', io.StringIO()):
+                    with self.assertRaises(VerifyBudgetError if mode == 'corrupt' else TimeoutError):
+                        runner.run(root / 'logs', 1, 10, partial_base='base' if mode == 'partial' else None)
+                events = [json.loads(line) for line in (root / 'logs/runner.jsonl').read_text().splitlines()]
+                self.assertFalse(any(event['kind'] == 'run_end' for event in events))
+                if mode == 'partial':
+                    self.assertEqual(json.loads((root / 'logs/partial-result.json').read_text())['status'], 'ERROR')
+                if mode == 'corrupt':
+                    self.assertEqual((root / 'logs/budget-error/session.json').read_text(), '{')
+
     def test_coordinated_calls_inherit_missing_timeout_and_preserve_supplied_limit(self):
         for supplied, argv, expected in ((None, [], None), ('1200', [], 1200),
                                          ('1200', ['--timeout', '30'], 30)):

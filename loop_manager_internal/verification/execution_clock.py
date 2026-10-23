@@ -19,6 +19,12 @@ BUDGET_DIRECTORY = "LOOP_MANAGER_VERIFY_BUDGET_DIR"
 _FilesystemPath = type(Path())
 
 
+class VerifyBudgetError(RuntimeError):
+    """대기 근거가 불일치하므로 원본 누계를 보존하고 성공을 거부한다."""
+
+    diagnostic_directory = None
+
+
 class ExecutionClock:
     def __init__(self, environment=None, *, clock=None):
         self.environment = dict(os.environ if environment is None else environment)
@@ -31,6 +37,8 @@ class ExecutionClock:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.clock = clock or time.monotonic
         self.started = self.clock()
+        self.wait_records = {}
+        self.wait_error = None
         self.initial_wait = self.waiting()
         self.last_elapsed = 0.0
         self.local_wait = 0.0
@@ -38,16 +46,46 @@ class ExecutionClock:
         self._tokens = []
 
     def waiting(self):
-        total = 0.0
-        for path in self.directory.glob("*.json"):
+        if self.wait_error is not None:
+            raise self.wait_error
+        records = {}
+        try:
+            paths = list(self.directory.iterdir())
+        except OSError:
+            self._reject_wait(f"실행 대기 누계 디렉터리를 읽지 못했습니다: {self.directory}")
+        for path in paths:
+            if path.suffix != ".json" or path.name == "wsl-lifecycle.json":
+                continue
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))["waiting_seconds"]
-                if type(value) in (float, int) and math.isfinite(value) and value >= 0:
-                    total += value
-            except (OSError, ValueError, KeyError, TypeError):
-                # 확인하지 못한 구간은 실제 시간으로 계산한다.
-                continue
+                if (type(value) not in (float, int) or not math.isfinite(value)
+                        or value < self.wait_records.get(path.name, 0)):
+                    raise ValueError("invalid or regressing wait total")
+                records[path.name] = value
+            except (OSError, ValueError, KeyError, TypeError, OverflowError):
+                self._reject_wait(f"실행 대기 누계가 손상되거나 역행했습니다: {path}")
+        if self.wait_records.keys() - records.keys():
+            self._reject_wait(f"실행 대기 누계가 사라졌습니다: {self.directory}")
+        try:
+            total = math.fsum(records.values())
+        except OverflowError:
+            self._reject_wait(f"실행 대기 누계가 범위를 초과했습니다: {self.directory}")
+        self.wait_records = records
         return total
+
+    def _reject_wait(self, message):
+        evidence = None
+        try:
+            evidence = _FilesystemPath(tempfile.mkdtemp(prefix="error-", dir=self.directory))
+            for source in self.directory.glob("*.json"):
+                shutil.copy2(source, evidence / source.name, follow_symlinks=False)
+            (evidence / "observed-records").write_text(json.dumps(self.wait_records), encoding="utf-8")
+            message += f"; 원본 진단: {evidence}"
+        except OSError as error:
+            message += f"; 원본 진단 복사 실패: {error}"
+        self.wait_error = VerifyBudgetError(message)
+        self.wait_error.diagnostic_directory = evidence
+        raise self.wait_error from None
 
     def elapsed(self):
         self.last_elapsed = max(self.last_elapsed, self.clock()-self.started - self.local_wait -
@@ -55,7 +93,8 @@ class ExecutionClock:
         return self.last_elapsed
 
     def remaining(self, timeout):
-        return None if timeout is None else max(0.0, timeout-self.elapsed())
+        elapsed = self.elapsed()
+        return None if timeout is None else max(0.0, timeout-elapsed)
 
     def close(self):
         if self.temporary is not None:
@@ -83,5 +122,5 @@ class ExecutionClock:
     def __exit__(self, _kind, error, _traceback):
         current_execution_clock.reset(self._tokens.pop())
         from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
-        if not isinstance(error,VerifyTerminationUncertain):
+        if not isinstance(error,(VerifyTerminationUncertain, VerifyBudgetError)):
             self.close()
