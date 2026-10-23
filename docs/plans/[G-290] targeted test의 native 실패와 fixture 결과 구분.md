@@ -91,3 +91,12 @@ priority: high
   `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_targeted_test_streak.TargetedRunnerTests.test_fixture_subtest_failures_do_not_replace_body_outcomes tests.test_targeted_test_streak.TargetedRunnerTests.test_unittest_fixture_errors_subtests_and_unexpected_success_keep_native_meaning tests.test_targeted_test_streak.TargetedRunnerTests.test_isolated_asyncio_sync_setup_fixture_preserves_existing_failure_streak`
 
   실행 결과: 3개 targeted test 통과. 전체 `scripts/verify`는 실행하지 않았다.
+
+## 현재 후보 재확인 (2026-10-23)
+
+- 현재 HEAD `f4043143f48accdab9454d71db1c078f99510258`와 base `c3802a66312ae9788c754b43a2c02a69497851a4`의 전체 diff를 최신 Acceptance Criteria와 대조했다. fixture lifecycle scope의 `addSubTest()` 귀속, 본문과 teardown 동시 실패의 단일 streak 누적, fixture-only·불명확 결과의 streak 보존 및 JUnit native 결과 분류가 구현·회귀 테스트에 반영되어 추가 코드 변경은 필요하지 않았다.
+- 현재 후보에서 setup·teardown subTest, `IsolatedAsyncioTestCase` setup·async teardown, 본문과 teardown 동시 실패를 실행하는 최소 회귀를 프로젝트 Python과 targeted runner로 확인했다.
+
+  `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_targeted_test_streak.TargetedRunnerTests.test_fixture_subtest_failures_do_not_replace_body_outcomes`
+
+  실행 결과: targeted test 1개 통과. 전체 `scripts/verify`는 실행하지 않았다.
