@@ -7,6 +7,7 @@ import json
 import sqlite3
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.git.managed_rebase_validation import valid_acceptance, fingerprint
+from .execplan_catalog_state import is_cancelled
 
 
 SCHEMA = """
@@ -114,6 +115,8 @@ class ExecutionCheckpointRepository:
         ensure_schema(connection)
 
     def get(self, repo: str, plan_id: str) -> CheckpointRecord:
+        if is_cancelled(self.connection, repo, plan_id):
+            return CheckpointRecord()
         row = self.connection.execute(
             "SELECT * FROM execution_checkpoints WHERE repo = ? AND plan_id = ?",
             (repo, plan_id),
@@ -162,6 +165,8 @@ class ExecutionCheckpointRepository:
         workspace_held = int(bool((snapshot or {}).get('workspace_ownership_hold')))
         self.connection.execute("SAVEPOINT execution_checkpoint_record")
         try:
+            if is_cancelled(self.connection, repo, plan_id):
+                raise CheckpointRace(f"취소된 작업의 checkpoint를 기록할 수 없습니다: {plan_id}")
             if expected_generation == 0:
                 result = self.connection.execute(
                     "INSERT OR IGNORE INTO execution_checkpoints "

@@ -220,6 +220,19 @@ def apply_mutable_catalog_changes(
                          "judgment": deletion.judgment,
                          "cleanup_pending": bool(row["branch"] or row["worktree"]),
                          "cleanup_reason": "취소한 소유 자원의 작업물·PR·writer 안전 재확인 필요"}
+        checkpoint_audit = {}
+        for table in ("execution_checkpoints", "blocked_checkpoints"):
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,),
+            ).fetchone():
+                checkpoint = connection.execute(
+                    f"SELECT * FROM {table} WHERE repo=? AND plan_id=?", (repo, original.plan_id),
+                ).fetchone()
+                if checkpoint is not None:
+                    checkpoint_audit[table] = dict(checkpoint)
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE repo=? AND plan_id=?", (repo, original.plan_id),
+                    )
         changed = connection.execute(
             f"""
             DELETE FROM exec_plans
@@ -272,9 +285,11 @@ def apply_mutable_catalog_changes(
             ),
         )
         execplan_draft_state.cancel(connection, repo, original.plan_id, plan_commit)
-        if preserved or deletion.judgment:
+        if preserved or deletion.judgment or checkpoint_audit:
             audit = preserved or {"text": original.text, "row": json.loads(original.execution_state or "{}"),
                                   "affected": [], "resolved": {}, "judgment": deletion.judgment}
+            if checkpoint_audit:
+                audit["checkpoints"] = checkpoint_audit
             connection.execute("UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",
                                (json.dumps(audit, ensure_ascii=False, sort_keys=True), repo, original.plan_id))
         project = connection.execute("SELECT phase, plan_path FROM projects WHERE repo=?", (repo,)).fetchone()

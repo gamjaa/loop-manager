@@ -482,3 +482,117 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
                 with self.assertRaises(CheckpointRace):
                     self.checkpoints.record('repo', 'G-047', expected_generation=pending.generation, **values)
                 self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+
+
+class CancelledCheckpointTests(unittest.TestCase):
+    def setUp(self):
+        import json
+        from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        self.connection = runtime_connection()
+        self.addCleanup(self.connection.close)
+        # This READY fixture has no execution ownership; checkpoint receipts
+        # below model pending requests and older confirmed publication audit.
+        self.connection.execute("UPDATE exec_plans SET workspace_owned=0 WHERE repo='repo'")
+        self.connection.commit()
+        self.execution = ExecutionCheckpointRepository(self.connection)
+        self.blocked = BlockedCheckpointRepository(self.connection)
+        self.execution.record(
+            'repo', 'G-047', expected_generation=0, operation='checkpoint',
+            expected_head='head', target_base_oid='base', observed_remote_oid='remote',
+            snapshot={'worker_result': 'saved', 'pushed_checkpoint_head': 'published'},
+        )
+        self.request = self.blocked.request(
+            repo='repo', plan_id='G-047', reason_code='failure', evidence='saved failure',
+            branch=None, worktree=None, expected_remote_oid='remote', rebase_recovery=False,
+        )
+        self.connection.execute("UPDATE blocked_checkpoints SET publication_history=?",
+                                (json.dumps([{'published_oid': 'confirmed'}]),))
+        self.connection.commit()
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.original = ReadyPlanSnapshot(
+            row['plan_id'], row['path'], row['title'], ('docs/PRODUCT.md',), (),
+            'low', 'low', row['priority'], row['content_hash'], row['plan_sha'],
+            '---\nid: G-047\n---\nSaved plan',
+            current_metadata_recorded=True,
+        )
+        self.receipts = {table: dict(self.connection.execute(f'SELECT * FROM {table}').fetchone())
+                         for table in ('execution_checkpoints', 'blocked_checkpoints')}
+
+    def cancel(self):
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
+        from loop_manager_internal.storage.runtime_state import _transaction
+        with _transaction(self.connection):
+            apply_mutable_catalog_changes(
+                self.connection, 'repo', deletions=(PlanDeletion(self.original),), revisions=(),
+                snapshot_token='snapshot', plan_commit='deletion', content_hash=lambda _: '',
+                agent=False,
+            )
+
+    def test_cancellation_moves_requests_and_confirmed_receipts_to_audit(self):
+        import json
+        self.cancel()
+        audit = json.loads(self.connection.execute(
+            'SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertEqual(audit['checkpoints'], self.receipts)
+        self.assertIsNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        for table in self.receipts:
+            self.assertIsNone(self.connection.execute(f'SELECT * FROM {table}').fetchone())
+        self.assertEqual(self.execution.get('repo', 'G-047').generation, 0)
+        self.assertEqual(self.blocked.pending('repo'), ())
+        self.assertIsNone(self.blocked.reconcile_cause(self.request))
+        with self.assertRaises(CheckpointRace):
+            self.execution.record(
+                'repo', 'G-047', expected_generation=0, operation='checkpoint',
+                expected_head='new', target_base_oid='base', observed_remote_oid=None, snapshot={},
+            )
+        with self.assertRaisesRegex(RuntimeError, '취소된 작업'):
+            self.blocked.request(
+                repo='repo', plan_id='G-047', reason_code='failure', evidence='stale',
+                branch=None, worktree=None, expected_remote_oid=None, rebase_recovery=False,
+            )
+        with self.assertRaisesRegex(RuntimeError, '취소된 작업'):
+            self.blocked.record_local(self.request, 'stale-head')
+        # An unrelated identity continues to accept independent Git intent.
+        other = self.execution.record(
+            'repo', 'G-999', expected_generation=0, operation='checkpoint',
+            expected_head='other', target_base_oid='base', observed_remote_oid=None, snapshot={},
+        )
+        self.assertEqual(other.generation, 1)
+        self.assertEqual(json.loads(self.connection.execute(
+            'SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0]), audit)
+
+    def test_cancellation_failure_restores_requests_with_execution_row(self):
+        self.connection.execute("CREATE TRIGGER reject_cancel BEFORE INSERT ON execplan_cancellations "
+                                "BEGIN SELECT RAISE(ABORT, 'interrupted cancellation'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'interrupted cancellation'):
+            self.cancel()
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+        for table, receipt in self.receipts.items():
+            self.assertEqual(dict(self.connection.execute(f'SELECT * FROM {table}').fetchone()), receipt)
+        self.connection.execute('DROP TRIGGER reject_cancel')
+        self.cancel()
+        self.assertEqual(self.blocked.pending('repo'), ())
+
+    def test_legacy_orphan_requests_cannot_resume_after_restart(self):
+        self.cancel()
+        # Older runtimes could leave rows behind. Reopening repositories must
+        # honor the cancellation even while those old receipts remain intact.
+        for table, receipt in self.receipts.items():
+            self.connection.execute(
+                f"INSERT INTO {table} ({', '.join(receipt)}) VALUES ({', '.join('?' for _ in receipt)})",
+                tuple(receipt.values()),
+            )
+        self.connection.commit()
+        from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
+        execution = ExecutionCheckpointRepository(self.connection)
+        blocked = BlockedCheckpointRepository(self.connection)
+        self.assertIsNone(execution.get('repo', 'G-047').operation)
+        self.assertEqual(blocked.pending('repo'), ())
+        with self.assertRaisesRegex(RuntimeError, '취소된 작업'):
+            blocked.get('repo', 'G-047')
+        self.assertIsNone(blocked.reconcile_cause(self.request))
+        for table, receipt in self.receipts.items():
+            self.assertEqual(dict(self.connection.execute(f'SELECT * FROM {table}').fetchone()), receipt)

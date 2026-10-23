@@ -362,6 +362,14 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
     def test_proven_finished_writer_cancellation_preserves_started_history(self):
         self._remote_deletion(started=True, new_plan=True)
         self.connection.execute("UPDATE exec_plans SET worker_result='완료된 Worker 결과' WHERE plan_id='G-001'")
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        checkpoints.record(
+            str(self.repo), 'G-001', expected_generation=0, operation='checkpoint',
+            expected_head='saved-head', target_base_oid=self.base, observed_remote_oid=None,
+            snapshot={'worker_result': 'saved result', 'pushed_checkpoint_head': 'confirmed-head'},
+        )
+        saved_checkpoint = dict(self.connection.execute('SELECT * FROM execution_checkpoints').fetchone())
         self.connection.commit()
         result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
         self.assertEqual(set(result.withheld_plan_ids), {"G-002"})
@@ -371,9 +379,14 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertEqual(history["row"]["worker_session_id"], "saved")
         self.assertEqual(history["row"]["worker_result"], "완료된 Worker 결과")
         self.assertEqual(history["affected"], ["G-002"])
+        self.assertEqual(history['checkpoints']['execution_checkpoints'], saved_checkpoint)
+        self.assertIsNone(self.connection.execute('SELECT * FROM execution_checkpoints').fetchone())
         repeated = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
         self.assertEqual(set(repeated.withheld_plan_ids), {"G-002"})
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 1)
+        self.assertEqual(json.loads(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'"
+        ).fetchone()[0])['checkpoints'], history['checkpoints'])
         self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
 
     def test_requirement_deletion_cancels_only_withdrawn_and_preserves_shared_goal(self):

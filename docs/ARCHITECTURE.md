@@ -279,6 +279,8 @@ draft 판단 대기와 검증 피드백 이행 표식은 실행·소유 이력�
 
 현재 `remote_deletions.py`는 고정 원격 revision과 마지막 채택 원문·선언·실행/게시 이력을 대조해 실제 Requirement·ExecPlan 삭제를 관측한다. archive·rename·조회 실패를 실제 삭제와 구별하고, 확인된 ExecPlan 삭제의 취소 감사와 Requirement 삭제에 따른 목표 복구 입력을 만든다. 일반 Planner의 철회·유지·대체 판단은 허용된 계획 개정·삭제 게시와 연결하며 Manager가 참조·소유권·현재 PR을 재검증한다. 확인되지 않은 범위는 보류하고 검증된 독립 작업은 계속한다.
 
+취소 적용 transaction은 `execution_checkpoints`·`blocked_checkpoints`의 해당 요청을 `execplan_cancellations.recovery_evidence.checkpoints`로 옮긴 뒤 활성 요청과 실행 row를 제거한다. `checkpoints`는 테이블명을 key로 하고 해당 row의 모든 필드·값을 보존하는 객체이며, 원래 snapshot·게시 이력의 JSON 문자열도 그대로 유지한다. 원격 삭제 증명을 합칠 때 이 별도 감사를 보존하며 transaction 실패 시 요청·실행 row·감사를 함께 롤백한다. checkpoint repository는 취소 ID의 조회·대기·기록·변경에서 취소 감사를 확인하므로 이전 runtime이 남긴 요청도 현재 요청으로 소비하지 않는다. 확정 게시 영수증은 이 감사에서 조회하며 새 게시 권한으로 재사용하지 않는다.
+
 삭제 관측·취소 경로가 있다는 사실만으로 후속 정리가 모두 완료된 것은 아니다. 취소 감사는 원문·실행 이력·예약과 소유 자원의 `cleanup_pending`을 보존한다. 유지하는 관리 브랜치의 문서 동기화, 취소·완료 작업의 소유 로컬·원격 branch 및 worktree 정리와 각 확정 지점의 중단 복구는 [R-055의 삭제 반영·복구 목표](requirements/%5BR-055%5D%20%EC%B0%A8%EB%8B%A8%20%EA%B2%BD%EB%A1%9C%20%EC%A0%84%EC%88%98%20%EC%A1%B0%EC%82%AC%EC%99%80%20%EB%B6%88%ED%95%84%EC%9A%94%ED%95%9C%20%EC%9E%91%EC%97%85%20%EC%A4%91%EB%8B%A8%20%EC%B6%95%EC%86%8C.md#삭제의-db브랜치-반영과-중단-복구)에 남은 범위다. 현재 Merge 정리와 삭제 처리의 권한을 이 목표로 확대하지 않는다.
 
 일반·유지보수 planning의 미해결 오류와 입력 지문은 다른 ExecPlan의 차단 해제·PR 상태 변경·project 실행 상태 정리와 독립적으로 보존한다. worktree 경로 부재나 관련 입력이 같은 원격 base 전진만으로 해제하지 않으며, 같은 입력의 반복 실행·재시작에서는 Planner를 다시 호출하지 않는다

@@ -7,6 +7,7 @@ import hashlib
 import json
 import sqlite3
 from loop_manager_internal.notifications import notifications
+from .execplan_catalog_state import is_cancelled
 
 from loop_manager_internal.recovery.blocked_checkpoint import (
     CheckpointPhase,
@@ -161,6 +162,8 @@ class BlockedCheckpointRepository:
         with self.connection:
             if not self.connection.in_transaction:
                 self.connection.execute('BEGIN IMMEDIATE')
+            if is_cancelled(self.connection, request.repo, request.plan_id):
+                return None
             row = self.connection.execute('SELECT * FROM blocked_checkpoints WHERE repo=? AND plan_id=?',
                                           (request.repo, request.plan_id)).fetchone()
             if row is None or row['request_identity'] != request.request_identity:
@@ -229,6 +232,10 @@ class BlockedCheckpointRepository:
         rebase_recovery: bool,
         release_fingerprint: str | None = None,
     ) -> CheckpointRequest:
+        if not self.connection.in_transaction:
+            self.connection.execute("BEGIN IMMEDIATE")
+        if is_cancelled(self.connection, repo, plan_id):
+            raise RuntimeError(f"취소된 작업의 checkpoint를 요청할 수 없습니다: {plan_id}")
         plan = self.connection.execute(
             "SELECT pr_url FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (repo, plan_id)).fetchone()
@@ -335,6 +342,8 @@ class BlockedCheckpointRepository:
         )
 
     def get(self, repo: str, plan_id: str) -> CheckpointRequest:
+        if is_cancelled(self.connection, repo, plan_id):
+            raise RuntimeError(f"취소된 작업의 checkpoint를 조회할 수 없습니다: {plan_id}")
         row = self.connection.execute(
             "SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
             (repo, plan_id),
@@ -361,11 +370,16 @@ class BlockedCheckpointRepository:
             sql += " AND plan_id = ?"
             parameters += (plan_id,)
         rows = self.connection.execute(sql + " ORDER BY plan_id", parameters).fetchall()
-        return tuple(self._from_row(row) for row in rows)
+        return tuple(self._from_row(row) for row in rows
+                     if not is_cancelled(self.connection, repo, str(row['plan_id'])))
 
     def _update(self, request: CheckpointRequest, **values: object) -> None:
         if not values:
             return
+        if not self.connection.in_transaction:
+            self.connection.execute("BEGIN IMMEDIATE")
+        if is_cancelled(self.connection, request.repo, request.plan_id):
+            raise RuntimeError(f"취소된 작업의 checkpoint를 변경할 수 없습니다: {request.plan_id}")
         assignments = ", ".join(f"{field} = ?" for field in values)
         changed = self.connection.execute(
             f"UPDATE blocked_checkpoints SET {assignments}, "

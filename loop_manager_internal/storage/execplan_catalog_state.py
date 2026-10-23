@@ -30,6 +30,17 @@ from loop_manager_internal.catalog.execplan_catalog import (
 )
 
 
+def is_cancelled(connection: sqlite3.Connection, repo: str, plan_id: str) -> bool:
+    """Read the durable tombstone, including repositories with no execution row."""
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'"
+    ).fetchone():
+        return False
+    return connection.execute(
+        "SELECT 1 FROM execplan_cancellations WHERE repo=? AND plan_id=?", (repo, plan_id),
+    ).fetchone() is not None
+
+
 HISTORICAL_CATALOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS execplan_catalog_history (
     repo TEXT NOT NULL,
@@ -907,9 +918,15 @@ class DefinitionStateRepository:
                         snapshot_token="remote-deletion", plan_commit=pinned.revision_sha,
                         content_hash=lambda _path: "", agent=False,
                     )
+                    saved = self.connection.execute(
+                        "SELECT recovery_evidence FROM execplan_cancellations WHERE repo=? AND plan_id=?",
+                        (repo, deletion.snapshot.plan_id),
+                    ).fetchone()
+                    evidence = json.loads(saved[0] or "{}")
+                    evidence.update(json.loads(deletion.evidence))
                     self.connection.execute(
                         "UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",
-                        (deletion.evidence, repo, deletion.snapshot.plan_id),
+                        (json.dumps(evidence, ensure_ascii=False, sort_keys=True), repo, deletion.snapshot.plan_id),
                     )
                     changed.append(deletion.snapshot.plan_id)
                     self._fault(f"after-cancellation:{deletion.snapshot.plan_id}")
