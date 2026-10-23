@@ -264,6 +264,18 @@ base 전진과 겹친 PRODUCT·ARCHITECTURE·scheduler·task_scheduling·Agent i
 
 현재 후보의 총 32개 targeted 결과와 base 대비 `git diff --check`가 통과했다. 이전 verify 자식 정리 중단의 진단은 과거 기록으로 보존하며 이번 unit 통과가 그 전체 verify의 완료를 뜻하지 않는다. 전체 verify·integration·전체 suite는 실행하지 않았다. 이번 호출은 이 본문 검토/검증 기록만 추가하고 frontmatter·사용자 판단·이력을 유지한다. 현재 base 기준 문서 patch hash를 재계산하며 Manager의 현재 후보 전체 verify·Review·Merge를 기다린다.
 
+### 60c86fe2 rebase 후보와 최종 문서 보고 교정
+
+시작 HEAD 60c86fe24a1385fad6df03e7766520b64a3367bf와 Manager 지정 base 7621566729f7047fab819351bc5bf6e1d6f30586 기준 전체 35개 파일의 diff를 다시 확인했다. 현재 ExecPlan의 sources·AC, R-053의 전송 허용/금지·조각 감사, R-055의 차단/통지 분리, R-074의 cycle 범위·실제 Merge·종료 보존과 archive의 G-265/266/267/268을 대조했다. unittest v1/launcher Python 3.11–3.14와 필수 compile 계약은 유지한다.
+
+이전 base 이후 겹치는 변경은 PRODUCT·ARCHITECTURE의 등록된 보류 선행을 참조하는 planning 게시/등록 정책이며 그대로 보존했다. 35개 파일의 추가/삭제 내용을 이전 후보의 feature delta와 전부 비교해 선택 ExecPlan의 실행 이력 외 G-226 변경이 유지됨을 확인했다. 알림 정책·현재 질문 snapshot·늦은 callback 계보와 문서 소유 절도 현재 원본과 대조했다. 추가 코드 교정은 필요하지 않았다. 최종 변경 문서는 PRODUCT·ARCHITECTURE·선택 ExecPlan뿐이다. 최종 문서 보고 오류는 새 base의 문서 patch hash로 교정하며 이전 설명의 범위를 유지한다. 현재 hash는 ARCHITECTURE `c35a847b0997c95cc95eee9f27ff247c42e219bf897070430e640060d3dd58cf`, PRODUCT `185f1ff47980cbb0be1c0d4a92682b9d5a0f1b65a8e0753074853aa14587fa8b`로 Manager 제공 값과 일치한다.
+
+이전 후보의 성공을 재사용하지 않고 이번 호출의 기록 디렉터리를 임시 경로로 지정해 현재 후보에서 아래 최소 unit 검사를 새로 실행했다.
+
+- `TMPDIR="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" TMP="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" TEMP="$LOOP_MANAGER_TARGETED_TEST_DIRECTORY" python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest tests.test_blocked_checkpoint_state.BlockedCheckpointRepositoryTest.test_plan_block_and_checkpoint_request_share_one_transaction tests.test_blocked_checkpoint_state.BlockedCheckpointRepositoryTest.test_terminal_result_and_outbox_rollback_and_retry_together tests.test_execution_checkpoint_recovery_phase.ExecutionCheckpointRecoveryPhaseTests.test_worker_decision_checkpoint_wait_survives_three_restarted_runs tests.test_notification_work_cycles.CompletionCycleTest.test_same_and_archive_only_cycle_preserve_completion_and_new_input_updates_it tests.test_maintenance_state.MaintenanceStateRepositoryTest.test_due_is_project_scoped_and_success_baseline_advances_only_on_success tests.test_notification_events.TimelyProgressEventTest.test_progress_kinds_never_create_even_silent_outbox_rows > "$LOOP_MANAGER_TARGETED_TEST_DIRECTORY/current-candidate.log" 2>&1`: 24개 통과, 7.087초. 현재 조치·독립 scope·취소 재확인/늦은 확인·호환 migration·차단/checkpoint 원자성·실제 Worker 질문·완료/유지보수 상태·진행 생성 금지를 확인했다.
+
+base 대비 전체 diff와 이번 기록의 `git diff --check` 통과. 이번 호출은 이 본문 기록만 추가하며 frontmatter·사용자 판단·기존 이력을 보존했다. 전체 verify·Review는 Manager의 현재 후보 검증을 기다린다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.
