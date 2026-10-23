@@ -528,7 +528,7 @@ class BootstrapService:
             return "main"
         for read_only in (True, False):
             try:
-                with closing(open_connection(database, read_only=read_only, timeout=5)) as connection, connection:
+                with closing(open_connection(database, read_only=read_only, create=False, timeout=5)) as connection, connection:
                     columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
                     if not {"repo", "base_branch"} <= columns:
                         raise RuntimeError("상태 DB의 프로젝트 등록 정보를 읽을 수 없습니다.")

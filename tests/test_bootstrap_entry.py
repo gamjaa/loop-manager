@@ -442,7 +442,27 @@ os._exit(0)
                 with self.assertRaises(sqlite3.OperationalError) as failed:
                     loop_manager._bootstrap_service().bootstrap_base_branch(state_dir, state_dir, 'owner/repo')
             self.assertIs(failed.exception, error)
-            opening.assert_called_once_with(state_dir / 'loop-manager.db', read_only=True, timeout=5)
+            opening.assert_called_once_with(state_dir / 'loop-manager.db', read_only=True, create=False, timeout=5)
+
+    def test_bootstrap_does_not_create_a_database_removed_before_journal_recovery(self):
+        from loop_manager_internal.runtime import bootstrap
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = state_dir / 'loop-manager.db'
+            database.touch()
+            original_open = bootstrap.open_connection
+            error = sqlite3.OperationalError('rollback required')
+            error.sqlite_errorcode = sqlite3.SQLITE_READONLY_ROLLBACK
+            def opening(path, **kwargs):
+                if kwargs['read_only']:
+                    database.unlink()
+                    raise error
+                return original_open(path, **kwargs)
+            with mock.patch.object(bootstrap, 'open_connection', side_effect=opening) as opened:
+                with self.assertRaises(sqlite3.OperationalError):
+                    loop_manager._bootstrap_service().bootstrap_base_branch(state_dir, state_dir, 'owner/repo')
+            self.assertEqual(opened.call_count, 2)
+            self.assertFalse(database.exists())
 
     def test_bootstrap_reads_legacy_registration_without_migrating_it(self):
         with tempfile.TemporaryDirectory() as directory:

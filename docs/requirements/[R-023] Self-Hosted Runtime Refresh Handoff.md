@@ -2,7 +2,7 @@
 
 ## Summary
 
-로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 실제 단계 진행 경계에서 최초 즉시, 이후 성공 관측으로부터 최소 30초 간격으로 최신 원격의 코드·설정·실행 지침 입력을 현재 runtime과 비교한다. 대기 중에는 조회하지 않고, 실행 입력 변경이 확인되면 종료 결정을 메모리에 유지해 추가 비교 없이 새 단계 진입을 막고 진행 중 호출의 안전한 반환·상태 보존 뒤 자동으로 갱신·재시작한다. runtime 갱신은 PR 조회·Merge 판정과 독립적으로 실행 입력 차이만으로 결정한다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 구성한다. Claude는 일반적인 호출을 공식 문서·모의 테스트로 개발하며 실환경 완전 지원과 실행 중 managed 정책 변경 대응은 완료 조건에서 제외한다. 정상 Git 변화의 오탐 복구와 호출별 실제 실패 처리는 유지한다. runtime 교체의 전체 배정 중단과 안전한 호출 반환은 R-091을 따른다.
+로컬 source 상태와 분리해 검증한 origin/<base-branch>의 bootstrap·runtime을 실행하고, 실제 PR 상태를 먼저 반영한 뒤 로컬 동기화를 평가한다. 실제 단계 진행 경계에서 최초 즉시, 이후 성공 관측으로부터 최소 30초 간격으로 최신 원격의 코드·설정·실행 지침 입력을 현재 runtime과 비교한다. 대기 중에는 조회하지 않고, 실행 입력 변경이 확인되면 종료 결정을 메모리에 유지해 추가 비교 없이 새 단계 진입을 막고 진행 중 호출의 안전한 반환·상태 보존 뒤 자동으로 갱신·재시작한다. runtime 갱신은 PR 조회·Merge 판정과 독립적으로 실행 입력 차이만으로 결정한다. Agent 접근은 provider 내장 쓰기 제한·자동 승인 검토로 구성한다. Claude는 일반적인 호출을 공식 문서·모의 테스트로 개발하며 실환경 완전 지원과 실행 중 managed 정책 변경 대응은 완료 조건에서 제외한다. bootstrap의 미완료 SQLite journal은 한정된 정상 롤백으로 복구하며 정상 Git 변화의 오탐 복구와 호출별 실제 실패 처리는 유지한다. runtime 교체의 전체 배정 중단과 안전한 호출 반환은 R-091을 따른다.
 
 ## Context
 
@@ -21,6 +21,8 @@ Loop Manager 저장소 자체의 원격 코드가 바뀌어도 PR Merge 관측�
 runtime handoff의 배정 중단 범위는 R-091대로 현재 runtime 전체다. 실행 중 호출은 강제로 취소하지 않고 안전한 반환·정리와 종료 확인을 기다리며, 호출 대기 작업은 시작하지 않고 저장된 단계로 남긴다. 작업 전체의 PR 게시·Merge를 기다리지 않는다.
 
 bootstrap은 process lock을 획득한 뒤 runtime worktree를 선택·생성하거나 runtime 자식 및 프로젝트 PR 동기화를 시작하기 전에 self `<base-branch>`를 해석하고 `origin/<base-branch>`를 fetch해야 한다. 최신으로 검증한 원격 revision의 bootstrap·runtime으로 실행을 넘기며, source checkout의 commit·파일·동기화 성공은 그 revision의 선택과 실행 조건으로 사용하지 않는다. source에 있는 로컬 전용 코드·문서는 자동 실행 입력에 포함하지 않는다.
+
+self base 조회는 정상 상태에서 읽기 전용으로 수행한다. 비정상 종료 뒤 hot rollback journal 때문에 SQLite가 `SQLITE_READONLY_ROLLBACK`을 반환한 경우에만 쓰기 가능한 연결로 한 번 다시 열어 SQLite의 미완료 트랜잭션 롤백과 기존 등록 정보 조회를 허용한다. 새 DB 생성·schema migration·등록 내용 변경은 수행하지 않으며, 다른 읽기 전용·권한·손상 오류나 재시도 실패는 원래 오류로 보존한다. 이 복구는 기존 실행·DB 접근 조율 안에서 수행한다.
 
 source bootstrap이 원격 base보다 뒤처졌거나 로컬 동기화를 할 수 없어도 검증한 원격 bootstrap·runtime을 실행할 수 있어야 한다. 원격 실행 revision·소유권 자체를 확인할 수 없는 오류는 상태를 보존해 재시도하며, 로컬 갱신 실패와 구분한다. 원격 실행 코드와 fetch된 원격 SHA는 일치해야 하지만 source checkout의 HEAD까지 일치하도록 요구하지 않는다.
 
@@ -83,6 +85,8 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 원격 SHA가 같거나 실행 입력이 동일하면 기존 runtime에서 계속 실행한다. 실행 입력이 달라진 검증된 fast-forward 후속이면 R-091대로 전체 신규·후속 배정을 멈추고 이미 실행 중인 단계만 반환·정리한 뒤 저장된 상태를 보존한다. 작업 전체 완료·PR 게시·Merge나 주기 실행을 기다리지 않고 bootstrap으로 제어를 넘겨 최신 원격을 다시 확인하고 새 runtime을 자동 시작한다. 실행 중 runtime 파일을 교체하거나 진행 중 Agent·verify를 강제로 종료하지 않으며, 재시작 후 같은 작업을 중복 실행하거나 실패·교정 이력을 초기화하지 않는다. 다른 등록 프로젝트의 원격 변경은 self runtime 변경 근거가 아니다.
 
 ## Acceptance Criteria
+
+- 실제 비정상 종료로 hot journal이 남아 읽기 전용 조회가 실패해도 기존 self base와 데이터를 롤백 후 읽어 시작할 수 있다. 일반 조회는 읽기 전용이며 다른 오류에는 쓰기 재시도나 DB 초기화를 하지 않는다.
 
 - bootstrap은 process lock을 획득한 뒤 runtime worktree 선택·생성, runtime 자식 시작과 프로젝트 PR 조회보다 먼저 self `<base-branch>`를 해석하고 `origin/<base-branch>`를 fetch한다.
 - bootstrap·runtime의 원격 실행 revision과 검증한 원격 SHA가 일치한다. source checkout의 HEAD 일치나 동기화 성공을 자식 실행 조건으로 요구하지 않는다.
