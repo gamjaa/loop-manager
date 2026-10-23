@@ -16,39 +16,33 @@ from tests.support.manual_work_case import ManualWorkCase
 
 @isolated_git_test
 class ManualWorkTest(ManualWorkCase):
-    def test_manual_waivers_follow_the_pinned_common_guidance_version(self):
+    def test_manual_waivers_follow_current_runtime_even_with_legacy_guidance(self):
         from loop_manager_internal.agents import common_guidance
         from loop_manager_internal.agents.agent_invocation import InvocationContext
-        from tests.support.workspace import pin_common_guidance
-        for pinned in (False,True):
-            with self.subTest(pinned=pinned),tempfile.TemporaryDirectory() as directory:
-                service,branch,worktree=self.fixture(directory)
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as directory:
+                service, branch, worktree = self.fixture(directory)
                 service.start('G-012')
-                guidance=None
-                if pinned:
-                    guidance=pin_common_guidance(service.connection,InvocationContext(service.repo,'G-012'),
-                                                 worktree,service.state_dir)
-                pinned_hash = service.connection.execute(
-                    'SELECT content_hash FROM common_guidance_versions WHERE task_id = ?',
-                    (guidance.task_id,),
-                ).fetchone()[0] if pinned else None
-                args=completion()
-                args.skip_verify=args.skip_review=True
-                args.expected_head=git_command(worktree,'rev-parse','HEAD')
-                args.skip_reason='External verification and review'
+                if legacy:
+                    identity = common_guidance.task_identity(
+                        InvocationContext(service.repo, 'G-012'), 'worker', worktree)
+                    GuidanceRepository(service.connection).save(
+                        identity, service.repo, 'a' * 64, 'a' * 40, '/old-guidance.json')
+                args = completion()
+                args.skip_verify = args.skip_review = True
+                args.expected_head = git_command(worktree, 'rev-parse', 'HEAD')
+                args.skip_reason = 'External verification and review'
                 service.complete(args)
-                context=SimpleNamespace(worktree=worktree,base_branch='main')
-                candidate=self.candidate(service,'G-012')
-                self.assertIsNotNone(candidate.waive(context,'verify',record=False))
-                with mock.patch.object(common_guidance,'runtime_content_hash',return_value='b'*64):
-                    if pinned:
-                        self.assertIsNotNone(candidate.waive(context,'verify',record=False))
-                        self.assertIsNotNone(candidate.waive(context,'review',record=False))
-                    else:
-                        self.assertIsNone(candidate.waive(context,'verify',record=False))
-                        self.assertIsNone(candidate.waive(context,'review',record=False))
-                    definition=candidate.definition(context,None,candidate.group()['base_sha'])
-                    self.assertEqual(definition.guidance_hash,pinned_hash if pinned else 'b'*64)
+                context = SimpleNamespace(worktree=worktree, base_branch='main')
+                candidate = self.candidate(service, 'G-012')
+                self.assertIsNotNone(candidate.waive(context, 'verify', record=False))
+                self.assertIsNotNone(candidate.waive(context, 'review', record=False))
+                with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='b' * 64):
+                    self.assertIsNone(candidate.waive(context, 'verify', record=False))
+                    self.assertIsNone(candidate.waive(context, 'review', record=False))
+                    definition = candidate.definition(context, None, candidate.group()['base_sha'])
+                    self.assertEqual(definition.guidance_hash, 'b' * 64)
 
 
     def test_generated_tracking_commit_invalidates_source_waiver(self):
