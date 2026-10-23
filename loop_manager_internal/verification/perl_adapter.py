@@ -105,7 +105,10 @@ def worker_main():
         unit = Module(request['module'], tuple(request['ids']), pattern=request['pattern'])
         report = {key: request[key] for key in ('version', 'run_id', 'stage_id', 'unit_id')}
         report.update(module=unit.name, passed=False, completed=[])
-        writer = EventWriter(Path(request['directory']) / f"worker-{request['worker']}.jsonl", identity=report.copy())
+        event_identity = {**report, 'worker_id': request['worker']}
+        if request.get('parent_run_id'):
+            event_identity['parent_run_id'] = request['parent_run_id']
+        writer = EventWriter(Path(request['directory']) / f"worker-{request['worker']}.jsonl", identity=event_identity)
         try:
             # *.jsonl belongs to the common EventWriter protocol, not native TAP records.
             raw = Path(request['result']).with_suffix('.native.ndjson')
@@ -133,12 +136,16 @@ def execute(connection, stage, modules, directory, writer, client, run_id, entry
     if modules != inventory(connection, stage):
         raise ContractError('Perl execution scope changed after collection')
     identity = {'version': 1, 'run_id': run_id, 'stage_id': stage['id']}
+    event_identity = {**identity}
+    parent_run_id = os.environ.get('LOOP_MANAGER_VERIFY_PARENT_RUN_ID')
+    if parent_run_id:
+        event_identity['parent_run_id'] = parent_run_id
     # Reuse the unittest worker's transport only; no unittest discovery/reporter semantics.
     def spawn(token, number, logs):
         return unittest_adapter.start_worker(token, number, logs,
             command=[sys.executable, '-u', str(entrypoint), '--perl-worker'], cwd=connection.root / stage['cwd'],
             environment=dict(os.environ, LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(connection.root),
-                LOOP_MANAGER_VERIFY_PERL=str(connection.tool)), identity=identity)
+                LOOP_MANAGER_VERIFY_PERL=str(connection.tool)), identity=event_identity)
     parent = client
     if stage['execution'] == 'serial':
         class SerialClient:

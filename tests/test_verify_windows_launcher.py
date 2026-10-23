@@ -44,14 +44,55 @@ class WslCleanupTests(unittest.TestCase):
             for name in ('project', 'runtime'):
                 with tarfile.open(bundle / (name + '.tar'), 'w'):
                     pass
+            original_mkdtemp = tempfile.mkdtemp
+            requested_tmp_dirs = []
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                # Keep checking the /tmp request while allocating under this writable fixture.
+                if dir == '/tmp':
+                    requested_tmp_dirs.append(dir)
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
             with mock.patch.object(launcher.subprocess, 'run'), \
                  mock.patch.object(verify_process, 'run_verify_process', return_value=(True, False, 'PASS')), \
+                 mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
                  mock.patch('builtins.print', side_effect=BrokenPipeError), self.assertRaises(BrokenPipeError):
                 launcher.wsl_main(bundle, 30, 'auto')
             receipt = json.loads((bundle / 'cleanup.json').read_text())
             self.assertTrue(receipt['stopped'])
             self.assertTrue(receipt['removed'])
+            self.assertEqual(requested_tmp_dirs, ['/tmp'])
             self.assertFalse(Path(receipt['root']).exists())
+
+    def test_live_logs_are_shared_and_linked_to_parent_run(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            for name in ('project', 'runtime'):
+                with tarfile.open(bundle / (name + '.tar'), 'w'):
+                    pass
+            run_root = bundle / 'supervised-run'
+            observed_environment = {}
+            def make_run_root(prefix='tmp-', **_options):
+                target = run_root if prefix == 'loop-manager-verify-' else bundle / (prefix + 'budget')
+                target.mkdir()
+                return str(target)
+            def run_verify(_arguments, _project, _timeout, *, environment, **_options):
+                observed_environment.update(environment)
+                log_directory = Path(environment['LOOP_MANAGER_VERIFY_LOG_DIR'])
+                (log_directory / 'runner.jsonl').write_text('{}\n', encoding='utf-8')
+                return True, False, 'PASS'
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=make_run_root), \
+                 mock.patch.object(launcher.subprocess, 'run'), \
+                 mock.patch.object(verify_process, 'run_verify_process', side_effect=run_verify):
+                self.assertEqual(launcher.wsl_main(bundle, 30, 'auto', parent_run_id='parent-run'), 0)
+            receipt = json.loads((bundle / 'cleanup.json').read_text())
+            self.assertTrue(receipt['stopped'])
+            self.assertTrue(receipt['removed'])
+            self.assertFalse(run_root.exists())
+            self.assertEqual(observed_environment['LOOP_MANAGER_VERIFY_PARENT_RUN_ID'], 'parent-run')
+            self.assertEqual(observed_environment['LOOP_MANAGER_VERIFY_LOG_DIR'], str(bundle / 'logs'))
+            self.assertTrue((bundle / 'logs/runner.jsonl').is_file())
 
 
 @isolated_git_test
@@ -131,6 +172,32 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertEqual(self.report()['windows'], 'FAIL')
         self.assertFalse(self.report()['passed'])
         self.assertEqual(self.native.call_args.args[2], 60)
+
+    def test_parent_report_links_wsl_and_native_summary_identities(self):
+        def run_wsl(_root, _bundle, logs, _timeout, _cap, parent_run_id):
+            (logs / 'summary.json').write_text(json.dumps({
+                'metadata': {'run_id': 'linux-child', 'parent_run_id': parent_run_id,
+                             'clock_domain': 'linux', 'mode': 'full'},
+                'result': {'passed': True}, 'elapsed_seconds': 12.0,
+                'counts': {'success': 2}, 'phases': [], 'assignments': [],
+                'allocations': [], 'git_commands': []}), encoding='utf-8')
+            return True
+        self.wsl.side_effect = run_wsl
+
+        self.assertEqual(launcher.windows_main(self.root), 0)
+
+        report = self.report()
+        self.assertEqual(report['wsl_run_id'], 'linux-child')
+        self.assertTrue(report['windows_run_id'])
+        self.assertEqual(report['wsl'], 'PASS')
+        summary = json.loads((self.logs / 'summary.json').read_text(encoding='utf-8'))
+        pipeline = summary['windows_pipeline']
+        self.assertEqual(pipeline['snapshot']['revision'], 'a' * 40)
+        self.assertEqual(pipeline['children']['wsl']['run_id'], 'linux-child')
+        self.assertEqual(pipeline['children']['wsl']['parent_run_id'], report['windows_run_id'])
+        self.assertEqual(pipeline['children']['wsl']['elapsed_seconds'], 12.0)
+        self.assertEqual(pipeline['children']['windows']['run_id'], report['windows_run_id'])
+        self.assertIn('summary.json', pipeline['children']['wsl']['summary_path'])
 
     def test_native_does_not_subtract_wsl_elapsed_time_twice(self):
         from loop_manager_internal.verification import execution_clock

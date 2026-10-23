@@ -112,7 +112,7 @@ def wsl_environment():
             and key.upper() not in {'WSLENV', 'VIRTUAL_ENV'}}
 
 
-def run_wsl(root, bundle, directory, timeout, cap):
+def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
     from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
     started = time.monotonic()
     environment = wsl_environment()
@@ -129,6 +129,8 @@ def run_wsl(root, bundle, directory, timeout, cap):
             raise RuntimeError('WSL 실행 시간 기록 경로 변환에 실패했습니다.')
         budget_arguments = [budget_path]
         lifecycle(os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'],'starting')
+    if parent_run_id:
+        budget_arguments.extend(['--parent-run-id', parent_run_id])
     timeout -= time.monotonic() - started
     if timeout <= CLEANUP_SECONDS:
         raise TimeoutError('전체 verify 제한 안에 WSL 실행·정리 시간을 확보하지 못했습니다.')
@@ -164,7 +166,7 @@ def run_wsl(root, bundle, directory, timeout, cap):
     return passed and not timed_out
 
 
-def wsl_main(bundle, timeout, cap, budget_directory=None):
+def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
     started = time.monotonic()
     bundle = Path(bundle)
     if budget_directory is not None:
@@ -203,9 +205,13 @@ def wsl_main(bundle, timeout, cap, budget_directory=None):
         tempfile.tempdir = str(temporary)
         sys.path.insert(0, str(runtime_root))
         from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
+        logs = bundle / 'logs'
+        logs.mkdir(exist_ok=True)
         environment = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
             GIT_CONFIG_SYSTEM='/dev/null', PYTHONIOENCODING='utf-8',
-            LOOP_MANAGER_VERIFY_LOG_DIR=str(run_root / 'logs'), LOOP_MANAGER_VERIFY_PARALLELISM=str(cap))
+            LOOP_MANAGER_VERIFY_LOG_DIR=str(logs), LOOP_MANAGER_VERIFY_PARALLELISM=str(cap))
+        if parent_run_id:
+            environment['LOOP_MANAGER_VERIFY_PARENT_RUN_ID'] = parent_run_id
         from loop_manager_internal.verification.execution_clock import ExecutionClock
         budget = ExecutionClock(environment)
         budget.started = started
@@ -235,11 +241,9 @@ def wsl_main(bundle, timeout, cap, budget_directory=None):
         if watcher.ident is not None:
             watcher.join()
         try:
-            if (run_root / 'logs').is_dir():
-                shutil.copytree(run_root / 'logs', bundle / 'logs')
-        finally:
             if receipt['stopped']:
                 shutil.rmtree(run_root)
+        finally:
             receipt['removed'] = not run_root.exists()
             lifecycle(budget_directory,'stopped' if receipt['stopped'] and receipt['removed'] else 'uncertain',
                       root=str(run_root),pid=os.getpid())
@@ -297,7 +301,7 @@ def native_main(root, entrypoint, directory, python):
 def windows_main(root):
     entrypoint, runtime_python = runtime(root)
     from loop_manager_internal.execution.verify_process import run_verify_process
-    from loop_manager_internal.verification.timing import EventWriter, atomic_json, phase
+    from loop_manager_internal.verification.timing import EventWriter, atomic_json, diagnostic, phase
     from loop_manager_internal.config.managed_config import load_managed_config
     from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY
     timeout = float(os.environ.get('LOOP_MANAGER_VERIFY_TIMEOUT', '600'))
@@ -316,10 +320,13 @@ def windows_main(root):
     if os.environ.get('LOOP_MANAGER_VERIFY_PARTIAL_BASE'):
         atomic_json(directory / 'partial-result.json', {'version': 1, 'kind': 'partial_verify',
             'run_id': session, 'status': 'FALLBACK', 'selection': {'fallback': ['self_windows_requires_full']}})
+        from loop_manager_internal.verification.timing import diagnostic
+        print(diagnostic(directory), flush=True)
         return 0
     writer = EventWriter(directory / 'launcher.jsonl', identity={'run_id': session})
-    report = {'kind': 'loop_manager_windows_verify', 'passed': False,
-              'wsl': 'NOT_RUN', 'windows': 'NOT_RUN'}
+    report = {'kind': 'loop_manager_windows_verify', 'run_id': session, 'passed': False,
+              'wsl': 'NOT_RUN', 'windows': 'NOT_RUN',
+              'wsl_run_id': None, 'windows_run_id': None}
     started = time.monotonic()
     budget = ExecutionClock()
     budget.__enter__()
@@ -331,7 +338,7 @@ def windows_main(root):
             bundle = Path(temporary)
             report.update(snapshot(root, bundle, entrypoint))
             atomic_json(directory / 'snapshot.json', {
-                'revision': report['revision'], 'bundle': str(bundle),
+                'run_id': session, 'revision': report['revision'], 'bundle': str(bundle),
                 'snapshot_sha256': report.get('snapshot_sha256')})
             wsl_logs = Path(str(directory) + '-wsl')
             wsl_logs.mkdir()
@@ -339,7 +346,14 @@ def windows_main(root):
             report['wsl'] = 'FAIL'
             with phase('wsl-full'):
                 passed = run_wsl(root, bundle, wsl_logs,
-                                 budget.remaining(timeout), cap)
+                                 budget.remaining(timeout), cap, session)
+            try:
+                wsl_summary = json.loads((wsl_logs / 'summary.json').read_text(encoding='utf-8'))
+                wsl_metadata = wsl_summary.get('metadata', {}) if isinstance(wsl_summary, dict) else {}
+                if isinstance(wsl_metadata, dict) and wsl_metadata.get('parent_run_id') == session:
+                    report['wsl_run_id'] = wsl_metadata.get('run_id')
+            except (OSError, UnicodeError, ValueError):
+                pass
             report['wsl'] = 'PASS' if passed else 'FAIL'
             report['wsl_diagnostic'] = str(wsl_logs / 'summary.json')
             if not passed:
@@ -348,6 +362,7 @@ def windows_main(root):
             native_logs.mkdir()
             print(f'Windows 핵심 회귀 시작: {native_logs}', flush=True)
             report['windows'] = 'FAIL'
+            report['windows_run_id'] = session
             with phase('windows-core'):
                 # 자체 실행기는 표준 라이브러리만 사용하며 venv redirector를 worker로 남기지 않는다.
                 passed, timed_out, output = run_verify_process(
@@ -370,13 +385,23 @@ def windows_main(root):
             os.environ[BUDGET_DIRECTORY] = previous_budget
         budget.__exit__(*sys.exc_info())
         print(f'Loop Manager 자체 verify: {directory / "result.json"}', flush=True)
+        print(diagnostic(directory), flush=True)
 
 
 if __name__ == '__main__':
     try:
         if len(sys.argv) > 1 and sys.argv[1] == '--wsl':
-            raise SystemExit(wsl_main(sys.argv[2], float(sys.argv[3]), sys.argv[4],
-                                     sys.argv[5] if len(sys.argv) > 5 else None))
+            arguments = sys.argv[2:]
+            parent_run_id = None
+            if '--parent-run-id' in arguments:
+                index = arguments.index('--parent-run-id')
+                if index + 1 >= len(arguments):
+                    raise ValueError('WSL parent run identity is missing.')
+                parent_run_id = arguments[index + 1]
+                del arguments[index:index + 2]
+            raise SystemExit(wsl_main(arguments[0], float(arguments[1]), arguments[2],
+                                     arguments[3] if len(arguments) > 3 else None,
+                                     parent_run_id=parent_run_id))
         if len(sys.argv) > 1 and sys.argv[1] == '--native':
             raise SystemExit(native_main(*sys.argv[2:]))
         if os.name != 'nt':

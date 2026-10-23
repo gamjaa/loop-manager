@@ -85,8 +85,48 @@ def execute_manifest(modules, directory, writer, client, *, spawn, validate_repo
                 if worker.process.poll() is not None:
                     raise RuntimeError("verify worker가 배정/정리 전에 종료됐습니다.")
                 if worker.module is not None and worker.report.is_file():
-                    if worker.job and worker.job.active() > 1:
-                        continue
+                    if getattr(worker, "result_observed_at", None) is None:
+                        observed = writer.emit("result_file_observed", unit_id=worker.module.name,
+                                    worker_id=worker.number, worker_pid=worker.process.pid,
+                                    result_file=worker.report.name)
+                        worker.result_observed_at = observed["at"]
+                    child_wait_started = getattr(worker, "child_wait_started_at", None)
+                    child_wait_active = None
+                    if worker.job:
+                        try:
+                            child_wait_active = worker.job.active()
+                        except Exception as error:
+                            writer.emit("job_child_exit_unconfirmed", unit_id=worker.module.name,
+                                        worker_id=worker.number, worker_pid=worker.process.pid,
+                                        wait_started_at=child_wait_started,
+                                        error_type=type(error).__name__)
+                            raise
+                        if child_wait_active > 1:
+                            if child_wait_started is None:
+                                wait = writer.emit("job_child_wait", unit_id=worker.module.name,
+                                    worker_id=worker.number, worker_pid=worker.process.pid,
+                                    result_observed_at=worker.result_observed_at,
+                                    active_processes=child_wait_active)
+                                worker.child_wait_started_at = wait["at"]
+                                worker.child_wait_last_active = child_wait_active
+                            elif child_wait_active != getattr(worker, "child_wait_last_active", None):
+                                writer.emit("job_child_wait_observation", unit_id=worker.module.name,
+                                            worker_id=worker.number, worker_pid=worker.process.pid,
+                                            active_processes=child_wait_active,
+                                            wait_started_at=child_wait_started)
+                                worker.child_wait_last_active = child_wait_active
+                            continue
+                        waited = (writer.clock() - child_wait_started
+                                  if child_wait_started is not None else 0.0)
+                        confirmation = writer.emit("job_child_exit_confirmed", unit_id=worker.module.name,
+                                    worker_id=worker.number, worker_pid=worker.process.pid,
+                                    result_observed_at=worker.result_observed_at,
+                                    wait_started_at=child_wait_started, wait_seconds=waited,
+                                    active_processes=child_wait_active)
+                        worker.child_wait_seconds = waited
+                        worker.result_ready_at = confirmation["at"]
+                    else:
+                        worker.result_ready_at = worker.result_observed_at
                     report = json.loads(worker.report.read_text(encoding="utf-8"))
                     passed = validate_report(worker.module, report) and passed
                     if not report["passed"]:
@@ -100,9 +140,28 @@ def execute_manifest(modules, directory, writer, client, *, spawn, validate_repo
                     memory = report.get("memory")
                     if memory:
                         budget = max(budget, int(memory["peak"] * 1.25))
-                    writer.emit("module_result", unit_id=worker.module.name, module=worker.module.name, passed=report["passed"], memory=memory)
+                    observed_at = worker.result_observed_at
+                    ready_at = getattr(worker, "result_ready_at", None) or observed_at
+                    result_event = writer.emit("module_result", unit_id=worker.module.name, module=worker.module.name,
+                                worker_id=worker.number, worker_pid=worker.process.pid,
+                                result_file_observed_at=observed_at,
+                                result_ready_at=ready_at,
+                                result_wait_seconds=max(0.0, ready_at - observed_at),
+                                result_processing_seconds=max(0.0, writer.clock() - ready_at),
+                                child_wait_seconds=(getattr(worker, "child_wait_seconds", None) or 0.0
+                                                    if worker.job else None),
+                                passed=report["passed"], memory=memory)
+                    module_result_at = result_event["at"]
                     client.request("idle", token=worker.token)
+                    worker.previous_unit_id = worker.module.name
+                    worker.previous_result_observed_at = observed_at
+                    worker.previous_module_result_at = module_result_at
                     worker.module = None
+                    worker.result_observed_at = None
+                    worker.result_ready_at = None
+                    worker.child_wait_started_at = None
+                    worker.child_wait_last_active = None
+                    worker.child_wait_seconds = None
                     progressed = True
             while pending:
                 idle = next((worker for worker in workers if worker.module is None), None)
@@ -129,7 +188,14 @@ def execute_manifest(modules, directory, writer, client, *, spawn, validate_repo
                         if idle.job:
                             idle.job.assign(idle.process)
                     module = pending.pop(0)
-                    writer.emit("unit_start", unit_id=module.name, pid=idle.process.pid, reservation=idle.token)
+                    assigned_at = writer.clock()
+                    previous_result_at = getattr(idle, "previous_module_result_at", None)
+                    writer.emit("unit_start", unit_id=module.name, pid=idle.process.pid,
+                                worker_id=idle.number, reservation=idle.token,
+                                previous_unit_id=getattr(idle, "previous_unit_id", None),
+                                previous_result_observed_at=getattr(idle, "previous_result_observed_at", None),
+                                seconds_since_previous_result=(max(0.0, assigned_at - previous_result_at)
+                                    if previous_result_at is not None else None))
                     idle.assign(module, directory / f"module-{len(modules) - len(pending) - 1}.json", directory)
                     progressed = True
                     # Collect an immediately available result before reserving more

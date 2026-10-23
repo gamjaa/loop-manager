@@ -34,8 +34,8 @@ priority: normal
 
 verification/core.py의 결과 수집·Windows Job 관측·unit_start와 기존 stop_worker phase, timing.py의 이벤트 집계 및 runner/manager_adapter의 metadata를 연결한다. runner의 mode·partial-result와 preliminary_reviews/verify_receipts의 기존 증거 연결, discovery·impact_selection phase를 재사용해 부분/전체 run을 구분한다. 이미 남기는 allocation·Git·fixture·시간 자료를 재사용하고 필요한 누락 시점만 보강한다. 기존 이벤트/요약 계약의 호환 확장으로 처리하고 별도 로그 저장소나 모니터링 서비스를 만들지 않는다. 실제 임시 경로의 선택·관측과 summary 연결은 G-253이 담당한다.
 
-- [ ] 직접 구현된 `verification/manager_adapter.py:progress_observation()`의 단계별 `rglob("*.jsonl")`·파일별 커서·부분 행/중단 처리와 `tests/test_verify_runtime.py:ManagerAdapterTests.test_progress_reads_stage_worker_events_once_and_tracks_interruption`을 재사용한다. 탐색 자체는 다시 구현하지 않고 남은 run/stage/unit identity·단계 종료 처리, 실제 Windows 형제 로그/부모 result 연결을 보완한다. `runner.py:run()`·`unittest_adapter.py:worker_main()`·`timing.py:TimedResult`·`scripts/verify_windows.py`의 소유 실행 배치를 사용해 다른 run·과거 잔여 자료를 섞지 않으며 읽기 실패는 미확인으로 남긴다. 추가 Git·DB·프로세스·모델 조회는 하지 않는다.
-- [ ] 기존 `runtime/operation_events.py:progress()`의 reporter와 중첩 표시 억제·문맥 복사·종료를 재사용한다. 파일 관측 실패는 미확인으로 설명하며 verify 결과·timeout·예약·실패 집계에 영향을 주지 않는다. 별도 중복 reporter·새 전역 상태를 만들지 않는다.
+- [x] 직접 구현된 `verification/manager_adapter.py:progress_observation()`의 단계별 `rglob("*.jsonl")`·파일별 커서·부분 행/중단 처리를 재사용해 run/stage/unit identity·단계 종료와 Windows live WSL·형제 로그/부모 result 연결을 보완했다. `runner.py:run()`·`unittest_adapter.py:worker_main()`·`timing.py:TimedResult`·`scripts/verify_windows.py`의 소유 실행 배치를 사용하며, 다른 run과 parent가 다른 WSL 자료를 제외하고 읽기 실패는 미확인으로 남긴다. 추가 Git·DB·프로세스·모델 조회는 하지 않았다.
+- [x] 기존 `runtime/operation_events.py:progress()` reporter와 중첩 표시 억제·문맥 복사·종료를 재사용했다. 파일 관측 실패는 미확인으로 설명하고 verify 결과·timeout·예약·실패 집계에는 영향을 주지 않는다. 별도 reporter·새 전역 상태를 만들지 않았다.
 
 ## Validation
 
@@ -49,9 +49,11 @@ verification/core.py의 결과 수집·Windows Job 관측·unit_start와 기존 
 
 - [x] 2026-10-10 기준 50c699c8f9c149cecb0ddf9b081527942d8e2289의 R-065/R-067·core의 Job active 대기·timing summary와 runner metadata를 정적으로 확인했다. 구현·테스트·OS 측정·verify는 실행하지 않았다.
 - [x] 2026-10-16 원격 코드의 단계별 이벤트 탐색·파일 커서·중단 처리와 최소 배치 회귀를 정적으로 확인했다. 테스트 실행 성공은 확인하지 않았다.
-- [ ] 남은 실행 identity·단계 종료·Windows 형제 로그의 운영 진행 연결
-- [ ] 진단 연결·문서 정합화·targeted unit 검증
+- [x] 남은 실행 identity·단계 종료·Windows 형제 로그의 운영 진행 연결
+- [x] 진단 연결·문서 정합화·targeted unit 검증
 - [ ] Manager 전체 verify·필요한 실제 Windows 자료·읽기 전용 Review·사용자 Merge
+- [x] 2026-10-23 targeted unit 11개를 통과시켰다. WSL cleanup 회귀는 `/tmp` 요청을 assertion으로 유지하고 test run root를 writable temporary fixture로 배정해 child 종료 후 정리를 확인했다. bundle live-log 연결도 mock 회귀로 확인했다. 실제 Windows/WSL 실행과 Manager 전체 verify는 실행하지 않았다.
+- [x] 2026-10-23 rebase base `c411905d6910a4794394d14dfb3f9e185a19eb07` 이후 현재 base-relative 변경 14개 파일의 전체 diff를 재검토했다. 관련 targeted unit 11개를 새로 실행해 통과했고 `git diff --check`도 통과했다. 실제 Windows/WSL 실행과 Manager 전체 verify는 실행하지 않았다.
 
 ## Decision Log
 
