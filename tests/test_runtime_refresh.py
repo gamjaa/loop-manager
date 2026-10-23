@@ -63,6 +63,55 @@ class RuntimeInputTests(unittest.TestCase):
 
 
 class RuntimeObservationTests(unittest.TestCase):
+    def test_successful_observation_is_shared_for_thirty_seconds_after_completion(self):
+        with mock.patch('time.monotonic', return_value=0) as clock:
+            def observe():
+                clock.return_value += 5
+            observer = mock.Mock(side_effect=observe)
+            gate = RuntimeHandoffGate(threading.Event(), threading.Lock(), observer=observer)
+            gate.observe()
+            clock.return_value = 34.9
+            gate.observe()
+            observer.assert_called_once()
+            clock.return_value = 35
+            gate.observe()
+            self.assertEqual(observer.call_count, 2)
+            gate.stop()
+            with self.assertRaises(SelfMergeRuntimeHandoff):
+                gate.observe()
+            self.assertEqual(observer.call_count, 2)
+
+    def test_failed_observation_is_not_cached(self):
+        observer = mock.Mock(side_effect=[OSError('fetch failed'), None])
+        gate = RuntimeHandoffGate(threading.Event(), threading.Lock(), observer=observer)
+        with self.assertRaisesRegex(OSError, 'fetch failed'):
+            gate.observe()
+        gate.observe()
+        self.assertEqual(observer.call_count, 2)
+
+    def test_parallel_stage_boundaries_share_one_observation(self):
+        observer = mock.Mock()
+        gate = RuntimeHandoffGate(threading.Event(), threading.Lock(), observer=observer)
+        ready = threading.Barrier(3)
+        errors = []
+        def enter():
+            try:
+                ready.wait(2)
+                gate.observe()
+            except BaseException as error:
+                errors.append(error)
+        threads = [threading.Thread(target=enter) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        try:
+            ready.wait(2)
+        finally:
+            for thread in threads:
+                thread.join(3)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        observer.assert_called_once()
+
     def test_observation_commits_completed_implicit_state_and_rejects_explicit_transaction(self):
         from loop_manager_internal.storage.db_access import open_connection, finish_implicit_request
         with tempfile.TemporaryDirectory() as directory:
@@ -121,7 +170,7 @@ class RuntimeObservationTests(unittest.TestCase):
         finally:
             _runtime_handoff_signal.reset(token)
 
-    def test_boundary_observes_after_persisted_failure_and_blocks_next_effect(self):
+    def test_boundary_preserves_failure_then_observes_at_next_stage(self):
         calls = []
         gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
         def observe():
@@ -135,8 +184,12 @@ class RuntimeObservationTests(unittest.TestCase):
             return 'retry'
         token = _runtime_handoff_signal.set(gate)
         try:
-            with self.assertRaises(SelfMergeRuntimeHandoff):
-                worker()
+            with mock.patch('time.monotonic', return_value=0) as clock:
+                self.assertEqual(worker(), 'retry')
+                self.assertEqual(calls, ['observe', 'saved-failure'])
+                clock.return_value = 30
+                with self.assertRaises(SelfMergeRuntimeHandoff):
+                    worker()
             with mock.patch('subprocess.Popen') as process, self.assertRaises(SelfMergeRuntimeHandoff):
                 gate.popen(['reviewer'])
             process.assert_not_called()

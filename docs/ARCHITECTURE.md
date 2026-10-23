@@ -351,7 +351,7 @@ runtime 경로가 존재하지만 소유권, repository, detached HEAD, SHA 또�
 
 runtime 자식은 등록된 canonical source·repository/origin·base·실제 runtime 경로/SHA를 검증하고, 선택된 프로젝트 목록과 별도로 self를 찾는다. `application/self_runtime.py`의 원격 관측은 기존 fetch journal·자원 잠금을 사용하며 PR 조회나 source 동기화를 수행하지 않는다. 일반 PR 수명주기의 base identity 검증·Merge 반영은 별도로 유지한다.
 
-단계 시작 전과 영속 결과 반환 뒤 `RuntimeHandoffGate.observe()`가 관측을 직렬화한다. 실행·planning·복구 coordinator와 실제 Agent/verify 배정 경계가 이를 호출한다. 관측 잠금을 기다리기 전에 완료한 단계의 implicit DB 요청을 확정하고 명시적 transaction 내부 관측은 거부하므로 DB 쓰기 transaction·scheduler condition·launch lock 안에서 원격 관측하지 않는다. 실제 실행 SHA와 원격 commit의 raw diff 및 blob을 비교해 추가·삭제·이동·mode/kind 변경을 포함한다. 알려진 문서 위치의 일반 UTF-8 prose만 제외하고 실행 bit·symlink·shebang·Python 구문과 문서 아래 실행 코드는 포함한다. 알 수 없는 경로와 비교 실패는 문서 전용 성공이 아니다.
+실제 단계 진입 전 `RuntimeHandoffGate.observe()`가 관측을 직렬화한다. 실행·planning·복구 coordinator와 실제 Agent/verify 배정 경계가 이를 호출한다. 최초 관측은 즉시 수행하고 성공 완료의 monotonic 시각을 runtime 전체에서 공유해 30초 미만이면 원격 조회·입력 비교를 재사용한다. 병렬 진입은 잠금 안에서 시각을 다시 확인하며 실패는 성공 시각을 갱신하지 않는다. 단계 종료와 재시도·사용량·기존 호출 종료 대기는 원격 관측을 만들지 않으며 pause·확정된 handoff 신호만 확인한다. 대기가 풀린 뒤 실제 단계 진입에서 같은 30초 기준으로 다시 확인한다. 관측 잠금을 기다리기 전에 완료한 단계의 implicit DB 요청을 확정하고 명시적 transaction 내부 관측은 거부하므로 DB 쓰기 transaction·scheduler condition·launch lock 안에서 원격 관측하지 않는다. 실제 실행 SHA와 원격 commit의 raw diff 및 blob을 비교해 추가·삭제·이동·mode/kind 변경을 포함한다. 알려진 문서 위치의 일반 UTF-8 prose만 제외하고 실행 bit·symlink·shebang·Python 구문과 문서 아래 실행 코드는 포함한다. 알 수 없는 경로와 비교 실패는 문서 전용 성공이 아니다.
 
 원격 SHA/코드가 같으면 실행을 계속한다. 코드가 다른 fast-forward 후속이면 원자 launch gate에 source/origin/base·실행/목표 SHA·mutation identity를 결합해 신규 관리·Agent·verify·게시를 막고 진행 중 호출은 반환·저장을 기다린다. 부모는 자식별 일회용 channel token과 논리 run ID에 결합한 `runtime-handoffs/<mutation>-<token>.json` 및 전용 반환 코드 75를 함께 검증한다. 임의 파일·출력·일반 종료 코드는 재시작 근거가 아니다. 확인한 자료는 consumed로 남기고 재소비하지 않는다. 미확정 반환은 별도 보존 코드 76으로 부모에 전달하며 새 runtime이나 기존 runtime 제거를 허용하지 않는다.
 
@@ -1256,7 +1256,7 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 
 [Agent CLI 실패](PRODUCT.md#외부-cli-실패)는 위 구현·검증 실패와 별도로 처리한다.
 
-Agent CLI 실행 실패·timeout·일시적 서비스 오류는 한 호출 요청에서 최초 실행 외 최대 3회 재시도한다. 세션 재개 불가로 새 세션을 한 번 시작하는 복구는 별도로 집계한다. 묶음이 소진되면 recovery record의 identity/generation에 결합한 `retry_after`를 저장한다. 작업별 30초 대기는 호출 자리를 점유하지 않고 runtime 확인을 계속하며 같은 실행에서 저장 단계를 다시 배정한다. runtime 교체 후에도 저장된 시각과 누적 감사를 유지한다. Review 교정은 시작한 turn만 세며 같은 피드백 turn의 예약·재처리는 중복 집계하지 않는다. AI 사용 한도는 실제 종료가 확인된 같은 provider/model의 독립 성공 기록 이후에만 재개하고 유료 probe·새 session·provider 전환으로 우회하지 않는다. 종료 불명 예약은 해당 token의 기존 receipt로 종료를 재확인한 뒤에만 회수한다.
+Agent CLI 실행 실패·timeout·일시적 서비스 오류는 한 호출 요청에서 최초 실행 외 최대 3회 재시도한다. 세션 재개 불가로 새 세션을 한 번 시작하는 복구는 별도로 집계한다. 묶음이 소진되면 recovery record의 identity/generation에 결합한 `retry_after`를 저장한다. 작업별 30초 대기는 호출 자리를 점유하지 않고 pause·확정된 handoff 신호를 확인하며 같은 실행에서 저장 단계를 다시 배정한다. runtime 원격 관측은 대기 해소 뒤 실제 단계 진입에서만 수행한다. runtime 교체 후에도 저장된 시각과 누적 감사를 유지한다. Review 교정은 시작한 turn만 세며 같은 피드백 turn의 예약·재처리는 중복 집계하지 않는다. AI 사용 한도는 실제 종료가 확인된 같은 provider/model의 독립 성공 기록 이후에만 재개하고 유료 probe·새 session·provider 전환으로 우회하지 않는다. 종료 불명 예약은 해당 token의 기존 receipt로 종료를 재확인한 뒤에만 회수한다.
 
 ### 자체 테스트의 Git 경계
 

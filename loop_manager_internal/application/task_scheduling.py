@@ -132,12 +132,8 @@ class TaskScheduler:
         saved = repository.defer_retry(repo, plan_id)
         events.emit('작업 재시도 대기', project=repo, plan=plan_id, reason_code=saved['reason_code'],
                     retry_after=saved['retry_after'])
-        observed = 0
         while True:
             self.check_project(repo)
-            if time.monotonic() >= observed:
-                observe_runtime()
-                observed = time.monotonic() + 1
             remaining = saved['retry_after'] - time.time()
             if remaining <= 0:
                 break
@@ -156,7 +152,6 @@ class TaskScheduler:
         events.emit('사용 한도 조건 대기', project=repo, plan=plan_id)
         while True:
             self.check_project(repo)
-            observe_runtime()
             if saved['finished_at'] and connection.execute(
                 "SELECT 1 FROM agent_invocations WHERE repo=? AND provider=? AND model=? "
                 "AND finished_at>? AND result_kind='success' AND result_code=0 "
@@ -173,7 +168,6 @@ class TaskScheduler:
             return False
         while keys:
             self.check_project(repo)
-            observe_runtime()
             live = {row['token'] for row in task_calls.recover(
                 connection, self.state_dir, tokens={value['token'] for value in keys.values()})}
             with self.condition:

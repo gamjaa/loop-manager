@@ -65,7 +65,6 @@ class PlanningLifecycleCoordinator:
                 observe_runtime()
                 with events.log_context(project=context.repo, plan=None, stage="PLANNING"):
                     step = service.step(phase, snapshot)
-                observe_runtime()
                 flush = getattr(self._ports.state, "flush_notifications", None)
                 if flush is not None:
                     flush(context.repo)

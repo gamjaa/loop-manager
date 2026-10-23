@@ -27,6 +27,7 @@ from pathlib import Path
 import secrets
 import sqlite3
 import threading
+import time
 from loop_manager_internal.verification.coordination import ExecutionSettings, VerifyCoordinator, settings as verify_settings
 from loop_manager_internal.application.task_scheduling import TaskScheduler, current_scheduler
 
@@ -203,6 +204,7 @@ def schedule_registered_projects(
     try:
         effects._preflight_self_merge_handoff(
             connection, projects, state_dir, runtime_mutation, config_path=config.path)
+        handoff_gate.observed_at = time.monotonic()
         with VerifyCoordinator() as verify_coordinator, ThreadPoolExecutor(
             max_workers=worker_count,
             thread_name_prefix="loop-project",
