@@ -147,6 +147,3 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - PR Merge 자체·문서 전용 게시·다른 프로젝트의 변경은 runtime 재시작 사유로 삼지 않는다. self 원격의 코드 입력 변경만 감지하며 PR 관리 기능의 기존 완료·충돌 복구 규칙을 바꾸지 않는다.
 - Git 범위 검사 제거를 이유로 sandbox의 source·다른 worktree·shared Git metadata 쓰기 제한이나 Manager의 작업물 보존·후보 검증·조건부 게시를 완화하지 않는다.
 
-## Open Questions
-
-- 없음
