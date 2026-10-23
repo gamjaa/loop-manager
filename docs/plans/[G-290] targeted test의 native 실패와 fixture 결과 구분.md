@@ -23,10 +23,10 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/verification/targeted.py`의 unittest/JUnit 기록과 `verification/timing.py:TimedResult`의 native callback을 대조한다. 기존 reporter·fixture 관측을 재사용해 targeted 집계에 필요한 발생 경계를 전달한다. shared reporter를 바꾸면 전체 verify의 결과·수집·fixture 의미를 보존하며 필요하지 않은 범용 reporter나 새 adapter를 만들지 않는다.
-- [ ] 확인한 `loop_manager_internal/storage/targeted_test_state.py`에서 `unexpected_success` 처리와 fixture/불확실 결과의 집계 제외를 명시한다. 기존 결과·streak 구조를 호환되게 확장하는 최소 방식을 선택하고 실행 ID·테스트 ID 중복/상충 검사를 약화하지 않는다. 비호환 상태 변경이 필요하면 구현하지 말고 Architecture Change Policy의 판단에 남긴다.
-- [ ] `targeted.py:junit_results()`가 받은 native 원본의 결과·오류 근거를 보존한다. 자유 형식 메시지나 명령 종료 코드만으로 개별 테스트 실패를 만들지 않는다. 지원하는 결과에서 필요한 구분과 불확실한 경우를 명시하고 새 언어/도구 지원이나 전체 verify 연결을 이 작업에 추가하지 않는다.
-- [ ] 확인한 `tests/test_targeted_test_streak.py`의 잘못된 unexpected-success 초기화 기대를 교정하고 native unittest fixture·subTest·JUnit 경계 회귀를 추가한다. `tests/test_execution_worker_phase.py`와 기존 `tests/test_verify_runtime.py`·`tests/test_verify_contract.py`에서 shared reporter 변경의 관련 assertion을 재사용한다. PRODUCT·ARCHITECTURE·`docs/AGENTS.worker.md`는 실제로 보완한 결과 구분만 정합화하며 사용자 Requirement는 수정하지 않는다.
+- [x] 확인한 `loop_manager_internal/verification/targeted.py`의 unittest/JUnit 기록과 `verification/timing.py:TimedResult`의 native callback을 대조한다. 기존 reporter·fixture 관측을 재사용해 targeted 집계에 필요한 발생 경계를 전달한다. shared reporter를 바꾸면 전체 verify의 결과·수집·fixture 의미를 보존하며 필요하지 않은 범용 reporter나 새 adapter를 만들지 않는다.
+- [x] 확인한 `loop_manager_internal/storage/targeted_test_state.py`에서 `unexpected_success` 처리와 fixture/불확실 결과의 집계 제외를 명시한다. 기존 결과·streak 구조를 호환되게 확장하는 최소 방식을 선택하고 실행 ID·테스트 ID 중복/상충 검사를 약화하지 않는다. 비호환 상태 변경이 필요하면 구현하지 말고 Architecture Change Policy의 판단에 남긴다.
+- [x] `targeted.py:junit_results()`가 받은 native 원본의 결과·오류 근거를 보존한다. 자유 형식 메시지나 명령 종료 코드만으로 개별 테스트 실패를 만들지 않는다. 지원하는 결과에서 필요한 구분과 불확실한 경우를 명시하고 새 언어/도구 지원이나 전체 verify 연결을 이 작업에 추가하지 않는다.
+- [x] 확인한 `tests/test_targeted_test_streak.py`의 잘못된 unexpected-success 초기화 기대를 교정하고 native unittest fixture·subTest·JUnit 경계 회귀를 추가한다. `tests/test_execution_worker_phase.py`와 기존 `tests/test_verify_runtime.py`·`tests/test_verify_contract.py`에서 shared reporter 변경의 관련 assertion을 재사용한다. PRODUCT·ARCHITECTURE·`docs/AGENTS.worker.md`는 실제로 보완한 결과 구분만 정합화하며 사용자 Requirement는 수정하지 않는다.
 
 ## Validation
 
@@ -39,8 +39,8 @@ priority: high
 ## Progress
 
 - [x] `5f0dc1c2af8027aed3bf13501f3d5c223f375215`부터 `5c133fbaddf281fef15d555f926b9aa81aa1aee9`까지의 변경과 R-055·관련 제품/설계 절, runner·reporter·저장 및 기존 회귀 원본을 정적으로 대조했다. 직접 구현된 집계 전체를 재계획하지 않았다.
-- [ ] native 결과 구분과 호환 집계 교정
-- [ ] 최소 targeted unit 회귀와 관련 문서 정합성
+- [x] native 결과 구분과 호환 집계 교정
+- [x] 최소 targeted unit 회귀와 관련 문서 정합성
 
 ## Decision Log
 
@@ -82,3 +82,12 @@ priority: high
   RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_targeted_test_streak.TargetedRunnerTests.test_fixture_subtest_failures_do_not_replace_body_outcomes
 
   재실행 결과: 1개 테스트 통과. 같은 현재 후보에서 기존 본문 subTest 결과와 IsolatedAsyncio 동기 setup의 streak 보존을 확인하는 좁은 두 case도 통과했다. 전체 `scripts/verify`는 실행하지 않았다.
+
+## Rebase된 HEAD 재확인 (2026-10-23)
+
+- 현재 HEAD의 구현은 두 `TestCase` 계열의 setup·teardown callback scope를 `EventWriter.active_fixtures`에 두고, `TimedResult.addSubTest()`가 해당 scope에서 발생한 assertion을 `fixture_error`로 보존한다. 새 Review delta의 setup·teardown subTest 및 본문+teardown 동시 실패 조건이 이미 회귀에 포함되어 있어 중복 코드나 테스트를 추가하지 않았다.
+- 현재 HEAD에서 setup·teardown 내부 subTest, fixture 결과 뒤 본문 실패, 기존 native 본문 subTest와 IsolatedAsyncio setup streak를 확인하는 아래 최소 실행을 새로 수행했다.
+
+  `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_targeted_test_streak.TargetedRunnerTests.test_fixture_subtest_failures_do_not_replace_body_outcomes tests.test_targeted_test_streak.TargetedRunnerTests.test_unittest_fixture_errors_subtests_and_unexpected_success_keep_native_meaning tests.test_targeted_test_streak.TargetedRunnerTests.test_isolated_asyncio_sync_setup_fixture_preserves_existing_failure_streak`
+
+  실행 결과: 3개 targeted test 통과. 전체 `scripts/verify`는 실행하지 않았다.
