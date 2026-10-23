@@ -808,6 +808,55 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
         self.assertEqual(self.connection.execute(
             "SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-049'").fetchone()[0], '{}')
 
+    def test_requirement_deletions_ignore_verified_merged_archive_rows(self):
+        from loop_manager_internal.git import command_adapter
+        from loop_manager_internal.storage import execplan_catalog_state
+
+        deleted_source, active_source = self.sources
+        current_revision = 'd' * 40
+        self.connection.execute("UPDATE exec_plans SET sources=?, plan_sha=? WHERE plan_id='G-047'",
+            (self.json.dumps([active_source]), 'c' * 40))
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE repo='repo'")
+        for plan_id, revision in (('G-048', 'a' * 40), ('G-049', 'b' * 40)):
+            original_path = f'docs/plans/[{plan_id}] Historical.md'
+            archived_path = f'docs/plans/archive/[{plan_id}] Historical.md'
+            content_hash = f'archive-hash-{plan_id}'
+            self.connection.execute('''INSERT INTO exec_plans
+                (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha)
+                VALUES ('repo', ?, ?, 'Historical', ?, '[]', 'normal', ?, 'MERGED', ?)''',
+                (plan_id, archived_path, self.json.dumps([deleted_source]), content_hash, revision))
+            self.connection.execute('''INSERT INTO execplan_catalog_history
+                (repo, plan_id, original_path, observed_path, original_content_hash, final_content_hash,
+                 plan_sha, merge_confirmed, identity_verified, currently_archived, proof_kind, proof_revision)
+                VALUES ('repo', ?, ?, ?, ?, ?, ?, 1, 1, 1, 'stored-and-git', ?)''',
+                (plan_id, original_path, archived_path, f'original-{plan_id}', content_hash,
+                 revision, 'e' * 40))
+        self.connection.commit()
+        rows = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo'").fetchall()
+        self.assertEqual(execplan_catalog_state.verified_merged_archive_execution_ids(
+            self.connection, 'repo', rows), frozenset({'G-048', 'G-049'}))
+        self.assertEqual(self.recovery.recovery_goals(self.connection, 'repo'), ())
+
+        contents_by_revision = {
+            current_revision: {active_source: '# [R-002] Active\n## Acceptance Criteria\n- Keep this goal\n'},
+            'a' * 40: {deleted_source: '# [R-001] Historical A\n## Acceptance Criteria\n- Original goal\n'},
+            'b' * 40: {deleted_source: '# [R-001] Historical B\n## Acceptance Criteria\n- Original goal\n'},
+        }
+        git = mock.Mock(return_value=SimpleNamespace(returncode=0))
+        with mock.patch.object(command_adapter, 'revision_requirement_documents',
+                               side_effect=lambda _git_bytes, _repository, revision:
+                                   contents_by_revision.get(revision, {})):
+            proofs = self.recovery.requirement_deletions(self.connection, 'repo', self.worktree,
+                SimpleNamespace(revision_sha=current_revision), git=git, git_bytes=mock.Mock())
+
+        self.assertEqual(proofs, {})
+        ready = self.connection.execute("SELECT status, sources FROM exec_plans WHERE plan_id='G-047'").fetchone()
+        self.assertEqual(ready['status'], 'READY')
+        self.assertEqual(self.json.loads(ready['sources']), [active_source])
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM execplan_catalog_holds WHERE repo='repo' AND plan_id='G-047'"
+        ).fetchone())
+
     def test_repeated_absence_keeps_first_proof_receipt_and_resume_phase(self):
         from loop_manager_internal.catalog.execplan_catalog import CatalogIssue, ExecPlanCatalogSnapshot
         from loop_manager_internal.storage.execplan_catalog_state import (

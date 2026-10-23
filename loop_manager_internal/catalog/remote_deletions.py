@@ -455,7 +455,11 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, ref
 def requirement_deletions(connection, repo, repository, pinned, *, git, git_bytes):
     """이전 source 원문과 현재 실제 부재를 원격 revision에 결합한다."""
     result = {}
-    rows = list(connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall())
+    execution_rows = list(connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall())
+    verified_merged_rows = execplan_catalog_state.verified_merged_archive_execution_ids(
+        connection, repo, execution_rows,
+    )
+    rows = [row for row in execution_rows if str(row["plan_id"]) not in verified_merged_rows]
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'"
     ).fetchone():
