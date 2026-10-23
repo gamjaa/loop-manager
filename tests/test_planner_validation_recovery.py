@@ -878,6 +878,69 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
         self.assertEqual(after_error['evidence'], expanded_row['evidence'])
         self.assertEqual(after_error['resume_status'], 'IMPLEMENTING')
 
+    def test_new_hold_reuses_first_deletion_proof_and_recovery_goals(self):
+        from loop_manager_internal.catalog.execplan_catalog import CatalogIssue, ExecPlanCatalogSnapshot
+        from loop_manager_internal.storage.execplan_catalog_state import (
+            DefinitionStateRepository, PinnedCatalog,
+        )
+
+        first_source, second_source = self.sources
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', sources=? WHERE plan_id='G-047'",
+            (self.json.dumps([first_source]),))
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE repo='repo'")
+        self.connection.commit()
+        first_row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-047'").fetchone()
+        first_revision, second_revision = 'a' * 40, 'b' * 40
+
+        def apply(revision, issues, withheld, proofs):
+            snapshot = ExecPlanCatalogSnapshot({}, {}, revision, True, tuple(issues), tuple(withheld))
+            repository = DefinitionStateRepository(self.connection)
+            expected = repository.capture('repo')
+            return repository.apply('repo', PinnedCatalog(revision, snapshot,
+                requirement_deletions=proofs), expected, revision_is_current=lambda: True)
+
+        first_proof = {'text': '# First Requirement\n', 'revision': '1' * 40,
+            'deletion_revision': first_revision, 'row': dict(first_row), 'affected': ['G-047']}
+        first_path = 'docs/plans/[G-047] Runtime.md'
+        apply(first_revision,
+            [CatalogIssue('G-047', first_path, 'missing-source', 'source is absent', first_source)],
+            [('G-047', first_path, 'hash-047')], {first_source: first_proof})
+        first_hold = self.json.loads(self.connection.execute(
+            "SELECT evidence FROM execplan_catalog_holds WHERE repo='repo' AND plan_id='G-047'").fetchone()[0])
+        first_hold['deleted_sources'][first_source]['resolved'] = {'G-047': 'published-repair'}
+        self.connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE repo='repo' AND plan_id='G-047'",
+            (self.json.dumps(first_hold),))
+
+        self.connection.execute('''INSERT INTO exec_plans
+            (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha)
+            VALUES ('repo', 'G-048', 'docs/plans/[G-048] Related.md', 'Related', ?, '[]',
+                    'normal', 'hash-048', 'READY', ?)''',
+            (self.json.dumps([second_source]), '2' * 40))
+        self.connection.commit()
+        second_row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-048'").fetchone()
+        second_path = 'docs/plans/[G-048] Related.md'
+        current_first_proof = dict(first_proof, deletion_revision=second_revision)
+        second_proof = {'text': '# Second Requirement\n', 'revision': '2' * 40,
+            'deletion_revision': second_revision, 'row': dict(second_row), 'affected': ['G-048']}
+        apply(second_revision,
+            [CatalogIssue('G-047', first_path, 'missing-source', 'source is absent', first_source),
+             CatalogIssue('G-048', second_path, 'missing-source', 'source is absent', second_source)],
+            [('G-047', first_path, 'hash-047'), ('G-048', second_path, 'hash-048')],
+            {first_source: current_first_proof, second_source: second_proof})
+
+        held = {row['plan_id']: self.json.loads(row['evidence']) for row in self.connection.execute(
+            "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo='repo'")}
+        goals = [self.json.loads(raw) for raw in self.recovery.recovery_goals(self.connection, 'repo')]
+        for plan_id in ('G-047', 'G-048'):
+            proofs = held[plan_id]['deleted_sources']
+            self.assertEqual(proofs[first_source]['deletion_revision'], first_revision)
+            self.assertEqual(proofs[first_source]['resolved'], {'G-047': 'published-repair'})
+            self.assertEqual(proofs[second_source]['deletion_revision'], second_revision)
+        goals_by_source = {goal['path']: goal for goal in goals if goal.get('kind') == 'missing-source'}
+        self.assertEqual(set(goals_by_source), {second_source})
+        self.assertEqual(goals_by_source[second_source]['deletion_revision'], second_revision)
+        self.assertEqual(goals_by_source[second_source]['affected_ids'], ['G-048'])
+
     def test_feedback_marker_does_not_authorize_requirement_withdrawal_or_release_draft(self):
         from loop_manager_internal.storage import validation_feedback_state, execplan_draft_state
         validation_feedback_state.ensure_schema(self.connection)

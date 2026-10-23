@@ -25,16 +25,16 @@ Requirement 삭제를 처음 관측하거나 다시 관측할 때 작업별 원�
 ## Implementation
 
 - [x] `requirement_deletions()`가 활성 실행 row와 취소 감사 row의 원문·원문 revision·삭제 관측 revision을 먼저 대조하고, 세 필드가 모두 같은 경우에만 영향 ID를 합치게 했다. 상충 proof는 기존 Planner 오류 경계로 거부하며 결과는 조회 순서와 무관하게 정렬한다. 동일 proof의 row 문맥도 안정적으로 선택한다.
-- [x] `_apply_execution_holds()`는 원문과 원문 revision이 같은 반복 부재에서 최초 proof·삭제 revision·row 문맥을 보존하고 최신 관측 revision은 hold에 따로 기록한다. 영향 ID가 늘면 기존 대상별 resolved 판단은 보존하고 전체 대상이 바뀐 `prepared_withdrawal`은 재사용하지 않는다. 원문 또는 원문 revision이 실제로 바뀌면 현재 CAS transaction을 롤백해 저장된 proof·receipt·resume_status를 보존한다.
+- [x] `_apply_execution_holds()`는 원문과 원문 revision이 같은 반복 부재에서 최초 proof·삭제 revision·row 문맥을 기존 hold와 새 hold 모두에 전달하고 최신 관측 revision은 hold에 따로 기록한다. 기존 hold 사이의 proof 충돌은 거부하며 공통 resolved 판단과 영향 ID를 보존한다. 영향 ID가 늘면 전체 대상이 바뀐 `prepared_withdrawal`은 재사용하지 않고, 원문 또는 원문 revision 변경은 현재 CAS transaction을 롤백해 저장된 proof·receipt·resume_status를 보존한다.
 - [x] `catalog_service`의 기존 관측→hold transaction, `recovery_goals()`의 복수 proof 충돌 검사, `requirement_recovery_decisions()`의 최신 snapshot 재확인과 `prompt_payload()`·snapshot token 전달을 대조했다. 기존 결과 형식과 오류 경계를 유지하고 Planner가 상충 proof를 선택하지 않게 했다.
-- [x] `RequirementRecoveryUnitTests`에 활성/취소 row의 동일 proof 합집합·역순 관측, 상충 proof 거부, 반복 부재의 최초 증명·판단·receipt·resume_status 보존, 영향 ID 추가, prompt/token 증명 결합 회귀를 추가했다. 기존 rename/archive와 단일 row 조회 회귀도 유지한다.
+- [x] `RequirementRecoveryUnitTests`에 활성/취소 row의 동일 proof 합집합·역순 관측, 상충 proof 거부, 반복 부재의 최초 증명·판단·receipt·resume_status 보존, 새 hold의 최초 proof·resolved 판단 전달과 `recovery_goals()` 회귀, 영향 ID 추가, prompt/token 증명 결합 회귀를 추가했다. 기존 rename/archive와 단일 row 조회 회귀도 유지한다.
 - [x] PRODUCT의 Requirement 변경·취소 절과 ARCHITECTURE의 삭제 관측·recovery snapshot 절이 proof 비병합, 최초 관측 보존, 최신 snapshot 결합을 이미 명시함을 확인했다. 현재 구현과의 차이를 이번 코드 변경으로 해소했으며 문서 추가 수정은 필요하지 않았다. Requirement·다른 ExecPlan은 수정하지 않았다.
 
 ## Validation
 
 - Worker는 새로 추가·변경한 최소 unit case만 선택해 실행한다. 실제 SQLite·증명 JSON·파일·snapshot/판단 검증을 사용하고 Git tree·원문 조회·PR 효과만 mock한다. Planner는 이번 계획 작성에서 테스트를 실행하지 않았다.
 - `RequirementRecoveryUnitTests`에 같은 source를 가진 복수 실행 row 및 실행/취소 row 조합을 둔다. 동일 proof는 모든 영향 ID를 보존하고, 다른 원문·같은 원문이지만 다른 원문 revision·다른 삭제 관측 revision은 합쳐지지 않아야 한다. row 순서를 뒤집어도 같은 보존/거부 결과이며 잘못된 철회 영수증·문서 삭제·활성 row 제거가 없어야 한다.
-- 기존 catalog 조율 fixture에서 최초 삭제 관측을 적용한 뒤 무관한 최신 원격 commit을 관측하고 같은 부재를 재확인한다. 원문·source revision·최초 삭제 revision·resume_status와 기존 판단/영수증이 유지되는지, 현재 원격 관측은 별도로 확인되는지 검사한다. 실제 원문/identity 변경에서는 stale 판단을 거부하고 이전 자료를 보존해야 한다. 이 상태 조합에 실제 Git lifecycle을 반복하지 않는다.
+- 기존 catalog 조율 fixture에서 최초 삭제 관측을 적용한 뒤 무관한 최신 원격 commit을 관측하고 같은 부재를 재확인한다. 원문·source revision·최초 삭제 revision·resume_status와 기존 판단/영수증이 유지되는지, 현재 원격 관측은 별도로 확인되는지 검사한다. 추가 회귀는 R1 삭제 proof가 든 G1 hold 뒤 R2 삭제 proof와 새 G2 hold를 적용해 R1의 최초 proof·resolved 판단이 모든 hold에 같고 `recovery_goals()`가 R2 복구 목표를 만드는지 검사한다. 실제 원문/identity 변경에서는 stale 판단을 거부하고 이전 자료를 보존해야 한다. 이 상태 조합에 실제 Git lifecycle을 반복하지 않는다.
 - 저장 직전/직후 중단·rollback 후 재개, 새 영향 작업 추가와 상충 proof 재관측을 확인한다. 유효한 동일 proof만 ID를 합치고 다른 proof·기존 사용자 판단·독립 작업은 보존해야 한다. 기존 snapshot 변경 거부·복수 source 철회·rename/archive·PR/수동 보호 회귀를 재사용하며 수행하지 않은 검증 성공을 기록하지 않는다.
 
 ## Progress
@@ -55,6 +55,17 @@ TARGETED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.
 - [x] 2026-10-22 Manager가 수용한 rebase 결과 HEAD `886ceeef321cd60b803cfcf39f34395b238318f4`의 base `d0ed33bb77ab1cabfc2c397780851c4e9f5f7e22` 대비 전체 diff를 다시 검토했다. 변경은 이 ExecPlan, 삭제 proof 집계·hold 저장 코드와 관련 recovery 및 verify 회귀 test에 한정되며 선택 선언과 source 경로는 유효하다.
 - [x] 현재 HEAD에서 proof/recovery 5개, 이전 verify 피드백의 partial/full runner와 Perl standalone/Manager 통합, coordinator fixture를 포함한 targeted test 8개를 실행해 PASS (8 tests, OK)로 확인했다. 이전 후보의 결과는 재사용하지 않았고 전체 verify는 Worker가 실행하지 않았다.
 - [x] 2026-10-22 이번 Worker 호출에서도 HEAD `886ceeef321cd60b803cfcf39f34395b238318f4`의 base 대비 전체 diff를 다시 검토하고 같은 8개 관련 case를 targeted runner로 새 실행해 PASS (8 tests, OK) 및 현재 호출의 개별 test 기록을 확인했다. 전체 verify는 실행하지 않았다.
+- [x] 2026-10-22 새 G2 hold가 추가될 때 기존 G1의 `R1@A`와 현재 입력의 `R1@B`가 서로 다른 hold에 저장되는 경로를 확인했다. 기존 hold proof를 먼저 통합해 현재 missing source를 위한 공통 proof로 모든 새 hold에 전달하고, 과거 hold 간 identity 충돌은 보류했다.
+
+- [x] 2026-10-23 Manager가 수용한 rebase 결과 HEAD `71c8d1f41413667c3d8f7feab343dfbfa51ae307`의 base `55446254671206a070427af9fd5c32428e667e27` 대비 전체 diff를 재검토했다. PRODUCT·ARCHITECTURE와 R-055/R-082의 삭제·반복 관측 계약을 현재 hold 병합과 `recovery_goals()`에 대조했으며, 변경은 선택된 ExecPlan 본문, 삭제 proof 처리, 관련 recovery 및 verify 회귀 테스트에 한정된다. `git diff --check` 통과.
+- [x] 2026-10-23 현재 후보에서 새 hold 추가·최초 proof 보존·`recovery_goals()` 회귀와 반복 부재 및 proof 충돌 검사를 targeted runner로 새 실행해 PASS (3 tests, OK)로 확인했다. 이전 후보의 테스트 결과를 재사용하지 않았고 전체 verify는 Worker가 실행하지 않았다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_new_hold_reuses_first_deletion_proof_and_recovery_goals
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_new_hold_reuses_first_deletion_proof_and_recovery_goals
+재실행 결과: PASS — 1 test, OK. 최초 실행은 새 hold 추가 뒤 `recovery_goals()`가 `deletion_revision` A/B 상충을 거부하는 회귀를 재현했고, 기존 최초 proof를 새 hold에 복사하도록 수정한 뒤 같은 명령으로 통과했다.
+
+TARGETED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_new_hold_reuses_first_deletion_proof_and_recovery_goals tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_repeated_absence_keeps_first_proof_receipt_and_resume_phase tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_repeated_source_proofs_union_affected_and_reject_stale_conflicts
+최종 결과: PASS — 3 tests, OK. 전체 verify는 실행하지 않았다.
 
 ## Decision Log
 

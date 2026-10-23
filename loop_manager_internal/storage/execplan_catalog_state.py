@@ -1044,9 +1044,42 @@ class DefinitionStateRepository:
         issues = [dict(plan_id=item.plan_id, path=item.path, code=item.code,
                        message=item.message, source=item.source)
                   for item in pinned.snapshot.issues]
+        missing_sources = {item.get("source") for item in issues if item["code"] == "missing-source"}
+        requirement_proofs = {
+            source: dict(proof) for source, proof in (pinned.requirement_deletions or {}).items()
+        }
+        prior_requirement_proofs = {}
+        for _plan_id, _revision, evidence, _phase in expected.holds:
+            for source, proof in json.loads(evidence).get("deleted_sources", {}).items():
+                previous = prior_requirement_proofs.get(source)
+                if previous is None:
+                    prior_requirement_proofs[source] = dict(proof)
+                    continue
+                if any(previous.get(field) != proof.get(field)
+                       for field in ("text", "revision", "deletion_revision")):
+                    from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+                    raise PlannerValidationError("Requirement 삭제 원문·revision 근거가 상충합니다.")
+                previous["affected"] = sorted(set(previous.get("affected", ()))
+                                               | set(proof.get("affected", ())))
+                previous["resolved"] = {
+                    key: value for key, value in previous.get("resolved", {}).items()
+                    if proof.get("resolved", {}).get(key) == value
+                }
+        for source, previous in prior_requirement_proofs.items():
+            if source not in missing_sources:
+                continue
+            observed = requirement_proofs.get(source)
+            if (observed is not None
+                    and any(previous.get(field) != observed.get(field) for field in ("text", "revision"))):
+                from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+                raise PlannerValidationError("Requirement 삭제 원문·revision 근거가 변경됐습니다.")
+            preserved = dict(previous)
+            preserved["affected"] = sorted(set(previous.get("affected", ()))
+                                            | set(observed.get("affected", ()) if observed else ()))
+            requirement_proofs[source] = preserved
         held = {key: json.dumps({"revision": pinned.revision_sha,
                     "plan_id": key, "path": path, "content_hash": content_hash,
-                    "causes": issues, "deleted_sources": dict(pinned.requirement_deletions or {})}, ensure_ascii=False, sort_keys=True)
+                    "causes": issues, "deleted_sources": requirement_proofs}, ensure_ascii=False, sort_keys=True)
                 for key, path, content_hash in pinned.snapshot.withheld}
         for key, _revision, prior, _phase in expected.holds:
             prior = json.loads(prior)
@@ -1054,7 +1087,6 @@ class DefinitionStateRepository:
                 current = json.loads(held[key])
                 if key in (pinned.rowless_hold_deletions or {}):
                     current["deleted_goal"] = dict(pinned.rowless_hold_deletions[key])
-                missing_sources = {item.get("source") for item in issues if item["code"] == "missing-source"}
                 prior_sources = prior.get("deleted_sources", {})
                 current_sources = current["deleted_sources"]
                 same_source_targets = set(prior_sources) == set(current_sources)
