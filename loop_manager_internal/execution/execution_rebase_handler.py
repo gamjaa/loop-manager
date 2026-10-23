@@ -273,7 +273,9 @@ class RebaseHandler:
         saved = json.loads(json.dumps(current.snapshot or {}))
         if saved:
             saved['rebase_operation_history'] = [
-                *saved.get('rebase_operation_history', ()), dict(current.snapshot)]
+                *saved.get('rebase_operation_history', ()),
+                {key: value for key, value in current.snapshot.items()
+                 if key != 'rebase_operation_history'}]
         if 'current_rebase_acceptance' in saved:
             saved.setdefault('current_rebase_acceptance_history', []).append(saved.pop('current_rebase_acceptance'))
         for key in ('pending', 'stage_evidence', 'worker_result', 'stash_oid', 'after_head'):
