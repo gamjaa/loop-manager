@@ -1164,6 +1164,82 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 planner_validation.validate_planner_result(effects, root, self.sha, [],
                     connection=self.connection, repo=self.repo)
 
+    def test_planner_can_publish_new_dependencies_on_held_plans_without_enabling_execution(self):
+        import tempfile
+        from loop_manager_internal.planning import planner_validation
+        self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+        broken = 'docs/plans/[G-006] Held predecessor.md'
+        self.fixture._insert('G-006', 'Held predecessor', status='READY')
+        self.connection.execute('UPDATE exec_plans SET repo = ?', (self.repo,))
+        self.connection.commit()
+        self.documents[broken] = self.fixture._text('G-006', 'Held predecessor', risk='invalid')
+        self.paths |= {broken}
+        self.boundary.refresh()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = 'docs/plans/[G-007] Dependent.md'
+            indirect = 'docs/plans/[G-008] Indirect.md'
+            documents = {**self.documents, 'docs/PRODUCT.md': 'Product.',
+                         path: self.fixture._text('G-007', 'Dependent', depends_on=('G-006',)),
+                         indirect: self.fixture._text('G-008', 'Indirect', depends_on=('G-007',))}
+            for relative, text in documents.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding='utf-8', newline='\n')
+            def git(_root, command, *args, **kwargs):
+                item = args[-1]
+                tree = f'100644 blob abc\t{item}\0' if item in self.documents else ''
+                return SimpleNamespace(returncode=0, stdout=tree if command == 'ls-tree' else '')
+
+            effects = SimpleNamespace(changed_files=lambda *args: [path, indirect],
+                mutable_snapshot_token=lambda *args: 'token',
+                git=git,
+                _parse_execplan=catalog.parse_execplan_file,
+                load_execplan_catalog=manager.load_execplan_catalog,
+                _validate_future_idea_separation=mock.Mock(),
+                file_hash=lambda target: catalog.plan_content_hash(target.read_bytes()),
+                _stored_string_list=planner_validation._stored_string_list)
+            result = planner_validation.validate_planner_result(effects, root, self.sha, [],
+                connection=self.connection, repo=self.repo)
+            self.assertEqual([plan['id'] for _, plan in result.plans], ['G-007', 'G-008'])
+            self.assertEqual(set(result.publication_paths), {path, indirect})
+            self.assertNotIn('G-007', self.held())
+            for invalid in (
+                self.fixture._text('G-008', 'Indirect', depends_on=('G-007', 'G-999')),
+                self.fixture._text('G-008', 'Indirect', depends_on=('G-007', 'G-008')),
+                documents[indirect].replace('docs/PRODUCT.md', 'docs/missing.md'),
+            ):
+                with self.subTest(invalid=invalid):
+                    (root / indirect).write_text(invalid, encoding='utf-8', newline='\n')
+                    with self.assertRaises(planner_validation.PlannerValidationError):
+                        planner_validation.validate_planner_result(effects, root, self.sha, [],
+                            connection=self.connection, repo=self.repo)
+            (root / indirect).write_text(documents[indirect], encoding='utf-8', newline='\n')
+            with mock.patch.object(manager, 'git_bytes', side_effect=lambda _root, _cmd, spec:
+                                   documents[spec.split(':', 1)[1]].encode('utf-8')):
+                manager._register_execplan_rows(self.connection, self.repo, root,
+                                               list(result.plans), 'c' * 40)
+            self.connection.commit()
+            self.assertEqual(json.loads(self.row('G-007')['depends_on']), ['G-006'])
+            self.assertEqual(json.loads(self.row('G-008')['depends_on']), ['G-007'])
+
+        self.documents.update({key: documents[key] for key in (path, indirect)})
+        self.paths |= {path, indirect}
+        self.sha = 'c' * 40
+        self.boundary.refresh()
+        self.assertTrue({'G-006', 'G-007', 'G-008'} <= self.held())
+        self.assertEqual(self.row('G-007')['status'], 'READY')
+        self.assertEqual(manager.select_ready_execplan(self.connection, self.repo)['plan_id'], 'G-001')
+        self.documents[broken] = self.fixture._text('G-006', 'Held predecessor')
+        self.sha = 'd' * 40
+        self.boundary.refresh()
+        self.assertFalse(self.held())
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id < 'G-006'")
+        self.assertEqual(manager.select_ready_execplan(self.connection, self.repo)['plan_id'], 'G-006')
+        for merged, selected in (('G-006', 'G-007'), ('G-007', 'G-008')):
+            self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id=?", (merged,))
+            self.assertEqual(manager.select_ready_execplan(self.connection, self.repo)['plan_id'], selected)
+
     def test_independent_planning_reuses_missing_manager_priority_hold_cause(self):
         import tempfile
         from loop_manager_internal.catalog import manager_sources
@@ -1382,7 +1458,8 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             self.assertNotEqual(self.row('G-002')['content_hash'], catalog.plan_content_hash(
                 (root / self.row('G-002')['path']).read_bytes()))
             path = 'docs/plans/[G-007] Refactor.md'
-            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8', newline='\n')
+            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor').replace(
+                'depends_on: []', 'depends_on:\n  - G-002'), encoding='utf-8', newline='\n')
             ready = context.eligible_plans[0]
             (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8', newline='\n')
             def git(_root, command, *args, **kwargs):
@@ -1397,21 +1474,22 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                     self.connection, context, root, [ready.path, path])
                 self.assertEqual([plan['id'] for _, plan in result.plans], ['G-007'])
                 self.assertEqual([revision.snapshot.plan_id for revision in result.revisions], ['G-001'])
-                for mutation in ('held-body', 'held-dependency', 'new-priority'):
+                for mutation in ('held-body', 'unregistered-dependency', 'new-priority'):
                     with self.subTest(mutation=mutation):
                         (root / broken).write_text(self.documents[broken], encoding='utf-8', newline='\n')
                         text = fixtures.plan_text('G-007', 'Refactor')
                         if mutation == 'held-body':
                             (root / broken).write_text(self.documents[broken] + '\nChanged.\n', encoding='utf-8', newline='\n')
-                        elif mutation == 'held-dependency':
-                            text = text.replace('depends_on: []', 'depends_on:\n  - G-002')
+                        elif mutation == 'unregistered-dependency':
+                            text = text.replace('depends_on: []', 'depends_on:\n  - G-006')
                         else:
                             text = text.replace('priority: normal\n', '')
                         (root / path).write_text(text, encoding='utf-8', newline='\n')
                         with self.assertRaises(manager.PlannerValidationError):
                             manager.validate_maintenance_planner_result(
                                 self.connection, context, root, [ready.path, path])
-                (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8', newline='\n')
+                (root / path).write_text(fixtures.plan_text('G-007', 'Refactor').replace(
+                'depends_on: []', 'depends_on:\n  - G-002'), encoding='utf-8', newline='\n')
                 (root / broken).write_text(self.documents[broken], encoding='utf-8', newline='\n')
                 self.connection.execute("INSERT INTO execplan_catalog_holds "
                     "SELECT repo, 'G-001', revision_sha, evidence, NULL FROM execplan_catalog_holds LIMIT 1")
@@ -1459,7 +1537,8 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             ports.enter_context(mock.patch.object(manager, '_ready_plan_snapshot_at_revision', side_effect=snapshot_at))
             context = manager.prepare_maintenance_planning_context(self.connection, self.repo, root, self.sha)
             path = 'docs/plans/[G-007] Refactor.md'
-            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8', newline='\n')
+            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor').replace(
+                'depends_on: []', 'depends_on:\n  - G-002'), encoding='utf-8', newline='\n')
             ready = context.eligible_plans[0]
             (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8', newline='\n')
             batch = SimpleNamespace(root=root, context=context, commit='e' * 40, remote=self.sha,

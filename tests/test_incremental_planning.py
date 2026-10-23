@@ -711,8 +711,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertEqual([item.snapshot.plan_id for item in result.revisions], ["G-002"])
         target.write_text(revised_text.replace(
             "  - G-004\n", "  - G-004\n  - G-005\n"), encoding="utf-8", newline="\n")
-        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "보류 계획에 의존"):
-            validate()
+        self.assertEqual([item.snapshot.plan_id for item in validate().revisions], ["G-002"])
         target.write_text(revised_text, encoding="utf-8", newline="\n")
 
         archived_bytes = (self.repo / archive_path).read_bytes()

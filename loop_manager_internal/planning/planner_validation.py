@@ -1159,10 +1159,10 @@ def validate_planner_result(
                         )
                     except RuntimeError as error:
                         raise PlannerValidationError(str(error)) from error
+        planned_ids = frozenset(str(plan["id"]) for plan in current_plans.values())
         if held_ids:
-            project_catalog_refresh.assert_planning_dependencies_unheld(
+            project_catalog_refresh.assert_planning_dependency_references(
                 {}, current_plans.items(), held_ids,
-                recovery_target_ids=frozenset(recovery_ids),
                 original_dependencies=original_dependencies,
             )
 
@@ -1171,18 +1171,18 @@ def validate_planner_result(
                 connection, repo, worktree, active_sha, git=effects.git,
                 load_snapshot=execplan_catalog.load_execplan_snapshot,
                 mutable_paths=frozenset(plan.path for plan in snapshot.plans if plan.plan_id in recovery_ids),
-                recovery_mode=bool(snapshot.recovery_goals))
+                recovery_mode=bool(snapshot.recovery_goals), planned_ids=planned_ids)
             catalog = local.active_metadata()
         else:
             catalog = effects.load_execplan_catalog(worktree)
+        catalog.update({str(plan["id"]): plan for plan in current_plans.values()})
         if connection is not None and repo is not None:
             from loop_manager_internal.storage import execplan_draft_state
             execplan_draft_state.validate_questions(connection, repo, catalog)
         else:
             execplan_drafts.validate_questions(catalog)
-        project_catalog_refresh.assert_planning_dependencies_unheld(
+        project_catalog_refresh.assert_planning_dependency_references(
             catalog, current_plans.items(), held_ids,
-            recovery_target_ids=frozenset(recovery_ids),
             original_dependencies=original_dependencies)
         remote_deletions.validate_recovery(worktree, snapshot, current_plans, catalog, connection=connection, repo=repo)
 
