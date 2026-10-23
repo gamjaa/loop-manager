@@ -45,6 +45,7 @@ priority: high
 - [x] 승인 전용 Planner trigger와 결과 제한을 제거하고, 승인 snapshot·현재 선언·소유권·실행 상태가 단일 기존 작업으로 확인될 때만 같은 Worker에 전달했다. 무연결·모호·stale·수동 소유·PR 경합은 승인 artifact와 독립 작업을 보존하며, legacy 문서 계획 복구는 유지한다.
 - [x] 현재 rebase 수용 후보에서 승인 연결·보류·bytes/CRLF·legacy 게시·Planner 선택·Requirement overview와 소유 rebase 재검사·planning drain 중 base-fetch를 검증하는 targeted unit test 23개가 통과했다. 전체 suite와 `scripts/verify`는 실행하지 않았다.
 - [x] 일반 Worker 전달 전 Requirement 대상 승인본을 권한 불일치로 보류하고 bind·bytes 적용을 막는다. 구현 이후 bytes가 없거나 변형된 mapped artifact는 계속 guard하며, 문서 의미·diff PASS와 코드 Review FAIL은 일반 실패·Worker 교정 흐름으로 분기한다. 이 경계의 신규 회귀와 기존 문서 전달·Review 회귀 targeted unit test 6개가 통과했다.
+- [x] 구현 이후 단계에서 재검증 실패와 승인 bytes 불일치가 함께 발생해도 mapped artifact를 반환해 document guard의 명시 거부로 이어지도록 보완했다. 재시작 stale-source·변경 bytes 조합의 targeted unit test 1개가 통과했다.
 - [x] rebase 재개는 identity 불일치 때 최신 service로 전체 소유권 검사를 한 번 재실행하고 재실패를 거부한다. planning drain 동안 base-fetch 자원 대기·획득은 허용하고 task/handoff gate는 유지한다.
 
 ## Decision Log

@@ -133,7 +133,7 @@ class DocumentsHandler:
                 )
             except document_drafts.DocumentDraftError as error:
                 self._hold(drafts, draft, f'승인 수정본 미적용: {error}')
-                if applied:
+                if phase != 'IMPLEMENTING' or applied:
                     return draft
                 return None
             if phase != 'IMPLEMENTING' and not applied:

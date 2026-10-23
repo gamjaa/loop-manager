@@ -525,6 +525,43 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
         )
 
 
+    def test_later_phase_revalidation_failure_with_changed_bytes_keeps_guard_active(self):
+        draft = self.approved_draft(
+            (('G-047', ('docs/PRODUCT.md',)),), plan_id='G-047',
+        )
+        self.effects.agent.is_loop_manager_repository.return_value = True
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            target = worktree / draft.target_path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b'# Product\r\nChanged after approval.\r\n')
+            context = replace(
+                self.context(), worktree=worktree, phase=ExecutionPhase.VERIFYING,
+            )
+            stale = handlers.document_drafts.DocumentDraftError(
+                'approved source changed during revalidation',
+            )
+            with (
+                mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                                  'assert_current', side_effect=stale) as assert_current,
+                mock.patch.object(handlers.document_publication, 'read_plan_text',
+                                  return_value='ordinary existing ExecPlan'),
+            ):
+                observed = self.handler._document_draft(context)
+                self.assertEqual(observed.draft_id, draft.draft_id)
+                with self.assertRaisesRegex(
+                    handlers.document_drafts.DocumentDraftError,
+                    'approved source changed during revalidation',
+                ):
+                    self.handler._document_guard(context, observed)
+            self.assertEqual(assert_current.call_count, 2)
+        self.assertIn(
+            'approved source changed during revalidation',
+            handlers.document_drafts.DocumentDraftRepository(self.connection)
+            .get(draft.draft_id).publication_error,
+        )
+
+
     def test_document_review_requires_explicit_meaning_and_diff_verdicts(self):
         draft = SimpleNamespace(draft_id="a" * 32, target_path="docs/PRODUCT.md")
         self.effects.agent.reviewer_prompt.return_value = 'review prompt'
