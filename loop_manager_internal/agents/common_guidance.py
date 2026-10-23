@@ -1,4 +1,4 @@
-"""Freeze runtime common/role sources and compose provider instructions outside Git."""
+"""Compose current runtime instructions without retaining task snapshots."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -6,10 +6,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import sqlite3
 import stat
-import subprocess
 import tempfile
 
 from loop_manager_internal.agents.agent_invocation import InvocationContext
@@ -30,7 +28,7 @@ RUNTIME_ROOT = Path(__file__).resolve().parents[2]
 
 
 class GuidanceError(RuntimeError):
-    """A common version cannot safely be delivered; never a session fallback."""
+    """Current runtime instructions cannot safely be delivered; never a session fallback."""
 
 
 @dataclass(frozen=True)
@@ -38,8 +36,7 @@ class CommonGuidance:
     task_id: str
     content: str
     content_hash: str
-    source_revision: str
-    snapshot_path: Path
+    instruction_path: Path
 
 
 def _read(path: Path) -> bytes:
@@ -72,18 +69,18 @@ def validate_state_root(context: InvocationContext, worktree: Path, state_dir: P
         raise GuidanceError("공통 지침 state 경로가 프로젝트 또는 runtime 안에 있습니다.")
 
 
-def _check_snapshot_directory(directory: Path) -> None:
+def _check_instruction_directory(directory: Path) -> None:
     try:
         status = directory.lstat()
         if (not stat.S_ISDIR(status.st_mode) or directory.resolve() != directory
                 or (os.name != 'nt' and (status.st_uid != os.getuid() or status.st_mode & 0o022))):
-            raise GuidanceError('공통 지침 snapshot 디렉터리의 소유권·쓰기 경계가 다릅니다.')
+            raise GuidanceError('공통 지침 실행용 디렉터리의 소유권·쓰기 경계가 다릅니다.')
     except OSError as error:
-        raise GuidanceError('공통 지침 snapshot 디렉터리를 확인할 수 없습니다.') from error
+        raise GuidanceError('공통 지침 실행용 디렉터리를 확인할 수 없습니다.') from error
 
 
 def task_identity(context: InvocationContext, role: str, worktree: Path) -> str:
-    # A plan keeps its version across revised definitions, profiles and roles.
+    # Keep session ownership stable across runtime and instruction changes.
     # Independent work uses the existing persisted workspace/input identity.
     value = [context.repo, "plan", context.plan_id] if context.plan_id else [
         context.repo, "independent", context.task_id or str(worktree.resolve()),
@@ -113,7 +110,7 @@ def independent_context(connection: sqlite3.Connection, context: InvocationConte
     return replace(context, task_id='planning:' + str(row[2])) if row[2] else context
 
 
-def _store_snapshot(directory: Path, contents: bytes, suffix: str) -> Path:
+def _store_instructions(directory: Path, contents: bytes, suffix: str) -> Path:
     snapshot = directory / (hashlib.sha256(contents).hexdigest() + suffix)
     # Publish complete bytes atomically; concurrent tasks may share this hash.
     if not snapshot.exists():
@@ -132,99 +129,37 @@ def _store_snapshot(directory: Path, contents: bytes, suffix: str) -> Path:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
     if _read(snapshot) != contents:
-        raise GuidanceError("공통 지침 snapshot이 기존 내용과 다릅니다.")
+        raise GuidanceError("공통 지침 실행용 파일이 기존 내용과 다릅니다.")
     return snapshot
-
-
-def _bundle_files(contents: bytes) -> dict[str, str]:
-    try:
-        bundle = json.loads(contents)
-        if (not isinstance(bundle, dict) or set(bundle) != {"version", "files"}
-                or type(bundle["version"]) is not int or bundle["version"] not in {1, 2}
-                or not isinstance(bundle["files"], dict)
-                or set(bundle["files"]) != set(
-                    LEGACY_GUIDANCE_PATHS if bundle['version'] == 1 else GUIDANCE_PATHS)
-                or any(not isinstance(value, str) or not value.strip() or "\0" in value
-                       for value in bundle["files"].values())):
-            raise ValueError("invalid instruction bundle")
-        for value in bundle["files"].values():
-            value.encode("utf-8")
-        return bundle["files"]
-    except (ValueError, UnicodeError, RecursionError) as error:
-        raise GuidanceError("공통·역할별 지침 snapshot 형식이 유효하지 않습니다.") from error
-
-
-def load_saved(task_id: str, row, state_dir: Path, role: str) -> CommonGuidance:
-    if role not in ROLE_PATHS:
-        raise GuidanceError(f"지원하지 않는 Agent 지침 역할입니다: {role}")
-    content_hash, revision, reference = row
-    if not re.fullmatch(r"[0-9a-f]{64}", str(content_hash)) or not re.fullmatch(
-        r"[0-9a-f]{40}|[0-9a-f]{64}", str(revision),
-    ):
-        raise GuidanceError("저장된 공통 지침 hash/revision이 유효하지 않습니다.")
-    path = Path(reference)
-    # Old Markdown snapshots remain authoritative for their existing tasks.
-    suffix = ".json" if path.suffix == ".json" else ".md"
-    expected = state_dir.resolve() / "agent-guidance" / (content_hash + suffix)
-    if path != expected or path.resolve() != expected:
-        raise GuidanceError("저장된 공통 지침 snapshot 경로가 Manager 경계와 다릅니다.")
-    _check_snapshot_directory(expected.parent)
-    contents = _read(path)
-    if hashlib.sha256(contents).hexdigest() != content_hash:
-        raise GuidanceError("저장된 공통 지침 snapshot의 내용 hash가 다릅니다.")
-    if suffix == ".json":
-        files = _bundle_files(contents)
-        contents = (files[COMMON_PATH].rstrip("\n") + "\n\n" + files[ROLE_PATHS[role]]).encode("utf-8")
-        if role == 'worker' and PONYTAIL_PATH in files:
-            contents = contents.rstrip(b'\n') + b'\n\n' + files[PONYTAIL_PATH].encode('utf-8')
-        path = _store_snapshot(expected.parent, contents, ".md")
-        content_hash = hashlib.sha256(contents).hexdigest()
-    return CommonGuidance(task_id, contents.decode("utf-8"), content_hash, revision, path)
 
 
 def resolve(repository: GuidanceRepository, context: InvocationContext,
             role: str, worktree: Path, state_dir: Path) -> CommonGuidance:
-    identity = task_identity(context, role, worktree)
+    validate_state_root(context, worktree, state_dir)
+    if role not in ROLE_PATHS:
+        raise GuidanceError(f"지원하지 않는 Agent 지침 역할입니다: {role}")
+    files = json.loads(_runtime_bundle())["files"]
+    contents = (files[COMMON_PATH].rstrip("\n") + "\n\n" + files[ROLE_PATHS[role]]).encode("utf-8")
+    if role == 'worker':
+        contents = contents.rstrip(b'\n') + b'\n\n' + files[PONYTAIL_PATH].encode('utf-8')
+    directory = state_dir.resolve() / "agent-instructions"
     try:
-        validate_state_root(context, worktree, state_dir)
-        saved = repository.get(identity)
-        if saved is not None:
-            return load_saved(identity, saved, state_dir, role)
-        if role not in ROLE_PATHS:
-            raise GuidanceError(f"지원하지 않는 Agent 지침 역할입니다: {role}")
-        contents = _runtime_bundle()
-        result = subprocess.run(
-            ["git", "-C", str(RUNTIME_ROOT), "rev-parse", "HEAD"],
-            capture_output=True, text=True, encoding="utf-8", timeout=15, check=False,
-        )
-        revision = result.stdout.strip()
-        if result.returncode or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
-            raise GuidanceError("공통 지침 runtime revision을 확인할 수 없습니다.")
-        content_hash = hashlib.sha256(contents).hexdigest()
-        directory = state_dir.resolve() / "agent-guidance"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _check_snapshot_directory(directory)
-        snapshot = _store_snapshot(directory, contents, ".json")
-        repository.save(identity, context.repo, content_hash, revision, str(snapshot))
-        return load_saved(identity, repository.get(identity), state_dir, role)
-    except sqlite3.Error as error:
-        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
-        if isinstance(error, DatabaseWaitTimeout):
-            raise
-        raise GuidanceError("공통 지침 버전 보존 실패") from error
-    except (OSError, subprocess.SubprocessError) as error:
-        raise GuidanceError("공통 지침 버전 보존 실패") from error
+        _check_instruction_directory(directory)
+        path = _store_instructions(directory, contents, ".md")
+    except OSError as error:
+        raise GuidanceError("공통 지침 실행용 파일 생성 실패") from error
+    return CommonGuidance(task_identity(context, role, worktree), contents.decode("utf-8"),
+                          hashlib.sha256(contents).hexdigest(), path)
 
 
 def plan_content_hash(connection: sqlite3.Connection, repo: str, plan_id: str) -> str:
-    """Use the ongoing plan's saved version, including at result reuse gates."""
-    identity = task_identity(InvocationContext(repo, plan_id), "worker", Path(repo))
-    row = GuidanceRepository(connection).get(identity)
-    return str(row[0]) if row else runtime_content_hash()
+    """Candidate reuse must compare against the current runtime instructions."""
+    return runtime_content_hash()
 
 
 def worker_content_hash(connection: sqlite3.Connection, repo: str, plan_id: str) -> str:
-    """Actual delivery affects candidate reuse, not the pinned source contract."""
+    """Actual delivery affects candidate reuse, independently of the current runtime source."""
     identity = task_identity(InvocationContext(repo, plan_id), 'worker', Path(repo))
     if connection.execute("SELECT 1 FROM sqlite_master WHERE name='agent_invocations'").fetchone():
         worker = connection.execute(
@@ -237,30 +172,10 @@ def worker_content_hash(connection: sqlite3.Connection, repo: str, plan_id: str)
     return ''
 
 
-def planning_content_hash(connection: sqlite3.Connection, repo: str) -> str | None:
-    """An owned ongoing planning workspace retains its input version."""
-    columns = {row[1] for row in connection.execute('PRAGMA table_info(projects)')}
-    if not {'phase', 'worktree'} <= columns:
-        return None
-    row = connection.execute('SELECT phase, worktree FROM projects WHERE repo = ?', (repo,)).fetchone()
-    if row is None or row[0] != 'PLANNING' or not row[1]:
-        return None
-    repository = GuidanceRepository(connection)
-    if 'planner_session_id' in columns:
-        session = connection.execute('SELECT planner_session_id FROM projects WHERE repo = ?', (repo,)).fetchone()[0]
-        if session:
-            bound = connection.execute(
-                'SELECT DISTINCT v.content_hash FROM common_guidance_sessions s '
-                'JOIN common_guidance_versions v USING (task_id) WHERE s.repo = ? AND s.session_id = ?',
-                (repo, session),
-            ).fetchall()
-            if len(bound) == 1:
-                return str(bound[0][0])
-    context = independent_context(connection, InvocationContext(repo, None), Path(row[1]))
-    identity = task_identity(context, 'planner', Path(row[1]))
-    saved = repository.get(identity)
-    return str(saved[0]) if saved else None
+def planning_content_hash(connection: sqlite3.Connection, repo: str) -> str:
+    """Planning, including resumed work, uses the current runtime instructions."""
+    return runtime_content_hash()
 
 
 def effective_planning_hash(connection: sqlite3.Connection, repo: str) -> str:
-    return planning_content_hash(connection, repo) or runtime_content_hash()
+    return planning_content_hash(connection, repo)

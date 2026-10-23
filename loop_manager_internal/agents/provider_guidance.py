@@ -27,10 +27,10 @@ def _probe(arguments: list[str], **context) -> str:
 
 
 def _validate(guidance: CommonGuidance) -> None:
-    contents = _read(guidance.snapshot_path)
+    contents = _read(guidance.instruction_path)
     if (contents.decode("utf-8") != guidance.content
             or hashlib.sha256(contents).hexdigest() != guidance.content_hash):
-        raise GuidanceError("Provider 실행 전 공통 지침 snapshot이 변경됐습니다.")
+        raise GuidanceError("Provider 실행 전 공통 지침 실행용 파일이 변경됐습니다.")
 
 
 def _developer_texts(arguments: list[str], worktree: Path,
@@ -114,5 +114,5 @@ def claude_arguments(guidance: CommonGuidance, *, environment: dict[str, str] | 
         "--append-system-prompt-file", "--system-prompt-snapshot",
     )):
         raise GuidanceError("Claude CLI의 추가 지침 파일·system prompt snapshot 기능이 없습니다.")
-    return ["--append-system-prompt-file", str(guidance.snapshot_path),
+    return ["--append-system-prompt-file", str(guidance.instruction_path),
             "--system-prompt-snapshot", "on"]

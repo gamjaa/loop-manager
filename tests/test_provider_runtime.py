@@ -932,7 +932,7 @@ class CommonGuidanceProviderTests(unittest.TestCase):
         snapshot.write_text(self.text, encoding='utf-8', newline='\n')
         import hashlib
         self.guidance = common_guidance.CommonGuidance('task', self.text,
-            hashlib.sha256(self.text.encode()).hexdigest(), 'b' * 40, snapshot)
+            hashlib.sha256(self.text.encode()).hexdigest(), snapshot)
         self.existing = 'cloud/profile/project 추가 지침'
         self.defaults = '기본 developer 지침과 sandbox 정책'
 
@@ -968,7 +968,7 @@ class CommonGuidanceProviderTests(unittest.TestCase):
             self.assertIn('selected-model', call.args[0])
             self.assertNotIn('--strict-config', call.args[0])
             self.assertEqual(call.kwargs['env'], {'CODEX_HOME': 'runtime-home'})
-        self.assertEqual(self.guidance.snapshot_path.read_text(), self.text)
+        self.assertEqual(self.guidance.instruction_path.read_text(), self.text)
 
     def test_capability_and_native_probes_filter_manager_secrets_and_keep_launch_environment(self):
         def run(arguments, **context):
@@ -1066,7 +1066,7 @@ class CommonGuidanceProviderTests(unittest.TestCase):
                         self.assertIn('--sandbox', args)
                         self.assertIn('approvals_reviewer="auto_review"', args)
                     else:
-                        self.assertEqual(args[args.index('--append-system-prompt-file') + 1], str(self.guidance.snapshot_path))
+                        self.assertEqual(args[args.index('--append-system-prompt-file') + 1], str(self.guidance.instruction_path))
                         self.assertEqual(args[args.index('--system-prompt-snapshot') + 1], 'on')
                         self.assertIn('--permission-mode', args)
                     self.assertNotIn(self.text, call.kwargs.get('input', ''))
@@ -1089,7 +1089,7 @@ class CommonGuidanceProviderTests(unittest.TestCase):
                     )
             effects._handoff_run.assert_not_called()
             effects._handoff_popen.assert_not_called()
-        self.guidance.snapshot_path.write_text('changed', encoding='utf-8')
+        self.guidance.instruction_path.write_text('changed', encoding='utf-8')
         with self.assertRaises(self.provider_guidance.GuidanceError):
             self.provider_guidance.claude_arguments(self.guidance)
 

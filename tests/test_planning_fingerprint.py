@@ -468,7 +468,7 @@ class CommonGuidanceFingerprintTest(unittest.TestCase):
         git.nonplan_fingerprint.assert_not_called()
         git.requirement_archive_only.assert_not_called()
 
-    def test_owned_planning_workspace_keeps_version_across_runtime_and_remote_changes(self):
+    def test_owned_planning_workspace_uses_current_runtime_across_remote_changes(self):
         from loop_manager_internal.agents import common_guidance
         from loop_manager_internal.agents.agent_invocation import InvocationContext
         from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
@@ -481,8 +481,8 @@ class CommonGuidanceFingerprintTest(unittest.TestCase):
         repository.save(common_guidance.task_identity(context, 'planner', Path('/worktree')),
                         'repo', 'a' * 64, 'b' * 40, '/snapshot')
         with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='c' * 64):
-            self.assertEqual(common_guidance.planning_content_hash(connection, 'repo'), 'a' * 64)
+            self.assertEqual(common_guidance.planning_content_hash(connection, 'repo'), 'c' * 64)
             connection.execute("UPDATE projects SET worktree = '/rebased-worktree'")
-            self.assertEqual(common_guidance.planning_content_hash(connection, 'repo'), 'a' * 64)
+            self.assertEqual(common_guidance.planning_content_hash(connection, 'repo'), 'c' * 64)
             connection.execute("UPDATE projects SET phase = NULL")
-            self.assertIsNone(common_guidance.planning_content_hash(connection, 'repo'))
+            self.assertEqual(common_guidance.planning_content_hash(connection, 'repo'), 'c' * 64)
