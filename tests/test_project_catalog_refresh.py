@@ -48,8 +48,8 @@ class _CatalogRefreshCase(unittest.TestCase):
         result = state.CatalogReconciliationService(
             state.DefinitionStateRepository(self.connection), fixtures.FakeDefinitionPort(pinned)
         ).reconcile(self.repo)
-        if result.kind is state.ReconciliationKind.RECONCILED:
-            remember(pinned)
+        if result.usable:
+            remember(result.catalog or pinned)
         return result
 
     def row(self, plan='G-001'):
@@ -203,6 +203,8 @@ class CatalogCacheAndCasTests(_CatalogRefreshCase):
             return replace(pinned, snapshot=replace(pinned.snapshot, isolation_enabled=True))
         self.pinned = isolated
         self.boundary.refresh()
+        self.assertEqual(self.boundary.pinned.revision_sha, self.sha)
+        self.assertNotIn(path, self.boundary.pinned.regular_paths)
         before = dict(self.row())
         self.boundary.refresh()
         self.assertEqual(self.loads, [previous_sha, self.sha, self.sha])
