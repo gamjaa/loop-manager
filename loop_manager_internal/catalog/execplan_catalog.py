@@ -530,8 +530,18 @@ def dependency_cycle_paths(
         stack.pop()
         visited.add(plan_id)
 
-    for plan_id in dependencies:
-        visit(plan_id)
+    if relevant_ids is None:
+        for plan_id in dependencies:
+            visit(plan_id)
+    else:
+        # A shared visited set can hide a second cycle through a changed node
+        # when it overlaps an unrelated cycle found from an earlier root.
+        for plan_id in dependencies:
+            if plan_id not in relevant_ids:
+                continue
+            visited.clear()
+            stack.clear()
+            visit(plan_id)
     return tuple(cycles)
 
 

@@ -1349,6 +1349,23 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             {'G-010', 'G-011'}, original_dependencies=original,
         )
 
+        with self.assertRaisesRegex(
+            catalog.ExecPlanCatalogError,
+            'G-004 -> G-003 -> G-002 -> G-004',
+        ):
+            refresh.assert_planning_dependency_references(
+                {},
+                [
+                    ('changed.md', {'id': 'G-001', 'depends_on': ['G-002']}),
+                    ('also-changed.md', {'id': 'G-004', 'depends_on': ['G-003']}),
+                ],
+                {'G-002', 'G-003'},
+                original_dependencies={
+                    'G-002': ('G-003', 'G-004'),
+                    'G-003': ('G-002',),
+                },
+            )
+
     def test_independent_planning_reuses_missing_manager_priority_hold_cause(self):
         import tempfile
         from loop_manager_internal.catalog import manager_sources
