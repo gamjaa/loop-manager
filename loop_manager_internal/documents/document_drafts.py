@@ -181,6 +181,70 @@ def checked_source_relationships(
     )
 
 
+def _source_relationship_exclusion(draft) -> str | None:
+    """Exclude legacy plans created after approval, but retain linked plans."""
+    plan_id = draft.plan_id
+    if plan_id is None:
+        return None
+    try:
+        relationships = json.loads(draft.source_relationships)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise DocumentDraftError("승인 당시 source 관계가 손상됐습니다.") from error
+    if (not isinstance(relationships, list)
+            or any(not isinstance(item, list) or len(item) != 2
+                   or not isinstance(item[0], str) or not isinstance(item[1], list)
+                   or any(not isinstance(source, str) for source in item[1])
+                   for item in relationships)):
+        raise DocumentDraftError("승인 당시 source 관계가 유효하지 않습니다.")
+    return None if any(item[0] == plan_id for item in relationships) else plan_id
+
+
+def _approval_handoff_error(connection: sqlite3.Connection, repo: str, source_relationships: str) -> str | None:
+    """Explain why an approval cannot be handed to one current automatic task."""
+    try:
+        relationships = json.loads(source_relationships)
+    except (TypeError, json.JSONDecodeError):
+        return "승인 당시 source 관계를 확인할 수 없어 기존 작업에 전달하지 않았습니다."
+    if (not isinstance(relationships, list)
+            or any(not isinstance(item, list) or len(item) != 2
+                   or not isinstance(item[0], str) or not isinstance(item[1], list)
+                   or any(not isinstance(source, str) for source in item[1])
+                   for item in relationships)):
+        return "승인 당시 source 관계가 유효하지 않아 기존 작업에 전달하지 않았습니다."
+    if not relationships:
+        return "승인 당시 연결된 기존 ExecPlan이 없어 수정본을 보존하고 전달하지 않습니다."
+    if len(relationships) != 1:
+        return "승인 당시 연결된 기존 ExecPlan이 여러 개라 대상을 정하지 않고 수정본을 보존합니다."
+    plan_id, sources = relationships[0]
+    plan = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+    ).fetchone()
+    if plan is None:
+        return "승인 당시 연결된 기존 ExecPlan이 사라져 수정본을 보존합니다."
+    try:
+        current_sources = json.loads(plan["sources"])
+    except (TypeError, json.JSONDecodeError):
+        return "연결된 기존 ExecPlan의 현재 source를 확인할 수 없어 수정본을 보존합니다."
+    if (not isinstance(current_sources, list)
+            or tuple(sorted(current_sources)) != tuple(sorted(sources))):
+        return "연결된 기존 ExecPlan의 source가 승인 snapshot과 달라 수정본을 보존합니다."
+    from loop_manager_internal.storage import runtime_state, work_claims
+    try:
+        _ownership, manually_owned = work_claims.manual_plan_ownership(
+            connection, repo, plan_id, plan,
+        )
+    except RuntimeError:
+        return "연결된 기존 ExecPlan의 수동 소유권을 확인할 수 없어 수정본을 보존합니다."
+    if manually_owned:
+        return "연결된 기존 ExecPlan이 수동 소유 상태라 자동 Worker에 전달하지 않습니다."
+    if (plan["pr_url"] or plan["pr_head_oid"] or plan["pr_conflict_recovery"]
+            or plan["status"] == "PR_OPEN"):
+        return "연결된 기존 ExecPlan에 PR이 있어 범위를 확장하지 않고 수정본을 보존합니다."
+    if plan["status"] != "READY" and plan["status"] not in runtime_state.ACTIVE_STATUSES:
+        return "연결된 기존 ExecPlan이 자동 Worker 실행 대상이 아니어서 수정본을 보존합니다."
+    return None
+
+
 def _complete_diff(path: str, original: bytes, proposed: bytes) -> str:
     lines = difflib.unified_diff(
         original.decode("utf-8").splitlines(keepends=True),
@@ -372,6 +436,12 @@ class DocumentDraftRepository:
             (reason, draft_id),
         )
 
+    def clear_publication_error(self, draft_id: str) -> None:
+        self.connection.execute(
+            "UPDATE document_drafts SET publication_error = NULL WHERE draft_id = ?",
+            (draft_id,),
+        )
+
     def assert_current(
         self, draft: DocumentDraft, repository: Path, base_branch: str,
     ) -> str:
@@ -382,7 +452,7 @@ class DocumentDraftRepository:
         )
         relationships = checked_source_relationships(
             self.connection, draft.repo, repository, revision, draft.target_path,
-            exclude_plan_id=draft.plan_id,
+            exclude_plan_id=_source_relationship_exclusion(draft),
         )
         if (draft.state != "approved"
             or original_revision != draft.original_revision
@@ -504,6 +574,7 @@ class DocumentDraftRepository:
             raise DocumentDraftError("이미 결정되거나 새 검토가 필요한 수정본입니다.")
         ownership_clear(self.connection, draft.repo)
         reason = None
+        publication_error = None
         if decision == "approve":
             if uncertain_reason:
                 decision = "stale"
@@ -525,16 +596,20 @@ class DocumentDraftRepository:
                     or relationships != draft.source_relationships):
                     decision = "stale"
                     reason = "원본 revision·내용 또는 비종료 ExecPlan source 관계가 변경됐습니다."
+                else:
+                    publication_error = _approval_handoff_error(
+                        self.connection, draft.repo, relationships,
+                    )
         elif uncertain_reason:
             raise DocumentDraftError("의미 보존 불확실 사유는 승인 요청에만 사용합니다.")
         token = uuid4().hex
         changed = self.connection.execute(
             "UPDATE document_drafts SET state = ?, requested_decision = ?, decision_revision = ?, "
-            "decision_reason = ?, decided_at = CURRENT_TIMESTAMP "
+            "decision_reason = ?, publication_error = ?, decided_at = CURRENT_TIMESTAMP "
             "WHERE draft_id = ? AND state = 'pending'",
             ("approved" if decision == "approve" else "rejected" if decision == "reject" else "stale",
              "approve" if decision in {"approve", "stale"} else "reject",
-             token, reason, draft_id),
+             token, reason, publication_error, draft_id),
         )
         stored = self.get(draft_id)
         if changed.rowcount != 1:
@@ -557,7 +632,7 @@ class DocumentDraftRepository:
                 current_revision, content = document_at(repository, revision, draft.target_path)
                 relationships = checked_source_relationships(
                     self.connection, repo, repository, revision, draft.target_path,
-                    exclude_plan_id=draft.plan_id,
+                    exclude_plan_id=_source_relationship_exclusion(draft),
                 )
             except DocumentDraftError:
                 continue

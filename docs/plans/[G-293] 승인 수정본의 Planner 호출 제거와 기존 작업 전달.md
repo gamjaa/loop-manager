@@ -27,10 +27,10 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `planning/selection_service.py`·`planning/state_ports.py`의 승인 전용 trigger와 `planning/validation_ports.py`의 prompt 조기 반환·단일 계획 강제를 제거한다. 승인 상태는 전달/보류 판단으로 소비하고 R-082의 실제 Planner 목적·유효한 결과/게시 복구는 유지한다. 다른 문서 관련성 판단을 모델 호출로 옮기지 않는다.
-- [ ] 확인한 `documents/document_drafts.py`의 승인·`plan_id` 연결·`assert_current()`와 `execution/execution_documents_handler.py`의 mapping·실행 guard를 재사용한다. 기존 작업으로의 명시적 연결이 확인된 입력만 Worker/Manager의 현재 실행 경계에 전달한다. 새 대상 선택 heuristic·CLI·범용 상태 모델을 만들지 않는다. 원문·source 관계·권한·소유권·dependency/PR 조건의 검증 실패는 해당 artifact의 보존/보류로 남긴다.
-- [ ] `documents/document_publication.py`의 기존 전용 claim·승인 bytes·Review/게시 검증을 legacy 복구와 일반 작업 전달에서 구분한다. 과거 게시된 claim과 `R027_SOURCE`의 조회 호환은 보존하되 archive된 R-027을 새 계획 source로 요구하거나 활성 복원하지 않는다. 일반 작업을 옛 전용 계획으로 재작성하거나 Worker의 Requirement 수정 예외로 처리하지 않는다.
-- [ ] 확인한 `tests/test_planning_selection.py`·`tests/test_maintenance_state.py`·`tests/test_execution_documents.py`·`tests/test_maintenance_planning.py`의 실제 저장소/승인/guard fixture를 재사용해 호출 수·전달·stale/경합·복구 검사를 보완한다. PRODUCT·ARCHITECTURE·실행 지침은 실제 연결한 동작 설명만 정합화하고 사용자 Requirement는 수정하지 않는다.
+- [x] 확인한 `planning/selection_service.py`·`planning/state_ports.py`의 승인 전용 trigger와 `planning/validation_ports.py`의 prompt 조기 반환·단일 계획 강제를 제거한다. 승인 상태는 전달/보류 판단으로 소비하고 R-082의 실제 Planner 목적·유효한 결과/게시 복구는 유지한다. 다른 문서 관련성 판단을 모델 호출로 옮기지 않는다.
+- [x] 확인한 `documents/document_drafts.py`의 승인·`plan_id` 연결·`assert_current()`와 `execution/execution_documents_handler.py`의 mapping·실행 guard를 재사용한다. 기존 작업으로의 명시적 연결이 확인된 입력만 Worker/Manager의 현재 실행 경계에 전달한다. 새 대상 선택 heuristic·CLI·범용 상태 모델을 만들지 않는다. 원문·source 관계·권한·소유권·dependency/PR 조건의 검증 실패는 해당 artifact의 보존/보류로 남긴다.
+- [x] `documents/document_publication.py`의 기존 전용 claim·승인 bytes·Review/게시 검증을 legacy 복구와 일반 작업 전달에서 구분한다. 과거 게시된 claim과 `R027_SOURCE`의 조회 호환은 보존하되 archive된 R-027을 새 계획 source로 요구하거나 활성 복원하지 않는다. 일반 작업을 옛 전용 계획으로 재작성하거나 Worker의 Requirement 수정 예외로 처리하지 않는다.
+- [x] 확인한 `tests/test_planning_selection.py`·`tests/test_maintenance_state.py`·`tests/test_execution_documents.py`·`tests/test_maintenance_planning.py`의 실제 저장소/승인/guard fixture를 재사용해 호출 수·전달·stale/경합·복구 검사를 보완한다. PRODUCT·ARCHITECTURE·실행 지침은 실제 연결한 동작 설명만 정합화하고 사용자 Requirement는 수정하지 않는다.
 
 ## Validation
 
@@ -42,8 +42,11 @@ priority: high
 ## Progress
 
 - [x] 원격 `5f49ff2f087d7108d92b481ad1a3bee98b0839cb`의 R-082 변경과 위 실제 trigger·prompt/결과 제한·문서 실행 guard 및 기존 회귀를 정적으로 대조했다. compact catalog에 이 잔여 전달/호출 제거 목표를 담당하는 비종료 작업은 없다.
-- [ ] 승인 전용 호출·결과 제한 제거와 확인된 기존 작업 전달
-- [ ] 호출 수·권한·원문/연결 경쟁·중단 복구의 최소 unit 검증
+- [x] 승인 전용 Planner trigger와 결과 제한을 제거하고, 승인 snapshot·현재 선언·소유권·실행 상태가 단일 기존 작업으로 확인될 때만 같은 Worker에 전달했다. 무연결·모호·stale·수동 소유·PR 경합은 승인 artifact와 독립 작업을 보존하며, legacy 문서 계획 복구는 유지한다.
+- [x] 현재 rebase 수용 후보에서 승인 연결·보류·bytes/CRLF·legacy 게시·Planner 선택·Requirement overview와 소유 rebase 재검사·planning drain 중 base-fetch를 검증하는 targeted unit test 23개가 통과했다. 전체 suite와 `scripts/verify`는 실행하지 않았다.
+- [x] 일반 Worker 전달 전 Requirement 대상 승인본을 권한 불일치로 보류하고 bind·bytes 적용을 막는다. 구현 이후 bytes가 없거나 변형된 mapped artifact는 계속 guard하며, 문서 의미·diff PASS와 코드 Review FAIL은 일반 실패·Worker 교정 흐름으로 분기한다. 이 경계의 신규 회귀와 기존 문서 전달·Review 회귀 targeted unit test 6개가 통과했다.
+- [x] 구현 이후 단계에서 재검증 실패와 승인 bytes 불일치가 함께 발생해도 mapped artifact를 반환해 document guard의 명시 거부로 이어지도록 보완했다. 재시작 stale-source·변경 bytes 조합의 targeted unit test 1개가 통과했다.
+- [x] rebase 재개는 identity 불일치 때 최신 service로 전체 소유권 검사를 한 번 재실행하고 재실패를 거부한다. planning drain 동안 base-fetch 자원 대기·획득은 허용하고 task/handoff gate는 유지한다.
 
 ## Decision Log
 

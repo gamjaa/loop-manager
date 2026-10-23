@@ -87,7 +87,19 @@ class RebaseHandler:
                     if current.generation == 0:
                         _, decision = self.ports.state.recover_rebase_checkpoint(checkpoint, service)
                     else:
-                        _, decision = service.require_owned(checkpoint=current)
+                        try:
+                            _, decision = service.require_owned(checkpoint=current)
+                        except manager_git_journal.MutationEvidenceError as error:
+                            if str(error) != (
+                                    'current rebase rejected: workspace_or_input_identity_mismatch'):
+                                raise
+                            # Manager may update the selected ExecPlan or its
+                            # linked inputs while this owned rebase is pending.
+                            # Rebuild once against those current inputs and run
+                            # the complete ownership check again; never treat a
+                            # changed fingerprint as ownership evidence.
+                            service = self.ports._current_rebase_service(context)
+                            _, decision = service.require_owned(checkpoint=current)
                 except manager_git_journal.MutationEvidenceError as error:
                     if current.generation != 0:
                         raise

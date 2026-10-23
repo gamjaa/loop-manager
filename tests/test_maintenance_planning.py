@@ -158,6 +158,45 @@ class MaintenancePublicationTransactionTest(unittest.TestCase):
         connection.close()
 
 class ApprovedDocumentPlanTest(unittest.TestCase):
+    def test_approved_draft_does_not_force_or_restrict_an_unrelated_planning_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(worktree),),
+            )
+            paths = (
+                'docs/plans/[G-300] First.md',
+                'docs/plans/[G-301] Second.md',
+            )
+            for path in paths:
+                target = worktree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('ordinary plan result\n', encoding='utf-8')
+            result = SimpleNamespace(
+                plans=tuple((path, {'id': f'G-30{index}'})
+                            for index, path in enumerate(paths)),
+                revisions=(SimpleNamespace(plan_id='G-099'),), deletions=(),
+                publication_paths=paths,
+            )
+            drafts = mock.Mock()
+            drafts.planning_candidate.return_value = SimpleNamespace(draft_id='a' * 32)
+            drafts.assert_current = mock.Mock()
+            with (
+                mock.patch.object(loop_manager, 'validate_planner_result', return_value=result),
+                mock.patch.object(loop_manager, 'is_loop_manager_repository', return_value=True),
+                mock.patch.object(document_drafts, 'DocumentDraftRepository', return_value=drafts),
+            ):
+                validated = loop_manager._PlanningValidationPorts(connection).validate_general_result(
+                    str(worktree), worktree, 'b' * 40, [], None,
+                )
+            self.assertIs(validated, result)
+            drafts.assert_not_called()
+
     def test_crlf_approved_diff_survives_planner_validation(self):
         original = b"# Product\r\nOld.\r\n"
         proposed = b"# Product\r\nNew.\r\n"

@@ -664,27 +664,40 @@ class PlanningSelectionTest(PlanningCase):
         with self.assertRaises(FrozenInstanceError):
             result.snapshot.general_fingerprint = "changed"
 
-    def test_new_document_approval_forces_planning_with_unchanged_fingerprints(self):
-        ports = FakePorts(planning_snapshot(
-            planning_fingerprint="fingerprint",
-            specification_fingerprint="specification",
-        ))
-        ports.state.document_approval_pending = True
-        ports.state.maintenance_due_required = True
-        ports.state.schedule_result.has_ready = True
-        ports.state.schedule_result.runnable_ready = object()
-        coordinator = PlanningLifecycleCoordinator(ports)
-        run = coordinator._new_run(replace(
-            self.context, registered_only=True, self_repository=True,
-        ))
+    def test_document_approval_alone_does_not_call_planner_or_change_work_selection(self):
+        for ready in ('runnable', 'waiting', 'none'):
+            with self.subTest(ready=ready):
+                ports = FakePorts(planning_snapshot(
+                    planning_fingerprint="fingerprint",
+                    specification_fingerprint="specification",
+                ))
+                ports.state.pending_document_approval = mock.Mock(return_value=True)
+                ports.state.schedule_result.has_ready = ready != 'none'
+                ports.state.schedule_result.has_waiting = ready == 'waiting'
+                ports.state.schedule_result.runnable_ready = (
+                    object() if ready == 'runnable' else None
+                )
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(replace(
+                    self.context, registered_only=True, self_repository=True,
+                ))
 
-        self.assertIsNone(coordinator._selection._select_planning_work(run))
-        self.assertEqual(
-            run.selection.kind,
-            PlanningDecisionKind.RUN_SPECIFICATION_PLANNING,
-        )
-        self.assertFalse(run.ready_activated_before_planning)
-        self.assertEqual(ports.state.maintenance_begin_count, 0)
+                outcome = coordinator._selection._select_planning_work(run)
+                ports.state.pending_document_approval.assert_not_called()
+                self.assertEqual(ports.agent.run_count, 0)
+                self.assertEqual(ports.state.maintenance_begin_count, 0)
+                if ready == 'runnable':
+                    self.assertIsNone(outcome)
+                    self.assertEqual(run.selection.kind, PlanningDecisionKind.ACTIVATE_READY)
+                    self.assertTrue(run.ready_activated_before_planning)
+                elif ready == 'waiting':
+                    self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+                    self.assertEqual(run.selection.kind, PlanningDecisionKind.STABLE_WAIT)
+                    self.assertFalse(run.ready_activated_before_planning)
+                else:
+                    self.assertIsNone(outcome)
+                    self.assertEqual(run.selection.kind, PlanningDecisionKind.COMPLETE)
+                    self.assertFalse(run.ready_activated_before_planning)
 
     def test_real_planner_port_records_resumption_at_agent_start(self):
         connection = sqlite3.connect(":memory:")

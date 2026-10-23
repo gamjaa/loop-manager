@@ -365,11 +365,43 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         scheduler = self.scheduler()
         scheduler.pause_project('A')
         token = scheduling.current_scheduler.set(scheduler)
+        task = scheduling.current_task.set(scheduling.Task('A', 'G-001', self.connection))
         gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
         handoff = _runtime_handoff_signal.set(gate)
         try:
             with resource_locks(self.directory, 'A', ['git:fetch'], owner='base-fetch'):
                 self.assertIn('A', scheduler.draining_projects)
+            waiting, fetched = threading.Event(), threading.Event()
+            errors = []
+            def queued_fetch():
+                task_token = scheduling.current_task.set(
+                    scheduling.Task('A', 'G-001', self.connection))
+                scheduler_token = scheduling.current_scheduler.set(scheduler)
+                try:
+                    with resource_locks(self.directory, 'A', ['git:fetch'], owner='base-fetch'):
+                        fetched.set()
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    scheduling.current_scheduler.reset(scheduler_token)
+                    scheduling.current_task.reset(task_token)
+            emit = scheduling.events.emit
+            def observe(message, **values):
+                if message == '공유 Git 자원 배정 대기':
+                    waiting.set()
+                emit(message, **values)
+            thread = threading.Thread(target=queued_fetch)
+            try:
+                with mock.patch.object(scheduling.events, 'emit', side_effect=observe):
+                    with resource_locks(self.directory, 'A', ['git:fetch'], owner='base-fetch'):
+                        thread.start()
+                        self.assertTrue(waiting.wait(2))
+                        self.assertFalse(fetched.is_set())
+                    self.assertTrue(fetched.wait(2))
+            finally:
+                if thread.ident is not None:
+                    thread.join(3)
+            self.assertEqual(errors, [])
             with self.assertRaises(scheduling.PlanningDrain), scheduler.task('A', 'G-001', self.connection):
                 self.fail('Planner 대기 중 작업이 재개됐습니다.')
             gate.stop()
@@ -378,6 +410,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 self.fail('runtime 교체 중 프로젝트 fetch가 시작됐습니다.')
         finally:
             _runtime_handoff_signal.reset(handoff)
+            scheduling.current_task.reset(task)
             scheduling.current_scheduler.reset(token)
 
     def test_configuration_defaults_validation_and_project_override_inheritance(self):

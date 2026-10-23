@@ -76,22 +76,6 @@ class _PlanningValidationPorts:
         mutable_snapshot: MutableReadySnapshot,
     ) -> str:
         prompt = self._effects.planner_prompt(error, catalog, mutable_snapshot)
-        from loop_manager_internal.documents import document_drafts
-        repository = Path(mutable_snapshot.repo)
-        if self._effects.is_loop_manager_repository(repository):
-            project = self._connection.execute(
-                "SELECT base_branch FROM projects WHERE repo = ?",
-                (mutable_snapshot.repo,),
-            ).fetchone()
-            if project is not None:
-                candidate = document_drafts.DocumentDraftRepository(
-                    self._connection,
-                ).planning_candidate(
-                    mutable_snapshot.repo, repository, str(project["base_branch"]),
-                )
-                if candidate is not None:
-                    prompt += document_publication.planning_instruction(candidate)
-                    return prompt  # This call is reserved for the approved document draft.
         prompt += self._requirement_overview_prompt(mutable_snapshot.repo, mutable_snapshot.active_sha)
         prompt += self._verify_request_prompt(mutable_snapshot.repo, mutable_snapshot.active_sha)
         from loop_manager_internal.storage import execplan_draft_state
@@ -198,15 +182,6 @@ class _PlanningValidationPorts:
         repository = Path(repo)
         if not self._effects.is_loop_manager_repository(repository):
             return result
-        project = self._connection.execute(
-            "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
-        ).fetchone()
-        if project is None:
-            return result
-        drafts = document_drafts.DocumentDraftRepository(self._connection)
-        candidate = drafts.planning_candidate(
-            repo, repository, str(project["base_branch"]),
-        )
         claims = []
         for path, plan in result.plans if result is not None else ():
             text = document_publication.read_plan_text(worktree / path)
@@ -215,24 +190,29 @@ class _PlanningValidationPorts:
             except document_drafts.DocumentDraftError as error:
                 raise PlannerValidationError(str(error)) from error
             if claim is not None:
-                claims.append((text, plan, claim))
-        if candidate is not None:
-            if (result is None or len(result.plans) != 1 or result.revisions
-                or result.deletions or result.publication_paths != (result.plans[0][0],)
-                or len(claims) != 1 or claims[0][2] != candidate.draft_id):
-                raise PlannerValidationError(
-                    "승인 문서 수정본에는 별도 새 ExecPlan 하나만 필요합니다."
-                )
+                claims.append((path, text, plan, claim))
+        if claims:
+            project = self._connection.execute(
+                "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
+            ).fetchone()
+            if project is None:
+                return result
+            drafts = document_drafts.DocumentDraftRepository(self._connection)
+            candidate = drafts.planning_candidate(
+                repo, repository, str(project["base_branch"]),
+            )
+            if (candidate is None or len(claims) != 1
+                    or claims[0][3] != candidate.draft_id
+                    or claims[0][0] not in result.publication_paths):
+                raise PlannerValidationError("승인 문서 ExecPlan identity가 현재 승인과 다릅니다.")
             try:
                 drafts.assert_current(candidate, repository, str(project["base_branch"]))
                 document_publication.validate_document_plan(
-                    claims[0][0], claims[0][1], candidate,
+                    claims[0][1], claims[0][2], candidate,
                 )
             except document_drafts.DocumentDraftError as error:
                 drafts.record_publication_error(candidate.draft_id, str(error))
                 raise PlannerValidationError(str(error)) from error
-        elif claims:
-            raise PlannerValidationError("계획할 승인 문서 수정본이 없습니다.")
         return result
 
     def validate_maintenance_result(

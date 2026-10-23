@@ -128,7 +128,7 @@ class RequirementOverviewTest(unittest.TestCase):
     def test_general_and_combined_maintenance_get_same_overview_and_other_modes_do_not(self):
         effects = SimpleNamespace(planner_prompt=lambda *args: 'general',
             maintenance_planner_prompt=lambda *args, **kwargs: 'maintenance',
-            is_loop_manager_repository=lambda repo: False, git_bytes=self.remote())
+            is_loop_manager_repository=lambda repo: False, git=None, git_bytes=self.remote())
         with sqlite3.connect(':memory:') as connection:
             connection.row_factory = sqlite3.Row
             port = _PlanningValidationPorts(effects, connection)
@@ -144,10 +144,13 @@ class RequirementOverviewTest(unittest.TestCase):
             connection.execute("INSERT INTO projects VALUES ('repo', 'main')")
             effects.is_loop_manager_repository = lambda repo: True
             with (mock.patch('loop_manager_internal.documents.document_drafts.DocumentDraftRepository') as drafts,
-                  mock.patch('loop_manager_internal.documents.document_publication.planning_instruction', return_value='draft')):
+                  mock.patch('loop_manager_internal.documents.document_publication.planning_instruction', return_value='draft') as instruction):
                 drafts.return_value.planning_candidate.return_value = object()
-                self.assertEqual(port.planner_prompt(None, 'catalog', snapshot), 'generaldraft')
-                self.assertEqual(effects.git_bytes.call_count, calls)
+                prompt = port.planner_prompt(None, 'catalog', snapshot)
+                self.assertTrue(prompt.startswith('general'))
+                self.assertNotIn('draft', prompt)
+                drafts.assert_not_called()
+                instruction.assert_not_called()
 
 
 @isolated_git_test

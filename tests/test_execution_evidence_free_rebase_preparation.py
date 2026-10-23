@@ -124,6 +124,44 @@ class EvidenceFreeRebasePreparationTests(TestCase):
         self.case.state.update_project('repo', last_error='different historical failure')
         self.assertTrue(self.case.handler._resolving_rebase(self.case.state.row()))
 
+    def test_owned_rebase_rechecks_current_inputs_once_after_identity_mismatch(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        self.pending()
+        case = self.case
+        case.fixture.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        stale = mock.Mock()
+        stale.require_owned.side_effect = MutationEvidenceError(
+            'current rebase rejected: workspace_or_input_identity_mismatch')
+        fresh = mock.Mock()
+        fresh.require_owned.return_value = (case.observed, SimpleNamespace(status=RebaseStatus.WAITING))
+        case.handler._current_rebase_service = mock.Mock(side_effect=(stale, fresh))
+
+        self.assertTrue(case.handler._resolving_rebase(case.state.row()))
+
+        self.assertEqual(case.handler._current_rebase_service.call_count, 2)
+        stale.require_owned.assert_called_once_with(checkpoint=case.checkpoint.get('repo', 'G-047'))
+        fresh.require_owned.assert_called_once_with(checkpoint=case.checkpoint.get('repo', 'G-047'))
+
+    def test_owned_rebase_still_rejects_when_current_input_recheck_fails(self):
+        from unittest import mock
+        from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
+        self.pending()
+        case = self.case
+        case.fixture.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        service = mock.Mock()
+        service.require_owned.side_effect = MutationEvidenceError(
+            'current rebase rejected: workspace_or_input_identity_mismatch')
+        case.handler._current_rebase_service = mock.Mock(return_value=service)
+
+        with self.assertRaisesRegex(MutationEvidenceError, 'workspace_or_input_identity_mismatch'):
+            case.handler._resolving_rebase(case.state.row())
+
+        self.assertEqual(case.handler._current_rebase_service.call_count, 2)
+        self.assertEqual(service.require_owned.call_count, 2)
+
     def test_detached_metadata_alone_cannot_bypass_current_remote_or_target_check(self):
         self.pending()
         original = self.case.observed

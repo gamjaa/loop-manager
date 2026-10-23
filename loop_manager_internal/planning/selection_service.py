@@ -406,13 +406,6 @@ class PlanningSelectionService(PlanningService):
             self._ports.events.log("실제 Open PR 대기: 새 due 유지보수는 PR 동기화·종료 확인 뒤 선택합니다.")
         if context.registered_only and waiting_for_manual and cycle.phase is maintenance_state.MaintenancePhase.IDLE:
             self._ports.events.log("수동 구현 대기: 새 유지보수 cycle을 보류하고 독립 일반 READY 선택을 계속합니다.")
-        approval_pending = (
-            context.self_repository
-            and cycle.phase is maintenance_state.MaintenancePhase.IDLE
-            and self._ports.state.pending_document_approval(
-                context.repo, context.repo_path, context.base_branch,
-            )
-        )
         if (cycle.phase in {maintenance_state.MaintenancePhase.IDLE,
                 maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
                 maintenance_state.MaintenancePhase.REFACTORING}
@@ -426,7 +419,6 @@ class PlanningSelectionService(PlanningService):
             and cycle.phase is maintenance_state.MaintenancePhase.IDLE
             and not waiting_for_pr
             and not waiting_for_manual
-            and not approval_pending
             and not run.retirement_pending
         ):
             tiered_selection = None
@@ -532,8 +524,7 @@ class PlanningSelectionService(PlanningService):
                 run.specification_fingerprint,
                 run.general_fingerprint,
             )
-            if (hasattr(self._ports.state, "planning_review") and not approval_pending
-                    and not specification_changed
+            if (hasattr(self._ports.state, "planning_review") and not specification_changed
                     and self._ports.state.final_review_candidate(context.repo,
                         context.refactoring_review_interval, self_repository=context.self_repository)):
                 from loop_manager_internal.planning.specification_review import current_receipt
@@ -549,8 +540,7 @@ class PlanningSelectionService(PlanningService):
                 )
             run.selection = choose_planning_decision(
                 has_active=getattr(decision, "active", None) is not None,
-                specification_changed=(specification_changed or approval_pending
-                                       or bool(run.retirement_pending)
+                specification_changed=(specification_changed or bool(run.retirement_pending)
                                        or run.final_review_required),
                 runnable_ready=decision.runnable_ready is not None,
                 planning_input_changed=specification_changed,

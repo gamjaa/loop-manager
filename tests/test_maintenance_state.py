@@ -121,6 +121,25 @@ class MaintenanceObservationFailureTests(unittest.TestCase):
 
 @isolated_git_test
 class DocumentDraftTest(unittest.TestCase):
+    def test_approval_without_one_existing_task_records_unapplied_reason(self):
+        draft = self._create()
+        approved = self.drafts.decide(
+            draft.draft_id, draft.proposed_hash, "approve", self.repo, "main",
+        )
+        self.assertEqual(approved.state, "approved")
+        self.assertIsNone(approved.plan_id)
+        self.assertIn("연결된 기존 ExecPlan이 없어", approved.publication_error)
+        self.assertIn(
+            "여러 개",
+            document_drafts._approval_handoff_error(
+                self.database, str(self.repo),
+                json.dumps([
+                    ["G-301", ["docs/PRODUCT.md"]],
+                    ["G-302", ["docs/PRODUCT.md"]],
+                ]),
+            ),
+        )
+
     def test_approved_document_bytes_apply_once_and_reject_unrelated_edits(self):
         draft = self._create()
         approved = self.drafts.decide(
