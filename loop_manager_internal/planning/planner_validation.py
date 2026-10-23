@@ -1161,9 +1161,12 @@ def validate_planner_result(
                         raise PlannerValidationError(str(error)) from error
         planned_ids = frozenset(str(plan["id"]) for plan in current_plans.values())
         if held_ids:
+            # Validate references first; the held snapshot below pins the
+            # registered edges before the final combined graph is checked.
             project_catalog_refresh.assert_planning_dependency_references(
                 {}, current_plans.items(), held_ids,
                 original_dependencies=original_dependencies,
+                check_cycles=False,
             )
 
         if held_ids:
@@ -1183,7 +1186,8 @@ def validate_planner_result(
             execplan_drafts.validate_questions(catalog)
         project_catalog_refresh.assert_planning_dependency_references(
             catalog, current_plans.items(), held_ids,
-            original_dependencies=original_dependencies)
+            original_dependencies=original_dependencies,
+            withheld_ids=local.withheld_ids if held_ids else ())
         remote_deletions.validate_recovery(worktree, snapshot, current_plans, catalog, connection=connection, repo=repo)
 
         for path in sorted(displaced_paths):

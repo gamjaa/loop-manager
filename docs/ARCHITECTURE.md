@@ -254,7 +254,7 @@ catalog 동기화는 정상적으로 열린 DB에서 개별 작업 행이 없을
 | 중복 ID·파일명과 선언 ID의 불일치·문서 인코딩/조회 실패·일반 파일이 아닌 입력 등 식별·공유 입력의 안전성을 확정할 수 없는 오류 | 프로젝트 범위 진단을 남기고 전체 catalog 동기화를 보류한다. 실패를 빈 catalog나 변경 없음으로 바꾸지 않는다. |
 | 진행 중 게시·공유 소유권과 충돌하거나 원격 revision·SQLite snapshot이 달라진 경우 | 기존 게시·소유 작업과 실행 이력을 보존하고 적용을 보류한다. 소유권 정리·게시 재개 또는 최신 snapshot 확인 뒤 다시 처리한다. |
 
-일반·유지보수 planning의 신규·허용 개정은 등록된 보류 선행을 직접·간접 참조할 수 있다. 고정 revision의 기존 보류 원문·hash·원인은 보존하며, 검증한 변경 대상에 전파된 보류만 허용한다. 변경 대상 자체의 선언·source·dependency 오류와 순환, 등록되지 않은 보류 선행 참조는 거부한다. 문서 게시·DB 등록과 Worker 실행 자격은 분리하며 선행 보류 해제만으로 실제 Merge gate를 통과하지 않는다.
+일반·유지보수 planning은 결과 검증에서 active catalog에 같은 batch의 신규·개정 선언을 overlay한다. 일반 metadata 검증에서 제외된 보류 노드는 등록된 SQLite dependency 관계로 연결하고, 보류 원인 전파로 snapshot에서 제외된 기존 노드도 고정 revision에서 확인한 withheld closure에 있을 때만 등록 관계로 graph를 완성한다. 고정 revision의 원문·hash·보류 원인과 미수정 withheld 파일을 확인한 뒤 이 관계를 사용하며, batch 선언이 있으면 해당 ID의 과거 SQLite dependency보다 현재 선언을 우선한다. 공통 graph 검사는 변경 계획이 순환에 참여하는 경우 거부하고, 변경 계획과 무관한 기존 보류 순환은 독립 계획의 전역 오류가 되지 않게 격리한다. 등록되지 않은 보류 선행 참조와 변경 대상 자체의 선언·source·dependency 오류도 거부한다. 유지보수 게시 재검증은 이 helper를 다시 실행한다. 일반 게시 후보는 intent에 저장한 revision·snapshot token과 commit에 포함된 검증 hash를 대조하고 transaction의 CAS에서 SQLite 소유권을 확인한다. 문서 게시·DB 등록과 Worker 실행 자격은 분리하며 선행 보류 해제만으로 실제 Merge gate를 통과하지 않는다.
 
 ExecPlan 번호는 연속일 필요가 없다. 번호 공백을 누락 계획으로 추정하거나 메우지 않으며 사용한 ID는 재사용하지 않는다. 파일 누락만으로 취소·완료를 확정하지 않고 검증된 삭제 처리와 구분한다. 오류 격리와 독립 작업 계속은 현재 동작이며, 아래의 관리 문서·자원 정리 목표와 구분한다.
 

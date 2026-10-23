@@ -149,7 +149,8 @@ def _validate_maintenance_planning_commit(
                 expected.items(), held_ids, original_dependencies={
                     str(row["plan_id"]): json.loads(row["depends_on"])
                     for row in connection.execute(
-                        "SELECT plan_id, depends_on FROM exec_plans WHERE repo=?", (context.repo,))})
+                        "SELECT plan_id, depends_on FROM exec_plans WHERE repo=?", (context.repo,))},
+                withheld_ids=snapshot.withheld_ids)
         except execplan_catalog.ExecPlanCatalogError as error:
             raise MaintenancePlanningError(str(error)) from error
     else:
