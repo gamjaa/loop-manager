@@ -203,11 +203,14 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
         process = InterruptedProcess()
         resumed_sessions = []
 
-        def verified_preflight(_provider, _role, worktree, _state_dir,
-                               read_only, observe, *_args, **_kwargs):
+        def verified_preflight(provider, _role, worktree, _state_dir,
+                               read_only, observe, *_args, **kwargs):
+            stable_configuration = loop_manager.agent_write_isolation._stable_configuration_digest(
+                provider, worktree, kwargs["config_path"], kwargs["environment_variables"])
             observe(loop_manager.agent_write_isolation.IsolationEvidence(
                 'codex', 'fixture-version', 'Linux:fixture', 'planner',
                 str(worktree), 'fixture-repository', 'fixture-policy', 'verified',
+                stable_configuration_digest=stable_configuration,
             ))
             return loop_manager.agent_write_isolation.codex_arguments(read_only)
 
@@ -244,6 +247,11 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 side_effect=verified_preflight,
             ), mock.patch(
                 "loop_manager.agent_write_isolation.assert_current",
+            ), mock.patch(
+                "loop_manager.agent_write_isolation.assert_current_configuration",
+            ), mock.patch(
+                "loop_manager.agent_write_isolation.refresh_configuration_evidence",
+                side_effect=lambda evidence, *_args, **_kwargs: evidence,
             ), mock.patch(
                 "loop_manager.validate_provider_runtime",
             ), mock.patch(

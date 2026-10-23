@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -221,11 +221,15 @@ def run_codex(
     if isolation_arguments is not None:
         if isolation_evidence is None or isolation_snapshot_digest is None:
             raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
-        agent_write_isolation.assert_current(
-            isolation_evidence, worktree, state_dir, config_path,
-            expected_repository, read_only, isolation_snapshot_digest,
-            environment_variables=launch_environment,
-        )
+        try:
+            agent_write_isolation.assert_current_configuration(
+                isolation_evidence, worktree, state_dir, config_path,
+                expected_repository, read_only, isolation_snapshot_digest,
+                environment_variables=launch_environment)
+        except agent_write_isolation.IsolationError as error:
+            if on_isolation_checked is not None:
+                on_isolation_checked(replace(isolation_evidence, status='rejected', reason=str(error)))
+            raise
     if codex_launch is None:
         prepare_authentication('codex', launch_environment)
     auth_links = authentication_links('codex', launch_environment)
@@ -255,16 +259,45 @@ def run_codex(
 
     guidance_context = tuple(isolation_arguments or codex_sandbox_arguments(read_only))
     instruction_digests = []
+
+    def check_native_lookup():
+        if codex_launch is None or isolation_evidence is None:
+            return
+        try:
+            return agent_write_isolation.assert_preparation_lookup_current(
+                isolation_evidence, worktree, state_dir, config_path,
+                environment_variables=launch_environment)
+        except agent_write_isolation.IsolationError as error:
+            if on_isolation_checked is not None:
+                on_isolation_checked(replace(
+                    isolation_evidence, status='rejected', reason=str(error)))
+            raise
+
     additional = (provider_guidance.codex_arguments(
         common_guidance, worktree, environment=launch_environment,
         observe_instruction=instruction_digests.append,
         context_arguments=("-m", model, "-c", f'model_reasoning_effort="{effort}"',
                           *fast_arguments, *guidance_context),
+        on_lookup=check_native_lookup,
     ) if common_guidance else [])
     assert_authentication_links('codex', launch_environment, auth_links)
     if codex_launch is not None and isolation_evidence is not None:
-        agent_write_isolation.assert_current(isolation_evidence, worktree, state_dir, config_path,
-            expected_repository, read_only, isolation_snapshot_digest, environment_variables=launch_environment)
+        final_evidence = isolation_evidence
+        try:
+            final_evidence = agent_write_isolation.refresh_configuration_evidence(
+                isolation_evidence, codex_launch, worktree, state_dir, config_path,
+                expected_repository, read_only, isolation_snapshot_digest,
+                session_id=session_id, environment_variables=launch_environment)
+            agent_write_isolation.assert_current(final_evidence, worktree, state_dir, config_path,
+                expected_repository, read_only, isolation_snapshot_digest,
+                environment_variables=launch_environment)
+        except agent_write_isolation.IsolationError as error:
+            if on_isolation_checked is not None:
+                on_isolation_checked(replace(final_evidence, status='rejected', reason=str(error)))
+            raise
+        if final_evidence != isolation_evidence and on_isolation_checked is not None:
+            on_isolation_checked(final_evidence)
+        isolation_evidence = final_evidence
         if on_execution_identity is not None:
             from loop_manager_internal.agents.provider_execution import execution_identity
             if not instruction_digests:
@@ -333,9 +366,24 @@ def run_codex(
         with log.open("w", encoding="utf-8") as output:
             output.write(fast_mode_log)
             start = codex_launch.start if codex_launch else effects._handoff_popen
+
+            def checked_handoff(command, **kwargs):
+                if codex_launch is not None and isolation_evidence is not None:
+                    try:
+                        agent_write_isolation.assert_current_configuration(
+                            isolation_evidence, worktree, state_dir, config_path,
+                            expected_repository, read_only, isolation_snapshot_digest,
+                            environment_variables=launch_environment)
+                    except agent_write_isolation.IsolationError as error:
+                        if on_isolation_checked is not None:
+                            on_isolation_checked(replace(
+                                isolation_evidence, status='rejected', reason=str(error)))
+                        raise
+                return effects._handoff_popen(command, **kwargs)
+
             process = start(
                 arguments,
-                **({'launch_process': effects._handoff_popen} if codex_launch else {'stdin': subprocess.PIPE}),
+                **({'launch_process': checked_handoff} if codex_launch else {'stdin': subprocess.PIPE}),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
