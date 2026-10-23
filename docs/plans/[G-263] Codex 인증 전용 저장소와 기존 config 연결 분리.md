@@ -54,6 +54,7 @@ priority: high
 - [x] 2026-10-23 관리 rebase 후 현재 HEAD `8c0f36c`에서 프로젝트 Python targeted runner로 설정 drift, probe 중 생성·충돌, 지침 조회 후 설정 수명, process handoff 경쟁, 호출 관측 identity를 확인하는 8개 unit test를 새로 실행해 모두 통과했다. 전달된 Perl 예제 실패 요약은 이전 revision `e8dba988`에 해당하며 세 번째 standalone/failing 하위 사례가 약 30초 뒤 timeout됐다. 해당 Manager 전용 통합 테스트는 G-263 diff에 없고 `docs/VERIFY.md`에 따라 Worker는 실행하지 않았다.
 - [x] 2026-10-23 현재 HEAD `81e1718`에서 프로젝트 Python targeted runner로 위 설정 수명·검사 순서·process handoff 관련 8개 unit test를 다시 실행해 모두 통과했다. 전달된 base `7621566` 대비 최종 diff와 PRODUCT·ARCHITECTURE·OPERATIONS 설명을 재확인했다. 이전 Perl 통합 테스트 진단은 이 HEAD의 verify 결과가 아니므로 전체 verify는 Manager에게 맡긴다.
 - [x] 2026-10-23 현재 HEAD `a2e5aee`의 최신 계획 조건을 코드와 대조해, version 조회와 features 조회 사이에 안전한 설정을 재검사하는 절차가 빠진 것을 확인했다. version 조회 뒤와 features 조회 뒤 sandbox probe 전에 정책을 검사하도록 보완했다. 프로젝트 Python targeted runner로 두 중간 충돌 거부 회귀와 기존 안전한 probe 생성 회귀를 실행해 3개 모두 통과했다.
+- [x] 2026-10-23 HEAD `4935299` 기반 후보에서 features 조회 중 안전한 원자 교체가 허용되고 현재 지문에 결합된 뒤 다음 호출에서도 재사용되는 회귀를 추가했다. 프로젝트 Python targeted runner로 version/features 조회 중 충돌·생성, probe 후 설정 결합·재개, 최종 검사 뒤 drift를 확인하는 5개 unit case가 통과했다.
 - [x] PRODUCT·ARCHITECTURE·OPERATIONS에 정상 생성 수용과 검사·거부 순서를 반영했다.
 
 ## Decision Log
