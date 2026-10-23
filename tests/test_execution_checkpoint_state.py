@@ -498,7 +498,7 @@ class CancelledCheckpointTests(unittest.TestCase):
         self.execution = ExecutionCheckpointRepository(self.connection)
         self.blocked = BlockedCheckpointRepository(self.connection)
         self.execution.record(
-            'repo', 'G-047', expected_generation=0, operation='checkpoint',
+            'repo', 'G-047', expected_generation=0, operation=None,
             expected_head='head', target_base_oid='base', observed_remote_oid='remote',
             snapshot={'worker_result': 'saved', 'pushed_checkpoint_head': 'published'},
         )
@@ -639,3 +639,82 @@ class CancelledCheckpointTests(unittest.TestCase):
         with self.assertRaises(CallDeferred):
             repository.start(context, 'worker', 'codex', profile, 'saved-session')
         self.assertEqual(dict(self.connection.execute('SELECT * FROM agent_invocations').fetchone()), audit)
+
+    def test_git_operation_defers_cancellation_without_consuming_requests(self):
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        current = self.execution.get('repo', 'G-047')
+        saved = self.execution.record(
+            'repo', 'G-047', expected_generation=current.generation, operation='rebase',
+            expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid, snapshot=current.snapshot,
+        )
+        self.connection.commit()
+        with self.assertRaisesRegex(PlannerValidationError, 'Git operation'):
+            self.cancel()
+        self.assertEqual(self.execution.get('repo', 'G-047'), saved)
+        self.assertEqual(self.blocked.get('repo', 'G-047'), self.request)
+        self.execution.record(
+            'repo', 'G-047', expected_generation=saved.generation, operation=None,
+            expected_head=saved.expected_head, target_base_oid=saved.target_base_oid,
+            observed_remote_oid=saved.observed_remote_oid, snapshot=saved.snapshot,
+        )
+        self.connection.commit()
+        self.cancel()
+        self.assertIsNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+
+    def test_manual_preparation_preserves_group_and_execution_until_owner_releases(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        store = ManualWorkRepository(self.connection)
+        group = store.create('repo', 'start', 'manual', [], 'head', 'base', members=('G-047',))
+        group = store.update(group, owner_id='G-047')
+        self.connection.commit()
+        with self.assertRaisesRegex(PlannerValidationError, '수동'):
+            self.cancel()
+        self.assertEqual(dict(store.get('repo', group['group_id'])), dict(group))
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        # A previously closed, unowned group remains historical audit. It is
+        # not a manual stop/reset request and is not rewritten by cancellation.
+        group = store.update(group, state='CLOSED')
+        self.connection.commit()
+        self.cancel()
+        self.assertEqual(dict(store.get('repo', group['group_id'])), dict(group))
+        with self.assertRaisesRegex(runtime_state.RuntimeStateError, '취소된 작업'):
+            store.accept(group, head='new', base='base', input_token='token')
+        self.assertIsNone(self.connection.execute('SELECT * FROM manual_work_requests').fetchone())
+
+    def test_stale_manual_request_is_not_selected_after_cancellation(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        store = ManualWorkRepository(self.connection)
+        self.connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+            "VALUES ('repo','G-999','other.md','Other','[]','[]','normal','other','READY')")
+        group = store.create('repo', 'start', 'manual', [], 'head', 'base', members=('G-047',))
+        group = store.update(group, state='CLOSED', owner_id='G-047')
+        self.connection.commit()
+        self.cancel()
+        # Preserve an old runtime's request verbatim, including audit identity.
+        self.connection.execute("INSERT INTO manual_work_requests "
+            "(request_id,repo,group_id,source_head,base_sha,input_token,skip_verify,skip_review,reason,created_at) "
+            "VALUES ('legacy','repo',?,'head','base','token',0,0,'old','earlier')", (group['group_id'],))
+        group = store.update(group, state='AUTOMATIC', request_id='legacy')
+        other = store.create('repo', 'start', 'independent', [], 'head', 'base', members=('G-999',))
+        other = store.update(other, owner_id='G-999', state='AUTOMATIC')
+        request = store.accept(other, head='head', base='base', input_token='token')
+        self.connection.commit()
+        self.assertEqual([row['group_id'] for row in store.pending('repo')], [other['group_id']])
+        self.assertEqual(dict(store.get('repo', group['group_id'])), dict(group))
+        self.assertEqual(store.request(group)['request_id'], 'legacy')
+        self.assertEqual(dict(store.request(store.get('repo', other['group_id']))), dict(request))
+
+    def test_shared_resource_owner_preserves_both_execution_rows(self):
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        self.connection.execute("UPDATE exec_plans SET branch='shared', worktree='/shared'")
+        self.connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,"
+            "content_hash,status,branch,worktree) VALUES ('repo','G-999','other.md','Other','[]','[]',"
+            "'normal','other','VERIFYING','shared','/shared')")
+        self.connection.commit()
+        before = [dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')]
+        with self.assertRaisesRegex(PlannerValidationError, '공유 자원'):
+            self.cancel()
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')], before)
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())

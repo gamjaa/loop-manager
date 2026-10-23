@@ -265,8 +265,13 @@ class ManualWorkRepository:
             "AND source_branch=? AND requirements=?", (repo, branch, json.dumps(sorted(requirements)))).fetchone()
 
     def pending(self, repo):
+        canceled = ("AND NOT EXISTS (SELECT 1 FROM json_each(manual_work_groups.members) m "
+            "JOIN execplan_cancellations c ON c.repo=manual_work_groups.repo AND c.plan_id=m.value) "
+            if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                       "AND name='execplan_cancellations'").fetchone() else "")
         return self.connection.execute("SELECT * FROM manual_work_groups WHERE repo=? "
             "AND state IN ('GENERATING','REGISTERING','AUTOMATIC') AND request_id IS NOT NULL "
+            + canceled +
             "ORDER BY (SELECT MIN(r.created_at) FROM manual_work_requests r "
             "WHERE r.repo=manual_work_groups.repo AND r.group_id=manual_work_groups.group_id), rowid", (repo,)).fetchall()
 
@@ -297,6 +302,11 @@ class ManualWorkRepository:
 
     def accept(self, group, *, head, base, input_token, verify_input_token=None,
                review_input_token=None, skip_verify=False, skip_review=False, reason=''):
+        from .execplan_catalog_state import is_cancelled
+        if not self.connection.in_transaction:
+            self.connection.execute('BEGIN IMMEDIATE')
+        if any(is_cancelled(self.connection, group['repo'], plan_id) for plan_id in json.loads(group['members'])):
+            raise runtime_state.RuntimeStateError('취소된 작업을 포함한 수동 묶음의 실행 요청을 만들 수 없습니다.')
         values = (group['repo'], group['group_id'], head, base, input_token,
                   int(skip_verify), int(skip_review), reason,
                   verify_input_token, review_input_token)

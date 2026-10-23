@@ -365,7 +365,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
         checkpoints = ExecutionCheckpointRepository(self.connection)
         checkpoints.record(
-            str(self.repo), 'G-001', expected_generation=0, operation='checkpoint',
+            str(self.repo), 'G-001', expected_generation=0, operation=None,
             expected_head='saved-head', target_base_oid=self.base, observed_remote_oid=None,
             snapshot={'worker_result': 'saved result', 'pushed_checkpoint_head': 'confirmed-head'},
         )
@@ -413,6 +413,40 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertNotIn('G-001', resumed.withheld_plan_ids)
         self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
         self.assertIsNotNone(self.connection.execute('SELECT * FROM agent_invocations WHERE invocation_id=?', (identity,)).fetchone())
+
+    def test_remote_deletion_preserves_git_operation_and_manual_preparation(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        self._remote_deletion(started=True, new_plan=True)
+        self.connection.execute("UPDATE exec_plans SET worker_result='saved result' WHERE plan_id='G-001'")
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        saved = checkpoints.record(
+            str(self.repo), 'G-001', expected_generation=0, operation='rebase',
+            expected_head='head', target_base_oid=self.base, observed_remote_oid=None, snapshot={'audit': 'saved'},
+        )
+        self.connection.commit()
+        deferred = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertIn('G-001', deferred.withheld_plan_ids)
+        self.assertEqual(checkpoints.get(str(self.repo), 'G-001'), saved)
+        checkpoints.record(
+            str(self.repo), 'G-001', expected_generation=saved.generation, operation=None,
+            expected_head=saved.expected_head, target_base_oid=saved.target_base_oid,
+            observed_remote_oid=None, snapshot=saved.snapshot,
+        )
+        store = ManualWorkRepository(self.connection)
+        group = store.create(str(self.repo), 'start', 'manual', [], 'head', self.base, members=('G-001',))
+        group = store.update(group, owner_id='G-001')
+        self.connection.commit()
+        deferred = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertIn('G-001', deferred.withheld_plan_ids)
+        self.assertEqual(dict(store.get(str(self.repo), group['group_id'])), dict(group))
+        group = store.update(group, state='CLOSED')
+        self.connection.commit()
+        resumed = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertNotIn('G-001', resumed.withheld_plan_ids)
+        self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+        self.assertEqual(dict(store.get(str(self.repo), group['group_id'])), dict(group))
 
     def test_requirement_deletion_cancels_only_withdrawn_and_preserves_shared_goal(self):
         self._requirement_deletion_recovers()

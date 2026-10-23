@@ -198,9 +198,10 @@ def apply_mutable_catalog_changes(
     cas = _mutable_ready_cas_where()
     for deletion in deletions:
         original = deletion.snapshot
-        from .task_calls import pending_for_plan
-        if pending_for_plan(connection, repo, original.plan_id):
-            raise PlannerValidationError("취소 전에 호출 예약·writer 종료가 확인되지 않았습니다.")
+        from .work_claims import cancellation_available
+        row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, original.plan_id)).fetchone()
+        if not cancellation_available(connection, repo, original.plan_id, row):
+            raise PlannerValidationError("취소 전에 호출 예약·writer 종료·Git operation·수동·공유 자원 소유권을 확인할 수 없습니다.")
         from . import execplan_draft_state
         if agent and original.plan_id in execplan_draft_state.pending_ids(connection, repo):
             raise PlannerValidationError("사용자 판단 대기 draft를 삭제할 수 없습니다.")
@@ -208,14 +209,11 @@ def apply_mutable_catalog_changes(
         preserved = None
         if original.execution_state and json.loads(original.execution_state).get("ever_started"):
             from loop_manager_internal.planning.planner_validation import planning_execution_state
-            row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, original.plan_id)).fetchone()
             if (row is None or planning_execution_state(row) != original.execution_state or row["agent_role"]
                     or row["pr_url"] or row["pr_head_oid"] or row["status"] == "MERGED"):
                 raise PlannerValidationError("취소 전에 작업의 writer·소유권·PR이 변경됐습니다.")
             if agent and not deletion.judgment:
                 raise PlannerValidationError("시작한 작업의 철회 판단이 없습니다.")
-            if connection.execute("SELECT 1 FROM manual_work_members WHERE repo=? AND plan_id=?", (repo, original.plan_id)).fetchone():
-                raise PlannerValidationError("취소 전에 수동 작업 소유권이 생겼습니다.")
             deletion_cas = "agent_role IS NULL AND pr_url IS NULL AND pr_head_oid IS NULL AND status != 'MERGED'"
             affected = [str(item[0]) for item in connection.execute("SELECT plan_id, depends_on FROM exec_plans WHERE repo=?", (repo,))
                         if item[0] != original.plan_id and original.plan_id in json.loads(item[1])]

@@ -279,7 +279,9 @@ draft 판단 대기와 검증 피드백 이행 표식은 실행·소유 이력�
 
 현재 `remote_deletions.py`는 고정 원격 revision과 마지막 채택 원문·선언·실행/게시 이력을 대조해 실제 Requirement·ExecPlan 삭제를 관측한다. archive·rename·조회 실패를 실제 삭제와 구별하고, 확인된 ExecPlan 삭제의 취소 감사와 Requirement 삭제에 따른 목표 복구 입력을 만든다. 일반 Planner의 철회·유지·대체 판단은 허용된 계획 개정·삭제 게시와 연결하며 Manager가 참조·소유권·현재 PR을 재검증한다. 확인되지 않은 범위는 보류하고 검증된 독립 작업은 계속한다.
 
-원격 삭제 증명·철회 문서 준비·취소 transaction은 `task_calls.pending_for_plan`으로 해당 작업의 호출 예약과 invocation ledger를 재확인한다. `finished_at`이 없는 호출, 또는 실제 실행 종료가 미확인이고 `not_executed`로 확정되지 않은 호출은 보류한다. 완료 결과 수집과 프로세스 종료를 구분하며 invocation·예약 감사를 삭제해 소유권을 해제하지 않는다. 새 호출 예약과 invocation 시작도 같은 SQLite writer 경계에서 취소 ID를 거부한다.
+원격 삭제 증명·철회 문서 준비·취소 transaction은 `work_claims.cancellation_available`로 호출 예약·invocation, 수동 준비/소유, 저장된 Git operation과 다른 활성 row의 branch/worktree 사용을 재확인한다. 수동 소유는 기존 `planning_ownership_state`를 사용하며 불완전한 소유 근거는 해당 삭제만 보류한다. `task_calls.pending_for_plan`이 확인하는 `finished_at` 없는 호출, 또는 실제 실행 종료가 미확인이고 `not_executed`로 확정되지 않은 호출도 보류한다. 완료 결과 수집과 프로세스 종료를 구분하며 invocation·예약 감사를 삭제해 소유권을 해제하지 않는다. 새 호출 예약과 invocation 시작도 같은 SQLite writer 경계에서 취소 ID를 거부한다.
+
+소유가 끝난 과거 수동 묶음의 membership은 현재 writer·준비 intent와 구분하며 취소로 묶음·요청·단계 감사를 다시 쓰지 않는다. 수동 대기 조회는 선언된 구성원에 취소 ID가 있는 묶음을 실행 대상으로 선택하지 않고 새 완료 요청도 거부한다. 과거 요청은 감사 조회에 남기며 다른 묶음의 실행 순서와 요청은 유지한다. 문서 삭제를 수동 stop/reset으로 해석하지 않는다.
 
 취소 적용 transaction은 `execution_checkpoints`·`blocked_checkpoints`의 해당 요청을 `execplan_cancellations.recovery_evidence.checkpoints`로 옮긴 뒤 활성 요청과 실행 row를 제거한다. `checkpoints`는 테이블명을 key로 하고 해당 row의 모든 필드·값을 보존하는 객체이며, 원래 snapshot·게시 이력의 JSON 문자열도 그대로 유지한다. 원격 삭제 증명을 합칠 때 이 별도 감사를 보존하며 transaction 실패 시 요청·실행 row·감사를 함께 롤백한다. checkpoint repository는 취소 ID의 조회·대기·기록·변경에서 취소 감사를 확인하므로 이전 runtime이 남긴 요청도 현재 요청으로 소비하지 않는다. 확정 게시 영수증은 이 감사에서 조회하며 새 게시 권한으로 재사용하지 않는다.
 
