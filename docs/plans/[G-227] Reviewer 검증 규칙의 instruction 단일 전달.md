@@ -5,12 +5,14 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
+  - docs/requirements/[R-072] 입력 동일성이 증명된 구현 후보 성공 결과 재사용.md
 depends_on:
   - G-242
   - G-265
   - G-266
   - G-267
   - G-268
+  - G-315
 complexity: low
 risk: low
 priority: normal
@@ -26,16 +28,18 @@ Reviewer의 정적 검증 책임은 매 호출 현재 선택 runtime의 common+r
 - 최초·같은 세션 재개·프로토콜 교정·새 세션 복구에 같은 경계가 적용된다. 현재 후보의 Worker 보고 또는 구체적 미실행 사유, Manager 실제 verify PASS/증명된 reuse/수동 생략의 구분, 후보 HEAD·base와 필요한 ISSUE_ID 결과 형식은 유지된다.
 - 최종 승인용 자동 Reviewer는 유효한 Worker 결과와 현재 후보에 연결된 Manager 전체 verify 성공 뒤에 시작한다. R-082의 관련 문서 변경에 따른 선행 Review에는 최신 문서·현재 구현·과거 verify의 확인 범위와 새 조건 미검증을 구분해 전달한다. 선행 PASS/VERIFY_REQUIRED는 최종 승인·게시 token이 아니며 구현 부족은 Worker, 검증 실행만 부족하면 Manager verify로 연결한다. 수동 제출·waiver를 자동 성공으로 합성하지 않고 원격 checkpoint 재개도 같은 구분을 보존한다. R-086 일반 선행 Reviewer에는 Manager 부분 PASS·선택/미선택 범위와 전체 verify 미실행을 전달한다. 동일 후보·실제 호출 identity·이후 전체 run을 확인한 최종 승격은 추가 Reviewer를 요구하지 않으며 R-082 문서 선행 결과와 혼합하지 않는다.
 - 실제 prompt를 사용하는 호출을 자동 테스트로 검사해 현재 runtime instruction의 허용·금지 경계와 사용자 메시지의 중복 부재를 함께 증명한다. 임의의 `delta only` 문자열 또는 prompt 함수 단독 검사만으로 실제 전달을 대신하지 않는다. 같은 작업·세션의 재개에도 현재 지침을 전달하고 과거 호출 해시·session 귀속은 보존한다.
+- R-072: 위 자동 테스트는 고정 샘플 또는 테스트가 소유한 임시 runtime 지침으로 전달·분리를 검사한다. 저장소의 실제 `docs/AGENTS.*.md`를 복사하거나 안내 문구를 검사하지 않으며, 실제 지침의 책임·정합성은 명세와 변경 diff의 읽기 전용 Review에서 확인한다.
 
 ## Implementation
 
 - [ ] `agents/agent_prompts.py`와 실제 Review/checkpoint 호출의 기존 prompt 조합을 확인해 instruction에 이미 있는 검증 규칙의 반복을 제거한다. 결과 형식과 후보별 사실은 사용자 메시지에 유지하고, 기존 common_guidance/provider의 현재 원본 선택·실행용 파일 검증·read_only 경계를 재사용한다. 작업별 snapshot 선택·복원은 추가하지 않는다.
 - [ ] `docs/AGENTS.common.md`·`docs/AGENTS.reviewer.md`의 현재 책임을 보존한다. 결과 전달을 위해 원본을 재작성하지 않으며 후보 worktree 편집본을 실행 입력으로 사용하지 않는다. 대응 테스트에서 사용자 메시지에 금지 문구를 요구하던 기대값을 실제 instruction과 결과 문맥 검사로 분리한다.
+- [ ] 확인한 `tests/support/fixed_samples.py`의 `PROJECT_FILES`·`use_fixed_guidance()`와 `tests/test_agent_invocation.py`의 임시 runtime/provider fixture를 재사용한다. 지침 원문 의존성을 제거한 선행 결과 위에서 고정 지침의 합성·실제 요청 전달과 후보별 사실을 검사하며, 자체 verify 입력 목록에 실제 지침 prose를 다시 추가하지 않는다.
 - [ ] Worker의 초기/delta/복구 prompt는 현재 `worker_prompt`·`execution_worker_handler.py`와 `storage/validation_feedback_state.py`의 직접 구현을 유지한다. 이 계획은 Worker session cursor, Review 성공 재사용, receipt 정책과 알림을 추가 구현하지 않는다. PRODUCT·ARCHITECTURE의 현재 단일 전달 계약은 유지하고 필요한 관련 설명만 정합하게 갱신한다.
 
 ## Validation
 
-- Worker는 `tests/test_loop_manager.py`의 Reviewer prompt case와 `tests/test_agent_invocation.py`의 역할별 전달 fixture를 재사용한 관련 최소 unit case만 실행한다. 실제 Reviewer prompt·현재 runtime 원본을 사용하는 provider double로 Codex·Claude의 신규/재개 요청에서 instruction과 사용자 문맥을 각각 확인한다. 같은 작업의 역할 원본 변경 뒤에도 정적 규칙은 현재 instruction에만 있고 후보·검증 사실은 사용자 prompt에 남아야 한다. 기존 지침 변경/감사 보존 회귀는 재사용하고 실제 Agent·Git 관측은 mock으로 대체한다.
+- Worker는 `tests/test_loop_manager.py`의 Reviewer prompt case와 `tests/test_agent_invocation.py`의 역할별 전달 fixture를 재사용한 관련 최소 unit case만 실행한다. 실제 Reviewer prompt·테스트가 소유한 runtime의 고정 지침을 사용하는 provider double로 Codex·Claude의 신규/재개 요청에서 instruction과 사용자 문맥을 각각 확인한다. 같은 작업의 fixture 역할 원본 변경 뒤에도 정적 규칙은 현재 instruction에만 있고 후보·검증 사실은 사용자 prompt에 남아야 한다. 기존 지침 변경/감사 보존 회귀는 재사용하고 실제 Agent·Git 관측은 mock으로 대체한다.
 - `tests/test_execution_verify_phase.py`·`tests/test_worker_validation.py`·`tests/test_review_specification_recovery.py`의 관련 assertion은 기본 경로의 Worker 반환→Manager 전체 verify→Reviewer 순서와 R-086의 부분 verify→일반 선행 Reviewer→실제 전체 verify→최종 승격 순서, 빈 stdout 성공, 후보/receipt 누락 거부 및 checkpoint 근거 전달을 보존한다. `tests/test_stage_documents.py`의 선행 Review에서는 과거 PASS 참고 표시, PASS/FAIL/VERIFY_REQUIRED의 분기와 최신 근거 없는 게시 금지를 실제 prompt 전달로 확인한다. 수동 결과 구분은 `tests/test_manual_work.py`의 기존 fixture를 재사용한다. `tests/test_preliminary_review.py`의 일반 선행 FAIL→전체 verify no-call·승인 재사용·증거 부재 fallback을 보존한다.
 - Manager 전체 verify는 실패 시 동일 Worker session 복귀, targeted 내부 재실행의 SQLite retry 비소비, 읽기 전용 Review와 최종 후보·게시 gate를 통과해야 한다. 검증 규칙의 전달 위치 변경으로 검증 실행·범위를 축소하지 않는다.
 
@@ -46,6 +50,8 @@ Reviewer의 정적 검증 책임은 매 호출 현재 선택 runtime의 common+r
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- full 검토 revision `ce0b989bda05fc89d6405d2577d7a3bb199e6259`, snapshot token `bd82b86275be0ee2424a23c810c620b9d9978c54af504debe6e122ff487ed345`와 원문 hash를 대조했다. R-072의 자체 지침 원문 소비 제거를 별도 선행으로 연결하고, 이 작업이 후속 전달 테스트에서 실제 정책 문구 검사를 되살리지 않도록 고정 샘플 조건을 통합했다. Reviewer prompt 정리 목표·ID·경로·기존 dependency·분류와 과거 수행/복구 기록은 보존한다. 구현·테스트·전체 verify는 실행하지 않았으며 프로젝트 최종 충족 판단이 아니다.
 
 - R-064의 현재 runtime 적용과 R-033의 같은 session delta 계약에 맞춰 호출별 지침 선택을 직접 구현으로 소비한다. 남은 작업은 실제 Reviewer 사용자 prompt의 정적 규칙 중복 제거이며 이전 로그의 고정 버전 표현은 현행 선택 조건이 아니다. ID·경로·기존 dependency와 복구 판단·수행 기록은 보존하고 새 지침 엔진이나 Worker prompt 작업을 만들지 않는다. 이번 delta에서 구현·테스트는 실행하지 않았다.
 
