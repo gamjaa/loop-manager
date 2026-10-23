@@ -240,6 +240,17 @@ base 대비 HEAD와 최종 작업 diff의 `git diff --check`도 통과했다. �
 
 base 대비 전체 diff와 이번 추가 기록의 `git diff --check` 통과. 이번 호출의 변경은 이 본문 검토/검증 기록뿐이며 이전 교정 파일과 frontmatter는 유지했다. 현재 base 대비 문서 patch hash를 다시 계산했다. 전체 verify는 실행하지 않았고 Manager의 현재 후보 전체 verify·독립 Review·Merge가 남아 있다.
 
+### verify 자식 정리 중단 진단
+
+시작 HEAD 1590993d59ffd63e948c041ffe19611363977efd에서 Manager가 전달한 verify identity `38c7da5b7c6d1337368626750d295749d5ab4650567076653317a980748c20b4` occurrence=1/revision=1은 종료 코드 2다. `/home/ubuntu/.local/state/loop-manager/logs/verify/93cabc3a5039202e3a273225139eb3e3/summary.json`과 runner/worker 로그를 확인했다. 완료 관측은 success 295개이며 보고된 assertion failure/error 결과는 없고 summary.result는 null이다. 완료되지 않은 검사를 통과·skip 또는 unit 실패 횟수로 바꾸어 기록하지 않는다.
+
+두 worker는 bootstrap 저장 scope/runtime 선택 시나리오를 실행 중이었다. resource_wait는 CPU/사용자 한도 2와 실행 중 2개를 관측했고 이것만으로 중단 원인을 단정하지 않는다. runner는 약 92초 뒤 finally의 worker_shutdown으로 들어가 각 worker 종료를 약 10초 대기한 뒤 두 종료 시간 초과를 보고했다. 전체 1800초 상한 소진은 관측되지 않았다. 이 정리 예외가 남은 자료에서는 최초 진입 예외를 확인할 수 없어 primary 원인을 확정하지 못했다. worker 로그에는 해당 미완료 방법의 최종 결과/traceback도 없다.
+
+현재 base 대비 verification core·verify_process·bootstrap 저장 scope fixture와 해당 두 test 모듈의 변경은 없다. G-226의 snapshot/확인 경로에 연결되는 원인도 확인되지 않아 timeout 확대·검사 삭제/skip·범위 밖 verifier 수정은 하지 않았다. bootstrap의 실제 CLI/Git 전체 시나리오나 전체 verify는 Worker에서 직접 실행하지 않았다. Manager가 최초 예외의 전체 runner 출력을 확보하고 같은 현재 후보의 전체 verify를 재실행해야 한다. 재현되는 원인이 확인되면 그 근거에 따라 후속 교정 범위를 판단한다.
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_verify_process.VerifyProcessTests.test_cleanup_uncertainty_keeps_the_primary_failure tests.test_execution_checkpoint_recovery_phase.ExecutionCheckpointRecoveryPhaseTests.test_worker_decision_checkpoint_wait_survives_three_restarted_runs tests.test_notification_delivery.CurrentActionPolicyTest.test_late_confirmation_updates_only_continued_versions_of_same_action tests.test_notification_delivery.CurrentActionPolicyTest.test_worker_question_survives_project_recovery_without_restoring_shared_record > /tmp/g226-verify-interruption-units.log 2>&1`: 이번 호출에서 4개 통과, 92.713초. 정리 불명 시 원래 오류 보존의 mock unit과 G-226의 실제 SQLite 질문/checkpoint·늦은 확인·독립 scope를 확인했다. 이 결과로 Manager 전체 verify 중단이 해소됐다고 간주하지 않는다.
+- `git diff --check` 통과. 이번 호출은 선택 ExecPlan 본문에 진단/검증 기록만 추가했다. 현재 후보의 전체 verify·Review·Merge는 여전히 대기한다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.
