@@ -1627,13 +1627,23 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
         broken = 'docs/plans/[G-006] New invalid.md'
         if registered_hold:
             self.fixture._insert('G-006', 'New invalid', status='READY', retry_count=2)
+            held_dependency = 'G-002' if revalidation else 'G-001'
             self.connection.execute(
-                "UPDATE exec_plans SET depends_on='[\"G-001\"]', repo=? WHERE plan_id='G-006'",
-                (self.repo,),
+                "UPDATE exec_plans SET depends_on=?, repo=? WHERE plan_id='G-006'",
+                (json.dumps([held_dependency]), self.repo),
             )
             self.documents[broken] = self.fixture._text(
-                'G-006', 'New invalid', depends_on=('G-001',), risk='invalid',
+                'G-006', 'New invalid', depends_on=(held_dependency,), risk='invalid',
             )
+            if revalidation:
+                self.connection.execute(
+                    "UPDATE exec_plans SET depends_on='[\"G-001\"]' "
+                    "WHERE repo=? AND plan_id='G-002'",
+                    (self.repo,),
+                )
+                self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text(
+                    'G-002', 'Dependency', depends_on=('G-001',),
+                )
         else:
             self.documents[broken] = self.fixture._text('G-006', 'New invalid').replace(
                 'priority: normal\n', '',
@@ -1760,12 +1770,14 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
     def test_maintenance_validation_and_publication_recheck_held_cycle(self):
         import hashlib
         from loop_manager_internal.maintenance import maintenance_publication
+        from loop_manager_internal.storage import maintenance_state
 
         with self._scoped_maintenance_publication(
             registered_hold=True, revalidation=True,
         ) as batch:
             self.assertIn('G-006', self.held())
             held_before = dict(self.row('G-006'))
+            path_plan_before = dict(self.row('G-002'))
             ready_before = dict(self.row('G-001'))
             holds_before = [tuple(row) for row in self.connection.execute(
                 'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
@@ -1781,11 +1793,15 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                     self.connection, batch.context, batch.root, [ready.path],
                 )
             self.assertEqual(dict(self.row('G-006')), held_before)
+            self.assertEqual(dict(self.row('G-002')), path_plan_before)
             self.assertEqual(dict(self.row('G-001')), ready_before)
             self.assertEqual([tuple(row) for row in self.connection.execute(
                 'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
                 (self.repo,),
             )], holds_before)
+            cycle_state = maintenance_state.MaintenanceRepository(self.connection).get(self.repo)
+            self.assertIsNone(cycle_state.publication_stage)
+            self.assertIsNone(self.row('G-007'))
 
             cycle_plan = catalog.parse_execplan_file(
                 batch.root, batch.root / ready.path, validate_sources=False,
@@ -1823,11 +1839,103 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                     connection=self.connection,
                 )
             self.assertEqual(dict(self.row('G-006')), held_before)
+            self.assertEqual(dict(self.row('G-002')), path_plan_before)
             self.assertEqual(dict(self.row('G-001')), ready_before)
             self.assertEqual([tuple(row) for row in self.connection.execute(
                 'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
                 (self.repo,),
             )], holds_before)
+            cycle_state = maintenance_state.MaintenanceRepository(self.connection).get(self.repo)
+            self.assertIsNone(cycle_state.publication_stage)
+            self.assertIsNone(self.row('G-007'))
+
+    def test_maintenance_new_plan_batch_cycle_is_rejected_before_intent(self):
+        import hashlib
+        from loop_manager_internal.maintenance import maintenance_publication
+        from loop_manager_internal.storage import maintenance_state
+
+        with self._scoped_maintenance_publication(registered_hold=True) as batch:
+            ready = batch.context.eligible_plans[0]
+            first_path, _first_plan = batch.result.plans[0]
+            second_path = 'docs/plans/[G-008] Second.md'
+            (batch.root / ready.path).write_text(
+                ready.text, encoding='utf-8', newline='\n',
+            )
+            first_text = (batch.root / first_path).read_text(encoding='utf-8')
+            first_text = first_text.replace(
+                '  - G-002', '  - G-008\n  - G-006',
+            )
+            (batch.root / first_path).write_text(
+                first_text, encoding='utf-8', newline='\n',
+            )
+            (batch.root / second_path).write_text(
+                fixtures.plan_text('G-008', 'Second').replace(
+                    'depends_on: []', 'depends_on:\n  - G-007',
+                ), encoding='utf-8', newline='\n',
+            )
+            paths = tuple(sorted((first_path, second_path)))
+            with mock.patch.object(manager, 'changed_files', return_value=list(paths)):
+                with self.assertRaises(manager.PlannerValidationError):
+                    manager.validate_maintenance_planner_result(
+                        self.connection, batch.context, batch.root, list(paths),
+                    )
+
+            held_before = dict(self.row('G-006'))
+            ready_before = dict(self.row('G-001'))
+            holds_before = [tuple(row) for row in self.connection.execute(
+                'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
+                (self.repo,),
+            )]
+            cycle_plans = tuple(
+                (path, catalog.parse_execplan_file(
+                    batch.root, batch.root / path, validate_sources=False,
+                ))
+                for path in paths
+            )
+            hashes = tuple(
+                (path, hashlib.sha256((batch.root / path).read_bytes()).hexdigest())
+                for path in paths
+            )
+            cycle_result = replace(
+                batch.result,
+                plans=cycle_plans,
+                publication_paths=paths,
+                publication_hashes=hashes,
+                revisions=(),
+                refactoring_plan_ids=('G-007', 'G-008'),
+            )
+            committed = {path: (batch.root / path).read_bytes() for path in paths}
+            batch.publication_paths = paths
+            batch.remote = batch.commit
+            planning_effects = maintenance_publication.ValidateMaintenancePlanningCommitEffects(
+                _parse_execplan=catalog.parse_execplan_file,
+                git=manager.git,
+                git_bytes=lambda _root, _command, spec: committed[spec.split(':', 1)[1]],
+                load_execplan_catalog=manager.load_execplan_catalog,
+                load_execplan_snapshot=manager.load_execplan_snapshot,
+            )
+            publication_effects = maintenance_publication.ValidateMaintenancePublicationCommitEffects(
+                _validate_maintenance_planning_commit=lambda root, result, commit, **kwargs:
+                    maintenance_publication._validate_maintenance_planning_commit(
+                        planning_effects, root, result, commit, **kwargs,
+                    ),
+                git=manager.git,
+            )
+            with self.assertRaises(manager.MaintenancePlanningError):
+                maintenance_publication._validate_maintenance_publication_commit(
+                    publication_effects, batch.root, 'main', cycle_result, batch.commit,
+                    connection=self.connection,
+                )
+            self.assertIsNone(self.row('G-007'))
+            self.assertIsNone(self.row('G-008'))
+            self.assertEqual(dict(self.row('G-006')), held_before)
+            self.assertEqual(dict(self.row('G-001')), ready_before)
+            self.assertEqual([tuple(row) for row in self.connection.execute(
+                'SELECT * FROM execplan_catalog_holds WHERE repo=? ORDER BY plan_id',
+                (self.repo,),
+            )], holds_before)
+            cycle_state = maintenance_state.MaintenanceRepository(self.connection).get(self.repo)
+            self.assertIsNone(cycle_state.publication_stage)
 
     def test_maintenance_publication_rejects_changed_hold_and_preserves_intent(self):
         from loop_manager_internal.storage import maintenance_state

@@ -63,11 +63,14 @@ def validated_held_planning_snapshot(
     causes = [dict(plan_id=item.plan_id, path=item.path, code=item.code,
                    message=item.message, source=item.source) for item in local.issues]
     declaration_holds = {key for key, evidence in held.items() if "causes" in evidence}
-    if (local.withheld_ids - planned_ids != declaration_holds
+    unplanned_withheld = local.withheld_ids - planned_ids
+    if ((not declaration_holds and unplanned_withheld)
+            or not declaration_holds <= unplanned_withheld
             or any(issue.plan_id in planned_ids for issue in local.issues)
             or any(held[key].get("causes") != causes for key in declaration_holds)
             or any(held[key].get("content_hash") != content_hash
-                   for key, _path, content_hash in local.withheld if key not in planned_ids)):
+                   for key, _path, content_hash in local.withheld
+                   if key not in planned_ids and key in held)):
         raise execplan_catalog.ExecPlanCatalogError(
             "planning 결과가 보류 catalog 오류의 원인이나 범위를 변경했습니다.",
             code="held-planning-mismatch")
@@ -87,7 +90,8 @@ def validated_held_planning_snapshot(
 
 
 def assert_planning_dependency_references(
-    catalog, plans, held_ids, *, original_dependencies=None, check_cycles=True,
+    catalog, plans, held_ids, *, original_dependencies=None, withheld_ids=(),
+    check_cycles=True,
 ) -> None:
     """A registered held prerequisite is a valid reference, not permission to run."""
     original_dependencies = original_dependencies or {}
@@ -120,9 +124,13 @@ def assert_planning_dependency_references(
     changed_ids = frozenset(str(plan["id"]) for _, plan in plans)
     for _, plan in plans:
         dependencies[str(plan["id"])] = tuple(str(item) for item in plan["depends_on"])
-    # Only quarantined plans need their registered relationship snapshot to
-    # complete the graph. A current planning declaration always takes priority.
-    for plan_id in held_ids:
+    # Quarantined dependency closure nodes have pinned files but no active
+    # metadata. Use their registered edge only when the snapshot withheld them;
+    # current declarations above always take priority.
+    fallback_ids = frozenset(str(item) for item in held_ids) | frozenset(
+        str(item) for item in withheld_ids
+    )
+    for plan_id in fallback_ids:
         if plan_id not in dependencies and plan_id in original_dependencies:
             dependencies[str(plan_id)] = tuple(
                 str(item) for item in original_dependencies[plan_id]
