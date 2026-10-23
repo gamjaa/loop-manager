@@ -1180,7 +1180,11 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 
 공통 진단은 EventWriter의 `*.jsonl`만 집계하며 native 원본의 별도 형식과 중단 자료를 보존한다. 파일 ID에 속한 동적 assertion 번호·plan과 parser/exit/signal을 대조해 완결된 suite만 완료로 기록한다. bailout은 plan 완료·정상 종료와 관계없이 suite 완료를 거부한다. nested subtest와 fixture 의미는 Test::More가 소유한다.
 
-EventWriter 이벤트는 `clock_domain=sys.platform`과 run/stage/unit/worker identity를 보존한다. Windows launcher의 parent summary는 `result.json`·`snapshot.json`과 `<run>-wsl`·`<run>-windows`의 summary 경로·run ID·결과·elapsed를 연결하고 각 자식 실행의 clock domain 안에서만 시간을 계산한다. WSL run ID는 `parent_run_id`로 launcher run에 연결된다. native child에도 launcher의 parent run ID를 전달하고, parent는 일치하는 parent identity를 확인한 child summary에서 실제 native run ID를 가져온다. live WSL worker JSONL은 공유 bundle log에서 읽고 cleanup 뒤 형제 디렉터리로 보존한다. Manager progress reader는 현재 run의 완성된 줄만 한 번 소비하며 `test_interrupted`·stage 종료·run 종료를 파일 순서와 독립적으로 적용해 늦게 읽은 worker 시작이 active 표시를 되살리지 못하게 한다. 파일 읽기 실패는 미확인으로 남긴다. summary는 각 OS의 child metrics와 전체 parent elapsed를 분리해 PID나 monotonic clock을 합치지 않는다.
+EventWriter 이벤트는 `clock_domain=sys.platform`과 run/stage/unit/worker identity를 보존한다. Windows launcher의 parent summary는 `result.json`·`snapshot.json`과 `<run>-wsl`·`<run>-windows`의 summary 경로·run ID·결과·elapsed를 연결하고 각 자식 실행의 clock domain 안에서만 시간을 계산한다. WSL run ID는 `parent_run_id`로 launcher run에 연결된다. native child에도 launcher의 parent run ID를 전달하고, parent는 일치하는 parent identity를 확인한 child summary에서 실제 native run ID를 가져온다. live WSL worker JSONL은 공유 bundle log에서 읽고 cleanup 뒤 형제 디렉터리로 보존한다.
+
+새 `phase_start`·`phase_end` 쌍은 같은 32자리 소문자 16진수 UUID `phase_id`를 사용한다. `timing.summarize()`와 Manager progress reader는 변경될 수 있는 stage/unit identity 대신 이 ID로 phase 종료를 연결한다. ID가 없는 legacy 이벤트는 같은 run·clock domain·PID·phase 이름·시작 시각으로 연결한다. 따라서 `verify` phase가 stage ID 변경을 가로질러 FALLBACK·예외로 종료되고 `run_end`가 없어도 실행 중 항목으로 남지 않는다.
+
+Manager progress reader는 현재 run의 완성된 줄만 한 번 소비하며 `test_interrupted`·stage 종료·run 종료를 파일 순서와 독립적으로 적용해 늦게 읽은 worker 시작이 active 표시를 되살리지 못하게 한다. 파일 읽기 실패는 미확인으로 남긴다. summary는 각 OS의 child metrics와 전체 parent elapsed를 분리해 PID나 monotonic clock을 합치지 않는다.
 
 `LoopManagerVerifyGuard.pm`은 테스트/compile BEGIN 전에 일반 Perl process·fork·network 경계를 막으며 CORE/XS/threads 우회는 지원하지 않는다. 부분 결과는 native 로그에 보존하고 공통 core가 실제 worker 종료 후 예약을 회수한다. Perl은 unittest AST 부분 선정·시간 큐 재사용에 진입하지 않는다.
 

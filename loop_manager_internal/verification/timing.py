@@ -13,6 +13,7 @@ import stat
 import sys
 import time
 import unittest
+import uuid
 from unittest import mock
 
 _current_writer: ContextVar[EventWriter | None] = ContextVar("verify_events", default=None)
@@ -54,16 +55,17 @@ def phase(name: str, *, writer=None):
     if writer is None:
         yield
         return
-    start = writer.emit("phase_start", name=name)
+    phase_id = uuid.uuid4().hex
+    start = writer.emit("phase_start", name=name, phase_id=phase_id)
     token = _phase_names.set((*_phase_names.get(), name))
     try:
         yield
     except BaseException:
-        writer.emit("phase_end", name=name, start=start["at"],
+        writer.emit("phase_end", name=name, phase_id=phase_id, start=start["at"],
                     duration=writer.clock() - start["at"], result="error")
         raise
     else:
-        writer.emit("phase_end", name=name, start=start["at"],
+        writer.emit("phase_end", name=name, phase_id=phase_id, start=start["at"],
                     duration=writer.clock() - start["at"], result="complete")
     finally:
         _phase_names.reset(token)
@@ -330,7 +332,13 @@ def summarize(directory: Path, *, now=None):
             run_key = (event.get("clock_domain", "legacy"), event.get("run_id"),
                        event.get("parent_run_id"))
             base_key = (*run_key, event.get("stage_id"), event.get("unit_id"), event["pid"])
-            key = (*base_key, kind.split("_")[0], identity)
+            if kind in {"phase_start", "phase_end"}:
+                phase_identity = event.get("phase_id")
+                if phase_identity is None:
+                    phase_identity = (event.get("name"), event.get("start", event.get("at")))
+                key = (*run_key, event["pid"], "phase", phase_identity)
+            else:
+                key = (*base_key, kind.split("_")[0], identity)
             if kind in {"test_start", "phase_start"}:
                 active[key] = event
             elif kind in {"test_end", "phase_end"}:

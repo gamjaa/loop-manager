@@ -9,6 +9,7 @@ from unittest import TestCase, mock
 
 from loop_manager_internal.runtime import operation_events as events
 from loop_manager_internal.verification.manager_adapter import progress_observation
+from loop_manager_internal.verification.timing import EventWriter, phase
 from loop_manager_internal.agents.agent_invocation import AgentResult, run_agent_with_retries
 
 
@@ -232,6 +233,33 @@ class OperationObservabilityTests(TestCase):
                 self.assertEqual(observed["active_tests"], 0)
                 self.assertEqual(observed["active_units"], 0)
                 self.assertEqual(observed["current_test"], "-")
+
+    def test_verify_progress_closes_phase_after_stage_identity_changes_without_run_end(self):
+        for raises in (False, True):
+            with self.subTest(raises=raises), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run_id = "run-stage-drift"
+                writer = EventWriter(root / "runner.jsonl", identity={"run_id": run_id})
+                try:
+                    with writer.activate():
+                        try:
+                            with phase("verify"):
+                                writer.identity["stage_id"] = "unittest"
+                                if raises:
+                                    raise RuntimeError("verify failed")
+                        except RuntimeError:
+                            pass
+                finally:
+                    writer.close()
+
+                observed = progress_observation(root, {}, {}, run_id)
+
+                self.assertEqual(observed["active_phases"], "-")
+                records = [json.loads(line) for line in (root / "runner.jsonl").read_text().splitlines()]
+                self.assertNotEqual(records[0].get("stage_id"), records[1].get("stage_id"))
+                self.assertEqual(records[0]["phase_id"], records[1]["phase_id"])
+                self.assertEqual(records[1]["result"], "error" if raises else "complete")
+                self.assertNotIn("run_end", [record["kind"] for record in records])
 
     def test_verify_progress_follows_windows_parent_snapshot_and_os_logs(self):
         with tempfile.TemporaryDirectory() as temporary:

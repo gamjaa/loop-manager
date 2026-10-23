@@ -56,6 +56,7 @@ verification/core.py의 결과 수집·Windows Job 관측·unit_start와 기존 
 - [x] 2026-10-23 rebase base `c411905d6910a4794394d14dfb3f9e185a19eb07` 이후 현재 base-relative 변경 14개 파일의 전체 diff를 재검토했다. 관련 targeted unit 11개를 새로 실행해 통과했고 `git diff --check`도 통과했다. 실제 Windows/WSL 실행과 Manager 전체 verify는 실행하지 않았다.
 - [x] `test_verify_progress_reads_only_complete_new_events`에서 allocation 거부만 기록된 경우 자원 대기가 표시되지 않는 회귀를 수정했다. 거부 이벤트를 즉시 대기로 표시하고 legacy 로그에는 기존처럼 이유만 출력한다. 실패한 동일 case와 run/stage·Windows parent·stage worker 진행 case 3개를 통과시켰다.
 - [x] Review의 종료-event 순서 지적에 따라 Manager progress와 timing summary에서 stage/run 종료를 worker 파일 읽기 순서와 독립적으로 적용하고, 시작·종료 이벤트가 같은 관측에 들어오는 회귀를 추가했다. Windows native child에 launcher parent ID를 전달하고 native summary의 parent identity를 확인해 실제 run ID를 parent 결과에 연결한다. 관련 targeted unit 7개를 통과시켰으며 실제 Windows/WSL 실행과 전체 verify는 수행하지 않았다.
+- [x] Review의 phase identity 지적에 따라 `phase_start`·`phase_end`에 안정적인 `phase_id`를 부여하고 Manager progress와 timing summary가 mutable stage/unit identity와 독립적으로 종료를 연결한다. stage 변경 뒤 `run_end` 없이 정상(FALLBACK)·예외 종료하는 새 회귀를 기존 파일 순서 회귀와 함께 targeted unit 4개로 통과시켰다.
 
 ## Decision Log
 

@@ -53,6 +53,32 @@ class TimingAndManifestTests(unittest.TestCase):
 
                 self.assertEqual(summary["active"], [])
 
+    def test_summary_closes_phase_after_stage_identity_changes_without_run_end(self):
+        for raises in (False, True):
+            with self.subTest(raises=raises), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                writer = EventWriter(root / "runner.jsonl", identity={"run_id": "run-stage-drift"})
+                try:
+                    with writer.activate():
+                        try:
+                            with phase("verify"):
+                                writer.identity["stage_id"] = "unittest"
+                                if raises:
+                                    raise RuntimeError("verify failed")
+                        except RuntimeError:
+                            pass
+                finally:
+                    writer.close()
+
+                records = [json.loads(line) for line in (root / "runner.jsonl").read_text().splitlines()]
+                summary = summarize(root, now=10)
+
+                self.assertNotEqual(records[0].get("stage_id"), records[1].get("stage_id"))
+                self.assertEqual(records[0]["phase_id"], records[1]["phase_id"])
+                self.assertEqual(records[1]["result"], "error" if raises else "complete")
+                self.assertNotIn("run_end", [record["kind"] for record in records])
+                self.assertEqual(summary["active"], [])
+
     def test_windows_summary_links_os_runs_without_combining_their_clocks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "run"

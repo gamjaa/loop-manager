@@ -167,7 +167,11 @@ def progress_observation(directory, positions, state, run_id=None):
                             active_units.pop(key, None)
                         elif kind == "phase_start":
                             phase_name = event.get("name")
-                            phase_key = (*scope, phase_name, event.get("at"))
+                            phase_identity = event.get("phase_id")
+                            if phase_identity is None:
+                                phase_identity = (phase_name, event.get("at"))
+                            phase_key = (source, clock_domain, event_run,
+                                         event.get("parent_run_id"), pid, "phase", phase_identity)
                             active_phases[phase_key] = {
                                 "context": context,
                                 "run_id": event_run, "clock_domain": clock_domain,
@@ -182,7 +186,11 @@ def progress_observation(directory, positions, state, run_id=None):
                                 }
                         elif kind == "phase_end":
                             phase_name = event.get("name")
-                            phase_key = (*scope, phase_name, event.get("start"))
+                            phase_identity = event.get("phase_id")
+                            if phase_identity is None:
+                                phase_identity = (phase_name, event.get("start"))
+                            phase_key = (source, clock_domain, event_run,
+                                         event.get("parent_run_id"), pid, "phase", phase_identity)
                             active_phases.pop(phase_key, None)
                             if phase_name == "resource_wait":
                                 resource_waits.pop(context, None)

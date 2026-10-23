@@ -152,7 +152,7 @@ unittest와 perl-tap 이외의 미연결 도구는 기존 verify를 유지하며
 
 ## 진단과 입력
 
-run별 `manifest.json`, 단계별 수집 요청/결과·단위 결과·worker 로그와 JSONL 이벤트, 전체 `summary.json`을 보존한다. version 1 이벤트는 run·stage·unit·worker·test identity와 `clock_domain`을 담으며, 이전 로그에 없는 필드는 확인되지 않은 값으로 남긴다. `clock_domain`은 이벤트를 기록한 Python의 `sys.platform` 문자열이다. monotonic `at`·`start`·`duration`은 같은 clock domain 안에서만 비교한다. 종료·정리 판단은 Manager/core가 소유하고 summary나 운영 진행 표시는 이를 바꾸지 않는다. 실패 피드백의 `[VERIFY_DIAGNOSTIC]` 경로로 원본 진단을 찾을 수 있다. 예약은 session·단위·PID와 프로세스 시작 identity에 결합한다. 종료가 확인된 자식/미시작 예약만 회수하고 종료 불명은 별도 journal에 보존한다.
+run별 `manifest.json`, 단계별 수집 요청/결과·단위 결과·worker 로그와 JSONL 이벤트, 전체 `summary.json`을 보존한다. version 1 이벤트는 run·stage·unit·worker·test identity와 `clock_domain`을 담으며, 이전 로그에 없는 필드는 확인되지 않은 값으로 남긴다. 새 `phase_start`·`phase_end` 이벤트는 동일한 32자리 소문자 16진수 UUID `phase_id`를 공유해 stage/unit identity가 달라져도 시작과 종료를 연결한다. 이 필드가 없는 legacy phase는 같은 run·clock domain·PID·phase 이름·시작 시각으로 대응한다. `clock_domain`은 이벤트를 기록한 Python의 `sys.platform` 문자열이다. monotonic `at`·`start`·`duration`은 같은 clock domain 안에서만 비교한다. 종료·정리 판단은 Manager/core가 소유하고 summary나 운영 진행 표시는 이를 바꾸지 않는다. 실패 피드백의 `[VERIFY_DIAGNOSTIC]` 경로로 원본 진단을 찾을 수 있다. 예약은 session·단위·PID와 프로세스 시작 identity에 결합한다. 종료가 확인된 자식/미시작 예약만 회수하고 종료 불명은 별도 journal에 보존한다.
 
 core는 `result_file_observed`에서 report 경로를 처음 발견한 parent 시각을 기록한다. Windows Job에서 `active_processes > 1`이면 `job_child_wait`와 변경된 process count를 남기고, worker만 남았음을 확인한 `job_child_exit_confirmed` 뒤에 report를 소비한다. 조회 오류는 `job_child_exit_unconfirmed`다. `module_result`는 결과 검증·집계 뒤에 기록하며 다음 `unit_start`에는 `worker_id`, `previous_unit_id`, 직전 결과 뒤 경과 시간이 있다. 이 대기와 coordinator `resource_wait`, `worker_shutdown:<worker>`는 따로 집계한다. 진단 이벤트는 worker 재사용·idle·예약 회수 정책을 완화하지 않는다.
 
