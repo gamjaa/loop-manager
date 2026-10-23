@@ -43,7 +43,7 @@ priority: high
 
 - [x] 원격 `5f49ff2f087d7108d92b481ad1a3bee98b0839cb`의 R-082 변경과 위 실제 trigger·prompt/결과 제한·문서 실행 guard 및 기존 회귀를 정적으로 대조했다. compact catalog에 이 잔여 전달/호출 제거 목표를 담당하는 비종료 작업은 없다.
 - [x] 승인 전용 Planner trigger와 결과 제한을 제거하고, 승인 snapshot·현재 선언·소유권·실행 상태가 단일 기존 작업으로 확인될 때만 같은 Worker에 전달했다. 무연결·모호·stale·수동 소유·PR 경합은 승인 artifact와 독립 작업을 보존하며, legacy 문서 계획 복구는 유지한다.
-- [x] 현재 rebase 수용 후보에서 승인 연결·보류·bytes/CRLF·legacy 게시·Planner 선택·Requirement overview와 소유 rebase 재검사·planning drain 중 base-fetch를 검증하는 targeted unit test 22개가 통과했다. 전체 suite와 `scripts/verify`는 실행하지 않았다.
+- [x] 현재 rebase 수용 후보에서 승인 연결·보류·bytes/CRLF·legacy 게시·Planner 선택·Requirement overview와 소유 rebase 재검사·planning drain 중 base-fetch를 검증하는 targeted unit test 23개가 통과했다. 전체 suite와 `scripts/verify`는 실행하지 않았다.
 - [x] rebase 재개는 identity 불일치 때 최신 service로 전체 소유권 검사를 한 번 재실행하고 재실패를 거부한다. planning drain 동안 base-fetch 자원 대기·획득은 허용하고 task/handoff gate는 유지한다.
 
 ## Decision Log
