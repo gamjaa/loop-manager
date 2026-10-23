@@ -10,7 +10,7 @@ from unittest import TestCase, mock
 
 from loop_manager_internal.execution import execution_handlers as handlers
 import loop_manager as lm
-from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
+from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind, ExecutionPhase
 
 
 from tests.support.execution_recovery_scenarios import ExecutionRecoveryScenarios
@@ -19,12 +19,12 @@ from dataclasses import replace
 
 
 class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
-    def approved_draft(self, relationships, *, plan_id=None):
+    def approved_draft(self, relationships, *, plan_id=None, target_path='docs/PRODUCT.md'):
         drafts = handlers.document_drafts.DocumentDraftRepository(self.connection)
         original, proposed = b'# Product\r\nOld.\r\n', b'# Product\r\nApproved.\r\n'
         draft_id = 'a' * 32
         diff = handlers.document_drafts._complete_diff(
-            'docs/PRODUCT.md', original, proposed,
+            target_path, original, proposed,
         )
         self.connection.execute(
             'INSERT INTO document_drafts (draft_id, repo, finding_ids, target_path, '
@@ -32,7 +32,7 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
             'proposed_hash, proposed_content, complete_diff, source_relationships, '
             'meaning_evidence, state, requested_decision, decision_revision, plan_id) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (draft_id, self.repo, '[]', 'docs/PRODUCT.md', 'b' * 40, 'c' * 40,
+            (draft_id, self.repo, '[]', target_path, 'b' * 40, 'c' * 40,
              hashlib.sha256(original).hexdigest(), original,
              hashlib.sha256(proposed).hexdigest(), proposed, diff,
              json.dumps([[plan, sorted(sources)] for plan, sources in relationships]),
@@ -445,6 +445,86 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
             self.assertEqual(target.read_bytes(), draft.original_content)
 
 
+    def test_requirement_approval_is_held_outside_general_worker_scope(self):
+        target = 'docs/requirements/[R-314] Example.md'
+        self.plan = {**self.plan, 'sources': [target]}
+        self.handler.plan = self.plan
+        self.connection.execute(
+            'UPDATE exec_plans SET sources = ? WHERE repo = ? AND plan_id = ?',
+            (json.dumps([target]), self.repo, 'G-047'),
+        )
+        self.connection.commit()
+        draft = self.approved_draft((('G-047', (target,)),), target_path=target)
+        self.effects.agent.is_loop_manager_repository.return_value = True
+        context = self.context()
+        repository = handlers.document_drafts.DocumentDraftRepository(self.connection)
+        with (
+            mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                              'unplanned_approved', return_value=(draft,)),
+            mock.patch.object(handlers.document_publication, 'read_plan_text',
+                              return_value='ordinary existing ExecPlan'),
+            mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                              'bind_plan') as bind,
+        ):
+            self.assertIsNone(self.handler._document_draft(context))
+        bind.assert_not_called()
+        stored = repository.get(draft.draft_id)
+        self.assertIsNone(stored.plan_id)
+        self.assertIn('Requirement', stored.publication_error)
+
+        repository.bind_plan(self.repo, draft.draft_id, 'G-047')
+        mapped = repository.for_plan(self.repo, 'G-047')
+        with mock.patch.object(
+            handlers.document_publication, 'apply_linked_approved_bytes',
+        ) as apply:
+            with self.assertRaisesRegex(
+                handlers.document_drafts.DocumentDraftError, 'Requirement',
+            ):
+                self.handler._apply_linked_document(context, mapped)
+        apply.assert_not_called()
+        self.assertIn('Requirement', repository.get(draft.draft_id).publication_error)
+
+
+    def test_changed_linked_bytes_after_restart_still_hit_document_guard(self):
+        draft = self.approved_draft(
+            (('G-047', ('docs/PRODUCT.md',)),), plan_id='G-047',
+        )
+        self.effects.agent.is_loop_manager_repository.return_value = True
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            target = worktree / draft.target_path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b'# Product\r\nChanged after approval.\r\n')
+            context = replace(
+                self.context(), worktree=worktree, phase=ExecutionPhase.VERIFYING,
+            )
+            with (
+                mock.patch.object(handlers.document_drafts.DocumentDraftRepository,
+                                  'assert_current', return_value='remote'),
+                mock.patch.object(handlers.document_publication, 'read_plan_text',
+                                  return_value='ordinary existing ExecPlan'),
+            ):
+                observed = self.handler._document_draft(context)
+                self.assertEqual(observed.draft_id, draft.draft_id)
+                with mock.patch.object(
+                    handlers.document_publication, 'validate_linked_worktree',
+                    side_effect=handlers.document_drafts.DocumentDraftError(
+                        'approved bytes changed after restart',
+                    ),
+                ) as validate:
+                    with self.assertRaisesRegex(
+                        handlers.document_drafts.DocumentDraftError,
+                        'approved bytes changed after restart',
+                    ):
+                        self.handler._document_guard(context, observed)
+            validate.assert_called_once()
+        self.assertIn(
+            'Worker 구현 단계가 지난',
+            handlers.document_drafts.DocumentDraftRepository(self.connection)
+            .get(draft.draft_id).publication_error,
+        )
+
+
     def test_document_review_requires_explicit_meaning_and_diff_verdicts(self):
         draft = SimpleNamespace(draft_id="a" * 32, target_path="docs/PRODUCT.md")
         self.effects.agent.reviewer_prompt.return_value = 'review prompt'
@@ -462,6 +542,39 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.assertIn('명시적으로 확정', block.call_args.args[2])
         self.effects.publication.command.assert_not_called()
+
+
+    def test_code_review_failure_with_document_pass_uses_normal_correction_flow(self):
+        draft = SimpleNamespace(draft_id='a' * 32, target_path='docs/PRODUCT.md')
+        self.effects.agent.run_agent.side_effect = lambda *args, **kwargs: lm.AgentResult(
+            0,
+            'DOCUMENT_MEANING: PASS\nDOCUMENT_DIFF: PASS\n'
+            'ISSUE_ID: app.py::code-defect::blocking\nVERDICT: FAIL',
+            session_id=None,
+        )
+        self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
+        self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(
+            blocked=False, fingerprint='code-review-failure',
+        )
+        with (
+            mock.patch.object(self.handler, '_document_draft', return_value=draft),
+            mock.patch.object(self.handler, '_document_guard'),
+            mock.patch.object(self.handler, '_document_block') as document_block,
+            mock.patch.object(
+                self.handler, '_recover',
+                return_value=ExecutionOutcome(ExecutionOutcomeKind.RETRY),
+            ) as recover,
+            mock.patch.object(handlers.document_drafts, 'review_artifact',
+                              return_value='artifact'),
+        ):
+            outcome = self.handler.review(self.review_context())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        document_block.assert_not_called()
+        self.effects.validation.transition_validation_failure.assert_called_once()
+        self.assertEqual(
+            recover.call_args.args[0],
+            handlers.RecoveryReason.REVIEW_FEEDBACK_CORRECTION,
+        )
 
 
     def test_document_review_passes_with_explicit_meaning_and_diff_verdicts(self):

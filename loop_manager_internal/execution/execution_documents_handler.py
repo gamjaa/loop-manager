@@ -30,6 +30,12 @@ class DocumentsHandler:
         self.ports = ports
 
     @staticmethod
+    def _requirement_scope_error(draft):
+        if draft.target_path.casefold().startswith('docs/requirements/'):
+            return 'Requirement 문서는 일반 Worker 권한 범위 밖이므로 승인 수정본을 미적용 상태로 보존합니다.'
+        return None
+
+    @staticmethod
     def _saved_relationships(draft):
         try:
             relationships = json.loads(draft.source_relationships)
@@ -115,6 +121,10 @@ class DocumentsHandler:
             return draft  # Preserve the already-published document-only plan contract.
         if draft is not None:
             phase = getattr(context.phase, 'value', str(context.phase))
+            scope_error = self._requirement_scope_error(draft)
+            if scope_error:
+                self._hold(drafts, draft, scope_error)
+                return draft if phase != 'IMPLEMENTING' else None
             applied = document_publication.approved_bytes_present(draft, context.worktree)
             try:
                 plan = self._linked_plan(context, draft)
@@ -128,7 +138,7 @@ class DocumentsHandler:
                 return None
             if phase != 'IMPLEMENTING' and not applied:
                 self._hold(drafts, draft, 'Worker 구현 단계가 지난 기존 작업에는 승인 bytes를 추가하지 않았습니다.')
-                return None
+                return draft
             if (phase == 'IMPLEMENTING' and not applied
                     and (plan['status'] != 'IMPLEMENTING' or plan['pr_url']
                          or plan['pr_head_oid'] or plan['pr_conflict_recovery'])):
@@ -159,6 +169,10 @@ class DocumentsHandler:
             return None
 
         candidate = candidates[0]
+        scope_error = self._requirement_scope_error(candidate)
+        if scope_error:
+            self._hold(drafts, candidate, scope_error)
+            return None
         try:
             plan = self._linked_plan(context, candidate, allow_unbound=True)
             if (plan['status'] != 'IMPLEMENTING' or plan['pr_url']
@@ -208,6 +222,9 @@ class DocumentsHandler:
                 draft, context.worktree, str(self.ports._row()['active_sha'] or ''),
             )
         else:
+            scope_error = self._requirement_scope_error(draft)
+            if scope_error:
+                raise document_drafts.DocumentDraftError(scope_error)
             self._linked_plan(context, draft)
             document_publication.validate_linked_worktree(
                 draft, context.worktree, str(self.ports._row()['active_sha'] or ''),
@@ -235,6 +252,9 @@ class DocumentsHandler:
                     'Worker 실행 중 승인 수정본 identity·revision·bytes가 변경됐습니다.'
                 )
             draft = current
+            scope_error = self._requirement_scope_error(draft)
+            if scope_error:
+                raise document_drafts.DocumentDraftError(scope_error)
             plan = self._linked_plan(context, draft)
             if (getattr(context.phase, 'value', str(context.phase)) == 'IMPLEMENTING'
                     and (plan['status'] != 'IMPLEMENTING' or plan['pr_url']
@@ -247,6 +267,8 @@ class DocumentsHandler:
             )
         except document_drafts.DocumentDraftError as error:
             self._hold(drafts, draft, f'승인 수정본 미적용: {error}')
+            if self._requirement_scope_error(draft):
+                raise
             return False
         try:
             document_publication.apply_linked_approved_bytes(
