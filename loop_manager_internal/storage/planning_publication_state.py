@@ -288,11 +288,16 @@ def apply_mutable_catalog_changes(
         execplan_draft_state.cancel(connection, repo, original.plan_id, plan_commit)
         from loop_manager_internal.notifications.incidents import cancel_plan_notifications
         cancel_plan_notifications(connection, repo, original.plan_id)
-        if preserved or deletion.judgment or checkpoint_audit:
+        from .maintenance_state import cycle_for_plan
+        cycle = cycle_for_plan(connection, repo, original.plan_id)
+        maintenance_audit = dict(cycle) if cycle is not None else None
+        if preserved or deletion.judgment or checkpoint_audit or maintenance_audit:
             audit = preserved or {"text": original.text, "row": json.loads(original.execution_state or "{}"),
                                   "affected": [], "resolved": {}, "judgment": deletion.judgment}
             if checkpoint_audit:
                 audit["checkpoints"] = checkpoint_audit
+            if maintenance_audit:
+                audit['maintenance_cycle'] = maintenance_audit
             connection.execute("UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",
                                (json.dumps(audit, ensure_ascii=False, sort_keys=True), repo, original.plan_id))
         project = connection.execute("SELECT phase, plan_path FROM projects WHERE repo=?", (repo,)).fetchone()

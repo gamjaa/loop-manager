@@ -387,6 +387,21 @@ def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
         connection.execute(f"RELEASE {savepoint}")
 
 
+def cycle_for_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> sqlite3.Row | None:
+    """Read current ownership and audit without creating or migrating a cycle."""
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_cycles'"
+    ).fetchone():
+        return None
+    cycle = connection.execute('SELECT * FROM maintenance_cycles WHERE repo=?', (repo,)).fetchone()
+    if cycle is not None and any(plan_id in json.loads(cycle[field]) for field in (
+        'prerequisite_plan_ids', 'refactoring_plan_ids', 'revalidation_plan_ids', 'assessment_plan_ids',
+        'publication_refactoring_plan_ids', 'publication_revalidation_plan_ids',
+    ) if field in cycle.keys()):
+        return cycle
+    return None
+
+
 class MaintenanceRepository:
     """Transactional persistence boundary for per-project maintenance cycles."""
 
@@ -482,15 +497,20 @@ class MaintenanceRepository:
                 "SELECT plan_id FROM exec_plans WHERE repo = ?", (repo,)
             )
         }
+        cancelled_plan_ids = ({str(item[0]) for item in self.connection.execute(
+            "SELECT plan_id FROM execplan_cancellations WHERE repo=?", (repo,),
+        )} if self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'"
+        ).fetchone() else set())
 
         def stored_plan_ids(field: str) -> tuple[str, ...]:
             plan_ids = _decode_plan_ids(row[field], field)
-            unknown = sorted(set(plan_ids) - known_plan_ids, key=_plan_sort_key)
+            unknown = sorted(set(plan_ids) - known_plan_ids - cancelled_plan_ids, key=_plan_sort_key)
             if unknown:
                 raise MaintenanceStateError(
                     f"{field}에 알 수 없는 plan ID가 있습니다: {', '.join(unknown)}"
                 )
-            return plan_ids
+            return tuple(plan_id for plan_id in plan_ids if plan_id not in cancelled_plan_ids)
 
         return MaintenanceCycle(
             repo=str(row["repo"]),

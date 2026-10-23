@@ -293,6 +293,8 @@ Requirement 철회의 `prepare_withdrawals`는 같은 외부 자원 helper를 �
 
 취소 적용 transaction은 `execution_checkpoints`·`blocked_checkpoints`의 해당 요청을 `execplan_cancellations.recovery_evidence.checkpoints`로 옮긴 뒤 활성 요청과 실행 row를 제거한다. `checkpoints`는 테이블명을 key로 하고 해당 row의 모든 필드·값을 보존하는 객체이며, 원래 snapshot·게시 이력의 JSON 문자열도 그대로 유지한다. 원격 삭제 증명을 합칠 때 이 별도 감사를 보존하며 transaction 실패 시 요청·실행 row·감사를 함께 롤백한다. checkpoint repository는 취소 ID의 조회·대기·기록·변경에서 취소 감사를 확인하므로 이전 runtime이 남긴 요청도 현재 요청으로 소비하지 않는다. 확정 게시 영수증은 이 감사에서 조회하며 새 게시 권한으로 재사용하지 않는다.
 
+유지보수 대상의 취소는 같은 transaction에서 `recovery_evidence.maintenance_cycle`에 해당 `maintenance_cycles` row의 전체 필드·값을 보존한다. 원래 대상 배열·요청 identity·게시 영수증·성공 기준은 다시 쓰지 않는다. `MaintenanceRepository.get`은 취소 감사가 있는 ID만 현재 prerequisite·refactoring·assessment·revalidation 집합에서 제외하고, 게시 배열은 과거 영수증 그대로 반환한다. 근거 없는 ID 부재와 남은 작업의 유효하지 않은 dependency는 계속 오류다. 공통 취소 gate는 이 작업을 포함한 cycle의 미확정 게시나 legacy workspace 해제 intent를 보호하며, 해당 소유가 끝난 뒤 취소할 수 있다. 대상 배열이 비었다는 이유로 cycle 종료·성공 통지·Merge 기준 전진을 수행하지 않는다.
+
 삭제 관측·취소 경로가 있다는 사실만으로 후속 정리가 모두 완료된 것은 아니다. 취소 감사는 원문·실행 이력·예약과 소유 자원의 `cleanup_pending`을 보존한다. 유지하는 관리 브랜치의 문서 동기화, 취소·완료 작업의 소유 로컬·원격 branch 및 worktree 정리와 각 확정 지점의 중단 복구는 [R-055의 삭제 반영·복구 목표](requirements/%5BR-055%5D%20%EC%B0%A8%EB%8B%A8%20%EA%B2%BD%EB%A1%9C%20%EC%A0%84%EC%88%98%20%EC%A1%B0%EC%82%AC%EC%99%80%20%EB%B6%88%ED%95%84%EC%9A%94%ED%95%9C%20%EC%9E%91%EC%97%85%20%EC%A4%91%EB%8B%A8%20%EC%B6%95%EC%86%8C.md#삭제의-db브랜치-반영과-중단-복구)에 남은 범위다. 현재 Merge 정리와 삭제 처리의 권한을 이 목표로 확대하지 않는다.
 
 일반·유지보수 planning의 미해결 오류와 입력 지문은 다른 ExecPlan의 차단 해제·PR 상태 변경·project 실행 상태 정리와 독립적으로 보존한다. worktree 경로 부재나 관련 입력이 같은 원격 base 전진만으로 해제하지 않으며, 같은 입력의 반복 실행·재시작에서는 Planner를 다시 호출하지 않는다

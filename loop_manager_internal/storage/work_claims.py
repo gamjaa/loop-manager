@@ -96,6 +96,11 @@ def cancellation_available(connection, repo, plan_id, row):
     _state, owned = manual_plan_ownership(connection, repo, plan_id, row)
     if owned:
         return False
+    from .maintenance_state import cycle_for_plan
+    cycle = cycle_for_plan(connection, repo, plan_id)
+    if cycle is not None and (cycle['publication_stage'] not in (None, 'remote_confirmed')
+            or ('legacy_release_identity' in cycle.keys() and cycle['legacy_release_identity'] is not None)):
+        return False
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_checkpoints'"
     ).fetchone() and connection.execute(
