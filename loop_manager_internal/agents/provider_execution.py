@@ -73,8 +73,15 @@ def observe(connection, *, repo: str, plan_id: str | None, worktree: Path,
             '-c', 'service_tier="fast"' if fast else 'service_tier="default"',
             '-c', f'features.fast_mode={str(fast).lower()}', *launch.arguments)
         instructions = []
+
+        def check_native_lookup():
+            agent_write_isolation.assert_preparation_lookup_current(
+                checked[0], worktree, state_dir, config_path,
+                environment_variables=launch.environment)
+
         provider_guidance.codex_arguments(guidance, worktree, environment=launch.environment,
-            context_arguments=context, observe_instruction=instructions.append)
+            context_arguments=context, observe_instruction=instructions.append,
+            on_lookup=check_native_lookup)
         evidence = agent_write_isolation.refresh_configuration_evidence(
             checked[0], launch, worktree, state_dir, config_path, repo, True, snapshot_digest,
             environment_variables=launch.environment)

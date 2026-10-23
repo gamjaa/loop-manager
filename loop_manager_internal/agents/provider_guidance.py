@@ -34,11 +34,15 @@ def _validate(guidance: CommonGuidance) -> None:
 
 
 def _developer_texts(arguments: list[str], worktree: Path,
-                     environment: dict[str, str] | None) -> list[str]:
+                     environment: dict[str, str] | None,
+                     on_lookup=None) -> list[str]:
     # Native resolution includes trusted projects, profiles and cloud/MDM layers.
     # This ephemeral prompt inspection does not enter run_turn or generate output.
     try:
-        items = json.loads(_probe(arguments, cwd=worktree, env=environment))
+        raw = _probe(arguments, cwd=worktree, env=environment)
+        if on_lookup is not None:
+            on_lookup()
+        items = json.loads(raw)
         if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
             raise ValueError("expected native prompt item list")
         texts = []
@@ -74,18 +78,21 @@ def _override(content: str) -> list[str]:
 def codex_arguments(guidance: CommonGuidance, worktree: Path, *,
                     context_arguments: tuple[str, ...] = (),
                     environment: dict[str, str] | None = None,
-                    observe_instruction=None) -> list[str]:
+                    observe_instruction=None, on_lookup=None) -> list[str]:
     _validate(guidance)
     version = _probe(["codex", "--version"], env=environment).strip()
+    if on_lookup is not None:
+        on_lookup()
     match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", version)
     if not match or tuple(map(int, match.groups())) < (0, 159, 3):
         raise GuidanceError("Codex CLI가 지원되는 developer_instructions 버전이 아닙니다.")
     # Exec-only switches are irrelevant to inspecting the resolved prompt.
     context = [arg for arg in context_arguments if arg not in ("--strict-config", "--ignore-rules")]
     command = ["codex", "-C", str(worktree), *context, "debug", "prompt-input"]
-    baseline = _developer_texts(command, worktree, environment)
+    baseline = _developer_texts(command, worktree, environment, on_lookup=on_lookup)
     sentinel = "loop-manager-guidance-" + uuid4().hex
-    projected = _developer_texts(command[:1] + _override(sentinel) + command[1:], worktree, environment)
+    projected = _developer_texts(command[:1] + _override(sentinel) + command[1:], worktree,
+                                  environment, on_lookup=on_lookup)
     positions = [index for index, text in enumerate(projected) if sentinel in text]
     if len(positions) != 1 or projected[positions[0]].count(sentinel) != 1:
         raise GuidanceError("Codex 관리 설정이 공통 추가 지침을 덮어쓰거나 native 입력이 불명확합니다.")
@@ -103,7 +110,8 @@ def codex_arguments(guidance: CommonGuidance, worktree: Path, *,
         existing = original[len(prefix):len(original) - len(suffix) if suffix else None]
     combined = (existing + "\n\n" if existing else "") + guidance.content
     override = _override(combined)
-    verified = _developer_texts(command[:1] + override + command[1:], worktree, environment)
+    verified = _developer_texts(command[:1] + override + command[1:], worktree,
+                                environment, on_lookup=on_lookup)
     expected = projected.copy()
     expected[index] = prefix + combined + suffix
     if verified != expected:

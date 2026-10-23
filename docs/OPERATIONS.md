@@ -17,7 +17,7 @@ Codex는 세 OS에서 상태 루트의 공통 홈을 인증·설정·session 저
 
 ### 전용 공급자 홈과 인증
 
-DB·잠금에 실제 사용하는 `state_dir` 아래의 `automation-codex`·`automation-claude`를 공급자별 공통 홈으로 직접 사용한다. 상태 루트는 `--state-dir`, `LOOP_MANAGER_STATE_DIR`, OS 기본 경로 순서로 선택한다. 외부 `CODEX_HOME`·`CLAUDE_CONFIG_DIR`은 홈 선택에 사용하지 않고 기존 허용 인증 환경변수의 전달은 유지한다. Manager는 설정 파일을 생성하거나 개인 홈에서 가져오지 않는다. Codex CLI의 준비 조회가 공통 설정을 생성·수정·원자 교체하면 Manager는 새 내용의 확장·권한 충돌을 다시 검사해 같은 호출의 최종 증거에 결합한다. 읽기 실패·충돌·검사 뒤 변경은 process를 시작하지 않는다. 이후 호출도 현재 설정을 다시 검사한다.
+DB·잠금에 실제 사용하는 `state_dir` 아래의 `automation-codex`·`automation-claude`를 공급자별 공통 홈으로 직접 사용한다. 상태 루트는 `--state-dir`, `LOOP_MANAGER_STATE_DIR`, OS 기본 경로 순서로 선택한다. 외부 `CODEX_HOME`·`CLAUDE_CONFIG_DIR`은 홈 선택에 사용하지 않고 기존 허용 인증 환경변수의 전달은 유지한다. Manager는 설정 파일을 생성하거나 개인 홈에서 가져오지 않는다. Codex 준비 조회가 공통 home의 `config.toml`을 안전하게 생성·교체하면 새 내용의 확장·권한 충돌을 재검사해 같은 호출의 최종 증거에 결합한다. Manager `config.ini`나 project/system Codex 설정의 변경, 읽기 실패·충돌은 거부하며 native 지침 조회에서 충돌을 발견하면 다음 Codex 조회 전에 중단한다. 이후 호출도 현재 설정을 다시 검사한다.
 
 | 공급자 | 전용 환경값 | 기본 인증 파일 |
 |---|---|---|

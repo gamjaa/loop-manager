@@ -30,8 +30,8 @@ priority: high
 
 ## Implementation
 
-- [x] `prepare_isolation`은 CLI version/features/sandbox 조회 전에 현재 설정을 검사하고, version 조회 뒤와 features 조회 뒤 sandbox probe 전에 설정 정책을 다시 검사한다. sandbox probe·실제 소비자 조회 뒤에는 안정된 최종 지문을 저장하며 `assert_current`와 process handoff 재검사로 이후 변경을 거부한다. 설정 생성·교체와 검사 뒤 경쟁을 구분하고 불안정한 설정은 기존 보존/재시도 경계로 반환한다.
-- [x] `provider_adapters.py`의 `run_codex`, `provider_execution.py`의 읽기 전용 `observe`와 G-262의 준비 환경을 대조한다. profile·native 지침 조회 등 실제 소비자에 같은 공통 홈과 최종 검사 기준을 적용하고, 최종 설정 변화에서는 실행/Review 동일성 증거를 만들지 않는다. 신규·재개·retry·fallback의 기존 session·ledger 관계를 바꾸지 않는다.
+- [x] `prepare_isolation`은 CLI version/features/sandbox 조회 전에 현재 설정을 검사하고, 조회 뒤와 sandbox probe 뒤 정책을 다시 검사한다. 안전하게 갱신할 수 있는 설정은 선택된 공통 Codex home의 `config.toml`뿐이며 Manager `config.ini`, project/system Codex 설정, 그 밖의 입력 변경은 기존 증거에 결합하지 않고 거부한다. 실제 소비자 조회 뒤 안정된 최종 지문을 저장하며 `assert_current`와 process handoff 재검사로 이후 변경을 거부한다.
+- [x] `provider_adapters.py`의 `run_codex`, `provider_execution.py`의 읽기 전용 `observe`와 G-262의 준비 환경을 대조한다. version 및 각 native 지침 조회가 끝날 때마다 설정 정책을 검사해 충돌 발견 뒤 다음 Codex 조회가 실행되지 않게 한다. 준비 중 공통 home 설정의 안전한 생성은 재검사 후 현재 호출 증거에 결합하고, 다른 입력 변화·충돌에서는 실행/Review 동일성 증거를 만들지 않는다. 신규·재개·retry·fallback의 기존 session·ledger 관계를 바꾸지 않는다.
 - [x] 확인한 `provider_home.py`, `agent_profiles.py`, `agent_codex_sandbox.py`의 공통 홈·인증 링크·호출별 attempt 구조를 유지한다. 삭제된 `_read_only_link`나 역할별 config 제거를 복원하지 않는다. `tests/test_provider_home.py`의 설정 수명/과거 홈 보존 fixture와 `tests/test_codex_native_invocation.py`·`test_agent_write_isolation.py`·`test_provider_runtime.py`의 실제 판단/모의 CLI 경계를 재사용한다.
 - [x] PRODUCT·ARCHITECTURE·`docs/OPERATIONS.md`의 관련 절을 검사 시점·정상 생성·경쟁 거부에 맞춰 통합한다. 공통 홈의 직접 사용과 과거 자료 보존은 이미 반영됐으므로 재구현 목표로 쓰지 않는다.
 
@@ -56,6 +56,7 @@ priority: high
 - [x] 2026-10-23 현재 HEAD `a2e5aee`의 최신 계획 조건을 코드와 대조해, version 조회와 features 조회 사이에 안전한 설정을 재검사하는 절차가 빠진 것을 확인했다. version 조회 뒤와 features 조회 뒤 sandbox probe 전에 정책을 검사하도록 보완했다. 프로젝트 Python targeted runner로 두 중간 충돌 거부 회귀와 기존 안전한 probe 생성 회귀를 실행해 3개 모두 통과했다.
 - [x] 2026-10-23 HEAD `4935299` 기반 후보에서 features 조회 중 안전한 원자 교체가 허용되고 현재 지문에 결합된 뒤 다음 호출에서도 재사용되는 회귀를 추가했다. 프로젝트 Python targeted runner로 version/features 조회 중 충돌·생성, probe 후 설정 결합·재개, 최종 검사 뒤 drift를 확인하는 5개 unit case가 통과했다.
 - [x] 2026-10-23 handoff 회귀 mock을 새 features-check callback 인자에 맞춰 feature 확인 후 handoff를 발생시키도록 갱신했다. 프로젝트 Python targeted runner에서 해당 worker/reviewer/session subtest가 모두 통과했다.
+- [x] 2026-10-23 현재 후보 `0e359bd`에 `refresh_configuration_evidence`의 Manager `config_path` 변경 거부와 첫 native 지침 조회 뒤 후속 Codex 조회 중단 회귀를 추가했다. 프로젝트 Python targeted runner로 직접 증거 갱신 거부, 호출 전 Manager drift 거부, hook 충돌의 조기 중단, 안전한 공통 home 설정 생성·관측 등 5건을 실행해 모두 통과했다.
 - [x] PRODUCT·ARCHITECTURE·OPERATIONS에 정상 생성 수용과 검사·거부 순서를 반영했다.
 
 ## Decision Log

@@ -67,8 +67,10 @@ class ProviderExecutionTests(ProviderExecutionFixture, unittest.TestCase):
         log_dir = provider_adapters._provider_log_directory(self.worktree, self.state)
         previous = log_dir / 'reviewer-last.txt'
         previous.write_text('previous result')
+        native_lookups = []
 
         def create_conflict(arguments):
+            native_lookups.append(tuple(arguments))
             if 'debug' in arguments and not config.exists():
                 config.write_text('hooks=["unsafe"]\n')
 
@@ -81,6 +83,28 @@ class ProviderExecutionTests(ProviderExecutionFixture, unittest.TestCase):
             'SELECT status, reason FROM agent_isolation_evidence').fetchone()
         self.assertEqual(proof['status'], 'rejected')
         self.assertIn('hook', proof['reason'])
+        self.assertEqual(sum('debug' in arguments for arguments in native_lookups), 1)
+
+    def test_manager_config_change_during_native_lookup_is_rejected_before_next_lookup(self):
+        native_lookups = []
+
+        def change_fast_mode(arguments):
+            native_lookups.append(tuple(arguments))
+            if 'debug' in arguments and self.config.read_text() == '[codex]\nfast_mode=false\n':
+                self.config.write_text('[codex]\nfast_mode=true\n')
+
+        self.native_probe_hook = change_fast_mode
+        with self.assertRaisesRegex(isolation.IsolationError, '설정이 준비 중 변경됐습니다'):
+            self.invoke()
+
+        self.popen.assert_not_called()
+        self.assertEqual(sum('debug' in arguments for arguments in native_lookups), 1)
+        proof = self.connection.execute('''SELECT proof.status, call.execution_identity,
+            call.execution_started_at FROM agent_isolation_evidence proof
+            JOIN agent_invocations call USING (invocation_id)''').fetchone()
+        self.assertEqual(proof['status'], 'rejected')
+        self.assertIsNone(proof['execution_identity'])
+        self.assertIsNone(proof['execution_started_at'])
 
     def test_config_changed_after_final_check_is_rejected_at_process_handoff(self):
         config = self.child_home / 'config.toml'

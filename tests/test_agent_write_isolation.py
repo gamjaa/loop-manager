@@ -270,6 +270,41 @@ class WriteIsolationTests(TestCase):
                                                  str(root / 'source'), False,
                                                  lambda: 'snapshot')
 
+    def test_refresh_configuration_evidence_rejects_manager_config_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / 'state'
+            provider_home = state_dir / 'automation-codex'
+            provider_home.mkdir(parents=True)
+            (root / '.git').mkdir()
+            (provider_home / 'config.toml').write_text('model = "selected"\n', encoding='utf-8')
+            config_path = root / 'config.ini'
+            config_path.write_text('[codex]\nfast_mode=false\n', encoding='utf-8')
+            environment = {'HOME': str(root), 'CODEX_HOME': str(provider_home)}
+            boundary = isolation.WorktreeBoundary(
+                root, root / 'source', (), root / '.git/worktrees/selected',
+                root / '.git', 'repository')
+            configuration = isolation._configuration_digest(
+                'codex', root, config_path, environment)
+            stable_configuration = isolation._stable_configuration_digest(
+                'codex', root, config_path, environment)
+            evidence = isolation.IsolationEvidence(
+                'codex', 'codex-cli 0.159.3', 'Linux:x:y', 'worker', str(root),
+                'repository', 'policy', 'verified', snapshot_digest='snapshot',
+                configuration_digest=configuration,
+                stable_configuration_digest=stable_configuration)
+            launch = isolation.CodexLaunch(
+                arguments=('exec',), probe_arguments=('codex', 'sandbox'),
+                environment=environment, runtime=root, attempt=root,
+                specification='{}')
+            config_path.write_text('[codex]\nfast_mode=true\n', encoding='utf-8')
+
+            with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary):
+                with self.assertRaisesRegex(isolation.IsolationError, '관리·프로젝트'):
+                    isolation.refresh_configuration_evidence(
+                        evidence, launch, root, state_dir, config_path, str(root / 'source'),
+                        False, lambda: 'snapshot', environment_variables=environment)
+
     def test_native_tool_probe_binds_new_configuration_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

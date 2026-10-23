@@ -37,6 +37,7 @@ class IsolationEvidence:
     reason: str = ""
     snapshot_digest: str = ""
     configuration_digest: str = ""
+    stable_configuration_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -126,13 +127,17 @@ def _inspect_read_only_runtime(selected: Path, state_root: Path, source: Path) -
 
 def _configuration_digest(provider: str, worktree: Path,
                           config_path: Path | None,
-                          environment_variables: dict[str, str] | None = None) -> str:
+                          environment_variables: dict[str, str] | None = None,
+                          *, exclude_common_codex_home: bool = False) -> str:
     """Bind evidence to local configuration bytes without storing secrets."""
     variables = os.environ if environment_variables is None else environment_variables
     home = Path(variables.get('HOME', variables.get('USERPROFILE', str(Path.home()))))
     if provider == "codex":
         candidates = (_codex_config_files(worktree) if environment_variables is None
                       else _codex_config_files(worktree, environment_variables))
+        if exclude_common_codex_home:
+            common_home = Path(variables.get("CODEX_HOME", home / ".codex")) / "config.toml"
+            candidates = tuple(path for path in candidates if path != common_home)
     else:
         provider_home = Path(variables.get("CLAUDE_CONFIG_DIR", home / ".claude"))
         candidates = (provider_home / "settings.json", worktree / ".claude/settings.json",
@@ -154,6 +159,14 @@ def _configuration_digest(provider: str, worktree: Path,
             raise IsolationError("Agent 설정 지문을 확인할 수 없습니다.") from error
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _stable_configuration_digest(provider: str, worktree: Path,
+                                 config_path: Path | None,
+                                 environment_variables: dict[str, str]) -> str:
+    """Fingerprint configuration that native Codex lookups may not replace."""
+    return _configuration_digest(provider, worktree, config_path, environment_variables,
+                                 exclude_common_codex_home=(provider == 'codex'))
 
 
 def _codex_config_files(worktree: Path, environment_variables: dict[str, str] | None = None) -> tuple[Path, ...]:
@@ -226,15 +239,19 @@ def _check_codex_configuration(worktree: Path, state_dir: Path,
     _assert_no_codex_extensions(worktree, environment_variables)
 
 
-def _checked_codex_configuration_digest(worktree: Path, state_dir: Path,
-                                        config_path: Path | None,
-                                        environment_variables: dict[str, str]) -> str:
+def _checked_codex_configuration(worktree: Path, state_dir: Path,
+                                 config_path: Path | None,
+                                 environment_variables: dict[str, str]) -> tuple[str, str]:
     before = _configuration_digest('codex', worktree, config_path, environment_variables)
+    stable_before = _stable_configuration_digest(
+        'codex', worktree, config_path, environment_variables)
     _check_codex_configuration(worktree, state_dir, environment_variables)
     current = _configuration_digest('codex', worktree, config_path, environment_variables)
-    if current != before:
+    stable_current = _stable_configuration_digest(
+        'codex', worktree, config_path, environment_variables)
+    if current != before or stable_current != stable_before:
         raise IsolationError('Codex 설정이 격리 검사 중 변경됐습니다.')
-    return current
+    return current, stable_current
 
 
 def _policy_digest(provider: str, version: str, environment: str, role: str,
@@ -309,6 +326,7 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
     reason = ""
     snapshot = ""
     configuration = ""
+    stable_configuration = ""
     try:
         boundary = inspect_worktree(worktree, state_dir, read_only=read_only)
         if expected_repository is None or Path(expected_repository).resolve() != boundary.source:
@@ -330,16 +348,22 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         except RuntimeError as error:
             raise IsolationError(str(error)) from error
         selected_environment = launch.environment
-        configuration = _checked_codex_configuration_digest(
+        configuration, stable_configuration = _checked_codex_configuration(
             boundary.worktree, state_dir, config_path, selected_environment)
+        def check_preparation_lookup() -> tuple[str, str]:
+            current_configuration, current_stable = _checked_codex_configuration(
+                boundary.worktree, state_dir, config_path, selected_environment)
+            if current_stable != stable_configuration:
+                raise IsolationError('관리·프로젝트 Codex 설정이 준비 중 변경됐습니다.')
+            return current_configuration, current_stable
+
         result = subprocess.run(["codex", "--version"], capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
                                 env=selected_environment)
         if result.returncode or not result.stdout.strip():
             raise IsolationError("Codex CLI 버전을 확인할 수 없습니다.")
         version = result.stdout.strip()
-        configuration = _checked_codex_configuration_digest(
-            boundary.worktree, state_dir, config_path, selected_environment)
+        configuration, _ = check_preparation_lookup()
         # The installed 0.159.3 baseline supports granular auto-review. Older
         # CLIs may ignore unknown overrides, so a filesystem probe alone is
         # insufficient. Direct exec still validates merged settings itself.
@@ -347,13 +371,11 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         if not match or tuple(map(int, match.groups())) < (0, 159, 3):
             raise IsolationError("Codex CLI가 지원되는 granular 자동 검토 버전이 아닙니다.")
         try:
-            launch.probe(on_features_checked=lambda: _checked_codex_configuration_digest(
-                boundary.worktree, state_dir, config_path, selected_environment))
+            launch.probe(on_features_checked=check_preparation_lookup)
             args = launch.arguments
         except RuntimeError as error:
             raise IsolationError(str(error)) from error
-        configuration = _checked_codex_configuration_digest(
-            boundary.worktree, state_dir, config_path, selected_environment)
+        configuration, _ = check_preparation_lookup()
         status = "verified"
     except (IsolationError, OSError, subprocess.TimeoutExpired) as error:
         reason = str(error) if isinstance(error, IsolationError) else "격리 확인 도구 실행 실패"
@@ -365,6 +387,7 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         _policy_digest(provider, version, environment, role, canonical_worktree,
                        repository_identity, configuration, args, launch, session_id),
         status, reason, snapshot, configuration,
+        stable_configuration_digest=stable_configuration,
     )
     if observe is not None:
         observe(evidence)
@@ -390,8 +413,10 @@ def refresh_configuration_evidence(evidence: IsolationEvidence, launch: CodexLau
             evidence.repository_identity != boundary.repository_identity or
             evidence.snapshot_digest != snapshot_digest()):
         raise IsolationError('Agent 준비 중 worktree·repository·Git 상태가 변경됐습니다.')
-    configuration = _checked_codex_configuration_digest(
+    configuration, stable_configuration = _checked_codex_configuration(
         boundary.worktree, state_dir, config_path, environment_variables)
+    if stable_configuration != evidence.stable_configuration_digest:
+        raise IsolationError('관리·프로젝트 Codex 설정이 준비 중 변경됐습니다.')
     if configuration == evidence.configuration_digest:
         return evidence
     return replace(evidence, configuration_digest=configuration,
@@ -399,6 +424,19 @@ def refresh_configuration_evidence(evidence: IsolationEvidence, launch: CodexLau
                        evidence.provider, evidence.cli_version, evidence.environment,
                        evidence.role, evidence.worktree, evidence.repository_identity,
                        configuration, launch.arguments, launch, session_id))
+
+
+def assert_preparation_lookup_current(evidence: IsolationEvidence, worktree: Path,
+                                     state_dir: Path, config_path: Path, *,
+                                     environment_variables: dict[str, str] | None = None) -> None:
+    """Reject policy or manager-input drift before another native lookup."""
+    if (evidence.provider != 'codex' or evidence.status != 'verified' or
+            not evidence.stable_configuration_digest or environment_variables is None):
+        raise IsolationError('Codex 준비 조회를 다시 검사할 사전 증거가 없습니다.')
+    _, stable_configuration = _checked_codex_configuration(
+        worktree, state_dir, config_path, environment_variables)
+    if stable_configuration != evidence.stable_configuration_digest:
+        raise IsolationError('관리·프로젝트 Codex 설정이 준비 중 변경됐습니다.')
 
 
 def assert_current_configuration(evidence: IsolationEvidence, worktree: Path, state_dir: Path,

@@ -259,11 +259,26 @@ def run_codex(
 
     guidance_context = tuple(isolation_arguments or codex_sandbox_arguments(read_only))
     instruction_digests = []
+
+    def check_native_lookup():
+        if codex_launch is None or isolation_evidence is None:
+            return
+        try:
+            agent_write_isolation.assert_preparation_lookup_current(
+                isolation_evidence, worktree, state_dir, config_path,
+                environment_variables=launch_environment)
+        except agent_write_isolation.IsolationError as error:
+            if on_isolation_checked is not None:
+                on_isolation_checked(replace(
+                    isolation_evidence, status='rejected', reason=str(error)))
+            raise
+
     additional = (provider_guidance.codex_arguments(
         common_guidance, worktree, environment=launch_environment,
         observe_instruction=instruction_digests.append,
         context_arguments=("-m", model, "-c", f'model_reasoning_effort="{effort}"',
                           *fast_arguments, *guidance_context),
+        on_lookup=check_native_lookup,
     ) if common_guidance else [])
     assert_authentication_links('codex', launch_environment, auth_links)
     if codex_launch is not None and isolation_evidence is not None:
