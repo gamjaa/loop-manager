@@ -211,6 +211,35 @@ base 대비 HEAD의 최종 diff 33개 파일 전체를 대상으로 생성·정�
 
 base 대비 HEAD와 최종 작업 diff의 `git diff --check`도 통과했다. 두 실행은 모두 이번 호출의 targeted runner 결과이며 전체 verify·integration·전체 suite는 실행하지 않았다. 문서 patch 보고는 이전 d0ed33bb 기준 hash를 재사용하지 않고 현재 base 4af7b49a 기준으로 다시 계산한다. Manager의 현재 후보 전체 verify·Review·Merge가 남아 있다.
 
+### Review 교정: 늦은 확인 계보와 Worker 질문의 scope 보존
+
+시작 HEAD b3ccbd9db7751fecf4fc581b147b5717f03a533a에서 `incidents.py::_queue_block::reconfirmed-inflight-cursor` occurrence=1/revision=1과 `policy.py::_block_action::cross-scope-recovery-shadowing` occurrence=2/revision=2를 교정했다. 앞선 지침 승인 전용 scope 검사는 Worker 질문의 최종 근거 보존을 보장하지 못했다.
+
+같은 조치를 재확인해 만든 새 payload에는 직전 event_key를 `continued_from`으로 기록한다. 성공 callback은 원래 조각 확인과 같은 transaction에서 동일 고정 본문을 이어받은 후속 version 계보의 cursor와 전체 완료도 전진시킨다. 두 번 이상 재확인해도 이미 확인한 조각을 다시 보내지 않으며, 질문이 바뀐 version에는 계보를 연결하지 않아 원래 확인이 새 질문으로 새지 않는다. 원래 취소 행·payload·실패 감사는 보존하고 잘못된 JSON payload는 계보 조회에서 제외한다. 확인 전 외부 수신 불명 상태의 기존 중복 가능성 계약은 유지한다.
+
+계획 차단에는 nullable `recovery_snapshot` JSON 컬럼을 호환 추가했다. `RuntimeStateRepository.block_plan`은 현재 원인과 일치하는 최종 recovery의 identity·revision·원문/Worker 결정 근거를 차단·checkpoint와 같은 transaction에 보존한다. 공유 per-plan recovery가 독립 프로젝트 최종 차단으로 덮이거나 없어지면 이 소유 snapshot을 읽는다. 공유 같은-scope pending/손상 근거는 여전히 우선하며 snapshot으로 검증을 우회하지 않는다. 현재 원인·scope·revision·identity를 재검사하고 block 교체/삭제 시 근거도 함께 교체/삭제한다. 기존 행은 보존하며 NULL인 과거 근거를 자동 합성하지 않는다. 복구 예산·실행·공유 recovery의 소유 정책은 바꾸지 않았다. PRODUCT·ARCHITECTURE의 소유 알림 절에 이 호환·보존 계약을 반영했다.
+
+추가 실제 SQLite 회귀는 원래 HTTP 진행 중 취소/재확인 두 번→원래 성공 callback→다음 dispatch 순서를 단일/다중 조각과 다른 질문으로 비교한다. Worker 질문은 미전송·이미 전송·최초 비활성화와 revision 변경을 비교하고 프로젝트 차단 해제 뒤 DB 재연결에도 원래 질문 1회 통지·revision 변경 시 억제·공유 프로젝트 recovery 유지·계획 질문 snapshot 보존을 검사한다. 구형 schema의 반복 migration도 기존 원문/행을 유지하며 nullable 값만 추가하는지 확인했다.
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest > /tmp/g226-review-late-scope.log 2>&1`: 18개 통과.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_blocked_checkpoint_state.BlockedCheckpointRepositoryTest.test_plan_block_and_checkpoint_request_share_one_transaction tests.test_blocked_checkpoint_state.BlockedCheckpointRepositoryTest.test_terminal_result_and_outbox_rollback_and_retry_together tests.test_runtime_state.RuntimeStateRepositoryTest.test_nonfinal_recovery_decision_cannot_enter_block_transaction tests.test_execution_checkpoint_recovery_phase.ExecutionCheckpointRecoveryPhaseTests.test_worker_decision_checkpoint_wait_survives_three_restarted_runs tests.test_notification_delivery.SegmentedDeliveryTest tests.test_notification_delivery.CurrentActionPolicyTest.test_old_block_schema_adds_nullable_proof_without_changing_existing_rows > /tmp/g226-review-storage-callback.log 2>&1`: fresh/migrated schema 컬럼 순서 정합화 뒤 15개 통과. 차단/checkpoint rollback·최종 판단 경계·네이티브 Worker 질문·분할 전송/실패 재시도를 포함한다.
+- `git diff --check` 통과. 전체 verify는 Worker에서 실행하지 않았다. Manager의 새 후보 전체 verify·Review·Merge가 남아 있다.
+
+### 재수용한 rebase 후보의 Review 교정 확인
+
+시작 HEAD 1bf4b689c062391c0a40b3cf266098d44f0355d9와 base 85e7fe732e3ba6bee0af1421c54dc3211a1da8b3을 확인했다. 직전 Review 교정 9개 파일은 rebase 뒤 작업 트리에 보존돼 있으며 HEAD에만 포함된 것으로 간주하지 않았다. 이 보존 수정까지 합친 최종 후보의 base 대비 전체 diff는 35개 파일이다. 이전 base 4af7b49a에서 새 base로 전진한 5개 문서는 이 35개 파일과 겹치지 않는다. 현재 코드·문서·검사의 실제 변경을 다시 대조했고 추가 구현 교정은 필요하지 않았다.
+
+현재 ExecPlan의 sources·AC와 R-053의 사용자 조치/구정책 큐/전송 확인 보존, R-055의 독립 차단·복구 근거, R-074의 cycle 수명·Merge·종료 조건을 다시 읽었다. G-265/266/267/268의 동일 ID archive 경로와 unittest v1/launcher·필수 compile 계약도 확인했다. 최종 문서 변경은 PRODUCT·ARCHITECTURE·선택 ExecPlan뿐이며 Requirement·다른 ExecPlan·verify·지침 원본의 작업 변경은 없다.
+
+반복 전달된 두 지적은 현재 작업 트리의 `continued_from` 동일 본문 계보 확인과 계획 차단의 원자적 recovery_snapshot으로 교정돼 있다. 생성→재확인→늦은 callback→다음 claim과 계획 질문→프로젝트 최종 차단→해제→재연결의 경로를 현재 원본에서 확인했다. schema 추가는 nullable 호환 migration이며 과거 질문 근거를 합성하거나 공유 pending/손상 기록을 우회하지 않는다. 원래 취소·본문·cursor·attempt/error 감사, 같은 조치/다른 질문 구분과 실제 Worker 질문 보존 검사는 유지한다.
+
+이전 후보의 통과 결과를 재사용하지 않고 현재 작업 트리에서 새로 실행했다.
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_notification_delivery.CurrentActionPolicyTest tests.test_blocked_checkpoint_state.BlockedCheckpointRepositoryTest.test_plan_block_and_checkpoint_request_share_one_transaction tests.test_blocked_checkpoint_state.BlockedCheckpointRepositoryTest.test_terminal_result_and_outbox_rollback_and_retry_together tests.test_runtime_state.RuntimeStateRepositoryTest.test_nonfinal_recovery_decision_cannot_enter_block_transaction tests.test_execution_checkpoint_recovery_phase.ExecutionCheckpointRecoveryPhaseTests.test_worker_decision_checkpoint_wait_survives_three_restarted_runs tests.test_notification_delivery.SegmentedDeliveryTest > /tmp/g226-rebased-late-scope.log 2>&1`
+- 결과: 32개 통과, 10.804초. 조치 정책 18개와 계획 차단/checkpoint 원자성·최종 판단 경계·네이티브 Worker 질문·분할 전송의 관련 최소 단위를 포함한다.
+
+base 대비 전체 diff와 이번 추가 기록의 `git diff --check` 통과. 이번 호출의 변경은 이 본문 검토/검증 기록뿐이며 이전 교정 파일과 frontmatter는 유지했다. 현재 base 대비 문서 patch hash를 다시 계산했다. 전체 verify는 실행하지 않았고 Manager의 현재 후보 전체 verify·독립 Review·Merge가 남아 있다.
+
 ## Decision Log
 
 - snapshot token `838df9fc33cc6c5ae03bf160617f85012fc5f000559f00c0b1efee15b7dc097f`의 원문 hash를 대조했다. 미착수 G-226의 ID와 당시 조사 기록은 보존하고 목표를 최신 R-053의 공통 정책 안에서 통합해 title/path를 개정한다. 유지보수 정책의 폐기된 메시지 범위 표시는 구현하지 않으며 R-074의 cycle 수명은 보존한다.

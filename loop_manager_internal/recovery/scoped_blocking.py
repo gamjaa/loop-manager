@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS execplan_blocks (
     release_fingerprint TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    recovery_snapshot TEXT,
     PRIMARY KEY (repo, plan_id),
     FOREIGN KEY (repo, plan_id) REFERENCES exec_plans(repo, plan_id)
 )
@@ -136,6 +137,8 @@ class BlockRecord:
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(PLAN_BLOCKS_SCHEMA)
+    if not any(row[1] == 'recovery_snapshot' for row in connection.execute('PRAGMA table_info(execplan_blocks)')):
+        connection.execute('ALTER TABLE execplan_blocks ADD COLUMN recovery_snapshot TEXT')
     connection.execute(PROJECT_BLOCKS_SCHEMA)
 
 

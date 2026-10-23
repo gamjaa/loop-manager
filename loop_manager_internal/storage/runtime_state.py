@@ -1590,19 +1590,36 @@ class RuntimeStateRepository:
                 repo, plan_id, values, expected_status=expected_status
             )
             self._fault("after_execplan_update")
+            # Keep the final proof with its plan block: a project recovery may
+            # subsequently replace the shared per-plan recovery projection.
+            recovery_snapshot = None
+            if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone():
+                recovery = self.connection.execute(
+                    "SELECT * FROM recovery_records WHERE repo=? AND subject=? AND pending_action='final_block' AND detail=?",
+                    (repo, plan_id, evidence)).fetchone()
+                if recovery is not None:
+                    try:
+                        final = json.loads(recovery['final_evidence'])
+                    except (TypeError, ValueError):
+                        final = None
+                    if isinstance(final, dict) and final.get('block_reason_code') == reason_code:
+                        recovery_snapshot = json.dumps({key: recovery[key] for key in (
+                            'identity', 'reason_code', 'phase', 'plan_revision', 'base_revision',
+                            'fingerprint', 'progress_marker', 'detail', 'pending_action', 'final_evidence')})
             self.connection.execute(
                 """
                 INSERT INTO execplan_blocks (
-                    repo, plan_id, scope, reason_code, evidence, release_fingerprint
-                ) VALUES (?, ?, 'plan', ?, ?, ?)
+                    repo, plan_id, scope, reason_code, evidence, release_fingerprint, recovery_snapshot
+                ) VALUES (?, ?, 'plan', ?, ?, ?, ?)
                 ON CONFLICT(repo, plan_id) DO UPDATE SET
                     scope = excluded.scope,
                     reason_code = excluded.reason_code,
                     evidence = excluded.evidence,
                     release_fingerprint = excluded.release_fingerprint,
+                    recovery_snapshot = excluded.recovery_snapshot,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (repo, plan_id, reason_code, evidence, release_fingerprint),
+                (repo, plan_id, reason_code, evidence, release_fingerprint, recovery_snapshot),
             )
             checkpoint_plan = self._plan_row(repo, plan_id)
             blocked_checkpoint_state.BlockedCheckpointRepository(

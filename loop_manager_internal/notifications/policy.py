@@ -11,11 +11,10 @@ SOURCE_ACTION_REASONS = frozenset({'guidance_approval_required', 'review_specifi
 
 
 def block_recovery(connection, repo, plan_id, scope):
-    """Read shared recovery only when its final block belongs to this scope."""
-    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone() is None:
-        return None
-    row = connection.execute('SELECT * FROM recovery_records WHERE repo=? AND subject=?',
-                             (repo, plan_id or '__project__')).fetchone()
+    """Keep pending same-scope recovery authoritative; retain independent plan proof."""
+    exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone()
+    row = (connection.execute('SELECT * FROM recovery_records WHERE repo=? AND subject=?',
+                              (repo, plan_id or '__project__')).fetchone() if exists else None)
     if row is not None and row['pending_action'] == 'final_block':
         from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, reason_scope
         try:
@@ -24,7 +23,19 @@ def block_recovery(connection, repo, plan_id, scope):
         except (KeyError, TypeError, ValueError):
             return row  # Malformed evidence must still fail the action validation.
         if recorded_scope != scope:
+            row = None
+    if row is None and scope == 'plan' and any(
+            column[1] == 'recovery_snapshot' for column in connection.execute('PRAGMA table_info(execplan_blocks)')):
+        saved = connection.execute('SELECT recovery_snapshot FROM execplan_blocks WHERE repo=? AND plan_id=?',
+                                   (repo, plan_id)).fetchone()
+        try:
+            snapshot = json.loads(saved[0]) if saved else None
+        except (TypeError, ValueError):
             return None
+        if isinstance(snapshot, dict) and all(key in snapshot for key in (
+                'identity', 'reason_code', 'phase', 'plan_revision', 'base_revision',
+                'fingerprint', 'progress_marker', 'detail', 'pending_action', 'final_evidence')):
+            return snapshot
     return row
 
 

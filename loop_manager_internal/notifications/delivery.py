@@ -211,6 +211,19 @@ def _deliver_rows(
                      row[0], cursor),
                 )
                 if row[1] == "blocked":
+                    # Only explicitly continued versions inherit this exact
+                    # frozen body's late confirmation; changed actions do not.
+                    connection.execute(
+                        "WITH RECURSIVE continued(event_key) AS ("
+                        "SELECT event_key FROM notification_outbox WHERE json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END, '$.continued_from')=? "
+                        "AND rendered_text IS (SELECT rendered_text FROM notification_outbox WHERE event_key=?) "
+                        "UNION SELECT o.event_key FROM notification_outbox o JOIN continued c "
+                        "ON json_extract(CASE WHEN json_valid(o.payload) THEN o.payload ELSE '{}' END, '$.continued_from')=c.event_key "
+                        "WHERE o.rendered_text IS (SELECT rendered_text FROM notification_outbox WHERE event_key=?)) "
+                        "UPDATE notification_outbox SET confirmed_pieces=MAX(confirmed_pieces, ?), "
+                        "sent_at=CASE WHEN ?=? THEN COALESCE(sent_at, CURRENT_TIMESTAMP) ELSE sent_at END "
+                        "WHERE event_key IN (SELECT event_key FROM continued)",
+                        (row[0], row[0], row[0], cursor + 1, cursor + 1, total))
                     incident = connection.execute(
                         "SELECT incident_id FROM block_notice_events "
                         "WHERE event_key = ?", (row[0],),

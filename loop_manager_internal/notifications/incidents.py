@@ -141,6 +141,8 @@ def _queue_block(
             (block_key, event_key, confirmed, version, confirmed,
              _encode_payload(payload), active[0]),
         )
+        if same_action:
+            payload['continued_from'] = active[2]
         _insert(connection, event_key, repo, "blocked", payload)
         if same_action:
             connection.execute(

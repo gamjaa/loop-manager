@@ -1373,6 +1373,105 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                 self.assertEqual(connection.execute('SELECT reason_code FROM recovery_records').fetchone()[0], 'state_unsafe')
                 self.assertIsNone(connection.execute('SELECT * FROM project_blocks').fetchone())
 
+    def test_late_confirmation_updates_only_continued_versions_of_same_action(self):
+        from loop_manager_internal.notifications.rendering import _message, _pieces
+        for long_question, changed in ((False, False), (True, False), (True, True)):
+            with self.subTest(long_question=long_question, changed=changed):
+                connection = self.connection()
+                question = 'q' * 1900 if long_question else 'Which permission?'
+                with connection:
+                    self.decision_block(connection, question=question)
+                first = dict(self.events(connection)[0])
+                frozen = _message('blocked', json.loads(first['payload']))
+                original_pieces = _pieces(frozen)
+                recovery = dict(connection.execute('SELECT * FROM recovery_records').fetchone())
+                def reconfirm_while_http_is_inflight(_token, _chat, piece):
+                    self.assertEqual(piece, original_pieces[0])
+                    for _ in range(2):
+                        with connection:
+                            RecoveryRepository(connection).observe(RecoveryObservation(
+                                RecoveryReason.GIT_LOCK, self.repo, 'G-018', recovery['phase'],
+                                recovery['plan_revision'], recovery['base_revision'], 'lock',
+                                recovery['progress_marker'], 'lock busy'), attempts=3)
+                            notifications.enqueue_current_project_events(connection, self.repo)
+                            self.decision_block(connection, question='A different question?' if changed else question)
+                    current = connection.execute('SELECT o.* FROM notified_block_incidents i '
+                        'JOIN notification_outbox o ON o.event_key=i.event_key').fetchone()
+                    self.assertEqual(current['confirmed_pieces'], 0)
+                notifications.dispatch_pending(connection, 'token', 'chat', adapter=reconfirm_while_http_is_inflight)
+                old = connection.execute('SELECT * FROM notification_outbox WHERE event_key=?', (first['event_key'],)).fetchone()
+                self.assertEqual(old['confirmed_pieces'], 1)
+                self.assertIsNotNone(old['canceled_at'])
+                self.assertEqual(old['payload'], first['payload'])
+                current = connection.execute('SELECT o.* FROM notified_block_incidents i '
+                    'JOIN notification_outbox o ON o.event_key=i.event_key').fetchone()
+                self.assertEqual(current['confirmed_pieces'], 0 if changed else 1)
+                adapter = mock.Mock()
+                notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter)
+                if changed:
+                    adapter.assert_called_once()
+                    self.assertIn('A different question?', adapter.call_args.args[2])
+                else:
+                    self.assertEqual([call.args[2] for call in adapter.call_args_list], original_pieces[1:])
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+
+    def test_worker_question_survives_project_recovery_without_restoring_shared_record(self):
+        for initially_enabled, already_sent, changed_revision in ((True, False, False), (True, True, False),
+                                                                (False, False, False), (True, False, True)):
+            with self.subTest(enabled=initially_enabled, sent=already_sent, revision=changed_revision):
+                directory = self.enterContext(tempfile.TemporaryDirectory())
+                database = Path(directory) / 'scope.sqlite'
+                connection = self.connection(enabled=initially_enabled, database=database)
+                self.addCleanup(connection.close)
+                with connection:
+                    connection.execute("UPDATE exec_plans SET current_revision_sha='question-revision'")
+                    self.decision_block(connection)
+                original_count = len(self.events(connection))
+                adapter = mock.Mock()
+                if already_sent:
+                    self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+                with connection:
+                    scoped_blocking.record_project_block(connection, self.repo,
+                        scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                        'independent project safety observation', 'safety-input', plan_id='G-018', previous_phase=None)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                    scoped_blocking.clear_project_block(connection, self.repo)
+                connection.close()
+                connection = sqlite3.connect(database)
+                connection.row_factory = sqlite3.Row
+                self.addCleanup(connection.close)
+                with connection:
+                    notifications.configure_session(connection, enabled=True)
+                    if changed_revision:
+                        connection.execute("UPDATE exec_plans SET current_revision_sha='replacement-revision'")
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                expected = not already_sent and not changed_revision
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), int(expected))
+                self.assertEqual(adapter.call_count, 1 if already_sent or expected else 0)
+                if expected:
+                    self.assertIn('Which permission should be granted?', adapter.call_args.args[2])
+                self.assertEqual(len(self.events(connection)), original_count or 1)
+                self.assertEqual(connection.execute('SELECT reason_code FROM recovery_records').fetchone()[0], 'state_unsafe')
+                block = connection.execute('SELECT * FROM execplan_blocks').fetchone()
+                self.assertEqual(block['reason_code'], 'user_decision_required')
+                self.assertEqual(json.loads(block['recovery_snapshot'])['reason_code'], 'user_decision')
+                self.assertIsNone(connection.execute('SELECT * FROM project_blocks').fetchone())
+
+    def test_old_block_schema_adds_nullable_proof_without_changing_existing_rows(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(scoped_blocking.PLAN_BLOCKS_SCHEMA.replace('    recovery_snapshot TEXT,\n', ''))
+        connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                           "VALUES ('repo', 'G-001', 'plan', 'user_decision_required', 'saved cause')")
+        original = dict(connection.execute('SELECT * FROM execplan_blocks').fetchone())
+        for _ in range(2):
+            scoped_blocking.ensure_schema(connection)
+        migrated = dict(connection.execute('SELECT * FROM execplan_blocks').fetchone())
+        self.assertIsNone(migrated.pop('recovery_snapshot'))
+        self.assertEqual(migrated, original)
+
     def test_next_piece_rechecks_resolved_action_and_confirmation_never_recreates_notice(self):
         connection = self.connection()
         with connection:
