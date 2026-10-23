@@ -400,7 +400,8 @@ def run_project_tasks(service, *, newly_activated):
             with closing(scheduler.connect_database(service.identity.state_dir, run_migrations=False)) as owned:
                 from loop_manager_internal.notifications import notifications
                 from loop_manager_internal.storage import recovery_state
-                notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled)
+                notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled,
+                    verify_timeout_seconds=getattr(scheduler.config, 'verify_timeout_seconds', None))
                 recovery_state.begin_external_run(owned, scheduler.external_run_id)
                 owned.commit()
                 child = ProjectService(service.effects, replace(service.identity, connection=owned))
@@ -491,7 +492,8 @@ def run_project_tasks(service, *, newly_activated):
             with closing(scheduler.connect_database(service.identity.state_dir, run_migrations=False)) as owned:
                 from loop_manager_internal.notifications import notifications
                 from loop_manager_internal.storage import recovery_state
-                notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled)
+                notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled,
+                    verify_timeout_seconds=getattr(scheduler.config, 'verify_timeout_seconds', None))
                 recovery_state.begin_external_run(owned, scheduler.external_run_id)
                 owned.commit()
                 token = current_task.set(Task(repo, plan_id, owned))

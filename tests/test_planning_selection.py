@@ -699,7 +699,8 @@ class PlanningSelectionTest(PlanningCase):
             "VALUES (?, 'main', 'bad plan')", (repo,),
         )
         with connection:
-            notifications.enqueue_current_project_events(connection, repo)
+            from tests.support.notification import NotificationFixture
+            NotificationFixture.legacy_planning_notice(connection, 'bad plan', confirmed=1, sent=True)
         notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
         loop_manager.update_project(connection, repo, planning_error=None)
         context = SimpleNamespace(
@@ -725,8 +726,13 @@ class PlanningSelectionTest(PlanningCase):
         resumed = connection.execute(
             "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
         ).fetchall()
-        self.assertEqual(len(resumed), 1)
-        self.assertEqual(json.loads(resumed[0][0])["operation"], "Planner")
+        self.assertEqual(resumed, [])
+        incident = connection.execute(
+            "SELECT started_operation, start_identity, started_at, resumed_at FROM notified_block_incidents"
+        ).fetchone()
+        self.assertEqual((incident['started_operation'], incident['start_identity']), ('Planner', 'actual-start'))
+        self.assertIsNotNone(incident['started_at'])
+        self.assertIsNotNone(incident['resumed_at'])
 
     def test_registered_self_flag_only_reaches_maintenance_due_for_self_context(self):
         for self_repository in (False, True):

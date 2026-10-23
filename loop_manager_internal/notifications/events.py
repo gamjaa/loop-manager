@@ -8,6 +8,7 @@ import sqlite3
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
+from .policy import is_current, cancel_stale_events, block_recovery, SOURCE_ACTION_REASONS
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
@@ -63,47 +64,27 @@ class _BlockedPlanProjection:
 def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) -> None:
     """Enqueue all plan/project events after their owning update and before commit."""
 
-    if not _enabled(connection):
-        return
     ensure_schema(connection)
     adopt_legacy_block_notices(connection)
+    cancel_stale_events(connection, repo)
+    if not _enabled(connection):
+        return
     project = connection.execute(
-        "SELECT phase, plan_path, pr_url, last_error, planning_error, "
-        "planning_attempt_fingerprint, planning_validation_error, active_sha "
-        "FROM projects WHERE repo = ?",
+        "SELECT 1 FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if project is None:
         return
     name = Path(repo).name or repo
-    planning_failure = project[3] or project[6]
-    if project[0] == "PLANNING" and planning_failure and not project[4]:
-        enqueue_progress(connection, repo, "stage_failed",
-                         str(project[5]) + "\0" + str(project[7]) + "\0" + str(planning_failure),
-                         operation="Planner", cause=str(planning_failure),
-                         status="다음 실행 또는 자동 교정 대기", silent=True)
-    if project[0] == "REVIEWING" and str(project[3] or "").startswith("Reviewer 결과 프로토콜 오류:"):
-        plan = connection.execute(
-            "SELECT plan_id, current_revision_sha, verify_token FROM exec_plans "
-            "WHERE repo = ? AND path = ?", (repo, project[1]),
-        ).fetchone()
-        if plan:
-            enqueue_review_failure(connection, repo, str(plan[0]), str(project[3]),
-                                   status="자동 교정·재시도 대기")
-    recovery_available = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recovery_records'"
-    ).fetchone() is not None
-
-    def final_recovery(subject: str) -> tuple[str | None, dict | None]:
-        if not recovery_available:
+    def final_recovery(plan_id, scope):
+        row = block_recovery(connection, repo, plan_id, scope)
+        if row is None or row['final_evidence'] is None:
             return None, None
-        row = connection.execute(
-            "SELECT identity, final_evidence FROM recovery_records "
-            "WHERE repo = ? AND subject = ?", (repo, subject),
-        ).fetchone()
-        if row is None or row[1] is None:
+        try:
+            evidence = json.loads(row['final_evidence'])
+        except (TypeError, ValueError):
             return None, None
-        return str(row[0]), json.loads(str(row[1]))
+        return (str(row['identity']), evidence) if isinstance(evidence, dict) else (None, None)
 
     enqueue_draft_decisions(connection, repo)
 
@@ -112,18 +93,15 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         "WHERE repo = ? AND status = 'PR_OPEN' AND pr_url IS NOT NULL",
         (repo,),
     ).fetchall():
-        _insert(
-            connection,
-            _key("pr", repo, str(plan[2])),
-            repo,
-            "pr_created",
-            {
-                "project": name,
-                "execplan_id": str(plan[0]),
-                "execplan_title": str(plan[1]),
-                "pr_url": str(plan[2]),
-            },
-        )
+        payload = {
+            "project": name,
+            "execplan_id": str(plan[0]),
+            "execplan_title": str(plan[1]),
+            "pr_url": str(plan[2]),
+        }
+        if is_current(connection, repo, "pr_created", payload):
+            _insert(connection, _key("pr", repo, str(plan[2])), repo, "pr_created", payload)
+
 
     plan_blocks = connection.execute(
         "SELECT p.plan_id AS plan_id, p.title AS plan_title, p.path AS plan_path, "
@@ -153,9 +131,11 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         stage = "ExecPlan"
         plan_id = plan.plan_id
         plan_title = plan.title
-        recovery_identity, recovery_evidence = final_recovery(plan_id)
+        recovery_identity, recovery_evidence = final_recovery(plan_id, 'plan')
+        if plan.reason_code in SOURCE_ACTION_REASONS:
+            recovery_identity = None
         paths = (
-            list(recovery_evidence["user_targets"])
+            list(recovery_evidence.get("user_targets", []))
             if recovery_evidence is not None
             else [plan.path, *(str(item) for item in sources)]
         )
@@ -191,7 +171,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             rows = connection.execute(
                 "SELECT proposal_id, proposal_line, decision_line "
                 "FROM guidance_approvals WHERE repo = ? AND plan_id = ? "
-                "AND applied = 0 ORDER BY sequence, proposal_id",
+                "AND applied = 0 AND decision = 'pending' ORDER BY sequence, proposal_id",
                 (repo, plan_id),
             ).fetchall()
             guidance_locations = [
@@ -262,7 +242,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         checkpoint = (_preservation_checkpoint(connection, repo, 'project', project_block[1])
                       or _project_checkpoint(connection, repo, project_block[1]))
         recovery_identity, recovery_evidence = final_recovery(
-            str(project_block[1] or "__project__")
+            project_block[1], "project"
         )
         try:
             project_sources = json.loads(str(project_block[5])) if project_block[5] else []
@@ -277,7 +257,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             else []
         )
         if recovery_evidence is not None:
-            project_paths = list(recovery_evidence["user_targets"])
+            project_paths = list(recovery_evidence.get("user_targets", []))
         suppress_persistent_failure_for_block(
             connection, repo, str(project_block[1] or "__project__"),
         )
@@ -304,36 +284,6 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             },
         )
 
-    if project[4] and project_block is None:
-        checkpoint = _preservation_checkpoint(connection, repo, 'planning', 'planning')
-        _queue_block(
-            connection,
-            repo,
-            "planning",
-            _key("blocked", repo, "project\0planning_error\0" + _project_checkpoint_suffix(checkpoint)),
-            {
-                "project": name,
-                "stage": "planning",
-                "scope": "project",
-                "reason_code": "planning_error",
-                "execplan_id": None,
-                "execplan_title": None,
-                "cause": str(project[4]),
-                "paths": [
-                    "docs/PRODUCT.md",
-                    "docs/requirements/*.md",
-                    "docs/ARCHITECTURE.md",
-                ],
-                "guidance_locations": [],
-                "checkpoint": checkpoint,
-            },
-        )
-
-
-def worker_targeted_failure(reason_code, detail) -> bool:
-    """The unresolved Worker test diagnostic is local correction evidence."""
-    return (reason_code in {'worker_correction', 'targeted_test_correction'} and
-            'Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다.' in str(detail))
 
 
 def cancel_pending_persistent_execution_failure_event(
@@ -501,34 +451,8 @@ def enqueue_completion_if_ready(
         return False
 
     cycle_key = str(project[1])
-    completion = connection.execute(
-        "SELECT last_completed_plan_id, last_completed_title "
-        "FROM project_completion_cycles WHERE repo = ?",
-        (repo,),
-    ).fetchone()
-    last_id = str(completion[0]) if completion and completion[0] else None
-    last_title = str(completion[1]) if completion and completion[1] else None
-    if last_id is None:
-        merged = connection.execute(
-            "SELECT plan_id, title FROM exec_plans "
-            "WHERE repo = ? AND status = 'MERGED'",
-            (repo,),
-        ).fetchall()
-        if merged:
-            def plan_order(row: sqlite3.Row) -> tuple[int, str]:
-                value = str(row[0])
-                try:
-                    return int(value.removeprefix("G-")), value
-                except ValueError:
-                    return -1, value
-
-            latest = max(merged, key=plan_order)
-            last_id, last_title = str(latest[0]), str(latest[1])
-    last_title = last_title or "Planner confirmed no additional work"
     with connection:
         _cancel_pending_waiting(connection, repo)
-        if not _enabled(connection):
-            return False
         connection.execute(
             """
             INSERT INTO project_completion_cycles (repo, cycle_key, completed_at)
@@ -536,20 +460,10 @@ def enqueue_completion_if_ready(
             ON CONFLICT(repo) DO UPDATE SET
                 cycle_key = excluded.cycle_key,
                 completed_at = excluded.completed_at
+            WHERE project_completion_cycles.cycle_key IS NOT excluded.cycle_key
+                OR project_completion_cycles.completed_at IS NULL
             """,
             (repo, cycle_key),
-        )
-        _insert(
-            connection,
-            _key("completed", repo, cycle_key),
-            repo,
-            "project_completed",
-            {
-                "project": Path(repo).name or repo,
-                "reason": snapshot.describe(),
-                "last_completed_plan_id": last_id,
-                "last_completed_title": last_title,
-            },
         )
     return True
 
@@ -578,7 +492,7 @@ def mark_work_available(connection: sqlite3.Connection, repo: str) -> None:
 def enqueue_waiting_reason(
     connection: sqlite3.Connection, repo: str, snapshot: WorkReasonSnapshot,
 ) -> bool:
-    """Create one waiting incident per stable cause and cause transition."""
+    """Record stable waiting episodes without creating a Telegram notice."""
 
     if snapshot.completed:
         return False
@@ -604,27 +518,13 @@ def enqueue_waiting_reason(
             "signature = excluded.signature, generation = excluded.generation",
             (repo, signature, generation),
         )
-        if not snapshot.has_distinct_wait or not (payload["plans"] or payload["requirements"]):
-            _cancel_pending_waiting(connection, repo)
-            return False
-        event_key = _key("waiting", repo, f"{generation}\0{signature}")
-        connection.execute(
-            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
-            "WHERE repo = ? AND event_type = 'work_waiting' "
-            "AND event_key != ? AND sent_at IS NULL AND canceled_at IS NULL",
-            (repo, event_key),
-        )
-        if not _enabled(connection):
-            return False
-        payload["silent"] = False
-        payload["status"] = "다음 작업 대기"
-        _insert(connection, event_key, repo, "work_waiting", payload)
-    return True
+        _cancel_pending_waiting(connection, repo)
+    return False
 
 
 def enqueue_progress(connection, repo, kind, identity, **payload):
     """Persist a boundary observation in the owning state transaction."""
-    if kind in {"stage_failed", "planning_result"} or not _enabled(connection):
+    if kind not in {"draft_decisions", "draft_decision", "pr_created"} or not _enabled(connection):
         return
     ensure_schema(connection)
     plan_id = payload.get("execplan_id")
@@ -635,38 +535,17 @@ def enqueue_progress(connection, repo, kind, identity, **payload):
             payload.setdefault("execplan_title", str(plan[0]))
     if isinstance(payload.get("cause"), str):
         payload["cause"] = redact_secrets(payload["cause"])
-    _insert(connection, _key(kind, repo, identity), repo, kind,
-            {"project": Path(repo).name or repo, **payload})
+    payload = {"project": Path(repo).name or repo, **payload}
+    if is_current(connection, repo, kind, payload):
+        _insert(connection, _key(kind, repo, identity), repo, kind, payload)
 
 
 def enqueue_review_failure(connection, repo, plan_id, cause, *, status):
-    """Persist a Reviewer failure in its owning state transaction."""
-    if not _enabled(connection):
-        return
-    plan = connection.execute(
-        "SELECT plan_id, current_revision_sha, verify_token FROM exec_plans "
-        "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
-    ).fetchone()
-    if plan:
-        enqueue_progress(connection, repo, "stage_failed",
-                         "review\0" + "\0".join(str(value) for value in (*plan, cause)),
-                         execplan_id=plan_id, operation="Reviewer", cause=cause,
-                         status=status, silent=True)
+    """Compatibility hook; Review diagnostics are retained by recovery, without Telegram."""
 
 
 def enqueue_worker_failure(connection, repo, plan_id, cause, *, status):
-    """Persist a Worker return failure in its owning state transaction."""
-    if not _enabled(connection) or worker_targeted_failure('worker_correction', cause):
-        return
-    plan = connection.execute(
-        "SELECT plan_id, current_revision_sha, worker_input_token FROM exec_plans "
-        "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
-    ).fetchone()
-    if plan:
-        enqueue_progress(connection, repo, "stage_failed",
-                         "worker\0" + "\0".join(str(value) for value in (*plan, cause)),
-                         execplan_id=plan_id, operation="Worker", cause=cause,
-                         status=status, silent=True)
+    """Compatibility hook; Worker diagnostics are retained by recovery, without Telegram."""
 
 
 def record_process_start(connection, repo, role, identity, *, plan_id=None, resumed=False):
@@ -676,8 +555,6 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
     from loop_manager_internal.storage import execplan_draft_state
     ensure_schema(connection)
     if connection.execute(
-        "SELECT 1 FROM notification_outbox WHERE event_key = ?", (_key("work_started", repo, identity),),
-    ).fetchone() or connection.execute(
         "SELECT 1 FROM notified_block_incidents WHERE repo = ? AND start_identity = ?", (repo, identity),
     ).fetchone():
         return
@@ -688,44 +565,14 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
     ).fetchone()):
         return
     operation = "Worker" if role == "worker" else "Planner"
-    blocked_resume = record_work_start(connection, repo, operation, plan_id=plan_id,
-                                      start_identity=identity, resumed=resumed)
-    # Delivery of a BLOCKED piece may still be in flight. The incident will
-    # materialize its resumption when confirmation arrives; suppress the generic start too.
-    pending_resume = connection.execute(
-        "SELECT 1 FROM notified_block_incidents i WHERE repo = ? AND started_operation = ? "
-        "AND start_identity = ? AND released_at IS NOT NULL AND resumed_at IS NULL "
-        "AND subject IN (?, 'project') AND EXISTS (SELECT 1 FROM block_notice_events b "
-        "JOIN notification_outbox o ON o.event_key = b.event_key "
-        "WHERE b.incident_id = i.id AND o.delivery_started_at IS NOT NULL "
-        "AND o.sent_at IS NULL) LIMIT 1",
-        (repo, operation, identity, f"plan:{plan_id}" if plan_id else "planning"),
-    ).fetchone()
-    already_started = plan_id and connection.execute(
-        "SELECT 1 FROM notification_outbox WHERE repo = ? "
-        "AND event_type IN ('work_started', 'resumed') "
-        "AND json_extract(payload, '$.execplan_id') = ? LIMIT 1", (repo, plan_id),
-    ).fetchone()
-    if role == "worker" and not resumed and not already_started and not blocked_resume and not pending_resume:
-        enqueue_progress(connection, repo, "work_started", identity,
-                         execplan_id=plan_id, operation=operation,
-                         status="작업 중", silent=True)
+    record_work_start(connection, repo, operation, plan_id=plan_id,
+                      start_identity=identity, resumed=resumed)
 
 
 def record_planning_publication(connection, repo, plans, revision):
     if not _enabled(connection):
         return
-    from loop_manager_internal.storage import execplan_draft_state
-    ordinary = []
-    drafts = execplan_draft_state.pending_ids(connection, repo)
-    for path, plan in plans:
-        plan_id = str(plan["id"])
-        if plan_id not in drafts:
-            ordinary.append({"id": plan_id, "title": str(plan["title"])})
     enqueue_draft_decisions(connection, repo)
-    if ordinary:
-        enqueue_progress(connection, repo, "plans_published", revision,
-                         plans=ordinary, status="실행 또는 dependency 대기", silent=True)
 
 
 def enqueue_draft_decisions(connection, repo):

@@ -163,6 +163,15 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
             snapshot.return_value.serialize.return_value = 'after-scope'
             result = self.handler.run(self.context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        # A native decision's failure identity and input-release identity have
+        # different domains; a valid question must still reach its outbox.
+        failure_fingerprint = self.connection.execute(
+            "SELECT fingerprint FROM recovery_records WHERE repo='repo' AND subject='G-047'"
+        ).fetchone()[0]
+        release_fingerprint = self.connection.execute(
+            "SELECT release_fingerprint FROM execplan_blocks WHERE repo='repo' AND plan_id='G-047'"
+        ).fetchone()[0]
+        self.assertNotEqual(failure_fingerprint, release_fingerprint)
         self.assertEqual(blocked_checkpoint_state.BlockedCheckpointRepository(
             self.connection).get('repo', 'G-047').phase,
             blocked_checkpoint.CheckpointPhase.REQUESTED)

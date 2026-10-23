@@ -130,15 +130,19 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
         notifications.ensure_schema(self.connection)
         for published in (True, False):
             with self.subTest(published=published):
-                request = self.request(evidence=str(published))
+                request = self.request(evidence=str(published), reason_code="user_decision_required")
                 self.connection.execute(
                     "INSERT OR REPLACE INTO execplan_blocks "
                     "(repo, plan_id, scope, reason_code, evidence) "
-                    "VALUES ('repo', 'G-034', 'plan', 'verify_retry_exhausted', ?)",
+                    "VALUES ('repo', 'G-034', 'plan', 'user_decision_required', ?)",
                     (str(published),),
                 )
-                self.connection.execute("DELETE FROM notification_outbox")
+                from tests.support.notification import NotificationFixture
+                NotificationFixture.decision_block(self.connection, repo='repo', plan_id='G-034',
+                    detail=str(published), fingerprint=str(published),
+                    question=f'Choose the {published} publication policy?', record_block=False)
                 self.connection.commit()
+                previous_count = self.connection.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0]
                 def finish():
                     if published:
                         self.repository.finish_published(request, "a" * 40)
@@ -152,12 +156,12 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
                     with self.assertRaises(KeyboardInterrupt):
                         finish()
                 self.assertEqual(len(self.repository.pending("repo")), 1)
-                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0)
+                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], previous_count)
                 finish()
                 self.assertEqual(self.repository.pending("repo"), ())
-                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 1)
+                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], previous_count + 1)
                 finish()
-                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 1)
+                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], previous_count + 1)
 
     def test_existing_pr_request_receipt_and_validation_invalidation_are_atomic(self):
         self.connection.execute("UPDATE exec_plans SET pr_url='https://example.test/pr/34', "
@@ -178,11 +182,11 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
             self.assertIsNone(plan[field])
         self.assertEqual(self.repository.get('repo', 'G-034').phase.value, 'published')
 
-    def request(self, evidence="failure", release_fingerprint=None):
+    def request(self, evidence="failure", release_fingerprint=None, reason_code="verify_retry_exhausted"):
         return self.repository.request(
             repo="repo",
             plan_id="G-034",
-            reason_code="verify_retry_exhausted",
+            reason_code=reason_code,
             evidence=evidence,
             branch="loop-manager/G-034",
             worktree="/state/G-034",

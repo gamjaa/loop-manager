@@ -318,6 +318,8 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
             "planning_correction_sha": "new-base",
             "planning_correction_context": "post_refactor_revalidation:2",
         })
+        from tests.support.notification import NotificationFixture
+        NotificationFixture.legacy_planning_notice(connection, 'old unsafe', repo='repo')
         incident = connection.execute(
             "SELECT id FROM notified_block_incidents WHERE repo = 'repo' "
             "AND subject = 'planning'",
@@ -379,6 +381,8 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         notifications.configure_session(connection, enabled=True)
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.update_project("repo", {"planning_error": "owner mismatch"})
+        from tests.support.notification import NotificationFixture
+        NotificationFixture.legacy_planning_notice(connection, 'owner mismatch', repo='repo')
         incident = connection.execute(
             "SELECT id, event_key FROM notified_block_incidents "
             "WHERE repo = 'repo' AND subject = 'planning'",

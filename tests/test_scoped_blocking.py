@@ -699,92 +699,29 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
 
     def test_block_notifications_distinguish_new_fingerprint_and_scope(self):
         notifications.configure_session(self.connection, enabled=True)
-        self.plan("G-001", "IMPLEMENTING")
+        self.plan('G-001', 'IMPLEMENTING')
+        checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+        for evidence, fingerprint in (('first evidence', 'one'), ('updated evidence', 'two')):
+            with self.connection:
+                scoped_blocking.record_plan_block(self.connection, self.repo, 'G-001',
+                    BlockReasonCode.REVIEW_RETRY_EXHAUSTED, evidence, fingerprint)
+                checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-001'),
+                    'local-only result', retryable=False)
+                notifications.enqueue_current_project_events(self.connection, self.repo)
+            block = scoped_blocking.plan_block(self.connection, self.repo, 'G-001')
+            self.assertEqual((block['scope'], block['evidence'], block['release_fingerprint']),
+                             ('plan', evidence, fingerprint))
+            self.assertEqual(checkpoints.get(self.repo, 'G-001').phase.value, 'unpublished')
         with self.connection:
-            scoped_blocking.record_plan_block(
-                self.connection,
-                self.repo,
-                "G-001",
-                BlockReasonCode.REVIEW_RETRY_EXHAUSTED,
-                "first evidence",
-                "one",
-            )
-            checkpoint_repository = (
-                blocked_checkpoint_state.BlockedCheckpointRepository(
-                    self.connection
-                )
-            )
-            checkpoint_repository.finish_unpublished(
-                checkpoint_repository.get(self.repo, "G-001"),
-                "first local-only result",
-                retryable=False,
-            )
-            notifications.enqueue_current_project_events(
-                self.connection, self.repo
-            )
-            scoped_blocking.record_plan_block(
-                self.connection,
-                self.repo,
-                "G-001",
-                BlockReasonCode.REVIEW_RETRY_EXHAUSTED,
-                "updated evidence",
-                "two",
-            )
-            checkpoint_repository.finish_unpublished(
-                checkpoint_repository.get(self.repo, "G-001"),
-                "updated local-only result",
-                retryable=False,
-            )
-            notifications.enqueue_current_project_events(
-                self.connection, self.repo
-            )
-        rows = self.connection.execute(
-            "SELECT payload FROM notification_outbox WHERE event_type = 'blocked'"
-        ).fetchall()
-        self.assertEqual(len(rows), 2)
-        payload = json.loads(rows[0]["payload"])
-        self.assertEqual(
-            (payload["scope"], payload["reason_code"], payload["execplan_id"]),
-            ("plan", "review_retry_exhausted", "G-001"),
-        )
-
-        with self.connection:
-            scoped_blocking.record_project_block(
-                self.connection,
-                self.repo,
-                BlockReasonCode.SHARED_GIT_CONFIG_MUTATION,
-                "shared config changed",
-                "config-fingerprint",
-                plan_id="G-001",
-                previous_phase=None,
-            )
-            notifications.enqueue_current_project_events(
-                self.connection, self.repo
-            )
-        project_payload = next(
-            parsed
-            for parsed in (
-                json.loads(row[0])
-                for row in self.connection.execute(
-                    "SELECT payload FROM notification_outbox "
-                    "WHERE event_type = 'blocked'"
-                )
-            )
-            if parsed["scope"] == "project"
-        )
-        self.assertEqual(
-            (
-                project_payload["scope"],
-                project_payload["reason_code"],
-                project_payload["execplan_id"],
-                project_payload["execplan_title"],
-            ),
-            ("project", "shared_git_config_mutation", "G-001", "Work G-001"),
-        )
-        self.assertEqual(
-            project_payload["paths"],
-            [],
-        )
+            scoped_blocking.record_project_block(self.connection, self.repo,
+                BlockReasonCode.SHARED_GIT_CONFIG_MUTATION, 'shared config changed',
+                'config-fingerprint', plan_id='G-001', previous_phase=None)
+            notifications.enqueue_current_project_events(self.connection, self.repo)
+        block = scoped_blocking.project_block(self.connection, self.repo)
+        self.assertEqual((block['scope'], block['reason_code'], block['plan_id'], block['release_fingerprint']),
+                         ('project', 'shared_git_config_mutation', 'G-001', 'config-fingerprint'))
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-001')['release_fingerprint'], 'two')
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0], 0)
 
 
     def test_plan_block_is_waiting_and_registry_removal_is_rejected(self):

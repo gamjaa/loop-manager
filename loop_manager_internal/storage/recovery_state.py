@@ -348,6 +348,8 @@ class RecoveryRepository:
             }
             if observation.worker_decision is not None:
                 evidence["worker_decision"] = observation.worker_decision
+            if observation.unavailable_recovery_routes is not None:
+                evidence["unavailable_recovery_routes"] = observation.unavailable_recovery_routes
         values = (
             observation.identity, observation.reason.value,
             decision.disposition.value, decision.action.value,

@@ -71,7 +71,8 @@ def _run_registered_project(
             # state transaction and can fail with SQLITE_BUSY.
             with closing(effects.connect_database(state_dir, run_migrations=False)) as connection:
                 notifications.configure_session(
-                    connection, enabled=bool(telegram_token and telegram_chat_id)
+                    connection, enabled=bool(telegram_token and telegram_chat_id),
+                    verify_timeout_seconds=verify_timeout_seconds,
                 )
                 # TEMP session setup opens a SQLite transaction. Close it before
                 # runtime-state repository operations so each lifecycle change
@@ -179,6 +180,7 @@ def schedule_registered_projects(
     if runtime_mutation is not None:
         notifications.configure_session(
             connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
+            verify_timeout_seconds=getattr(config, 'verify_timeout_seconds', None),
         )
         connection.commit()
     planner_mutex = threading.Lock()
@@ -264,6 +266,7 @@ def run_registered_projects(
             with connection:
                 notifications.configure_session(
                     connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
+                    verify_timeout_seconds=getattr(config, 'verify_timeout_seconds', None),
                 )
                 notifications.recover_interrupted_starts(connection)
             notifications.dispatch_pending(
