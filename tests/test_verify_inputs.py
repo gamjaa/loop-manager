@@ -510,9 +510,8 @@ class WorkerExclusionReviewTests(unittest.TestCase):
         with mock.patch.object(inputs, 'observe', side_effect=mutate):
             self.assertFalse(self.observe().proven)
 
-    def test_production_observer_and_prompt_accept_explicit_review_for_custom_entrypoints(self):
+    def test_production_observer_accepts_explicit_review_for_custom_entrypoints(self):
         from loop_manager_internal.execution import result_validation
-        from loop_manager_internal.agents.agent_prompts import worker_prompt
         message = inputs.EXCLUSION_MARKER + json.dumps(self.review)
         for platform, script in (('posix', 'verify.sh'), ('nt', 'verify.ps1')):
             with mock.patch.object(result_validation, 'os', SimpleNamespace(name=platform)):
@@ -522,10 +521,3 @@ class WorkerExclusionReviewTests(unittest.TestCase):
                 (self.root / 'scripts' / script).write_text('now consumes README.md')
                 self.assertFalse(result_validation.observe_verify_inputs(self.root, worker_result=message).proven)
                 (self.root / 'scripts' / script).write_text('custom native verify')
-        prompt = worker_prompt('plan', None)
-        self.assertIn(inputs.EXCLUSION_MARKER, prompt)
-        self.assertIn('--review-request .', prompt)
-        self.assertIn('어떤 내용이어도 소비되지 않음', prompt)
-        self.assertNotIn(inputs.EXCLUSION_MARKER, worker_prompt('plan', None, session_resume=True))
-        self.assertIn(inputs.EXCLUSION_MARKER, worker_prompt('plan', None,
-            session_resume=True, session_recovery=True))

@@ -759,7 +759,10 @@ class CommonGuidanceInvocationTests(TestCase):
             for rule in ('최소 범위의 targeted unit test만', '개별 test case·class·module',
                          '공백을 정규화한 뒤 정확히 같아야', 'Worker는 Git add·commit·fetch·rebase·push·PR',
                          'frontmatter는 직접 변경하지', 'sources 문자열은 보존',
-                         '모든 Requirement', 'Ponytail', 'User Decision'):
+                         '모든 Requirement', 'Ponytail', 'User Decision',
+                         'VERIFY_INPUT_EXCLUSIONS:', '--review-request .',
+                         '어떤 내용이어도 소비되지 않음',
+                         '스크립트와 같은 디렉터리의 `inputs.py`'):
                 self.assertIn(rule, instruction)
                 self.assertNotIn(rule, prompt)
             self.assertNotIn('PRIVATE OLD WORKER RESULT', prompt)
