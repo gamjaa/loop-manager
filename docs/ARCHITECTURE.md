@@ -1626,7 +1626,7 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 | 실행 | 목록 자체·선택한 저장소 verify 진입점·코드/테스트/의존성·검증 선언의 파일 입력을 결합 |
 | 생성물·의존성 | Git 내부·bytecode·`.venv` 등 설치 환경은 비교 대상 밖이다. 저장소 의존성 선언·lock 파일과 테스트 고정 자료는 코드 입력이다. |
 
-다음은 R-072에서 채택한 코드 입력 관측 계약이며 기존 환경 완전성 adapter를 이 기준으로 전환하는 구현이 필요하다. `InputObservation.proven`은 유효 목록·저장소 코드 입력 관측·목록 밖 코드 누락 확인과 `fingerprint`/`reason`으로 판단한다. 파일을 읽거나 비교할 수 없는 경우는 미확인이며 runtime·Git/외부 identity의 `None`은 그 자체로 미확인이 아니다. 기존 환경 관측 자료는 감사로 보존할 수 있으나 코드 기준 재사용 gate로 사용하지 않는다. 목록 밖 제외 근거는 아래 completeness token의 코드 입력에 결합한다.
+관측은 R-072의 저장소 코드 입력 기준을 사용한다. `InputObservation.proven`은 유효 목록·저장소 코드 입력 관측·목록 밖 코드 누락 확인과 `fingerprint`/`reason`으로 판단한다. 파일을 읽거나 비교할 수 없는 경우는 미확인이며 runtime·Git/외부 identity의 `None`은 그 자체로 미확인이 아니다. 기존 환경 관측 자료는 감사로 보존할 수 있으나 코드 기준 재사용 gate로 사용하지 않는다. 목록 밖 제외 근거는 아래 completeness token의 코드 입력에 결합한다.
 
 입력 목록의 부재·오류는 관측을 미확인으로 만들어 전체 verify를 유지한다. 공통 runner 연결 선언 `scripts/verify.json`의 형식·지원 오류는 [공통 verify 실행 경계](#공통-verify-실행-경계)에 따라 실행 실패이며 두 파일의 오류 처리를 혼동하지 않는다.
 
@@ -1635,13 +1635,13 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 자체 `scripts/verify-inputs.json`은 다음 입력을 고정 목록으로 관측한다.
 
 - `loop_manager.py`, `loop_manager_internal/**`, `tests/**`, `requirements.txt`
-- `scripts/verify.json`, `scripts/verify.sh`, `scripts/verify.ps1`, `scripts/verify_windows.py`, `scripts/verify-windows-tests.json`
+- `scripts/verify.json`, `scripts/verify.sh`, `scripts/verify.ps1`, `scripts/verify_windows.py`, `scripts/verify-windows-tests.json`, `scripts/setup.sh`
 - `scripts/copy-project-files.sh`, `scripts/copy-project-files.ps1`
 - `.agents/skills/specification-docs/scripts/**`, `run.sh`, `run.ps1`
 
 `tests/**`의 등록·profile·프로젝트 준비 검증은 문서·설정 예제 대신 고정 샘플을 사용한다. 복사 회귀는 실제 copy 스크립트 bytes를 샘플 source root에서 실행해 결과 bytes·경로·기존 파일 보존·재실행 거부를 확인한다. 배포되는 조회 도구와 Skill 자체 문서 파서는 실제 실행 코드 bytes를 샘플 source에 배치해 배포 결과·조회 동작을 확인한다.
 
-샘플은 현재 문서 원본에서 자동 생성·동기화하지 않는다. `AGENTS.md`·README·docs와 `.agents`의 prose·`config.ini.example`·사용자 운영 설정·소비하지 않는 setup/ignore/attributes 변경은 자체 verify 입력이 아니다. Windows verify driver·선택 목록은 이미 포함돼 있다. 테스트가 실제로 읽어 실행하는 `scripts/setup.sh`의 누락 보완은 R-072의 변경 목표다. 이 제외는 원문의 일관성·품질을 확인하지 않으며 필수 테스트·전체 compile·실제 verify/copy 스크립트 검증을 축소하지 않는다.
+샘플은 현재 문서 원본에서 자동 생성·동기화하지 않는다. `AGENTS.md`·README·docs와 `.agents`의 prose·`config.ini.example`·사용자 운영 설정·소비하지 않는 setup/ignore/attributes 변경은 자체 verify 입력이 아니다. Windows verify driver·선택 목록과 Linux 실행 경로 회귀가 임시 source에 복사해 실행하는 `scripts/setup.sh`는 입력이다. setup의 bytes·kind·mode 변경은 입력 지문과 기존 제외 근거를 바꾼다. 소비하지 않는 다른 플랫폼 setup은 추가하지 않는다. 이 제외는 원문의 일관성·품질을 확인하지 않으며 필수 테스트·전체 compile·실제 verify/copy 스크립트 검증을 축소하지 않는다.
 
 verify 기록은 실행 시 Python의 bytecode write 정책·cache tag·prefix와 프로젝트 Python cache의
 전후 개수, 생성·변경·유지·삭제 수를 남기며 snapshot 소요 시간을 별도 phase로 기록한다.
@@ -1717,7 +1717,21 @@ source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 �
 | 범위 밖 | 설치 Python/Git/Bash/Perl·native library·환경변수·사용자/시스템 설정·외부 파일/동적 입력·Git HEAD/이력/revision 값은 지문·완전성의 필수 조건이 아니다. |
 | 전체 실행 | 목록/코드 관측 오류·코드 입력 누락 의심·변경·유효한 실제 전체 성공 부재에서는 전체 verify를 실행한다. |
 
-현재 구현은 일반 경로에서 `runtime_identity=None`을 미확인으로 취급하며 고정 Linux isolated compile에만 환경·runtime 측정을 결합한 증명을 제공한다. 이는 새 정책의 완료 조건이 아니라 전환할 기존 구현이다. 일반 runner가 외부 의존성을 모두 증명하거나 고정 toolchain·통제된 Linux 환경을 도입해야 코드 기준 재사용을 구현할 수 있다고 판단하지 않는다. 기존 runtime 측정 자료·receipt는 보존하되 새 판정에서 불필요한 환경 증명은 제외한다.
+일반 경로와 isolated compile의 입력 관측은 같은 코드 기준을 사용하며 `runtime_identity=None`·환경·Git/외부 identity의 미확인이나 변경만으로 재사용을 거부하지 않는다. 선택한 저장소 진입점과 연결 선언이 목록에서 빠지면 미확인이다. fingerprint는 선택 파일과 진입점의 상대경로, 목록 bytes·해석 규칙, 실행 중인 관측·runner/adapter·receipt 판정 코드 bytes를 결합한다. 예전 환경 지문을 현재 값으로 합성하지 않으며 기존 receipt와 실패 감사는 그대로 보존한다. compile 실행 fast path는 유지하지만 더 이상 설치 runtime을 측정하지 않는다.
+
+문서 제외는 현재 파일 관측과 코드 소비 관계의 재확인을 결합한다. 고정 POSIX launcher·unittest의 제한된 정적 증명은 기존 `impact_analysis.review_document`를 사용한다. 일반 스크립트·native/동적 소비는 Worker가 진입점·수집·테스트의 실제 저장소 소비를 검토하고, 특정 목록 밖 경로가 내용과 무관하게 소비되지 않는다는 근거를 기존 `worker_result`에 기록한다. 새 DB나 프로젝트별 중앙 경로 설정은 두지 않는다. Reviewer에게 저장된 선언을 실제 verify receipt 설명과 함께 전달해 목록 누락과 소비 검토를 확인하게 한다. 선언은 PR Summary나 targeted test 결과에 섞지 않는다.
+
+Worker 결과의 선택적 단일 `VERIFY_INPUT_EXCLUSIONS: <JSON>` 선언은 다음 version 1 계약이다. 읽기 전용 `verification/inputs.py --review-request <worktree> --entrypoint <상대경로>`는 identity만 출력하며 소비 검토나 승인을 대신하지 않는다. Worker는 최종 코드 기준으로 identity를 얻고 실제 확인한 `basis`를 추가한다. 실제 확인한 다른 플랫폼 진입점은 `--entrypoint`를 반복한다.
+
+| 필드 | 의미 |
+|---|---|
+| `version` | 정수 1. 중복 key·중복 선언·잘못된 형식은 제외 권한으로 채택하지 않는다. |
+| `codes` | 검토한 진입점별 현재 코드 fingerprint의 비어 있지 않은 문자열 목록. 선택 파일·목록·진입점·판정 구현과 제외 정책을 결합한다. |
+| `outside` | 정렬한 목록 밖 정확 경로 목록의 SHA-256. 경로 추가·삭제·이동은 새 소비 검토가 필요하다. |
+| `operating_paths` | 내용·존재 여부와 무관한 운영/예제 설정의 정확한 상대경로 배열. glob·중복·안전하지 않은 경로는 거부하며 manifest 선택이 항상 우선한다. 검증이 소비하는 고정 설정/자료는 여기에 넣지 않는다. |
+| `basis` | 해당 경로의 어떤 내용도 실제 검증 소비에 영향을 주지 않는다는 Worker의 구체적인 소비 검토 근거. PASS나 identity 출력은 이 근거가 아니다. |
+
+Manager는 현재 작업의 저장된 Worker 결과에서 이 선언을 읽고, 현재 코드 fingerprint와 목록 밖 경로 집합을 다시 대조한다. 목록 밖 파일은 현재 bytes·kind·mode로 두 번 관측해 새 completeness를 확정한다. 같은 경로의 문서 bytes·mode 변경은 내용에 의존하지 않는 소비 관계가 그대로일 때만 새 근거로 갱신한다. symlink·special 파일·읽기 실패·관측 경쟁·코드나 진입점/규칙 변경·새 목록 밖 파일은 재사용하지 않는다. stale 선언을 다른 증명으로 조용히 대체하지 않는다. 명시한 운영 설정만 내용·존재·부재를 비교에서 제외하며 manifest에 선택된 설정은 계속 코드 입력으로 비교한다. Windows snapshot의 전체 tree 준비·bundle 감사는 코드 입력 비교를 대신하지 않으며, 실제 WSL/native 검증이 소비하는 저장소 코드·선언은 목록에 남긴다.
 
 실행 전후·reuse 확정 직전과 Review/게시 revision gate에서 코드 입력을 재관측한다. 외부 입력 관측은 DB 처리 밖에서 수행하고 짧은 확정 transaction에서 같은 실행 상태·소유 identity를 재확인한다. 코드가 달라졌거나 읽기·비교를 확정할 수 없으면 필요한 verify로 돌아간다. 과거 receipt는 새 기준의 코드 입력·원래 run·작업 주기·후보 연결을 확인할 수 있는 경우만 재평가하고 과거 입력을 현재 값으로 합성하지 않는다. reuse는 새 verify 실행·성공 감사·사용량을 만들거나 새 실패를 지우지 않는다. Reviewer의 명세·diff·실제 지침·승인과 publication token·원격 lease는 별도 조건이다. 일반 선행 Review PASS 뒤 실제 전체 run과 수동 면제의 별도 후보/설정 계약은 유지한다.
 
