@@ -52,6 +52,7 @@ priority: high
 - [x] 2026-10-21 현재 rebase 후보 HEAD `fa877ad`에서 프로젝트 Python의 targeted runner로 같은 8개 설정 수명·검사 순서·호출 증거 unit case를 새로 실행해 모두 통과했다. 전달된 전체 verify 진단은 이전 revision `739e33f` 결과이며 현재 후보의 전체 verify 결과는 아직 없다.
 - [x] 2026-10-21 현재 HEAD `e8dba98`에서 프로젝트 Python의 targeted runner로 설정 drift, probe 중 안전한 생성·충돌, 지침 조회 후 설정 수명, 실제 호출 관측 identity를 확인하는 8개 unit test를 새로 실행해 모두 통과했다. 전달된 현재 verify 실패는 G-263 diff에 없는 Perl 예제의 Manager 전용 통합 테스트가 단독 하위 실행 중 timeout된 건이며, 해당 통합 테스트는 Worker가 실행하지 않는다.
 - [x] 2026-10-23 관리 rebase 후 현재 HEAD `8c0f36c`에서 프로젝트 Python targeted runner로 설정 drift, probe 중 생성·충돌, 지침 조회 후 설정 수명, process handoff 경쟁, 호출 관측 identity를 확인하는 8개 unit test를 새로 실행해 모두 통과했다. 전달된 Perl 예제 실패 요약은 이전 revision `e8dba988`에 해당하며 세 번째 standalone/failing 하위 사례가 약 30초 뒤 timeout됐다. 해당 Manager 전용 통합 테스트는 G-263 diff에 없고 `docs/VERIFY.md`에 따라 Worker는 실행하지 않았다.
+- [x] 2026-10-23 현재 HEAD `81e1718`에서 프로젝트 Python targeted runner로 위 설정 수명·검사 순서·process handoff 관련 8개 unit test를 다시 실행해 모두 통과했다. 전달된 base `7621566` 대비 최종 diff와 PRODUCT·ARCHITECTURE·OPERATIONS 설명을 재확인했다. 이전 Perl 통합 테스트 진단은 이 HEAD의 verify 결과가 아니므로 전체 verify는 Manager에게 맡긴다.
 - [x] PRODUCT·ARCHITECTURE·OPERATIONS에 정상 생성 수용과 검사·거부 순서를 반영했다.
 
 ## Decision Log
