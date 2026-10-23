@@ -1019,6 +1019,33 @@ class CommonGuidanceProviderTests(unittest.TestCase):
         self.assertEqual(tomllib.loads(args[1])['developer_instructions'], self.text)
         self.assertNotIn(self.defaults, repr(args))
 
+    def test_native_tool_items_do_not_replace_developer_instructions(self):
+        import tomllib
+        def probe(arguments, **context):
+            value = self.native_probe(arguments, **context)
+            if arguments == ['codex', '--version']:
+                return 'codex-cli 0.164.0'
+            items = json.loads(value)
+            items.insert(0, {'type': 'additional_tools', 'id': str(arguments),
+                'role': 'developer', 'tools': [{'type': 'function', 'name': 'fixture_tool'}]})
+            return json.dumps(items)
+        with mock.patch.object(self.provider_guidance, '_probe', side_effect=probe):
+            args = self.provider_guidance.codex_arguments(self.guidance, self.worktree)
+        self.assertEqual(tomllib.loads(args[1])['developer_instructions'],
+                         self.existing + '\n\n' + self.text)
+
+    def test_malformed_tool_items_and_unknown_developer_items_are_rejected(self):
+        for item in (
+            {'type': 'additional_tools'},
+            {'type': 'additional_tools', 'tools': {}},
+            {'type': 'additional_tools', 'tools': [None]},
+            {'type': 'unknown', 'tools': []},
+        ):
+            with self.subTest(item=item), mock.patch.object(self.provider_guidance, '_probe',
+                    return_value=json.dumps([{**item, 'role': 'developer'}])):
+                with self.assertRaises(self.provider_guidance.GuidanceError):
+                    self.provider_guidance._developer_texts([], self.worktree, None)
+
     def test_ambiguous_native_inputs_and_ineffective_final_override_fail_closed(self):
         for defect in ('json', 'defaults', 'final'):
             def defective(arguments, **context):
