@@ -463,9 +463,17 @@ def requirement_deletions(connection, repo, repository, pinned, *, git, git_byte
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'"
     ).fetchone():
-        rows.extend(connection.execute(
+        cancellations = connection.execute(
             "SELECT * FROM execplan_cancellations WHERE repo=?", (repo,),
-        ).fetchall())
+        ).fetchall()
+        if cancellations:
+            # Historical cancellation sources matter only when an active declaration is missing that source.
+            active_missing_sources = {
+                issue.source for issue in pinned.snapshot.issues
+                if issue.code == "missing-source" and issue.source
+            }
+            rows.extend(row for row in cancellations
+                        if active_missing_sources.intersection(json.loads(row["sources"])))
     if not any(source.startswith("docs/requirements/") for row in rows for source in json.loads(row["sources"])):
         return result
     from loop_manager_internal.catalog import requirement_sources

@@ -726,6 +726,7 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
 
     def test_requirement_deletions_union_only_identical_active_and_cancelled_proofs(self):
         from loop_manager_internal.git import command_adapter
+        from loop_manager_internal.catalog.execplan_catalog import CatalogIssue
 
         source = self.sources[0]
         original_revision = 'a' * 40
@@ -776,11 +777,16 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
         def documents(_git_bytes, _repository, revision):
             return {} if revision == current_revision else {source: contents}
 
+        pinned = SimpleNamespace(revision_sha=current_revision, snapshot=SimpleNamespace(issues=(
+            CatalogIssue('G-047', 'docs/plans/[G-047] Runtime.md', 'missing-source',
+                'source is absent', source),
+        )))
+
         with mock.patch.object(command_adapter, 'revision_requirement_documents', side_effect=documents):
             forward = self.recovery.requirement_deletions(self.connection, 'repo', self.worktree,
-                SimpleNamespace(revision_sha=current_revision), git=git, git_bytes=mock.Mock())
+                pinned, git=git, git_bytes=mock.Mock())
             reversed_rows = self.recovery.requirement_deletions(ReorderedConnection(self.connection, True),
-                'repo', self.worktree, SimpleNamespace(revision_sha=current_revision), git=git, git_bytes=mock.Mock())
+                'repo', self.worktree, pinned, git=git, git_bytes=mock.Mock())
         self.assertEqual(forward, reversed_rows)
         self.assertEqual(forward[source]['affected'], ['G-047', 'G-048', 'G-049'])
         self.assertEqual(forward[source]['revision'], original_revision)
@@ -802,11 +808,69 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
                         command_adapter, 'revision_requirement_documents', side_effect=changed_documents):
                     with self.assertRaisesRegex(self.recovery.PlannerValidationError, '상충'):
                         self.recovery.requirement_deletions(ReorderedConnection(self.connection, reverse),
-                            'repo', self.worktree, SimpleNamespace(revision_sha=current_revision),
+                            'repo', self.worktree, pinned,
                             git=git, git_bytes=mock.Mock())
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM exec_plans WHERE repo='repo'").fetchone()[0], 2)
         self.assertEqual(self.connection.execute(
             "SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-049'").fetchone()[0], '{}')
+
+        self.connection.execute("DELETE FROM execplan_cancellations WHERE plan_id='G-049'")
+        self.connection.execute("UPDATE exec_plans SET plan_sha=? WHERE plan_id='G-048'", ('b' * 40,))
+        self.connection.commit()
+
+        def conflicting_active_documents(_git_bytes, _repository, revision):
+            if revision == current_revision:
+                return {}
+            return {source: contents + '- changed\n' if revision != original_revision else contents}
+
+        with mock.patch.object(command_adapter, 'revision_requirement_documents',
+                               side_effect=conflicting_active_documents):
+            with self.assertRaisesRegex(self.recovery.PlannerValidationError, '상충'):
+                self.recovery.requirement_deletions(self.connection, 'repo', self.worktree,
+                    pinned, git=git, git_bytes=mock.Mock())
+
+    def test_requirement_deletions_ignore_conflicting_cancellations_without_active_impact(self):
+        from loop_manager_internal.git import command_adapter
+
+        deleted_source, active_source = self.sources
+        current_revision = 'd' * 40
+        self.connection.execute("UPDATE exec_plans SET sources=?, plan_sha=? WHERE plan_id='G-047'",
+            (self.json.dumps([active_source]), 'c' * 40))
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE repo='repo'")
+        expected_cancellations = []
+        for plan_id, revision in (('G-048', 'a' * 40), ('G-049', 'b' * 40)):
+            path = f'docs/plans/[{plan_id}] Cancelled.md'
+            self.connection.execute('''INSERT INTO execplan_cancellations
+                (repo, plan_id, path, title, sources, depends_on, complexity, risk, priority,
+                 content_hash, plan_sha, deletion_commit)
+                VALUES ('repo', ?, ?, 'Cancelled', ?, '[]', 'low', 'low', 'normal', ?, ?, ?)''',
+                (plan_id, path, self.json.dumps([deleted_source]), f'hash-{plan_id}', revision,
+                 'e' * 40))
+            expected_cancellations.append((plan_id, self.json.dumps([deleted_source]), revision, 'e' * 40))
+        self.connection.commit()
+
+        contents_by_revision = {
+            current_revision: {active_source: '# [R-002] Active\n## Acceptance Criteria\n- Keep this goal\n'},
+            'a' * 40: {deleted_source: '# [R-001] Historical A\n## Acceptance Criteria\n- Original goal\n'},
+            'b' * 40: {deleted_source: '# [R-001] Historical B\n## Acceptance Criteria\n- Original goal\n'},
+        }
+        pinned = SimpleNamespace(revision_sha=current_revision, snapshot=SimpleNamespace(issues=()))
+        git = mock.Mock(return_value=SimpleNamespace(returncode=0))
+        with mock.patch.object(command_adapter, 'revision_requirement_documents',
+                               side_effect=lambda _git_bytes, _repository, revision:
+                                   contents_by_revision.get(revision, {})):
+            proofs = self.recovery.requirement_deletions(self.connection, 'repo', self.worktree,
+                pinned, git=git, git_bytes=mock.Mock())
+
+        self.assertEqual(self.recovery.recovery_goals(self.connection, 'repo'), ())
+        self.assertEqual(proofs, {})
+        ready = self.connection.execute("SELECT status, sources FROM exec_plans WHERE plan_id='G-047'").fetchone()
+        self.assertEqual(ready['status'], 'READY')
+        self.assertEqual(self.json.loads(ready['sources']), [active_source])
+        cancellations = self.connection.execute(
+            "SELECT plan_id, sources, plan_sha, deletion_commit FROM execplan_cancellations ORDER BY plan_id"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in cancellations], expected_cancellations)
 
     def test_requirement_deletions_ignore_verified_merged_archive_rows(self):
         from loop_manager_internal.git import command_adapter
