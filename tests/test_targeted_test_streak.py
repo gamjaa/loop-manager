@@ -438,6 +438,90 @@ class BrokenSetup(unittest.IsolatedAsyncioTestCase):
             repository.observe('repo', 'G-290', [event('after-fixture', identity)])
             self.assertEqual(repository.repeated('repo', 'G-290'), (identity,))
 
+    def test_fixture_subtest_failures_do_not_replace_body_outcomes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project, records = root / 'project', root / 'records'
+            project.mkdir()
+            records.mkdir()
+            (project / 'case_fixture_subtests.py').write_text('''import unittest
+class SetUpSubTestBroken(unittest.TestCase):
+    def setUp(self):
+        with self.subTest(): self.fail('setUp subtest assertion')
+    def test_case(self): pass
+class TearDownSubTestBroken(unittest.TestCase):
+    def tearDown(self):
+        with self.subTest(): self.fail('tearDown subtest assertion')
+    def test_case(self): pass
+class BodyAndTearDownSubTestBroken(unittest.TestCase):
+    def tearDown(self):
+        with self.subTest(): self.fail('tearDown subtest assertion')
+    def test_case(self):
+        with self.subTest(): self.fail('body subtest assertion')
+class AsyncSetUpSubTestBroken(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        with self.subTest(): self.fail('async case setUp subtest assertion')
+    async def test_case(self): pass
+class AsyncTearDownSubTestBroken(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        with self.subTest(): self.fail('asyncTearDown subtest assertion')
+    async def test_case(self): pass
+''', encoding='utf-8')
+            environment = dict(os.environ, LOOP_MANAGER_TARGETED_TEST_DIRECTORY=str(records),
+                               LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(project))
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            ensure_schema(connection)
+            repository = TargetedTestRepository(connection)
+            identities = [f'case_fixture_subtests.{name}.test_case' for name in (
+                'AsyncSetUpSubTestBroken', 'AsyncTearDownSubTestBroken',
+                'BodyAndTearDownSubTestBroken', 'SetUpSubTestBroken',
+                'TearDownSubTestBroken')]
+            repository.observe('repo', 'G-290', [
+                *(event(f'prior-{attempt}', identity) for identity in identities
+                  for attempt in ('a', 'b'))])
+
+            result = subprocess.run([sys.executable, str(Path(targeted.__file__).resolve()),
+                '--unittest', 'case_fixture_subtests'], cwd=project, env=environment,
+                capture_output=True, text=True, check=False)
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            completed = targeted.collect(records)
+            self.assertEqual({item['id']: item['result'] for item in completed}, {
+                identities[0]: 'fixture_error',
+                identities[1]: 'fixture_error',
+                identities[2]: 'failure',
+                identities[3]: 'fixture_error',
+                identities[4]: 'fixture_error',
+            })
+            repository.observe('repo', 'G-290', completed)
+            self.assertEqual(repository.repeated('repo', 'G-290'), (identities[2],))
+            streaks = dict(connection.execute('''SELECT test_id, failures FROM targeted_test_streaks
+                WHERE repo='repo' AND plan_id='G-290' '''))
+            self.assertEqual({identity: streaks[identity] for identity in identities}, {
+                identities[0]: 2, identities[1]: 2, identities[2]: 3,
+                identities[3]: 2, identities[4]: 2,
+            })
+            events = [json.loads(line) for path in records.glob('targeted-*.jsonl')
+                      for line in path.read_text(encoding='utf-8').splitlines()]
+            fixture_scopes = {(item['id'], item['scope']) for item in events
+                              if item['kind'] == 'fixture_result'}
+            self.assertEqual(fixture_scopes, {
+                (identities[0], 'setUp'), (identities[1], 'tearDown'),
+                (identities[2], 'tearDown'), (identities[3], 'setUp'),
+                (identities[4], 'tearDown'),
+            })
+            subtest_scopes = {(item['id'], item.get('scope'), item['result']) for item in events
+                              if item['kind'] == 'subtest_result'}
+            self.assertEqual(subtest_scopes, {
+                (identities[0], 'setUp', 'failure'),
+                (identities[1], 'tearDown', 'failure'),
+                (identities[2], None, 'failure'),
+                (identities[2], 'tearDown', 'failure'),
+                (identities[3], 'setUp', 'failure'),
+                (identities[4], 'tearDown', 'failure'),
+            })
+
     def test_module_and_class_fixture_errors_do_not_reset_test_history(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

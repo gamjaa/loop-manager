@@ -25,6 +25,7 @@ class EventWriter:
     def __init__(self, path: Path, *, clock=time.monotonic, identity=None):
         self.path, self.clock = path, clock
         self.identity = identity or {}
+        self.active_fixtures = {}
         self.stream = path.open("a", encoding="utf-8")
 
     def emit(self, kind: str, **values):
@@ -78,7 +79,10 @@ class TimedResult(unittest.TextTestResult):
         self.started[test.id()] = self.writer.emit("test_start", id=test.id())["at"]
 
     def _outcome(self, test, outcome):
-        if self.outcomes.get(test.id()) not in {"failure", "error", "unexpected_success"}:
+        previous = self.outcomes.get(test.id())
+        if (previous not in {"failure", "error", "unexpected_success"}
+                and not (previous == "fixture_error"
+                         and outcome in {"success", "skip", "expected_failure", "fixture_error"})):
             self.outcomes[test.id()] = outcome
         if test.id() not in self.started:
             self.writer.emit("fixture_result", id=test.id(), result=outcome)
@@ -136,11 +140,18 @@ class TimedResult(unittest.TextTestResult):
 
     def addSubTest(self, test, subtest, err):
         super().addSubTest(test, subtest, err)
+        fixture = self.writer.active_fixtures.get(id(test))
         outcome = "success"
         if err is not None:
             outcome = "failure" if issubclass(err[0], test.failureException) else "error"
-            self._outcome(test, outcome)
-        self.writer.emit("subtest_result", id=test.id(), result=outcome)
+            if fixture is None:
+                self._outcome(test, outcome)
+            else:
+                self._record_fixture_error(test, fixture)
+        event = {"id": test.id(), "result": outcome}
+        if fixture is not None:
+            event["scope"] = fixture
+        self.writer.emit("subtest_result", **event)
 
     def stopTest(self, test):
         self.writer.current_test = None
@@ -185,6 +196,12 @@ def fixture_timing():
                     original = getattr(case_type, name)
 
                     def measured_test_fixture(test, *args, _original=original, _scope=scope, **kwargs):
+                        writer = _current_writer.get()
+                        active = writer.active_fixtures if writer is not None else None
+                        key = id(test)
+                        previous = active.get(key) if active is not None else None
+                        if active is not None:
+                            active[key] = _scope
                         try:
                             return _original(test, *args, **kwargs)
                         except unittest.SkipTest:
@@ -196,6 +213,12 @@ def fixture_timing():
                             if failures is not None:
                                 failures[id(test)] = (_scope, error)
                             raise
+                        finally:
+                            if active is not None:
+                                if previous is None:
+                                    active.pop(key, None)
+                                else:
+                                    active[key] = previous
 
                     patches.enter_context(mock.patch.object(case_type, name, measured_test_fixture))
             for name in names:

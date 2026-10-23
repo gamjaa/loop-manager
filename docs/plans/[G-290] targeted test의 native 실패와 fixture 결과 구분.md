@@ -71,3 +71,14 @@ priority: high
 ## Rebase 충돌 검증 (2026-10-23)
 
 - 마지막 rebase commit의 `IsolatedAsyncioTestCase` fixture hook 계측을 예외 identity 분류와 병합하고, 동기 `setUp()` 오류 뒤 기존 실패 streak가 보존되는 회귀를 추가했다. 별도 class-fixture 회귀는 앞/중간/끝 클래스와 각 테스트 streak를 함께 확인하는 기존 회귀가 더 넓게 검증하므로 중복 추가하지 않았다. 현재 후보에서 fixture assertion·subTest/teardown assertion·async setup streak·class/module fixture·streak 보존의 targeted 5개 case가 통과했다. 전체 `scripts/verify`는 실행하지 않았다.
+
+## 후속 Review 보완 (2026-10-23)
+
+- Review에서 `addSubTest()`가 setup·teardown 안에서 삼킨 assertion도 본문 실패로 집계하는 경계를 확인했다. `EventWriter`가 현재 실행 중인 테스트 fixture scope를 보유하고, `TimedResult.addSubTest()`가 callback 안의 subTest 실패를 해당 fixture 오류로 기록하도록 했다. native subTest 결과와 fixture scope는 함께 보존한다. `fixture_error`는 뒤따르는 성공·skip·expected failure가 덮지 않으며, 실제 본문 failure·error는 이를 대체해 실패를 한 번 누적한다.
+- 새 회귀는 `TestCase`와 `IsolatedAsyncioTestCase`의 동기 setup, 동기 teardown, async teardown 내부 subTest와 본문·teardown subTest 동시 실패를 실행한다. fixture-only 네 경우는 기존 두 번의 streak를 유지하고, 본문 실패와 teardown fixture 오류가 함께 있는 경우에만 세 번째 실패로 차단되는 것을 확인한다.
+
+  FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_targeted_test_streak.TargetedRunnerTests.test_fixture_subtest_failures_do_not_replace_body_outcomes
+
+  RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_targeted_test_streak.TargetedRunnerTests.test_fixture_subtest_failures_do_not_replace_body_outcomes
+
+  재실행 결과: 1개 테스트 통과. 같은 현재 후보에서 기존 본문 subTest 결과와 IsolatedAsyncio 동기 setup의 streak 보존을 확인하는 좁은 두 case도 통과했다. 전체 `scripts/verify`는 실행하지 않았다.
