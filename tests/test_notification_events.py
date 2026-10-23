@@ -29,7 +29,7 @@ class NotificationRenderingTest(unittest.TestCase):
             "pr_url": "https://example.test/pr/18",
         }
         message = rendering._message("pr_created", payload)
-        self.assertTrue(message.startswith("[alpha] G-018 PR 생성\n"))
+        self.assertTrue(message.startswith("[alpha] G-018 PR 검토 후보 게시\n"))
         positions = [message.index(value) for value in (
             payload["execplan_title"], payload["pr_url"], "PR 검토·Merge 대기",
         )]
@@ -440,6 +440,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
 
     def test_disabled_and_partial_configuration_do_not_create_events(self):
         connection = self.connection(enabled=False)
+        self.prepare_pr_candidate(connection)
         loop_manager.update_project(
             connection,
             "/projects/alpha",
@@ -524,15 +525,9 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
     def test_pr_and_blocked_payloads_are_complete_and_deduplicated(self):
         connection = self.connection()
         repo = "/projects/alpha"
-        path = "docs/plans/[G-018] Reliable notices.md"
-        loop_manager.update_project(
-            connection,
-            repo,
-            phase="PR_OPEN",
-            plan_path=path,
-            pr_url="https://example.test/pr/18",
-        )
-        loop_manager.update_project(connection, repo, phase="PR_OPEN")
+        candidate = self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
         with connection:
             scoped_blocking.record_plan_block(
                 connection,
@@ -561,14 +556,17 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             row["event_type"]: json.loads(row["payload"]) for row in events
         }
         self.assertEqual(
-            payloads["pr_created"],
+            {key: payloads["pr_created"][key] for key in (
+                "project", "execplan_id", "execplan_title", "pr_url",
+                "candidate_identity", "candidate_head_oid", "user_action",
+                "status", "silent",
+            )},
             {
                 "project": "alpha",
                 "execplan_id": "G-018",
                 "execplan_title": "Reliable notices",
-                "pr_url": "https://example.test/pr/18",
-                "occurred_at": payloads["pr_created"]["occurred_at"],
-                "status": "PR Merge 대기", "silent": False,
+                **candidate,
+                "status": "PR 검토·Merge 대기", "silent": False,
             },
         )
         blocked = payloads["blocked"]
@@ -918,12 +916,48 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
 
     def test_pr_registration_reports_merge_wait_with_original_time(self):
         connection = self.connection()
-        loop_manager.update_project(connection, '/projects/alpha', phase='PR_OPEN', pr_url='https://example.test/pr/18')
+        self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, '/projects/alpha')
         row = next(row for row in self.events(connection) if row['event_type'] == 'pr_created')
         payload = json.loads(row['payload'])
         self.assertFalse(payload['silent'])
-        self.assertEqual(payload['status'], 'PR Merge 대기')
+        self.assertEqual(payload['status'], 'PR 검토·Merge 대기')
         self.assertIn(payload['occurred_at'], notifications._message('pr_created', payload))
+
+    def test_pr_candidate_event_uses_review_identity_and_ignores_head_advance_alone(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        first = self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
+        events = [row for row in self.events(connection) if row['event_type'] == 'pr_created']
+        self.assertEqual(len(events), 1)
+        first_key = events[0]['event_key']
+        self.assertEqual(json.loads(events[0]['payload'])['candidate_identity'], first['candidate_identity'])
+
+        with connection:
+            connection.execute(
+                "UPDATE projects SET pr_head_oid=? WHERE repo=?",
+                ('c' * 40, repo),
+            )
+            connection.execute(
+                "UPDATE exec_plans SET pr_head_oid=? WHERE repo=? AND plan_id='G-018'",
+                ('c' * 40, repo),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'pr_created']), 1)
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+
+        second = self.prepare_pr_candidate(connection, head='c' * 40)
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        events = [row for row in self.events(connection) if row['event_type'] == 'pr_created']
+        self.assertEqual(len(events), 2)
+        current = next(row for row in events if row['canceled_at'] is None)
+        self.assertNotEqual(current['event_key'], first_key)
+        self.assertEqual(json.loads(current['payload'])['candidate_identity'], second['candidate_identity'])
 
     def test_planning_result_only_notifies_after_catalog_publication(self):
         from types import SimpleNamespace

@@ -116,7 +116,7 @@ def _event_message(kind: str, payload: dict[str, object]) -> str:
         return "\n".join(lines)
     if kind == "pr_created":
         return (
-            f"[{payload['project']}] {payload['execplan_id']} PR 생성\n"
+            f"[{payload['project']}] {payload['execplan_id']} PR 검토 후보 게시\n"
             f"{payload['execplan_title']}\n"
             f"{payload['pr_url']}\n상태: PR 검토·Merge 대기"
         )

@@ -320,6 +320,6 @@ def _event_payload(kind: str, payload: dict[str, object]) -> dict[str, object]:
     payload = dict(payload)
     payload.setdefault("occurred_at", datetime.now(timezone.utc).isoformat())
     payload.setdefault("silent", kind in {"resumed", "project_completed", "work_started", "planning_result"})
-    payload.setdefault("status", {"pr_created": "PR Merge 대기", "blocked": "사용자 조치 대기",
+    payload.setdefault("status", {"pr_created": "PR 검토·Merge 대기", "blocked": "사용자 조치 대기",
                                   "resumed": "작업 중", "project_completed": "완료"}.get(kind, "대기"))
     return payload

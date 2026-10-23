@@ -8,7 +8,8 @@ import sqlite3
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
-from .policy import is_current, cancel_stale_events, block_recovery, SOURCE_ACTION_REASONS
+from .policy import (is_current, cancel_stale_events, block_recovery,
+                     pr_review_candidate, SOURCE_ACTION_REASONS)
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
@@ -93,14 +94,24 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         "WHERE repo = ? AND status = 'PR_OPEN' AND pr_url IS NOT NULL",
         (repo,),
     ).fetchall():
+        candidate = pr_review_candidate(
+            connection, repo, str(plan[0]), str(plan[2]),
+        )
+        if candidate is None:
+            continue
         payload = {
             "project": name,
             "execplan_id": str(plan[0]),
             "execplan_title": str(plan[1]),
             "pr_url": str(plan[2]),
+            **candidate,
         }
         if is_current(connection, repo, "pr_created", payload):
-            _insert(connection, _key("pr", repo, str(plan[2])), repo, "pr_created", payload)
+            identity = "\0".join((
+                str(plan[2]), str(candidate["candidate_identity"]),
+                str(candidate["user_action"]),
+            ))
+            _insert(connection, _key("pr", repo, identity), repo, "pr_created", payload)
 
 
     plan_blocks = connection.execute(

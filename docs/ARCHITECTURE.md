@@ -1523,7 +1523,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 일반 계획 게시·Worker 최초 시작·유지보수 cycle 시작/종료는 outbox 사건을 만들지 않는다. `enqueue_progress`는 draft 판단·PR 사건 종류만 허용한다. `record_process_start`는 실제 시작을 기존 incident 기록에 연결하며 일반 시작 알림을 위한 과거 outbox 조회는 수행하지 않는다. 유지보수 저장소는 알림용 계획 목록 조회·enqueue 없이 기존 cycle 상태·범위·Merge 확인·종료를 기록한다. 현재 draft 판단 목록은 `draft_decisions`로 저장한다. 미해결 targeted test와 단순 단계 실패는 별도 단순/지속 실패 사건을 만들지 않는다. 차단 통지는 아래 공통 조치 판정을 따른다.
 
-조각 claim은 `blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision` 외 사건의 잔여 전송을 취소한다. 구정책 진행·완료·대기·재개 사건에도 적용하며 payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim을 사용한다. `policy.is_current`를 생성과 각 claim의 공통 판정으로 사용한다. PR은 현재 같은 계획·URL의 PR_OPEN 투영을, draft는 기존 질문 목록·판단 identity/revision을 재사용한다. PR 검토 후보·draft 링크의 세부 identity 확장은 별도 후속 작업이며 이 경계는 추가 외부 호출이나 Git 쓰기를 수행하지 않는다.
+조각 claim은 `blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision` 외 사건의 잔여 전송을 취소한다. 구정책 진행·완료·대기·재개 사건에도 적용하며 payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim을 사용한다. `policy.is_current`를 생성과 각 claim의 공통 판정으로 사용한다. PR은 같은 ExecPlan의 `PR_OPEN`·URL과 저장된 실제 PR head를 확인하고, 직렬화된 `DefinitionSnapshot`·`validated_base_sha`·`pr_head_oid`에서 기대 `review_token`과 `publication_token`을 다시 계산한다. Review 결과와 두 token이 있고 현재 값과 일치해야 게시 후보로 인정한다. 결과 문자열로 사용자 승인 여부를 추론하지 않는다. 사건 identity는 repository·PR URL·publication token·`review_merge` 사용자 행동에 결합되므로 URL만으로 다른 후보를 합치거나 head SHA 전진만으로 새 후보를 만들지 않는다. PR 소유 복구·게시 경계가 외부 PR 관측을 수행하고 확정 상태를 SQLite에 기록한다. 알림 정책은 추가 원격 조회나 Git 쓰기를 하지 않으며 누락·불일치 후보는 미전송분을 취소한다. PR 상태·후보 조회가 실패하면 claim transaction을 롤백해 전송과 cursor 변경을 보류하며 미전송 사건을 다음 확인까지 유지한다. draft는 기존 질문 목록·판단 identity/revision을 재사용한다.
 
 `policy.block_action`은 현재 block의 scope·대상·원문 원인과 복구 기록의 최종 원문 근거·현재 계획 revision을 대조한다. 복구 fingerprint는 기존 `RecoveryObservation.identity`를 재계산해 무결성을 확인하며, block의 release fingerprint는 입력·설정 재검사의 원본으로 유지한다. 두 지문은 서로 다른 의미이므로 값의 일치를 요구하지 않는다. 해당 scope의 복구가 pending이거나 필요한 근거가 손상·누락되면 보류한다. `block_recovery`는 최종 근거의 코드 소유 차단 원인으로 scope를 구분하며 생성·정책·claim의 사건 키 계산에 같은 관측을 사용한다. 다른 scope의 최종 recovery와 그 근거를 보존한 복구 완료(`reconcile`) 기록은 현재 계획의 질문·승인 근거를 대체하지 않는다. 계획 차단을 기록할 때 일치하는 최종 recovery를 같은 transaction에서 `execplan_blocks.recovery_snapshot`에 보존한다. 이 선택적 nullable JSON object는 identity·원인 코드·phase·계획/base revision·fingerprint·progress marker·detail·pending_action과 JSON 문자열 final_evidence를 유지한다. final_evidence 안의 검증된 Worker 결정이 질문 원본이다. 공유 recovery 부재 또는 다른 scope의 최종·복구 완료 기록에는 이 snapshot을 재사용하되 현재 block 원인·대상·계획 revision과 identity 무결성은 다시 검사한다. 같은 scope의 pending/손상 기록은 우선하며 과거 snapshot으로 우회하지 않는다. 기존 DB에는 nullable 컬럼을 추가해 행을 보존하며, snapshot이 없는 기존 기록에서 질문을 합성하지 않는다. 계획 차단 교체·해제에는 snapshot도 함께 교체·제거한다. 지침 승인·명세 교착은 자체 pending 승인 행·파싱한 원문을 조치 원본으로 사용하고 사건 키에서 공유 recovery identity를 제외해 독립 scope 변경에 따른 중복 통지도 막는다. 허용 근거는 이미 검증한 Worker 결정의 질문/위치, 파싱·허용 문서 검사를 통과한 SPEC_DEADLOCK, 현재 pending 지침 승인, 같은 닫힌 PR·게시 branch 삭제에 연결된 조치, 기록된 verify 상한과 실제 timeout 결과다. 최종 disposition·예산 소진·user_targets만으로 복구 불가능성을 추론하지 않는다. 조치 없는 최종 중단은 아래 명시적 복구 경로 근거 계약을 만족해야 한다. 원인이 일반 진행/복구/불충분 근거이면 outbox 없이 원본 상태와 진단을 유지한다.
 
@@ -1572,6 +1572,16 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 | `plans[].id`·`plans[].title` | ExecPlan ID·제목 문자열. 본문은 전체 건수와 항목별 ID·제목을 표시하고 제목의 공백을 정리한다. |
 | `plans[].url` | 확인된 원격 문서 URL 문자열 또는 `null`. 값이 있을 때 ID에 링크하고 없으면 일반 텍스트로 표시한다. |
 | `plans[].decision_identity`·`plans[].decision_revision` | 저장된 판단 identity(문자열 또는 `null`)·판단 revision 문자열. ID와 함께 중복·현재성 판단에 사용한다. |
+
+`pr_created` payload는 기존 프로젝트·ExecPlan·PR URL·발생 시각·상태 필드와 함께 다음 후보 근거를 요구한다. 이 event type은 새 PR과 기존 PR의 새 게시 후보를 함께 표현하며 본문은 PR이 생성됐다고 단정하지 않는다.
+
+| payload 필드 | 타입·의미 |
+|---|---|
+| `candidate_identity` | 현재 저장된 `publication_token` 문자열. `DefinitionSnapshot`과 검증 base·PR head에서 다시 계산한 값과 같아야 한다. |
+| `candidate_head_oid` | 해당 게시·검토 입력의 PR head OID 문자열. 후보를 구분하는 token 입력이며 단독으로 새 사건을 만들지 않는다. |
+| `user_action` | 정확히 `review_merge`. 현재 PR이 열려 있고 이 사용 행동이 남아 있음을 나타내는 알림 계약값이지 자동 Review 결과나 사용자 승인 증거가 아니다. |
+
+생성과 조각 claim은 같은 후보·행동·URL을 다시 대조한다. `PR_OPEN`·URL·Review 결과·token이 없거나 재계산과 다르면 새 사건을 만들지 않고 해당 후보의 미전송 조각을 취소한다. 이전에 전송한 조각·payload·cursor·attempts·오류는 유지한다. 후보가 달라지면 새 event key를 사용하고 같은 후보의 반복 enqueue·복구 확인은 기존 사건에 합쳐 중복 생성하지 않는다.
 
 본문은 Python 문자열의 문자 위치로 최대 4096자씩 나눈다. draft 링크는 각 조각 안의 ID 구간에 `text_link` entity로 붙이며 `offset`·`length`는 UTF-16 code unit 수로 계산한다. 분할 위치와 entity 단위를 구분해 한글·이모지·조각 경계에서도 ID와 URL의 대응을 유지한다.
 

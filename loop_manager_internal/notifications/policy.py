@@ -4,10 +4,46 @@ from __future__ import annotations
 import json
 
 from loop_manager_internal.documents import reviewer_specification
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.storage import execplan_draft_state
 
 
 SOURCE_ACTION_REASONS = frozenset({'guidance_approval_required', 'review_specification_deadlock'})
+PR_REVIEW_ACTION = 'review_merge'
+
+
+def pr_review_candidate(connection, repo, plan_id, pr_url=None):
+    """Return a confirmed published review candidate and its remaining user action."""
+    try:
+        row = connection.execute(
+            'SELECT status, pr_url, pr_head_oid, validated_base_sha, '
+            'definition_snapshot, review_result, review_token, publication_token '
+            'FROM exec_plans WHERE repo=? AND plan_id=?',
+            (repo, plan_id),
+        ).fetchone()
+        if (row is None or row['status'] != 'PR_OPEN' or not row['pr_url']
+                or (pr_url is not None and row['pr_url'] != pr_url)):
+            return None
+        head = str(row['pr_head_oid'] or '')
+        base = str(row['validated_base_sha'] or '')
+        if not head or not base or not row['review_result']:
+            return None
+        definition = DefinitionSnapshot.deserialize(row['definition_snapshot'])
+        if definition is None:
+            return None
+        review_token = definition.review_token(base, head)
+        publication_token = definition.publication_token(base, head)
+        if (row['review_token'] != review_token
+                or row['publication_token'] != publication_token):
+            return None
+        return {
+            'candidate_identity': publication_token,
+            'candidate_head_oid': head,
+            'user_action': PR_REVIEW_ACTION,
+        }
+    except (AttributeError, KeyError, TypeError, ValueError):
+        # Missing or malformed proof cannot authorize a PR notification.
+        return None
 
 
 def block_recovery(connection, repo, plan_id, scope):
@@ -180,9 +216,13 @@ def is_current(connection, repo, kind, payload):
             action = block_action(connection, repo, payload)
             return action is not None and (action['kind'] != 'unrecoverable' or payload.get('action') == action)
         if kind == 'pr_created':
-            row = connection.execute('SELECT status, pr_url FROM exec_plans WHERE repo=? AND plan_id=?',
-                                     (repo, payload.get('execplan_id'))).fetchone()
-            return bool(row and row[0] == 'PR_OPEN' and row[1] and row[1] == payload.get('pr_url'))
+            candidate = pr_review_candidate(
+                connection, repo, payload.get('execplan_id'), payload.get('pr_url'),
+            )
+            return bool(candidate and all(
+                payload.get(key) == candidate[key]
+                for key in ('candidate_identity', 'candidate_head_oid', 'user_action')
+            ))
         if kind == 'draft_decisions':
             plans = payload['plans']
             if not plans or {item['id'] for item in plans} != execplan_draft_state.user_question_ids(connection, repo):

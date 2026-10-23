@@ -48,6 +48,61 @@ class NotificationFixture:
         return connection
 
     @staticmethod
+    def prepare_pr_candidate(
+        connection,
+        *,
+        repo="/projects/alpha",
+        plan_id="G-018",
+        pr_url="https://example.test/pr/18",
+        base="b" * 40,
+        head="a" * 40,
+        path="docs/plans/[G-018] Reliable notices.md",
+        title="Reliable notices",
+    ):
+        """Persist the exact Review/publication input for a current PR candidate."""
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+
+        definition = DefinitionSnapshot(
+            revision_sha="definition-revision",
+            path=path,
+            title=title,
+            sources=("docs/PRODUCT.md",),
+            depends_on=(),
+            complexity="medium",
+            risk="medium",
+            priority="high",
+            body_hash="body-hash",
+            source_fingerprint="source-fingerprint",
+            archive_candidates=(),
+        )
+        review_token = definition.review_token(base, head)
+        publication_token = definition.publication_token(base, head)
+        shared = (
+            pr_url, head, head, base, base, definition.serialize(), "PASS",
+            review_token, publication_token, repo, plan_id,
+        )
+        connection.execute(
+            "UPDATE projects SET phase='PR_OPEN', pr_url=?, pr_head_oid=?, "
+            "publication_remote_oid=?, active_sha=?, validated_base_sha=?, "
+            "definition_snapshot=?, review_result=?, review_token=?, publication_token=? "
+            "WHERE repo=?",
+            shared[:-1],
+        )
+        connection.execute(
+            "UPDATE exec_plans SET status='PR_OPEN', pr_url=?, pr_head_oid=?, "
+            "publication_remote_oid=?, active_sha=?, validated_base_sha=?, "
+            "definition_snapshot=?, review_result=?, review_token=?, publication_token=? "
+            "WHERE repo=? AND plan_id=?",
+            shared,
+        )
+        return {
+            "pr_url": pr_url,
+            "candidate_identity": publication_token,
+            "candidate_head_oid": head,
+            "user_action": "review_merge",
+        }
+
+    @staticmethod
     def decision_block(connection, *, repo="/projects/alpha", plan_id="G-018", question='Which permission should be granted?',
                        problem='The required repository permission is unavailable.',
                        proposal='Grant the documented permission or choose a supported alternative.',

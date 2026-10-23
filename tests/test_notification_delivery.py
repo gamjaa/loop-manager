@@ -136,6 +136,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
 
     def test_failed_delivery_stays_pending_retries_once_and_hides_secrets(self):
         connection = self.connection()
+        self.prepare_pr_candidate(connection)
         loop_manager.update_project(
             connection,
             "/projects/alpha",
@@ -199,12 +200,18 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
             (other_repo, "https://example.test/pr/19"),
         )
         with connection:
+            self.prepare_pr_candidate(connection)
             loop_manager.update_project(
                 connection,
                 repo,
                 phase="PR_OPEN",
                 plan_path="docs/plans/[G-018] Reliable notices.md",
                 pr_url="https://example.test/pr/18",
+            )
+            self.prepare_pr_candidate(
+                connection, repo=other_repo, plan_id='G-019',
+                pr_url='https://example.test/pr/19',
+                path='docs/plans/other.md', title='Other PR',
             )
             notifications.enqueue_current_project_events(connection, other_repo)
 
@@ -258,6 +265,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
         def run_step(*_args, **_kwargs):
             steps.append(len(steps) + 1)
             if len(steps) == 1:
+                self.prepare_pr_candidate(connection)
                 loop_manager.update_project(
                     connection,
                     repo,
@@ -311,11 +319,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
             delivered = mock.Mock()
             def run_one(worker_connection, *_args, on_step_completed, **_kwargs):
                 with worker_connection:
-                    worker_connection.execute(
-                        "UPDATE exec_plans SET status = 'PR_OPEN', pr_url = ? "
-                        "WHERE repo = ? AND plan_id = 'G-018'",
-                        ("https://example.test/pr/18", repo),
-                    )
+                    self.prepare_pr_candidate(worker_connection)
                     notifications.enqueue_current_project_events(
                         worker_connection, repo
                     )
@@ -364,6 +368,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
             cleanup.callback(connection.close)
+            self.prepare_pr_candidate(connection)
             loop_manager.update_project(
                 connection,
                 "/projects/alpha",
@@ -414,6 +419,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
 
     def test_scheduler_retries_pending_when_project_processing_is_skipped(self):
         connection = self.connection()
+        self.prepare_pr_candidate(connection)
         loop_manager.update_project(
             connection,
             "/projects/alpha",
@@ -453,12 +459,14 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
 
 class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
     def add_event(self, connection, kind="pr_created", body=""):
+        candidate = self.prepare_pr_candidate(connection)
         payload = {
             "project": "alpha", "execplan_id": "G-018",
             "execplan_title": body, "pr_url": "https://example.test/pr/18",
-            "occurred_at": "2000-01-01T00:00:00Z", "status": "PR Merge 대기", "silent": False,
+            **candidate,
+            "occurred_at": "2000-01-01T00:00:00Z",
+            "status": "PR 검토·Merge 대기", "silent": False,
         }
-        connection.execute("UPDATE exec_plans SET status='PR_OPEN', pr_url=? WHERE repo='/projects/alpha' AND plan_id='G-018'", (payload['pr_url'],))
         notifications._insert(connection, "test-event", "/projects/alpha", kind, payload)
         connection.commit()
         return notifications._message(kind, payload)
@@ -467,8 +475,8 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
         for length in (4096, 4097, 8193):
             with self.subTest(length=length):
                 connection = self.connection()
-                header = "[alpha] G-018 PR 생성\n"
-                suffix = "\nhttps://example.test/pr/18\n상태: PR 검토·Merge 대기\n발생 시각: 2000-01-01T00:00:00Z\n처리 상태: PR Merge 대기"
+                header = "[alpha] G-018 PR 검토 후보 게시\n"
+                suffix = "\nhttps://example.test/pr/18\n상태: PR 검토·Merge 대기\n발생 시각: 2000-01-01T00:00:00Z\n처리 상태: PR 검토·Merge 대기"
                 title_length = length - len(header) - len(suffix)
                 title = ("한글🙂\n" * (title_length // 4 + 1))[:title_length]
                 body = self.add_event(connection, body=title)
@@ -865,10 +873,10 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
         with notifications.immediate_delivery(connection, 'token', 'chat', repo), \
              mock.patch.object(delivery, 'send_telegram', side_effect=lambda *args, **kw: sent.append((args, kw))):
             with connection:
-                connection.execute("UPDATE exec_plans SET status='PR_OPEN', pr_url='https://example.test/pr/18'")
+                candidate = self.prepare_pr_candidate(connection)
                 notifications._insert(connection, 'legacy-pr', repo, 'pr_created',
                     {'project': 'alpha', 'execplan_id': 'G-018', 'execplan_title': 'x' * 6000,
-                     'pr_url': 'https://example.test/pr/18', 'silent': True})
+                     **candidate, 'silent': True})
                 self.assertEqual(notifications.flush_project_events(connection, repo), 0)
             self.assertEqual(sent, [])
             self.assertEqual(notifications.flush_project_events(connection, repo), 1)
@@ -1568,17 +1576,81 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
 
     def test_pr_claim_requires_current_merge_wait_for_same_pr(self):
         connection = self.connection()
-        loop_manager.update_project(connection, self.repo, phase='PR_OPEN', pr_url='https://example.test/pr/18')
-        before = dict(self.events(connection)[0])
+        self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, self.repo)
+        before = dict(next(row for row in self.events(connection) if row['event_type'] == 'pr_created'))
         with connection:
             connection.execute("UPDATE exec_plans SET status='MERGED'")
         adapter = mock.Mock()
         self.assertEqual(notifications.dispatch_new_pr_notifications(connection, 'token', 'chat', self.repo, adapter=adapter), 0)
         adapter.assert_not_called()
-        row = self.events(connection)[0]
+        row = next(row for row in self.events(connection) if row['event_key'] == before['event_key'])
         self.assertIsNotNone(row['canceled_at'])
         self.assertEqual(row['payload'], before['payload'])
         self.assertEqual(row['attempts'], 0)
+
+    def test_replaced_pr_candidate_cancels_remaining_piece_and_preserves_audit(self):
+        connection = self.connection()
+        repo = self.repo
+        self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        original = next(row for row in self.events(connection) if row['event_type'] == 'pr_created')
+        connection.execute(
+            "UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=1, "
+            "attempts=2, last_error=? WHERE event_key=?",
+            ('confirmed first piece\npending second piece', 'previous send failed', original['event_key']),
+        )
+        connection.commit()
+
+        replacement = self.prepare_pr_candidate(connection, head='c' * 40)
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
+
+        rows = {row['event_key']: row for row in self.events(connection)}
+        stale = rows[original['event_key']]
+        self.assertIsNotNone(stale['canceled_at'])
+        self.assertEqual(stale['payload'], original['payload'])
+        self.assertEqual(
+            (stale['rendered_text'], stale['confirmed_pieces'], stale['attempts'], stale['last_error']),
+            ('confirmed first piece\npending second piece', 1, 2, 'previous send failed'),
+        )
+        current = next(row for row in rows.values() if row['canceled_at'] is None)
+        self.assertNotEqual(current['event_key'], original['event_key'])
+        self.assertEqual(json.loads(current['payload'])['candidate_identity'], replacement['candidate_identity'])
+
+        sent = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, 'token', 'chat', adapter=lambda _token, _chat, text: sent.append(text),
+        ), 1)
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn('pending second piece', ''.join(sent))
+
+    def test_pr_candidate_lookup_failure_holds_event_without_claiming_piece(self):
+        connection = self.connection()
+        self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, self.repo)
+        original = next(row for row in self.events(connection) if row['event_type'] == 'pr_created')
+        adapter = mock.Mock()
+
+        def deny_pr_state(action, table, _column, _database, _trigger):
+            if action == sqlite3.SQLITE_READ and table == 'exec_plans':
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(deny_pr_state)
+        with self.assertRaises(sqlite3.DatabaseError):
+            notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter)
+        connection.set_authorizer(None)
+
+        adapter.assert_not_called()
+        row = next(row for row in self.events(connection) if row['event_key'] == original['event_key'])
+        self.assertIsNone(row['canceled_at'])
+        self.assertEqual(row['attempts'], 0)
+        self.assertEqual(row['payload'], original['payload'])
 
     def test_deleted_published_branch_requires_restart_until_request_is_recorded(self):
         from loop_manager_internal.recovery.work_branch_integration import require_remote_present
