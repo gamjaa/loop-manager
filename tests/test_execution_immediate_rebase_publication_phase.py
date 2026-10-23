@@ -1028,6 +1028,7 @@ class ImmediateRebasePublicationTests(TestCase):
         with self.assertRaises(Exit):
             self.complete()
         intent = self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent']
+        attempts = list(self.pushes)
         self.before_push = None
         self.restart()
         def fetch():
@@ -1036,7 +1037,25 @@ class ImmediateRebasePublicationTests(TestCase):
         self.handler._fetch_latest_base = fetch
         with self.assertRaises(Exit):
             self.handler.guard(self.handler._context())
-        self.assertEqual(self.events[-2:], ['push', 'fetch-later-base'])
+        # A saved publication intent cannot bypass fresh cancellation proof.
+        self.assertEqual(self.pushes, attempts)
+        self.assertEqual(self.events[-1], 'fetch-later-base')
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'], intent)
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'remote')
+
+        self.handler._fetch_latest_base = lambda: self.events.append('fetch-later-base') or 'base'
+        self.handler.effects.revision.reconcile_catalog.side_effect = lambda *_: (
+            self.events.append('catalog') or SimpleNamespace(
+                kind=SimpleNamespace(value='reconciled'), revision_sha='base'))
+        publish = self.handler._publish_rebased_checkpoint
+        def publish_and_stop(context):
+            publish(context)
+            raise Exit()
+        self.handler._publish_rebased_checkpoint = publish_and_stop
+        with self.assertRaises(Exit):
+            self.handler.guard(self.handler._context())
+        self.assertEqual(self.events[-3:], ['fetch-later-base', 'catalog', 'push'])
+        self.assertEqual(self.pushes, attempts + attempts)
         self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'], intent)
         self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
 

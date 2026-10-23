@@ -707,7 +707,8 @@ class ProjectCatalogConsumerTests(_CatalogRefreshCase):
              mock.patch.object(fixture.recovery, 'independent_scope', side_effect=lambda *a, **k: events.append('scope')):
             self.assertTrue(coordinator.refresh_catalog('G-106'))
         self.assertEqual(events, ['validate', 'scope', 'fetch', 'catalog'])
-        self.assertEqual(fixture.ports.reconcile_execplan_catalog.call_args.kwargs, {'record_invalid': False})
+        self.assertEqual(fixture.ports.reconcile_execplan_catalog.call_args.kwargs,
+                         {'record_invalid': False, 'state_dir': coordinator.state_dir})
         self.assertEqual(manager.scoped_blocking.project_block(fixture.connection, fixture.repo)['evidence'], 'original project cause')
         events.clear()
         with mock.patch.object(coordinator, '_validate', side_effect=RuntimeError('unsafe')):
