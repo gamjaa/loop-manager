@@ -4,7 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import ExitStack, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -18,102 +18,215 @@ from tests.support.git import (
 )
 from tests.support.worker import isolated_scope_resources
 from tests.support.worker import dummy_worker_sessions
+from tests.support.planning_case import FakeGitPort, PlanningCase, maintenance_cycle
+from tests.support.scope import snapshot as scope_snapshot
+
+
+class IgnoredScopeErrorRecoveryUnitTest(PlanningCase):
+    def _assert_recovery_case(
+        self, *, preserved, mutation, observation_failure=None, database_competition=False,
+    ):
+        from dataclasses import replace
+        from loop_manager_internal.planning.selection_service import PlanningSelectionService
+        from loop_manager_internal.storage import runtime_state
+
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "planning"
+            state_dir = root / "state"
+            repo.mkdir()
+            worktree.mkdir()
+            state_dir.mkdir()
+
+            current = scope_snapshot()
+            start = scope_snapshot(dirty={"cache.bin": (("untracked",), "legacy")})
+            result = scope_snapshot()
+            if mutation == "tracked":
+                result = replace(result, dirty={"src/app.py": (("unstaged",), "actual violation")})
+            if mutation == "config":
+                result = replace(result, config={**result.config, "local:core.hooksPath": ("foreign",)})
+            if mutation == "current_tracked":
+                current = replace(current, dirty={"src/app.py": (("unstaged",), "current target")})
+
+            error = (
+                "planner failed" if mutation == "other_error" else
+                "planner 결과 변경 범위 오류: src/app.py" if mutation == "tracked" else
+                "planner Git 범위 위반: legacy comparison"
+            )
+            recovered_input = (
+                mutation in {"ignored", "config", "current_tracked"}
+                and observation_failure is None and not database_competition
+            )
+            pending_validation, completed = (
+                (0, 1) if mutation == "config" else (1, 0) if recovered_input else (0, 0)
+            )
+            database = state_dir / "state.sqlite"
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            loop_manager._ensure_execplans_schema(connection)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch, phase, worktree, "
+                "planning_workspace_owned, planning_attempt_fingerprint, active_sha, "
+                "planner_session_id, planning_result, planning_result_pending_validation, "
+                "planning_result_completed, planning_retry_count, planning_error, "
+                "planning_validation_error, planning_error_fingerprint, last_error, agent_role, "
+                "agent_snapshot, agent_result_snapshot) "
+                "VALUES (?, 'main', 'PLANNING', ?, 1, 'same', ?, 'saved-session', ?, ?, ?, 3, ?, ?, "
+                "'same', ?, 'planner', ?, ?)",
+                (str(repo), str(worktree), current.head, "saved planner result", pending_validation,
+                 completed, error, error, error, start.serialize(), result.serialize()),
+            )
+            connection.commit()
+            repository = runtime_state.RuntimeStateRepository(connection)
+            if preserved:
+                repository.suspend_planning(repository.planning(str(repo)))
+            connection.close()
+
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            cleanup.callback(connection.close)
+            repository = runtime_state.RuntimeStateRepository(connection)
+            original = repository.planning(str(repo))
+            preserved_state = original.planning_preserved_state
+            context = replace(
+                self.context, repo=str(repo), repo_path=repo, state_dir=state_dir,
+                base_branch="main", base_sha=current.head,
+            )
+            agent = loop_manager._PlanningAgentPorts(connection, context, None)
+            git = FakeGitPort()
+            git.fingerprint = "same"
+            if mutation == "ownership":
+                git.validate_workspace_identity = mock.Mock(side_effect=RuntimeError("wrong owner"))
+
+            @contextmanager
+            def transaction():
+                if database_competition:
+                    with sqlite3.connect(database) as competing_connection:
+                        competing_connection.execute(
+                            "UPDATE projects SET last_error = 'competing writer' WHERE repo = ?",
+                            (str(repo),),
+                        )
+                with runtime_state._transaction(connection):
+                    yield
+
+            state = SimpleNamespace(
+                planning=repository.planning,
+                transaction=transaction if database_competition else lambda: runtime_state._transaction(connection),
+                schedule=lambda _: SimpleNamespace(active=None),
+                planning_release_pending=lambda _: False,
+                preserve_diagnostics=mock.Mock(),
+                retry_diagnostic_preservation=mock.Mock(),
+            )
+            service = PlanningSelectionService(SimpleNamespace(
+                agent=agent, git=git, state=state, events=SimpleNamespace(error=mock.Mock()),
+            ))
+            run = SimpleNamespace(
+                row=original, context=context, base_sha=current.head,
+                publication_recovery_verified=False, maintenance_planning=False,
+                maintenance_cycle=maintenance_cycle(),
+            )
+
+            if mutation == "race":
+                observations = [current, replace(current, head="foreign")]
+            elif mutation == "config":
+                observations = [current, replace(
+                    current,
+                    refs={**current.refs, "refs/remotes/origin/main": ("foreign", "")},
+                    config={**current.config, "local:core.hooksPath": ("foreign",)},
+                )]
+            else:
+                observations = [current, current]
+            if observation_failure is not None:
+                observations[observation_failure - 1] = RuntimeError("current snapshot unavailable")
+            with mock.patch.object(loop_manager, "capture_git_snapshot", side_effect=observations) as capture, \
+                    mock.patch.object(loop_manager, "validate_managed_worktree") as validate_worktree, \
+                    mock.patch.object(loop_manager, "run_codex") as planner, \
+                    mock.patch.object(service, "_suspend_failed_planning", return_value="waiting"), \
+                    mock.patch.object(service, "_continue_published_work", return_value="waiting"), \
+                    mock.patch("subprocess.run", side_effect=AssertionError("unexpected subprocess")) as run_process, \
+                    mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess")) as start_process:
+                outcome = service._gate_preserved_error(run)
+                recovered = (
+                    mutation in {"ignored", "config", "current_tracked"}
+                    and observation_failure is None and not database_competition
+                )
+                self.assertEqual(outcome, None if recovered else "waiting")
+                planner.assert_not_called()
+                run_process.assert_not_called()
+                start_process.assert_not_called()
+
+            saved = repository.planning(str(repo))
+            recovered = (
+                mutation in {"ignored", "config", "current_tracked"}
+                and observation_failure is None and not database_competition
+            )
+            if recovered:
+                self.assertIsNone(saved.planning_error)
+                self.assertIsNone(saved.planning_validation_error)
+                self.assertIsNone(saved.planning_error_fingerprint)
+                self.assertIsNone(saved.planning_error_origin)
+                self.assertEqual(saved.planner_session_id, "saved-session")
+                self.assertEqual(saved.planning_retry_count, 3)
+                self.assertEqual(saved.planning_result, "saved planner result")
+                self.assertEqual(saved.agent_snapshot, start.serialize())
+                self.assertEqual(saved.agent_result_snapshot, result.serialize())
+                self.assertEqual(saved.planning_result_pending_validation, bool(pending_validation))
+                self.assertEqual(saved.planning_result_completed, bool(completed))
+                self.assertIsNone(saved.planning_preserved_state)
+                self.assertFalse(service._recover_ignored_error(run))
+                self.assertEqual(capture.call_count, 2)
+                validate_worktree.assert_called_once_with(repo, worktree, None)
+            else:
+                expected = replace(original, last_error="competing writer") if database_competition else original
+                self.assertEqual(saved, expected)
+                self.assertEqual(saved.planning_error, error)
+                self.assertEqual(saved.planning_error_fingerprint, "same")
+                self.assertEqual(saved.planning_preserved_state, preserved_state)
+                self.assertEqual(saved.agent_snapshot, original.agent_snapshot)
+                self.assertEqual(saved.agent_result_snapshot, original.agent_result_snapshot)
+                if preserved:
+                    preserved_values = runtime_state._preserved_planning_values(saved.planning_preserved_state)
+                    self.assertEqual(preserved_values["planning_validation_error"], error)
+                    self.assertEqual(preserved_values["planner_session_id"], "saved-session")
+                    self.assertEqual(preserved_values["planning_retry_count"], 3)
+                    self.assertEqual(preserved_values["agent_snapshot"], start.serialize())
+                    self.assertEqual(preserved_values["agent_result_snapshot"], result.serialize())
+                else:
+                    self.assertEqual(saved.planning_validation_error, error)
+                expected_captures = 2 if mutation == "race" or observation_failure == 2 else (
+                    1 if observation_failure == 1 else 0
+                )
+                self.assertEqual(capture.call_count, expected_captures)
+                if not database_competition and (
+                    mutation in {"race", "ignored", "config", "current_tracked"} or observation_failure
+                ):
+                    validate_worktree.assert_called_once_with(repo, worktree, None)
+                else:
+                    validate_worktree.assert_not_called()
+
+    def test_ignored_scope_error_restarts_same_input_without_repeating_planner(self):
+        for preserved in (False, True):
+            for mutation in ("ignored", "tracked", "config", "current_tracked", "race", "ownership", "other_error"):
+                with self.subTest(preserved=preserved, mutation=mutation):
+                    self._assert_recovery_case(preserved=preserved, mutation=mutation)
+
+    def test_ignored_scope_error_observation_and_database_races_preserve_state(self):
+        for preserved in (False, True):
+            for observation_failure in (1, 2):
+                with self.subTest(preserved=preserved, observation_failure=observation_failure):
+                    self._assert_recovery_case(
+                        preserved=preserved, mutation="ignored", observation_failure=observation_failure,
+                    )
+            with self.subTest(preserved=preserved, database_competition=True):
+                self._assert_recovery_case(
+                    preserved=preserved, mutation="ignored", database_competition=True,
+                )
 
 
 @isolated_git_test
 class PlanningErrorRecoveryTest(unittest.TestCase):
-    def test_ignored_scope_error_restarts_same_input_without_repeating_planner(self):
-        from dataclasses import replace
-        from loop_manager_internal.planning.selection_service import PlanningSelectionService
-        from loop_manager_internal.storage import runtime_state
-        for preserved in (False, True):
-            for mutation in ('ignored', 'tracked', 'config', 'current_tracked', 'race', 'ownership', 'other_error'):
-                with self.subTest(preserved=preserved, mutation=mutation), tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
-                    repo = make_remote_repository(directory)
-                    (repo / '.gitignore').write_text('cache.bin\n')
-                    commit_and_push(repo, 'Ignore cache')
-                    git_command(repo, 'switch', '--detach')
-                    state_dir = Path(directory) / 'state'
-                    state_dir.mkdir()
-                    current = loop_manager.capture_git_snapshot(repo)
-                    start = replace(current, dirty={'cache.bin': (('untracked',), 'legacy')})
-                    result = current
-                    if mutation == 'tracked':
-                        result = replace(result, dirty={'src/app.py': (('unstaged',), 'actual violation')})
-                    if mutation == 'config':
-                        result = replace(result, config={**result.config, 'local:core.hooksPath': ('foreign',)})
-                    error = ('planner failed' if mutation == 'other_error' else
-                             'planner 결과 변경 범위 오류: src/app.py' if mutation == 'tracked' else
-                             'planner Git 범위 위반: legacy comparison')
-                    if mutation == 'current_tracked':
-                        (repo / 'src/app.py').write_text('VALUE = 99\n')
-                        current = loop_manager.capture_git_snapshot(repo)
-                    database = state_dir / 'state.db'
-                    connection = sqlite3.connect(database)
-                    connection.row_factory = sqlite3.Row
-                    connection.execute(loop_manager.SCHEMA)
-                    loop_manager._ensure_execplans_schema(connection)
-                    connection.execute("INSERT INTO projects (repo, base_branch, phase, worktree, "
-                        "planning_workspace_owned, planning_attempt_fingerprint, active_sha, "
-                        "planner_session_id, planning_result, planning_retry_count, planning_error, "
-                        "planning_validation_error, planning_error_fingerprint, agent_role, "
-                        "agent_snapshot, agent_result_snapshot) "
-                        "VALUES (?, 'main', 'PLANNING', ?, 1, 'same', ?, 'saved-session', '', 3, ?, ?, "
-                        "'same', 'planner', ?, ?)",
-                        (str(repo), str(repo), current.head, error, error, start.serialize(), result.serialize()))
-                    connection.commit()
-                    repository = runtime_state.RuntimeStateRepository(connection)
-                    if preserved:
-                        repository.suspend_planning(repository.planning(str(repo)))
-                    connection.close()
-                    # Reopen the persisted state, using the real scope validator.
-                    connection = sqlite3.connect(database)
-                    connection.row_factory = sqlite3.Row
-                    cleanup.callback(connection.close)
-                    repository = runtime_state.RuntimeStateRepository(connection)
-                    context = SimpleNamespace(repo=str(repo), repo_path=repo, state_dir=state_dir,
-                                              base_branch='main', recovery_request_id=None,
-                                              local_environment_recheck=False)
-                    agent = loop_manager._PlanningAgentPorts(connection, context, None)
-                    git = SimpleNamespace(validate_workspace_identity=mock.Mock(),
-                                          input_fingerprint=lambda *_: 'same')
-                    if mutation == 'ownership':
-                        git.validate_workspace_identity.side_effect = RuntimeError('wrong owner')
-                    state = SimpleNamespace(planning=repository.planning,
-                        transaction=lambda: runtime_state._transaction(connection),
-                        schedule=lambda _: SimpleNamespace(active=None),
-                        planning_release_pending=lambda _: False, preserve_diagnostics=mock.Mock(),
-                        retry_diagnostic_preservation=mock.Mock())
-                    service = PlanningSelectionService(SimpleNamespace(
-                        agent=agent, git=git, state=state, events=SimpleNamespace(error=mock.Mock())))
-                    original = repository.planning(str(repo))
-                    from loop_manager_internal.storage import maintenance_state
-                    run = SimpleNamespace(row=original, context=context, base_sha=current.head,
-                        publication_recovery_verified=False, maintenance_planning=False,
-                        maintenance_cycle=SimpleNamespace(phase=maintenance_state.MaintenancePhase.IDLE))
-                    if mutation == 'race':
-                        observations = [current, replace(current, head='foreign')]
-                        capture = mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=observations)
-                    else:
-                        capture = mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=current)
-                    with capture, mock.patch.object(loop_manager, 'run_codex') as planner, \
-                            mock.patch.object(service, '_suspend_failed_planning', return_value='waiting'), \
-                            mock.patch.object(service, '_continue_published_work', return_value='waiting'):
-                        self.assertEqual(service._gate_preserved_error(run),
-                                         None if mutation in {'ignored', 'config', 'current_tracked'} else 'waiting')
-                        planner.assert_not_called()
-                    if mutation in {'ignored', 'config', 'current_tracked'}:
-                        saved = repository.planning(str(repo))
-                        self.assertIsNone(saved.planning_error)
-                        self.assertEqual(saved.planner_session_id, 'saved-session')
-                        self.assertEqual(saved.planning_retry_count, 3)
-                        self.assertEqual(saved.agent_snapshot, start.serialize())
-                        self.assertEqual(saved.agent_result_snapshot, result.serialize())
-                        self.assertEqual(saved.planning_result_completed, original.planning_result_completed)
-                        self.assertFalse(service._recover_ignored_error(run))
-                    else:
-                        self.assertEqual(repository.planning(str(repo)), original)
-
     @dummy_worker_sessions
     def test_planning_scope_error_preserves_unauthorized_result_after_input_advance(self):
         isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
