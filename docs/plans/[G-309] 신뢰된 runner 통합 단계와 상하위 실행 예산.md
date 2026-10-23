@@ -52,8 +52,12 @@ Python·Perl 실제 runner 예제를 일반 unittest 자식에서 신뢰된 전�
 ## Progress
 
 - [x] revision `9f877ad110999e0f198f7977d23d31d6b8eb5d89`의 선택 adapter(version 1 unittest, launcher Python 3.11–3.14)·지원 계약·예제 unittest 중첩 호출·guard·session 대기 누계와 관련 회귀를 정적으로 대조했다. 구현·테스트·verify는 실행하지 않았다.
+- [x] 같은 coordinator·정규화된 예산 디렉터리의 session 대기를 공통 누계 하나로 기록하도록 변경했다. 모든 session의 대기·1초 이내 heartbeat·활성/종료 불명 예약 부재를 확인하며, 겹친 대기를 한 번만 공제하고 종료 후 다음 session에도 누계를 보존한다. 다른 예산은 분리한다. `docs/VERIFY.md`·ARCHITECTURE에 현재 집계 범위와 아직 없는 상하위 실행 관계를 반영했다. 기존 `loop_manager_internal/**`·`tests/**` 입력 glob이 이번 코드·회귀를 포함하므로 verify-inputs 변경은 없다.
+- [x] 이번 호출의 프로젝트 Python은 `.venv`가 없어 `python3`을 사용했다. `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_task_scheduling.ExecutionClockTests` 최종 실행은 4개 통과했다. 두 session의 겹친 30초 대기, 2초 처리 뒤 남은 8초, 다음 session·중첩 clock의 누계 보존과 총 실제 처리 12초의 예산 소진, 준비/활성/종료 불명/heartbeat 단절 및 다른 예산 분리를 확인했다. `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_task_scheduling.ExecutionClockTests --unittest tests.test_verify_contract.CoordinatorIdentityTests` 호출은 runner가 마지막 `--unittest`만 선택해 identity 검사 1개만 통과했으므로 clock 검증으로 계산하지 않았고, 앞의 단독 명령으로 변경된 clock 회귀를 별도 실행했다. `git diff --check`도 통과했다. 전체 verify·실제 runner 통합 단계·Windows 검증은 실행하지 않았다.
 - [ ] 신뢰된 필수 통합 단계·두 언어 및 partial/full 실제 회귀 이전과 상하위 실행 예산 연결
 - [ ] 최소 unit·실제 필수 단계의 결과/종료 근거 및 문서 정합성 확인
+
+현재 보존점은 session별 겹친 대기 합산의 교정이다. 신뢰된 runner port·필수 단계 선언/manifest·예제/partial roundtrip 이관·전체 트리 대기 관측·상하위 예산 불일치 거부·재시작/WSL 연결은 아직 구현하지 않았다. 기존 실제 예제·고정 sampler helper와 전용 테스트를 유지했으며 삭제하거나 필수 단계를 성공 처리하지 않았다. 별도 coordinator 사이의 동일 예산 누계 연결도 다음 구현에서 확인해야 한다. 실행 트리와 전체 결과 계약은 이 보존점으로 충족되지 않으며 전체 완료 후보로 제출하지 않는다.
 
 ## Decision Log
 

@@ -80,33 +80,51 @@ class VerifyCoordinator:
         self.clock, self.identity = clock, identity
         self.lock = threading.Lock()
         self.sessions, self.reservations, self.waiters, self.last_request = {}, {}, deque(), {}
+        self.wait_groups = {}
+        self.wait_identity = secrets.token_hex(16)
         self.server = self.thread = None
 
     def open(self, cap, *, require_guard=False):
         session, secret = secrets.token_hex(16), secrets.token_hex(32)
         with self.lock:
             self.sessions[session] = {"secret": secret, "cap": cap, "guard": None, "require_guard": require_guard,
-                "waiting": False, "waiting_seconds": 0.0, "waiting_at": self.clock(),
-                "budget_directory": os.environ.get("LOOP_MANAGER_VERIFY_BUDGET_DIR")}
+                "waiting": False, "waiting_at": self.clock(),
+                "budget_directory": (str(Path(os.environ["LOOP_MANAGER_VERIFY_BUDGET_DIR"]).resolve())
+                                     if os.environ.get("LOOP_MANAGER_VERIFY_BUDGET_DIR") else None)}
         return session, secret
 
     def track_waiting(self, session, directory):
         with self.lock:
-            self.sessions[session]["budget_directory"] = str(directory)
+            self.sessions[session].update(budget_directory=str(Path(directory).resolve()),
+                                          waiting=False, waiting_at=self.clock())
 
     def _record_wait(self, session, waiting):
         owner = self.sessions[session]
         now = self.clock()
-        interval = now-owner["waiting_at"]
-        # 배정 요청의 heartbeat가 끊긴 구간을 대기로 추정하지 않는다.
-        if owner["waiting"] and 0 <= interval <= 1:
-            owner["waiting_seconds"] += interval
+        directory = owner["budget_directory"]
+        if directory:
+            group = self.wait_groups.setdefault(directory,
+                {"at": now, "waiting": False, "waiting_seconds": 0.0})
+            members = {key: value for key, value in self.sessions.items()
+                       if value["budget_directory"] == directory}
+            def confirmed_wait():
+                return (all(value["waiting"] and 0 <= now-value["waiting_at"] <= 1
+                            for value in members.values())
+                        and not any(value["active"] or value["uncertain"]
+                                    for value in self.reservations.values()
+                                    if value["session"] in members))
+            interval = now-group["at"]
+            # 같은 예산의 모든 session이 기다린 겹친 구간은 한 번만 기록한다.
+            # heartbeat 단절이나 실행/종료 불명 예약이 있으면 공제하지 않는다.
+            if group["waiting"] and confirmed_wait() and 0 <= interval <= 1:
+                group["waiting_seconds"] += interval
         owner.update(waiting=waiting, waiting_at=now)
-        if owner["budget_directory"]:
+        if directory:
+            group.update(at=now, waiting=confirmed_wait())
             from loop_manager_internal.verification.timing import atomic_json
-            directory = Path(owner["budget_directory"])
-            directory.mkdir(parents=True, exist_ok=True)
-            atomic_json(directory / (session+".json"), {"waiting_seconds": owner["waiting_seconds"]})
+            path = Path(directory)
+            path.mkdir(parents=True, exist_ok=True)
+            atomic_json(path / (self.wait_identity+".json"), {"waiting_seconds": group["waiting_seconds"]})
 
     def _allocation(self, session, reply):
         active = any(value["active"] or value["uncertain"] for value in self.reservations.values()

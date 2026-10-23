@@ -1347,7 +1347,7 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 
 `result_validation.verify`는 선언이 없을 때만 기존 verify 경로를 실행한다. 잘못된 선언·미지원 version/adapter·실행 도구 부재는 연결 실패이며 기존 경로로 우회하지 않는다. 필수 필드·타입·경로와 단계 형식은 [선언 version 1](VERIFY.md#선언-version-1)을 따른다.
 
-실제 시간은 `ExecutionClock`이 동일 검증의 누계 디렉터리에서 확인한 순번 대기만 제외해 계산한다. coordinator는 실행 중·종료 불명 자식이 없는 session의 정상 배정 heartbeat 구간만 대기로 기록한다. 자식 일부가 실행 중이면 부모 시간도 계속 흐른다. Manager·launcher·runner와 Windows/WSL 단계가 이 누계를 공유하고 단계별 남은 예산을 전달하며 테스트 worker에는 조율 환경을 전달하지 않는다. 준비·수집·복사·I/O·실행·결과 처리·정리 시간은 그대로 계산한다. 상세 연결은 [시간 예산](VERIFY.md#순번-대기와-시간-예산)을 따른다.
+실제 시간은 `ExecutionClock`이 동일 검증의 누계 디렉터리에서 확인한 순번 대기만 제외해 계산한다. coordinator는 정규화한 예산 디렉터리별로 소속 session 전체의 공통 배정 대기를 집계하고, 해당 coordinator의 파일 하나에 `waiting_seconds` 누계를 기록한다. 모든 소속 session의 대기 상태와 1초 이내 heartbeat, 실행 중·종료 불명 예약 부재를 확인한 구간만 더하므로 겹친 session 시간이 중복 공제되지 않는다. 준비 중인 session·heartbeat 단절·활성 또는 종료 불명 예약은 공제를 막으며 다른 예산의 session은 분리한다. session을 종료해도 누계는 유지해 같은 coordinator의 다음 단계와 중첩 clock이 이전 대기를 다시 계산하거나 소비 예산을 초기화하지 않는다. 살아 있는 하위 runner의 순수 대기를 판정할 상하위 실행 관계 연결은 아직 미구현이다. Manager·launcher·runner와 Windows/WSL 단계가 이 누계를 공유하고 단계별 남은 예산을 전달하며 테스트 worker에는 조율 환경을 전달하지 않는다. 준비·수집·복사·I/O·실행·결과 처리·정리 시간은 그대로 계산한다. 상세 연결은 [시간 예산](VERIFY.md#순번-대기와-시간-예산)을 따른다.
 
 시간 상한을 전달하지 않는 구형 조율 호출은 runner·명령·프로세스/Windows Job 대기에서 바깥 Manager의 상한을 상속하며 새 기본 상한을 중첩하지 않는다. 명시적 상한과 단독 실행의 설정·기본 상한은 유지한다.
 

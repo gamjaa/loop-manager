@@ -3430,6 +3430,78 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
 
 
 class ExecutionClockTests(unittest.TestCase):
+    def test_shared_budget_counts_overlapping_session_wait_once_and_keeps_execution(self):
+        now = [0.0]
+        sampler = mock.Mock()
+        sampler.sample.side_effect = lambda: Snapshot(now[0], 1, 1, 4096*MIB, 'fake')
+        coordinator = VerifyCoordinator(sampler=sampler, clock=lambda: now[0])
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = [coordinator.open(1) for _ in range(2)]
+            for session, _ in sessions:
+                coordinator.track_waiting(session, directory)
+            with ExecutionClock({BUDGET_DIRECTORY: directory}, clock=lambda: now[0]) as budget:
+                for step in range(301):
+                    now[0] = step / 10
+                    for session, secret in sessions:
+                        self.assertFalse(coordinator.request(session, secret, 'acquire')['granted'])
+                self.assertAlmostEqual(budget.remaining(10), 10)
+                # Stopping sessions keeps their common cumulative record for
+                # the next stage; it must not reset already consumed time.
+                for session, _ in sessions:
+                    coordinator.finish(session, stopped=True)
+                now[0] = 32
+                self.assertAlmostEqual(budget.remaining(10), 8)
+                # A later session/stage in this coordinator keeps the prior
+                # cumulative wait, while a nested clock starts at its own budget.
+                session, secret = coordinator.open(1)
+                coordinator.track_waiting(session, directory)
+                with ExecutionClock({BUDGET_DIRECTORY: directory}, clock=lambda: now[0]) as nested:
+                    for step in range(301):
+                        now[0] = 32 + step / 10
+                        self.assertFalse(coordinator.request(session, secret, 'acquire')['granted'])
+                    self.assertAlmostEqual(budget.remaining(10), 8)
+                    self.assertAlmostEqual(nested.remaining(8), 8)
+                coordinator.finish(session, stopped=True)
+                now[0] = 72
+                self.assertEqual(budget.remaining(10), 0)
+                self.assertAlmostEqual(budget.elapsed(), 12)
+                self.assertEqual(len(list(Path(directory).glob('*.json'))), 1)
+
+    def test_common_wait_requires_all_sessions_and_fresh_heartbeats(self):
+        for state in ('preparing', 'running', 'uncertain', 'stale', 'other-budget'):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                now = [0.0]
+                busy = [0]
+                sampler = mock.Mock()
+                sampler.sample.side_effect = lambda: Snapshot(now[0], 1, busy[0], 4096*MIB, 'fake')
+                coordinator = VerifyCoordinator(sampler=sampler, clock=lambda: now[0])
+                sibling, sibling_secret = coordinator.open(1)
+                session, secret = coordinator.open(1)
+                coordinator.track_waiting(sibling, Path(directory) / 'other' if state == 'other-budget' else directory)
+                coordinator.track_waiting(session, directory)
+                if state in ('running', 'uncertain', 'other-budget'):
+                    reservation = coordinator.request(sibling, sibling_secret, 'acquire')
+                    self.assertTrue(reservation['granted'])
+                    if state == 'uncertain':
+                        coordinator.finish(sibling, stopped=False)
+                busy[0] = 1
+                with ExecutionClock({BUDGET_DIRECTORY: directory}, clock=lambda: now[0]) as budget:
+                    if state == 'stale':
+                        self.assertFalse(coordinator.request(sibling, sibling_secret, 'acquire')['granted'])
+                    self.assertFalse(coordinator.request(session, secret, 'acquire')['granted'])
+                    for step in range(1, 21):
+                        now[0] = step / 10
+                        self.assertFalse(coordinator.request(session, secret, 'acquire')['granted'])
+                    if state == 'other-budget':
+                        self.assertAlmostEqual(budget.elapsed(), 0)
+                    elif state == 'stale':
+                        # Only the first second has both live heartbeats.
+                        self.assertAlmostEqual(budget.elapsed(), 1)
+                    else:
+                        self.assertAlmostEqual(budget.elapsed(), 2)
+                for identity, _ in ((sibling, sibling_secret), (session, secret)):
+                    coordinator.finish(identity, stopped=True)
+
     def test_only_confirmed_wait_is_excluded_and_nested_clocks_keep_prior_execution(self):
         now=[0.0]
         with tempfile.TemporaryDirectory() as directory:
