@@ -4,7 +4,7 @@ title: Claude 내장 쓰기 경계와 자동 승인 검토 검증
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
-  - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
+  - docs/requirements/[R-055] Blocking Path Audit and Minimal Interruption.md
 depends_on: []
 complexity: high
 risk: high
