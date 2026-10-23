@@ -31,14 +31,14 @@ priority: high
 ## Implementation
 
 - [x] `prepare_isolation`은 CLI version/features/sandbox 조회 전에 현재 설정을 검사하고, 조회 뒤와 sandbox probe 뒤 정책을 다시 검사한다. 안전하게 갱신할 수 있는 설정은 선택된 공통 Codex home의 `config.toml`뿐이며 Manager `config.ini`, project/system Codex 설정, 그 밖의 입력 변경은 기존 증거에 결합하지 않고 거부한다. 실제 소비자 조회 뒤 안정된 최종 지문을 저장하며 `assert_current`와 process handoff 재검사로 이후 변경을 거부한다.
-- [x] `provider_adapters.py`의 `run_codex`, `provider_execution.py`의 읽기 전용 `observe`와 G-262의 준비 환경을 대조한다. version 및 각 native 지침 조회가 끝날 때마다 설정 정책을 검사해 충돌 발견 뒤 다음 Codex 조회가 실행되지 않게 한다. 준비 중 공통 home 설정의 안전한 생성은 재검사 후 현재 호출 증거에 결합하고, 다른 입력 변화·충돌에서는 실행/Review 동일성 증거를 만들지 않는다. 신규·재개·retry·fallback의 기존 session·ledger 관계를 바꾸지 않는다.
+- [x] `provider_adapters.py`의 `run_codex`, `provider_execution.py`의 읽기 전용 `observe`와 G-262의 준비 환경을 대조한다. version 및 각 native 지침 조회가 끝날 때마다 설정 정책을 검사해 충돌 발견 뒤 다음 Codex 조회가 실행되지 않게 한다. 준비 중 공통 home 설정의 안전한 생성은 재검사 후 현재 호출 증거에 결합하고, 지침 조회 사이 설정이 바뀌면 baseline부터 다시 해석해 같은 설정 identity의 지침만 전달한다. 다른 입력 변화·충돌·계속되는 설정 churn에서는 실행/Review 동일성 증거를 만들지 않는다. 신규·재개·retry·fallback의 기존 session·ledger 관계를 바꾸지 않는다.
 - [x] 확인한 `provider_home.py`, `agent_profiles.py`, `agent_codex_sandbox.py`의 공통 홈·인증 링크·호출별 attempt 구조를 유지한다. 삭제된 `_read_only_link`나 역할별 config 제거를 복원하지 않는다. `tests/test_provider_home.py`의 설정 수명/과거 홈 보존 fixture와 `tests/test_codex_native_invocation.py`·`test_agent_write_isolation.py`·`test_provider_runtime.py`의 실제 판단/모의 CLI 경계를 재사용한다.
 - [x] PRODUCT·ARCHITECTURE·`docs/OPERATIONS.md`의 관련 절을 검사 시점·정상 생성·경쟁 거부에 맞춰 통합한다. 공통 홈의 직접 사용과 과거 자료 보존은 이미 반영됐으므로 재구현 목표로 쓰지 않는다.
 
 ## Validation
 
 - Worker는 `python3 -m unittest tests.test_agent_write_isolation.WriteIsolationTests.test_configuration_drift_refuses_launch_after_successful_probe tests.test_agent_write_isolation.WriteIsolationTests.test_native_tool_probe_binds_new_configuration_and_resume`와 새로 추가한 검사 순서/설정 수명 unit case를 실행한다. `tests/test_provider_home.py`의 기존 준비/지문 수명 검사를 전체 호출 검증으로 대신하지 않는다.
-- 모의 version/features/probe 또는 profile/지침 조회가 안전한 config를 최초 생성·원자 교체하는 case에서 최종 증거가 현재 bytes에 결합되고 다음 동일 호출이 낡은 연결 때문에 실패하지 않아야 한다. 같은 시점에 Hook/권한 충돌을 생성하면 모델 process 시작 전 거부하고 파일·기존 결과를 보존해야 한다.
+- 모의 version/features/probe 또는 profile/지침 조회가 안전한 config를 최초 생성·원자 교체하는 case에서 최종 증거가 현재 bytes에 결합되고 다음 동일 호출이 낡은 연결 때문에 실패하지 않아야 한다. native sentinel 조회 중 `developer_instructions`를 A에서 B로 원자 교체하면 baseline부터 다시 조회해 B와 공통 지침을 보존한 override를 실제 실행·관측 identity에 결합해야 한다. 같은 시점에 Hook/권한 충돌을 생성하면 모델 process 시작 전 거부하고 파일·기존 결과를 보존해야 한다.
 - 최종 검사 이후 교체·읽기 실패·중단·불안정 입력에서는 새 성공 증거가 없어야 한다. 재개·retry·session-unavailable fallback이 각각 현재 공통 홈을 검사하며 저장된 session/실패와 이전 홈 파일·부모 환경을 보존하는지 기존 invocation fixture로 확인한다.
 - 부분/전체 verify의 고유 회귀는 실제 Reviewer 환경 관측과 호출 지문의 일치, Fast 기본 off·명시 profile/instruction·인증 링크 보호·사용량·호출별 임시 경로·자식 종료·Reviewer 읽기 전용이다. CLI/계정과 다른 OS의 실제 효과를 모의 검증의 성공으로 보고하지 않는다.
 
@@ -59,6 +59,7 @@ priority: high
 - [x] 2026-10-23 현재 후보 `0e359bd`에 `refresh_configuration_evidence`의 Manager `config_path` 변경 거부와 첫 native 지침 조회 뒤 후속 Codex 조회 중단 회귀를 추가했다. 프로젝트 Python targeted runner로 직접 증거 갱신 거부, 호출 전 Manager drift 거부, hook 충돌의 조기 중단, 안전한 공통 home 설정 생성·관측 등 5건을 실행해 모두 통과했다.
 - [x] 2026-10-23 Manager 복구점 HEAD `624a3a6`에서 위 Manager 설정 drift 거부·native 조회 중단·공통 설정 생성 회귀 5건을 프로젝트 Python targeted runner로 다시 실행해 모두 통과했다. 전체 verify와 Review는 Manager 확인으로 남긴다.
 - [x] 2026-10-23 현재 HEAD `61f9288`에서 Planner interruption recovery 테스트의 모의 사전검사가 현재 Manager·project/system 입력으로 안정 설정 지문을 제공하도록 갱신했다. 실제 준비 조회별 재검사는 유지했고 `test_interrupted_planner_persists_started_session_and_resumes` targeted unit test가 통과했다.
+- [x] 2026-10-23 HEAD `f51f3c9` 기반 후보에서 native sentinel 조회 중 공통 `developer_instructions`를 A에서 B로 원자 교체하는 경우 baseline 재조회와 B 기준 invocation/observation identity를 확인하는 targeted unit test 2건을 추가했다. `test_native_instruction_lookup_config_generation_is_bound_to_actual_call` 및 `test_current_observation_accepts_safe_config_created_during_instruction_lookup`도 함께 실행해 모두 통과했다.
 - [x] PRODUCT·ARCHITECTURE·OPERATIONS에 정상 생성 수용과 검사·거부 순서를 반영했다.
 
 ## Decision Log

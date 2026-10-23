@@ -264,7 +264,7 @@ def run_codex(
         if codex_launch is None or isolation_evidence is None:
             return
         try:
-            agent_write_isolation.assert_preparation_lookup_current(
+            return agent_write_isolation.assert_preparation_lookup_current(
                 isolation_evidence, worktree, state_dir, config_path,
                 environment_variables=launch_environment)
         except agent_write_isolation.IsolationError as error:

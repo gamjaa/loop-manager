@@ -89,36 +89,62 @@ def codex_arguments(guidance: CommonGuidance, worktree: Path, *,
     # Exec-only switches are irrelevant to inspecting the resolved prompt.
     context = [arg for arg in context_arguments if arg not in ("--strict-config", "--ignore-rules")]
     command = ["codex", "-C", str(worktree), *context, "debug", "prompt-input"]
-    baseline = _developer_texts(command, worktree, environment, on_lookup=on_lookup)
     sentinel = "loop-manager-guidance-" + uuid4().hex
-    projected = _developer_texts(command[:1] + _override(sentinel) + command[1:], worktree,
-                                  environment, on_lookup=on_lookup)
-    positions = [index for index, text in enumerate(projected) if sentinel in text]
-    if len(positions) != 1 or projected[positions[0]].count(sentinel) != 1:
-        raise GuidanceError("Codex 관리 설정이 공통 추가 지침을 덮어쓰거나 native 입력이 불명확합니다.")
-    index = positions[0]
-    prefix, suffix = projected[index].split(sentinel)
-    without = projected[:index] + projected[index + 1:]
-    existing = ""
-    if baseline != without:
-        if len(baseline) != len(projected) or baseline[:index] + baseline[index + 1:] != without:
-            raise GuidanceError("Codex 기존 추가 지침과 기본 지침을 분리해 보존할 수 없습니다.")
-        original = baseline[index]
-        if (not original.startswith(prefix) or not original.endswith(suffix)
-                or len(original) < len(prefix) + len(suffix)):
-            raise GuidanceError("Codex 기존 추가 지침의 native 형식이 불명확합니다.")
-        existing = original[len(prefix):len(original) - len(suffix) if suffix else None]
-    combined = (existing + "\n\n" if existing else "") + guidance.content
-    override = _override(combined)
-    verified = _developer_texts(command[:1] + override + command[1:], worktree,
-                                environment, on_lookup=on_lookup)
-    expected = projected.copy()
-    expected[index] = prefix + combined + suffix
-    if verified != expected:
-        raise GuidanceError("Codex 공통 추가 지침의 실제 적용과 기존 지침 보존을 확인할 수 없습니다.")
-    if observe_instruction is not None:
-        observe_instruction(hashlib.sha256(json.dumps(verified, ensure_ascii=False).encode()).hexdigest())
-    return override
+
+    def native_lookup(arguments):
+        before = on_lookup() if on_lookup is not None else None
+        after = []
+
+        def check_after_lookup():
+            if on_lookup is not None:
+                after.append(on_lookup())
+
+        texts = _developer_texts(
+            arguments, worktree, environment,
+            on_lookup=check_after_lookup if on_lookup is not None else None)
+        return texts, before, after[-1] if after else before
+
+    def configuration_was_stable(*identities):
+        return on_lookup is None or all(identity == identities[0] for identity in identities[1:])
+
+    for _ in range(3):
+        baseline, baseline_before, baseline_after = native_lookup(command)
+        if not configuration_was_stable(baseline_before, baseline_after):
+            continue
+        projected, projected_before, projected_after = native_lookup(
+            command[:1] + _override(sentinel) + command[1:])
+        if not configuration_was_stable(baseline_after, projected_before, projected_after):
+            continue
+
+        positions = [index for index, text in enumerate(projected) if sentinel in text]
+        if len(positions) != 1 or projected[positions[0]].count(sentinel) != 1:
+            raise GuidanceError("Codex 관리 설정이 공통 추가 지침을 덮어쓰거나 native 입력이 불명확합니다.")
+        index = positions[0]
+        prefix, suffix = projected[index].split(sentinel)
+        without = projected[:index] + projected[index + 1:]
+        existing = ""
+        if baseline != without:
+            if len(baseline) != len(projected) or baseline[:index] + baseline[index + 1:] != without:
+                raise GuidanceError("Codex 기존 추가 지침과 기본 지침을 분리해 보존할 수 없습니다.")
+            original = baseline[index]
+            if (not original.startswith(prefix) or not original.endswith(suffix)
+                    or len(original) < len(prefix) + len(suffix)):
+                raise GuidanceError("Codex 기존 추가 지침의 native 형식이 불명확합니다.")
+            existing = original[len(prefix):len(original) - len(suffix) if suffix else None]
+        combined = (existing + "\n\n" if existing else "") + guidance.content
+        override = _override(combined)
+        verified, verified_before, verified_after = native_lookup(command[:1] + override + command[1:])
+        if not configuration_was_stable(projected_after, verified_before, verified_after):
+            continue
+        expected = projected.copy()
+        expected[index] = prefix + combined + suffix
+        if verified != expected:
+            raise GuidanceError("Codex 공통 추가 지침의 실제 적용과 기존 지침 보존을 확인할 수 없습니다.")
+        if observe_instruction is not None:
+            observe_instruction(hashlib.sha256(json.dumps(verified, ensure_ascii=False).encode()).hexdigest())
+        return override
+
+    raise GuidanceError("Codex 설정이 지침 조회 중 계속 변경됐습니다.")
 
 
 def claude_arguments(guidance: CommonGuidance, *, environment: dict[str, str] | None = None) -> list[str]:

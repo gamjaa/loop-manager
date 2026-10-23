@@ -1,4 +1,5 @@
 """Prepared provider inputs and durable physical-call identity boundaries."""
+import json
 import unittest
 from unittest import mock
 from loop_manager_internal.agents import agent_profiles, agent_write_isolation as isolation
@@ -9,6 +10,31 @@ from tests.support.provider_execution import ProviderExecutionFixture
 
 
 class ProviderExecutionTests(ProviderExecutionFixture, unittest.TestCase):
+    def replace_instruction_during_sentinel_lookup(self):
+        config = self.child_home / 'config.toml'
+        config.write_text('developer_instructions="A"\n')
+        self.instruction_extra = 'A'
+        lookups = []
+        replaced = False
+
+        def replace(arguments):
+            nonlocal replaced
+            if 'debug' not in arguments:
+                return
+            override = next((json.loads(argument.partition('=')[2])
+                             for argument in arguments
+                             if argument.startswith('developer_instructions=')), None)
+            if override is not None and override.startswith('loop-manager-guidance-') and not replaced:
+                replacement = config.with_suffix('.replacement')
+                replacement.write_text('developer_instructions="B"\n')
+                replacement.replace(config)
+                self.instruction_extra = 'B'
+                replaced = True
+            lookups.append((override, self.instruction_extra))
+
+        self.native_probe_hook = replace
+        return lookups
+
     def test_current_and_actual_request_share_environment_instruction_and_policy(self):
         current = self.observe()
         self.assertIsNotNone(current)
@@ -47,6 +73,38 @@ class ProviderExecutionTests(ProviderExecutionFixture, unittest.TestCase):
         self.assertEqual(proof['configuration_digest'], isolation._configuration_digest(
             'codex', self.worktree, self.config,
             {'CODEX_HOME': str(self.child_home)}))
+        self.assertEqual(self.observe(invocation_id=result.isolation_invocation_id), self.observe())
+
+    def test_instruction_change_during_native_lookup_restarts_observation_baseline(self):
+        lookups = self.replace_instruction_during_sentinel_lookup()
+
+        observed = self.observe()
+
+        self.assertIsNotNone(observed)
+        self.assertEqual([instructions for _, instructions in lookups], ['A', 'B', 'B', 'B', 'B'])
+        self.assertIsNone(lookups[0][0])
+        self.assertTrue(lookups[1][0].startswith('loop-manager-guidance-'))
+        self.assertIsNone(lookups[2][0])
+        self.assertTrue(lookups[3][0].startswith('loop-manager-guidance-'))
+        self.assertEqual(lookups[4][0], 'B\n\n' + self.guidance.content)
+        self.assertEqual(self.observe(), observed)
+
+    def test_instruction_change_during_native_lookup_restarts_execution_baseline(self):
+        lookups = self.replace_instruction_during_sentinel_lookup()
+
+        result = self.invoke()
+
+        self.assertEqual(result.code, 0)
+        self.assertEqual([instructions for _, instructions in lookups], ['A', 'B', 'B', 'B', 'B'])
+        self.assertIsNone(lookups[0][0])
+        self.assertTrue(lookups[1][0].startswith('loop-manager-guidance-'))
+        self.assertIsNone(lookups[2][0])
+        self.assertTrue(lookups[3][0].startswith('loop-manager-guidance-'))
+        self.assertEqual(lookups[4][0], 'B\n\n' + self.guidance.content)
+        arguments = self.popen.call_args.args[0]
+        override = next(argument for argument in arguments
+                        if argument.startswith('developer_instructions='))
+        self.assertEqual(json.loads(override.partition('=')[2]), 'B\n\n' + self.guidance.content)
         self.assertEqual(self.observe(invocation_id=result.isolation_invocation_id), self.observe())
 
     def test_current_observation_accepts_safe_config_created_during_instruction_lookup(self):

@@ -37,7 +37,7 @@ class ProviderExecutionFixture:
         agent_invocation_state.ensure_schema(self.connection)
         self.repo = str(self.source)
         self.plan_id = getattr(self, 'plan_id', 'G-262')
-        pin_common_guidance(self.connection, InvocationContext(self.repo, self.plan_id),
+        self.guidance = pin_common_guidance(self.connection, InvocationContext(self.repo, self.plan_id),
             self.worktree, self.state, role='reviewer')
         self.profile = ResolvedProfile('model', 'high')
         self.boundary = isolation.WorktreeBoundary(self.worktree, self.source, (),

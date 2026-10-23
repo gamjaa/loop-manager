@@ -75,7 +75,7 @@ def observe(connection, *, repo: str, plan_id: str | None, worktree: Path,
         instructions = []
 
         def check_native_lookup():
-            agent_write_isolation.assert_preparation_lookup_current(
+            return agent_write_isolation.assert_preparation_lookup_current(
                 checked[0], worktree, state_dir, config_path,
                 environment_variables=launch.environment)
 

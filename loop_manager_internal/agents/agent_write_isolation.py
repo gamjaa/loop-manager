@@ -428,15 +428,16 @@ def refresh_configuration_evidence(evidence: IsolationEvidence, launch: CodexLau
 
 def assert_preparation_lookup_current(evidence: IsolationEvidence, worktree: Path,
                                      state_dir: Path, config_path: Path, *,
-                                     environment_variables: dict[str, str] | None = None) -> None:
-    """Reject policy or manager-input drift before another native lookup."""
+                                     environment_variables: dict[str, str] | None = None) -> str:
+    """Reject policy or manager-input drift and return the current config identity."""
     if (evidence.provider != 'codex' or evidence.status != 'verified' or
             not evidence.stable_configuration_digest or environment_variables is None):
         raise IsolationError('Codex 준비 조회를 다시 검사할 사전 증거가 없습니다.')
-    _, stable_configuration = _checked_codex_configuration(
+    configuration, stable_configuration = _checked_codex_configuration(
         worktree, state_dir, config_path, environment_variables)
     if stable_configuration != evidence.stable_configuration_digest:
         raise IsolationError('관리·프로젝트 Codex 설정이 준비 중 변경됐습니다.')
+    return configuration
 
 
 def assert_current_configuration(evidence: IsolationEvidence, worktree: Path, state_dir: Path,
