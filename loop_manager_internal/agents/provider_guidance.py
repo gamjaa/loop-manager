@@ -45,6 +45,13 @@ def _developer_texts(arguments: list[str], worktree: Path,
         for item in items:
             if item.get("role") != "developer":
                 continue
+            if item.get("type") == "additional_tools":
+                if not isinstance(item.get("tools"), list) or any(not isinstance(tool, dict) for tool in item["tools"]):
+                    raise ValueError("unsupported developer tools")
+                # Transport IDs vary between probes; preserve the actual tool definitions.
+                texts.append(json.dumps({key: value for key, value in item.items() if key != "id"},
+                                        ensure_ascii=False, sort_keys=True))
+                continue
             if item.get("type") != "message" or not isinstance(item.get("content"), list):
                 raise ValueError("unsupported developer message")
             for content in item["content"]:
