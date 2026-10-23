@@ -109,6 +109,59 @@ class PullRequestHistoryTests(unittest.TestCase):
 
 
 class WorkerCheckpointPublicationTests(unittest.TestCase):
+    def test_accepted_rebase_and_later_commit_wait_for_final_publication(self):
+        from loop_manager_internal.git.managed_rebase_validation import Remote
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+        from tests.support.rebase_observations import decision_for, expectation, observation
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin, branch, base, connection = self._repository(directory)
+            self.addCleanup(connection.close)
+            remote = git_command(repo, 'rev-parse', 'HEAD')
+            git_command(repo, 'push', 'origin', f'HEAD:refs/heads/{branch}')
+            git_command(repo, 'switch', 'main')
+            (repo / 'base.txt').write_text('new base\n', encoding='utf-8')
+            git_command(repo, 'add', 'base.txt')
+            git_command(repo, 'commit', '-m', 'Advance base')
+            latest = git_command(repo, 'rev-parse', 'HEAD')
+            git_command(repo, 'switch', branch)
+            git_command(repo, 'rebase', 'main')
+            rebased = git_command(repo, 'rev-parse', 'HEAD')
+            path = 'docs/plans/[G-001] Resume.md'
+            expected = expectation(repo=str(repo), repository_identity=str(repo / '.git'),
+                plan_id='G-001', plan_path=path, worktree=str(repo), branch=branch,
+                target_base_oid=latest, remote=Remote(str(repo), branch, remote))
+            acceptance = decision_for(expected, observation(expected,
+                head=rebased, branch_ref=(rebased, ''),
+                registration=(f'HEAD={rebased}', f'branch=refs/heads/{branch}'))).acceptance
+            connection.execute('UPDATE exec_plans SET active_sha=?, publication_remote_oid=?',
+                               (latest, remote))
+            connection.commit()
+            checkpoint = ExecutionCheckpointRepository(connection)
+            checkpoint.record(str(repo), 'G-001', expected_generation=0, operation=None,
+                expected_head=rebased, target_base_oid=latest, observed_remote_oid=remote,
+                snapshot={'accepted_work_branch': remote, 'current_rebase_acceptance': acceptance})
+            connection.commit()
+            effects = self._effects(repo, origin, connection)
+            for followup in (False, True):
+                if followup:
+                    (repo / 'src/app.py').write_text('VALUE = 99\n', encoding='utf-8')
+                    git_command(repo, 'add', 'src/app.py')
+                    git_command(repo, 'commit', '-m', 'Follow up after rebase')
+                head = git_command(repo, 'rev-parse', 'HEAD')
+                with self.subTest(followup=followup):
+                    self.assertEqual(publication_service.push_worker_checkpoint_commits(
+                        effects, connection, repo, Path(directory), str(repo), 'G-001',
+                        branch, repo, 'main', remote, None), (head, 0))
+                    self.assertEqual(git_command(repo.parent / 'remote.git', 'rev-parse',
+                                                f'refs/heads/{branch}'), remote)
+                    self.assertEqual(checkpoint.get(str(repo), 'G-001').expected_head, rebased)
+            connection.execute('UPDATE exec_plans SET active_sha=?', (base,))
+            connection.commit()
+            with self.assertRaises(RecoveryFailure):
+                publication_service.push_worker_checkpoint_commits(effects, connection,
+                    repo, Path(directory), str(repo), 'G-001', branch, repo, 'main', remote, None)
+
     def test_confirmed_push_and_later_remote_input_are_separate_facts(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, origin, branch, base, connection = self._repository(directory)

@@ -454,6 +454,19 @@ def push_worker_checkpoint_commits(
     if ancestry.returncode not in (0, 1):
         raise RuntimeError('Worker checkpoint commit ancestry를 확인할 수 없습니다.')
     if ancestry.returncode:
+        from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
+        acceptance = (current.snapshot or {}).get('current_rebase_acceptance')
+        if (pending is None and valid_acceptance(acceptance)
+                and all(acceptance[key] == value for key, value in {
+                    'repo': repo, 'plan_id': plan_id, 'plan_path': str(plan['path']),
+                    'worktree': str(worktree), 'branch': branch,
+                    'target_base_oid': str(plan['active_sha']),
+                }.items())
+                and acceptance['remote']['oid'] == remote_oid
+                and effects.git(worktree, 'merge-base', '--is-ancestor',
+                                acceptance['head'], head, check=False).returncode == 0):
+            # Rewritten history belongs to the validated rebase/final publication path.
+            return head, 0
         raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                               '원격 또는 base commit이 Worker checkpoint의 조상이 아닙니다.')
     commits = []
