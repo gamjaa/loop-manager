@@ -58,6 +58,7 @@ priority: high
 - [x] 2026-10-23 handoff 회귀 mock을 새 features-check callback 인자에 맞춰 feature 확인 후 handoff를 발생시키도록 갱신했다. 프로젝트 Python targeted runner에서 해당 worker/reviewer/session subtest가 모두 통과했다.
 - [x] 2026-10-23 현재 후보 `0e359bd`에 `refresh_configuration_evidence`의 Manager `config_path` 변경 거부와 첫 native 지침 조회 뒤 후속 Codex 조회 중단 회귀를 추가했다. 프로젝트 Python targeted runner로 직접 증거 갱신 거부, 호출 전 Manager drift 거부, hook 충돌의 조기 중단, 안전한 공통 home 설정 생성·관측 등 5건을 실행해 모두 통과했다.
 - [x] 2026-10-23 Manager 복구점 HEAD `624a3a6`에서 위 Manager 설정 drift 거부·native 조회 중단·공통 설정 생성 회귀 5건을 프로젝트 Python targeted runner로 다시 실행해 모두 통과했다. 전체 verify와 Review는 Manager 확인으로 남긴다.
+- [x] 2026-10-23 현재 HEAD `61f9288`에서 Planner interruption recovery 테스트의 모의 사전검사가 현재 Manager·project/system 입력으로 안정 설정 지문을 제공하도록 갱신했다. 실제 준비 조회별 재검사는 유지했고 `test_interrupted_planner_persists_started_session_and_resumes` targeted unit test가 통과했다.
 - [x] PRODUCT·ARCHITECTURE·OPERATIONS에 정상 생성 수용과 검사·거부 순서를 반영했다.
 
 ## Decision Log
