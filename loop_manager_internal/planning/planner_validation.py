@@ -911,6 +911,9 @@ class ValidatePlannerResultEffects:
     load_execplan_catalog: Callable[..., object]
     mutable_snapshot_token: Callable[..., object]
     _assert_mutable_ready_snapshot_current: Callable[..., object] | None = None
+    pr_for_branch: Callable[..., object] | None = None
+    validate_managed_worktree: Callable[..., object] | None = None
+    git_operation_entries: Callable[..., object] | None = None
 
 
 def validate_planner_result(
@@ -922,6 +925,7 @@ def validate_planner_result(
     repo: str | None = None,
     mutable_snapshot: MutableReadySnapshot | None = None,
     manager_paths: tuple[str, ...] = (),
+    state_dir: Path | None = None,
 ) -> ValidatedPlanningResult | None:
     """Validate one create/revise/rename/delete planning batch.
 
@@ -938,7 +942,11 @@ def validate_planner_result(
         from loop_manager_internal.catalog import remote_deletions
         withdrawals = remote_deletions.prepare_withdrawals(
             connection, repo, worktree, mutable_snapshot,
-            assert_current=effects._assert_mutable_ready_snapshot_current)
+            assert_current=effects._assert_mutable_ready_snapshot_current,
+            check_resources=lambda row: remote_deletions.deletion_resources_available(
+                row, repo, Path(repo), pr_for_branch=effects.pr_for_branch,
+                validate_worktree=effects.validate_managed_worktree,
+                git_operations=effects.git_operation_entries, state_dir=state_dir))
     # A resumed batch can still have Manager moves in the index/worktree.
     # Saved dirty paths are hints, not proof that a receipted move exists.
     observed = (set(effects.changed_files(worktree, active_sha))

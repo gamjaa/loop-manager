@@ -9,6 +9,7 @@ import json
 import re
 
 from loop_manager_internal.catalog import execplan_catalog as catalog
+from loop_manager_internal.git.command_adapter import ExternalObservationError
 from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
 from loop_manager_internal.maintenance.maintenance_orchestration import is_unowned_ready
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
@@ -778,15 +779,16 @@ def requirement_recovery_decisions(connection, repo, snapshot):
     return decisions, withdrawals
 
 
-def prepare_withdrawals(connection, repo, worktree, snapshot, *, assert_current=None):
+def prepare_withdrawals(connection, repo, worktree, snapshot, *, assert_current=None, check_resources=None):
     """시작한 작업의 직접 삭제 대신 안전한 Manager 문서 전환을 준비한다."""
     _decisions, withdrawals = requirement_recovery_decisions(connection, repo, snapshot)
+    if withdrawals and connection.in_transaction:
+        raise ExternalObservationError("작업 철회의 외부 자원 확인은 SQLite transaction 밖에서 수행해야 합니다.")
     if withdrawals and assert_current is not None:
         from dataclasses import replace
         assert_current(connection, replace(snapshot, plans=tuple(
             plan for plan in snapshot.plans if plan.plan_id in withdrawals)))
-    prepared = {}
-    for key, judgment in withdrawals.items():
+    for key in withdrawals:
         original = snapshot.by_id[key]
         from loop_manager_internal.storage import execplan_draft_state, work_claims
         if original.draft or key in execplan_draft_state.pending_ids(connection, repo):
@@ -803,6 +805,11 @@ def prepare_withdrawals(connection, repo, worktree, snapshot, *, assert_current=
             from loop_manager_internal.planning.planner_validation import planning_execution_state
             if row is None or planning_execution_state(row) != original.execution_state or row["agent_role"]:
                 raise PlannerValidationError("작업 철회 전에 실행 소유권·writer가 변경됐습니다.")
+        if (row["branch"] or row["worktree"]) and (check_resources is None or not check_resources(row)):
+            raise ExternalObservationError("작업 철회 전에 실제 PR·worktree·Git operation·journal 안전을 확인할 수 없습니다.")
+    prepared = {}
+    for key, judgment in withdrawals.items():
+        original = snapshot.by_id[key]
         prepared[key] = judgment
         if original.execution_state and json.loads(original.execution_state).get("ever_started"):
             path = worktree / original.path

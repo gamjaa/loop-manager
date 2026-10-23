@@ -456,10 +456,117 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
         self.assertTrue(self.path.exists())
         pr.assert_called_once_with(Path('repo'), 'topic')
         pr.return_value = None
-        self.prepare(assert_current=check)
+        self.prepare(assert_current=check, check_resources=lambda _row: True)
         pr.return_value = {'url': 'PR on resume'}
         with self.assertRaisesRegex(planner_validation.MutableReadyPRConflict, 'PR'):
             self.prepare(assert_current=check)
+
+    def test_external_resources_protect_withdrawal_and_prepared_receipt_on_resume(self):
+        from dataclasses import replace
+        from loop_manager_internal.planning.planner_validation import planning_execution_state
+        self.connection.execute("UPDATE exec_plans SET branch='topic', worktree='/owned'")
+        self.connection.commit()
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.snapshot = replace(self.snapshot, plans=(replace(self.snapshot.plans[0],
+            execution_state=planning_execution_state(row)),))
+        before = dict(self.connection.execute('SELECT * FROM execplan_catalog_holds').fetchone())
+        operations = mock.Mock(return_value={'rebase-merge': 'active'})
+        validate = mock.Mock()
+        pr = mock.Mock(return_value=None)
+        def available(target):
+            self.assertFalse(self.connection.in_transaction)
+            return self.recovery.deletion_resources_available(target, 'repo', Path('repo'),
+                pr_for_branch=pr, validate_worktree=validate, git_operations=operations,
+                state_dir=self.worktree / 'state')
+        kwargs = dict(assert_current=mock.Mock(), check_resources=available)
+        with self.assertRaisesRegex(ExternalObservationError, 'journal'):
+            self.prepare(**kwargs)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM execplan_catalog_holds').fetchone()), before)
+        self.assertEqual(self.path.read_text(encoding='utf-8'), self.text)
+        operations.return_value = {}
+        prepared = self.prepare(**kwargs)
+        self.assertEqual(prepared['G-047']['preserved_text'], self.text)
+        self.assertFalse(self.path.exists())
+        receipt = dict(self.connection.execute('SELECT * FROM execplan_catalog_holds').fetchone())
+        operations.return_value = {'MERGE_HEAD': 'active'}
+        with self.assertRaisesRegex(ExternalObservationError, 'journal'):
+            self.prepare(**kwargs)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM execplan_catalog_holds').fetchone()), receipt)
+        self.assertFalse(self.path.exists())
+        operations.return_value = {}
+        self.assertEqual(self.prepare(**kwargs), prepared)
+        validate.assert_called_with(Path('repo'), Path('/owned'), 'topic')
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), dict(row))
+
+    def test_owned_withdrawal_requires_observer_and_no_external_io_under_transaction(self):
+        from dataclasses import replace
+        from loop_manager_internal.planning.planner_validation import planning_execution_state
+        self.connection.execute("UPDATE exec_plans SET worktree='/owned'")
+        self.connection.commit()
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.snapshot = replace(self.snapshot, plans=(replace(self.snapshot.plans[0],
+            execution_state=planning_execution_state(row)),))
+        with self.assertRaisesRegex(ExternalObservationError, 'journal'):
+            self.prepare()
+        check = mock.Mock(side_effect=AssertionError('external I/O under SQLite writer'))
+        self.connection.execute('BEGIN IMMEDIATE')
+        with self.assertRaisesRegex(ExternalObservationError, 'transaction'):
+            self.prepare(assert_current=check, check_resources=check)
+        check.assert_not_called()
+        self.assertTrue(self.connection.in_transaction)
+        self.connection.rollback()
+        self.assertEqual(self.path.read_text(encoding='utf-8'), self.text)
+        self.assertNotIn('prepared_withdrawal', self.json.loads(self.connection.execute(
+            'SELECT evidence FROM execplan_catalog_holds').fetchone()[0]))
+
+    def test_composed_validation_rechecks_worktree_before_preparing_withdrawal(self):
+        from dataclasses import replace
+        from loop_manager_internal.planning.planner_validation import planning_execution_state
+        self.connection.execute("UPDATE exec_plans SET branch='topic', worktree='/owned'")
+        self.connection.commit()
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.snapshot = replace(self.snapshot, plans=(replace(self.snapshot.plans[0],
+            execution_state=planning_execution_state(row)),))
+        with mock.patch.object(loop_manager, '_assert_mutable_ready_snapshot_current'), \
+             mock.patch.object(loop_manager, 'validate_managed_worktree') as validate, \
+             mock.patch.object(loop_manager, '_git_operation_entries', return_value={'rebase-merge': 'active'}) as operations, \
+             mock.patch.object(loop_manager, 'pr_for_branch', return_value=None) as pr:
+            port = loop_manager._PlanningValidationPorts(self.connection, self.worktree / 'state')
+            with self.assertRaisesRegex(ExternalObservationError, 'journal'):
+                port.validate_general_result('repo', self.worktree, 'base', [], self.snapshot)
+        validate.assert_called_once_with(Path('repo'), Path('/owned'), 'topic')
+        operations.assert_called_once_with(Path('/owned'))
+        pr.assert_called_once_with(Path('repo'), 'topic')
+        self.assertEqual(self.path.read_text(encoding='utf-8'), self.text)
+        self.assertNotIn('prepared_withdrawal', self.json.loads(self.connection.execute(
+            'SELECT evidence FROM execplan_catalog_holds').fetchone()[0]))
+
+    def test_batch_checks_every_owned_target_before_writing_any_withdrawal_receipt(self):
+        from dataclasses import replace
+        from loop_manager_internal.planning.planner_validation import planning_execution_state
+        self.connection.execute("UPDATE exec_plans SET worktree='/owned/G-047'")
+        first = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        second = dict(first)
+        second.update(plan_id='G-048', path='docs/plans/[G-048] Other.md', worktree='/owned/G-048')
+        self.connection.execute(f"INSERT INTO exec_plans ({', '.join(second)}) "
+            f"VALUES ({', '.join('?' for _ in second)})", tuple(second.values()))
+        self.connection.commit()
+        original = self.snapshot.plans[0]
+        self.snapshot = replace(self.snapshot, plans=(
+            replace(original, execution_state=planning_execution_state(first)),
+            replace(original, plan_id='G-048', path=second['path'], execution_state=planning_execution_state(second)),
+        ))
+        before = dict(self.connection.execute('SELECT * FROM execplan_catalog_holds').fetchone())
+        check = mock.Mock(side_effect=lambda row: row['plan_id'] != 'G-048')
+        # Decision parsing is covered separately; this case checks the atomic
+        # preparation boundary for a batch whose second resource is unsafe.
+        with mock.patch.object(self.recovery, 'requirement_recovery_decisions',
+                               return_value=({}, {'G-047': {}, 'G-048': {}})):
+            with self.assertRaisesRegex(ExternalObservationError, 'journal'):
+                self.prepare(check_resources=check)
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(self.path.read_text(encoding='utf-8'), self.text)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM execplan_catalog_holds').fetchone()), before)
 
     def test_user_decision_and_manual_preparation_intent_cannot_be_withdrawn(self):
         from loop_manager_internal.storage import execplan_draft_state

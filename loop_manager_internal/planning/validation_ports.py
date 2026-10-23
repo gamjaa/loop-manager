@@ -32,9 +32,11 @@ class PlanningValidationPortsEffects:
 class _PlanningValidationPorts:
     """Bind prompt and validation helpers without lifecycle decisions."""
 
-    def __init__(self, effects: PlanningValidationPortsEffects, connection: sqlite3.Connection):
+    def __init__(self, effects: PlanningValidationPortsEffects, connection: sqlite3.Connection,
+                 state_dir: Path | None = None):
         self._effects = effects
         self._connection = connection
+        self._state_dir = state_dir
 
     def maintenance_context_at_revision(
         self,
@@ -177,6 +179,7 @@ class _PlanningValidationPorts:
             repo=repo,
             mutable_snapshot=mutable_snapshot,
             manager_paths=manager_paths,
+            state_dir=self._state_dir,
         )
         from loop_manager_internal.documents import document_drafts
         repository = Path(repo)

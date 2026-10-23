@@ -95,6 +95,9 @@ def register(assembly: Composition) -> None:
             load_execplan_catalog=assembly.callback('load_execplan_catalog'),
             _assert_mutable_ready_snapshot_current=assembly.callback('_assert_mutable_ready_snapshot_current'),
             mutable_snapshot_token=assembly.callback('mutable_snapshot_token'),
+            pr_for_branch=assembly.callback('pr_for_branch'),
+            validate_managed_worktree=assembly.callback('validate_managed_worktree'),
+            git_operation_entries=assembly.callback('_git_operation_entries'),
         ),
     )
 
