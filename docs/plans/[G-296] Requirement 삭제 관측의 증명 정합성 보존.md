@@ -24,7 +24,7 @@ Requirement 삭제를 처음 관측하거나 다시 관측할 때 작업별 원�
 
 ## Implementation
 
-- [x] `requirement_deletions()`가 활성 실행 row와 현재 `missing-source` 영향이 있는 취소 감사 row의 원문·원문 revision·삭제 관측 revision을 먼저 대조하고, 세 필드가 모두 같은 경우에만 영향 ID를 합치게 했다. 현재 활성 영향이 없는 취소 감사는 보존하되 source proof 집계에서 제외한다. 검증된 MERGED·archive 실행 row도 `verified_merged_archive_execution_ids()` 판정으로 제외한다. 활성 proof의 상충은 기존 Planner 오류 경계로 거부하며 결과는 조회 순서와 무관하게 정렬한다. 동일 proof의 row 문맥도 안정적으로 선택한다.
+- [x] `requirement_deletions()`가 활성 실행 row와 현재 `missing-source` 영향이 있는 취소 감사 row의 원문·원문 revision·삭제 관측 revision을 먼저 대조하고, 세 필드가 모두 같은 경우에만 영향 ID를 합치게 했다. 취소 감사는 각 source에 현재 활성 영향 필터를 적용하며, 영향이 없는 source는 감사를 보존하되 proof 집계에서 제외한다. 검증된 MERGED·archive 실행 row도 `verified_merged_archive_execution_ids()` 판정으로 제외한다. 활성 proof의 상충은 기존 Planner 오류 경계로 거부하며 결과는 조회 순서와 무관하게 정렬한다. 동일 proof의 row 문맥도 안정적으로 선택한다.
 - [x] `_apply_execution_holds()`는 원문과 원문 revision이 같은 반복 부재에서 최초 proof·삭제 revision·row 문맥을 기존 hold와 새 hold 모두에 전달하고 최신 관측 revision은 hold에 따로 기록한다. 기존 hold 사이의 proof 충돌은 거부하며 공통 resolved 판단과 영향 ID를 보존한다. 영향 ID가 늘면 전체 대상이 바뀐 `prepared_withdrawal`은 재사용하지 않고, 원문 또는 원문 revision 변경은 현재 CAS transaction을 롤백해 저장된 proof·receipt·resume_status를 보존한다.
 - [x] `catalog_service`의 기존 관측→hold transaction, `recovery_goals()`의 복수 proof 충돌 검사, `requirement_recovery_decisions()`의 최신 snapshot 재확인과 `prompt_payload()`·snapshot token 전달을 대조했다. 기존 결과 형식과 오류 경계를 유지하고 Planner가 상충 proof를 선택하지 않게 했다.
 - [x] `RequirementRecoveryUnitTests`에 활성 source 이슈가 없는 상태에서 서로 다른 revision의 취소 감사 둘과 독립 READY를 둔 비차단·감사 보존 회귀, 활성 source 이슈가 있을 때 동일한 활성/취소 proof 합집합과 상충 거부, 활성 row끼리의 상충 거부를 추가했다. 서로 다른 revision의 검증된 MERGED·archive row와 독립 READY를 함께 두고 `recovery_goals()`가 비어 있는 비차단 회귀, 반복 부재의 최초 증명·판단·receipt·resume_status 보존, 새 hold의 최초 proof·resolved 판단 전달과 `recovery_goals()` 회귀, 영향 ID 추가, prompt/token 증명 결합 회귀도 유지한다.
@@ -94,3 +94,13 @@ TARGETED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.
 - G-259의 Merge된 복수 source 의미 판단·엄격한 결과 parser·철회 준비/영수증·게시를 다시 구현하지 않는다. 현재 `test_repeated_source_proofs_union_affected_and_reject_stale_conflicts`는 이미 저장된 hold 사이의 상충만 검사하고, `test_deleted_renamed_source_uses_preserved_identity_and_observation_errors_are_not_withdrawal`은 하나의 실행 row만 검사한다. 최초 관측에서 정보가 합쳐지면 이 후속 검사는 차이를 복구할 수 없다.
 - 이 작업은 현재 PRODUCT의 변경된 삭제 원문/revision으로 철회를 확정하지 않는 계약과 ARCHITECTURE의 proof 비병합·반복 관측 보존을 구현한다. 최신 revision을 우선하는 새 정책, source 삭제 취소, 자동 사용자 승인이나 물리 자원 정리는 도입하지 않는다. G-260은 여기서 검증한 근거를 소비해 후속 수명을 처리한다.
 - complexity medium: 기존 resolver·proof·hold·snapshot/CAS를 연결하는 한정된 관측 및 오류 처리 변경이다. risk high: 잘못 합친 근거는 필요한 작업의 철회와 문서 삭제를 허용하고, 잘못 바꾼 증명은 저장된 복구 판단을 무효화한다. 원문·실행/취소 감사를 보존하고 집계 전 상충 거부·재관측·중단 복구를 검증해 수동 재평가가 가능하게 한다. 초기 level은 3이며 Model/Effort는 Manager 설정을 따른다. priority high는 취소 판단의 안전 근거 보완 때문이다.
+
+- [x] 2026-10-23 호출 시작 HEAD `b2dd1e110b1555514815add79e43f60650ce8645`의 base `55446254671206a070427af9fd5c32428e667e27` 대비 최종 diff와 최신 sources·설계 계약을 다시 대조했다. 취소 row 선택만으로는 복수 source 중 현재 영향 없는 source가 섞이는 오류를 확인하고, row 원문은 유지한 채 집계할 source 집합만 현재 `missing-source`와 교차하도록 변경했다. 활성 실행 row의 모든 source에 대한 기존 검증은 유지한다.
+- [x] 새 회귀는 활성 누락 R1·R3과 취소 `A:[R1,R2]`, `B:[R3,R2]`를 구성한다. R2의 원문·revision 상충에도 R1·R3만 동일 proof의 영향 ID를 합치며 취소 감사 전체 row가 그대로 보존됨을 검사한다. PRODUCT·ARCHITECTURE의 기존 계약을 구현하는 수정으로 추가 설계 문서 변경은 없다. unittest adapter v1·launcher Python 3.12.3/Linux와 verify 입력의 코드·테스트 glob을 확인했다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_requirement_deletions_filter_each_cancelled_source_by_active_impact
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_requirement_deletions_filter_each_cancelled_source_by_active_impact
+재실행 결과: PASS — 1 test, OK. 최초 실행은 영향 없는 공유 R2의 과거 proof 충돌로 실패했고 source별 필터 적용 후 같은 명령으로 통과했다.
+
+TARGETED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_requirement_deletions_ignore_conflicting_cancellations_without_active_impact tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_requirement_deletions_union_only_identical_active_and_cancelled_proofs tests.test_planner_validation_recovery.RequirementRecoveryUnitTests.test_requirement_deletions_ignore_verified_merged_archive_rows
+최종 결과: PASS — 3 tests, OK. 현재 후보에서 새 회귀 1개와 기존 관련 회귀 3개를 새로 실행했다. 전체 verify는 실행하지 않았으며 Manager 검증·Review가 남는다.

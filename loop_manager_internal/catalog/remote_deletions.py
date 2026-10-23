@@ -459,7 +459,8 @@ def requirement_deletions(connection, repo, repository, pinned, *, git, git_byte
     verified_merged_rows = execplan_catalog_state.verified_merged_archive_execution_ids(
         connection, repo, execution_rows,
     )
-    rows = [row for row in execution_rows if str(row["plan_id"]) not in verified_merged_rows]
+    rows = [(row, json.loads(row["sources"])) for row in execution_rows
+            if str(row["plan_id"]) not in verified_merged_rows]
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'"
     ).fetchone():
@@ -472,20 +473,20 @@ def requirement_deletions(connection, repo, repository, pinned, *, git, git_byte
                 issue.source for issue in pinned.snapshot.issues
                 if issue.code == "missing-source" and issue.source
             }
-            rows.extend(row for row in cancellations
-                        if active_missing_sources.intersection(json.loads(row["sources"])))
-    if not any(source.startswith("docs/requirements/") for row in rows for source in json.loads(row["sources"])):
+            rows.extend((row, active_missing_sources.intersection(json.loads(row["sources"])))
+                        for row in cancellations)
+    if not any(source.startswith("docs/requirements/") for _row, sources in rows for source in sources):
         return result
     from loop_manager_internal.catalog import requirement_sources
     from loop_manager_internal.git.command_adapter import revision_requirement_documents
     documents = revision_requirement_documents(git_bytes, repository, pinned.revision_sha)
     previous_documents = {}
-    for row in rows:
+    for row, sources in rows:
         current_revision = row["current_revision_sha"] if "current_revision_sha" in row.keys() else None
         revision = str(current_revision or row["plan_sha"] or "")
         if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
             continue
-        for source in json.loads(row["sources"]):
+        for source in sorted(sources):
             if not source.startswith("docs/requirements/") or source.count("/") != 2:
                 continue
             resolution = requirement_sources.resolve_requirement_source(source, documents, allow_archive=True)

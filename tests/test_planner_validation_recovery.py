@@ -872,6 +872,51 @@ class RequirementRecoveryUnitTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([tuple(row) for row in cancellations], expected_cancellations)
 
+    def test_requirement_deletions_filter_each_cancelled_source_by_active_impact(self):
+        from loop_manager_internal.git import command_adapter
+        from loop_manager_internal.catalog.execplan_catalog import CatalogIssue
+
+        first, shared = self.sources
+        third = 'docs/requirements/[R-003] Third.md'
+        current_revision = 'd' * 40
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE repo='repo'")
+        self.connection.execute("UPDATE exec_plans SET sources=?, plan_sha=? WHERE plan_id='G-047'",
+            (self.json.dumps([first]), 'a' * 40))
+        self.connection.execute('''INSERT INTO exec_plans
+            (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha)
+            VALUES ('repo', 'G-050', 'docs/plans/[G-050] Active.md', 'Active', ?, '[]',
+                    'normal', 'active-hash', 'READY', ?)''',
+            (self.json.dumps([third]), 'b' * 40))
+        for plan_id, source, revision in (('G-048', first, 'a' * 40), ('G-049', third, 'b' * 40)):
+            self.connection.execute('''INSERT INTO execplan_cancellations
+                (repo, plan_id, path, title, sources, depends_on, complexity, risk, priority,
+                 content_hash, plan_sha, deletion_commit)
+                VALUES ('repo', ?, ?, 'Cancelled', ?, '[]', 'low', 'low', 'normal', 'hash', ?, ?)''',
+                (plan_id, f'docs/plans/[{plan_id}] Cancelled.md', self.json.dumps([source, shared]),
+                 revision, 'e' * 40))
+        self.connection.commit()
+        before = [tuple(row) for row in self.connection.execute(
+            'SELECT * FROM execplan_cancellations ORDER BY plan_id')]
+        documents = {
+            current_revision: {},
+            'a' * 40: {first: '# [R-001] First\n', shared: '# [R-002] Shared A\n'},
+            'b' * 40: {third: '# [R-003] Third\n', shared: '# [R-002] Shared B\n'},
+        }
+        pinned = SimpleNamespace(revision_sha=current_revision, snapshot=SimpleNamespace(issues=tuple(
+            CatalogIssue(key, f'docs/plans/[{key}] Active.md', 'missing-source', 'absent', source)
+            for key, source in (('G-047', first), ('G-050', third)))))
+        with mock.patch.object(command_adapter, 'revision_requirement_documents',
+                side_effect=lambda _bytes, _repo, revision: documents[revision]):
+            proofs = self.recovery.requirement_deletions(self.connection, 'repo', self.worktree,
+                pinned, git=mock.Mock(return_value=SimpleNamespace(returncode=0)), git_bytes=mock.Mock())
+        self.assertEqual(set(proofs), {first, third})
+        self.assertEqual(proofs[first]['affected'], ['G-047', 'G-048'])
+        self.assertEqual(proofs[third]['affected'], ['G-049', 'G-050'])
+        self.assertEqual(proofs[first]['revision'], 'a' * 40)
+        self.assertEqual(proofs[third]['revision'], 'b' * 40)
+        self.assertEqual([tuple(row) for row in self.connection.execute(
+            'SELECT * FROM execplan_cancellations ORDER BY plan_id')], before)
+
     def test_requirement_deletions_ignore_verified_merged_archive_rows(self):
         from loop_manager_internal.git import command_adapter
         from loop_manager_internal.storage import execplan_catalog_state
