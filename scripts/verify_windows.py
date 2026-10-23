@@ -280,7 +280,11 @@ def native_main(root, entrypoint, directory, python):
     stage = {'id': 'windows-core', 'cwd': '.', 'execution': 'serial',
              'collection': {'directory': 'scripts', 'pattern': 'verify_windows.py'}}
     connection = Connection(root, 'unittest', Path(python), (stage,))
-    writer = EventWriter(directory / 'runner.jsonl', identity={'run_id': session, 'stage_id': stage['id']})
+    identity = {'run_id': session, 'stage_id': stage['id']}
+    parent_run_id = os.environ.get('LOOP_MANAGER_VERIFY_PARENT_RUN_ID')
+    if parent_run_id:
+        identity['parent_run_id'] = parent_run_id
+    writer = EventWriter(directory / 'runner.jsonl', identity=identity)
     passed = False
     try:
         writer.emit('run_start', mode='windows-core', coordinated=coordinator is None)
@@ -362,14 +366,23 @@ def windows_main(root):
             native_logs.mkdir()
             print(f'Windows 핵심 회귀 시작: {native_logs}', flush=True)
             report['windows'] = 'FAIL'
-            report['windows_run_id'] = session
             with phase('windows-core'):
                 # 자체 실행기는 표준 라이브러리만 사용하며 venv redirector를 worker로 남기지 않는다.
+                native_environment = dict(os.environ, LOOP_MANAGER_VERIFY_PARENT_RUN_ID=session)
                 passed, timed_out, output = run_verify_process(
                     [runtime_python, '-u', str(Path(__file__).resolve()), '--native', str(root),
                      str(entrypoint), str(native_logs), str(getattr(sys, '_base_executable', sys.executable))],
-                    root, timeout, job_scope=True, execution_clock=budget)
+                    root, timeout, environment=native_environment, job_scope=True, execution_clock=budget)
                 print(output, flush=True)
+            try:
+                native_summary = json.loads((native_logs / 'summary.json').read_text(encoding='utf-8'))
+                native_metadata = native_summary.get('metadata', {})
+                if (isinstance(native_metadata, dict)
+                        and native_metadata.get('parent_run_id') == session
+                        and isinstance(native_metadata.get('run_id'), str)):
+                    report['windows_run_id'] = native_metadata['run_id']
+            except (OSError, UnicodeError, ValueError):
+                pass
             report['windows'] = 'PASS' if passed and not timed_out else 'FAIL'
             report['windows_diagnostic'] = str(native_logs / 'summary.json')
         report['passed'] = report['windows'] == 'PASS'

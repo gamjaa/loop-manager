@@ -315,6 +315,7 @@ def bytecode_cache_changes(before, after):
 def summarize(directory: Path, *, now=None):
     now = time.monotonic() if now is None else now
     finished_at, executions = {}, {}
+    ended_runs, ended_stages = set(), set()
     completed, active, phases, decisions, metadata, fixtures, result = [], {}, [], [], {}, [], None
     git_costs, git_incomplete = [], []
     assignments, module_results, child_events, queues, selections = [], [], [], [], []
@@ -337,6 +338,7 @@ def summarize(directory: Path, *, now=None):
                 (completed if kind == "test_end" else phases).append(event)
                 if kind == "phase_end" and event.get("name", "").startswith("stage:"):
                     stage_key = base_key[:4]
+                    ended_stages.add(stage_key)
                     for active_key in list(active):
                         if active_key[:4] == stage_key:
                             active.pop(active_key, None)
@@ -350,6 +352,7 @@ def summarize(directory: Path, *, now=None):
                 bytecode_cache = event.get("bytecode_cache")
                 executions.setdefault(run_key, {})["end"] = event
                 finished_at[run_key] = event.get("at", finished_at.get(run_key))
+                ended_runs.add(run_key)
             elif kind == "allocation":
                 decisions.append(event)
             elif kind == "unit_start":
@@ -374,6 +377,13 @@ def summarize(directory: Path, *, now=None):
                 for active_key in list(active):
                     if active_key[:3] == execution_key:
                         active.pop(active_key, None)
+    active = {
+        key: event for key, event in active.items()
+        if ((event.get("clock_domain", "legacy"), event.get("run_id"),
+             event.get("parent_run_id")) not in ended_runs
+            and (event.get("clock_domain", "legacy"), event.get("run_id"),
+                 event.get("parent_run_id"), event.get("stage_id")) not in ended_stages)
+    }
     snapshots = {}
     for event in phases:
         if event.get("snapshot") != "full":

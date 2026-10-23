@@ -183,20 +183,39 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
                 'allocations': [], 'git_commands': []}), encoding='utf-8')
             return True
         self.wsl.side_effect = run_wsl
+        native_environment = {}
+        def run_native(arguments, _root, _timeout, *, environment, **_options):
+            from loop_manager_internal.verification import unittest_adapter
+            native_environment.update(environment)
+            native_logs = Path(arguments[6])
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                 mock.patch.object(sys, 'path', list(sys.path)), \
+                 mock.patch('loop_manager_internal.verification.guard.install_guard'), \
+                 mock.patch.object(unittest_adapter, 'collect_project', return_value=([], sys.executable)), \
+                 mock.patch.object(unittest_adapter, 'execute', return_value=True), \
+                 mock.patch('builtins.print'):
+                code = launcher.native_main(Path(arguments[4]), Path(arguments[5]),
+                                            native_logs, arguments[7])
+            return code == 0, False, verify_process.VerifyProcessOutput('core PASS', exit_code=code)
+        self.native.side_effect = run_native
 
         self.assertEqual(launcher.windows_main(self.root), 0)
 
         report = self.report()
         self.assertEqual(report['wsl_run_id'], 'linux-child')
-        self.assertTrue(report['windows_run_id'])
+        self.assertEqual(native_environment['LOOP_MANAGER_VERIFY_PARENT_RUN_ID'], report['run_id'])
         self.assertEqual(report['wsl'], 'PASS')
         summary = json.loads((self.logs / 'summary.json').read_text(encoding='utf-8'))
         pipeline = summary['windows_pipeline']
         self.assertEqual(pipeline['snapshot']['revision'], 'a' * 40)
+        self.assertEqual(report['windows_run_id'], pipeline['children']['windows']['run_id'])
         self.assertEqual(pipeline['children']['wsl']['run_id'], 'linux-child')
-        self.assertEqual(pipeline['children']['wsl']['parent_run_id'], report['windows_run_id'])
+        self.assertEqual(pipeline['children']['wsl']['parent_run_id'], report['run_id'])
         self.assertEqual(pipeline['children']['wsl']['elapsed_seconds'], 12.0)
+        self.assertNotEqual(pipeline['children']['windows']['run_id'], report['run_id'])
         self.assertEqual(pipeline['children']['windows']['run_id'], report['windows_run_id'])
+        self.assertEqual(pipeline['children']['windows']['parent_run_id'], report['run_id'])
+        self.assertGreaterEqual(pipeline['children']['windows']['elapsed_seconds'], 0.0)
         self.assertIn('summary.json', pipeline['children']['wsl']['summary_path'])
 
     def test_native_does_not_subtract_wsl_elapsed_time_twice(self):

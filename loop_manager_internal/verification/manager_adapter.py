@@ -75,6 +75,8 @@ def progress_observation(directory, positions, state, run_id=None):
     allocation_reasons = state.setdefault("allocation_reasons", {})
     resource_waits = state.setdefault("resource_waits", {})
     seen_results = state.setdefault("seen_results", set())
+    ended_runs = state.setdefault("ended_runs", set())
+    ended_stages = state.setdefault("ended_stages", set())
     for source, root in sources:
         try:
             paths = sorted(root.rglob("*.jsonl"))
@@ -125,6 +127,17 @@ def progress_observation(directory, positions, state, run_id=None):
                         pid = event.get("pid")
                         context = (source, clock_domain, event_run, event.get("parent_run_id"), stage_id)
                         scope = (*context, worker_id, pid, unit_id)
+                        if kind == "run_end":
+                            ended_runs.add(context[:4])
+                        elif (kind == "phase_end" and isinstance(event.get("name"), str)
+                              and event["name"].startswith("stage:")):
+                            ended_stages.add(context)
+                        scope_ended = context[:4] in ended_runs or context in ended_stages
+                        if scope_ended and (
+                                kind in {"test_start", "unit_start", "phase_start", "job_child_wait"}
+                                or (kind == "allocation" and isinstance(event.get("decision"), dict)
+                                    and not event["decision"].get("granted"))):
+                            continue
                         if kind == "test_start":
                             test_id = event.get("id")
                             active_tests[(*scope, test_id)] = {

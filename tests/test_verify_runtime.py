@@ -29,6 +29,30 @@ from loop_manager_internal.verification.timing import (
 
 
 class TimingAndManifestTests(unittest.TestCase):
+    def test_summary_terminal_stage_or_run_event_dominates_worker_starts(self):
+        for terminal_kind in ("stage_end", "run_end"):
+            with self.subTest(terminal=terminal_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stage = root / "stage-0"
+                stage.mkdir()
+                run_id = f"run-{terminal_kind}"
+                terminal = {"kind": "phase_end", "run_id": run_id, "clock_domain": "linux",
+                    "stage_id": "unittest", "pid": 10, "name": "stage:unittest",
+                    "start": 0, "duration": 5, "result": "complete", "at": 5}
+                if terminal_kind == "run_end":
+                    terminal = {"kind": "run_end", "run_id": run_id, "clock_domain": "linux",
+                                "stage_id": "unittest", "pid": 10, "at": 6}
+                (root / "runner.jsonl").write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+                (stage / "worker-0.jsonl").write_text(json.dumps({
+                    "kind": "test_start", "run_id": run_id, "clock_domain": "linux",
+                    "stage_id": "unittest", "unit_id": "module.test", "worker_id": 0,
+                    "pid": 11, "id": "tests.sample.Case.test_active", "at": 1}) + "\n",
+                    encoding="utf-8")
+
+                summary = summarize(root, now=10)
+
+                self.assertEqual(summary["active"], [])
+
     def test_windows_summary_links_os_runs_without_combining_their_clocks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "run"
