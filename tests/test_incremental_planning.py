@@ -532,15 +532,48 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                     observe.side_effect = response
                 else:
                     observe.return_value = response
-                result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+                result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main", state_dir=self.repo / 'state')
                 self.assertIn("G-001", result.withheld_plan_ids)
                 self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 0)
                 self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
         with mock.patch.object(loop_manager, "pr_for_branch", return_value=None):
-            loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+            loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main", state_dir=self.repo / 'state')
         audit = json.loads(self.connection.execute("SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0])
         self.assertEqual(audit["row"]["branch"], "loop-manager/G-001")
         self.assertTrue(audit["cleanup_pending"])
+
+    def test_remote_deletion_rechecks_worktree_and_pr_before_database_apply(self):
+        self._remote_deletion(started=True, new_plan=True)
+        self.connection.execute("UPDATE exec_plans SET branch='owned', worktree='/owned/G-001', "
+                                "worker_result='completed' WHERE plan_id='G-001'")
+        self.connection.commit()
+        with mock.patch.object(loop_manager, 'validate_managed_worktree') as validate, \
+             mock.patch.object(loop_manager, '_git_operation_entries', return_value={'rebase-merge': 'active'}) as operations, \
+             mock.patch.object(loop_manager, 'pr_for_branch', return_value=None) as observe:
+            def refresh():
+                return loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo),
+                    'main', state_dir=self.repo / 'state')
+            deferred = refresh()
+            self.assertIn('G-001', deferred.withheld_plan_ids)
+            self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+            operations.return_value = {}
+            def pr_race(*_args):
+                self.assertFalse(self.connection.in_transaction)
+                return None if observe.call_count == 1 else {'state': 'OPEN'}
+            observe.reset_mock()
+            observe.side_effect = pr_race
+            raced = refresh()
+            self.assertEqual(raced.kind, execplan_catalog_state.ReconciliationKind.STALE)
+            self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+            self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+            observe.side_effect = None
+            resumed = refresh()
+            self.assertNotIn('G-001', resumed.withheld_plan_ids)
+            validate.assert_called_with(self.repo, Path('/owned/G-001'), 'owned')
+            audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+            self.assertEqual(audit['row']['worktree'], '/owned/G-001')
+            self.assertTrue(audit['cleanup_pending'])
+            self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
 
     def test_requirement_body_answer_is_proven_and_cleanup_is_publication_bound(self):
         from loop_manager_internal.catalog import draft_decisions, execplan_catalog, execplan_drafts
@@ -3283,3 +3316,64 @@ class EverStartedMigrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeletionExternalResourcesTests(unittest.TestCase):
+    def setUp(self):
+        from loop_manager_internal.catalog.remote_deletions import deletion_resources_available
+        self.check = deletion_resources_available
+        self.row = {'branch': 'owned', 'worktree': '/owned/worktree'}
+        self.pr = mock.Mock(return_value=None)
+        self.validate = mock.Mock()
+        self.operations = mock.Mock(return_value={})
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.state = Path(temporary.name)
+
+    def available(self, **kwargs):
+        kwargs.setdefault('state_dir', self.state)
+        return self.check(self.row, 'repo', Path('/repo'), pr_for_branch=self.pr,
+                          validate_worktree=self.validate, git_operations=self.operations, **kwargs)
+
+    def test_live_git_control_and_ownership_failures_preserve_resources(self):
+        self.assertTrue(self.available())
+        self.validate.assert_called_with(Path('/repo'), Path('/owned/worktree'), 'owned')
+        for markers in ({'rebase-merge': 'active'}, {'MERGE_HEAD': 'active'}, {'sequencer': 'active'}):
+            with self.subTest(markers=markers):
+                self.operations.return_value = markers
+                self.assertFalse(self.available())
+        self.operations.return_value = {'REBASE_HEAD': 'old', 'MERGE_MSG': 'old message'}
+        self.assertTrue(self.available())
+        self.validate.side_effect = RuntimeError('ownership unknown')
+        self.assertFalse(self.available())
+        self.validate.side_effect = None
+        self.operations.side_effect = OSError('unreadable operation')
+        self.assertFalse(self.available())
+        self.assertFalse(self.check(self.row, 'repo', Path('/repo'), pr_for_branch=self.pr))
+
+    def test_actual_pr_and_query_uncertainty_are_never_cancellation_evidence(self):
+        for state in ('OPEN', 'CLOSED', 'MERGED'):
+            with self.subTest(state=state):
+                self.pr.return_value = {'state': state, 'url': 'pr'}
+                self.assertFalse(self.available())
+        self.pr.side_effect = RuntimeError('query failed')
+        self.assertFalse(self.available())
+
+    def test_only_the_owned_resource_journal_defers_deletion(self):
+        from loop_manager_internal.git import manager_git_journal as journal
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            def interrupt(_identity):
+                raise RuntimeError('stopped after intent')
+            with self.assertRaisesRegex(RuntimeError, 'stopped after intent'):
+                journal.execute(state, owner='manager', kind='managed_rebase', repo='repo', target='independent',
+                    before={'head': 'before'}, expected={'head': 'after'}, observe=lambda: {'head': 'before'},
+                    apply=interrupt, marker=lambda _: False)
+            self.assertTrue(self.available(state_dir=state))
+            with self.assertRaisesRegex(RuntimeError, 'stopped after intent'):
+                journal.execute(state, owner='manager', kind='managed_rebase', repo='repo', target=self.row['worktree'],
+                    before={'head': 'before'}, expected={'head': 'after'}, observe=lambda: {'head': 'before'},
+                    apply=interrupt, marker=lambda _: False)
+            files = {path: path.read_bytes() for path in state.rglob('*.json')}
+            self.assertFalse(self.available(state_dir=state))
+            self.assertEqual({path: path.read_bytes() for path in files}, files)

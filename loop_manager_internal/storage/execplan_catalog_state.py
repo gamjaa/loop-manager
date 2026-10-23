@@ -902,6 +902,9 @@ class DefinitionStateRepository:
             revision_current = revision_is_current()
             self._fault("before-revision-recheck")
             revision_stable = revision_is_current()
+            for deletion in pinned.deletions:
+                if deletion.recheck is not None and (self.connection.in_transaction or not deletion.recheck()):
+                    return None
             with _transaction(self.connection):
                 if (self.capture(repo) != expected or self.has_publication_intent(repo)
                         or not revision_current or not revision_stable):

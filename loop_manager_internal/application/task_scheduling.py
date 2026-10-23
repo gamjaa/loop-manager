@@ -812,7 +812,7 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                         f"refs/remotes/origin/{child.state.base}^{{commit}}").stdout.strip(),
                     lambda revision, remember: service.effects.reconcile_execplan_catalog(
                         owned, child.state.repo_path, repo, child.state.base, remote_sha=revision,
-                        on_reconciled=remember),
+                        on_reconciled=remember, state_dir=service.identity.state_dir),
                 )
                 with scheduler.task(repo, plan_id, owned, resumed=resumed), notifications.immediate_delivery(
                         owned, scheduler.config.telegram_token, scheduler.config.telegram_chat_id, repo):

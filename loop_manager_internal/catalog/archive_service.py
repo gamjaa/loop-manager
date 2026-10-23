@@ -42,7 +42,7 @@ def dispatch_execplan_archive_housekeeping(
         if catalog_refresh is not None:
             return catalog_refresh.refresh(base_sha) == base_sha
         result = effects.reconcile_execplan_catalog(
-            connection, repo_path, repo, base_branch
+            connection, repo_path, repo, base_branch, state_dir=state_dir,
         )
         if result.kind is not execplan_catalog_state.ReconciliationKind.RECONCILED:
             return False

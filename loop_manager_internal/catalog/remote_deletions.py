@@ -1,7 +1,10 @@
 """Revision-proven cancellation and Planner-owned dependency goal recovery."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
+from pathlib import Path
+from typing import Callable
 import json
 import re
 
@@ -17,6 +20,32 @@ from loop_manager_internal.storage.planning_publication_state import _mutable_re
 class RemoteDeletion:
     snapshot: ReadyPlanSnapshot
     evidence: str
+    recheck: Callable[[], bool] | None = field(default=None, compare=False, repr=False)
+
+
+def deletion_resources_available(row, repo, repository, *, pr_for_branch=None,
+                                 validate_worktree=None, git_operations=None, state_dir=None):
+    """Reobserve external ownership without mutating worktrees or holding SQLite."""
+    from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+    from loop_manager_internal.git.manager_git_journal import has_pending_project_mutation
+    try:
+        if (row['branch'] or row['worktree']) and state_dir is None:
+            return False
+        if row['branch'] and (pr_for_branch is None or pr_for_branch(repository, str(row['branch'])) is not None):
+            return False
+        if row['worktree']:
+            if validate_worktree is None or git_operations is None:
+                return False
+            worktree = Path(str(row['worktree']))
+            validate_worktree(repository, worktree, row['branch'])
+            if controlling_git_operation(git_operations(worktree)):
+                return False
+        targets = {str(row[key]) for key in ('branch', 'worktree') if row[key]}
+        if targets and has_pending_project_mutation(Path(state_dir), repo, targets=targets):
+            return False
+    except (RuntimeError, OSError):
+        return False
+    return True
 
 
 _REQUIREMENT_PROOF_FIELDS = ("text", "revision", "deletion_revision")
@@ -392,7 +421,8 @@ def cancellation_recovery_evidence(connection, repo, repository, pinned, referen
     return result
 
 
-def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, references=None, pr_for_branch=None):
+def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, references=None,
+                    pr_for_branch=None, validate_worktree=None, git_operations=None, state_dir=None):
     """Absence alone cannot cancel a row: prove its last adopted bytes/ancestry."""
     from loop_manager_internal.storage.execplan_catalog_state import DefinitionStateRepository
     state = DefinitionStateRepository(connection).capture(repo)
@@ -412,16 +442,13 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, ref
             continue
         completed = any(row[field] is not None for field in ("worker_result", "verify_result", "review_result", "agent_result_snapshot"))
         started = bool(row["ever_started"] and completed and revisable_row(row) and row["agent_role"] is None)
-        if started and row["branch"]:
-            if pr_for_branch is None:
-                continue
-            try:
-                if pr_for_branch(repository, str(row["branch"])) is not None:
-                    continue
-            except RuntimeError:
-                continue  # 실제 PR 부재를 확인하지 못한 작업만 보류한다.
         if (key in pinned.snapshot.observed_ids or key in reserved and not started
                 or not started and mutable_row(connection, repo, key) is None):
+            continue
+        recheck = partial(deletion_resources_available, dict(row), repo, repository,
+            pr_for_branch=pr_for_branch, validate_worktree=validate_worktree,
+            git_operations=git_operations, state_dir=state_dir)
+        if not recheck():
             continue
         revision = str(row["current_revision_sha"] or row["plan_sha"] or "")
         if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
@@ -461,7 +488,7 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, ref
                                "resolved": {}, "cleanup_pending": bool(row["branch"] or row["worktree"]),
                                "cleanup_reason": "취소한 소유 자원의 작업물·PR·writer 안전 재확인 필요"},
                               ensure_ascii=False, sort_keys=True)
-        deletions.append(RemoteDeletion(original, evidence))
+        deletions.append(RemoteDeletion(original, evidence, recheck))
     return tuple(deletions)
 
 

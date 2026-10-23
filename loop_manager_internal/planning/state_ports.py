@@ -63,7 +63,7 @@ class _PlanningStatePorts:
     ) -> None:
         result = self._effects.reconcile_execplan_catalog(
             self._connection, repository, repo, base_branch,
-            remote_sha=revision,
+            remote_sha=revision, state_dir=self._state_dir,
         )
         if not result.usable:
             detail = result.diagnostic.message if result.diagnostic else result.kind.value

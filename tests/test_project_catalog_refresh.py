@@ -190,6 +190,25 @@ class CatalogPlanningConsumerTests(_CatalogRefreshCase):
 
 
 class CatalogCacheAndCasTests(_CatalogRefreshCase):
+    def test_missing_active_file_rechecks_external_deletion_boundary_at_same_revision(self):
+        self.boundary.refresh()
+        previous_sha = self.sha
+        path = self.row()['path']
+        del self.documents[path]
+        self.paths = self.paths - {path}
+        self.sha = 'c' * 40
+        original = self.pinned
+        def isolated(revision):
+            pinned = original(revision)
+            return replace(pinned, snapshot=replace(pinned.snapshot, isolation_enabled=True))
+        self.pinned = isolated
+        self.boundary.refresh()
+        before = dict(self.row())
+        self.boundary.refresh()
+        self.assertEqual(self.loads, [previous_sha, self.sha, self.sha])
+        self.assertEqual(dict(self.row()), before)
+        self.assertIsNotNone(self.row('G-002'))
+
     def test_refresh_does_not_update_another_repositorys_plan(self):
         project = dict(self.connection.execute(
             "SELECT * FROM projects WHERE repo = ?", (self.repo,)
@@ -344,6 +363,15 @@ class CatalogCacheAndCasTests(_CatalogRefreshCase):
 
 
 class CatalogArchiveConsumerTests(_CatalogRefreshCase):
+    def test_archive_does_not_replay_already_applied_deletion_receipt(self):
+        self.boundary.refresh()
+        recheck = mock.Mock(side_effect=AssertionError('applied deletion replayed'))
+        self.boundary._remember(replace(self.boundary.pinned,
+            deletions=(SimpleNamespace(recheck=recheck),)))
+        self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
+        recheck.assert_not_called()
+        self.assertTrue(self.row('G-002')['path'].startswith('docs/plans/archive/'))
+
     def test_archive_revalidation_preserves_renamed_requirement_contents(self):
         source = 'docs/requirements/[R-066] AGENTS 변경 사전 승인.md'
         renamed = 'docs/requirements/[R-066] Agent CLI 지침의 독립성.md'

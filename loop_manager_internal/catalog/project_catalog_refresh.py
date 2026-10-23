@@ -191,7 +191,12 @@ class ProjectCatalogRefresh:
 
     def refresh(self, revision: str | None = None) -> str:
         revision = revision or self.current_revision()
+        pending_deletion = (self.pinned is not None and self.pinned.regular_paths is not None
+            and any(row[0] not in self.pinned.regular_paths for row in self.repository.connection.execute(
+                "SELECT path FROM exec_plans WHERE repo=? AND status<>'MERGED'", (self.repo,),
+            )))
         if (revision == self.revision
+                and not pending_deletion
                 and self.declarations == self._declarations()
                 and self.current_revision() == revision):
             return revision
@@ -204,7 +209,7 @@ class ProjectCatalogRefresh:
         return self.revision
 
     def _remember(self, pinned: state.PinnedCatalog) -> None:
-        self.pinned = pinned
+        self.pinned = replace(pinned, deletions=())
 
     def adopt_history(self) -> None:
         """History reconciliation is a known, durable local DB transition."""

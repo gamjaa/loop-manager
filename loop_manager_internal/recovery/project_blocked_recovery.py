@@ -478,7 +478,7 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             )
             result = self.ports.reconcile_execplan_catalog(
                 self.connection, self.repo_path, self.repo, self.base,
-                record_invalid=False,
+                record_invalid=False, state_dir=self.state_dir,
             )
             return result.kind is ReconciliationKind.RECONCILED
         except (OSError, RuntimeError, ValueError, TypeError):

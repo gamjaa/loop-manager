@@ -718,3 +718,38 @@ class CancelledCheckpointTests(unittest.TestCase):
             self.cancel()
         self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')], before)
         self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+
+    def test_external_deletion_recheck_precedes_transaction_and_preserves_audit_on_race(self):
+        from loop_manager_internal.catalog import execplan_catalog, remote_deletions
+        from loop_manager_internal.storage.execplan_catalog_state import DefinitionStateRepository, PinnedCatalog
+        repository = DefinitionStateRepository(self.connection)
+        expected = repository.capture('repo')
+        safe = [False]
+        def recheck():
+            self.assertFalse(self.connection.in_transaction)
+            return safe[0]
+        deletion = remote_deletions.RemoteDeletion(self.original, '{}', recheck)
+        pinned = PinnedCatalog('revision', execplan_catalog.snapshot_from_documents({}), deletions=(deletion,))
+        self.assertIsNone(repository.apply('repo', pinned, expected, revision_is_current=lambda: True))
+        self.assertEqual(repository.capture('repo'), expected)
+        for table, receipt in self.receipts.items():
+            self.assertEqual(dict(self.connection.execute(f'SELECT * FROM {table}').fetchone()), receipt)
+        safe[0] = True
+        self.assertEqual(repository.apply('repo', pinned, expected, revision_is_current=lambda: True), ('G-047',))
+        self.assertIsNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+
+    def test_external_recheck_never_runs_inside_callers_transaction(self):
+        from unittest import mock
+        from loop_manager_internal.catalog import execplan_catalog, remote_deletions
+        from loop_manager_internal.storage.execplan_catalog_state import DefinitionStateRepository, PinnedCatalog
+        repository = DefinitionStateRepository(self.connection)
+        expected = repository.capture('repo')
+        recheck = mock.Mock(side_effect=AssertionError('external I/O under SQLite writer'))
+        pinned = PinnedCatalog('revision', execplan_catalog.snapshot_from_documents({}),
+            deletions=(remote_deletions.RemoteDeletion(self.original, '{}', recheck),))
+        self.connection.execute('BEGIN IMMEDIATE')
+        self.assertIsNone(repository.apply('repo', pinned, expected, revision_is_current=lambda: True))
+        recheck.assert_not_called()
+        self.assertTrue(self.connection.in_transaction)
+        self.assertEqual(repository.capture('repo'), expected)
+        self.connection.rollback()

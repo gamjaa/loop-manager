@@ -411,6 +411,8 @@ class ReconcileExecplanCatalogEffects:
     pr_for_branch: Callable[..., object] | None = None
     assess_cleanup: Callable[..., object] | None = None
     remove_cleanup_worktree: Callable[..., object] | None = None
+    validate_managed_worktree: Callable[..., object] | None = None
+    git_operation_entries: Callable[..., object] | None = None
 
 
 def reconcile_execplan_catalog(
@@ -422,6 +424,7 @@ def reconcile_execplan_catalog(
     record_invalid: bool = True,
     remote_sha: str | None = None,
     on_reconciled: Callable[[execplan_catalog_state.PinnedCatalog], None] | None = None,
+    state_dir: Path | None = None,
 ) -> execplan_catalog_state.CatalogReconciliationResult:
     """Converge declaration cache or persist a recoverable project diagnostic."""
 
@@ -485,6 +488,8 @@ def reconcile_execplan_catalog(
             port.loaded = replace(pinned, deletions=remote_deletions.prove_deletions(
                 connection, repo, repo_path, pinned, git=effects.git,
                 git_bytes=port._effects.git_bytes, references=references, pr_for_branch=effects.pr_for_branch,
+                validate_worktree=effects.validate_managed_worktree, git_operations=effects.git_operation_entries,
+                state_dir=state_dir,
             ))
             cancelled = {item.snapshot.plan_id for item in port.loaded.deletions}
             cancelled_paths = {item.snapshot.path for item in port.loaded.deletions}
@@ -529,6 +534,12 @@ def reconcile_execplan_catalog(
             prepared = (effects.migrate_legacy_execplans(connection, reconcile_history=True, target_repo=repo,
                 ensure_schema=False, pinned_catalog=pinned, prepare_only=True) if not missing else None)
             observed_revision = port.current_revision()
+            for deletion in pinned.deletions:
+                if deletion.recheck is not None and (connection.in_transaction or not deletion.recheck()):
+                    raise project_catalog_refresh.CatalogRefreshStopped(
+                        execplan_catalog_state.CatalogReconciliationResult(
+                            execplan_catalog_state.ReconciliationKind.STALE, revision_sha=pinned.revision_sha))
+            pinned = replace(pinned, deletions=tuple(replace(item, recheck=None) for item in pinned.deletions))
             observed_service = execplan_catalog_state.CatalogReconciliationService(repository,
                 SimpleNamespace(load=lambda: pinned, current_revision=lambda: observed_revision))
             with execplan_catalog_state._transaction(connection):
@@ -633,11 +644,12 @@ def reconcile_execution_execplan_catalog(
     repo_path: Path,
     repo: str,
     base_branch: str,
+    *, state_dir: Path | None = None,
 ) -> execplan_catalog_state.CatalogReconciliationResult:
     """Let the execution recovery gate persist its own final decision."""
 
     return effects.reconcile_execplan_catalog(
-        connection, repo_path, repo, base_branch, record_invalid=False
+        connection, repo_path, repo, base_branch, record_invalid=False, state_dir=state_dir,
     )
 
 

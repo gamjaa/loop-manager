@@ -22,6 +22,51 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_confirmed_cancellation_stops_phase_and_checkpoint_publication(self):
+        import json
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.planning.planner_validation import planning_execution_state
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
+        from loop_manager_internal.storage.runtime_state import _transaction
+        context = self.context()
+        publish_checkpoint = mock.Mock()
+        self.handler._publish_rebased_checkpoint = publish_checkpoint
+        def cancel(*_args):
+            row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-047'").fetchone()
+            original = ReadyPlanSnapshot(
+                row['plan_id'], row['path'], row['title'], tuple(json.loads(row['sources'])),
+                tuple(json.loads(row['depends_on'])), 'low', 'low', row['priority'], row['content_hash'],
+                row['current_revision_sha'] or row['plan_sha'], '---\nid: G-047\n---\nSaved plan',
+                current_complexity=row['current_complexity'], current_risk=row['current_risk'],
+                current_metadata_recorded=True, execution_state=planning_execution_state(row),
+            )
+            with _transaction(self.connection):
+                apply_mutable_catalog_changes(self.connection, self.repo, deletions=(PlanDeletion(original),),
+                    revisions=(), snapshot_token='remote', plan_commit='base', content_hash=lambda _: '', agent=False)
+            return SimpleNamespace(kind=SimpleNamespace(value='reconciled'), revision_sha='base')
+        self.effects.revision.reconcile_catalog.side_effect = cancel
+        outcome = ExecutionPhaseCoordinator(self.handler).dispatch(context)
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.STABLE_WAIT)
+        self.assertIsNone(outcome.context)
+        self.assertFalse(outcome.error)
+        publish_checkpoint.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-047'").fetchone())
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM execplan_cancellations WHERE plan_id='G-047'").fetchone())
+
+    def test_catalog_hold_stops_checkpoint_publication_before_saved_results(self):
+        publish_checkpoint = mock.Mock()
+        self.handler._publish_rebased_checkpoint = publish_checkpoint
+        self.connection.execute("INSERT INTO execplan_catalog_holds (repo,plan_id,revision_sha,evidence) "
+                                "VALUES ('repo','G-047','base','{}')")
+        self.connection.commit()
+        outcome = self.handler.guard(self.context())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.STABLE_WAIT)
+        publish_checkpoint.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+
     def test_exact_legacy_worker_token_retains_implementation_after_source_only_change(self):
         self.handler.guard(self.context())
         previous = self.handler._definition_snapshot
