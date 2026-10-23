@@ -1036,6 +1036,51 @@ class PlanningPublicationTest(PlanningCase):
             self.assertTrue(worktree.exists())
             self.assertEqual(ports.agent.run_count, 0)
 
+    def test_saved_publication_resource_race_preserves_intent_before_recovery_or_cleanup(self):
+        before = planning_snapshot(phase='PLANNING', active_sha='base', worktree='/planning',
+            planning_attempt_fingerprint='fingerprint', planning_workspace_owned=1,
+            planner_session_id='saved-session', planning_result='saved result', planning_result_completed=True)
+        ports = FakePorts(before)
+        intent = SimpleNamespace(base_sha='base', commit_sha='plan-commit', stage='prepared')
+        ports.state.general_intent = intent
+        ports.git.remote = 'plan-commit'
+        ports.state.assert_general_deletion_resources = mock.Mock(side_effect=RuntimeError('resource busy'))
+        ports.state.recover_general_batch = mock.Mock(side_effect=AssertionError('unsafe DB consumption'))
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        ports.state.assert_general_deletion_resources.assert_called_once_with(self.context.repo)
+        ports.state.recover_general_batch.assert_not_called()
+        self.assertIs(ports.state.general_intent, intent)
+        self.assertEqual(ports.state.snapshot.planning_result, before.planning_result)
+        self.assertEqual(ports.state.snapshot.planner_session_id, before.planner_session_id)
+        self.assertEqual(ports.state.clear_calls, [])
+        self.assertFalse(any(args[:2] == ('worktree', 'remove') for _, args, _ in ports.git.calls))
+        self.assertEqual(ports.agent.run_count, 0)
+
+    def test_post_push_resource_race_keeps_published_intent_without_db_apply_or_cleanup(self):
+        before = planning_snapshot(phase='PLANNING', active_sha='base', worktree='/planning',
+            planning_attempt_fingerprint='fingerprint', planning_workspace_owned=1,
+            planning_result='saved result', planning_result_completed=True,
+            planning_result_pending_validation=True)
+        ports = FakePorts(before)
+        ports.git.dirty_files = ['docs/plans/[G-001] Plan.md']
+        ports.git.advance_remote_on_push = True
+        def busy(*_args):
+            self.assertEqual(ports.git.remote, 'plan-commit')
+            raise RuntimeError('resource busy after push')
+        ports.state.assert_general_deletion_resources = mock.Mock(side_effect=busy)
+        ports.state.publish_general_batch = mock.Mock(side_effect=AssertionError('unsafe DB application'))
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        ports.state.assert_general_deletion_resources.assert_called_once()
+        ports.state.publish_general_batch.assert_not_called()
+        self.assertIsNotNone(ports.state.general_intent)
+        self.assertEqual(ports.state.snapshot.planning_result, before.planning_result)
+        self.assertEqual(ports.state.clear_calls, [])
+        commands = [args for _, args, _ in ports.git.calls]
+        self.assertEqual(sum(args[:1] == ('push',) for args in commands), 1)
+        self.assertFalse(any(args[:2] == ('worktree', 'remove') for args in commands))
+
     def test_verified_pending_general_publication_resumes_saved_result(self):
         ports = FakePorts(planning_snapshot(
             phase="PLANNING",

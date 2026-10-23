@@ -88,6 +88,7 @@ class PlanningPublicationService(PlanningService):
                     # The intent has not reached origin. Keep its candidate
                     # and session for the owned-worktree rebase boundary.
                     return None
+                self._ports.state.assert_general_deletion_resources(context.repo)
                 recovery = self._ports.state.recover_general_batch(
                     context.repo, worktree, context.base_branch
                 )
@@ -599,6 +600,8 @@ class PlanningPublicationService(PlanningService):
                 return self._operational_error()
 
         try:
+            if not run.maintenance_planning:
+                self._ports.state.assert_general_deletion_resources(context.repo, validated_result)
             if run.maintenance_planning:
                 self._ports.state.publish_maintenance_batch(
                     context.repo,

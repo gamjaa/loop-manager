@@ -407,6 +407,9 @@ class FakeStatePort:
     def general_publication(self, _repo):
         return self.general_intent
 
+    def assert_general_deletion_resources(self, _repo, result=None):
+        pass
+
     def recover_general_batch(self, *_args):
         if self.general_recovery_result != "pending":
             self.retain_planning_after_publication("/repo", self.general_intent.commit_sha)

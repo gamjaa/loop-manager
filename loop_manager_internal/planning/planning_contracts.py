@@ -409,6 +409,8 @@ class PlanningStatePort(Protocol):
         planning_fingerprint: str,
     ) -> Any: ...
 
+    def assert_general_deletion_resources(self, repo: str, result: Any = None) -> None: ...
+
     def publish_general_batch(
         self,
         repo: str,

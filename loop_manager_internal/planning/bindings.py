@@ -1,5 +1,7 @@
 """Own planning dependency wiring; no CLI import or resource effects."""
 from __future__ import annotations
+from functools import partial
+from loop_manager_internal.catalog import remote_deletions
 
 from loop_manager_internal.application.composition import Composition
 from loop_manager_internal.planning import agent_ports
@@ -310,6 +312,12 @@ def register(assembly: Composition) -> None:
             recover_maintenance_planning_batch=assembly.callback('recover_maintenance_planning_batch'),
             reconcile_execplan_catalog=assembly.callback('reconcile_execplan_catalog'),
             register_execplans=assembly.callback('register_execplans'),
+            planning_result_from_manifest=assembly.callback('_planning_result_from_manifest'),
+            pr_for_branch=assembly.callback('pr_for_branch'),
+            deletion_resources_available=partial(remote_deletions.deletion_resources_available,
+                pr_for_branch=assembly.callback('pr_for_branch'),
+                validate_worktree=assembly.callback('validate_managed_worktree'),
+                git_operations=assembly.callback('_git_operation_entries')),
         ),
     )
 

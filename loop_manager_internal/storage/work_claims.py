@@ -90,7 +90,8 @@ def manual_plan_ownership(connection, repo, plan_id, execution_row):
 def cancellation_available(connection, repo, plan_id, row):
     """Recheck durable writers, manual ownership and shared resources before removal."""
     from .task_calls import pending_for_plan
-    if row is None or row['agent_role'] or pending_for_plan(connection, repo, plan_id):
+    from .execplan_catalog_state import is_cancelled
+    if row is None or is_cancelled(connection, repo, plan_id) or row['agent_role'] or pending_for_plan(connection, repo, plan_id):
         return False
     _state, owned = manual_plan_ownership(connection, repo, plan_id, row)
     if owned:
