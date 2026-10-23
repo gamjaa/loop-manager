@@ -830,6 +830,44 @@ class CancelledCheckpointTests(unittest.TestCase):
         self.assertEqual(store.get('repo'), current)
         self.assertEqual((current.last_success_commit, current.last_cycle_commit), ('assessed', 'previous'))
 
+    def test_cancelled_document_snapshots_do_not_replay_after_repository_restart(self):
+        import json
+        from types import SimpleNamespace
+        from unittest import mock
+        from loop_manager_internal.execution import stage_documents
+        from tests.support.revision import definition
+        previous = definition()
+        item = dict(version=1, stage='prepared', base='old-base', phase='REVIEWING',
+            paths=[previous.path], document_only=True, previous=previous.serialize(),
+            assessment=dict(relevant=True, implementation='needed', plan_text=self.original.text,
+                            evidence='Saved publication candidate'), workspace='/preserved', commit='unpublished')
+        current = self.execution.get('repo', 'G-047')
+        self.execution.record('repo', 'G-047', expected_generation=current.generation, operation=None,
+            expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'document_revision': item})
+        self.connection.commit()
+        self.receipts['execution_checkpoints'] = dict(self.connection.execute('SELECT * FROM execution_checkpoints').fetchone())
+        self.assertEqual(stage_documents.pending(self.execution, 'repo', 'G-047'), item)
+        self.cancel()
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertEqual(audit['checkpoints'], self.receipts)
+        # An old runtime's orphan receipt is still historical after restart.
+        receipt = self.receipts['execution_checkpoints']
+        self.connection.execute(f"INSERT INTO execution_checkpoints ({', '.join(receipt)}) "
+            f"VALUES ({', '.join('?' for _ in receipt)})", tuple(receipt.values()))
+        self.connection.commit()
+        reopened = ExecutionCheckpointRepository(self.connection)
+        state, effects = mock.Mock(), mock.Mock()
+        state.row.side_effect = AssertionError('cancelled execution row consumed')
+        result = stage_documents.refresh(effects, state, reopened, SimpleNamespace(repo='repo'),
+            SimpleNamespace(plan=SimpleNamespace(plan_id='G-047')), previous, previous, [])
+        self.assertIsNone(result)
+        self.assertFalse(stage_documents.review_pending(reopened, 'repo', 'G-047', previous, 'unpublished'))
+        state.row.assert_not_called()
+        self.assertEqual(effects.mock_calls, [])
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM execution_checkpoints').fetchone()), receipt)
+
     def test_external_recheck_never_runs_inside_callers_transaction(self):
         from unittest import mock
         from loop_manager_internal.catalog import execplan_catalog, remote_deletions

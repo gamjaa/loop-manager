@@ -237,10 +237,10 @@ def remember_workspace_metadata(effects, state, checkpoints, identity, context, 
 def refresh(effects, state, checkpoints, identity, context, previous, definition, changed):
     """저장된 결과·게시를 복구하고 새 조건은 기존 Worker gate에 넘긴다."""
     repo, plan_id = identity.repo, context.plan.plan_id
-    row = state.row()
     item = pending(checkpoints, repo, plan_id)
     if item is None:
         return None
+    row = state.row()
     if row['pr_url'] or effects.pr_for_branch(identity.repo_path, context.branch) is not None:
         if item is not None and item['stage'] not in {'proposed', 'prepared'}:
             save(checkpoints, repo, plan_id, None)
