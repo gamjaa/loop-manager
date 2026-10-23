@@ -347,6 +347,9 @@ def run_verify_process(
     job_scope: bool = False,
     on_started: Callable[..., None] | None = None,
     execution_clock=None,
+    on_wait: Callable[[], None] | None = None,
+    on_stopped: Callable[[], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> tuple[bool, bool, str]:
     """Confirm owned descendants; None inherits an enclosing Manager deadline."""
     job = None
@@ -384,6 +387,8 @@ def run_verify_process(
                 raise
             task_calls.verify_stopped(receipt)
             stopped = True
+            if on_stopped:
+                on_stopped()
         try:
             receipt=task_calls.prepare_verify_receipt()
             process = (launch_process or subprocess.Popen)(
@@ -402,13 +407,18 @@ def run_verify_process(
                 process.stdin.write(b"start\n")
                 process.stdin.close()
             while True:
+                if on_wait:
+                    on_wait()
                 remaining = active_clock.remaining(timeout_seconds)
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError("verify actual execution timeout")
                 try:
-                    code = process.wait(timeout=remaining)
+                    code = process.wait(timeout=min(0.1, remaining) if on_wait and remaining is not None
+                                        else 0.1 if on_wait else remaining)
                     break
                 except subprocess.TimeoutExpired:
+                    if on_wait:
+                        continue
                     if (active_clock.remaining(timeout_seconds) <= 0
                             or active_clock.waiting() <= active_clock.initial_wait):
                         raise
@@ -460,7 +470,17 @@ def run_verify_process(
                 confirmed_stop()
             raise
         finally:
-            if process is not None:
-                budget.active_processes -= 1
-            if job:
-                job.close()
+            primary = sys.exc_info()[1] if on_output else None
+            try:
+                if on_output:
+                    try:
+                        on_output(_tail(output))
+                    except Exception as error:
+                        if primary is None:
+                            raise
+                        primary.add_note(f"verify output preservation failed: {error}")
+            finally:
+                if process is not None:
+                    budget.active_processes -= 1
+                if job:
+                    job.close()

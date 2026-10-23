@@ -96,6 +96,15 @@ class ExecutionClock:
         elapsed = self.elapsed()
         return None if timeout is None else max(0.0, timeout-elapsed)
 
+    def snapshot(self, timeout):
+        waiting = self.waiting() - self.initial_wait
+        wall = self.clock() - self.started
+        execution = max(0.0, wall - self.local_wait - waiting)
+        self.last_elapsed = max(self.last_elapsed, execution)
+        return {"elapsed": self.last_elapsed, "execution_seconds": execution,
+                "wall_seconds": wall, "local_wait_seconds": self.local_wait,
+                "waiting_seconds": waiting, "timeout": timeout}
+
     def close(self):
         if self.temporary is not None:
             resolved=self.temporary.resolve()

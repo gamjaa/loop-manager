@@ -96,7 +96,7 @@ def load(root, project_python=None):
             raise ContractError("verify stages are empty")
         names = set()
         for stage in stages:
-            fields(stage, ("id", "kind", "cwd"), ("argv", "collection", "execution"))
+            fields(stage, ("id", "kind", "cwd"), ("argv", "collection", "execution", "suite"))
             name = stage["id"]
             if not isinstance(name, str) or not name or name in names:
                 raise ContractError("duplicate or missing verify stage identity")
@@ -118,6 +118,12 @@ def load(root, project_python=None):
                 argv = stage["argv"]
                 if not isinstance(argv, list) or not argv or not all(isinstance(item, str) and item and "\0" not in item for item in argv):
                     raise ContractError("verify command requires a nonempty argv array")
+            elif stage["kind"] == "runner-integration":
+                fields(stage, ("id", "kind", "cwd", "suite"))
+                if (data["adapter"] != "unittest" or stage["cwd"] != "."
+                        or stage["suite"] != "loop-manager-v1" or stage is not stages[-1]
+                        or sum(item.get("kind") == "runner-integration" for item in stages) != 1):
+                    raise ContractError("invalid fixed runner integration stage")
             else:
                 raise ContractError("unsupported verify stage kind")
         if not any(stage["kind"] == "tests" for stage in stages):

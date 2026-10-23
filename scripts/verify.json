@@ -15,6 +15,12 @@
       "kind": "command",
       "cwd": ".",
       "argv": ["{python}", "{runner}", "--compile", "loop_manager.py", "loop_manager_internal"]
+    },
+    {
+      "id": "runner-integration",
+      "kind": "runner-integration",
+      "cwd": ".",
+      "suite": "loop-manager-v1"
     }
   ]
 }

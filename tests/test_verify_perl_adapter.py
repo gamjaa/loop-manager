@@ -294,10 +294,10 @@ class PerlAdapterTests(unittest.TestCase):
 
     def test_windows_keeps_portable_unit_and_python_example_checks(self):
         import runpy
+        from loop_manager_internal.verification import integration
         # Check collection policy without executing either integration scenario.
         with mock.patch.object(sys, 'platform', 'win32'):
             unit_class = runpy.run_path(str(Path(__file__)))['PerlAdapterTests']
-            integration_class = runpy.run_path(str(Path(__file__).with_name('test_verify_language_examples.py')))['LanguageExampleIntegrationTests']
         for name in ('test_native_plan_skip_todo_and_subtest_meaning',
                 'test_perl_agent_network_and_parallel_boundaries_are_blocked_before_execution',
                 'test_partial_duplicate_missing_and_identity_results_fail_closed',
@@ -308,6 +308,14 @@ class PerlAdapterTests(unittest.TestCase):
                 'test_both_examples_load_ordered_required_compile_and_tests',
                 'test_completed_plan_bailout_with_zero_exit_never_completes'):
             self.assertFalse(getattr(getattr(unit_class, name), '__unittest_skip__', False))
-        self.assertFalse(getattr(integration_class.test_python_standalone_and_manager_preserve_success_and_native_failure,
-            '__unittest_skip__', False))
-        self.assertTrue(integration_class.test_perl_standalone_and_manager_preserve_success_and_native_failure.__unittest_skip__)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(sys, 'platform', 'win32'), \
+                mock.patch.object(integration, 'TrustedRunnerPort'), \
+                mock.patch.object(integration, 'language_case', side_effect=lambda root, path, port, language, coordinated, failing, revision:
+                    {'run_id': f'{language}-{coordinated}-{failing}', 'revision': revision, 'adapter': 'unittest'}) as language, \
+                mock.patch.object(integration, 'partial_case', return_value={
+                    'partial_run': 'partial', 'full_run': 'full', 'fixture_revision': 'fixture'}) as partial:
+            result = integration.execute(Path(directory), Path(directory), mock.Mock(), mock.Mock(), 10, 'parent', 'integration', 'head')
+            self.assertEqual(language.call_count, 4)
+            self.assertTrue(all(call.args[3] == 'python' for call in language.call_args_list))
+            self.assertEqual(sum(case['status'] == 'SKIP' for case in result['cases']), 4)
+            partial.assert_called_once()

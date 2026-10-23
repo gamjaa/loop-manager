@@ -16,11 +16,12 @@ import time
 import traceback
 import uuid
 
+from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.verification.coordination import CoordinatorClient, VerifyCoordinator
-from loop_manager_internal.verification.guard import MARKER, install_guard
+from loop_manager_internal.verification.guard import MARKER, install_guard, _local
 from loop_manager_internal.verification.unittest_adapter import (worker_main, start_worker, stop_worker, failure_output, compile_project)
 from loop_manager_internal.verification.manifest import validate_report
-from loop_manager_internal.verification.contract import VERSION, ADAPTERS, ContractError, load
+from loop_manager_internal.verification.contract import VERSION, ADAPTERS, ContractError, load, fields
 from loop_manager_internal.verification import unittest_adapter, perl_adapter
 from loop_manager_internal.verification.core import execute_command
 from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
@@ -122,7 +123,25 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
     if connection is None:
         raise ContractError("scripts/verify.json is required for the common runner")
     adapter = IMPLEMENTATIONS[connection.adapter]
-    run_id = os.environ.get("LOOP_MANAGER_VERIFY_SESSION", uuid.uuid4().hex)
+    integration_stage = any(stage['kind'] == 'runner-integration' for stage in connection.stages)
+    if integration_stage:
+        from loop_manager_internal.verification.integration import _require_orchestrator
+        _require_orchestrator()
+        if os.name == 'nt' and not partial_base:
+            raise ContractError('Loop Manager full integration requires WSL; use scripts/verify.ps1')
+    observation = json.loads(os.environ["LOOP_MANAGER_VERIFY_OBSERVER"]) if "LOOP_MANAGER_VERIFY_OBSERVER" in os.environ else None
+    observer = None
+    if "LOOP_MANAGER_VERIFY_OBSERVER" in os.environ:
+        fields(observation, ("endpoint", "session", "secret"))
+        endpoint = observation["endpoint"]
+        if (not isinstance(endpoint, list) or len(endpoint) != 2 or not isinstance(endpoint[0], str)
+                or not _local(endpoint[0]) or type(endpoint[1]) is not int or not 0 < endpoint[1] < 65536
+                or any(not isinstance(observation[key], str) or not observation[key] for key in ("session", "secret"))):
+            raise ContractError("invalid standalone runner observation context")
+        if any(key in os.environ for key in ("LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SESSION", "LOOP_MANAGER_VERIFY_SECRET")):
+            raise ContractError("standalone observation and resource coordination cannot be combined")
+        observer = CoordinatorClient(observation["endpoint"], observation["session"], observation["secret"])
+    run_id = observation["session"] if observer else os.environ.get("LOOP_MANAGER_VERIFY_SESSION", uuid.uuid4().hex)
     entrypoint = Path(__file__).with_name("entrypoint.py").resolve()
     started_at = time.monotonic()
     budget = ExecutionClock()
@@ -131,7 +150,8 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
     directory.mkdir(parents=True, exist_ok=True)
     os.environ["LOOP_MANAGER_VERIFY_PROJECT_ROOT"] = str(connection.root)
     os.environ[MARKER] = "1"
-    install_guard()
+    if not integration_stage:
+        install_guard()
     parent_run_id = os.environ.get("LOOP_MANAGER_VERIFY_PARENT_RUN_ID")
     writer_identity = {"run_id": run_id}
     if parent_run_id:
@@ -142,7 +162,14 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
     partial = None
     partial_status = "ERROR"
     preserve_budget = False
+    termination_uncertain = False
     try:
+        if observer:
+            while not observer.request("observer_state", waiting=False)["ready"]:
+                remaining = budget.remaining(timeout)
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("verify observer startup timeout")
+                time.sleep(0.05)
         if "LOOP_MANAGER_VERIFY_ENDPOINT" in os.environ:
             client = CoordinatorClient(json.loads(os.environ["LOOP_MANAGER_VERIFY_ENDPOINT"]),
                                        os.environ["LOOP_MANAGER_VERIFY_SESSION"], os.environ["LOOP_MANAGER_VERIFY_SECRET"])
@@ -150,10 +177,15 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
         else:
             coordinator = VerifyCoordinator()
             session, secret = coordinator.open(cap)
-            coordinator.track_waiting(session, budget.directory)
+            coordinator.track_waiting(session, directory / "local-budget" if observer else budget.directory)
             class LocalClient:
                 def request(self, operation, **data):
-                    return coordinator.request(session, secret, operation, **data)
+                    if operation == "open_child" and coordinator.server is None:
+                        coordinator.start()
+                    reply = coordinator.request(session, secret, operation, **data)
+                    if observer:
+                        observer.request("observer_state", waiting=coordinator.sessions[session]["waiting"])
+                    return reply
             client, coordinated = LocalClient(), False
         def git_value(*arguments):
             return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=5).stdout.strip()
@@ -226,6 +258,23 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                             impact.assert_candidate(connection.root, selection.head, selection.base)
                             partial_status = "PASS" if passed else "FAIL"
                             break  # Mandatory commands remain part of the later full verify.
+                    elif stage['kind'] == 'runner-integration':
+                        from loop_manager_internal.verification import integration
+                        units = [{'id': identity, 'ids': [identity], 'execution': 'serial'} for identity in integration.case_ids()]
+                        manifest_stages.append({'id': stage['id'], 'kind': stage['kind'], 'suite': stage['suite'], 'units': units,
+                                               'result_path': f'stage-{index}/integration-result.json'})
+                        atomic_json(directory / 'manifest.json', {'version': VERSION, 'run_id': run_id,
+                            'adapter': connection.adapter, 'adapter_version': ADAPTERS[connection.adapter]['version'], 'stages': manifest_stages})
+                        result = integration.execute(connection.root, stage_directory, client, budget, timeout,
+                                                     run_id, stage['id'], metadata['revision'])
+                        saved = json.loads((stage_directory / 'integration-result.json').read_text(encoding='utf-8'))
+                        if saved != result:
+                            raise ContractError('integration result receipt mismatch')
+                        writer.emit('integration_result', result=result,
+                                    diagnostic=str(stage_directory / 'integration-result.json'))
+                        passed = integration.validate_stage(result, run_id, stage['id'], metadata['revision'])
+                        if git_value('rev-parse', 'HEAD') != metadata['revision']:
+                            raise ContractError('integration candidate revision changed')
                     else:
                         command = perl_adapter.command_argv(connection, stage["argv"]) if connection.adapter == "perl-tap" else stage["argv"]
                         argv = [{"{python}": str(connection.python), "{runner}": str(entrypoint)}.get(item, item)
@@ -242,10 +291,16 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
             remaining = budget.remaining(timeout)
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("verify total timeout")
+            if passed and not partial_base and [stage['id'] for stage in manifest_stages] != [stage['id'] for stage in connection.stages]:
+                raise ContractError('missing mandatory verify stage')
             writer.emit("run_end", version=VERSION, run_id=run_id, passed=passed, memory=process_memory(),
+                        budget=budget.snapshot(timeout),
                         bytecode_cache=bytecode_cache_changes(bytecode_before, bytecode_after))
             return 0 if passed else 1
     except BaseException as error:
+        if isinstance(error, VerifyTerminationUncertain):
+            preserve_budget = True
+            termination_uncertain = True
         if partial_base:
             partial_status = "ERROR"
         if isinstance(error, VerifyBudgetError):
@@ -255,25 +310,34 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                 shutil.copytree(error.diagnostic_directory, directory / "budget-error", symlinks=True)
         raise
     finally:
-        writer.close()
-        if partial_base:
-            atomic_json(directory / "partial-result.json", {"version": 1, "kind": "partial_verify",
-                "run_id": run_id, "status": partial_status, "selection": partial,
-                "duration": time.monotonic() - started_at,
-                "diagnostic": str(directory / "summary.json")})
-        if coordinator and session:
-            if coordinator.reservations:
-                atomic_json(directory / "uncertain-reservations.json", coordinator.reservations)
-            coordinator.finish(session, stopped=not coordinator.reservations)
-        print(diagnostic(directory), flush=True)
         try:
-            if not preserve_budget:
-                budget.close()
+            writer.close()
+            if partial_base:
+                atomic_json(directory / "partial-result.json", {"version": 1, "kind": "partial_verify",
+                    "run_id": run_id, "status": partial_status, "selection": partial,
+                    "duration": time.monotonic() - started_at,
+                    "diagnostic": str(directory / "summary.json")})
+            if coordinator and session:
+                if coordinator.reservations:
+                    atomic_json(directory / "uncertain-reservations.json", coordinator.reservations)
+                try:
+                    if observer:
+                        observer.request("observer_state", waiting=False)
+                finally:
+                    try:
+                        coordinator.finish(session, stopped=not coordinator.reservations and not termination_uncertain)
+                    finally:
+                        coordinator.close()
+            print(diagnostic(directory), flush=True)
         finally:
-            if previous_budget is None:
-                os.environ.pop(BUDGET_DIRECTORY, None)
-            else:
-                os.environ[BUDGET_DIRECTORY] = previous_budget
+            try:
+                if not preserve_budget and not isinstance(sys.exc_info()[1], VerifyTerminationUncertain):
+                    budget.close()
+            finally:
+                if previous_budget is None:
+                    os.environ.pop(BUDGET_DIRECTORY, None)
+                else:
+                    os.environ[BUDGET_DIRECTORY] = previous_budget
 
 
 def main():
@@ -326,7 +390,7 @@ def main():
     if arguments.execute or coordinated:
         # Older coordinated Managers own the outer deadline but do not transmit it.
         timeout = arguments.timeout if arguments.timeout is not None else (
-            None if coordinated else 600)
+            None if coordinated or "LOOP_MANAGER_VERIFY_OBSERVER" in os.environ else 600)
         return run(directory, cap, timeout, arguments.project_python, arguments.partial_base)
     # 단독 스크립트도 기존 전체 verify timeout과 자식 종료 확인 경계를 사용한다.
     from loop_manager_internal.execution.verify_process import run_verify_process

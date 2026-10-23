@@ -322,11 +322,34 @@ def summarize(directory: Path, *, now=None):
     git_costs, git_incomplete = [], []
     assignments, module_results, child_events, queues, selections = [], [], [], [], []
     bytecode_cache = None
+    integrations = []
+    run_id = None
+    # Child runners retain their own journals below the integration stage.
+    # Their expected native failures must never replace the parent's result.
+    root_journal = directory / "runner.jsonl"
+    if root_journal.is_file():
+        for line in root_journal.read_text(encoding="utf-8").splitlines(keepends=True):
+            if not line.endswith("\n"):
+                break
+            event = json.loads(line)
+            if event.get("kind") == "run_start":
+                run_id = event.get("run_id")
+                break
+    manifest_path = directory / 'manifest.json'
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        declared_id = manifest.get('run_id') if isinstance(manifest, dict) else None
+        if declared_id is not None:
+            if run_id is not None and run_id != declared_id:
+                raise RuntimeError('verify diagnostic run identity mismatch')
+            run_id = declared_id
     for path in sorted(directory.rglob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
             if not line.endswith("\n"):
                 break
             event = json.loads(line)
+            if run_id is not None and event.get("run_id", run_id) != run_id:
+                continue
             kind = event["kind"]
             identity = event.get("id", event.get("name", ""))
             run_key = (event.get("clock_domain", "legacy"), event.get("run_id"),
@@ -380,6 +403,8 @@ def summarize(directory: Path, *, now=None):
                 git_costs.append(event)
             elif kind == 'git_cost_incomplete':
                 git_incomplete.append(event)
+            elif kind == 'integration_result':
+                integrations.append({'result': event['result'], 'diagnostic': event['diagnostic']})
             if kind == "run_end":
                 execution_key = run_key[:3]
                 for active_key in list(active):
@@ -438,7 +463,7 @@ def summarize(directory: Path, *, now=None):
                "active": list(active.values()),
                "allocations": decisions, "git_snapshots": snapshots, "git_commands": git_costs,
                "git_commands_incomplete": git_incomplete, "fixture_results": fixtures,
-               "bytecode_cache": bytecode_cache, "result": result,
+               "bytecode_cache": bytecode_cache, "result": result, "integrations": integrations,
                "assignments": assignments, "module_results": module_results,
                "child_lifecycle": child_events, "execution_queues": queues,
                "partial_selections": selections, "partial_result": partial_result,
@@ -515,7 +540,7 @@ def comparison(directories, summaries, *, manifests=None):
             json.loads(path.read_text(encoding="utf-8")) if path.is_file() else [])
         contracts.append(None if isinstance(modules, list) else (
             modules.get("version"), modules.get("adapter"), modules.get("adapter_version"),
-            [(stage["id"], stage.get("kind"), stage.get("python"), stage.get("argv"), stage.get("cwd"),
+            [(stage["id"], stage.get("kind"), stage.get("python"), stage.get("argv"), stage.get("cwd"), stage.get('suite'),
               [(unit.get("id"), unit.get("argv"), unit.get("cwd"), unit.get("execution"),
                 unit.get("payload"), unit.get("status")) for unit in stage.get("units", [])])
              for stage in modules.get("stages", [])]))

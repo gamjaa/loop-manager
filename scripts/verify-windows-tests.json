@@ -6,6 +6,7 @@
   "tests.test_origin_isolation.OriginIsolationScopeTest.test_project_fetch_recovers_owned_ref_update_after_result_write_crash",
   "tests.test_verify_runtime",
   "tests.test_verify_contract",
+  "tests.test_verify_integration",
   "tests.test_verify_windows",
   "tests.test_verify_windows_launcher",
   "tests.test_partial_verify_runner",
