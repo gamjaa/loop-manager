@@ -187,8 +187,12 @@ def progress_observation(directory, positions, state, run_id=None):
                             allocation_reasons[context] = reason
                             if decision.get("granted"):
                                 resource_waits.pop(context, None)
-                            elif context in resource_waits:
-                                resource_waits[context]["reason"] = reason or "자원 배정 대기"
+                            else:
+                                resource_waits[context] = {
+                                    "context": context,
+                                    "stage_id": stage_id, "unit_id": unit_id,
+                                    "reason": reason or "자원 배정 대기",
+                                }
                         elif kind == "job_child_wait":
                             key = (*context, worker_id, unit_id)
                             child_waits[key] = {
@@ -222,7 +226,10 @@ def progress_observation(directory, positions, state, run_id=None):
     def scope_label(item):
         return "/".join(str(value) for value in
                         (item.get("clock_domain"), item.get("stage_id"), item.get("unit_id"))
-                        if value not in (None, "")) or "-"
+                        if value not in (None, "", "legacy")) or "-"
+    def scoped_text(item, value):
+        scope = scope_label(item)
+        return f"{scope}: {value}" if scope != "-" else str(value)
 
     tests = list(active_tests.values())
     units = list(active_units.values())
@@ -232,12 +239,12 @@ def progress_observation(directory, positions, state, run_id=None):
     first_test = tests[0] if tests else {}
     first_unit = units[0] if units else {}
     first_phase = phases[0] if phases else {}
-    wait_text = ", ".join(f"{scope_label(item)}: {item.get('reason')}" for item in waits) or "-"
+    wait_text = ", ".join(scoped_text(item, item.get("reason")) for item in waits) or "-"
     def child_label(item):
         status = item.get("status") or f"active={item.get('active_processes')}"
         return f"{scope_label(item)}: worker={item.get('worker_id')} unit={item.get('unit_id')} {status}"
     child_text = ", ".join(child_label(item) for item in child_activity) or "-"
-    phase_text = ", ".join(f"{scope_label(item)}: {item.get('phase')}" for item in phases) or "-"
+    phase_text = ", ".join(scoped_text(item, item.get("phase")) for item in phases) or "-"
     def child_status(name, phase_name):
         if result.get(name) not in (None, "NOT_RUN"):
             return result[name]
