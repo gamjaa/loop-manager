@@ -94,6 +94,7 @@ WORKER_OUTCOME 앞에 `VERIFY_INPUT_EXCLUSIONS: <JSON>` 한 줄로 제출한다.
   추가 수정을 멈추고 실패를 보고한다. 실행·수집 중단이나 기록 부재를 테스트 실패 횟수로 보고하지 않는다.
 - 실패 명령은 `FAILED_COMMAND:`, 수정 후 동일 명령은 `RERUN:` 줄로 보고하고
   재실행 결과를 그 뒤에 명시한다. 두 명령은 공백을 정규화한 뒤 정확히 같아야 한다. 성공·실패가 섞인 요약을 통과로 보고하지 않는다.
+- Loop Manager targeted 결과에서는 확인된 본문 실패·오류와 unittest `unexpected_success`를 실패로 보고한다. 성공·skip·expected failure만 실패 이력을 초기화하며, fixture-only·수집 오류와 구분 불명 결과는 누적하거나 초기화하지 않는다. JUnit 명령 종료 코드만으로 testcase 결과를 만들지 않는다.
 - 전체 verify의 실제 입력을 `scripts/verify-inputs.json` version 1 상대 경로/glob 목록으로
   스크립트와 함께 유지한다. 코드·테스트·fixture·의존성 선언·저장소 검증 스크립트/선언과
   실제로 읽는 문서·`.agents/`를 반영한다. 재사용은 저장소 코드 입력 기준이며 실행 머신의 환경·

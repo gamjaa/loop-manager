@@ -17,6 +17,7 @@ from unittest import mock
 
 _current_writer: ContextVar[EventWriter | None] = ContextVar("verify_events", default=None)
 _fixture_timing_active: ContextVar[bool] = ContextVar("fixture_timing_active", default=False)
+_test_fixture_failures: ContextVar[dict[int, tuple[str, BaseException]] | None] = ContextVar("test_fixture_failures", default=None)
 _phase_names: ContextVar[tuple[str, ...]] = ContextVar("verify_phase_names", default=())
 
 
@@ -24,6 +25,7 @@ class EventWriter:
     def __init__(self, path: Path, *, clock=time.monotonic, identity=None):
         self.path, self.clock = path, clock
         self.identity = identity or {}
+        self.active_fixtures = {}
         self.stream = path.open("a", encoding="utf-8")
 
     def emit(self, kind: str, **values):
@@ -77,7 +79,10 @@ class TimedResult(unittest.TextTestResult):
         self.started[test.id()] = self.writer.emit("test_start", id=test.id())["at"]
 
     def _outcome(self, test, outcome):
-        if self.outcomes.get(test.id()) not in {"failure", "error", "unexpected_success"}:
+        previous = self.outcomes.get(test.id())
+        if (previous not in {"failure", "error", "unexpected_success"}
+                and not (previous == "fixture_error"
+                         and outcome in {"success", "skip", "expected_failure", "fixture_error"})):
             self.outcomes[test.id()] = outcome
         if test.id() not in self.started:
             self.writer.emit("fixture_result", id=test.id(), result=outcome)
@@ -87,12 +92,39 @@ class TimedResult(unittest.TextTestResult):
         self._outcome(test, "success")
 
     def addFailure(self, test, err):
+        fixture = self._fixture_scope(test, err)
+        if fixture is not None:
+            super().addError(test, err)
+            self._record_fixture_error(test, fixture)
+            return
         super().addFailure(test, err)
-        self._outcome(test, "failure")
+        failures = _test_fixture_failures.get()
+        fixture = failures.pop(id(test), None) if failures is not None else None
+        if fixture is None:
+            self._outcome(test, "failure")
+            return
+        self.writer.emit("fixture_result", id=test.id(), result="failure", scope=fixture)
+        self._outcome(test, "fixture_error")
 
     def addError(self, test, err):
+        fixture = self._fixture_scope(test, err)
         super().addError(test, err)
-        self._outcome(test, "error")
+        if fixture is None:
+            self._outcome(test, "error")
+            return
+        self._record_fixture_error(test, fixture)
+
+    def _fixture_scope(self, test, err):
+        failures = _test_fixture_failures.get()
+        fixture = failures.get(id(test)) if failures is not None else None
+        if fixture is None or err[1] is not fixture[1]:
+            return None
+        del failures[id(test)]
+        return fixture[0]
+
+    def _record_fixture_error(self, test, fixture):
+        self.writer.emit("fixture_result", id=test.id(), result="error", scope=fixture)
+        self._outcome(test, "fixture_error")
 
     def addSkip(self, test, reason):
         super().addSkip(test, reason)
@@ -108,11 +140,18 @@ class TimedResult(unittest.TextTestResult):
 
     def addSubTest(self, test, subtest, err):
         super().addSubTest(test, subtest, err)
+        fixture = self.writer.active_fixtures.get(id(test))
         outcome = "success"
         if err is not None:
             outcome = "failure" if issubclass(err[0], test.failureException) else "error"
-            self._outcome(test, outcome)
-        self.writer.emit("subtest_result", id=test.id(), result=outcome)
+            if fixture is None:
+                self._outcome(test, outcome)
+            else:
+                self._record_fixture_error(test, fixture)
+        event = {"id": test.id(), "result": outcome}
+        if fixture is not None:
+            event["scope"] = fixture
+        self.writer.emit("subtest_result", **event)
 
     def stopTest(self, test):
         self.writer.current_test = None
@@ -136,6 +175,7 @@ def fixture_timing():
         yield
         return
     token = _fixture_timing_active.set(True)
+    fixture_failures = _test_fixture_failures.set({})
     names = ("_handleClassSetUp", "_tearDownPreviousClass", "_handleModuleFixture", "_handleModuleTearDown")
     try:
         with ExitStack() as patches:
@@ -147,6 +187,40 @@ def fixture_timing():
                 with phase(f'subtest:{test.id()}:{variants[test.id()]}'), subtest(test, *args, **kwargs):
                     yield
             patches.enter_context(mock.patch.object(unittest.TestCase, 'subTest', timed_subtest))
+            test_case_types = [unittest.TestCase]
+            isolated_async_case = getattr(unittest, "IsolatedAsyncioTestCase", None)
+            if isolated_async_case is not None:
+                test_case_types.append(isolated_async_case)
+            for case_type in test_case_types:
+                for name, scope in (("_callSetUp", "setUp"), ("_callTearDown", "tearDown")):
+                    original = getattr(case_type, name)
+
+                    def measured_test_fixture(test, *args, _original=original, _scope=scope, **kwargs):
+                        writer = _current_writer.get()
+                        active = writer.active_fixtures if writer is not None else None
+                        key = id(test)
+                        previous = active.get(key) if active is not None else None
+                        if active is not None:
+                            active[key] = _scope
+                        try:
+                            return _original(test, *args, **kwargs)
+                        except unittest.SkipTest:
+                            raise
+                        except KeyboardInterrupt:
+                            raise
+                        except BaseException as error:
+                            failures = _test_fixture_failures.get()
+                            if failures is not None:
+                                failures[id(test)] = (_scope, error)
+                            raise
+                        finally:
+                            if active is not None:
+                                if previous is None:
+                                    active.pop(key, None)
+                                else:
+                                    active[key] = previous
+
+                    patches.enter_context(mock.patch.object(case_type, name, measured_test_fixture))
             for name in names:
                 original = getattr(unittest.TestSuite, name)
 
@@ -173,6 +247,7 @@ def fixture_timing():
                 patches.enter_context(mock.patch.object(unittest.TestSuite, name, measured))
             yield
     finally:
+        _test_fixture_failures.reset(fixture_failures)
         _fixture_timing_active.reset(token)
 
 
