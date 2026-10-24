@@ -18,6 +18,7 @@ R-083의 충돌 해결 진단 ref에 한해, 원인 해소·해결 결과의 정
 ## Acceptance Criteria
 
 - 승인된 R-083 대상만 첫 안전한 실행 경계에서 정리한다. 삭제 직전 origin/게시 대상·작업/원인·정상 원격 반영·SQLite 해소·모든 ref 사용자·자료 보존과 자원 소유를 재검증한다. PR Merge를 추가 조건으로 요구하거나 다른 차단·실행 gate를 함께 해제하지 않는다.
+- `diagnostic_cleanup_preparations`의 `ready`·`basis`는 재관측할 입력이며 삭제 승인이 아니다. 현재 원인별 사용·generation·호출 예약·checkpoint·origin·자료·정상 branch 게시가 준비 시점과 달라지면 낡은 준비로 삭제하지 않는다. WAITING 해제는 같은 target의 현재 COMPLETE가 확인돼야 하고, 해소 때 남은 작업물은 정상 원격 게시가 별도로 확인돼야 한다.
 - 정확한 ref의 현재 OID가 저장된 게시 성공 OID와 같을 때만 그 값의 lease로 해당 ref를 삭제한다. 원래 작업·base·사용자·다른 작업 branch는 변경하지 않는다. 처음부터 다른 OID와 조회/삭제 사이 경쟁은 보존하며 현재 OID를 새 기대값으로 채택하지 않는다.
 - 원격 부재가 확인되면 push·재생성 없이 정리 완료로 처리한다. 조회 실패·불명확 응답은 부재가 아니며 삭제 뒤 확인 실패는 미확정으로 유지한다. 원문 자료·과거 ref/OID·게시·실패·session·감사는 삭제하지 않고 현재 ref 존재와 과거 게시 성공을 구분한다.
 - 삭제 전 intent, 삭제 성공 뒤, 부재 확인 뒤 및 SQLite 확정 전의 중단은 실제 ref·현재 안전 조건·저장 근거를 대조해 멱등 재개한다. 진행 중 보존/게시와 같은 ref를 동시에 변경하지 않는다.
@@ -27,22 +28,24 @@ R-083의 충돌 해결 진단 ref에 한해, 원인 해소·해결 결과의 정
 
 ## Implementation
 
-- [ ] 선행 작업의 ref별 근거를 소비하는 정리 handler를 위 Purpose의 범위에서 Manager의 안전한 실행 경계에 연결한다. `loop_manager_internal/recovery/project_blocked_recovery.py`, `checkpoint_service.py`, `bindings.py`의 원인별 복구/보존 경계와 PR 대기 중 관측을 재사용하며 실패를 최종 차단 handler로 전파하지 않는다.
-- [ ] `loop_manager_internal/recovery/checkpoint_adapter.py`의 등록 origin 검증·원격 응답 검사·고정 push 대상과 `loop_manager_internal/git/manager_git_journal.py`의 정확한 lease를 재사용한다. 현재 생성 전용 helper의 의미를 일반 삭제로 바꾸지 않고 진단 정리 대상 검증과 삭제 효과를 분리한다. hook·tracking ref·다른 ref 보호와 기존 자원 조율을 유지한다.
-- [ ] `loop_manager_internal/storage/blocked_checkpoint_state.py`의 게시 성공 기록과 보존 감사를 유지하면서 삭제 intent·기대 OID·관측 결과·미확정/완료·재평가 사유를 같은 기존 저장 책임에 둔다. 원격 효과와 SQLite 확정을 원자 작업으로 가정하지 않는다.
-- [ ] `loop_manager_internal/recovery/diagnostic_preservation.py`와 `project_blocked_recovery.py`의 과거 intent 재사용을 정리 결과와 대조한다. 이미 정리된 ref의 재생성을 막고 새 원인의 보존은 유지한다. 부족한 과거 근거를 보충하려고 원격 namespace를 일괄 채택하지 않는다.
-- [ ] `tests/test_project_diagnostic_publication.py`, `tests/test_diagnostic_preservation.py`와 선행 정리 판정 fixture를 확장한다. 승인 후 PRODUCT의 차단 복구와 ARCHITECTURE의 차단 진단·Repository Safety 절에 정확한 삭제 조건·보존·실패/재개를 반영한다. 새 테스트나 handler 경로가 필요하면 예정임을 구분한다.
+- [ ] 확인한 `loop_manager_internal/recovery/diagnostic_cleanup.py`의 `_snapshot`·`_observe`·`assess_ref`와 `prepare_recorded`를 재사용해 삭제 직전의 자격 재검증을 연결한다. `diagnostic_ref_uses`·`diagnostic_cause_resolutions`·게시 intent의 현재 근거를 소비하고 원인 기록·bundle 검증·준비 엔진을 다시 만들지 않는다. acceptance의 repo identity와 등록 origin은 현재 계약대로 별도로 대조하며, WAITING 후 COMPLETE·미게시 작업물·복수 사용의 보존 조건을 유지한다.
+- [ ] 확인한 `application/project_runner.py:run_project_result`와 `application/bindings.py`·`recovery/bindings.py`의 준비 callback을 출발점으로 첫 안전한 정리 경계에 삭제 handler를 연결한다. 준비 기록만 보고 삭제하거나 PR Merge까지 미루지 않으며, PR 대기에서도 같은 현재 조건을 적용한다. 대상 자원의 진행 중/종료 불명 호출·게시와 경합하면 해당 정리만 보류하고 runtime handoff에서는 새 관측·삭제를 시작하지 않는다. 외부 관측·push 동안 DB 접근을 반환하고, 짧은 적용 transaction에서 소유권·사용 generation·basis를 다시 확인한다.
+- [ ] 확인한 `recovery/checkpoint_adapter.py`의 `_validated_push_url`·`_frozen_push_target`과 `git/manager_git_journal.py`의 `parse_remote_branch_oid`·`exact_branch_lease`를 재사용한다. 저장된 게시 성공 OID를 lease로 고정한 진단 ref 삭제 효과를 추가하되 생성 전용 `push_diagnostic_checkpoint`의 의미는 유지한다. hooks·tracking ref·다른 ref 보호와 기존 자원 조율을 지킨다. 현재 journal의 일반 허용 전이를 진단 삭제 성공으로 가장하지 않고, 삭제 intent·실제 원격 부재·완료 확정을 이 정리의 저장 근거로 연결한다.
+- [ ] 확인한 `storage/blocked_checkpoint_state.py`의 기존 세 준비 테이블과 게시/보존 기록을 유지하며 삭제 intent·기대 OID·사용/basis·시도 결과·미확정/완료·재평가 사유를 호환 가능하게 저장한다. 기존 payload/감사를 덮어 정리 완료를 표현하지 않는다. 원격 효과와 SQLite 확정을 원자 작업으로 가정하지 않고, 삭제 성공 뒤 기록 실패도 실제 부재와 현재 안전 조건을 대조해 재개한다.
+- [ ] 확인한 `recovery/diagnostic_preservation.py:preserve`, `project_blocked_recovery.py`의 진단 `_publish`, `storage/blocked_checkpoint_state.py`의 보존·게시 결과 조회를 삭제 수명과 연결한다. 정리된 과거 intent/receipt는 ref 재생성이나 현재 원격 보존 성공으로 보고하지 않고 원문·과거 성공·정리 감사를 함께 유지한다. 새 충돌은 독립 원인으로 기존 보존 정책을 적용하며 부족한 과거 근거를 원격 namespace 탐색이나 추정 backfill로 보충하지 않는다.
+- [ ] 확인한 `tests/test_diagnostic_cleanup.py`·`tests/support/diagnostic.py`, `tests/test_project_diagnostic_publication.py`, `tests/test_diagnostic_preservation.py`, `tests/test_blocked_checkpoint_state.py`의 fixture와 실제 판단·저장 함수를 재사용해 아래 삭제 고유 회귀를 추가한다. 이미 있는 준비·원문 검증 assertion은 유지하고 같은 조건을 복제하지 않는다. PRODUCT의 현재 준비 전용 설명과 ARCHITECTURE의 정리 준비 근거 절을 실제 삭제·보존·실패/재개 계약으로 통합한다. 별도 테스트 파일이 필요하면 예정 경로로 명시한다.
 
 ## Validation
 
-- 실제 정책·SQLite·원문 파일과 모의 Git 관측으로 전체 안전 조건의 충족/부족, 복수 ref/원인·진행 중 게시, PR Merge 대기·다른 차단 유지, origin/사용자/자료 변경을 확인한다. 모의 결과는 실제 OS·원격 성공으로 기록하지 않는다.
-- 임시 로컬 원격을 사용하는 최소 Git 통합 사례에서 정확한 lease 삭제와 삭제 직전 경쟁의 거부를 확인한다. assertion은 ref/OID·원래/base/사용자 branch 불변·로컬 원문 복구에 연결하고 정책 조합별 Git 실행을 반복하지 않는다.
-- 삭제 전·push 후·부재 확인 후·DB 확정 전 중단, 이미 없는 ref, 삭제 후 조회 실패, 일시 오류와 반복 경쟁/권한 거부를 검사한다. 미확정 보존·다음 실행 재시도·중복 삭제/재생성/알림 없음과 독립 진행을 확인한다.
-- 부분/전체 verify 회귀는 과거 보존 intent·감사 조회, 충분/불충분한 과거 ref, 정리된 intent 재시도와 새 충돌 보존, checkpoint/rebase/PR gate다. 원격 정리 결과를 검증·Review·Merge 성공으로 사용하면 실패해야 한다.
+- Worker는 `tests/test_diagnostic_cleanup.py`의 삭제 판정·run 경계, `tests/test_project_diagnostic_publication.py:ProjectDiagnosticPublicationUnitTests`의 삭제 인자/응답 검사와 저장·과거 intent 재사용을 변경한 최소 unit case만 실행한다. 실제 정책·SQLite·원문 파일과 모의 Git 관측을 사용하며 기존 `DiagnosticCleanupTests`의 준비 조건·`ArtifactRecoveryTests`의 독립 복구 검증은 재사용한다.
+- 준비 뒤 origin·자료·원인 사용/generation·checkpoint·호출 예약이 바뀌면 삭제 push가 0회인지 확인한다. 같은 target의 WAITING→COMPLETE, 해소 때 남은 작업의 clean 게시 후속 commit, 복수 원인/ref·진행 중 게시, PR 대기·별개 차단 보존을 실제 삭제 진입과 연결한다. 원격 처리 중 다른 DB 연결의 쓰기가 가능하고 경쟁 변경 뒤 낡은 결과 적용만 거부되는지 검사한다.
+- 임시 로컬 원격의 최소 Git 통합 회귀는 Manager 검증에 둔다. 기존 `tests/support/git.py`의 seed부터 격리된 fixture를 사용해 저장 OID의 정확한 lease 삭제와 삭제 직전 경쟁 거부, 원래/base/사용자/tracking ref 불변·로컬 원문 복구를 확인한다. 기존 생성 전용 회귀만으로 증명할 수 없는 삭제 효과를 검사하며 정책 조합별 Git 실행은 반복하지 않는다.
+- 삭제 전·push 후·부재 확인 후·DB 확정 전 중단, 이미 없는 ref, 삭제 후 조회 실패, 일시 오류와 반복 경쟁/권한 거부를 검사한다. 미확정 보존·다음 정상 실행 재시도·동일 근거의 반복 push 방지·중복 재생성/알림 없음과 독립 진행을 확인한다. 정리 실패와 runtime handoff에서 기존 run 결과·다른 차단·session·작업물이 바뀌지 않아야 한다.
+- 과거 보존 intent·감사 조회, 충분/불충분한 과거 ref, 정리된 intent 재시도와 새 충돌 보존, checkpoint/rebase/PR gate를 후속 소비자까지 확인한다. 과거 게시 성공과 현재 원격 부재를 구별하고 원격 정리 결과를 검증·Review·Merge 성공으로 사용하면 실패해야 한다. 현재 unittest version 1·launcher Python·독립 tests와 필수 compile 계약을 유지하며 native 원격/OS 성공을 mock 결과로 대신하지 않는다.
 
 ## Progress
 
-현재 생성·게시와 자료 보존 코드에는 ref 삭제·확인·재개 경로가 없음을 정적으로 확인했다. 원격 경계의 사용자 판단은 아래와 같이 확인했고 구현·검증은 미완료다. 사용자 답변의 원격 게시·출처 확인과 draft 대기 해제는 기존 Manager 전환을 따른다.
+원격 base `b0ec450f821b9cf7689dfd879acc5ebf68e23cb3`에 반영된 G-276의 준비 판정·세 저장 테이블·원문 복구·run 경계와 관련 회귀를 정적으로 대조했다. 이 구현은 준비/보류만 기록하며 ref 삭제·삭제 후 확인·중단 재개·정리 후 재생성 방지는 이 작업의 잔여 범위다. 아래 사용자 판단 기록은 보존하며 이번 Planner는 구현·테스트·verify를 실행하지 않았다.
 
 - [x] 2026-10-16 사용자 요청 “277은 권장 방향으로 적용해주고”에 따라 선택지 A 승인을 위 User Decision에 기록했다.
 - [ ] 승인 범위의 삭제·재개·보존 재사용 교정
@@ -50,6 +53,7 @@ R-083의 충돌 해결 진단 ref에 한해, 원인 해소·해결 결과의 정
 
 ## Decision Log
 
+- G-276의 `ready`·`basis`와 두 번의 외부 관측은 준비 근거이며, 실제 삭제 직전의 현재성·자원 소유·정확한 lease를 대신하지 않는다. 이번 개정은 그 구현을 소비하도록 Implementation·Validation을 구체화하며 기존 ID·경로·sources·G-276 dependency·분류·priority와 사용자 판단 기록을 보존한다. 준비 기능이나 launcher fixture 교정을 소급 계획하지 않고 실제 삭제의 미충족 범위만 유지한다.
 - 질문 해소 검토: 제공된 verified 사용자 변경 `d7a199007b8f7959611d5f7e7fbe7a070f24f5f1`의 새 Answer는 R-083의 대상·원인별 사용 종료·정상 원격 반영·로컬 복구·등록 origin/소유권·저장 OID lease·중단 재개를 모두 선택한다. PR Merge 대기 제외와 불확실한 대상 보존도 명시해 기존 질문 전체를 해소한다. 이를 위 Purpose와 Implementation에 통합했고 실제 ref 삭제·검증은 미완료로 유지한다. 최신 Architecture Change Policy도 이 승인 범위를 반복 승인 대상으로 만들지 않는다. Draft Decision·User Decision·draft 표시는 Manager의 출처·현재 입력·게시 검증을 위해 원문 그대로 남긴다.
 - R-083의 목표를 원격 삭제 없이 완료로 처리하지 않는다. 원인/자료 준비와 실제 삭제를 나누어 독립 작업은 진행한다. 2026-10-16의 사용자 요청으로 선택지 A가 승인됐으며, 문서의 draft 표시와 저장된 대기는 사용자 출처·질문 해소를 검증하는 기존 Manager 전환에서 정리한다. 이 승인으로 구현·검증 성공이나 다른 범위의 승인을 만들지 않는다.
 - complexity high: ref 사용·원인 해소·실제 게시의 최신 근거를 삭제 직전 경쟁 및 Git/SQLite 사이 중단에 결합하고 과거 intent 재생 방지까지 지켜야 한다.
