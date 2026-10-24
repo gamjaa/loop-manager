@@ -63,6 +63,11 @@ class WorkerPromptFocusTests(TestCase):
                  result, raw, 'request', revision))
             connection.commit()
         stage('verify', 'PASS', 'PRIVATE VERIFY PASS LOG', '1')
+        connection.execute(
+            "INSERT INTO manual_work_requests (request_id,repo,group_id,source_head,base_sha,"
+            "input_token,skip_verify,skip_review,reason,created_at) "
+            "VALUES ('request','repo','group','head','base','token',0,1,?, 'now')",
+            ('user requested omission',))
         stage('review', 'SKIPPED_BY_USER', 'skip; user requested omission', '2')
         feedback = ValidationFeedbackRepository(connection)
         with mock.patch.object(manual, 'enabled', return_value=True), mock.patch.object(manual, 'group', return_value=group):
@@ -72,7 +77,8 @@ class WorkerPromptFocusTests(TestCase):
             self.assertIn('first G', text)
             self.assertIn('second G', text)
             self.assertIn('SKIPPED_BY_USER', text)
-            self.assertIn('user requested omission', text)
+            self.assertIn('제공 사유: user requested omission', text)
+            self.assertNotIn('skip; user requested omission', text)
             self.assertIn('외부 targeted test 결과는 확인되지 않았으며', text)
             self.assertNotIn('PRIVATE VERIFY PASS LOG', text)
             feedback.delivered(first.attempt_id, 'session')
