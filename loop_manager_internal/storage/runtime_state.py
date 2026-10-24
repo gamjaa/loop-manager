@@ -1151,7 +1151,10 @@ class RuntimeStateRepository:
                                    'prior_artifacts': {key: expected_plan[key] for key in (
                                       'worker_result', 'verify_result', 'review_result', 'last_error')}}]})
             scoped_blocking.clear_revalidated_rebase_block(
-                self.connection, block, is_plan_block=is_plan_block)
+                self.connection, block, is_plan_block=is_plan_block,
+                acceptance=decision.acceptance if decision.status is RebaseStatus.COMPLETE else None,
+                pending_work=bool(observed.files), pending_target=(
+                    current_checkpoint.target_base_oid if decision.status is RebaseStatus.WAITING else None))
             self._fault('after_rebase_block_release')
             recovery_state.RecoveryRepository(self.connection).resolve_rebase_block(
                 repo, plan_id, block)

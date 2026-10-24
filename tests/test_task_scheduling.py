@@ -1367,7 +1367,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             expected_head='original', target_base_oid='new-base', observed_remote_oid='remote', snapshot={})
         original = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
         sibling = runtime.get('A', 'G-002')
-        observed = SimpleNamespace(fingerprint='owned-original-head')
+        observed = SimpleNamespace(fingerprint='owned-original-head', files={})
         decision = RebaseDecision(RebaseStatus.START, 'owned_original_head_before_rebase')
         block = scoped_blocking.plan_block(self.connection, 'A', 'G-001')
         with fast_mode_scope(self.config), recovering_plan(self.connection, self.directory, 'A', 'G-001') as available:

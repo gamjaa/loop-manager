@@ -1105,6 +1105,20 @@ rebase나 사용자 입력으로 후보 HEAD가 바뀌면 후보에 결합된 ve
 
 진단 ref 생성·checkpoint commit·push·SQLite 확정 사이의 중단은 저장 intent와 실제 OID를 대조해 복구한다. 같은 입력·결과의 rebase·게시·검사·알림을 반복하지 않으며 알림에는 확인된 ref·OID 또는 실제 local-only 이유와 보존 경로를 포함한다.
 
+#### 진단 ref의 정리 준비 근거
+
+`diagnostic_cleanup`은 프로젝트 실행 종료의 안전한 경계에서 저장된 ref만 관측하고 준비·보류 기록을 갱신한다. 원격 namespace 탐색·push·ref 삭제·원인 해제·알림은 수행하지 않는다. 준비 실패는 원래 실행 결과를 유지하며 runtime handoff에서는 준비를 수행하지 않는다. 실제 원격 삭제는 후속 경계에서 별도 구현한다.
+
+원본은 기존 `diagnostic_preservations`·`blocked_diagnostic_publications`의 intent/결과와 `diagnostic_ref_uses`의 원인별 사용이다. 사용 identity는 repo·scope(`plan`/`project`/`planning`)·owner·ref·cause identity·input identity·등록 origin에 결합하고 원래 branch·tree/commit OID, 게시 대기·확정과 변경 generation을 보존한다. 같은 내용의 ref를 새 원인에서 재사용해도 이전 사용을 덮어쓰지 않는다. origin이 바뀌거나 과거 성공 receipt를 반복 조회해도 미확정 사용의 게시 성공을 추정하지 않는다. 실제 충돌은 원문 manifest에 보존된 unmerged index stage 1/2/3으로 확인하며 원인 code만으로 추정하지 않는다. target·원인 연결이 부족한 과거 intent는 보존한다.
+
+`diagnostic_cause_resolutions`는 원인 해제 transaction에 정확한 원인 snapshot·scope/작업·origin·branch/worktree와 현재 `COMPLETE` acceptance의 해결 HEAD·target·generation·identity를 보존한다. `WAITING` 상태에서 Worker 재개를 위해 해제하면 acceptance 대신 원래 pending target을 남기며, 준비 시 같은 target의 현재 `COMPLETE`를 별도로 확인해야 한다. acceptance의 `repo`와 `remote.repository`는 등록 프로젝트의 로컬 저장소 경로 identity이며 등록 origin과 별도로 대조한다. origin은 해제 시 프로젝트 기록과 게시 사용 기록에 결합하고, 과거 checkpoint의 origin도 해당 게시 사용 기록에서 읽는다. 일반 차단 삭제·활성 row 부재는 해소 증거로 승격하지 않는다. project 원인의 기존 두 identity 형식은 같은 원인 snapshot에서 각각 연결한다. 과거 checkpoint도 정확한 현재 generation의 acceptance와 마지막 해제 감사가 원인을 함께 증명할 때만 소비하며 서로 다른 이력 항목을 추정해 연결하지 않는다.
+
+정상 branch 게시가 해소 확정의 앞이나 뒤에 일어나도 `publication_remote_oid`와 해결 HEAD가 현재 정상 원격 branch에 포함되는지 확인한다. 해소 때 미커밋 작업이 남았거나 과거 기록으로 당시의 clean 상태를 증명할 수 없으면 현재 작업물이 clean이고 HEAD가 저장된 게시 HEAD이며 해소 HEAD 이후의 commit임을 추가로 확인한다. 미게시 작업물을 이전 원격 HEAD의 성공으로 대신하지 않는다. PR Merge·다른 원인의 해제는 이 증명을 대신하거나 지연시키지 않는다.
+
+원문 증명은 기존 `diagnostic-artifacts/<input identity>` bundle에서만 얻는다. 일반 파일의 bytes와 version 1 manifest의 scope·owner·원래 branch·revisions·파일별 index stage/작업 파일·부재·모드를 읽고 blob SHA-256, diff/manifest 완전성과 저장된 orphan tree/commit OID를 대조한다. 모드는 `100644`·`100755`·`120000`이며 원래 symlink의 target bytes도 일반 blob으로 읽고 link를 따라가지 않는다. SHA-1/SHA-256의 고정 orphan 형식을 bytes로 재구성하므로 원격 ref·작업 공간·Git 객체 DB 없이도 복구 근거를 검사한다. 누락·손상·불완전 manifest·지원하지 않는 형식·bundle 내부/부모 symlink·identity 불일치는 해당 준비를 보류한다.
+
+`diagnostic_cleanup_preparations`의 ref별 `basis`는 현재 프로젝트·작업 소유권·원인·사용 generation·진행 중 호출 예약·checkpoint·intent/보존 자료·해소 기록 snapshot의 SHA-256이다. payload에는 boolean `ready`, 보류 `reason`, 저장된 게시 OID인 `expected_oid`와 원격·정상 branch 포함 관계·자료 digest 관측을 남긴다. 판정은 부작용과 분리하며 외부 관측을 두 번 대조하고 짧은 쓰기 transaction에서 snapshot이 같을 때만 기록한다. 준비 기록은 삭제 승인·완료나 영구 자격이 아니다. 후속 삭제자는 현재 basis·모든 사용·origin·원격 OID·자료를 재확인해야 하며 이전 준비 기록만 소비할 수 없다. 기존 원문·session·실패·게시 intent·확정 감사는 유지한다.
+
 #### rebase 차단과 과거 오탐 복구
 
 저장된 `managed_worktree_conflict`와 계획에 연결된 rebase 완료·소유권 오탐은 같은 현재 상태 서비스로 재평가한다. 특정 구형 오류 문구, 과거 Worker 세션·교정 turn·stage 승인·receipt·journal 완전성이나 입력 변경 지문 부재만으로 복구를 거부하지 않는다. 저장 원인을 해당 계획의 rebase intent와 연결할 수 없으면 차단을 유지한다
