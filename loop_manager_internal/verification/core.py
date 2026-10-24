@@ -198,9 +198,10 @@ def execute_manifest(modules, directory, writer, client, *, spawn, validate_repo
                                     if previous_result_at is not None else None))
                     idle.assign(module, directory / f"module-{len(modules) - len(pending) - 1}.json", directory)
                     progressed = True
-                    # Collect an immediately available result before reserving more
-                    # workers, without weakening the descendant/Job checks above.
-                    if idle.report.is_file():
+                    # Re-scan every worker before another reservation. A different
+                    # worker may have completed while this assignment was starting.
+                    if any(worker.module is not None and worker.report.is_file()
+                           for worker in workers):
                         break
                 else:
                     rejected = True

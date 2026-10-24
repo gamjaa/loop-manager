@@ -1192,7 +1192,7 @@ Manager progress reader는 현재 run의 완성된 줄만 한 번 소비하며 `
 
 ### 실행량·예약·시간 큐
 
-core는 완료 report와 기존 자식/Windows Job 종료 조건을 먼저 확인하고, 매 acquire의 cap·공정성·미반영 CPU/메모리 예약 판단이 허용하는 pending 모듈을 연속 배정한다. 즉시 report가 나타나면 수집으로 돌아가며, 진행이 없거나 acquire가 거절되고 즉시 수집할 report도 없으면 50ms bounded 대기한다. 시작 실패의 미시작 확인, PID bind, idle 전환과 실제 종료 뒤 release 경계는 유지한다.
+core는 완료 report와 기존 자식/Windows Job 종료 조건을 먼저 확인하고, 매 acquire의 cap·공정성·미반영 CPU/메모리 예약 판단이 허용하는 pending 모듈을 연속 배정한다. 각 배정 뒤 전체 worker의 즉시 report를 다시 확인하고 수집 가능한 결과가 있으면 다음 acquire 전에 수집한다. 진행이 없거나 acquire가 거절되고 즉시 수집할 report가 없으면 50ms bounded 대기한다. report가 있어도 살아 있는 자식의 종료 확인을 생략하지 않는다. 시작 실패의 미시작 확인, PID bind, idle 전환과 실제 종료 뒤 release 경계는 유지한다.
 
 결과 파일을 처음 관측한 시각, Job의 active child 대기·종료 확인, report 검증 후 module result, 같은 worker의 다음 unit 배정 시각을 JSONL로 연결한다. Job 대기 이벤트는 Windows Job의 active process 수가 worker만 남을 때까지 기다리는 구간을 나타낸다. coordinator의 `resource_wait`와 `worker_shutdown:<worker>` phase는 별도다. Job 상태 조회 오류는 종료 미확인 이벤트로 보존하고 idle·예약 회수 조건을 바꾸지 않는다. 다음 `unit_start`는 `worker_id`와 직전 unit을 포함해 결과 확인부터 재배정까지의 실제 경과와 allocation snapshot을 대조하게 한다.
 
