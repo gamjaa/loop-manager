@@ -8,6 +8,7 @@ from loop_manager_internal.recovery import blocked_agent_service
 from loop_manager_internal.recovery import blocked_plan_service
 from loop_manager_internal.recovery import checkpoint_service
 from loop_manager_internal.recovery import diagnostic_preservation
+from loop_manager_internal.recovery import diagnostic_cleanup
 from loop_manager_internal.recovery import pr_ownership
 from loop_manager_internal.recovery import project_block_service
 from loop_manager_internal.recovery import recovery_adapter
@@ -15,6 +16,14 @@ from loop_manager_internal.recovery import waiting_pr_service
 
 
 def register(assembly: Composition) -> None:
+    assembly.bind('prepare_diagnostic_cleanup', diagnostic_cleanup.prepare_recorded,
+        lambda: diagnostic_cleanup.CleanupEffects(
+            git=assembly.callback('git'),
+            capture_git_snapshot=assembly.callback('capture_git_snapshot'),
+            validate_execplan_workspace_identity=assembly.callback('validate_execplan_workspace_identity'),
+            validate_managed_worktree=assembly.callback('validate_managed_worktree'),
+            adapter_factory=assembly.callback('_BlockedCheckpointAdapter'),
+            current_rebase_service=assembly.callback('_current_rebase_service')))
     assembly.bind('_pull_request_recovery_effects_reconcile_existing_pull_request', recovery_adapter._pull_request_recovery_effects_reconcile_existing_pull_request,
         lambda: recovery_adapter.PullRequestRecoveryEffectsReconcileExistingPullRequestEffects(
             remote_integration_effects=assembly.callback('_checkpoint_recovery_effects_reconcile_published_blocked_checkpoint'),

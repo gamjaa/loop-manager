@@ -85,6 +85,16 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         generation INTEGER NOT NULL DEFAULT 1,
         PRIMARY KEY (repo, scope, owner, ref, cause_identity, input_identity, origin)
     )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS diagnostic_cause_resolutions (
+        repo TEXT NOT NULL, scope TEXT NOT NULL, owner TEXT NOT NULL,
+        cause_identity TEXT NOT NULL, origin TEXT NOT NULL,
+        original_branch TEXT NOT NULL, worktree TEXT NOT NULL, payload TEXT NOT NULL,
+        PRIMARY KEY (repo, scope, owner, cause_identity)
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS diagnostic_cleanup_preparations (
+        repo TEXT NOT NULL, ref TEXT NOT NULL, basis TEXT NOT NULL,
+        payload TEXT NOT NULL, PRIMARY KEY (repo, ref)
+    )""")
     columns = {row[1] for row in connection.execute("PRAGMA table_info(blocked_checkpoints)")}
     for name in (
         "published_oid", "accepted_remote_oid", "pending_remote_oid",
@@ -615,6 +625,34 @@ class BlockedCheckpointRepository:
             # Reserving the event key now would hide a later published result.
             if not retryable:
                 notifications.enqueue_current_project_events(self.connection, request.repo)
+
+
+def record_diagnostic_cause_resolution(connection, block, acceptance, *, pending_work=False, pending_target=None):
+    """Seal an exact completed cause or owned pending admission at release."""
+    from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
+    from loop_manager_internal.recovery.scoped_blocking import project_cause_identity
+
+    complete = valid_acceptance(acceptance)
+    if not complete and not (isinstance(pending_target, str) and pending_target):
+        return  # Generic block removal is not a resolution or owned admission.
+    repo, owner = block['repo'], block['plan_id']
+    plan = connection.execute('SELECT branch, worktree FROM exec_plans WHERE repo=? AND plan_id=?',
+                              (repo, owner)).fetchone()
+    project = connection.execute('SELECT origin FROM projects WHERE repo=?', (repo,)).fetchone()
+    if (plan is None or project is None or not project['origin']
+            or not plan['branch'] or not plan['worktree']
+            or complete and (acceptance['repo'], acceptance['plan_id'], acceptance['branch'], acceptance['worktree'],
+                acceptance['remote']['repository']) !=
+               (repo, owner, plan['branch'], plan['worktree'], project['origin'])):
+        return
+    identities = {hashlib.sha256(json.dumps(dict(block), sort_keys=True).encode()).hexdigest()}
+    if block['scope'] == 'project':
+        identities.add(project_cause_identity(block))
+    payload = json.dumps(dict(cause=dict(block), acceptance=acceptance if complete else None,
+                              pending_work=bool(pending_work), pending_target=pending_target), sort_keys=True)
+    for identity in identities:
+        connection.execute('INSERT OR IGNORE INTO diagnostic_cause_resolutions VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (repo, block['scope'], owner, identity, project['origin'], plan['branch'], plan['worktree'], payload))
 
 
 class DiagnosticPublicationRepository:

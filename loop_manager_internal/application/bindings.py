@@ -86,6 +86,7 @@ def register(assembly: Composition) -> None:
         lambda: project_runner.RunProjectResultEffects(
             _blocked_recovery_subjects=assembly.callback('_blocked_recovery_subjects'),
             _run_project_result=assembly.callback('_run_project_result'),
+            prepare_diagnostic_cleanup=assembly.callback('prepare_diagnostic_cleanup'),
         ),
     )
 

@@ -366,12 +366,17 @@ def clear_plan_block(connection: sqlite3.Connection, repo: str, plan_id: str) ->
     )
 
 
-def clear_revalidated_rebase_block(connection, expected, *, is_plan_block):
+def clear_revalidated_rebase_block(connection, expected, *, is_plan_block, acceptance=None,
+                                   pending_work=False, pending_target=None):
     """Release the selected cause only; the caller owns the transaction."""
     current = (plan_block(connection, expected['repo'], expected['plan_id'])
                if is_plan_block else project_block(connection, expected['repo']))
     if current is None or dict(current) != dict(expected):
         raise runtime_state.RuntimeStateError('rebase block changed during revalidation')
+    if acceptance is not None or pending_target is not None:
+        from loop_manager_internal.storage.blocked_checkpoint_state import record_diagnostic_cause_resolution
+        record_diagnostic_cause_resolution(connection, expected, acceptance,
+            pending_work=pending_work, pending_target=pending_target)
     if is_plan_block:
         clear_plan_block(connection, expected['repo'], expected['plan_id'])
     else:

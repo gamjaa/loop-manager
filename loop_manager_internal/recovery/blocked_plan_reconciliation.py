@@ -617,7 +617,7 @@ class BlockedPlanReconciler:
         checkpoints = ExecutionCheckpointRepository(self.connection)
         expected_checkpoint = checkpoints.get(self.repo, plan['plan_id'])
         self._check_owner(plan['plan_id'], context)
-        self._candidate_unchanged(plan, context)
+        acceptance = self._candidate_unchanged(plan, context)
         from loop_manager_internal.recovery.plan_recovery import recovery_admission
         with recovery_admission(self.connection, self.repo, plan['plan_id']), runtime_state._transaction(self.connection):
             self._check_owner(plan['plan_id'], context)
@@ -629,7 +629,8 @@ class BlockedPlanReconciler:
                 project_values={'phase': 'WORKING', 'last_error': values['last_error']},
                 expected_status='PLAN_BLOCKED', enqueue=False)
             scoped_blocking.clear_revalidated_rebase_block(
-                self.connection, context['block'], is_plan_block=True)
+                self.connection, context['block'], is_plan_block=True,
+                acceptance=acceptance, pending_work=context.get('cleanup_pending_work', True))
             runtime.hydrate_snapshot(self.repo, resumed)
             self._save(plan['plan_id'], context['input_identity'], 'complete', context)
 
@@ -637,12 +638,14 @@ class BlockedPlanReconciler:
         self._remote(context, allow_published=True)
         if self.ports._worktree_state_signature(Path(plan['worktree'])) != context['candidate']:
             raise RuntimeError('차단 원인 검사 뒤 후보 HEAD·index·작업물이 변경됐습니다.')
-        _, decision = self.ports._current_rebase_service(
+        observed, decision = self.ports._current_rebase_service(
             self.connection, self.repo_path, self.state_dir, self.repo, plan['plan_id'],
             Path(plan['worktree']), plan['branch'], target=context['base_oid'],
         ).require_owned(checkpoint=ExecutionCheckpointRepository(self.connection).get(self.repo, plan['plan_id']))
         if decision.status.value != 'complete':
             raise RuntimeError('차단 후보가 현재 소유 범위·target base·clean index 조건을 충족하지 않습니다.')
+        context['cleanup_pending_work'] = bool(observed.files) if decision.acceptance else True
+        return decision.acceptance
 
     def reconcile(self, plan_id, *, local_verify_recheck=False):
         plan = self._plan(plan_id)

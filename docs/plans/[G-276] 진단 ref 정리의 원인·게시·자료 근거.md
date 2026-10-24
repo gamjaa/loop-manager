@@ -25,11 +25,11 @@ priority: normal
 
 ## Implementation
 
-- [ ] `loop_manager_internal/storage/blocked_checkpoint_state.py`의 `diagnostic_preservations`, `blocked_diagnostic_publications`, `project_checkpoint_results`를 재사용해 ref별 게시 identity와 복수 원인·진행 중 사용 관계를 보존한다. 정리 준비·보류 근거는 호환 가능한 저장 변경으로 추가하고 기존 intent/감사를 초기화하지 않는다.
-- [x] `loop_manager_internal/recovery/diagnostic_preservation.py`의 원문 bundle·manifest·내용 identity를 읽어 로컬 복구 가능성을 검증한다. 과거 진단 방식에 같은 증명이 없으면 보존하며 기존 생성·비밀값 제외·private index 정책은 유지한다.
-- [ ] `loop_manager_internal/recovery/project_blocked_recovery.py`, `checkpoint_service.py`, `scoped_blocking.py`와 `loop_manager_internal/git/publication_service.py`의 실제 정상 branch 게시·원인 해소 경계를 조사해 근거를 연결한다. 원인 해소와 원격 반영의 순서가 모두 충족된 후에만 후보를 준비하며 현재 ACTIVE row가 없다는 사실을 해소 증거로 쓰지 않는다.
-- [ ] 후보 판정은 부작용과 분리된 책임으로 만들고 현재 저장·관측 helper를 재사용한다. 별도 모듈이 필요하면 `loop_manager_internal/recovery/diagnostic_cleanup.py`는 예정 경로다. 최종 삭제자가 현재 근거를 다시 확인할 수 있는 입력을 제공한다.
-- [ ] `tests/test_diagnostic_preservation.py`, `tests/test_project_diagnostic_publication.py`, `tests/test_scoped_blocking.py`의 fixture를 재사용한다. 정리 판정 전용 `tests/test_diagnostic_cleanup.py`는 예정 파일이며 원인·게시·자료의 조합은 모의 Git 관측과 실제 SQLite/파일로 검사한다. PRODUCT·ARCHITECTURE에는 구현된 준비·보존 책임과 실제 삭제 미구현 상태를 구분해 반영한다.
+- [x] `blocked_checkpoint_state`의 기존 보존·게시 intent/결과를 유지하며 `diagnostic_ref_uses`, `diagnostic_cause_resolutions`, `diagnostic_cleanup_preparations`를 호환 가능하게 추가했다. ref별 복수 원인·origin·확정 OID·진행 중 사용과 준비 basis를 보존한다.
+- [x] `diagnostic_preservation.load_verified_artifacts`가 로컬 bundle의 원문·모드·diff·manifest와 고정 orphan tree/commit을 독립적으로 검증한다. 자료 부족·손상·symlink·identity 불일치는 보존 사유이며 기존 생성·비밀값 제외·private index 정책을 유지한다.
+- [x] 원인 해제 transaction에서 현재 COMPLETE 또는 소유된 WAITING admission을 정확한 원인에 연결했다. WAITING은 원래 target의 실제 COMPLETE가 추가로 필요하다. 정상 branch 게시 경계의 기존 `publication_remote_oid`와 해결 HEAD의 원격 포함 관계를 소비하며 게시·해소의 순서나 ACTIVE row 부재에 의존하지 않는다.
+- [x] `diagnostic_cleanup.assess_ref`의 순수 판정과 관측/저장을 분리했다. 실행 종료 경계에서 저장 ref별로 두 번 관측하고 DB snapshot이 유지될 때만 준비·보류를 저장한다. 후속 삭제자는 basis·현재 사용·원격·자료를 다시 확인해야 한다.
+- [x] 기존 원문·복구 fixture를 재사용해 `tests/test_diagnostic_cleanup.py`와 관련 targeted unit을 검증했다. PRODUCT·ARCHITECTURE에 준비 책임·입력 계약·보존 조건과 실제 삭제의 후속 범위를 기록했다.
 
 ## Validation
 
@@ -40,25 +40,46 @@ priority: normal
 
 ## Progress
 
-기존 진단 보존·게시 transaction에 `diagnostic_ref_uses`를 연결했다. scope·작업·ref·원인·입력·등록 origin별 사용과 원래 branch·tree/commit OID를 유지하고 게시 대기·확정 및 generation을 기록한다. 같은 ref의 새 원인은 기존 intent·확정 기록과 별도로 보존한다. origin이 바뀌면 별도 사용으로 남기며 과거 성공 receipt의 반복 조회나 다른 origin의 cached 성공을 미확정 사용의 게시 증거로 승격하지 않는다. 기존 원문·게시 intent·최신 결과·알림 경계는 유지한다.
+구현 완료 후보이며 전체 verify·Reviewer 검증은 Manager에 인계한다. 저장된 게시 identity·모든 원인 사용·현재 소유권·원인 해소·정상 branch 게시·독립 로컬 자료를 ref별로 결합했다. 원격 삭제·push·원인 해제·새 알림은 준비 판정에 추가하지 않았다. 일반 차단 삭제, 캐시된 성공, 미게시 작업물, 불충분한 과거 기록을 자격으로 승격하지 않는다.
 
-`load_verified_artifacts`는 기존 로컬 bundle의 일반 파일만 읽고 원문 bytes·모드·index stage·diff·manifest와 저장된 원인 설명·scope·작업·branch·base·ref를 대조한다. SHA-1/SHA-256 orphan tree·commit을 bytes로 재구성해 저장 OID와 비교하므로 원격 ref·worktree·일시적 Git 객체 없이도 자료 동일성을 검사한다. 불완전 manifest, 자료 누락·손상·추가, 잘못된 모드·blob identity, 파일/디렉터리 symlink와 읽기 중 변경은 보존 사유로 거부한다. 기존 bundle 재사용에도 같은 일반 파일 읽기를 적용한다. 이 함수의 성공은 로컬 자료 증명이며 정리 자격이나 원인 해소를 뜻하지 않는다.
+원인 해제는 기존 상태 transaction에 기록한다. 실제 COMPLETE와 WAITING 후 재개를 구분하고 후자는 같은 target의 현재 COMPLETE를 요구한다. 해소 때 미커밋 작업이 남았으면 clean·저장된 게시 HEAD·해소 HEAD 이후 commit을 추가 확인한다. 원래 generation의 acceptance와 마지막 해제 감사가 함께 남은 과거 기록도 소비하며 추정 연결은 하지 않는다. 여러 원인·ref와 실행 중/종료 불명 예약을 각각 확인하고, 관측 또는 DB generation 변경은 준비를 확정하지 않는다. 기존 원문·session·실패·intent·게시 확정과 무관한 차단은 유지한다.
 
-관리 rebase 수용 후 이번 호출에서 현재 HEAD `000ad57c1049438bf7c985bfcd4038e7c15d9b41` 대비 전체 diff와 최신 sources를 다시 확인하고 프로젝트 Python `python3`과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 targeted unit을 새로 실행했다.
+현재 복구점 `d4e63c53dde36b44ac65e70d1997262b4f4af42a`에서 이어 구현했으며 base `000ad57c1049438bf7c985bfcd4038e7c15d9b41` 대비 전체 변경과 새 파일을 확인했다. 프로젝트 Python `python3`과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 구현 세션에서 다음 최소 unit 범위를 실제 실행했다. 결과 형식 교정 호출에서는 원인에 관련된 cleanup module과 plan publication race class만 다시 실행해 각각 25개·18개 통과를 확인했다.
 
-- `--unittest tests.test_blocked_checkpoint_state.BlockedCheckpointRepositoryTest`: 14개 통과. 복수 원인·ref, origin 변경, schema 보존, 손상 intent 거부와 결과/사용/알림 rollback을 검사했다.
-- `--unittest tests.test_diagnostic_preservation.PreservationTests`: 14개 통과. 동일 ref 재사용, 과거 receipt 반복 조회, origin 왕복 변경 뒤 cached 성공 거부, 중단·재시도의 사용 generation과 기존 보존 회귀를 검사했다.
-- `--unittest tests.test_diagnostic_preservation.ArtifactRecoveryTests`: 9개 통과. 실제 SQLite·파일로 복구·손상·symlink·관측 경쟁을 검사했다. 직렬화 계약의 독립 확인에 필요한 한 native unit에서만 격리된 임시 저장소의 실제 Git으로 SHA-1/SHA-256 orphan OID·부모 부재·HEAD/index 불변을 확인하고 객체 DB 제거 뒤 bundle 복구를 검사했다. 원격·게시·정책 조합은 실제 Git으로 반복하지 않았다.
-- 전체 verify는 Worker에서 실행하지 않았다. 이번 checkpoint는 구현 완료·전체 검증 완료 후보가 아니다.
+| `--unittest` 대상 | 결과 |
+|---|---|
+| `tests.test_diagnostic_cleanup` | 25개 통과: 복수 원인/ref·준비/보류·순서·과거 기록·진행 중 사용·관측 경쟁·쓰기 후 rollback/재시작·실제 composition 연결·실행 결과 불변·runtime handoff |
+| `tests.test_diagnostic_preservation.ArtifactRecoveryTests` | 9개 통과: 독립 원문/모드/diff 복구와 손상·symlink·identity, SHA-1/SHA-256 native orphan 계약 |
+| `tests.test_diagnostic_preservation.PreservationTests` | 14개 통과: 생성/재사용·비밀 경로 정책·cached origin·중단/재시도 |
+| `tests.test_blocked_checkpoint_state.BlockedCheckpointRepositoryTest` | 14개 통과: 원인별 게시·schema·intent·알림 transaction |
+| `tests.test_plan_block_revalidation.PlanCheckpointPublicationRaceTests` | 18개 통과: 현재 원인 해제·순서·게시/소유권 경쟁 |
+| `tests.test_project_block_revalidation.ProjectCauseRevalidationTests` | 11개 통과: 연결된 project 원인과 독립 상태 보존 |
+| `tests.test_scope_block_revalidation.EvidenceFreeRebaseBlockTests` | 29개 통과: COMPLETE/WAITING 복구·차단 해제·generation/transaction 경계 |
 
-남은 구현은 원인 해소의 영속 확정과 정상 작업 branch 원격 게시의 연결, 모든 사용자·진행 중 보존/게시 및 관측 경쟁을 확인하는 정리 준비/보류 판정이다. `diagnostic_ref_uses`와 로컬 bundle 증명만으로 정리 자격을 인정하지 않으며 원격 ref 변경·삭제는 추가하지 않았다. PRODUCT·ARCHITECTURE의 준비 책임 반영은 이 판정 구현과 함께 진행한다.
+정책 조합은 mock Git·실제 SQLite/파일을 사용했다. 기존 artifact native unit 한 곳만 Git 직렬화 형식·부모 부재·HEAD/index 불변과 객체 DB 제거 후 복구를 확인한다. 테스트 삭제·skip·assertion 약화는 하지 않았으며 기존 상태 전용 복구 mock에는 새 선택적 acceptance 부재를 `None`으로 명시했다.
 
-- [ ] 정리 준비 근거와 후보 판정
-- [ ] 관련 targeted unit 검증과 문서 정합성
+초기 새 테스트는 fixture의 plan path/원격 identity 누락으로 본문 실행 전 오류가 났다. fixture 교정 뒤 원격 parser가 placeholder OID를 거부한 본문 실패는 유효 OID fixture로 수정했다. 기존 plan 회귀의 두 단계 실패는 COMPLETE 상태만 제공하던 공통/개별 mock에 `acceptance=None`을 추가해 수정했다. 두 명령 모두 동일 명령 재실행에서 위 표의 통과를 확인했고 미해결 실패는 없다.
+
+Manager의 미해결 targeted 판정은 최종 보고에 `FAILED_COMMAND`·`RERUN`만 있고 그 사이 실제 이전 결과가 누락돼 발생했다. 이전 실행 기록에서 본문에 실패했던 15개 ID가 모두 후속 성공했음을 대조했다. 검사 기준이나 제품 코드는 바꾸지 않고 명령 사이에 이전 결과를 명시하고 재실행 결과를 별도 줄에 두었다. 제출할 최종 응답 그대로 현재 `parse_worker_result`를 호출해 publication 계약이 수용됨도 확인했다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_diagnostic_cleanup
+이전 본문 결과: FAILED (failures=6).
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_diagnostic_cleanup
+현재 교정 호출 결과: OK (25 tests).
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_plan_block_revalidation.PlanCheckpointPublicationRaceTests
+이전 마지막 결과: FAILED (errors=1).
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_plan_block_revalidation.PlanCheckpointPublicationRaceTests
+현재 교정 호출 결과: OK (18 tests).
+
+전체 verify·전체 suite·lint/build/type check는 Worker에서 실행하지 않았다. `scripts/verify-inputs.json`의 기존 `loop_manager_internal/**`·`tests/**` glob이 새 코드/테스트를 포함하며 목록 밖 경로의 exclusion identity는 선언하지 않았다. 실제 원격 삭제는 이 작업의 구현 대상이 아니며 후속 사용자 판단 경계를 유지한다.
+
+- [x] 정리 준비 근거와 후보 판정
+- [x] 관련 targeted unit 검증과 문서 정합성
 
 ## Decision Log
 
 - 정리 준비는 원격 삭제 경계 승인과 독립적으로 Merge할 수 있다. 기존 보존 기록을 소비하되 원인 연결이 부족한 과거 ref를 추정해서 정리하지 않는다. R-083의 실제 삭제는 후속 작업과 별도 사용자 판단에 남긴다.
-- complexity high: 같은 ref의 복수 원인·게시 수명, 정상 branch의 해결 결과와 원인 해소 확정, 부모 없는 원문의 복구 증명을 중단·경쟁에도 연결할 판단이 남아 있다.
+- complexity high: 같은 ref의 복수 원인·게시 수명, 정상 branch의 해결 결과와 원인 해소 확정, 부모 없는 원문의 복구 증명을 중단·경쟁에도 연결해야 해 원인 감사와 현재 관측을 분리했다.
 - risk medium: 잘못된 기록은 정리를 누락하거나 부정확한 후보를 후속 삭제자에게 전달할 수 있다. 이 단계는 원격을 변경하지 않으며 기존 원문/감사를 보존하고 후속 삭제 직전 재검증을 요구해 기록 재관측으로 복구한다.
 - priority normal: R-083의 필수 준비 작업이다. 기존 충돌 복구·보존·진행을 막는 선행 gate나 새로운 관리 CLI를 추가하지 않는다.

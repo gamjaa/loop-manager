@@ -398,18 +398,20 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
         self._remote(context, allow_published=True)
         if self.ports._worktree_state_signature(Path(plan['worktree'])) != context['candidate']:
             raise InputChanged('project 복구 후보 HEAD·index·작업물이 변경됐습니다.')
-        _, decision = self.ports._current_rebase_service(
+        observed, decision = self.ports._current_rebase_service(
             self.connection, self.repo_path, self.state_dir, self.repo, plan['plan_id'],
             Path(plan['worktree']), plan['branch'], target=context['base_oid'],
             remote_oid=self._remote(context, allow_published=True),
         ).require_owned(checkpoint=ExecutionCheckpointRepository(self.connection).get(self.repo, plan['plan_id']))
         if decision.status.value != 'complete':
             raise RuntimeError('project 복구 후보의 현재 rebase 상태가 완료되지 않았습니다.')
+        context['cleanup_pending_work'] = bool(observed.files) if decision.acceptance else True
+        return decision.acceptance
 
     def _revalidate_project_cause(self, plan, context):
         with runtime_state._transaction(self.connection):
             self._check_owner(plan['plan_id'], context)
-            self._candidate_unchanged(plan, context)
+            acceptance = self._candidate_unchanged(plan, context)
             reason = context['project_block']['reason_code']
             proven_publication = False
             if reason == scoped_blocking.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value and not context['diagnostic']:
@@ -423,7 +425,8 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                                           and self._lineage_known(self._plan(plan['plan_id']), context))
             if proven_publication or reason == scoped_blocking.BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value:
                 scoped_blocking.clear_revalidated_rebase_block(
-                    self.connection, context['project_block'], is_plan_block=False)
+                    self.connection, context['project_block'], is_plan_block=False,
+                    acceptance=acceptance, pending_work=context.get('cleanup_pending_work', True))
             elif plan['agent_snapshot']:
                 self.ports.resume_project_block_if_safe(self.connection, self.repo_path, self.state_dir, self.repo)
             released = scoped_blocking.project_block(self.connection, self.repo) is None

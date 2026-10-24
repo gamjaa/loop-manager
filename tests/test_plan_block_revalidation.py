@@ -1334,7 +1334,7 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
         self.connection.commit()
         status = SimpleNamespace(value='ready_to_start')
         self.ports._current_rebase_service.return_value.require_owned.return_value = (
-            SimpleNamespace(head=self.head), SimpleNamespace(status=status))
+            SimpleNamespace(head=self.head), SimpleNamespace(status=status, acceptance=None))
         def start(*args, **kwargs):
             status.value = 'complete'
             return SimpleNamespace(returncode=0, stdout='rebased')

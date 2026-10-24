@@ -43,6 +43,15 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
         self.assertIsNone(self.connection.execute('SELECT accepted_remote_oid FROM blocked_checkpoints').fetchone()[0])
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM blocked_diagnostic_publications').fetchone()[0], 1)
         self.assertEqual(self.connection.execute('SELECT confirmed_oid FROM blocked_diagnostic_publications').fetchone()[0], 'b' * 40)
+        uses = self.connection.execute(
+            'SELECT * FROM diagnostic_ref_uses ORDER BY cause_identity').fetchall()
+        self.assertEqual({row['cause_identity'] for row in uses}, {cause, current_cause})
+        by_cause = {row['cause_identity']: row for row in uses}
+        self.assertIsNone(by_cause[cause]['confirmed_oid'])
+        self.assertEqual(by_cause[cause]['publication_pending'], 1)
+        self.assertEqual(by_cause[current_cause]['confirmed_oid'], 'b' * 40)
+        self.assertEqual(by_cause[current_cause]['publication_pending'], 0)
+        self.assertEqual(by_cause[current_cause]['generation'], 2)
         with self.assertRaises(RuntimeError):
             repository.result('repo', 'G-034', current_cause, {**payload, 'commit_oid': 'd' * 40}, intent=reused)
 
@@ -59,6 +68,57 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
                                        base_oid='a' * 40), intent=intent)
         self.assertIsNone(self.connection.execute('SELECT confirmed_oid FROM blocked_diagnostic_publications').fetchone()[0])
         self.assertIsNone(self.connection.execute('SELECT * FROM project_checkpoint_results').fetchone())
+        use = self.connection.execute('SELECT * FROM diagnostic_ref_uses').fetchone()
+        self.assertIsNone(use['confirmed_oid'])
+        self.assertEqual((use['publication_pending'], use['generation']), (1, 1))
+
+    def test_diagnostic_uses_keep_each_ref_and_registered_origin(self):
+        request = self.request()
+        self.diagnostic_cause()
+        repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        self.connection.execute("UPDATE projects SET origin='owner/first'")
+        first = repository.intent(request, base_oid='a' * 40, head_oid='b' * 40,
+                                  tree_oid='c' * 40, cause='failure')
+        repository.intent(request, base_oid='a' * 40, head_oid='d' * 40,
+                          tree_oid='e' * 40, cause='failure')
+        self.connection.execute("UPDATE projects SET origin='owner/second'")
+        cause = scoped_blocking.project_cause_identity(scoped_blocking.project_block(self.connection, 'repo'))
+        repository.result('repo', 'G-034', cause,
+            dict(result='published', diagnostic=True, branch=first['ref'], commit_oid='b' * 40,
+                 original_branch=request.branch, base_oid='a' * 40), intent=first)
+        uses = self.connection.execute('SELECT * FROM diagnostic_ref_uses').fetchall()
+        self.assertEqual(len(uses), 3)
+        self.assertEqual({row['origin'] for row in uses}, {'owner/first', 'owner/second'})
+        self.assertEqual(len({row['ref'] for row in uses}), 2)
+        self.assertTrue(all(row['confirmed_oid'] is None for row in uses))
+
+    def test_existing_diagnostic_intents_are_not_inferred_as_cause_uses(self):
+        request = self.request()
+        self.diagnostic_cause()
+        repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        intent = repository.intent(request, base_oid='a' * 40, head_oid='b' * 40,
+                                   tree_oid='c' * 40, cause='failure')
+        self.connection.execute('DROP TABLE diagnostic_ref_uses')
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM diagnostic_ref_uses').fetchone()[0], 0)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM blocked_diagnostic_publications').fetchone()),
+                         dict(intent))
+
+    def test_invalid_saved_intent_cannot_register_another_cause_use(self):
+        request = self.request()
+        self.diagnostic_cause()
+        repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        repository.intent(request, base_oid='a' * 40, head_oid='b' * 40,
+                          tree_oid='c' * 40, cause='failure')
+        original = dict(self.connection.execute('SELECT * FROM diagnostic_ref_uses').fetchone())
+        self.connection.execute("UPDATE blocked_diagnostic_publications SET tree_oid='corrupt'")
+        self.connection.execute("UPDATE project_blocks SET evidence='another cause'")
+        self.connection.commit()
+        with self.assertRaisesRegex(RuntimeError, 'identity'):
+            repository.intent(request, base_oid='a' * 40, head_oid='b' * 40,
+                              tree_oid='c' * 40, cause='another cause')
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM diagnostic_ref_uses')],
+                         [original])
 
     def test_diagnostic_result_rejects_stale_cause_and_missing_intent_row(self):
         request = self.request()

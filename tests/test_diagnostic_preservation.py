@@ -381,7 +381,7 @@ class PreservationEngineTests(unittest.TestCase):
         self.assertNotIn('private-body', detail)
 
 
-class ArtifactRecoveryTests(unittest.TestCase):
+class ArtifactRecoveryFixture:
     def setUp(self):
         self.connection = runtime_connection()
         self.addCleanup(self.connection.close)
@@ -430,6 +430,7 @@ class ArtifactRecoveryTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
 
+class ArtifactRecoveryTests(ArtifactRecoveryFixture, unittest.TestCase):
     def test_orphan_bytes_modes_diff_and_manifest_recover_without_git(self):
         assets, manifest = preservation.load_verified_artifacts(self.state, self.saved)
         self.assertEqual(assets, self.assets)

@@ -63,7 +63,7 @@ class BlockedRemoteFixture:
         self.ports._update_blocked_error.side_effect = loop_manager._update_blocked_error
         self.ports._evaluate_remote_checkpoint_cause.return_value = (False, 'same failure', 'verify')
         self.ports._current_rebase_service.return_value.require_owned.return_value = (
-            SimpleNamespace(head=self.head), SimpleNamespace(status=SimpleNamespace(value='complete')))
+            SimpleNamespace(head=self.head), SimpleNamespace(status=SimpleNamespace(value='complete'), acceptance=None))
         self.ports.observe_blocked_plan_remotes.side_effect = self.observe
         self.ref_probe = mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(
             blocked_remote_observation.RefObservation('present', self.base),
