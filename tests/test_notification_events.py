@@ -1008,8 +1008,8 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             snippet.write_text('value = "base"\n', encoding='utf-8')
             branches = repo_path / 'branches.py'
             branches.write_text(
-                'def choose(flag):\n    if flag:\n        return 0\n'
-                '    else:\n        return 0\n', encoding='utf-8',
+                'def f():\n    before()\n    value = 0\n    after()\n\n'
+                'def g():\n    before()\n    value = 0\n    after()\n', encoding='utf-8',
             )
             latin = repo_path / 'latin.py'
             latin.write_bytes(b'value = "base"\n')
@@ -1090,14 +1090,14 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             )
             self.assertNotEqual(one_space_indent[1], two_space_indent[1])
             if_branch, if_branch_head = candidate_with_content(
-                'candidate-if-branch', 'branches.py',
-                'def choose(flag):\n    if flag:\n        return 1\n'
-                '    else:\n        return 0\n',
+                'candidate-first-function', 'branches.py',
+                'def f():\n    before()\n    value = 1\n    after()\n\n'
+                'def g():\n    before()\n    value = 0\n    after()\n',
             )
             else_branch, else_branch_head = candidate_with_content(
-                'candidate-else-branch', 'branches.py',
-                'def choose(flag):\n    if flag:\n        return 0\n'
-                '    else:\n        return 1\n',
+                'candidate-second-function', 'branches.py',
+                'def f():\n    before()\n    value = 0\n    after()\n\n'
+                'def g():\n    before()\n    value = 1\n    after()\n',
             )
             self.assertNotEqual(if_branch[1], else_branch[1])
             latin_one, latin_one_head = candidate_with_content(
@@ -1163,8 +1163,8 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(sent.call_count, 3)
 
             for branch, proof, head in (
-                ('if branch', if_branch, if_branch_head),
-                ('else branch', else_branch, else_branch_head),
+                ('first repeated context', if_branch, if_branch_head),
+                ('second repeated context', else_branch, else_branch_head),
                 ('Latin-1 byte one', latin_one, latin_one_head),
                 ('Latin-1 byte two', latin_two, latin_two_head),
             ):

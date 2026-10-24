@@ -237,16 +237,48 @@ class ReviewHandler:
             )
             if not isinstance(diff, bytes):
                 raise TypeError('raw Git diff did not return bytes')
-            # Rebase changes object IDs, numeric offsets, and Git's guessed
-            # section label. Keep adjacent context as the location anchor.
-            stable_diff = re.sub(
-                rb'^index [0-9a-f]+\.\.[0-9a-f]+', b'index', diff,
-                flags=re.MULTILINE,
+            # Full context supplies the old file without parsing Git's quoted paths.
+            # Anchor repeated contexts by occurrence, never by absolute line number.
+            full_diff = self.ports.git_bytes(
+                context.worktree, 'diff', '--binary', '--unified=2147483647',
+                '--no-ext-diff', '--no-textconv', base, candidate_head,
             )
-            stable_diff = re.sub(
-                rb'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*$',
-                b'@@', stable_diff, flags=re.MULTILINE,
-            )
+            old_files = {}
+            old_lines = None
+            in_hunk = False
+            for line in full_diff.split(b'\n'):
+                if line.startswith(b'diff --git '):
+                    old_lines = old_files.setdefault(line, [])
+                    in_hunk = False
+                elif line.startswith(b'@@ '):
+                    in_hunk = True
+                elif in_hunk and line[:1] in (b' ', b'-'):
+                    old_lines.append(line[1:])
+
+            old_lines = []
+            def location(match):
+                start = int(match[1])
+                count = int(match[2] or b'1')
+                offset = start - 1 if count else start
+                anchor = old_lines[offset:offset + count]
+                # ponytail: linear anchor scan per hunk; index anchors if large patches need it.
+                occurrence = sum(
+                    old_lines[index:index + count] == anchor
+                    for index in range(offset)
+                )
+                return b'@@ occurrence=' + str(occurrence).encode('ascii')
+
+            stable_lines = []
+            for line in diff.split(b'\n'):
+                if line.startswith(b'diff --git '):
+                    old_lines = old_files[line]
+                line = re.sub(rb'^index [0-9a-f]+\.\.[0-9a-f]+', b'index', line)
+                line = re.sub(
+                    rb'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@.*$',
+                    location, line,
+                )
+                stable_lines.append(line)
+            stable_diff = b'\n'.join(stable_lines)
             change_identity = hashlib.sha256(stable_diff).hexdigest()
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             events.emit(
