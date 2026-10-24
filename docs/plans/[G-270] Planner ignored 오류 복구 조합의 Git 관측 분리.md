@@ -26,9 +26,9 @@ priority: normal
 
 ## Implementation
 
-- [ ] 확인한 `tests/support/planning_case.py`·`scope.py`와 파일 SQLite 준비로 원문·snapshot·현재 대상 및 관측 응답을 구성한다. `planning/agent_ports.py`의 현재 `recover_ignored_scope_error()`와 `planning/selection_service.py`의 gate를 실제로 실행하고 Git 관측·workspace 확인 입력만 좁은 double로 제공한다.
-- [ ] 현재 14개 조건의 해소/유지 결과와 완료 marker 불변을 그대로 검사한다. 전환 전후 assertion을 대응시키고 예상 밖 subprocess를 거부하며 운영 복구 정책·runner·cache를 변경하지 않는다.
-- [ ] 같은 모듈의 결과 범위 오류·원격 입력 전진·게시 보존 회귀와 실제 Git 효과의 대응을 남긴다. 정책 조합을 전체 planning 실행으로 반복하지 않고 G-278의 실제 실행 자리 보완과 분리한다.
+- [x] `tests/support/planning_case.py`·`scope.py`의 fixture와 파일 SQLite 재개를 사용해 원문·snapshot·현재 대상 및 관측 응답을 구성한다. `planning/agent_ports.py`의 현재 `recover_ignored_scope_error()`와 `planning/selection_service.py`의 gate를 실제로 실행하고 Git 관측·workspace 확인 입력만 좁은 double로 제공한다.
+- [x] 현재 14개 조건의 해소/유지 결과와 완료 marker 불변을 그대로 검사한다. 전환 전후 assertion을 대응시키고 예상 밖 subprocess를 거부하며 운영 복구 정책·runner·cache를 변경하지 않는다. 첫 번째·확인 관측 실패와 파일 SQLite의 경쟁 입력에서도 오류·보존 상태를 검사한다.
+- [x] 같은 모듈의 결과 범위 오류·원격 입력 전진·게시 보존 회귀와 실제 Git 효과의 대응을 유지한다. 정책 조합을 전체 planning 실행으로 반복하지 않고 G-278의 실제 실행 자리 보완과 분리한다.
 
 ## Validation
 
@@ -40,7 +40,7 @@ priority: normal
 
 - [x] 2026-10-13 기준 `20e6f0fbfdb6ceb5384d42c83f3904490b441356`의 해당 테스트와 오류 gate·support를 정적으로 대조했다. 현재 조합은 저장소 생성·commit·detach·snapshot 수집 후 다시 snapshot을 mock한다.
 - [x] 코드·테스트가 같은 저장 verify `64fd60600657b242f833a1b1355aaab0`에서 해당 조합은 PASS이며 Git 316 호출을 기록했다. 전체는 3,631 success·5 skip 및 compile PASS다. 실행하지 않은 새 검증이나 비용 감소를 기록하지 않는다.
-- [ ] 정책 조합 전환·assertion 대응과 최소 targeted unit 검증
+- [x] 정책 조합 전환·assertion 대응과 최소 targeted unit 검증: 14개 기존 조합, 첫 관측·확인 관측 실패, SQLite 경쟁을 Git subprocess 없이 실행해 PASS
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
