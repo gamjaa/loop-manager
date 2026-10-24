@@ -182,6 +182,32 @@ class TieredAssessmentTest(PlanningCase):
         self.assertEqual(self.ports.tiered.repository.evidence("/repo", 1, self.sha)["receipts"], [])
         self.ports.agent.run_planner.assert_not_called()
 
+    def test_fast_with_current_root_evidence_has_no_model_call_or_receipt(self):
+        from dataclasses import asdict
+        from loop_manager_internal.maintenance.maintenance_file_inventory import RootPlacement, TrackedSource
+
+        root = {"path": "docs", "category": "documentation"}
+        placement = {**root, "reason": "Tracked documentation root"}
+        source = asdict(TrackedSource(".", "d" * 64, "040000", self.sha, "root review source"))
+        selection = replace(self.ports.tiered.select.return_value, required=True, mode="fast",
+            reasons=("same_input",), paths=(), roots=(root,), base="main", root_source=source,
+            root_placements=(placement,), root_reviews=(root,))
+        self.ports.agent.run_planner = mock.Mock(side_effect=AssertionError("fast must not call a model"))
+        with mock.patch.object(self.ports.tiered, "select", return_value=selection), \
+                mock.patch.object(tiered_review, "root_placement_inventory",
+                                  return_value=(RootPlacement(**placement),)), \
+                mock.patch.object(maintenance_file_ledger, "root_review_source",
+                                  return_value=TrackedSource(**source)), \
+                mock.patch.object(maintenance_file_ledger, "validate_root_reviews", return_value=(root,)):
+            outcome, context = tiered_assessment.prepare_turn(self.ports, self.run, self.run.planning_worktree)
+            evidence = self.ports.tiered.repository.evidence("/repo", 1, self.sha)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(context, "no_model_needed")
+        self.assertEqual(evidence["receipts"], [])
+        self.assertEqual(evidence["root_reviews"], [root])
+        self.ports.agent.run_planner.assert_not_called()
+
     def test_resumed_legacy_fast_root_scope_becomes_targeted_and_keeps_session(self):
         from dataclasses import asdict
         from loop_manager_internal.agents import common_guidance
@@ -197,13 +223,13 @@ class TieredAssessmentTest(PlanningCase):
         legacy = {"version": 1, "analysis_version": code_index.VERSION, "mode": "fast",
             "reasons": list(selection.reasons), "records": selection.index.records,
             "roots": list(selection.roots), "paths": list(selection.paths), "merged_count": 0,
-            "request_id": None, "source_revision": self.sha, "cycle": 0, "cycle_id": None,
+            "request_id": None, "source_revision": self.sha, "cycle": 1, "cycle_id": None,
             "review_mode": "fast", "base": "main", "root_source": root_source,
             "root_placements": placements, "root_reviews": None, "root_classifications": [],
             "guidance_hash": guidance, "root_guidance_hash": guidance}
         legacy["digest"] = tiered_review.digest(legacy)
         self.connection.execute("INSERT INTO tiered_maintenance_assessments VALUES (?, ?, ?, ?, ?)",
-            ("/repo", 0, self.sha, legacy["digest"], code_index.encode(legacy)))
+            ("/repo", 1, self.sha, legacy["digest"], code_index.encode(legacy)))
         old_unit = tiered_review._root_review_unit(legacy)
         self.connection.execute("INSERT INTO tiered_maintenance_units (repo, digest, session_id) VALUES (?, ?, ?)",
             ("/repo", old_unit["digest"], "saved-root-session"))
@@ -215,9 +241,99 @@ class TieredAssessmentTest(PlanningCase):
         self.assertEqual(assessment["paths"], [])
         self.assertIsNotNone(pending)
         self.assertEqual(pending["kind"], "root_placement")
-        self.assertEqual(pending["session_id"], "saved-root-session", [tuple(row) for row in
-            self.connection.execute("SELECT digest, session_id FROM tiered_maintenance_units")])
+        self.assertEqual(pending["session_id"], "saved-root-session")
         self.assertEqual(len(self.ports.tiered.repository.units(assessment)), 1)
+
+    def test_reclassified_fast_assessment_rebinds_validated_root_result_atomically(self):
+        from dataclasses import asdict
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.maintenance.maintenance_file_inventory import TrackedSource
+
+        root = {"path": "docs", "category": "documentation"}
+        root_source = asdict(TrackedSource(".", "d" * 64, "040000", self.sha, "root review source"))
+        placements = [{**root, "reason": "Tracked documentation root"}]
+        selection = replace(self.ports.tiered.select.return_value, mode="fast",
+            reasons=("known_incremental_change",), paths=tuple(self.contents), roots=(root,), base="main",
+            root_source=root_source, root_placements=tuple(placements), root_reviews=None)
+        guidance = "same-guidance"
+        legacy = {"version": 1, "analysis_version": code_index.VERSION, "mode": "fast",
+            "reasons": list(selection.reasons), "records": selection.index.records, "roots": [root],
+            "paths": list(selection.paths), "merged_count": 0, "request_id": None,
+            "source_revision": self.sha, "cycle": 1, "cycle_id": None, "review_mode": "fast",
+            "base": "main", "root_source": root_source, "root_placements": placements,
+            "root_reviews": None, "root_classifications": [], "guidance_hash": guidance,
+            "root_guidance_hash": guidance}
+        legacy["digest"] = tiered_review.digest(legacy)
+        self.connection.execute("INSERT INTO tiered_maintenance_assessments VALUES (?, ?, ?, ?, ?)",
+            ("/repo", 1, self.sha, legacy["digest"], code_index.encode(legacy)))
+        old_unit = tiered_review._root_review_unit(legacy)
+        result = {"root_reviews": [root]}
+        output = "saved validated root output"
+        self.connection.execute("INSERT INTO tiered_maintenance_units (repo, digest, result_json) VALUES (?, ?, ?)",
+            ("/repo", old_unit["digest"], code_index.encode(result)))
+        self.connection.execute("INSERT INTO tiered_maintenance_result_audit VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("/repo", old_unit["digest"], tiered_review.ROOT_RESULT_PROTOCOL, self.sha,
+             code_index.encode(old_unit), output, code_index.encode(result)))
+
+        def parse_in_transaction(*_args, **_kwargs):
+            self.assertTrue(self.connection.in_transaction)
+            return result
+
+        with mock.patch.object(common_guidance, "effective_planning_hash", return_value=guidance), \
+                mock.patch.object(tiered_review, "parse_root_review_result", side_effect=parse_in_transaction) as parse:
+            assessment = self.ports.tiered.prepare(self.run, selection)
+            pending = self.ports.tiered.repository.pending("/repo", assessment)
+
+        new_unit = tiered_review._root_review_unit(assessment)
+        self.assertEqual(assessment["mode"], "targeted")
+        self.assertEqual(assessment["paths"], [])
+        self.assertIsNone(pending)
+        self.assertEqual(parse.call_count, 1)
+        stored = self.connection.execute(
+            "SELECT result_json FROM tiered_maintenance_units WHERE repo = ? AND digest = ?",
+            ("/repo", new_unit["digest"])).fetchone()
+        self.assertIsNotNone(stored)
+        self.assertEqual(json.loads(stored[0]), result)
+        rebound_audit = self.connection.execute(
+            "SELECT protocol, source_revision, scope_json, normalized_result FROM tiered_maintenance_result_audit "
+            "WHERE repo = ? AND digest = ?", ("/repo", new_unit["digest"])).fetchone()
+        self.assertEqual((rebound_audit[0], rebound_audit[1], json.loads(rebound_audit[2]),
+                          json.loads(rebound_audit[3])),
+                         (tiered_review.ROOT_RESULT_PROTOCOL, self.sha, new_unit, result))
+        self.assertEqual(self.connection.execute(
+            "SELECT count(*) FROM tiered_maintenance_result_audit WHERE repo = ? AND protocol = ?",
+            ("/repo", tiered_review.ROOT_RESULT_PROTOCOL)).fetchone()[0], 2)
+        self.assertFalse(self.connection.in_transaction)
+
+    def test_resumed_fast_assessment_adopts_current_root_evidence_without_a_unit(self):
+        from dataclasses import asdict
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.maintenance.maintenance_file_inventory import TrackedSource
+
+        root = {"path": "docs", "category": "documentation"}
+        root_source = asdict(TrackedSource(".", "d" * 64, "040000", self.sha, "root review source"))
+        placements = [{**root, "reason": "Tracked documentation root"}]
+        guidance = "current-guidance"
+        selection = replace(self.ports.tiered.select.return_value, required=True, mode="fast",
+            reasons=("same_input",), paths=(), roots=(root,), base="main", root_source=root_source,
+            root_placements=tuple(placements), root_reviews=(root,))
+        legacy = {"version": 1, "analysis_version": code_index.VERSION, "mode": "fast",
+            "reasons": ["same_input"], "records": selection.index.records, "roots": [root], "paths": [],
+            "merged_count": 0, "request_id": None, "source_revision": self.sha, "cycle": 1,
+            "cycle_id": None, "review_mode": "fast", "base": "main", "root_source": root_source,
+            "root_placements": placements, "root_reviews": None, "root_classifications": [],
+            "guidance_hash": guidance, "root_guidance_hash": guidance}
+        legacy["digest"] = tiered_review.digest(legacy)
+        self.connection.execute("INSERT INTO tiered_maintenance_assessments VALUES (?, ?, ?, ?, ?)",
+            ("/repo", 1, self.sha, legacy["digest"], code_index.encode(legacy)))
+
+        with mock.patch.object(common_guidance, "effective_planning_hash", return_value=guidance), \
+                mock.patch.object(self.ports.tiered, "select", return_value=selection):
+            assessment = self.ports.tiered.prepare(self.run)
+
+        self.assertEqual(assessment["mode"], "fast")
+        self.assertEqual(assessment["root_reviews"], [root])
+        self.assertEqual(self.ports.tiered.repository.units(assessment), ())
 
     def test_confirmed_root_move_candidate_prevents_no_change_and_enters_plan_context(self):
         root = {"path": "notes.md", "category": "internal_implementation",

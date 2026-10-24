@@ -141,6 +141,7 @@ class Selection:
     root_placements: tuple[dict, ...] = ()
     root_reviews: tuple[dict, ...] | None = None
     root_classifications: tuple[dict, ...] = ()
+    root_guidance_hash: str | None = None
 
 
 class TieredReviewRepository:
@@ -168,9 +169,9 @@ class TieredReviewRepository:
         classifications = tuple(asdict(item) for item in getattr(inventory, "classifications", ()))
         roots = tuple({"path": item["path"], "category": item["category"]} for item in placements)
         previous = self.success(repo)
-        root_source, root_reviews = None, ()
+        root_source, root_reviews, root_guidance_hash = None, (), None
         if placements:
-            guidance_hash = common_guidance.effective_planning_hash(self.connection, repo)
+            root_guidance_hash = common_guidance.effective_planning_hash(self.connection, repo)
             from loop_manager_internal.storage.maintenance_file_ledger import (
                 FileReviewRepository, root_review_source, validate_root_reviews,
             )
@@ -178,7 +179,7 @@ class TieredReviewRepository:
             root_reviews = FileReviewRepository(self.connection).reusable_root_reviews(repo, inventory)
             if root_reviews is None and previous is not None and previous["root_reviews"] is not None:
                 if (previous["source_revision"] == revision
-                        and previous["guidance_hash"] == guidance_hash):
+                        and previous["guidance_hash"] == root_guidance_hash):
                     try:
                         root_reviews = validate_root_reviews(repository, inventory, previous["root_reviews"])
                     except (ValueError, TypeError):
@@ -188,7 +189,7 @@ class TieredReviewRepository:
 
         def selected(required, mode, reasons, paths, selected_request=None):
             return Selection(required, mode, reasons, paths, index, roots, merged_count, selected_request,
-                             base, root_source, placements, root_reviews, classifications)
+                             base, root_source, placements, root_reviews, classifications, root_guidance_hash)
 
         root_review_required = bool(placements and root_reviews is None)
 
@@ -258,6 +259,9 @@ class TieredReviewRepository:
     def prepare(self, repo, cycle, selection: Selection, *, cycle_id=None, review_mode=None,
                 guidance_hash=None):
         current_guidance = common_guidance.effective_planning_hash(self.connection, repo)
+        if (selection.root_reviews is not None and selection.root_guidance_hash is not None
+                and selection.root_guidance_hash != current_guidance):
+            selection = replace(selection, root_reviews=None)
         if selection.mode == "fast" and selection.root_placements and selection.root_reviews is None:
             selection = replace(selection, mode="targeted", reasons=("root_review_required",), paths=())
         placements = list(selection.root_placements)
@@ -298,7 +302,9 @@ class TieredReviewRepository:
                                   "root_guidance_hash"))
             mode_corrected = (saved.get("mode") == "fast" and value["mode"] == "targeted"
                               and bool(value["root_placements"]) and value["root_reviews"] is None)
-            if upgraded_roots or root_guidance_changed or mode_corrected:
+            root_reviews_added = (bool(saved.get("root_placements")) and saved.get("root_reviews") is None
+                                  and value["root_reviews"] is not None)
+            if upgraded_roots or root_guidance_changed or mode_corrected or root_reviews_added:
                 saved = {**saved, "base": value["base"], "root_source": value["root_source"],
                          "root_placements": value["root_placements"],
                          "root_reviews": value["root_reviews"],
@@ -309,9 +315,6 @@ class TieredReviewRepository:
                                   ("mode", "reasons", "paths", "review_mode", "root_reviews")})
                 saved.pop("digest", None)
                 saved["digest"] = digest(saved)
-                with self.connection:
-                    self.connection.execute("UPDATE tiered_maintenance_assessments SET digest = ?, assessment_json = ? "
-                        "WHERE repo = ?", (saved["digest"], code_index.encode(saved), repo))
             if saved["records"] != value["records"]:
                 identities = lambda records: {path: (item["content_hash"], item["mode"])
                                                for path, item in records.items()}
@@ -325,12 +328,13 @@ class TieredReviewRepository:
                          "prior_analysis_assessment": previous}
                 saved.pop("digest", None)
                 saved["digest"] = digest(saved)
-                with self.connection:
-                    self.connection.execute("UPDATE tiered_maintenance_assessments SET digest = ?, assessment_json = ? "
-                        "WHERE repo = ?", (saved["digest"], code_index.encode(saved), repo))
             if saved.get('guidance_hash'):
-                if root_guidance_changed or mode_corrected:
-                    self._preserve_root_unit(repo, row[3], saved)
+                if saved["digest"] != row[2] or code_index.encode(saved) != row[3]:
+                    with self.connection:
+                        self.connection.execute("UPDATE tiered_maintenance_assessments SET digest = ?, assessment_json = ? "
+                            "WHERE repo = ?", (saved["digest"], code_index.encode(saved), repo))
+                        if saved.get("root_placements") and saved.get("root_reviews") is None:
+                            self._preserve_root_unit(repo, row[3], saved)
                 return saved
             # A legacy assessment is not evidence of the newly injected rules.
             # Keep its source/task scope and audit, but recheck its judgments.
@@ -343,11 +347,11 @@ class TieredReviewRepository:
         with self.connection:
             self.connection.execute("INSERT OR REPLACE INTO tiered_maintenance_assessments VALUES (?, ?, ?, ?, ?)",
                                     (repo, cycle, selection.index.revision, value["digest"], code_index.encode(value)))
-        if row and (row[0], row[1]) == (cycle, selection.index.revision):
-            old = json.loads(row[3])
-            if (old.get("mode") == "fast" and value.get("mode") == "targeted"
-                    and old.get("root_placements") and value.get("root_reviews") is None):
-                self._preserve_root_unit(repo, row[3], value)
+            if row and (row[0], row[1]) == (cycle, selection.index.revision):
+                old = json.loads(row[3])
+                if (old.get("root_placements") and value.get("root_placements")
+                        and value.get("root_reviews") is None):
+                    self._preserve_root_unit(repo, row[3], value)
         return value
 
     def active(self, repo, cycle, revision):
@@ -434,10 +438,9 @@ class TieredReviewRepository:
             except TieredReviewError:
                 return
             return
-        with self.connection:
-            self.connection.execute("INSERT OR IGNORE INTO tiered_maintenance_units "
-                "(repo, digest, session_id, error) VALUES (?, ?, ?, ?)",
-                (repo, new_unit["digest"], row[0], row[2]))
+        self.connection.execute("INSERT OR IGNORE INTO tiered_maintenance_units "
+            "(repo, digest, session_id, error) VALUES (?, ?, ?, ?)",
+            (repo, new_unit["digest"], row[0], row[2]))
 
     def pending(self, repo, assessment):
         for unit in self.units(assessment):
