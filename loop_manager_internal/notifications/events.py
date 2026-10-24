@@ -8,7 +8,8 @@ import sqlite3
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
-from .policy import is_current, cancel_stale_events, block_recovery, SOURCE_ACTION_REASONS
+from .policy import (is_current, cancel_stale_events, block_recovery,
+                     cancel_event, pr_review_candidate, SOURCE_ACTION_REASONS)
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
@@ -61,6 +62,44 @@ class _BlockedPlanProjection:
         )
 
 
+def record_pr_review_candidate(
+    connection: sqlite3.Connection, repo: str, plan_id: str, *,
+    publication_token: str, review_input_identity: str,
+) -> None:
+    """Persist the exact published review token and its rebase-stable input identity."""
+    if not publication_token or not review_input_identity:
+        return
+    ensure_schema(connection)
+    connection.execute(
+        "INSERT INTO pr_review_candidates "
+        "(repo, plan_id, publication_token, review_input_identity) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(repo, plan_id) DO UPDATE SET "
+        "publication_token=excluded.publication_token, "
+        "review_input_identity=excluded.review_input_identity",
+        (repo, plan_id, publication_token, review_input_identity),
+    )
+
+
+def cancel_pr_review_events_for_plans(
+    connection: sqlite3.Connection, repo: str, plan_ids,
+) -> None:
+    """Cancel pending notices when a conflict observation confirms a different PR head."""
+    stale_plan_ids = {str(plan_id) for plan_id in plan_ids}
+    if not stale_plan_ids:
+        return
+    for row in connection.execute(
+        "SELECT event_key, payload FROM notification_outbox "
+        "WHERE repo=? AND event_type='pr_created' "
+        "AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+    ).fetchall():
+        try:
+            payload = json.loads(str(row[1]))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and str(payload.get('execplan_id') or '') in stale_plan_ids:
+            cancel_event(connection, str(row[0]))
+
+
 def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) -> None:
     """Enqueue all plan/project events after their owning update and before commit."""
 
@@ -93,14 +132,24 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         "WHERE repo = ? AND status = 'PR_OPEN' AND pr_url IS NOT NULL",
         (repo,),
     ).fetchall():
+        candidate = pr_review_candidate(
+            connection, repo, str(plan[0]), str(plan[2]),
+        )
+        if candidate is None:
+            continue
         payload = {
             "project": name,
             "execplan_id": str(plan[0]),
             "execplan_title": str(plan[1]),
             "pr_url": str(plan[2]),
+            **candidate,
         }
         if is_current(connection, repo, "pr_created", payload):
-            _insert(connection, _key("pr", repo, str(plan[2])), repo, "pr_created", payload)
+            identity = "\0".join((
+                str(plan[2]), str(candidate["candidate_identity"]),
+                str(candidate["user_action"]),
+            ))
+            _insert(connection, _key("pr", repo, identity), repo, "pr_created", payload)
 
 
     plan_blocks = connection.execute(

@@ -41,6 +41,17 @@ import sys
 import threading
 
 
+def _stale_conflicting_pr_plan_ids(observation):
+    """Find conflict observations whose remote head cannot authorize an old notice."""
+    stale = set()
+    for plan, pull_request in observation.conflicts:
+        stored_head = str(plan['pr_head_oid'] or '')
+        observed_head = pull_request.get('headRefOid')
+        if not observed_head or str(observed_head) != stored_head:
+            stale.add(str(plan['plan_id']))
+    return stale
+
+
 @dataclass(frozen=True)
 class RunProjectStepEffects:
     """Named effects for _run_project_step; no entry-point/module access."""
@@ -571,14 +582,28 @@ class ProjectService:
 
     def _synchronize_pull_requests(self) -> int | None:
         try:
+            def after_observation(observation):
+                self.effects._handoff_observed_self_merge(
+                    self.identity.connection, self.state.repo,
+                    self.identity.state_dir, self.identity.runtime_mutation,
+                    observation,
+                )
+                stale_plan_ids = _stale_conflicting_pr_plan_ids(observation)
+                if stale_plan_ids:
+                    with self.identity.connection:
+                        notifications.cancel_pr_review_events_for_plans(
+                            self.identity.connection, self.state.repo, stale_plan_ids,
+                        )
+                notifications.flush_observed_pr_events(
+                    self.identity.connection, self.state.repo,
+                )
+
             pr_sync = self.effects.synchronize_waiting_pull_requests(
                 self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo,
                 after_reconciliation=self._synchronize_source_after_pr_reconciliation,
                 require_base_identity=self.state.require_self_pr_base,
                 config_path=self.identity.config_path,
-                after_observation=lambda observation: self.effects._handoff_observed_self_merge(
-                    self.identity.connection, self.state.repo, self.identity.state_dir, self.identity.runtime_mutation, observation,
-                ),
+                after_observation=after_observation,
             )
             self.state.base_sha = self._refresh_catalog()
         except project_catalog_refresh.CatalogRefreshStopped as error:

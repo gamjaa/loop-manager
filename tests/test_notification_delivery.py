@@ -136,6 +136,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
 
     def test_failed_delivery_stays_pending_retries_once_and_hides_secrets(self):
         connection = self.connection()
+        self.prepare_pr_candidate(connection)
         loop_manager.update_project(
             connection,
             "/projects/alpha",
@@ -199,12 +200,18 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
             (other_repo, "https://example.test/pr/19"),
         )
         with connection:
+            self.prepare_pr_candidate(connection)
             loop_manager.update_project(
                 connection,
                 repo,
                 phase="PR_OPEN",
                 plan_path="docs/plans/[G-018] Reliable notices.md",
                 pr_url="https://example.test/pr/18",
+            )
+            self.prepare_pr_candidate(
+                connection, repo=other_repo, plan_id='G-019',
+                pr_url='https://example.test/pr/19',
+                path='docs/plans/other.md', title='Other PR',
             )
             notifications.enqueue_current_project_events(connection, other_repo)
 
@@ -258,6 +265,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
         def run_step(*_args, **_kwargs):
             steps.append(len(steps) + 1)
             if len(steps) == 1:
+                self.prepare_pr_candidate(connection)
                 loop_manager.update_project(
                     connection,
                     repo,
@@ -311,11 +319,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
             delivered = mock.Mock()
             def run_one(worker_connection, *_args, on_step_completed, **_kwargs):
                 with worker_connection:
-                    worker_connection.execute(
-                        "UPDATE exec_plans SET status = 'PR_OPEN', pr_url = ? "
-                        "WHERE repo = ? AND plan_id = 'G-018'",
-                        ("https://example.test/pr/18", repo),
-                    )
+                    self.prepare_pr_candidate(worker_connection)
                     notifications.enqueue_current_project_events(
                         worker_connection, repo
                     )
@@ -325,6 +329,12 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
                     ).fetchone()[0]
                 )
                 on_step_completed()
+                self.assertIsNone(
+                    worker_connection.execute(
+                        "SELECT sent_at FROM notification_outbox"
+                    ).fetchone()[0]
+                )
+                notifications.flush_new_pr_events(worker_connection, repo)
                 self.assertIsNotNone(
                     worker_connection.execute(
                         "SELECT sent_at FROM notification_outbox"
@@ -364,6 +374,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
             cleanup.callback(connection.close)
+            self.prepare_pr_candidate(connection)
             loop_manager.update_project(
                 connection,
                 "/projects/alpha",
@@ -414,6 +425,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
 
     def test_scheduler_retries_pending_when_project_processing_is_skipped(self):
         connection = self.connection()
+        self.prepare_pr_candidate(connection)
         loop_manager.update_project(
             connection,
             "/projects/alpha",
@@ -429,9 +441,9 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
         delivered = mock.Mock()
         original_dispatch = notifications.dispatch_pending
 
-        def dispatch_pending(connection, token, chat_id):
+        def dispatch_pending(connection, token, chat_id, **options):
             return original_dispatch(
-                connection, token, chat_id, adapter=delivered
+                connection, token, chat_id, adapter=delivered, **options
             )
 
         with mock.patch(
@@ -447,18 +459,23 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
                 0,
             )
         self.assertEqual(dispatch.call_count, 2)
-        delivered.assert_called_once()
-        self.assertIsNotNone(self.events(connection)[0]["sent_at"])
+        self.assertTrue(all(call.kwargs.get('exclude_pr') for call in dispatch.call_args_list))
+        delivered.assert_not_called()
+        pending = self.events(connection)[0]
+        self.assertIsNone(pending["sent_at"])
+        self.assertEqual(pending['attempts'], 0)
 
 
 class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
     def add_event(self, connection, kind="pr_created", body=""):
+        candidate = self.prepare_pr_candidate(connection)
         payload = {
             "project": "alpha", "execplan_id": "G-018",
             "execplan_title": body, "pr_url": "https://example.test/pr/18",
-            "occurred_at": "2000-01-01T00:00:00Z", "status": "PR Merge 대기", "silent": False,
+            **candidate,
+            "occurred_at": "2000-01-01T00:00:00Z",
+            "status": "PR 검토·Merge 대기", "silent": False,
         }
-        connection.execute("UPDATE exec_plans SET status='PR_OPEN', pr_url=? WHERE repo='/projects/alpha' AND plan_id='G-018'", (payload['pr_url'],))
         notifications._insert(connection, "test-event", "/projects/alpha", kind, payload)
         connection.commit()
         return notifications._message(kind, payload)
@@ -467,8 +484,8 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
         for length in (4096, 4097, 8193):
             with self.subTest(length=length):
                 connection = self.connection()
-                header = "[alpha] G-018 PR 생성\n"
-                suffix = "\nhttps://example.test/pr/18\n상태: PR 검토·Merge 대기\n발생 시각: 2000-01-01T00:00:00Z\n처리 상태: PR Merge 대기"
+                header = "[alpha] G-018 PR 검토 후보 게시\n"
+                suffix = "\nhttps://example.test/pr/18\n상태: PR 검토·Merge 대기\n발생 시각: 2000-01-01T00:00:00Z\n처리 상태: PR 검토·Merge 대기"
                 title_length = length - len(header) - len(suffix)
                 title = ("한글🙂\n" * (title_length // 4 + 1))[:title_length]
                 body = self.add_event(connection, body=title)
@@ -865,16 +882,16 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
         with notifications.immediate_delivery(connection, 'token', 'chat', repo), \
              mock.patch.object(delivery, 'send_telegram', side_effect=lambda *args, **kw: sent.append((args, kw))):
             with connection:
-                connection.execute("UPDATE exec_plans SET status='PR_OPEN', pr_url='https://example.test/pr/18'")
+                candidate = self.prepare_pr_candidate(connection)
                 notifications._insert(connection, 'legacy-pr', repo, 'pr_created',
                     {'project': 'alpha', 'execplan_id': 'G-018', 'execplan_title': 'x' * 6000,
-                     'pr_url': 'https://example.test/pr/18', 'silent': True})
+                     **candidate, 'silent': True})
                 self.assertEqual(notifications.flush_project_events(connection, repo), 0)
             self.assertEqual(sent, [])
-            self.assertEqual(notifications.flush_project_events(connection, repo), 1)
+            self.assertEqual(notifications.flush_new_pr_events(connection, repo), 1)
             self.assertEqual(len(sent), 2)
             self.assertTrue(all(kw['disable_notification'] for _args, kw in sent))
-            self.assertEqual(notifications.flush_project_events(connection, repo), 0)
+            self.assertEqual(notifications.flush_new_pr_events(connection, repo), 0)
 
     def test_transport_preserves_explicit_silent_flag(self):
         response = mock.MagicMock()
@@ -921,7 +938,7 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
                     return ()
                 with mock.patch('loop_manager.schedule_registered_projects', side_effect=worker), \
                         mock.patch.object(delivery, 'send_telegram', sent), \
-                        mock.patch.object(notifications, 'dispatch_pending', side_effect=lambda conn, token, chat: dispatch(conn, token, chat, adapter=sent)):
+                        mock.patch.object(notifications, 'dispatch_pending', side_effect=lambda conn, token, chat, **options: dispatch(conn, token, chat, adapter=sent, **options)):
                     self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
                     self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
                 sent.assert_not_called()
@@ -1568,17 +1585,344 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
 
     def test_pr_claim_requires_current_merge_wait_for_same_pr(self):
         connection = self.connection()
-        loop_manager.update_project(connection, self.repo, phase='PR_OPEN', pr_url='https://example.test/pr/18')
-        before = dict(self.events(connection)[0])
+        self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, self.repo)
+        before = dict(next(row for row in self.events(connection) if row['event_type'] == 'pr_created'))
         with connection:
             connection.execute("UPDATE exec_plans SET status='MERGED'")
         adapter = mock.Mock()
         self.assertEqual(notifications.dispatch_new_pr_notifications(connection, 'token', 'chat', self.repo, adapter=adapter), 0)
         adapter.assert_not_called()
-        row = self.events(connection)[0]
+        row = next(row for row in self.events(connection) if row['event_key'] == before['event_key'])
         self.assertIsNotNone(row['canceled_at'])
         self.assertEqual(row['payload'], before['payload'])
         self.assertEqual(row['attempts'], 0)
+
+    def test_replaced_pr_candidate_cancels_remaining_piece_and_preserves_audit(self):
+        connection = self.connection()
+        repo = self.repo
+        self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        original = next(row for row in self.events(connection) if row['event_type'] == 'pr_created')
+        connection.execute(
+            "UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=1, "
+            "attempts=2, last_error=? WHERE event_key=?",
+            ('confirmed first piece\npending second piece', 'previous send failed', original['event_key']),
+        )
+        connection.commit()
+
+        replacement = self.prepare_pr_candidate(
+            connection, head='c' * 40, reviewed_change_identity='replacement-change',
+        )
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
+
+        rows = {row['event_key']: row for row in self.events(connection)}
+        stale = rows[original['event_key']]
+        self.assertIsNotNone(stale['canceled_at'])
+        self.assertEqual(stale['payload'], original['payload'])
+        self.assertEqual(
+            (stale['rendered_text'], stale['confirmed_pieces'], stale['attempts'], stale['last_error']),
+            ('confirmed first piece\npending second piece', 1, 2, 'previous send failed'),
+        )
+        current = next(row for row in rows.values() if row['canceled_at'] is None)
+        self.assertNotEqual(current['event_key'], original['event_key'])
+        self.assertEqual(json.loads(current['payload'])['candidate_identity'], replacement['candidate_identity'])
+
+        sent = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, 'token', 'chat', adapter=lambda _token, _chat, text: sent.append(text),
+        ), 1)
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn('pending second piece', ''.join(sent))
+
+    def test_rebased_pr_candidate_preserves_canceled_payload_and_resumes_remaining_piece(self):
+        connection = self.connection()
+        repo = self.repo
+        candidate = self.prepare_pr_candidate(connection)
+        with connection:
+            connection.execute(
+                "UPDATE exec_plans SET title=? WHERE repo=? AND plan_id='G-018'",
+                ('long review title ' * 400, repo),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        original = dict(next(row for row in self.events(connection)
+                             if row['event_type'] == 'pr_created'))
+        original_payload = json.loads(original['payload'])
+        frozen = notifications._message('pr_created', original_payload)
+        pieces = notifications._pieces(frozen)
+        self.assertGreater(len(pieces), 1)
+        with connection:
+            connection.execute(
+                "UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=1, "
+                "attempts=2, last_error='previous send uncertainty' WHERE event_key=?",
+                (frozen, original['event_key']),
+            )
+            connection.execute(
+                "UPDATE exec_plans SET publication_token='rebase-in-progress' "
+                "WHERE repo=? AND plan_id='G-018'", (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        canceled = dict(next(row for row in self.events(connection)
+                             if row['event_key'] == original['event_key']))
+        self.assertIsNotNone(canceled['canceled_at'])
+
+        rebased = self.prepare_pr_candidate(connection, head='c' * 40)
+        self.assertEqual(candidate['candidate_identity'], rebased['candidate_identity'])
+        self.assertNotEqual(candidate['candidate_publication_token'],
+                            rebased['candidate_publication_token'])
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
+
+        rows = {row['event_key']: dict(row) for row in self.events(connection)
+                if row['event_type'] == 'pr_created'}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[original['event_key']], canceled)
+        continued = next(row for key, row in rows.items() if key != original['event_key'])
+        self.assertEqual(continued['event_key'], f"{original['event_key']}:v1")
+        self.assertIsNone(continued['canceled_at'])
+        self.assertEqual(continued['rendered_text'], frozen)
+        self.assertEqual(continued['confirmed_pieces'], 1)
+        self.assertEqual(continued['attempts'], 2)
+        self.assertEqual(continued['last_error'], 'previous send uncertainty')
+        payload = json.loads(continued['payload'])
+        self.assertEqual(payload['continued_from'], original['event_key'])
+        self.assertEqual(payload['candidate_identity'], candidate['candidate_identity'])
+        self.assertEqual(payload['candidate_head_oid'], rebased['candidate_head_oid'])
+        self.assertEqual(payload['candidate_publication_token'],
+                         rebased['candidate_publication_token'])
+        self.assertEqual(payload['occurred_at'], original_payload['occurred_at'])
+
+        sent = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, 'token', 'chat', adapter=lambda _token, _chat, text: sent.append(text),
+        ), 1)
+        self.assertEqual(sent, pieces[1:])
+        self.assertEqual(dict(next(row for row in self.events(connection)
+                                   if row['event_key'] == original['event_key'])), canceled)
+        self.assertIsNotNone(connection.execute(
+            'SELECT sent_at FROM notification_outbox WHERE event_key=?',
+            (continued['event_key'],),
+        ).fetchone()[0])
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(len([row for row in self.events(connection)
+                             if row['event_type'] == 'pr_created']), 2)
+
+    def test_late_pr_confirmation_advances_only_same_candidate_continuation(self):
+        connection = self.connection()
+        repo = self.repo
+        self.prepare_pr_candidate(connection)
+        with connection:
+            connection.execute(
+                "UPDATE exec_plans SET title=? WHERE repo=? AND plan_id='G-018'",
+                ('long review title ' * 400, repo),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        original = dict(next(row for row in self.events(connection)
+                             if row['event_type'] == 'pr_created'))
+        original_payload = original['payload']
+        frozen = notifications._message('pr_created', json.loads(original_payload))
+        pieces = notifications._pieces(frozen)
+        self.assertGreater(len(pieces), 1)
+
+        def rebase_while_send_is_in_flight(_token, _chat, piece):
+            self.assertEqual(piece, pieces[0])
+            with connection:
+                connection.execute(
+                    "UPDATE exec_plans SET publication_token='rebase-in-progress' "
+                    "WHERE repo=? AND plan_id='G-018'", (repo,),
+                )
+                notifications.enqueue_current_project_events(connection, repo)
+            canceled = connection.execute(
+                'SELECT * FROM notification_outbox WHERE event_key=?',
+                (original['event_key'],),
+            ).fetchone()
+            self.assertIsNotNone(canceled['canceled_at'])
+            self.assertEqual(canceled['payload'], original_payload)
+
+            self.prepare_pr_candidate(connection, head='c' * 40)
+            with connection:
+                notifications.enqueue_current_project_events(connection, repo)
+            continued = connection.execute(
+                'SELECT * FROM notification_outbox WHERE event_key=?',
+                (f"{original['event_key']}:v1",),
+            ).fetchone()
+            self.assertEqual(continued['rendered_text'], frozen)
+            self.assertEqual(continued['confirmed_pieces'], 0)
+
+        self.assertEqual(notifications.dispatch_pending(
+            connection, 'token', 'chat', adapter=rebase_while_send_is_in_flight,
+        ), 0)
+        old = connection.execute(
+            'SELECT * FROM notification_outbox WHERE event_key=?',
+            (original['event_key'],),
+        ).fetchone()
+        continued = connection.execute(
+            'SELECT * FROM notification_outbox WHERE event_key=?',
+            (f"{original['event_key']}:v1",),
+        ).fetchone()
+        self.assertEqual(old['payload'], original_payload)
+        self.assertIsNotNone(old['canceled_at'])
+        self.assertEqual(old['confirmed_pieces'], 1)
+        self.assertEqual(continued['confirmed_pieces'], 1)
+
+        sent = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, 'token', 'chat', adapter=lambda _token, _chat, text: sent.append(text),
+        ), 1)
+        self.assertEqual(sent, pieces[1:])
+        self.assertEqual(connection.execute(
+            'SELECT confirmed_pieces FROM notification_outbox WHERE event_key=?',
+            (continued['event_key'],),
+        ).fetchone()[0], len(pieces))
+
+    def test_pr_candidate_lookup_failure_holds_event_without_claiming_piece(self):
+        connection = self.connection()
+        self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, self.repo)
+        original = next(row for row in self.events(connection) if row['event_type'] == 'pr_created')
+        adapter = mock.Mock()
+
+        def deny_pr_state(action, table, _column, _database, _trigger):
+            if action == sqlite3.SQLITE_READ and table == 'exec_plans':
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(deny_pr_state)
+        with self.assertRaises(sqlite3.DatabaseError):
+            notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter)
+        connection.set_authorizer(None)
+
+        adapter.assert_not_called()
+        row = next(row for row in self.events(connection) if row['event_key'] == original['event_key'])
+        self.assertIsNone(row['canceled_at'])
+        self.assertEqual(row['attempts'], 0)
+        self.assertEqual(row['payload'], original['payload'])
+
+    def test_pr_retry_waits_for_successful_observation_and_rechecks_closed_or_replaced(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.application.project_service import _stale_conflicting_pr_plan_ids
+        from loop_manager_internal.recovery import waiting_pr_service
+
+        for outcome in ('lookup_failure', 'closed', 'replaced', 'replaced_conflict', 'still_open'):
+            with self.subTest(outcome=outcome):
+                connection = self.connection()
+                repo = self.repo
+                candidate = self.prepare_pr_candidate(connection)
+                branch = 'loop-manager/G-018'
+                connection.execute(
+                    "UPDATE exec_plans SET branch=? WHERE repo=? AND plan_id='G-018'",
+                    (branch, repo),
+                )
+                with connection:
+                    notifications.enqueue_current_project_events(connection, repo)
+                original = next(row for row in self.events(connection)
+                                if row['event_type'] == 'pr_created')
+                self.assertEqual(notifications.dispatch_pending(
+                    connection, 'token', 'chat', adapter=mock.Mock(
+                        side_effect=RuntimeError('temporary Telegram outage'),
+                    ),
+                ), 0)
+                before = next(row for row in self.events(connection)
+                              if row['event_key'] == original['event_key'])
+                self.assertEqual(before['attempts'], 1)
+
+                sent = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(
+                    connection, 'token', 'chat', adapter=sent, exclude_pr=True,
+                ), 0)
+                with notifications.immediate_delivery(connection, 'token', 'chat', repo), \
+                        mock.patch.object(delivery, 'send_telegram', sent):
+                    notifications.flush_project_events(connection, repo)
+                    sent.assert_not_called()
+
+                    def pr_for_branch(_repo_path, _branch, _url):
+                        if outcome == 'lookup_failure':
+                            raise RuntimeError('GitHub lookup unavailable')
+                        state = 'CLOSED' if outcome == 'closed' else 'OPEN'
+                        observed_head = ('c' * 40 if outcome in {'replaced', 'replaced_conflict'}
+                                         else candidate['candidate_head_oid'])
+                        return {
+                            'url': candidate['pr_url'], 'state': state,
+                            'headRefName': branch, 'headRefOid': observed_head,
+                            'baseRefName': 'main',
+                        }
+
+                    closed_effects = waiting_pr_service.BlockClosedPullRequestEffects(
+                        _final_block_recovery_decision=lambda *args, **kwargs: None,
+                    )
+                    observe_effects = waiting_pr_service.ObserveWaitingPullRequestsEffects(
+                        _block_closed_pull_request=lambda conn, observed_repo, plan, url, head: \
+                            waiting_pr_service._block_closed_pull_request(
+                                closed_effects, conn, observed_repo, plan, url, head,
+                            ),
+                        _recorded_base_fetch=lambda *args, **kwargs: None,
+                        _resume_reopened_pull_request=lambda *args, **kwargs: None,
+                        classify_pull_request_mergeability=lambda _pr: (
+                            'conflicting' if outcome == 'replaced_conflict' else 'mergeable'
+                        ),
+                        complete_merged_execplan_worktree=lambda *args, **kwargs: None,
+                        operation_log=lambda *args, **kwargs: None,
+                        operation_print=lambda *args, **kwargs: None,
+                        pr_for_branch=pr_for_branch,
+                    )
+                    synchronize_effects = waiting_pr_service.SynchronizeWaitingPullRequestsEffects(
+                        observe_waiting_pull_requests=lambda conn, repo_path, state_dir, observed_repo, **kwargs:
+                            waiting_pr_service.observe_waiting_pull_requests(
+                                observe_effects, conn, repo_path, state_dir, observed_repo, **kwargs,
+                            ),
+                        select_waiting_pull_request_conflict=lambda *args, **kwargs:
+                            SimpleNamespace(step_result=None),
+                    )
+                    def after_observation(observation):
+                        stale_plan_ids = _stale_conflicting_pr_plan_ids(observation)
+                        if stale_plan_ids:
+                            with connection:
+                                notifications.cancel_pr_review_events_for_plans(
+                                    connection, repo, stale_plan_ids,
+                                )
+                        notifications.flush_observed_pr_events(connection, repo)
+
+                    observe_options = {'after_observation': after_observation}
+                    if outcome == 'lookup_failure':
+                        with self.assertRaisesRegex(RuntimeError, 'lookup unavailable'):
+                            waiting_pr_service.synchronize_waiting_pull_requests(
+                                synchronize_effects, connection, Path('/unused'), Path('/state'), repo,
+                                **observe_options,
+                            )
+                    else:
+                        waiting_pr_service.synchronize_waiting_pull_requests(
+                            synchronize_effects, connection, Path('/unused'), Path('/state'), repo,
+                            **observe_options,
+                        )
+
+                rows = {row['event_key']: row for row in self.events(connection)}
+                current = rows[original['event_key']]
+                if outcome == 'still_open':
+                    sent.assert_called_once()
+                    self.assertIsNotNone(current['sent_at'])
+                    self.assertIsNone(current['canceled_at'])
+                else:
+                    sent.assert_not_called()
+                    self.assertIsNone(current['sent_at'])
+                    if outcome in {'closed', 'replaced', 'replaced_conflict'}:
+                        self.assertIsNotNone(current['canceled_at'])
+                    else:
+                        self.assertIsNone(current['canceled_at'])
+                    if outcome == 'replaced_conflict':
+                        stored_head = connection.execute(
+                            "SELECT pr_head_oid FROM exec_plans WHERE repo=? AND plan_id='G-018'",
+                            (repo,),
+                        ).fetchone()[0]
+                        self.assertEqual(stored_head, candidate['candidate_head_oid'])
+                    self.assertEqual(current['attempts'], 1)
+                connection.close()
 
     def test_deleted_published_branch_requires_restart_until_request_is_recorded(self):
         from loop_manager_internal.recovery.work_branch_integration import require_remote_present

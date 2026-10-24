@@ -270,7 +270,8 @@ def run_registered_projects(
                 )
                 notifications.recover_interrupted_starts(connection)
             notifications.dispatch_pending(
-                connection, config.telegram_token, config.telegram_chat_id
+                connection, config.telegram_token, config.telegram_chat_id,
+                exclude_pr=True,
             )
         except Exception as error:
             effects.operation_log(
@@ -295,7 +296,8 @@ def run_registered_projects(
             raise refresh.RuntimePaused()
         try:
             notifications.dispatch_pending(
-                connection, config.telegram_token, config.telegram_chat_id
+                connection, config.telegram_token, config.telegram_chat_id,
+                exclude_pr=True,
             )
         except Exception as error:
             effects.operation_log(

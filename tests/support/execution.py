@@ -400,6 +400,9 @@ def execution_policy_fixture(test, *, pr_conflict=False):
         elif args == ('diff', '--no-ext-diff', '--name-status', '-z', '--find-renames',
                       'base', fixture.candidate):
             output = ''
+        elif args == ('diff', '--binary', '--unified=0', '--no-ext-diff', '--no-textconv',
+                      'base', fixture.candidate):
+            output = f'diff --git a/app.py b/app.py\n{fixture.candidate}\n'
         elif args in {
             ('fetch', 'origin'), ('add', '-A'),
             ('show', 'plan-sha:docs/plans/[G-047] Runtime.md'),

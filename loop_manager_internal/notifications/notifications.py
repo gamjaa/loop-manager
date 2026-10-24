@@ -7,6 +7,8 @@ from .incidents import (_key, _remote_inspection_suffix, _queue_block,
                         _project_checkpoint_suffix, _current_block_key,
                         recover_interrupted_starts)
 from .events import (enqueue_current_project_events,
+                     record_pr_review_candidate,
+                     cancel_pr_review_events_for_plans,
                      cancel_pending_persistent_execution_failure_event,
                      suppress_persistent_failure_for_block, record_merged_plan,
                      enqueue_completion_if_ready, mark_work_available,
@@ -16,4 +18,5 @@ from .events import (enqueue_current_project_events,
 from .rendering import _message, _pieces, MESSAGE_LIMIT
 from .transport import send_telegram
 from .delivery import (dispatch_pending, dispatch_new_pr_notifications,
-                       immediate_delivery, flush_project_events)
+                       immediate_delivery, flush_project_events,
+                       flush_new_pr_events, flush_observed_pr_events)

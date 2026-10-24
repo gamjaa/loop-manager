@@ -38,6 +38,16 @@ CREATE TABLE IF NOT EXISTS work_reason_episodes (
     FOREIGN KEY (repo) REFERENCES projects(repo)
 )
 """
+PR_REVIEW_CANDIDATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pr_review_candidates (
+    repo TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    publication_token TEXT NOT NULL,
+    review_input_identity TEXT NOT NULL,
+    PRIMARY KEY (repo, plan_id),
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
 BLOCK_INCIDENT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS notified_block_incidents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +100,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         )
     connection.execute(COMPLETION_SCHEMA)
     connection.execute(WORK_REASON_SCHEMA)
+    connection.execute(PR_REVIEW_CANDIDATE_SCHEMA)
     connection.execute(BLOCK_INCIDENT_SCHEMA)
     connection.execute(BLOCK_NOTICE_SCHEMA)
     incident_columns = {
@@ -303,10 +314,46 @@ def _insert(
     payload: dict[str, object],
 ) -> None:
     payload = _event_payload(kind, payload)
+    if kind != "pr_created":
+        connection.execute(
+            "INSERT OR IGNORE INTO notification_outbox "
+            "(event_key, repo, event_type, payload) VALUES (?, ?, ?, ?)",
+            (key, repo, kind, _encode_payload(payload)),
+        )
+        return
+
+    versions = connection.execute(
+        "SELECT event_key, payload, attempts, last_error, rendered_text, "
+        "confirmed_pieces, canceled_at, sent_at FROM notification_outbox "
+        "WHERE repo=? AND event_type=? AND "
+        "(event_key=? OR event_key LIKE ?) ORDER BY rowid",
+        (repo, kind, key, f"{key}:v%"),
+    ).fetchall()
+    if not versions:
+        connection.execute(
+            "INSERT OR IGNORE INTO notification_outbox "
+            "(event_key, repo, event_type, payload) VALUES (?, ?, ?, ?)",
+            (key, repo, kind, _encode_payload(payload)),
+        )
+        return
+    if any(row[7] is not None or row[6] is None for row in versions):
+        # A sent or currently pending version already represents this action.
+        return
+
+    previous = versions[-1]
+    try:
+        original = json.loads(str(previous[1]))
+    except (TypeError, ValueError):
+        original = {}
+    if isinstance(original, dict) and original.get("occurred_at"):
+        payload["occurred_at"] = original["occurred_at"]
+    payload["continued_from"] = str(previous[0])
     connection.execute(
         "INSERT OR IGNORE INTO notification_outbox "
-        "(event_key, repo, event_type, payload) VALUES (?, ?, ?, ?)",
-        (key, repo, kind, _encode_payload(payload)),
+        "(event_key, repo, event_type, payload, attempts, last_error, "
+        "rendered_text, confirmed_pieces) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (f"{key}:v{len(versions)}", repo, kind, _encode_payload(payload),
+         previous[2], previous[3], previous[4], previous[5]),
     )
 
 
@@ -320,6 +367,6 @@ def _event_payload(kind: str, payload: dict[str, object]) -> dict[str, object]:
     payload = dict(payload)
     payload.setdefault("occurred_at", datetime.now(timezone.utc).isoformat())
     payload.setdefault("silent", kind in {"resumed", "project_completed", "work_started", "planning_result"})
-    payload.setdefault("status", {"pr_created": "PR Merge 대기", "blocked": "사용자 조치 대기",
+    payload.setdefault("status", {"pr_created": "PR 검토·Merge 대기", "blocked": "사용자 조치 대기",
                                   "resumed": "작업 중", "project_completed": "완료"}.get(kind, "대기"))
     return payload

@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -29,7 +30,7 @@ class NotificationRenderingTest(unittest.TestCase):
             "pr_url": "https://example.test/pr/18",
         }
         message = rendering._message("pr_created", payload)
-        self.assertTrue(message.startswith("[alpha] G-018 PR 생성\n"))
+        self.assertTrue(message.startswith("[alpha] G-018 PR 검토 후보 게시\n"))
         positions = [message.index(value) for value in (
             payload["execplan_title"], payload["pr_url"], "PR 검토·Merge 대기",
         )]
@@ -440,6 +441,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
 
     def test_disabled_and_partial_configuration_do_not_create_events(self):
         connection = self.connection(enabled=False)
+        self.prepare_pr_candidate(connection)
         loop_manager.update_project(
             connection,
             "/projects/alpha",
@@ -524,15 +526,9 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
     def test_pr_and_blocked_payloads_are_complete_and_deduplicated(self):
         connection = self.connection()
         repo = "/projects/alpha"
-        path = "docs/plans/[G-018] Reliable notices.md"
-        loop_manager.update_project(
-            connection,
-            repo,
-            phase="PR_OPEN",
-            plan_path=path,
-            pr_url="https://example.test/pr/18",
-        )
-        loop_manager.update_project(connection, repo, phase="PR_OPEN")
+        candidate = self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
         with connection:
             scoped_blocking.record_plan_block(
                 connection,
@@ -561,14 +557,18 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             row["event_type"]: json.loads(row["payload"]) for row in events
         }
         self.assertEqual(
-            payloads["pr_created"],
+            {key: payloads["pr_created"][key] for key in (
+                "project", "execplan_id", "execplan_title", "pr_url",
+                "candidate_identity", "candidate_head_oid",
+                "candidate_publication_token", "user_action",
+                "status", "silent",
+            )},
             {
                 "project": "alpha",
                 "execplan_id": "G-018",
                 "execplan_title": "Reliable notices",
-                "pr_url": "https://example.test/pr/18",
-                "occurred_at": payloads["pr_created"]["occurred_at"],
-                "status": "PR Merge 대기", "silent": False,
+                **candidate,
+                "status": "PR 검토·Merge 대기", "silent": False,
             },
         )
         blocked = payloads["blocked"]
@@ -918,12 +918,325 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
 
     def test_pr_registration_reports_merge_wait_with_original_time(self):
         connection = self.connection()
-        loop_manager.update_project(connection, '/projects/alpha', phase='PR_OPEN', pr_url='https://example.test/pr/18')
+        self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, '/projects/alpha')
         row = next(row for row in self.events(connection) if row['event_type'] == 'pr_created')
         payload = json.loads(row['payload'])
         self.assertFalse(payload['silent'])
-        self.assertEqual(payload['status'], 'PR Merge 대기')
+        self.assertEqual(payload['status'], 'PR 검토·Merge 대기')
         self.assertIn(payload['occurred_at'], notifications._message('pr_created', payload))
+
+    def test_pr_candidate_event_reuses_identity_after_rebase_tokens_are_renewed(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        first = self.prepare_pr_candidate(connection)
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
+        events = [row for row in self.events(connection) if row['event_type'] == 'pr_created']
+        self.assertEqual(len(events), 1)
+        original = dict(events[0])
+        first_key = original['event_key']
+        self.assertEqual(json.loads(original['payload'])['candidate_identity'], first['candidate_identity'])
+
+        with connection:
+            connection.execute(
+                "UPDATE projects SET pr_head_oid=? WHERE repo=?",
+                ('c' * 40, repo),
+            )
+            connection.execute(
+                "UPDATE exec_plans SET pr_head_oid=? WHERE repo=? AND plan_id='G-018'",
+                ('c' * 40, repo),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'pr_created']), 1)
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+        canceled = dict(self.events(connection)[0])
+
+        second = self.prepare_pr_candidate(connection, head='c' * 40)
+        self.assertNotEqual(first['candidate_publication_token'], second['candidate_publication_token'])
+        self.assertEqual(first['candidate_identity'], second['candidate_identity'])
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
+        events = {row['event_key']: row for row in self.events(connection)
+                  if row['event_type'] == 'pr_created'}
+        self.assertEqual(len(events), 2)
+        self.assertEqual(dict(events[first_key]), canceled)
+        current = next(row for key, row in events.items() if key != first_key)
+        self.assertEqual(current['event_key'], f'{first_key}:v1')
+        self.assertIsNone(current['canceled_at'])
+        self.assertEqual(json.loads(current['payload'])['candidate_identity'], second['candidate_identity'])
+        self.assertEqual(json.loads(current['payload'])['candidate_head_oid'], second['candidate_head_oid'])
+        self.assertEqual(json.loads(current['payload'])['candidate_publication_token'],
+                         second['candidate_publication_token'])
+        self.assertEqual(json.loads(current['payload'])['occurred_at'],
+                         json.loads(original['payload'])['occurred_at'])
+        self.assertEqual(json.loads(current['payload'])['continued_from'], first_key)
+
+    def test_real_rebase_keeps_review_patch_identity_and_does_not_repeat_pr_notice(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.execution.execution_review_handler import ReviewHandler
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+
+        project_repo = '/projects/alpha'
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path = Path(directory) / 'repo'
+            repo_path.mkdir()
+
+            def git(*args, input=None):
+                if args and isinstance(args[0], Path):
+                    path, *args = args
+                else:
+                    path = repo_path
+                result = subprocess.run(
+                    ['git', '-C', str(path), *args], capture_output=True,
+                    text=True, input=input, check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError(result.stderr)
+                return result
+
+            for args in (('init', '-b', 'main'), ('config', 'user.email', 'tests@example.test'),
+                         ('config', 'user.name', 'Tests')):
+                subprocess.run(['git', '-C', str(repo_path), *args], check=True,
+                               capture_output=True, text=True)
+            source = repo_path / 'source.txt'
+            source.write_text('zero\ntarget\nend\n', encoding='utf-8')
+            snippet = repo_path / 'snippet.py'
+            snippet.write_text('value = "base"\n', encoding='utf-8')
+            branches = repo_path / 'branches.py'
+            branches.write_text(
+                'def f():\n    before()\n    value = 0\n    after()\n\n'
+                'def g():\n    before()\n    value = 0\n    after()\n', encoding='utf-8',
+            )
+            latin = repo_path / 'latin.py'
+            latin.write_bytes(b'value = "base"\n')
+            git('add', 'source.txt', 'snippet.py', 'branches.py', 'latin.py')
+            git('commit', '-m', 'base')
+            dependency = repo_path / 'dependency'
+            dependency.mkdir()
+            dependency_oid = git('rev-parse', 'HEAD').stdout.strip()
+            git('update-index', '--add', '--cacheinfo', f'160000,{dependency_oid},dependency')
+            git('commit', '-m', 'base gitlink')
+            base_before = git('rev-parse', 'HEAD').stdout.strip()
+            git('checkout', '-b', 'feature')
+            source.write_text('zero\nreviewed change\nend\n', encoding='utf-8')
+            git('commit', '-am', 'reviewed change')
+            head_before = git('rev-parse', 'HEAD').stdout.strip()
+
+            definition = DefinitionSnapshot(
+                revision_sha='definition-revision',
+                path='docs/plans/[G-018] Reliable notices.md',
+                title='Reliable notices', sources=('docs/PRODUCT.md',),
+                depends_on=(), complexity='medium', risk='medium', priority='high',
+                body_hash='body-hash', source_fingerprint='source-fingerprint',
+                archive_candidates=(),
+            )
+            handler = object.__new__(ReviewHandler)
+            handler.ports = SimpleNamespace(
+                snapshot=lambda: SimpleNamespace(_definition_snapshot=definition),
+                git=git,
+                git_bytes=lambda path, *args: subprocess.run(
+                    ['git', '-C', str(path), '-c', 'diff.autoRefreshIndex=false', *args],
+                    capture_output=True, check=True,
+                ).stdout,
+                identity=SimpleNamespace(repo=project_repo),
+            )
+            context = SimpleNamespace(
+                worktree=repo_path, plan=SimpleNamespace(plan_id='G-018'),
+            )
+            before = handler._pr_review_candidate_proof(
+                context, {'validated_base_sha': base_before}, head_before,
+            )
+
+            git('checkout', 'main')
+            source.write_text('upstream\nzero\ntarget\nend\n', encoding='utf-8')
+            git('commit', '-am', 'base advances')
+            base_after = git('rev-parse', 'HEAD').stdout.strip()
+            git('checkout', 'feature')
+            git('rebase', 'main')
+            head_after = git('rev-parse', 'HEAD').stdout.strip()
+            after = handler._pr_review_candidate_proof(
+                context, {'validated_base_sha': base_after}, head_after,
+            )
+
+            self.assertNotEqual(before[0], after[0])
+            self.assertEqual(before[1], after[1])
+
+            def candidate_with_content(branch, path, content):
+                git('checkout', 'main')
+                git('checkout', '-b', branch)
+                target = repo_path / path
+                if path == 'dependency':
+                    git('update-index', '--cacheinfo', f'160000,{content},dependency')
+                elif isinstance(content, bytes):
+                    target.write_bytes(content)
+                else:
+                    target.write_text(content, encoding='utf-8')
+                git('commit', '-m' if path == 'dependency' else '-am', branch)
+                head = git('rev-parse', 'HEAD').stdout.strip()
+                proof = handler._pr_review_candidate_proof(
+                    context, {'validated_base_sha': base_after}, head,
+                )
+                return proof, head
+
+            spaced, spaced_head = candidate_with_content(
+                'candidate-spaced', 'snippet.py', 'value = "a b"\n',
+            )
+            compact, compact_head = candidate_with_content(
+                'candidate-compact', 'snippet.py', 'value = "ab"\n',
+            )
+            self.assertNotEqual(spaced[1], compact[1])
+            one_space_indent, _ = candidate_with_content(
+                'candidate-one-space-indent', 'snippet.py', 'def value():\n return "x"\n',
+            )
+            two_space_indent, _ = candidate_with_content(
+                'candidate-two-space-indent', 'snippet.py', 'def value():\n  return "x"\n',
+            )
+            self.assertNotEqual(one_space_indent[1], two_space_indent[1])
+            if_branch, if_branch_head = candidate_with_content(
+                'candidate-first-function', 'branches.py',
+                'def f():\n    before()\n    value = 1\n    after()\n\n'
+                'def g():\n    before()\n    value = 0\n    after()\n',
+            )
+            else_branch, else_branch_head = candidate_with_content(
+                'candidate-second-function', 'branches.py',
+                'def f():\n    before()\n    value = 0\n    after()\n\n'
+                'def g():\n    before()\n    value = 1\n    after()\n',
+            )
+            self.assertNotEqual(if_branch[1], else_branch[1])
+            latin_one, latin_one_head = candidate_with_content(
+                'candidate-latin-one', 'latin.py', b'value = "\xe9"\n',
+            )
+            latin_two, latin_two_head = candidate_with_content(
+                'candidate-latin-two', 'latin.py', b'value = "\xea"\n',
+            )
+            self.assertNotEqual(latin_one[1], latin_two[1])
+
+            gitlink_one, gitlink_one_head = candidate_with_content(
+                'candidate-gitlink-one', 'dependency', head_before,
+            )
+            gitlink_two, gitlink_two_head = candidate_with_content(
+                'candidate-gitlink-two', 'dependency', head_after,
+            )
+            self.assertIsNotNone(gitlink_one)
+            self.assertIsNotNone(gitlink_two)
+            self.assertNotEqual(gitlink_one[1], gitlink_two[1])
+
+            # A repeated block inserted before g must not rename g's candidate.
+            git('checkout', 'main')
+            branches.write_text(
+                'def h():\n    before()\n    value = 0\n    after()\n\n'
+                + branches.read_text(encoding='utf-8'), encoding='utf-8',
+            )
+            git('commit', '-am', 'upstream adds identical context before g')
+            repeated_base = git('rev-parse', 'HEAD').stdout.strip()
+            git('checkout', 'candidate-second-function')
+            git('rebase', 'main')
+            repeated_head = git('rev-parse', 'HEAD').stdout.strip()
+            repeated_proof = handler._pr_review_candidate_proof(
+                context, {'validated_base_sha': repeated_base}, repeated_head,
+            )
+            self.assertNotEqual(else_branch[0], repeated_proof[0])
+            self.assertEqual(else_branch[1], repeated_proof[1])
+
+            git('checkout', 'candidate-gitlink-two')
+            git('rebase', 'main')
+            rebased_gitlink = handler._pr_review_candidate_proof(
+                context, {'validated_base_sha': repeated_base},
+                git('rev-parse', 'HEAD').stdout.strip(),
+            )
+            self.assertEqual(gitlink_two[1], rebased_gitlink[1])
+
+            connection = self.connection()
+            first = self.prepare_pr_candidate(
+                connection, repo=project_repo, base=base_before, head=head_before,
+                review_input_identity=before[1],
+            )
+            self.assertEqual(first['candidate_publication_token'], before[0])
+            with connection:
+                notifications.enqueue_current_project_events(connection, project_repo)
+            sent = mock.Mock()
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 1)
+            rebased_candidate = self.prepare_pr_candidate(
+                connection, repo=project_repo, base=base_after, head=head_after,
+                review_input_identity=after[1],
+            )
+            self.assertNotEqual(first['candidate_publication_token'],
+                                rebased_candidate['candidate_publication_token'])
+            self.assertEqual(rebased_candidate['candidate_publication_token'], after[0])
+            self.assertEqual(rebased_candidate['candidate_identity'], before[1])
+            with connection:
+                notifications.enqueue_current_project_events(connection, project_repo)
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 0)
+            self.assertEqual(len([row for row in self.events(connection)
+                                  if row['event_type'] == 'pr_created']), 1)
+            sent.assert_called_once()
+
+            spaced_candidate = self.prepare_pr_candidate(
+                connection, repo=project_repo, base=base_after, head=spaced_head,
+                review_input_identity=spaced[1],
+            )
+            self.assertEqual(spaced_candidate['candidate_publication_token'], spaced[0])
+            with connection:
+                notifications.enqueue_current_project_events(connection, project_repo)
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 1)
+
+            compact_candidate = self.prepare_pr_candidate(
+                connection, repo=project_repo, base=base_after, head=compact_head,
+                review_input_identity=compact[1],
+            )
+            self.assertEqual(compact_candidate['candidate_publication_token'], compact[0])
+            with connection:
+                notifications.enqueue_current_project_events(connection, project_repo)
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 1)
+            self.assertEqual(len([row for row in self.events(connection)
+                                  if row['event_type'] == 'pr_created']), 3)
+            self.assertEqual(sent.call_count, 3)
+
+            for branch, proof, head in (
+                ('first repeated context', if_branch, if_branch_head),
+                ('second repeated context', else_branch, else_branch_head),
+                ('Latin-1 byte one', latin_one, latin_one_head),
+                ('Latin-1 byte two', latin_two, latin_two_head),
+                ('gitlink one', gitlink_one, gitlink_one_head),
+                ('gitlink two', gitlink_two, gitlink_two_head),
+            ):
+                with self.subTest(candidate=branch):
+                    candidate = self.prepare_pr_candidate(
+                        connection, repo=project_repo, base=base_after, head=head,
+                        review_input_identity=proof[1],
+                    )
+                    self.assertEqual(candidate['candidate_identity'], proof[1])
+                    with connection:
+                        notifications.enqueue_current_project_events(connection, project_repo)
+                    self.assertEqual(notifications.dispatch_pending(
+                        connection, 'token', 'chat', adapter=sent,
+                    ), 1)
+            self.assertEqual(len([row for row in self.events(connection)
+                                  if row['event_type'] == 'pr_created']), 9)
+            self.assertEqual(sent.call_count, 9)
+            self.prepare_pr_candidate(
+                connection, repo=project_repo, base=repeated_base, head=repeated_head,
+                review_input_identity=repeated_proof[1],
+            )
+            with connection:
+                notifications.enqueue_current_project_events(connection, project_repo)
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 0)
+            self.assertEqual(sent.call_count, 9)
+
 
     def test_planning_result_only_notifies_after_catalog_publication(self):
         from types import SimpleNamespace

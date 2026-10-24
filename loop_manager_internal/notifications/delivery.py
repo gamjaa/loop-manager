@@ -113,6 +113,7 @@ def dispatch_pending(
     chat_id: str,
     *,
     adapter: Callable[[str, str, str], None] = send_telegram,
+    exclude_pr: bool = False,
 ) -> int:
     """Deliver pending rows; delivery errors remain secret-free and isolated."""
 
@@ -120,11 +121,13 @@ def dispatch_pending(
         return 0
     ensure_schema(connection)
     adopt_legacy_block_notices(connection)
-    rows = connection.execute(
+    query = (
         "SELECT event_key, event_type, payload, repo FROM notification_outbox "
         "WHERE sent_at IS NULL AND canceled_at IS NULL "
-        "ORDER BY created_at, event_key"
-    ).fetchall()
+        + ("AND event_type != 'pr_created' " if exclude_pr else "")
+        + "ORDER BY created_at, event_key"
+    )
+    rows = connection.execute(query).fetchall()
     return _deliver_rows(connection, token, chat_id, rows, adapter)
 
 
@@ -210,7 +213,7 @@ def _deliver_rows(
                     (cursor + 1, cursor + 1, total, cursor + 1, total,
                      row[0], cursor),
                 )
-                if row[1] == "blocked":
+                if row[1] in {"blocked", "pr_created"}:
                     # Only explicitly continued versions inherit this exact
                     # frozen body's late confirmation; changed actions do not.
                     connection.execute(
@@ -224,6 +227,7 @@ def _deliver_rows(
                         "sent_at=CASE WHEN ?=? THEN COALESCE(sent_at, CURRENT_TIMESTAMP) ELSE sent_at END "
                         "WHERE event_key IN (SELECT event_key FROM continued)",
                         (row[0], row[0], row[0], cursor + 1, cursor + 1, total))
+                if row[1] == "blocked":
                     incident = connection.execute(
                         "SELECT incident_id FROM block_notice_events "
                         "WHERE event_key = ?", (row[0],),
@@ -271,11 +275,57 @@ def flush_project_events(connection, repo):
     try:
         rows = connection.execute(
             "SELECT event_key, event_type, payload, repo FROM notification_outbox "
-            "WHERE repo = ? AND sent_at IS NULL AND canceled_at IS NULL AND attempts = 0 "
+            "WHERE repo = ? AND event_type != 'pr_created' "
+            "AND sent_at IS NULL AND canceled_at IS NULL AND attempts = 0 "
             "ORDER BY rowid", (repo,),
         ).fetchall()
         return _deliver_rows(connection, token, chat_id, rows, send_telegram, first_attempt_only=True)
     except Exception as error:
         events.emit("Telegram 즉시 전송 처리 실패: 다음 실행에서 재시도", level="WARN",
+                    error_type=type(error).__name__)
+        return 0
+
+
+def flush_new_pr_events(connection, repo):
+    """Attempt newly published PR events at their already-observed publication boundary."""
+    binding = _immediate_delivery.get()
+    if binding is None or binding[0] is not connection or binding[3] != repo or connection.in_transaction:
+        return 0
+    _, token, chat_id, _ = binding
+    if not token or not chat_id:
+        return 0
+    try:
+        rows = connection.execute(
+            "SELECT event_key, event_type, payload, repo FROM notification_outbox "
+            "WHERE repo = ? AND event_type = 'pr_created' "
+            "AND sent_at IS NULL AND canceled_at IS NULL AND attempts = 0 "
+            "ORDER BY created_at, event_key", (repo,),
+        ).fetchall()
+        return _deliver_rows(connection, token, chat_id, rows, send_telegram,
+                             first_attempt_only=True)
+    except Exception as error:
+        events.emit("새 PR 알림 전송 실패: 다음 실행에서 재확인", level="WARN",
+                    error_type=type(error).__name__)
+        return 0
+
+
+def flush_observed_pr_events(connection, repo):
+    """Retry this project's PR notices only after its remote PR observation succeeds."""
+    binding = _immediate_delivery.get()
+    if binding is None or binding[0] is not connection or binding[3] != repo or connection.in_transaction:
+        return 0
+    _, token, chat_id, _ = binding
+    if not token or not chat_id:
+        return 0
+    try:
+        rows = connection.execute(
+            "SELECT event_key, event_type, payload, repo FROM notification_outbox "
+            "WHERE repo = ? AND event_type = 'pr_created' "
+            "AND sent_at IS NULL AND canceled_at IS NULL "
+            "ORDER BY created_at, event_key", (repo,),
+        ).fetchall()
+        return _deliver_rows(connection, token, chat_id, rows, send_telegram)
+    except Exception as error:
+        events.emit("PR 알림 재확인 전송 실패: 다음 실행에서 다시 확인", level="WARN",
                     error_type=type(error).__name__)
         return 0

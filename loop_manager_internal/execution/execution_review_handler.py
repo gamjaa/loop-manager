@@ -25,6 +25,9 @@ from loop_manager_internal.storage import pre_review
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
+import ast
+import hashlib
+import re
 
 @dataclass(frozen=True)
 class ReviewHandlerPorts:
@@ -66,6 +69,7 @@ class ReviewHandlerPorts:
     observe_verify_inputs: Callable[..., Any] | None = None
     checkpoint: Any = None
     pre_review_identity: Callable[..., Any] | None = None
+    git_bytes: Callable[..., bytes] | None = None
 
 
 class ReviewHandler:
@@ -219,6 +223,87 @@ class ReviewHandler:
                 f"candidate HEAD={candidate_head}; base={base_sha}; 전체 verify PASS가 아닙니다. "
                 f"{redact_secrets(str(receipt['result']))}.")
 
+    def _pr_review_candidate_proof(self, context, row, candidate_head):
+        """Bind publication proof to the reviewed patch, not its rebase-specific OIDs."""
+        definition = self.ports.snapshot()._definition_snapshot
+        base = str(row['validated_base_sha'] or row['active_sha'] or '')
+        if definition is None or not base or not candidate_head:
+            return None
+        try:
+            if self.ports.git_bytes is None:
+                raise RuntimeError('raw Git diff bytes are unavailable')
+            diff = self.ports.git_bytes(
+                context.worktree, 'diff', '--binary', '--unified=1', '--no-ext-diff',
+                '--no-textconv', '--submodule=short', base, candidate_head,
+            )
+            if not isinstance(diff, bytes):
+                raise TypeError('raw Git diff did not return bytes')
+            old_path = None
+            gitlink = False
+            def location(match):
+                start = int(match[1])
+                count = int(match[2] or b'1')
+                if not count or gitlink:
+                    return b'@@'
+                # Blame retains the original commit/line when upstream inserts
+                # identical contexts before this location. Current offsets do not.
+                blame = self.ports.git_bytes(
+                    context.worktree, 'blame', '--porcelain',
+                    '-L', f'{start},+{count}', base, '--', old_path,
+                )
+                origins = re.findall(
+                    rb'^([0-9a-f]{40,64}) (\d+) \d+(?: \d+)?$',
+                    blame, flags=re.MULTILINE,
+                )
+                if len(origins) != count:
+                    raise ValueError('incomplete original line identity')
+                return b'@@ origins=' + b';'.join(oid + b':' + line for oid, line in origins)
+
+            stable_lines = []
+            in_hunk = False
+            for line in diff.split(b'\n'):
+                if line.startswith(b'diff --git '):
+                    in_hunk = False
+                    gitlink = False
+                elif line.startswith(b'@@ '):
+                    in_hunk = True
+                if not in_hunk and line.startswith(b'--- '):
+                    path = line[4:]
+                    if path.startswith(b'"'):
+                        path = ast.literal_eval('b' + path.decode('ascii'))
+                    old_path = path[2:].decode('utf-8', errors='surrogateescape')
+                if not in_hunk and re.search(rb'^(?:index .*|(?:old|new|deleted file|new file) mode) 160000$', line):
+                    gitlink = True
+                if not gitlink:
+                    line = re.sub(rb'^index [0-9a-f]+\.\.[0-9a-f]+', b'index', line)
+                line = re.sub(
+                    rb'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@.*$',
+                    location, line,
+                )
+                stable_lines.append(line)
+            stable_diff = b'\n'.join(stable_lines)
+            change_identity = hashlib.sha256(stable_diff).hexdigest()
+        except (OSError, RuntimeError, SyntaxError, UnicodeError, TypeError, ValueError) as error:
+            events.emit(
+                'Review 후보 변경 identity를 확인할 수 없어 PR 알림 후보를 보류',
+                level='WARN', project=self.ports.identity.repo,
+                plan=context.plan.plan_id, stage='REVIEW',
+                error_type=type(error).__name__,
+            )
+            return None
+        return (
+            definition.publication_token(base, candidate_head),
+            definition.review_candidate_identity(change_identity),
+        )
+
+    def _record_pr_review_candidate(self, proof, context):
+        if proof is not None:
+            notifications.record_pr_review_candidate(
+                self.ports.state.connection, self.ports.identity.repo,
+                context.plan.plan_id, publication_token=proof[0],
+                review_input_identity=proof[1],
+            )
+
     def review(self, context: ExecutionContext) -> ExecutionOutcome:
         self._preliminary = None
         self.ports.state.check_context(context)
@@ -241,6 +326,7 @@ class ReviewHandler:
             if (preliminary_review.reusable(self.ports, context, approved)
                     and preliminary_review.full_evidence(self.ports, context, approved)):
                 candidate_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+                candidate_proof = self._pr_review_candidate_proof(context, row, candidate_head)
                 reusable = preliminary_review.reusable(self.ports, context, approved)
                 full_evidence = preliminary_review.full_evidence(self.ports, context, approved)
                 with runtime_state._transaction(self.ports.state.connection):
@@ -251,6 +337,7 @@ class ReviewHandler:
                         return self.ports._retry('선행 Review 최종 승인 입력이 변경됐습니다.')
                     pre_review.update(self.ports.state.connection, approved, 'finalized_reuse')
                     self.ports.clear_validation_failure_history(self.ports.identity.repo, 'review')
+                    self._record_pr_review_candidate(candidate_proof, context)
                     self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
                         phase='PUBLISHING', last_error=None, review_result=approved['review'],
                         review_token=self.ports.snapshot()._definition_snapshot.review_token(
@@ -295,10 +382,17 @@ class ReviewHandler:
         waiver = manual.waive(context, 'review', snapshot=manual_snapshot) if manual else None
         if waiver:
             self.ports.operation_print(waiver)
-            self.ports.state.update_project(self.ports.identity.repo, phase='PUBLISHING', last_error=None,
-                review_result=waiver, review_token=self.ports.snapshot()._definition_snapshot.review_token(
-                    str(row['validated_base_sha'] or row['active_sha']),
-                    self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()), publication_token=None)
+            candidate_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+            candidate_proof = self._pr_review_candidate_proof(context, row, candidate_head)
+            with runtime_state._transaction(self.ports.state.connection):
+                self._record_pr_review_candidate(candidate_proof, context)
+                self.ports.state.update_project(
+                    self.ports.identity.repo, preserve_transaction=True,
+                    phase='PUBLISHING', last_error=None, review_result=waiver,
+                    review_token=self.ports.snapshot()._definition_snapshot.review_token(
+                        str(row['validated_base_sha'] or row['active_sha']), candidate_head),
+                    publication_token=None,
+                )
             return self.ports._advanced()
         notice = manual.invalid_waiver_notice(context,'review',snapshot=manual_snapshot) if manual else None
         if notice:
@@ -611,18 +705,23 @@ class ReviewHandler:
         prior = pre_review.current(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id)
         if prior and prior['status'] in {'review_pass', 'final_review_running'}:
             pre_review.update(self.ports.state.connection, prior, 'finalized_review')
-        self.ports.state.update_project(
-            self.ports.identity.repo,
-            phase='PUBLISHING',
-            last_error=None,
-            review_result=review,
-            review_token=(
-                self.ports.snapshot()._definition_snapshot.review_token(
-                    str(row['validated_base_sha'] or row['active_sha'] or ''),
-                    self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip(),
-                )
-                if self.ports.snapshot()._definition_snapshot is not None else None
-            ),
-            publication_token=None,
-        )
+        candidate_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        candidate_proof = self._pr_review_candidate_proof(context, row, candidate_head)
+        with runtime_state._transaction(self.ports.state.connection):
+            self._record_pr_review_candidate(candidate_proof, context)
+            self.ports.state.update_project(
+                self.ports.identity.repo,
+                preserve_transaction=True,
+                phase='PUBLISHING',
+                last_error=None,
+                review_result=review,
+                review_token=(
+                    self.ports.snapshot()._definition_snapshot.review_token(
+                        str(row['validated_base_sha'] or row['active_sha'] or ''),
+                        candidate_head,
+                    )
+                    if self.ports.snapshot()._definition_snapshot is not None else None
+                ),
+                publication_token=None,
+            )
         return self.ports._advanced()
