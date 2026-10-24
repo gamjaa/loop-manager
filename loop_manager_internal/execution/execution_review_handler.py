@@ -234,15 +234,16 @@ class ReviewHandler:
                 raise RuntimeError('raw Git diff bytes are unavailable')
             diff = self.ports.git_bytes(
                 context.worktree, 'diff', '--binary', '--unified=1', '--no-ext-diff',
-                '--no-textconv', base, candidate_head,
+                '--no-textconv', '--submodule=short', base, candidate_head,
             )
             if not isinstance(diff, bytes):
                 raise TypeError('raw Git diff did not return bytes')
             old_path = None
+            gitlink = False
             def location(match):
                 start = int(match[1])
                 count = int(match[2] or b'1')
-                if not count:
+                if not count or gitlink:
                     return b'@@'
                 # Blame retains the original commit/line when upstream inserts
                 # identical contexts before this location. Current offsets do not.
@@ -263,6 +264,7 @@ class ReviewHandler:
             for line in diff.split(b'\n'):
                 if line.startswith(b'diff --git '):
                     in_hunk = False
+                    gitlink = False
                 elif line.startswith(b'@@ '):
                     in_hunk = True
                 if not in_hunk and line.startswith(b'--- '):
@@ -270,7 +272,10 @@ class ReviewHandler:
                     if path.startswith(b'"'):
                         path = ast.literal_eval('b' + path.decode('ascii'))
                     old_path = path[2:].decode('utf-8', errors='surrogateescape')
-                line = re.sub(rb'^index [0-9a-f]+\.\.[0-9a-f]+', b'index', line)
+                if not in_hunk and re.search(rb'^(?:index .*|(?:old|new|deleted file|new file) mode) 160000$', line):
+                    gitlink = True
+                if not gitlink:
+                    line = re.sub(rb'^index [0-9a-f]+\.\.[0-9a-f]+', b'index', line)
                 line = re.sub(
                     rb'^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@.*$',
                     location, line,

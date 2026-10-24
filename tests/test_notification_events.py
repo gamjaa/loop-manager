@@ -1015,6 +1015,11 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             latin.write_bytes(b'value = "base"\n')
             git('add', 'source.txt', 'snippet.py', 'branches.py', 'latin.py')
             git('commit', '-m', 'base')
+            dependency = repo_path / 'dependency'
+            dependency.mkdir()
+            dependency_oid = git('rev-parse', 'HEAD').stdout.strip()
+            git('update-index', '--add', '--cacheinfo', f'160000,{dependency_oid},dependency')
+            git('commit', '-m', 'base gitlink')
             base_before = git('rev-parse', 'HEAD').stdout.strip()
             git('checkout', '-b', 'feature')
             source.write_text('zero\nreviewed change\nend\n', encoding='utf-8')
@@ -1064,11 +1069,13 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
                 git('checkout', 'main')
                 git('checkout', '-b', branch)
                 target = repo_path / path
-                if isinstance(content, bytes):
+                if path == 'dependency':
+                    git('update-index', '--cacheinfo', f'160000,{content},dependency')
+                elif isinstance(content, bytes):
                     target.write_bytes(content)
                 else:
                     target.write_text(content, encoding='utf-8')
-                git('commit', '-am', branch)
+                git('commit', '-m' if path == 'dependency' else '-am', branch)
                 head = git('rev-parse', 'HEAD').stdout.strip()
                 proof = handler._pr_review_candidate_proof(
                     context, {'validated_base_sha': base_after}, head,
@@ -1108,6 +1115,16 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             )
             self.assertNotEqual(latin_one[1], latin_two[1])
 
+            gitlink_one, gitlink_one_head = candidate_with_content(
+                'candidate-gitlink-one', 'dependency', head_before,
+            )
+            gitlink_two, gitlink_two_head = candidate_with_content(
+                'candidate-gitlink-two', 'dependency', head_after,
+            )
+            self.assertIsNotNone(gitlink_one)
+            self.assertIsNotNone(gitlink_two)
+            self.assertNotEqual(gitlink_one[1], gitlink_two[1])
+
             # A repeated block inserted before g must not rename g's candidate.
             git('checkout', 'main')
             branches.write_text(
@@ -1124,6 +1141,14 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             )
             self.assertNotEqual(else_branch[0], repeated_proof[0])
             self.assertEqual(else_branch[1], repeated_proof[1])
+
+            git('checkout', 'candidate-gitlink-two')
+            git('rebase', 'main')
+            rebased_gitlink = handler._pr_review_candidate_proof(
+                context, {'validated_base_sha': repeated_base},
+                git('rev-parse', 'HEAD').stdout.strip(),
+            )
+            self.assertEqual(gitlink_two[1], rebased_gitlink[1])
 
             connection = self.connection()
             first = self.prepare_pr_candidate(
@@ -1184,6 +1209,8 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
                 ('second repeated context', else_branch, else_branch_head),
                 ('Latin-1 byte one', latin_one, latin_one_head),
                 ('Latin-1 byte two', latin_two, latin_two_head),
+                ('gitlink one', gitlink_one, gitlink_one_head),
+                ('gitlink two', gitlink_two, gitlink_two_head),
             ):
                 with self.subTest(candidate=branch):
                     candidate = self.prepare_pr_candidate(
@@ -1197,8 +1224,8 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
                         connection, 'token', 'chat', adapter=sent,
                     ), 1)
             self.assertEqual(len([row for row in self.events(connection)
-                                  if row['event_type'] == 'pr_created']), 7)
-            self.assertEqual(sent.call_count, 7)
+                                  if row['event_type'] == 'pr_created']), 9)
+            self.assertEqual(sent.call_count, 9)
             self.prepare_pr_candidate(
                 connection, repo=project_repo, base=repeated_base, head=repeated_head,
                 review_input_identity=repeated_proof[1],
@@ -1208,7 +1235,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(notifications.dispatch_pending(
                 connection, 'token', 'chat', adapter=sent,
             ), 0)
-            self.assertEqual(sent.call_count, 7)
+            self.assertEqual(sent.call_count, 9)
 
 
     def test_planning_result_only_notifies_after_catalog_publication(self):
