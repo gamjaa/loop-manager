@@ -15,6 +15,7 @@ from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
 
 
 _context = ContextVar("operation_context", default={})
+_active_progress = ContextVar("operation_progress", default=None)
 _output_lock = threading.Lock()
 PROGRESS_INTERVAL_SECONDS = 30
 
@@ -53,41 +54,72 @@ def emit(message: str, *, level="INFO", **fields) -> None:
         operation_log(OperationLogEffects(local_now), message, level=level, **fields)
 
 
+class _ProgressReporter:
+    def __init__(self):
+        self.stopped = threading.Event()
+        self._lock = threading.Lock()
+        self._paused = 0
+
+    def pause(self):
+        with self._lock:
+            self._paused += 1
+
+    def resume(self):
+        with self._lock:
+            self._paused -= 1
+
+    def should_report(self):
+        with self._lock:
+            return not self._paused and not self.stopped.is_set()
+
+
 @contextmanager
 def progress(label: str, *, describe=None, interval=None):
-    """관측만 복사한 스레드에서 상태를 출력하며 SQLite·실행 상태는 건드리지 않는다."""
-    if _context.get().get("progress_active"):
-        yield
-        return
-    stopped, started = threading.Event(), time.monotonic()
+    """중첩 관측이 부모 heartbeat를 잠시 이어받으며 실행 상태는 건드리지 않는다."""
+    parent = _active_progress.get()
+    if parent is not None:
+        parent.pause()
+    reporter = _ProgressReporter()
+    progress_token = _active_progress.set(reporter)
+    context_token = _context.set({**_context.get(), "progress_active": True})
+    started = time.monotonic()
     interval = PROGRESS_INTERVAL_SECONDS if interval is None else interval
     def report():
-        while not stopped.wait(interval):
+        while not reporter.stopped.wait(interval):
+            if not reporter.should_report():
+                continue
             try:
                 try:
                     fields = describe() if describe else {}
                 except Exception:
                     fields = {"progress_observation": "미확인"}
-                if stopped.is_set():
+                if reporter.stopped.is_set():
                     break
+                if not reporter.should_report():
+                    continue
                 emit(f"{label} 진행 중", elapsed_seconds=round(time.monotonic() - started, 1),
                      **fields)
             except Exception:
                 pass  # 선택적 관측 실패로 실행 결과를 바꾸지 않는다.
-    token = _context.set({**_context.get(), "progress_active": True})
     thread = threading.Thread(target=copy_context().run, args=(report,), daemon=True)
     try:
         thread.start()
     except (OSError, RuntimeError):
-        _context.reset(token)
+        _active_progress.reset(progress_token)
+        _context.reset(context_token)
+        if parent is not None:
+            parent.resume()
         yield
         return
     try:
         yield
     finally:
-        stopped.set()
+        reporter.stopped.set()
         thread.join(timeout=1)
-        _context.reset(token)
+        _active_progress.reset(progress_token)
+        _context.reset(context_token)
+        if parent is not None:
+            parent.resume()
 
 
 @contextmanager

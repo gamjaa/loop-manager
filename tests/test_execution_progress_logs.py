@@ -73,6 +73,7 @@ class ExecutionProgressLogTest(unittest.TestCase):
             content_file.write_bytes(b"draft input")
             artifact = b"original document\n--- diff ---\nproposed document\n"
             draft = types.SimpleNamespace(repo=str(repository))
+            original_emit = events.emit
             connection = mock.Mock()
             connection.execute.return_value.fetchone.return_value = {
                 "base_branch": "main", "provider": "codex",
@@ -81,6 +82,15 @@ class ExecutionProgressLogTest(unittest.TestCase):
             drafts.get.return_value = draft
             drafts.create.return_value = draft
             drafts.generation_prompt.return_value = ("prompt", "identity")
+            agent_progress = threading.Event()
+            def run_agent(*_args, **_kwargs):
+                with events.activity("Agent 호출 처리", heartbeat=True):
+                    self.assertTrue(agent_progress.wait(2))
+                return object()
+            def observe_emit(message, **fields):
+                if message == "Agent 호출 처리 진행 중":
+                    agent_progress.set()
+                original_emit(message, **fields)
             effects = commands_app.DocumentDraftsCommandEffects(
                 ROOT=repository,
                 _coerce_agent_result=lambda *_args: types.SimpleNamespace(code=0, message="generated"),
@@ -88,7 +98,7 @@ class ExecutionProgressLogTest(unittest.TestCase):
                 connect_database=lambda _state: connection,
                 is_loop_manager_repository=lambda _repo: True,
                 operation_print=mock.Mock(),
-                run_agent=mock.Mock(return_value=object()),
+                run_agent=mock.Mock(side_effect=run_agent),
             )
             for command in ("show", "generate", "create"):
                 with self.subTest(command=command):
@@ -105,6 +115,8 @@ class ExecutionProgressLogTest(unittest.TestCase):
                          mock.patch.object(document_drafts, "DocumentDraftRepository", return_value=drafts), \
                          mock.patch.object(document_drafts, "review_artifact_bytes", return_value=artifact) as render, \
                          mock.patch.object(document_drafts, "parse_generated_draft", return_value=(b"draft", "meaning")), \
+                         mock.patch.object(events, "emit", side_effect=observe_emit), \
+                         mock.patch.object(events, "PROGRESS_INTERVAL_SECONDS", .001), \
                          events.log_context(result_output=True):
                         self.assertEqual(commands_app._document_drafts_command(
                             effects, args, root / "state", root / "config.ini",
@@ -112,6 +124,8 @@ class ExecutionProgressLogTest(unittest.TestCase):
                     self.assertEqual(stdout.buffer.getvalue(), artifact)
                     self.assertEqual(stdout.getvalue(), "")
                     self.assertIn("문서 수정본 처리 종료", stderr.getvalue())
+                    if command == "generate":
+                        self.assertIn("Agent 호출 처리 진행 중", stderr.getvalue())
                     render.assert_called_once_with(draft)
 
     def test_bootstrap_parent_and_runtime_child_keep_result_artifact_separate(self):
@@ -174,9 +188,14 @@ class ExecutionProgressLogTest(unittest.TestCase):
 
     def test_manual_command_logs_its_own_repository_and_plan_scope(self):
         connection = mock.Mock()
-        observed = []
+        observed, nested_results = [], []
+        nested_progress = threading.Event()
         service = mock.Mock()
-        service.validate_repository.side_effect = lambda: observed.append(events.current_context())
+        def validate_repository():
+            observed.append(events.current_context())
+            with events.progress("수동 하위 관측", interval=.001):
+                nested_results.append(nested_progress.wait(2))
+        service.validate_repository.side_effect = validate_repository
         service.start.return_value = 0
         effects = types.SimpleNamespace(
             connect_database=mock.Mock(return_value=connection),
@@ -186,10 +205,12 @@ class ExecutionProgressLogTest(unittest.TestCase):
             repository="/tmp/manual-repo", manual_command="start", plan_id="G-283",
         )
         with mock.patch.object(manual_work_app, "ManualWorkService", return_value=service), \
-             mock.patch.object(events, "emit"):
+             mock.patch.object(events, "emit", side_effect=lambda message, **_fields:
+                               nested_progress.set() if message == "수동 하위 관측 진행 중" else None):
             self.assertEqual(manual_work_app.manual_command(
                 effects, args, Path("state"), Path("config.ini"),
             ), 0)
+        self.assertEqual(nested_results, [True])
         self.assertEqual(observed[0]["project"], str(Path(args.repository).resolve()))
         self.assertEqual(observed[0]["plan"], "G-283")
         self.assertEqual(observed[0]["stage"], "MANUAL_START")
@@ -207,10 +228,17 @@ class ExecutionProgressLogTest(unittest.TestCase):
             return cursor
         connection.execute.side_effect = query
         outcome = ProjectRunResult(ProjectRunKind.TRANSIENT_PAUSE, 0, "retry later")
-        observed, emitted = [], []
+        observed, emitted, nested_results = [], [], []
+        verify_progress = threading.Event()
         def run_project(*_args, **_kwargs):
             observed.append(events.current_context())
+            with events.progress("verify", interval=.001):
+                nested_results.append(verify_progress.wait(2))
             return outcome
+        def record(message, **fields):
+            emitted.append((message, fields))
+            if message == "verify 진행 중":
+                verify_progress.set()
         effects = commands_app.LocalRecoveryExecutionEffects(
             operation_print=mock.Mock(), run_project_result=run_project,
         )
@@ -220,7 +248,7 @@ class ExecutionProgressLogTest(unittest.TestCase):
         }
         with mock.patch.object(commands_app.local_recovery_state, "snapshot", return_value=after), \
              mock.patch.object(commands_app.local_recovery_state, "complete_request"), \
-             mock.patch.object(events, "emit", side_effect=lambda message, **fields: emitted.append((message, fields))):
+             mock.patch.object(events, "emit", side_effect=record):
             result = commands_app.execute_local_recovery_request(
                 effects, connection, Path("state"), request, Path("config.ini"),
                 planner_mutex=threading.Lock(),
@@ -228,6 +256,7 @@ class ExecutionProgressLogTest(unittest.TestCase):
             )
         self.assertEqual(result.exit_code, 1)
         self.assertEqual(result.kind, ProjectRunKind.TRANSIENT_PAUSE)
+        self.assertEqual(nested_results, [True])
         self.assertEqual(observed[0]["project"], request.repo)
         self.assertEqual(observed[0]["plan"], request.plan_id)
         self.assertEqual(observed[0]["stage"], "RECOVERY")

@@ -91,17 +91,29 @@ class OperationObservabilityTests(TestCase):
         self.assertEqual(records[-1][0], "Agent 호출 처리 종료")
         self.assertTrue(all(fields["provider"] == "codex" for _, fields in records))
 
-    def test_progress_copies_context_stops_and_suppresses_nested_reporters(self):
-        seen, observed = [], threading.Event()
+    def test_nested_progress_reports_child_and_resumes_parent(self):
+        seen, parent_before, child_seen, parent_after = [], threading.Event(), threading.Event(), threading.Event()
+        child_finished = threading.Event()
         def record(message, **fields):
             seen.append((message, events.current_context()))
-            observed.set()
+            if message == "부모 진행 중":
+                if child_finished.is_set():
+                    parent_after.set()
+                else:
+                    parent_before.set()
+            elif message == "자식 진행 중":
+                child_seen.set()
         with mock.patch.object(events, "emit", side_effect=record):
             with events.log_context(run="run-2", project="repo"):
-                with events.progress("부모", interval=.001), events.progress("자식", interval=.001):
-                    self.assertTrue(observed.wait(2))
+                with events.progress("부모", interval=.001):
+                    self.assertTrue(parent_before.wait(2))
+                    with events.progress("자식", interval=.001):
+                        self.assertTrue(child_seen.wait(2))
+                    child_finished.set()
+                    self.assertTrue(parent_after.wait(2))
                 self.assertFalse(events.current_context().get("progress_active"))
-        self.assertTrue(all(message == "부모 진행 중" and context["run"] == "run-2" for message, context in seen))
+        self.assertIn("자식 진행 중", [message for message, _ in seen])
+        self.assertTrue(all(context["run"] == "run-2" for _, context in seen))
 
     def test_exception_is_not_reported_as_completion(self):
         with mock.patch.object(events, "emit") as output:
