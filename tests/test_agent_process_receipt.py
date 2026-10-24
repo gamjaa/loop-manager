@@ -64,7 +64,7 @@ class ProcessReceiptTest(TestCase):
 
     def test_process_receipt_updates_preserve_the_invocation_observation(self):
         facts = dict(started_at='2026-10-24T12:00:00+00:00', session_id='session')
-        process_receipt.observe(self.launch, self.identity, facts)
+        process_receipt.observe(self.path, self.identity, facts)
         process_receipt.started(self.launch, SimpleNamespace(pid=1234))
         self.assertEqual(process_receipt.observation(str(self.path), self.state, self.identity)['session_id'], 'session')
         process_receipt.finished(self.launch, SimpleNamespace(pid=1234))
@@ -84,7 +84,7 @@ class ProcessReceiptTest(TestCase):
                 self.path.unlink(missing_ok=True)
                 identity = 'other-invocation' if mode == 'foreign' else self.identity
                 facts = {} if mode == 'foreign' else {'outcome': {'kind': 'success'}}
-                process_receipt.observe(self.launch, identity, facts)
+                process_receipt.observe(self.path, identity, facts)
                 process_receipt.finished(self.launch, SimpleNamespace(pid=1234))
                 self.assertEqual(self.repository.reconcile_interrupted(state_dir=self.state), 0)
                 self.assertIsNone(self.row()['finished_at'])
@@ -94,7 +94,7 @@ class ProcessReceiptTest(TestCase):
     def test_prelaunch_rejection_is_recovered_as_non_execution_without_a_result(self):
         with self.connection:
             self.connection.execute("UPDATE agent_invocations SET execution_status='prepared', execution_started_at=NULL")
-        process_receipt.not_started(self.launch)
+        process_receipt.not_started(self.path)
         self.repository.reconcile_interrupted(state_dir=self.state)
         first = dict(self.row())
         self.assertEqual((first['execution_status'], first['result_code']), ('not_executed', None))
@@ -106,10 +106,10 @@ class ProcessReceiptTest(TestCase):
         from loop_manager_internal.storage import task_calls
         self.started()
         original = self.path.read_bytes()
-        process_receipt.not_started(self.launch)
+        process_receipt.not_started(self.path)
         self.assertEqual(self.path.read_bytes(), original)
         self.path.unlink()
-        process_receipt.not_started(self.launch)
+        process_receipt.not_started(self.path)
         self.repository.reconcile_interrupted(state_dir=self.state)
         self.assertEqual(self.row()['execution_status'], 'executed')
         self.assertIsNone(self.row()['execution_finished_at'])

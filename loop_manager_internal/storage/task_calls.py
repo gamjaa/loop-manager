@@ -183,13 +183,18 @@ def _confirmed(connection, row, state_dir):
     return bool(invocation and invocation[1])
 
 
+def execution_confirmed(connection, row, state_dir):
+    """Physical termination is independent of pending observation persistence."""
+    return _confirmed(connection, row, state_dir)
+
+
 def confirmed(owner):
     from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
     row=owner.connection.execute("SELECT * FROM task_call_reservations WHERE token=?",(owner.token,)).fetchone()
     pending = (InvocationRepository(owner.connection).reconcile_observations(
         state_dir=owner.state_dir, invocation_id=row['invocation_id'])
         if row is not None and row['invocation_id'] is not None else set())
-    return row is not None and row['invocation_id'] not in pending and _confirmed(owner.connection,row,owner.state_dir)
+    return row is not None and row['invocation_id'] not in pending and execution_confirmed(owner.connection,row,owner.state_dir)
 
 
 def recover(connection, state_dir, *, tokens=None):
@@ -205,7 +210,7 @@ def recover(connection, state_dir, *, tokens=None):
             pending.update(repository.reconcile_observations(state_dir=state_dir, invocation_id=row['invocation_id']))
     repository.reconcile_execution(state_dir=state_dir)
     for row in rows:
-        if row['invocation_id'] not in pending and _confirmed(connection,row,state_dir):
+        if row['invocation_id'] not in pending and execution_confirmed(connection,row,state_dir):
             with connection:
                 connection.execute("DELETE FROM task_call_reservations WHERE token=?",(row["token"],))
     return tuple(row for row in connection.execute("SELECT * FROM task_call_reservations")

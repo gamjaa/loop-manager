@@ -62,9 +62,8 @@ def _write_process(launch, value):
     _write(path, value)
 
 
-def observe(launch, identity: str, observation: dict) -> None:
+def observe(path: Path, identity: str, observation: dict) -> None:
     """Keep non-secret facts beside the existing process receipt before DB writes."""
-    path = receipt_path(launch)
     value = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {'platform': sys.platform}
     if not isinstance(value, dict) or value.get('platform') != sys.platform:
         raise ValueError('process receipt 형식 또는 실행 환경이 다릅니다.')
@@ -93,8 +92,15 @@ def observation(path: str, state_dir: Path, identity: str) -> dict | None:
         return None
     if (not isinstance(value, dict) or type(value.get('version')) is not int
             or value['version'] != 1 or value.get('identity') != identity
-            or set(value) - {'version', 'identity', 'started_at', 'finished_at', 'duration_ms', 'session_id', 'outcome'}):
+            or set(value) - {'version', 'identity', 'started_at', 'finished_at', 'duration_ms', 'session_id', 'outcome',
+                             'database_pending', 'request_sha256', 'message_sha256'}):
         raise ValueError('invocation 관측 identity 또는 형식이 다릅니다.')
+    if 'database_pending' in value and type(value['database_pending']) is not bool:
+        raise ValueError('invocation 저장 대기 형식이 다릅니다.')
+    for key in ('request_sha256', 'message_sha256'):
+        if key in value and (not isinstance(value[key], str) or len(value[key]) != 64
+                            or any(char not in '0123456789abcdef' for char in value[key])):
+            raise ValueError('invocation 결과 지문 형식이 다릅니다.')
     for key in ('started_at', 'finished_at'):
         if key in value and (not isinstance(value[key], str)
                 or datetime.fromisoformat(value[key]).tzinfo is None):
@@ -128,11 +134,32 @@ def observation(path: str, state_dir: Path, identity: str) -> dict | None:
     return value
 
 
-def not_started(launch) -> None:
+def delivered(path: str, state_dir: Path, identity: str) -> None:
+    value = observation(path, state_dir, identity)
+    if value is not None and value.get('database_pending'):
+        root = json.loads(Path(path).read_text(encoding='utf-8'))
+        root['invocation_observation'] = {**value, 'database_pending': False}
+        _write(Path(path), root)
+
+
+def result_message(path: str, expected: str) -> str:
+    """Use only the existing provider artifact; never synthesize a role response."""
+    receipt = Path(path)
+    source = receipt.parent / receipt.name.removesuffix('.process.json') / 'last-message.txt'
+    if source.is_symlink() or source.resolve() != source.absolute():
+        raise ValueError('Agent 원래 결과 파일 경로가 변경되었습니다.')
+    message = source.read_text(encoding='utf-8')
+    for candidate in (message, message.strip()):
+        if hashlib.sha256(candidate.encode('utf-8')).hexdigest() == expected:
+            return candidate
+    raise ValueError('Agent 원래 결과 파일의 지문이 다릅니다.')
+
+
+def not_started(path: Path) -> None:
     """Only a rejected prelaunch callback can prove process creation was not reached."""
-    if receipt_path(launch).exists():
+    if path.exists():
         return  # Never replace an existing process observation with non-execution.
-    _write(receipt_path(launch), dict(platform=sys.platform,
+    _write(path, dict(platform=sys.platform,
            finished_at=datetime.now(timezone.utc).isoformat(), evidence='not_started'))
 
 

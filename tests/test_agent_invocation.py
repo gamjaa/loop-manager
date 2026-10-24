@@ -240,6 +240,71 @@ class RunnerTests(TestCase):
                 self.assertEqual(dict(reopened.execute('SELECT * FROM agent_invocations').fetchone()), recovered)
                 self.assertEqual(len(calls), 1)
 
+    def test_storage_pending_restart_consumes_existing_message_or_holds_without_provider(self):
+        from loop_manager_internal.storage.db_access import open_connection, DatabaseWaitTimeout
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        from loop_manager_internal.agents import process_receipt
+        for mode in ('matching', 'missing', 'changed_request', 'changed_message', 'changed_ledger', 'changed_session_owner', 'exception'):
+            with self.subTest(mode=mode):
+                path = self.state_dir / (mode + '.db')
+                connection = open_connection(path)
+                self.addCleanup(connection.close)
+                connection.row_factory = sqlite3.Row
+                with connection:
+                    state.ensure_schema(connection)
+                launch = self.targeted_launch(mode)
+                source = launch.attempt / 'last-message.txt'
+                source.write_text('original role result\n', encoding='utf-8')
+                class Provider:
+                    def run(_, request):
+                        request.on_launch_prepared(launch)
+                        request.on_process_started()
+                        request.on_process_finished()
+                        if mode == 'exception':
+                            raise OSError('original provider exception')
+                        return manager.AgentResult(0, 'original role result', 'session', usage=invocation.Usage(input_tokens=7))
+                arguments = ('codex', Path('/worktree'), self.state_dir, Path('/config'), 'planner')
+                kwargs = dict(read_only=True, connection=connection, invocation=invocation.InvocationContext('repo', None),
+                              resolved_profile=invocation.ResolvedProfile('model', 'high'))
+                with mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+                     mock.patch.object(state.InvocationRepository, 'finish', side_effect=DatabaseWaitTimeout('finish wait')):
+                    if mode == 'exception':
+                        with self.assertRaises(OSError):
+                            manager.run_agent(*arguments, 'prompt', **kwargs)
+                    else:
+                        self.assertEqual(manager.run_agent(*arguments, 'prompt', **kwargs).message, 'original role result')
+                identity = connection.execute('SELECT invocation_id FROM agent_invocations').fetchone()[0]
+                connection.close()
+                reopened = open_connection(path)
+                self.addCleanup(reopened.close)
+                reopened.row_factory = sqlite3.Row
+                state.InvocationRepository(reopened).reconcile_interrupted(state_dir=self.state_dir)
+                kwargs['connection'] = reopened
+                if mode == 'missing':
+                    source.unlink()
+                if mode == 'changed_message':
+                    source.write_text('different response', encoding='utf-8')
+                if mode == 'changed_ledger':
+                    with reopened:
+                        reopened.execute("UPDATE agent_invocations SET result_kind='interrupted'")
+                if mode == 'changed_session_owner':
+                    with reopened:
+                        reopened.execute("UPDATE common_guidance_sessions SET task_id='another-task'")
+                provider = mock.Mock()
+                provider.run.side_effect = AssertionError('provider must not be repeated')
+                with mock.patch.object(manager, 'agent_provider', return_value=provider):
+                    if mode == 'matching':
+                        result = manager.run_agent(*arguments, 'prompt', **kwargs)
+                        self.assertEqual((result.code, result.message, result.usage.input_tokens, result.isolation_invocation_id),
+                                         (0, 'original role result', 7, identity))
+                    else:
+                        with self.assertRaises(CallDeferred):
+                            manager.run_agent(*arguments, 'different prompt' if mode == 'changed_request' else 'prompt', **kwargs)
+                provider.run.assert_not_called()
+                self.assertEqual(reopened.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 1)
+                saved = process_receipt.observation(str(process_receipt.receipt_path(launch)), self.state_dir, identity)
+                self.assertEqual(saved['database_pending'], mode != 'matching')
+
     def test_callback_database_requests_retry_without_replaying_the_session_callback(self):
         from loop_manager_internal.storage.db_access import open_connection
         connection = open_connection(self.state_dir / 'callbacks.db')
@@ -480,6 +545,35 @@ class RunnerTests(TestCase):
                             self.assertEqual(task_calls.recover(connection, self.state_dir), ())
                     finally:
                         task_calls.current_call.reset(token)
+
+    def test_direct_targeted_preparation_binds_the_reservation_and_preserves_unknown_exit(self):
+        from loop_manager_internal.storage import task_calls
+        from loop_manager_internal.agents import process_receipt
+        task_calls.ensure_schema(self.connection)
+        owner = task_calls.reserve(self.connection, self.state_dir, 'repo', 'G-1', 'agent', 'run')
+        token = task_calls.current_call.set(owner)
+        launch = self.targeted_launch()
+        receipt = process_receipt.receipt_path(launch)
+        class Provider:
+            def run(_, request):
+                request.on_targeted_prepared(launch.attempt, receipt)
+                request.on_process_started()
+                raise OSError('exit is not confirmed')
+        try:
+            with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+                with self.assertRaises(OSError):
+                    manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                        'worker', 'prompt', read_only=False, connection=self.connection,
+                        invocation=invocation.InvocationContext('repo', 'G-1'),
+                        resolved_profile=invocation.ResolvedProfile('model', 'high'))
+            row = self.connection.execute('SELECT * FROM task_call_reservations').fetchone()
+            self.assertEqual(row['receipt_path'], str(receipt))
+            self.assertIsNotNone(row['invocation_id'])
+            self.assertFalse(task_calls.confirmed(owner))
+            self.assertEqual(len(task_calls.recover(self.connection, self.state_dir)), 1)
+            self.assertIsNone(self.connection.execute('SELECT execution_finished_at FROM agent_invocations').fetchone()[0])
+        finally:
+            task_calls.current_call.reset(token)
 
     def test_prelaunch_receipt_write_failure_keeps_original_database_wait(self):
         from loop_manager_internal.storage.db_access import DatabaseWaitTimeout

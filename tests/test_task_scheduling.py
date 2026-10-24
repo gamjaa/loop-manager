@@ -321,6 +321,259 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(sum(scheduler.running['agent'].values()), 0)
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
 
+    def test_agent_storage_retry_keeps_result_and_frees_confirmed_process_capacity(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, AgentResult, Usage
+        from loop_manager_internal.storage import agent_invocation_state
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from tests.support.fixed_samples import PROJECT_FILES
+        from uuid import uuid4
+        import shutil
+        scheduler = self.scheduler(max_workers=1)
+        task = scheduling.Task('A', 'G-001', self.connection)
+        runtime = self.directory / 'agent-runtime' / uuid4().hex
+        attempt = runtime / 'attempt'
+        attempt.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, runtime)
+        launch = SimpleNamespace(runtime=runtime, attempt=attempt)
+        physical = []
+        class Provider:
+            def run(_, request):
+                request.on_launch_prepared(launch)
+                physical.append(True)
+                request.on_process_started()
+                request.on_process_finished()
+                return AgentResult(0, 'original role result', usage=Usage(input_tokens=7))
+        finish = agent_invocation_state.InvocationRepository.finish
+        attempts = []
+        def delayed_finish(repository, *args, **kwargs):
+            attempts.append(True)
+            if len(attempts) <= 2:
+                raise DatabaseWaitTimeout('finish wait')
+            return finish(repository, *args, **kwargs)
+        sibling = []
+        def wait(_seconds):
+            self.assertEqual(scheduler.running['agent']['A'], 0)
+            with scheduler.slot('agent', scheduling.Task('B', 'G-003', self.connection)):
+                sibling.append(True)
+                self.assertEqual(scheduler.running['agent']['B'], 1)
+        token = scheduling.current_scheduler.set(scheduler)
+        selected = scheduling.current_task.set(task)
+        try:
+            with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+                 mock.patch.object(loop_manager, 'agent_provider', return_value=Provider()), \
+                 mock.patch.object(agent_invocation_state.InvocationRepository, 'finish', delayed_finish), \
+                 mock.patch.object(scheduler.condition, 'wait', side_effect=wait):
+                result = loop_manager.run_agent('codex', Path('/worktree'), self.directory, self.config_path,
+                    'worker', 'prompt', read_only=False, connection=self.connection,
+                    invocation=InvocationContext('A', 'G-001'), resolved_profile=ResolvedProfile('model', 'high'))
+        finally:
+            scheduling.current_task.reset(selected)
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual((result.code, result.message, result.usage.input_tokens), (0, 'original role result', 7))
+        self.assertEqual((len(physical), len(sibling)), (1, 1))
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 1)
+
+    def test_scheduled_agent_preparation_wait_retries_without_a_provider_failure(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, AgentResult
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from tests.support.fixed_samples import PROJECT_FILES
+        scheduler = self.scheduler(max_workers=1)
+        task = scheduling.Task('A', 'G-001', self.connection)
+        context = InvocationContext('A', 'G-001')
+        class Provider:
+            def run(_, request):
+                request.on_process_started()
+                request.on_process_finished()
+                return AgentResult(0, 'original role result')
+        provider = mock.Mock(wraps=Provider())
+        phase = ['prepare']
+        def prepare(*_args):
+            if phase[0] == 'prepare':
+                phase[0] = 'waiting'
+                raise DatabaseWaitTimeout('prepare wait')
+            phase[0] = 'ready'
+            return context
+        def observe():
+            self.assertNotEqual(phase[0], 'waiting', 'runtime remote observation during DB wait')
+        token = scheduling.current_scheduler.set(scheduler)
+        selected = scheduling.current_task.set(task)
+        try:
+            with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+                 mock.patch.object(common_guidance, 'independent_context', side_effect=prepare), \
+                 mock.patch.object(loop_manager, 'agent_provider', return_value=provider), \
+                 mock.patch.object(scheduling, 'observe_runtime', side_effect=observe), \
+                 mock.patch('loop_manager_internal.runtime.handoff_gate.observe_runtime', side_effect=observe), \
+                 mock.patch.object(scheduler.condition, 'wait'):
+                result = loop_manager.run_agent('codex', Path('/worktree'), self.directory, self.config_path,
+                    'worker', 'prompt', read_only=False, connection=self.connection,
+                    invocation=context, resolved_profile=ResolvedProfile('model', 'high'))
+        finally:
+            scheduling.current_task.reset(selected)
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(result.message, 'original role result')
+        provider.run.assert_called_once()
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 1)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM recovery_records').fetchone()[0], 0)
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+
+    def test_restart_separates_stopped_storage_wait_from_an_unknown_agent_exit(self):
+        from dataclasses import asdict
+        from loop_manager_internal.agents import process_receipt
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
+        from loop_manager_internal.storage import task_calls, agent_invocation_state
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from uuid import uuid4
+        import shutil
+        self.connection.commit()
+        calls = agent_invocation_state.InvocationRepository(self.connection)
+        runtime = self.directory / 'agent-runtime' / uuid4().hex
+        runtime.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, runtime)
+        timestamp = '2026-10-24T12:00:00+00:00'
+        for repo, plan, stopped in (('A', 'G-001', True), ('B', 'G-003', False)):
+            identity = calls.start(InvocationContext(repo, plan), 'worker', 'codex', ResolvedProfile('model', 'high'), None)
+            calls.mark_execution_started(identity)
+            if stopped:
+                calls.mark_execution_finished(identity, 1)
+            receipt = runtime / (plan + '.process.json')
+            calls.bind_process_receipt(identity, str(receipt))
+            facts = dict(started_at=timestamp, database_pending=True, outcome=dict(kind='success', code=0,
+                    duration_ms=1, session_id=None, usage=asdict(Usage()), collection_status='unknown', observed_at=timestamp))
+            if stopped:
+                facts.update(finished_at=timestamp, duration_ms=1)
+            process_receipt.observe(receipt, identity, facts)
+            owner = task_calls.reserve(self.connection, self.directory, repo, plan, 'agent', 'run')
+            with self.connection:
+                self.connection.execute('UPDATE task_call_reservations SET invocation_id=?, receipt_path=? WHERE token=?',
+                                        (identity, str(receipt), owner.token))
+        with mock.patch.object(agent_invocation_state.InvocationRepository, 'finish', side_effect=DatabaseWaitTimeout('pending')):
+            scheduler = self.scheduler(max_workers=2)
+        self.assertEqual((scheduler.running['agent']['A'], scheduler.running['agent']['B'], scheduler.uncertain['agent']), (0, 1, 1))
+        self.assertTrue(scheduler.retained[('A', 'G-001', 'agent')]['storage_only'])
+        self.assertFalse(scheduler.retained[('B', 'G-003', 'agent')]['storage_only'])
+        self.assertTrue(scheduler.wait_existing_call(self.connection, 'A', 'G-001'))
+        self.assertEqual(scheduler.running['agent']['A'], 0)
+        self.assertIn(('B', 'G-003', 'agent'), scheduler.retained)
+        process_receipt.finished(SimpleNamespace(runtime=runtime, attempt=runtime / 'G-003'), SimpleNamespace(pid=1234))
+        finish = agent_invocation_state.InvocationRepository.finish
+        busy = [True]
+        def store(repository, *args, **kwargs):
+            if busy[0]:
+                raise DatabaseWaitTimeout('still pending')
+            return finish(repository, *args, **kwargs)
+        def healed(_seconds):
+            self.assertEqual((scheduler.running['agent']['B'], scheduler.uncertain['agent']), (0, 0))
+            busy[0] = False
+        with mock.patch.object(agent_invocation_state.InvocationRepository, 'finish', store), \
+             mock.patch.object(scheduler.condition, 'wait', side_effect=healed):
+            self.assertTrue(scheduler.wait_existing_call(self.connection, 'B', 'G-003'))
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+
+    def test_slot_cleanup_database_wait_does_not_repeat_a_returned_agent_call(self):
+        from loop_manager_internal.storage import task_calls
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        scheduler = self.scheduler(max_workers=1)
+        task = scheduling.Task('A', 'G-001', self.connection)
+        result = object()
+        provider = mock.Mock(return_value=result)
+        call = scheduling.scheduled_call('agent')(provider)
+        token = scheduling.current_scheduler.set(scheduler)
+        selected = scheduling.current_task.set(task)
+        try:
+            with mock.patch.object(task_calls, 'release', side_effect=DatabaseWaitTimeout('release wait')), \
+                 mock.patch.object(scheduler.condition, 'wait'):
+                self.assertIs(call(role_name='worker'), result)
+        finally:
+            scheduling.current_task.reset(selected)
+            scheduling.current_scheduler.reset(token)
+        provider.assert_called_once()
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+
+    def test_preparation_db_retry_rechecks_the_original_task_input(self):
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        scheduler = self.scheduler(max_workers=1)
+        task = scheduling.Task('A', 'G-001', self.connection)
+        prepare = mock.Mock(side_effect=DatabaseWaitTimeout('preparation wait'))
+        call = scheduling.scheduled_call('agent')(prepare)
+        def changed(_seconds):
+            with self.connection:
+                self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo='A' AND plan_id='G-001'")
+        token = scheduling.current_scheduler.set(scheduler)
+        selected = scheduling.current_task.set(task)
+        try:
+            with mock.patch.object(scheduler.condition, 'wait', side_effect=changed):
+                with self.assertRaises(scheduling.TaskRecheckRequired):
+                    call(role_name='worker')
+        finally:
+            scheduling.current_task.reset(selected)
+            scheduling.current_scheduler.reset(token)
+        prepare.assert_called_once()
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+
+    def test_slot_cleanup_sql_error_keeps_the_original_agent_exception(self):
+        from loop_manager_internal.storage import task_calls
+        scheduler = self.scheduler(max_workers=1)
+        task = scheduling.Task('A', 'G-001', self.connection)
+        original = OSError('original provider exception')
+        provider = mock.Mock(side_effect=original)
+        call = scheduling.scheduled_call('agent')(provider)
+        token = scheduling.current_scheduler.set(scheduler)
+        selected = scheduling.current_task.set(task)
+        try:
+            with mock.patch.object(task_calls, 'release', side_effect=sqlite3.OperationalError('storage error')):
+                with self.assertRaises(OSError) as raised:
+                    call(role_name='worker')
+            self.assertIs(raised.exception, original)
+            self.assertTrue(scheduler.wait_existing_call(self.connection, 'A', 'G-001'))
+        finally:
+            scheduling.current_task.reset(selected)
+            scheduling.current_scheduler.reset(token)
+        provider.assert_called_once()
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+
+    def test_planner_request_retries_storage_without_repeating_the_provider(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, AgentResult
+        from loop_manager_internal.storage import agent_invocation_state
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from tests.support.fixed_samples import PROJECT_FILES
+        scheduler = self.scheduler(max_workers=1)
+        context = InvocationContext('A', None)
+        class Provider:
+            def run(_, request):
+                request.on_process_started()
+                request.on_process_finished()
+                return AgentResult(0, 'original planner result')
+        provider = mock.Mock(wraps=Provider())
+        finish = agent_invocation_state.InvocationRepository.finish
+        attempts = []
+        def delayed(repository, *args, **kwargs):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise DatabaseWaitTimeout('finish wait')
+            return finish(repository, *args, **kwargs)
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+                 mock.patch.object(common_guidance, 'independent_context', side_effect=[DatabaseWaitTimeout('prepare wait'), context]), \
+                 mock.patch.object(loop_manager, 'agent_provider', return_value=provider), \
+                 mock.patch.object(agent_invocation_state.InvocationRepository, 'finish', delayed), \
+                 mock.patch.object(scheduler.condition, 'wait'):
+                result = loop_manager.run_agent('codex', Path('/worktree'), self.directory, self.config_path,
+                    'planner', 'prompt', read_only=False, connection=self.connection,
+                    invocation=context, resolved_profile=ResolvedProfile('model', 'high'))
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(result.message, 'original planner result')
+        provider.run.assert_called_once()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+
     def test_automatic_fetch_waits_and_manual_fetch_still_rejects_contention(self):
         from loop_manager_internal.runtime.resource_lock import resource_locks
         from loop_manager_internal.runtime.contracts import ProcessLockBusyError
