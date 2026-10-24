@@ -44,7 +44,9 @@ priority: normal
 
 원인 해제는 기존 상태 transaction에 기록한다. 실제 COMPLETE와 WAITING 후 재개를 구분하고 후자는 같은 target의 현재 COMPLETE를 요구한다. 해소 때 미커밋 작업이 남았으면 clean·저장된 게시 HEAD·해소 HEAD 이후 commit을 추가 확인한다. 원래 generation의 acceptance와 마지막 해제 감사가 함께 남은 과거 기록도 소비하며 추정 연결은 하지 않는다. 여러 원인·ref와 실행 중/종료 불명 예약을 각각 확인하고, 관측 또는 DB generation 변경은 준비를 확정하지 않는다. 기존 원문·session·실패·intent·게시 확정과 무관한 차단은 유지한다.
 
-현재 복구점 `d4e63c53dde36b44ac65e70d1997262b4f4af42a`에서 이어 구현했으며 base `000ad57c1049438bf7c985bfcd4038e7c15d9b41` 대비 전체 변경과 새 파일을 확인했다. 프로젝트 Python `python3`과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 구현 세션에서 다음 최소 unit 범위를 실제 실행했다. 결과 형식 교정 호출에서는 원인에 관련된 cleanup module과 plan publication race class만 다시 실행해 각각 25개·18개 통과를 확인했다.
+문서 설명 교정에서는 관리 rebase를 수용한 HEAD `83d87ea10c4c25461000a737607484d79d3e1677`과 base `2ac56997f433ad8246d8f3faa6306ec78d1d56d4` 사이의 18개 파일 전체 diff, 최신 ExecPlan과 sources를 다시 확인했다. PRODUCT·ARCHITECTURE의 기존 설명은 유효하며 rebase로 바뀐 최종 patch hash로 보고를 갱신한다. 현재 후보에서 `tests.test_diagnostic_cleanup` 25개, `tests.test_diagnostic_preservation.ArtifactRecoveryTests` 9개, `tests.test_scope_block_revalidation.EvidenceFreeRebaseBlockTests` 29개를 프로젝트 Python과 targeted runner로 새로 실행해 모두 통과했다. 전체 verify는 실행하지 않았고 제품 코드·Requirement·선언은 변경하지 않았다. 아래 표는 앞선 구현 세션의 검증 기록으로 구분한다.
+
+초기 복구점 `d4e63c53dde36b44ac65e70d1997262b4f4af42a`에서 이어 구현했으며 base `000ad57c1049438bf7c985bfcd4038e7c15d9b41` 대비 전체 변경과 새 파일을 확인했다. 프로젝트 Python `python3`과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 구현 세션에서 다음 최소 unit 범위를 실제 실행했다. 결과 형식 교정 호출에서는 원인에 관련된 cleanup module과 plan publication race class만 다시 실행해 각각 25개·18개 통과를 확인했다.
 
 | `--unittest` 대상 | 결과 |
 |---|---|
