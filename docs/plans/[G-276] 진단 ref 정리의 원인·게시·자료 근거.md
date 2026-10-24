@@ -40,6 +40,8 @@ priority: normal
 
 ## Progress
 
+최신 관리 rebase의 HEAD `7fcbcbb818b0f1bdd3af42a40b028bad49cb02b6`와 base `4334a1e398ccb906163147885e034d55f9b066f4` 사이의 21개 파일 전체 diff, 현재 ExecPlan·R-083·PRODUCT·ARCHITECTURE를 다시 확인했다. 문서 설명의 의미는 유지하고 현재 patch hash로 최종 보고를 교정한다. 현재 후보에서 targeted runner로 cleanup module 25개, artifact recovery class 9개, compatibility export case·fixture import case·START scheduling case·launcher class 각 1개를 새로 실행해 총 38개가 통과했다. 제품 코드·Requirement·frontmatter는 변경하지 않았다. 전체 verify와 native 예제 통합은 Manager 경계에 남기며 아래 검증 기록은 이전 후보의 이력이다.
+
 Manager의 HEAD `1dd16b57cb39fe4da3c66eb07eee323d38e7dc25` 전체 verify 피드백 네 건을 교정했다. 새 compatibility export의 effect 타입 주석을 기존 문자열 계약에 맞추고, 두 진단 테스트가 공유하는 bundle fixture를 `tests/support/diagnostic.py`로 이동했다. START 재평가의 상태 전용 mock에는 실제 observation 계약의 빈 `files`를 명시했다. 기존 assertion·테스트·지원 경계는 유지했다.
 
 Perl native 예제의 기존 로그는 `stage-1` 결과 파일 부재에 따른 `StopIteration`이었다. 단독 launcher가 생성하는 별도 `--execute` 프로세스가 fixture의 고정 자원 관측을 우회하는 경로를 확인하고, 해당 프로세스만 fixture bootstrap으로 연결했다. 실제 project worker는 원래 entrypoint와 자격 증명 제거를 유지한다. 기존 launcher unit에서 모드별 argv·옵션 전달·자원 관측·patch 복원과 자격 증명 격리를 검증했다. native 결과가 없으면 원래 진단을 포함하는 assertion으로 실패하며 결과 부재를 성공으로 바꾸지 않는다. Worker의 통합 실행 제한에 따라 Perl native 예제와 전체 verify는 직접 재실행하지 않았으며 Manager 재검증이 필요하다.
