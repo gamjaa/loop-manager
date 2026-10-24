@@ -1006,7 +1006,14 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             source.write_text('zero\ntarget\nend\n', encoding='utf-8')
             snippet = repo_path / 'snippet.py'
             snippet.write_text('value = "base"\n', encoding='utf-8')
-            git('add', 'source.txt', 'snippet.py')
+            branches = repo_path / 'branches.py'
+            branches.write_text(
+                'def choose(flag):\n    if flag:\n        return 0\n'
+                '    else:\n        return 0\n', encoding='utf-8',
+            )
+            latin = repo_path / 'latin.py'
+            latin.write_bytes(b'value = "base"\n')
+            git('add', 'source.txt', 'snippet.py', 'branches.py', 'latin.py')
             git('commit', '-m', 'base')
             base_before = git('rev-parse', 'HEAD').stdout.strip()
             git('checkout', '-b', 'feature')
@@ -1026,6 +1033,10 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             handler.ports = SimpleNamespace(
                 snapshot=lambda: SimpleNamespace(_definition_snapshot=definition),
                 git=git,
+                git_bytes=lambda path, *args: subprocess.run(
+                    ['git', '-C', str(path), '-c', 'diff.autoRefreshIndex=false', *args],
+                    capture_output=True, check=True,
+                ).stdout,
                 identity=SimpleNamespace(repo=project_repo),
             )
             context = SimpleNamespace(
@@ -1049,10 +1060,14 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertNotEqual(before[0], after[0])
             self.assertEqual(before[1], after[1])
 
-            def candidate_with_snippet(branch, content):
+            def candidate_with_content(branch, path, content):
                 git('checkout', 'main')
                 git('checkout', '-b', branch)
-                snippet.write_text(content, encoding='utf-8')
+                target = repo_path / path
+                if isinstance(content, bytes):
+                    target.write_bytes(content)
+                else:
+                    target.write_text(content, encoding='utf-8')
                 git('commit', '-am', branch)
                 head = git('rev-parse', 'HEAD').stdout.strip()
                 proof = handler._pr_review_candidate_proof(
@@ -1060,20 +1075,38 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
                 )
                 return proof, head
 
-            spaced, spaced_head = candidate_with_snippet(
-                'candidate-spaced', 'value = "a b"\n',
+            spaced, spaced_head = candidate_with_content(
+                'candidate-spaced', 'snippet.py', 'value = "a b"\n',
             )
-            compact, compact_head = candidate_with_snippet(
-                'candidate-compact', 'value = "ab"\n',
+            compact, compact_head = candidate_with_content(
+                'candidate-compact', 'snippet.py', 'value = "ab"\n',
             )
             self.assertNotEqual(spaced[1], compact[1])
-            one_space_indent, _ = candidate_with_snippet(
-                'candidate-one-space-indent', 'def value():\n return "x"\n',
+            one_space_indent, _ = candidate_with_content(
+                'candidate-one-space-indent', 'snippet.py', 'def value():\n return "x"\n',
             )
-            two_space_indent, _ = candidate_with_snippet(
-                'candidate-two-space-indent', 'def value():\n  return "x"\n',
+            two_space_indent, _ = candidate_with_content(
+                'candidate-two-space-indent', 'snippet.py', 'def value():\n  return "x"\n',
             )
             self.assertNotEqual(one_space_indent[1], two_space_indent[1])
+            if_branch, if_branch_head = candidate_with_content(
+                'candidate-if-branch', 'branches.py',
+                'def choose(flag):\n    if flag:\n        return 1\n'
+                '    else:\n        return 0\n',
+            )
+            else_branch, else_branch_head = candidate_with_content(
+                'candidate-else-branch', 'branches.py',
+                'def choose(flag):\n    if flag:\n        return 0\n'
+                '    else:\n        return 1\n',
+            )
+            self.assertNotEqual(if_branch[1], else_branch[1])
+            latin_one, latin_one_head = candidate_with_content(
+                'candidate-latin-one', 'latin.py', b'value = "\xe9"\n',
+            )
+            latin_two, latin_two_head = candidate_with_content(
+                'candidate-latin-two', 'latin.py', b'value = "\xea"\n',
+            )
+            self.assertNotEqual(latin_one[1], latin_two[1])
 
             connection = self.connection()
             first = self.prepare_pr_candidate(
@@ -1128,6 +1161,27 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(len([row for row in self.events(connection)
                                   if row['event_type'] == 'pr_created']), 3)
             self.assertEqual(sent.call_count, 3)
+
+            for branch, proof, head in (
+                ('if branch', if_branch, if_branch_head),
+                ('else branch', else_branch, else_branch_head),
+                ('Latin-1 byte one', latin_one, latin_one_head),
+                ('Latin-1 byte two', latin_two, latin_two_head),
+            ):
+                with self.subTest(candidate=branch):
+                    candidate = self.prepare_pr_candidate(
+                        connection, repo=project_repo, base=base_after, head=head,
+                        review_input_identity=proof[1],
+                    )
+                    self.assertEqual(candidate['candidate_identity'], proof[1])
+                    with connection:
+                        notifications.enqueue_current_project_events(connection, project_repo)
+                    self.assertEqual(notifications.dispatch_pending(
+                        connection, 'token', 'chat', adapter=sent,
+                    ), 1)
+            self.assertEqual(len([row for row in self.events(connection)
+                                  if row['event_type'] == 'pr_created']), 7)
+            self.assertEqual(sent.call_count, 7)
 
     def test_planning_result_only_notifies_after_catalog_publication(self):
         from types import SimpleNamespace

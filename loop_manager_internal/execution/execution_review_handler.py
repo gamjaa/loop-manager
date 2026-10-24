@@ -68,6 +68,7 @@ class ReviewHandlerPorts:
     observe_verify_inputs: Callable[..., Any] | None = None
     checkpoint: Any = None
     pre_review_identity: Callable[..., Any] | None = None
+    git_bytes: Callable[..., bytes] | None = None
 
 
 class ReviewHandler:
@@ -228,23 +229,25 @@ class ReviewHandler:
         if definition is None or not base or not candidate_head:
             return None
         try:
-            diff = self.ports.git(
-                context.worktree, 'diff', '--binary', '--unified=0', '--no-ext-diff',
+            if self.ports.git_bytes is None:
+                raise RuntimeError('raw Git diff bytes are unavailable')
+            diff = self.ports.git_bytes(
+                context.worktree, 'diff', '--binary', '--unified=1', '--no-ext-diff',
                 '--no-textconv', base, candidate_head,
-            ).stdout
-            # Rebase changes object IDs and line offsets; preserve mode metadata
-            # and every changed line byte, including meaningful whitespace.
+            )
+            if not isinstance(diff, bytes):
+                raise TypeError('raw Git diff did not return bytes')
+            # Rebase changes object IDs, numeric offsets, and Git's guessed
+            # section label. Keep adjacent context as the location anchor.
             stable_diff = re.sub(
-                r'^index [0-9a-f]+\.\.[0-9a-f]+', 'index', diff,
+                rb'^index [0-9a-f]+\.\.[0-9a-f]+', b'index', diff,
                 flags=re.MULTILINE,
             )
             stable_diff = re.sub(
-                r'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@',
-                '@@', stable_diff, flags=re.MULTILINE,
+                rb'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*$',
+                b'@@', stable_diff, flags=re.MULTILINE,
             )
-            change_identity = hashlib.sha256(
-                stable_diff.encode('utf-8', errors='surrogateescape'),
-            ).hexdigest()
+            change_identity = hashlib.sha256(stable_diff).hexdigest()
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             events.emit(
                 'Review 후보 변경 identity를 확인할 수 없어 PR 알림 후보를 보류',
