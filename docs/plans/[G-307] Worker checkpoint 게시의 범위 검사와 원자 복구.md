@@ -58,7 +58,9 @@ priority: high
 - 게시 port는 DB 대기 한도 소진만 `TRANSIENT_PAUSE`로 반환해 일반 복구·교정 횟수를 소비하지 않는다. runtime handoff와 비잠금 SQL 오류는 전파하고 기존 요청·session·pending intent를 보존한다. 기존 pending 복구·Worker 진입 gate와 재작성 acceptance의 최종 게시 반환은 재사용했다.
 - 프로젝트 Python `python3`와 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 `--unittest tests.test_worker_checkpoint_publication` 실행: 17 tests PASS. 신규 DB 회귀는 intent/완료 각각에서 실제 파일 SQLite reader가 COMMIT을 막는 경합을 발생시켜 rollback·재준비, generation/session 경쟁 변경 거부, 실제 deadline 소진, runtime 취소와 비잠금 SQL 오류 뒤 재진입을 확인했다. publication OID·PR head·checkpoint 감사의 원자성, 원래 요청/session 보존과 push 1회를 검사했다. Git/PR은 이 DB 조합에서 double이며 기존 모듈의 실제 Git 범위·lease·부분 게시·중단·rebase 회귀도 통과했다.
 - `--unittest tests.test_execution_worker_phase.ExecutionWorkerPhaseTests.test_pending_checkpoint_request_prevents_a_new_worker_turn`: 1 test PASS. pending 요청에서 새 Worker·verify 호출이 없고 요청을 보존함을 확인했다. 신규 production port 회귀는 timeout의 일시 대기와 SQL 오류/runtime handoff 전파 및 실행 row 불변을 확인했다.
-- 관련 테스트의 삭제·skip·assertion 약화는 없으며 전체 verify·Windows native 실행·Review·게시·Merge 판정은 수행하지 않았다. Manager 후속 검증 대상이다.
+- Review 피드백 `speculative-state-on-retry`에서 production의 `state.update_project()`가 `ExecutionStatePort.expected`를 COMMIT 전에 갱신하는 누락을 확인했다. 기존 DB 조합의 직접 SQL double을 실제 `ExecutionStatePort`·runtime repository·`state.bind()`로 교체해 완료 COMMIT 경합의 snapshot 오류를 재현했다. 최초 해당 1개 test 실행은 1 failure·4 errors였으며 이 결과를 PASS로 사용하지 않는다.
+- `run_checkpoint_publication_request()`를 게시 effects에 연결했다. 각 시도 callback의 정상/예외 반환에서 실행 port snapshot을 원복하고 COMMIT 성공 후에만 갱신 snapshot을 확정한다. 동일 경합 test의 재실행은 PASS이며 수정 후 동일 runner의 `--unittest tests.test_worker_checkpoint_publication`도 17 tests PASS다. retry/timeout/cancel·generation/session 경쟁·SQL 오류와 재진입에서 port snapshot, checkpoint, publication OID와 PR head를 검증한다. DB 잠금은 실제 SQLite이고 Git/PR은 double이다.
+- 관련 테스트의 삭제·skip·assertion 약화는 없으며 전체 verify·Windows native 실행·게시·Merge 판정은 수행하지 않았다. Review 지적 수정의 전체 검증은 Manager가 수행한다.
 
 ## Decision Log
 

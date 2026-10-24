@@ -371,6 +371,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             validate_execplan_workspace_identity=dependencies.validate_execplan_workspace_identity,
             validate_managed_worktree=dependencies.validate_managed_worktree,
             update_project=lambda _connection, repo, **values: state.update_project(repo, preserve_transaction=True, **values),
+            run_request=state.run_checkpoint_publication_request,
         )
         pushed = 0
         if pending is not None:

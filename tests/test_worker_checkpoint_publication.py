@@ -526,7 +526,8 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
 class WorkerCheckpointPolicyTests(unittest.TestCase):
     def test_database_requests_retry_or_preserve_the_same_publication(self):
         from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
-        from loop_manager_internal.storage import db_access
+        from loop_manager_internal.storage import db_access, runtime_state
+        from loop_manager_internal.execution.execution_state import ExecutionStatePort
         from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRace
         from tests.support.database import runtime_connection
 
@@ -537,7 +538,8 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                     source = runtime_connection()
                     base, head, tree = 'a' * 40, 'b' * 40, 'c' * 40
                     branch = 'loop-manager/G-047'
-                    source.execute("UPDATE projects SET origin='owner/repo'")
+                    source.execute("UPDATE projects SET origin='owner/repo', "
+                                   "plan_path='docs/plans/[G-047] Runtime.md'")
                     source.execute("UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, "
                                    "branch=?, worktree='/managed', worker_session_id='same-session', "
                                    "publication_remote_oid=?, pr_head_oid=?, pr_url='existing-pr'",
@@ -558,6 +560,7 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                     self.addCleanup(connection.close)
                     self.addCleanup(reader.close)
                     checkpoints = ExecutionCheckpointRepository(connection)
+                    state = ExecutionStatePort(connection, runtime_state.RuntimeStateRepository(connection), 'repo')
                     live, pushes, attempts = base, [], []
                     def git(_path, *args, **kwargs):
                         nonlocal live
@@ -582,14 +585,13 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                                 'baseRefName': 'main', 'headRefOid': live}
                     observe_pr = mock.Mock(side_effect=pr)
                     effects = publication_service.WorkerCheckpointPublicationEffects(
-                        active_execplan=lambda c, r: c.execute('SELECT * FROM exec_plans').fetchone(),
+                        active_execplan=lambda c, r: state.active_execplan(r),
                         git=git, remote_branch_oid=lambda *_: live, pr_for_branch=observe_pr,
                         github_repository=lambda _: 'owner/repo',
                         validate_execplan_workspace_identity=lambda *_: None,
                         validate_managed_worktree=lambda *_: None,
-                        update_project=lambda c, r, **values: c.execute(
-                            'UPDATE exec_plans SET publication_remote_oid=?, pr_head_oid=?',
-                            (values['publication_remote_oid'], values['pr_head_oid'])))
+                        update_project=lambda c, r, **values: state.update_project(r, preserve_transaction=True, **values),
+                        run_request=state.run_checkpoint_publication_request)
                     record = ExecutionCheckpointRepository.record
                     def contend(repository, *args, **kwargs):
                         selected = bool(kwargs['snapshot'].get('worker_checkpoint_history')) == (phase == 'completion')
@@ -607,6 +609,7 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                     def after_rollback(deadline, interval=.01):
                         self.assertFalse(connection.in_transaction)
                         self.assertFalse(connection._held)
+                        self.assertEqual(state.check().publication_remote_oid, base)
                         saved = checkpoints.get('repo', 'G-047')
                         self.assertEqual(saved.generation, initial.generation + (phase == 'completion'))
                         self.assertEqual(tuple(connection.execute(
@@ -631,7 +634,8 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                         return publication_service.push_worker_checkpoint_commits(effects, connection,
                             Path('/source'), Path(directory), 'repo', 'G-047', branch,
                             Path('/managed'), 'main', live, pr())
-                    errors = {'generation': CheckpointRace, 'owner': CheckpointRace,
+                    publish = state.bind(publish, mutates=True)
+                    errors = {'generation': CheckpointRace, 'owner': runtime_state.RuntimeStateError,
                               'timeout': db_access.DatabaseWaitTimeout, 'cancel': SelfMergeRuntimeHandoff,
                               'sql_error': sqlite3.OperationalError}
                     with mock.patch.object(ExecutionCheckpointRepository, 'record', new=contend), \
@@ -644,6 +648,7 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                             with self.assertRaises(errors[mode]):
                                 publish()
                     reader.rollback()
+                    self.assertEqual(state.expected, state.repository.projected('repo'))
                     saved = checkpoints.get('repo', 'G-047')
                     self.assertEqual(saved.snapshot['worker_checkpoint_request'], request)
                     self.assertEqual(connection.execute('SELECT worker_session_id FROM exec_plans').fetchone()[0],

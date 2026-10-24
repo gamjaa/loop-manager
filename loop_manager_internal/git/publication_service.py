@@ -286,6 +286,7 @@ class WorkerCheckpointPublicationEffects:
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
     update_project: Callable[..., object]
+    run_request: Callable[..., object] | None = None
 
 
 def push_worker_checkpoint_commits(
@@ -369,7 +370,9 @@ def push_worker_checkpoint_commits(
             if values:
                 effects.update_project(connection, repo, **values)
             return result, dict(effects.active_execplan(connection, repo))
-        if isinstance(connection, CoordinatedConnection):
+        if effects.run_request is not None:
+            result, saved_owner = effects.run_request(apply)
+        elif isinstance(connection, CoordinatedConnection):
             result, saved_owner = connection.run_request(apply)
         else:
             with runtime_state._transaction(connection):
