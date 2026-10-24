@@ -16,7 +16,7 @@ try {
         $tempDirectoryInput = Join-Path $env:USERPROFILE '.cache/loop-manager/verify/tmp'
     }
     if ([string]::IsNullOrWhiteSpace($tempDirectoryInput)) {
-        throw '빈 경로는 사용할 수 없습니다.'
+        throw 'Temporary directory input is empty.'
     }
     try {
         if ([System.IO.Path]::IsPathRooted($tempDirectoryInput)) {
@@ -26,7 +26,7 @@ try {
         }
         New-Item -ItemType Directory -Path $tempDirectory -Force | Out-Null
         if (-not (Test-Path -LiteralPath $tempDirectory -PathType Container)) {
-            throw '임시 경로가 디렉터리가 아닙니다.'
+            throw 'Temporary path is not a directory.'
         }
         $probePath = Join-Path $tempDirectory ('.loop-manager-verify-' + [Guid]::NewGuid().ToString('N'))
         $probe = $null
@@ -43,7 +43,7 @@ try {
             }
         }
     } catch {
-        throw "자체 Windows verify 임시 경로 오류 ($tempDirectoryInput): $($_.Exception.Message)"
+        throw "Loop Manager verify temporary directory error ($tempDirectoryInput): $($_.Exception.Message)"
     }
     $env:LOOP_MANAGER_VERIFY_TEMP_DIR = $tempDirectory
     $env:TEMP = $tempDirectory

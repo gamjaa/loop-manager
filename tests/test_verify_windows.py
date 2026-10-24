@@ -10,6 +10,16 @@ import unittest
 from tests.support.git import isolated_git_test, make_remote_repository
 
 
+class VerifyWindowsSourceEncodingTests(unittest.TestCase):
+    def test_temp_path_error_literals_are_ascii_for_windows_powershell_51(self):
+        source = Path(__file__).resolve().parents[1] / 'scripts/verify.ps1'
+        error_lines = [line for line in source.read_bytes().splitlines()
+                       if line.lstrip().startswith(b'throw ')]
+        self.assertTrue(error_lines)
+        self.assertTrue(all(line.isascii() for line in error_lines), error_lines)
+        self.assertIn(b'Loop Manager verify temporary directory error', b'\n'.join(error_lines))
+
+
 @unittest.skipUnless(sys.platform == 'win32', 'Windows verify 스크립트 검증')
 @isolated_git_test
 class VerifyWindowsTests(unittest.TestCase):
@@ -197,7 +207,7 @@ if ([Console]::OutputEncoding.CodePage -ne $encoding.CodePage) { throw '출력 �
                 encoding='utf-8', errors='replace', timeout=30,
             )
             self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-            self.assertIn('자체 Windows verify 임시 경로 오류', completed.stdout + completed.stderr)
+            self.assertIn('Loop Manager verify temporary directory error', completed.stdout + completed.stderr)
             self.assertFalse(default.exists())
 
 
