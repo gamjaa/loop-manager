@@ -128,6 +128,20 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_origin
 
 - 추가 최소 명령 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_invocation.RunnerTests.test_database_request_confirms_implicit_writes_and_preserves_explicit_rollback tests.test_agent_invocation.RunnerTests.test_callback_database_requests_retry_without_replaying_the_session_callback tests.test_agent_invocation.RunnerTests.test_invocation_preparation_retries_atomically_or_leaves_provider_unstarted` 결과는 3개 success, exit 0이다. 이번 호출의 5개 unit에 미해결 failure/error는 없다. 실제 Agent CLI·전체 verify·Windows native 검증은 실행하지 않았다. 앞선 전체 verify 실패를 성공으로 대체하지 않으며 최종 전체 verify와 Review는 Manager가 수행한다.
 
+### Review 교정: session 입력과 전달 표식 (2026-10-24)
+
+- `review:loop_manager_internal/agents/invocation_service.py::run_agent::pending-session-identity`와 `review:loop_manager_internal/application/task_scheduling.py::scheduled_call::delivery-acknowledgement-loss`(각 occurrence 1, revision 1)을 교정했다. 원래 요청 `session_id`(신규 요청은 null)를 요청 SHA-256에 포함한다. 원래 요청 session과 provider가 관측·반환한 session은 다를 수 있으며, 원래 입력이 같을 때만 기존 결과를 복구한다. 같은 작업의 다른 session 또는 결과 session으로 요청 입력을 바꾸면 `CallDeferred`로 보류하고 provider를 재호출하지 않는다. session 입력이 없던 구형 지문은 일치로 추정하지 않는다.
+- 관리 호출은 전달 표식 쓰기가 성공해야 응답을 반환한다. 쓰기 실패 시 경고와 `CallDeferred`를 전달해 기존 결과를 미전달 상태로 보존한다. 다음 같은 요청은 provider 실행 없이 원래 응답을 복구하고 표식 해제 후 반환하며, 그다음 다른 요청은 새 provider 호출로 진행한다. 새 DB 컬럼·ledger·캐시나 사용자 결정을 추가하지 않았다. PRODUCT와 ARCHITECTURE의 소유 절을 실제 동작에 맞췄다.
+- 기존 재시작 복구 unit을 확장해 원래 요청 session 유지, 같은 작업에 속한 다른 session, 반환된 새 session 입력을 구별했다. 신규 배정 unit은 실제 receipt 쓰기의 전달 표식만 OSError로 실패시켜 응답 보류→기존 응답 복구→다음 요청의 새 실행과 예약/실행 자리 정리를 확인한다. 실제 provider는 double이며 테스트를 삭제하거나 skip하지 않았다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_invocation.RunnerTests.test_storage_pending_restart_consumes_existing_message_or_holds_without_provider tests.test_task_scheduling.TaskSchedulingTests.test_delivery_marker_failure_defers_until_acknowledged_and_next_request_runs
+
+최초 결과: session fixture에 기존 지침 귀속이 없어 복구 case 9개 subtest failure, 신규 전달 표식 case success였다. fixture의 원래 session 귀속을 기존 helper로 준비한 뒤 두 번째 실행에서는 session 소유권 충돌 fixture가 요청 session까지 변경해 복구 경계 전에 반환되므로 1개 subtest failure였다. 충돌 대상을 결과 session으로 한정해 원래 소유권 충돌 assertion을 보존했다.
+
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_invocation.RunnerTests.test_storage_pending_restart_consumes_existing_message_or_holds_without_provider tests.test_task_scheduling.TaskSchedulingTests.test_delivery_marker_failure_defers_until_acknowledged_and_next_request_runs
+
+최종 동일 명령 결과: 2개 unit success, exit 0. 두 unit의 미해결 failure/error는 없다. 전체 verify·실제 Agent CLI·Windows native 검증은 실행하지 않았으며 현재 변경의 전체 verify와 Review 확인은 Manager에게 인계한다.
+
 ## Decision Log
 
 - 이번 R-091 delta에서 요청 한도 소진을 다음 외부 실행 전용 pause로 고정하지 않는다. 같은 실행의 저장 재개에서도 실제 provider 결과·호출 identity·필수 증거 gate를 보존하며 기존 G-303 dependency와 독립된 DB 확정 목표를 유지한다. 대기열·단계 실패 정책은 G-297/G-313의 책임이며 새 순환 dependency를 만들지 않는다. 구현·테스트는 실행하지 않았다.

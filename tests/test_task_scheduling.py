@@ -376,6 +376,65 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 1)
 
+    def test_delivery_marker_failure_defers_until_acknowledged_and_next_request_runs(self):
+        from loop_manager_internal.agents import common_guidance, process_receipt
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, AgentResult
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        from tests.support.fixed_samples import PROJECT_FILES
+        from uuid import uuid4
+        import shutil
+        scheduler = self.scheduler(max_workers=1)
+        runtime = self.directory / 'agent-runtime' / uuid4().hex
+        runtime.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, runtime)
+        launches = []
+        class Provider:
+            def run(_, request):
+                attempt = runtime / str(len(launches))
+                attempt.mkdir()
+                launch = SimpleNamespace(runtime=runtime, attempt=attempt)
+                launches.append(launch)
+                message = 'result-' + str(len(launches))
+                (attempt / 'last-message.txt').write_text(message, encoding='utf-8')
+                request.on_launch_prepared(launch)
+                request.on_process_started()
+                request.on_process_finished()
+                return AgentResult(0, message)
+        def invoke(prompt):
+            return loop_manager.run_agent('codex', Path('/worktree'), self.directory, self.config_path,
+                'reviewer', prompt, read_only=True, connection=self.connection,
+                invocation=InvocationContext('A', 'G-001'), resolved_profile=ResolvedProfile('model', 'high'))
+        token = scheduling.current_scheduler.set(scheduler)
+        selected = scheduling.current_task.set(scheduling.Task('A', 'G-001', self.connection))
+        try:
+            with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+                 mock.patch.object(loop_manager, 'agent_provider', return_value=Provider()), \
+                 mock.patch.object(process_receipt, 'recover', return_value={'finished_at': 'proof'}):
+                original_write = process_receipt._write
+                def fail_delivery(path, root):
+                    if root.get('invocation_observation', {}).get('database_pending') is False:
+                        raise OSError('delivery marker unavailable')
+                    return original_write(path, root)
+                with mock.patch.object(process_receipt, '_write', side_effect=fail_delivery):
+                    with self.assertRaisesRegex(CallDeferred, '전달 표식'):
+                        invoke('first prompt')
+                row = self.connection.execute('SELECT invocation_id,process_receipt_path FROM agent_invocations').fetchone()
+                self.assertTrue(process_receipt.observation(row[1], self.directory, row[0])['database_pending'])
+                self.assertEqual(len(launches), 1)
+                recovered = invoke('first prompt')
+                self.assertEqual((recovered.message, recovered.isolation_invocation_id), ('result-1', row[0]))
+                self.assertFalse(process_receipt.observation(row[1], self.directory, row[0])['database_pending'])
+                self.assertEqual(len(launches), 1)
+                fresh = invoke('next prompt')
+                self.assertEqual(fresh.message, 'result-2')
+                self.assertNotEqual(fresh.isolation_invocation_id, row[0])
+                self.assertEqual(len(launches), 2)
+        finally:
+            scheduling.current_task.reset(selected)
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+
     def test_scheduled_agent_preparation_wait_retries_without_a_provider_failure(self):
         from loop_manager_internal.agents import common_guidance
         from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, AgentResult

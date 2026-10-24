@@ -135,7 +135,7 @@ def run_agent(
             collection_status = "error"
     ledger = agent_invocation_state.InvocationRepository(connection) if connection is not None else None
     request_sha256 = hashlib.sha256(json.dumps([
-        provider, role_name, str(worktree.resolve()), prompt, read_only, level, persist_session,
+        provider, role_name, str(worktree.resolve()), prompt, read_only, level, persist_session, session_id,
         guidance.task_id, guidance.content_hash, invocation.definition_revision if invocation else None,
         invocation.purpose if invocation else None, invocation.target if invocation else None,
         asdict(resolved) if resolved else None,

@@ -708,7 +708,7 @@ Manager 전용 process receipt는 기존 PID·호스트/boot·종료 근거와 �
 | `session_id` | 관측한 비어 있지 않은 session 문자열. 귀속 충돌은 계속 거부한다. |
 | `outcome` | 필수 key는 `kind`, `code`, `duration_ms`, `session_id`, `usage`, `collection_status`, `observed_at`이다. 각각 종류·정수/null 코드·0 이상 정수 처리 시간·session 문자열/null·사용량·문자열 수집 상태·timezone 포함 시각이다. 종류는 `success`, `transient_failure`, `usage_limit`, `permanent_configuration`, `timeout`, `exception`, `interrupted`, `database_wait`이고 성공 코드는 0이다. |
 | `database_pending` | 저장/전달 확정 대기의 boolean. 관리 호출은 예약 정리와 결과 전달 경계를 지난 뒤 해제한다. |
-| `request_sha256`, `message_sha256` | 소문자 16진수 64자리 지문. 요청은 prompt·역할/provider/profile·작업 공간·지침·definition/목적/target 등 현재 호출 입력을 결합한다. 메시지는 실제 역할 응답의 지문이며 원문을 새 감사 자료에 복사하지 않는다. |
+| `request_sha256`, `message_sha256` | 소문자 16진수 64자리 지문. 요청은 요청 session ID(null은 신규 요청)·prompt·역할/provider/profile·작업 공간·지침·definition/목적/target 등 현재 호출 입력을 결합한다. 메시지는 실제 역할 응답의 지문이며 원문을 새 감사 자료에 복사하지 않는다. |
 
 `usage`는 `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`의 0 이상 정수/null과 `status`의 `unknown`·`known`·`partial`·`invalid`를 요구한다. 관측 object의 version/identity 외 필드는 부분 관측 수집을 위해 선택 사항이며, 역할 응답 전달에는 outcome과 요청/메시지 지문을 모두 요구한다.
 
@@ -716,7 +716,7 @@ Manager 전용 process receipt는 기존 PID·호스트/boot·종료 근거와 �
 
 관리 실행의 준비 대기 만료는 현재 작업 입력을 재확인한 RETRY 배정으로 이어간다. 결과를 확보한 호출은 원래 스택의 응답/예외를 유지하며 DB 확정만 다시 요청하고, 예약 정리가 대기해도 반환된 응답을 보존한다. `TaskScheduler`는 확인된 실제 종료와 저장 대기를 구분해 실행 개수만 먼저 반환할 수 있다. 이 구분은 재시작 때 같은 프로세스 종료 근거로 복원하고 저장 대기 예약·관리 작업은 유지한다. 종료 불명은 실행 개수도 유지한다. 대기 중에는 local pause/handoff만 확인하고 runtime 원격 관측은 DB 준비 후 실제 단계 진입에서 수행한다.
 
-재시작의 응답 전달은 대기 표식이 있는 기존 호출에 한정한다. 요청 지문, ledger의 원래 결과·session·사용량과 session 귀속을 확인하고, 기존 attempt의 `last-message.txt` 원문 또는 그 양끝 공백을 제거한 값이 메시지 지문과 일치할 때만 같은 invocation의 `AgentResult`를 전달한다. 원문 부재·교체·지문 불일치·입력 변경·예외 원문 부족은 `CallDeferred`로 후속 처리를 보류하며 provider를 재호출하지 않는다. 이는 호출 성공 재사용·검증/게시 승인과 별개이며 기존 안전 gate와 targeted pending을 유지한다.
+재시작의 응답 전달은 대기 표식이 있는 기존 호출에 한정한다. 요청 지문에는 원래 요청 session을 포함한다. 요청 session이 같으면 provider가 새 session을 반환한 결과도 복구할 수 있지만, 현재 요청을 그 새 session이나 같은 작업의 다른 session으로 바꾸면 입력 변경으로 보류한다. session 입력이 빠진 구형 요청 지문도 일치로 추정하지 않는다. 요청 지문, ledger의 원래 결과·session·사용량과 session 귀속을 확인하고, 기존 attempt의 `last-message.txt` 원문 또는 그 양끝 공백을 제거한 값이 메시지 지문과 일치할 때만 같은 invocation의 `AgentResult`를 전달한다. 원문 부재·교체·지문 불일치·입력 변경·예외 원문 부족은 `CallDeferred`로 후속 처리를 보류하며 provider를 재호출하지 않는다. 관리 호출은 예약 정리 뒤 응답 반환 전에 기존 receipt의 `database_pending`을 해제한다. 표식 쓰기가 실패하면 경고와 `CallDeferred`로 응답 반환을 보류하며 관측 결과는 미전달 상태로 유지한다. 같은 요청의 다음 호출은 원래 결과를 복구하고 표식 확정 뒤 반환한다. 전달된 결과를 계속 복구 대상으로 남겨 중복 응답이나 다음 요청의 영구 보류를 만들지 않는다. 이는 호출 성공 재사용·검증/게시 승인과 별개이며 기존 안전 gate와 targeted pending을 유지한다.
 
 ### Planner의 입력과 쓰기 범위
 

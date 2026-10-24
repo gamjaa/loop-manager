@@ -282,7 +282,8 @@ class RunnerTests(TestCase):
         from loop_manager_internal.storage.db_access import open_connection, DatabaseWaitTimeout
         from loop_manager_internal.storage.task_calls import CallDeferred
         from loop_manager_internal.agents import process_receipt
-        for mode in ('matching', 'missing', 'changed_request', 'changed_message', 'changed_ledger', 'changed_session_owner', 'exception'):
+        for mode in ('matching', 'missing', 'changed_request', 'changed_session', 'observed_session',
+                     'changed_message', 'changed_ledger', 'changed_session_owner', 'exception'):
             with self.subTest(mode=mode):
                 path = self.state_dir / (mode + '.db')
                 connection = open_connection(path)
@@ -302,8 +303,12 @@ class RunnerTests(TestCase):
                             raise OSError('original provider exception')
                         return manager.AgentResult(0, 'original role result', 'session', usage=invocation.Usage(input_tokens=7))
                 arguments = ('codex', Path('/worktree'), self.state_dir, Path('/config'), 'planner')
-                kwargs = dict(read_only=True, connection=connection, invocation=invocation.InvocationContext('repo', None),
+                kwargs = dict(read_only=True, session_id='requested-session', connection=connection,
+                              invocation=invocation.InvocationContext('repo', None),
                               resolved_profile=invocation.ResolvedProfile('model', 'high'))
+                from tests.support.workspace import pin_common_guidance
+                pin_common_guidance(connection, kwargs['invocation'], Path('/worktree'), self.state_dir,
+                                    sessions=('requested-session',), role='planner')
                 with mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
                      mock.patch.object(state.InvocationRepository, 'finish', side_effect=DatabaseWaitTimeout('finish wait')):
                     if mode == 'exception':
@@ -318,6 +323,12 @@ class RunnerTests(TestCase):
                 reopened.row_factory = sqlite3.Row
                 state.InvocationRepository(reopened).reconcile_interrupted(state_dir=self.state_dir)
                 kwargs['connection'] = reopened
+                if mode in {'changed_session', 'observed_session'}:
+                    from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+                    repository = GuidanceRepository(reopened)
+                    task_id = repository.session_task('repo', 'codex', 'session')
+                    repository.bind_session('repo', 'codex', 'another-session', task_id)
+                    kwargs['session_id'] = 'another-session' if mode == 'changed_session' else 'session'
                 if mode == 'missing':
                     source.unlink()
                 if mode == 'changed_message':
@@ -327,7 +338,7 @@ class RunnerTests(TestCase):
                         reopened.execute("UPDATE agent_invocations SET result_kind='interrupted'")
                 if mode == 'changed_session_owner':
                     with reopened:
-                        reopened.execute("UPDATE common_guidance_sessions SET task_id='another-task'")
+                        reopened.execute("UPDATE common_guidance_sessions SET task_id='another-task' WHERE session_id='session'")
                 provider = mock.Mock()
                 provider.run.side_effect = AssertionError('provider must not be repeated')
                 with mock.patch.object(manager, 'agent_provider', return_value=provider):
