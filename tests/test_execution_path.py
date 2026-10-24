@@ -94,6 +94,35 @@ class ExecutionPathTests(unittest.TestCase):
             with self.assertRaises(ManagedConfigError):
                 execution_path.apply_execution_path(self.source)
 
+    def test_command_lookup_classifier_requires_explicit_missing_executable_output(self):
+        for output in (
+            'bash: line 1: node: command not found',
+            '/bin/sh: 1: node: not found',
+            'env: ‘node’: No such file or directory',
+            'Error: spawn node ENOENT',
+            "FileNotFoundError: [Errno 2] No such file or directory: 'node'",
+        ):
+            with self.subTest(output=output):
+                self.assertTrue(execution_path.command_lookup_failed(output))
+                self.assertIn('bash scripts/setup.sh',
+                              execution_path.append_path_recovery_hint(output))
+        for output in (
+            'session not found',
+            'not logged in',
+            'permission denied',
+            'command failed with exit code 1',
+        ):
+            with self.subTest(output=output):
+                self.assertFalse(execution_path.command_lookup_failed(output))
+                self.assertEqual(execution_path.append_path_recovery_hint(output), output)
+        with mock.patch.object(execution_path.sys, 'platform', 'darwin'):
+            self.assertEqual(
+                execution_path.append_path_recovery_hint('node: command not found'),
+                'node: command not found',
+            )
+            self.assertFalse(execution_path.missing_executable(
+                FileNotFoundError(2, 'No such file or directory', 'git'), 'git'))
+
     def test_other_platforms_leave_environment_and_cache_untouched(self):
         self.write_cache('unchanged')
         for platform in ('win32', 'darwin'):
@@ -131,6 +160,19 @@ class ExecutionPathTests(unittest.TestCase):
             self.assertEqual(loop_manager.main(), 1)
         prepare.assert_not_called()
         lock.assert_not_called()
+
+    def test_source_bootstrap_missing_git_reports_setup_recovery(self):
+        error = FileNotFoundError(2, 'No such file or directory', 'git')
+        with mock.patch.object(loop_manager, 'ROOT', self.source), \
+                mock.patch.object(sys, 'argv', ['loop_manager.py', 'config', 'init']), \
+                mock.patch.object(loop_manager, 'process_lock',
+                                  return_value=nullcontext(mock.Mock())), \
+                mock.patch.object(loop_manager, 'prepare_bootstrap_runtime', side_effect=error), \
+                mock.patch.object(loop_manager, 'operation_log') as operation_log:
+            self.assertEqual(loop_manager.main(), 1)
+        message = operation_log.call_args.args[0]
+        self.assertIn("'git'", message)
+        self.assertIn('bash scripts/setup.sh', message)
 
     def test_runtime_child_does_not_read_or_rebuild_path(self):
         self.write_cache('invalid runtime cache')

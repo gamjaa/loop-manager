@@ -18,6 +18,8 @@ import tomllib
 from typing import Callable
 
 from loop_manager_internal.agents.agent_codex_sandbox import CODEX_EXTENSION_ARGUMENTS, CodexLaunch, prepare_launch
+from loop_manager_internal.config import execution_path
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 
 class IsolationError(RuntimeError):
@@ -303,7 +305,7 @@ def prepare_execution_environment(provider: str, role: str, worktree: Path, stat
         return prepare_launch(boundary, state_dir, role, read_only,
                               codex_arguments(read_only), dict(environment_variables))
     except RuntimeError as error:
-        raise IsolationError(str(error)) from error
+        raise IsolationError(execution_path.append_path_recovery_hint(str(error))) from error
 
 
 def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
@@ -346,7 +348,7 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
             launch = prepared_launch or prepare_launch(boundary, state_dir, role, read_only,
                                                        codex_arguments(read_only), environment_variables)
         except RuntimeError as error:
-            raise IsolationError(str(error)) from error
+            raise IsolationError(execution_path.append_path_recovery_hint(str(error))) from error
         selected_environment = launch.environment
         configuration, stable_configuration = _checked_codex_configuration(
             boundary.worktree, state_dir, config_path, selected_environment)
@@ -361,6 +363,12 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
                                 text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
                                 env=selected_environment)
         if result.returncode or not result.stdout.strip():
+            output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+            if execution_path.command_lookup_failed(output):
+                raise IsolationError(execution_path.append_path_recovery_hint(
+                    redact_secrets(
+                        f"Codex CLI version check failed (exit {result.returncode}):\n{output[-6000:]}"
+                    )))
             raise IsolationError("Codex CLI 버전을 확인할 수 없습니다.")
         version = result.stdout.strip()
         configuration, _ = check_preparation_lookup()
@@ -374,11 +382,18 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
             launch.probe(on_features_checked=check_preparation_lookup)
             args = launch.arguments
         except RuntimeError as error:
-            raise IsolationError(str(error)) from error
+            message = execution_path.append_path_recovery_hint(str(error))
+            raise IsolationError(message) from error
         configuration, _ = check_preparation_lookup()
         status = "verified"
     except (IsolationError, OSError, subprocess.TimeoutExpired) as error:
-        reason = str(error) if isinstance(error, IsolationError) else "격리 확인 도구 실행 실패"
+        if isinstance(error, IsolationError):
+            reason = str(error)
+        elif execution_path.missing_executable(error, provider):
+            reason = execution_path.with_path_recovery_hint(
+                f"{provider.capitalize()} CLI 실행 실패: {error}")
+        else:
+            reason = "격리 확인 도구 실행 실패"
     canonical_worktree = str(boundary.worktree) if boundary else str(worktree)
     repository_identity = boundary.repository_identity if boundary else ""
     evidence = IsolationEvidence(
@@ -478,8 +493,17 @@ def assert_current(evidence: IsolationEvidence, worktree: Path, state_dir: Path,
                                 text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
                                 env=environment_variables)
     except (OSError, subprocess.TimeoutExpired) as error:
+        if isinstance(error, OSError) and execution_path.missing_executable(error, evidence.provider):
+            raise IsolationError(execution_path.with_path_recovery_hint(
+                f"Agent CLI 실행 실패: {error}")) from error
         raise IsolationError("Agent CLI 버전 재확인 실패") from error
     if result.returncode or result.stdout.strip() != evidence.cli_version:
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+        if execution_path.command_lookup_failed(output):
+            raise IsolationError(execution_path.append_path_recovery_hint(
+                redact_secrets(
+                    f"Agent CLI version check failed (exit {result.returncode}):\n{output[-6000:]}"
+                )))
         raise IsolationError("Agent CLI 버전이 사전 검사 뒤 변경됐습니다.")
     assert_current_configuration(evidence, worktree, state_dir, config_path,
                                  expected_repository, read_only, snapshot_digest,

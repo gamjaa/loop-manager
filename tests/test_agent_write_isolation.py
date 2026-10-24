@@ -354,6 +354,38 @@ class WriteIsolationTests(TestCase):
             self.assertNotEqual(records[0].policy_digest, records[1].policy_digest)
             self.assertEqual(records[0].repository_identity, 'repository')
 
+    def test_missing_node_in_codex_preflight_preserves_output_and_path_recovery(self):
+        from loop_manager_internal.config import execution_path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boundary = isolation.WorktreeBoundary(
+                root, root / 'source', (), root / 'git', root / 'common', 'repository',
+            )
+            launch = isolation.CodexLaunch(
+                arguments=('codex', 'exec'), probe_arguments=('codex', 'sandbox'),
+                environment={'CODEX_HOME': str(root / 'codex-home')},
+                runtime=root, attempt=root, specification=json.dumps({'worktree': str(root)}),
+            )
+            records = []
+            result = manager.subprocess.CompletedProcess(
+                ['codex', '--version'], 127, '', '/bin/sh: 1: node: not found\n',
+            )
+            with mock.patch.object(execution_path.sys, 'platform', 'linux'), \
+                    mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                    mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                    mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
+                    mock.patch.object(isolation, '_checked_codex_configuration',
+                                      return_value=('digest', 'stable')), \
+                    mock.patch.object(isolation.subprocess, 'run', return_value=result):
+                with self.assertRaisesRegex(isolation.IsolationError, 'node: not found') as failure:
+                    isolation.prepare_isolation(
+                        'codex', 'worker', root, root, False, records.append,
+                        lambda: 'snapshot', expected_repository=str(root / 'source'),
+                        environment_variables={}, config_path=root / 'config',
+                    )
+            self.assertIn('bash scripts/setup.sh', str(failure.exception))
+            self.assertEqual(records[0].status, 'rejected')
+
     def test_extension_conflict_created_during_probe_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

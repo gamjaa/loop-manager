@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from loop_manager_internal.agents.agent_profiles import AGENT_PROVIDERS
 from loop_manager_internal.application.contracts import ProjectRegistrationInspection
+from loop_manager_internal.config import execution_path
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.storage import execplan_catalog_state
 from loop_manager_internal.storage import maintenance_state
@@ -32,16 +33,16 @@ def validate_runtime_prerequisites(
     """Validate executable, authentication, and profile prerequisites only."""
 
     if not shutil.which("git") or not shutil.which("gh"):
-        raise RuntimeError("git과 gh CLI가 PATH에 있어야 합니다.")
+        raise RuntimeError(execution_path.with_path_recovery_hint(
+            "git과 gh CLI가 PATH에 있어야 합니다."))
     if provider not in AGENT_PROVIDERS:
         raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     if config_path is not None:
         effects.validate_provider_runtime(config_path, provider, path,
                                          **({'state_dir': state_dir} if state_dir is not None else {}))
     elif not shutil.which(provider):
-        raise RuntimeError(
-            f"선택한 {provider.capitalize()} CLI가 PATH에 설치되어 있지 않습니다."
-        )
+        raise RuntimeError(execution_path.with_path_recovery_hint(
+            f"선택한 {provider.capitalize()} CLI가 PATH에 설치되어 있지 않습니다."))
 
 
 @dataclass(frozen=True)

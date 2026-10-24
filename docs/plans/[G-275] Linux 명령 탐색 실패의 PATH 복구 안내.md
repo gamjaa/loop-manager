@@ -37,7 +37,7 @@ Linux에서 필요한 CLI 또는 실제 실행 의존성을 찾지 못한 오류
 ## Progress
 
 - [x] 2026-10-13 `041e6ee8ba3145eae988e99fdd4055cb743f08d1`의 R-089 직접 구현·`tests/test_execution_path.py`·README·운영 안내와 bootstrap/등록/provider/명령 오류 전달을 정적으로 대조했다. 손상 캐시 복구와 PATH 기본 동작은 구현돼 있으며 명령 탐색 실패의 실행 시 복구 안내가 남아 있다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 탐색 실패의 복구 안내와 targeted unit 검증
+- [x] 2026-10-24 Linux source bootstrap·등록·Agent preflight/호출의 확인된 CLI·의존 명령 탐색 실패에 setup 복구 안내를 연결했다. provider 원문과 exit code·비밀값 제거, 기존 인증/session/권한 분류·재시도를 보존하고 README·운영 안내·PRODUCT·ARCHITECTURE를 실제 동작에 맞췄다. 관리 rebase 후 HEAD `000ad57c1049438bf7c985bfcd4038e7c15d9b41`의 변경 전체를 다시 확인하고 관련 targeted unit 12개를 새로 실행해 통과했다.
 - [ ] Manager 검증·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

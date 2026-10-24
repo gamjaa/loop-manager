@@ -12,6 +12,7 @@ from uuid import uuid4
 from typing import Callable, TYPE_CHECKING
 
 from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence, CodexLaunch
+from loop_manager_internal.config import execution_path
 
 if TYPE_CHECKING:
     from loop_manager_internal.agents.common_guidance import CommonGuidance
@@ -275,13 +276,21 @@ def run_agent_with_retries(
                 AgentResultKind.TRANSIENT_FAILURE,
             )
         except OSError as error:
+            message = f"Agent CLI 실행 실패: {error}"
+            if any(execution_path.missing_executable(error, provider)
+                   for provider in ("codex", "claude")):
+                message = execution_path.with_path_recovery_hint(message)
             result = AgentResult(
                 1,
-                f"Agent CLI 실행 실패: {error}",
+                message,
                 active_session_id,
                 AgentResultKind.TRANSIENT_FAILURE,
             )
 
+        if result.code:
+            result = replace(
+                result, message=execution_path.append_path_recovery_hint(result.message),
+            )
         if result.session_id:
             active_session_id = result.session_id
         if result.result_kind is AgentResultKind.SUCCESS:

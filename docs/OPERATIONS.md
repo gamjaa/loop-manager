@@ -47,7 +47,13 @@ env CLAUDE_CONFIG_DIR=/path/to/state/automation-claude claude auth status
 
 Python source 진입은 bootstrap의 첫 Git 호출 전에 저장된 PATH, 현재 PATH의 추가 디렉터리, 기본 시스템 디렉터리 순서로 합친다. runtime 자식·Agent·verify는 확정된 환경을 상속하며 캐시를 다시 읽지 않는다. 캐시 위치는 source checkout에 고정되고 cwd·`--config`·state_dir 변경과 무관하다. 캐시가 없으면 현재 PATH와 시스템 후보를 사용하므로 PATH를 명시한 기존 cron 설정도 사용할 수 있다.
 
-프로그램이나 Node 등의 의존 실행 파일을 찾지 못하면 같은 계정의 정상 터미널에서 설치 경로를 확인하고 setup을 다시 실행한다. 읽기 불가·빈 파일·손상된 캐시는 bootstrap 전에 중단하며 현재 PATH로 조용히 대체하지 않는다. setup 재실행은 PATH 캐시만 갱신하고 `config.ini`·인증·DB·session은 초기화하지 않는다. 실행 중 캐시 갱신은 다음 source 실행부터 적용된다. 가상환경을 다시 만들어도 `config`의 PATH 캐시는 유지된다.
+bootstrap의 Git, 등록의 Git·gh·선택 provider, Agent 사전 확인과 실제 호출에서 필수 CLI 또는 Node 등 확인된 실행 의존성을 찾지 못하면 오류 원인·기존 provider 출력·실패 결과를 보존해 복구 방법을 안내한다. 같은 실행 계정의 정상 터미널에서 설치 경로를 확인하고 Loop Manager source checkout에서 다음 명령을 실행한다.
+
+```sh
+bash scripts/setup.sh
+```
+
+명령 누락 표식이 확인된 실패만 PATH 복구 대상으로 안내한다. 일반 명령 실패·session 부재·인증 실패·권한 거부는 원래 실패로 처리한다. 진단은 환경 전체나 인증값을 추가 출력하지 않고 캐시 변경·로그인·다른 provider 실행을 시작하지 않는다. 읽기 불가·빈 파일·손상된 캐시는 bootstrap 전에 중단하며 현재 PATH로 조용히 대체하지 않는다. setup 재실행은 PATH 캐시만 갱신하고 `config.ini`·인증·DB·session은 초기화하지 않는다. 실행 중 캐시 갱신은 다음 source 실행부터 적용된다. 가상환경을 다시 만들어도 `config`의 PATH 캐시는 유지된다.
 
 ## 설정
 

@@ -63,6 +63,77 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 self.assertEqual(result.code, 1)
                 invoke.assert_called_once_with(session, False)
 
+    def test_confirmed_dependency_lookup_failure_adds_hint_without_changing_result(self):
+        from loop_manager_internal.config import execution_path
+        output = 'Error: spawn node ENOENT'
+        failure = loop_manager.AgentResult(
+            127, output, kind=loop_manager.AgentResultKind.PERMANENT_CONFIGURATION,
+        )
+        invoke = mock.Mock(return_value=failure)
+        with mock.patch.object(execution_path.sys, 'platform', 'linux'):
+            result = loop_manager.run_agent_with_retries(invoke, session_id=None)
+        self.assertEqual(result.code, 127)
+        self.assertEqual(result.result_kind, loop_manager.AgentResultKind.PERMANENT_CONFIGURATION)
+        self.assertTrue(result.message.startswith(output))
+        self.assertIn('bash scripts/setup.sh', result.message)
+        invoke.assert_called_once_with(None, False)
+
+        missing_cli = mock.Mock(side_effect=FileNotFoundError(
+            2, 'No such file or directory', 'claude',
+        ))
+        with mock.patch.object(execution_path.sys, 'platform', 'linux'):
+            result = loop_manager.run_agent_with_retries(missing_cli, session_id=None)
+        self.assertEqual(result.code, 1)
+        self.assertIn('claude', result.message)
+        self.assertIn('bash scripts/setup.sh', result.message)
+        self.assertEqual(missing_cli.call_count, loop_manager.MAX_TRANSIENT_AGENT_RETRIES + 1)
+
+        for output in ('session not found', 'not logged in', 'permission denied', 'command failed'):
+            with self.subTest(output=output), \
+                    mock.patch.object(execution_path.sys, 'platform', 'linux'):
+                failure = loop_manager.AgentResult(
+                    1, output, kind=loop_manager.AgentResultKind.PERMANENT_CONFIGURATION,
+                )
+                result = loop_manager.run_agent_with_retries(
+                    mock.Mock(return_value=failure), session_id=None,
+                )
+                self.assertEqual(result.message, output)
+
+    def test_provider_preflight_preserves_redacted_dependency_output(self):
+        from loop_manager_internal.agents import provider_guidance
+        from loop_manager_internal.agents.common_guidance import GuidanceError
+        from loop_manager_internal.config import execution_path
+        output = 'node: command not found\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789'
+        result = subprocess.CompletedProcess(['codex', '--version'], 127, output, '')
+        with mock.patch.object(execution_path.sys, 'platform', 'linux'), \
+                mock.patch.object(provider_guidance.subprocess, 'run', return_value=result):
+            with self.assertRaises(GuidanceError) as failure:
+                provider_guidance._probe(['codex', '--version'])
+        self.assertIn('node: command not found', str(failure.exception))
+        self.assertIn('bash scripts/setup.sh', str(failure.exception))
+        self.assertNotIn('sk-abcdefghijklmnopqrstuvwxyz', str(failure.exception))
+
+    def test_claude_model_lookup_preserves_redacted_dependency_output(self):
+        from loop_manager_internal.agents import agent_profiles
+        from loop_manager_internal.config import execution_path
+        config = profile_config(self)
+        output = 'Error: spawn node ENOENT\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789'
+        effects = mock.Mock()
+        effects.command.return_value = subprocess.CompletedProcess(
+            ['claude', '--bare', '--init-only'], 127, output, '',
+        )
+        with mock.patch.object(execution_path.sys, 'platform', 'linux'), \
+                mock.patch.object(agent_profiles, 'agent_environment',
+                                  return_value={'PATH': '/usr/bin'}):
+            with self.assertRaises(RuntimeError) as failure:
+                agent_profiles.claude_model_efforts(config, effects=effects)
+        message = str(failure.exception)
+        self.assertIn('Error: spawn node ENOENT', message)
+        self.assertIn('exit 127', message)
+        self.assertIn('bash scripts/setup.sh', message)
+        self.assertNotIn('sk-abcdefghijklmnopqrstuvwxyz', message)
+        effects.command.assert_called_once()
+
     def test_parallel_claude_resumes_share_home_but_keep_sessions_temporary_paths_and_results(self):
         config = profile_config(self)
         barrier = threading.Barrier(2)
@@ -298,8 +369,10 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         with mock.patch("loop_manager.shutil.which", return_value=None), mock.patch(
             "loop_manager.command"
         ) as command:
-            with self.assertRaisesRegex(RuntimeError, "설치되어 있지 않습니다"):
+            with self.assertRaisesRegex(RuntimeError, "설치되어 있지 않습니다") as missing:
                 loop_manager.validate_provider_runtime(config, "claude")
+        if loop_manager.execution_path.sys.platform == 'linux':
+            self.assertIn('bash scripts/setup.sh', str(missing.exception))
         command.assert_not_called()
 
         unauthenticated = subprocess.CompletedProcess(
@@ -314,6 +387,20 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         ) as model_efforts:
             with self.assertRaisesRegex(RuntimeError, "인증되어 있지 않습니다"):
                 loop_manager.validate_provider_runtime(config, "claude")
+        model_efforts.assert_not_called()
+
+    def test_node_lookup_failure_during_provider_preflight_keeps_original_output(self):
+        config = profile_config(self)
+        auth = subprocess.CompletedProcess(
+            ["claude", "auth", "status"], 127, stdout="node: command not found\n", stderr="",
+        )
+        with mock.patch("loop_manager.shutil.which", return_value="/bin/claude"), \
+                mock.patch("loop_manager.command", return_value=auth), \
+                mock.patch("loop_manager.claude_model_efforts") as model_efforts:
+            with self.assertRaisesRegex(RuntimeError, "node: command not found") as failure:
+                loop_manager.validate_provider_runtime(config, "claude")
+        self.assertIn('bash scripts/setup.sh', str(failure.exception))
+        self.assertNotIn('인증되어 있지 않습니다', str(failure.exception))
         model_efforts.assert_not_called()
         authenticated = subprocess.CompletedProcess(
             ["claude", "auth", "status"], 0, stdout='{"loggedIn":true}'

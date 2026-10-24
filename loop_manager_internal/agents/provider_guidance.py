@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from loop_manager_internal.agents.common_guidance import CommonGuidance, GuidanceError, _read
 from loop_manager_internal.agents.agent_profiles import agent_environment
+from loop_manager_internal.config import execution_path
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 
 def _probe(arguments: list[str], **context) -> str:
@@ -20,8 +22,17 @@ def _probe(arguments: list[str], **context) -> str:
         result = subprocess.run(arguments, capture_output=True, text=True,
                                 encoding="utf-8", timeout=15, check=False, **context)
     except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+        if isinstance(error, OSError) and execution_path.missing_executable(error, arguments[0]):
+            raise GuidanceError(execution_path.with_path_recovery_hint(
+                f"Provider 실행 실패: {error}")) from error
         raise GuidanceError("Provider 추가 지침 기능을 확인할 수 없습니다.") from error
     if result.returncode:
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+        if execution_path.command_lookup_failed(output):
+            safe_output = redact_secrets(
+                f"Provider preflight command failed (exit {result.returncode}):\n{output[-6000:]}"
+            )
+            raise GuidanceError(execution_path.append_path_recovery_hint(safe_output))
         raise GuidanceError("Provider 추가 지침 기능 조회가 실패했습니다.")
     return result.stdout
 

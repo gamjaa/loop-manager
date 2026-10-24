@@ -227,7 +227,10 @@ def main() -> int:
             sqlite3.DatabaseError,
             json.JSONDecodeError,
         ) as error:
-            operation_log(f"오류: {error}", error=True)
+            message = str(error)
+            if (not args.runtime_child and execution_path.missing_executable(error, "git")):
+                message = execution_path.with_path_recovery_hint(message)
+            operation_log(f"오류: {message}", error=True)
             return 1
 
 
