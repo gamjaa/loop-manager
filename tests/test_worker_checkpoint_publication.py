@@ -238,11 +238,10 @@ class PullRequestHistoryTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, 'identity'):
                         self._lookup(records)
 
-    def test_prepare_rejects_mismatched_merged_history_before_terminal_or_workspace_effects(self):
+    def _prepare_fixture(self):
         from dataclasses import replace
         import loop_manager
         from tests.support.execution import execution_fixture
-        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
 
         fixture = execution_fixture(self)
         fixture.connection.executescript(
@@ -262,10 +261,17 @@ class PullRequestHistoryTests(unittest.TestCase):
             checkpoint=ExecutionCheckpointRepository(fixture.connection),
             publication=replace(fixture.effects.publication,
                 pr_for_branch=ports.effects.publication.pr_for_branch,
+                reconcile_existing_pull_request=ports.effects.publication.reconcile_existing_pull_request,
                 github_repository=loop_manager.github_repository))
         fixture.effects.workspace._plan_id_from_path.return_value = 'G-047'
         fixture.effects.workspace.git.side_effect = lambda *_a, **_k: SimpleNamespace(
             stdout='https://github.com/owner/repo.git', returncode=0)
+        return fixture
+
+    def test_prepare_rejects_mismatched_merged_history_before_terminal_or_workspace_effects(self):
+        import loop_manager
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+        fixture = self._prepare_fixture()
         for changes in ({'baseRefName': 'other'}, {'headRefName': 'other'},
                         {'url': 'https://github.com/other/repo/pull/1'}):
             with self.subTest(changes=changes), \
@@ -278,9 +284,56 @@ class PullRequestHistoryTests(unittest.TestCase):
                 self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
                 command.assert_called_once()
                 fixture.effects.workspace.make_worktree.assert_not_called()
-                fixture.effects.publication.reconcile_existing_pull_request.assert_not_called()
                 fixture.effects.agent.run_agent.assert_not_called()
                 self.assertEqual(fixture.state.active_execplan('repo')['status'], 'IMPLEMENTING')
+
+    def test_prepare_merged_uses_real_terminal_binding_before_fetch(self):
+        import loop_manager
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+        for failed_fetch in (False, True):
+            with self.subTest(failed_fetch=failed_fetch):
+                fixture = self._prepare_fixture()
+                fixture.connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+                fixture.connection.commit()
+                pr = self._pr(state='MERGED', headRefOid='b' * 40,
+                              mergeCommit={'oid': 'c' * 40})
+                with mock.patch.object(fixture.handler, '_resolving_rebase', return_value=False), \
+                     mock.patch.object(fixture.handler, '_fetch_latest_base') as fetch, \
+                     mock.patch.object(fixture.handler, '_checkpoint_remote_oid') as branch, \
+                     mock.patch.object(loop_manager, 'command', return_value=subprocess.CompletedProcess(
+                         [], 0, json.dumps([pr]), '')), \
+                     mock.patch.object(loop_manager, '_assess_missing_managed_cleanup',
+                                       return_value=loop_manager.CleanupAssessment('missing')), \
+                     mock.patch.object(loop_manager, 'remote_base',
+                                       side_effect=RuntimeError('fetch unavailable') if failed_fetch else None):
+                    result = fixture.handler.prepare()
+                self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY if failed_fetch
+                                 else ExecutionOutcomeKind.PLANNING_PENDING)
+                fetch.assert_not_called()
+                branch.assert_not_called()
+                fixture.effects.workspace.make_worktree.assert_not_called()
+                fixture.effects.agent.run_agent.assert_not_called()
+                saved = fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+                self.assertEqual((saved['status'], saved['pr_url'], saved['pr_head_oid']),
+                                 ('MERGED', pr['url'], 'b' * 40))
+
+    def test_prepare_preserves_competing_owner_during_terminal_observation(self):
+        import loop_manager
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+        fixture = self._prepare_fixture()
+        def competing(*_a, **_k):
+            fixture.connection.execute('UPDATE exec_plans SET workspace_owned=1')
+            fixture.connection.commit()
+            return subprocess.CompletedProcess([], 0, json.dumps([self._pr(state='MERGED')]), '')
+        with mock.patch.object(fixture.handler, '_resolving_rebase', return_value=False), \
+             mock.patch.object(loop_manager, 'command', side_effect=competing), \
+             mock.patch.object(loop_manager, 'complete_merged_execplan_worktree') as complete:
+            result = fixture.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        complete.assert_not_called()
+        fixture.effects.workspace.make_worktree.assert_not_called()
+        saved = fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((saved['status'], saved['workspace_owned']), ('IMPLEMENTING', 1))
 
     def test_absent_open_closed_and_incomplete_history(self):
         self.assertIsNone(self._lookup([]))

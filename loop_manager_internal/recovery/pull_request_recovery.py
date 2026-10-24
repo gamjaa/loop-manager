@@ -97,6 +97,11 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
         raise PublicationSafetyError(
             f"기존 PR head branch가 관리 branch와 다릅니다: {head_name}"
         )
+    if (pull_request.get('baseRefName') is not None
+            and pull_request['baseRefName'] != project['base_branch']):
+        raise PublicationSafetyError('기존 PR base가 등록 base와 다릅니다.')
+    if project['pr_url'] and project['pr_url'] != url:
+        raise PublicationSafetyError('저장된 PR URL과 관측한 PR identity가 다릅니다.')
     head_value = pull_request.get("headRefOid")
     head_oid = str(head_value) if head_value else project["pr_head_oid"]
     state = str(pull_request.get("state") or "OPEN").upper()
@@ -209,10 +214,10 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
             file=sys.stderr,
         )
         return 1
-    if state != "OPEN" or (
+    if state != 'MERGED' and not pull_request.get('mergedAt') and (state != "OPEN" or (
         project["phase"] not in {"PR_OPEN", "PLAN_BLOCKED"}
         and not int(project["pr_conflict_recovery"])
-    ):
+    )):
         effects.update_project(
             connection,
             repo,
@@ -528,15 +533,6 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
         return 0
 
     if state == "MERGED" or pull_request.get("mergedAt"):
-        effects.remote_base(
-            repo_path, str(project["base_branch"]), state_dir=state_dir,
-        )
-        persisted = runtime_state.project_row(connection, repo)
-        stored_head_oid = (
-            str(persisted["pr_head_oid"])
-            if persisted and persisted["pr_head_oid"]
-            else None
-        )
         plan = effects.project_execplan(connection, repo)
         if plan is None:
             raise RuntimeError("병합된 PR과 연결된 ExecPlan을 찾을 수 없습니다.")
@@ -549,9 +545,16 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
                 state_dir,
                 plan,
                 url,
-                stored_head_oid,
+                head_oid,
             )
         except WorkspaceOwnershipError as error:
+            persisted = connection.execute(
+                'SELECT status FROM exec_plans WHERE repo=? AND plan_id=?',
+                (repo, plan['plan_id']),
+            ).fetchone()
+            if persisted is not None and persisted[0] == 'MERGED':
+                effects.operation_print(f'Merge 확인 완료; 정리 재시도: {error}', file=sys.stderr)
+                return PROJECT_STEP_RETRY
             workspace_error = (
                 f"Merge cleanup workspace 소유권 검증 실패: {error}"
             )
@@ -565,13 +568,18 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
             )
             effects.operation_print(workspace_error, file=sys.stderr)
             return 1
-        except RuntimeError as error:
+        except (RuntimeError, OSError) as error:
             detail = f"Merge cleanup workspace 조회 재시도: {error}"
             effects._record_project_recovery(
                 connection, repo, recovery_runtime.RecoveryReason.WORKTREE_RECOVERY_FAILED,
                 detail,
             )
             effects.operation_print(detail, file=sys.stderr)
+            return PROJECT_STEP_RETRY
+        try:
+            effects.remote_base(repo_path, str(project['base_branch']), state_dir=state_dir)
+        except (RuntimeError, OSError) as error:
+            effects.operation_print(f'Merge 확인 완료; base 동기화 재시도: {error}', file=sys.stderr)
             return PROJECT_STEP_RETRY
         if assessment.status in {"safe", "missing"}:
             effects.operation_print(f"Merge 확인 및 worktree 정리 완료: {url}")

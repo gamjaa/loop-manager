@@ -106,7 +106,7 @@ class WorkspaceHandler:
 
     def _terminal_adopted_pr(self, plan_id, pull_request):
         result = self.ports.reconcile_existing_pull_request(
-            self.ports.state.connection, self.ports.identity.repo_path,
+            self.ports.identity.repo_path,
             self.ports.identity.state_dir, self.ports.identity.repo,
             self.ports._row(), pull_request,
         )
@@ -115,6 +115,9 @@ class WorkspaceHandler:
                 ExecutionOutcomeKind.PLANNING_PENDING,
                 detail='기존 PR 병합 완료를 반영하고 base/catalog 동기화를 예약했습니다.',
             )
+        if result == self.ports.contract.PROJECT_STEP_RETRY:
+            return ExecutionOutcome(ExecutionOutcomeKind.RETRY,
+                                    detail='기존 terminal PR의 후속 처리를 재시도합니다.')
         return ExecutionOutcome(
             ExecutionOutcomeKind.FINAL_BLOCK,
             detail=('병합되지 않은 닫힌 PR의 명시적 재개 결정을 기다립니다.'
@@ -755,12 +758,27 @@ class WorkspaceHandler:
                     raise self.ports.contract.WorkspaceOwnershipError(
                         '활성 ExecPlan의 정확한 관리 branch identity가 아닙니다.')
                 self._validate_registered_remote()
-                self.ports._fetch_latest_base()
-                remote_observed = self.ports._checkpoint_remote_oid(
-                    self.ports.identity.repo_path, branch)
+                observed_checkpoint = self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
                 adopted_pr = self.ports.pr_for_branch(
                     self.ports.identity.repo_path, branch, history=True,
                 )
+                self.ports.state.check()
+                if (self.ports.state.active_execplan(self.ports.identity.repo)['catalog_generation']
+                        != catalog_plan['catalog_generation']
+                        or self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
+                        != observed_checkpoint):
+                    raise CheckpointRace('원격 인수 PR 관측 중 catalog/checkpoint가 변경됐습니다.')
+                if adopted_pr is not None and (
+                        adopted_pr.get('headRefName') != branch
+                        or adopted_pr.get('baseRefName') != self.ports.identity.base):
+                    raise self.ports.contract.WorkspaceOwnershipError(
+                        '원격 작업 PR의 head/base가 등록 대상과 다릅니다.')
+                if adopted_pr is not None and (
+                        adopted_pr.get('state') in {'MERGED', 'CLOSED'} or adopted_pr.get('mergedAt')):
+                    return self._terminal_adopted_pr(plan_id, adopted_pr)
+                self.ports._fetch_latest_base()
+                remote_observed = self.ports._checkpoint_remote_oid(
+                    self.ports.identity.repo_path, branch)
                 saved = self.ports.checkpoint.get(
                     self.ports.identity.repo, plan_id).snapshot or {}
                 prior_adoption = saved.get('remote_adoption')
@@ -776,12 +794,7 @@ class WorkspaceHandler:
                     raise self.ports.contract.WorkspaceOwnershipError(
                         '중단된 원격 작업 인수의 저장 identity가 유효하지 않습니다.')
                 if adopted_pr is not None:
-                    if adopted_pr.get('headRefName') != branch:
-                        raise self.ports.contract.WorkspaceOwnershipError(
-                            '원격 작업 branch PR의 head가 현재 작업과 다릅니다.')
                     pr_state = str(adopted_pr.get('state') or '').upper()
-                    if pr_state in {'CLOSED', 'MERGED'} or adopted_pr.get('mergedAt'):
-                        return self._terminal_adopted_pr(plan_id, adopted_pr)
                     if (pr_state != 'OPEN' or adopted_pr.get('baseRefName') != self.ports.identity.base
                             or remote_observed is None
                             or adopted_pr.get('headRefOid') != remote_observed):
@@ -920,6 +933,9 @@ class WorkspaceHandler:
             database.record_execplan_workspace_seen(
                 self.ports.state.connection, self.ports.identity.repo, plan_id)
             self._workspace_boundary(plan_id, row, pending=False)
+        except RuntimeStateError as error:
+            return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
+                                    detail=f'원격 인수 중 실행 상태가 변경됐습니다: {error}')
         except self.ports.contract.WorkspaceOwnershipError as error:
             workspace_error = f"관리 workspace 소유권/복구 검증 실패: {error}"
             outcome = self.ports._recover(

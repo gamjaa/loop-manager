@@ -264,6 +264,43 @@ def complete_merged_execplan_worktree(
     manual_work_recovery.validate_merge(connection,repo,plan,pr_url,pr_head_oid,
                                        pr_for_branch=effects.pr_for_branch)
 
+    plan_id = str(plan['plan_id'])
+    def record_merge(current_connection):
+        current = current_connection.execute(
+            'SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id),
+        ).fetchone()
+        identity_fields = ('path', 'content_hash', 'catalog_generation', 'branch',
+                           'worktree', 'workspace_owned', 'worker_session_id')
+        if (current is None or any(current[key] != plan[key] for key in identity_fields)
+                or current['status'] not in {plan['status'], 'MERGED'}
+                or current['pr_url'] and current['pr_url'] != pr_url):
+            raise WorkspaceOwnershipError('Merge 관측 뒤 ExecPlan identity/소유 상태가 변경됐습니다.')
+        effects._ensure_cleanup_pending_schema(current_connection)
+        effects._store_cleanup_pending(
+            current_connection, repo, Path(str(current['worktree'] or '')),
+            pr_url, pr_head_oid, 'Merge 확인; worktree 정리 대기',
+            workspace_owned=int(current['workspace_owned']),
+        )
+        mirrored = runtime_state.project_row(current_connection, repo)
+        project_values = (effects._clear_active_values()
+            if mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
+            and mirrored['plan_path'] == current['path'] else {})
+        runtime_state.RuntimeStateRepository(current_connection).mark_merged(
+            repo, plan_id, project_values=project_values, enqueue=False,
+            pr_url=pr_url, pr_head_oid=pr_head_oid,
+        )
+        manual_store.mark_group_merged(repo, plan_id)
+        scoped_blocking.clear_plan_block(current_connection, repo, plan_id)
+        notifications.record_merged_plan(current_connection, repo, plan_id, str(current['title']))
+        notifications.enqueue_current_project_events(current_connection, repo)
+
+    from loop_manager_internal.storage.db_access import CoordinatedConnection
+    if isinstance(connection, CoordinatedConnection):
+        connection.run_request(record_merge)
+    else:
+        with connection:
+            record_merge(connection)
+
     effects._ensure_cleanup_pending_schema(connection)
     branch = str(plan["branch"] or "")
     worktree = Path(str(plan["worktree"] or ""))
@@ -315,6 +352,10 @@ def complete_merged_execplan_worktree(
                 owner=f"plan:{plan['plan_id']}",
             )
 
+    effects._record_merged_worktree_cleanup(
+        connection, repo_path, repo, plan_id, worktree, branch,
+        pr_head_oid, assessment, cleanup_registration,
+    )
     with connection:
         if assessment.status in {"safe", "missing"}:
             connection.execute(
@@ -331,27 +372,6 @@ def complete_merged_execplan_worktree(
                 assessment.reason or assessment.status,
                 workspace_owned=workspace_owned,
             )
-        plan_id = str(plan["plan_id"])
-        mirrored = runtime_state.project_row(connection, repo)
-        project_values: dict[str, object] = {}
-        if (mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
-                and mirrored["plan_path"] == plan["path"]):
-            project_values.update(effects._clear_active_values())
-        runtime_state.RuntimeStateRepository(connection).mark_merged(
-            repo,
-            plan_id,
-            project_values=project_values,
-            enqueue=False,
-        )
-        manual_store.mark_group_merged(repo,plan_id)
-        effects._record_merged_worktree_cleanup(
-            connection, repo_path, repo, plan_id, worktree, branch,
-            pr_head_oid, assessment, cleanup_registration,
-        )
-        scoped_blocking.clear_plan_block(connection, repo, str(plan["plan_id"]))
-        notifications.record_merged_plan(
-            connection, repo, str(plan["plan_id"]), str(plan["title"])
-        )
         if assessment.status == "unverifiable":
             scoped_blocking.record_project_block(
                 connection,
