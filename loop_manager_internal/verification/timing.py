@@ -13,6 +13,7 @@ import stat
 import sys
 import time
 import unittest
+import uuid
 from unittest import mock
 
 _current_writer: ContextVar[EventWriter | None] = ContextVar("verify_events", default=None)
@@ -29,7 +30,8 @@ class EventWriter:
         self.stream = path.open("a", encoding="utf-8")
 
     def emit(self, kind: str, **values):
-        event = {"version": 1, **self.identity, "kind": kind, "at": self.clock(), "utc": datetime.now(timezone.utc).isoformat(),
+        event = {"version": 1, **self.identity, "kind": kind, "at": self.clock(),
+                 "utc": datetime.now(timezone.utc).isoformat(), "clock_domain": sys.platform,
                  "pid": os.getpid(), **values}
         self.stream.write(json.dumps(event, ensure_ascii=False) + "\n")
         self.stream.flush()
@@ -53,16 +55,17 @@ def phase(name: str, *, writer=None):
     if writer is None:
         yield
         return
-    start = writer.emit("phase_start", name=name)
+    phase_id = uuid.uuid4().hex
+    start = writer.emit("phase_start", name=name, phase_id=phase_id)
     token = _phase_names.set((*_phase_names.get(), name))
     try:
         yield
     except BaseException:
-        writer.emit("phase_end", name=name, start=start["at"],
+        writer.emit("phase_end", name=name, phase_id=phase_id, start=start["at"],
                     duration=writer.clock() - start["at"], result="error")
         raise
     else:
-        writer.emit("phase_end", name=name, start=start["at"],
+        writer.emit("phase_end", name=name, phase_id=phase_id, start=start["at"],
                     duration=writer.clock() - start["at"], result="complete")
     finally:
         _phase_names.reset(token)
@@ -313,9 +316,11 @@ def bytecode_cache_changes(before, after):
 
 def summarize(directory: Path, *, now=None):
     now = time.monotonic() if now is None else now
-    finished_at = None
+    finished_at, executions = {}, {}
+    ended_runs, ended_stages = set(), set()
     completed, active, phases, decisions, metadata, fixtures, result = [], {}, [], [], {}, [], None
     git_costs, git_incomplete = [], []
+    assignments, module_results, child_events, queues, selections = [], [], [], [], []
     bytecode_cache = None
     for path in sorted(directory.rglob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
@@ -324,27 +329,69 @@ def summarize(directory: Path, *, now=None):
             event = json.loads(line)
             kind = event["kind"]
             identity = event.get("id", event.get("name", ""))
-            key = (event["pid"], kind.split("_")[0], identity)
+            run_key = (event.get("clock_domain", "legacy"), event.get("run_id"),
+                       event.get("parent_run_id"))
+            base_key = (*run_key, event.get("stage_id"), event.get("unit_id"), event["pid"])
+            if kind in {"phase_start", "phase_end"}:
+                phase_identity = event.get("phase_id")
+                if phase_identity is None:
+                    phase_identity = (event.get("name"), event.get("start", event.get("at")))
+                key = (*run_key, event["pid"], "phase", phase_identity)
+            else:
+                key = (*base_key, kind.split("_")[0], identity)
             if kind in {"test_start", "phase_start"}:
                 active[key] = event
             elif kind in {"test_end", "phase_end"}:
                 active.pop(key, None)
                 (completed if kind == "test_end" else phases).append(event)
-                if kind == "phase_end" and event["name"] in {"verify_process", "verify"}:
-                    finished_at = max(finished_at or event["at"], event["at"])
-            elif kind == "allocation":
-                decisions.append(event)
+                if kind == "phase_end" and event.get("name", "").startswith("stage:"):
+                    stage_key = base_key[:4]
+                    ended_stages.add(stage_key)
+                    for active_key in list(active):
+                        if active_key[:4] == stage_key:
+                            active.pop(active_key, None)
+                if kind == "phase_end" and event.get("name") in {"verify_process", "verify"}:
+                    finished_at[run_key] = max(finished_at.get(run_key, event["at"]), event["at"])
             elif kind == "run_start":
                 metadata = event
+                executions.setdefault(run_key, {})["start"] = event
             elif kind == "run_end":
                 result = event
                 bytecode_cache = event.get("bytecode_cache")
+                executions.setdefault(run_key, {})["end"] = event
+                finished_at[run_key] = event.get("at", finished_at.get(run_key))
+                ended_runs.add(run_key)
+            elif kind == "allocation":
+                decisions.append(event)
+            elif kind == "unit_start":
+                assignments.append(event)
+            elif kind == "module_result":
+                module_results.append(event)
+            elif kind in {"result_file_observed", "job_child_wait", "job_child_wait_observation",
+                          "job_child_exit_confirmed", "job_child_exit_unconfirmed"}:
+                child_events.append(event)
+            elif kind == "execution_queue":
+                queues.append(event)
+            elif kind == "partial_selection":
+                selections.append(event)
             elif kind == "fixture_result":
                 fixtures.append(event)
             elif kind == 'git_cost':
                 git_costs.append(event)
             elif kind == 'git_cost_incomplete':
                 git_incomplete.append(event)
+            if kind == "run_end":
+                execution_key = run_key[:3]
+                for active_key in list(active):
+                    if active_key[:3] == execution_key:
+                        active.pop(active_key, None)
+    active = {
+        key: event for key, event in active.items()
+        if ((event.get("clock_domain", "legacy"), event.get("run_id"),
+             event.get("parent_run_id")) not in ended_runs
+            and (event.get("clock_domain", "legacy"), event.get("run_id"),
+                 event.get("parent_run_id"), event.get("stage_id")) not in ended_stages)
+    }
     snapshots = {}
     for event in phases:
         if event.get("snapshot") != "full":
@@ -356,15 +403,107 @@ def summarize(directory: Path, *, now=None):
             total = cost["commands"].setdefault(command, {"count": 0, "seconds": 0.0})
             total["count"] += values["count"]
             total["seconds"] += values["seconds"]
+    execution_runs = []
+    for (clock_domain, run_id, parent_run_id), events in executions.items():
+        start, end = events.get("start"), events.get("end")
+        started_at = start.get("at") if isinstance(start, dict) else None
+        ended_at = end.get("at") if isinstance(end, dict) else None
+        elapsed = None
+        if isinstance(started_at, (int, float)) and isinstance(ended_at, (int, float)):
+            elapsed = max(0.0, ended_at - started_at)
+        elif (isinstance(started_at, (int, float)) and clock_domain == sys.platform):
+            elapsed = max(0.0, now - started_at)
+        execution_runs.append({
+            "run_id": run_id, "parent_run_id": parent_run_id,
+            "clock_domain": clock_domain,
+            "mode": start.get("mode") if isinstance(start, dict) else None,
+            "started_at": started_at, "ended_at": ended_at,
+            "elapsed_seconds": elapsed,
+            "result": end,
+        })
+    primary_run = next((item for item in execution_runs
+                        if item.get("run_id") == metadata.get("run_id")), None)
+    for item in active.values():
+        domain = item.get("clock_domain", "legacy")
+        run_key = (domain, item.get("run_id"), item.get("parent_run_id"))
+        end_at = finished_at.get(run_key)
+        if end_at is None and domain == sys.platform:
+            end_at = now
+        item["elapsed"] = max(0.0, end_at - item["at"]) if end_at is not None else None
+    partial_result = _read_summary_object(directory / "partial-result.json")
+    windows_pipeline = _windows_pipeline_summary(directory, metadata.get("run_id"))
     summary = {"metadata": metadata, "counts": dict(Counter(item["result"] for item in completed)),
                "tests": sorted(completed, key=lambda item: item["duration"], reverse=True),
                "phases": sorted(phases, key=lambda item: item["duration"], reverse=True),
-               "active": [{**event, "elapsed": max(0, (finished_at if finished_at is not None else now) - event["at"])} for event in active.values()],
+               "active": list(active.values()),
                "allocations": decisions, "git_snapshots": snapshots, "git_commands": git_costs,
                "git_commands_incomplete": git_incomplete, "fixture_results": fixtures,
-               "bytecode_cache": bytecode_cache, "result": result}
+               "bytecode_cache": bytecode_cache, "result": result,
+               "assignments": assignments, "module_results": module_results,
+               "child_lifecycle": child_events, "execution_queues": queues,
+               "partial_selections": selections, "partial_result": partial_result,
+               "execution_runs": execution_runs,
+               "elapsed_seconds": primary_run.get("elapsed_seconds") if primary_run else None,
+               "windows_pipeline": windows_pipeline}
     atomic_json(directory / "summary.json", summary)
     return summary
+
+
+def _read_summary_object(path):
+    try:
+        if path.is_file() and not path.is_symlink():
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return None
+
+
+def _windows_pipeline_summary(directory, parent_run_id=None):
+    result = _read_summary_object(directory / "result.json")
+    snapshot = _read_summary_object(directory / "snapshot.json")
+    if parent_run_id is not None:
+        if result is not None and result.get("run_id") != parent_run_id:
+            result = None
+        if snapshot is not None and snapshot.get("run_id") != parent_run_id:
+            snapshot = None
+    if result is None and snapshot is None:
+        return None
+    children = {}
+    for name in ("wsl", "windows"):
+        child_directory = Path(str(directory) + f"-{name}")
+        child = _read_summary_object(child_directory / "summary.json")
+        metadata = child.get("metadata", {}) if child else {}
+        if not isinstance(metadata, dict):
+            child, metadata = None, {}
+        if child is not None and parent_run_id is not None:
+            reported_run = (result or {}).get(f"{name}_run_id")
+            linked = (metadata.get("parent_run_id") == parent_run_id
+                      or metadata.get("run_id") == parent_run_id
+                      or reported_run is not None and metadata.get("run_id") == reported_run)
+            if not linked:
+                child, metadata = None, {}
+        child_result = child.get("result") if child else None
+        reported_path = (result or {}).get(f"{name}_diagnostic")
+        summary_path = str(child_directory / "summary.json") if child else reported_path
+        children[name] = {
+            "directory": str(child_directory),
+            "summary_path": summary_path,
+            "summary_available": child is not None,
+            "run_id": metadata.get("run_id") or (result or {}).get(f"{name}_run_id"),
+            "parent_run_id": metadata.get("parent_run_id"),
+            "clock_domain": metadata.get("clock_domain"),
+            "mode": metadata.get("mode"),
+            "result": child_result,
+            "elapsed_seconds": child.get("elapsed_seconds") if child else None,
+            "completed_tests": child.get("counts", {}) if child else {},
+            "phase_count": len(child.get("phases", [])) if child else None,
+            "assignment_count": len(child.get("assignments", [])) if child else None,
+            "allocation_count": len(child.get("allocations", [])) if child else None,
+            "git_command_count": sum(item.get("count", 0) for item in child.get("git_commands", [])) if child else None,
+            "git_command_seconds": sum(item.get("seconds", 0.0) for item in child.get("git_commands", [])) if child else None,
+        }
+    return {"result": result, "snapshot": snapshot, "children": children}
 
 
 def comparison(directories, summaries, *, manifests=None):
@@ -454,6 +593,26 @@ def diagnostic(directory: Path):
     summary = summarize(directory)
     lines = [f"verify 시간 진단: {directory / 'summary.json'}", f"완료 결과: {summary['counts']}",
              f"fixture 결과: {dict(Counter(event['result'] for event in summary['fixture_results']))}"]
+    if summary.get("elapsed_seconds") is not None:
+        lines.append(f"전체 실제 경과: {summary['elapsed_seconds']:.3f}s")
+    if summary.get("assignments") or summary.get("module_results"):
+        lines.append("배정/결과: "
+                     f"assignments={len(summary['assignments'])}, "
+                     f"result_files_observed={sum(event['kind'] == 'result_file_observed' for event in summary['child_lifecycle'])}, "
+                     f"modules_completed={len(summary['module_results'])}, "
+                     f"Job_child_waits={sum(event['kind'] == 'job_child_wait' for event in summary['child_lifecycle'])}")
+    partial = summary.get("partial_result")
+    if isinstance(partial, dict):
+        lines.append(f"부분 verify: {partial.get('status', '상태 미기록')} (전체 verify 아님)")
+    pipeline = summary.get("windows_pipeline")
+    if isinstance(pipeline, dict):
+        result = pipeline.get("result") or {}
+        lines.append(f"Windows 단계: WSL={result.get('wsl', '미확인')}, native={result.get('windows', '미확인')}")
+        for name, child in pipeline.get("children", {}).items():
+            if child.get("run_id"):
+                status = "summary" if child.get("summary_available") else "summary 미확인"
+                lines.append(f"{name} {status}: {child.get('summary_path') or '-'} (run={child['run_id']}, "
+                             f"clock={child.get('clock_domain') or 'legacy'})")
     policy = summary["metadata"].get("bytecode_policy")
     cache = summary.get("bytecode_cache")
     if isinstance(policy, dict) and isinstance(cache, dict):
