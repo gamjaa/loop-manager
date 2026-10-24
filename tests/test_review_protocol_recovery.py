@@ -10,7 +10,9 @@ from unittest import mock
 from tests.support.notification import NotificationFixture
 from loop_manager_internal.agents.agent_invocation import AgentResult
 from loop_manager_internal.execution.execution_review_handler import ReviewHandler
+from loop_manager_internal.execution.execution_state import ExecutionStatePort
 from loop_manager_internal.notifications import notifications
+from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from tests.support.worker import dummy_worker_sessions
 from tests.support.git import isolated_git_test
 
@@ -30,8 +32,10 @@ class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
         ports.contract = loop_manager
         ports.feedback = None
         ports.checkpoint = None
-        ports.state.connection = connection
-        ports.state.update_project.side_effect = lambda repo, **values: loop_manager.update_project(connection, repo, **values)
+        ports.state = ExecutionStatePort(
+            connection, RuntimeStateRepository(connection), repo,
+        )
+        ports.state.check_context = mock.Mock()
         ports.snapshot.return_value = snapshot
         ports._row.side_effect = lambda: connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()
         ports._document_draft.return_value = None

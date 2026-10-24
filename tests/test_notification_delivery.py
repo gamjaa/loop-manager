@@ -329,6 +329,12 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
                     ).fetchone()[0]
                 )
                 on_step_completed()
+                self.assertIsNone(
+                    worker_connection.execute(
+                        "SELECT sent_at FROM notification_outbox"
+                    ).fetchone()[0]
+                )
+                notifications.flush_new_pr_events(worker_connection, repo)
                 self.assertIsNotNone(
                     worker_connection.execute(
                         "SELECT sent_at FROM notification_outbox"
@@ -882,10 +888,10 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
                      **candidate, 'silent': True})
                 self.assertEqual(notifications.flush_project_events(connection, repo), 0)
             self.assertEqual(sent, [])
-            self.assertEqual(notifications.flush_project_events(connection, repo), 1)
+            self.assertEqual(notifications.flush_new_pr_events(connection, repo), 1)
             self.assertEqual(len(sent), 2)
             self.assertTrue(all(kw['disable_notification'] for _args, kw in sent))
-            self.assertEqual(notifications.flush_project_events(connection, repo), 0)
+            self.assertEqual(notifications.flush_new_pr_events(connection, repo), 0)
 
     def test_transport_preserves_explicit_silent_flag(self):
         response = mock.MagicMock()
