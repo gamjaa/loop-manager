@@ -41,6 +41,10 @@ class InvocationEffects:
 def _database_request(connection, operation):
     """Replay only DB preparation, never a provider or caller callback."""
     if isinstance(connection, CoordinatedConnection):
+        if connection._request_deadline is None and (connection._depth or connection._explicit_transaction):
+            # Join caller ownership without replaying or committing its body.
+            with connection:
+                return operation()
         if (connection.in_transaction and not connection._depth and not connection._explicit_transaction
                 and connection._request_deadline is None):
             # A completed callback may leave an implicit write. Confirm it once;

@@ -29,7 +29,7 @@ Agent의 지침·session·격리/실행 identity·호출 기록 저장에서 DB 
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/agents/invocation_service.py:run_agent()`의 invocation 준비, `observe_session/isolation/execution_identity/targeted/launch`와 정상/예외 종료 저장에 G-303의 제한된 DB 요청 재시도를 연결한다. 이미 반영된 준비 대기 전파·완료 결과 보존을 다시 구현하지 않는다. 준비/실행/완료 단계별로 DB 확정만 재개하고 임의 provider callback 전체를 replay하지 않으며 공통 대기 오류를 영구 설정/격리 실패로 재분류하지 않는다.
+- [x] 확인한 `loop_manager_internal/agents/invocation_service.py:run_agent()`의 invocation 준비, `observe_session/isolation/execution_identity/targeted/launch`와 정상/예외 종료 저장에 G-303의 제한된 DB 요청 재시도를 연결한다. 이미 반영된 준비 대기 전파·완료 결과 보존을 다시 구현하지 않는다. 준비/실행/완료 단계별로 DB 확정만 재개하고 임의 provider callback 전체를 replay하지 않으며 공통 대기 오류를 영구 설정/격리 실패로 재분류하지 않는다.
 - [x] 확인한 `storage/common_guidance_state.py`·`agent_invocation_state.py`·`task_calls.py`의 task/session·실제 호출/종료·예약 identity를 재사용한다. 새 session 귀속 fallback은 유지하되 ledger 종료도 저장되지 않은 경우까지 해결됐다고 가정하지 않는다. 이미 확보한 결과와 `agents/process_receipt.py`·기존 launch 자료를 같은 invocation에 연결해 저장 대기 뒤 확정하며 새 ledger·인증/설정 캐시·관측 서비스를 만들지 않는다. 실제 provider 결과가 없는 과거 행은 추측으로 채우지 않고 귀속 충돌은 계속 거부한다.
 - [x] 확인한 `storage/targeted_test_state.py`와 Worker의 기존 수집 pending 경계를 유지한다. G-292는 Claude의 callback·허용 경로 전달을, G-185는 provider 사용량 범위·파싱·조회와 예외 원문 회수를 담당한다. 이 작업은 공통 DB 경합의 분류·기존 결과 보존만 맡고 해당 기능을 중복 구현하지 않는다.
 - [x] 확인한 `tests/test_agent_invocation.py:RunnerTests`·`tests/test_agent_invocation_state.py`·`tests/test_task_scheduling.py`의 실제 저장/호출 예약 fixture에 DB 대기 위치별 최소 unit을 연결한다. PRODUCT·ARCHITECTURE의 Agent 준비·호출 저장 절은 실제 구현한 결과로 정합화한다. G-191의 보존된 Claude 구현·실행 이력은 변경하지 않는다.
@@ -45,8 +45,8 @@ Agent의 지침·session·격리/실행 identity·호출 기록 저장에서 DB 
 
 - [x] 현재 revision의 invocation 서비스·영속화·실제 결과 보존 회귀를 정적으로 대조했다. 최초 guidance DB 대기 전파와 선택적 ledger 오류의 기존 성공 보존은 재구현 대상에서 제외한다.
 - [x] `2219730c40def01f6c38ed1d68b8c35fa44c29e7`에서 추가 준비 대기 전파·정상 결과/session 보존·완료 invocation 귀속 fallback과 두 회귀를 정적으로 확인했다. 구현 수행·실행 검증 성공을 새로 기록하지 않았다.
-- [ ] 필수 준비·callback·종료 저장의 DB 요청 재시도와 물리 결과의 비중복 확정/재개
-- [ ] 최소 targeted 회귀와 중단 뒤 비중복 확정 검증
+- [x] 필수 준비·callback·종료 저장의 DB 요청 재시도와 물리 결과의 비중복 확정/재개
+- [x] 최소 targeted 회귀와 중단 뒤 비중복 확정 검증
 
 ### 준비 단계 중간 보존점
 
@@ -116,6 +116,17 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_origin
 - 신규 `RunnerTests.test_database_request_confirms_implicit_writes_and_preserves_explicit_rollback`과 기존 `test_callback_database_requests_retry_without_replaying_the_session_callback`을 같은 공통 targeted runner로 실행해 2개 모두 통과했다. 전자는 완료된 암시적 쓰기의 확정과 명시적 caller transaction의 rollback·연산 비실행을 확인한다. 기존 실패 case의 assertion·fixture·skip은 변경하지 않았다.
 - Planner 재개는 두 번째 Agent 진입의 guidance 저장소 준비에서 caller transaction으로 인식되는 활성 상태가 남아 `run_request()`가 거부된다. 이 transaction의 소유·수명과 DB 요청 경계의 결합은 미해결이다. Manager verify 1회와 targeted 2회의 같은 Planner 본문 error를 확인했으므로 연속 3회 실패 제한에 따라 추가 구현 수정을 멈췄다. 다음 작업은 이 활성 transaction 경계의 원인을 확인하고 caller의 원자성·session 보존을 유지해 재개하는 것이다. 성공한 scope 귀속과 callback 비재실행 조건을 유지해야 한다.
 - 현재 결과는 checkpoint이며 완료 후보가 아니다. Requirement·다른 ExecPlan·선택 frontmatter·사용자 결정을 변경하지 않았고, Manager 상태나 실패를 성공으로 기록하지 않았다.
+
+### verify 피드백 교정 완료 후보 (2026-10-24)
+
+- `1177093be6d5b3ad332ac4f3d9036a220b2b6ff0`의 게시 확인과 재개 요청 뒤 남은 Planner 오류를 교정했다. 해당 테스트의 두 번째 `run_project()`는 `with connection` 안에서 실행된다. 독립 DB 요청만 허용하던 새 helper가 기존 명시적 caller transaction을 거부한 것이 원인이다. 기존 명시적 transaction은 savepoint로 합류해 연산을 한 번만 실행하고 바깥 rollback을 유지한다. 독립 요청의 제한 재시도와 완료된 암시적 쓰기 확정은 유지하며 공통 `run_request()`의 소유권 계약은 변경하지 않았다.
+- 기존 helper 회귀에서 명시적 transaction 거부 assertion을 실제 호환 계약인 합류·단일 실행·바깥 rollback assertion으로 바꿨다. `with connection`과 SQL `BEGIN IMMEDIATE` 두 경계에서 helper 내부 쓰기도 함께 rollback되는지 확인한다. 기존 Planner·scope 실패 회귀의 fixture와 assertion은 변경하지 않았다. PRODUCT의 중첩 transaction 소유권 보장과 일치하며 ARCHITECTURE의 DB 확정 절에 합류와 암시적 쓰기 확정 경계를 반영했다.
+
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_origin_isolation.TaskRelevantInvocationScopeTests.test_run_agent_binds_the_physical_invocation_to_the_saved_scope tests.test_planner_interruption_recovery.PlannerInterruptionRecoveryTest.test_interrupted_planner_persists_started_session_and_resumes
+
+재실행 결과: 2개 success, exit 0. 이전 보존점에 기록된 같은 실패 명령의 두 error를 해소했다.
+
+- 추가 최소 명령 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_invocation.RunnerTests.test_database_request_confirms_implicit_writes_and_preserves_explicit_rollback tests.test_agent_invocation.RunnerTests.test_callback_database_requests_retry_without_replaying_the_session_callback tests.test_agent_invocation.RunnerTests.test_invocation_preparation_retries_atomically_or_leaves_provider_unstarted` 결과는 3개 success, exit 0이다. 이번 호출의 5개 unit에 미해결 failure/error는 없다. 실제 Agent CLI·전체 verify·Windows native 검증은 실행하지 않았다. 앞선 전체 verify 실패를 성공으로 대체하지 않으며 최종 전체 verify와 Review는 Manager가 수행한다.
 
 ## Decision Log
 

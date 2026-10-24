@@ -33,14 +33,28 @@ class RunnerTests(TestCase):
         operation.assert_called_once()
         self.assertFalse(connection.in_transaction)
         self.assertFalse(connection._held)
-        operation.reset_mock()
-        with self.assertRaisesRegex(ValueError, 'outer rollback'), connection:
-            connection.execute('UPDATE sample SET value=2')
-            with self.assertRaisesRegex(RuntimeError, 'transaction 밖'):
-                _database_request(connection, operation)
-            operation.assert_not_called()
-            raise ValueError('outer rollback')
-        self.assertEqual(connection.execute('SELECT value FROM sample').fetchone()[0], 1)
+        def write_value():
+            value = connection.execute('SELECT value FROM sample').fetchone()[0]
+            connection.execute('UPDATE sample SET value=3')
+            return value
+        operation.side_effect = write_value
+        for explicit_begin in (False, True):
+            with self.subTest(explicit_begin=explicit_begin):
+                operation.reset_mock()
+                if explicit_begin:
+                    connection.execute('BEGIN IMMEDIATE')
+                try:
+                    with self.assertRaisesRegex(ValueError, 'outer rollback'), connection:
+                        connection.execute('UPDATE sample SET value=2')
+                        self.assertEqual(_database_request(connection, operation), 2)
+                        operation.assert_called_once()
+                        self.assertTrue(connection.in_transaction)
+                        self.assertEqual(connection.execute('SELECT value FROM sample').fetchone()[0], 3)
+                        raise ValueError('outer rollback')
+                finally:
+                    if explicit_begin:
+                        connection.rollback()
+                self.assertEqual(connection.execute('SELECT value FROM sample').fetchone()[0], 1)
 
     def test_invalid_targeted_evidence_still_finishes_the_physical_invocation_ledger(self):
         class Provider:

@@ -697,7 +697,7 @@ ledger의 `duration_ms`는 호출 처리 전체 경과 시간이고 `execution_d
 
 #### DB 대기와 호출 결과 확정
 
-DB 전용 준비·확정은 `CoordinatedConnection.run_request()`의 공통 예산·rollback/재조회를 사용한다. invocation 생성과 지침 결합, launch의 예약/receipt 결합은 각각 원자 요청이고, 격리·실행 identity·targeted 결합도 CLI 시작 전에 확정한다. targeted 경로·device/inode 검사는 SQL 재시도 밖에서 수행하고 SQL은 미시작·미완료 Worker 소유권을 다시 확인한다. provider·Git·파일 생성·임의 session callback은 이 요청에서 replay하지 않는다. invocation 준비는 launch lock을 잡지 않으며 실제 spawn의 handoff gate는 유지한다. 명시적 caller transaction은 중간 commit 없이 보존한다.
+DB 전용 준비·확정은 `CoordinatedConnection.run_request()`의 공통 예산·rollback/재조회를 사용한다. invocation 생성과 지침 결합, launch의 예약/receipt 결합은 각각 원자 요청이고, 격리·실행 identity·targeted 결합도 CLI 시작 전에 확정한다. targeted 경로·device/inode 검사는 SQL 재시도 밖에서 수행하고 SQL은 미시작·미완료 Worker 소유권을 다시 확인한다. provider·Git·파일 생성·임의 session callback은 이 요청에서 replay하지 않는다. invocation 준비는 launch lock을 잡지 않으며 실제 spawn의 handoff gate는 유지한다. 완료된 callback의 암시적 쓰기는 기존 요청 종료 경계에서 한 번 확정한 뒤 재시도 요청을 연다. 명시적 caller transaction에서는 savepoint로 합류해 DB 연산을 한 번만 수행하며 바깥 본문을 replay하거나 중간 commit하지 않는다.
 
 Manager 전용 process receipt는 기존 PID·호스트/boot·종료 근거와 별도로 `invocation_observation`을 원자 저장한다. 시작·종료 receipt 갱신은 이 관측을 보존하며 경로·platform·invocation identity·형식을 검증한다. 필드는 다음과 같고 관측하지 않은 값은 추가하지 않는다.
 
