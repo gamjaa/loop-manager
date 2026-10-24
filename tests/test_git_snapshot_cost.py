@@ -17,10 +17,11 @@ from loop_manager_internal.git.managed_rebase_validation import RebaseObservatio
 from loop_manager_internal.verification import git_timing
 from loop_manager_internal.verification.git_timing import snapshot_timing, git_command_timing
 from loop_manager_internal.verification.timing import EventWriter, summarize, phase
-from tests.support.git import git_command, make_remote_repository
+from tests.support.git import git_command, isolated_git_test, make_remote_repository
 from tests.support.rebase_observations import expectation
 
 
+@isolated_git_test
 class GitSnapshotCostTests(unittest.TestCase):
     def test_adoption_shares_owner_inspection_but_reobserves_confirmation(self):
         from loop_manager_internal.execution.execution_ownership_handler import OwnershipHandler
