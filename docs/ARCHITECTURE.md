@@ -443,11 +443,11 @@ planning worktree는 `<state-dir>/worktrees/<project-id>/planning/<input-fingerp
 
 #### 개정 snapshot과 작업 취소
 
-일반 planning snapshot은 실제 PR이 없는 READY·진행 중 선언을 Git 원문과 SQLite의 선언·실행 근거에 결합한다. 실행 이력·branch·worktree·세션·checkpoint는 개정 금지 사유가 아니며, 게시 직전에 실행 근거와 실제 PR 부재를 다시 확인한다.
+일반 planning snapshot은 실제 PR이 없는 READY·진행 중 선언과 일반 `PLAN_BLOCKED` 선언을 Git 원문과 SQLite의 선언·실행 근거에 결합한다. 차단 상태는 삭제·참조 복구 허용 집합과 별도로 판단하며, 독립 catalog hold는 복구 proof로 허용되지 않는 한 후보에서 제외한다. 실행 이력·branch·worktree·세션·checkpoint는 개정 금지 사유가 아니며, 게시 직전에 실행 근거와 실제 PR 부재를 다시 확인한다.
 
 R-077의 수동 소유 계획과 start/submit 준비 intent 대상은 후보에서 제외하고, 계획별 수동 group·membership 지문을 snapshot에 결합해 intent 예약과 게시 transaction에서 현재 소유와 변화를 다시 확인한다. snapshot 이후 시작·등록·membership 변경은 해당 계획의 개정을 거부하고 독립 계획의 게시를 막지 않는다.
 
-실제 종료·정당한 대상 해제 뒤 남은 과거 membership/audit만으로 현재 소유권을 추정하지 않으며, 해당 계획의 불완전한 membership 증거는 그 계획의 개정 게시를 거부한다. 개정은 실행 상태·세션·실패 이력을 보존하고 이미 시작한 계획의 effective level을 낮추지 않는다. Planner의 직접 이름 변경·삭제와 유지보수 snapshot은 기존 미착수·무소유 READY 범위를 유지한다.
+실제 종료·정당한 대상 해제 뒤 남은 과거 membership/audit만으로 현재 소유권을 추정하지 않으며, 해당 계획의 불완전한 membership 증거는 그 계획의 개정 게시를 거부한다. 게시 적용은 선언 cache와 revision만 갱신해 기존 status·차단 사유·질문·checkpoint·실행/실패/승격 감사를 유지하고, 이미 시작한 계획의 effective level을 낮추지 않는다. 원격·catalog·DB 반영 확정만으로 차단 원인을 해소하지 않으며 원인별 재평가는 기존 실행 경계에서 수행한다. Planner의 직접 이름 변경·삭제와 유지보수 snapshot은 기존 미착수·무소유 READY 범위를 유지한다.
 
 검증된 Requirement 전체 철회는 Manager가 writer·실행 snapshot·실제 PR 부재를 재확인하고 삭제 전 원문·판단 영수증을 보존해 시작한 작업의 문서 취소를 준비할 수 있다. 원격 문서 자체의 삭제도 원문 hash·ancestor revision·완료된 writer 결과·PR 부재를 증명한 범위만 취소한다. 계획 삭제는 활성 row 제거와 ID 취소 감사를 같은 transaction에서 기록하며 ID를 재사용하지 않는다.
 
