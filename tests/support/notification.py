@@ -58,6 +58,8 @@ class NotificationFixture:
         head="a" * 40,
         path="docs/plans/[G-018] Reliable notices.md",
         title="Reliable notices",
+        reviewed_change_identity="same-reviewed-change",
+        review_input_identity=None,
     ):
         """Persist the exact Review/publication input for a current PR candidate."""
         from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
@@ -77,6 +79,9 @@ class NotificationFixture:
         )
         review_token = definition.review_token(base, head)
         publication_token = definition.publication_token(base, head)
+        candidate_identity = review_input_identity or definition.review_candidate_identity(
+            reviewed_change_identity,
+        )
         shared = (
             pr_url, head, head, base, base, definition.serialize(), "PASS",
             review_token, publication_token, repo, plan_id,
@@ -95,10 +100,15 @@ class NotificationFixture:
             "WHERE repo=? AND plan_id=?",
             shared,
         )
+        notifications.record_pr_review_candidate(
+            connection, repo, plan_id, publication_token=publication_token,
+            review_input_identity=candidate_identity,
+        )
         return {
             "pr_url": pr_url,
-            "candidate_identity": publication_token,
+            "candidate_identity": candidate_identity,
             "candidate_head_oid": head,
+            "candidate_publication_token": publication_token,
             "user_action": "review_merge",
         }
 

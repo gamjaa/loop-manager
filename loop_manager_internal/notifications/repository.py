@@ -38,6 +38,16 @@ CREATE TABLE IF NOT EXISTS work_reason_episodes (
     FOREIGN KEY (repo) REFERENCES projects(repo)
 )
 """
+PR_REVIEW_CANDIDATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pr_review_candidates (
+    repo TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    publication_token TEXT NOT NULL,
+    review_input_identity TEXT NOT NULL,
+    PRIMARY KEY (repo, plan_id),
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
 BLOCK_INCIDENT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS notified_block_incidents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +100,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         )
     connection.execute(COMPLETION_SCHEMA)
     connection.execute(WORK_REASON_SCHEMA)
+    connection.execute(PR_REVIEW_CANDIDATE_SCHEMA)
     connection.execute(BLOCK_INCIDENT_SCHEMA)
     connection.execute(BLOCK_NOTICE_SCHEMA)
     incident_columns = {
@@ -308,6 +319,25 @@ def _insert(
         "(event_key, repo, event_type, payload) VALUES (?, ?, ?, ?)",
         (key, repo, kind, _encode_payload(payload)),
     )
+    if kind == "pr_created":
+        previous = connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_key=? AND event_type=? "
+            "AND sent_at IS NULL AND canceled_at IS NOT NULL",
+            (key, kind),
+        ).fetchone()
+        if previous is not None:
+            try:
+                original = json.loads(str(previous[0]))
+            except (TypeError, ValueError):
+                original = {}
+            if isinstance(original, dict) and original.get("occurred_at"):
+                payload["occurred_at"] = original["occurred_at"]
+            connection.execute(
+                "UPDATE notification_outbox SET payload=?, canceled_at=NULL, "
+                "delivery_started_at=NULL WHERE event_key=? AND event_type=? "
+                "AND sent_at IS NULL AND canceled_at IS NOT NULL",
+                (_encode_payload(payload), key, kind),
+            )
 
 
 def _encode_payload(payload: dict[str, object]) -> str:

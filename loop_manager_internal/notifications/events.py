@@ -62,6 +62,24 @@ class _BlockedPlanProjection:
         )
 
 
+def record_pr_review_candidate(
+    connection: sqlite3.Connection, repo: str, plan_id: str, *,
+    publication_token: str, review_input_identity: str,
+) -> None:
+    """Persist the exact published review token and its rebase-stable input identity."""
+    if not publication_token or not review_input_identity:
+        return
+    ensure_schema(connection)
+    connection.execute(
+        "INSERT INTO pr_review_candidates "
+        "(repo, plan_id, publication_token, review_input_identity) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(repo, plan_id) DO UPDATE SET "
+        "publication_token=excluded.publication_token, "
+        "review_input_identity=excluded.review_input_identity",
+        (repo, plan_id, publication_token, review_input_identity),
+    )
+
+
 def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) -> None:
     """Enqueue all plan/project events after their owning update and before commit."""
 

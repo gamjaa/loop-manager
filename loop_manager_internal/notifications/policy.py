@@ -36,9 +36,17 @@ def pr_review_candidate(connection, repo, plan_id, pr_url=None):
         if (row['review_token'] != review_token
                 or row['publication_token'] != publication_token):
             return None
+        proof = connection.execute(
+            'SELECT publication_token, review_input_identity FROM pr_review_candidates '
+            'WHERE repo=? AND plan_id=?', (repo, plan_id),
+        ).fetchone()
+        if (proof is None or proof['publication_token'] != publication_token
+                or not proof['review_input_identity']):
+            return None
         return {
-            'candidate_identity': publication_token,
+            'candidate_identity': str(proof['review_input_identity']),
             'candidate_head_oid': head,
+            'candidate_publication_token': publication_token,
             'user_action': PR_REVIEW_ACTION,
         }
     except (AttributeError, KeyError, TypeError, ValueError):
@@ -221,7 +229,8 @@ def is_current(connection, repo, kind, payload):
             )
             return bool(candidate and all(
                 payload.get(key) == candidate[key]
-                for key in ('candidate_identity', 'candidate_head_oid', 'user_action')
+                for key in ('candidate_identity', 'candidate_head_oid',
+                            'candidate_publication_token', 'user_action')
             ))
         if kind == 'draft_decisions':
             plans = payload['plans']

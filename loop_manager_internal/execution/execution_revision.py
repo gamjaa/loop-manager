@@ -250,6 +250,10 @@ class DefinitionSnapshot:
             (self.definition_token, self.review_token(base_token, candidate_head)),
         )
 
+    def review_candidate_identity(self, reviewed_change_identity: str) -> str:
+        """Identify the reviewed change independently of its rebased commit IDs."""
+        return _digest("pr-review-candidate", (self.definition_token, reviewed_change_identity))
+
 
 def execplan_body_hash(text: str) -> str:
     """Hash only the Markdown body so metadata-only edits stay distinguishable."""

@@ -7,6 +7,7 @@ from typing import Callable, Any, Mapping
 import hashlib
 import json
 from loop_manager_internal.documents import document_drafts
+from loop_manager_internal.notifications import notifications
 from loop_manager_internal.git import manager_git_journal
 import sys
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -636,6 +637,9 @@ class PublicationHandler:
             pr_conflict_head_oid=None,
             pr_conflict_base_oid=None,
         )
+        notifications.flush_new_pr_events(
+            self.ports.state.connection, self.ports.identity.repo,
+        )
         self.ports.operation_print(f"기존 PR 후보 게시 완료: {row['pr_url']}")
         return ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
 
@@ -858,5 +862,8 @@ class PublicationHandler:
             self.ports.identity.repo, context=context, pr_url=url, pr_head_oid=head_oid,
         )
         self._complete_publication_intent(context)
+        notifications.flush_new_pr_events(
+            self.ports.state.connection, self.ports.identity.repo,
+        )
         self.ports.operation_print(f"PR 생성 완료: {url}")
         return ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)

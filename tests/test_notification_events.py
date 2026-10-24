@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -558,7 +559,8 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(
             {key: payloads["pr_created"][key] for key in (
                 "project", "execplan_id", "execplan_title", "pr_url",
-                "candidate_identity", "candidate_head_oid", "user_action",
+                "candidate_identity", "candidate_head_oid",
+                "candidate_publication_token", "user_action",
                 "status", "silent",
             )},
             {
@@ -925,7 +927,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(payload['status'], 'PR 검토·Merge 대기')
         self.assertIn(payload['occurred_at'], notifications._message('pr_created', payload))
 
-    def test_pr_candidate_event_uses_review_identity_and_ignores_head_advance_alone(self):
+    def test_pr_candidate_event_reuses_identity_after_rebase_tokens_are_renewed(self):
         connection = self.connection()
         repo = '/projects/alpha'
         first = self.prepare_pr_candidate(connection)
@@ -951,13 +953,114 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
 
         second = self.prepare_pr_candidate(connection, head='c' * 40)
+        self.assertNotEqual(first['candidate_publication_token'], second['candidate_publication_token'])
+        self.assertEqual(first['candidate_identity'], second['candidate_identity'])
         with connection:
             notifications.enqueue_current_project_events(connection, repo)
         events = [row for row in self.events(connection) if row['event_type'] == 'pr_created']
-        self.assertEqual(len(events), 2)
-        current = next(row for row in events if row['canceled_at'] is None)
-        self.assertNotEqual(current['event_key'], first_key)
+        self.assertEqual(len(events), 1)
+        current = events[0]
+        self.assertEqual(current['event_key'], first_key)
+        self.assertIsNone(current['canceled_at'])
         self.assertEqual(json.loads(current['payload'])['candidate_identity'], second['candidate_identity'])
+        self.assertEqual(json.loads(current['payload'])['candidate_head_oid'], second['candidate_head_oid'])
+        self.assertEqual(json.loads(current['payload'])['candidate_publication_token'],
+                         second['candidate_publication_token'])
+
+    def test_real_rebase_keeps_review_patch_identity_and_does_not_repeat_pr_notice(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.execution.execution_review_handler import ReviewHandler
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path = Path(directory) / 'repo'
+            repo_path.mkdir()
+
+            def git(*args, input=None):
+                if args and isinstance(args[0], Path):
+                    path, *args = args
+                else:
+                    path = repo_path
+                result = subprocess.run(
+                    ['git', '-C', str(path), *args], capture_output=True,
+                    text=True, input=input, check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError(result.stderr)
+                return result
+
+            for args in (('init', '-b', 'main'), ('config', 'user.email', 'tests@example.test'),
+                         ('config', 'user.name', 'Tests')):
+                subprocess.run(['git', '-C', str(repo_path), *args], check=True,
+                               capture_output=True, text=True)
+            source = repo_path / 'source.txt'
+            source.write_text('zero\ntarget\nend\n', encoding='utf-8')
+            git('add', 'source.txt')
+            git('commit', '-m', 'base')
+            base_before = git('rev-parse', 'HEAD').stdout.strip()
+            git('checkout', '-b', 'feature')
+            source.write_text('zero\nreviewed change\nend\n', encoding='utf-8')
+            git('commit', '-am', 'reviewed change')
+            head_before = git('rev-parse', 'HEAD').stdout.strip()
+
+            definition = DefinitionSnapshot(
+                revision_sha='definition-revision',
+                path='docs/plans/[G-018] Reliable notices.md',
+                title='Reliable notices', sources=('docs/PRODUCT.md',),
+                depends_on=(), complexity='medium', risk='medium', priority='high',
+                body_hash='body-hash', source_fingerprint='source-fingerprint',
+                archive_candidates=(),
+            )
+            handler = object.__new__(ReviewHandler)
+            handler.ports = SimpleNamespace(
+                snapshot=lambda: SimpleNamespace(_definition_snapshot=definition),
+                git=git,
+                identity=SimpleNamespace(repo='/projects/alpha'),
+            )
+            context = SimpleNamespace(
+                worktree=repo_path, plan=SimpleNamespace(plan_id='G-018'),
+            )
+            before = handler._pr_review_candidate_proof(
+                context, {'validated_base_sha': base_before}, head_before,
+            )
+
+            git('checkout', 'main')
+            source.write_text('upstream\nzero\ntarget\nend\n', encoding='utf-8')
+            git('commit', '-am', 'base advances')
+            base_after = git('rev-parse', 'HEAD').stdout.strip()
+            git('checkout', 'feature')
+            git('rebase', 'main')
+            head_after = git('rev-parse', 'HEAD').stdout.strip()
+            after = handler._pr_review_candidate_proof(
+                context, {'validated_base_sha': base_after}, head_after,
+            )
+
+            self.assertNotEqual(before[0], after[0])
+            self.assertEqual(before[1], after[1])
+            connection = self.connection()
+            first = self.prepare_pr_candidate(
+                connection, base=base_before, head=head_before,
+                review_input_identity=before[1],
+            )
+            self.assertEqual(first['candidate_publication_token'], before[0])
+            with connection:
+                notifications.enqueue_current_project_events(connection, self.repo)
+            sent = mock.Mock()
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 1)
+            self.prepare_pr_candidate(
+                connection, base=base_after, head=head_after,
+                review_input_identity=after[1],
+            )
+            with connection:
+                notifications.enqueue_current_project_events(connection, self.repo)
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 0)
+            self.assertEqual(len([row for row in self.events(connection)
+                                  if row['event_type'] == 'pr_created']), 1)
+            sent.assert_called_once()
 
     def test_planning_result_only_notifies_after_catalog_publication(self):
         from types import SimpleNamespace

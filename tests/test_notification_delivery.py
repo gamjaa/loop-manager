@@ -435,9 +435,9 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
         delivered = mock.Mock()
         original_dispatch = notifications.dispatch_pending
 
-        def dispatch_pending(connection, token, chat_id):
+        def dispatch_pending(connection, token, chat_id, **options):
             return original_dispatch(
-                connection, token, chat_id, adapter=delivered
+                connection, token, chat_id, adapter=delivered, **options
             )
 
         with mock.patch(
@@ -453,8 +453,11 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
                 0,
             )
         self.assertEqual(dispatch.call_count, 2)
-        delivered.assert_called_once()
-        self.assertIsNotNone(self.events(connection)[0]["sent_at"])
+        self.assertTrue(all(call.kwargs.get('exclude_pr') for call in dispatch.call_args_list))
+        delivered.assert_not_called()
+        pending = self.events(connection)[0]
+        self.assertIsNone(pending["sent_at"])
+        self.assertEqual(pending['attempts'], 0)
 
 
 class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
@@ -929,7 +932,7 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
                     return ()
                 with mock.patch('loop_manager.schedule_registered_projects', side_effect=worker), \
                         mock.patch.object(delivery, 'send_telegram', sent), \
-                        mock.patch.object(notifications, 'dispatch_pending', side_effect=lambda conn, token, chat: dispatch(conn, token, chat, adapter=sent)):
+                        mock.patch.object(notifications, 'dispatch_pending', side_effect=lambda conn, token, chat, **options: dispatch(conn, token, chat, adapter=sent, **options)):
                     self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
                     self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
                 sent.assert_not_called()
@@ -1604,7 +1607,9 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
         )
         connection.commit()
 
-        replacement = self.prepare_pr_candidate(connection, head='c' * 40)
+        replacement = self.prepare_pr_candidate(
+            connection, head='c' * 40, reviewed_change_identity='replacement-change',
+        )
         with connection:
             notifications.enqueue_current_project_events(connection, repo)
             notifications.enqueue_current_project_events(connection, repo)
@@ -1651,6 +1656,110 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
         self.assertIsNone(row['canceled_at'])
         self.assertEqual(row['attempts'], 0)
         self.assertEqual(row['payload'], original['payload'])
+
+    def test_pr_retry_waits_for_successful_observation_and_rechecks_closed_or_replaced(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.recovery import waiting_pr_service
+
+        for outcome in ('lookup_failure', 'closed', 'replaced', 'still_open'):
+            with self.subTest(outcome=outcome):
+                connection = self.connection()
+                repo = self.repo
+                candidate = self.prepare_pr_candidate(connection)
+                branch = 'loop-manager/G-018'
+                connection.execute(
+                    "UPDATE exec_plans SET branch=? WHERE repo=? AND plan_id='G-018'",
+                    (branch, repo),
+                )
+                with connection:
+                    notifications.enqueue_current_project_events(connection, repo)
+                original = next(row for row in self.events(connection)
+                                if row['event_type'] == 'pr_created')
+                self.assertEqual(notifications.dispatch_pending(
+                    connection, 'token', 'chat', adapter=mock.Mock(
+                        side_effect=RuntimeError('temporary Telegram outage'),
+                    ),
+                ), 0)
+                before = next(row for row in self.events(connection)
+                              if row['event_key'] == original['event_key'])
+                self.assertEqual(before['attempts'], 1)
+
+                sent = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(
+                    connection, 'token', 'chat', adapter=sent, exclude_pr=True,
+                ), 0)
+                with notifications.immediate_delivery(connection, 'token', 'chat', repo), \
+                        mock.patch.object(delivery, 'send_telegram', sent):
+                    notifications.flush_project_events(connection, repo)
+                    sent.assert_not_called()
+
+                    def pr_for_branch(_repo_path, _branch, _url):
+                        if outcome == 'lookup_failure':
+                            raise RuntimeError('GitHub lookup unavailable')
+                        state = 'CLOSED' if outcome == 'closed' else 'OPEN'
+                        observed_head = ('c' * 40 if outcome == 'replaced'
+                                         else candidate['candidate_head_oid'])
+                        return {
+                            'url': candidate['pr_url'], 'state': state,
+                            'headRefName': branch, 'headRefOid': observed_head,
+                            'baseRefName': 'main',
+                        }
+
+                    closed_effects = waiting_pr_service.BlockClosedPullRequestEffects(
+                        _final_block_recovery_decision=lambda *args, **kwargs: None,
+                    )
+                    observe_effects = waiting_pr_service.ObserveWaitingPullRequestsEffects(
+                        _block_closed_pull_request=lambda conn, observed_repo, plan, url, head: \
+                            waiting_pr_service._block_closed_pull_request(
+                                closed_effects, conn, observed_repo, plan, url, head,
+                            ),
+                        _recorded_base_fetch=lambda *args, **kwargs: None,
+                        _resume_reopened_pull_request=lambda *args, **kwargs: None,
+                        classify_pull_request_mergeability=lambda _pr: 'mergeable',
+                        complete_merged_execplan_worktree=lambda *args, **kwargs: None,
+                        operation_log=lambda *args, **kwargs: None,
+                        operation_print=lambda *args, **kwargs: None,
+                        pr_for_branch=pr_for_branch,
+                    )
+                    synchronize_effects = waiting_pr_service.SynchronizeWaitingPullRequestsEffects(
+                        observe_waiting_pull_requests=lambda conn, repo_path, state_dir, observed_repo, **kwargs:
+                            waiting_pr_service.observe_waiting_pull_requests(
+                                observe_effects, conn, repo_path, state_dir, observed_repo, **kwargs,
+                            ),
+                        select_waiting_pull_request_conflict=lambda *args, **kwargs:
+                            SimpleNamespace(step_result=None),
+                    )
+                    observe_options = {
+                        'after_observation': lambda _observation:
+                            notifications.flush_observed_pr_events(connection, repo),
+                    }
+                    if outcome == 'lookup_failure':
+                        with self.assertRaisesRegex(RuntimeError, 'lookup unavailable'):
+                            waiting_pr_service.synchronize_waiting_pull_requests(
+                                synchronize_effects, connection, Path('/unused'), Path('/state'), repo,
+                                **observe_options,
+                            )
+                    else:
+                        waiting_pr_service.synchronize_waiting_pull_requests(
+                            synchronize_effects, connection, Path('/unused'), Path('/state'), repo,
+                            **observe_options,
+                        )
+
+                rows = {row['event_key']: row for row in self.events(connection)}
+                current = rows[original['event_key']]
+                if outcome == 'still_open':
+                    sent.assert_called_once()
+                    self.assertIsNotNone(current['sent_at'])
+                    self.assertIsNone(current['canceled_at'])
+                else:
+                    sent.assert_not_called()
+                    self.assertIsNone(current['sent_at'])
+                    if outcome in {'closed', 'replaced'}:
+                        self.assertIsNotNone(current['canceled_at'])
+                    else:
+                        self.assertIsNone(current['canceled_at'])
+                    self.assertEqual(current['attempts'], 1)
+                connection.close()
 
     def test_deleted_published_branch_requires_restart_until_request_is_recorded(self):
         from loop_manager_internal.recovery.work_branch_integration import require_remote_present
