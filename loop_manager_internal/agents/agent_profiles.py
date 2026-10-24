@@ -14,7 +14,9 @@ from pathlib import Path
 import re
 
 from loop_manager_internal.agents.agent_invocation import AgentProfile
+from loop_manager_internal.config import execution_path
 from loop_manager_internal.config.managed_config import provider_fast_mode
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .provider_home import PROVIDERS, prepare_authentication, authentication_links, assert_authentication_links, login_instructions
 
 
@@ -318,6 +320,11 @@ def claude_model_efforts(
             env=environment,
         )
         if result.returncode:
+            if execution_path.command_lookup_failed(result.stdout or ''):
+                output = redact_secrets(
+                    f"Claude CLI command failed (exit {result.returncode}):\n{(result.stdout or '').strip()}"
+                )
+                raise RuntimeError(execution_path.append_path_recovery_hint(output))
             raise RuntimeError(f"Claude CLI가 Model을 지원하지 않습니다: {model}")
 
     catalog: dict[str, set[str]] = {
@@ -339,6 +346,11 @@ def claude_model_efforts(
             env=environment,
         )
         if result.returncode:
+            if execution_path.command_lookup_failed(result.stdout or ''):
+                output = redact_secrets(
+                    f"Claude CLI command failed (exit {result.returncode}):\n{(result.stdout or '').strip()}"
+                )
+                raise RuntimeError(execution_path.append_path_recovery_hint(output))
             raise RuntimeError(
                 "Claude CLI가 Model/Effort 조합을 지원하지 않습니다: "
                 f"{model},{effort}"
@@ -399,22 +411,36 @@ def validate_provider_runtime(
     executable = "codex" if provider == "codex" else "claude"
     label = "Codex" if provider == "codex" else "Claude"
     if not shutil.which(executable, path=environment.get('PATH', os.defpath)):
-        raise RuntimeError(f"선택한 {label} CLI가 PATH에 설치되어 있지 않습니다.")
+        raise RuntimeError(execution_path.with_path_recovery_hint(
+            f"선택한 {label} CLI가 PATH에 설치되어 있지 않습니다."))
 
     auth_arguments = (
         ["codex", "login", "status"]
         if provider == "codex"
         else ["claude", "auth", "status"]
     )
-    auth = effects.command(
-        auth_arguments,
-        cwd=worktree,
-        check=False,
-        env=environment,
-    )
+    try:
+        auth = effects.command(
+            auth_arguments,
+            cwd=worktree,
+            check=False,
+            env=environment,
+        )
+    except OSError as error:
+        if execution_path.missing_executable(error, executable):
+            raise RuntimeError(execution_path.with_path_recovery_hint(
+                f"Agent CLI 실행 실패: {error}")) from error
+        raise
     if links:
         assert_authentication_links(provider, environment, links)
     if auth.returncode:
+        auth_output = auth.stdout or ''
+        if execution_path.command_lookup_failed(auth_output):
+            output = redact_secrets(
+                f"{label} CLI authentication check failed (exit {auth.returncode}):\n"
+                f"{auth_output.strip()}"
+            )
+            raise RuntimeError(execution_path.append_path_recovery_hint(output))
         variable, folder, _, _, _ = PROVIDERS[provider]
         home = Path(environment.get(variable, str(Path.home() / folder)))
         raise RuntimeError(
@@ -431,5 +457,13 @@ def validate_provider_runtime(
         if links:
             assert_authentication_links(provider, environment, links)
         validate_provider_profiles(config_path, provider, model_efforts)
+    except OSError as error:
+        if execution_path.missing_executable(error, executable):
+            raise RuntimeError(execution_path.with_path_recovery_hint(
+                f"Agent CLI 실행 실패: {error}")) from error
+        raise
     except RuntimeError as error:
-        raise RuntimeError(f"{label} profile 설정 오류: {error}") from error
+        message = f"{label} profile 설정 오류: {error}"
+        if execution_path.command_lookup_failed(message):
+            message = execution_path.append_path_recovery_hint(redact_secrets(message))
+        raise RuntimeError(message) from error

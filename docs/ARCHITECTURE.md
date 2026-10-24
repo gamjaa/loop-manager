@@ -53,7 +53,9 @@ Python 3 venv·Git·gh(GitHub CLI)와 선택 provider의 설치·인증·저장�
 
 부모는 다른 Git 작업 전에 process lock을 얻고 runtime 자식이 끝날 때까지 유지한다. bootstrap은 기본 `config/config.ini` 또는 명시한 `--config`를 source 기준 절대 경로로 확정해 전달하고 자식의 runtime `ROOT`에서 다시 계산하지 않는다. 설정을 runtime에 복사·이동·symlink하지 않으며 launcher가 선택한 interpreter도 같은 절대 경로로 전달한다.
 
-Linux source 진입은 `config/execution_path.py`의 정리 규칙으로 source의 `config/execution-path.txt`·현재 PATH·존재하는 기본 시스템 후보를 순서대로 합쳐 첫 외부 명령 전에 적용한다. setup은 같은 규칙으로 Git·gh·최소 한 provider 탐색을 확인하고 캐시를 원자적으로 갱신한다. 자식은 확정된 PATH만 상속하며 캐시·source의 다른 ignored 파일을 복사하거나 다시 읽지 않는다.
+Linux source 진입은 `loop_manager_internal/config/execution_path.py`의 정리 규칙으로 source의 `config/execution-path.txt`·현재 PATH·존재하는 기본 시스템 후보를 순서대로 합쳐 첫 외부 명령 전에 적용한다. setup은 같은 규칙으로 Git·gh·최소 한 provider 탐색을 확인하고 캐시를 원자적으로 갱신한다. 자식은 확정된 PATH만 상속하며 캐시·source의 다른 ignored 파일을 복사하거나 다시 읽지 않는다.
+
+PATH 복구 안내는 Linux bootstrap의 Git 실행 파일 부재, 등록·Agent 사전 검사의 확인된 탐색 실패와 provider 출력의 명시적인 명령 누락 표식에만 붙인다. 등록·사전 검사는 같은 source checkout에서 setup 재실행을 안내하고, provider 출력은 기존 비밀값 제거 뒤 원인과 종료 결과를 보존한다. 일반 명령·session·인증·권한 실패에는 안내를 붙이지 않는다. 이 경계는 PATH·캐시를 바꾸거나 인증·provider 실행을 시작하지 않는다.
 
 ### 설정과 DB 준비 실패
 

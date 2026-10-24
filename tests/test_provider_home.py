@@ -305,6 +305,20 @@ class ProviderHomeTests(unittest.TestCase):
         effects.validate_provider_runtime.assert_called_once_with(
             self.root / 'config', 'claude', self.root, state_dir=self.state)
 
+    def test_registration_missing_cli_reports_linux_path_recovery(self):
+        from loop_manager_internal.config import execution_path
+        from loop_manager_internal.runtime import registration_service
+        effects = mock.Mock()
+        with mock.patch.object(execution_path.sys, 'platform', 'linux'):
+            for missing in ('git', 'gh', 'claude'):
+                def which(command):
+                    return None if command == missing else '/tools/' + command
+                with self.subTest(missing=missing), \
+                        mock.patch.object(registration_service.shutil, 'which', side_effect=which):
+                    with self.assertRaisesRegex(RuntimeError, 'bash scripts/setup.sh'):
+                        registration_service.validate_runtime_prerequisites(
+                            effects, self.root, provider='claude', config_path=None)
+
     @unittest.skipIf(os.name == 'nt', 'Windows 파일 인증 저장소 검사는 별도 정책이다')
     def test_path_scoped_credential_store_reuse_is_not_assumed(self):
         env = self.environment()

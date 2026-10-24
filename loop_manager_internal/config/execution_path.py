@@ -1,8 +1,10 @@
 """Linux 설치별 PATH 캐시와 bootstrap 실행 환경."""
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -12,6 +14,52 @@ from loop_manager_internal.config.managed_config import ManagedConfigError
 
 SYSTEM_DIRECTORIES = ('/usr/local/bin', '/usr/bin', '/bin',
                       '/usr/local/sbin', '/usr/sbin', '/sbin')
+_COMMAND_NOT_FOUND = (
+    re.compile(
+        r"(?im)^[ \t]*(?:(?:/[^\s:]+/)?(?:sh|bash|dash|zsh)"
+        r"(?::[ \t]+(?:line[ \t]+\d+|\d+))?:[ \t]+)?"
+        r"[A-Za-z0-9_.+-]+:[ \t]+(?:command not found|not found)[ \t]*$"
+    ),
+    re.compile(
+        r"(?im)^[ \t]*(?:/usr/bin/)?env:[ \t]*[\"'‘]?"
+        r"[A-Za-z0-9_.+-]+[\"'’]?:[ \t]*No such file or directory[ \t]*$"
+    ),
+    re.compile(r"(?im)^[ \t]*(?:Error:[ \t]*)?spawn(?:Sync)?[ \t]+[\"']?[A-Za-z0-9_./+-]+[\"']?[ \t]+ENOENT\b"),
+)
+
+
+def path_recovery_hint() -> str:
+    if sys.platform != 'linux':
+        return ''
+    return (
+        '같은 실행 계정의 정상 터미널에서 설치 경로를 확인한 뒤 '
+        'Loop Manager source checkout에서 `bash scripts/setup.sh`를 실행해 PATH를 갱신하세요.'
+    )
+
+
+def missing_executable(error: OSError, executable: str | None = None) -> bool:
+    if (sys.platform != 'linux' or not isinstance(error, FileNotFoundError)
+            or error.errno != errno.ENOENT or not error.filename):
+        return False
+    name = Path(os.fsdecode(error.filename)).name
+    return executable is None or name == executable
+
+
+def command_lookup_failed(output: str) -> bool:
+    return any(pattern.search(output) for pattern in _COMMAND_NOT_FOUND)
+
+
+def with_path_recovery_hint(output: str) -> str:
+    hint = path_recovery_hint()
+    if not hint or hint in output:
+        return output
+    return f'{output.rstrip()}\n{hint}'
+
+
+def append_path_recovery_hint(output: str) -> str:
+    if not command_lookup_failed(output):
+        return output
+    return with_path_recovery_hint(output)
 
 
 def normalize_path(value: str) -> str:
@@ -62,7 +110,9 @@ def apply_execution_path(source: Path) -> None:
                 raise ManagedConfigError('PATH 캐시가 비어 있거나 절대 경로가 없습니다.')
             normalize_path(stored)
     except (OSError, UnicodeError, ManagedConfigError) as error:
-        raise ManagedConfigError(f'PATH 캐시를 읽을 수 없습니다: {cache}. 정상 터미널에서 setup을 다시 실행하세요.') from error
+        raise ManagedConfigError(
+            f'PATH 캐시를 읽을 수 없습니다: {cache}. {path_recovery_hint()}'
+        ) from error
     os.environ['PATH'] = normalize_path(os.pathsep.join((
         stored or '', os.environ.get('PATH', ''), *SYSTEM_DIRECTORIES,
     )))

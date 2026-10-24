@@ -562,6 +562,7 @@ Loop Manager가 만드는 계획과 구현 변경은 대상 프로젝트 밖의 
   원격 revision·runtime 소유권 검증 실패는 보존·진단하며 로컬 HEAD나 오래된 코드로 대체 실행하지 않는다.
 
 - Linux source 진입은 setup이 저장한 설치별 PATH, 현재 실행 환경, 기본 시스템 후보 순서로 bootstrap의 첫 외부 명령 전에 프로그램 탐색 환경을 확정한다. 캐시가 없으면 현재 PATH와 시스템 후보로 기존 설치·명시적 cron PATH를 지원하며 손상된 캐시는 진단하고 중단한다. 같은 실행의 runtime·Agent·verify는 확정값을 유지하고 setup의 갱신은 다음 실행부터 반영한다. PATH 캐시는 다른 설정·인증·작업 상태를 초기화하지 않는다.
+- Linux bootstrap의 Git, 프로젝트 등록의 Git·gh·선택 provider, Agent 사전 확인과 실제 호출에서 필수 CLI 또는 확인된 실행 의존성을 찾지 못하면 기존 원인·출력·실패 결과와 함께 같은 계정의 정상 터미널에서 설치 경로를 확인하고 Loop Manager source checkout의 `bash scripts/setup.sh`를 다시 실행하라고 안내한다. 일반 명령·session·인증·권한 실패는 PATH 탐색 실패로 바꾸지 않으며, 오류 안내는 캐시 갱신·로그인·다른 provider 실행을 시작하지 않는다.
 - runtime의 Python bytecode 캐시는 선택 source·revision·interpreter에 맞는 표준 Python 캐시로 재사용한다. 기본 캐시는 일회성 runtime worktree 밖에 두며 source checkout의 ignored 파일은 runtime 입력이 아니다. 캐시 생성·갱신·부재·손상·쓰기 실패는 현재 원본 실행과 Git 범위 판정을 바꾸지 않고, 사용자가 명시한 bytecode 비활성화나 캐시 경로 선택을 존중한다.
 
 #### Claude 개발·지원 범위

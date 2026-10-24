@@ -37,7 +37,9 @@ Linux에서 필요한 CLI 또는 실제 실행 의존성을 찾지 못한 오류
 ## Progress
 
 - [x] 2026-10-13 `041e6ee8ba3145eae988e99fdd4055cb743f08d1`의 R-089 직접 구현·`tests/test_execution_path.py`·README·운영 안내와 bootstrap/등록/provider/명령 오류 전달을 정적으로 대조했다. 손상 캐시 복구와 PATH 기본 동작은 구현돼 있으며 명령 탐색 실패의 실행 시 복구 안내가 남아 있다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 탐색 실패의 복구 안내와 targeted unit 검증
+- [x] 2026-10-24 Linux source bootstrap·등록·Agent preflight/호출의 확인된 CLI·의존 명령 탐색 실패에 setup 복구 안내를 연결했다. provider 원문과 exit code·비밀값 제거, 기존 인증/session/권한 분류·재시도를 보존하고 README·운영 안내·PRODUCT·ARCHITECTURE를 실제 동작에 맞췄다. 관리 rebase 후 HEAD `000ad57c1049438bf7c985bfcd4038e7c15d9b41`의 변경 전체를 다시 확인하고 관련 targeted unit 12개를 새로 실행해 통과했다.
+- [x] 2026-10-24 Manager verify에서 일반 실패 결과 객체의 identity 회귀를 확인했다. PATH 안내가 실제 추가될 때만 `AgentResult`를 교체하도록 수정하고 실패 테스트와 session 전환·의존성 안내 회귀 등 targeted unit 3개를 통과시켰다.
+- [x] 2026-10-24 Review가 일반 `FileNotFoundError` 파일 경로를 명령 누락으로 오인하는 패턴을 찾아 제거하고 설정·인증·session 파일의 음성 회귀와 Linux·macOS·Windows provider preflight 회귀를 추가했다. 현재 후보에서 관련 targeted unit 3개를 새로 실행해 통과했다.
 - [ ] Manager 검증·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
