@@ -68,15 +68,29 @@ class PullRequestHistoryTests(unittest.TestCase):
                     with self.assertRaises(type(error)):
                         ports.effects.publication.publish_worker_checkpoints(context)
                 self.assertEqual(dict(ports.effects.state.row()), before)
+    def _pr(self, **changes):
+        return {'url': 'https://github.com/owner/repo/pull/1', 'state': 'OPEN',
+                'mergedAt': None, 'headRefOid': 'a' * 40,
+                'headRefName': 'loop-manager/G-047', 'baseRefName': 'main',
+                'mergeable': 'MERGEABLE', 'isCrossRepository': False, **changes}
+
+    def _lookup(self, payload):
+        effects = github_observation.PrForBranchEffects(command=mock.Mock(return_value=
+            subprocess.CompletedProcess([], 0, json.dumps(payload), '')))
+        return github_observation.pr_for_branch(
+            effects, Path('/repo'), 'loop-manager/G-047', history=True,
+            expected_repository='owner/repo', expected_base='main')
 
     def test_production_ports_forward_history_and_preserve_default_lookup(self):
         import loop_manager
         from tests.support.execution import execution_fixture
 
         fixture = execution_fixture(self)
+        fixture.connection.execute("UPDATE projects SET origin='owner/repo'")
+        fixture.connection.commit()
         repo_path = Path('/repo')
         branch = 'loop-manager/G-047'
-        pull_request = {'url': 'existing-pr', 'state': 'OPEN'}
+        pull_request = self._pr()
         with mock.patch.object(loop_manager, 'pr_for_branch', return_value=pull_request) as lookup:
             ports = loop_manager._ExecutionLifecyclePorts(
                 fixture.connection, fixture.repository,
@@ -84,55 +98,95 @@ class PullRequestHistoryTests(unittest.TestCase):
                 base='main', base_sha='base', provider='codex',
                 config_path=Path('/config'), newly_activated=False,
             )
-            for url in (None, 'existing-pr'):
+            for url in (None, pull_request['url']):
                 for history in (False, True):
                     with self.subTest(url=url, history=history):
                         args = (repo_path, branch, url) if url else (repo_path, branch)
-                        options = {'history': True} if history else {}
-                        result = ports.effects.publication.pr_for_branch(*args, **options)
+                        options = ({'history': True, 'expected_repository': 'owner/repo',
+                                    'expected_base': 'main'} if history else {})
+                        result = ports.effects.publication.pr_for_branch(*args, history=history)
                         self.assertEqual(result, pull_request)
                         lookup.assert_called_once_with(*args, **options)
                         lookup.reset_mock()
+            fixture.connection.execute("UPDATE projects SET base_branch='other'")
+            with self.assertRaisesRegex(RuntimeError, '등록 repository/base'):
+                ports.effects.publication.pr_for_branch(repo_path, branch, history=True)
+            lookup.assert_not_called()
 
-    def test_merged_history_wins_over_an_open_pr_for_the_same_branch(self):
-        effects = github_observation.PrForBranchEffects(command=mock.Mock(return_value=subprocess.CompletedProcess(
-            [], 0, json.dumps([
-                {'url': 'open', 'state': 'OPEN', 'mergedAt': None, 'headRefOid': 'a' * 40,
-                 'headRefName': 'loop-manager/G-001', 'baseRefName': 'main', 'mergeable': 'MERGEABLE'},
-                {'url': 'merged-old', 'state': 'MERGED', 'mergedAt': '2026-01-01T00:00:00Z',
-                 'headRefOid': 'b' * 40, 'headRefName': 'loop-manager/G-001',
-                 'baseRefName': 'develop', 'mergeable': None,
-                 'mergeCommit': {'oid': 'c' * 40}},
-            ]), '')))
+    def test_merged_history_wins_only_after_all_identities_match(self):
+        merged = self._pr(url='https://github.com/owner/repo/pull/2', state='MERGED',
+                          mergedAt='2026-01-01T00:00:00Z', headRefOid='b' * 40,
+                          mergeCommit={'oid': 'c' * 40})
+        self.assertEqual(self._lookup([self._pr(), merged]), merged)
+        # No ancestry or live branch observation is needed for a real Merge.
+        for changes in ({'baseRefName': 'develop'}, {'headRefName': 'other'},
+                        {'url': 'https://github.com/other/repo/pull/2'},
+                        {'isCrossRepository': True}, {'isCrossRepository': None},
+                        {'headRefOid': 'short'}, {'headRefOid': None}):
+            for invalid_index in (0, 1):
+                with self.subTest(changes=changes, invalid_index=invalid_index):
+                    records = [self._pr(), merged]
+                    records[invalid_index] = {**records[invalid_index], **changes}
+                    with self.assertRaisesRegex(RuntimeError, 'identity'):
+                        self._lookup(records)
 
-        result = github_observation.pr_for_branch(
-            effects, Path('/repo'), 'loop-manager/G-001', history=True,
-        )
+    def test_prepare_rejects_mismatched_merged_history_before_terminal_or_workspace_effects(self):
+        from dataclasses import replace
+        import loop_manager
+        from tests.support.execution import execution_fixture
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
 
-        self.assertEqual(result['url'], 'merged-old')
-        arguments = effects.command.call_args.args[0]
-        self.assertEqual(arguments[:5], ['gh', 'pr', 'list', '--head', 'loop-manager/G-001'])
-        self.assertIn('--state', arguments)
-        self.assertEqual(arguments[arguments.index('--state') + 1], 'all')
+        fixture = execution_fixture(self)
+        fixture.connection.executescript(
+            "CREATE TABLE manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "INSERT INTO manager_metadata VALUES ('created_from_absence', '1');"
+            "UPDATE projects SET origin='owner/repo';"
+            "UPDATE exec_plans SET workspace_owned=0;")
+        fixture.state.expected = fixture.repository.projected('repo')
+        ports = loop_manager._ExecutionLifecyclePorts(
+            fixture.connection, fixture.repository,
+            repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'),
+            base='main', base_sha='base', provider='codex',
+            config_path=Path('/config'), newly_activated=True)
+        fixture.handler.effects = replace(fixture.effects,
+            checkpoint=ExecutionCheckpointRepository(fixture.connection),
+            publication=replace(fixture.effects.publication,
+                pr_for_branch=ports.effects.publication.pr_for_branch,
+                github_repository=loop_manager.github_repository))
+        fixture.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        fixture.effects.workspace.git.side_effect = lambda *_a, **_k: SimpleNamespace(
+            stdout='https://github.com/owner/repo.git', returncode=0)
+        for changes in ({'baseRefName': 'other'}, {'headRefName': 'other'},
+                        {'url': 'https://github.com/other/repo/pull/1'}):
+            with self.subTest(changes=changes), \
+                    mock.patch.object(fixture.handler, '_resolving_rebase', return_value=False), \
+                    mock.patch.object(fixture.handler, '_fetch_latest_base', return_value='b' * 40), \
+                    mock.patch.object(fixture.handler, '_checkpoint_remote_oid', return_value=None), \
+                    mock.patch.object(loop_manager, 'command', return_value=subprocess.CompletedProcess(
+                        [], 0, json.dumps([self._pr(state='MERGED', **changes)]), '')) as command:
+                result = fixture.handler.prepare()
+                self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+                command.assert_called_once()
+                fixture.effects.workspace.make_worktree.assert_not_called()
+                fixture.effects.publication.reconcile_existing_pull_request.assert_not_called()
+                fixture.effects.agent.run_agent.assert_not_called()
+                self.assertEqual(fixture.state.active_execplan('repo')['status'], 'IMPLEMENTING')
 
-    def test_incomplete_history_and_multiple_open_prs_are_not_guessed(self):
-        saturated = github_observation.PrForBranchEffects(command=mock.Mock(return_value=
-            subprocess.CompletedProcess([], 0, '[]', '')))
-        saturated.command.return_value.stdout = json.dumps([{}] * 1000)
+    def test_absent_open_closed_and_incomplete_history(self):
+        self.assertIsNone(self._lookup([]))
+        self.assertEqual(self._lookup([self._pr()]), self._pr())
+        closed = self._pr(state='CLOSED')
+        self.assertEqual(self._lookup([closed]), closed)
         with self.assertRaisesRegex(RuntimeError, '목록 응답'):
-            github_observation.pr_for_branch(
-                saturated, Path('/repo'), 'loop-manager/G-001', history=True,
-            )
-
-        opened = [{'url': f'open-{i}', 'state': 'OPEN', 'mergedAt': None, 'headRefOid': 'a' * 40,
-                   'headRefName': 'loop-manager/G-001', 'baseRefName': 'main', 'mergeable': 'MERGEABLE'}
-                  for i in range(2)]
-        ambiguous = github_observation.PrForBranchEffects(command=mock.Mock(return_value=
-            subprocess.CompletedProcess([], 0, json.dumps(opened), '')))
+            self._lookup([{}] * 1000)
         with self.assertRaisesRegex(RuntimeError, '열린 PR이 여러 개'):
+            self._lookup([self._pr(), self._pr(url='https://github.com/owner/repo/pull/2')])
+        with self.assertRaisesRegex(RuntimeError, '필드'):
+            self._lookup([self._pr(state='UNKNOWN')])
+        with self.assertRaisesRegex(RuntimeError, '등록 repository'):
             github_observation.pr_for_branch(
-                ambiguous, Path('/repo'), 'loop-manager/G-001', history=True,
-            )
+                github_observation.PrForBranchEffects(command=mock.Mock()),
+                Path('/repo'), 'loop-manager/G-047', history=True)
 
 
 class WorkerCheckpointPublicationTests(unittest.TestCase):

@@ -177,6 +177,13 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         from loop_manager_internal.recovery.deleted_branch_restart import current_pr
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
         options = {'history': True} if history else {}
+        if history:
+            project = connection.execute(
+                'SELECT origin, base_branch FROM projects WHERE repo=?', (identity['repo'],),
+            ).fetchone()
+            if project is None or project['base_branch'] != identity['base'] or not project['origin']:
+                raise RuntimeError('PR 이력의 등록 repository/base를 확인할 수 없습니다.')
+            options.update(expected_repository=project['origin'], expected_base=project['base_branch'])
         pr = lookup_pr(repo_path, branch, url, **options) if url else lookup_pr(repo_path, branch, **options)
         plan = state.active_execplan(identity['repo'])
         if plan is not None and plan['branch'] == branch:

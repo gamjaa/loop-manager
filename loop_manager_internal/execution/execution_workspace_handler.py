@@ -937,35 +937,41 @@ class WorkspaceHandler:
                 classify_exception(error, operation=RecoveryReason.WORKTREE_RECOVERY_FAILED),
                 detail,
             )
-        if int(row['pr_conflict_recovery']):
-            recovery_rebase = self.ports.resume_pr_conflict_rebase(self.ports.identity.repo_path, self.ports.identity.repo, row, worktree, branch)
-            if recovery_rebase == 1:
-                return self.ports._final()
-            if recovery_rebase == self.ports.contract.PROJECT_STEP_RETRY:
-                return self.ports._recover(
-                    RecoveryReason.REBASE_CONTINUE_FAILED,
-                    str(self.ports._row()['last_error'] or 'PR rebase 복구 재시도'),
-                )
-            row = self.ports._row()
-            resolving_rebase = self.ports._resolving_rebase(row)
-        rebase_error = str(row['last_error'] or '')
-        rebase_recovery = bool(
-            row['phase'] == 'WORKING' and (rebase_error == self.ports.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.ports.contract.REBASE_CONFLICT_PREFIX)),
-        )
-        if rebase_recovery and (not resolving_rebase) and (not int(row['pr_conflict_recovery'])):
-            resume_status = str(row['revision_resume_status'] or 'VERIFYING')
-            resume_phase = 'WORKING' if resume_status == 'IMPLEMENTING' else resume_status
-            self.ports.state.update_project(
-                self.ports.identity.repo,
-                phase=resume_phase,
-                revision_resume_status=None,
-                last_error=None,
+        try:
+            if int(row['pr_conflict_recovery']):
+                recovery_rebase = self.ports.resume_pr_conflict_rebase(self.ports.identity.repo_path, self.ports.identity.repo, row, worktree, branch)
+                if recovery_rebase == 1:
+                    return self.ports._final()
+                if recovery_rebase == self.ports.contract.PROJECT_STEP_RETRY:
+                    return self.ports._recover(
+                        RecoveryReason.REBASE_CONTINUE_FAILED,
+                        str(self.ports._row()['last_error'] or 'PR rebase 복구 재시도'),
+                    )
+                row = self.ports._row()
+                resolving_rebase = self.ports._resolving_rebase(row)
+            rebase_error = str(row['last_error'] or '')
+            rebase_recovery = bool(
+                row['phase'] == 'WORKING' and (rebase_error == self.ports.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.ports.contract.REBASE_CONFLICT_PREFIX)),
             )
-            row = self.ports._row()
-        assert catalog_plan is not None
-        self.ports.update_snapshot(plan=self.ports._cached_plan(catalog_plan))
-        self.ports.update_snapshot(level=self.ports.ensure_worker_level_state(
-            self.ports.identity.repo, self.ports.snapshot().plan
-        ))
-        self.ports.update_snapshot(catalog_plan=catalog_plan)
-        return self.ports._context()
+            if rebase_recovery and (not resolving_rebase) and (not int(row['pr_conflict_recovery'])):
+                resume_status = str(row['revision_resume_status'] or 'VERIFYING')
+                resume_phase = 'WORKING' if resume_status == 'IMPLEMENTING' else resume_status
+                self.ports.state.update_project(
+                    self.ports.identity.repo,
+                    phase=resume_phase,
+                    revision_resume_status=None,
+                    last_error=None,
+                )
+                row = self.ports._row()
+            assert catalog_plan is not None
+            self.ports.update_snapshot(plan=self.ports._cached_plan(catalog_plan))
+            self.ports.update_snapshot(level=self.ports.ensure_worker_level_state(
+                self.ports.identity.repo, self.ports.snapshot().plan
+            ))
+            self.ports.update_snapshot(catalog_plan=catalog_plan)
+            return self.ports._context()
+        except (RecoveryFailure, manager_git_journal.MutationEvidenceError) as error:
+            return self.ports._recover(
+                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                str(error),
+            )
