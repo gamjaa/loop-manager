@@ -17,7 +17,7 @@ from loop_manager_internal.recovery import diagnostic_cleanup as cleanup, scoped
 from loop_manager_internal.storage import blocked_checkpoint_state as storage, runtime_state
 from tests.support.database import runtime_connection
 from tests.support.rebase_observations import expectation, observation, decision_for
-from tests.test_diagnostic_preservation import ArtifactRecoveryFixture
+from tests.support.diagnostic import ArtifactRecoveryFixture
 
 
 class DiagnosticCleanupTests(ArtifactRecoveryFixture, unittest.TestCase):

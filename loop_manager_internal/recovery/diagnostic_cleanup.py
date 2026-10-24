@@ -245,7 +245,7 @@ def assess_ref(state, facts):
     return None
 
 
-def prepare_recorded(effects, connection, state_dir, repo):
+def prepare_recorded(effects: 'CleanupEffects', connection, state_dir, repo):
     """Reobserve recorded refs once; preparation failure never gates the caller."""
     refs = connection.execute('SELECT ref FROM diagnostic_preservations WHERE repo=? AND ref IS NOT NULL '
         'UNION SELECT ref FROM blocked_diagnostic_publications WHERE repo=? '

@@ -40,6 +40,12 @@ priority: normal
 
 ## Progress
 
+Manager의 HEAD `1dd16b57cb39fe4da3c66eb07eee323d38e7dc25` 전체 verify 피드백 네 건을 교정했다. 새 compatibility export의 effect 타입 주석을 기존 문자열 계약에 맞추고, 두 진단 테스트가 공유하는 bundle fixture를 `tests/support/diagnostic.py`로 이동했다. START 재평가의 상태 전용 mock에는 실제 observation 계약의 빈 `files`를 명시했다. 기존 assertion·테스트·지원 경계는 유지했다.
+
+Perl native 예제의 기존 로그는 `stage-1` 결과 파일 부재에 따른 `StopIteration`이었다. 단독 launcher가 생성하는 별도 `--execute` 프로세스가 fixture의 고정 자원 관측을 우회하는 경로를 확인하고, 해당 프로세스만 fixture bootstrap으로 연결했다. 실제 project worker는 원래 entrypoint와 자격 증명 제거를 유지한다. 기존 launcher unit에서 모드별 argv·옵션 전달·자원 관측·patch 복원과 자격 증명 격리를 검증했다. native 결과가 없으면 원래 진단을 포함하는 assertion으로 실패하며 결과 부재를 성공으로 바꾸지 않는다. Worker의 통합 실행 제한에 따라 Perl native 예제와 전체 verify는 직접 재실행하지 않았으며 Manager 재검증이 필요하다.
+
+이번 교정 후 targeted runner에서 compatibility 계약 1개, support fixture class 29개, START scheduling case 1개, diagnostic cleanup 25개, artifact recovery 9개, launcher unit 1개가 통과했다(서로 다른 66개). compatibility와 START case는 이 호출에서 관측한 오류를 수정한 뒤 같은 실패 명령으로 재검증했다. 처음 여러 `--unittest`를 지정한 명령은 마지막 case만 실행하므로 각 범위는 별도 명령으로 검증했다. PRODUCT·ARCHITECTURE의 제품/설계 설명은 그대로 유효하며 최종 base 대비 patch hash도 유지된다. 아래 기록은 이전 후보와 구현 세션의 검증이며 이번 native 통합 성공을 의미하지 않는다.
+
 구현 완료 후보이며 전체 verify·Reviewer 검증은 Manager에 인계한다. 저장된 게시 identity·모든 원인 사용·현재 소유권·원인 해소·정상 branch 게시·독립 로컬 자료를 ref별로 결합했다. 원격 삭제·push·원인 해제·새 알림은 준비 판정에 추가하지 않았다. 일반 차단 삭제, 캐시된 성공, 미게시 작업물, 불충분한 과거 기록을 자격으로 승격하지 않는다.
 
 원인 해제는 기존 상태 transaction에 기록한다. 실제 COMPLETE와 WAITING 후 재개를 구분하고 후자는 같은 target의 현재 COMPLETE를 요구한다. 해소 때 미커밋 작업이 남았으면 clean·저장된 게시 HEAD·해소 HEAD 이후 commit을 추가 확인한다. 원래 generation의 acceptance와 마지막 해제 감사가 함께 남은 과거 기록도 소비하며 추정 연결은 하지 않는다. 여러 원인·ref와 실행 중/종료 불명 예약을 각각 확인하고, 관측 또는 DB generation 변경은 준비를 확정하지 않는다. 기존 원문·session·실패·intent·게시 확정과 무관한 차단은 유지한다.

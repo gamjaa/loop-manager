@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from textwrap import indent
 import time
 from types import SimpleNamespace
 import unittest
@@ -52,7 +53,18 @@ from pathlib import Path
 config = json.loads(Path(__file__).with_suffix('.json').read_text())
 os.environ.update(config['coordination'])
 sys.argv[0] = config['entrypoint']
-''' + nested_runner_source(entrypoint))
+''' + f"sys.path.insert(0, {str(entrypoint.resolve().parents[2])!r})\n" + '''
+from unittest.mock import patch
+from loop_manager_internal.execution import verify_process
+native_run = verify_process.run_verify_process
+def standalone_run(argv, *args, **kwargs):
+    # The standalone runner creates a new --execute process. Keep this
+    # fixture's sampler there too; project workers use the real entrypoint.
+    if '--execute' in argv:
+        argv = [__file__ if arg == config['entrypoint'] else arg for arg in argv]
+    return native_run(argv, *args, **kwargs)
+with patch.object(verify_process, 'run_verify_process', standalone_run):
+''' + indent(nested_runner_source(entrypoint), '    '))
     options['env'] = dict(options['env'], LOOP_MANAGER_VERIFY_RUNNER=str(script))
     # Direct entrypoint calls and shell launchers cross the same guard boundary.
     command = [str(script) if arg == str(entrypoint) else arg for arg in command]
@@ -63,6 +75,7 @@ class CoordinatedLaunchTests(unittest.TestCase):
     def test_guarded_runner_restores_only_fixture_coordination_and_workers_stay_sanitized(self):
         import runpy
         from loop_manager_internal.verification.resources import ResourceSampler, decide
+        from loop_manager_internal.execution import verify_process
         original_sampler = ResourceSampler.sample
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -100,11 +113,19 @@ class CoordinatedLaunchTests(unittest.TestCase):
                         self.assertEqual((observed.cpus, observed.busy, observed.available),
                                          (2, 0, 4 * 1024 ** 3))
                         self.assertTrue(decide(observed, now=observed.at, running=0, cap=1).granted)
+                        for mode in ('--execute', '--worker'):
+                            argv = ['python', str(entrypoint), mode]
+                            self.assertIs(verify_process.run_verify_process(argv, root, 90,
+                                environment=sanitized), native.return_value)
+                            native.assert_called_with(['python', str(script) if mode == '--execute'
+                                else str(entrypoint), mode], root, 90, environment=sanitized)
                     with mock.patch.dict(os.environ, sanitized, clear=True), \
                             mock.patch.object(sys, 'path', list(sys.path)), \
                             mock.patch.object(sys, 'argv', [str(script), '--protocol-version', '1']), \
+                            mock.patch.object(verify_process, 'run_verify_process') as native, \
                             mock.patch.object(runpy, 'run_path', side_effect=entered) as run:
                         exec(compile(script.read_bytes(), str(script), 'exec'), {'__file__': str(script)})
+                        self.assertIs(verify_process.run_verify_process, native)
                     run.assert_called_once()
                     self.assertIs(ResourceSampler.sample, original_sampler)
 
@@ -175,7 +196,9 @@ class LanguageExampleIntegrationTests(unittest.TestCase):
                             self.assertEqual(manifest['run_id'], manifest_path.parent.name)
                         self.assertEqual([stage['kind'] for stage in manifest['stages']], ['command', 'tests'])
                         self.assertEqual(manifest['adapter'], 'perl-tap' if language == 'perl' else 'unittest')
-                        report = json.loads(next((manifest_path.parent / 'stage-1').glob('module-*.json')).read_text())
+                        reports = list((manifest_path.parent / 'stage-1').glob('module-*.json'))
+                        self.assertEqual(len(reports), 1, diagnostic)
+                        report = json.loads(reports[0].read_text())
                         self.assertEqual(report['run_id'], manifest['run_id'])
                         self.assertEqual(report['passed'], not failing)
                         self.assertFalse(coordinator.reservations)
