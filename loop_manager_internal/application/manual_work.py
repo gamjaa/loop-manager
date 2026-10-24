@@ -20,8 +20,11 @@ from loop_manager_internal.runtime import operation_events as events
 from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.git import manager_git_journal, workspace
 from loop_manager_internal.recovery import scoped_blocking
-from loop_manager_internal.storage import execplan_catalog_state, runtime_state, maintenance_state
-from loop_manager_internal.storage.manual_work_state import ManualWorkRepository, digest, live_requirement_paths
+from loop_manager_internal.storage import (db_access, execplan_catalog_state,
+                                           runtime_state, maintenance_state)
+from loop_manager_internal.storage.manual_work_state import (
+    ManualWorkRepository, acceptance_snapshot, digest, live_requirement_paths,
+)
 
 
 class ManualDependencyWait(ManualWorkError):
@@ -201,8 +204,17 @@ class ManualWorkService:
 
     @manual_preparation
     def start(self, plan_id):
-        group = self.store.for_plan(self.repo, plan_id)
-        row = self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (self.repo, plan_id)).fetchone()
+        def observe(db):
+            group = self.store.for_plan(self.repo, plan_id)
+            row = db.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                             (self.repo, plan_id)).fetchone()
+            members = json.loads(group['members']) if group else [plan_id]
+            state = acceptance_snapshot(
+                db, self.repo, group['group_id'] if group else None, members,
+            )
+            return group, row, state
+
+        group, row, observed_state = db_access.run_database_request(self.connection, observe)
         if row is None:
             raise ManualWorkError(f'G 계획이 없습니다: {plan_id}')
         from loop_manager_internal.storage.execplan_draft_state import pending_ids
@@ -248,29 +260,45 @@ class ManualWorkService:
                     or manager_git_journal.live_remote_branch_oid(self.effects.git,self.repo_path,branch) is not None:
                 raise ManualWorkError('동일 이름의 기존 branch/worktree에 SQLite 소유 근거가 없습니다.')
         start_base=(row['active_sha'] or base_head) if owned or group is not None else base_head
-        with runtime_state._transaction(self.connection):
-            preparation_gate(self, plan_ids=[plan_id], group=group, inspect_workspace=False)
-            current = self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
-                                             (self.repo, plan_id)).fetchone()
-            if dict(current) != dict(row):
-                raise ManualWorkError(f'{plan_id}: 준비 중 계획·실행 소유권이 변경됐습니다. 다시 실행하세요.')
-            collision = self.connection.execute('SELECT plan_id FROM exec_plans WHERE repo=? AND plan_id!=? '
-                'AND (branch=? OR worktree=?)', (self.repo, plan_id, branch, str(worktree))).fetchone()
-            if collision:
-                raise ManualWorkError(f"자원 소유자 {collision['plan_id']}와 branch·worktree 충돌: {branch}; {worktree}")
-            if group is None:
-                group = self.store.create(self.repo,'start',branch,(),base_head,base_head,
-                                          members=(plan_id,),documents=documents)
-                group = self.store.update(group,owner_id=plan_id,active_id=plan_id,
-                                          branch=branch,worktree=str(worktree))
-            self.runtime.update_plan(self.repo,plan_id,plan_values={
-                'status':'MANUAL_WORKING','ever_started':1,'branch':branch,'worktree':str(worktree),
-                'workspace_owned':1 if owned else 2,'active_sha':start_base},enqueue=False)
-            if row['status']=='PLAN_BLOCKED':
-                scoped_blocking.clear_plan_block(self.connection,self.repo,plan_id)
-                projection=self.connection.execute('SELECT plan_path FROM projects WHERE repo=?',(self.repo,)).fetchone()
-                if projection['plan_path']==row['path']:
-                    self.runtime.clear(self.repo)
+        preparation_gate(self, plan_ids=[plan_id], group=group, inspect_workspace=False)
+
+        def reserve_start(db):
+            with runtime_state._transaction(db):
+                current_group = self.store.for_plan(self.repo, plan_id)
+                members = json.loads(current_group['members']) if current_group else [plan_id]
+                current_state = acceptance_snapshot(
+                    db, self.repo, group['group_id'] if group else None, members,
+                )
+                current = db.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                                     (self.repo, plan_id)).fetchone()
+                if current_state != observed_state or current is None or dict(current) != dict(row):
+                    raise ManualConflictError(
+                        f'{plan_id}: 준비 중 계획·요청·소유권이 변경됐습니다. 다시 실행하세요.'
+                    )
+                preparation_gate(self, plan_ids=[plan_id], group=current_group,
+                                 inspect_workspace=False, check_git_journal=False)
+                collision = db.execute('SELECT plan_id FROM exec_plans WHERE repo=? AND plan_id!=? '
+                    'AND (branch=? OR worktree=?)', (self.repo, plan_id, branch, str(worktree))).fetchone()
+                if collision:
+                    raise ManualConflictError(
+                        f"자원 소유자 {collision['plan_id']}와 branch·worktree 충돌: {branch}; {worktree}"
+                    )
+                if current_group is None:
+                    current_group = self.store.create(self.repo,'start',branch,(),base_head,base_head,
+                                                      members=(plan_id,),documents=documents)
+                    current_group = self.store.update(current_group,owner_id=plan_id,active_id=plan_id,
+                                                      branch=branch,worktree=str(worktree))
+                self.runtime.update_plan(self.repo,plan_id,plan_values={
+                    'status':'MANUAL_WORKING','ever_started':1,'branch':branch,'worktree':str(worktree),
+                    'workspace_owned':1 if owned else 2,'active_sha':start_base},enqueue=False)
+                if row['status']=='PLAN_BLOCKED':
+                    scoped_blocking.clear_plan_block(db,self.repo,plan_id)
+                    projection=db.execute('SELECT plan_path FROM projects WHERE repo=?',(self.repo,)).fetchone()
+                    if projection['plan_path']==row['path']:
+                        self.runtime.clear(self.repo)
+                return self.store.get(self.repo, current_group['group_id'])
+
+        group = db_access.run_database_request(self.connection, reserve_start)
         if owned and worktree.is_dir() and row['blocked_reason'] in {'verify_retry_exhausted','review_retry_exhausted'}:
             stage='verify' if row['blocked_reason']=='verify_retry_exhausted' else 'review'
             known_head=self.effects.git(worktree,'rev-parse','HEAD').stdout.strip()
@@ -376,8 +404,16 @@ class ManualWorkService:
 
     @manual_preparation
     def complete(self, args):
-        group = self.store.for_plan(self.repo,args.plan_id)
-        row = self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (self.repo,args.plan_id)).fetchone()
+        def observe(db):
+            group = self.store.for_plan(self.repo, args.plan_id)
+            row = db.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                             (self.repo, args.plan_id)).fetchone()
+            state = (acceptance_snapshot(
+                db, self.repo, group['group_id'], json.loads(group['members']),
+            ) if group is not None else None)
+            return group, row, state
+
+        group, row, observed_state = db_access.run_database_request(self.connection, observe)
         if row is None or group is None:
             raise ManualWorkError('수동 시작 또는 submit으로 등록된 G만 완료 요청할 수 있습니다.')
         if row['status'] == 'MERGED':
@@ -414,31 +450,44 @@ class ManualWorkService:
             self.effects,self.repo_path,head,base_head,documents,connection=self.connection,
             config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
         from loop_manager_internal.execution.manual_candidate import candidate_token
-        with runtime_state._transaction(self.connection):
-            if (dict(self.store.get(self.repo, group['group_id'])) != dict(group)
-                    or candidate_token(self.connection,self.repo_path,head,base_head,documents) != candidate):
-                raise ManualConflictError('수동 완료 관측 뒤 요청·지침 입력이 변경됐습니다.')
-            preparation_gate(self, plan_ids=json.loads(group['members']), group=group, inspect_workspace=False)
-            group=self.store.update(group,documents=json.dumps(documents,ensure_ascii=False),definition_head=definition_head)
-            self.store.accept(group,head=head,base=base_head,input_token=candidate,
-                verify_input_token=verify_input,review_input_token=review_input,
-                skip_verify=args.skip_verify,skip_review=args.skip_review,
-                reason=normalize_skip_reason(args.skip_reason))
-            self.store.update(group,state='AUTOMATIC',base_sha=base_head,last_error=None)
-            for member in json.loads(group['members']):
-                current = self.runtime.get(self.repo,member)
-                if current.status=='MANUAL_WORKING':
-                    self.runtime.update_plan(self.repo,member,plan_values={'status':'MANUAL_PENDING'},enqueue=False)
-                elif current.status=='PLAN_BLOCKED' and repaired:
-                    blocked=self.connection.execute('SELECT blocked_reason FROM exec_plans WHERE repo=? AND plan_id=?',
-                                                    (self.repo,member)).fetchone()[0]
-                    if blocked in {'verify_retry_exhausted','review_retry_exhausted','review_protocol_exhausted','worker_output_invalid'}:
-                        scoped_blocking.clear_plan_block(self.connection,self.repo,member)
-                        self.runtime.update_plan(self.repo,member,plan_values={'status':'MANUAL_PENDING',
-                            'last_error':None,'verify_result':None,'review_result':None,'worker_result':None,
-                            'verify_token':None,'review_token':None,'publication_token':None,'worker_input_token':None},enqueue=False)
-                        self.store.update(group,resume_phase='VERIFYING')
-        return group['group_id']
+        preparation_gate(self, plan_ids=json.loads(group['members']), group=group, inspect_workspace=False)
+
+        def accept_complete(db):
+            with runtime_state._transaction(db):
+                current_group = self.store.for_plan(self.repo, args.plan_id)
+                current_state = (acceptance_snapshot(
+                    db, self.repo, group['group_id'], json.loads(current_group['members']),
+                ) if current_group is not None else None)
+                if (current_group is None or current_state != observed_state
+                        or candidate_token(db,self.repo_path,head,base_head,documents) != candidate):
+                    raise ManualConflictError('수동 완료 관측 뒤 요청·구성 G·리비전·소유권 입력이 변경됐습니다.')
+                preparation_gate(self, plan_ids=json.loads(current_group['members']),
+                                 group=current_group, inspect_workspace=False, check_git_journal=False)
+                updated = self.store.update(
+                    current_group, documents=json.dumps(documents,ensure_ascii=False),
+                    definition_head=definition_head,
+                )
+                self.store.accept(updated,head=head,base=base_head,input_token=candidate,
+                    verify_input_token=verify_input,review_input_token=review_input,
+                    skip_verify=args.skip_verify,skip_review=args.skip_review,
+                    reason=normalize_skip_reason(args.skip_reason))
+                updated = self.store.update(updated,state='AUTOMATIC',base_sha=base_head,last_error=None)
+                for member in json.loads(updated['members']):
+                    current = self.runtime.get(self.repo,member)
+                    if current.status=='MANUAL_WORKING':
+                        self.runtime.update_plan(self.repo,member,plan_values={'status':'MANUAL_PENDING'},enqueue=False)
+                    elif current.status=='PLAN_BLOCKED' and repaired:
+                        blocked=db.execute('SELECT blocked_reason FROM exec_plans WHERE repo=? AND plan_id=?',
+                                           (self.repo,member)).fetchone()[0]
+                        if blocked in {'verify_retry_exhausted','review_retry_exhausted','review_protocol_exhausted','worker_output_invalid'}:
+                            scoped_blocking.clear_plan_block(db,self.repo,member)
+                            self.runtime.update_plan(self.repo,member,plan_values={'status':'MANUAL_PENDING',
+                                'last_error':None,'verify_result':None,'review_result':None,'worker_result':None,
+                                'verify_token':None,'review_token':None,'publication_token':None,'worker_input_token':None},enqueue=False)
+                            self.store.update(updated,resume_phase='VERIFYING')
+                return updated['group_id']
+
+        return db_access.run_database_request(self.connection, accept_complete)
 
     def drive(self, group_id):
         with serial_manual_drive(self.state_dir) as available:
@@ -637,22 +686,44 @@ class ManualWorkService:
         return group['group_id']
 
     def _accept_submit(self, group, args, head, base):
-        group=self.store.get(self.repo, group['group_id'])
-        documents=json.loads(group['documents'])
+        def observe(db):
+            current_group = self.store.get(self.repo, group['group_id'])
+            if current_group is None:
+                raise ManualConflictError('수동 제출 관측 대상 묶음이 사라졌습니다.')
+            documents = json.loads(current_group['documents'])
+            state = acceptance_snapshot(
+                db, self.repo, current_group['group_id'], json.loads(current_group['members']),
+            )
+            return current_group, documents, state
+
+        group, documents, observed_state = db_access.run_database_request(self.connection, observe)
         candidate,verify_input,review_input=candidate_input(
             self.effects,self.repo_path,head,base,documents,connection=self.connection,
             config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
         from loop_manager_internal.execution.manual_candidate import candidate_token
-        with runtime_state._transaction(self.connection):
-            if (dict(self.store.get(self.repo, group['group_id'])) != dict(group)
-                    or candidate_token(self.connection,self.repo_path,head,base,documents) != candidate):
-                raise ManualConflictError('수동 제출 관측 뒤 요청·지침 입력이 변경됐습니다.')
-            preparation_gate(self, plan_ids=json.loads(group['members']), group=group,
-                             requirements=json.loads(group['requirements']), inspect_workspace=False)
-            self.store.accept(group,head=head,base=base,input_token=candidate,
-                verify_input_token=verify_input,review_input_token=review_input,
-                skip_verify=args.skip_verify,skip_review=args.skip_review,
-                reason=normalize_skip_reason(args.skip_reason))
+        preparation_gate(self, plan_ids=json.loads(group['members']), group=group,
+                         requirements=json.loads(group['requirements']), inspect_workspace=False)
+
+        def accept_submit(db):
+            with runtime_state._transaction(db):
+                current_group = self.store.get(self.repo, group['group_id'])
+                current_state = (acceptance_snapshot(
+                    db, self.repo, group['group_id'], json.loads(current_group['members']),
+                ) if current_group is not None else None)
+                if (current_group is None or current_state != observed_state
+                        or candidate_token(db,self.repo_path,head,base,documents) != candidate):
+                    raise ManualConflictError(
+                        '수동 제출 관측 뒤 요청·구성 G·리비전·소유권 입력이 변경됐습니다.'
+                    )
+                preparation_gate(self, plan_ids=json.loads(current_group['members']), group=current_group,
+                                 requirements=json.loads(current_group['requirements']),
+                                 inspect_workspace=False, check_git_journal=False)
+                self.store.accept(current_group,head=head,base=base,input_token=candidate,
+                    verify_input_token=verify_input,review_input_token=review_input,
+                    skip_verify=args.skip_verify,skip_review=args.skip_review,
+                    reason=normalize_skip_reason(args.skip_reason))
+
+        db_access.run_database_request(self.connection, accept_submit)
 
     def generate(self, group):
         if group['attempts'] >= 3:

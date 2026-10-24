@@ -509,6 +509,16 @@ class CoordinatedConnection(sqlite3.Connection):
             return super().backup(target, progress=check, sleep=0, **kwargs)
 
 
+def run_database_request(connection, operation):
+    """Run a short DB-only operation with the connection's retry boundary."""
+    run_request = getattr(connection, 'run_request', None)
+    if callable(run_request):
+        return run_request(operation)
+    from .runtime_state import _transaction
+    with _transaction(connection):
+        return operation(connection)
+
+
 def open_connection(path, *, read_only=False, create=True, timeout=30.0, factory=CoordinatedConnection):
     path = Path(path).resolve()
     uri = read_only or not create

@@ -555,7 +555,7 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 배정기의 공통 condition 안에서는 대기열·메모리 실행 자리만 갱신한다. 호출 자리를 먼저 확보하고 공통 condition을 놓은 뒤 DB에서 호출 예약과 배정 cursor를 같은 transaction으로 확정하며, 실패하면 미시작 자리를 반환한다. 종료 시 DB 예약 반환이 확인된 뒤 메모리 자리를 비우고 확인 실패는 종료 불명으로 보존한다. 호출 대기 중 rank를 갱신하고 실제 호출 직전 작업 snapshot·프로젝트 차단·catalog/draft 보류를 재검사한다. 입력 변경은 실패 횟수를 늘리지 않고 단계 재준비로 돌리며, 지속되는 차단·보류는 해당 작업의 대기로 반환한다.
 
-수동 recover의 연결 수명과 transaction 수명은 분리하며, 수동 완료·제출은 외부 profile 관측 뒤 요청·지침 입력을 짧은 transaction에서 다시 확인한다.
+수동 start·complete·submit은 Git·profile 관측 전에 group, 요청, 구성원별 `exec_plans` 전체 행과 수동 소유 fingerprint를 짧은 공통 DB 요청에서 snapshot으로 확보한다. 외부 관측 뒤 적용 요청은 그 snapshot과 후보 입력을 다시 비교하고, `preparation_gate`의 현재 자원·게시 예약을 함께 검사해 소유권·계획 리비전·상태가 그대로일 때만 예약·수락을 원자 적용한다. 차이가 있으면 충돌로 거부해 경쟁 상태와 기존 작업물을 보존한다. `run_database_request`는 이 DB 전용 재확인·적용만 rollback 후 다시 읽어 재시도하며 Git·profile·Agent·검증·게시를 감싸거나 반복하지 않는다.
 
 자동 실행의 `git:*` 자원 충돌은 기존 프로세스 lease를 매번 다시 획득하며 취소·Planner/runtime 중단을 확인한다. 대기는 DB transaction과 실제 Agent/verify 호출 자리를 점유하지 않으며 복구 실패로 기록하지 않는다. 수동 요청과 계획 소유권 충돌은 기존 거부 경계를 유지한다. 일반 차단은 선택된 ExecPlan 전체 row를 관측 기준으로 삼고 지문·Git·Reviewer 자료를 읽은 뒤 짧은 transaction에서 다시 비교한다. 그 사이 row가 바뀌면 오래된 상태를 차단에 적용하지 않고 재검사를 요구한다. BLOCKED Agent 변경 보존·복구 완료는 명시 plan ID의 실행 선택 context에서 Agent snapshot과 recovery 상태를 읽고 갱신한다. 중단 복구 재진입은 `projects`에 남은 복구의 `owner_plan_id`로 대상만 선택한 뒤 그 plan의 최신 recovery와 snapshot을 사용하므로, 낡은 대표 투영을 완료 상태의 원본으로 다시 소비하지 않는다. 소유자 필드가 없는 기존 복구 기록은 `projects` 호환 projection을 상태 원본으로 읽고 완료·재진입에서도 같은 projection을 기준으로 갱신하며, `plan_path`가 ExecPlan을 가리키면 기존 mirror 규칙으로 대상 행도 동기화한다. 대표 `projects` 투영이 다른 작업을 가리켜도 다른 branch의 snapshot과 비교하거나 그 상태를 덮지 않는다. direct rebase 시작·완료는 명시된 plan ID와 실행 선택 context가 함께 있으면 둘의 일치를 효과 전에 확인한다. 완료 처리는 명시된 작업을 선택해 해당 작업의 phase·checkpoint·candidate를 소비하며 다른 plan의 대표 `projects` 투영과 planning 기록은 보존한다. PR head는 선택된 ExecPlan의 실행 상태에서 읽고 프로젝트 등록 origin·base와 안전 gate는 프로젝트 원본을 따른다.
 
@@ -1226,6 +1226,8 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 등록 프로젝트 scheduler는 worker connection에서 DDL 없이 pending을 접수 시각·삽입 순서로 읽고 실행 가능한 첫 요청을 선택한다. 즉시 명령도 같은 순서를 적용해 앞선 실행 가능 요청을 추월하지 않는다. 앞선 요청이 다른 소유자 때문에 대기하면 뒤의 실행 가능한 요청을 선택하고, 그런 요청도 없으면 일반 project runner를 호출하며 대기 요청을 보존한다. 프로젝트별 한 번의 scheduler 방문에서는 선택한 요청 하나를 처리한다.
 
 즉시·지연 실행은 같은 executor에 저장된 요청 identity·계획 범위·현재 설정과 공유 Planner mutex·verify coordinator·runtime mutation·단계 알림 경계를 전달하고 결과·소비를 동일하게 기록한다. 완료한 요청은 다시 처리하지 않는다.
+
+외부 executor 뒤 `complete_request()`·`record_progress()`는 DB 요청 하나에서 `request_id`, `repo`, `plan_id`, `pending` 상태를 확인하고 관측 당시 범위 snapshot과 현재 상태가 같을 때만 전후 snapshot·결과를 기록한다. 잠금 재시도마다 요청과 snapshot을 다시 읽으며 요청 identity·대상·상태가 달라졌으면 기록을 거부하고 pending 요청과 경쟁 변경을 보존한다. 재시도 한도 초과도 pending을 유지한다. 이 경계는 executor를 다시 호출하지 않으므로 Git·Agent·verify·게시·완료 사건은 DB 저장 재시도로 중복되지 않는다.
 
 종료 코드 0은 요청 범위의 원인 해소와 복구 실행 종료를 뜻하며 전체 프로젝트 완료·검증 성공·Merge를 합성하지 않는다. 입력 거부·대기·진행 중·미해결을 성공으로 바꾸거나 별도 차단·실패·교정·승격 이력을 초기화하지 않는다.
 

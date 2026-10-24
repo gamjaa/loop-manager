@@ -202,6 +202,50 @@ def planning_ownership_state(connection, repo, plan_id, execution_row):
     return digest(snapshot), owned
 
 
+def acceptance_snapshot(connection, repo, group_id, plan_ids):
+    """Fingerprint the request, member revisions and ownership used by a manual observation."""
+    group = (connection.execute(
+        'SELECT * FROM manual_work_groups WHERE repo=? AND group_id=?', (repo, group_id),
+    ).fetchone() if group_id else None)
+    declared = []
+    if group is not None:
+        declared, _stored = _validated_group_members(connection, repo, group)
+    targets = sorted(set(plan_ids) | set(declared))
+    membership_rows = []
+    if group_id:
+        membership_rows = [dict(row) for row in connection.execute(
+            'SELECT repo,plan_id,group_id FROM manual_work_members WHERE repo=? AND '
+            '(group_id=? OR plan_id IN (' + ','.join('?' for _ in targets) + ')) '
+            'ORDER BY plan_id,group_id', (repo, group_id, *targets),
+        )]
+    elif targets:
+        membership_rows = [dict(row) for row in connection.execute(
+            'SELECT repo,plan_id,group_id FROM manual_work_members WHERE repo=? AND plan_id IN ('
+            + ','.join('?' for _ in targets) + ') ORDER BY plan_id,group_id', (repo, *targets),
+        )]
+    request = None
+    if group is not None and group['request_id']:
+        row = connection.execute(
+            'SELECT * FROM manual_work_requests WHERE request_id=?', (group['request_id'],),
+        ).fetchone()
+        request = dict(row) if row else None
+    plans = {str(row['plan_id']): dict(row) for row in connection.execute(
+        'SELECT * FROM exec_plans WHERE repo=? AND plan_id IN (' + ','.join('?' for _ in targets)
+        + ') ORDER BY plan_id', (repo, *targets),
+    )} if targets else {}
+    ownership = {
+        plan_id: planning_ownership_state(connection, repo, plan_id, plans.get(plan_id))
+        for plan_id in targets
+    }
+    return digest({
+        'group': dict(group) if group is not None else None,
+        'memberships': membership_rows,
+        'request': request,
+        'plans': plans,
+        'ownership': ownership,
+    })
+
+
 class ManualWorkRepository:
     def __init__(self, connection):
         self.connection = connection
