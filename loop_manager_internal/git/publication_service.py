@@ -12,6 +12,7 @@ from loop_manager_internal.runtime.contracts import PublicationSafetyError
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage.db_access import CoordinatedConnection
 from pathlib import Path
 import re
 from copy import deepcopy
@@ -353,7 +354,7 @@ def push_worker_checkpoint_commits(
     def persist(expected, snapshot, *, head, remote, values=None):
         nonlocal owner
         # Observe Git/PR outside this short CAS. A DB retry never repeats a push.
-        with runtime_state._transaction(connection):
+        def apply(connection):
             selected = effects.active_execplan(connection, repo)
             registration = connection.execute('SELECT origin, base_branch FROM projects WHERE repo=?', (repo,)).fetchone()
             if (registration is None or dict(registration) != dict(project)
@@ -367,7 +368,14 @@ def push_worker_checkpoint_commits(
                 observed_remote_oid=remote, snapshot=snapshot)
             if values:
                 effects.update_project(connection, repo, **values)
-            owner = dict(effects.active_execplan(connection, repo))
+            return result, dict(effects.active_execplan(connection, repo))
+        if isinstance(connection, CoordinatedConnection):
+            result, saved_owner = connection.run_request(apply)
+        else:
+            with runtime_state._transaction(connection):
+                result, saved_owner = apply(connection)
+        # Publish the in-memory owner only after the transaction commits.
+        owner = saved_owner
         return result
 
     def validate_commit(parent, target):

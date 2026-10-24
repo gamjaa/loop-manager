@@ -846,7 +846,7 @@ invocation ledger는 각 호출의 목적·대상과 실제 실행 근거를 연
 
 게시할 변경이 없으면 빈 PR을 만들지 않고 계획 입력 오류로 보존한다. 검증과 결과 재사용의 구체적인 조건은 아래 절을 따른다.
 
-Worker는 의미 있는 작업 단위의 checkpoint를 요청하고 종료한다. Git add·commit·fetch·rebase·push·PR 조작은 Manager가 전담한다. Manager는 종료한 호출의 작업·branch·worktree·시작 HEAD와 보호 문서·선언·index를 확인하고 허용 파일만 commit해 정확한 원격 OID 또는 branch 부재에 결합한 lease로 게시한다. 중간 보존점과 완료 후보는 별도 결과이며 checkpoint만으로 Worker 완료·targeted test·verify·Review 성공을 기록하지 않는다. 과거 직접 commit도 각 중간 commit의 실제 변경 범위를 확인해 게시하며 최종 diff에서 되돌린 금지 변경은 게시하지 않는다. 생성·게시·결과 저장 중단에는 같은 요청·commit·session을 재관측해 완료한 효과를 반복하지 않는다. 게시 실패에는 commit·index·작업물·실패 근거를 보존하고 해결되기 전 새 Worker 작업을 진행하지 않는다.
+Worker는 의미 있는 작업 단위의 checkpoint를 요청하고 종료한다. Git add·commit·fetch·rebase·push·PR 조작은 Manager가 전담한다. Manager는 종료한 호출의 작업·branch·worktree·시작 HEAD와 보호 문서·선언·index를 확인하고 허용 파일만 commit해 정확한 원격 OID 또는 branch 부재에 결합한 lease로 게시한다. 중간 보존점과 완료 후보는 별도 결과이며 checkpoint만으로 Worker 완료·targeted test·verify·Review 성공을 기록하지 않는다. 과거 직접 commit도 각 중간 commit의 실제 변경 범위를 확인해 게시하며 최종 diff에서 되돌린 금지 변경은 게시하지 않는다. 생성·게시·결과 저장 중단에는 같은 요청·commit·session을 재관측해 완료한 효과를 반복하지 않는다. intent와 게시 완료의 DB 확정은 잠금 경합 시 변경 전체를 되돌리고 최신 실행·소유권·checkpoint를 다시 확인해 제한 재시도한다. DB 대기 한도 소진은 실행·교정 실패 횟수를 소비하지 않는 일시 대기이며, 취소도 원래 요청과 이미 확인한 게시 효과를 보존한다. 게시 실패에는 commit·index·작업물·실패 근거를 보존하고 해결되기 전 새 Worker 작업을 진행하지 않는다.
 
 원격 작업 branch가 먼저 전진하면 Manager는 저장소·작업·branch 소유권과 정확한 원격 OID를 재확인한다. 안전한 충돌 없는 rebase를 할 수 있으면 원격 commit을 보존해 통합한 뒤 변경된 후보의 검증·Review 근거를 다시 판단한다. 충돌·lease 경쟁·소유권 불명에서는 양쪽 commit을 보존하고 작업을 보류한다.
 

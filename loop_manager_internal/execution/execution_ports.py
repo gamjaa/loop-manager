@@ -260,6 +260,16 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             connection, identity['repo_path'], identity['state_dir'], identity['repo'],
             plan, remote, pull_request)
     def publish_worker_checkpoints(context, *, allowed_requirement_archives=(), worker_start_head=None):
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        try:
+            return _publish_worker_checkpoints(context,
+                allowed_requirement_archives=allowed_requirement_archives,
+                worker_start_head=worker_start_head)
+        except DatabaseWaitTimeout as error:
+            return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
+                detail=f'Worker checkpoint DB 확정을 기다립니다: {error}')
+
+    def _publish_worker_checkpoints(context, *, allowed_requirement_archives=(), worker_start_head=None):
         from loop_manager_internal.git import publication_service
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
         if context.resolving_rebase:

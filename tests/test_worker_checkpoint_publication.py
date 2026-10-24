@@ -42,6 +42,33 @@ class RemoteWorkAdoptionDatabaseTests(unittest.TestCase):
 
 
 class PullRequestHistoryTests(unittest.TestCase):
+    def test_checkpoint_database_timeout_pauses_without_recovery_budget(self):
+        import loop_manager
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
+        from tests.support.execution import execution_fixture
+
+        fixture = execution_fixture(self)
+        ports = loop_manager._ExecutionLifecyclePorts(
+            fixture.connection, fixture.repository,
+            repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'),
+            base='main', base_sha='base', provider='codex',
+            config_path=Path('/config'), newly_activated=False)
+        context = SimpleNamespace(resolving_rebase=False)
+        before = dict(ports.effects.state.row())
+        for error in (DatabaseWaitTimeout('budget'), sqlite3.OperationalError('SQL error'),
+                      SelfMergeRuntimeHandoff()):
+            with self.subTest(error=type(error).__name__), \
+                 mock.patch.object(ports.effects.state, 'active_execplan', side_effect=error):
+                if isinstance(error, DatabaseWaitTimeout):
+                    outcome = ports.effects.publication.publish_worker_checkpoints(context)
+                    self.assertEqual(outcome.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+                else:
+                    with self.assertRaises(type(error)):
+                        ports.effects.publication.publish_worker_checkpoints(context)
+                self.assertEqual(dict(ports.effects.state.row()), before)
+
     def test_production_ports_forward_history_and_preserve_default_lookup(self):
         import loop_manager
         from tests.support.execution import execution_fixture
@@ -497,6 +524,155 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
 
 
 class WorkerCheckpointPolicyTests(unittest.TestCase):
+    def test_database_requests_retry_or_preserve_the_same_publication(self):
+        from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
+        from loop_manager_internal.storage import db_access
+        from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRace
+        from tests.support.database import runtime_connection
+
+        for phase in ('intent', 'completion'):
+            for mode in ('retry', 'generation', 'owner', 'timeout', 'cancel', 'sql_error'):
+                with self.subTest(phase=phase, mode=mode), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / 'state.db'
+                    source = runtime_connection()
+                    base, head, tree = 'a' * 40, 'b' * 40, 'c' * 40
+                    branch = 'loop-manager/G-047'
+                    source.execute("UPDATE projects SET origin='owner/repo'")
+                    source.execute("UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, "
+                                   "branch=?, worktree='/managed', worker_session_id='same-session', "
+                                   "publication_remote_oid=?, pr_head_oid=?, pr_url='existing-pr'",
+                                   (base, branch, base, base))
+                    source.commit()
+                    checkpoints = ExecutionCheckpointRepository(source)
+                    request = {'session': 'same-session'}
+                    initial = checkpoints.record('repo', 'G-047', expected_generation=0,
+                        operation=None, expected_head=base, target_base_oid=base,
+                        observed_remote_oid=base, snapshot={'worker_checkpoint_request': request,
+                                                           'accepted_work_branch': base})
+                    with sqlite3.connect(path) as destination:
+                        source.backup(destination)
+                    source.close()
+                    connection = db_access.open_connection(path, timeout=.08)
+                    connection.row_factory = sqlite3.Row
+                    reader = sqlite3.connect(path)
+                    self.addCleanup(connection.close)
+                    self.addCleanup(reader.close)
+                    checkpoints = ExecutionCheckpointRepository(connection)
+                    live, pushes, attempts = base, [], []
+                    def git(_path, *args, **kwargs):
+                        nonlocal live
+                        self.assertFalse(connection.in_transaction, args)
+                        if args[0] == 'remote': value = 'https://github.com/owner/repo.git'
+                        elif args[0] == 'symbolic-ref': value = branch
+                        elif args[0] == 'rev-parse': value = tree if args[-1].endswith('^{tree}') else head
+                        elif args[0] == 'ls-remote': value = f'{live}\trefs/heads/{branch}' if live else ''
+                        elif args[0] == 'rev-list': value = f'{head} {base}'
+                        elif args[0] == 'show': value = base
+                        elif args[0] == 'diff': value = 'app.py\0'
+                        elif args[0] == 'merge-base':
+                            return SimpleNamespace(returncode=1 if args[-1] == 'refs/remotes/origin/main' else 0)
+                        elif args[0] == 'push':
+                            pushes.append(args)
+                            live, value = head, ''
+                        else: raise AssertionError(args)
+                        return SimpleNamespace(stdout=value, returncode=0)
+                    def pr(*_):
+                        self.assertFalse(connection.in_transaction)
+                        return {'url': 'existing-pr', 'state': 'OPEN', 'headRefName': branch,
+                                'baseRefName': 'main', 'headRefOid': live}
+                    observe_pr = mock.Mock(side_effect=pr)
+                    effects = publication_service.WorkerCheckpointPublicationEffects(
+                        active_execplan=lambda c, r: c.execute('SELECT * FROM exec_plans').fetchone(),
+                        git=git, remote_branch_oid=lambda *_: live, pr_for_branch=observe_pr,
+                        github_repository=lambda _: 'owner/repo',
+                        validate_execplan_workspace_identity=lambda *_: None,
+                        validate_managed_worktree=lambda *_: None,
+                        update_project=lambda c, r, **values: c.execute(
+                            'UPDATE exec_plans SET publication_remote_oid=?, pr_head_oid=?',
+                            (values['publication_remote_oid'], values['pr_head_oid'])))
+                    record = ExecutionCheckpointRepository.record
+                    def contend(repository, *args, **kwargs):
+                        selected = bool(kwargs['snapshot'].get('worker_checkpoint_history')) == (phase == 'completion')
+                        if selected:
+                            attempts.append(repository.get('repo', 'G-047').generation)
+                        result = record(repository, *args, **kwargs)
+                        if selected and len(attempts) == 1:
+                            if mode == 'sql_error':
+                                connection.execute('UPDATE missing_publication_table SET value=1')
+                            # A real SQLite reader prevents COMMIT after both writes.
+                            reader.execute('BEGIN')
+                            reader.execute('SELECT * FROM exec_plans').fetchall()
+                        return result
+                    pause = db_access._pause
+                    def after_rollback(deadline, interval=.01):
+                        self.assertFalse(connection.in_transaction)
+                        self.assertFalse(connection._held)
+                        saved = checkpoints.get('repo', 'G-047')
+                        self.assertEqual(saved.generation, initial.generation + (phase == 'completion'))
+                        self.assertEqual(tuple(connection.execute(
+                            'SELECT publication_remote_oid, pr_head_oid FROM exec_plans').fetchone()), (base, base))
+                        if mode == 'timeout':
+                            return pause(deadline, interval)
+                        reader.rollback()
+                        if mode == 'cancel':
+                            raise SelfMergeRuntimeHandoff()
+                        if mode in ('generation', 'owner'):
+                            with sqlite3.connect(path) as competitor:
+                                competitor.row_factory = sqlite3.Row
+                                if mode == 'owner':
+                                    competitor.execute("UPDATE exec_plans SET worker_session_id='competing-session'")
+                                else:
+                                    record(ExecutionCheckpointRepository(competitor), 'repo', 'G-047',
+                                        expected_generation=saved.generation, operation=None,
+                                        expected_head=saved.expected_head, target_base_oid=base,
+                                        observed_remote_oid=None,
+                                        snapshot={**saved.snapshot, 'competing': True})
+                    def publish():
+                        return publication_service.push_worker_checkpoint_commits(effects, connection,
+                            Path('/source'), Path(directory), 'repo', 'G-047', branch,
+                            Path('/managed'), 'main', live, pr())
+                    errors = {'generation': CheckpointRace, 'owner': CheckpointRace,
+                              'timeout': db_access.DatabaseWaitTimeout, 'cancel': SelfMergeRuntimeHandoff,
+                              'sql_error': sqlite3.OperationalError}
+                    with mock.patch.object(ExecutionCheckpointRepository, 'record', new=contend), \
+                         mock.patch.object(db_access, '_pause', side_effect=after_rollback):
+                        if mode == 'retry':
+                            self.assertEqual(publish(), (head, 1))
+                            self.assertEqual(len(attempts), 2)
+                            self.assertEqual(attempts[0], attempts[1])
+                        else:
+                            with self.assertRaises(errors[mode]):
+                                publish()
+                    reader.rollback()
+                    saved = checkpoints.get('repo', 'G-047')
+                    self.assertEqual(saved.snapshot['worker_checkpoint_request'], request)
+                    self.assertEqual(connection.execute('SELECT worker_session_id FROM exec_plans').fetchone()[0],
+                                     'competing-session' if mode == 'owner' else 'same-session')
+                    self.assertEqual(len(pushes), int(phase == 'completion' or mode == 'retry'))
+                    observe_pr.assert_called_once()
+                    if mode in ('timeout', 'cancel', 'sql_error'):
+                        if phase == 'completion':
+                            self.assertEqual(saved.snapshot['worker_checkpoint_pending']['target'], head)
+                        # Resume observes the remote result without another push.
+                        publish()
+                        self.assertEqual(len(pushes), 1)
+                    if mode not in ('generation', 'owner'):
+                        saved = checkpoints.get('repo', 'G-047')
+                        self.assertNotIn('worker_checkpoint_pending', saved.snapshot)
+                        self.assertEqual(saved.snapshot['accepted_work_branch'], head)
+                        self.assertEqual(len(saved.snapshot['worker_checkpoint_history']), 1)
+                        self.assertEqual(tuple(connection.execute(
+                            'SELECT publication_remote_oid, pr_head_oid FROM exec_plans').fetchone()), (head, head))
+                    elif mode == 'generation':
+                        self.assertTrue(saved.snapshot['competing'])
+                    if mode in ('generation', 'owner'):
+                        self.assertEqual(tuple(connection.execute(
+                            'SELECT publication_remote_oid, pr_head_oid FROM exec_plans').fetchone()), (base, base))
+                        self.assertEqual(saved.snapshot.get('worker_checkpoint_pending') is not None,
+                                         phase == 'completion')
+                    connection.close()
+                    reader.close()
+
     def test_final_candidate_uses_literal_owned_paths_and_preserves_unsafe_index(self):
         from dataclasses import replace
         from loop_manager_internal.agents.scope_contracts import GitSnapshot
