@@ -186,6 +186,56 @@ class PreservationTests(unittest.TestCase):
         return preservation.preserve(self.effects, self.connection, self.root, self.source,
                                      self.adapter, self.request, 'original branch unavailable')
 
+    def test_same_ref_preserves_each_cause_and_publication_generation(self):
+        self.connection.execute("UPDATE projects SET origin='owner/repo'")
+        first = self.preserve()
+        self.source = replace(self.source, cause_identity='second-cause')
+        second = self.preserve()
+        self.assertEqual(first['branch'], second['branch'])
+        store = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        # Reopening the repository and replaying a cached receipt is idempotent.
+        self.preserve()
+        rows = store.connection.execute('SELECT * FROM diagnostic_ref_uses').fetchall()
+        self.assertEqual({row['cause_identity'] for row in rows}, {'cause', 'second-cause'})
+        self.assertTrue(all(row['origin'] == 'owner/repo' and row['confirmed_oid'] == 'commit'
+                            and row['generation'] == 2 and not row['publication_pending'] for row in rows))
+        self.push.assert_called_once()
+
+    def test_cached_legacy_receipt_cannot_create_confirmed_use(self):
+        first = self.preserve()
+        self.connection.execute('DELETE FROM diagnostic_ref_uses')
+        for _ in range(2):
+            self.assertEqual(self.preserve(), first)
+        row = self.connection.execute('SELECT * FROM diagnostic_ref_uses').fetchone()
+        self.assertIsNone(row['confirmed_oid'])
+        self.assertEqual((row['publication_pending'], row['generation']), (0, 1))
+        self.push.assert_called_once()
+
+    def test_interrupted_push_retains_pending_use_until_confirmed_observation(self):
+        self.push.side_effect = blocked_checkpoint.CheckpointPushError('offline', retryable=True)
+        self.assertEqual(self.preserve()['result'], 'local_only')
+        row = self.connection.execute('SELECT * FROM diagnostic_ref_uses').fetchone()
+        self.assertIsNone(row['confirmed_oid'])
+        self.assertEqual((row['publication_pending'], row['generation']), (1, 1))
+        self.push.side_effect = self._push
+        self.assertEqual(self.preserve()['result'], 'published')
+        row = self.connection.execute('SELECT * FROM diagnostic_ref_uses').fetchone()
+        self.assertEqual((row['confirmed_oid'], row['publication_pending'], row['generation']), ('commit', 0, 2))
+
+    def test_cached_success_from_another_origin_cannot_confirm_old_pending_use(self):
+        self.connection.execute("UPDATE projects SET origin='owner/first'")
+        self.push.side_effect = blocked_checkpoint.CheckpointPushError('offline', retryable=True)
+        self.assertEqual(self.preserve()['result'], 'local_only')
+        self.connection.execute("UPDATE projects SET origin='owner/second'")
+        self.push.side_effect = self._push
+        self.assertEqual(self.preserve()['result'], 'published')
+        self.connection.execute("UPDATE projects SET origin='owner/first'")
+        self.assertEqual(self.preserve()['result'], 'published')
+        rows = {row['origin']: row for row in self.connection.execute('SELECT * FROM diagnostic_ref_uses')}
+        self.assertIsNone(rows['owner/first']['confirmed_oid'])
+        self.assertEqual(rows['owner/second']['confirmed_oid'], 'commit')
+        self.assertEqual(self.push.call_count, 2)
+
     def test_published_artifact_reuses_intent_without_commit_push_or_pr(self):
         first = self.preserve()
         self.assertEqual(first['result'], 'published')
@@ -329,6 +379,209 @@ class PreservationEngineTests(unittest.TestCase):
             '-----BEGIN OPENSSH PRIVATE KEY-----\nprivate-body\n-----END OPENSSH PRIVATE KEY-----')
         self.assertNotIn('password', detail)
         self.assertNotIn('private-body', detail)
+
+
+class ArtifactRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.connection = runtime_connection()
+        self.addCleanup(self.connection.close)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.state = Path(self.directory.name)
+        self.identity = 'a' * 64
+        self.bundle = self.state / 'diagnostic-artifacts' / self.identity
+        self.contents = b'original\0bytes\xff\n'
+        digest = hashlib.sha256(self.contents).hexdigest()
+        original = dict(mode='100755', blob=digest,
+                        oid=hashlib.sha1(b'blob ' + str(len(self.contents)).encode() + b'\0' + self.contents).hexdigest())
+        self.manifest = dict(version=1, scope='plan', owner='G-047', original_branch='branch',
+            revisions={'base': 'b' * 40, 'head': 'c' * 40}, detail={'reason': 'conflict'},
+            files={'app.bin': dict(base={'absent': True}, head=original,
+                index={'1': original, '2': original, '3': original}, worktree=original)},
+            omitted={}, complete=True)
+        self.assets = {'blobs/' + digest: self.contents,
+                       'diff/worktree.patch': b'binary worktree diff',
+                       'diff/staged.patch': b'binary staged diff',
+                       'diff/unstaged.patch': b'binary unstaged diff'}
+        self.saved = dict(repo='repo', scope='plan', owner='G-047', input_identity=self.identity)
+        self.seal()
+        payload = json.loads(self.saved['payload'])
+        store = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        store.preserve('repo', 'plan', 'G-047', self.identity, payload, ref=self.saved['ref'],
+                       tree=self.saved['tree_oid'], commit=self.saved['commit_oid'])
+        self.saved = dict(store.preservation('repo', 'plan', 'G-047', self.identity))
+
+    def seal(self, algorithm='sha1'):
+        self.assets['manifest.json'] = json.dumps(self.manifest, sort_keys=True).encode()
+        tree, commit = preservation.artifact_identity(self.assets, algorithm)
+        ref = blocked_checkpoint.diagnostic_branch('repo', 'G-047', 'branch',
+            self.manifest['revisions']['base'], commit, tree)
+        payload = dict(result='published', diagnostic=True, artifact_path=str(self.bundle),
+            original_branch='branch', base_oid=self.manifest['revisions']['base'], branch=ref,
+            commit_oid=commit, cause=self.manifest['detail'], cause_identity='cause',
+            complete=True, omitted={})
+        self.saved.update(ref=ref, tree_oid=tree, commit_oid=commit, payload=json.dumps(payload))
+        self.bundle.mkdir(parents=True, exist_ok=True)
+        for path in self.bundle.rglob('*'):
+            if path.is_file():
+                path.unlink()
+        for name, content in self.assets.items():
+            target = self.bundle / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+    def test_orphan_bytes_modes_diff_and_manifest_recover_without_git(self):
+        assets, manifest = preservation.load_verified_artifacts(self.state, self.saved)
+        self.assertEqual(assets, self.assets)
+        self.assertEqual(manifest, self.manifest)
+        original = manifest['files']['app.bin']['worktree']
+        self.assertEqual(assets['blobs/' + original['blob']], self.contents)
+        self.assertEqual(original['mode'], '100755')
+        # Original symlink data is a regular blob; recovery never follows it.
+        original['mode'] = '120000'
+        self.manifest = manifest
+        self.seal()
+        self.assertEqual(preservation.load_verified_artifacts(self.state, self.saved)[1], self.manifest)
+
+    def test_missing_and_corrupt_artifacts_are_rejected(self):
+        for name, data in self.assets.items():
+            path = self.bundle / name
+            for replacement in (None, b'corrupt'):
+                with self.subTest(name=name, replacement=replacement):
+                    if replacement is None:
+                        path.unlink()
+                    else:
+                        path.write_bytes(replacement)
+                    with self.assertRaises((OSError, RuntimeError)):
+                        preservation.load_verified_artifacts(self.state, self.saved)
+                    path.write_bytes(data)
+
+    def test_identity_mismatches_and_legacy_missing_bundle_are_rejected(self):
+        for field, value in (('input_identity', '../outside'), ('owner', 'G-048'),
+                             ('scope', 'project'), ('commit_oid', 'd' * 40),
+                             ('tree_oid', 'e' * 40), ('ref', 'branch')):
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                preservation.load_verified_artifacts(self.state, dict(self.saved, **{field: value}))
+        absent = dict(self.saved, input_identity='f' * 64)
+        payload = json.loads(absent['payload'])
+        payload['artifact_path'] = str(self.bundle.parent / absent['input_identity'])
+        absent['payload'] = json.dumps(payload)
+        with self.assertRaises(OSError):
+            preservation.load_verified_artifacts(self.state, absent)
+
+    def test_matching_tree_is_insufficient_for_incomplete_or_invalid_manifest(self):
+        baseline = json.dumps(self.manifest)
+        mutations = [
+            lambda m: m.update(complete=False),
+            lambda m: m.update(omitted={'secret': 'excluded'}),
+            lambda m: m.update(version=True),
+            lambda m: m['revisions'].update(head=None),
+            lambda m: m['files']['app.bin'].pop('base'),
+            lambda m: m['files']['app.bin'].update(base={'absent': 1}),
+            lambda m: m['files']['app.bin']['worktree'].update(mode='160000'),
+            lambda m: m['files']['app.bin']['worktree'].update(mode=[]),
+            lambda m: m['files']['app.bin']['worktree'].update(unavailable='bytes'),
+            lambda m: m['files']['app.bin']['worktree'].update(oid='f' * 40),
+            lambda m: m['files'].update({'../outside': m['files'].pop('app.bin')}),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                self.manifest = json.loads(baseline)
+                mutate(self.manifest)
+                self.seal()
+                with self.assertRaises(RuntimeError):
+                    preservation.load_verified_artifacts(self.state, self.saved)
+
+    def test_missing_diff_and_unreferenced_blobs_are_rejected_even_with_matching_tree(self):
+        original = self.assets.pop('diff/staged.patch')
+        self.seal()
+        with self.assertRaisesRegex(RuntimeError, 'diff'):
+            preservation.load_verified_artifacts(self.state, self.saved)
+        self.assets['diff/staged.patch'] = original
+        self.assets['blobs/' + 'f' * 64] = b'unreferenced'
+        self.seal()
+        with self.assertRaisesRegex(RuntimeError, 'diff'):
+            preservation.load_verified_artifacts(self.state, self.saved)
+
+    def test_autostash_diffs_and_each_original_version_are_required(self):
+        versions = self.manifest['files']['app.bin']
+        for label in ('stash-base', 'stash', 'staged-original'):
+            self.manifest['revisions'][label] = 'd' * 40
+            versions[label] = dict(versions['head'])
+        self.assets.update({'diff/stash.patch': b'stash diff',
+                            'diff/staged-original.patch': b'staged original diff'})
+        self.seal()
+        self.assertEqual(preservation.load_verified_artifacts(self.state, self.saved)[1], self.manifest)
+        self.assets.pop('diff/stash.patch')
+        self.seal()
+        with self.assertRaisesRegex(RuntimeError, 'diff'):
+            preservation.load_verified_artifacts(self.state, self.saved)
+
+    def test_bundle_and_parent_symlinks_are_rejected(self):
+        blob = next((self.bundle / 'blobs').iterdir())
+        for path in (blob, self.bundle / 'manifest.json', self.bundle / 'blobs',
+                     self.bundle, self.bundle.parent):
+            with self.subTest(path=path):
+                original = path.with_name(path.name + '-original')
+                path.rename(original)
+                try:
+                    try:
+                        path.symlink_to(original, target_is_directory=original.is_dir())
+                    except OSError as error:
+                        self.skipTest('native symlink unavailable: ' + str(error))
+                    with self.assertRaises(RuntimeError):
+                        preservation.load_verified_artifacts(self.state, self.saved)
+                    with self.assertRaises(RuntimeError):
+                        preservation._save_assets(self.state, self.identity, self.assets)
+                finally:
+                    if path.is_symlink():
+                        path.unlink()
+                    original.rename(path)
+
+    def test_file_change_while_reading_is_rejected(self):
+        original_read = Path.read_bytes
+        def read(path):
+            data = original_read(path)
+            if path.name == 'manifest.json':
+                path.write_bytes(data + b' ')
+            return data
+        with mock.patch.object(Path, 'read_bytes', read), self.assertRaisesRegex(RuntimeError, '변경'):
+            preservation.load_verified_artifacts(self.state, self.saved)
+
+    def test_orphan_identity_matches_native_git_and_survives_object_database_removal(self):
+        # Native Git is needed only to check the serialized tree/commit contract.
+        # No remote, branch publication or recovery-policy combinations run here.
+        import shutil
+        from tests.support.git import git_command, git_test_environment
+        worktree = self.state / 'native'
+        worktree.mkdir()
+        for algorithm in ('sha1', 'sha256'):
+            with self.subTest(algorithm=algorithm):
+                for versions in self.manifest['files'].values():
+                    entries = [value for key, value in versions.items() if key != 'index']
+                    entries.extend(versions['index'].values())
+                    for entry in entries:
+                        if 'oid' in entry:
+                            entry['oid'] = hashlib.new(algorithm,
+                                b'blob ' + str(len(self.contents)).encode() + b'\0' + self.contents).hexdigest()
+                self.seal(algorithm)
+                git_command(worktree, 'init', '--object-format=' + algorithm)
+                before = (worktree / '.git/HEAD').read_bytes()
+                def git(path, *args, **kwargs):
+                    environment = dict(kwargs.get('env', {}))
+                    environment.update({key: value for key, value in git_test_environment().items()
+                                        if key in {'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM',
+                                                   'GIT_TEMPLATE_DIR', 'GIT_ATTR_NOSYSTEM', 'XDG_CONFIG_HOME'}})
+                    return result(git_command(path, *args, env=environment))
+                source = SimpleNamespace(worktree=worktree)
+                effects = preservation.PreservationEffects(git, mock.Mock(), mock.Mock())
+                actual = preservation._commit(effects, self.state, source, self.assets)
+                self.assertEqual(actual, preservation.artifact_identity(self.assets, algorithm))
+                self.assertEqual((worktree / '.git/HEAD').read_bytes(), before)
+                self.assertFalse((worktree / '.git/index').exists())
+                self.assertEqual(git_command(worktree, 'show', '-s', '--format=%P', actual[1]), '')
+                shutil.rmtree(worktree / '.git')
+                self.assertEqual(preservation.load_verified_artifacts(self.state, self.saved)[0], self.assets)
 
 
 class PreservationBoundaryTests(unittest.TestCase):

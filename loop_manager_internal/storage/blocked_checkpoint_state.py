@@ -75,6 +75,16 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         repo TEXT NOT NULL, plan_id TEXT NOT NULL, cause_identity TEXT NOT NULL,
         payload TEXT NOT NULL, PRIMARY KEY (repo, plan_id)
     )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS diagnostic_ref_uses (
+        repo TEXT NOT NULL, scope TEXT NOT NULL, owner TEXT NOT NULL,
+        ref TEXT NOT NULL, cause_identity TEXT NOT NULL,
+        input_identity TEXT NOT NULL, origin TEXT NOT NULL,
+        original_branch TEXT NOT NULL, tree_oid TEXT NOT NULL,
+        commit_oid TEXT NOT NULL, cause TEXT NOT NULL,
+        confirmed_oid TEXT, publication_pending INTEGER NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (repo, scope, owner, ref, cause_identity, input_identity, origin)
+    )""")
     columns = {row[1] for row in connection.execute("PRAGMA table_info(blocked_checkpoints)")}
     for name in (
         "published_oid", "accepted_remote_oid", "pending_remote_oid",
@@ -619,6 +629,43 @@ class DiagnosticPublicationRepository:
             'SELECT * FROM diagnostic_preservations WHERE repo = ? AND scope = ? '
             'AND owner = ? AND input_identity = ?', (repo, scope, owner, identity)).fetchone()
 
+    def _record_use(self, repo, scope, owner, identity, payload, *, ref, tree,
+                    commit, pending, confirm=False):
+        """Keep every cause/target binding; a cached receipt is not a new intent.
+
+        Called inside the existing intent/receipt transaction. Missing legacy
+        evidence stays unconfirmed rather than acquiring ownership by backfill.
+        """
+        cause_identity = payload.get('cause_identity')
+        branch = payload.get('original_branch')
+        if not all((ref, tree, commit, cause_identity, branch)):
+            return
+        project = self.connection.execute(
+            'SELECT origin FROM projects WHERE repo = ?', (repo,)).fetchone()
+        origin = (project['origin'] or '') if project else ''
+        key = (repo, scope, owner, ref, cause_identity, identity, origin)
+        previous = self.connection.execute(
+            'SELECT * FROM diagnostic_ref_uses WHERE repo=? AND scope=? AND owner=? '
+            'AND ref=? AND cause_identity=? AND input_identity=? AND origin=?', key).fetchone()
+        cause = json.dumps(payload.get('cause', {}), sort_keys=True)
+        if previous and (previous['original_branch'], previous['tree_oid'],
+                         previous['commit_oid'], previous['cause']) != (branch, tree, commit, cause):
+            raise RuntimeError('진단 ref 사용의 원인·게시 identity가 변경됐습니다.')
+        confirmed = previous['confirmed_oid'] if previous else None
+        if previous and previous['publication_pending'] and confirm:
+            confirmed = commit
+        self.connection.execute(
+            'INSERT INTO diagnostic_ref_uses '
+            '(repo, scope, owner, ref, cause_identity, input_identity, origin, '
+            'original_branch, tree_oid, commit_oid, cause, confirmed_oid, publication_pending) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(repo, scope, owner, ref, cause_identity, input_identity, origin) '
+            'DO UPDATE SET confirmed_oid=excluded.confirmed_oid, '
+            'publication_pending=excluded.publication_pending, generation=generation+1 '
+            'WHERE confirmed_oid IS NOT excluded.confirmed_oid '
+            'OR publication_pending != excluded.publication_pending',
+            (*key, branch, tree, commit, cause, confirmed, int(pending)))
+
     def preserve(self, repo, scope, owner, identity, payload, *, ref=None,
                  tree=None, commit=None, retryable=False, revalidate=None):
         with self.connection:
@@ -628,6 +675,10 @@ class DiagnosticPublicationRepository:
             if previous and previous['commit_oid'] and (
                     previous['ref'], previous['tree_oid'], previous['commit_oid']) != (ref, tree, commit):
                 raise RuntimeError('진단 보존 intent가 변경됐습니다.')
+            self._record_use(repo, scope, owner, identity, payload, ref=ref,
+                tree=tree, commit=commit, pending=retryable,
+                confirm=bool(previous and json.loads(previous['payload']).get('result') != 'published'
+                             and payload.get('result') == 'published'))
             self.connection.execute(
                 'INSERT INTO diagnostic_preservations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '
                 '(SELECT COALESCE(MAX(observed_order), 0) + 1 FROM diagnostic_preservations)) '
@@ -644,6 +695,8 @@ class DiagnosticPublicationRepository:
         return json.loads(row[0]) if row else None
 
     def intent(self, request, *, base_oid, head_oid, tree_oid, cause):
+        from loop_manager_internal.recovery import scoped_blocking
+
         ref = diagnostic_branch(request.repo, request.plan_id, request.branch,
                                 base_oid, head_oid, tree_oid)
         with self.connection:
@@ -653,12 +706,18 @@ class DiagnosticPublicationRepository:
                 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                 (request.repo, request.plan_id, ref, request.branch, base_oid,
                  head_oid, tree_oid, cause))
-        row = self.connection.execute(
-            'SELECT * FROM blocked_diagnostic_publications WHERE repo = ? AND plan_id = ? AND ref = ?',
-            (request.repo, request.plan_id, ref)).fetchone()
-        if (row['original_branch'], row['base_oid'], row['head_oid'], row['tree_oid']) != (
-                request.branch, base_oid, head_oid, tree_oid):
-            raise RuntimeError('진단 게시 intent의 작업물 identity가 변경됐습니다.')
+            row = self.connection.execute(
+                'SELECT * FROM blocked_diagnostic_publications WHERE repo = ? AND plan_id = ? AND ref = ?',
+                (request.repo, request.plan_id, ref)).fetchone()
+            if (row['original_branch'], row['base_oid'], row['head_oid'], row['tree_oid']) != (
+                    request.branch, base_oid, head_oid, tree_oid):
+                raise RuntimeError('진단 게시 intent의 작업물 identity가 변경됐습니다.')
+            block = scoped_blocking.project_block(self.connection, request.repo)
+            if block is not None and block['plan_id'] == request.plan_id:
+                self._record_use(request.repo, 'project', request.plan_id, '',
+                    dict(original_branch=request.branch, cause=dict(block),
+                         cause_identity=scoped_blocking.project_cause_identity(block)),
+                    ref=ref, tree=tree_oid, commit=head_oid, pending=True)
         return row
 
     def result(self, repo, plan_id, cause_identity, payload, *, intent=None):
@@ -707,6 +766,10 @@ class DiagnosticPublicationRepository:
                     (repo, plan_id, intent['ref']))
                 if changed.rowcount != 1:
                     raise RuntimeError('진단 게시 intent 결과가 변경됐습니다.')
+                self._record_use(repo, 'project', plan_id, '',
+                    dict(payload, cause=dict(block), cause_identity=cause_identity),
+                    ref=intent['ref'], tree=intent['tree_oid'],
+                    commit=intent['head_oid'], pending=False, confirm=True)
             elif payload.get('result') == 'published':
                 request = self.connection.execute(
                     'SELECT branch, worktree, phase, remote_oid FROM blocked_checkpoints '

@@ -8,9 +8,10 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import sqlite3
+import stat
 import tempfile
 from typing import Callable
 
@@ -179,6 +180,8 @@ def collect(effects, source, snapshot):
 def _commit(effects, state_dir, source, assets):
     directory = state_dir / 'diagnostic-artifacts'
     directory.mkdir(parents=True, exist_ok=True)
+    if directory.is_symlink():
+        raise RuntimeError('진단 자료 디렉터리가 symlink입니다.')
     with tempfile.TemporaryDirectory(dir=directory) as temporary:
         root = Path(temporary)
         environment = {name: value for name, value in os.environ.items() if not name.startswith('GIT_')}
@@ -207,10 +210,11 @@ def _save_assets(state_dir, identity, assets):
     """Retain inspected bytes across object GC and interrupted commit/push."""
     directory = state_dir / 'diagnostic-artifacts'
     directory.mkdir(parents=True, exist_ok=True)
+    if directory.is_symlink():
+        raise RuntimeError('진단 자료 디렉터리가 symlink입니다.')
     bundle = directory / identity
-    if bundle.exists():
-        if bundle.is_symlink() or any((bundle / name).is_symlink()
-                                     or (bundle / name).read_bytes() != data for name, data in assets.items()):
+    if bundle.exists() or bundle.is_symlink():
+        if _read_assets(bundle) != assets:
             raise RuntimeError('관리 진단 자료의 identity가 변경됐습니다.')
         return
     with tempfile.TemporaryDirectory(dir=directory) as temporary:
@@ -227,6 +231,143 @@ def _save_assets(state_dir, identity, assets):
                 _sync_directory(subdirectory)
         os.replace(root, bundle)
         _sync_directory(directory)
+
+
+def _read_assets(bundle):
+    """Read regular bundle files only, rejecting redirected or changing paths."""
+    def signature(path, directory=False):
+        value = path.lstat()
+        if not (stat.S_ISDIR(value.st_mode) if directory else stat.S_ISREG(value.st_mode)):
+            raise RuntimeError('진단 bundle에 일반 파일이 아닌 경로가 있습니다.')
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns,
+                value.st_ctime_ns)
+
+    roots = {bundle.parent: signature(bundle.parent, True), bundle: signature(bundle, True)}
+    assets = {}
+    for path in sorted(bundle.iterdir()):
+        if path.name in {'blobs', 'diff'}:
+            roots[path] = signature(path, True)
+            files = sorted(path.iterdir())
+        else:
+            files = [path]
+        for file in files:
+            before = signature(file)
+            assets[file.relative_to(bundle).as_posix()] = file.read_bytes()
+            if signature(file) != before:
+                raise RuntimeError('진단 bundle을 읽는 중 파일이 변경됐습니다.')
+    if any(signature(path, True) != before for path, before in roots.items()):
+        raise RuntimeError('진단 bundle을 읽는 중 경로가 변경됐습니다.')
+    return assets
+
+
+def artifact_identity(assets, algorithm):
+    """Rebuild this fixed orphan format without Git objects, refs or an index."""
+    def oid(kind, data):
+        return hashlib.new(algorithm, kind + b' ' + str(len(data)).encode() + b'\0' + data).digest()
+
+    groups = {'': []}
+    for name, data in sorted(assets.items()):
+        parent, _, leaf = name.rpartition('/')
+        if parent not in {'', 'blobs', 'diff'} or not leaf or '/' in leaf:
+            raise RuntimeError('진단 bundle의 자료 경로가 유효하지 않습니다.')
+        groups.setdefault(parent, []).append(b'100644 ' + leaf.encode('ascii') + b'\0' + oid(b'blob', data))
+    root = {entry.split(b'\0', 1)[0].split(b' ', 1)[1]: entry for entry in groups['']}
+    for name in sorted(set(groups) - {''}):
+        root[name.encode()] = b'40000 ' + name.encode() + b'\0' + oid(b'tree', b''.join(groups[name]))
+    tree = oid(b'tree', b''.join(root[key] for key in sorted(root))).hex()
+    author = b'Loop Manager <loop-manager@localhost> 946684800 +0000\n'
+    commit = oid(b'commit', b'tree ' + tree.encode() + b'\nauthor ' + author +
+                 b'committer ' + author + b'\nLoop Manager diagnostic artifacts\n').hex()
+    return tree, commit
+
+
+def load_verified_artifacts(state_dir, saved):
+    """Return recoverable bytes and modes, or a preservation reason via exception.
+
+    SQLite's immutable publication intent binds the orphan tree and commit. A
+    fresh Git object database, worktree or remote ref is deliberately unnecessary.
+    """
+    identity = saved['input_identity']
+    if not isinstance(identity, str) or re.fullmatch('[0-9a-f]{64}', identity) is None:
+        raise RuntimeError('진단 bundle의 입력 identity가 유효하지 않습니다.')
+    payload = json.loads(saved['payload'])
+    bundle = Path(state_dir) / 'diagnostic-artifacts' / identity
+    if (not isinstance(payload, dict) or payload.get('artifact_path') != str(bundle)
+            or payload.get('diagnostic') is not True
+            or not isinstance(payload.get('original_branch'), str) or not payload['original_branch']):
+        raise RuntimeError('진단 bundle의 저장 경로 identity가 다릅니다.')
+    assets = _read_assets(bundle)
+    tree, commit = saved['tree_oid'], saved['commit_oid']
+    if not isinstance(tree, str) or re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', tree) is None:
+        raise RuntimeError('진단 bundle의 저장 tree identity가 유효하지 않습니다.')
+    algorithm = 'sha1' if len(tree) == 40 else 'sha256'
+    if artifact_identity(assets, algorithm) != (tree, commit):
+        raise RuntimeError('진단 bundle의 tree·commit identity가 다릅니다.')
+    if 'manifest.json' not in assets:
+        raise RuntimeError('진단 manifest가 없습니다.')
+    manifest = json.loads(assets['manifest.json'])
+    if (not isinstance(manifest, dict) or type(manifest.get('version')) is not int
+            or manifest['version'] != 1 or manifest.get('scope') != saved['scope']
+            or manifest.get('owner') != saved['owner']
+            or manifest.get('original_branch') != payload.get('original_branch')
+            or not isinstance(manifest.get('detail'), dict)
+            or manifest.get('detail') != payload.get('cause')
+            or manifest.get('complete') is not True or manifest.get('omitted') != {}
+            or payload.get('complete') is not True or payload.get('omitted') != {}
+            or not isinstance(manifest.get('files'), dict)
+            or not isinstance(manifest.get('revisions'), dict)
+            or not {'base', 'head'} <= set(manifest['revisions'])
+            or not all(isinstance(key, str) and key and isinstance(value, str) and value
+                       for key, value in manifest['revisions'].items())):
+        raise RuntimeError('진단 manifest의 identity 또는 원문 완전성을 확인할 수 없습니다.')
+    required = {'manifest.json'}
+    for name, versions in manifest['files'].items():
+        relative = PurePosixPath(name)
+        if (not name or relative.is_absolute() or '..' in relative.parts or '\\' in name
+                or '\0' in name or any(part.casefold() == '.git' for part in relative.parts)
+                or not isinstance(versions, dict)
+                or set(versions) != set(manifest['revisions']) | {'index', 'worktree'}
+                or not isinstance(versions['index'], dict)
+                or not set(versions['index']) <= {'0', '1', '2', '3'}):
+            raise RuntimeError('진단 원문 경로 또는 버전이 유효하지 않습니다.')
+        originals = [value for key, value in versions.items() if key != 'index']
+        originals.extend(versions['index'].values())
+        for original in originals:
+            if not isinstance(original, dict):
+                raise RuntimeError('진단 원문의 bytes·모드가 유효하지 않습니다.')
+            if set(original) == {'absent'} and original['absent'] is True:
+                continue
+            digest = original.get('blob')
+            if (not isinstance(original.get('mode'), str)
+                    or original['mode'] not in {'100644', '100755', '120000'}
+                    or not isinstance(digest, str) or re.fullmatch('[0-9a-f]{64}', digest) is None
+                    or not set(original) <= {'mode', 'blob', 'oid'}):
+                raise RuntimeError('진단 원문의 bytes·모드가 유효하지 않습니다.')
+            key = 'blobs/' + digest
+            if key not in assets:
+                raise RuntimeError('진단 원문 blob이 없습니다.')
+            data = assets[key]
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise RuntimeError('진단 원문 blob의 identity가 다릅니다.')
+            if 'oid' in original:
+                header = b'blob ' + str(len(data)).encode() + b'\0'
+                if hashlib.new(algorithm, header + data).hexdigest() != original['oid']:
+                    raise RuntimeError('진단 원문의 Git blob identity가 다릅니다.')
+            required.add(key)
+    if manifest['files']:
+        labels = {'worktree', 'staged', 'unstaged'}
+        if 'stash-base' in manifest['revisions']:
+            labels.update({'stash', 'staged-original'})
+        required.update('diff/' + label + '.patch' for label in labels)
+    if set(assets) != required:
+        raise RuntimeError('진단 bundle의 diff·blob·manifest 자료가 누락되거나 다릅니다.')
+    if (payload.get('branch'), payload.get('commit_oid')) != (saved['ref'], commit):
+        raise RuntimeError('진단 bundle의 게시 identity가 다릅니다.')
+    expected_ref = blocked_checkpoint.diagnostic_branch(saved['repo'], saved['owner'],
+        payload['original_branch'], manifest['revisions'].get('base'), commit, tree)
+    if saved['ref'] != expected_ref or payload.get('base_oid') != manifest['revisions'].get('base'):
+        raise RuntimeError('진단 bundle의 ref·base identity가 다릅니다.')
+    return assets, manifest
 
 
 def preserve(effects, connection, state_dir, source, adapter, request, original_reason):
