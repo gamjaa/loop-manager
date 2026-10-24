@@ -30,6 +30,7 @@ depends_on:
   - G-266
   - G-267
   - G-268
+  - G-317
 complexity: high
 risk: high
 priority: high
@@ -53,7 +54,7 @@ priority: high
 - [ ] 확인한 `loop_manager_internal/execution/execution_review_handler.py`의 `_review_entry_evidence()`·Review 처리와 publication 후보 확인, storage의 기존 validation/checkpoint 경계를 확장한다. `verification/inputs.py`·`manager_adapter.py`와 `execution/result_validation.py`에 남은 환경/runtime 완전성 gate의 전환은 G-241이 담당하며 이 작업에서 중복 구현하지 않는다. 그 결과의 코드 입력 receipt와 실제 Reviewer 호출 identity를 분리하되 필수 선행 검증 관계를 유지한다. R-086의 preliminary_reviews·실제 전체 run ID·최종 승격 및 게시 재확인 경계를 보존하고, 부분 token/receipt를 전체 검증 증거로 읽거나 일반 선행 단계를 다시 구현하지 않는다.
 - [ ] 직접 구현된 `agents/common_guidance.py:runtime_content_hash()`·`plan_content_hash()`와 invocation ledger의 실제 전달 해시를 재사용한다. 현재 전체 원본 해시와 승인 당시 실제 Reviewer instruction을 별도로 보존·비교하며 common 본문만으로 역할·Ponytail 변경을 누락하지 않는다. 과거 JSON·Markdown snapshot과 `common_guidance_versions`는 감사로만 보존하고 그 누락·손상을 현재 호출의 거부 조건으로 되살리지 않는다. 승인 당시 입력 근거가 부족하거나 실제 외부 검토 기준을 확인할 수 없으면 새 Review를 선택하며 과거 증거를 현재 값으로 합성하지 않는다. 문서 source fallback/예약어 규칙 버전과 G-171의 최종 문서 diff 보고는 유지한다.
 - [ ] 실제 Reviewer 호출에는 G-197의 최종 후보 검증 근거 전달 경계를 재사용한다. verify 성공을 재사용했으면 원래 성공 근거와 현재 입력의 동일성 확인을 전달하고, 새 verify를 실행한 것으로 보고하지 않는다.
-- [ ] G-262의 준비된 실행 환경·실제 설정 관측과 G-263/G-264의 provider별 공통 홈/소비 source를 사용한다. 역할별 임시 경로와 공통 홈을 구분하고 실제 현재 설정 생성·교체 및 최종 검사 뒤 변경을 같은 비밀값 없는 환경/정책 identity에 반영한다. 사용하지 않는 과거 runtime config·개인 config를 조회·복원하거나 인증 cache를 추가하지 않는다. 과거 환경의 증거 부재나 확인 불가를 동일성으로 대용하지 않는다.
+- [ ] G-262의 준비된 실행 환경·실제 설정 관측과 G-263/G-264의 provider별 공통 홈/소비 source, G-317의 native 지침 해석·최종 설정 동일성 근거를 사용한다. 역할별 임시 경로와 공통 홈을 구분하고 실제 현재 설정 생성·교체 및 최종 검사 뒤 변경을 같은 비밀값 없는 환경/정책 identity에 반영한다. 지침 해석 완료 뒤 증거 갱신 전 설정 변경으로 현재 관측이 거부되면 과거 승인과 동일하다고 대용하지 않는다. provider 경계의 검사 자체는 선행 구현을 소비하며 사용하지 않는 과거 runtime config·개인 config를 조회·복원하거나 인증 cache를 추가하지 않는다. 과거 환경의 증거 부재나 확인 불가를 동일성으로 대용하지 않는다.
 - [ ] 자동 역할·권한·검증은 매 호출 현재 선택 runtime의 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md instruction을 사용하고, 설계·계획 작성은 docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 프로젝트 지침 해석은 Agent CLI에 맡기며 Manager가 루트 지침을 읽거나 과거 승인·patch를 Review receipt에 추가하지 않는다. 기존 helper·관련 테스트와 R-064의 예약 경로를 유지한다.
 
 ## Validation
@@ -65,7 +66,7 @@ priority: high
 - 실제 Review가 필요한 경우 실행한 verify 또는 재사용한 verify의 유효한 근거가 같은 후보에 결합돼 전달되는지 확인한다. Review 생략은 새 Reviewer 호출·새 테스트 실행 근거를 만들지 않는다.
 - 단계별 문서 변경 뒤 선행 PASS·VERIFY_REQUIRED·최종 PASS를 구분하고, 일반 verify 재사용 및 새 완료 조건의 증거 부재에서 최종 Review를 잘못 생략하지 않는 최소 unit case를 확인한다.
 - R-085 fixture에서 실제 미소비 개인 설정만 변경한 경우와 관리 home/source·소비 설정/정책 변경·과거 환경 identity 부재를 분리한다. 실제 no-call/필수 Reviewer call·기존 receipt 보존·비밀값 비노출을 확인하며 모의 인증 성공을 실계정 실행 근거로 사용하지 않는다.
-- 공통 홈의 정상 설정 생성/교체 뒤에는 새 현재 설정 관측을 사용하고 낡은 설정의 Review를 재사용하지 않는다. 호출별 소유 임시 경로 정규화가 다른 worktree/role/정책 변경을 숨기지 않는지 기존 provider execution fixture로 확인한다. R-085 Non-Goals의 session/CLI·실계정/OS 호환성 미수행을 별도 선행 gate로 추가하지 않으며 현재 호출의 실제 격리/완료 증거는 계속 요구한다.
+- 공통 홈의 정상 설정 생성/교체 뒤에는 새 현재 설정 관측을 사용하고 낡은 설정의 Review를 재사용하지 않는다. G-317의 지침 해석 완료→증거 갱신 사이 변경 거부를 소비해 동일성 미확인에서 Review를 생략하지 않는지 확인하며 provider의 원자 교체 회귀를 다시 구현하지 않는다. 호출별 소유 임시 경로 정규화가 다른 worktree/role/정책 변경을 숨기지 않는지 기존 provider execution fixture로 확인한다. R-085 Non-Goals의 session/CLI·실계정/OS 호환성 미수행을 별도 선행 gate로 추가하지 않으며 현재 호출의 실제 격리/완료 증거는 계속 요구한다.
 
 ## Progress
 
@@ -77,6 +78,8 @@ priority: high
 - [x] 2026-10-11 delta 검토: PR 전 snapshot token `4e4794ea5a72e4acbf130a00b86c65166feb4676b19e417a33a4af84e631cb28`, revision `6fc245469a6bd3cced81dbf64fc049130982bbc8`와 원본 hash `94dc14021dce370d8033c0c91bf1ab0dcea013699e1240603e397a78571a4314`를 대조했다. R-085의 미구현 실행 환경 전환을 기존 최종 Review 동일성 목표에 연결했다. 기존 기록을 보존하며 구현·테스트·전체 verify는 실행하지 않았다.
 
 ## Decision Log
+
+- 이번 delta는 최종 설정 지문만으로 native 지침 해석 입력의 동일성을 대용할 수 없는 잔여 경계를 G-317로 분리해 선행 연결한다. 이 계획은 그 실제 호출/현재 관측 증거를 최종 Review 재사용에서 소비하며 provider 검사를 재구현하지 않는다. snapshot token `b25626c9f0d22f95b03568ae3107cb6ef6c15ddf4022c860e429a278286ac16f`과 원문 hash를 확인했고 ID·경로·기존 목표·metadata·dependency·수행 기록을 보존한다. 정적 검토이며 구현·테스트·verify 성공이나 프로젝트 최종 전문 확인이 아니다.
 
 - revision `e5bddd3ac59afa446cce932f57d287d912b6c68b`의 R-064/R-072와 직접 구현된 현재 지침 선택·호출별 해시를 대조했다. 과거 기록의 작업별 고정 조건은 이번 개정으로 대체하고 마지막 실제 승인과 현재 입력을 비교하는 기존 재사용 목표·dependency는 보존한다. 지침 전달 자체를 재구현하거나 과거 PASS를 최신 지침의 성공으로 소급하지 않는다. snapshot token `e2935128fd0ed8e25abee0c202494be4aeab70b45eb9cc478432a59dfd1af059`의 원문 hash를 확인한 delta 개정이며 구현·테스트는 실행하지 않았다.
 
