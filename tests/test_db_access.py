@@ -24,6 +24,15 @@ class DatabaseAccessTests(unittest.TestCase):
             self.connection.execute('CREATE TABLE sample(id INTEGER PRIMARY KEY, value INTEGER)')
             self.connection.executemany('INSERT INTO sample VALUES (?,0)', [(1,), (2,), (3,)])
 
+    def test_existing_only_writer_cannot_create_missing_database(self):
+        missing = self.path.parent / 'missing.db'
+        with self.assertRaises(sqlite3.OperationalError):
+            open_connection(missing, create=False)
+        self.assertFalse(missing.exists())
+        with closing(open_connection(self.path, create=False)) as connection, connection:
+            connection.execute('UPDATE sample SET value=7 WHERE id=1')
+        self.assertEqual(self.connection.execute('SELECT value FROM sample WHERE id=1').fetchone()[0], 7)
+
     def test_open_iteration_does_not_retain_a_read_lock(self):
         cursor = self.connection.execute('SELECT * FROM sample ORDER BY id')
         self.assertEqual(cursor.fetchone(), (1, 0))

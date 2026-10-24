@@ -657,7 +657,7 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
             self.handler._run_managed_rebase(self.fixture.context(), 'wrong-target')
         self.fixture.effects.workspace.git.assert_not_called()
 
-    def test_new_rebase_preserves_nested_prior_operation_audit_without_cycles(self):
+    def test_new_rebase_keeps_prior_operation_history_without_recursive_embedding(self):
         self.handler._complete_rebase_intent(self.fixture.context())
         saved = self.checkpoint.get('repo', 'G-047')
         prior = {**saved.snapshot, 'rebase_operation_history': [{'before_head': 'older'}]}
@@ -671,9 +671,26 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
             self.handler._record_rebase_intent(self.handler._context(), 'advanced-base')
         current = self.checkpoint.get('repo', 'G-047')
         self.assertEqual(current.target_base_oid, 'advanced-base')
-        self.assertEqual(current.snapshot['rebase_operation_history'], [{'before_head': 'older'}, prior])
+        prior_entry = {key: value for key, value in prior.items() if key != 'rebase_operation_history'}
+        self.assertEqual(current.snapshot['rebase_operation_history'], [{'before_head': 'older'}, prior_entry])
         self.assertNotIn('current_rebase_acceptance', current.snapshot)
         self.assertEqual(current.snapshot['current_rebase_acceptance_history'][-1], prior['current_rebase_acceptance'])
+
+        # Repeated rebase starts retain each old operation once instead of doubling its history.
+        import json
+        first_size = len(json.dumps(current.snapshot))
+        for number in range(6):
+            self.checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+                operation=None, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid='remote', snapshot=current.snapshot)
+            with mock.patch.object(handlers.manager_git_journal, 'live_remote_branch_oid', return_value='remote'), \
+                 mock.patch.object(handlers.manager_git_journal, 'begin_current_rebase', return_value='new-audit'):
+                self.handler._record_rebase_intent(self.handler._context(), f'advanced-base-{number}')
+            current = self.checkpoint.get('repo', 'G-047')
+        self.assertEqual(len(current.snapshot['rebase_operation_history']), 8)
+        self.assertTrue(all('rebase_operation_history' not in entry
+                            for entry in current.snapshot['rebase_operation_history']))
+        self.assertLess(len(json.dumps(current.snapshot)), first_size * 9)
 
     def test_only_confirmed_worker_patch_carries_candidate_token_to_manager_commit(self):
         from tests.support.revision import definition

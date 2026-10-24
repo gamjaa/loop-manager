@@ -970,6 +970,29 @@ class CommonGuidanceProviderTests(unittest.TestCase):
             self.assertEqual(call.kwargs['env'], {'CODEX_HOME': 'runtime-home'})
         self.assertEqual(self.guidance.instruction_path.read_text(), self.text)
 
+    def test_codex_preserves_additional_tools_but_ignores_transport_ids(self):
+        import tomllib
+        for changed in (False, True):
+            calls = []
+            def probe(arguments, **context):
+                raw = self.native_probe(arguments, **context)
+                if arguments == ['codex', '--version']:
+                    return raw
+                items = json.loads(raw)
+                calls.append(items)
+                name = 'changed_tool' if changed and len(calls) == 3 else 'project_tool'
+                items.insert(0, {'type': 'additional_tools', 'role': 'developer',
+                    'id': f'probe-{len(calls)}', 'tools': [{'name': name}]})
+                return json.dumps(items)
+            with self.subTest(changed=changed), mock.patch.object(self.provider_guidance, '_probe', side_effect=probe):
+                if changed:
+                    with self.assertRaisesRegex(self.provider_guidance.GuidanceError, '기존 지침 보존'):
+                        self.provider_guidance.codex_arguments(self.guidance, self.worktree)
+                else:
+                    args = self.provider_guidance.codex_arguments(self.guidance, self.worktree)
+                    self.assertEqual(tomllib.loads(args[1])['developer_instructions'], self.existing + '\n\n' + self.text)
+            self.assertEqual(len(calls), 3)
+
     def test_capability_and_native_probes_filter_manager_secrets_and_keep_launch_environment(self):
         def run(arguments, **context):
             return subprocess.CompletedProcess(arguments, 0, self.native_probe(arguments, **context))

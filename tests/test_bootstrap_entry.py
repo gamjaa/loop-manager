@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -394,6 +395,74 @@ class BootstrapEntryTests(unittest.TestCase):
             self.assertEqual(runtime.commit_sha, latest)
             self.assertEqual(git(runtime.path, "rev-parse", "HEAD"), latest)
 
+
+    def test_bootstrap_recovers_hot_journal_before_reading_registered_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'
+            source.mkdir()
+            state_dir = Path(directory) / 'state'
+            state_dir.mkdir()
+            database = state_dir / 'loop-manager.db'
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute('CREATE TABLE projects (repo TEXT, base_branch TEXT)')
+                connection.execute("INSERT INTO projects VALUES (?, 'develop')", (str(source),))
+                connection.execute('CREATE TABLE payload (data BLOB)')
+                connection.executemany('INSERT INTO payload VALUES (?)', [(b'original' * 2048,)] * 16)
+            # A real abrupt exit is needed to exercise SQLite's hot-journal rollback.
+            child = """import os, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute('PRAGMA cache_size=1')
+c.execute('BEGIN IMMEDIATE')
+c.execute("UPDATE projects SET base_branch='uncommitted'")
+c.execute('UPDATE payload SET data=zeroblob(16384)')
+os._exit(0)
+"""
+            subprocess.run([sys.executable, '-c', child, str(database)], check=True)
+            self.assertTrue(database.with_name('loop-manager.db-journal').is_file())
+            with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as connection:
+                with self.assertRaises(sqlite3.OperationalError) as failed:
+                    connection.execute('SELECT base_branch FROM projects').fetchone()
+                self.assertEqual(failed.exception.sqlite_errorcode, sqlite3.SQLITE_READONLY_ROLLBACK)
+            self.assertEqual(loop_manager._bootstrap_service().bootstrap_base_branch(
+                source, state_dir, 'owner/repo'), 'develop')
+            self.assertFalse(database.with_name('loop-manager.db-journal').exists())
+            with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as connection:
+                self.assertEqual(connection.execute('SELECT data FROM payload LIMIT 1').fetchone()[0], b'original' * 2048)
+                self.assertEqual({row[1] for row in connection.execute('PRAGMA table_info(projects)')},
+                                 {'repo', 'base_branch'})
+
+    def test_bootstrap_does_not_retry_other_readonly_errors_with_write_access(self):
+        from loop_manager_internal.runtime import bootstrap
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            (state_dir / 'loop-manager.db').touch()
+            error = sqlite3.OperationalError('read-only filesystem')
+            error.sqlite_errorcode = sqlite3.SQLITE_READONLY
+            with mock.patch.object(bootstrap, 'open_connection', side_effect=error) as opening:
+                with self.assertRaises(sqlite3.OperationalError) as failed:
+                    loop_manager._bootstrap_service().bootstrap_base_branch(state_dir, state_dir, 'owner/repo')
+            self.assertIs(failed.exception, error)
+            opening.assert_called_once_with(state_dir / 'loop-manager.db', read_only=True, create=False, timeout=5)
+
+    def test_bootstrap_does_not_create_a_database_removed_before_journal_recovery(self):
+        from loop_manager_internal.runtime import bootstrap
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = state_dir / 'loop-manager.db'
+            database.touch()
+            original_open = bootstrap.open_connection
+            error = sqlite3.OperationalError('rollback required')
+            error.sqlite_errorcode = sqlite3.SQLITE_READONLY_ROLLBACK
+            def opening(path, **kwargs):
+                if kwargs['read_only']:
+                    database.unlink()
+                    raise error
+                return original_open(path, **kwargs)
+            with mock.patch.object(bootstrap, 'open_connection', side_effect=opening) as opened:
+                with self.assertRaises(sqlite3.OperationalError):
+                    loop_manager._bootstrap_service().bootstrap_base_branch(state_dir, state_dir, 'owner/repo')
+            self.assertEqual(opened.call_count, 2)
+            self.assertFalse(database.exists())
 
     def test_bootstrap_reads_legacy_registration_without_migrating_it(self):
         with tempfile.TemporaryDirectory() as directory:

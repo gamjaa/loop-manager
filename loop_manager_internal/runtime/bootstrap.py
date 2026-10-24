@@ -521,20 +521,27 @@ class BootstrapService:
 
 
     def bootstrap_base_branch(self, source: Path, state_dir: Path, origin: str) -> str:
-        """Read a registered self base without changing SQLite before the handoff."""
+        """Read a registered self base, recovering only a hot rollback journal if needed."""
 
         database = state_dir / "loop-manager.db"
         if not database.is_file():
             return "main"
-        with closing(open_connection(database, read_only=True, timeout=5)) as connection, connection:
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
-            if not {"repo", "base_branch"} <= columns:
-                raise RuntimeError("상태 DB의 프로젝트 등록 정보를 읽을 수 없습니다.")
-            origin_column = "origin" if "origin" in columns else "NULL AS origin"
-            registered_filter = "WHERE registered = 1" if "registered" in columns else ""
-            rows = connection.execute(
-                f"SELECT repo, base_branch, {origin_column} FROM projects {registered_filter}"
-            ).fetchall()
+        for read_only in (True, False):
+            try:
+                with closing(open_connection(database, read_only=read_only, create=False, timeout=5)) as connection, connection:
+                    columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
+                    if not {"repo", "base_branch"} <= columns:
+                        raise RuntimeError("상태 DB의 프로젝트 등록 정보를 읽을 수 없습니다.")
+                    origin_column = "origin" if "origin" in columns else "NULL AS origin"
+                    registered_filter = "WHERE registered = 1" if "registered" in columns else ""
+                    rows = connection.execute(
+                        f"SELECT repo, base_branch, {origin_column} FROM projects {registered_filter}"
+                    ).fetchall()
+                break
+            except sqlite3.OperationalError as error:
+                if not read_only or getattr(error, 'sqlite_errorcode', None) != sqlite3.SQLITE_READONLY_ROLLBACK:
+                    raise
+                # SQLite needs one writable open to roll back an interrupted transaction.
         # A registered alias or another worktree must not select the bootstrap base.
         matches = [row for row in rows if row[0] == str(source)]
         if len(matches) > 1:

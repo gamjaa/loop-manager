@@ -230,7 +230,7 @@ ExecPlan은 [PLANS.md](PLANS.md)의 고정 key/value와 `sources`·`depends_on` 
 | PR Open·Closed·Merged 상태 | GitHub |
 | Model·Effort·동시 실행 수·Telegram 설정 | `config/config.ini` |
 
-SQLite는 `<state-dir>/loop-manager.db`에 저장하고 상태 변경은 transaction으로 기록한다. 현재 문서의 원본은 Git이며 경로·내용 해시로 연결한다. 복구·사용자 결정·문서 수정본 검증에 필요한 원문·snapshot은 별도 증거로 SQLite에 보존할 수 있으며 현재 문서의 원본을 대신하지 않는다.
+SQLite는 `<state-dir>/loop-manager.db`에 저장하고 상태 변경은 transaction으로 기록한다. bootstrap의 등록 조회는 읽기 전용으로 시작하며 `SQLITE_READONLY_ROLLBACK`일 때만 기존 DB를 쓰기 연결로 한 번 다시 열어 SQLite의 미완료 트랜잭션 복구를 허용한다. 같은 DB 접근 조율을 유지하고 schema migration·등록 변경·다른 오류의 우회는 하지 않는다. runtime gate의 pause 조회가 DB를 기다리는 동안 같은 실행 context의 pause 재진입만 억제하며 확정된 runtime 종료 결정은 중첩 확인에서도 적용한다. 현재 문서의 원본은 Git이며 경로·내용 해시로 연결한다. 복구·사용자 결정·문서 수정본 검증에 필요한 원문·snapshot은 별도 증거로 SQLite에 보존할 수 있으며 현재 문서의 원본을 대신하지 않는다.
 
 SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 과거 등록·승인 감사, 마지막 성공 Planner의 명세·전체 계획 입력 지문과 `planning_error`, 복구 가능한 planning publication intent, ExecPlan 메타데이터와 의존성, 최초 실행 여부, 실행 상태와 재시도 횟수, AI Agent 세션, worktree, branch, PR, 삭제된 미착수 ExecPlan의 ID 예약·감사 기록, `cleanup_pending`, 알림과 프로젝트 완료 주기를 저장한다.
 
@@ -802,7 +802,7 @@ CLI·OS별 실행 전제는 [인증과 실행 조건](OPERATIONS.md#인증과-�
 |---|---|
 | 실행 환경 준비 | `AgentRequest.prepared_launch`가 worktree·repository·role의 공통 홈과 호출별 임시 저장을 provider 조회 전에 선택한다. legacy profile callback도 `prepared_environment`의 같은 필터된 mapping을 사용하며 부모 `os.environ`·호출자 mapping은 바꾸지 않는다. |
 | 모델 호출 없는 사전 검사 | 현재 CLI·설정·확장·역할 정책과 별도 `codex sandbox` 안의 파일 도구 경계를 검사한다. version 조회 뒤와 feature 조회 뒤 sandbox probe 전에 설정 정책을 다시 확인하고, sandbox probe 뒤에도 안정된 최종 설정 지문을 계산한다. 조회 사이 설정이 충돌 상태로 바뀌면 다음 Codex 조회 전에 중단한다. 실제 Agent 실행을 감싸는 wrapper나 모델 호출·중첩 도구 시연과 구분한다. |
-| 실행 직전 | 같은 환경의 인증·Model/Effort·Fast·native 지침을 확인하고 workspace·설정·CLI와 인증 링크를 재검사한다. 준비 조회가 안전한 설정을 바꿨으면 새 내용을 다시 검사해 최종 격리·실행 지문에 결합한다. 최종 증거를 invocation에 저장한 뒤 process handoff에서도 설정·workspace snapshot을 확인하고 실제 `codex exec`를 시작한다. |
+| 실행 직전 | 같은 환경의 인증·Model/Effort·Fast·native 지침을 확인하고 workspace·설정·CLI와 인증 링크를 재검사한다. native developer의 `additional_tools`는 전송 ID를 제외한 정의를 전후 비교하며 지침 메시지로 해석하지 않는다. 준비 조회가 안전한 설정을 바꿨으면 새 내용을 다시 검사해 최종 격리·실행 지문에 결합한다. 최종 증거를 invocation에 저장한 뒤 process handoff에서도 설정·workspace snapshot을 확인하고 실제 `codex exec`를 시작한다. |
 | 종료 | 프로세스 그룹 또는 Windows Job의 정리·wait 성공 뒤에만 종료 콜백을 호출한다. 시작·writer 종료·결과 성공·검증 성공은 별도 사실로 기록한다. |
 
 `provider_execution.observe`는 모델 실행 없이 현재 Codex Reviewer의 입력을 확인하거나 지정한 실제 invocation의 완료 기록을 읽는다. `execution_identity`의 문자열 필드는 `provider`·`model`·`effort`·`instruction`·`environment`·`policy`이며 지침·환경·정책은 지문으로 저장한다. 실제 호출 identity는 process 시작 전에 한 번 결합하고 현재 설정을 과거 행에 소급하지 않는다. credential 값·그 값의 해시·prompt 원문은 저장하지 않는다.
@@ -995,6 +995,8 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 rebase의 검사 시점은 [R-055](requirements/%5BR-055%5D%20차단%20경로%20전수%20조사와%20불필요한%20작업%20중단%20축소.md#불필요한-중단의-수정)를 따른다. 시작에는 repository·계획·worktree·branch·시작 HEAD·고정 target·원격/PR·writer·index 안전·작업물 보존 조건만 확인하고 파일·선언을 비교·복구 기준으로 기록한다. 최신 target 선언과의 일치·역할별 전체 diff·문서/archive 최종 내용·과거 definition snapshot 존재는 시작 gate가 아니다. 공통 현재 상태 서비스는 현재 소유 branch가 아직 target을 포함하지 않는 형상을 시작 입력으로 구분한다. 시작 HEAD의 누락·노후화는 최종 범위 위반이 아니며, 실제 새 rebase를 시작할 때 현재 HEAD를 checkpoint와 journal에 결합하고 이전 시작 근거는 감사로 보존한다. 진행 중 operation의 `orig-head`·`head-name`·`onto` 검사는 유지한다. rebase 전 변경 관측은 target과 현재 HEAD의 merge-base를 사용하므로 base에만 추가된 문서·archive를 작업 branch의 삭제·되돌림으로 읽지 않는다. target 자체의 유효한 작업 identity·비draft 선언은 확인하고 현재 worktree의 최종 선언 검사는 유예한다. 시작·중간 형상에서 구성한 서비스가 완료 형상을 관측하면 최종 계약을 새로 구성하도록 요구하며 유예한 검사를 완료 승인으로 재사용하지 않는다.
 
 Worker 종료 후에는 해당 호출이 만든 변경의 역할별 허용 범위를 검사한다. commit 재생·일부 stage·autostash 복원 중간 형상은 전체 최종 후보로 검사하지 않는다. Git 완료 후 고정 target의 선택 ExecPlan frontmatter를 본문·mode·다른 작업물 보존 하에 복원하고 갱신한 checkpoint·서비스·HEAD에서 최종 선언·전체 diff·보호 문서·archive를 검사한 뒤 채택한다. 최종 금지 변경·잘못된 선언은 거부한다. 충돌 해결 Agent의 sandbox는 계속 적용하며 Git 전후 차이를 접근 권한 위반으로 추정하지 않는다. 관측 중 단계가 바뀌면 재관측하고 최종 archive 계약을 새로 구성한다. `REBASE_HEAD`·`MERGE_MSG`·`MERGE_MODE`만 남은 상태는 controlling operation이나 autostash 복원 대기로 취급하지 않는다.
+
+`execution_checkpoints.snapshot.rebase_operation_history`는 이전 operation의 상태를 순서대로 보존하되 새 항목에서 같은 history 필드를 제외한다. 이전 history는 바깥 배열에 한 번만 유지하므로 새 rebase를 시작할 때 기존 이력 전체가 다시 중첩되지 않는다. 현재 실행·acceptance·원격 lease의 필드와 과거 operation 상태의 감사는 유지한다.
 
 시작 전 Worker branch·target의 merge-base 이후 문서·코드 형상은 소유 operation의 재생·보존 입력으로 기록한다. 이 기록은 역할별 전체 diff의 허용 판정이나 Worker 변경 승인이 아니다. Requirement·ExecPlan의 자동 채택은 고정 target 원문·경로·identity에 결합하고 최종 문서·archive 및 Worker 결과의 판정은 각 완료 시점에 수행한다.
 

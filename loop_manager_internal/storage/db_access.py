@@ -341,10 +341,12 @@ class CoordinatedConnection(sqlite3.Connection):
             return super().backup(target, progress=check, **kwargs)
 
 
-def open_connection(path, *, read_only=False, timeout=30.0, factory=CoordinatedConnection):
+def open_connection(path, *, read_only=False, create=True, timeout=30.0, factory=CoordinatedConnection):
     path = Path(path).resolve()
-    database = path.as_uri() + '?mode=ro' if read_only else str(path)
-    connection = sqlite3.connect(database, timeout=timeout, uri=read_only, factory=factory)
+    uri = read_only or not create
+    mode = 'ro' if read_only else 'rw'
+    database = path.as_uri() + '?mode=' + mode if uri else str(path)
+    connection = sqlite3.connect(database, timeout=timeout, uri=uri, factory=factory)
     connection.configure_access(path, timeout)
     connection._read_only = read_only
     return connection

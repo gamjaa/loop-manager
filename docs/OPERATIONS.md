@@ -183,6 +183,8 @@ Windows에서는 `.\.venv\Scripts\python.exe`와 `D:\repo\my-project` 같은 경
 
 **SQLite와 기존 감사 자료를 함께 백업한다.** 과거 `agent-guidance/` snapshot은 감사에만 보존하며 재개 지침은 매 호출 현재 runtime에서 읽는다. `agent-instructions/`의 실행용 파일은 현재 원본으로 재생성할 수 있다. [지침 적용 계약](ARCHITECTURE.md#지침-원본과-호출별-적용)
 
+비정상 종료 뒤 `SQLITE_READONLY_ROLLBACK`은 DB 파일 권한 부족과 구분한다. bootstrap은 해당 오류에만 쓰기 연결을 한 번 사용해 SQLite가 미완료 트랜잭션을 복구하도록 한다. 수동 조치가 필요하면 다른 실행과 DB 접근을 정지·조율하고 DB와 같은 이름의 `-journal` 파일을 함께 보존한 뒤 SQLite의 정상 복구를 사용한다. 원인과 무관한 권한 변경이나 journal 삭제로 우회하지 않는다. pause DB의 접근 경합에서도 pause 확인은 자기 자신을 재귀 호출하지 않고 기존 대기 제한과 실제 중단 결정을 유지한다.
+
 SQLite가 없거나 손상되면 일반 `run`은 자동 초기화하지 않는다. 백업을 복원하거나 손상 DB를 별도 보관한 뒤 명시적으로 `config init`·재등록한다. 자동 상태 재구성은 지원하지 않는다.
 
 Merge 확인 후 clean하고 PR head에 없는 로컬 commit이 없는 worktree만 Merge·Squash·Rebase 방식과 관계없이 정리한다. 불확실한 작업 공간은 `cleanup_pending`으로 보존한다. 다음 작업·프로젝트 완료를 막지 않으며 안전 조건 충족·경로 부재 시 자동 해제된다.

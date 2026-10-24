@@ -2,7 +2,7 @@
 
 ## Summary
 
-자동 Agent의 공통·역할 지침을 현재 선택된 최신 runtime 원본에서 매 호출 읽어 provider의 developer/system instruction으로 전달하고, 프로젝트 CLI 지침 및 작업별 prompt와 분리한다. 직접 대화형 작업은 관련 활성 Requirement를 재사용·갱신하되 ExecPlan을 선작성하지 않으며 Skill에는 문서 작성·검토 규칙만 둔다. 지침 파일 변경의 PR 문서 보고는 파일명·요약·이유·영향만 표시하고, 원본 버전·session·호출 감사와 기존 권한·검증·게시 경계를 유지한다.
+자동 Agent의 공통·역할 지침을 현재 선택된 최신 runtime 원본에서 매 호출 읽어 provider의 developer/system instruction으로 전달하고, 프로젝트 CLI 지침 및 작업별 prompt와 분리한다. Codex native developer 입력의 도구 정의는 지침 메시지와 구분해 보존한다. 직접 대화형 작업은 관련 활성 Requirement를 재사용·갱신하되 ExecPlan을 선작성하지 않으며 Skill에는 문서 작성·검토 규칙만 둔다. 지침 파일 변경의 PR 문서 보고는 파일명·요약·이유·영향만 표시하고, 원본 버전·session·호출 감사와 기존 권한·검증·게시 경계를 유지한다.
 
 ## Context
 
@@ -16,7 +16,7 @@
 - 실행 지침의 원본은 Loop Manager runtime의 `docs/AGENTS.common.md`와 역할별 `docs/AGENTS.planner.md`·`docs/AGENTS.planner_check.md`·`docs/AGENTS.worker.md`·`docs/AGENTS.reviewer.md`다. 공통에는 모든 자동 역할에 적용되는 기준만 남기고, 특정 역할의 권한·금지사항·작성·판단·검토·검증 절차는 해당 역할 파일에 둔다. 파일들은 이어붙일 실행 지침이므로 자신의 구성·합성·snapshot·버전 관리에 대한 설명을 넣지 않는다. 초기 분리는 기존 루트 AGENTS와 역할 prompt의 규칙을 기준으로 필요한 내용만 옮기며 기준 revision·분리 내용·이유를 구현 PR에서 설명한다. 루트에는 Loop Manager 개발에 필요한 작업 지침만 두며 docs의 규칙·스펙과 코드·문서로 쉽게 확인할 수 있는 설명을 반복하지 않는다.
 - 게시된 공통·역할별 파일이 이후 실행 원본이다. 각 프로젝트에 복사하지 않고 프로그램이 선택한 게시된 runtime worktree의 내용을 사용한다. source checkout의 로컬 편집이나 선택한 작업 worktree·등록 프로젝트의 동명 파일을 실행 지침의 원본으로 사용하지 않는다.
 - Manager는 일반·유지보수·수동 제출 Planner에 common+planner, 읽기 전용 점검에 common+planner_check, Worker에 common+worker, Reviewer에 common+reviewer를 합쳐 전달한다. 다른 역할의 상세 지침을 한 호출에 함께 넣지 않는다. 합친 실행용 파일은 저장소 밖 Manager 상태 디렉터리에만 만들며 커밋하지 않는다. 실행용 파일은 현재 runtime 원본에서 생성하며 작업별 원본 snapshot은 저장하지 않는다. 새 호출의 선택은 R-082를 따르며 ExecPlan·코드 변경만의 점검 Planner는 제거한다. 기존 점검 원본·snapshot·호출 기록은 호환·감사를 위해 보존하고, 원본이나 profile이 있다는 사실을 새 호출 사유로 사용하지 않는다.
-- 모든 지원 역할·provider의 신규·재개·복구 호출에 common+해당 역할 내용을 Codex의 추가 developer instruction 또는 Claude의 append system prompt로 전달한다. provider의 기본 지침과 기존 추가 지침, 프로젝트 규칙을 보존한다. 정적 공통·역할 규칙은 사용자 메시지에 복사하지 않으며 작업별 목표·snapshot·승인 사실·피드백·결과 형식만 prompt에 둔다.
+- 모든 지원 역할·provider의 신규·재개·복구 호출에 common+해당 역할 내용을 Codex의 추가 developer instruction 또는 Claude의 append system prompt로 전달한다. provider의 기본 지침과 기존 추가 지침, 프로젝트 규칙을 보존한다. Codex native developer 입력에 추가 도구 정의가 있으면 지침 메시지로 오인하지 않고 전후 동일성을 확인한다. 조회별 전송 ID 차이만 무시하며 실제 도구 정의 변경·알 수 없는 developer 형식은 거부한다. 정적 공통·역할 규칙은 사용자 메시지에 복사하지 않으며 작업별 목표·snapshot·승인 사실·피드백·결과 형식만 prompt에 둔다.
 - 공통·역할별 instruction은 Loop Manager 자동 실행의 역할·권한·승인·검증·게시 책임에 적용한다. 프로젝트의 언어·코딩 규칙·빌드 방법은 프로젝트 지침을 따른다. 프로젝트 지침이나 작업별 사용자 prompt만으로 자동 실행 권한을 넓히거나 필요한 승인을 생략하지 않는다. 제품 목표의 의미를 바꿔야 해결되는 충돌은 사용자 판단을 기다린다.
 
 ### 로컬 직접 작업과 자동 실행의 경계

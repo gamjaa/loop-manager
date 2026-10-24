@@ -53,7 +53,9 @@ def _developer_texts(arguments: list[str], worktree: Path,
                 if not isinstance(item.get("tools"), list) or any(
                         not isinstance(tool, dict) for tool in item["tools"]):
                     raise ValueError("unsupported developer tools")
-                # Tool declarations are separate from developer instruction text.
+                # Compare tool definitions, ignoring only unstable transport IDs.
+                texts.append(json.dumps({key: value for key, value in item.items() if key != "id"},
+                                        ensure_ascii=False, sort_keys=True))
                 continue
             if item.get("type") != "message" or not isinstance(item.get("content"), list):
                 raise ValueError("unsupported developer message")
