@@ -15,6 +15,7 @@ from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
 
 
 _context = ContextVar("operation_context", default={})
+_active_progress = ContextVar("operation_progress", default=None)
 _output_lock = threading.Lock()
 PROGRESS_INTERVAL_SECONDS = 30
 
@@ -53,45 +54,76 @@ def emit(message: str, *, level="INFO", **fields) -> None:
         operation_log(OperationLogEffects(local_now), message, level=level, **fields)
 
 
+class _ProgressReporter:
+    def __init__(self):
+        self.stopped = threading.Event()
+        self._lock = threading.Lock()
+        self._paused = 0
+
+    def pause(self):
+        with self._lock:
+            self._paused += 1
+
+    def resume(self):
+        with self._lock:
+            self._paused -= 1
+
+    def should_report(self):
+        with self._lock:
+            return not self._paused and not self.stopped.is_set()
+
+
 @contextmanager
 def progress(label: str, *, describe=None, interval=None):
-    """관측만 복사한 스레드에서 상태를 출력하며 SQLite·실행 상태는 건드리지 않는다."""
-    if _context.get().get("progress_active"):
-        yield
-        return
-    stopped, started = threading.Event(), time.monotonic()
+    """중첩 관측이 부모 heartbeat를 잠시 이어받으며 실행 상태는 건드리지 않는다."""
+    parent = _active_progress.get()
+    if parent is not None:
+        parent.pause()
+    reporter = _ProgressReporter()
+    progress_token = _active_progress.set(reporter)
+    context_token = _context.set({**_context.get(), "progress_active": True})
+    started = time.monotonic()
     interval = PROGRESS_INTERVAL_SECONDS if interval is None else interval
     def report():
-        while not stopped.wait(interval):
+        while not reporter.stopped.wait(interval):
+            if not reporter.should_report():
+                continue
             try:
                 try:
                     fields = describe() if describe else {}
                 except Exception:
                     fields = {"progress_observation": "미확인"}
-                if stopped.is_set():
+                if reporter.stopped.is_set():
                     break
+                if not reporter.should_report():
+                    continue
                 emit(f"{label} 진행 중", elapsed_seconds=round(time.monotonic() - started, 1),
                      **fields)
             except Exception:
                 pass  # 선택적 관측 실패로 실행 결과를 바꾸지 않는다.
-    token = _context.set({**_context.get(), "progress_active": True})
     thread = threading.Thread(target=copy_context().run, args=(report,), daemon=True)
     try:
         thread.start()
     except (OSError, RuntimeError):
-        _context.reset(token)
+        _active_progress.reset(progress_token)
+        _context.reset(context_token)
+        if parent is not None:
+            parent.resume()
         yield
         return
     try:
         yield
     finally:
-        stopped.set()
+        reporter.stopped.set()
         thread.join(timeout=1)
-        _context.reset(token)
+        _active_progress.reset(progress_token)
+        _context.reset(context_token)
+        if parent is not None:
+            parent.resume()
 
 
 @contextmanager
-def activity(label: str, *, heartbeat=False, **fields):
+def activity(label: str, *, heartbeat=False, error_level="WARN", **fields):
     """짧은 처리는 종료 한 줄, 긴 처리는 주기적 관측과 종료 결과를 기록한다."""
     from contextlib import nullcontext
     started, result = time.monotonic(), {}
@@ -100,7 +132,8 @@ def activity(label: str, *, heartbeat=False, **fields):
             yield result
     except BaseException as error:
         handoff = isinstance(error, SelfMergeRuntimeHandoff)
-        emit(f"{label} 종료", level="INFO" if handoff else "WARN",
+        level = "INFO" if handoff else error_level if isinstance(error, Exception) else "WARN"
+        emit(f"{label} 종료", level=level,
              result="runtime_handoff" if handoff else "미확인" if not isinstance(error, Exception) else "실패",
              error_type=type(error).__name__, elapsed_seconds=round(time.monotonic() - started, 1), **fields)
         raise
@@ -150,5 +183,9 @@ def operation_print(effects: OperationPrintEffects, *values: object, **kwargs: o
 
     output = kwargs.get("file", sys.stdout)
     separator = str(kwargs.get("sep", " "))
-    effects.operation_log(separator.join(str(value) for value in values),
-                          error=output is sys.stderr or bool(kwargs.get("error")))
+    level = kwargs.get("level")
+    effects.operation_log(
+        separator.join(str(value) for value in values),
+        error=output is sys.stderr or bool(kwargs.get("error")),
+        **({"level": level} if level is not None else {}),
+    )

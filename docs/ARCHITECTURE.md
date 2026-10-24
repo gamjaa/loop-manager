@@ -1491,11 +1491,15 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 공백이나 구분자가 있는 값은 따옴표와 escape로 경계를 보존하고, 값의 줄바꿈이 별도 사건처럼 출력되지 않게 한다. 병렬 처리에서도 사건별 문맥을 섞지 않고 즉시 출력한다. `INFO`는 stdout, `WARN`·`ERROR`는 stderr로 출력하되, JSON·원문 등 명령의 결과 전용 stdout에는 운영 로그를 섞지 않고 stderr를 사용한다. provider 원문·검증 진단 등 기존 상세 기록의 고유 형식을 이 포맷으로 강제 변환하지 않는다.
 
+프로젝트 결과의 수준은 `ProjectRunKind`로 정한다. `completed`·`waiting`·`usage_limit_pause`·`runtime_handoff`는 INFO, `transient_pause`는 WARN, `blocked`·`configuration_error`·`operational_error`는 ERROR다. 전체 실행 요약은 프로젝트 결과 종류 중 가장 높은 수준을 쓰고, `failed` 집계와 명령 종료 코드는 기존 exit code를 그대로 사용한다. 따라서 복구 요청의 접수·대기·진행 상태를 나타내는 비정상 종료 코드만으로 최종 ERROR를 만들지 않으며, 자동 재검사가 가능한 일시 Git lock도 WARN으로 남긴다.
+
+명령의 결과 stdout 여부는 `main()`이 파싱한 Namespace와 출력 계약으로 고정한다. `status --json`과 `document-drafts show/generate/create`만 운영 로그를 stderr로 보낸다. 문서 수정본은 `review_artifact_bytes()`의 bytes를 그대로 stdout에 쓰며 formatter를 통과시키지 않는다. bootstrap 부모는 파싱된 명령의 출력·repository·plan 문맥으로 runtime 준비를 기록하고, runtime 자식은 전달된 실행 ID와 자신의 파싱 결과로 같은 경계를 다시 선택한다. repository 값에 포함된 `--json`·`--raw` 문자열은 경계를 바꾸지 않는다.
+
 ### 기록 원본과 보호
 
 작업 상태와 복구 판단의 원본은 기존 SQLite·Git·GitHub 관측이며 운영 로그를 파싱해 상태 전이·재시도·차단을 결정하지 않는다. 운영 로그의 문구와 요약은 Telegram 메시지와 같이 프로그램 코드가 이미 관측·확정한 결과를 정해진 형식에 대입해 결정적으로 생성한다. 로그 작성·요약에 AI를 사용하지 않으며, 이를 위한 모델·Agent 호출이나 검증·원격 조회를 추가 실행하지 않는다. 상세 근거는 기존 invocation ledger·검증 진단·상태 디렉터리의 기록에 연결하며, 긴 원문을 운영 로그에 반복 복사하지 않는다.
 
-실행 문맥은 bootstrap에서 runtime 자식으로 실행 ID만 전달하고 병렬 프로젝트·단계·호출별 문맥은 `ContextVar`로 격리한다. 주기적 진행 표시는 관측 문맥을 복사한 스레드에서 수행하며 SQLite나 작업 상태를 변경하지 않는다. verify는 이미 저장된 진단 행의 새 관측만 읽어 진행량·자원 대기를 표시한다. Agent 원문은 호출 ID별 파일로 보존하며 기존 역할별 최신 파일도 유지하고, 요약에서 invocation ID·상세 경로를 연결한다.
+실행 문맥은 bootstrap에서 runtime 자식으로 실행 ID만 전달하고 병렬 프로젝트·단계·호출별 문맥은 `ContextVar`로 격리한다. 수동 명령은 repository와 확인된 계획 또는 branch/Requirement 범위를, 로컬 복구는 repository·plan·request ID를 자신의 접수·실행 로그에 연결한다. 각 경계는 끝날 때 이전 문맥을 복원하고 project 범위로 넘어가면 plan을 명시적으로 비운다. 주기적 진행 표시는 관측 문맥을 복사한 스레드에서 수행하며 SQLite나 작업 상태를 변경하지 않는다. verify는 이미 저장된 진단 행의 새 관측만 읽어 진행량·자원 대기를 표시한다. Agent 원문은 호출 ID별 파일로 보존하며 기존 역할별 최신 파일도 유지하고, 요약에서 invocation ID·상세 경로를 연결한다.
 
 공통 출력 경계에서 비밀값을 제거하고 인증 자료·설정 원문·prompt·코드·문서 전문을 운영 로그에 추가하지 않는다. 로그의 수준·전송 실패는 Telegram 이벤트 선택을 바꾸지 않는다. 선택적인 로그·관측 수집 실패만으로 성공한 동작을 실패로 바꾸거나 재호출하지 않는다. 필수 상태·격리·소유권·검증 증거의 저장 조건은 각 실행·검증 경계가 소유하며, 로그의 실패 격리를 이유로 해당 조건을 생략하지 않는다. Worker targeted test 결과 수집 실패는 기존 검증 실패 경계로 처리한다.
 

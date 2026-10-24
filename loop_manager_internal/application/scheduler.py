@@ -302,7 +302,19 @@ def run_registered_projects(
                 f"알림 재시도 실패 ({type(error).__name__})", error=True
             )
         failed = sum(bool(item.result.exit_code) for item in results)
+        levels = {item.result.log_level for item in results}
+        level = "ERROR" if "ERROR" in levels else "WARN" if "WARN" in levels else "INFO"
+        waiting = any(item.result.kind in {
+            ProjectRunKind.WAITING, ProjectRunKind.USAGE_LIMIT_PAUSE,
+        } for item in results)
+        result, next_action = (
+            ("failure", "실패·차단 프로젝트의 원인과 조치 확인") if level == "ERROR"
+            else ("paused", "일시 중단 프로젝트를 다음 run에서 재검사") if level == "WARN"
+            else ("waiting", "예상된 대기 조건을 다음 run에서 재확인") if waiting
+            else ("complete", "선택된 프로젝트 처리 종료") if results
+            else ("no_projects", "등록 프로젝트를 확인")
+        )
         report.update(projects=len(results), failed=failed,
                       results=','.join(f"{item.repo}:{item.result.kind.value}" for item in results),
-                      level="ERROR" if failed else "INFO")
+                      result=result, next_action=next_action, level=level)
         return 1 if failed else 0

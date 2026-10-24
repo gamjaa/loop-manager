@@ -8,6 +8,7 @@ from loop_manager_internal.notifications import notifications
 from loop_manager_internal.agents.agent_invocation import InvocationContext
 from loop_manager_internal.config.managed_config import ManagedConfigError, fast_mode_scope
 from loop_manager_internal.runtime import project_registry
+from loop_manager_internal.runtime import operation_events as events
 from loop_manager_internal.runtime.contracts import ProcessLockBusyError, RuntimeMutation
 from loop_manager_internal.runtime.process_lock import process_lock
 from loop_manager_internal.storage import agent_invocation_state, local_recovery_state, runtime_state
@@ -153,9 +154,29 @@ class DocumentDraftsCommandEffects:
 def _document_drafts_command(
     effects: DocumentDraftsCommandEffects, args: argparse.Namespace, state_dir: Path, config_path: Path,
 ) -> int:
+    repository = Path(args.repository).expanduser().resolve()
+    target = getattr(args, "target", getattr(args, "draft_id", args.draft_command))
+    with events.log_context(project=str(repository), plan=None, stage="DOCUMENT_DRAFTS"):
+        with events.activity(
+            "문서 수정본 처리", heartbeat=args.draft_command == "generate",
+            error_level="ERROR", command=args.draft_command, target=target,
+        ) as report:
+            result = _execute_document_drafts_command(
+                effects, args, state_dir, config_path, repository,
+            )
+            report.update(
+                result="명령 결과 출력 완료",
+                next_action="출력된 원문·diff 또는 명령 결과 확인",
+            )
+            return result
+
+
+def _execute_document_drafts_command(
+    effects: DocumentDraftsCommandEffects, args: argparse.Namespace,
+    state_dir: Path, config_path: Path, repository: Path,
+) -> int:
     from loop_manager_internal.documents import document_drafts
 
-    repository = Path(args.repository).expanduser().resolve()
     if not effects.is_loop_manager_repository(repository):
         raise document_drafts.DocumentDraftError(
             "일회성 문서 수정본은 Loop Manager 저장소 자체에서만 사용할 수 있습니다."
@@ -315,49 +336,61 @@ def recover_local_environment(
     """Accept a request concurrently; drive it only under the normal process lease."""
     repository = str(Path(args.repository).expanduser().resolve())
     plan_id = args.plan
-    with closing(effects.connect_database(state_dir)) as connection:
-        project = connection.execute(
-            "SELECT provider, planning_error FROM projects WHERE repo = ? AND registered = 1", (repository,),
-        ).fetchone()
-        if project is None:
-            raise ValueError(f"등록된 프로젝트가 아닙니다: {repository}")
-        if plan_id is not None and connection.execute(
-            "SELECT 1 FROM exec_plans WHERE repo = ? AND plan_id = ?",
-            (repository, plan_id),
-        ).fetchone() is None:
-            raise ValueError(f"등록 프로젝트에 없는 계획입니다: {plan_id}")
+    with events.log_context(project=repository, plan=plan_id, stage="RECOVERY"):
+        with closing(effects.connect_database(state_dir)) as connection:
+            project = connection.execute(
+                "SELECT provider, planning_error FROM projects WHERE repo = ? AND registered = 1", (repository,),
+            ).fetchone()
+            if project is None:
+                raise ValueError(f"등록된 프로젝트가 아닙니다: {repository}")
+            if plan_id is not None and connection.execute(
+                "SELECT 1 FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repository, plan_id),
+            ).fetchone() is None:
+                raise ValueError(f"등록 프로젝트에 없는 계획입니다: {plan_id}")
 
-        request = local_recovery_state.begin_request(connection, repository, plan_id)
-        try:
-            config = effects.load_managed_config(config_path)
-        except ManagedConfigError as error:
-            raise ManagedConfigError(
-                f"{error} 로컬 재검사를 위해 {config_path.expanduser().resolve()}를 수정한 뒤 "
-                "같은 `recover` 명령을 다시 실행하세요."
-            ) from error
-        notifications.configure_session(
-            connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
-            verify_timeout_seconds=getattr(config, 'verify_timeout_seconds', None),
-        )
-        connection.commit()
-        # Only request intake may overlap automatic execution. Commit its
-        # short DB transaction before trying the automatic process lease.
-        with ExitStack() as stack, fast_mode_scope(config):
+            with events.activity("로컬 복구 요청 접수", error_level="ERROR",
+                                 target=plan_id or "project") as report:
+                request = local_recovery_state.begin_request(connection, repository, plan_id)
+                report.update(
+                    result="기존 요청 재사용" if request.resumed else "요청 저장됨",
+                    next_action="실행 가능 조건 확인",
+                    request_id=request.request_id,
+                )
             try:
-                stack.enter_context(process_lock(state_dir, identity="recover:" + request.request_id))
-            except ProcessLockBusyError:
-                return _local_recovery_waiting(effects, request)
-            next_request = next_local_recovery_request(connection, repository)
-            if next_request is None or next_request.request_id != request.request_id:
-                return _local_recovery_waiting(effects, request)
-            return execute_local_recovery_request(
-                LocalRecoveryExecutionEffects(effects.operation_print, effects.run_project_result),
-                connection, state_dir, request, config.path,
-                planner_mutex=threading.Lock(),
-                refactoring_review_interval=config.refactoring_review_interval,
-                verify_timeout_seconds=config.verify_timeout_seconds,
-                runtime_mutation=runtime_mutation,
-            ).exit_code
+                config = effects.load_managed_config(config_path)
+            except ManagedConfigError as error:
+                raise ManagedConfigError(
+                    f"{error} 로컬 재검사를 위해 {config_path.expanduser().resolve()}를 수정한 뒤 "
+                    "같은 `recover` 명령을 다시 실행하세요."
+                ) from error
+            notifications.configure_session(
+                connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
+                verify_timeout_seconds=getattr(config, 'verify_timeout_seconds', None),
+            )
+            connection.commit()
+            # Only request intake may overlap automatic execution. Commit its
+            # short DB transaction before trying the automatic process lease.
+            with ExitStack() as stack, fast_mode_scope(config):
+                try:
+                    stack.enter_context(process_lock(state_dir, identity="recover:" + request.request_id))
+                except ProcessLockBusyError:
+                    events.emit("로컬 복구 실행 대기", request_id=request.request_id,
+                                next_action="다음 run에서 재개")
+                    return _local_recovery_waiting(effects, request)
+                next_request = next_local_recovery_request(connection, repository)
+                if next_request is None or next_request.request_id != request.request_id:
+                    events.emit("로컬 복구 실행 대기", request_id=request.request_id,
+                                next_action="앞선 실행 또는 소유 scope 종료 뒤 재확인")
+                    return _local_recovery_waiting(effects, request)
+                return execute_local_recovery_request(
+                    LocalRecoveryExecutionEffects(effects.operation_print, effects.run_project_result),
+                    connection, state_dir, request, config.path,
+                    planner_mutex=threading.Lock(),
+                    refactoring_review_interval=config.refactoring_review_interval,
+                    verify_timeout_seconds=config.verify_timeout_seconds,
+                    runtime_mutation=runtime_mutation,
+                ).exit_code
 
 
 def _local_recovery_waiting(effects, request: local_recovery_state.LocalRecoveryRequest) -> int:
@@ -434,24 +467,45 @@ def execute_local_recovery_request(
         if plan_id is None and target is not None and local_recovery_state.recheck_consumed(
                 connection, request.request_id, target, "verify"):
             continue
-        outcome = effects.run_project_result(
-            connection,
-            state_dir,
-            repository,
-            config_path,
-            None,
-            False,
-            str(project["provider"]),
-            registered_only=True,
-            planner_mutex=planner_mutex,
-            refactoring_review_interval=refactoring_review_interval,
-            verify_timeout_seconds=verify_timeout_seconds,
-            external_run_id=request.request_id,
-            recovery_request_id=request.request_id,
-            recovery_plan_id=target,
-            runtime_mutation=runtime_mutation,
-            **({"on_step_completed": on_step_completed} if on_step_completed is not None else {}),
-        )
+        with events.log_context(project=repository, plan=target, stage="RECOVERY"):
+            with events.activity(
+                "로컬 환경 재검사 처리", heartbeat=True, error_level="ERROR",
+                request_id=request.request_id, target=target or "project",
+            ) as report:
+                outcome = effects.run_project_result(
+                    connection,
+                    state_dir,
+                    repository,
+                    config_path,
+                    None,
+                    False,
+                    str(project["provider"]),
+                    registered_only=True,
+                    planner_mutex=planner_mutex,
+                    refactoring_review_interval=refactoring_review_interval,
+                    verify_timeout_seconds=verify_timeout_seconds,
+                    external_run_id=request.request_id,
+                    recovery_request_id=request.request_id,
+                    recovery_plan_id=target,
+                    runtime_mutation=runtime_mutation,
+                    **({"on_step_completed": on_step_completed} if on_step_completed is not None else {}),
+                )
+                report.update(
+                    result=outcome.kind.value,
+                    next_action=(
+                        "다음 run에서 원인 재검사" if outcome.kind is ProjectRunKind.TRANSIENT_PAUSE
+                        else "사용 한도 조건 해소 뒤 다음 run에서 재검사"
+                        if outcome.kind is ProjectRunKind.USAGE_LIMIT_PAUSE
+                        else "대기 조건 또는 남은 차단을 확인"
+                        if outcome.kind is ProjectRunKind.WAITING
+                        else "기록된 차단 원인과 해제 조건 확인"
+                        if outcome.kind is ProjectRunKind.BLOCKED
+                        else "실패 원인 확인 뒤 재실행"
+                        if outcome.kind in {ProjectRunKind.CONFIGURATION_ERROR, ProjectRunKind.OPERATIONAL_ERROR}
+                        else "다음 프로젝트 처리 또는 다음 run 대기"
+                    ),
+                    level=outcome.log_level,
+                )
         outcomes.append(outcome)
     outcome = next((item for item in outcomes if item.exit_code or item.kind not in {
         ProjectRunKind.COMPLETED, ProjectRunKind.WAITING,
@@ -494,7 +548,7 @@ def execute_local_recovery_request(
                     error=True,
                 )
         if outcome.detail:
-            effects.operation_print(redact_secrets(str(outcome.detail)), error=True)
+            effects.operation_print(redact_secrets(str(outcome.detail)), level=outcome.log_level)
     return replace(outcome, exit_code=result_code)
 
 

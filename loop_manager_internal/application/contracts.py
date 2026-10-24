@@ -25,12 +25,28 @@ class ProjectRunKind(str, Enum):
     OPERATIONAL_ERROR = "operational_error"
     RUNTIME_HANDOFF = "runtime_handoff"
 
+    @property
+    def log_level(self) -> str:
+        if self in {
+            ProjectRunKind.BLOCKED,
+            ProjectRunKind.CONFIGURATION_ERROR,
+            ProjectRunKind.OPERATIONAL_ERROR,
+        }:
+            return "ERROR"
+        if self is ProjectRunKind.TRANSIENT_PAUSE:
+            return "WARN"
+        return "INFO"
+
 
 @dataclass(frozen=True)
 class ProjectRunResult:
     kind: ProjectRunKind
     exit_code: int
     detail: str | None = None
+
+    @property
+    def log_level(self) -> str:
+        return self.kind.log_level
 
 
 @dataclass(frozen=True)

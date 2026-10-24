@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import TestCase, mock
 
 from loop_manager_internal.runtime import operation_events as events
+from loop_manager_internal.application.contracts import ProjectRunKind, ProjectRunResult
 from loop_manager_internal.verification.manager_adapter import progress_observation
 from loop_manager_internal.verification.timing import EventWriter, phase
 from loop_manager_internal.agents.agent_invocation import AgentResult, run_agent_with_retries
@@ -55,6 +56,11 @@ class OperationObservabilityTests(TestCase):
         self.assertIn("INFO", stderr.getvalue())
         self.assertIn("WARN", stderr.getvalue())
 
+    def test_operation_print_preserves_an_explicit_severity(self):
+        operation_log = mock.Mock()
+        events.operation_print(events.OperationPrintEffects(operation_log), "retry later", level="WARN")
+        operation_log.assert_called_once_with("retry later", error=False, level="WARN")
+
     def test_output_failure_does_not_change_successful_operation(self):
         output = mock.Mock()
         output.write.side_effect = RuntimeError("출력 불가")
@@ -85,23 +91,57 @@ class OperationObservabilityTests(TestCase):
         self.assertEqual(records[-1][0], "Agent 호출 처리 종료")
         self.assertTrue(all(fields["provider"] == "codex" for _, fields in records))
 
-    def test_progress_copies_context_stops_and_suppresses_nested_reporters(self):
-        seen, observed = [], threading.Event()
+    def test_nested_progress_reports_child_and_resumes_parent(self):
+        seen, parent_before, child_seen, parent_after = [], threading.Event(), threading.Event(), threading.Event()
+        child_finished = threading.Event()
         def record(message, **fields):
             seen.append((message, events.current_context()))
-            observed.set()
+            if message == "부모 진행 중":
+                if child_finished.is_set():
+                    parent_after.set()
+                else:
+                    parent_before.set()
+            elif message == "자식 진행 중":
+                child_seen.set()
         with mock.patch.object(events, "emit", side_effect=record):
             with events.log_context(run="run-2", project="repo"):
-                with events.progress("부모", interval=.001), events.progress("자식", interval=.001):
-                    self.assertTrue(observed.wait(2))
+                with events.progress("부모", interval=.001):
+                    self.assertTrue(parent_before.wait(2))
+                    with events.progress("자식", interval=.001):
+                        self.assertTrue(child_seen.wait(2))
+                    child_finished.set()
+                    self.assertTrue(parent_after.wait(2))
                 self.assertFalse(events.current_context().get("progress_active"))
-        self.assertTrue(all(message == "부모 진행 중" and context["run"] == "run-2" for message, context in seen))
+        self.assertIn("자식 진행 중", [message for message, _ in seen])
+        self.assertTrue(all(context["run"] == "run-2" for _, context in seen))
 
     def test_exception_is_not_reported_as_completion(self):
         with mock.patch.object(events, "emit") as output:
             with self.assertRaises(KeyboardInterrupt), events.activity("검증"):
                 raise KeyboardInterrupt()
         self.assertEqual(output.call_args.kwargs["result"], "미확인")
+
+    def test_activity_can_report_a_command_failure_as_error(self):
+        with mock.patch.object(events, "emit") as output:
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                with events.activity("명령 처리", error_level="ERROR"):
+                    raise ValueError("invalid")
+        self.assertEqual(output.call_args.kwargs["level"], "ERROR")
+
+    def test_project_result_log_level_uses_result_kind_not_exit_code(self):
+        cases = (
+            (ProjectRunResult(ProjectRunKind.COMPLETED, 0), "INFO"),
+            (ProjectRunResult(ProjectRunKind.WAITING, 0), "INFO"),
+            (ProjectRunResult(ProjectRunKind.USAGE_LIMIT_PAUSE, 1), "INFO"),
+            (ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0), "INFO"),
+            (ProjectRunResult(ProjectRunKind.TRANSIENT_PAUSE, 1), "WARN"),
+            (ProjectRunResult(ProjectRunKind.BLOCKED, 1), "ERROR"),
+            (ProjectRunResult(ProjectRunKind.CONFIGURATION_ERROR, 0), "ERROR"),
+            (ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1), "ERROR"),
+        )
+        for result, level in cases:
+            with self.subTest(kind=result.kind, exit_code=result.exit_code):
+                self.assertEqual(result.log_level, level)
 
     def test_runtime_handoff_is_a_normal_pause(self):
         from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff

@@ -129,16 +129,45 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    run_id = os.environ.get("LOOP_MANAGER_RUN_ID") if "--runtime-child" in sys.argv else None
-    with operation_events.log_context(run=run_id or secrets.token_hex(16), stage="COMMAND",
-                            result_output="--json" in sys.argv or "--raw" in sys.argv):
-        raw_arguments = sys.argv[1:]
-        args = build_parser().parse_args(raw_arguments)
-        if args.command == 'manual' and args.manual_command != 'start':
-            try:
-                manual_work.validate_options(args)
-            except ValueError as error:
-                build_parser().error(str(error))
+    raw_arguments = sys.argv[1:]
+    parser = build_parser()
+    args = parser.parse_args(raw_arguments)
+    if args.command == 'manual' and args.manual_command != 'start':
+        try:
+            manual_work.validate_options(args)
+        except ValueError as error:
+            parser.error(str(error))
+    run_id = os.environ.get("LOOP_MANAGER_RUN_ID") if args.runtime_child else None
+    result_output = (
+        args.command == "status" and args.json
+        or args.command == "document-drafts"
+        and args.draft_command in {"show", "generate", "create"}
+    )
+    context = {
+        "run": run_id or secrets.token_hex(16),
+        "stage": "COMMAND",
+        "result_output": result_output,
+    }
+    repository = getattr(args, "repository", None)
+    if repository is not None:
+        context["project"] = str(Path(repository).expanduser().resolve())
+    plan_id = getattr(args, "plan_id", getattr(args, "plan", None))
+    context["plan"] = plan_id
+    bootstrap_fields = {}
+    if args.command == "document-drafts":
+        bootstrap_fields["target"] = getattr(
+            args, "target", getattr(args, "draft_id", args.draft_command),
+        )
+    elif args.command == "manual" and args.manual_command == "submit":
+        bootstrap_fields.update(
+            target=args.branch, requirement_count=len(args.requirement),
+            requirements=",".join(args.requirement),
+        )
+    elif args.command == "recover":
+        bootstrap_fields["target"] = args.plan or "project"
+    elif repository is not None:
+        bootstrap_fields["target"] = plan_id or repository
+    with operation_events.log_context(**context):
         state_dir = state_directory(args.state_dir)
         config_path = source_config_path(ROOT, args.config)
         try:
@@ -191,7 +220,9 @@ def main() -> int:
                 while True:
                     if args.command == 'run' and refresh.paused(state_dir):
                         return 0
-                    with operation_events.log_context(stage="BOOTSTRAP"), operation_events.activity("runtime 준비", heartbeat=True) as report:
+                    with operation_events.log_context(stage="BOOTSTRAP"), operation_events.activity(
+                        "runtime 준비", heartbeat=True, **bootstrap_fields,
+                    ) as report:
                         runtime = prepare_bootstrap_runtime(source, state_dir, mutation_id, **runtime_options)
                         report.update(result="준비 완료", runtime_sha=runtime.commit_sha)
                     if request is not None:
@@ -202,7 +233,8 @@ def main() -> int:
                         return 0
                     seen.add(runtime.commit_sha)
                     _write_process_lock_identity(lock_handle, f"runtime:{mutation_id}")
-                    result = run_runtime_child(source, state_dir, config_path, runtime, raw_arguments)
+                    with operation_events.log_context(stage="BOOTSTRAP"):
+                        result = run_runtime_child(source, state_dir, config_path, runtime, raw_arguments)
                     if not isinstance(result, RuntimeRefresh):
                         return result
                     request = result
