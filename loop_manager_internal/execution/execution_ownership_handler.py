@@ -535,7 +535,7 @@ class OwnershipHandler:
         saved = current.snapshot or {}
         target = getattr(current, 'target_base_oid', None)
         head = getattr(current, 'expected_head', None)
-        remote = getattr(current, 'observed_remote_oid', None)
+        remote = saved.get('accepted_work_branch') or getattr(current, 'observed_remote_oid', None)
         if (current.operation is not None or not target or not head or not remote
                 or head == remote or saved.get('current_rebase_acceptance')
                 or saved.get('published_review_resume')):

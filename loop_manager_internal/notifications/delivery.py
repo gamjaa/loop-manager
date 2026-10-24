@@ -7,9 +7,10 @@ from contextlib import contextmanager
 import json
 import sqlite3
 from .repository import adopt_legacy_block_notices, ensure_schema
-from .incidents import _current_block_key, _materialize_resumption, _materialize_unnotified_start
+from .incidents import _current_block_key, _materialize_resumption
 from .rendering import _message, _pieces, _draft_entities, MESSAGE_LIMIT
 from .transport import send_telegram
+from .policy import is_current, cancel_event
 
 def _cancel_stale_block(
     connection: sqlite3.Connection, event_key: str, repo: str,
@@ -40,7 +41,14 @@ def _claim_piece(
         ).fetchone()
         if row is None or (first_attempt_only and row[5] != 0):
             return None
-        payload = json.loads(str(row[2]))
+        try:
+            payload = json.loads(str(row[2]))
+        except (TypeError, ValueError):
+            cancel_event(connection, event_key)
+            return None
+        if not isinstance(payload, dict):
+            cancel_event(connection, event_key)
+            return None
         if row[1] == "persistent_execution_failure":
             # Recheck the exact target and cause before retiring the legacy
             # event. A matching current block owns the notice; a missing or
@@ -59,34 +67,9 @@ def _claim_piece(
                 (event_key,),
             )
             return None
-        from .events import worker_targeted_failure
-        reason = ('worker_correction' if row[1] == 'stage_failed' and payload.get('operation') == 'Worker'
-                  else payload.get('reason_code') if row[1] == 'persistent_execution_failure' else None)
-        if worker_targeted_failure(reason, payload.get('cause')):
-            connection.execute("UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP, "
-                               "delivery_started_at=NULL WHERE event_key=? AND sent_at IS NULL", (event_key,))
-            return None  # Sent pieces and original diagnostics remain auditable.
-        if row[1] == "draft_decisions":
-            from loop_manager_internal.storage import execplan_draft_state
-            current = execplan_draft_state.user_question_ids(connection, str(row[0]))
-            stale = current != {plan["id"] for plan in payload["plans"]}
-            for plan in payload["plans"]:
-                saved = execplan_draft_state.evidence(connection, str(row[0]), plan["id"])
-                if (not saved or not saved.get("pending")
-                        or saved["revision"] != plan["decision_revision"]
-                        or saved.get("identity") != plan["decision_identity"]):
-                    stale = True
-            if stale:
-                connection.execute("UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
-                                   "delivery_started_at = NULL WHERE event_key = ?", (event_key,))
-                return None
-        if row[1] == "draft_decision":
-            from loop_manager_internal.storage import execplan_draft_state
-            saved = execplan_draft_state.evidence(connection, str(row[0]), str(payload["execplan_id"]))
-            if not saved or not saved.get("pending") or saved["revision"] != payload.get("decision_revision"):
-                connection.execute("UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
-                                   "delivery_started_at = NULL WHERE event_key = ?", (event_key,))
-                return None
+        if not is_current(connection, str(row[0]), str(row[1]), payload):
+            cancel_event(connection, event_key)
+            return None
         if row[1] == "blocked":
             incident = connection.execute(
                 "SELECT released_at, block_key FROM notified_block_incidents "
@@ -214,12 +197,6 @@ def _deliver_rows(
                         "AND confirmed_pieces = ?",
                         (failure, row[0], cursor),
                     )
-                    if row[1] == "blocked":
-                        incident = connection.execute(
-                            "SELECT incident_id FROM block_notice_events WHERE event_key = ?", (row[0],),
-                        ).fetchone()
-                        if incident is not None:
-                            _materialize_unnotified_start(connection, int(incident[0]))
                 break
             with connection:
                 connection.execute(
@@ -234,6 +211,19 @@ def _deliver_rows(
                      row[0], cursor),
                 )
                 if row[1] == "blocked":
+                    # Only explicitly continued versions inherit this exact
+                    # frozen body's late confirmation; changed actions do not.
+                    connection.execute(
+                        "WITH RECURSIVE continued(event_key) AS ("
+                        "SELECT event_key FROM notification_outbox WHERE json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END, '$.continued_from')=? "
+                        "AND rendered_text IS (SELECT rendered_text FROM notification_outbox WHERE event_key=?) "
+                        "UNION SELECT o.event_key FROM notification_outbox o JOIN continued c "
+                        "ON json_extract(CASE WHEN json_valid(o.payload) THEN o.payload ELSE '{}' END, '$.continued_from')=c.event_key "
+                        "WHERE o.rendered_text IS (SELECT rendered_text FROM notification_outbox WHERE event_key=?)) "
+                        "UPDATE notification_outbox SET confirmed_pieces=MAX(confirmed_pieces, ?), "
+                        "sent_at=CASE WHEN ?=? THEN COALESCE(sent_at, CURRENT_TIMESTAMP) ELSE sent_at END "
+                        "WHERE event_key IN (SELECT event_key FROM continued)",
+                        (row[0], row[0], row[0], cursor + 1, cursor + 1, total))
                     incident = connection.execute(
                         "SELECT incident_id FROM block_notice_events "
                         "WHERE event_key = ?", (row[0],),

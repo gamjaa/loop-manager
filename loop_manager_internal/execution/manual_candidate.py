@@ -20,6 +20,24 @@ MANUAL_TEST_EVIDENCE = 'MANUAL_EXTERNAL_TARGETED_TESTS_UNCONFIRMED'
 _UNSET = object()
 
 
+def manual_waiver_label(reason):
+    reason = reason if isinstance(reason, str) else ''
+    return f'제공 사유: {reason}' if reason.strip() else '사유 미입력'
+
+
+def manual_waiver_detail(head, reason):
+    return f'SKIPPED_BY_USER @{head}; {manual_waiver_label(reason)}'
+
+
+def manual_skip_reason_label(result, request_reason):
+    if result != 'SKIPPED_BY_USER':
+        return None
+    # The linked request disambiguates a legacy reason equal to the display label.
+    if not isinstance(request_reason, str):
+        return '사유 확인 불가'
+    return manual_waiver_label(request_reason)
+
+
 @dataclass(frozen=True)
 class ManualStageSnapshot:
     """Candidate and effective settings observed immediately before a manual stage."""
@@ -312,10 +330,14 @@ class ManualCandidate:
         if message or not self.enabled():
             return fallback(message,plan)
         group=self.group()
-        results=self.connection.execute('SELECT plan_id,stage,result,head,detail FROM manual_work_results '
-            'WHERE repo=? AND group_id=? ORDER BY created_at', (self.repo,group['group_id'])).fetchall()
-        evidence='\n'.join(f"- {row['plan_id']} {row['stage']}: {row['result']} @{row['head']} "
-                           f"{row['detail'][:1000]}" for row in results)
+        results=self.connection.execute('SELECT r.plan_id,r.stage,r.result,r.head,r.detail,'
+            'q.reason AS request_reason FROM manual_work_results r LEFT JOIN manual_work_requests q '
+            'ON q.request_id=r.request_id WHERE r.repo=? AND r.group_id=? ORDER BY r.created_at',
+            (self.repo,group['group_id'])).fetchall()
+        evidence='\n'.join(
+            f"- {row['plan_id']} {row['stage']}: {row['result']} @{row['head']} "
+            f"{(redact_secrets(manual_skip_reason_label(row['result'], row['request_reason'])) if row['result']=='SKIPPED_BY_USER' else row['detail'])[:1000]}"
+            for row in results)
         return ManualPublication(f"{plan['id']}: {plan['title']}",
             f"수동 제출 묶음 {group['group_id']}: {', '.join(json.loads(group['members']))}\n"
             f"Source: {group['source_branch']}@{group['source_head']}\n"
@@ -414,7 +436,7 @@ class ManualCandidate:
             "AND stage=? AND head=? AND result='FAIL' LIMIT 1",(self.repo,group['group_id'],stage,head)).fetchone()
         if failed:
             return None
-        detail=f"SKIPPED_BY_USER @{head}; {request['reason']}"
+        detail=manual_waiver_detail(head, request['reason'])
         if record:
             self.store.record(group,stage,head,base,stage_token,'SKIPPED_BY_USER',detail)
         return detail
@@ -502,13 +524,14 @@ class ManualCandidate:
             '현재 후보의 R 원문과 아래 모든 G를 함께 확인하세요. 한 G도 누락하지 마세요.\n'
             + '\n\n'.join(f"### {item['path']}\n{item['text']}" for item in documents))}
         rows = self.connection.execute(
-            'SELECT plan_id,stage,result,head,detail FROM manual_work_results '
-            'WHERE repo=? AND group_id=? ORDER BY created_at,rowid',
+            'SELECT r.plan_id,r.stage,r.result,r.head,r.detail,q.reason AS request_reason '
+            'FROM manual_work_results r LEFT JOIN manual_work_requests q ON q.request_id=r.request_id '
+            'WHERE r.repo=? AND r.group_id=? ORDER BY r.created_at,r.rowid',
             (self.repo, group['group_id'])).fetchall()
         for row in rows:
             detail = ''
-            if row['result'] == 'SKIPPED_BY_USER' and ';' in row['detail']:
-                detail = '; ' + redact_secrets(row['detail'].split(';', 1)[1].strip())
+            if row['result'] == 'SKIPPED_BY_USER':
+                detail = '; ' + redact_secrets(manual_skip_reason_label(row['result'], row['request_reason']))
             # A later result replaces only this plan/stage's observation. Raw
             # verify/Review logs stay in their audit and feedback repositories.
             context[f"manual_stage:{row['plan_id']}:{row['stage']}"] = (
@@ -534,13 +557,15 @@ class ManualCandidate:
                 '상태가 SKIPPED_BY_USER이면 실행 성공으로 취급하지 마세요.\n'
             )
         instruction += '현재 후보의 R 원문과 아래 모든 G를 함께 확인하세요. 한 G도 누락하지 마세요.\n'
-        result_rows=self.connection.execute('SELECT plan_id,stage,result,head,detail FROM manual_work_results '
-            'WHERE repo=? AND group_id=? ORDER BY created_at', (self.repo,group['group_id'])).fetchall()
+        result_rows=self.connection.execute('SELECT r.plan_id,r.stage,r.result,r.head,r.detail,'
+            'q.reason AS request_reason FROM manual_work_results r LEFT JOIN manual_work_requests q '
+            'ON q.request_id=r.request_id WHERE r.repo=? AND r.group_id=? ORDER BY r.created_at',
+            (self.repo,group['group_id'])).fetchall()
         rows=[]
         for item in result_rows:
             detail = ''
-            if item['result']=='SKIPPED_BY_USER' and ';' in item['detail']:
-                detail='; '+redact_secrets(item['detail'].split(';',1)[1].strip())
+            if item['result']=='SKIPPED_BY_USER':
+                detail='; '+redact_secrets(manual_skip_reason_label(item['result'],item['request_reason']))
             rows.append(f"- {item['plan_id']} {item['stage']}: {item['result']} @{item['head']}{detail}")
         instruction += '\n수동 단계 결과 (로그 본문 생략):\n'+'\n'.join(rows)+'\n'
         if group['pending_source_head'] and group['source_update_conflict']:
@@ -581,9 +606,17 @@ class ManualCandidate:
             return body
         group=self.group()
         head=self.git(Path(group['worktree']),'rev-parse','HEAD').stdout.strip()
-        results=self.connection.execute('SELECT plan_id,stage,result,detail FROM manual_work_results '
-            'WHERE repo=? AND group_id=? AND head=? ORDER BY created_at', (self.repo,group['group_id'],head)).fetchall()
-        rows='\n'.join(f"- {row['plan_id']} {row['stage']}: {row['result']} — {row['detail'][:1000]}" for row in results)
+        results=self.connection.execute('SELECT r.plan_id,r.stage,r.result,r.detail,q.reason AS request_reason '
+            'FROM manual_work_results r LEFT JOIN manual_work_requests q ON q.request_id=r.request_id '
+            'WHERE r.repo=? AND r.group_id=? AND r.head=? ORDER BY r.created_at',
+            (self.repo,group['group_id'],head)).fetchall()
+        formatted=[]
+        for row in results:
+            detail=row['detail']
+            if row['result']=='SKIPPED_BY_USER':
+                detail=redact_secrets(manual_skip_reason_label(row['result'],row['request_reason']))
+            formatted.append(f"- {row['plan_id']} {row['stage']}: {row['result']} — {detail[:1000]}")
+        rows='\n'.join(formatted)
         members='\n'.join(f"- {item['plan']['id']}: {item['path']} (R: {', '.join(item['plan']['sources'])})"
                           for item in json.loads(group['documents']))
         return (body+f"\n\n## Manual submission\nGroup: {group['group_id']}\n"

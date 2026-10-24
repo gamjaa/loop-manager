@@ -131,7 +131,11 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
     os.environ["LOOP_MANAGER_VERIFY_PROJECT_ROOT"] = str(connection.root)
     os.environ[MARKER] = "1"
     install_guard()
-    writer = EventWriter(directory / "runner.jsonl", identity={"run_id": run_id})
+    parent_run_id = os.environ.get("LOOP_MANAGER_VERIFY_PARENT_RUN_ID")
+    writer_identity = {"run_id": run_id}
+    if parent_run_id:
+        writer_identity["parent_run_id"] = parent_run_id
+    writer = EventWriter(directory / "runner.jsonl", identity=writer_identity)
     coordinator = None
     session = None
     partial = None

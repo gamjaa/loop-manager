@@ -45,7 +45,8 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
                 "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence) "
                 "VALUES ('repo', 'project', 'repository_state_unsafe', 'G-047', 'unsafe')"
             )
-            notifications.enqueue_current_project_events(self.connection, 'repo')
+            from tests.support.notification import NotificationFixture
+            NotificationFixture.legacy_project_notice(self.connection, repo='repo')
         notifications.dispatch_pending(
             self.connection, 'token', 'chat', adapter=mock.Mock(),
         )
@@ -60,9 +61,13 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         resumed = self.connection.execute(
             "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
         ).fetchall()
-        self.assertEqual(len(resumed), 1)
-        self.assertEqual(json.loads(resumed[0][0])['operation'],
-                         'Worker')
+        self.assertEqual(resumed, [])
+        incident = self.connection.execute(
+            "SELECT started_operation, start_identity, started_at, resumed_at FROM notified_block_incidents"
+        ).fetchone()
+        self.assertEqual((incident['started_operation'], incident['start_identity']), ('Worker', 'actual-start'))
+        self.assertIsNotNone(incident['started_at'])
+        self.assertIsNotNone(incident['resumed_at'])
 
 
     def test_worker_decision_without_file_change_bypasses_no_change_gate(self):

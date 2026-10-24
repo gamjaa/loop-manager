@@ -333,7 +333,12 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         self.assertIn("PR Merge 대기", result.detail)
         self.assertEqual(connection.execute(
             "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'work_waiting'"
-        ).fetchone()[0], 1)
+        ).fetchone()[0], 0)
+        episode = tuple(connection.execute(
+            "SELECT signature, generation FROM work_reason_episodes WHERE repo=?", (repo,)
+        ).fetchone())
+        self.assertTrue(episode[0])
+        self.assertEqual(episode[1], 1)
         with mock.patch("loop_manager._checkpoint_dispatch_ready", return_value=False), \
                 mock.patch("loop_manager._run_project_step", return_value=loop_manager.PROJECT_STEP_TRANSIENT_PAUSE), \
                 mock.patch("loop_manager._stable_work_reason") as reason:
@@ -343,6 +348,9 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             )
         self.assertEqual(paused.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
         reason.assert_not_called()
+        self.assertEqual(tuple(connection.execute(
+            "SELECT signature, generation FROM work_reason_episodes WHERE repo=?", (repo,)
+        ).fetchone()), episode)
         connection.close()
 
     @dummy_worker_sessions

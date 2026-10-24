@@ -9,6 +9,7 @@ from unittest import TestCase, mock
 
 from loop_manager_internal.runtime import operation_events as events
 from loop_manager_internal.verification.manager_adapter import progress_observation
+from loop_manager_internal.verification.timing import EventWriter, phase
 from loop_manager_internal.agents.agent_invocation import AgentResult, run_agent_with_retries
 
 
@@ -152,3 +153,154 @@ class OperationObservabilityTests(TestCase):
             second = progress_observation(directory, positions, state)
             self.assertEqual((second["active_tests"], second["observed_completed_tests"]), (0, 1))
             self.assertEqual(progress_observation(directory, positions, state), second)
+
+    def test_verify_progress_keeps_run_identity_and_clears_stage_end(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "stage-0"
+            stage.mkdir()
+            worker_log = stage / "worker-1.jsonl"
+            runner_log = root / "runner.jsonl"
+            worker_events = [
+                {"kind": "test_start", "run_id": "run-a", "clock_domain": "linux",
+                 "stage_id": "unittest", "unit_id": "module.test", "worker_id": 1,
+                 "pid": 11, "id": "tests.sample.Case.test_active", "at": 4},
+                {"kind": "test_start", "run_id": "run-other", "clock_domain": "linux",
+                 "stage_id": "unittest", "unit_id": "module.test", "worker_id": 1,
+                 "pid": 11, "id": "tests.sample.Case.test_foreign", "at": 5},
+            ]
+            runner_events = [
+                {"kind": "unit_start", "run_id": "run-a", "clock_domain": "linux",
+                 "stage_id": "unittest", "unit_id": "module.test", "worker_id": 1,
+                 "pid": 11, "at": 1},
+                {"kind": "phase_start", "run_id": "run-a", "clock_domain": "linux",
+                 "stage_id": "unittest", "pid": 10, "name": "resource_wait", "at": 2},
+                {"kind": "allocation", "run_id": "run-a", "clock_domain": "linux",
+                 "stage_id": "unittest", "pid": 10,
+                 "decision": {"granted": False, "reason": "memory pressure"}, "at": 3},
+                {"kind": "job_child_wait", "run_id": "run-a", "clock_domain": "linux",
+                 "stage_id": "unittest", "unit_id": "module.test", "worker_id": 1,
+                 "worker_pid": 11, "pid": 10, "active_processes": 2, "at": 6},
+            ]
+            worker_log.write_text("".join(json.dumps(item) + "\n" for item in worker_events), encoding="utf-8")
+            runner_log.write_text("".join(json.dumps(item) + "\n" for item in runner_events), encoding="utf-8")
+            positions, state = {}, {}
+
+            observed = progress_observation(root, positions, state, "run-a")
+
+            self.assertEqual(observed["active_tests"], 1)
+            self.assertIn("module.test", observed["current_unit"])
+            self.assertIn("tests.sample.Case.test_active", observed["current_test"])
+            self.assertIn("memory pressure", observed["resource_wait"])
+            self.assertIn("active=2", observed["job_child_wait"])
+            self.assertEqual(observed["active_units"], 1)
+
+            with runner_log.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"kind": "phase_end", "run_id": "run-a",
+                    "clock_domain": "linux", "stage_id": "unittest", "pid": 10,
+                    "name": "stage:unittest", "start": 0, "duration": 7,
+                    "result": "complete", "at": 7}) + "\n")
+            observed = progress_observation(root, positions, state, "run-a")
+
+            self.assertEqual(observed["active_tests"], 0)
+            self.assertEqual(observed["active_units"], 0)
+            self.assertEqual(observed["resource_wait"], "-")
+            self.assertEqual(observed["job_child_wait"], "-")
+            self.assertEqual(observed["current_test"], "-")
+
+    def test_terminal_stage_or_run_event_dominates_worker_starts_in_same_observation(self):
+        for terminal_kind in ("stage_end", "run_end"):
+            with self.subTest(terminal=terminal_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stage = root / "stage-0"
+                stage.mkdir()
+                run_id = f"run-{terminal_kind}"
+                terminal = {"kind": "phase_end", "run_id": run_id, "clock_domain": "linux",
+                    "stage_id": "unittest", "pid": 10, "name": "stage:unittest",
+                    "start": 0, "duration": 5, "result": "complete", "at": 5}
+                if terminal_kind == "run_end":
+                    terminal = {"kind": "run_end", "run_id": run_id, "clock_domain": "linux",
+                                "stage_id": "unittest", "pid": 10, "at": 6}
+                (root / "runner.jsonl").write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+                (stage / "worker-0.jsonl").write_text(json.dumps({
+                    "kind": "test_start", "run_id": run_id, "clock_domain": "linux",
+                    "stage_id": "unittest", "unit_id": "module.test", "worker_id": 0,
+                    "pid": 11, "id": "tests.sample.Case.test_active", "at": 1}) + "\n",
+                    encoding="utf-8")
+
+                observed = progress_observation(root, {}, {}, run_id)
+
+                self.assertEqual(observed["active_tests"], 0)
+                self.assertEqual(observed["active_units"], 0)
+                self.assertEqual(observed["current_test"], "-")
+
+    def test_verify_progress_closes_phase_after_stage_identity_changes_without_run_end(self):
+        for raises in (False, True):
+            with self.subTest(raises=raises), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run_id = "run-stage-drift"
+                writer = EventWriter(root / "runner.jsonl", identity={"run_id": run_id})
+                try:
+                    with writer.activate():
+                        try:
+                            with phase("verify"):
+                                writer.identity["stage_id"] = "unittest"
+                                if raises:
+                                    raise RuntimeError("verify failed")
+                        except RuntimeError:
+                            pass
+                finally:
+                    writer.close()
+
+                observed = progress_observation(root, {}, {}, run_id)
+
+                self.assertEqual(observed["active_phases"], "-")
+                records = [json.loads(line) for line in (root / "runner.jsonl").read_text().splitlines()]
+                self.assertNotEqual(records[0].get("stage_id"), records[1].get("stage_id"))
+                self.assertEqual(records[0]["phase_id"], records[1]["phase_id"])
+                self.assertEqual(records[1]["result"], "error" if raises else "complete")
+                self.assertNotIn("run_end", [record["kind"] for record in records])
+
+    def test_verify_progress_follows_windows_parent_snapshot_and_os_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "parent-run"
+            root.mkdir()
+            bundle = Path(temporary) / "loop-manager-verify-bundle"
+            wsl_logs = bundle / "logs"
+            wsl_logs.mkdir(parents=True)
+            windows_logs = Path(str(root) + "-windows")
+            windows_stage = windows_logs / "stage-0"
+            windows_stage.mkdir(parents=True)
+            (root / "snapshot.json").write_text(json.dumps({
+                "run_id": "parent-run", "revision": "a" * 40, "bundle": str(bundle),
+                "snapshot_sha256": "b" * 64}), encoding="utf-8")
+            (root / "result.json").write_text(json.dumps({
+                "run_id": "parent-run", "wsl": "PASS", "windows": "NOT_RUN", "wsl_run_id": "linux-run",
+                "windows_run_id": "parent-run"}), encoding="utf-8")
+            (wsl_logs / "worker-0.jsonl").write_text(json.dumps({
+                "kind": "test_end", "run_id": "linux-run", "parent_run_id": "parent-run",
+                "clock_domain": "linux", "stage_id": "unittest", "unit_id": "module.wsl",
+                "worker_id": 0, "pid": 20, "id": "tests.wsl.Case.test_done", "at": 3,
+                "duration": 1, "result": "success"}) + "\n"
+                + json.dumps({"kind": "test_end", "run_id": "linux-run", "parent_run_id": "other-parent",
+                    "clock_domain": "linux", "stage_id": "unittest", "unit_id": "module.old",
+                    "worker_id": 0, "pid": 20, "id": "tests.wsl.Case.test_foreign", "at": 4,
+                    "duration": 1, "result": "success"}) + "\n", encoding="utf-8")
+            (windows_stage / "worker-0.jsonl").write_text(json.dumps({
+                "kind": "test_start", "run_id": "parent-run", "clock_domain": "win32",
+                "stage_id": "windows-core", "unit_id": "module.windows", "worker_id": 0,
+                "pid": 20, "id": "tests.windows.Case.test_active", "at": 1}) + "\n",
+                encoding="utf-8")
+            (root / "launcher.jsonl").write_text(json.dumps({
+                "kind": "phase_start", "run_id": "parent-run", "clock_domain": "win32",
+                "pid": 10, "name": "windows-core", "at": 2}) + "\n", encoding="utf-8")
+
+            observed = progress_observation(root, {}, {}, "parent-run")
+
+            self.assertEqual(observed["observed_completed_tests"], 1)
+            self.assertEqual(observed["active_tests"], 1)
+            self.assertEqual(observed["current_stage"], "windows-core")
+            self.assertEqual(observed["current_unit"], "module.windows")
+            self.assertEqual(observed["windows_wsl"], "PASS")
+            self.assertEqual(observed["windows_native"], "RUNNING")
+            self.assertEqual(observed["snapshot_revision"], "a" * 40)

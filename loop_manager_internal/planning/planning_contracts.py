@@ -218,10 +218,6 @@ class PlanningStatePort(Protocol):
 
     def schedule(self, repo: str) -> Any: ...
 
-    def pending_document_approval(
-        self, repo: str, repository: Path, base_branch: str,
-    ) -> bool: ...
-
     def pending_user_decision(self, repo: str, entries: Any) -> bool: ...
 
     def maintenance_due(

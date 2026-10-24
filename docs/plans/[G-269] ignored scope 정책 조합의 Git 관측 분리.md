@@ -27,10 +27,10 @@ priority: normal
 
 ## Implementation
 
-- [ ] 확인한 `tests/support/scope.py`·`scoped_recovery.py`의 snapshot·실제 SQLite fixture를 재사용하고 `agents/scope_observation.py`의 관측만 double로 제공한다. `agents/scope_validation.py`·`scope_recovery.py`·복구 transaction을 실행하며 예상 밖 subprocess는 실패하게 한다.
-- [ ] R-080의 제거 기준을 두 소비 지점에 적용한다. `agents/scope_validation.py:validate_agent_scope()`의 Reviewer 조기 반환과 `tests/test_scope_role_boundaries.py:ScopeRoleBoundariesTest.test_writing_roles_validate_output_while_read_only_access_uses_sandbox`·`test_worker_product_documents_and_guidance_remain_allowed`가 보장하는 no-op에 위 Reviewer 반복을 대응시킨다. 역할별 저장·재개나 실제 ignore 관측의 assertion을 함께 버리지 않으며 공유 support는 참조가 남으면 보존한다.
-- [ ] 두 조합과 CLI 지침 case를 현재 R-055 계약으로 전환한다. readonly validator의 조기 반환과 저장 재개를 역사 snapshot 권한 검사로 대체하지 않고, 현재 후보·결과·독립 원인 보존을 assertion에 연결한다.
-- [ ] 실제 ignore/index/worktree·bytecode 효과와 provider 정책 검증의 대응을 `tests/test_scope_role_boundaries.py`·`test_scope_configuration.py`·`test_execution_guidance.py` 및 기존 관련 회귀에서 확인한다. 새 fixture 체계·cache·runner나 운영 권한 정책을 도입하지 않는다.
+- [x] 확인한 `tests/support/scope.py`·`scoped_recovery.py`의 snapshot·실제 SQLite fixture를 재사용하고 `agents/scope_observation.py`의 관측만 double로 제공한다. `agents/scope_validation.py`·`scope_recovery.py`·복구 transaction을 실행하며 예상 밖 subprocess는 실패하게 한다.
+- [x] R-080의 제거 기준을 두 소비 지점에 적용한다. `agents/scope_validation.py:validate_agent_scope()`의 Reviewer 조기 반환과 `tests/test_scope_role_boundaries.py:ScopeRoleBoundariesTest.test_writing_roles_validate_output_while_read_only_access_uses_sandbox`·`test_worker_product_documents_and_guidance_remain_allowed`가 보장하는 no-op에 위 Reviewer 반복을 대응시킨다. 역할별 저장·재개나 실제 ignore 관측의 assertion을 함께 버리지 않으며 공유 support는 참조가 남으면 보존한다.
+- [x] 두 조합과 CLI 지침 case를 현재 R-055 계약으로 전환한다. readonly validator의 조기 반환과 저장 재개를 역사 snapshot 권한 검사로 대체하지 않고, 현재 후보·결과·독립 원인 보존을 assertion에 연결한다.
+- [x] 실제 ignore/index/worktree·bytecode 효과와 provider 정책 검증의 대응을 `tests/test_scope_role_boundaries.py`·`test_scope_configuration.py`·`test_execution_guidance.py` 및 기존 관련 회귀에서 확인한다. 새 fixture 체계·cache·runner나 운영 권한 정책을 도입하지 않는다.
 
 ## Validation
 
@@ -42,12 +42,13 @@ priority: normal
 
 - [x] 2026-10-13 기준 `20e6f0fbfdb6ceb5384d42c83f3904490b441356`의 원본·기존 support·현재 catalog를 정적으로 확인했다. 역할 정책·반복 verify 실패의 기존 전환은 재사용하며 이 잔여 조합만 대상으로 한다.
 - [x] 저장된 전체 verify `64fd60600657b242f833a1b1355aaab0`은 3,631 success·5 skip과 compile PASS다. 해당 후보와 현재 기준의 코드·테스트·검증 입력에는 diff가 없다. 위 historical 조합은 1,425 Git 호출, 생성/수정/삭제 조합은 300 호출을 기록했다. 이는 Python 3.14.3/Linux의 한 표본이며 새 변경의 성공이나 절감량이 아니다.
-- [ ] 관측 분리·Reviewer no-op 중복 제거·assertion 대응과 최소 targeted unit 검증
+- [x] 2026-10-23 Linux/Python 3.12.3 targeted 검증: 마지막 변경 뒤 focus set 7개 PASS, 실제 ignore/config·index·bytecode·ref 및 현재 race/독립 오류 supporting set 7개·6개·5개 PASS. 전체 verify와 unittest 수집·compile은 Manager 실행 경계로 남겼다.
+- [x] 동일 조건의 실행 전 관측 비용은 focus의 잔여 조건에서 full snapshot 77회·관측 Git subprocess 974회·snapshot 측정 3.492초였다(Planner/Worker artifact 12회·152회·0.612초, 역사/blocked 63회·798회·2.807초, Worker CLI 2회·24회·0.073초). 전환 뒤 세 변경 테스트의 scope 판정 구간에서 full snapshot 및 관측 Git subprocess는 0회다. 테스트 fixture 준비의 Git 실행은 이 비교에서 제외한다. 세 Reviewer artifact no-op subtest와 CLI no-op assertion 제거는 별도 범위 변경으로 기록하며 총 실행시간을 절감률로 해석하지 않는다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - R-080의 추가된 정리 기준을 기존 범위에 통합한다. 현재 Reviewer validator는 snapshot 비교 전에 반환하고 역할 경계 unit test가 이를 검사한다. artifact 세 변형과 CLI 지침 case의 같은 호출 반복만 제거 대상으로 확정하며, 역사/blocked 조합의 Reviewer 전용 저장·재개 assertion은 유지한다. 원격에서 직접 삭제한 catalog/checkpoint wiring·단순 정상 ExecPlan 테스트는 재구현하거나 소급 계획하지 않는다. 새 독립 목표·dependency는 없고 기존 ID·metadata·수행 기록을 보존한다.
-- 이번 delta는 Git 권한 귀속 검사의 폐지를 이미 반영한 코드·테스트를 기준으로 한다. 남은 일은 반복 Git fixture의 관측 분리이며 폐지된 Reviewer 거부·저장 snapshot 일치 조건을 보존 대상으로 요구하지 않는다. 기존 Progress의 원문·측정 감사는 유지하고 새 검증 성공은 기록하지 않는다.
+- 이번 delta는 Git 권한 귀속 검사의 폐지를 이미 반영한 코드·테스트를 기준으로 하며, 반복 Git fixture 관측 분리를 targeted 실행으로 완료했다. 폐지된 Reviewer 거부·저장 snapshot 일치 조건은 보존 대상으로 요구하지 않는다. 기존 Progress의 원문·측정 감사는 유지하고 전체 verify 성공은 기록하지 않는다.
 - complexity medium: 기존 관측·scope·저장 경계는 명확하지만 legacy 시작 규칙과 여러 저장 소비자의 입력을 함께 구성해야 한다. risk medium: 잘못된 mock은 보존·거부 회귀를 놓칠 수 있으며 실제 판정·DB와 통합 회귀의 대응 검토 및 테스트 교정으로 복구한다.
 - R-080의 남은 테스트 실행 경계만 변경한다. catalog의 차단 경로 감사나 Merge된 Git 관측 전환 작업을 다시 구현하지 않고 정책 변경·검증 성공을 합성하지 않는다.

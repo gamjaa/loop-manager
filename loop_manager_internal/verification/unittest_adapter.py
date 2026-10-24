@@ -39,7 +39,7 @@ def bind_instrumentation():
     # Candidate helpers use the same context as the runtime's unittest hooks.
     candidate = sys.modules.get("loop_manager_internal.verification.timing")
     if candidate is not None and candidate is not instrumentation:
-        for name in ("_current_writer", "_fixture_timing_active", "_phase_names"):
+        for name in ("_current_writer", "_fixture_timing_active", "_test_fixture_failures", "_phase_names"):
             setattr(candidate, name, getattr(instrumentation, name))
 
 
@@ -58,8 +58,9 @@ def worker_main():
         for line in sys.stdin:
             request = json.loads(line)
             if writer is None:
-                writer = EventWriter(Path(request["directory"]) / f"worker-{request['worker']}.jsonl", identity={key: request[key] for key in ("run_id", "stage_id") if key in request})
-            writer.identity.update({key: request[key] for key in ("run_id", "stage_id", "unit_id") if key in request})
+                writer = EventWriter(Path(request["directory"]) / f"worker-{request['worker']}.jsonl")
+            writer.identity = {key: request[key] for key in
+                ("run_id", "parent_run_id", "stage_id", "unit_id", "worker_id") if key in request}
             module = Module(request["module"], tuple(request["ids"]), tuple(tuple(owner) for owner in request["owners"]), request["pattern"])
             try:
                 with writer.activate(), phase(f"import:{module.name}"):
@@ -110,13 +111,23 @@ class Worker:
     report: Path | None = None
     log_offset: int = 0
     identity: dict | None = None
+    result_observed_at: float | None = None
+    result_ready_at: float | None = None
+    child_wait_started_at: float | None = None
+    child_wait_last_active: int | None = None
+    child_wait_seconds: float | None = None
+    previous_unit_id: str | None = None
+    previous_result_observed_at: float | None = None
+    previous_module_result_at: float | None = None
 
     def assign(self, module, report, directory):
         self.output.flush()
         self.log_offset = self.output.tell()
         self.module, self.report = module, report
         self.process.stdin.write(json.dumps({"module": module.name, "ids": module.ids, "owners": module.owners, "pattern": module.pattern,
-                                 "result": str(report), "directory": str(directory), "worker": self.number, **(self.identity or {}), **({"unit_id": module.name} if self.identity else {})}) + "\n")
+                                 "result": str(report), "directory": str(directory), "worker": self.number,
+                                 "worker_id": self.number, **(self.identity or {}),
+                                 **({"unit_id": module.name} if self.identity else {})}) + "\n")
         self.process.stdin.flush()
 
 
@@ -172,6 +183,10 @@ def execute(connection, stage, modules, directory, writer, client, run_id, entry
     from loop_manager_internal.verification.core import execute_manifest
     environment = dict(os.environ, LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(connection.root), LOOP_MANAGER_VERIFY_TEST_DIRECTORY=str(connection.root / stage["collection"]["directory"]))
     identity = {"version": 1, "run_id": run_id, "stage_id": stage["id"]}
+    event_identity = {**identity}
+    parent_run_id = os.environ.get("LOOP_MANAGER_VERIFY_PARENT_RUN_ID")
+    if parent_run_id:
+        event_identity["parent_run_id"] = parent_run_id
     def validate(unit, report):
         if type(report.get("version")) is not int or any(report.get(key) != value for key, value in {**identity, "unit_id": unit.name}.items()):
             raise RuntimeError("unittest result identity/version mismatch")
@@ -179,7 +194,7 @@ def execute(connection, stage, modules, directory, writer, client, run_id, entry
     def spawn(token, number, logs):
         return start_worker(token, number, logs,
             command=[str(connection.python), "-u", str(entrypoint), "--worker"],
-            cwd=connection.root / stage["cwd"], environment=environment, identity=identity)
+            cwd=connection.root / stage["cwd"], environment=environment, identity=event_identity)
     if stage["execution"] == "serial":
         # Keep one reusable process, so module fixtures and dependency order remain intact.
         parent = client

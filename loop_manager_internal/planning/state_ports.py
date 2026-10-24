@@ -237,16 +237,6 @@ class _PlanningStatePorts:
     def schedule(self, repo: str) -> CatalogScheduleDecision:
         return self._effects.catalog_schedule_decision(self._connection, repo)
 
-    def pending_document_approval(
-        self, repo: str, repository: Path, base_branch: str,
-    ) -> bool:
-        if not self._effects.is_loop_manager_repository(repository):
-            return False
-        from loop_manager_internal.documents import document_drafts
-        return bool(document_drafts.DocumentDraftRepository(
-            self._connection,
-        ).unplanned_approved(repo, repository, base_branch))
-
     def pending_user_decision(self, repo: str, entries) -> bool:
         from loop_manager_internal.storage import execplan_draft_state
         return execplan_draft_state.needs_semantic_review(self._connection, repo, entries)

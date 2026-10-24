@@ -1,5 +1,6 @@
 """execution execution ports boundaries and named composition effects."""
 from __future__ import annotations
+import json
 from loop_manager_internal.storage import runtime_state
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -213,6 +214,16 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     def workspace_identity(state_dir, repo, plan_id, branch, worktree):
         return dependencies.validate_execplan_workspace_identity(state_dir, repo,
             manual.store.workspace_owner(repo, plan_id), branch, worktree)
+    def reviewer_prompt(*args, **kwargs):
+        from loop_manager_internal.verification.inputs import worker_exclusions, EXCLUSION_MARKER
+        from loop_manager_internal.execution.validation_feedback import redact_secrets
+        review = worker_exclusions(state.row()['worker_result'])
+        if review:
+            kwargs['verify_evidence'] = (str(kwargs.get('verify_evidence') or '')
+                + '\nWorker의 저장소 소비 검토 근거입니다. 실제 입력 누락과 제외 타당성을 검토하라:\n'
+                + EXCLUSION_MARKER + ' ' + redact_secrets(json.dumps(review, ensure_ascii=False)))
+        return manual.prompt(dependencies.reviewer_prompt(*args, **kwargs), review=True)
+
     def publication(message, plan):
         return manual.publication(message, plan, dependencies.parse_worker_result)
     def targeted_reason(evidence):
@@ -438,7 +449,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             run_agent=state.bind(dependencies._run_agent_with_connection, name="run_agent", connected=True, mutates=False),
             run_agent_with_retries=state.bind(dependencies.run_agent_with_retries, name="run_agent_with_retries", connected=False, mutates=False),
             worker_prompt=state.bind(lambda *a, **kw: dependencies.worker_prompt(*a, **kw), name="worker_prompt", connected=False, mutates=False),
-            reviewer_prompt=state.bind(lambda *a, **kw: manual.prompt(dependencies.reviewer_prompt(*a, **kw), review=True), name="reviewer_prompt", connected=False, mutates=False),
+            reviewer_prompt=state.bind(reviewer_prompt, name="reviewer_prompt", connected=False, mutates=False),
             resolve_worker_profile=lambda config_path, provider, level, worktree: dependencies._agent_profile(
                 config_path, provider, "worker", level, worktree,
             ),
@@ -450,7 +461,8 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                 name="partial_verify", connected=False, mutates=False),
             pre_review_identity=dependencies.pre_review_identity or partial_review_identity,
             observe_verify_inputs=state.bind(
-                result_validation.observe_verify_inputs,
+                lambda worktree: result_validation.observe_verify_inputs(
+                    worktree, worker_result=state.row()["worker_result"]),
                 name="observe_verify_inputs", connected=False, mutates=False,
             ),
             verify=state.bind(

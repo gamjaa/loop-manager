@@ -700,7 +700,9 @@ def validate_maintenance_planner_result(
             if held_ids:
                 catalog_snapshot = project_catalog_refresh.validated_held_planning_snapshot(
                     connection, context.repo, worktree, context.active_sha,
-                    git=effects.git, load_snapshot=effects.load_execplan_snapshot)
+                    git=effects.git, load_snapshot=effects.load_execplan_snapshot,
+                    planned_ids=frozenset(str(plan["id"]) for _path, plan in new_plans)
+                    | frozenset(eligible[path].plan_id for path in revised_paths))
             else:
                 catalog_snapshot = effects.load_execplan_snapshot(worktree, validate_sources=False)
         except (ExternalObservationError, GitLockError):
@@ -708,12 +710,19 @@ def validate_maintenance_planner_result(
         except RuntimeError as error:
             raise MaintenancePlanningError(str(error)) from error
         catalog = catalog_snapshot.active_metadata()
+        catalog.update({str(plan["id"]): plan for _path, plan in new_plans})
+        catalog.update({eligible[path].plan_id: effects._parse_execplan(worktree, worktree / path)
+                        for path in revised_paths})
         try:
             from loop_manager_internal.storage import execplan_draft_state
             execplan_draft_state.validate_questions(connection, context.repo, catalog)
-            project_catalog_refresh.assert_planning_dependencies_unheld(
+            project_catalog_refresh.assert_planning_dependency_references(
                 catalog, new_plans + [(path, catalog[eligible[path].plan_id]) for path in revised_paths],
-                held_ids)
+                held_ids, original_dependencies={
+                    str(row["plan_id"]): json.loads(row["depends_on"])
+                    for row in connection.execute(
+                        "SELECT plan_id, depends_on FROM exec_plans WHERE repo=?", (context.repo,))},
+                withheld_ids=catalog_snapshot.withheld_ids)
         except RuntimeError as error:
             raise MaintenancePlanningError(str(error)) from error
 

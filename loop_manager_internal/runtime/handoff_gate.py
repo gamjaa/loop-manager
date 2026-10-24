@@ -7,6 +7,7 @@ from functools import wraps
 from .contracts import RuntimeRefresh
 import subprocess
 import threading
+import time
 
 _pause_check_active = ContextVar('runtime_pause_check_active', default=False)
 
@@ -28,7 +29,7 @@ class RuntimeHandoffGate:
     observer: Callable[[], None] | None = None
     request: RuntimeRefresh | None = None
     observation_lock: threading.Lock = field(default_factory=threading.Lock)
-    generation: int = 0
+    observed_at: float | None = None
     pause_check: Callable[[], None] | None = None
     before_observe: Callable[[], None] | None = None
 
@@ -54,12 +55,11 @@ class RuntimeHandoffGate:
             return
         if self.before_observe is not None:
             self.before_observe()
-        generation = self.generation
         with self.observation_lock:
             self.check()
-            if generation == self.generation:
+            if self.observed_at is None or time.monotonic() - self.observed_at >= 30:
                 self.observer()
-                self.generation += 1
+                self.observed_at = time.monotonic()
         self.check()
 
     def popen(self, *args: object, **kwargs: object) -> subprocess.Popen:
@@ -85,9 +85,7 @@ def runtime_boundary(function):
     @wraps(function)
     def call(*args, **kwargs):
         observe_runtime()
-        result = function(*args, **kwargs)
-        observe_runtime()
-        return result
+        return function(*args, **kwargs)
     return call
 
 

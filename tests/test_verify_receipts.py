@@ -288,12 +288,21 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(self.state.row()['verify_token'],
                          self.definition.verify_token('base', 'new-head', 'OK'))
 
-    def test_changed_file_environment_git_or_uncovered_input_runs_again(self):
+    def test_environment_and_revision_changes_reuse_original_run(self):
+        self.verify()
+        self.environment.update(MODE='changed')
+        self.git_inputs.update(HEAD='new-revision')
+        self.ready()
+        self.verify()
+        self.assertEqual(self.calls.count('verify'), 1)
+        run, reused = self.receipts()
+        self.assertEqual(reused['origin_id'], run['id'])
+        self.assertEqual(reused['kind'], 'reuse')
+
+    def test_changed_code_or_uncovered_input_runs_again(self):
         self.verify()
         for change in (
             lambda: self.source.write_text('changed'),
-            lambda: self.environment.update(MODE='new'),
-            lambda: self.git_inputs.update(HEAD='revision-dependent'),
             lambda: (self.root / 'new-config.json').write_text('uncovered'),
             lambda: (self.root / inputs.MANIFEST).write_text('invalid'),
         ):
@@ -308,15 +317,13 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         from loop_manager_internal.execution.result_validation import observe_verify_inputs
         observed = observe_verify_inputs(self.root)
         self.assertFalse(observed.proven)
-        self.assertIn('unconfirmed', observed.reason)
+        self.assertIn('entrypoint outside manifest', observed.reason)
 
-    def test_production_ports_reuse_measured_contract_and_run_unknown_scripts(self):
+    def test_production_ports_reuse_general_scripts_and_reject_changed_code(self):
         import loop_manager
-        from types import SimpleNamespace
         from loop_manager_internal.execution import result_validation
-        from loop_manager_internal.verification import manager_adapter
         script = self.root / 'scripts/verify.sh'
-        script.write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT)
+        script.write_text('#!/bin/sh\npython -m unittest\n')
         (self.root / inputs.MANIFEST).write_text(json.dumps(
             {'version': 1, 'paths': ['src/**', 'scripts/**']}))
         self.state.update_project('repo', worktree=str(self.root))
@@ -328,39 +335,103 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.handler.effects = replace(self.handler.effects, state=self.state,
             validation=replace(self.handler.effects.validation,
                 observe_verify_inputs=production.effects.validation.observe_verify_inputs))
-        with mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix', environ={})), \
-                mock.patch.object(manager_adapter, 'os', SimpleNamespace(name='posix')), \
-                mock.patch.object(manager_adapter.shutil, 'which', return_value=str(self.root / 'python')), \
-                mock.patch.object(manager_adapter.subprocess, 'run',
-                    return_value=type('Result', (), {'stdout': 'a' * 64})()) as probe:
+        with mock.patch.object(result_validation, 'os', type('OS', (), {'name': 'posix'})()):
             self.verify()
             self.ready()
             self.verify()
             self.assertEqual(self.calls.count('verify'), 1)
             self.assertEqual(self.receipts()[-1]['kind'], 'reuse')
-            self.assertTrue(probe.called)
-            self.assertEqual(probe.call_args.args[0][1:5], ['-I', '-S', '-B', '-c'])
-            probe.return_value.stdout = 'b' * 64
+            script.write_text('#!/bin/sh\npython -m unittest changed\n')
             self.ready()
             self.verify()
             self.assertEqual(self.calls.count('verify'), 2)
-            script.write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT + b'# custom command\n')
+            (self.root / 'uncovered.py').write_text('new code')
             self.ready()
-            before = probe.call_count
             self.verify()
             self.assertEqual(self.calls.count('verify'), 3)
-            self.assertEqual(probe.call_count, before)
-        script.write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT)
-        with mock.patch.object(result_validation, 'os', SimpleNamespace(name='nt', environ={})), \
-                mock.patch.object(manager_adapter, 'os', SimpleNamespace(name='nt')), \
-                mock.patch.object(result_validation.shutil, 'which', return_value=None), \
-                mock.patch.object(manager_adapter.subprocess, 'run') as probe:
-            for _ in range(2):
-                self.ready()
-                self.verify()
-            self.assertEqual(self.calls.count('verify'), 5)
-            self.assertTrue(all(row['kind'] == 'run' for row in self.receipts()[-2:]))
-            probe.assert_not_called()
+
+    def test_production_document_reconfirmation_reuses_original_run_for_new_head(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.execution import result_validation
+        self.enterContext(mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix')))
+        from loop_manager_internal.execution.result_validation import observe_verify_inputs
+        repository = Path(__file__).resolve().parents[1]
+        (self.root / 'scripts/verify.sh').write_bytes((repository / 'scripts/verify.sh').read_bytes())
+        (self.root / inputs.MANIFEST).write_text(json.dumps(
+            {'version': 1, 'paths': ['src/**', 'scripts/**', 'tests/**']}))
+        (self.root / 'tests').mkdir()
+        (self.root / 'tests/test_app.py').write_text('import unittest\n')
+        (self.root / 'scripts/verify.json').write_text(json.dumps({
+            'version': 1, 'adapter': 'unittest', 'environment': {'python': 'launcher'},
+            'stages': [{'id': 'tests', 'kind': 'tests', 'cwd': '.',
+                        'collection': {'directory': 'tests', 'pattern': 'test*.py'},
+                        'execution': 'independent'}]}))
+        (self.root / 'docs').mkdir()
+        document = self.root / 'docs/PRODUCT.md'
+        document.write_text('# Original')
+        self.observer.side_effect = lambda _: observe_verify_inputs(self.root)
+        self.verify()
+        document.write_text('# Updated after rebase')
+        original_git = self.effects.workspace.git.side_effect
+        self.effects.workspace.git.side_effect = lambda path, *args, **kwargs: (
+            type('Result', (), {'stdout': 'new-head', 'returncode': 0})()
+            if args == ('rev-parse', 'HEAD') else original_git(path, *args, **kwargs))
+        self.ready()
+        self.verify()
+        self.assertEqual(self.calls.count('verify'), 1)
+        run, reused = self.receipts()
+        self.assertEqual(reused['origin_id'], run['id'])
+        self.assertEqual(reused['head'], 'new-head')
+        self.assertNotEqual(json.loads(run['observation'])['completeness_token'],
+                            json.loads(reused['observation'])['completeness_token'])
+
+    def test_worker_review_through_production_ports_reuses_original_run_after_document_rebase(self):
+        import loop_manager
+        from loop_manager_internal.execution import result_validation
+        from types import SimpleNamespace
+        self.enterContext(mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix')))
+        (self.root / 'scripts/verify.sh').write_text('custom native verify')
+        (self.root / inputs.MANIFEST).write_text(json.dumps(
+            {'version': 1, 'paths': ['src/**', 'scripts/**']}))
+        document = self.root / 'README.md'
+        document.write_text('not consumed')
+        review = inputs.exclusion_request(self.root, ('scripts/verify.sh',))
+        review['basis'] = 'Custom script consumes src only, never README contents.'
+        message = READY_WORKER_RESULT + '\n' + inputs.EXCLUSION_MARKER + json.dumps(review)
+        self.state.update_project('repo', worktree=str(self.root), worker_result=message)
+        production = loop_manager._ExecutionLifecyclePorts(
+            self.connection, self.repository, repo='repo', repo_path=Path('/repo'),
+            state_dir=Path('/state'), base='main', base_sha='base', provider='codex',
+            config_path=Path('/config'), newly_activated=False)
+        self.state = production.effects.state
+        self.handler.effects = replace(self.handler.effects, state=self.state,
+            validation=replace(self.handler.effects.validation,
+                observe_verify_inputs=production.effects.validation.observe_verify_inputs))
+        self.assertEqual(production.effects.agent.worker_prompt('plan', None, session_resume=True),
+                         loop_manager.worker_prompt('plan', None, session_resume=True))
+        prompt = production.effects.agent.reviewer_prompt('main', verify_evidence='Manager receipt')
+        self.assertIn(review['basis'], prompt)
+        self.assertIn(inputs.EXCLUSION_MARKER, prompt)
+        self.assertIn('Manager receipt', prompt)
+        self.assertEqual(self.state.row()['worker_result'], message)
+        self.verify()
+        document.write_text('changed after rebase')
+        original_git = self.effects.workspace.git.side_effect
+        self.effects.workspace.git.side_effect = lambda path, *args, **kwargs: (
+            type('Result', (), {'stdout': 'new-head', 'returncode': 0})()
+            if args == ('rev-parse', 'HEAD') else original_git(path, *args, **kwargs))
+        self.ready()
+        self.state.update_project('repo', worker_result=message)
+        self.verify()
+        run, reused = self.receipts()
+        self.assertEqual(self.calls.count('verify'), 1)
+        self.assertEqual((reused['kind'], reused['origin_id'], reused['head']),
+                         ('reuse', run['id'], 'new-head'))
+        (self.root / 'scripts/verify.sh').write_text('now consumes README')
+        self.ready()
+        self.state.update_project('repo', worker_result=message)
+        self.verify()
+        self.assertEqual(self.calls.count('verify'), 2)
 
     def test_later_completeness_proof_does_not_promote_an_unproven_original_run(self):
         (self.root / 'excluded.json').write_text('outside')
@@ -471,11 +542,11 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertIsNone(self.state.row()['verify_token'])
         self.assertEqual(len(self.receipts()), 1)
 
-    def test_review_gate_reobserves_reused_environment_without_invalidating_worker(self):
+    def test_review_gate_reobserves_reused_code_without_invalidating_worker(self):
         self.verify()
         self.ready()
         self.verify()
-        self.environment['MODE'] = 'changed-after-reuse'
+        self.source.write_text('changed-after-reuse')
         result = self.handler.guard(self.context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
         self.assertEqual(self.state.row()['phase'], 'VERIFYING')
@@ -548,10 +619,10 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
                          self.definition.worker_candidate_token(acceptance['head']))
 
     def test_clean_base_change_preserves_worker_and_session_but_invalidates_review(self):
-        # Match the production script adapter: unmeasured inputs require verify
-        # again even though a clean rebase retains the completed Worker.
+        # Unconfirmed repository code requires verify again while a clean
+        # rebase retains the completed Worker.
         self.observer.side_effect = lambda _: inputs.InputObservation(
-            None, reason='unconfirmed runtime/Git/external inputs')
+            None, reason='unconfirmed repository code inputs')
         self.verify()
         self.state.update_project('repo', worker_session_id='saved',
                                   review_result='VERDICT: PASS', review_token='old-review')

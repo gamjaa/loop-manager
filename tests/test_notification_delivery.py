@@ -44,6 +44,75 @@ class TelegramTransportTest(unittest.TestCase):
 
 
 class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_legacy_progress_pieces_are_canceled_with_original_audit_after_restart(self):
+        kinds = (
+            'plans_published', 'planning_result', 'work_started', 'resumed',
+            'stage_failed', 'maintenance_started', 'maintenance_completed',
+            'project_completed', 'work_waiting',
+        )
+        for kind in kinds:
+            for cursor in (0, 1):
+                with self.subTest(kind=kind, cursor=cursor), tempfile.TemporaryDirectory() as directory:
+                    database = Path(directory) / 'state.db'
+                    connection = self.connection(database=database)
+                    try:
+                        notifications._insert(connection, 'legacy-progress', '/projects/alpha', kind,
+                                              {'project': 'alpha', 'silent': True, 'cause': 'original cause'})
+                        text = 'frozen progress ' * 700
+                        connection.execute(
+                            'UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=?, '
+                            'attempts=3, last_error=?, delivery_started_at=CURRENT_TIMESTAMP',
+                            (text, cursor, 'original delivery error'))
+                        connection.commit()
+                        before = dict(self.events(connection)[0])
+                    finally:
+                        connection.close()
+                    connection = sqlite3.connect(database)
+                    connection.row_factory = sqlite3.Row
+                    try:
+                        adapter = mock.Mock()
+                        for _ in range(2):
+                            self.assertEqual(notifications.dispatch_pending(
+                                connection, 'token', 'chat', adapter=adapter), 0)
+                        adapter.assert_not_called()
+                        after = dict(self.events(connection)[0])
+                        self.assertIsNotNone(after['canceled_at'])
+                        self.assertIsNone(after['delivery_started_at'])
+                        for field in before.keys() - {'canceled_at', 'delivery_started_at'}:
+                            self.assertEqual(after[field], before[field], field)
+                        plan = connection.execute('SELECT status FROM exec_plans').fetchone()
+                        self.assertEqual(plan[0], 'READY')
+                    finally:
+                        connection.close()
+
+    def test_immediate_progress_delivery_uses_same_cancellation_policy(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with notifications.immediate_delivery(connection, 'token', 'chat', repo):
+            with connection:
+                notifications._insert(connection, 'progress', repo, 'work_started',
+                                      {'project': 'alpha', 'silent': True})
+            with mock.patch.object(delivery, 'send_telegram') as adapter:
+                self.assertEqual(notifications.flush_project_events(connection, repo), 0)
+            adapter.assert_not_called()
+        row = self.events(connection)[0]
+        self.assertIsNotNone(row['canceled_at'])
+        self.assertEqual(row['attempts'], 0)
+        self.assertIsNone(row['rendered_text'])
+
+    def test_stale_selection_cannot_claim_canceled_progress(self):
+        connection = self.connection()
+        with connection:
+            notifications._insert(connection, 'progress', '/projects/alpha', 'work_waiting',
+                                  {'project': 'alpha'})
+        rows = connection.execute(
+            'SELECT event_key, event_type, payload, repo FROM notification_outbox').fetchall()
+        adapter = mock.Mock()
+        self.assertEqual(delivery._deliver_rows(connection, 'token', 'chat', rows, adapter), 0)
+        self.assertEqual(delivery._deliver_rows(connection, 'token', 'chat', rows, adapter), 0)
+        adapter.assert_not_called()
+        self.assertEqual(self.events(connection)[0]['attempts'], 0)
+
     def test_pending_targeted_failure_notices_are_canceled_without_losing_sent_piece_audit(self):
         for kind in ('persistent_execution_failure', 'stage_failed'):
             for attempts, pieces in ((0, 0), (1, 0), (1, 1)):
@@ -389,6 +458,7 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
             "execplan_title": body, "pr_url": "https://example.test/pr/18",
             "occurred_at": "2000-01-01T00:00:00Z", "status": "PR Merge 대기", "silent": False,
         }
+        connection.execute("UPDATE exec_plans SET status='PR_OPEN', pr_url=? WHERE repo='/projects/alpha' AND plan_id='G-018'", (payload['pr_url'],))
         notifications._insert(connection, "test-event", "/projects/alpha", kind, payload)
         connection.commit()
         return notifications._message(kind, payload)
@@ -442,7 +512,7 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
                 self.assertNotIn(secret, row["last_error"])
             connection.execute(
                 "UPDATE notification_outbox SET payload = ? WHERE event_key = ?",
-                ('{"project":"changed"}', "test-event"),
+                (json.dumps({**json.loads(row['payload']), 'project': 'changed'}), "test-event"),
             )
             connection.commit()
             connection.close()
@@ -690,6 +760,7 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
             checkpoint.finish_unpublished(
                 checkpoint.get(repo, "G-018"), "local only", retryable=False,
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         calls = []
 
@@ -719,6 +790,7 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
                 scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
                 "Decision still required", "fingerprint",
             )
+            self.confirm_worker_question(connection)
         checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
         request = checkpoint.get(repo, "G-018")
         checkpoint.finish_published(request, "a" * 40)
@@ -745,9 +817,8 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
     def test_cleared_planning_error_cancels_only_its_unsent_notice(self):
         connection = self.connection()
         repo = "/projects/alpha"
-        loop_manager.update_project(
-            connection, repo, phase="PLANNING", planning_error="Old failure",
-        )
+        with connection:
+            self.legacy_planning_notice(connection, 'Old failure')
         pr_message = self.add_event(connection, body="Unrelated PR")
         connection.execute(
             "UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,),
@@ -787,16 +858,17 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
-    def test_immediate_delivery_waits_for_commit_and_preserves_silent_pieces(self):
-        from loop_manager_internal.notifications import delivery
+    def test_action_delivery_waits_for_commit_and_preserves_legacy_silent_pieces(self):
         connection = self.connection()
         repo = '/projects/alpha'
         sent = []
         with notifications.immediate_delivery(connection, 'token', 'chat', repo), \
              mock.patch.object(delivery, 'send_telegram', side_effect=lambda *args, **kw: sent.append((args, kw))):
             with connection:
-                notifications.enqueue_progress(connection, repo, 'maintenance_started', 'failure',
-                    cause='x' * 6000, status='자동 교정 대기', silent=True)
+                connection.execute("UPDATE exec_plans SET status='PR_OPEN', pr_url='https://example.test/pr/18'")
+                notifications._insert(connection, 'legacy-pr', repo, 'pr_created',
+                    {'project': 'alpha', 'execplan_id': 'G-018', 'execplan_title': 'x' * 6000,
+                     'pr_url': 'https://example.test/pr/18', 'silent': True})
                 self.assertEqual(notifications.flush_project_events(connection, repo), 0)
             self.assertEqual(sent, [])
             self.assertEqual(notifications.flush_project_events(connection, repo), 1)
@@ -804,34 +876,12 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
             self.assertTrue(all(kw['disable_notification'] for _args, kw in sent))
             self.assertEqual(notifications.flush_project_events(connection, repo), 0)
 
-    def test_silent_transport_and_partial_restart_keep_original_payload(self):
+    def test_transport_preserves_explicit_silent_flag(self):
         response = mock.MagicMock()
         response.__enter__.return_value.status = 200
         with mock.patch.object(transport, 'urlopen', return_value=response) as open_url:
             transport.send_telegram('token', 'chat', 'notice', disable_notification=True)
         self.assertTrue(json.loads(open_url.call_args.args[0].data)['disable_notification'])
-        directory = self.enterContext(tempfile.TemporaryDirectory())
-        database = Path(directory) / 'state.db'
-        connection = self.connection(database=database)
-        with connection:
-            notifications._insert(connection, 'legacy-failure', '/projects/alpha', 'stage_failed',
-                {'project': 'alpha', 'cause': 'x' * 6000, 'status': '자동 교정 대기', 'silent': True})
-        original = self.events(connection)[0]['payload']
-        send = mock.Mock(side_effect=[None, RuntimeError('secret token')])
-        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
-        self.assertEqual(self.events(connection)[0]['confirmed_pieces'], 1)
-        connection.close()
-        restarted = sqlite3.connect(database)
-        self.addCleanup(restarted.close)
-        restarted.row_factory = sqlite3.Row
-        notifications.configure_session(restarted, enabled=True)
-        with restarted:
-            notifications.enqueue_progress(restarted, '/projects/alpha', 'stage_failed', 'failure',
-                cause='changed observation', status='automatic', silent=True)
-        self.assertEqual(self.events(restarted)[0]['payload'], original)
-        delivered = mock.Mock()
-        self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=delivered), 1)
-        delivered.assert_called_once()
 
 
 class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
@@ -845,6 +895,7 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
                 repo = '/projects/alpha'
                 with connection:
                     connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', ?)", (repo, 'x' * 6000))
+                    self.confirm_worker_question(connection)
                     notifications.enqueue_current_project_events(connection, repo)
                     if confirmed:
                         connection.execute("UPDATE notification_outbox SET confirmed_pieces=1")
@@ -861,26 +912,30 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
                 self.addCleanup(restarted.close)
                 restarted.row_factory = sqlite3.Row
                 config = SimpleNamespace(telegram_token='token', telegram_chat_id='chat')
-                expected = 'resumed' if confirmed else 'work_started'
+                before = dict(self.events(restarted)[0])
                 sent = mock.Mock()
                 dispatch = notifications.dispatch_pending
                 def worker(*a, **kw):
-                    self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type=? AND sent_at IS NOT NULL", (expected,)).fetchone()[0], 1)
+                    self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
+                    self.assertEqual(restarted.execute('SELECT started_at FROM notified_block_incidents').fetchone()[0], started_at)
                     return ()
                 with mock.patch('loop_manager.schedule_registered_projects', side_effect=worker), \
                         mock.patch.object(delivery, 'send_telegram', sent), \
                         mock.patch.object(notifications, 'dispatch_pending', side_effect=lambda conn, token, chat: dispatch(conn, token, chat, adapter=sent)):
                     self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
                     self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
-                self.assertEqual(sent.call_count, 2 if confirmed else 1)
-                self.assertTrue(all(call.kwargs['disable_notification'] for call in sent.call_args_list))
-                event = restarted.execute("SELECT payload FROM notification_outbox WHERE event_type=?", (expected,)).fetchone()[0]
-                self.assertEqual(json.loads(event)['occurred_at'], started_at)
+                sent.assert_not_called()
                 self.assertIsNotNone(restarted.execute('SELECT canceled_at FROM notification_outbox WHERE event_key=?', (key,)).fetchone()[0])
                 with restarted:
                     notifications.record_process_start(restarted, repo, 'worker', 'saved-start', plan_id='G-018')
                     notifications.record_process_start(restarted, repo, 'worker', 'new-start', plan_id='G-018')
-                self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='work_started'").fetchone()[0], 0 if confirmed else 1)
+                self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('resumed', 'work_started')").fetchone()[0], 0)
+                incident = restarted.execute('SELECT start_identity, started_at FROM notified_block_incidents').fetchone()
+                self.assertEqual(tuple(incident), ('saved-start', started_at))
+                after = dict(self.events(restarted)[0])
+                self.assertEqual(after['confirmed_pieces'], int(confirmed))
+                for field in before.keys() - {'delivery_started_at'}:
+                    self.assertEqual(after[field], before[field], field)
                 restarted.close()
 
     def test_disabled_startup_preserves_abandoned_record_without_notice(self):
@@ -890,6 +945,7 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
         repo = '/projects/alpha'
         with connection:
             connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         key = self.events(connection)[0]['event_key']
         delivery._claim_piece(connection, key, first_attempt_only=False)
@@ -938,7 +994,7 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
                            "reason": "사용자 판단 대기", "question": "Question: Choose?"},), (), None, None))
         rows = self.events(connection)
         self.assertEqual([row["event_type"] for row in rows],
-                         ["draft_decisions", "plans_published", "work_waiting"])
+                         ["draft_decisions"])
         payload = json.loads(rows[0]["payload"])
         self.assertEqual([plan["id"] for plan in payload["plans"]], ["G-018", "G-019"])
         self.assertFalse(payload["silent"])
@@ -947,7 +1003,7 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
         self.assertIn("각 작업 문서에서 질문을 확인", message)
         self.assertNotIn("Which storage policy", message)
         self.assertNotIn("https://", message)
-        self.assertEqual(json.loads(rows[1]["payload"])["plans"], [{"id": "G-020", "title": "구현"}])
+        self.assertEqual(connection.execute("SELECT generation FROM work_reason_episodes").fetchone()[0], 1)
 
     def test_disabled_and_empty_lists_do_not_create_notices(self):
         connection = self.connection()
@@ -1142,3 +1198,533 @@ class TelegramEntityTransportTest(unittest.TestCase):
         payload = json.loads(open_url.call_args.args[0].data)
         self.assertEqual(payload["entities"], entities)
         self.assertEqual(payload["text"], "G-018 · 작업")
+
+
+class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
+    repo = '/projects/alpha'
+
+    def test_same_status_needs_concrete_current_question_before_one_notice(self):
+        connection = self.connection()
+        with connection:
+            scoped_blocking.record_plan_block(connection, self.repo, 'G-018',
+                scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
+                'Permission denied; retry budget exhausted', 'unconfirmed')
+            checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_not_called()
+        self.assertEqual(self.events(connection), [])
+        with connection:
+            detail = self.decision_block(connection)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_called_once()
+        self.assertIn('Which permission should be granted?', adapter.call_args.args[2])
+        self.assertIn(detail, adapter.call_args.args[2])
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+
+    def test_final_block_and_user_targets_do_not_prove_user_action(self):
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryAction
+        for reason, block_reason in (
+            (RecoveryReason.VERIFY_EXHAUSTED, 'verify_retry_exhausted'),
+            (RecoveryReason.REVIEW_EXHAUSTED, 'review_retry_exhausted'),
+            (RecoveryReason.WORKER_OUTPUT_EXHAUSTED, 'worker_output_invalid'),
+            (RecoveryReason.PLAN_INPUT_INVALID, 'plan_input_invalid'),
+            (RecoveryReason.STATE_UNSAFE, 'repository_state_unsafe'),
+        ):
+            with self.subTest(reason=reason):
+                connection = self.connection()
+                with connection:
+                    record = RecoveryRepository(connection).observe(RecoveryObservation(
+                        reason, self.repo, 'G-018', 'WORKING', '', '', 'failure', 'head',
+                        'CPU/DB/Git/resource/usage wait or next-run correction remains possible',
+                        user_targets=('docs/PRODUCT.md',)), attempts=3)
+                    self.assertEqual(record.decision.action, RecoveryAction.FINAL_BLOCK)
+                    if block_reason == 'repository_state_unsafe':
+                        connection.execute("INSERT INTO project_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'project', ?, ?)",
+                            (self.repo, block_reason, record.decision.observation.detail))
+                    else:
+                        RuntimeStateRepository(connection).block_plan(self.repo, 'G-018',
+                            reason_code=block_reason, evidence=record.decision.observation.detail,
+                            release_fingerprint='failure', enqueue=False)
+                        checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+                        checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                adapter.assert_not_called()
+                self.assertEqual(self.events(connection), [])
+                self.assertEqual(connection.execute('SELECT attempts FROM recovery_records').fetchone()[0], 3)
+
+    def test_pending_recovery_cancels_partial_question_without_rewriting_audit(self):
+        connection = self.connection()
+        with connection:
+            self.decision_block(connection)
+            connection.execute("UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=1, attempts=2, last_error='original failure'", ('frozen ' * 1000,))
+            before = dict(self.events(connection)[0])
+            RecoveryRepository(connection).observe(RecoveryObservation(
+                RecoveryReason.GIT_LOCK, self.repo, 'G-018', 'WORKING', '', '', 'lock', 'head', 'lock busy'), attempts=3)
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_not_called()
+        after = dict(self.events(connection)[0])
+        self.assertIsNotNone(after['canceled_at'])
+        for key in before.keys() - {'canceled_at', 'delivery_started_at'}:
+            self.assertEqual(after[key], before[key], key)
+        self.assertEqual(connection.execute('SELECT pending_action FROM recovery_records').fetchone()[0], 'pause')
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+
+    def test_reconfirmed_canceled_action_gets_new_event_without_rewriting_old_delivery(self):
+        from loop_manager_internal.notifications.rendering import _message, _pieces
+        for cursor, sent in ((0, False), (1, False), (0, True)):
+            with self.subTest(cursor=cursor, sent=sent):
+                directory = self.enterContext(tempfile.TemporaryDirectory())
+                database = Path(directory) / 'queue.sqlite'
+                connection = self.connection(database=database)
+                self.addCleanup(connection.close)
+                with connection:
+                    self.decision_block(connection, question='q' * 1900, problem='p' * 1900, proposal='r' * 1900)
+                    first = dict(self.events(connection)[0])
+                    frozen = _message('blocked', json.loads(first['payload']))
+                    pieces = _pieces(frozen)
+                    self.assertGreater(len(pieces), 1)
+                    confirmed = len(pieces) if sent else cursor
+                    connection.execute("UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=?, "
+                        "attempts=2, last_error='original transport error', "
+                        "sent_at=CASE WHEN ? THEN CURRENT_TIMESTAMP END", (frozen, confirmed, sent))
+                    recovery = dict(connection.execute('SELECT * FROM recovery_records').fetchone())
+                    RecoveryRepository(connection).observe(RecoveryObservation(
+                        RecoveryReason.GIT_LOCK, self.repo, 'G-018', recovery['phase'],
+                        recovery['plan_revision'], recovery['base_revision'], 'lock',
+                        recovery['progress_marker'], 'lock busy'), attempts=3)
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                old = dict(self.events(connection)[0])
+                adapter.assert_not_called()
+                if not sent:
+                    self.assertIsNotNone(old['canceled_at'])
+                connection.close()
+                connection = sqlite3.connect(database)
+                self.addCleanup(connection.close)
+                connection.row_factory = sqlite3.Row
+                with connection:
+                    notifications.configure_session(connection, enabled=True)
+                    self.decision_block(connection, question='q' * 1900, problem='p' * 1900, proposal='r' * 1900)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                self.assertEqual(connection.execute('SELECT identity FROM recovery_records').fetchone()[0], recovery['identity'])
+                self.assertEqual(len(self.events(connection)), 1 if sent else 2)
+                self.assertEqual(dict(connection.execute('SELECT * FROM notification_outbox WHERE event_key=?',
+                                                        (first['event_key'],)).fetchone()), old)
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0 if sent else 1)
+                self.assertEqual(adapter.call_count, 0 if sent else len(pieces) - cursor)
+                if not sent:
+                    self.assertEqual([call.args[2] for call in adapter.call_args_list], pieces[cursor:])
+                with connection:
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                self.assertEqual(len(self.events(connection)), 1 if sent else 2)
+
+    def test_guidance_action_survives_other_scope_recovery_and_project_release(self):
+        from loop_manager_internal.documents.guidance_approval import parse_guidance_document, guidance_patch_hash
+        from tests.support.guidance import guidance_plan
+        for previously_sent in (False, True, None):
+            with self.subTest(previously_sent=previously_sent):
+                connection = self.connection(enabled=previously_sent is not None)
+                proposal = parse_guidance_document(guidance_plan()).proposals[0]
+                with connection:
+                    connection.execute('INSERT INTO guidance_approvals '
+                        '(repo, plan_id, proposal_id, proposal_hash, target_path, scope, proposal_patch, '
+                        'proposal_patch_hash, proposal_line, decision_line, batch_id, sequence, baseline_content, baseline_mode) '
+                        "VALUES (?, 'G-018', ?, ?, ?, ?, ?, ?, ?, ?, 'batch', 0, ?, 33188)",
+                        (self.repo, proposal.proposal_id, proposal.identity, proposal.target, proposal.scope,
+                         proposal.patch, guidance_patch_hash(proposal.target, proposal.patch), proposal.line,
+                         proposal.decision.line, b'# Agents\n'))
+                    scoped_blocking.record_plan_block(connection, self.repo, 'G-018',
+                        scoped_blocking.BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED, 'approval is pending', 'guidance-input')
+                    checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+                    checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+                adapter = mock.Mock()
+                if previously_sent:
+                    self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+                original = dict(self.events(connection)[0]) if self.events(connection) else None
+                approval = dict(connection.execute('SELECT * FROM guidance_approvals').fetchone())
+                with connection:
+                    scoped_blocking.record_project_block(connection, self.repo,
+                        scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                        'independent project safety observation', 'safety-input', plan_id='G-018', previous_phase=None)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                self.assertEqual([dict(row) for row in self.events(connection)], [original] if original else [])
+                with connection:
+                    scoped_blocking.clear_project_block(connection, self.repo)
+                    notifications.configure_session(connection, enabled=True)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0 if previously_sent else 1)
+                adapter.assert_called_once()
+                self.assertEqual(len(self.events(connection)), 1)
+                self.assertEqual(dict(connection.execute('SELECT * FROM guidance_approvals').fetchone()), approval)
+                self.assertEqual(connection.execute('SELECT reason_code FROM execplan_blocks').fetchone()[0], 'guidance_approval_required')
+                self.assertEqual(connection.execute('SELECT reason_code FROM recovery_records').fetchone()[0], 'state_unsafe')
+                self.assertIsNone(connection.execute('SELECT * FROM project_blocks').fetchone())
+
+    def test_late_confirmation_updates_only_continued_versions_of_same_action(self):
+        from loop_manager_internal.notifications.rendering import _message, _pieces
+        for long_question, changed in ((False, False), (True, False), (True, True)):
+            with self.subTest(long_question=long_question, changed=changed):
+                connection = self.connection()
+                question = 'q' * 1900 if long_question else 'Which permission?'
+                with connection:
+                    self.decision_block(connection, question=question)
+                first = dict(self.events(connection)[0])
+                frozen = _message('blocked', json.loads(first['payload']))
+                original_pieces = _pieces(frozen)
+                recovery = dict(connection.execute('SELECT * FROM recovery_records').fetchone())
+                def reconfirm_while_http_is_inflight(_token, _chat, piece):
+                    self.assertEqual(piece, original_pieces[0])
+                    for _ in range(2):
+                        with connection:
+                            RecoveryRepository(connection).observe(RecoveryObservation(
+                                RecoveryReason.GIT_LOCK, self.repo, 'G-018', recovery['phase'],
+                                recovery['plan_revision'], recovery['base_revision'], 'lock',
+                                recovery['progress_marker'], 'lock busy'), attempts=3)
+                            notifications.enqueue_current_project_events(connection, self.repo)
+                            self.decision_block(connection, question='A different question?' if changed else question)
+                    current = connection.execute('SELECT o.* FROM notified_block_incidents i '
+                        'JOIN notification_outbox o ON o.event_key=i.event_key').fetchone()
+                    self.assertEqual(current['confirmed_pieces'], 0)
+                notifications.dispatch_pending(connection, 'token', 'chat', adapter=reconfirm_while_http_is_inflight)
+                old = connection.execute('SELECT * FROM notification_outbox WHERE event_key=?', (first['event_key'],)).fetchone()
+                self.assertEqual(old['confirmed_pieces'], 1)
+                self.assertIsNotNone(old['canceled_at'])
+                self.assertEqual(old['payload'], first['payload'])
+                current = connection.execute('SELECT o.* FROM notified_block_incidents i '
+                    'JOIN notification_outbox o ON o.event_key=i.event_key').fetchone()
+                self.assertEqual(current['confirmed_pieces'], 0 if changed else 1)
+                adapter = mock.Mock()
+                notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter)
+                if changed:
+                    adapter.assert_called_once()
+                    self.assertIn('A different question?', adapter.call_args.args[2])
+                else:
+                    self.assertEqual([call.args[2] for call in adapter.call_args_list], original_pieces[1:])
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+
+    def test_worker_question_survives_project_recovery_without_restoring_shared_record(self):
+        for initially_enabled, already_sent, changed_revision in ((True, False, False), (True, True, False),
+                                                                (False, False, False), (True, False, True)):
+            with self.subTest(enabled=initially_enabled, sent=already_sent, revision=changed_revision):
+                directory = self.enterContext(tempfile.TemporaryDirectory())
+                database = Path(directory) / 'scope.sqlite'
+                connection = self.connection(enabled=initially_enabled, database=database)
+                self.addCleanup(connection.close)
+                with connection:
+                    connection.execute("UPDATE exec_plans SET current_revision_sha='question-revision'")
+                    self.decision_block(connection)
+                original_count = len(self.events(connection))
+                adapter = mock.Mock()
+                if already_sent:
+                    self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+                with connection:
+                    scoped_blocking.record_project_block(connection, self.repo,
+                        scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                        'independent project safety observation', 'safety-input', plan_id='G-018', previous_phase=None)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                    project_block = scoped_blocking.project_block(connection, self.repo)
+                    RecoveryRepository(connection).resolve_rebase_block(self.repo, 'G-018', project_block)
+                    self.assertEqual(RecoveryRepository(connection).row(self.repo, 'G-018')['pending_action'],
+                                     'reconcile')
+                    scoped_blocking.clear_project_block(connection, self.repo)
+                connection.close()
+                connection = sqlite3.connect(database)
+                connection.row_factory = sqlite3.Row
+                self.addCleanup(connection.close)
+                with connection:
+                    notifications.configure_session(connection, enabled=True)
+                    if changed_revision:
+                        connection.execute("UPDATE exec_plans SET current_revision_sha='replacement-revision'")
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                expected = not already_sent and not changed_revision
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), int(expected))
+                self.assertEqual(adapter.call_count, 1 if already_sent or expected else 0)
+                if expected:
+                    self.assertIn('Which permission should be granted?', adapter.call_args.args[2])
+                self.assertEqual(len(self.events(connection)), original_count or 1)
+                self.assertEqual(connection.execute('SELECT reason_code FROM recovery_records').fetchone()[0], 'state_unsafe')
+                self.assertEqual(RecoveryRepository(connection).row(self.repo, 'G-018')['pending_action'], 'reconcile')
+                block = connection.execute('SELECT * FROM execplan_blocks').fetchone()
+                self.assertEqual(block['reason_code'], 'user_decision_required')
+                self.assertEqual(json.loads(block['recovery_snapshot'])['reason_code'], 'user_decision')
+                self.assertIsNone(connection.execute('SELECT * FROM project_blocks').fetchone())
+
+    def test_old_block_schema_adds_nullable_proof_without_changing_existing_rows(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(scoped_blocking.PLAN_BLOCKS_SCHEMA.replace('    recovery_snapshot TEXT,\n', ''))
+        connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                           "VALUES ('repo', 'G-001', 'plan', 'user_decision_required', 'saved cause')")
+        original = dict(connection.execute('SELECT * FROM execplan_blocks').fetchone())
+        for _ in range(2):
+            scoped_blocking.ensure_schema(connection)
+        migrated = dict(connection.execute('SELECT * FROM execplan_blocks').fetchone())
+        self.assertIsNone(migrated.pop('recovery_snapshot'))
+        self.assertEqual(migrated, original)
+
+    def test_next_piece_rechecks_resolved_action_and_confirmation_never_recreates_notice(self):
+        connection = self.connection()
+        with connection:
+            self.decision_block(connection, question='q' * 1900, problem='p' * 1900, proposal='r' * 1900)
+        original = dict(self.events(connection)[0])
+        calls = []
+        def clear_during_send(_token, _chat, text):
+            self.assertFalse(connection.in_transaction)
+            calls.append(text)
+            with connection:
+                scoped_blocking.clear_plan_block(connection, self.repo, 'G-018')
+                notifications.record_process_start(connection, self.repo, 'worker', 'process', plan_id='G-018')
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=clear_during_send), 0)
+        self.assertEqual(len(calls), 1)
+        row = self.events(connection)[0]
+        self.assertEqual(row['confirmed_pieces'], 1)
+        self.assertEqual(row['attempts'], 1)
+        self.assertIsNotNone(row['canceled_at'])
+        self.assertEqual(row['payload'], original['payload'])
+        self.assertIsNotNone(row['rendered_text'])
+        with connection:
+            notifications.recover_interrupted_starts(connection)
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(connection.execute('SELECT start_identity FROM notified_block_incidents').fetchone()[0], 'process')
+
+    def test_latest_question_replaces_pending_action_in_same_incident(self):
+        connection = self.connection()
+        with connection:
+            self.decision_block(connection, question='Choose permission A?')
+        first = dict(self.events(connection)[0])
+        with connection:
+            self.decision_block(connection, question='Choose permission B?')
+        rows = self.events(connection)
+        self.assertEqual(len(rows), 2)
+        old = next(row for row in rows if row['event_key'] == first['event_key'])
+        self.assertIsNotNone(old['canceled_at'])
+        self.assertEqual(old['payload'], first['payload'])
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        adapter.assert_called_once()
+        self.assertIn('Choose permission B?', adapter.call_args.args[2])
+        self.assertNotIn('Choose permission A?', adapter.call_args.args[2])
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM notified_block_incidents').fetchone()[0], 1)
+
+    def test_changed_question_after_confirmation_is_not_regenerated_from_first_incident_payload(self):
+        connection = self.connection()
+        with connection:
+            self.decision_block(connection, question='Choose permission A?',
+                                detail='permission choice', fingerprint='permission')
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        original = connection.execute('SELECT payload FROM notified_block_incidents').fetchone()[0]
+        with connection:
+            self.decision_block(connection, question='Choose permission B?',
+                                detail='permission choice', fingerprint='permission')
+            notifications.enqueue_current_project_events(connection, self.repo)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 2)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        with connection:
+            notifications.enqueue_current_project_events(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 2)
+        self.assertEqual(adapter.call_count, 2)
+        self.assertIn('Choose permission B?', adapter.call_args.args[2])
+        self.assertEqual(connection.execute('SELECT payload FROM notified_block_incidents').fetchone()[0], original)
+
+    def test_old_planning_partial_queue_is_canceled_without_incident_reactivation(self):
+        connection = self.connection()
+        payload = {'project': 'alpha', 'stage': 'planning', 'scope': 'project',
+                   'reason_code': 'planning_error', 'cause': 'old planning failure', 'execplan_id': None}
+        key = notifications._key('blocked', self.repo, 'project\0planning_error\0')
+        with connection:
+            connection.execute("UPDATE projects SET planning_error='old planning failure'")
+            notifications._insert(connection, key, self.repo, 'blocked', payload)
+            notifications.adopt_legacy_block_notices(connection)
+            connection.execute("UPDATE notification_outbox SET rendered_text='frozen', confirmed_pieces=1, attempts=2, last_error='old error', canceled_at=CURRENT_TIMESTAMP")
+            connection.execute('UPDATE notified_block_incidents SET released_at=CURRENT_TIMESTAMP')
+            before = dict(self.events(connection)[0])
+            incident = dict(connection.execute('SELECT * FROM notified_block_incidents').fetchone())
+            for _ in range(2):
+                notifications.enqueue_current_project_events(connection, self.repo)
+                notifications.recover_interrupted_starts(connection)
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_not_called()
+        self.assertEqual(dict(self.events(connection)[0]), before)
+        self.assertEqual(dict(connection.execute('SELECT * FROM notified_block_incidents').fetchone()), incident)
+        self.assertEqual(connection.execute('SELECT planning_error FROM projects').fetchone()[0], 'old planning failure')
+
+    def test_pr_claim_requires_current_merge_wait_for_same_pr(self):
+        connection = self.connection()
+        loop_manager.update_project(connection, self.repo, phase='PR_OPEN', pr_url='https://example.test/pr/18')
+        before = dict(self.events(connection)[0])
+        with connection:
+            connection.execute("UPDATE exec_plans SET status='MERGED'")
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_new_pr_notifications(connection, 'token', 'chat', self.repo, adapter=adapter), 0)
+        adapter.assert_not_called()
+        row = self.events(connection)[0]
+        self.assertIsNotNone(row['canceled_at'])
+        self.assertEqual(row['payload'], before['payload'])
+        self.assertEqual(row['attempts'], 0)
+
+    def test_deleted_published_branch_requires_restart_until_request_is_recorded(self):
+        from loop_manager_internal.recovery.work_branch_integration import require_remote_present
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+        connection = self.connection()
+        with connection:
+            connection.execute("UPDATE exec_plans SET branch='loop-manager/G-018', publication_remote_oid=?", ('a' * 40,))
+            plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+            with self.assertRaises(RecoveryFailure) as failure:
+                require_remote_present(connection, self.repo, plan, None, None)
+            self.assertEqual(failure.exception.reason, RecoveryReason.REMOTE_BRANCH_DELETED)
+            scoped_blocking.record_plan_block(connection, self.repo, 'G-018',
+                scoped_blocking.BlockReasonCode.REMOTE_BRANCH_DELETED, str(failure.exception), 'deleted-published-branch')
+            checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'preserved locally', retryable=False)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        row = self.events(connection)[0]
+        self.assertEqual(json.loads(row['payload'])['action']['kind'], 'restart')
+        self.assertIn('명시적 재시작', notifications._message('blocked', json.loads(row['payload'])))
+        with connection:
+            current = dict(connection.execute('SELECT * FROM execplan_blocks').fetchone())
+            from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+            store = ExecutionCheckpointRepository(connection)
+            saved = store.get(self.repo, 'G-018')
+            store.record(self.repo, 'G-018', expected_generation=saved.generation,
+                operation=saved.operation, expected_head=saved.expected_head,
+                target_base_oid=saved.target_base_oid, observed_remote_oid=saved.observed_remote_oid,
+                snapshot={'deleted_branch_restart': {'state': 'complete', 'block': current}})
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_not_called()
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+        self.assertEqual(self.events(connection)[0]['attempts'], 0)
+
+    def test_invalid_recovery_evidence_and_changed_revision_preserve_unsent_audit(self):
+        for mutation in ('not-json', 'null', '[]', 'changed-revision', 'changed-fingerprint'):
+            with self.subTest(mutation=mutation):
+                connection = self.connection()
+                with connection:
+                    self.decision_block(connection)
+                    before = dict(self.events(connection)[0])
+                    if mutation == 'changed-fingerprint':
+                        connection.execute("UPDATE recovery_records SET fingerprint='unbound'")
+                    elif mutation == 'changed-revision':
+                        connection.execute("UPDATE recovery_records SET plan_revision='previous'")
+                        connection.execute("UPDATE exec_plans SET current_revision_sha='latest'")
+                    else:
+                        connection.execute('UPDATE recovery_records SET final_evidence=?', (mutation,))
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                adapter.assert_not_called()
+                after = dict(self.events(connection)[0])
+                self.assertIsNotNone(after['canceled_at'])
+                for key in before.keys() - {'canceled_at', 'delivery_started_at'}:
+                    self.assertEqual(after[key], before[key], key)
+
+    def test_closed_pr_and_recorded_verify_limit_expose_only_their_current_action(self):
+        for reason, fingerprint, expected_kind in (
+            (scoped_blocking.BlockReasonCode.PULL_REQUEST_CLOSED, 'closed-head', 'reopen_pr'),
+            (scoped_blocking.BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT, '90', 'verify_timeout'),
+        ):
+            with self.subTest(reason=reason):
+                connection = self.connection()
+                with connection:
+                    notifications.configure_session(connection, enabled=True, verify_timeout_seconds=90)
+                    connection.execute("UPDATE exec_plans SET pr_url='https://example.test/pr/18', verify_result='전체 verify 시간 초과: verify_timeout_seconds=90'")
+                    scoped_blocking.record_plan_block(connection, self.repo, 'G-018', reason,
+                        'Observed native result requires this specific user action.', fingerprint)
+                    checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+                    checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                row = self.events(connection)[0]
+                payload = json.loads(row['payload'])
+                self.assertEqual(payload['action']['kind'], expected_kind)
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+                adapter.assert_called_once()
+                if expected_kind == 'verify_timeout':
+                    self.assertIn('verify_timeout_seconds', adapter.call_args.args[2])
+                    self.assertIn('90초보다', adapter.call_args.args[2])
+                else:
+                    self.assertIn('다시 열어', adapter.call_args.args[2])
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+
+    def test_explicit_route_assessment_allows_unrecoverable_stop_without_fake_user_action(self):
+        routes = {
+            'reobservation': 'The immutable source inventory has been rechecked; no source copy exists.',
+            'retry': 'The required original bytes are absent rather than temporarily unavailable.',
+            'correction': 'No valid input remains for a correction task.',
+            'condition_wait': 'There is no pending resource or condition that can restore those bytes.',
+            'next_run': 'The saved source inventory is permanent and unchanged by restarting.',
+            'safe_recovery': 'No owned checkpoint, backup or alternate source contains the original bytes.',
+        }
+        for missing in (None, 'retry', 'next_run'):
+            with self.subTest(missing=missing):
+                connection = self.connection()
+                facts = {key: value for key, value in routes.items() if key != missing}
+                with connection:
+                    record = RecoveryRepository(connection).observe(RecoveryObservation(
+                        RecoveryReason.STATE_UNSAFE, self.repo, None, 'PROJECT_BLOCKED', None, None,
+                        'confirmed-source-inventory', 'inventory-v1', 'Required original artifacts are unavailable.',
+                        unavailable_recovery_routes=facts), attempts=0 if missing is None else 50)
+                    scoped_blocking.record_project_block(connection, self.repo,
+                        scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                        record.decision.observation.detail, 'confirmed-source-inventory',
+                        plan_id=None, previous_phase=None, recovery_decision=record.decision)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                    notifications.enqueue_current_project_events(connection, self.repo)
+                adapter = mock.Mock()
+                expected = 1 if missing is None else 0
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), expected)
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                if missing is None:
+                    adapter.assert_called_once()
+                    text = adapter.call_args.args[2]
+                    self.assertIn('자동 복구 불가', text)
+                    self.assertIn(routes['safe_recovery'], text)
+                    self.assertNotIn('사용자 조치', text)
+                    self.assertNotIn('Question:', text)
+                    self.assertEqual(len(self.events(connection)), 1)
+                else:
+                    adapter.assert_not_called()
+                    self.assertEqual(self.events(connection), [])
+                saved = connection.execute('SELECT final_evidence FROM recovery_records').fetchone()[0]
+                self.assertEqual(json.loads(saved)['unavailable_recovery_routes'], facts)
+                self.assertEqual(connection.execute('SELECT evidence FROM project_blocks').fetchone()[0], record.decision.observation.detail)
+
+    def test_current_limit_change_or_missing_settings_cancel_old_configuration_action(self):
+        for current_limit in (None, 120):
+            with self.subTest(current_limit=current_limit):
+                connection = self.connection()
+                with connection:
+                    notifications.configure_session(connection, enabled=True, verify_timeout_seconds=90)
+                    connection.execute("UPDATE exec_plans SET verify_result='전체 verify 시간 초과: verify_timeout_seconds=90'")
+                    scoped_blocking.record_plan_block(connection, self.repo, 'G-018',
+                        scoped_blocking.BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT, 'native timeout limit insufficient', '90')
+                    checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+                    checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+                original = dict(self.events(connection)[0])
+                with connection:
+                    notifications.configure_session(connection, enabled=True, verify_timeout_seconds=current_limit)
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                adapter.assert_not_called()
+                after = dict(self.events(connection)[0])
+                self.assertIsNotNone(after['canceled_at'])
+                for field in original.keys() - {'canceled_at', 'delivery_started_at'}:
+                    self.assertEqual(after[field], original[field], field)
+                self.assertEqual(connection.execute('SELECT release_fingerprint FROM execplan_blocks').fetchone()[0], '90')

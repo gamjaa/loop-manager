@@ -397,7 +397,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             },
         )
 
-    def test_merged_completion_outbox_replays_once_after_restart(self):
+    def test_merged_completion_state_survives_restart_without_notice(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
@@ -429,17 +429,14 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 restarted, repo, snapshot,
             ))
             delivered = mock.Mock()
-            self.assertEqual(notifications.dispatch_pending(
-                restarted, "token", "chat", adapter=delivered,
-            ), 1)
-            delivered.assert_called_once()
-            self.assertEqual(restarted.execute(
-                "SELECT COUNT(*) FROM notification_outbox "
-                "WHERE repo = ? AND event_type = 'project_completed'", (repo,),
-            ).fetchone()[0], 1)
-            self.assertEqual(notifications.dispatch_pending(
-                restarted, "token", "chat", adapter=delivered,
-            ), 0)
+            self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=delivered), 0)
+            delivered.assert_not_called()
+            completion = restarted.execute('SELECT * FROM project_completion_cycles WHERE repo = ?', (repo,)).fetchone()
+            self.assertEqual(completion['cycle_key'], 'merge-cycle')
+            self.assertEqual(completion['last_completed_plan_id'], 'G-018')
+            self.assertEqual(completion['last_completed_title'], 'Reliable notices')
+            self.assertIsNotNone(completion['completed_at'])
+            self.assertEqual(self.events(restarted), [])
 
     def test_disabled_and_partial_configuration_do_not_create_events(self):
         connection = self.connection(enabled=False)
@@ -553,7 +550,9 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 "workspace가 아직 생성되지 않았습니다.",
                 retryable=False,
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
 
         events = self.events(connection)
@@ -633,7 +632,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
         }
         self.assertEqual(
             causes,
-            {"Initial user action"},
+            set(),
         )
 
     def test_blocked_event_waits_for_checkpoint_and_includes_published_commit(self):
@@ -669,6 +668,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 "User decision required",
                 "decision-fingerprint",
             )
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         self.assertEqual(self.events(connection), [])
 
@@ -697,11 +697,13 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(pending[0].phase.value, "retry_pending")
             self.assertEqual(pending[0].local_oid, oid)
             with connection:
+                self.confirm_worker_question(connection)
                 notifications.enqueue_current_project_events(connection, repo)
             self.assertEqual(self.events(connection), [])
         repository.finish_published(repository.get(repo, "G-018"), oid)
         repository.finish_published(repository.get(repo, "G-018"), oid)
         with connection:
+            self.confirm_worker_question(connection)
             notifications.enqueue_current_project_events(connection, repo)
         self.assertEqual(len(self.events(connection)), 1)
         self.assertEqual(self.events(connection)[0]["event_type"], "blocked")
@@ -731,24 +733,35 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             plan_path=None,
             planning_error="Planner output remained invalid",
         )
-        row = self.events(connection)[0]
-        payload = json.loads(row["payload"])
-        self.assertEqual(row["event_type"], "blocked")
-        self.assertEqual(payload["stage"], "planning")
-        self.assertIn("docs/PRODUCT.md", payload["paths"])
-        self.assertIn("docs/requirements/*.md", payload["paths"])
-        self.assertIn("docs/ARCHITECTURE.md", payload["paths"])
+        self.assertEqual(self.events(connection), [])
+        self.assertEqual(connection.execute('SELECT planning_error FROM projects').fetchone()[0], 'Planner output remained invalid')
 
 
 class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
+    def test_progress_kinds_never_create_even_silent_outbox_rows(self):
+        connection = self.connection()
+        for kind in ('plans_published', 'planning_result', 'work_started', 'resumed',
+                     'stage_failed', 'maintenance_started', 'maintenance_completed',
+                     'project_completed', 'work_waiting'):
+            for silent in (False, True):
+                with self.subTest(kind=kind, silent=silent), connection:
+                    notifications.enqueue_progress(connection, '/projects/alpha', kind,
+                        kind + str(silent), execplan_id='G-018', silent=silent)
+        self.assertEqual(self.events(connection), [])
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'READY')
+
     def test_progress_cause_redaction_preserves_identity_and_payload(self):
         from loop_manager_internal.execution.validation_feedback import redact_secrets
         connection = self.connection()
+        from loop_manager_internal.storage import execplan_draft_state
+        execplan_draft_state.ensure_schema(connection)
+        connection.execute("INSERT INTO execplan_drafts VALUES (?, 'G-018', 1, ?)",
+            ('/projects/alpha', json.dumps({'pending': True, 'question': 'Which retention policy?', 'revision': 'question-revision'})))
         cause = 'request rejected\n{"password": "first-private\\nsecond-private"}\nBearer bearer-private\n' + 'sk-' + 'a' * 24
         for identity in ('first-error', 'first-error', 'second-error'):
             with connection:
-                notifications.enqueue_progress(connection, '/projects/alpha', 'maintenance_started', identity,
-                    execplan_id='G-018', operation='Planner', cause=cause,
+                notifications.enqueue_progress(connection, '/projects/alpha', 'draft_decision', identity,
+                    execplan_id='G-018', decision_revision='question-revision', operation='Planner', cause=cause,
                     status='자동 교정 대기', silent=True)
         events = self.events(connection)
         self.assertEqual(len(events), 2)
@@ -758,7 +771,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(payload['execplan_id'], 'G-018')
             self.assertEqual(payload['status'], '자동 교정 대기')
             self.assertTrue(payload['silent'])
-            text = notifications._message('maintenance_started', payload)
+            text = notifications._message('draft_decision', payload)
             self.assertIn('request rejected', text)
             self.assertIn(payload['occurred_at'], text)
             for secret in ('first-private', 'second-private', 'bearer-private', 'sk-' + 'a' * 24):
@@ -803,19 +816,12 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         with connection:
             notifications.record_process_start(connection, repo, 'worker', 'process-1', plan_id='G-018')
             notifications.record_process_start(connection, repo, 'worker', 'process-1', plan_id='G-018')
-        event = self.events(connection)[0]
-        payload = json.loads(event['payload'])
-        self.assertEqual(len(self.events(connection)), 1)
-        self.assertEqual(payload['execplan_title'], 'Reliable notices')
-        self.assertTrue(payload['silent'])
-        self.assertEqual(payload['status'], '작업 중')
-        self.assertIn(payload['occurred_at'], notifications._message('work_started', payload))
+        self.assertEqual(self.events(connection), [])
         with connection:
             notifications.record_process_start(connection, repo, 'worker', 'process-2', plan_id='G-018', resumed=True)
-        self.assertEqual(len(self.events(connection)), 1)
-        with connection:
             notifications.record_process_start(connection, repo, 'worker', 'process-3', plan_id='G-018')
-        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(self.events(connection), [])
+        self.assertEqual(connection.execute('SELECT phase FROM projects').fetchone()[0], 'IMPLEMENTING')
 
     def test_publication_and_draft_share_one_decision_notice_with_waiting(self):
         from loop_manager_internal.storage import execplan_draft_state
@@ -834,9 +840,8 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(snapshot)
         notifications.enqueue_waiting_reason(connection, repo, snapshot)
         events = self.events(connection)
-        self.assertEqual([row['event_type'] for row in events], ['draft_decisions', 'work_waiting'])
-        self.assertFalse(json.loads(events[1]['payload'])['silent'])
-        self.assertEqual(json.loads(events[1]['payload'])['plans'][0]['status'], 'DRAFT')
+        self.assertEqual([row['event_type'] for row in events], ['draft_decisions'])
+        self.assertEqual(connection.execute('SELECT generation FROM work_reason_episodes').fetchone()[0], 1)
         payload = json.loads(events[0]['payload'])
         self.assertFalse(payload['silent'])
         self.assertIn('/blob/remote-sha/', payload['plans'][0]['url'])
@@ -934,8 +939,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             notifications.record_planning_publication(connection, '/projects/alpha', [], 'no-new-plans')
             notifications.record_planning_publication(connection, '/projects/alpha', plans, 'remote-sha')
             notifications.record_planning_publication(connection, '/projects/alpha', plans, 'remote-sha')
-        self.assertEqual(len(self.events(connection)), 1)
-        self.assertEqual(self.events(connection)[0]['event_type'], 'plans_published')
+        self.assertEqual(self.events(connection), [])
 
     def test_same_failure_after_resolution_is_a_separate_incident(self):
         connection = self.connection()
@@ -993,9 +997,8 @@ class MaintenanceProgressEventTest(NotificationFixture, unittest.TestCase):
         with notifications.immediate_delivery(connection, 'token', 'chat', repo), mock.patch.object(delivery, 'send_telegram', sent):
             cycle, created = ports.begin_maintenance_assessment(repo, 20, 'a' * 40, include_general_planning=False)
             self.assertTrue(created)
-            sent.assert_called_once()
-            self.assertTrue(sent.call_args.kwargs['disable_notification'])
-            self.assertIn('사용자의 명시적 유지보수 요청', sent.call_args.args[2])
+            sent.assert_not_called()
+            self.assertIsNotNone(cycle.cycle_id)
             again, created = ports.begin_maintenance_assessment(repo, 20, 'a' * 40, include_general_planning=False)
             self.assertFalse(created)
             self.assertEqual(again, cycle)
@@ -1005,15 +1008,15 @@ class MaintenanceProgressEventTest(NotificationFixture, unittest.TestCase):
                     repository.advance_success_baseline(repo, expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit='a' * 40)
                     raise RuntimeError('interrupted')
             self.assertEqual(repository.get(repo), cycle)
-            self.assertEqual(len(self.events(connection)), 1)
+            self.assertEqual(self.events(connection), [])
             done = repository.advance_success_baseline(repo, expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit='a' * 40)
             ports.flush_notifications(repo)
             self.assertEqual(done.phase, maintenance_state.MaintenancePhase.IDLE)
-            self.assertEqual(sent.call_count, 2)
-            self.assertIn('후속 계획 없이', sent.call_args.args[2])
+            sent.assert_not_called()
+            self.assertEqual(done.last_cycle_commit, 'a' * 40)
             with self.assertRaises(maintenance_state.MaintenanceStateError):
                 repository.advance_success_baseline(repo, expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit='a' * 40)
-            self.assertEqual(len(self.events(connection)), 2)
+            self.assertEqual(self.events(connection), [])
 
     def test_cycle_with_followup_does_not_finish_until_confirmed_merge(self):
         from loop_manager_internal.storage import maintenance_state
@@ -1026,7 +1029,7 @@ class MaintenanceProgressEventTest(NotificationFixture, unittest.TestCase):
         repository.record_assessment_plans(repo, cycle.revision, ('G-018',))
         cycle = repository.advance_success_baseline(repo, expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit='a' * 40)
         self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.REFACTORING)
-        self.assertEqual([row['event_type'] for row in self.events(connection)], ['maintenance_started'])
+        self.assertEqual(self.events(connection), [])
         with connection:
             connection.execute("UPDATE exec_plans SET status = 'PR_OPEN' WHERE repo = ?", (repo,))
         with self.assertRaises(maintenance_state.MaintenanceStateError):
@@ -1038,10 +1041,9 @@ class MaintenanceProgressEventTest(NotificationFixture, unittest.TestCase):
             repository.finish_cycle(repo, expected=cycle, source_sha='c' * 40)
         done = repository.finish_cycle(repo, expected=cycle, source_sha='b' * 40)
         self.assertEqual(done.phase, maintenance_state.MaintenancePhase.IDLE)
-        completed = next(row for row in self.events(connection) if row['event_type'] == 'maintenance_completed')
-        payload = json.loads(completed['payload'])
-        self.assertEqual(payload['plans'], [{'id': 'G-018', 'title': 'Reliable notices'}])
-        self.assertTrue(payload['silent'])
+        self.assertEqual(done.last_cycle_commit, 'b' * 40)
+        self.assertEqual(repository.get(repo), done)
+        self.assertEqual(self.events(connection), [])
         with self.assertRaises(maintenance_state.MaintenanceStateError):
             repository.finish_cycle(repo, expected=cycle, source_sha='b' * 40)
-        self.assertEqual(len(self.events(connection)), 2)
+        self.assertEqual(self.events(connection), [])

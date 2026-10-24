@@ -394,20 +394,6 @@ class MaintenanceRepository:
         self.connection = connection
         ensure_schema(connection)
 
-    def _notify_cycle(self, repo, cycle, kind, reason, plan_ids=()):
-        from loop_manager_internal.notifications import notifications
-        if not notifications._enabled(self.connection):
-            return
-        identity = cycle.cycle_id or f"{cycle.cycle_base_sha}:{cycle.cycle_start_merged_count}"
-        titles = {row["plan_id"]: row["title"] for row in self.plan_rows(repo)}
-        notifications.enqueue_progress(
-            self.connection, repo, kind, identity,
-            operation="유지보수", cause=reason,
-            plans=[{"id": plan_id, "title": titles[plan_id]} for plan_id in plan_ids],
-            status="유지보수 평가 중" if kind == "maintenance_started" else "일반 작업 선택 대기",
-            silent=True,
-        )
-
     def _merged_count(self, repo: str) -> int:
         from .execplan_catalog_state import verified_historical_merge_ids
 
@@ -694,7 +680,6 @@ class MaintenanceRepository:
                 "include_general_planning = 0, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE repo = ?",
                 (source_sha, count, repo),
             )
-            self._notify_cycle(repo, state, "maintenance_completed", "확정 범위의 실제 Merge 완료", scope)
             return self.get(repo)
 
     def _verified_merged_count(
@@ -942,11 +927,6 @@ class MaintenanceRepository:
                 (request_id, request_id, uuid4().hex, repo),
             )
             cycle = self.get(repo)
-            self._notify_cycle(repo, cycle, "maintenance_started", {
-                "initial_full": "최초 유지보수 평가",
-                "interval_reached": "Merge 수에 따른 유지보수 주기 도래",
-                "requested_full": "사용자의 명시적 유지보수 요청",
-            }.get(decision.reason, decision.reason))
             return cycle, True
 
     def record_full_assessment(
@@ -1354,8 +1334,4 @@ class MaintenanceRepository:
                 raise MaintenanceStateError(
                     "유지보수 주기 단계 또는 revision이 변경됐습니다."
                 )
-            self._notify_cycle(repo, state, "maintenance_completed",
-                               "후속 계획 없이 평가·게시 완료" if expected_phase is MaintenancePhase.ASSESSMENT
-                               else "확정 범위의 실제 Merge 완료",
-                               () if expected_phase is MaintenancePhase.ASSESSMENT else scope)
             return self.get(repo)

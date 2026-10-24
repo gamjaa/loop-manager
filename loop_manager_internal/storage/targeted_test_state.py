@@ -110,7 +110,8 @@ class TargetedTestRepository:
             for event in results:
                 run_id, test_id, result = (event[key] for key in ('run_id', 'id', 'result'))
                 if (not all(isinstance(value, str) and value.strip() for value in (run_id, test_id))
-                        or result not in {'success', 'failure', 'error', 'skip', 'expected_failure', 'unexpected_success'}):
+                        or result not in {'success', 'failure', 'error', 'skip', 'expected_failure',
+                                          'unexpected_success', 'fixture_error', 'indeterminate'}):
                     raise ValueError('targeted test 실행 결과가 유효하지 않습니다.')
                 old = self.connection.execute('''SELECT result FROM targeted_test_results
                     WHERE repo=? AND plan_id=? AND run_id=? AND test_id=?''',
@@ -122,10 +123,12 @@ class TargetedTestRepository:
                 self.connection.execute('''INSERT INTO targeted_test_results
                     (repo, plan_id, run_id, test_id, result) VALUES (?, ?, ?, ?, ?)''',
                     (repo, plan_id, run_id, test_id, result))
+                if result in {'fixture_error', 'indeterminate'}:
+                    continue
                 previous = self.connection.execute('''SELECT failures, repeated FROM targeted_test_streaks
                     WHERE repo=? AND plan_id=? AND test_id=?''', (repo, plan_id, test_id)).fetchone()
                 failures = ((previous[0] if previous else 0) + 1
-                            if result in {'failure', 'error'} else 0)
+                            if result in {'failure', 'error', 'unexpected_success'} else 0)
                 repeated = bool(failures >= 3 or (previous and previous[1]))
                 self.connection.execute('''INSERT INTO targeted_test_streaks VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(repo, plan_id, test_id) DO UPDATE SET

@@ -525,10 +525,7 @@ class ReviewHandler:
                 continue
             break
         assert verdict is not None
-        if draft is not None and (
-            verdict != 'PASS'
-            or not document_publication.review_confirms_publication(review)
-        ):
+        if draft is not None and not document_publication.review_confirms_publication(review):
             return self.ports._document_block(
                 context, draft,
                 "Reviewer가 의미 보존과 승인 diff 일치를 명시적으로 확정하지 못했습니다. "

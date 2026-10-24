@@ -194,6 +194,14 @@ Manager의 `document-drafts` 문서 수정본 결과는 application의 `tagged_j
 
 후보의 내용 문자열은 해석 과정에서 정규화하지 않으며 전체 JSON의 2,100,000 UTF-8 byte 제한과 기존 저장 bytes/hash 계약을 유지한다. 형식 오류는 `DocumentDraftError` 경계로 전달되어 후보 저장이나 사용자 결정을 만들지 않고 기존 수정본·결정 상태를 보존한다.
 
+**승인 수정본과 기존 작업 전달.**
+
+승인 수정본은 독립 Planner 호출이나 새 ExecPlan 생성 대상이 아니다. 다음 조건을 모두 확인할 때만 정상 실행 선택으로 이미 시작한 기존 자동 Worker에게 artifact를 전달한다: 승인 당시의 source 관계가 한 개의 ExecPlan ID·sources로 현재 작업과 정확히 일치하고, 저장된 현재 선언의 path·sources와 repository가 같으며, 현재 단계가 구현 중이고 수동 소유나 PR 연결이 없다. 일반 작업 전달 대상은 Worker checkpoint 허용 범위에 있는 PRODUCT·ARCHITECTURE 문서다. Requirement 대상은 일반 Worker 권한 밖이므로 bind·bytes 적용 전에 `publication_error`에 미적용 이유를 기록하고 승인 artifact를 보존한다. 승인 시 source 관계가 없거나 여러 계획을 가리키면 `publication_error`에 미전달 이유를 기록하며, stale 원문·변경된 source·소유권 불명·수동 소유·PR·자동 실행 대상이 아닌 상태도 작업에 매핑하지 않고 승인 artifact를 보존한다. 이 보류는 독립 작업 선택과 별도 목적의 Planner 판단을 막지 않는다.
+
+`plan_id`의 기존 단일 연결과 compare-and-set을 재사용해 한 승인 artifact를 한 작업에만 결합한다. 연결 뒤에도 승인 snapshot에 포함된 계획의 source 관계를 원격 catalog와 다시 대조한다. source snapshot에 없는 계획을 제외하는 예외는 승인 뒤 생성된 legacy 문서 전용 계획에만 적용해 게시 복구를 유지한다. Worker에는 원본·제안·의미 근거·전체 diff를 입력으로 전달하고 대상 문서 직접 수정은 금지한다. 성공 결과를 확인한 뒤 Manager가 저장된 승인 identity·revision·bytes와 원격 원문·source 관계를 다시 검증하고 대상이 원본 bytes 또는 이미 적용된 승인 bytes일 때만 정확한 승인 bytes를 쓴다. 구현 단계 뒤에는 원문·source·소유권 재검증 실패나 승인 bytes 누락·변형을 연결 해제로 취급하지 않는다. mapped artifact와 미적용 이유를 보존해 문서 guard가 verify·Review·게시를 명시적으로 거부하게 한다. 다른 task 변경은 유지하지만 대상 내용·diff·file mode가 승인과 다르면 덮어쓰지 않고 Worker 교정 경계로 돌린다. 문서 의미·diff가 PASS이고 코드 Review만 FAIL이면 문서 교착으로 분류하지 않고 기존 validation failure·Worker 교정 경로를 따른다. 이후에도 기존 targeted test·전체 verify·의미 보존 Review·PR gate를 통과해야 한다.
+
+기존에 게시된 `DOCUMENT_DRAFT_ID` claim을 가진 전용 계획은 legacy 복구 경로에서 승인 diff만 있는 worktree를 검증·적용한다. 이 claim과 R-027 source 제약은 예전 게시 결과를 위해 유지하며 새 문서 수정본의 작업으로 만들지 않는다.
+
 **ExecPlan 문서 형식.**
 
 ExecPlan은 [PLANS.md](PLANS.md)의 고정 key/value와 `sources`·`depends_on` 목록만 파싱하며 전체 YAML을 지원하지 않는다. 파일 앞의 `---` 경계 안에서 key를 한 번씩 선언하고 목록 항목은 두 칸 들여쓴 `- `로 쓴다. 허용 key 이외의 선언과 중복 key는 거부한다.
@@ -245,6 +253,8 @@ catalog 동기화는 정상적으로 열린 DB에서 개별 작업 행이 없을
 | 작업을 유일하게 식별할 수 있는 metadata·source·dependency 오류 또는 삭제 경위가 확인되지 않은 원격 파일 누락 | 해당 작업과 전이적으로 의존하는 후속 작업을 실행 후보에서 제외하고 진단과 기존 실행 이력을 보존한다. 검증된 독립 작업의 cache 갱신·선택·PR 관측은 계속한다. |
 | 중복 ID·파일명과 선언 ID의 불일치·문서 인코딩/조회 실패·일반 파일이 아닌 입력 등 식별·공유 입력의 안전성을 확정할 수 없는 오류 | 프로젝트 범위 진단을 남기고 전체 catalog 동기화를 보류한다. 실패를 빈 catalog나 변경 없음으로 바꾸지 않는다. |
 | 진행 중 게시·공유 소유권과 충돌하거나 원격 revision·SQLite snapshot이 달라진 경우 | 기존 게시·소유 작업과 실행 이력을 보존하고 적용을 보류한다. 소유권 정리·게시 재개 또는 최신 snapshot 확인 뒤 다시 처리한다. |
+
+일반·유지보수 planning은 결과 검증에서 active catalog에 같은 batch의 신규·개정 선언을 overlay한다. 일반 metadata 검증에서 제외된 보류 노드는 등록된 SQLite dependency 관계로 연결하고, 보류 원인 전파로 snapshot에서 제외된 기존 노드도 고정 revision에서 확인한 withheld closure에 있을 때만 등록 관계로 graph를 완성한다. 고정 revision의 원문·hash·보류 원인과 미수정 withheld 파일을 확인한 뒤 이 관계를 사용하며, batch 선언이 있으면 해당 ID의 과거 SQLite dependency보다 현재 선언을 우선한다. 공통 graph 검사는 변경 계획이 순환에 참여하는 경우 거부하고, 변경 계획과 무관한 기존 보류 순환은 독립 계획의 전역 오류가 되지 않게 격리한다. 등록되지 않은 보류 선행 참조와 변경 대상 자체의 선언·source·dependency 오류도 거부한다. 유지보수 게시 재검증은 이 helper를 다시 실행한다. 일반 게시 후보는 intent에 저장한 revision·snapshot token과 commit에 포함된 검증 hash를 대조하고 transaction의 CAS에서 SQLite 소유권을 확인한다. 문서 게시·DB 등록과 Worker 실행 자격은 분리하며 선행 보류 해제만으로 실제 Merge gate를 통과하지 않는다.
 
 ExecPlan 번호는 연속일 필요가 없다. 번호 공백을 누락 계획으로 추정하거나 메우지 않으며 사용한 ID는 재사용하지 않는다. 파일 누락만으로 취소·완료를 확정하지 않고 검증된 삭제 처리와 구분한다. 오류 격리와 독립 작업 계속은 현재 동작이며, 아래의 관리 문서·자원 정리 목표와 구분한다.
 
@@ -351,7 +361,7 @@ runtime 경로가 존재하지만 소유권, repository, detached HEAD, SHA 또�
 
 runtime 자식은 등록된 canonical source·repository/origin·base·실제 runtime 경로/SHA를 검증하고, 선택된 프로젝트 목록과 별도로 self를 찾는다. `application/self_runtime.py`의 원격 관측은 기존 fetch journal·자원 잠금을 사용하며 PR 조회나 source 동기화를 수행하지 않는다. 일반 PR 수명주기의 base identity 검증·Merge 반영은 별도로 유지한다.
 
-단계 시작 전과 영속 결과 반환 뒤 `RuntimeHandoffGate.observe()`가 관측을 직렬화한다. 실행·planning·복구 coordinator와 실제 Agent/verify 배정 경계가 이를 호출한다. 관측 잠금을 기다리기 전에 완료한 단계의 implicit DB 요청을 확정하고 명시적 transaction 내부 관측은 거부하므로 DB 쓰기 transaction·scheduler condition·launch lock 안에서 원격 관측하지 않는다. 실제 실행 SHA와 원격 commit의 raw diff 및 blob을 비교해 추가·삭제·이동·mode/kind 변경을 포함한다. 알려진 문서 위치의 일반 UTF-8 prose만 제외하고 실행 bit·symlink·shebang·Python 구문과 문서 아래 실행 코드는 포함한다. 알 수 없는 경로와 비교 실패는 문서 전용 성공이 아니다.
+실제 단계 진입 전 `RuntimeHandoffGate.observe()`가 관측을 직렬화한다. 실행·planning·복구 coordinator와 실제 Agent/verify 배정 경계가 이를 호출한다. 최초 관측은 즉시 수행하고 성공 완료의 monotonic 시각을 runtime 전체에서 공유해 30초 미만이면 원격 조회·입력 비교를 재사용한다. 병렬 진입은 잠금 안에서 시각을 다시 확인하며 실패는 성공 시각을 갱신하지 않는다. 단계 종료와 재시도·사용량·기존 호출 종료 대기는 원격 관측을 만들지 않으며 pause·확정된 handoff 신호만 확인한다. 대기가 풀린 뒤 실제 단계 진입에서 같은 30초 기준으로 다시 확인한다. 관측 잠금을 기다리기 전에 완료한 단계의 implicit DB 요청을 확정하고 명시적 transaction 내부 관측은 거부하므로 DB 쓰기 transaction·scheduler condition·launch lock 안에서 원격 관측하지 않는다. 실제 실행 SHA와 원격 commit의 raw diff 및 blob을 비교해 추가·삭제·이동·mode/kind 변경을 포함한다. 알려진 문서 위치의 일반 UTF-8 prose만 제외하고 실행 bit·symlink·shebang·Python 구문과 문서 아래 실행 코드는 포함한다. 알 수 없는 경로와 비교 실패는 문서 전용 성공이 아니다.
 
 원격 SHA/코드가 같으면 실행을 계속한다. 코드가 다른 fast-forward 후속이면 원자 launch gate에 source/origin/base·실행/목표 SHA·mutation identity를 결합해 신규 관리·Agent·verify·게시를 막고 진행 중 호출은 반환·저장을 기다린다. 부모는 자식별 일회용 channel token과 논리 run ID에 결합한 `runtime-handoffs/<mutation>-<token>.json` 및 전용 반환 코드 75를 함께 검증한다. 임의 파일·출력·일반 종료 코드는 재시작 근거가 아니다. 확인한 자료는 consumed로 남기고 재소비하지 않는다. 미확정 반환은 별도 보존 코드 76으로 부모에 전달하며 새 runtime이나 기존 runtime 제거를 허용하지 않는다.
 
@@ -405,7 +415,7 @@ Planner의 표준 결과는 `FINAL_SPECIFICATION_REVIEW: <JSON object>` 하나�
 
 최종 확인의 `work_cycle`은 MERGED 수·유지보수 revision·Merge된 작업의 검증 identity에 결합한다. 재사용은 확정된 `fulfilled`의 현재 입력·명세 지문·주기 일치를 요구하며, 원문 보존 archive-only 이동은 유효한 계획 선언과 정확한 이동을 검증한 예외로만 허용한다. 상태 공백·catalog 부재·일반 검토의 추가 계획 없음이나 검토 파일명만으로 완료를 합성하지 않는다.
 
-안정적 완료·작업 소진의 원본은 현재 원격 입력·catalog·SQLite 상태다. 완료 알림의 사건 키는 프로젝트의 유효 planning 입력 지문으로 관리하며 최종 확인의 `work_cycle`과 구분한다. 대기 사건은 현재 계획·Requirement·차단 원인 snapshot의 지문과 세대로 중복 제거한다. Merge 후 worktree cleanup·ExecPlan archive pending은 완료를 막지 않지만 미완료 planning publication·활성 writer·안전 gate를 우회하는 근거로 사용하지 않는다.
+안정적 완료·작업 소진의 원본은 현재 원격 입력·catalog·SQLite 상태다. 완료 기록의 `cycle_key`는 프로젝트의 유효 planning 입력 지문으로 관리하며 최종 확인의 `work_cycle`과 구분한다. `project_completion_cycles`의 완료 시각·마지막 Merge 계획과 `work_reason_episodes`의 snapshot 지문·세대는 Telegram 활성 여부와 독립적으로 유지한다. 완료·대기 outbox는 만들지 않는다. Merge 후 worktree cleanup·ExecPlan archive pending은 완료를 막지 않지만 미완료 planning publication·활성 writer·안전 gate를 우회하는 근거로 사용하지 않는다.
 
 ### 계획 게시와 작업 공간
 
@@ -791,11 +801,13 @@ CLI·OS별 실행 전제는 [인증과 실행 조건](OPERATIONS.md#인증과-�
 | 경계 | 확인·저장하는 근거 |
 |---|---|
 | 실행 환경 준비 | `AgentRequest.prepared_launch`가 worktree·repository·role의 공통 홈과 호출별 임시 저장을 provider 조회 전에 선택한다. legacy profile callback도 `prepared_environment`의 같은 필터된 mapping을 사용하며 부모 `os.environ`·호출자 mapping은 바꾸지 않는다. |
-| 모델 호출 없는 사전 검사 | 현재 CLI·설정·확장·역할 정책과 별도 `codex sandbox` 안의 파일 도구 경계를 검사한다. 실제 Agent 실행을 감싸는 wrapper나 모델 호출·중첩 도구 시연과 구분한다. |
-| 실행 직전 | 같은 환경의 인증·Model/Effort·Fast·native 지침을 확인하고 workspace·설정·CLI와 인증 링크를 재검사한다. native developer의 `additional_tools`는 전송 ID를 제외한 정의를 전후 비교하며 지침 메시지로 해석하지 않는다. 전체 developer 지침·환경·정책 지문을 invocation에 결합한 뒤 실제 `codex exec`를 시작한다. |
+| 모델 호출 없는 사전 검사 | 현재 CLI·설정·확장·역할 정책과 별도 `codex sandbox` 안의 파일 도구 경계를 검사한다. version 조회 뒤와 feature 조회 뒤 sandbox probe 전에 설정 정책을 다시 확인하고, sandbox probe 뒤에도 안정된 최종 설정 지문을 계산한다. 조회 사이 설정이 충돌 상태로 바뀌면 다음 Codex 조회 전에 중단한다. 실제 Agent 실행을 감싸는 wrapper나 모델 호출·중첩 도구 시연과 구분한다. |
+| 실행 직전 | 같은 환경의 인증·Model/Effort·Fast·native 지침을 확인하고 workspace·설정·CLI와 인증 링크를 재검사한다. native developer의 `additional_tools`는 전송 ID를 제외한 정의를 전후 비교하며 지침 메시지로 해석하지 않는다. 준비 조회가 안전한 설정을 바꿨으면 새 내용을 다시 검사해 최종 격리·실행 지문에 결합한다. 최종 증거를 invocation에 저장한 뒤 process handoff에서도 설정·workspace snapshot을 확인하고 실제 `codex exec`를 시작한다. |
 | 종료 | 프로세스 그룹 또는 Windows Job의 정리·wait 성공 뒤에만 종료 콜백을 호출한다. 시작·writer 종료·결과 성공·검증 성공은 별도 사실로 기록한다. |
 
 `provider_execution.observe`는 모델 실행 없이 현재 Codex Reviewer의 입력을 확인하거나 지정한 실제 invocation의 완료 기록을 읽는다. `execution_identity`의 문자열 필드는 `provider`·`model`·`effort`·`instruction`·`environment`·`policy`이며 지침·환경·정책은 지문으로 저장한다. 실제 호출 identity는 process 시작 전에 한 번 결합하고 현재 설정을 과거 행에 소급하지 않는다. credential 값·그 값의 해시·prompt 원문은 저장하지 않는다.
+
+준비 CLI 조회가 선택 state directory의 공통 `automation-codex/config.toml`을 안전하게 생성·교체하면 새 내용을 재검사한 뒤 현재 invocation의 격리·실행 지문을 갱신한다. Manager `config.ini`, project/system Codex 설정, 그 밖의 준비 입력은 갱신 대상이 아니며 조회 사이 변경되면 다음 Codex 조회 전에 거부한다. version·features·native 지침 조회가 각각 끝난 뒤 정책을 다시 검사해 충돌 파일을 발견하면 후속 조회를 실행하지 않는다. MCP·plugin·hook·profile·권한·exec-policy 충돌, 읽기 실패, 검사 중 불안정한 내용은 거부한다. 공통 설정의 안전한 변경이 native 지침 조회 사이에 발견되면 baseline 지침부터 다시 해석하고 sentinel·최종 override 조회가 같은 설정 identity를 확인한 경우에만 전달 내용을 증명한다. 변경이 반복돼 조회 결과를 한 설정에 결합할 수 없으면 거부한다. 저장된 증거 갱신은 process 시작 전의 미완료 invocation에서 공통 home 설정의 안전한 변화에만 허용하며 process handoff에서 전체 설정과 workspace snapshot을 다시 대조한다. 그 밖의 입력 변경은 호출을 시작하지 않고 기존 결과·session·작업 이력을 보존한다.
 
 일회성 임시 경로는 정확히 확인한 소유 디렉터리만 정규화한다. 실제 process 시작·종료·성공·격리·지침과 repository/plan/role/worktree 결합이 없거나 legacy 입력이 누락되면 재사용 증거를 반환하지 않는다. 현재 환경 확인만으로 과거 성공을 합성하지 않는다.
 
@@ -996,7 +1008,7 @@ rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업�
 
 적용·stage 중단은 같은 원문으로 재개하고 뒤늦은 replay 충돌도 같은 문서 revision을 사용한다. 후속 catalog·source·rename 판정 오류의 uncertain 기록도 이전 채택 이력과 원문·blob을 유지한다. 모든 재생 위치의 채택 경로를 checkpoint 이력에서 모아 완료 직전 HEAD·index·작업 파일을 원문과 대조한다. 후속 비충돌 재생이 원문을 바꿨으면 완료 채택을 거부하고 checkpoint와 작업물을 기존 복구 경계에 보존한다.
 
-충돌 해결 Worker의 종료 검사도 소유된 중간 상태에서는 최종 변경 범위·선언 판정을 유예하고 구조·operation·원격 소유권을 확인한다. 응답·실제 호출 전에 고정한 입력 snapshot·session·종료 코드·결과 종류는 후속 검사 전에 같은 교정 turn에 함께 보존한다. 검사 오류 뒤 재개에도 당시 입력을 최신 definition으로 대체하지 않는다. Git rebase가 끝나면 Manager가 고정 target base의 선택된 ExecPlan frontmatter를 복원하며 구현·검증 본문과 mode는 보존한다. 복원 전후 bytes·다른 파일의 상태·commit tree를 execution checkpoint에 기록해 쓰기·stage·commit 중단을 같은 결과로 재개한다. 복원 후 전체 최종 범위·선언 검사와 기존 verify·Review를 수행한다. 선언 불일치는 Worker 반복 교정으로 보내지 않으며 plan_input_invalid의 소유 rebase도 일반 branch 검사 전에 같은 복구 경계로 재평가한다.
+충돌 해결 Worker의 종료 검사도 소유된 중간 상태에서는 최종 변경 범위·선언 판정을 유예하고 구조·operation·원격 소유권을 확인한다. 응답·실제 호출 전에 고정한 입력 snapshot·session·종료 코드·결과 종류는 후속 검사 전에 같은 교정 turn에 함께 보존한다. 검사 오류 뒤 재개에도 당시 입력을 최신 definition으로 대체하지 않는다. Git rebase가 끝나면 Manager가 고정 target base의 선택된 ExecPlan frontmatter를 복원하며 구현·검증 본문과 mode는 보존한다. 복원 전후 bytes·다른 파일의 상태·commit tree를 execution checkpoint에 기록해 쓰기·stage·commit 중단을 같은 결과로 재개한다. 선택 ExecPlan의 본문은 기존 Worker turn receipt가 없는 저장 rebase에서도 사용자 결정·draft 보호와 현재 소유권·다른 문서의 채택 원문을 검증한 뒤 선언 복원 전후 bytes로 보존할 수 있다. 복원된 정확한 출력만 후속 문서 범위 검사에서 수용하며, 복원 기록을 Worker 완료·targeted test·verify·Review 성공 근거로 사용하지 않는다. 복원 후 전체 최종 범위·선언 검사와 기존 verify·Review를 수행한다. 선언 불일치는 Worker 반복 교정으로 보내지 않으며 plan_input_invalid의 소유 rebase도 일반 branch 검사 전에 같은 복구 경계로 재평가한다.
 
 rebase target은 바꾸지 않으며 원격 재전진은 기존 operation 완료 후 반영한다. 문서 전용 충돌은 Manager가 continue/skip하고 혼합 충돌의 나머지 파일과 autostash 충돌은 기존 Worker 교정 경계에 남긴다. 문서 Progress는 현재 후보의 실행·검증 성공 증거가 아니며 완료 후의 입력 재평가·verify·Review·게시 gate는 유지한다
 
@@ -1170,11 +1182,19 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 
 공통 진단은 EventWriter의 `*.jsonl`만 집계하며 native 원본의 별도 형식과 중단 자료를 보존한다. 파일 ID에 속한 동적 assertion 번호·plan과 parser/exit/signal을 대조해 완결된 suite만 완료로 기록한다. bailout은 plan 완료·정상 종료와 관계없이 suite 완료를 거부한다. nested subtest와 fixture 의미는 Test::More가 소유한다.
 
+EventWriter 이벤트는 `clock_domain=sys.platform`과 run/stage/unit/worker identity를 보존한다. Windows launcher의 parent summary는 `result.json`·`snapshot.json`과 `<run>-wsl`·`<run>-windows`의 summary 경로·run ID·결과·elapsed를 연결하고 각 자식 실행의 clock domain 안에서만 시간을 계산한다. WSL run ID는 `parent_run_id`로 launcher run에 연결된다. native child에도 launcher의 parent run ID를 전달하고, parent는 일치하는 parent identity를 확인한 child summary에서 실제 native run ID를 가져온다. live WSL worker JSONL은 공유 bundle log에서 읽고 cleanup 뒤 형제 디렉터리로 보존한다.
+
+새 `phase_start`·`phase_end` 쌍은 같은 32자리 소문자 16진수 UUID `phase_id`를 사용한다. `timing.summarize()`와 Manager progress reader는 변경될 수 있는 stage/unit identity 대신 이 ID로 phase 종료를 연결한다. ID가 없는 legacy 이벤트는 같은 run·clock domain·PID·phase 이름·시작 시각으로 연결한다. 따라서 `verify` phase가 stage ID 변경을 가로질러 FALLBACK·예외로 종료되고 `run_end`가 없어도 실행 중 항목으로 남지 않는다.
+
+Manager progress reader는 현재 run의 완성된 줄만 한 번 소비하며 `test_interrupted`·stage 종료·run 종료를 파일 순서와 독립적으로 적용해 늦게 읽은 worker 시작이 active 표시를 되살리지 못하게 한다. 파일 읽기 실패는 미확인으로 남긴다. summary는 각 OS의 child metrics와 전체 parent elapsed를 분리해 PID나 monotonic clock을 합치지 않는다.
+
 `LoopManagerVerifyGuard.pm`은 테스트/compile BEGIN 전에 일반 Perl process·fork·network 경계를 막으며 CORE/XS/threads 우회는 지원하지 않는다. 부분 결과는 native 로그에 보존하고 공통 core가 실제 worker 종료 후 예약을 회수한다. Perl은 unittest AST 부분 선정·시간 큐 재사용에 진입하지 않는다.
 
 ### 실행량·예약·시간 큐
 
 core는 완료 report와 기존 자식/Windows Job 종료 조건을 먼저 확인하고, 매 acquire의 cap·공정성·미반영 CPU/메모리 예약 판단이 허용하는 pending 모듈을 연속 배정한다. 즉시 report가 나타나면 수집으로 돌아가며, 진행이 없거나 acquire가 거절되고 즉시 수집할 report도 없으면 50ms bounded 대기한다. 시작 실패의 미시작 확인, PID bind, idle 전환과 실제 종료 뒤 release 경계는 유지한다.
+
+결과 파일을 처음 관측한 시각, Job의 active child 대기·종료 확인, report 검증 후 module result, 같은 worker의 다음 unit 배정 시각을 JSONL로 연결한다. Job 대기 이벤트는 Windows Job의 active process 수가 worker만 남을 때까지 기다리는 구간을 나타낸다. coordinator의 `resource_wait`와 `worker_shutdown:<worker>` phase는 별도다. Job 상태 조회 오류는 종료 미확인 이벤트로 보존하고 idle·예약 회수 조건을 바꾸지 않는다. 다음 `unit_start`는 `worker_id`와 직전 unit을 포함해 결과 확인부터 재배정까지의 실제 경과와 allocation snapshot을 대조하게 한다.
 
 runner의 실행 큐는 같은 진단 부모 디렉터리의 가장 최근 `summary.json`과 manifest·모듈 report를 읽는다. 큐 재사용은 실행 모드·선택 상태·수집 ID·fixture 소유자·pattern과 현재 단계 및 전체 실행 선언·프로젝트 Python·병렬도/조율·임시 경로·Python 경로·계측 버전이 같은 경우에만 허용한다.
 
@@ -1219,13 +1239,13 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 ### targeted test와 실패 수집
 
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다
-- targeted unit test 실패는 Worker가 같은 세션에서 수정하고 재실행한다. 프로젝트 Python과 Manager runtime의 `verification/targeted.py`로 unittest의 `test_end` 또는 새 JUnit 보고서의 개별 결과를 남긴다. 실행별 ID와 기록 폴더는 호출별 쓰기 허용 임시 폴더에 결합한다. JUnit의 classname·name은 파라미터를 포함한 안정적 테스트 ID여야 한다. unittest subTest는 상위 test.id()의 최종 결과로 집계한다.
+- targeted unit test 실패는 Worker가 같은 세션에서 수정하고 재실행한다. 프로젝트 Python과 Manager runtime의 `verification/targeted.py`는 실행별 ID·기록 폴더와 JUnit의 안정적인 classname·name·파라미터 ID를 결합해 native 개별 결과를 보존한다. unittest subTest는 상위 `test.id()`의 최종 결과 하나로 집계한다. unittest 본문의 failure·error와 `unexpected_success`는 실패이며, 성공·skip·expected failure만 명시된 초기화 결과다. `TestCase`와 `IsolatedAsyncioTestCase`의 표준 `_callSetUp`·`_callTearDown` lifecycle 경로에서 callback의 원래 예외 identity를 대응시켜 동기·비동기 fixture 오류를 `fixture_error`로 남긴다. lifecycle callback이 실행 중임을 추적해 `addSubTest()`가 삼킨 setup·teardown subTest assertion도 해당 fixture에 귀속하며, native subTest 결과와 scope를 함께 기록한다. 본문 subTest는 상위 failure로 유지하고 본문과 teardown이 모두 실패하면 본문 failure 한 건과 별도 fixture 증거를 보존한다. class/module teardown과 같이 테스트 identity에 안전하게 귀속할 수 없는 fixture 오류가 동반된 성공 결과는 `indeterminate`로 관측한다. 수집·중단에는 개별 결과를 만들지 않는다.
 
   실행 가능한 관련 unit test가 없는 변경은 사유를 남기며 전체 검증을 생략하는 근거로 사용하지 않는다
 
 - 실행 전 `targeted_test_collections`에 물리 invocation과 기록 디렉터리·파일시스템 identity·process receipt 경로를 결합한다. invocation ledger가 repository·ExecPlan·Worker 역할·guidance 작업·scope와 실제 provider/model을 소유한다. 기록 경로는 기존 `state/agent-runtime/<runtime>/<call>`이고 receipt는 쓰기 허용 call 바깥의 `<call>.process.json`이다. 정규 경로·기존 디렉터리·Worker 소유권과 호출별 경로의 유일성을 확인하며 파일시스템 device/inode는 Windows의 큰 식별자도 보존하도록 십진 문자열로 저장한다. 이 additive 테이블이 없는 과거 호출의 기록 위치를 디렉터리 탐색으로 추측하지 않는다.
 - invocation 종료의 finally, Manager의 `reconcile_interrupted()`와 Worker 호출 전·CLI retry 전·호출 후 경계가 같은 미소비 기록을 재관측한다. 기존 process receipt 복구로 writer 종료가 확인되고 디렉터리 identity가 일치할 때만 읽는다. 살아 있는 수동 작업은 기존 소유권 보호를 적용한다. receipt 부재·종료 불명·경로 교체·symlink·읽기/해석/저장 오류에서는 원문·결합을 보존하고 해당 작업을 대기한다. 같은 작업의 앞선 호출이 대기하면 후속 호출도 순서를 보존하며 다른 repository·ExecPlan의 수집은 이어간다. runtime·모델 교체는 저장된 호출 귀속을 바꾸지 않는다. `AgentRequest.on_targeted_prepared`는 launch 객체 없이 같은 디렉터리·receipt를 결합하는 port이며 Claude의 실제 전달 연결은 별도 작업이다.
-- Manager는 완료된 개별 결과를 SQLite `targeted_test_results`·`targeted_test_streaks`에 반영하고, 실행 ID의 invocation 귀속(`targeted_test_run_owners`)과 collection의 `collected` 전이를 같은 transaction에서 확정한다. 미소비 상태는 `pending` 또는 오류 종류를 가진 `error`이며 저장 실패·transaction 중단 뒤에도 재시도한다. repository·ExecPlan·실행 ID·테스트 ID로 중복과 상충 결과를 검사하고 다른 호출의 실행 ID 재사용은 거부한다. JSONL의 불완전한 마지막 줄과 기록 부재에서 성공·실패를 합성하지 않으며 수집·fixture 오류도 개별 테스트 실패로 세지 않는다. 세 번째 실패 도달은 같은 turn에서 뒤에 성공하더라도 소비 전까지 보존하고 새 Worker·CLI retry·verify 전에 `targeted_test_exhausted`로 차단한다.
+- Manager는 완료된 개별 결과를 SQLite `targeted_test_results`·`targeted_test_streaks`에 반영하고, 실행 ID의 invocation 귀속(`targeted_test_run_owners`)과 collection의 `collected` 전이를 같은 transaction에서 확정한다. 미소비 상태는 `pending` 또는 오류 종류를 가진 `error`이며 저장 실패·transaction 중단 뒤에도 재시도한다. repository·ExecPlan·실행 ID·테스트 ID로 중복과 상충 결과를 검사하고 다른 호출의 실행 ID 재사용은 거부한다. `failure`·`error`·`unexpected_success`는 누적하고 `success`·`skip`·`expected_failure`는 초기화한다. `fixture_error`·`indeterminate`는 감사 결과로 기록하되 기존 streak를 늘리거나 초기화하지 않는다. JSONL의 불완전한 마지막 줄과 기록 부재에서 성공·실패를 합성하지 않으며 수집·fixture 오류도 개별 테스트 실패로 세지 않는다. JUnit `<failure>`는 native 실패로, `<skipped>`는 skip으로 기록한다. fixture 여부를 구별할 원본 근거가 없는 `<error>`는 `indeterminate`이며, suite 오류와 명령 종료 코드는 별도 실행 오류로 남겨 개별 테스트 실패를 합성하지 않는다. 기존 저장 결과는 이 분류로 소급 변경하지 않는다. 세 번째 실패 도달은 같은 turn에서 뒤에 성공하더라도 소비 전까지 보존하고 새 Worker·CLI retry·verify 전에 `targeted_test_exhausted`로 차단한다.
 
   차단 확정과 도달 표식 소비는 같은 transaction이며 실행·실패 감사는 보존한다. Worker 최종 실패 보고는 `targeted_test_correction`, 수집 대기는 `targeted_collection_pending`으로 구별해 일반·rebase 보고 오류 한도를 소비하지 않는다. 근거 없는 실패 보고는 작업별 재시도 대기 뒤 재검증하고 수집 대기는 기존 자료를 먼저 재수집한다. 수집 대기는 별도 반환 표식으로 전달하며 물리 provider 결과·사용량·종료 감사를 덮지 않는다. 실제 provider 거부·완료 보고 오류·명시적 사용자 결정과 독립 안전 차단은 각 기존 경계에서 처리한다.
 
@@ -1258,7 +1278,7 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 
 [Agent CLI 실패](PRODUCT.md#외부-cli-실패)는 위 구현·검증 실패와 별도로 처리한다.
 
-Agent CLI 실행 실패·timeout·일시적 서비스 오류는 한 호출 요청에서 최초 실행 외 최대 3회 재시도한다. 세션 재개 불가로 새 세션을 한 번 시작하는 복구는 별도로 집계한다. 묶음이 소진되면 recovery record의 identity/generation에 결합한 `retry_after`를 저장한다. 작업별 30초 대기는 호출 자리를 점유하지 않고 runtime 확인을 계속하며 같은 실행에서 저장 단계를 다시 배정한다. runtime 교체 후에도 저장된 시각과 누적 감사를 유지한다. Review 교정은 시작한 turn만 세며 같은 피드백 turn의 예약·재처리는 중복 집계하지 않는다. AI 사용 한도는 실제 종료가 확인된 같은 provider/model의 독립 성공 기록 이후에만 재개하고 유료 probe·새 session·provider 전환으로 우회하지 않는다. 종료 불명 예약은 해당 token의 기존 receipt로 종료를 재확인한 뒤에만 회수한다.
+Agent CLI 실행 실패·timeout·일시적 서비스 오류는 한 호출 요청에서 최초 실행 외 최대 3회 재시도한다. 세션 재개 불가로 새 세션을 한 번 시작하는 복구는 별도로 집계한다. 묶음이 소진되면 recovery record의 identity/generation에 결합한 `retry_after`를 저장한다. 작업별 30초 대기는 호출 자리를 점유하지 않고 pause·확정된 handoff 신호를 확인하며 같은 실행에서 저장 단계를 다시 배정한다. runtime 원격 관측은 대기 해소 뒤 실제 단계 진입에서만 수행한다. runtime 교체 후에도 저장된 시각과 누적 감사를 유지한다. Review 교정은 시작한 turn만 세며 같은 피드백 turn의 예약·재처리는 중복 집계하지 않는다. AI 사용 한도는 실제 종료가 확인된 같은 provider/model의 독립 성공 기록 이후에만 재개하고 유료 probe·새 session·provider 전환으로 우회하지 않는다. 종료 불명 예약은 해당 token의 기존 receipt로 종료를 재확인한 뒤에만 회수한다.
 
 ### 자체 테스트의 Git 경계
 
@@ -1475,7 +1495,19 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 사건 선택·주의 수준·해제·완료·대기 정책은 [PRODUCT의 Telegram 알림 조건](PRODUCT.md#telegram-알림-조건)을 따른다. token·chat ID가 모두 있을 때만 outbox에 새 사건을 저장하고 전송한다. 모두 없으면 생성·전송하지 않으며 일부만 있으면 설정 오류다. 상태 소유 경계가 같은 SQLite transaction에 사건을 기록하고 commit 뒤 즉시 전송 경계가 새 건을 시도한다. 실패한 건은 다음 실행의 미확정 전송 처리로 이어가며 작업 상태와 전송 결과를 분리한다.
 
-새 일반 계획의 원격 게시·catalog 반영은 `plans_published`, 현재 draft 판단 목록은 `draft_decisions`로 기록한다. 단순 `planning_result`·`stage_failed`는 새 사건 선택에서 제외한다. Planner 실제 시작은 차단 후 재개 판단에 사용하며 일반 시작 알림을 만들지 않는다. Worker 최초 시작은 해당 계획의 실제 프로세스 시작과 저장된 시작·재개 이력으로 중복 제거한다. 유지보수 시작·종료는 cycle identity·상태 전이에 연결한다. 미해결 targeted test 보고는 별도 단순/지속 실패 사건을 만들지 않으며 기존 outbox의 해당 미전송 진단도 취소하되 실패·전송 감사를 보존한다. 실제 최종 차단은 원인별 기존 경계를 따른다.
+일반 계획 게시·Worker 최초 시작·유지보수 cycle 시작/종료는 outbox 사건을 만들지 않는다. `enqueue_progress`는 draft 판단·PR 사건 종류만 허용한다. `record_process_start`는 실제 시작을 기존 incident 기록에 연결하며 일반 시작 알림을 위한 과거 outbox 조회는 수행하지 않는다. 유지보수 저장소는 알림용 계획 목록 조회·enqueue 없이 기존 cycle 상태·범위·Merge 확인·종료를 기록한다. 현재 draft 판단 목록은 `draft_decisions`로 저장한다. 미해결 targeted test와 단순 단계 실패는 별도 단순/지속 실패 사건을 만들지 않는다. 차단 통지는 아래 공통 조치 판정을 따른다.
+
+조각 claim은 `blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision` 외 사건의 잔여 전송을 취소한다. 구정책 진행·완료·대기·재개 사건에도 적용하며 payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim을 사용한다. `policy.is_current`를 생성과 각 claim의 공통 판정으로 사용한다. PR은 현재 같은 계획·URL의 PR_OPEN 투영을, draft는 기존 질문 목록·판단 identity/revision을 재사용한다. PR 검토 후보·draft 링크의 세부 identity 확장은 별도 후속 작업이며 이 경계는 추가 외부 호출이나 Git 쓰기를 수행하지 않는다.
+
+`policy.block_action`은 현재 block의 scope·대상·원문 원인과 복구 기록의 최종 원문 근거·현재 계획 revision을 대조한다. 복구 fingerprint는 기존 `RecoveryObservation.identity`를 재계산해 무결성을 확인하며, block의 release fingerprint는 입력·설정 재검사의 원본으로 유지한다. 두 지문은 서로 다른 의미이므로 값의 일치를 요구하지 않는다. 해당 scope의 복구가 pending이거나 필요한 근거가 손상·누락되면 보류한다. `block_recovery`는 최종 근거의 코드 소유 차단 원인으로 scope를 구분하며 생성·정책·claim의 사건 키 계산에 같은 관측을 사용한다. 다른 scope의 최종 recovery와 그 근거를 보존한 복구 완료(`reconcile`) 기록은 현재 계획의 질문·승인 근거를 대체하지 않는다. 계획 차단을 기록할 때 일치하는 최종 recovery를 같은 transaction에서 `execplan_blocks.recovery_snapshot`에 보존한다. 이 선택적 nullable JSON object는 identity·원인 코드·phase·계획/base revision·fingerprint·progress marker·detail·pending_action과 JSON 문자열 final_evidence를 유지한다. final_evidence 안의 검증된 Worker 결정이 질문 원본이다. 공유 recovery 부재 또는 다른 scope의 최종·복구 완료 기록에는 이 snapshot을 재사용하되 현재 block 원인·대상·계획 revision과 identity 무결성은 다시 검사한다. 같은 scope의 pending/손상 기록은 우선하며 과거 snapshot으로 우회하지 않는다. 기존 DB에는 nullable 컬럼을 추가해 행을 보존하며, snapshot이 없는 기존 기록에서 질문을 합성하지 않는다. 계획 차단 교체·해제에는 snapshot도 함께 교체·제거한다. 지침 승인·명세 교착은 자체 pending 승인 행·파싱한 원문을 조치 원본으로 사용하고 사건 키에서 공유 recovery identity를 제외해 독립 scope 변경에 따른 중복 통지도 막는다. 허용 근거는 이미 검증한 Worker 결정의 질문/위치, 파싱·허용 문서 검사를 통과한 SPEC_DEADLOCK, 현재 pending 지침 승인, 같은 닫힌 PR·게시 branch 삭제에 연결된 조치, 기록된 verify 상한과 실제 timeout 결과다. 최종 disposition·예산 소진·user_targets만으로 복구 불가능성을 추론하지 않는다. 조치 없는 최종 중단은 아래 명시적 복구 경로 근거 계약을 만족해야 한다. 원인이 일반 진행/복구/불충분 근거이면 outbox 없이 원본 상태와 진단을 유지한다.
+
+새 blocked payload의 선택적 `action` object는 현재 조치의 snapshot이다. `kind`는 `decision`·`specification`·`guidance`·`reopen_pr`·`restart`·`verify_timeout`·`unrecoverable`이며 질문은 `decision`, 승인 목록은 `proposals`, PR은 `pr_url`, 재시작은 `branch`, 상한은 양의 정수 `seconds`에 결합한다. `guidance.proposals`는 승인 순서대로 `[proposal_id, proposal_hash, target_path, proposal_line, decision_line]` 배열을 보존한다. `unrecoverable`은 원래 recovery의 `identity`를 `recovery_identity`로 보존하며 이 action이 없는 구정책 payload를 복구 불가 통지로 소급 해석하지 않는다. 나머지 기존 payload에 action이 없더라도 현재 원본으로 유효성을 확인할 수 있으면 그대로 전송한다. action이 있으면 현재 조치와 정확히 비교하며 원래 payload·고정 본문을 소급 갱신하지 않는다. 변경된 조치는 기존 incident의 다음 version으로 연결하고 취소·전송 감사를 남긴다. 중복 판정은 현재 outbox payload와 비교하며 incident에 남긴 첫 확인 원문은 감사용으로 보존한다. 같은 조치의 기존 행이 취소됐고 전송 완료가 확인되지 않았다면 현재 근거 재확인 뒤 다음 version의 새 outbox를 만든다. 기존 취소 행·attempt/error·payload는 변경하지 않으며 새 version은 기존 고정 본문·확인 cursor를 승계해 잔여 조각만 전송한다. 미취소 행·전송 완료 행과 이력이 누락된 행은 이 재생성 대상이 아니다. 같은 조치를 이어받은 payload의 선택적 `continued_from`은 직전 outbox event_key 문자열이다. 이전 HTTP 요청의 늦은 성공은 동일한 고정 본문을 가진 이 계보의 후속 version에도 확인 cursor·전체 완료를 전파한다. 계보가 없는 기존 payload는 그대로 지원하며 새 질문·다른 조치로 교체한 version에는 이전 확인을 전달하지 않는다. 취소 시각·원문·attempt/error는 보존한다.
+
+`RecoveryObservation.unavailable_recovery_routes`는 복구 소유자가 이미 확인한 복구 불가 사실만 전달하는 선택적 JSON object다. 최종 판단일 때 `final_evidence`에 보존하며 기존 복구 결정·예산·재개 정책은 바꾸지 않는다. 허용 키는 `reobservation`·`retry`·`correction`·`condition_wait`·`next_run`·`safe_recovery`의 정확한 여섯 개이며 값은 각 경로를 사용할 수 없는 근거인 비어 있지 않은 문자열이다. 현재 원인·지문·revision과 일치하는 최종 기록에 이 근거가 모두 있고 사용자 조치가 없을 때만 `unrecoverable`을 선택한다. 기존 기록의 필드 부재·부분 근거는 보류하며 일반 final 분류에서 자동 생성하지 않는다. 본문에는 원래 원인·보존 결과·경로별 근거를 표시하고 가짜 질문·조치 안내를 붙이지 않는다.
+
+`configure_session`은 credential 없이 연결별 TEMP 상태에 활성 여부와 현재 양의 정수 `verify_timeout_seconds`를 묶는다. scheduler·수동 recover·독립 task 연결은 transaction 밖에서 읽은 설정을 전달한다. 미확인 값은 NULL로 처리하며, 상한 조치는 현재 값·block 지문·실제 verify timeout 결과가 모두 같은 상한일 때만 허용한다. 값 변경·누락은 이전 통지의 잔여 조각을 취소하며 기존 설정·오류·감사를 덮지 않는다.
+
+사건 투영은 Telegram 설정과 독립적으로 오래된 미전송 사건을 취소한 뒤 새 사건을 선택한다. planning_error enqueue와 과거 planning 사건의 released_at/canceled_at을 해제하던 복원 경로는 제거했다. legacy 통지 채택과 첫 확인 원인·확인 조각의 연결은 감사용으로 유지한다. 원격 관측과 설정 확인의 소유자는 transaction 밖에서 사실을 확보하고 현재 DB에 반영하며, 공통 판정은 전송 transaction에서 해당 현재 원인을 다시 대조한다.
 
 지속 실행 실패 집계는 복구 진단으로 보존하고 독립 outbox 사건을 만들지 않는다. 같은 대상·원인의 실제 `PLAN_BLOCKED`·`PROJECT_BLOCKED`와 checkpoint 결과가 확정되면 기존 BLOCKED outbox만 사용한다.
 
@@ -1502,7 +1534,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 전송할 조각은 transaction에서 선택하고 HTTP 전송 뒤 현재 조각 위치를 대조해 확인 수를 전진시킨다. 고유 사건 키의 중복 삽입 방지와 외부 수신의 중복 방지는 별도다. 수신 후 확인 저장 전 중단·불명확한 실패는 같은 미확인 조각을 재시도하므로 외부 수신의 정확히 한 번을 보장하지 않는다.
 
-차단 해제와 해당 사건 해제·미전송 조각 취소는 같은 transaction에 반영한다. 재개는 한 조각 이상의 통지 확인과 원인 해제, 해당 작업의 실제 시작이 연결돼야 하며 시작 중 전송 확인이 늦게 도착해도 같은 사건·시작 identity로 한 번만 기록한다. 과거 planning 중복 사건의 확인 이력은 현재 사건에 연결하고 과거 행을 삭제하지 않는다. 안정적 작업 소진은 draft·계획 차단을 포함하되 프로젝트 차단을 제외하며 완료·대기 사건 키는 [프로젝트 최종 확인과 완료 판정](#프로젝트-최종-확인과-완료-판정)을 따른다. 새 PRODUCT·ARCHITECTURE·Requirement 변경 등으로 갱신된 완료 주기와 내용 보존 archive를 구분한다.
+차단 해제와 해당 사건 해제·미전송 조각 취소는 같은 transaction에 반영한다. incident의 실제 시작은 기존 원인 해제·작업 identity·첫 시작 시각과 연결해 Telegram 설정과 독립적으로 보존한다. `record_work_start`는 처음 확정한 통지 확인·실제 시작 연결 수를 반환하므로 PR 재개 운영 로그는 메시지 생성에 의존하지 않는다. `resumed_at`은 기존 `confirmed_before` 또는 현재 outbox의 확인된 조각이 있고 해당 작업이 시작됐을 때 한 번 기록한다. 전송 확인 callback은 원래 조각 cursor와 incident 확인 감사를 전진시키고 이 연결만 확정하며 새 메시지는 만들지 않는다. 실패 callback과 시작 복구도 시작/재개 outbox를 만들지 않고, 시작 복구는 취소 사건의 중단된 claim 표식과 저장된 시작만 정리한다. 과거 planning 중복 사건의 확인 이력은 현재 사건에 연결하고 과거 행을 삭제하지 않는다. 안정적 작업 소진은 draft·계획 차단을 포함하되 프로젝트 차단을 제외하며 완료·대기 상태는 [프로젝트 최종 확인과 완료 판정](#프로젝트-최종-확인과-완료-판정)을 따른다. 새 PRODUCT·ARCHITECTURE·Requirement 변경 등으로 갱신된 완료 주기와 내용 보존 archive를 구분한다.
 
 `notifications/rendering.py`는 저장된 payload만으로 텍스트를 결정적으로 생성하며 모델을 호출하지 않는다. 확인된 질문·수정 대상·PR 상태 순으로 정보를 구성하고 원인·복구 시도·Checkpoint 근거를 보존한다. 공통 payload와 `draft_decisions` 목록의 계약은 다음과 같다.
 
@@ -1626,7 +1658,7 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 | 실행 | 목록 자체·선택한 저장소 verify 진입점·코드/테스트/의존성·검증 선언의 파일 입력을 결합 |
 | 생성물·의존성 | Git 내부·bytecode·`.venv` 등 설치 환경은 비교 대상 밖이다. 저장소 의존성 선언·lock 파일과 테스트 고정 자료는 코드 입력이다. |
 
-다음은 R-072에서 채택한 코드 입력 관측 계약이며 기존 환경 완전성 adapter를 이 기준으로 전환하는 구현이 필요하다. `InputObservation.proven`은 유효 목록·저장소 코드 입력 관측·목록 밖 코드 누락 확인과 `fingerprint`/`reason`으로 판단한다. 파일을 읽거나 비교할 수 없는 경우는 미확인이며 runtime·Git/외부 identity의 `None`은 그 자체로 미확인이 아니다. 기존 환경 관측 자료는 감사로 보존할 수 있으나 코드 기준 재사용 gate로 사용하지 않는다. 목록 밖 제외 근거는 아래 completeness token의 코드 입력에 결합한다.
+관측은 R-072의 저장소 코드 입력 기준을 사용한다. `InputObservation.proven`은 유효 목록·저장소 코드 입력 관측·목록 밖 코드 누락 확인과 `fingerprint`/`reason`으로 판단한다. 파일을 읽거나 비교할 수 없는 경우는 미확인이며 runtime·Git/외부 identity의 `None`은 그 자체로 미확인이 아니다. 기존 환경 관측 자료는 감사로 보존할 수 있으나 코드 기준 재사용 gate로 사용하지 않는다. 목록 밖 제외 근거는 아래 completeness token의 코드 입력에 결합한다.
 
 입력 목록의 부재·오류는 관측을 미확인으로 만들어 전체 verify를 유지한다. 공통 runner 연결 선언 `scripts/verify.json`의 형식·지원 오류는 [공통 verify 실행 경계](#공통-verify-실행-경계)에 따라 실행 실패이며 두 파일의 오류 처리를 혼동하지 않는다.
 
@@ -1635,13 +1667,13 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 자체 `scripts/verify-inputs.json`은 다음 입력을 고정 목록으로 관측한다.
 
 - `loop_manager.py`, `loop_manager_internal/**`, `tests/**`, `requirements.txt`
-- `scripts/verify.json`, `scripts/verify.sh`, `scripts/verify.ps1`, `scripts/verify_windows.py`, `scripts/verify-windows-tests.json`
+- `scripts/verify.json`, `scripts/verify.sh`, `scripts/verify.ps1`, `scripts/verify_windows.py`, `scripts/verify-windows-tests.json`, `scripts/setup.sh`
 - `scripts/copy-project-files.sh`, `scripts/copy-project-files.ps1`
 - `.agents/skills/specification-docs/scripts/**`, `run.sh`, `run.ps1`
 
 `tests/**`의 등록·profile·프로젝트 준비 검증은 문서·설정 예제 대신 고정 샘플을 사용한다. 복사 회귀는 실제 copy 스크립트 bytes를 샘플 source root에서 실행해 결과 bytes·경로·기존 파일 보존·재실행 거부를 확인한다. 배포되는 조회 도구와 Skill 자체 문서 파서는 실제 실행 코드 bytes를 샘플 source에 배치해 배포 결과·조회 동작을 확인한다.
 
-샘플은 현재 문서 원본에서 자동 생성·동기화하지 않는다. `AGENTS.md`·README·docs와 `.agents`의 prose·`config.ini.example`·사용자 운영 설정·소비하지 않는 setup/ignore/attributes 변경은 자체 verify 입력이 아니다. Windows verify driver·선택 목록은 이미 포함돼 있다. 테스트가 실제로 읽어 실행하는 `scripts/setup.sh`의 누락 보완은 R-072의 변경 목표다. 이 제외는 원문의 일관성·품질을 확인하지 않으며 필수 테스트·전체 compile·실제 verify/copy 스크립트 검증을 축소하지 않는다.
+샘플은 현재 문서 원본에서 자동 생성·동기화하지 않는다. `AGENTS.md`·README·docs와 `.agents`의 prose·`config.ini.example`·사용자 운영 설정·소비하지 않는 setup/ignore/attributes 변경은 자체 verify 입력이 아니다. Windows verify driver·선택 목록과 Linux 실행 경로 회귀가 임시 source에 복사해 실행하는 `scripts/setup.sh`는 입력이다. setup의 bytes·kind·mode 변경은 입력 지문과 기존 제외 근거를 바꾼다. 소비하지 않는 다른 플랫폼 setup은 추가하지 않는다. 이 제외는 원문의 일관성·품질을 확인하지 않으며 필수 테스트·전체 compile·실제 verify/copy 스크립트 검증을 축소하지 않는다.
 
 verify 기록은 실행 시 Python의 bytecode write 정책·cache tag·prefix와 프로젝트 Python cache의
 전후 개수, 생성·변경·유지·삭제 수를 남기며 snapshot 소요 시간을 별도 phase로 기록한다.
@@ -1698,11 +1730,13 @@ source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 �
 
 | 수동 complete/submit 면제 조건 | 적용 |
 |---|---|
-| 요청 | 단계별 skip 옵션과 원격 commit 전체 SHA인 `--expected-head`·비어 있지 않은 `--skip-reason`이 필요하다. SHA는 소문자 40자리 또는 64자리 16진수이며 수락 시 관측 HEAD와 일치해야 한다. |
+| 요청 | 단계별 skip 옵션과 원격 commit 전체 SHA인 `--expected-head`가 필요하다. `--skip-reason`은 선택 입력이며 생략·빈 문자열·공백은 `manual_work_requests.reason`에 빈 문자열로 저장한다. skip 옵션 없는 reason 단독 지정은 거부한다. SHA는 소문자 40자리 또는 64자리 16진수이며 수락 시 관측 HEAD와 일치해야 한다. |
 | 실제 실패 | 같은 묶음·단계·후보 HEAD에 실제 FAIL 기록이 있으면 `execution/manual_candidate.py`가 면제를 거부한다. 면제로 PASS를 만들거나 실패를 지우지 않는다. |
 | 후보·설정 증명 | 수락한 후보·문서·설정 token이 현재 입력과 같아야 한다. 관측 불가·불일치는 skip·과거 단계 근거를 사용하지 않고 기본 단계를 실행한다. |
 
 `manual_work_requests`는 후보 token과 단계별 유효 설정 token을 보존한다. verify 설정은 기존 managed-config loader의 timeout·parallelism, Review 설정은 verify 설정과 기존 profile resolver가 선택한 provider·Model·Effort를 결합한다. 실행 중 receipt·최종 게시·PR 대기 재평가에 같은 계산을 사용한다.
+
+생략 결과의 감사 `detail`은 `SKIPPED_BY_USER`와 후보 SHA를 유지하면서 사유 제공 여부를 표시한다. Reviewer 입력·PR 설명·상태 출력은 같은 formatter를 쓰며, 사유 제공 여부의 원본은 각 result의 `request_id`가 연결한 request의 `reason`이다. 따라서 formatter는 legacy `detail` 문자열로 의미를 추측하지 않고 실제 제공 사유가 표시 문구와 같아도 보존한다. 출력 경계에는 기존 비밀값 redaction을 적용하며 과거 request·result 원문은 표시를 위해 다시 쓰지 않는다.
 
 각 단계 시작 때 실제 verify timeout·coordinator parallelism과 Reviewer에 전달할 profile을 고정한다. 완료 시 설정을 다시 읽어 수행 당시 지문을 바꾸지 않으며 실행 중 입력 변경 뒤의 현재 근거로 재사용하지 않는다. 새 열이 없는 기존 요청은 `NULL`로 유지해 당시 입력을 소급 추정하지 않는다. SQLite에는 token·비밀값 없는 무효화 사유만 저장하고 설정 원문·Model 인증 자료는 저장하지 않는다.
 
@@ -1717,7 +1751,21 @@ source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 �
 | 범위 밖 | 설치 Python/Git/Bash/Perl·native library·환경변수·사용자/시스템 설정·외부 파일/동적 입력·Git HEAD/이력/revision 값은 지문·완전성의 필수 조건이 아니다. |
 | 전체 실행 | 목록/코드 관측 오류·코드 입력 누락 의심·변경·유효한 실제 전체 성공 부재에서는 전체 verify를 실행한다. |
 
-현재 구현은 일반 경로에서 `runtime_identity=None`을 미확인으로 취급하며 고정 Linux isolated compile에만 환경·runtime 측정을 결합한 증명을 제공한다. 이는 새 정책의 완료 조건이 아니라 전환할 기존 구현이다. 일반 runner가 외부 의존성을 모두 증명하거나 고정 toolchain·통제된 Linux 환경을 도입해야 코드 기준 재사용을 구현할 수 있다고 판단하지 않는다. 기존 runtime 측정 자료·receipt는 보존하되 새 판정에서 불필요한 환경 증명은 제외한다.
+일반 경로와 isolated compile의 입력 관측은 같은 코드 기준을 사용하며 `runtime_identity=None`·환경·Git/외부 identity의 미확인이나 변경만으로 재사용을 거부하지 않는다. 선택한 저장소 진입점과 연결 선언이 목록에서 빠지면 미확인이다. fingerprint는 선택 파일과 진입점의 상대경로, 목록 bytes·해석 규칙, 실행 중인 관측·runner/adapter·receipt 판정 코드 bytes를 결합한다. 예전 환경 지문을 현재 값으로 합성하지 않으며 기존 receipt와 실패 감사는 그대로 보존한다. compile 실행 fast path는 유지하지만 더 이상 설치 runtime을 측정하지 않는다.
+
+문서 제외는 현재 파일 관측과 코드 소비 관계의 재확인을 결합한다. 고정 POSIX launcher·unittest의 제한된 정적 증명은 기존 `impact_analysis.review_document`를 사용한다. 일반 스크립트·native/동적 소비는 Worker가 진입점·수집·테스트의 실제 저장소 소비를 검토하고, 특정 목록 밖 경로가 내용과 무관하게 소비되지 않는다는 근거를 기존 `worker_result`에 기록한다. 새 DB나 프로젝트별 중앙 경로 설정은 두지 않는다. Reviewer에게 저장된 선언을 실제 verify receipt 설명과 함께 전달해 목록 누락과 소비 검토를 확인하게 한다. 선언은 PR Summary나 targeted test 결과에 섞지 않는다.
+
+Worker 결과의 선택적 단일 `VERIFY_INPUT_EXCLUSIONS: <JSON>` 선언은 다음 version 1 계약이다. 읽기 전용 `verification/inputs.py --review-request <worktree> --entrypoint <상대경로>`는 identity만 출력하며 소비 검토나 승인을 대신하지 않는다. Worker는 최종 코드 기준으로 identity를 얻고 실제 확인한 `basis`를 추가한다. 실제 확인한 다른 플랫폼 진입점은 `--entrypoint`를 반복한다.
+
+| 필드 | 의미 |
+|---|---|
+| `version` | 정수 1. 중복 key·중복 선언·잘못된 형식은 제외 권한으로 채택하지 않는다. |
+| `codes` | 검토한 진입점별 현재 코드 fingerprint의 비어 있지 않은 문자열 목록. 선택 파일·목록·진입점·판정 구현과 제외 정책을 결합한다. |
+| `outside` | 정렬한 목록 밖 정확 경로 목록의 SHA-256. 경로 추가·삭제·이동은 새 소비 검토가 필요하다. |
+| `operating_paths` | 내용·존재 여부와 무관한 운영/예제 설정의 정확한 상대경로 배열. glob·중복·안전하지 않은 경로는 거부하며 manifest 선택이 항상 우선한다. 검증이 소비하는 고정 설정/자료는 여기에 넣지 않는다. |
+| `basis` | 해당 경로의 어떤 내용도 실제 검증 소비에 영향을 주지 않는다는 Worker의 구체적인 소비 검토 근거. PASS나 identity 출력은 이 근거가 아니다. |
+
+Manager는 현재 작업의 저장된 Worker 결과에서 이 선언을 읽고, 현재 코드 fingerprint와 목록 밖 경로 집합을 다시 대조한다. 목록 밖 파일은 현재 bytes·kind·mode로 두 번 관측해 새 completeness를 확정한다. 같은 경로의 문서 bytes·mode 변경은 내용에 의존하지 않는 소비 관계가 그대로일 때만 새 근거로 갱신한다. symlink·special 파일·읽기 실패·관측 경쟁·코드나 진입점/규칙 변경·새 목록 밖 파일은 재사용하지 않는다. stale 선언을 다른 증명으로 조용히 대체하지 않는다. 명시한 운영 설정만 내용·존재·부재를 비교에서 제외하며 manifest에 선택된 설정은 계속 코드 입력으로 비교한다. Windows snapshot의 전체 tree 준비·bundle 감사는 코드 입력 비교를 대신하지 않으며, 실제 WSL/native 검증이 소비하는 저장소 코드·선언은 목록에 남긴다.
 
 실행 전후·reuse 확정 직전과 Review/게시 revision gate에서 코드 입력을 재관측한다. 외부 입력 관측은 DB 처리 밖에서 수행하고 짧은 확정 transaction에서 같은 실행 상태·소유 identity를 재확인한다. 코드가 달라졌거나 읽기·비교를 확정할 수 없으면 필요한 verify로 돌아간다. 과거 receipt는 새 기준의 코드 입력·원래 run·작업 주기·후보 연결을 확인할 수 있는 경우만 재평가하고 과거 입력을 현재 값으로 합성하지 않는다. reuse는 새 verify 실행·성공 감사·사용량을 만들거나 새 실패를 지우지 않는다. Reviewer의 명세·diff·실제 지침·승인과 publication token·원격 lease는 별도 조건이다. 일반 선행 Review PASS 뒤 실제 전체 run과 수동 면제의 별도 후보/설정 계약은 유지한다.
 

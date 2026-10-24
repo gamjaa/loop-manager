@@ -142,9 +142,15 @@ def _validate_maintenance_planning_commit(
         try:
             snapshot = project_catalog_refresh.validated_held_planning_snapshot(
                 connection, context.repo, repository, context.active_sha,
-                git=effects.git, load_snapshot=effects.load_execplan_snapshot)
-            project_catalog_refresh.assert_planning_dependencies_unheld(
-                snapshot.active_metadata(), expected.items(), held_ids)
+                git=effects.git, load_snapshot=effects.load_execplan_snapshot,
+                planned_ids=frozenset(str(plan["id"]) for plan in expected.values()))
+            project_catalog_refresh.assert_planning_dependency_references(
+                {**snapshot.active_metadata(), **{str(plan["id"]): plan for plan in expected.values()}},
+                expected.items(), held_ids, original_dependencies={
+                    str(row["plan_id"]): json.loads(row["depends_on"])
+                    for row in connection.execute(
+                        "SELECT plan_id, depends_on FROM exec_plans WHERE repo=?", (context.repo,))},
+                withheld_ids=snapshot.withheld_ids)
         except execplan_catalog.ExecPlanCatalogError as error:
             raise MaintenancePlanningError(str(error)) from error
     else:

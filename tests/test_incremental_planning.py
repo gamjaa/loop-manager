@@ -711,8 +711,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertEqual([item.snapshot.plan_id for item in result.revisions], ["G-002"])
         target.write_text(revised_text.replace(
             "  - G-004\n", "  - G-004\n  - G-005\n"), encoding="utf-8", newline="\n")
-        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "보류 계획에 의존"):
-            validate()
+        self.assertEqual([item.snapshot.plan_id for item in validate().revisions], ["G-002"])
         target.write_text(revised_text, encoding="utf-8", newline="\n")
 
         archived_bytes = (self.repo / archive_path).read_bytes()
@@ -893,7 +892,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
 
     def test_remote_deletion_replacement_cycle_is_rejected_before_publication(self):
         self._remote_deletion()
-        _, validate = self._recovery_result()
+        snapshot, validate = self._recovery_result()
         target = self.repo / "docs/plans/[G-003] Replacement.md"
         target.write_text(plan_text("G-003", "Replacement").replace(
             "depends_on: []", "depends_on:\n  - G-004"), encoding="utf-8")
@@ -902,9 +901,34 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                 "depends_on: []", "depends_on:\n  - G-003"),
             encoding="utf-8",
         )
+        before_rows = {
+            plan_id: dict(self.connection.execute(
+                "SELECT * FROM exec_plans WHERE repo=? AND plan_id=?",
+                (str(self.repo), plan_id),
+            ).fetchone())
+            for plan_id in ("G-002",)
+        }
+        before_recovery = self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE repo=? AND plan_id='G-001'",
+            (str(self.repo),),
+        ).fetchone()[0]
         with self.assertRaisesRegex(loop_manager.PlannerValidationError, "새 오류|순환"):
             validate()
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM general_planning_publications").fetchone()[0], 0)
+        self.assertEqual(snapshot.recovery_goals, loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base,
+        ).recovery_goals)
+        self.assertEqual(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE repo=? AND plan_id='G-001'",
+            (str(self.repo),),
+        ).fetchone()[0], before_recovery)
+        self.assertEqual({
+            plan_id: dict(self.connection.execute(
+                "SELECT * FROM exec_plans WHERE repo=? AND plan_id=?",
+                (str(self.repo), plan_id),
+            ).fetchone())
+            for plan_id in before_rows
+        }, before_rows)
 
     def test_remote_deletion_goal_recovery_publication_is_atomic_and_idempotent(self):
         self._remote_deletion()

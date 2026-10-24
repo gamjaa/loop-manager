@@ -664,27 +664,40 @@ class PlanningSelectionTest(PlanningCase):
         with self.assertRaises(FrozenInstanceError):
             result.snapshot.general_fingerprint = "changed"
 
-    def test_new_document_approval_forces_planning_with_unchanged_fingerprints(self):
-        ports = FakePorts(planning_snapshot(
-            planning_fingerprint="fingerprint",
-            specification_fingerprint="specification",
-        ))
-        ports.state.document_approval_pending = True
-        ports.state.maintenance_due_required = True
-        ports.state.schedule_result.has_ready = True
-        ports.state.schedule_result.runnable_ready = object()
-        coordinator = PlanningLifecycleCoordinator(ports)
-        run = coordinator._new_run(replace(
-            self.context, registered_only=True, self_repository=True,
-        ))
+    def test_document_approval_alone_does_not_call_planner_or_change_work_selection(self):
+        for ready in ('runnable', 'waiting', 'none'):
+            with self.subTest(ready=ready):
+                ports = FakePorts(planning_snapshot(
+                    planning_fingerprint="fingerprint",
+                    specification_fingerprint="specification",
+                ))
+                ports.state.pending_document_approval = mock.Mock(return_value=True)
+                ports.state.schedule_result.has_ready = ready != 'none'
+                ports.state.schedule_result.has_waiting = ready == 'waiting'
+                ports.state.schedule_result.runnable_ready = (
+                    object() if ready == 'runnable' else None
+                )
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(replace(
+                    self.context, registered_only=True, self_repository=True,
+                ))
 
-        self.assertIsNone(coordinator._selection._select_planning_work(run))
-        self.assertEqual(
-            run.selection.kind,
-            PlanningDecisionKind.RUN_SPECIFICATION_PLANNING,
-        )
-        self.assertFalse(run.ready_activated_before_planning)
-        self.assertEqual(ports.state.maintenance_begin_count, 0)
+                outcome = coordinator._selection._select_planning_work(run)
+                ports.state.pending_document_approval.assert_not_called()
+                self.assertEqual(ports.agent.run_count, 0)
+                self.assertEqual(ports.state.maintenance_begin_count, 0)
+                if ready == 'runnable':
+                    self.assertIsNone(outcome)
+                    self.assertEqual(run.selection.kind, PlanningDecisionKind.ACTIVATE_READY)
+                    self.assertTrue(run.ready_activated_before_planning)
+                elif ready == 'waiting':
+                    self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+                    self.assertEqual(run.selection.kind, PlanningDecisionKind.STABLE_WAIT)
+                    self.assertFalse(run.ready_activated_before_planning)
+                else:
+                    self.assertIsNone(outcome)
+                    self.assertEqual(run.selection.kind, PlanningDecisionKind.COMPLETE)
+                    self.assertFalse(run.ready_activated_before_planning)
 
     def test_real_planner_port_records_resumption_at_agent_start(self):
         connection = sqlite3.connect(":memory:")
@@ -699,7 +712,8 @@ class PlanningSelectionTest(PlanningCase):
             "VALUES (?, 'main', 'bad plan')", (repo,),
         )
         with connection:
-            notifications.enqueue_current_project_events(connection, repo)
+            from tests.support.notification import NotificationFixture
+            NotificationFixture.legacy_planning_notice(connection, 'bad plan', confirmed=1, sent=True)
         notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
         loop_manager.update_project(connection, repo, planning_error=None)
         context = SimpleNamespace(
@@ -725,8 +739,13 @@ class PlanningSelectionTest(PlanningCase):
         resumed = connection.execute(
             "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
         ).fetchall()
-        self.assertEqual(len(resumed), 1)
-        self.assertEqual(json.loads(resumed[0][0])["operation"], "Planner")
+        self.assertEqual(resumed, [])
+        incident = connection.execute(
+            "SELECT started_operation, start_identity, started_at, resumed_at FROM notified_block_incidents"
+        ).fetchone()
+        self.assertEqual((incident['started_operation'], incident['start_identity']), ('Planner', 'actual-start'))
+        self.assertIsNotNone(incident['started_at'])
+        self.assertIsNotNone(incident['resumed_at'])
 
     def test_registered_self_flag_only_reaches_maintenance_due_for_self_context(self):
         for self_repository in (False, True):

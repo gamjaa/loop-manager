@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
+from .repository import (adopt_legacy_block_notices, ensure_schema,
                          _insert, _encode_payload, _event_payload, _planner_started_after_notice)
 from .rendering import _checkpoint_link
+from .policy import block_action, block_recovery, SOURCE_ACTION_REASONS
 
 def _key(kind: str, repo: str, identity: str) -> str:
     digest = hashlib.sha256(f"{repo}\0{identity}".encode()).hexdigest()
@@ -55,7 +56,6 @@ def _carry_planning_delivery(
     ).fetchall()
     confirmed_payload = None
     confirmed_from_older = False
-    retry_row = None
     for row in rows:
         try:
             same_cause = (row[1] == block_key
@@ -70,8 +70,6 @@ def _carry_planning_delivery(
         if (int(row[5]) > 0 or int(row[6] or 0) > 0 or row[7] is not None):
             confirmed_payload = row[3]
             confirmed_from_older = int(row[0]) != incident_id
-            retry_row = (row if confirmed_from_older
-                         and int(row[6] or 0) > 0 and row[7] is None else None)
     if confirmed_payload is None:
         return False
     connection.execute(
@@ -79,17 +77,6 @@ def _carry_planning_delivery(
         "payload = ? WHERE id = ?",
         (confirmed_payload, incident_id),
     )
-    if retry_row is not None:
-        # A false release canceled the unfinished pieces. Keep the original
-        # cursor retryable while the newer duplicate notice stays canceled.
-        connection.execute(
-            "UPDATE notified_block_incidents SET released_at = NULL WHERE id = ?",
-            (retry_row[0],),
-        )
-        connection.execute(
-            "UPDATE notification_outbox SET canceled_at = NULL "
-            "WHERE event_key = ? AND sent_at IS NULL", (retry_row[2],),
-        )
     if confirmed_from_older:
         connection.execute(
             "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
@@ -106,79 +93,38 @@ def _queue_block(
 ) -> None:
     """Give each separately notified block its own durable delivery identity."""
 
+    action = block_action(connection, repo, payload)
+    if action is None:
+        return
+    payload = {**payload, "action": action}
+    if action['kind'] == 'unrecoverable':
+        payload['status'] = '자동 복구 불가'
     payload = _event_payload("blocked", payload)
 
     active = connection.execute(
-        "SELECT id, block_key, event_key, confirmed_before, version, payload FROM "
+        "SELECT id, block_key, event_key, confirmed_before, version, "
+        "COALESCE((SELECT payload FROM notification_outbox o WHERE "
+        "o.event_key=notified_block_incidents.event_key), payload) FROM "
         "notified_block_incidents "
         "WHERE repo = ? AND subject = ? AND released_at IS NULL "
         "ORDER BY id DESC LIMIT 1", (repo, subject),
     ).fetchone()
-    reactivated = False
-    if active is None and subject == "planning":
-        # Earlier versions could release a planning incident while its error
-        # was still present. Reuse that incident if no Planner has since
-        # started, keeping its delivery audit and identity intact.
-        previous = connection.execute(
-            "SELECT i.id, i.block_key, i.event_key, i.confirmed_before, "
-            "i.version, i.payload, o.created_at, i.started_operation, "
-            "EXISTS (SELECT 1 FROM notification_outbox started "
-            "WHERE started.repo = i.repo AND started.event_type = 'work_started' "
-            "AND started.rowid > o.rowid "
-            "AND json_extract(started.payload, '$.operation') "
-            "IN ('Planner', '유지보수 평가')) "
-            "FROM notified_block_incidents i "
-            "JOIN notification_outbox o ON o.event_key = i.event_key "
-            "WHERE i.repo = ? AND i.subject = 'planning' "
-            "ORDER BY i.id DESC LIMIT 1", (repo,),
-        ).fetchone()
-        if (previous is not None and previous[1] == block_key
-                and previous[5] is not None
-                and previous[7] is None
-                and not previous[8]
-                and json.loads(str(previous[5])).get("cause") == payload.get("cause")
-                and not _planner_started_after_notice(
-                    connection, repo, str(previous[6]),
-                )):
-            resumed = connection.execute(
-                "SELECT resumed_at FROM notified_block_incidents WHERE id = ?",
-                (previous[0],),
-            ).fetchone()
-            if resumed is not None and resumed[0] is None:
-                connection.execute(
-                    "UPDATE notified_block_incidents SET released_at = NULL "
-                    "WHERE id = ?", (previous[0],),
-                )
-                active = previous
-                reactivated = True
     if active is not None:
-        if active[1] == block_key:
-            carried = (subject == "planning" and _carry_planning_delivery(
-                connection, repo, int(active[0]), block_key, payload.get("cause"),
-            ))
-            if reactivated and not carried:
-                connection.execute(
-                    "UPDATE notification_outbox SET canceled_at = NULL "
-                    "WHERE event_key = ? AND sent_at IS NULL",
-                    (active[2],),
-                )
-            if connection.execute(
-                "SELECT 1 FROM notification_outbox WHERE event_key = ?",
-                (active[2],),
-            ).fetchone() is None:
-                _insert(connection, str(active[2]), repo, "blocked",
-                        json.loads(str(active[5])))
-                if carried:
-                    connection.execute(
-                        "UPDATE notification_outbox SET canceled_at = "
-                        "CURRENT_TIMESTAMP WHERE event_key = ?",
-                        (active[2],),
-                    )
-            return
+        try:
+            saved = json.loads(str(active[5]))
+        except (TypeError, ValueError):
+            saved = {}
+        if not isinstance(saved, dict):
+            saved = {}
         previous = connection.execute(
-            "SELECT confirmed_pieces FROM notification_outbox "
+            "SELECT confirmed_pieces, canceled_at, sent_at, rendered_text FROM notification_outbox "
             "WHERE event_key = ?", (active[2],),
         ).fetchone()
+        same_action = active[1] == block_key and (
+            saved.get('action') == action or block_action(connection, repo, saved) == action
+        )
+        if same_action and (previous is None or previous[1] is None or previous[2] is not None):
+            return
         confirmed = max(int(active[3]), int(previous[0]) if previous else 0)
         connection.execute(
             "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
@@ -195,7 +141,13 @@ def _queue_block(
             (block_key, event_key, confirmed, version, confirmed,
              _encode_payload(payload), active[0]),
         )
+        if same_action:
+            payload['continued_from'] = active[2]
         _insert(connection, event_key, repo, "blocked", payload)
+        if same_action:
+            connection.execute(
+                'UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=? WHERE event_key=?',
+                (previous[3], previous[0], event_key))
         connection.execute(
             "INSERT INTO block_notice_events (event_key, incident_id) "
             "VALUES (?, ?)", (event_key, active[0]),
@@ -274,7 +226,7 @@ def record_work_start(
     *, plan_id: str | None = None, start_identity: str | None = None,
     resumed: bool = False,
 ) -> int:
-    """Preserve real starts; enqueue resumption only for confirmed notices."""
+    """Record starts without Telegram; count newly finalized confirmed incidents."""
 
     tables = {
         str(row[0]) for row in connection.execute(
@@ -304,7 +256,7 @@ def record_work_start(
         subjects.append("planning")
     elif plan_id is not None and operation in {"Worker", "PR handling"}:
         subjects.append(f"plan:{plan_id}")
-    queued = 0
+    started = 0
     for subject in subjects:
         if subject.startswith("plan:") and connection.execute(
             "SELECT 1 FROM execplan_blocks WHERE repo = ? AND plan_id = ?",
@@ -331,12 +283,6 @@ def record_work_start(
                 "AND resumed_at IS NULL ORDER BY id", (repo, subject),
             ).fetchall()
         for row in rows:
-            if not _enabled(connection):
-                connection.execute(
-                    "UPDATE notified_block_incidents SET resumed_at = CURRENT_TIMESTAMP "
-                    "WHERE id = ? AND resumed_at IS NULL", (row[0],),
-                )
-                continue
             connection.execute(
                 "UPDATE notified_block_incidents SET started_operation = ?, start_identity = ?, started_at = "
                 "strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), "
@@ -345,14 +291,12 @@ def record_work_start(
                 "WHERE id = ? AND started_operation IS NULL",
                 (operation, start_identity, plan_id, plan_id, int(resumed), row[0]),
             )
-            queued += _materialize_resumption(connection, int(row[0]))
-    return queued
+            started += _materialize_resumption(connection, int(row[0]))
+    return started
 
 
 def recover_interrupted_starts(connection):
     """Reconcile abandoned sends at startup, before project workers exist."""
-    if not _enabled(connection):
-        return
     ensure_schema(connection)
     rows = connection.execute(
         "SELECT id FROM notified_block_incidents WHERE released_at IS NOT NULL "
@@ -365,74 +309,23 @@ def recover_interrupted_starts(connection):
             "(SELECT event_key FROM block_notice_events WHERE incident_id = ?)",
             (row[0],),
         )
-        if not _materialize_resumption(connection, int(row[0])):
-            _materialize_unnotified_start(connection, int(row[0]))
-
-
-def _materialize_unnotified_start(connection, incident_id):
-    """An in-flight block send failed after release and a physical start."""
-    if not _enabled(connection):
-        return
-    row = connection.execute(
-        "SELECT repo, payload, started_operation, start_identity, started_at FROM notified_block_incidents "
-        "WHERE id = ? AND released_at IS NOT NULL AND resumed_at IS NULL "
-        "AND start_identity IS NOT NULL AND confirmed_before = 0 "
-        "AND NOT EXISTS (SELECT 1 FROM block_notice_events b JOIN notification_outbox o "
-        "ON o.event_key = b.event_key WHERE b.incident_id = notified_block_incidents.id "
-        "AND (o.confirmed_pieces > 0 OR (o.delivery_started_at IS NOT NULL AND o.sent_at IS NULL)))",
-        (incident_id,),
-    ).fetchone()
-    if row is None:
-        return
-    old = json.loads(row[1])
-    plan_id = old.get("execplan_id") or old.get("started_execplan_id")
-    if row[2] != "Worker" or old.get("started_as_resume") or connection.execute(
-        "SELECT 1 FROM notification_outbox WHERE repo = ? "
-        "AND event_type IN ('work_started', 'resumed') "
-        "AND json_extract(payload, '$.execplan_id') = ? LIMIT 1",
-        (row[0], plan_id),
-    ).fetchone():
-        return
-    _insert(connection, _key("work_started", row[0], row[3]), row[0], "work_started",
-            {"project": old["project"], "execplan_id": plan_id,
-             "execplan_title": old.get("execplan_title"), "operation": row[2],
-             "occurred_at": row[4], "status": "작업 중", "silent": True})
+        _materialize_resumption(connection, int(row[0]))
 
 
 def _materialize_resumption(connection: sqlite3.Connection, incident_id: int) -> int:
+    """Finalize a confirmed incident's actual start without another message."""
     row = connection.execute(
-        "SELECT i.repo, i.payload, i.started_operation, o.confirmed_pieces, "
-        "i.confirmed_before, i.started_at "
-        "FROM notified_block_incidents i JOIN notification_outbox o "
-        "ON o.event_key = i.event_key WHERE i.id = ? "
-        "AND i.released_at IS NOT NULL AND i.resumed_at IS NULL",
-        (incident_id,),
+        "SELECT i.confirmed_before, o.confirmed_pieces FROM notified_block_incidents i "
+        "JOIN notification_outbox o ON o.event_key = i.event_key "
+        "WHERE i.id = ? AND i.released_at IS NOT NULL AND i.resumed_at IS NULL "
+        "AND i.started_operation IS NOT NULL", (incident_id,),
     ).fetchone()
-    if row is None or not row[2]:
+    if row is None or max(int(row[0]), int(row[1])) == 0:
         return 0
-    if max(int(row[3]), int(row[4])) == 0:
-        return 0
-    if not _enabled(connection):
-        connection.execute(
-            "UPDATE notified_block_incidents SET resumed_at = CURRENT_TIMESTAMP "
-            "WHERE id = ? AND resumed_at IS NULL", (incident_id,),
-        )
-        return 0
-    repo = str(row[0])
-    old = json.loads(str(row[1]))
-    payload = {
-        "project": old["project"], "scope": old["scope"],
-        "execplan_id": old.get("execplan_id") or old.get("started_execplan_id"),
-        "reason_code": old["reason_code"], "cause": old["cause"],
-        "operation": str(row[2]), "occurred_at": row[5], "silent": True, "status": "작업 중",
-    }
-    _insert(connection, _key("resumed", repo, str(incident_id)), repo,
-            "resumed", payload)
-    connection.execute(
+    return connection.execute(
         "UPDATE notified_block_incidents SET resumed_at = CURRENT_TIMESTAMP "
         "WHERE id = ? AND resumed_at IS NULL", (incident_id,),
-    )
-    return 1
+    ).rowcount
 
 
 def _project_checkpoint(connection, repo, plan_id):
@@ -512,7 +405,6 @@ def _current_block_key(
         ).fetchone()
         if block is None or block[0] != reason:
             return None
-        recovery_subject = str(subject)
         remote = _remote_inspection_suffix(block[1], block[2], block[3])
         remote += _project_checkpoint_suffix(_preservation_checkpoint(connection, repo, 'plan', str(subject)))
     elif payload.get("scope") == "project":
@@ -522,24 +414,15 @@ def _current_block_key(
         ).fetchone()
         if block is None or block[0] != reason or block[1] != subject:
             return None
-        recovery_subject = str(subject or "__project__")
         remote = _project_checkpoint_suffix(_preservation_checkpoint(connection, repo, 'project', subject)
                                              or _project_checkpoint(connection, repo, subject))
     else:
         return None
-    recovery_table = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'recovery_records'"
-    ).fetchone()
-    recovery_identity = None
-    if recovery_table:
-        recovery = connection.execute(
-            "SELECT identity FROM recovery_records WHERE repo = ? "
-            "AND subject = ? AND final_evidence IS NOT NULL",
-            (repo, recovery_subject),
-        ).fetchone()
-        if recovery:
-            recovery_identity = recovery[0]
+    recovery = block_recovery(connection, repo, subject, payload.get('scope'))
+    recovery_identity = (recovery['identity'] if recovery is not None
+                         and recovery['final_evidence'] is not None else None)
+    if reason in SOURCE_ACTION_REASONS:
+        recovery_identity = None
     if payload.get("scope") == "plan":
         return _plan_block_key(repo, reason, subject, recovery_identity, remote)
     return _project_block_key(repo, reason, subject, recovery_identity, remote)

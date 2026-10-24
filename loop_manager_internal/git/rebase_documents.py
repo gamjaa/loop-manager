@@ -113,18 +113,21 @@ def selected_plan_output(checkpoint, worktree, path, *, pending=False, ignore_de
             return None
         declaration = execplan_catalog.parse_frontmatter(pinned.decode('utf-8'))
         current = execplan_catalog.parse_frontmatter(raw.decode('utf-8'))
-        if (not ignore_declaration and declaration != current) or current.get('id') != identity[1]:
+        restored = saved.get('rebase_frontmatter') or {}
+        restored_output = bool(restored.get('target') == checkpoint.target_base_oid
+            and restored.get('before_head') == checkpoint.expected_head
+            and restored.get('path') == path and restored.get('head')
+            and base64.b64decode(restored['after'], validate=True) == raw)
+        if (current.get('id') != identity[1]
+                or not ignore_declaration and not restored_output and declaration != current):
             return None
-        if not pending:
+        from loop_manager_internal.catalog.execplan_drafts import validate_agent_change
+        validate_agent_change(execplan_catalog.parse_execplan_text(path, raw.decode('utf-8'),
+                              validate_sources=False), pinned.decode('utf-8'))
+        # Header restoration preserves the selected body, never a Worker success receipt.
+        if not pending and not ignore_declaration and not restored_output:
             stage = saved.get('stage_evidence') or {}
             signature = hashlib.sha256(str(info.st_mode).encode('ascii') + b'\0' + raw).hexdigest()
-            restored = saved.get('rebase_frontmatter') or {}
-            if (restored.get('target') == checkpoint.target_base_oid
-                    and restored.get('before_head') == checkpoint.expected_head
-                    and restored.get('path') == path and restored.get('head')
-                    and base64.b64decode(restored['after'], validate=True) == raw):
-                prior = base64.b64decode(restored['before'], validate=True)
-                signature = hashlib.sha256(str(info.st_mode).encode('ascii') + b'\0' + prior).hexdigest()
             if (saved.get('pending') not in {'stage', 'continue'} or not saved.get('worker_result')
                     or stage.get('files', {}).get(path) != signature):
                 return None

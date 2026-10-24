@@ -37,7 +37,7 @@ class ProviderExecutionFixture:
         agent_invocation_state.ensure_schema(self.connection)
         self.repo = str(self.source)
         self.plan_id = getattr(self, 'plan_id', 'G-262')
-        pin_common_guidance(self.connection, InvocationContext(self.repo, self.plan_id),
+        self.guidance = pin_common_guidance(self.connection, InvocationContext(self.repo, self.plan_id),
             self.worktree, self.state, role='reviewer')
         self.profile = ResolvedProfile('model', 'high')
         self.boundary = isolation.WorktreeBoundary(self.worktree, self.source, (),
@@ -49,13 +49,15 @@ class ProviderExecutionFixture:
         self.lookups = []
         self.instruction_extra = 'native project instructions'
         self.calls = 0
+        self.native_probe_hook = None
+        self.before_handoff = None
+        self.popen = None
         patches = (
             mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES),
             mock.patch.object(isolation, 'inspect_worktree', return_value=self.boundary),
             mock.patch.object(isolation, 'prepare_launch', side_effect=self.prepare_launch),
             mock.patch.object(isolation.CodexLaunch, 'probe'),
-            mock.patch.object(isolation.CodexLaunch, 'start', side_effect=
-                              lambda arguments, launch_process, **kwargs: launch_process(arguments, **kwargs)),
+            mock.patch.object(isolation.CodexLaunch, 'start', side_effect=self.start_launch),
             mock.patch.object(isolation.CodexLaunch, 'stop'),
             mock.patch.object(isolation.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'codex-cli 0.159.3')),
             mock.patch.object(provider_guidance, '_probe', side_effect=self.native_probe),
@@ -76,6 +78,8 @@ class ProviderExecutionFixture:
 
     def native_probe(self, arguments, **kwargs):
         self.assertEqual(kwargs['env']['CODEX_HOME'], str(self.child_home))
+        if self.native_probe_hook is not None:
+            self.native_probe_hook(arguments)
         if arguments == ['codex', '--version']:
             return 'codex-cli 0.159.3'
         text = self.instruction_extra
@@ -84,6 +88,11 @@ class ProviderExecutionFixture:
                 text = json.loads(arg.partition('=')[2])
         return json.dumps([{'type': 'message', 'role': 'developer',
                             'content': [{'type': 'input_text', 'text': text}]}])
+
+    def start_launch(self, arguments, launch_process, **kwargs):
+        if self.before_handoff is not None:
+            self.before_handoff()
+        return launch_process(arguments, **kwargs)
 
     def resolve(self, *_args):
         self.lookups.append(agent_profiles.agent_environment('codex'))
@@ -106,6 +115,7 @@ class ProviderExecutionFixture:
             json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: PASS'}}) + '\n')
         process.wait.return_value = result_code
         popen = mock.Mock(return_value=process)
+        self.popen = popen
         effects = provider_adapters.ProviderEffects(mock.Mock(), mock.Mock(), self.resolve, popen, mock.Mock(), self.validate)
         adapter = provider_adapters.CodexAgentAdapter(lambda *args, **kwargs: provider_adapters.run_codex(*args, effects=effects, **kwargs))
         invoke_effects = invocation_service.InvocationEffects(self.resolve, lambda: None,

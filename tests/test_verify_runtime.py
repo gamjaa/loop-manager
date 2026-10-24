@@ -29,6 +29,101 @@ from loop_manager_internal.verification.timing import (
 
 
 class TimingAndManifestTests(unittest.TestCase):
+    def test_summary_terminal_stage_or_run_event_dominates_worker_starts(self):
+        for terminal_kind in ("stage_end", "run_end"):
+            with self.subTest(terminal=terminal_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stage = root / "stage-0"
+                stage.mkdir()
+                run_id = f"run-{terminal_kind}"
+                terminal = {"kind": "phase_end", "run_id": run_id, "clock_domain": "linux",
+                    "stage_id": "unittest", "pid": 10, "name": "stage:unittest",
+                    "start": 0, "duration": 5, "result": "complete", "at": 5}
+                if terminal_kind == "run_end":
+                    terminal = {"kind": "run_end", "run_id": run_id, "clock_domain": "linux",
+                                "stage_id": "unittest", "pid": 10, "at": 6}
+                (root / "runner.jsonl").write_text(json.dumps(terminal) + "\n", encoding="utf-8")
+                (stage / "worker-0.jsonl").write_text(json.dumps({
+                    "kind": "test_start", "run_id": run_id, "clock_domain": "linux",
+                    "stage_id": "unittest", "unit_id": "module.test", "worker_id": 0,
+                    "pid": 11, "id": "tests.sample.Case.test_active", "at": 1}) + "\n",
+                    encoding="utf-8")
+
+                summary = summarize(root, now=10)
+
+                self.assertEqual(summary["active"], [])
+
+    def test_summary_closes_phase_after_stage_identity_changes_without_run_end(self):
+        for raises in (False, True):
+            with self.subTest(raises=raises), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                writer = EventWriter(root / "runner.jsonl", identity={"run_id": "run-stage-drift"})
+                try:
+                    with writer.activate():
+                        try:
+                            with phase("verify"):
+                                writer.identity["stage_id"] = "unittest"
+                                if raises:
+                                    raise RuntimeError("verify failed")
+                        except RuntimeError:
+                            pass
+                finally:
+                    writer.close()
+
+                records = [json.loads(line) for line in (root / "runner.jsonl").read_text().splitlines()]
+                summary = summarize(root, now=10)
+
+                self.assertNotEqual(records[0].get("stage_id"), records[1].get("stage_id"))
+                self.assertEqual(records[0]["phase_id"], records[1]["phase_id"])
+                self.assertEqual(records[1]["result"], "error" if raises else "complete")
+                self.assertNotIn("run_end", [record["kind"] for record in records])
+                self.assertEqual(summary["active"], [])
+
+    def test_windows_summary_links_os_runs_without_combining_their_clocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            root.mkdir()
+            clock = [100.0]
+            writer = EventWriter(root / "launcher.jsonl", clock=lambda: clock[0],
+                                 identity={"run_id": "parent-run"})
+            with writer.activate():
+                writer.emit("run_start", mode="windows+wsl")
+                with phase("wsl-full"):
+                    clock[0] += 10
+                clock[0] += 10
+                writer.emit("run_end", passed=True, wsl="PASS", windows="PASS")
+            writer.close()
+            (root / "snapshot.json").write_text(json.dumps({
+                "run_id": "parent-run", "revision": "a" * 40,
+                "bundle": "C:/Temp/loop-manager-verify-1",
+                "snapshot_sha256": "b" * 64}), encoding="utf-8")
+            (root / "result.json").write_text(json.dumps({
+                "run_id": "parent-run", "passed": True, "wsl": "PASS", "windows": "PASS",
+                "wsl_run_id": "linux-run", "windows_run_id": "parent-run"}), encoding="utf-8")
+            for name, run_id, domain, elapsed in (
+                    ("wsl", "linux-run", "linux", 8.0),
+                    ("windows", "parent-run", "win32", 4.0)):
+                child = Path(str(root) + f"-{name}")
+                child.mkdir()
+                (child / "summary.json").write_text(json.dumps({
+                    "metadata": {"run_id": run_id, "parent_run_id": "parent-run",
+                                 "clock_domain": domain, "mode": "full"},
+                    "result": {"passed": True}, "elapsed_seconds": elapsed,
+                    "counts": {"success": 3}, "phases": [], "assignments": [],
+                    "allocations": [], "git_commands": []}), encoding="utf-8")
+
+            summary = summarize(root, now=130.0)
+
+            self.assertEqual(summary["elapsed_seconds"], 20.0)
+            self.assertEqual(len(summary["execution_runs"]), 1)
+            self.assertEqual(summary["counts"], {})
+            pipeline = summary["windows_pipeline"]
+            self.assertEqual(pipeline["snapshot"]["revision"], "a" * 40)
+            self.assertEqual(pipeline["children"]["wsl"]["run_id"], "linux-run")
+            self.assertEqual(pipeline["children"]["wsl"]["elapsed_seconds"], 8.0)
+            self.assertEqual(pipeline["children"]["windows"]["clock_domain"], "win32")
+            self.assertEqual(pipeline["children"]["windows"]["elapsed_seconds"], 4.0)
+
     def test_comparison_rejects_changed_scope_environment_and_incomplete_run(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -707,6 +802,7 @@ class RunnerPoolTests(unittest.TestCase):
         cleanup = ExitStack()
         self.addCleanup(cleanup.close)
         root = Path(cleanup.enter_context(tempfile.TemporaryDirectory()))
+        self.pool_root = root
         clock, identities, workers, sleeps, requests, allocations = [0.0], {}, [], [], [], []
         coordinator = VerifyCoordinator(clock=lambda: clock[0], identity=identities.get,
             sampler=SimpleNamespace(sample=lambda: Snapshot(clock[0], 8, 0, 4096 * MIB, 'fake')))
@@ -803,6 +899,23 @@ class RunnerPoolTests(unittest.TestCase):
         self.assertTrue(sleeps)
         self.assertEqual([at for operation, at, _, _ in requests if operation == 'idle'], [1, 2, 3])
         self.assertEqual(assigned, [('0', 0), ('1', 1), ('2', 2)])
+        events = [json.loads(line) for line in (self.pool_root / "events.jsonl").read_text().splitlines()]
+        for unit_id in ("0", "1", "2"):
+            observed = next(i for i, event in enumerate(events)
+                            if event["kind"] == "result_file_observed" and event["unit_id"] == unit_id)
+            waiting = next(i for i, event in enumerate(events)
+                           if event["kind"] == "job_child_wait" and event["unit_id"] == unit_id)
+            confirmed = next(i for i, event in enumerate(events)
+                             if event["kind"] == "job_child_exit_confirmed" and event["unit_id"] == unit_id)
+            completed = next(i for i, event in enumerate(events)
+                             if event["kind"] == "module_result" and event["unit_id"] == unit_id)
+            self.assertLess(observed, waiting)
+            self.assertLess(waiting, confirmed)
+            self.assertLess(confirmed, completed)
+        assignments = [event for event in events if event["kind"] == "unit_start"]
+        self.assertEqual([event["previous_unit_id"] for event in assignments], [None, "0", "1"])
+        self.assertTrue(all(event["seconds_since_previous_result"] is not None
+                            for event in assignments[1:]))
 
     def test_continuous_start_failure_cleans_previous_worker_and_only_unstarted_token(self):
         coordinator, requests, _, _, _ = self.exercise_pool(fail_start=True)
@@ -892,6 +1005,48 @@ class RunnerPoolTests(unittest.TestCase):
             self.assertEqual(report["completed"], [])
             self.assertIn("fixture failed", stderr.getvalue())
             self.assertEqual(summarize(root)["fixture_results"][0]["result"], "error")
+
+    def test_reused_worker_events_update_module_identity_each_assignment(self):
+        modules = {}
+        requests = []
+        for name in ("verify_reuse_first", "verify_reuse_second"):
+            module = ModuleType(name)
+            class Case(unittest.TestCase):
+                def test_case(self):
+                    pass
+            Case.__module__ = name
+            module.Case = Case
+            modules[name] = module
+            ids = list(manifest.test_ids(unittest.TestLoader().loadTestsFromModule(module)))
+            requests.append({"module": name, "ids": ids, "owners": [],
+                "pattern": "test*.py", "worker": 0, "worker_id": 0, "directory": None,
+                "result": None, "run_id": "run-current", "parent_run_id": "parent-run",
+                "stage_id": "unittest", "unit_id": name})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for request in requests:
+                request["directory"] = directory
+                request["result"] = str(root / f"{request['module']}.json")
+            stdin = io.StringIO("".join(json.dumps(request) + "\n" for request in requests))
+            stderr = io.StringIO()
+            with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ), \
+                 mock.patch.object(unittest_adapter, "install_guard"), \
+                 mock.patch.object(unittest_adapter, "process_memory", return_value=None), \
+                 mock.patch.object(sys, "platform", "win32"), mock.patch.object(sys, "path", list(sys.path)), \
+                 mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stderr", stderr):
+                self.assertEqual(unittest_adapter.worker_main(), 0)
+
+            reports = [json.loads((root / f"{name}.json").read_text())
+                       for name in ("verify_reuse_first", "verify_reuse_second")]
+            self.assertTrue(all(report.get("passed") for report in reports),
+                            {"reports": reports, "stderr": stderr.getvalue()})
+            events = [json.loads(line) for line in (root / "worker-0.jsonl").read_text().splitlines()]
+            starts = [event for event in events if event["kind"] == "test_start"]
+            self.assertEqual([event["unit_id"] for event in starts],
+                             ["verify_reuse_first", "verify_reuse_second"])
+            self.assertTrue(all(event["run_id"] == "run-current" for event in starts))
+            self.assertTrue(all(event["parent_run_id"] == "parent-run" for event in starts))
+            self.assertTrue(all(event["worker_id"] == 0 for event in starts))
 
     def test_failed_module_output_omits_previous_success_and_redacts_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1099,21 +1254,25 @@ class ManagerAdapterTests(unittest.TestCase):
             root = Path(directory)
             stage = root / 'stage-0'
             stage.mkdir()
-            writer = EventWriter(stage / 'worker-1.jsonl')
+            writer = EventWriter(stage / 'worker-1.jsonl',
+                                 identity={'run_id': 'run-current', 'stage_id': 'unittest',
+                                           'unit_id': 'module.test_verify_runtime'})
             cleanup.callback(writer.close)
             writer.emit('test_start', id='test_done')
             writer.emit('test_end', id='test_done')
             writer.emit('test_start', id='test_running')
             positions, state = {}, {}
 
-            observed = manager_adapter.progress_observation(root, positions, state)
+            observed = manager_adapter.progress_observation(root, positions, state, 'run-current')
 
             self.assertEqual(observed['observed_completed_tests'], 1)
             self.assertEqual(observed['active_tests'], 1)
             self.assertEqual(observed['current_test'], 'test_running')
-            self.assertEqual(manager_adapter.progress_observation(root, positions, state), observed)
+            self.assertEqual(observed['current_stage'], 'unittest')
+            self.assertEqual(observed['current_unit'], 'module.test_verify_runtime')
+            self.assertEqual(manager_adapter.progress_observation(root, positions, state, 'run-current'), observed)
             writer.emit('test_interrupted', id='test_running')
-            observed = manager_adapter.progress_observation(root, positions, state)
+            observed = manager_adapter.progress_observation(root, positions, state, 'run-current')
             self.assertEqual(observed['observed_completed_tests'], 1)
             self.assertEqual(observed['active_tests'], 0)
 

@@ -115,8 +115,13 @@ Perl native case만 명시적으로 skip하고 Python 예제와 플랫폼 독립
 [test_verify_perl_adapter.py](../tests/test_verify_perl_adapter.py)는 native assertion·plan·skip·TODO·
 subtest·오류, 수집/결과 identity·범위·부분 결과·통신 실패·guard·serial 예산을 검사한다.
 [test_verify_language_examples.py](../tests/test_verify_language_examples.py)는 실제 두 예제의
-단독/Manager 성공·실패와 공통 manifest·예약 회수를 확인하는 Manager 전용 통합 회귀다.
-Worker는 이를 실행하지 않는다. 로컬 targeted 근거는 Linux/Perl 5.38.2이며 실제 강제 종료,
+단독/Manager 성공·실패와 실제 조율 모드·session/run identity·공통 manifest·예약 회수를 확인한다.
+단독/Manager 호출 fixture는 guard가 자식 환경에서 제거한 테스트 예산 경로를 임시 파일로
+runner 진입점에 전달하며 Manager 호출에는 해당 fixture의 session도 전달한다.
+같은 wrapper에서 중첩 runner의 자원 관측도 고정해 호스트 부하와 분리한다.
+프로젝트 test worker의 인증값 제거와 Agent guard는 유지한다.
+이 전달 계약은 subprocess를 mock한 unit test로 확인하며 native 통합 회귀는 Worker가 실행하지 않는다.
+로컬 native targeted 근거는 Linux/Perl 5.38.2이며 실제 강제 종료,
 Windows/Linux 격리와 동시 실행 실측은 전체 verify·후속 Manager 검증으로 남는다.
 
 ## 영향 기반 부분 실행
@@ -147,10 +152,16 @@ unittest와 perl-tap 이외의 미연결 도구는 기존 verify를 유지하며
 
 ## 진단과 입력
 
-run별 `manifest.json`, 단계별 수집 요청/결과·단위 결과·worker 로그와 JSONL 이벤트, 전체 `summary.json`을 보존한다. 이벤트는 version·run·단계·단위/테스트 identity를 결합하며 단계별 로그도 전체 진단에 포함한다. 실패 피드백의 `[VERIFY_DIAGNOSTIC]` 경로로 원본 진단을 찾을 수 있다. 예약은 session·단위·PID와 프로세스 시작 identity에 결합한다. 종료가 확인된 자식/미시작 예약만 회수하고 종료 불명은 별도 journal에 보존한다.
+run별 `manifest.json`, 단계별 수집 요청/결과·단위 결과·worker 로그와 JSONL 이벤트, 전체 `summary.json`을 보존한다. version 1 이벤트는 run·stage·unit·worker·test identity와 `clock_domain`을 담으며, 이전 로그에 없는 필드는 확인되지 않은 값으로 남긴다. 새 `phase_start`·`phase_end` 이벤트는 동일한 32자리 소문자 16진수 UUID `phase_id`를 공유해 stage/unit identity가 달라져도 시작과 종료를 연결한다. 이 필드가 없는 legacy phase는 같은 run·clock domain·PID·phase 이름·시작 시각으로 대응한다. `clock_domain`은 이벤트를 기록한 Python의 `sys.platform` 문자열이다. monotonic `at`·`start`·`duration`은 같은 clock domain 안에서만 비교한다. 종료·정리 판단은 Manager/core가 소유하고 summary나 운영 진행 표시는 이를 바꾸지 않는다. 실패 피드백의 `[VERIFY_DIAGNOSTIC]` 경로로 원본 진단을 찾을 수 있다. 예약은 session·단위·PID와 프로세스 시작 identity에 결합한다. 종료가 확인된 자식/미시작 예약만 회수하고 종료 불명은 별도 journal에 보존한다.
+
+core는 `result_file_observed`에서 report 경로를 처음 발견한 parent 시각을 기록한다. Windows Job에서 `active_processes > 1`이면 `job_child_wait`와 변경된 process count를 남기고, worker만 남았음을 확인한 `job_child_exit_confirmed` 뒤에 report를 소비한다. 조회 오류는 `job_child_exit_unconfirmed`다. `module_result`는 결과 검증·집계 뒤에 기록하며 다음 `unit_start`에는 `worker_id`, `previous_unit_id`, 직전 결과 뒤 경과 시간이 있다. 이 대기와 coordinator `resource_wait`, `worker_shutdown:<worker>`는 따로 집계한다. 진단 이벤트는 worker 재사용·idle·예약 회수 정책을 완화하지 않는다.
+
+Manager의 30초 진행 관측은 현재 run ID와 일치하는 완성된 JSONL 행만 읽고 파일별 커서로 한 번 소비한다. `stage-N/worker-*.jsonl`의 test 시작·종료·중단과 runner의 단계·unit·allocation 이벤트를 연결한다. stage/run 종료는 파일 읽기 순서와 독립적으로 적용해 종료 뒤 늦게 소비한 worker 시작 행이 active 표시를 되살리지 못하게 한다. Windows parent는 `snapshot.json`이 가리키는 live WSL bundle log와 native sibling log를 읽고 WSL `parent_run_id`·부모 `result.json`·snapshot revision을 함께 표시한다. native child에도 parent run ID를 전달하고 실제 child run ID는 같은 parent ID를 가진 summary에서 가져온다. WSL·native의 PID·monotonic time·run-local result를 합치지 않는다. partial row는 newline 뒤에만 소비하며 stage/run 종료 뒤 남은 active 표시를 지우고 읽기 실패·불완전 legacy 데이터는 미확인으로 남긴다.
+
+`summary.json`은 같은 run·clock domain의 `run_start`/`run_end` 차이로 완료 run의 전체 경과를 계산한다. `run_end`가 없으면 현재 플랫폼과 clock domain이 일치할 때만 summary 관측 시점까지의 경과를 표시하고, 다른 clock domain은 미확인으로 둔다. assignment 시각·report 관측/검증·Job child 대기·allocation 당시 실행량과 resource snapshot·phase별 prepare/collection/test/cleanup·Git invocation 및 누적 시간을 원 이벤트와 연결한다. Windows parent의 `windows_pipeline`은 `result.json`·`snapshot.json`과 `<run>-wsl/summary.json`, `<run>-windows/summary.json`의 run ID·clock domain·결과·elapsed·요약 경로를 연결하며 OS별 상세 자료는 각 sibling summary에 둔다. `partial_result`·`partial_selections`는 선택 범위와 실제 partial 결과를 보존한다. 미실행 단계·NOT_SELECTED·FALLBACK·선행 FAIL 뒤의 미호출 full verify에는 완료 이벤트나 성공 시간을 만들지 않는다.
 
 자체 `scripts/verify-inputs.json`은 `loop_manager.py`, `loop_manager_internal/**`, `tests/**`,
-`requirements.txt`, `scripts/verify.json`, 두 verify 스크립트, Windows driver·선택 목록, 두 copy 스크립트와 소비되는
+`requirements.txt`, `scripts/verify.json`, 두 verify 스크립트, Windows driver·선택 목록, `scripts/setup.sh`, 두 copy 스크립트와 소비되는
 `run.sh`·`run.ps1`과 실행 코드 `.agents/skills/specification-docs/scripts/**`를
 관측한다. 복사 회귀는 이 조회 도구와 `loop_manager_internal/catalog/frontmatter.py`의 실제 bytes를
 샘플 source에 배치하고 배포 결과·조회 동작을 확인한다. 선언 파일은 실제 adapter·interpreter·수집·필수 compile 단계를
@@ -159,8 +170,10 @@ run별 `manifest.json`, 단계별 수집 요청/결과·단위 결과·worker �
 실제 copy 스크립트는 이 샘플 source에서 실행해 결과 bytes·경로·보존·덮어쓰기 거부를 확인한다.
 `AGENTS.md`, README, docs와 `.agents`의 prose, `config/config.ini.example`·운영 설정, 소비하지 않는 setup·ignore·attributes는
 자체 verify의 prose/예제 입력에서 제외한다. 이 범위는 문서·예제의 품질 검증을 뜻하지 않으며
-필수 unittest 수집과 전체 compile을 유지한다. Windows verify driver·선택 목록은 이미 포함돼 있으며
-테스트가 실제로 읽어 실행하는 `scripts/setup.sh`의 누락 보완은 R-072의 변경 목표다.
+필수 unittest 수집과 전체 compile을 유지한다. Linux 실행 경로 회귀가 실제 `scripts/setup.sh`를
+임시 source에 복사해 실행하므로 이 파일의 bytes·kind·mode 변경은 입력 지문과 기존 제외 근거를 바꾼다.
+소비하지 않는 다른 플랫폼 setup은 추가하지 않는다. Windows driver·선택 목록의 코드 입력 관측은
+WSL/native 환경의 재현성 보장과 구분한다.
 
 성공 재사용의 채택 기준은 같은 프로젝트·ExecPlan·작업 주기의 실제 전체 성공과 저장소 코드 입력의
 동일성이다. 소스·테스트·fixture·의존성 선언·검증 스크립트/선언과 선택 진입점·목록의 bytes·경로·
@@ -168,8 +181,25 @@ kind·mode를 비교하고 미커밋/untracked·목록 밖 코드 누락도 확�
 환경변수·사용자/시스템 설정·외부 동적 입력·Git revision 값은 비교 범위 밖이며 그 미확인만으로
 전체 실행이나 별도 infrastructure를 요구하지 않는다. 환경 재현성을 보장하는 정책은 아니다.
 
-현재 일반 관측은 runtime identity 부재를 unknown으로 처리한다. 이는 R-072에 맞춰 바꿀 기존
-구현이며 코드 기준 재사용이 이미 구현됐다는 뜻은 아니다. 코드 입력 변경·목록/비교 오류·누락 의심·
+일반 스크립트와 연결 runner는 코드 기준으로 관측하며 runtime identity 부재는 재사용을 막지 않는다.
+선택 진입점·연결 선언이 목록에 포함돼야 하고 관측/실행/receipt 판정 코드 bytes도 결합한다.
+문서 제외는 현재 bytes·kind·mode와 실제 코드 소비 관계를 다시 확인한다. 고정 POSIX launcher·unittest의
+제한된 정적 증명 외에, 일반/native 진입점은 Worker가 실제 소비를 검토한 명시적 제외 근거를
+기존 Worker 결과에 제출한다. 최종 코드에서 프로젝트 Python으로 다음 읽기 전용 명령을 사용한다.
+
+```sh
+python /manager/runtime/loop_manager_internal/verification/inputs.py --review-request . --entrypoint scripts/verify.sh --operating-path config/config.ini --operating-path config/config.ini.example
+```
+
+실제로 검토한 경우에만 Windows 진입점도 `--entrypoint scripts/verify.ps1`로 추가한다. 출력 JSON은
+identity 요청 자료이며 승인이나 verify 성공이 아니다. 소비하지 않는 정확한 목록 밖 경로가 어떤 내용이어도
+검증에 영향을 주지 않는다는 실제 소비 검토 근거 `basis`를 추가해 최종 결과에
+`VERIFY_INPUT_EXCLUSIONS: <JSON>` 한 줄을 제출한다. 형식은
+[ARCHITECTURE의 관측 계약](ARCHITECTURE.md#운영-입력-관측-adapter)을 따른다.
+운영/예제 설정만 정확 경로로 제외하며 검증이 소비하는 고정 자료는 manifest에 포함한다.
+현재 코드/진입점/규칙·경로 집합과 근거가 맞을 때 문서 내용·mode를 재관측해 completeness를 갱신한다.
+새 코드·경로·실제 소비·불명확한 관계·비정상 kind·비교 오류는 기존 Worker 확인과 전체 실행을 유지한다.
+코드 입력 변경·목록/비교 오류·누락 의심·
 유효한 전체 성공 부재에는 전체 실행을 유지한다. 새 실패·중단을 과거 성공으로 덮지 않으며,
 부분 PASS·선행 Review·수동 면제와 실제 전체 run은 구분한다. 일반 선행 PASS 뒤 실제 전체 실행과
 Windows의 WSL 전체 검증+native 핵심 회귀 계약은 유지한다.

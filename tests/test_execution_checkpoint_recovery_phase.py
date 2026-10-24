@@ -26,6 +26,24 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_legacy_rebase_uses_accepted_remote_before_old_observation(self):
+        from loop_manager_internal.execution.execution_ownership_handler import OwnershipHandler
+        git = mock.Mock(return_value=SimpleNamespace(returncode=1))
+        handler = OwnershipHandler(SimpleNamespace(
+            identity=SimpleNamespace(repo_path=Path('/repo')), git=git,
+            _row=lambda: {'pr_url': None, 'pr_conflict_recovery': 0}))
+        checkpoint = SimpleNamespace(operation=None, expected_head='accepted',
+            target_base_oid='base', observed_remote_oid='old',
+            snapshot={'accepted_work_branch': 'accepted'})
+        self.assertFalse(handler._legacy_current_rebase(None, checkpoint))
+        git.assert_not_called()
+        checkpoint.expected_head = 'local'
+        self.assertTrue(handler._legacy_current_rebase(None, checkpoint))
+        self.assertEqual(git.call_args.args[-2:], ('base', 'accepted'))
+        checkpoint.snapshot = {}
+        self.assertTrue(handler._legacy_current_rebase(None, checkpoint))
+        self.assertEqual(git.call_args.args[-2:], ('base', 'old'))
+
     def test_manual_detached_block_recovers_changed_plan_without_rebase_journal(self):
         self._legacy_rebase_false_block_recovery(plan_block=True, manual='waiting')
 
@@ -145,6 +163,15 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
             snapshot.return_value.serialize.return_value = 'after-scope'
             result = self.handler.run(self.context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        # A native decision's failure identity and input-release identity have
+        # different domains; a valid question must still reach its outbox.
+        failure_fingerprint = self.connection.execute(
+            "SELECT fingerprint FROM recovery_records WHERE repo='repo' AND subject='G-047'"
+        ).fetchone()[0]
+        release_fingerprint = self.connection.execute(
+            "SELECT release_fingerprint FROM execplan_blocks WHERE repo='repo' AND plan_id='G-047'"
+        ).fetchone()[0]
+        self.assertNotEqual(failure_fingerprint, release_fingerprint)
         self.assertEqual(blocked_checkpoint_state.BlockedCheckpointRepository(
             self.connection).get('repo', 'G-047').phase,
             blocked_checkpoint.CheckpointPhase.REQUESTED)

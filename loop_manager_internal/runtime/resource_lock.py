@@ -48,7 +48,7 @@ def resource_locks(state_dir: Path, repo: str, resources, *, owner: str):
                 if task is not None and (task.connection.in_transaction or getattr(task.connection, '_depth', 0)):
                     raise DatabaseWaitTimeout('Git 자원 대기 전에 DB 처리를 종료해야 합니다.') from error
                 _check_runtime_handoff()
-                if task is not None:
+                if task is not None and owner != 'base-fetch':
                     scheduler.check_project(repo)
                 if not waiting:
                     from . import operation_events as events
@@ -71,7 +71,9 @@ def resource_locks(state_dir: Path, repo: str, resources, *, owner: str):
         if scheduler is not None:
             _check_runtime_handoff()
             # 프로젝트 준비·planning의 Git 접근은 작업 배정 중단 중에도 필요하다.
-            if current_task.get() is not None:
+            # A base fetch is itself a prerequisite for planning, so a drain
+            # must not reject it while it waits for or acquires the fetch lock.
+            if current_task.get() is not None and owner != 'base-fetch':
                 scheduler.check_project(repo)
         yield
 

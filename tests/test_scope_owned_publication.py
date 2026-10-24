@@ -997,6 +997,9 @@ class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
                 "VALUES (?, 'G-001', 'plan', 'user_decision_required', 'decision')",
                 (self.repo,),
             )
+            from tests.support.notification import NotificationFixture
+            NotificationFixture.decision_block(self.connection, repo=self.repo, plan_id='G-001',
+                                               detail='decision', record_block=False)
             notifications.enqueue_current_project_events(self.connection, self.repo)
         event = self.connection.execute(
             "SELECT event_key FROM notification_outbox WHERE event_type = 'blocked'"

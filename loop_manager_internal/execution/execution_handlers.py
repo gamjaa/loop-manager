@@ -261,6 +261,12 @@ class ExecutionHandlers:
     def _document_review_prompt(self, base_prompt, draft):
         return self._documents_handler()._document_review_prompt(base_prompt, draft)
 
+    def _document_worker_prompt(self, base_prompt, draft):
+        return self._documents_handler()._document_worker_prompt(base_prompt, draft)
+
+    def _apply_linked_document(self, context, draft):
+        return self._documents_handler()._apply_linked_document(context, draft)
+
     def _run_document(self, context, draft):
         return self._documents_handler()._run_document(context, draft)
 
@@ -532,6 +538,8 @@ class ExecutionHandlers:
                 "_complete_rebase_intent": lambda *a, **kw: self._complete_rebase_intent(*a, **kw),
                 "_current_rebase_service": lambda *a, **kw: self._current_rebase_service(*a, **kw),
                 "_document_draft": lambda *a, **kw: self._document_draft(*a, **kw),
+                "_document_worker_prompt": lambda *a, **kw: self._document_worker_prompt(*a, **kw),
+                "_apply_linked_document": lambda *a, **kw: self._apply_linked_document(*a, **kw),
                 "_execute_rebase_step": lambda *a, **kw: self._execute_rebase_step(*a, **kw),
                 "_fetch_latest_base": lambda *a, **kw: self._fetch_latest_base(*a, **kw),
                 "_final": lambda *a, **kw: self._final(*a, **kw),

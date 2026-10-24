@@ -18,19 +18,84 @@ from tests.support.manual_work_case import ManualWorkCase
 
 @isolated_git_test
 class ManualWorkTest(ManualWorkCase):
-    def test_options_require_exact_head_and_reason_independently(self):
+    def test_options_require_exact_head_and_allow_optional_skip_reason(self):
         for values in ({'skip_verify':True},{'skip_review':True},{'skip_reason':'external'},
+                       {'skip_reason':'   '},
                        {'expected_head':'main'},{'expected_head':'a'*12}):
             args=completion()
             for key,value in values.items():
                 setattr(args,key,value)
             with self.assertRaises(ValueError):
                 validate_options(args)
-        args=completion()
-        args.skip_review=True
-        args.expected_head='a'*40
-        args.skip_reason='external review'
-        validate_options(args)
+        for skip_verify,skip_review in ((False,False),(True,False),(False,True),(True,True)):
+            for reason in (None,'','   ','external review'):
+                args=completion()
+                args.skip_verify=skip_verify
+                args.skip_review=skip_review
+                args.expected_head='a'*40 if skip_verify or skip_review else None
+                args.skip_reason=reason
+                if not (skip_verify or skip_review) and reason is not None:
+                    with self.assertRaises(ValueError):
+                        validate_options(args)
+                else:
+                    validate_options(args)
+
+
+    def test_complete_normalizes_blank_skip_reason_in_request_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service=self.mocked_service(directory)
+            group,documents,head,base=self.seed_manual_group(service,directory,kind='start')
+            service.fetch=mock.Mock(side_effect=lambda branch: head if branch==group['branch'] else base)
+            args=completion('G-047')
+            args.skip_verify=True
+            args.expected_head=head
+            args.skip_reason='   '
+            validate_options(args)
+            with mock.patch('loop_manager_internal.execution.manual_candidate.ManualCandidate.documents',
+                            return_value=documents), \
+                    mock.patch('loop_manager_internal.catalog.manual_catalog.updated_base_documents',
+                               return_value=documents), \
+                    mock.patch('loop_manager_internal.application.manual_work.candidate_input',
+                               return_value=('candidate-token','verify-token','review-token')), \
+                    mock.patch('loop_manager_internal.execution.manual_candidate.candidate_token',
+                               return_value='candidate-token'):
+                service.complete(args)
+            group=service.store.for_plan(service.repo,'G-047')
+            request=service.store.request(group)
+            self.assertEqual(request['reason'],'')
+            self.assertEqual((request['skip_verify'],request['skip_review']),(1,0))
+            service.store.record(group,'verify',head,base,'verify-token','SKIPPED_BY_USER',
+                                 f'SKIPPED_BY_USER @{head}; ')
+            service.effects.operation_print.reset_mock()
+            service.display(group,accepted=True)
+            output='\n'.join(str(call.args[0]) for call in service.effects.operation_print.call_args_list)
+            self.assertIn(f'SKIPPED_BY_USER @{head}: 사유 미입력',output)
+            service.effects.git.assert_not_called()
+            service.effects.fetch_base.assert_not_called()
+
+
+    def test_submit_normalizes_blank_skip_reason_in_request_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service=self.mocked_service(directory)
+            group,_documents,head,base=self.seed_manual_group(service,directory,kind='submit')
+            service.fetch=mock.Mock(side_effect=lambda branch: head if branch=='source' else base)
+            service.document=mock.Mock(return_value='# [R-001] Active\n')
+            args=completion('G-047',branch='source',requirement=['docs/requirements/Active.md'])
+            args.skip_verify=args.skip_review=True
+            args.expected_head=head
+            args.skip_reason='   '
+            validate_options(args)
+            with mock.patch('loop_manager_internal.application.manual_work.candidate_input',
+                            return_value=('candidate-token','verify-token','review-token')), \
+                    mock.patch('loop_manager_internal.execution.manual_candidate.candidate_token',
+                               return_value='candidate-token'):
+                service.submit(args)
+            group=service.store.for_source(service.repo,'source',['docs/requirements/Active.md'])
+            request=service.store.request(group)
+            self.assertEqual(request['reason'],'')
+            self.assertEqual((request['skip_verify'],request['skip_review']),(1,1))
+            service.effects.git.assert_not_called()
+            service.effects.fetch_base.assert_not_called()
 
 
     def test_legacy_manual_requests_keep_unknown_stage_inputs_null(self):

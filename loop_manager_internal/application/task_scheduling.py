@@ -132,12 +132,8 @@ class TaskScheduler:
         saved = repository.defer_retry(repo, plan_id)
         events.emit('작업 재시도 대기', project=repo, plan=plan_id, reason_code=saved['reason_code'],
                     retry_after=saved['retry_after'])
-        observed = 0
         while True:
             self.check_project(repo)
-            if time.monotonic() >= observed:
-                observe_runtime()
-                observed = time.monotonic() + 1
             remaining = saved['retry_after'] - time.time()
             if remaining <= 0:
                 break
@@ -156,7 +152,6 @@ class TaskScheduler:
         events.emit('사용 한도 조건 대기', project=repo, plan=plan_id)
         while True:
             self.check_project(repo)
-            observe_runtime()
             if saved['finished_at'] and connection.execute(
                 "SELECT 1 FROM agent_invocations WHERE repo=? AND provider=? AND model=? "
                 "AND finished_at>? AND result_kind='success' AND result_code=0 "
@@ -173,7 +168,6 @@ class TaskScheduler:
             return False
         while keys:
             self.check_project(repo)
-            observe_runtime()
             live = {row['token'] for row in task_calls.recover(
                 connection, self.state_dir, tokens={value['token'] for value in keys.values()})}
             with self.condition:
@@ -406,7 +400,8 @@ def run_project_tasks(service, *, newly_activated):
             with closing(scheduler.connect_database(service.identity.state_dir, run_migrations=False)) as owned:
                 from loop_manager_internal.notifications import notifications
                 from loop_manager_internal.storage import recovery_state
-                notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled)
+                notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled,
+                    verify_timeout_seconds=getattr(scheduler.config, 'verify_timeout_seconds', None))
                 recovery_state.begin_external_run(owned, scheduler.external_run_id)
                 owned.commit()
                 child = ProjectService(service.effects, replace(service.identity, connection=owned))
@@ -497,7 +492,8 @@ def run_project_tasks(service, *, newly_activated):
             with closing(scheduler.connect_database(service.identity.state_dir, run_migrations=False)) as owned:
                 from loop_manager_internal.notifications import notifications
                 from loop_manager_internal.storage import recovery_state
-                notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled)
+                notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled,
+                    verify_timeout_seconds=getattr(scheduler.config, 'verify_timeout_seconds', None))
                 recovery_state.begin_external_run(owned, scheduler.external_run_id)
                 owned.commit()
                 token = current_task.set(Task(repo, plan_id, owned))

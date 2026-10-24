@@ -540,6 +540,11 @@ class UsageTests(TestCase):
                  mock.patch.object(provider_adapters.agent_write_isolation,
                                    "prepare_isolation", side_effect=prepare), \
                  mock.patch.object(provider_adapters.agent_write_isolation,
+                                   "assert_current_configuration"), \
+                 mock.patch.object(provider_adapters.agent_write_isolation,
+                                   "refresh_configuration_evidence",
+                                   side_effect=lambda current, *_args, **_kwargs: current), \
+                 mock.patch.object(provider_adapters.agent_write_isolation,
                                    "assert_current"), \
                  mock.patch.object(Path, "write_text", autospec=True,
                                    side_effect=write_text):

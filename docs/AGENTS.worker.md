@@ -50,6 +50,19 @@ PRODUCT·ARCHITECTURE의 실제 경로·절만 사용하고 완료 publication �
 checkpoint·판단 대기는 완료 후보와 구분하며 Manager의 검증·Review를 대신하지 않는다.
 검증 adapter 문맥은 scripts/verify.json의 선택 adapter·환경과 docs/VERIFY.md에서 확인한다.
 
+목록 밖 파일의 제외 근거는 verify PASS와 별도로 확인한다. 최종 코드의 실제 verify
+진입점·수집·테스트·native/동적 소비를 검토해 특정 목록 밖 경로가 어떤 내용이어도 소비되지 않음을
+확인한 경우에만 읽기 전용 identity를 얻는다. 프로젝트 Python으로 환경변수
+`LOOP_MANAGER_TARGETED_TEST_RUNNER`의 스크립트와 같은 디렉터리의 `inputs.py`를 실행하고
+`--review-request . --entrypoint scripts/verify.sh`를 전달한다. Windows 진입점도 실제로
+확인했다면 `--entrypoint scripts/verify.ps1`을 추가한다.
+내용·존재와 무관한 운영 설정만 `--operating-path <정확한 상대경로>`로 지정하며 실제 고정
+설정/자료는 입력 목록에 포함한다. 출력은 승인 근거가 아니며 최종 코드 변경 뒤 다시 얻는다.
+확인한 출력 JSON에 `basis` 문자열로 실제 소비 검토 근거를 추가하고 최종 응답의
+WORKER_OUTCOME 앞에 `VERIFY_INPUT_EXCLUSIONS: <JSON>` 한 줄로 제출한다. 미확인·누락
+의심이면 선언하지 않고 전체 verify와 기존 Worker 확인 경계를 유지한다. Reviewer는 이
+근거와 실제 소비 누락을 검토한다.
+
 
 ## 설계 문서 갱신
 
@@ -81,6 +94,7 @@ checkpoint·판단 대기는 완료 후보와 구분하며 Manager의 검증·Re
   추가 수정을 멈추고 실패를 보고한다. 실행·수집 중단이나 기록 부재를 테스트 실패 횟수로 보고하지 않는다.
 - 실패 명령은 `FAILED_COMMAND:`, 수정 후 동일 명령은 `RERUN:` 줄로 보고하고
   재실행 결과를 그 뒤에 명시한다. 두 명령은 공백을 정규화한 뒤 정확히 같아야 한다. 성공·실패가 섞인 요약을 통과로 보고하지 않는다.
+- Loop Manager targeted 결과에서는 확인된 본문 실패·오류와 unittest `unexpected_success`를 실패로 보고한다. 성공·skip·expected failure만 실패 이력을 초기화하며, fixture-only·수집 오류와 구분 불명 결과는 누적하거나 초기화하지 않는다. JUnit 명령 종료 코드만으로 testcase 결과를 만들지 않는다.
 - 전체 verify의 실제 입력을 `scripts/verify-inputs.json` version 1 상대 경로/glob 목록으로
   스크립트와 함께 유지한다. 코드·테스트·fixture·의존성 선언·저장소 검증 스크립트/선언과
   실제로 읽는 문서·`.agents/`를 반영한다. 재사용은 저장소 코드 입력 기준이며 실행 머신의 환경·

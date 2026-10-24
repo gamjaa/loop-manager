@@ -8,6 +8,13 @@ from tests.support.worker import worker_result
 class WorkerResultContractTest(unittest.TestCase):
     plan = {"id": "G-008", "title": "Descriptive Worker Commits"}
 
+    def test_exclusion_review_stays_in_raw_result_without_entering_publication_fields(self):
+        message = worker_result('Bind code consumption review', 'Summary', 'unit case: PASS')
+        expected = loop_manager.parse_worker_result(message, self.plan)
+        for value in ('{}', '{"basis":"reviewed"}'):
+            actual = loop_manager.parse_worker_result(message + '\nVERIFY_INPUT_EXCLUSIONS: ' + value, self.plan)
+            self.assertEqual(expected, actual)
+
     def test_explicit_korean_no_failures_does_not_hide_actual_failures(self):
         declarations = ('이번 실행 실패·skip 없음.', '실패 및 오류 없습니다.',
                         '실패, errors, skips 없음.', '재실행 실패 없음.')

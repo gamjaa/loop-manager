@@ -1,4 +1,5 @@
 """The Manager leaves project CLI guidance to the Agent."""
+from dataclasses import replace
 from pathlib import Path
 import json
 import sqlite3
@@ -7,7 +8,7 @@ from unittest import TestCase, mock
 
 import loop_manager as lm
 from tests.support.execution import ExecutionFixture
-from tests.support.scope import AgentScopeFixture
+from tests.support.scope import AgentScopeFixture, snapshot
 
 
 class ExecutionGuidanceTests(ExecutionFixture, TestCase):
@@ -63,6 +64,11 @@ class WorkerPromptFocusTests(TestCase):
                  result, raw, 'request', revision))
             connection.commit()
         stage('verify', 'PASS', 'PRIVATE VERIFY PASS LOG', '1')
+        connection.execute(
+            "INSERT INTO manual_work_requests (request_id,repo,group_id,source_head,base_sha,"
+            "input_token,skip_verify,skip_review,reason,created_at) "
+            "VALUES ('request','repo','group','head','base','token',0,1,?, 'now')",
+            ('user requested omission',))
         stage('review', 'SKIPPED_BY_USER', 'skip; user requested omission', '2')
         feedback = ValidationFeedbackRepository(connection)
         with mock.patch.object(manual, 'enabled', return_value=True), mock.patch.object(manual, 'group', return_value=group):
@@ -72,7 +78,8 @@ class WorkerPromptFocusTests(TestCase):
             self.assertIn('first G', text)
             self.assertIn('second G', text)
             self.assertIn('SKIPPED_BY_USER', text)
-            self.assertIn('user requested omission', text)
+            self.assertIn('제공 사유: user requested omission', text)
+            self.assertNotIn('skip; user requested omission', text)
             self.assertIn('외부 targeted test 결과는 확인되지 않았으며', text)
             self.assertNotIn('PRIVATE VERIFY PASS LOG', text)
             feedback.delivered(first.attempt_id, 'session')
@@ -135,10 +142,17 @@ class WorkerPromptFocusTests(TestCase):
 class WorkerCliGuidanceScopeTests(AgentScopeFixture, TestCase):
     def test_worker_can_change_cli_guidance_within_ordinary_worktree_scope(self):
         with tempfile.TemporaryDirectory() as directory:
-            repo, plan_path = self._repository_with_plan(directory)
-            before = lm.capture_git_snapshot(repo)
+            repo = Path(directory)
+            plan_path = 'docs/plans/[G-047] Runtime.md'
+            before = snapshot()
+            after = replace(before, dirty={'AGENTS.md': (('untracked',), 'binary-guidance')})
             (repo / 'AGENTS.md').write_bytes(b'project instructions\xff\n')
-            after = lm.capture_git_snapshot(repo)
-            lm.validate_agent_scope('worker', repo, before, after, selected_plan_path=plan_path)
-            with self.subTest():
-                lm.validate_agent_scope('reviewer', repo, before, after)
+            with (mock.patch.object(lm, 'capture_git_snapshot',
+                                    side_effect=(before, after)) as observe,
+                  mock.patch('subprocess.Popen',
+                             side_effect=AssertionError('예상 밖 Git process 실행'))):
+                self.assertEqual(lm.capture_git_snapshot(repo), before)
+                self.assertEqual(lm.capture_git_snapshot(repo), after)
+                lm.validate_agent_scope('worker', repo, before, after,
+                                        selected_plan_path=plan_path)
+                self.assertEqual(observe.call_count, 2)

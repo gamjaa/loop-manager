@@ -123,6 +123,14 @@ def _observed_changed_paths(worktree: Path, base_revision: str) -> tuple[set[str
     return changed, untracked
 
 
+def _file_mode_changed(draft: DocumentDraft, worktree: Path, base_revision: str) -> bool:
+    return bool(
+        _git(worktree, "diff", "--summary", base_revision, "--", draft.target_path)
+        or _git(worktree, "diff", "--cached", "--summary", base_revision,
+                "--", draft.target_path)
+    )
+
+
 def apply_approved_bytes(
     draft: DocumentDraft, worktree: Path, base_revision: str,
 ) -> None:
@@ -140,6 +148,48 @@ def apply_approved_bytes(
     if current == draft.original_content:
         target.write_bytes(draft.proposed_content)
     validate_exact_worktree(draft, worktree, base_revision)
+
+
+def apply_linked_approved_bytes(
+    draft: DocumentDraft, worktree: Path, base_revision: str,
+) -> None:
+    """Apply the approved file exactly while retaining an existing task's work."""
+    target = _document_target(draft, worktree)
+    original = _git(worktree, "show", f"{base_revision}:{draft.target_path}")
+    if original != draft.original_content:
+        raise DocumentDraftError("기존 작업의 원본 바이트가 승인 원본과 다릅니다.")
+    if _file_mode_changed(draft, worktree, base_revision):
+        raise DocumentDraftError("기존 작업의 승인 문서 파일 mode가 변경됐습니다.")
+    current = target.read_bytes()
+    if current == draft.original_content:
+        target.write_bytes(draft.proposed_content)
+    elif current != draft.proposed_content:
+        raise DocumentDraftError("기존 작업이 승인 대상 문서를 다른 내용으로 변경했습니다.")
+    validate_linked_worktree(draft, worktree, base_revision)
+
+
+def validate_linked_worktree(
+    draft: DocumentDraft, worktree: Path, base_revision: str,
+) -> None:
+    """Require the mixed task diff to retain only the exact approved document bytes."""
+    target = _document_target(draft, worktree)
+    original = _git(worktree, "show", f"{base_revision}:{draft.target_path}")
+    current = target.read_bytes()
+    if (original != draft.original_content
+            or current != draft.proposed_content
+            or _hash(current) != draft.proposed_hash
+            or _complete_diff(draft.target_path, original, current) != draft.complete_diff):
+        raise DocumentDraftError("기존 작업의 문서 bytes·diff가 승인 수정본과 다릅니다.")
+    if _file_mode_changed(draft, worktree, base_revision):
+        raise DocumentDraftError("기존 작업의 승인 문서 파일 mode가 변경됐습니다.")
+
+
+def approved_bytes_present(draft: DocumentDraft, worktree: Path) -> bool:
+    """Tell whether an existing worktree already contains the exact proposal."""
+    try:
+        return _document_target(draft, worktree).read_bytes() == draft.proposed_content
+    except (DocumentDraftError, OSError):
+        return False
 
 
 def validate_exact_worktree(

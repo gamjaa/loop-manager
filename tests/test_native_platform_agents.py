@@ -311,6 +311,9 @@ class NativePlatformAgentTests(unittest.TestCase):
                 _handoff_popen=start, _handoff_run=mock.Mock())
             sessions = []
             with mock.patch.object(isolation, 'prepare_isolation', side_effect=prepare), \
+                 mock.patch.object(isolation, 'assert_current_configuration'), \
+                 mock.patch.object(isolation, 'refresh_configuration_evidence',
+                                   side_effect=lambda evidence, *_args, **_kwargs: evidence), \
                  mock.patch.object(isolation, 'assert_current'), \
                  mock.patch.object(windows_runtime, 'check_command'):
                 result = provider_adapters.run_codex(root, root, root / 'config', 'planner', '입력',

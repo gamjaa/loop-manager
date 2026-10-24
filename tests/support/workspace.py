@@ -172,11 +172,14 @@ def native_agent_boundary(root: Path):
                                      'repository'), state_root, home
 
 
-def native_developer_texts(arguments, _worktree, _environment):
+def native_developer_texts(arguments, _worktree, _environment, on_lookup=None):
     """Native-policy fixtures isolate sandbox checks from prompt inspection.
 
     Provider tests exercise real sentinel projection and effective layer checks.
     """
     import tomllib
-    return [tomllib.loads(argument)['developer_instructions'] for argument in arguments
-            if argument.startswith('developer_instructions=')]
+    result = [tomllib.loads(argument)['developer_instructions'] for argument in arguments
+              if argument.startswith('developer_instructions=')]
+    if on_lookup is not None:
+        on_lookup()
+    return result

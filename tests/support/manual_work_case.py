@@ -2,10 +2,12 @@ import contextlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 import loop_manager
+from loop_manager_internal.application.manual_work import validate_options
 from loop_manager_internal.agents.agent_invocation import ResolvedProfile
 from loop_manager_internal.execution.manual_candidate import ManualCandidate
 from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
@@ -17,13 +19,59 @@ from types import SimpleNamespace
 
 
 class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
+    def mocked_service(self, directory):
+        from loop_manager_internal.application.manual_work import ManualWorkService
+        from tests.support.database import runtime_connection
+
+        repo=Path(directory)/'repo'
+        connection=runtime_connection(str(repo))
+        self.addCleanup(connection.close)
+        connection.execute('UPDATE projects SET registered=1,origin=? WHERE repo=?',
+            (str(Path(directory)/'origin.git'),str(repo)))
+        connection.commit()
+        state_dir=Path(directory)/'state'
+        state_dir.mkdir()
+        config_path=Path(directory)/'operational-config.ini'
+        config_path.write_text('[loop]\nverify_timeout_seconds=600\nverify_parallelism=auto\n',encoding='utf-8')
+        unexpected=mock.Mock(side_effect=AssertionError('unexpected Git or external operation'))
+        effects=replace(loop_manager._manual_work_effects(),validate_repository=unexpected,
+            fetch_base=unexpected,git=unexpected,git_bytes=unexpected,make_worktree=unexpected,
+            validate_workspace=unexpected,capture_snapshot=unexpected,pr_for_branch=unexpected,
+            generate_plans=unexpected,run_project=unexpected,operation_print=mock.Mock(),
+            resolve_profile=mock.Mock(return_value=ResolvedProfile('fixture-reviewer','medium')))
+        service=ManualWorkService(effects,connection,state_dir,repo,config_path)
+        service.drive=mock.Mock(return_value=0)
+        return service
+
+    def seed_manual_group(self, service, directory, *, kind):
+        plan={'id':'G-047','title':'Runtime','sources':['docs/PRODUCT.md'],'depends_on':[],
+              'complexity':'medium','risk':'medium','priority':'normal'}
+        path='docs/plans/[G-047] Runtime.md'
+        documents=[{'path':path,'text':'# Runtime\n','plan':plan}]
+        head='a'*40
+        base='b'*40
+        source_branch='source' if kind=='submit' else 'loop-manager/G-047'
+        requirements=('docs/requirements/Active.md',) if kind=='submit' else ()
+        group=service.store.create(service.repo,kind,source_branch,requirements,head,base,
+            members=('G-047',),documents=documents)
+        worktree=Path(directory)/'worktree'
+        group=service.store.update(group,state='AUTOMATIC' if kind=='submit' else 'MANUAL_WORKING',
+            owner_id='G-047',branch='loop-manager/G-047',worktree=str(worktree),
+            workspace_created=0,prepared_head=head,definition_head=head)
+        status='MANUAL_PENDING' if kind=='submit' else 'MANUAL_WORKING'
+        service.connection.execute('UPDATE exec_plans SET status=?,branch=?,worktree=?,workspace_owned=1,active_sha=? '
+            'WHERE repo=? AND plan_id=?',
+            (status,group['branch'],group['worktree'],base,service.repo,'G-047'))
+        service.connection.commit()
+        return service.store.get(service.repo,group['group_id']),documents,head,base
+
     def candidate(self, service, plan_id):
         return ManualCandidate(service.connection,service.repo,plan_id,service.effects.git,
             service.effects.git_bytes,config_path=service.config_path,provider=service.project['provider'],
             resolve_profile=service.effects.resolve_profile)
 
 
-    def submitted(self, directory, *, count=2, skip=False):
+    def submitted(self, directory, *, count=2, skip=False, skip_reason='External checks'):
         service,_,_=self.fixture(directory)
         user=Path(directory)/'source-worktree'
         git_command(service.repo_path,'worktree','add','-b','source',str(user),'origin/main')
@@ -39,7 +87,8 @@ class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
         if skip:
             args.skip_verify=args.skip_review=True
             args.expected_head=git_command(user,'rev-parse','HEAD')
-            args.skip_reason='External checks'
+            args.skip_reason=skip_reason
+        validate_options(args)
         service.submit(args)
         return service,service.store.for_source(service.repo,'source',args.requirement),user
 
@@ -126,7 +175,7 @@ class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
         return service,branch,worktree,head,base,project,pull_request
 
 
-    def _verify_fixture_with_manual_skip(self):
+    def _verify_fixture_with_manual_skip(self, *, reason='external verify'):
         from tests.support.execution import execution_fixture
         from loop_manager_internal.execution.manual_candidate import candidate_token, stage_input_tokens
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
@@ -159,7 +208,7 @@ class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
         verify_input,review_input=stage_input_tokens(config_path,'codex',context.worktree,resolve_profile)
         store.accept(group,head=head,base=base,input_token=candidate_input,
                      verify_input_token=verify_input,review_input_token=review_input,
-                     skip_verify=True,reason='external verify')
+                     skip_verify=True,reason=reason)
         fixture.state.manual=candidate
         return fixture,context,candidate,config_path
 

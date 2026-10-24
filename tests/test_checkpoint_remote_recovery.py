@@ -942,7 +942,7 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         after_events = self.connection.execute(
             "SELECT COUNT(*) FROM notification_outbox"
         ).fetchone()[0]
-        self.assertEqual(after_events, before_events + 1)
+        self.assertEqual(after_events, before_events)
         self.assertFalse(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir,
             str(self.repo.resolve()), "main",
@@ -1066,7 +1066,7 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         after_events = self.connection.execute(
             "SELECT COUNT(*) FROM notification_outbox"
         ).fetchone()[0]
-        self.assertEqual(after_events, before_events + 1)
+        self.assertEqual(after_events, before_events)
 
         remote_calls = loop_manager.git
         with mock.patch.object(loop_manager, "git", wraps=remote_calls) as git_calls, \
@@ -1143,7 +1143,7 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         ).fetchone()[0]
         self.assertEqual(evidence, inspected["inspection_reason"])
         payloads = self.connection.execute("SELECT payload FROM notification_outbox").fetchall()
-        self.assertTrue(any(evidence in json.loads(row[0]).get("cause", "") for row in payloads))
+        self.assertEqual(payloads, [])
         self.assertFalse(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
         ))
@@ -1576,7 +1576,7 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         failure_events = self.connection.execute(
             "SELECT COUNT(*) FROM notification_outbox"
         ).fetchone()[0]
-        self.assertEqual(failure_events, before_events + 1)
+        self.assertEqual(failure_events, before_events)
         with mock.patch.object(loop_manager, "git", side_effect=unavailable_fetch):
             self.assertFalse(loop_manager.resume_plan_blocks(
                 self.connection, self.repo, self.state_dir,

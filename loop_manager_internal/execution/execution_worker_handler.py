@@ -8,6 +8,7 @@ from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.storage import review_correction_state, runtime_state
 from loop_manager_internal.storage import recovery_state
+from loop_manager_internal.documents import document_drafts, document_publication
 from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
 from loop_manager_internal.execution.result_validation import TargetedTestFailure
 from loop_manager_internal.verification.targeted import RUNNER_INSTRUCTION
@@ -79,6 +80,8 @@ class WorkerHandlerPorts:
     _complete_rebase_intent: Callable[..., Any]
     _current_rebase_service: Callable[..., Any]
     _document_draft: Callable[..., Any]
+    _document_worker_prompt: Callable[..., str]
+    _apply_linked_document: Callable[..., bool]
     _execute_rebase_step: Callable[..., Any]
     _fetch_latest_base: Callable[[], str]
     _final: Callable[..., ExecutionOutcome]
@@ -233,7 +236,15 @@ class WorkerHandler:
         plan = self.ports.snapshot().plan
         assert catalog_plan is not None and plan is not None
         draft = self.ports._document_draft(context)
+        legacy_document_plan = False
         if draft is not None:
+            plan_text = document_publication.read_plan_text(
+                context.worktree / context.plan.path,
+            )
+            legacy_document_plan = (
+                document_publication.plan_claim(plan_text) == draft.draft_id
+            )
+        if legacy_document_plan:
             return self.ports._run_document(context, draft)
         self.ports.operation_log(f"Worker 준비: {plan['id']} {plan['title']}")
         correction_turn = None
@@ -495,6 +506,8 @@ class WorkerHandler:
                 session_recovery=recovering, allow_common_plans=allow_common_plans,
                 session_resume=not initial and not recovering,
                 task_changed='task' in changed, context_delta='\n'.join(extras))
+            if draft is not None and not legacy_document_plan:
+                prompt = self.ports._document_worker_prompt(prompt, draft)
             if initial or recovering:
                 prompt = (prompt or '') + query_context
             try:
@@ -758,6 +771,17 @@ class WorkerHandler:
         delivered_session = result.session_id or self.ports._row()['worker_session_id']
         if feedback_repo is not None and delivery is not None and delivered_session:
             feedback_repo.delivered(delivery.attempt_id, str(delivered_session))
+        if draft is not None and not legacy_document_plan:
+            try:
+                self.ports._apply_linked_document(context, draft)
+            except document_drafts.DocumentDraftError as error:
+                detail = f'승인 문서 bytes 적용 대기: {error}'
+                self.ports.state.update_project(
+                    self.ports.identity.repo, phase='WORKING', last_error=detail,
+                )
+                return self.ports._recover(
+                    RecoveryReason.WORKER_CORRECTION, detail, context=context,
+                )
         evidence = re.search(
             r"(?m)^VERIFY_TIMEOUT_LIMIT_INSUFFICIENT:\s*(\S[^\r\n]*)$",
             message,

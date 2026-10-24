@@ -18,8 +18,9 @@ def validated_held_planning_snapshot(
     *, git: Callable, load_snapshot: Callable,
     mutable_paths: frozenset[str] = frozenset(),
     recovery_mode: bool = False,
+    planned_ids: frozenset[str] = frozenset(),
 ) -> execplan_catalog.ExecPlanCatalogSnapshot:
-    """Reuse only unchanged, revision-bound errors for either Planner consumer."""
+    """Preserve pinned errors while allowing new plans to inherit their holds."""
     view = connection.execute(
         "SELECT revision_sha FROM execplan_catalog_views WHERE repo = ?", (repo,),
     ).fetchone()
@@ -42,7 +43,8 @@ def validated_held_planning_snapshot(
         # A deletion recovery may repair only its snapshot files. All other
         # quarantined bytes stay pinned, including synthetic missing-file holds.
         editable = {key for key, evidence in held.items() if evidence.get("path") in mutable_paths}
-        if (local.withheld_ids - held.keys()
+        if (local.withheld_ids - held.keys() - planned_ids
+                or any(issue.plan_id in planned_ids for issue in local.issues)
                 or any(issue.plan_id in editable for issue in local.issues)):
             raise execplan_catalog.ExecPlanCatalogError(
                 "삭제 복구 결과에 새 오류 또는 미해결 개정 대상이 있습니다.", code="held-planning-mismatch")
@@ -61,14 +63,20 @@ def validated_held_planning_snapshot(
     causes = [dict(plan_id=item.plan_id, path=item.path, code=item.code,
                    message=item.message, source=item.source) for item in local.issues]
     declaration_holds = {key for key, evidence in held.items() if "causes" in evidence}
-    if (local.withheld_ids != declaration_holds
-            or any(held[key].get("causes") != causes for key in local.withheld_ids)
+    unplanned_withheld = local.withheld_ids - planned_ids
+    if ((not declaration_holds and unplanned_withheld)
+            or not declaration_holds <= unplanned_withheld
+            or any(issue.plan_id in planned_ids for issue in local.issues)
+            or any(held[key].get("causes") != causes for key in declaration_holds)
             or any(held[key].get("content_hash") != content_hash
-                   for key, _path, content_hash in local.withheld)):
+                   for key, _path, content_hash in local.withheld
+                   if key not in planned_ids and key in held)):
         raise execplan_catalog.ExecPlanCatalogError(
             "planning 결과가 보류 catalog 오류의 원인이나 범위를 변경했습니다.",
             code="held-planning-mismatch")
-    for _, path, _ in local.withheld:
+    for key, path, _ in local.withheld:
+        if key in planned_ids:
+            continue
         if not revision_path_exists(git, worktree, active_sha, path):
             raise execplan_catalog.ExecPlanCatalogError(
                 f"보류 catalog 파일이 변경됐습니다: {path}", code="held-planning-mismatch", path=path)
@@ -81,32 +89,64 @@ def validated_held_planning_snapshot(
     return local
 
 
-def assert_planning_dependencies_unheld(
-    catalog, plans, held_ids, *, recovery_target_ids=frozenset(), original_dependencies=None,
+def assert_planning_dependency_references(
+    catalog, plans, held_ids, *, original_dependencies=None, withheld_ids=(),
+    check_cycles=True,
 ) -> None:
-    """Reject held prerequisites except unchanged paths in a deletion recovery."""
+    """A registered held prerequisite is a valid reference, not permission to run."""
     original_dependencies = original_dependencies or {}
+    plans = tuple(plans)
     for path, plan in plans:
-        plan_id = str(plan["id"])
-        pending = [(plan_id, str(dependency), plan_id in recovery_target_ids)
-                   for dependency in plan["depends_on"]]
+        pending = list(plan["depends_on"])
         visited = set()
         while pending:
-            parent, dependency, inherited = pending.pop()
-            marker = (parent, dependency, inherited)
-            if marker in visited:
+            dependency = str(pending.pop())
+            if dependency in visited:
                 continue
-            visited.add(marker)
-            inherited = inherited and dependency in original_dependencies.get(parent, ())
-            if dependency in held_ids and not inherited:
+            visited.add(dependency)
+            if dependency in held_ids and dependency not in original_dependencies:
                 raise execplan_catalog.ExecPlanCatalogError(
-                    f"새 planning 결과가 보류 계획에 의존합니다: {path} -> {dependency}",
+                    f"등록되지 않은 보류 계획에 의존합니다: {path} -> {dependency}",
                     code="held-planning-dependency", path=path)
             current = catalog.get(dependency)
             dependencies = (current.get("depends_on") if current is not None else None)
             if dependencies is None:
                 dependencies = original_dependencies.get(dependency, ())
-            pending.extend((dependency, str(item), inherited) for item in dependencies)
+            pending.extend(dependencies)
+
+    if not check_cycles:
+        return
+
+    dependencies = {
+        str(plan_id): tuple(str(item) for item in metadata.get("depends_on", ()))
+        for plan_id, metadata in catalog.items()
+    }
+    changed_ids = frozenset(str(plan["id"]) for _, plan in plans)
+    for _, plan in plans:
+        dependencies[str(plan["id"])] = tuple(str(item) for item in plan["depends_on"])
+    # Quarantined dependency closure nodes have pinned files but no active
+    # metadata. Use their registered edge only when the snapshot withheld them;
+    # current declarations above always take priority.
+    fallback_ids = frozenset(str(item) for item in held_ids) | frozenset(
+        str(item) for item in withheld_ids
+    )
+    for plan_id in fallback_ids:
+        if plan_id not in dependencies and plan_id in original_dependencies:
+            dependencies[str(plan_id)] = tuple(
+                str(item) for item in original_dependencies[plan_id]
+            )
+    cycles = execplan_catalog.dependency_cycle_paths(
+        dependencies, relevant_ids=changed_ids,
+    )
+    if cycles:
+        cycle = cycles[0]
+        changed_id = next(item for item in cycle if item in changed_ids)
+        path = next(path for path, plan in plans if str(plan["id"]) == changed_id)
+        raise execplan_catalog.ExecPlanCatalogError(
+            "이번 planning 선언이 순환 ExecPlan 의존성을 만듭니다: "
+            + " -> ".join(cycle),
+            code="dependency-cycle", path=path,
+        )
 
 
 class CatalogRefreshStopped(RuntimeError):

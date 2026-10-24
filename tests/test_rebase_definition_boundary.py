@@ -284,6 +284,58 @@ class RebaseDefinitionBoundaryTests(TestCase):
         self.assertEqual((self.worktree / self.plan_path).read_text(), raw)
         self.assertEqual(git_command(self.worktree, 'rev-parse', 'HEAD'), self.head)
 
+    def test_completed_legacy_rebase_restores_header_with_adopted_plan_and_no_turn_receipt(self):
+        import base64
+        import hashlib
+        from loop_manager_internal.git import rebase_documents
+        body = '\n## Progress\nPreserved Worker investigation.\n'
+        replay = self.new_text + body
+        (self.worktree / self.plan_path).write_text(replay)
+        git_command(self.worktree, 'add', self.plan_path)
+        git_command(self.worktree, 'commit', '-m', 'Replay newer plan with Worker notes')
+        replayed = git_command(self.worktree, 'rev-parse', 'HEAD')
+        self.state.update_project(self.repo_key, definition_snapshot=None)
+        pinned = self.new_text.encode()
+        digest = hashlib.sha256(pinned).hexdigest()
+        original = {'mode': '100644', 'blob': digest,
+                    'oid': git_command(self.repo, 'rev-parse', f'{self.latest}:{self.plan_path}')}
+        current = self.checkpoints.get(self.repo_key, 'G-047')
+        self.checkpoints.record(self.repo_key, 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head=self.head, target_base_oid=self.base,
+            observed_remote_oid=None, snapshot={'pending': 'continue', 'worker_result': None,
+                'failure': 'prior failure', 'rebase_documents': {
+                    'state': 'staged', 'target': self.base, 'before_head': self.head,
+                    'paths': [self.plan_path], 'originals': {self.plan_path: {'base': original}},
+                    'blobs': {digest: base64.b64encode(pinned).decode()}}})
+        with self.assertRaises(RecoveryFailure):
+            self.service().require_owned()
+        checkpoint = self.checkpoints.get(self.repo_key, 'G-047')
+        (self.worktree / self.plan_path).write_text(replay + '\n## User Decision\nDecision: approve\n')
+        self.assertIsNone(rebase_documents.selected_plan_output(
+            checkpoint, self.worktree, self.plan_path, ignore_declaration=True))
+        (self.worktree / self.plan_path).write_text(replay)
+        self.assertTrue(self.service().normalize_frontmatter())
+        restored = git_command(self.worktree, 'rev-parse', 'HEAD')
+        self.assertEqual(git_command(self.worktree, 'rev-parse', 'HEAD^'), replayed)
+        raw = (self.worktree / self.plan_path).read_bytes()
+        self.assertEqual(raw.split(b'---', 2)[1], self.old_text.split('---', 2)[1].encode())
+        self.assertEqual(raw.split(b'---', 2)[2], replay.encode().split(b'---', 2)[2])
+        self.assertFalse(self.service().normalize_frontmatter())
+        self.assertEqual(git_command(self.worktree, 'rev-parse', 'HEAD'), restored)
+        checkpoint = self.checkpoints.get(self.repo_key, 'G-047')
+        self.service().require_owned(checkpoint=checkpoint)
+        rebase_documents.validate_final(
+            context=SimpleNamespace(worktree=self.worktree, plan=SimpleNamespace(path=self.plan_path)),
+            checkpoint=checkpoint, git_bytes=lm.git_bytes)
+        self.assertIsNone(checkpoint.snapshot['worker_result'])
+        self.assertNotIn('stage_evidence', checkpoint.snapshot)
+        self.assertEqual(checkpoint.snapshot['failure'], 'prior failure')
+        (self.worktree / self.plan_path).write_bytes(raw + b'\nUnrecorded edit.\n')
+        with self.assertRaises(RecoveryFailure):
+            rebase_documents.validate_final(
+                context=SimpleNamespace(worktree=self.worktree, plan=SimpleNamespace(path=self.plan_path)),
+                checkpoint=checkpoint, git_bytes=lm.git_bytes)
+
     def test_metadata_mismatch_is_visible_input_error_without_polling_retry(self):
         # Neither the applied nor exact target declaration permits this mixture.
         (self.worktree / self.plan_path).write_text(self.old_text.replace('risk: medium', 'risk: high'))

@@ -17,7 +17,7 @@ Codex는 세 OS에서 상태 루트의 공통 홈을 인증·설정·session 저
 
 ### 전용 공급자 홈과 인증
 
-DB·잠금에 실제 사용하는 `state_dir` 아래의 `automation-codex`·`automation-claude`를 공급자별 공통 홈으로 직접 사용한다. 상태 루트는 `--state-dir`, `LOOP_MANAGER_STATE_DIR`, OS 기본 경로 순서로 선택한다. 외부 `CODEX_HOME`·`CLAUDE_CONFIG_DIR`은 홈 선택에 사용하지 않고 기존 허용 인증 환경변수의 전달은 유지한다. Manager는 설정 파일을 생성하거나 개인 홈에서 가져오지 않는다. CLI가 공통 홈의 설정을 생성·원자적으로 교체하면 다음 호출은 그 홈의 현재 설정을 검사해 사용한다.
+DB·잠금에 실제 사용하는 `state_dir` 아래의 `automation-codex`·`automation-claude`를 공급자별 공통 홈으로 직접 사용한다. 상태 루트는 `--state-dir`, `LOOP_MANAGER_STATE_DIR`, OS 기본 경로 순서로 선택한다. 외부 `CODEX_HOME`·`CLAUDE_CONFIG_DIR`은 홈 선택에 사용하지 않고 기존 허용 인증 환경변수의 전달은 유지한다. Manager는 설정 파일을 생성하거나 개인 홈에서 가져오지 않는다. Codex 준비 조회가 공통 home의 `config.toml`을 안전하게 생성·교체하면 새 내용의 확장·권한 충돌을 재검사해 같은 호출의 지침과 최종 증거에 결합한다. 공통 설정의 developer instruction 변경도 새 값을 기준으로 다시 해석한다. Manager `config.ini`나 project/system Codex 설정의 변경, 읽기 실패·충돌은 거부하며 native 지침 조회에서 충돌을 발견하면 다음 Codex 조회 전에 중단한다. 변경이 반복되어 지침 조회를 같은 설정에 결합할 수 없는 경우도 거부한다. 이후 호출도 현재 설정을 다시 검사한다.
 
 | 공급자 | 전용 환경값 | 기본 인증 파일 |
 |---|---|---|
@@ -143,7 +143,7 @@ python loop_manager.py manual submit /path/to/my-project \
 
 Manager가 완성된 G를 생성하고 별도 소유 branch에 source 이력과 함께 보존한다. 복수 G는 같은 최종 후보·PR을 공유하므로 내부 선행 Merge가 필요한 묶음은 분리 제출한다. 이후 수정은 안내된 소유 branch로 push한다. 최초 source의 새 변경은 같은 source·R 범위로 `submit`을 다시 실행해야 반영된다.
 
-`complete`·`submit`은 기본적으로 전체 verify와 읽기 전용 Review를 수행하고 실패하면 자동 교정·재검증한다. 외부 검증을 생략 근거로 쓰려면 해당 단계의 `--skip-verify`·`--skip-review`, 원격 commit의 전체 SHA인 `--expected-head`, `--skip-reason`을 함께 제공한다. 생략은 `SKIPPED_BY_USER`로 기록해 PASS와 구분한다. SHA·base·G/R·환경 또는 관련 단계 입력이 달라지면 기본 검증을 다시 실행한다. `submit`의 G 생성 commit도 SHA를 바꾸므로 source SHA의 생략 승인은 무효화된다.
+`complete`·`submit`은 기본적으로 전체 verify와 읽기 전용 Review를 수행하고 실패하면 자동 교정·재검증한다. 외부 검증을 생략하려면 해당 단계에 대응하는 `--skip-verify` 또는 `--skip-review`와 원격 commit 전체 SHA인 `--expected-head`를 제공한다. `--skip-reason`은 선택 입력이며, 생략·빈 문자열·공백은 감사·Reviewer·PR 설명에 `사유 미입력`으로 표시되고 입력한 사유는 `제공 사유`로 표시된다. 생략 옵션 없는 사유만의 지정은 거부한다. 생략은 `SKIPPED_BY_USER`로 기록해 PASS와 구분한다. SHA·base·G/R·환경 또는 관련 단계 입력이 달라지면 기본 검증을 다시 실행한다. `submit`의 G 생성 commit도 SHA를 바꾸므로 source SHA의 생략 승인은 무효화된다.
 
 | 종료 코드 | 의미 |
 |---|---|

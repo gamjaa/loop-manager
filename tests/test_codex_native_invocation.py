@@ -432,6 +432,11 @@ class NativeWriteIsolationTests(TestCase):
                 handoff = manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
                 token = manager._runtime_handoff_signal.set(handoff)
                 try:
+                    def stop_during_probe(*, on_features_checked=None):
+                        if on_features_checked is not None:
+                            on_features_checked()
+                        handoff.stop()
+
                     with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
                          mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                          mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
@@ -440,7 +445,7 @@ class NativeWriteIsolationTests(TestCase):
                                            mock.Mock(serialize=lambda: 'snapshot')), \
                          mock.patch.object(isolation.subprocess, 'run', return_value=
                                            manager.subprocess.CompletedProcess([], 0, 'codex-cli 0.159.3', '')), \
-                         mock.patch.object(envelope.CodexLaunch, 'probe', side_effect=handoff.stop) as probe, \
+                         mock.patch.object(envelope.CodexLaunch, 'probe', side_effect=stop_during_probe) as probe, \
                          mock.patch.object(manager.subprocess, 'Popen') as spawn, \
                          mock.patch.object(envelope.os, 'killpg') as terminate:
                         with self.assertRaises(manager.SelfMergeRuntimeHandoff):
