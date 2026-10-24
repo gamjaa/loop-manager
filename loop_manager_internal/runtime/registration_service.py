@@ -306,6 +306,11 @@ def add_registered_project(
     pinned = None
     prepared = None
     before_project = connection.execute('SELECT * FROM projects WHERE repo=?', (project.repo,)).fetchone()
+    bootstrap = (connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_metadata'"
+    ).fetchone() is not None and connection.execute(
+        "SELECT 1 FROM manager_metadata WHERE key='remote_adoption_bootstrap'"
+    ).fetchone() is not None)
     if inspection.root.is_dir():
         current_sha = effects.git(inspection.root, 'rev-parse', '--verify',
             f'refs/remotes/origin/{project.base_branch}^{{commit}}').stdout.strip()
@@ -315,8 +320,9 @@ def add_registered_project(
         snapshot = effects.revision_execplan_snapshot(inspection.root, source_sha,
             archive_conflict_plan_ids=effects._merged_execplan_ids(connection, project.repo))
         pinned = execplan_catalog_state.PinnedCatalog(source_sha, snapshot)
-        prepared = effects.migrate_legacy_execplans(connection, reconcile_history=True, target_repo=project.repo,
-            ensure_schema=False, pinned_catalog=pinned, prepare_only=True, registration=project)
+        if not bootstrap:
+            prepared = effects.migrate_legacy_execplans(connection, reconcile_history=True, target_repo=project.repo,
+                ensure_schema=False, pinned_catalog=pinned, prepare_only=True, registration=project)
         current_sha = effects.git(inspection.root, 'rev-parse', '--verify',
             f'refs/remotes/origin/{project.base_branch}^{{commit}}').stdout.strip()
         if current_sha != source_sha:
@@ -325,7 +331,7 @@ def add_registered_project(
         if connection.execute('SELECT * FROM projects WHERE repo=?', (project.repo,)).fetchone() != before_project:
             raise RuntimeError('등록 중 프로젝트 상태가 변경됐습니다.')
         project_registry.add_project(connection, project, manage_transaction=False)
-        if pinned is not None:
+        if pinned is not None and not bootstrap:
             effects.migrate_legacy_execplans(connection, reconcile_history=True, target_repo=project.repo,
                 ensure_schema=False, manage_transaction=False, pinned_catalog=pinned, prepared=prepared)
             connection.execute(

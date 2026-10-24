@@ -15,30 +15,138 @@ from tests.support.git import git_command, git_test_environment, local_github_or
 
 
 class RemoteWorkAdoptionDatabaseTests(unittest.TestCase):
-    def test_only_a_database_created_from_absence_can_adopt_first_workspace(self):
+    def _database(self, *, fresh=True):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state_dir = Path(directory.name)
+        connection = database.connect_database(
+            state_dir, create=True, mark_created_from_absence=fresh)
+        self.addCleanup(connection.close)
+        connection.execute("INSERT INTO projects(repo, base_branch, origin) VALUES ('repo', 'main', 'owner/repo')")
+        connection.commit()
+        return connection, state_dir
+
+    def _catalog(self, connection, *, repo='repo', ids=('G-001',), revision='a' * 40):
+        from tests.support.catalog import active_snapshot, execplan_header, FakeDefinitionPort
+        from loop_manager_internal.storage import execplan_catalog_state as catalog
+        pinned = active_snapshot(revision, {
+            f'docs/plans/[{plan_id}] Resume.md': execplan_header(plan_id, 'Resume')
+            for plan_id in ids})
+        result = catalog.CatalogReconciliationService(
+            catalog.DefinitionStateRepository(connection), FakeDefinitionPort(pinned)).reconcile(repo)
+        self.assertTrue(result.usable, repr(result))
+        return pinned
+
+    def test_first_catalog_grant_survives_restart_and_is_consumed_by_workspace(self):
+        connection, state_dir = self._database()
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+        self._catalog(connection)
+        self.assertTrue(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+        reopened = database.connect_database(state_dir, create=True, mark_created_from_absence=True)
+        self.addCleanup(reopened.close)
+        self.assertTrue(database.remote_work_adoption_allowed(reopened, 'repo', 'G-001'))
+        database.record_execplan_workspace_seen(reopened, 'repo', 'G-001')
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+        self._catalog(connection)
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_later_plan_project_and_lost_row_do_not_inherit_grants(self):
+        connection, _ = self._database()
+        self._catalog(connection)
+        connection.execute("UPDATE exec_plans SET worker_session_id='preserved', verify_result='evidence'")
+        connection.commit()
+        self._catalog(connection, ids=('G-001', 'G-002'))
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-002'))
+        self.assertEqual(tuple(connection.execute(
+            "SELECT worker_session_id, verify_result FROM exec_plans WHERE plan_id='G-001'").fetchone()),
+            ('preserved', 'evidence'))
+        connection.execute("INSERT INTO projects(repo, base_branch, origin) VALUES ('later', 'main', 'owner/later')")
+        connection.commit()
+        self._catalog(connection, repo='later')
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'later', 'G-001'))
+        connection.execute("DELETE FROM exec_plans WHERE repo='repo' AND plan_id='G-001'")
+        connection.commit()
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+        self._catalog(connection, ids=('G-001', 'G-002'))
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_existing_and_legacy_absence_marker_do_not_authorize_adoption(self):
+        for legacy_marker in (False, True):
+            with self.subTest(legacy_marker=legacy_marker):
+                connection, state_dir = self._database(fresh=False)
+                if legacy_marker:
+                    connection.execute("INSERT INTO manager_metadata VALUES ('created_from_absence', '1')")
+                    connection.commit()
+                reinitialized = database.connect_database(state_dir, create=True, mark_created_from_absence=True)
+                reinitialized.close()
+                self._catalog(connection)
+                self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_changed_registration_or_declaration_does_not_match_grant(self):
+        connection, _ = self._database()
+        self._catalog(connection)
+        for table, field, value in (('projects', 'origin', 'other/repo'),
+                                    ('projects', 'base_branch', 'other'),
+                                    ('exec_plans', 'content_hash', 'changed')):
+            with self.subTest(field=field):
+                connection.execute('SAVEPOINT changed_identity')
+                connection.execute(f'UPDATE {table} SET {field}=?', (value,))
+                self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+                connection.execute('ROLLBACK TO changed_identity')
+                connection.execute('RELEASE changed_identity')
+        self.assertTrue(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_stale_catalog_does_not_consume_bootstrap_scope(self):
+        from loop_manager_internal.storage import execplan_catalog_state as catalog
+        from tests.support.catalog import active_snapshot, execplan_header
+        connection, _ = self._database()
+        repository = catalog.DefinitionStateRepository(connection)
+        pinned = active_snapshot('a' * 40, {'docs/plans/[G-001] Resume.md': execplan_header('G-001', 'Resume')})
+        changed = repository.apply('repo', pinned, repository.capture('repo'),
+                                   revision_is_current=lambda: False, new_plan_ids=('G-001',))
+        self.assertIsNone(changed)
+        self.assertEqual(connection.execute("SELECT value FROM manager_metadata WHERE key='remote_adoption_bootstrap'").fetchone()[0], 'null')
+        self._catalog(connection)
+        self.assertTrue(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_fresh_registration_defers_active_pr_observation_to_recovery_catalog(self):
+        from loop_manager_internal.runtime import registration_service
+        from tests.support.catalog import active_snapshot, execplan_header
+        for fresh in (False, True):
+            with self.subTest(fresh=fresh):
+                connection, state_dir = self._database(fresh=fresh)
+                root = state_dir / 'project'
+                root.mkdir()
+                pinned = active_snapshot('a' * 40, {
+                    'docs/plans/[G-001] Resume.md': execplan_header('G-001', 'Resume')})
+                migrate = mock.Mock()
+                effects = registration_service.AddRegisteredProjectEffects(
+                    _ensure_execplans_schema=database._ensure_execplans_schema,
+                    _merged_execplan_ids=lambda *_: frozenset(),
+                    git=mock.Mock(return_value=SimpleNamespace(stdout=pinned.revision_sha)),
+                    inspect_project_registration=mock.Mock(return_value=SimpleNamespace(
+                        root=root, base_branch='main', provider='codex', agents_hash=None,
+                        agents_approved=False, origin='owner/repo', source_revision=pinned.revision_sha)),
+                    migrate_legacy_execplans=migrate,
+                    revision_execplan_snapshot=mock.Mock(return_value=pinned.snapshot))
+                registration_service.add_registered_project(effects, connection, root,
+                    config_path=state_dir / 'config.ini', provider='codex',
+                    requested_base='main', approve_agents_mismatch=False)
+                if fresh:
+                    migrate.assert_not_called()
+                    self._catalog(connection, repo=str(root))
+                    self.assertTrue(database.remote_work_adoption_allowed(connection, str(root), 'G-001'))
+                else:
+                    self.assertEqual(migrate.call_count, 2)
+
+    def test_corrupt_database_is_preserved_by_explicit_init(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
-            connection = database.connect_database(
-                state_dir, create=True, mark_created_from_absence=True,
-            )
-            try:
-                self.assertTrue(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
-                database.record_execplan_workspace_seen(connection, 'repo', 'G-001')
-                self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
-            finally:
-                connection.close()
-
-            existing_dir = state_dir / 'existing'
-            existing_dir.mkdir()
-            existing_path = existing_dir / 'loop-manager.db'
-            existing = sqlite3.connect(existing_path)
-            existing.executescript(database.SCHEMA)
-            existing.close()
-            existing = database.connect_database(existing_dir)
-            try:
-                self.assertFalse(database.remote_work_adoption_allowed(existing, 'repo', 'G-001'))
-            finally:
-                existing.close()
+            path = state_dir / 'loop-manager.db'
+            path.write_bytes(b'corrupt database')
+            with self.assertRaises(sqlite3.DatabaseError):
+                database.connect_database(state_dir, create=True, mark_created_from_absence=True)
+            self.assertEqual(path.read_bytes(), b'corrupt database')
 
 
 class PullRequestHistoryTests(unittest.TestCase):
@@ -139,9 +247,11 @@ class PullRequestHistoryTests(unittest.TestCase):
         fixture = execution_fixture(self)
         fixture.connection.executescript(
             "CREATE TABLE manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
-            "INSERT INTO manager_metadata VALUES ('created_from_absence', '1');"
+            "INSERT INTO manager_metadata VALUES ('remote_adoption_bootstrap', 'null');"
             "UPDATE projects SET origin='owner/repo';"
             "UPDATE exec_plans SET workspace_owned=0;")
+        database.record_remote_work_adoption_catalog(fixture.connection, 'repo', 'a' * 40, ('G-047',))
+        fixture.connection.commit()
         fixture.state.expected = fixture.repository.projected('repo')
         ports = loop_manager._ExecutionLifecyclePorts(
             fixture.connection, fixture.repository,
