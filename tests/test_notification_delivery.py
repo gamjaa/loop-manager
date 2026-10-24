@@ -1639,6 +1639,148 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertNotIn('pending second piece', ''.join(sent))
 
+    def test_rebased_pr_candidate_preserves_canceled_payload_and_resumes_remaining_piece(self):
+        connection = self.connection()
+        repo = self.repo
+        candidate = self.prepare_pr_candidate(connection)
+        with connection:
+            connection.execute(
+                "UPDATE exec_plans SET title=? WHERE repo=? AND plan_id='G-018'",
+                ('long review title ' * 400, repo),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        original = dict(next(row for row in self.events(connection)
+                             if row['event_type'] == 'pr_created'))
+        original_payload = json.loads(original['payload'])
+        frozen = notifications._message('pr_created', original_payload)
+        pieces = notifications._pieces(frozen)
+        self.assertGreater(len(pieces), 1)
+        with connection:
+            connection.execute(
+                "UPDATE notification_outbox SET rendered_text=?, confirmed_pieces=1, "
+                "attempts=2, last_error='previous send uncertainty' WHERE event_key=?",
+                (frozen, original['event_key']),
+            )
+            connection.execute(
+                "UPDATE exec_plans SET publication_token='rebase-in-progress' "
+                "WHERE repo=? AND plan_id='G-018'", (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        canceled = dict(next(row for row in self.events(connection)
+                             if row['event_key'] == original['event_key']))
+        self.assertIsNotNone(canceled['canceled_at'])
+
+        rebased = self.prepare_pr_candidate(connection, head='c' * 40)
+        self.assertEqual(candidate['candidate_identity'], rebased['candidate_identity'])
+        self.assertNotEqual(candidate['candidate_publication_token'],
+                            rebased['candidate_publication_token'])
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
+
+        rows = {row['event_key']: dict(row) for row in self.events(connection)
+                if row['event_type'] == 'pr_created'}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[original['event_key']], canceled)
+        continued = next(row for key, row in rows.items() if key != original['event_key'])
+        self.assertEqual(continued['event_key'], f"{original['event_key']}:v1")
+        self.assertIsNone(continued['canceled_at'])
+        self.assertEqual(continued['rendered_text'], frozen)
+        self.assertEqual(continued['confirmed_pieces'], 1)
+        self.assertEqual(continued['attempts'], 2)
+        self.assertEqual(continued['last_error'], 'previous send uncertainty')
+        payload = json.loads(continued['payload'])
+        self.assertEqual(payload['continued_from'], original['event_key'])
+        self.assertEqual(payload['candidate_identity'], candidate['candidate_identity'])
+        self.assertEqual(payload['candidate_head_oid'], rebased['candidate_head_oid'])
+        self.assertEqual(payload['candidate_publication_token'],
+                         rebased['candidate_publication_token'])
+        self.assertEqual(payload['occurred_at'], original_payload['occurred_at'])
+
+        sent = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, 'token', 'chat', adapter=lambda _token, _chat, text: sent.append(text),
+        ), 1)
+        self.assertEqual(sent, pieces[1:])
+        self.assertEqual(dict(next(row for row in self.events(connection)
+                                   if row['event_key'] == original['event_key'])), canceled)
+        self.assertIsNotNone(connection.execute(
+            'SELECT sent_at FROM notification_outbox WHERE event_key=?',
+            (continued['event_key'],),
+        ).fetchone()[0])
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(len([row for row in self.events(connection)
+                             if row['event_type'] == 'pr_created']), 2)
+
+    def test_late_pr_confirmation_advances_only_same_candidate_continuation(self):
+        connection = self.connection()
+        repo = self.repo
+        self.prepare_pr_candidate(connection)
+        with connection:
+            connection.execute(
+                "UPDATE exec_plans SET title=? WHERE repo=? AND plan_id='G-018'",
+                ('long review title ' * 400, repo),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        original = dict(next(row for row in self.events(connection)
+                             if row['event_type'] == 'pr_created'))
+        original_payload = original['payload']
+        frozen = notifications._message('pr_created', json.loads(original_payload))
+        pieces = notifications._pieces(frozen)
+        self.assertGreater(len(pieces), 1)
+
+        def rebase_while_send_is_in_flight(_token, _chat, piece):
+            self.assertEqual(piece, pieces[0])
+            with connection:
+                connection.execute(
+                    "UPDATE exec_plans SET publication_token='rebase-in-progress' "
+                    "WHERE repo=? AND plan_id='G-018'", (repo,),
+                )
+                notifications.enqueue_current_project_events(connection, repo)
+            canceled = connection.execute(
+                'SELECT * FROM notification_outbox WHERE event_key=?',
+                (original['event_key'],),
+            ).fetchone()
+            self.assertIsNotNone(canceled['canceled_at'])
+            self.assertEqual(canceled['payload'], original_payload)
+
+            self.prepare_pr_candidate(connection, head='c' * 40)
+            with connection:
+                notifications.enqueue_current_project_events(connection, repo)
+            continued = connection.execute(
+                'SELECT * FROM notification_outbox WHERE event_key=?',
+                (f"{original['event_key']}:v1",),
+            ).fetchone()
+            self.assertEqual(continued['rendered_text'], frozen)
+            self.assertEqual(continued['confirmed_pieces'], 0)
+
+        self.assertEqual(notifications.dispatch_pending(
+            connection, 'token', 'chat', adapter=rebase_while_send_is_in_flight,
+        ), 0)
+        old = connection.execute(
+            'SELECT * FROM notification_outbox WHERE event_key=?',
+            (original['event_key'],),
+        ).fetchone()
+        continued = connection.execute(
+            'SELECT * FROM notification_outbox WHERE event_key=?',
+            (f"{original['event_key']}:v1",),
+        ).fetchone()
+        self.assertEqual(old['payload'], original_payload)
+        self.assertIsNotNone(old['canceled_at'])
+        self.assertEqual(old['confirmed_pieces'], 1)
+        self.assertEqual(continued['confirmed_pieces'], 1)
+
+        sent = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, 'token', 'chat', adapter=lambda _token, _chat, text: sent.append(text),
+        ), 1)
+        self.assertEqual(sent, pieces[1:])
+        self.assertEqual(connection.execute(
+            'SELECT confirmed_pieces FROM notification_outbox WHERE event_key=?',
+            (continued['event_key'],),
+        ).fetchone()[0], len(pieces))
+
     def test_pr_candidate_lookup_failure_holds_event_without_claiming_piece(self):
         connection = self.connection()
         self.prepare_pr_candidate(connection)

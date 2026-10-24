@@ -232,13 +232,19 @@ class ReviewHandler:
                 context.worktree, 'diff', '--binary', '--unified=0', '--no-ext-diff',
                 '--no-textconv', base, candidate_head,
             ).stdout
-            stable = self.ports.git(
-                context.worktree, 'patch-id', '--stable', input=diff,
-            ).stdout.split()
-            change_identity = (
-                stable[0] if stable and re.fullmatch(r'[0-9a-f]{40,64}', stable[0])
-                else hashlib.sha256(diff.encode('utf-8')).hexdigest()
+            # Rebase changes object IDs and line offsets; preserve mode metadata
+            # and every changed line byte, including meaningful whitespace.
+            stable_diff = re.sub(
+                r'^index [0-9a-f]+\.\.[0-9a-f]+', 'index', diff,
+                flags=re.MULTILINE,
             )
+            stable_diff = re.sub(
+                r'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@',
+                '@@', stable_diff, flags=re.MULTILINE,
+            )
+            change_identity = hashlib.sha256(
+                stable_diff.encode('utf-8', errors='surrogateescape'),
+            ).hexdigest()
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             events.emit(
                 'Review 후보 변경 identity를 확인할 수 없어 PR 알림 후보를 보류',

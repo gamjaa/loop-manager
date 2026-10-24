@@ -213,7 +213,7 @@ def _deliver_rows(
                     (cursor + 1, cursor + 1, total, cursor + 1, total,
                      row[0], cursor),
                 )
-                if row[1] == "blocked":
+                if row[1] in {"blocked", "pr_created"}:
                     # Only explicitly continued versions inherit this exact
                     # frozen body's late confirmation; changed actions do not.
                     connection.execute(
@@ -227,6 +227,7 @@ def _deliver_rows(
                         "sent_at=CASE WHEN ?=? THEN COALESCE(sent_at, CURRENT_TIMESTAMP) ELSE sent_at END "
                         "WHERE event_key IN (SELECT event_key FROM continued)",
                         (row[0], row[0], row[0], cursor + 1, cursor + 1, total))
+                if row[1] == "blocked":
                     incident = connection.execute(
                         "SELECT incident_id FROM block_notice_events "
                         "WHERE event_key = ?", (row[0],),

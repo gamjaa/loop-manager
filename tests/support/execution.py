@@ -1,7 +1,6 @@
 from tests.support.lifecycle import fixture_cleanup
 from contextlib import nullcontext
 from dataclasses import fields, replace
-import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -404,9 +403,6 @@ def execution_policy_fixture(test, *, pr_conflict=False):
         elif args == ('diff', '--binary', '--unified=0', '--no-ext-diff', '--no-textconv',
                       'base', fixture.candidate):
             output = f'diff --git a/app.py b/app.py\n{fixture.candidate}\n'
-        elif args == ('patch-id', '--stable'):
-            patch = str(_kwargs.get('input') or '')
-            output = f'{hashlib.sha1(patch.encode("utf-8")).hexdigest()} {"0" * 40}\n'
         elif args in {
             ('fetch', 'origin'), ('add', '-A'),
             ('show', 'plan-sha:docs/plans/[G-047] Runtime.md'),

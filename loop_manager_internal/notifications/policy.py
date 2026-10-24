@@ -229,8 +229,7 @@ def is_current(connection, repo, kind, payload):
             )
             return bool(candidate and all(
                 payload.get(key) == candidate[key]
-                for key in ('candidate_identity', 'candidate_head_oid',
-                            'candidate_publication_token', 'user_action')
+                for key in ('candidate_identity', 'user_action')
             ))
         if kind == 'draft_decisions':
             plans = payload['plans']

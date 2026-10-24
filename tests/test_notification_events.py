@@ -936,8 +936,9 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             notifications.enqueue_current_project_events(connection, repo)
         events = [row for row in self.events(connection) if row['event_type'] == 'pr_created']
         self.assertEqual(len(events), 1)
-        first_key = events[0]['event_key']
-        self.assertEqual(json.loads(events[0]['payload'])['candidate_identity'], first['candidate_identity'])
+        original = dict(events[0])
+        first_key = original['event_key']
+        self.assertEqual(json.loads(original['payload'])['candidate_identity'], first['candidate_identity'])
 
         with connection:
             connection.execute(
@@ -951,21 +952,28 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             notifications.enqueue_current_project_events(connection, repo)
         self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'pr_created']), 1)
         self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+        canceled = dict(self.events(connection)[0])
 
         second = self.prepare_pr_candidate(connection, head='c' * 40)
         self.assertNotEqual(first['candidate_publication_token'], second['candidate_publication_token'])
         self.assertEqual(first['candidate_identity'], second['candidate_identity'])
         with connection:
             notifications.enqueue_current_project_events(connection, repo)
-        events = [row for row in self.events(connection) if row['event_type'] == 'pr_created']
-        self.assertEqual(len(events), 1)
-        current = events[0]
-        self.assertEqual(current['event_key'], first_key)
+            notifications.enqueue_current_project_events(connection, repo)
+        events = {row['event_key']: row for row in self.events(connection)
+                  if row['event_type'] == 'pr_created'}
+        self.assertEqual(len(events), 2)
+        self.assertEqual(dict(events[first_key]), canceled)
+        current = next(row for key, row in events.items() if key != first_key)
+        self.assertEqual(current['event_key'], f'{first_key}:v1')
         self.assertIsNone(current['canceled_at'])
         self.assertEqual(json.loads(current['payload'])['candidate_identity'], second['candidate_identity'])
         self.assertEqual(json.loads(current['payload'])['candidate_head_oid'], second['candidate_head_oid'])
         self.assertEqual(json.loads(current['payload'])['candidate_publication_token'],
                          second['candidate_publication_token'])
+        self.assertEqual(json.loads(current['payload'])['occurred_at'],
+                         json.loads(original['payload'])['occurred_at'])
+        self.assertEqual(json.loads(current['payload'])['continued_from'], first_key)
 
     def test_real_rebase_keeps_review_patch_identity_and_does_not_repeat_pr_notice(self):
         from types import SimpleNamespace
@@ -996,7 +1004,9 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
                                capture_output=True, text=True)
             source = repo_path / 'source.txt'
             source.write_text('zero\ntarget\nend\n', encoding='utf-8')
-            git('add', 'source.txt')
+            snippet = repo_path / 'snippet.py'
+            snippet.write_text('value = "base"\n', encoding='utf-8')
+            git('add', 'source.txt', 'snippet.py')
             git('commit', '-m', 'base')
             base_before = git('rev-parse', 'HEAD').stdout.strip()
             git('checkout', '-b', 'feature')
@@ -1038,6 +1048,33 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
 
             self.assertNotEqual(before[0], after[0])
             self.assertEqual(before[1], after[1])
+
+            def candidate_with_snippet(branch, content):
+                git('checkout', 'main')
+                git('checkout', '-b', branch)
+                snippet.write_text(content, encoding='utf-8')
+                git('commit', '-am', branch)
+                head = git('rev-parse', 'HEAD').stdout.strip()
+                proof = handler._pr_review_candidate_proof(
+                    context, {'validated_base_sha': base_after}, head,
+                )
+                return proof, head
+
+            spaced, spaced_head = candidate_with_snippet(
+                'candidate-spaced', 'value = "a b"\n',
+            )
+            compact, compact_head = candidate_with_snippet(
+                'candidate-compact', 'value = "ab"\n',
+            )
+            self.assertNotEqual(spaced[1], compact[1])
+            one_space_indent, _ = candidate_with_snippet(
+                'candidate-one-space-indent', 'def value():\n return "x"\n',
+            )
+            two_space_indent, _ = candidate_with_snippet(
+                'candidate-two-space-indent', 'def value():\n  return "x"\n',
+            )
+            self.assertNotEqual(one_space_indent[1], two_space_indent[1])
+
             connection = self.connection()
             first = self.prepare_pr_candidate(
                 connection, repo=project_repo, base=base_before, head=head_before,
@@ -1050,10 +1087,14 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(notifications.dispatch_pending(
                 connection, 'token', 'chat', adapter=sent,
             ), 1)
-            self.prepare_pr_candidate(
+            rebased_candidate = self.prepare_pr_candidate(
                 connection, repo=project_repo, base=base_after, head=head_after,
                 review_input_identity=after[1],
             )
+            self.assertNotEqual(first['candidate_publication_token'],
+                                rebased_candidate['candidate_publication_token'])
+            self.assertEqual(rebased_candidate['candidate_publication_token'], after[0])
+            self.assertEqual(rebased_candidate['candidate_identity'], before[1])
             with connection:
                 notifications.enqueue_current_project_events(connection, project_repo)
             self.assertEqual(notifications.dispatch_pending(
@@ -1062,6 +1103,31 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(len([row for row in self.events(connection)
                                   if row['event_type'] == 'pr_created']), 1)
             sent.assert_called_once()
+
+            spaced_candidate = self.prepare_pr_candidate(
+                connection, repo=project_repo, base=base_after, head=spaced_head,
+                review_input_identity=spaced[1],
+            )
+            self.assertEqual(spaced_candidate['candidate_publication_token'], spaced[0])
+            with connection:
+                notifications.enqueue_current_project_events(connection, project_repo)
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 1)
+
+            compact_candidate = self.prepare_pr_candidate(
+                connection, repo=project_repo, base=base_after, head=compact_head,
+                review_input_identity=compact[1],
+            )
+            self.assertEqual(compact_candidate['candidate_publication_token'], compact[0])
+            with connection:
+                notifications.enqueue_current_project_events(connection, project_repo)
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 1)
+            self.assertEqual(len([row for row in self.events(connection)
+                                  if row['event_type'] == 'pr_created']), 3)
+            self.assertEqual(sent.call_count, 3)
 
     def test_planning_result_only_notifies_after_catalog_publication(self):
         from types import SimpleNamespace

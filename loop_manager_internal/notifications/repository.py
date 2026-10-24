@@ -314,30 +314,47 @@ def _insert(
     payload: dict[str, object],
 ) -> None:
     payload = _event_payload(kind, payload)
+    if kind != "pr_created":
+        connection.execute(
+            "INSERT OR IGNORE INTO notification_outbox "
+            "(event_key, repo, event_type, payload) VALUES (?, ?, ?, ?)",
+            (key, repo, kind, _encode_payload(payload)),
+        )
+        return
+
+    versions = connection.execute(
+        "SELECT event_key, payload, attempts, last_error, rendered_text, "
+        "confirmed_pieces, canceled_at, sent_at FROM notification_outbox "
+        "WHERE repo=? AND event_type=? AND "
+        "(event_key=? OR event_key LIKE ?) ORDER BY rowid",
+        (repo, kind, key, f"{key}:v%"),
+    ).fetchall()
+    if not versions:
+        connection.execute(
+            "INSERT OR IGNORE INTO notification_outbox "
+            "(event_key, repo, event_type, payload) VALUES (?, ?, ?, ?)",
+            (key, repo, kind, _encode_payload(payload)),
+        )
+        return
+    if any(row[7] is not None or row[6] is None for row in versions):
+        # A sent or currently pending version already represents this action.
+        return
+
+    previous = versions[-1]
+    try:
+        original = json.loads(str(previous[1]))
+    except (TypeError, ValueError):
+        original = {}
+    if isinstance(original, dict) and original.get("occurred_at"):
+        payload["occurred_at"] = original["occurred_at"]
+    payload["continued_from"] = str(previous[0])
     connection.execute(
         "INSERT OR IGNORE INTO notification_outbox "
-        "(event_key, repo, event_type, payload) VALUES (?, ?, ?, ?)",
-        (key, repo, kind, _encode_payload(payload)),
+        "(event_key, repo, event_type, payload, attempts, last_error, "
+        "rendered_text, confirmed_pieces) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (f"{key}:v{len(versions)}", repo, kind, _encode_payload(payload),
+         previous[2], previous[3], previous[4], previous[5]),
     )
-    if kind == "pr_created":
-        previous = connection.execute(
-            "SELECT payload FROM notification_outbox WHERE event_key=? AND event_type=? "
-            "AND sent_at IS NULL AND canceled_at IS NOT NULL",
-            (key, kind),
-        ).fetchone()
-        if previous is not None:
-            try:
-                original = json.loads(str(previous[0]))
-            except (TypeError, ValueError):
-                original = {}
-            if isinstance(original, dict) and original.get("occurred_at"):
-                payload["occurred_at"] = original["occurred_at"]
-            connection.execute(
-                "UPDATE notification_outbox SET payload=?, canceled_at=NULL, "
-                "delivery_started_at=NULL WHERE event_key=? AND event_type=? "
-                "AND sent_at IS NULL AND canceled_at IS NOT NULL",
-                (_encode_payload(payload), key, kind),
-            )
 
 
 def _encode_payload(payload: dict[str, object]) -> str:
