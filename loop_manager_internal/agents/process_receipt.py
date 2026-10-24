@@ -51,6 +51,14 @@ def finished(launch, process) -> None:
     _write(receipt_path(launch), value)
 
 
+def not_started(launch) -> None:
+    """Only a rejected prelaunch callback can prove process creation was not reached."""
+    if receipt_path(launch).exists():
+        return  # Never replace an existing process observation with non-execution.
+    _write(receipt_path(launch), dict(platform=sys.platform,
+           finished_at=datetime.now(timezone.utc).isoformat(), evidence='not_started'))
+
+
 def recover(path: str, state_dir: Path) -> dict | None:
     """실행 결과를 추정하지 않고, 같은 호스트의 writer 종료만 재관측한다."""
     try:
@@ -60,8 +68,13 @@ def recover(path: str, state_dir: Path) -> dict | None:
                 or candidate.parent.parent != base or not candidate.name.endswith('.process.json')):
             return None
         value = json.loads(candidate.read_text(encoding='utf-8'))
-        if (not isinstance(value, dict) or value.get('platform') != sys.platform or type(value.get('pid')) is not int
-                or value['pid'] <= 1):
+        if not isinstance(value, dict) or value.get('platform') != sys.platform:
+            return None
+        if value.get('evidence') == 'not_started' and 'pid' not in value:
+            if datetime.fromisoformat(value.get('finished_at')).tzinfo is not None:
+                return value
+            return None
+        if type(value.get('pid')) is not int or value['pid'] <= 1:
             return None
         if value.get('finished_at') and value.get('evidence') in {
                 'windows_job_stopped', 'process_group_stopped',

@@ -62,6 +62,36 @@ class ProcessReceiptTest(TestCase):
         self.assertEqual(self.recover(), 0)
         self.assertEqual(dict(self.row()), first)
 
+    def test_prelaunch_rejection_is_recovered_as_non_execution_without_a_result(self):
+        with self.connection:
+            self.connection.execute("UPDATE agent_invocations SET execution_status='prepared', execution_started_at=NULL")
+        process_receipt.not_started(self.launch)
+        self.repository.reconcile_interrupted(state_dir=self.state)
+        first = dict(self.row())
+        self.assertEqual((first['execution_status'], first['result_code']), ('not_executed', None))
+        self.assertEqual(json.loads(first['execution_finish_evidence'])['evidence'], 'not_started')
+        self.repository.reconcile_interrupted(state_dir=self.state)
+        self.assertEqual(dict(self.row()), first)
+
+    def test_non_execution_proof_cannot_replace_a_process_start_or_downgrade_the_ledger(self):
+        from loop_manager_internal.storage import task_calls
+        self.started()
+        original = self.path.read_bytes()
+        process_receipt.not_started(self.launch)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.path.unlink()
+        process_receipt.not_started(self.launch)
+        self.repository.reconcile_interrupted(state_dir=self.state)
+        self.assertEqual(self.row()['execution_status'], 'executed')
+        self.assertIsNone(self.row()['execution_finished_at'])
+        task_calls.ensure_schema(self.connection)
+        owner = task_calls.reserve(self.connection, self.state, 'repo', 'G-1', 'agent', 'run')
+        with self.connection:
+            self.connection.execute('UPDATE task_call_reservations SET invocation_id=?, receipt_path=?',
+                                    (self.identity, str(self.path)))
+        self.assertFalse(task_calls.confirmed(owner))
+        self.assertEqual(len(task_calls.recover(self.connection, self.state)), 1)
+
     def test_live_group_and_missing_or_malformed_proof_stay_unknown(self):
         self.recover()
         self.assertIsNone(self.row()['execution_finished_at'])

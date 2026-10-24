@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 
 from loop_manager_internal.storage.runtime_state import _transaction
+from loop_manager_internal.storage.db_access import CoordinatedConnection
 
 
 def ensure_schema(connection):
@@ -37,14 +38,21 @@ class TargetedTestRepository:
                 or proof != root.parent / (root.name + '.process.json')):
             raise ValueError('targeted test 기록의 호출 경로가 유효하지 않습니다.')
         info = root.stat()
-        with _transaction(self.connection):
-            owner = self.connection.execute('''SELECT role, plan_id FROM agent_invocations
-                WHERE invocation_id=?''', (identity,)).fetchone()
-            if owner is None or owner[0] != 'worker' or not owner[1]:
-                raise ValueError('targeted test 기록의 Worker 소유권이 없습니다.')
-            self.connection.execute('''INSERT INTO targeted_test_collections
-                (invocation_id, directory, device, inode, receipt) VALUES (?, ?, ?, ?, ?)''',
-                (identity, str(root), str(info.st_dev), str(info.st_ino), str(proof)))
+        def bind(current):
+            with _transaction(current):
+                owner = current.execute('''SELECT role, plan_id FROM agent_invocations
+                    WHERE invocation_id=? AND execution_started_at IS NULL AND finished_at IS NULL''',
+                    (identity,)).fetchone()
+                if owner is None or owner[0] != 'worker' or not owner[1]:
+                    raise ValueError('targeted test 기록의 Worker 소유권이 없습니다.')
+                current.execute('''INSERT INTO targeted_test_collections
+                    (invocation_id, directory, device, inode, receipt) VALUES (?, ?, ?, ?, ?)''',
+                    (identity, str(root), str(info.st_dev), str(info.st_ino), str(proof)))
+        if isinstance(self.connection, CoordinatedConnection) and not self.connection.in_transaction:
+            self.connection.run_request(bind)
+        else:
+            # An explicit caller transaction retains rollback/retry ownership.
+            bind(self.connection)
 
     def pending(self, repo, plan_id):
         return bool(self.connection.execute('''SELECT 1 FROM targeted_test_collections c
@@ -59,13 +67,13 @@ class TargetedTestRepository:
         from loop_manager_internal.verification.targeted import collect
         protected = live_manual_tasks(self.connection, state_dir)
         rows = self.connection.execute('''SELECT c.invocation_id, c.directory, c.device,
-            c.inode, c.receipt, a.repo, a.plan_id, a.guidance_task_id, a.process_receipt_path
+            c.inode, c.receipt, a.repo, a.plan_id, a.guidance_task_id, a.process_receipt_path, a.execution_started_at
             FROM targeted_test_collections c JOIN agent_invocations a USING (invocation_id)
             WHERE c.status!='collected' AND (? IS NULL OR a.repo=?)
             AND (? IS NULL OR a.plan_id=?) ORDER BY a.rowid''',
             (repo, repo, plan_id, plan_id)).fetchall()
         waiting = set()
-        for identity, directory, device, inode, receipt, owner_repo, owner_plan, task, bound_receipt in rows:
+        for identity, directory, device, inode, receipt, owner_repo, owner_plan, task, bound_receipt, started_at in rows:
             owner = (owner_repo, owner_plan)
             if owner in waiting:
                 continue
@@ -77,7 +85,8 @@ class TargetedTestRepository:
                         or receipt != bound_receipt
                         or (str(root.stat().st_dev), str(root.stat().st_ino)) != (device, inode)):
                     raise ValueError('targeted test 기록 경로가 교체되었거나 호출 결합이 다릅니다.')
-                if task in protected or recover(receipt, Path(state_dir)) is None:
+                proof = None if task in protected else recover(receipt, Path(state_dir))
+                if (proof is None or proof.get('evidence') == 'not_started' and started_at is not None):
                     waiting.add(owner)
                     continue
                 results = collect(root)

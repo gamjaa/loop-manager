@@ -298,6 +298,99 @@ class RunnerTests(TestCase):
         self.assertEqual((json.loads(row[0]), row[1]), (value, 'executed'))
         self.assertEqual(connection.execute('SELECT COUNT(*) FROM agent_isolation_evidence').fetchone()[0], 1)
 
+    def test_launch_binding_wait_retries_db_only_and_preserves_proven_non_execution(self):
+        from loop_manager_internal.storage.db_access import open_connection, DatabaseWaitTimeout
+        from loop_manager_internal.storage import task_calls
+        from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
+        from loop_manager_internal.agents import process_receipt
+        markers = ('SET receipt_path=?', 'SET process_receipt_path=?', 'INSERT INTO targeted_test_collections')
+        for index, marker in enumerate(markers):
+            for stop in (None, DatabaseWaitTimeout('launch wait'), SelfMergeRuntimeHandoff()):
+                with self.subTest(marker=marker, stop=type(stop).__name__):
+                    name = f'launch-{index}-{type(stop).__name__}'
+                    connection = open_connection(self.state_dir / (name + '.db'))
+                    self.addCleanup(connection.close)
+                    connection.row_factory = sqlite3.Row
+                    with connection:
+                        state.ensure_schema(connection)
+                        task_calls.ensure_schema(connection)
+                    owner = task_calls.reserve(connection, self.state_dir, 'repo', 'G-1', 'agent', 'run')
+                    token = task_calls.current_call.set(owner)
+                    launch = self.targeted_launch(name)
+                    physical_starts = []
+                    class Provider:
+                        def run(_, request):
+                            request.on_launch_prepared(launch)
+                            physical_starts.append(True)
+                            request.on_process_started()
+                            request.on_process_finished()
+                            return manager.AgentResult(0, 'done')
+                    execute = connection.execute
+                    attempts = []
+                    def busy_once(sql, parameters=()):
+                        result = execute(sql, parameters)
+                        if marker in sql:
+                            attempts.append(True)
+                            if len(attempts) == 1:
+                                error = sqlite3.OperationalError('database is locked')
+                                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                                def locked():
+                                    raise error
+                                connection._call(locked)
+                        return result
+                    try:
+                        with mock.patch.object(connection, 'execute', side_effect=busy_once), \
+                             mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+                             mock.patch('loop_manager_internal.storage.db_access._pause', side_effect=stop):
+                            def run():
+                                return manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                                    'worker', 'prompt', read_only=False, connection=connection,
+                                    invocation=invocation.InvocationContext('repo', 'G-1'),
+                                    resolved_profile=invocation.ResolvedProfile('model', 'high'))
+                            if stop is None:
+                                self.assertEqual(run().message, 'done')
+                                self.assertEqual(len(physical_starts), 1)
+                                self.assertGreaterEqual(len(attempts), 2)
+                                self.assertEqual(connection.execute('SELECT COUNT(*) FROM targeted_test_collections').fetchone()[0], 1)
+                                row = connection.execute('SELECT * FROM task_call_reservations').fetchone()
+                                self.assertEqual(row['receipt_path'], str(process_receipt.receipt_path(launch)))
+                                self.assertIsNotNone(row['invocation_id'])
+                            else:
+                                with self.assertRaises(type(stop)):
+                                    run()
+                                self.assertEqual(physical_starts, [])
+                                proof = process_receipt.recover(str(process_receipt.receipt_path(launch)), self.state_dir)
+                                self.assertEqual(proof['evidence'], 'not_started')
+                                self.assertEqual(connection.execute('SELECT execution_status FROM agent_invocations').fetchone()[0], 'not_executed')
+                                if isinstance(stop, DatabaseWaitTimeout):
+                                    self.assertEqual(connection.execute('SELECT result_kind FROM agent_invocations').fetchone()[0], 'database_wait')
+                            self.assertTrue(task_calls.confirmed(owner))
+                            self.assertEqual(task_calls.recover(connection, self.state_dir), ())
+                    finally:
+                        task_calls.current_call.reset(token)
+
+    def test_prelaunch_receipt_write_failure_keeps_original_database_wait(self):
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.runtime import operation_events as events
+        launch = self.targeted_launch()
+        original = DatabaseWaitTimeout('original launch wait')
+        class Provider:
+            def run(_, request):
+                request.on_launch_prepared(launch)
+                self.fail('process creation must not be reached')
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+             mock.patch.object(state.InvocationRepository, 'bind_process_receipt', side_effect=original), \
+             mock.patch('loop_manager_internal.agents.process_receipt.not_started', side_effect=OSError('disk full')), \
+             mock.patch.object(events, 'emit') as emit:
+            with self.assertRaises(DatabaseWaitTimeout) as raised:
+                manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                    'worker', 'prompt', read_only=False, connection=self.connection,
+                    invocation=invocation.InvocationContext('repo', 'G-1'),
+                    resolved_profile=invocation.ResolvedProfile('model', 'high'))
+        self.assertIs(raised.exception, original)
+        self.assertTrue(any(call.args[0] == 'Agent 미시작 근거 보존 실패'
+                            and call.kwargs.get('error_type') == 'OSError' for call in emit.call_args_list))
+
     def test_log_start_follows_process_callback_and_preserves_each_attempt(self):
         from loop_manager_internal.runtime import operation_events as events
         from loop_manager_internal.agents.provider_adapters import _provider_log_path

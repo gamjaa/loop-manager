@@ -55,6 +55,13 @@ Agent의 지침·session·격리/실행 identity·호출 기록 저장에서 DB 
 - `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest`에 `tests.test_agent_invocation.RunnerTests.` 아래 `test_invocation_preparation_retries_atomically_or_leaves_provider_unstarted`, `test_prelaunch_evidence_db_retry_does_not_replay_provider`, `test_guidance_database_wait_does_not_start_or_reclassify_provider`, `test_session_db_wait_keeps_completed_result_and_recoverable_binding`, `test_ledger_failure_does_not_change_agent_success`, `test_auxiliary_collection_error_keeps_success_and_usage_in_ledger`를 전달해 6개 모두 통과했다. launch lock 수정과 해당 assertion 추가 후 앞의 신규 두 case를 같은 runner로 실행해 2개 모두 통과했다. SQLite BUSY/LOCKED 주입은 실제 coordinated 요청의 rollback/retry를 사용하며 실제 Agent CLI는 호출하지 않았다. 전체 verify는 실행하지 않았다.
 - 아직 완료 후보가 아니다. launch/targeted 결합, 시작·종료 callback, session 및 ledger 종료 저장의 대기 보존·재시작 복구, 물리 호출을 반복하지 않는 같은 실행 재배정과 PRODUCT·ARCHITECTURE 정합화가 남아 있다. 이번 checkpoint의 준비 단계 결과로 실제 호출 결과의 영속 복구나 전체 Acceptance Criteria 충족을 주장하지 않는다.
 
+### launch 결합 중간 보존점
+
+- `f951d068d1e401c43ee261166cce28433a25b66f`의 게시 확인 뒤 launch의 예약/receipt/invocation 결합과 targeted 결합을 DB 요청 재시도에 연결했다. targeted 경로·inode 검사는 재시도 밖에서 수행하며, SQL은 현재 invocation이 미시작·미완료 Worker인지 재확인한다. 명시적인 caller transaction은 기존 rollback 소유권을 유지한다.
+- launch callback이 반환되기 전에 거부되면 기존 Manager 전용 process receipt에 `not_started` 근거와 관측 시각만 남긴다. 기존 receipt는 덮지 않으며 원래 DB 대기와 receipt 쓰기 오류를 모두 진단한다. 미시작 DB 대기의 ledger 종류는 `database_wait`로 분리하고 예외는 그대로 전달한다. 이 근거는 프로세스 종료 성공이나 provider 결과가 아니다. invocation 시작 기록과 충돌하는 미시작 근거는 종료 확정·예약 회수·targeted 수집에 사용하지 않는다.
+- 이번 호출에서 공통 targeted runner로 다음 최소 case를 실행했다. `RunnerTests.test_launch_binding_wait_retries_db_only_and_preserves_proven_non_execution`은 예약 receipt·invocation receipt·targeted INSERT의 BUSY rollback과 해소/만료/handoff 9개 조합을 확인한다. `ProcessReceiptTest`의 신규 2개 case는 재시작의 미실행 복구와 기존 시작 근거 보존을 확인한다. 최초 3개 case 통과 후 예약 충돌 assertion과 targeted 소유권 회귀를 보강해 관련 6개 case를 통과했다. caller transaction 보존 추가 후 해당 case와 launch case 2개, 수집 모순 거부 추가 후 해당 case와 기존 재시작 회귀 2개, receipt 쓰기 실패의 원래 오류 보존 case 1개를 각각 통과했다. 실제 Agent·전체 verify·Windows native 검증은 실행하지 않았다.
+- 완료 후보가 아니다. 실제 시작 뒤 callback/session/ledger 종료 관측의 영속 보존·DB 확정 재개와 같은 실행 재배정, 독립 `on_targeted_prepared` 경로의 저장 대기, PRODUCT·ARCHITECTURE 계약 정합화가 남아 있다. 다음 작업은 관측 결과를 같은 invocation/receipt에 보존하고 선택적 수집 오류와 필수 후속 보류를 구별하는 경계다. provider 실행 재호출로 복구하지 않는다.
+
 ## Decision Log
 
 - 이번 R-091 delta에서 요청 한도 소진을 다음 외부 실행 전용 pause로 고정하지 않는다. 같은 실행의 저장 재개에서도 실제 provider 결과·호출 identity·필수 증거 gate를 보존하며 기존 G-303 dependency와 독립된 DB 확정 목표를 유지한다. 대기열·단계 실패 정책은 G-297/G-313의 책임이며 새 순환 dependency를 만들지 않는다. 구현·테스트는 실행하지 않았다.

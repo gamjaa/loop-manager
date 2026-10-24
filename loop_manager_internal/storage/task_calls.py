@@ -171,7 +171,12 @@ def _confirmed(connection, row, state_dir):
     if row["kind"]=="verify":
         return _verify_recovered(row,state_dir)
     from loop_manager_internal.agents.process_receipt import recover as recover_agent
-    if recover_agent(row["receipt_path"],Path(state_dir)) is not None:
+    proof = recover_agent(row["receipt_path"],Path(state_dir))
+    if proof is not None:
+        if proof.get('evidence') == 'not_started' and row['invocation_id'] is not None:
+            invocation = connection.execute('SELECT execution_started_at FROM agent_invocations '
+                'WHERE invocation_id=?', (row['invocation_id'],)).fetchone()
+            return invocation is not None and invocation[0] is None
         return True
     invocation=connection.execute("SELECT execution_status,execution_finish_evidence "
         "FROM agent_invocations WHERE invocation_id=?",(row["invocation_id"],)).fetchone()

@@ -267,7 +267,7 @@ def run_agent(
         from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
         try:
             TargetedTestRepository(connection).bind(identity, directory, receipt, state_dir=state_dir)
-            ledger.bind_process_receipt(identity, str(receipt))
+            _database_request(connection, lambda: ledger.bind_process_receipt(identity, str(receipt)))
         except DatabaseWaitTimeout:
             raise
         except (OSError, ValueError, sqlite3.Error) as error:
@@ -278,13 +278,26 @@ def run_agent(
         prepared_launch = launch
         from .process_receipt import receipt_path
         from loop_manager_internal.storage import task_calls
-        task_calls.bind_agent_receipt(receipt_path(launch))
-        if identity is not None:
-            task_calls.bind_agent(identity)
-        if ledger is not None and identity is not None:
-            from .process_receipt import receipt_path
-            ledger.bind_process_receipt(identity, str(receipt_path(launch)))
-        observe_targeted(launch.attempt, receipt_path(launch))
+        receipt = receipt_path(launch)
+        def bind_launch():
+            task_calls.bind_agent_receipt(receipt)
+            if identity is not None:
+                task_calls.bind_agent(identity)
+            if ledger is not None and identity is not None:
+                ledger.bind_process_receipt(identity, str(receipt))
+        try:
+            _database_request(guidance_connection, bind_launch)
+            observe_targeted(launch.attempt, receipt)
+        except BaseException:
+            # This callback has not returned to the adapter: no spawn can have
+            # occurred. Preserve that fact even if the DB is still unavailable.
+            from .process_receipt import not_started
+            try:
+                not_started(launch)
+            except OSError as error:
+                events.emit('Agent 미시작 근거 보존 실패', level='WARN', invocation_id=identity,
+                            error_type=type(error).__name__)
+            raise
 
     request = AgentRequest(
         worktree=worktree,
@@ -339,7 +352,8 @@ def run_agent(
                     result=type(error).__name__, execution_status="executed" if execution_started else "not_executed",
                     elapsed_seconds=round(time.monotonic() - started, 1))
         if ledger is not None and identity is not None:
-            kind = ("interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else
+            kind = ("database_wait" if isinstance(error, DatabaseWaitTimeout) and not execution_started else
+                    "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else
                     "timeout" if isinstance(error, subprocess.TimeoutExpired) else
                     "transient_failure" if isinstance(error, OSError) else "exception")
             try:

@@ -143,6 +143,50 @@ class TargetedRecoveryTests(TestCase):
     def replay(self):
         self.calls.reconcile_interrupted(state_dir=self.root)
 
+    def test_binding_refuses_a_call_that_started_or_finished_before_storage(self):
+        from loop_manager_internal.agents.agent_invocation import Usage
+        for phase in ('started', 'finished'):
+            with self.subTest(phase=phase):
+                identity, directory = self.bind(phase)
+                if phase == 'started':
+                    self.calls.mark_execution_started(identity)
+                else:
+                    self.calls.finish(identity, 'exception', None, 0, None, Usage())
+                replacement = directory.parent / (phase + '-replacement')
+                replacement.mkdir()
+                receipt = replacement.parent / (replacement.name + '.process.json')
+                with self.assertRaisesRegex(ValueError, '소유권'):
+                    self.tests.bind(identity, replacement, receipt, state_dir=self.root)
+                row = self.connection.execute('SELECT directory FROM targeted_test_collections WHERE invocation_id=?',
+                                              (identity,)).fetchone()
+                self.assertEqual(row[0], str(directory))
+
+    def test_binding_keeps_the_coordinated_callers_transaction(self):
+        from loop_manager_internal.storage.db_access import open_connection
+        with closing(open_connection(self.root / 'coordinated.db')) as connection:
+            with connection:
+                invocation_schema(connection)
+            calls = InvocationRepository(connection)
+            identity = calls.start(InvocationContext('repo', 'G-1'), 'worker', 'codex',
+                                   ResolvedProfile('model', 'high'), None)
+            directory = self.root / 'agent-runtime' / 'runtime' / 'nested'
+            directory.mkdir(parents=True)
+            receipt = directory.parent / (directory.name + '.process.json')
+            with self.assertRaisesRegex(RuntimeError, 'outer'), connection:
+                TargetedTestRepository(connection).bind(identity, directory, receipt, state_dir=self.root)
+                raise RuntimeError('outer')
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM targeted_test_collections').fetchone()[0], 0)
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 1)
+
+    def test_non_execution_receipt_cannot_collect_a_call_with_a_recorded_start(self):
+        identity, directory = self.bind()
+        self.calls.mark_execution_started(identity)
+        self.write(directory)
+        self.recover.return_value = {'finished_at': 'proof', 'evidence': 'not_started'}
+        self.tests.reconcile(state_dir=self.root)
+        self.assertTrue(self.tests.pending('repo', 'G-1'))
+        self.assertEqual(self.tests.sequence('repo', 'G-1'), 0)
+
     def test_restart_without_finally_replays_once_and_does_not_restore_consumed_reach(self):
         identity, directory = self.bind()
         self.write(directory, ('a', 'b', 'c'), suffix='{"kind":')

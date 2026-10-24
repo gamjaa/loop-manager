@@ -179,8 +179,12 @@ class InvocationRepository:
             if proof is not None:
                 with _transaction(self.connection):
                     self.connection.execute('''UPDATE agent_invocations SET execution_finished_at=?,
-                        execution_finish_evidence=? WHERE invocation_id=? AND execution_finished_at IS NULL''',
-                        (proof['finished_at'], json.dumps(proof, sort_keys=True), identity))
+                        execution_finish_evidence=?,
+                        execution_status=CASE WHEN ?='not_started' THEN 'not_executed' ELSE execution_status END
+                        WHERE invocation_id=? AND execution_finished_at IS NULL
+                        AND (?!='not_started' OR execution_started_at IS NULL)''',
+                        (proof['finished_at'], json.dumps(proof, sort_keys=True), proof.get('evidence'),
+                         identity, proof.get('evidence', '')))
 
     def verified_scope(self, scope_id: str, *, repo: str, plan_id: str | None,
                        role: str, provider: str, session_id: str | None,
