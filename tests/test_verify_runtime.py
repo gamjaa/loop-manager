@@ -894,6 +894,16 @@ class RunnerPoolTests(unittest.TestCase):
         self.assertEqual(len(sleeps), 1)
         self.assertFalse(coordinator.reservations)
 
+    def test_other_worker_result_is_collected_before_the_next_grant(self):
+        coordinator, requests, assigned, sleeps, workers = self.exercise_pool(
+            complete_during_burst=True)
+        operations = [operation for operation, _, _, _ in requests]
+        self.assertLess(operations.index('idle'), operations.index('acquire', 3))
+        self.assertEqual(assigned, [('0', 0), ('1', 0), ('2', 0)])
+        self.assertEqual(len(workers), 2)
+        self.assertEqual(len(sleeps), 1)
+        self.assertFalse(coordinator.reservations)
+
     def test_report_with_live_descendant_waits_before_idle_or_reuse(self):
         _, requests, assigned, sleeps, _ = self.exercise_pool(immediate=True, cap=1, child=True)
         self.assertTrue(sleeps)
