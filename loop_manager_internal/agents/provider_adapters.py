@@ -258,7 +258,10 @@ def run_codex(
         fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
 
     guidance_context = tuple(isolation_arguments or codex_sandbox_arguments(read_only))
-    instruction_digests = []
+    instruction_evidence = []
+
+    def observe_instruction(instruction_digest, configuration_digest):
+        instruction_evidence.append((instruction_digest, configuration_digest))
 
     def check_native_lookup():
         if codex_launch is None or isolation_evidence is None:
@@ -275,7 +278,7 @@ def run_codex(
 
     additional = (provider_guidance.codex_arguments(
         common_guidance, worktree, environment=launch_environment,
-        observe_instruction=instruction_digests.append,
+        observe_instruction=observe_instruction,
         context_arguments=("-m", model, "-c", f'model_reasoning_effort="{effort}"',
                           *fast_arguments, *guidance_context),
         on_lookup=check_native_lookup,
@@ -284,10 +287,17 @@ def run_codex(
     if codex_launch is not None and isolation_evidence is not None:
         final_evidence = isolation_evidence
         try:
+            if common_guidance is not None and (len(instruction_evidence) != 1
+                    or not isinstance(instruction_evidence[0][1], str)
+                    or not instruction_evidence[0][1]):
+                raise agent_write_isolation.IsolationError('실제 Provider 지침 적용 증거가 없습니다.')
             final_evidence = agent_write_isolation.refresh_configuration_evidence(
                 isolation_evidence, codex_launch, worktree, state_dir, config_path,
                 expected_repository, read_only, isolation_snapshot_digest,
-                session_id=session_id, environment_variables=launch_environment)
+                session_id=session_id,
+                instruction_configuration_digest=(instruction_evidence[0][1]
+                    if instruction_evidence else None),
+                environment_variables=launch_environment)
             agent_write_isolation.assert_current(final_evidence, worktree, state_dir, config_path,
                 expected_repository, read_only, isolation_snapshot_digest,
                 environment_variables=launch_environment)
@@ -300,10 +310,10 @@ def run_codex(
         isolation_evidence = final_evidence
         if on_execution_identity is not None:
             from loop_manager_internal.agents.provider_execution import execution_identity
-            if not instruction_digests:
+            if len(instruction_evidence) != 1:
                 raise agent_write_isolation.IsolationError('실제 Provider 지침 적용 증거가 없습니다.')
             on_execution_identity(execution_identity(isolation_evidence, codex_launch,
-                ResolvedProfile(model, effort), instruction_digests[0], read_only=read_only))
+                ResolvedProfile(model, effort), instruction_evidence[0][0], read_only=read_only))
     if codex_launch is not None and on_launch_prepared is not None:
         on_launch_prepared(codex_launch)
     project_dir = _provider_log_directory(worktree, state_dir)

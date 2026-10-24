@@ -143,7 +143,9 @@ def codex_arguments(guidance: CommonGuidance, worktree: Path, *,
         if verified != expected:
             raise GuidanceError("Codex 공통 추가 지침의 실제 적용과 기존 지침 보존을 확인할 수 없습니다.")
         if observe_instruction is not None:
-            observe_instruction(hashlib.sha256(json.dumps(verified, ensure_ascii=False).encode()).hexdigest())
+            observe_instruction(
+                hashlib.sha256(json.dumps(verified, ensure_ascii=False).encode()).hexdigest(),
+                verified_after)
         return override
 
     raise GuidanceError("Codex 설정이 지침 조회 중 계속 변경됐습니다.")

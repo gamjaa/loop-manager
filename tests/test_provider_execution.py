@@ -75,6 +75,84 @@ class ProviderExecutionTests(ProviderExecutionFixture, unittest.TestCase):
             {'CODEX_HOME': str(self.child_home)}))
         self.assertEqual(self.observe(invocation_id=result.isolation_invocation_id), self.observe())
 
+    def test_config_change_after_instruction_resolution_rejects_execution_and_retries(self):
+        first = self.invoke()
+        old_identity = self.observe(invocation_id=first.isolation_invocation_id)
+        old_call = self.connection.execute(
+            'SELECT session_id, execution_identity FROM agent_invocations WHERE invocation_id=?',
+            (first.isolation_invocation_id,)).fetchone()
+        old_proof = self.connection.execute(
+            'SELECT status, configuration_digest FROM agent_isolation_evidence WHERE invocation_id=?',
+            (first.isolation_invocation_id,)).fetchone()
+        old_result = provider_adapters._provider_log_directory(
+            self.worktree, self.state) / 'reviewer-last.txt'
+        old_result.write_text('preserve previous result')
+
+        config = self.child_home / 'config.toml'
+        config.write_text('developer_instructions="A"\n')
+        self.instruction_extra = 'A'
+        refresh = isolation.refresh_configuration_evidence
+
+        def replace_before_refresh(*args, **kwargs):
+            replacement = config.with_suffix('.replacement')
+            replacement.write_text('developer_instructions="B"\n')
+            replacement.replace(config)
+            self.instruction_extra = 'B'
+            return refresh(*args, **kwargs)
+
+        with mock.patch.object(isolation, 'refresh_configuration_evidence',
+                               side_effect=replace_before_refresh):
+            with self.assertRaisesRegex(isolation.IsolationError, '지침 해석 뒤 변경'):
+                self.invoke()
+
+        self.popen.assert_not_called()
+        self.assertEqual(old_result.read_text(), 'preserve previous result')
+        old_call_after = self.connection.execute(
+            'SELECT session_id, execution_identity FROM agent_invocations WHERE invocation_id=?',
+            (first.isolation_invocation_id,)).fetchone()
+        self.assertEqual(tuple(old_call_after), tuple(old_call))
+        old_proof_after = self.connection.execute(
+            'SELECT status, configuration_digest FROM agent_isolation_evidence WHERE invocation_id=?',
+            (first.isolation_invocation_id,)).fetchone()
+        self.assertEqual(tuple(old_proof_after), tuple(old_proof))
+        self.assertEqual(self.observe(invocation_id=first.isolation_invocation_id), old_identity)
+        rejected = self.connection.execute('''SELECT proof.status, call.execution_identity,
+            call.execution_started_at FROM agent_isolation_evidence proof
+            JOIN agent_invocations call USING(invocation_id)
+            ORDER BY call.rowid DESC LIMIT 1''').fetchone()
+        self.assertEqual(rejected['status'], 'rejected')
+        self.assertIsNone(rejected['execution_identity'])
+        self.assertIsNone(rejected['execution_started_at'])
+
+        retried = self.invoke()
+        self.assertEqual(retried.code, 0)
+        arguments = self.popen.call_args.args[0]
+        override = next(argument for argument in arguments
+                        if argument.startswith('developer_instructions='))
+        self.assertEqual(json.loads(override.partition('=')[2]), 'B\n\n' + self.guidance.content)
+        actual = self.observe(invocation_id=retried.isolation_invocation_id)
+        self.assertEqual(actual, self.observe())
+
+    def test_current_observation_rejects_config_change_after_instruction_resolution(self):
+        config = self.child_home / 'config.toml'
+        config.write_text('developer_instructions="A"\n')
+        self.instruction_extra = 'A'
+        refresh = isolation.refresh_configuration_evidence
+
+        def replace_before_refresh(*args, **kwargs):
+            replacement = config.with_suffix('.replacement')
+            replacement.write_text('developer_instructions="B"\n')
+            replacement.replace(config)
+            self.instruction_extra = 'B'
+            return refresh(*args, **kwargs)
+
+        with mock.patch.object(isolation, 'refresh_configuration_evidence',
+                               side_effect=replace_before_refresh):
+            self.assertIsNone(self.observe())
+
+        self.assertEqual(config.read_text(), 'developer_instructions="B"\n')
+        self.assertIsNotNone(self.observe())
+
     def test_instruction_change_during_native_lookup_restarts_observation_baseline(self):
         lookups = self.replace_instruction_during_sentinel_lookup()
 
