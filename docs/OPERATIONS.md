@@ -211,7 +211,14 @@ python -m loop_manager_internal.verification.runner --report <직렬 기록 디�
 
 ### Windows Defender와 테스트 임시 폴더
 
-Loop Manager 자체 `scripts/verify.ps1`은 `%USERPROFILE%\.cache\loop-manager\verify\tmp\`를 생성하고 실행 중 `TEMP`·`TMP`·`TMPDIR`로 지정한다. checkout·Codex·상태 DB 위치와 무관한 고정 경로이며 AppData 리다이렉션을 피한다. `LOOP_MANAGER_STATE_DIR`을 지정해도 이 테스트 임시 경로는 바뀌지 않는다. 기본 임시 경로를 사용하는 테스트의 Git 저장소·SQLite 등은 이 폴더 아래에 생성된다. 성공·실패 모두에서 기존 환경 변수와 작업 디렉터리를 복원하며, 동시 실행의 파일을 지우지 않도록 공유 임시 폴더 전체를 삭제하지 않는다. 다른 등록 프로젝트의 verify에는 자동 적용되지 않는다.
+Loop Manager 자체 `scripts/verify.ps1`은 `LOOP_MANAGER_VERIFY_TEMP_DIR`로 테스트 임시 경로를 선택한다. 단독 실행은 PowerShell에서, Manager 실행은 Manager를 시작하는 프로세스에서 설정하면 같은 launcher 입력으로 전달된다. 상대 경로는 checkout 기준으로 해석된다.
+
+```powershell
+$env:LOOP_MANAGER_VERIFY_TEMP_DIR = 'D:\verify temp\테스트'
+.\scripts\verify.ps1
+```
+
+입력이 없으면 `%USERPROFILE%\.cache\loop-manager\verify\tmp\`를 사용한다. launcher는 Python 실행 전에 최종 경로를 만들고 파일 생성·삭제가 가능한지 확인한 뒤 `TEMP`·`TMP`·`TMPDIR`로 설정한다. 경로를 만들거나 쓸 수 없으면 그 경로 오류로 실패하며 기본 경로나 다른 디스크로 바꾸지 않는다. Python의 실제 임시 위치는 launcher `result.json`의 `temporary_directories.windows_launcher`, Windows native `summary.json`의 `temporary_directory`, WSL `summary.json`의 `metadata.execution_context.temporary_directory`에서 확인할 수 있다. 부분 요청의 FALLBACK 진단은 launcher 위치만 포함한다. 성공·실패 모두에서 선택 입력을 포함한 기존 환경 변수와 작업 디렉터리를 복원하며, 동시 실행의 파일을 지우지 않도록 공유 임시 폴더 전체를 삭제하지 않는다. 다른 등록 프로젝트의 verify에는 자동 적용되지 않는다.
 
 Defender 검사로 verify가 느릴 때만 검사 제외를 선택적으로 설정한다. 기본 추천 범위는 테스트 전용 임시 폴더다. 관리자 PowerShell에서 다음을 실행한다.
 
@@ -219,9 +226,11 @@ Defender 검사로 verify가 느릴 때만 검사 제외를 선택적으로 설�
 Add-MpPreference -ExclusionPath (Join-Path $env:USERPROFILE '.cache\loop-manager\verify\tmp')
 ```
 
+다른 경로를 선택했다면 진단에 기록된 실제 임시 경로를 대상으로 제외를 설정한다.
+
 폴더 제외 후에도 Defender의 CPU 점유와 verify 지연이 계속되면 성능 기록으로 원인 프로세스를 확인한 뒤 실제 실행 파일의 전체 경로에 대한 프로세스 제외를 검토한다. 프로세스 제외는 그 프로세스가 여는 파일에 적용되므로 폴더 제외보다 범위가 넓다. 실행 파일 이름만으로 모든 같은 이름의 프로세스를 제외하거나 드라이브·사용자 임시 폴더 전체를 제외하지 않는다. 설정은 사용자가 선택하며 스크립트는 변경하지 않는다. [Microsoft 제외 설정 안내](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-exclusions-overview#process-exclusions)
 
-같은 사용자 계정의 checkout과 worktree는 같은 테스트 임시 폴더를 사용하므로 실행 checkout마다 제외를 등록할 필요가 없다. 진단 로그는 단독 실행의 `.cache/verify/<실행 ID>/` 또는 Manager 실행의 `<state-dir>/logs/verify/<실행 ID>/`에 계속 남는다. 제외 전후에는 같은 검증 범위와 비슷한 부하에서 시간을 비교한다.
+같은 사용자 계정에서 기본값을 사용하는 checkout과 worktree는 같은 테스트 임시 폴더를 사용하므로 실행 checkout마다 제외를 등록할 필요가 없다. 진단 로그는 단독 실행의 `.cache/verify/<실행 ID>/` 또는 Manager 실행의 `<state-dir>/logs/verify/<실행 ID>/`에 계속 남는다. 제외 전후에는 같은 검증 범위와 비슷한 부하에서 시간을 비교한다.
 
 ## 재시도와 배정 중단
 

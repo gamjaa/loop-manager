@@ -142,34 +142,68 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.addCleanup(self.cleanup.close)
         self.root = Path(self.cleanup.enter_context(tempfile.TemporaryDirectory()))
         self.logs = self.root / 'logs'
+        self.temporary = self.root / 'selected temp ü'
+        self.temporary.mkdir()
         self.cleanup.enter_context(mock.patch.dict(os.environ))
+        self.cleanup.enter_context(mock.patch.object(launcher.tempfile, 'tempdir', None))
         for key in tuple(os.environ):
             if key.startswith('LOOP_MANAGER_VERIFY_'):
                 os.environ.pop(key)
-        os.environ.update(LOOP_MANAGER_VERIFY_LOG_DIR=str(self.logs), LOOP_MANAGER_VERIFY_TIMEOUT='60')
+        os.environ.update(LOOP_MANAGER_VERIFY_LOG_DIR=str(self.logs), LOOP_MANAGER_VERIFY_TIMEOUT='60',
+                          LOOP_MANAGER_VERIFY_TEMP_DIR=str(self.temporary), TEMP=str(self.temporary),
+                          TMP=str(self.temporary), TMPDIR=str(self.temporary))
         self.cleanup.enter_context(mock.patch.object(launcher, 'runtime', return_value=(ENTRYPOINT, sys.executable)))
         self.snapshot = self.cleanup.enter_context(mock.patch.object(launcher, 'snapshot', return_value={'revision': 'a' * 40}))
         self.real_wsl = launcher.run_wsl
-        self.wsl = self.cleanup.enter_context(mock.patch.object(launcher, 'run_wsl', return_value=True))
+        self.wsl_result = True
+        self.wsl = self.cleanup.enter_context(mock.patch.object(launcher, 'run_wsl', side_effect=self.run_wsl))
+        self.native_result = (True, False, verify_process.VerifyProcessOutput('core PASS', exit_code=0))
         self.native = self.cleanup.enter_context(mock.patch.object(verify_process, 'run_verify_process',
-            return_value=(True, False, verify_process.VerifyProcessOutput('core PASS', exit_code=0))))
+            side_effect=self.run_native))
+
+    def write_wsl_summary(self, directory):
+        directory = Path(directory)
+        (directory / 'summary.json').write_text(json.dumps({'metadata': {
+            'run_id': 'linux-child', 'execution_context': {
+                'temporary_directory': '/tmp/loop-manager-verify-unit/tmp'}}}), encoding='utf-8')
+
+    def run_wsl(self, _root, _bundle, directory, _timeout, _cap, parent_run_id):
+        self.write_wsl_summary(directory)
+        summary_path = Path(directory) / 'summary.json'
+        summary = json.loads(summary_path.read_text(encoding='utf-8'))
+        summary['metadata']['parent_run_id'] = parent_run_id
+        summary_path.write_text(json.dumps(summary), encoding='utf-8')
+        return self.wsl_result
+
+    def write_native_summary(self, arguments):
+        directory = Path(arguments[arguments.index('--native') + 3])
+        (directory / 'summary.json').write_text(json.dumps({
+            'temporary_directory': str(Path(os.environ['LOOP_MANAGER_VERIFY_TEMP_DIR']).resolve())
+        }), encoding='utf-8')
+
+    def run_native(self, arguments, *_args, **_kwargs):
+        self.write_native_summary(arguments)
+        return self.native_result
 
     def report(self):
         return json.loads((self.logs / 'result.json').read_text(encoding='utf-8'))
 
     def test_wsl_failure_does_not_run_native_or_claim_whole_success(self):
-        self.wsl.return_value = False
+        self.wsl_result = False
         self.assertEqual(launcher.windows_main(self.root), 1)
         self.native.assert_not_called()
         self.assertEqual(self.report()['wsl'], 'FAIL')
         self.assertEqual(self.report()['windows'], 'NOT_RUN')
+        self.assertEqual(self.report()['temporary_directories']['wsl'], '/tmp/loop-manager-verify-unit/tmp')
+        self.assertIsNone(self.report()['temporary_directories']['windows_native'])
         self.assertFalse(self.report()['passed'])
 
     def test_native_failure_and_timeout_share_the_remaining_total_budget(self):
-        self.native.return_value = (False, True, verify_process.VerifyProcessOutput('timeout', exit_code=1))
+        self.native_result = (False, True, verify_process.VerifyProcessOutput('timeout', exit_code=1))
         self.assertEqual(launcher.windows_main(self.root), 1)
         self.assertEqual(self.report()['wsl'], 'PASS')
         self.assertEqual(self.report()['windows'], 'FAIL')
+        self.assertEqual(self.report()['temporary_directories']['windows_native'], str(self.temporary.resolve()))
         self.assertFalse(self.report()['passed'])
         self.assertEqual(self.native.call_args.args[2], 60)
 
@@ -177,7 +211,8 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         def run_wsl(_root, _bundle, logs, _timeout, _cap, parent_run_id):
             (logs / 'summary.json').write_text(json.dumps({
                 'metadata': {'run_id': 'linux-child', 'parent_run_id': parent_run_id,
-                             'clock_domain': 'linux', 'mode': 'full'},
+                             'clock_domain': 'linux', 'mode': 'full',
+                             'execution_context': {'temporary_directory': '/tmp/loop-manager-verify-unit/tmp'}},
                 'result': {'passed': True}, 'elapsed_seconds': 12.0,
                 'counts': {'success': 2}, 'phases': [], 'assignments': [],
                 'allocations': [], 'git_commands': []}), encoding='utf-8')
@@ -204,6 +239,11 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         report = self.report()
         self.assertEqual(report['wsl_run_id'], 'linux-child')
         self.assertEqual(native_environment['LOOP_MANAGER_VERIFY_PARENT_RUN_ID'], report['run_id'])
+        self.assertEqual(report['temporary_directories'], {
+            'windows_launcher': str(self.temporary.resolve()),
+            'wsl': '/tmp/loop-manager-verify-unit/tmp',
+            'windows_native': str(self.temporary.resolve()),
+        })
         self.assertEqual(report['wsl'], 'PASS')
         summary = json.loads((self.logs / 'summary.json').read_text(encoding='utf-8'))
         pipeline = summary['windows_pipeline']
@@ -218,14 +258,34 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(pipeline['children']['windows']['elapsed_seconds'], 0.0)
         self.assertIn('summary.json', pipeline['children']['wsl']['summary_path'])
 
+    def test_explicit_temp_directory_is_used_and_stage_paths_are_observed(self):
+        self.assertEqual(launcher.windows_main(self.root), 0)
+        self.assertEqual(self.report()['temporary_directories'], {
+            'windows_launcher': str(self.temporary.resolve()),
+            'wsl': '/tmp/loop-manager-verify-unit/tmp',
+            'windows_native': str(self.temporary.resolve()),
+        })
+
+    def test_temp_environment_mismatch_fails_before_bundle_or_stages(self):
+        fallback = self.root / 'different-temp'
+        fallback.mkdir()
+        os.environ['TMPDIR'] = str(fallback)
+        with self.assertRaisesRegex(RuntimeError, '실제 Python 임시 경로'):
+            launcher.windows_main(self.root)
+        self.snapshot.assert_not_called()
+        self.wsl.assert_not_called()
+        self.native.assert_not_called()
+
     def test_native_does_not_subtract_wsl_elapsed_time_twice(self):
         from loop_manager_internal.verification import execution_clock
         clock_type = execution_clock.ExecutionClock
         now = [0.0]
         def wsl(*args):
+            self.write_wsl_summary(args[2])
             now[0] = 40.0
             return True
         def native(*args, **kwargs):
+            self.write_native_summary(args[0])
             budget = kwargs['execution_clock']
             self.assertIs(execution_clock.current_execution_clock.get(), budget)
             self.assertEqual(budget.remaining(args[2]), 20.0)
@@ -246,6 +306,8 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.native.assert_not_called()
         report = json.loads((self.logs / 'partial-result.json').read_text())
         self.assertEqual((report['run_id'], report['status']), ('session', 'FALLBACK'))
+        self.assertEqual(report['temporary_directories'], {
+            'windows_launcher': str(self.temporary.resolve()), 'wsl': None, 'windows_native': None})
         self.assertFalse((self.logs / 'result.json').exists())
 
     def test_windows_copy_cleanup_failure_cannot_claim_whole_success(self):

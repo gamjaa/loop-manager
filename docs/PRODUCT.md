@@ -224,6 +224,8 @@ Requirement의 추가·변경은 실제 미충족 범위와 관련 기존 작업
 
 실패 내용은 같은 Worker 세션에 전달하고 성공 출력은 전달하지 않는다. verify와 Review의 출력을 결정적으로 정규화해 단계별 실패 지문·발생 횟수를 SQLite에 별도로 저장한다.
 
+Loop Manager 자체 Windows verify는 사용자가 테스트 임시 경로를 선택할 수 있다. 선택이 없으면 `%USERPROFILE%\.cache\loop-manager\verify\tmp`를 사용하고, 지정한 위치를 만들거나 쓸 수 없으면 다른 경로로 바꾸지 않고 verify를 실패시킨다. [선택 방법과 진단 위치](OPERATIONS.md#windows-defender와-테스트-임시-폴더)를 따른다.
+
 - 새로운 verify 지문이 나타나는 동안에는 총 실패 횟수와 관계없이 Worker 수정과 전체 검증을 계속한다.
 - 같은 verify 지문이 최초 실패 후 Worker 수정을 거쳐 세 번 다시 발생하면, 즉 총 네 번 관측되면 구조화된 원인·지문을 기록하고 `PLAN_BLOCKED`로 변경한다. 연속 실패일 필요는 없으며 중간에 다른 지문이 발생해도 이전 이력을 유지한다.
 - 전체 검증 성공은 verify 지문 이력만 초기화한다.

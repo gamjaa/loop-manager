@@ -5,13 +5,47 @@ $previousPythonEncoding = $env:PYTHONIOENCODING
 $previousTemp = $env:TEMP
 $previousTmp = $env:TMP
 $previousTmpDir = $env:TMPDIR
+$previousVerifyTempDir = $env:LOOP_MANAGER_VERIFY_TEMP_DIR
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $root
 try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $env:PYTHONIOENCODING = 'utf-8'
-    $tempDirectory = Join-Path $env:USERPROFILE '.cache/loop-manager/verify/tmp'
-    New-Item -ItemType Directory -Path $tempDirectory -Force | Out-Null
+    $tempDirectoryInput = $env:LOOP_MANAGER_VERIFY_TEMP_DIR
+    if ($null -eq $tempDirectoryInput) {
+        $tempDirectoryInput = Join-Path $env:USERPROFILE '.cache/loop-manager/verify/tmp'
+    }
+    if ([string]::IsNullOrWhiteSpace($tempDirectoryInput)) {
+        throw '빈 경로는 사용할 수 없습니다.'
+    }
+    try {
+        if ([System.IO.Path]::IsPathRooted($tempDirectoryInput)) {
+            $tempDirectory = [System.IO.Path]::GetFullPath($tempDirectoryInput)
+        } else {
+            $tempDirectory = [System.IO.Path]::GetFullPath((Join-Path $root $tempDirectoryInput))
+        }
+        New-Item -ItemType Directory -Path $tempDirectory -Force | Out-Null
+        if (-not (Test-Path -LiteralPath $tempDirectory -PathType Container)) {
+            throw '임시 경로가 디렉터리가 아닙니다.'
+        }
+        $probePath = Join-Path $tempDirectory ('.loop-manager-verify-' + [Guid]::NewGuid().ToString('N'))
+        $probe = $null
+        try {
+            $probe = [System.IO.File]::Open($probePath, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $probe.Dispose()
+            $probe = $null
+            Remove-Item -LiteralPath $probePath -ErrorAction Stop
+        } finally {
+            if ($null -ne $probe) { $probe.Dispose() }
+            if (Test-Path -LiteralPath $probePath) {
+                Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        throw "자체 Windows verify 임시 경로 오류 ($tempDirectoryInput): $($_.Exception.Message)"
+    }
+    $env:LOOP_MANAGER_VERIFY_TEMP_DIR = $tempDirectory
     $env:TEMP = $tempDirectory
     $env:TMP = $tempDirectory
     $env:TMPDIR = $tempDirectory
@@ -33,6 +67,7 @@ try {
     $env:TEMP = $previousTemp
     $env:TMP = $previousTmp
     $env:TMPDIR = $previousTmpDir
+    $env:LOOP_MANAGER_VERIFY_TEMP_DIR = $previousVerifyTempDir
     Pop-Location
 }
 exit $verifyExitCode

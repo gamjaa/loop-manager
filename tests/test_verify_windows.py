@@ -103,7 +103,7 @@ class VerifyWindowsTests(unittest.TestCase):
             harness.write_text(r'''
 $ErrorActionPreference = 'Stop'
 $originalLocation = (Get-Location).Path
-$keys = @('TEMP', 'TMP', 'TMPDIR', 'PYTHONIOENCODING')
+$keys = @('TEMP', 'TMP', 'TMPDIR', 'PYTHONIOENCODING', 'LOOP_MANAGER_VERIFY_TEMP_DIR')
 $before = @{}
 foreach ($key in $keys) { $before[$key] = [Environment]::GetEnvironmentVariable($key, 'Process') }
 $encoding = [Console]::OutputEncoding
@@ -136,34 +136,69 @@ foreach ($key in $keys) {
 if ((Get-Location).Path -ne $originalLocation) { throw '작업 경로가 복원되지 않았습니다.' }
 if ([Console]::OutputEncoding.CodePage -ne $encoding.CodePage) { throw '출력 인코딩이 복원되지 않았습니다.' }
 ''', encoding='utf-8-sig')
-            for configured, custom_state in ((False, False), (True, False), (True, True)):
-                temporary = user_profile / '.cache/loop-manager/verify/tmp'
-                self.assertFalse(temporary.is_relative_to(root))
+            default_temp = user_profile / '.cache/loop-manager/verify/tmp'
+            absolute_temp = Path(directory) / 'custom temp ü absolute'
+            relative_value = 'custom temp ü relative'
+            cases = ((None, default_temp, False), (str(absolute_temp), absolute_temp, True),
+                     (relative_value, root / relative_value, True))
+            for selection, temporary, custom_state in cases:
+                if selection is None:
+                    self.assertFalse(temporary.is_relative_to(root))
                 sentinel = temporary / 'existing-file'
-                for result in ('0', '7', 'throw'):
-                    with self.subTest(configured=configured, custom_state=custom_state, result=result):
-                        environment = dict(os.environ, USERPROFILE=str(user_profile), VERIFY_TEST_PYTHON=sys.executable,
-                                           VERIFY_TEST_ROOT=str(root), VERIFY_TEST_RESULT=result,
-                                           VERIFY_TEST_TEMP_DIR=str(temporary))
-                        environment.pop('LOOP_MANAGER_STATE_DIR', None)
-                        if custom_state:
-                            environment['LOOP_MANAGER_STATE_DIR'] = str(Path(directory) / 'custom-state')
-                        for key in ('TEMP', 'TMP', 'TMPDIR'):
-                            environment.pop(key, None)
-                            if configured:
-                                environment[key] = str(Path(directory) / key)
-                        completed = subprocess.run(
-                            [powershell, '-NoProfile', '-File', str(harness)],
-                            cwd=directory, env=environment, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, encoding='utf-8',
-                            errors='replace', timeout=30,
-                        )
-                        self.assertEqual(completed.returncode, 0, completed.stdout)
-                        self.assertTrue(temporary.is_dir())
-                        if sentinel.exists():
-                            self.assertEqual(sentinel.read_text(encoding='utf-8'), '보존')
-                        else:
-                            sentinel.write_text('보존', encoding='utf-8')
+                for configured in (False, True):
+                    for result in ('0', '7', 'throw'):
+                        with self.subTest(selection=selection, configured=configured,
+                                          custom_state=custom_state, result=result):
+                            environment = dict(os.environ, USERPROFILE=str(user_profile), VERIFY_TEST_PYTHON=sys.executable,
+                                               VERIFY_TEST_ROOT=str(root), VERIFY_TEST_RESULT=result,
+                                               VERIFY_TEST_TEMP_DIR=str(temporary))
+                            environment.pop('LOOP_MANAGER_VERIFY_TEMP_DIR', None)
+                            if selection is not None:
+                                environment['LOOP_MANAGER_VERIFY_TEMP_DIR'] = selection
+                            environment.pop('LOOP_MANAGER_STATE_DIR', None)
+                            if custom_state:
+                                environment['LOOP_MANAGER_STATE_DIR'] = str(Path(directory) / 'custom-state')
+                            for key in ('TEMP', 'TMP', 'TMPDIR'):
+                                environment.pop(key, None)
+                                if configured:
+                                    environment[key] = str(Path(directory) / key)
+                            completed = subprocess.run(
+                                [powershell, '-NoProfile', '-File', str(harness)],
+                                cwd=directory, env=environment, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding='utf-8',
+                                errors='replace', timeout=30,
+                            )
+                            self.assertEqual(completed.returncode, 0, completed.stdout)
+                            self.assertTrue(temporary.is_dir())
+                            if sentinel.exists():
+                                self.assertEqual(sentinel.read_text(encoding='utf-8'), '보존')
+                            else:
+                                sentinel.write_text('보존', encoding='utf-8')
+
+    def test_invalid_selected_temp_directory_fails_without_default_fallback(self):
+        powershell = shutil.which('pwsh') or shutil.which('powershell')
+        if powershell is None:
+            self.skipTest('PowerShell 없음')
+        source = Path(__file__).resolve().parents[1] / 'scripts/verify.ps1'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'checkout'
+            scripts = root / 'scripts'
+            scripts.mkdir(parents=True)
+            shutil.copyfile(source, scripts / 'verify.ps1')
+            user_profile = Path(directory) / 'user'
+            invalid = Path(directory) / 'existing-file'
+            invalid.write_text('file, not a directory', encoding='utf-8')
+            environment = dict(os.environ, USERPROFILE=str(user_profile),
+                               LOOP_MANAGER_VERIFY_TEMP_DIR=str(invalid))
+            default = user_profile / '.cache/loop-manager/verify/tmp'
+            completed = subprocess.run(
+                [powershell, '-NoProfile', '-File', str(scripts / 'verify.ps1')],
+                cwd=directory, env=environment, capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=30,
+            )
+            self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn('자체 Windows verify 임시 경로 오류', completed.stdout + completed.stderr)
+            self.assertFalse(default.exists())
 
 
 if __name__ == '__main__':
