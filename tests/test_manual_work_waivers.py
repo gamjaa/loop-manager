@@ -208,7 +208,8 @@ class ManualWorkTest(ManualWorkCase):
         publication=candidate.publication('',fixture.plan,lambda *_: self.fail(
             'manual candidate should not use Worker publication data'))
         body=candidate.decorate_body('PR body')
-        for rendered in (prompt,publication.summary,body):
+        worker_context='\n'.join(candidate.worker_context().values())
+        for rendered in (prompt,publication.summary,body,worker_context):
             self.assertIn('사유 미입력',rendered)
             self.assertNotIn('제공 사유:',rendered)
 
@@ -220,11 +221,29 @@ class ManualWorkTest(ManualWorkCase):
         publication=candidate.publication('',fixture.plan,lambda *_: self.fail(
             'manual candidate should not use Worker publication data'))
         body=candidate.decorate_body('PR body')
-        for rendered in (prompt,publication.summary,body):
+        worker_context='\n'.join(candidate.worker_context().values())
+        for rendered in (prompt,publication.summary,body,worker_context):
             self.assertIn('사유 미입력',rendered)
         saved=fixture.connection.execute("SELECT detail FROM manual_work_results "
             "WHERE stage='verify' AND result='SKIPPED_BY_USER'").fetchone()
         self.assertEqual(saved['detail'],legacy_detail)
+
+        legacy_provided_detail='SKIPPED_BY_USER @candidate-head; 사유 미입력'
+        with fixture.connection:
+            fixture.connection.execute('UPDATE manual_work_requests SET reason=?',('사유 미입력',))
+            fixture.connection.execute("UPDATE manual_work_results SET detail=? "
+                "WHERE stage='verify' AND result='SKIPPED_BY_USER'",(legacy_provided_detail,))
+        prompt=candidate.prompt('Reviewer input',review=True)
+        publication=candidate.publication('',fixture.plan,lambda *_: self.fail(
+            'manual candidate should not use Worker publication data'))
+        body=candidate.decorate_body('PR body')
+        worker_context='\n'.join(candidate.worker_context().values())
+        for rendered in (prompt,publication.summary,body,worker_context):
+            self.assertIn('제공 사유: 사유 미입력',rendered)
+            self.assertNotIn('; 사유 미입력',rendered)
+        saved=fixture.connection.execute("SELECT detail FROM manual_work_results "
+            "WHERE stage='verify' AND result='SKIPPED_BY_USER'").fetchone()
+        self.assertEqual(saved['detail'],legacy_provided_detail)
 
 
     def test_grant_expires_for_environment_new_sha_and_new_default_request(self):

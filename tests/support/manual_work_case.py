@@ -2,6 +2,7 @@ import contextlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +19,52 @@ from types import SimpleNamespace
 
 
 class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
+    def mocked_service(self, directory):
+        from loop_manager_internal.application.manual_work import ManualWorkService
+        from tests.support.database import runtime_connection
+
+        repo=Path(directory)/'repo'
+        connection=runtime_connection(str(repo))
+        self.addCleanup(connection.close)
+        connection.execute('UPDATE projects SET registered=1,origin=? WHERE repo=?',
+            (str(Path(directory)/'origin.git'),str(repo)))
+        connection.commit()
+        state_dir=Path(directory)/'state'
+        state_dir.mkdir()
+        config_path=Path(directory)/'operational-config.ini'
+        config_path.write_text('[loop]\nverify_timeout_seconds=600\nverify_parallelism=auto\n',encoding='utf-8')
+        unexpected=mock.Mock(side_effect=AssertionError('unexpected Git or external operation'))
+        effects=replace(loop_manager._manual_work_effects(),validate_repository=unexpected,
+            fetch_base=unexpected,git=unexpected,git_bytes=unexpected,make_worktree=unexpected,
+            validate_workspace=unexpected,capture_snapshot=unexpected,pr_for_branch=unexpected,
+            generate_plans=unexpected,run_project=unexpected,operation_print=mock.Mock(),
+            resolve_profile=mock.Mock(return_value=ResolvedProfile('fixture-reviewer','medium')))
+        service=ManualWorkService(effects,connection,state_dir,repo,config_path)
+        service.drive=mock.Mock(return_value=0)
+        return service
+
+    def seed_manual_group(self, service, directory, *, kind):
+        plan={'id':'G-047','title':'Runtime','sources':['docs/PRODUCT.md'],'depends_on':[],
+              'complexity':'medium','risk':'medium','priority':'normal'}
+        path='docs/plans/[G-047] Runtime.md'
+        documents=[{'path':path,'text':'# Runtime\n','plan':plan}]
+        head='a'*40
+        base='b'*40
+        source_branch='source' if kind=='submit' else 'loop-manager/G-047'
+        requirements=('docs/requirements/Active.md',) if kind=='submit' else ()
+        group=service.store.create(service.repo,kind,source_branch,requirements,head,base,
+            members=('G-047',),documents=documents)
+        worktree=Path(directory)/'worktree'
+        group=service.store.update(group,state='AUTOMATIC' if kind=='submit' else 'MANUAL_WORKING',
+            owner_id='G-047',branch='loop-manager/G-047',worktree=str(worktree),
+            workspace_created=0,prepared_head=head,definition_head=head)
+        status='MANUAL_PENDING' if kind=='submit' else 'MANUAL_WORKING'
+        service.connection.execute('UPDATE exec_plans SET status=?,branch=?,worktree=?,workspace_owned=1,active_sha=? '
+            'WHERE repo=? AND plan_id=?',
+            (status,group['branch'],group['worktree'],base,service.repo,'G-047'))
+        service.connection.commit()
+        return service.store.get(service.repo,group['group_id']),documents,head,base
+
     def candidate(self, service, plan_id):
         return ManualCandidate(service.connection,service.repo,plan_id,service.effects.git,
             service.effects.git_bytes,config_path=service.config_path,provider=service.project['provider'],

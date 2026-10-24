@@ -522,8 +522,10 @@ class ManualWorkService:
         rows = self.connection.execute('SELECT plan_id,status,pr_url FROM exec_plans WHERE repo=? '
             'AND plan_id IN (SELECT plan_id FROM manual_work_members WHERE repo=? AND group_id=?)',
             (self.repo,self.repo,group['group_id'])).fetchall()
-        receipts = self.connection.execute('SELECT plan_id,stage,result,head,detail FROM manual_work_results '
-            'WHERE repo=? AND group_id=? ORDER BY created_at', (self.repo,group['group_id'])).fetchall()
+        receipts = self.connection.execute('SELECT r.plan_id,r.stage,r.result,r.head,r.detail,'
+            'q.reason AS request_reason FROM manual_work_results r LEFT JOIN manual_work_requests q '
+            'ON q.request_id=r.request_id WHERE r.repo=? AND r.group_id=? ORDER BY r.created_at',
+            (self.repo,group['group_id'])).fetchall()
         request=self.store.request(group)
         current=group['definition_head'] or group['prepared_head'] or group['source_head']
         if group['worktree'] and Path(group['worktree']).is_dir() and group['workspace_created']:
@@ -539,9 +541,13 @@ class ManualWorkService:
             for stage in ('verify','review'):
                 if not any(receipt['plan_id']==row['plan_id'] and receipt['stage']==stage for receipt in receipts):
                     self.effects.operation_print(f"{row['plan_id']} {stage} NOT_RUN")
+        from loop_manager_internal.execution.manual_candidate import manual_skip_reason_label
         for receipt in receipts:
+            detail=receipt['detail']
+            if receipt['result']=='SKIPPED_BY_USER':
+                detail=manual_skip_reason_label(receipt['result'],receipt['request_reason'])
             self.effects.operation_print(redact_secrets(f"{receipt['plan_id']} {receipt['stage']} "
-                f"{receipt['result']} @{receipt['head']}: {receipt['detail'][:1000]}"))
+                f"{receipt['result']} @{receipt['head']}: {detail[:1000]}"))
         if group['state']=='MANUAL_WORKING':
             head=manager_git_journal.live_remote_branch_oid(self.effects.git,self.repo_path,group['branch'])
             self.effects.operation_print(f'현재 원격 HEAD={head}; worktree={group["worktree"]}')

@@ -1726,7 +1726,7 @@ source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 �
 
 `manual_work_requests`는 후보 token과 단계별 유효 설정 token을 보존한다. verify 설정은 기존 managed-config loader의 timeout·parallelism, Review 설정은 verify 설정과 기존 profile resolver가 선택한 provider·Model·Effort를 결합한다. 실행 중 receipt·최종 게시·PR 대기 재평가에 같은 계산을 사용한다.
 
-생략 결과의 감사 `detail`은 `SKIPPED_BY_USER`와 후보 SHA를 유지하면서 사유 제공 여부를 표시한다. 새 결과와 과거의 빈 사유 결과는 `사유 미입력`, 제공된 사유는 `제공 사유: …`로 Reviewer 입력·PR 설명·상태 출력에서 같은 formatter로 표시하고 출력 경계의 기존 비밀값 redaction을 적용한다. 과거 request·result 원문은 표시를 위해 다시 쓰지 않는다.
+생략 결과의 감사 `detail`은 `SKIPPED_BY_USER`와 후보 SHA를 유지하면서 사유 제공 여부를 표시한다. Reviewer 입력·PR 설명·상태 출력은 같은 formatter를 쓰며, 사유 제공 여부의 원본은 각 result의 `request_id`가 연결한 request의 `reason`이다. 따라서 formatter는 legacy `detail` 문자열로 의미를 추측하지 않고 실제 제공 사유가 표시 문구와 같아도 보존한다. 출력 경계에는 기존 비밀값 redaction을 적용하며 과거 request·result 원문은 표시를 위해 다시 쓰지 않는다.
 
 각 단계 시작 때 실제 verify timeout·coordinator parallelism과 Reviewer에 전달할 profile을 고정한다. 완료 시 설정을 다시 읽어 수행 당시 지문을 바꾸지 않으며 실행 중 입력 변경 뒤의 현재 근거로 재사용하지 않는다. 새 열이 없는 기존 요청은 `NULL`로 유지해 당시 입력을 소급 추정하지 않는다. SQLite에는 token·비밀값 없는 무효화 사유만 저장하고 설정 원문·Model 인증 자료는 저장하지 않는다.
 
