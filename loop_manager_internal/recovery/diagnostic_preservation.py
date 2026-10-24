@@ -15,6 +15,7 @@ import stat
 import tempfile
 from typing import Callable
 
+from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.git import rebase_file_evidence
 from loop_manager_internal.git.manager_git_journal import _sync_directory
@@ -381,9 +382,11 @@ def preserve(effects, connection, state_dir, source, adapter, request, original_
     saved = store.preservation(source.repo, source.scope, source.owner, identity)
     if saved and (json.loads(saved['payload']).get('result') == 'published' or not saved['retryable']):
         payload = json.loads(saved['payload'])
-        store.preserve(source.repo, source.scope, source.owner, identity, payload,
-                       ref=saved['ref'], tree=saved['tree_oid'], commit=saved['commit_oid'])
-        return payload
+        current = store.current_payload(source.repo, payload)
+        if current == payload:
+            store.preserve(source.repo, source.scope, source.owner, identity, payload,
+                           ref=saved['ref'], tree=saved['tree_oid'], commit=saved['commit_oid'])
+        return current
     tree = head = ref = None
     payload = dict(result='local_only', diagnostic=True, original_branch=source.branch,
                    worktree=str(source.worktree), cause=source.detail,
@@ -416,23 +419,26 @@ def preserve(effects, connection, state_dir, source, adapter, request, original_
             ref = blocked_checkpoint.diagnostic_branch(
                 source.repo, source.owner, source.branch, source.revisions['base'], head, tree)
         payload.update(branch=ref, commit_oid=head, base_oid=source.revisions['base'])
-        store.preserve(source.repo, source.scope, source.owner, identity, payload,
-                       ref=ref, tree=tree, commit=head, retryable=True, revalidate=validate_receipt)
-        # Diagnostic observation must not query/recreate an existing PR.
-        target = replace(request, branch=ref, pr_url=None)
-        remote = adapter.observe_remote(target)
-        decision = blocked_checkpoint.decide_diagnostic_push(head, remote)
-        if decision.mode is blocked_checkpoint.PushMode.REJECT:
-            raise blocked_checkpoint.CheckpointPushError(decision.reason, retryable=False)
-        unchanged()
-        if decision.mode is blocked_checkpoint.PushMode.CREATE:
-            effects.push_diagnostic_checkpoint(adapter, target, head)
-        if adapter.observe_remote(target) != head:
-            raise blocked_checkpoint.CheckpointPushError('진단 ref OID를 확인할 수 없습니다.', retryable=True)
-        unchanged()
-        payload.update(result='published', reason=None)
-        store.preserve(source.repo, source.scope, source.owner, identity, payload,
-                       ref=ref, tree=tree, commit=head, revalidate=validate_receipt)
+        with resource_locks(state_dir, source.repo, ['diagnostic:' + ref], owner='diagnostic-preservation'):
+            if store.cleanup_receipt(source.repo, ref, source.cause_identity) is not None:
+                return store.current_payload(source.repo, payload)
+            store.preserve(source.repo, source.scope, source.owner, identity, payload,
+                           ref=ref, tree=tree, commit=head, retryable=True, revalidate=validate_receipt)
+            # Diagnostic observation must not query/recreate an existing PR.
+            target = replace(request, branch=ref, pr_url=None)
+            remote = adapter.observe_remote(target)
+            decision = blocked_checkpoint.decide_diagnostic_push(head, remote)
+            if decision.mode is blocked_checkpoint.PushMode.REJECT:
+                raise blocked_checkpoint.CheckpointPushError(decision.reason, retryable=False)
+            unchanged()
+            if decision.mode is blocked_checkpoint.PushMode.CREATE:
+                effects.push_diagnostic_checkpoint(adapter, target, head)
+            if adapter.observe_remote(target) != head:
+                raise blocked_checkpoint.CheckpointPushError('진단 ref OID를 확인할 수 없습니다.', retryable=True)
+            unchanged()
+            payload.update(result='published', reason=None)
+            store.preserve(source.repo, source.scope, source.owner, identity, payload,
+                           ref=ref, tree=tree, commit=head, revalidate=validate_receipt)
     except (OSError, RuntimeError, sqlite3.Error) as error:
         payload['result'] = 'local_only'
         payload['reason'] = redact_detail(str(error))

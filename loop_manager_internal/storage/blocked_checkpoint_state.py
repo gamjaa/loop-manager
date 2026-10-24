@@ -95,6 +95,12 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         repo TEXT NOT NULL, ref TEXT NOT NULL, basis TEXT NOT NULL,
         payload TEXT NOT NULL, PRIMARY KEY (repo, ref)
     )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS diagnostic_cleanup_attempts (
+        repo TEXT NOT NULL, ref TEXT NOT NULL, basis TEXT NOT NULL,
+        expected_oid TEXT NOT NULL, status TEXT NOT NULL,
+        attempts INTEGER NOT NULL, payload TEXT NOT NULL,
+        PRIMARY KEY (repo, ref, basis)
+    )""")
     columns = {row[1] for row in connection.execute("PRAGMA table_info(blocked_checkpoints)")}
     for name in (
         "published_oid", "accepted_remote_oid", "pending_remote_oid",
@@ -656,6 +662,27 @@ def record_diagnostic_cause_resolution(connection, block, acceptance, *, pending
             (repo, block['scope'], owner, identity, project['origin'], plan['branch'], plan['worktree'], payload))
 
 
+def diagnostic_cleanup_receipt(connection, repo, ref, cause_identity):
+    """Read the cause's retirement without initializing or changing any schema."""
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='diagnostic_cleanup_attempts'").fetchone() is None:
+        return None
+    statuses = [row['status'] for row in connection.execute(
+        'SELECT status, payload FROM diagnostic_cleanup_attempts WHERE repo=? AND ref=?', (repo, ref))
+        if any(use['cause_identity'] == cause_identity
+               for use in json.loads(row['payload'])['state']['uses'])]
+    return 'complete' if 'complete' in statuses else next(iter(statuses), None)
+
+
+def current_diagnostic_payload(connection, repo, payload, *, cause_identity=None):
+    status = diagnostic_cleanup_receipt(connection, repo, payload.get('branch'),
+        cause_identity or payload.get('cause_identity'))
+    if status is None:
+        return payload
+    return dict(payload, result='local_only', historical_publication=payload.get('result') == 'published',
+                remote_state='absent' if status == 'complete' else 'cleanup_pending',
+                reason='과거 진단 ref의 정리 intent를 보존하며 재생성하지 않습니다.')
+
+
 class DiagnosticPublicationRepository:
     """Immutable diagnostic intents never confer original-branch ownership."""
 
@@ -667,6 +694,12 @@ class DiagnosticPublicationRepository:
         return self.connection.execute(
             'SELECT * FROM diagnostic_preservations WHERE repo = ? AND scope = ? '
             'AND owner = ? AND input_identity = ?', (repo, scope, owner, identity)).fetchone()
+
+    def cleanup_receipt(self, repo, ref, cause_identity):
+        return diagnostic_cleanup_receipt(self.connection, repo, ref, cause_identity)
+
+    def current_payload(self, repo, payload, *, cause_identity=None):
+        return current_diagnostic_payload(self.connection, repo, payload, cause_identity=cause_identity)
 
     def _record_use(self, repo, scope, owner, identity, payload, *, ref, tree,
                     commit, pending, confirm=False):
@@ -731,7 +764,7 @@ class DiagnosticPublicationRepository:
         row = self.connection.execute(
             'SELECT payload FROM diagnostic_preservations WHERE repo = ? AND scope = ? '
             'AND owner = ? ORDER BY observed_order DESC LIMIT 1', (repo, scope, owner)).fetchone()
-        return json.loads(row[0]) if row else None
+        return self.current_payload(repo, json.loads(row[0])) if row else None
 
     def intent(self, request, *, base_oid, head_oid, tree_oid, cause):
         from loop_manager_internal.recovery import scoped_blocking

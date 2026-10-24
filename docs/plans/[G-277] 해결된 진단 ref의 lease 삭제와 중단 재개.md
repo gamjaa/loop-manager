@@ -28,12 +28,12 @@ R-083의 충돌 해결 진단 ref에 한해, 원인 해소·해결 결과의 정
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/recovery/diagnostic_cleanup.py`의 `_snapshot`·`_observe`·`assess_ref`와 `prepare_recorded`를 재사용해 삭제 직전의 자격 재검증을 연결한다. `diagnostic_ref_uses`·`diagnostic_cause_resolutions`·게시 intent의 현재 근거를 소비하고 원인 기록·bundle 검증·준비 엔진을 다시 만들지 않는다. acceptance의 repo identity와 등록 origin은 현재 계약대로 별도로 대조하며, WAITING 후 COMPLETE·미게시 작업물·복수 사용의 보존 조건을 유지한다.
-- [ ] 확인한 `application/project_runner.py:run_project_result`와 `application/bindings.py`·`recovery/bindings.py`의 준비 callback을 출발점으로 첫 안전한 정리 경계에 삭제 handler를 연결한다. 준비 기록만 보고 삭제하거나 PR Merge까지 미루지 않으며, PR 대기에서도 같은 현재 조건을 적용한다. 대상 자원의 진행 중/종료 불명 호출·게시와 경합하면 해당 정리만 보류하고 runtime handoff에서는 새 관측·삭제를 시작하지 않는다. 외부 관측·push 동안 DB 접근을 반환하고, 짧은 적용 transaction에서 소유권·사용 generation·basis를 다시 확인한다.
-- [ ] 확인한 `recovery/checkpoint_adapter.py`의 `_validated_push_url`·`_frozen_push_target`과 `git/manager_git_journal.py`의 `parse_remote_branch_oid`·`exact_branch_lease`를 재사용한다. 저장된 게시 성공 OID를 lease로 고정한 진단 ref 삭제 효과를 추가하되 생성 전용 `push_diagnostic_checkpoint`의 의미는 유지한다. hooks·tracking ref·다른 ref 보호와 기존 자원 조율을 지킨다. 현재 journal의 일반 허용 전이를 진단 삭제 성공으로 가장하지 않고, 삭제 intent·실제 원격 부재·완료 확정을 이 정리의 저장 근거로 연결한다.
-- [ ] 확인한 `storage/blocked_checkpoint_state.py`의 기존 세 준비 테이블과 게시/보존 기록을 유지하며 삭제 intent·기대 OID·사용/basis·시도 결과·미확정/완료·재평가 사유를 호환 가능하게 저장한다. 기존 payload/감사를 덮어 정리 완료를 표현하지 않는다. 원격 효과와 SQLite 확정을 원자 작업으로 가정하지 않고, 삭제 성공 뒤 기록 실패도 실제 부재와 현재 안전 조건을 대조해 재개한다.
-- [ ] 확인한 `recovery/diagnostic_preservation.py:preserve`, `project_blocked_recovery.py`의 진단 `_publish`, `storage/blocked_checkpoint_state.py`의 보존·게시 결과 조회를 삭제 수명과 연결한다. 정리된 과거 intent/receipt는 ref 재생성이나 현재 원격 보존 성공으로 보고하지 않고 원문·과거 성공·정리 감사를 함께 유지한다. 새 충돌은 독립 원인으로 기존 보존 정책을 적용하며 부족한 과거 근거를 원격 namespace 탐색이나 추정 backfill로 보충하지 않는다.
-- [ ] 확인한 `tests/test_diagnostic_cleanup.py`·`tests/support/diagnostic.py`, `tests/test_project_diagnostic_publication.py`, `tests/test_diagnostic_preservation.py`, `tests/test_blocked_checkpoint_state.py`의 fixture와 실제 판단·저장 함수를 재사용해 아래 삭제 고유 회귀를 추가한다. 이미 있는 준비·원문 검증 assertion은 유지하고 같은 조건을 복제하지 않는다. PRODUCT의 현재 준비 전용 설명과 ARCHITECTURE의 정리 준비 근거 절을 실제 삭제·보존·실패/재개 계약으로 통합한다. 별도 테스트 파일이 필요하면 예정 경로로 명시한다.
+- [x] 확인한 `loop_manager_internal/recovery/diagnostic_cleanup.py`의 `_snapshot`·`_observe`·`assess_ref`와 `prepare_recorded`를 재사용해 삭제 직전의 자격 재검증을 연결한다. `diagnostic_ref_uses`·`diagnostic_cause_resolutions`·게시 intent의 현재 근거를 소비하고 원인 기록·bundle 검증·준비 엔진을 다시 만들지 않는다. acceptance의 repo identity와 등록 origin은 현재 계약대로 별도로 대조하며, WAITING 후 COMPLETE·미게시 작업물·복수 사용의 보존 조건을 유지한다.
+- [x] 확인한 `application/project_runner.py:run_project_result`와 `application/bindings.py`·`recovery/bindings.py`의 준비 callback을 출발점으로 첫 안전한 정리 경계에 삭제 handler를 연결한다. 준비 기록만 보고 삭제하거나 PR Merge까지 미루지 않으며, PR 대기에서도 같은 현재 조건을 적용한다. 대상 자원의 진행 중/종료 불명 호출·게시와 경합하면 해당 정리만 보류하고 runtime handoff에서는 새 관측·삭제를 시작하지 않는다. 외부 관측·push 동안 DB 접근을 반환하고, 짧은 적용 transaction에서 소유권·사용 generation·basis를 다시 확인한다.
+- [x] 확인한 `recovery/checkpoint_adapter.py`의 `_validated_push_url`·`_frozen_push_target`과 `git/manager_git_journal.py`의 `parse_remote_branch_oid`·`exact_branch_lease`를 재사용한다. 저장된 게시 성공 OID를 lease로 고정한 진단 ref 삭제 효과를 추가하되 생성 전용 `push_diagnostic_checkpoint`의 의미는 유지한다. hooks·tracking ref·다른 ref 보호와 기존 자원 조율을 지킨다. 현재 journal의 일반 허용 전이를 진단 삭제 성공으로 가장하지 않고, 삭제 intent·실제 원격 부재·완료 확정을 이 정리의 저장 근거로 연결한다.
+- [x] 확인한 `storage/blocked_checkpoint_state.py`의 기존 세 준비 테이블과 게시/보존 기록을 유지하며 삭제 intent·기대 OID·사용/basis·시도 결과·미확정/완료·재평가 사유를 호환 가능하게 저장한다. 기존 payload/감사를 덮어 정리 완료를 표현하지 않는다. 원격 효과와 SQLite 확정을 원자 작업으로 가정하지 않고, 삭제 성공 뒤 기록 실패도 실제 부재와 현재 안전 조건을 대조해 재개한다.
+- [x] 확인한 `recovery/diagnostic_preservation.py:preserve`, `project_blocked_recovery.py`의 진단 `_publish`, `storage/blocked_checkpoint_state.py`의 보존·게시 결과 조회를 삭제 수명과 연결한다. 정리된 과거 intent/receipt는 ref 재생성이나 현재 원격 보존 성공으로 보고하지 않고 원문·과거 성공·정리 감사를 함께 유지한다. 새 충돌은 독립 원인으로 기존 보존 정책을 적용하며 부족한 과거 근거를 원격 namespace 탐색이나 추정 backfill로 보충하지 않는다.
+- [x] 확인한 `tests/test_diagnostic_cleanup.py`·`tests/support/diagnostic.py`, `tests/test_project_diagnostic_publication.py`, `tests/test_diagnostic_preservation.py`, `tests/test_blocked_checkpoint_state.py`의 fixture와 실제 판단·저장 함수를 재사용해 아래 삭제 고유 회귀를 추가한다. 이미 있는 준비·원문 검증 assertion은 유지하고 같은 조건을 복제하지 않는다. PRODUCT의 현재 준비 전용 설명과 ARCHITECTURE의 정리 준비 근거 절을 실제 삭제·보존·실패/재개 계약으로 통합한다. 별도 테스트 파일이 필요하면 예정 경로로 명시한다.
 
 ## Validation
 
@@ -45,11 +45,15 @@ R-083의 충돌 해결 진단 ref에 한해, 원인 해소·해결 결과의 정
 
 ## Progress
 
-원격 base `b0ec450f821b9cf7689dfd879acc5ebf68e23cb3`에 반영된 G-276의 준비 판정·세 저장 테이블·원문 복구·run 경계와 관련 회귀를 정적으로 대조했다. 이 구현은 준비/보류만 기록하며 ref 삭제·삭제 후 확인·중단 재개·정리 후 재생성 방지는 이 작업의 잔여 범위다. 아래 사용자 판단 기록은 보존하며 이번 Planner는 구현·테스트·verify를 실행하지 않았다.
+G-276의 준비 판정·원문 복구·run 경계를 재사용해 자원 잠금 아래 삭제 직전 재관측, 저장 OID의 정확한 lease 삭제, 원격 부재 확인과 중단 재개를 구현했다. `diagnostic_cleanup_attempts`에 basis별 intent·시도 예약·단계/실패 감사를 보존하고 같은 근거의 일시 시도는 최대 3회, lease/정책 거부는 재push하지 않는다. 보존·프로젝트 진단 게시가 같은 ref 잠금을 공유하며 정리된 과거 원인의 재생성과 현재 원격 게시 성공 오보를 막는다. PRODUCT·ARCHITECTURE에 제품 수명·호환 저장 계약을 반영했다. 기존 사용자 판단·선언은 변경하지 않았다.
+
+Worker targeted 결과: 삭제/준비·보존·게시 인자 단위 61개, 기존 프로젝트 게시 단위 11개, 삭제 직전 generation 경쟁·과거 프로젝트 intent·알림 경계 3개, pending handoff 1개를 실행했다. 추가로 복수 원인·미게시 작업물·WAITING→COMPLETE·독립 차단의 실제 삭제 경로 4개를 좁혀 검증했다. 실패한 두 실행은 각각 새 checkpoint fixture 필수 인자 누락과 프로젝트 fixture tree 불일치였으며 교정 뒤 동일 명령으로 통과했다. 최초 34개 준비/삭제 실행의 재실행도 통과했다. 전체 verify와 Windows/실제 Git 실행 성공을 주장하지 않는다. 후속 결과 검증에서 최종 보고의 FAILED_COMMAND와 RERUN 사이에 본래 실패 결과를 빠뜨린 형식 오류를 확인했다. 원본 targeted JSONL의 76개 test ID를 시각순으로 대조해 두 과거 오류 모두 최신 success임을 확인했고, 실패 결과를 명령 뒤·재실행 앞에 명시한 전체 보고를 실제 parse_worker_result가 수용함을 확인했다. 제품 코드나 검증 조건은 바꾸지 않았으며 이미 성공한 unit test는 반복하지 않았다.
+
+Manager 검증용 `tests/test_diagnostic_cleanup.py:DiagnosticCleanupGitTests`는 기존 격리 seed와 실제 orphan 자료를 사용해 단일 lease 삭제·삭제 직전 경쟁 거부·원래/base/사용자/다른 branch·tracking ref·로컬 원문 보존을 검사한다. Worker는 이 native 통합 회귀와 전체 verify를 실행하지 않았다. 새 파일·dependency·Requirement 변경은 없다.
 
 - [x] 2026-10-16 사용자 요청 “277은 권장 방향으로 적용해주고”에 따라 선택지 A 승인을 위 User Decision에 기록했다.
-- [ ] 승인 범위의 삭제·재개·보존 재사용 교정
-- [ ] targeted 검증과 제품·설계 정합성
+- [x] 승인 범위의 삭제·재개·보존 재사용 교정
+- [x] targeted 검증과 제품·설계 정합성 (전체 verify·native Git 통합 회귀·Review는 Manager 대기)
 
 ## Decision Log
 

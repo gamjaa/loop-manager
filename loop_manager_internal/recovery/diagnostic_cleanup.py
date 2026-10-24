@@ -1,8 +1,4 @@
-"""Read-only diagnostic eligibility observations; never delete or release work.
-
-Preparations are disposable observations bound to SQLite and external evidence.
-The eventual deletion boundary must repeat these checks and acquire its writer.
-"""
+"""Reobserve and retire resolved diagnostic refs without releasing work gates."""
 from dataclasses import dataclass
 import hashlib
 import json
@@ -14,7 +10,10 @@ from typing import Callable
 from loop_manager_internal.git.manager_git_journal import parse_remote_branch_oid
 from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
 from loop_manager_internal.recovery import diagnostic_preservation
-from loop_manager_internal.recovery.checkpoint_adapter import _frozen_push_target
+from loop_manager_internal.recovery.checkpoint_adapter import _frozen_push_target, delete_diagnostic_checkpoint
+from loop_manager_internal.recovery.blocked_checkpoint import CheckpointPushError
+from loop_manager_internal.runtime.resource_lock import resource_locks
+from loop_manager_internal.runtime.handoff_gate import _check_runtime_handoff, SelfMergeRuntimeHandoff
 from loop_manager_internal.recovery.scoped_blocking import project_cause_identity
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
@@ -41,13 +40,17 @@ def _snapshot(connection, repo, ref):
         return [dict(row) for row in connection.execute(f'SELECT * FROM {table} WHERE {where}', args)]
     uses = rows('diagnostic_ref_uses')
     preservations = rows('diagnostic_preservations')
+    for saved in preservations:
+        saved.pop('observed_order', None)  # Receipt display order is not new safety evidence.
     publications = rows('blocked_diagnostic_publications')
     owners = sorted({row['owner'] for row in uses + preservations} |
                     {row['plan_id'] for row in publications})
     project = connection.execute('SELECT origin, base_branch FROM projects WHERE repo=?', (repo,)).fetchone()
     state = dict(repo=repo, ref=ref, project=dict(project) if project else None,
                  uses=uses, preservations=preservations, publications=publications,
-                 plans=[], resolutions=[], blocks=[], checkpoints=[], reservations=[])
+                 plans=[], resolutions=[], blocks=[], checkpoints=[], reservations=[], blocked_checkpoints=[],
+                 branch_users=rows('exec_plans', 'repo=? AND branch=?', (repo, ref)),
+                 manual_users=rows('manual_work_groups', 'repo=? AND (branch=? OR source_branch=?)', (repo, ref, ref)))
     for owner in owners:
         plan = connection.execute('SELECT plan_id, branch, worktree, workspace_owned, publication_remote_oid '
             'FROM exec_plans WHERE repo=? AND plan_id=?', (repo, owner)).fetchone()
@@ -60,6 +63,7 @@ def _snapshot(connection, repo, ref):
             state['checkpoints'].extend(rows('execution_checkpoints', 'repo=? AND plan_id=?', (repo, owner)))
         state['blocks'].extend(rows('execplan_blocks', 'repo=? AND plan_id=?', (repo, owner)))
         state['reservations'].extend(rows('task_call_reservations', 'repo=? AND plan_id=?', (repo, owner)))
+        state['blocked_checkpoints'].extend(rows('blocked_checkpoints', 'repo=? AND plan_id=?', (repo, owner)))
     state['blocks'].extend(rows('project_blocks', 'repo=?', (repo,)))
     # Older exact-generation acceptances can already carry the released cause.
     # Never pair an arbitrary history entry with a later unrelated acceptance.
@@ -114,6 +118,11 @@ def _observe(effects, connection, state_dir, state):
         if (any(row['plan_id'] == owner for row in state['reservations'])
                 or not management_available(connection, repo, owner)):
             raise RuntimeError('진단 자료를 사용하는 실행이 진행 중입니다.')
+        if (any(row['plan_id'] == owner and row['operation'] is not None
+                for row in state['checkpoints'])
+                or any(row['plan_id'] == owner and row['phase'] not in {'published', 'unpublished'}
+                       for row in state['blocked_checkpoints'])):
+            raise RuntimeError('진단 자료를 사용하는 checkpoint가 진행 중입니다.')
         path = Path(worktree)
         effects.validate_execplan_workspace_identity(state_dir, repo,
             manual_workspace_owner(connection, repo, owner), branch, path)
@@ -172,6 +181,8 @@ def assess_ref(state, facts):
     """Pure decision: every recorded user must have complete matching evidence."""
     # ponytail: matching costs O(uses * causes); index by cause if histories grow.
     uses, ref, project = state['uses'], state['ref'], state['project']
+    if state['branch_users'] or state['manual_users']:
+        return '작업 또는 수동 입력 branch로 사용 중인 ref입니다.'
     if not uses or project is None or not project['origin']:
         return '게시 대상·원인 사용 근거가 부족합니다.'
     owners = {row['owner'] for row in uses}
@@ -276,3 +287,88 @@ def prepare_recorded(effects: 'CleanupEffects', connection, state_dir, repo):
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, sqlite3.Error):
             continue  # Keep the original work/diagnostic; retry at the next boundary.
     return results
+
+
+def _record_attempt(connection, state, facts, status, *, attempt=False, reason=None):
+    """Short CAS only; never hold SQLite across a remote observation or push."""
+    repo, ref, basis = state['repo'], state['ref'], _digest(state)
+    with runtime_state._transaction(connection):
+        if _snapshot(connection, repo, ref) != state:
+            raise RuntimeError('진단 삭제의 사용·generation·소유권 근거가 변경됐습니다.')
+        row = connection.execute('SELECT * FROM diagnostic_cleanup_attempts '
+            'WHERE repo=? AND ref=? AND basis=?', (repo, ref, basis)).fetchone()
+        payload = json.loads(row['payload']) if row else dict(state=state, facts=facts, events=[])
+        payload['events'].append(dict(status=status, reason=reason))
+        connection.execute('INSERT INTO diagnostic_cleanup_attempts VALUES (?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(repo, ref, basis) DO UPDATE SET status=excluded.status, '
+            'attempts=excluded.attempts, payload=excluded.payload',
+            (repo, ref, basis, state['uses'][0]['confirmed_oid'], status,
+             (row['attempts'] if row else 0) + int(attempt), json.dumps(payload, sort_keys=True)))
+
+
+def _cleanup_ref(effects, connection, state_dir, repo, ref):
+    state = _snapshot(connection, repo, ref)
+    resources = ['plan:' + row['plan_id'] for row in state['plans']] + ['diagnostic:' + ref]
+    with resource_locks(state_dir, repo, resources, owner='diagnostic-cleanup'):
+        state = _snapshot(connection, repo, ref)
+        # Changed ownership needs a new lock acquisition at the next boundary.
+        if any('plan:' + row['plan_id'] not in resources for row in state['plans']):
+            return
+        facts = _observe(effects, connection, state_dir, state)
+        reason = assess_ref(state, facts)
+        if reason is not None or _observe(effects, connection, state_dir, state) != facts:
+            return
+        row = connection.execute('SELECT * FROM diagnostic_cleanup_attempts '
+            'WHERE repo=? AND ref=? AND basis=?', (repo, ref, _digest(state))).fetchone()
+        # A completed intent must never remove a later recreation. A policy
+        # refusal or three transient attempts needs changed evidence, not a loop.
+        if row and row['status'] == 'complete':
+            return
+        if facts['remote_oid'] is None:
+            _record_attempt(connection, state, facts, 'absent')
+            _record_attempt(connection, state, facts, 'complete')
+            return
+        if row and (row['status'] == 'held' or row['attempts'] >= 3):
+            return
+        _record_attempt(connection, state, facts, 'intent', attempt=True)
+        try:
+            plan = state['plans'][0]
+            adapter = effects.adapter_factory(connection, Path(repo), state_dir, repo)
+            request = SimpleNamespace(repo=repo, worktree=plan['worktree'], branch=ref)
+            def revalidate():
+                _check_runtime_handoff()
+                if _observe(effects, connection, state_dir, state) != facts:
+                    raise RuntimeError('진단 삭제 직전 원격·자료·소유권 관측이 변경됐습니다.')
+                _record_attempt(connection, state, facts, 'intent')
+            delete_diagnostic_checkpoint(effects.git, adapter, request,
+                state['uses'][0]['confirmed_oid'],
+                target_digest=facts['owners'][plan['plan_id']]['target_digest'], revalidate=revalidate)
+            _record_attempt(connection, state, facts, 'pushed')
+            after = _observe(effects, connection, state_dir, state)
+            if after != dict(facts, remote_oid=None):
+                raise RuntimeError('삭제 후 현재 안전 조건 또는 원격 부재를 확인할 수 없습니다.')
+            _record_attempt(connection, state, facts, 'absent')
+            _record_attempt(connection, state, facts, 'complete')
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
+            _record_attempt(connection, state, facts,
+                'held' if isinstance(error, CheckpointPushError) and not error.retryable else 'unconfirmed',
+                reason=diagnostic_preservation.redact_detail(str(error)))
+
+
+def cleanup_recorded(effects: CleanupEffects, connection, state_dir, repo):
+    """One bounded attempt per recorded ready ref; failures never gate work."""
+    if connection.in_transaction or getattr(connection, '_depth', 0):
+        return  # Caller owns uncommitted work; never commit it to start cleanup.
+    try:
+        _check_runtime_handoff()
+    except SelfMergeRuntimeHandoff:
+        return
+    for prepared in prepare_recorded(effects, connection, state_dir, repo):
+        if prepared['ready']:
+            try:
+                _check_runtime_handoff()
+                _cleanup_ref(effects, connection, state_dir, repo, prepared['ref'])
+            except SelfMergeRuntimeHandoff:
+                return
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError, sqlite3.Error):
+                continue  # Durable intent and originals survive for the next run.

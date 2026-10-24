@@ -313,6 +313,26 @@ class PreservationTests(unittest.TestCase):
         self.assertEqual(store.latest_preservation('repo', 'plan', 'G-047'), first)
         self.push.assert_called_once()
 
+    def test_retired_cached_intent_is_local_only_and_new_cause_can_preserve(self):
+        first = self.preserve()
+        uses = [dict(row) for row in self.connection.execute('SELECT * FROM diagnostic_ref_uses')]
+        self.connection.execute('INSERT INTO diagnostic_cleanup_attempts VALUES (?, ?, ?, ?, ?, ?, ?)',
+            ('repo', first['branch'], 'basis', first['commit_oid'], 'complete', 1,
+             json.dumps(dict(state=dict(uses=uses), events=[]))))
+        self.connection.commit()
+        self.remote = None
+        calls = self.adapter.observe_remote.call_count
+        retired = self.preserve()
+        self.assertEqual(retired['result'], 'local_only')
+        self.assertEqual(retired['remote_state'], 'absent')
+        self.assertEqual(self.adapter.observe_remote.call_count, calls)
+        self.assertEqual(self.push.call_count, 1)
+        self.assertEqual(json.loads(self.connection.execute(
+            'SELECT payload FROM diagnostic_preservations').fetchone()[0]), first)
+        self.source = replace(self.source, cause_identity='new conflict')
+        self.assertEqual(self.preserve()['result'], 'published')
+        self.assertEqual(self.push.call_count, 2)
+
     def test_partial_artifacts_never_claim_complete_and_new_shape_gets_new_intent(self):
         self.manifest['omitted'] = {'secret.bin': 'credential content'}
         self.manifest['complete'] = False

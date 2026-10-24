@@ -914,6 +914,32 @@ class BlockedCheckpointAdapter(CheckpointSafetyAdapter, CheckpointPublicationAda
         self.project_recovery_scope = project_recovery_scope
 
 
+def delete_diagnostic_checkpoint(git, adapter, request, expected_oid, *, target_digest, revalidate):
+    """Delete only a pinned diagnostic ref at the freshly validated destination.
+
+    The caller owns the ref lock and durable cleanup intent. This effect does
+    not turn a successful push into a confirmed absence or a journal transition.
+    """
+    if (not request.branch or not request.branch.startswith('loop-manager/diagnostics/')
+            or not isinstance(expected_oid, str)
+            or re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', expected_oid) is None):
+        raise RuntimeError('진단 삭제 ref 또는 저장된 게시 OID가 유효하지 않습니다.')
+    origin = adapter._validated_push_url(request)
+    if hashlib.sha256(origin.encode()).hexdigest() != target_digest:
+        raise RuntimeError('진단 삭제의 관측 후 게시 대상이 변경됐습니다.')
+    revalidate()
+    options, operand = _frozen_push_target(origin)
+    pushed = git(Path(request.worktree), '-c', f'core.hooksPath={os.devnull}',
+        *options, 'push', manager_git_journal.exact_branch_lease(request.branch, expected_oid),
+        operand, f':refs/heads/{request.branch}', check=False)
+    if pushed.returncode:
+        detail = pushed.stdout[-8000:]
+        raise blocked_checkpoint.CheckpointPushError('진단 ref 삭제 실패: ' + detail,
+            retryable=blocked_checkpoint.push_failure_retryable(detail)
+                and not any(marker in detail.casefold() for marker in (
+                    'stale info', 'fetch first', 'hook declined', 'remote rejected')))
+
+
 def push_diagnostic_checkpoint(effects: PushDiagnosticCheckpointEffects, adapter, request, head):
     """Create an exact absent ref; never update original or tracking refs."""
     if not request.branch or not request.branch.startswith('loop-manager/diagnostics/'):

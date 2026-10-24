@@ -86,6 +86,31 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
             operand, 'a' * 40 + ':refs/heads/loop-manager/diagnostics/G-107/artifact'))
         self.assertNotIn('origin', git.call_args.args)
 
+    def test_diagnostic_delete_uses_exact_lease_frozen_url_and_disables_hooks(self):
+        from loop_manager_internal.recovery.checkpoint_adapter import delete_diagnostic_checkpoint
+        request = SimpleNamespace(branch='loop-manager/diagnostics/G-107/artifact', worktree='/state/G-107')
+        adapter = mock.Mock()
+        url = 'https://github.com/example/repo.git'
+        adapter._validated_push_url.return_value = url
+        git, revalidate = mock.Mock(return_value=SimpleNamespace(returncode=0)), mock.Mock()
+        delete_diagnostic_checkpoint(git, adapter, request, 'a' * 40,
+            target_digest=hashlib.sha256(url.encode()).hexdigest(), revalidate=revalidate)
+        revalidate.assert_called_once_with()
+        args = git.call_args.args
+        operand = args[-2]
+        self.assertEqual(args, (Path(request.worktree), '-c', f'core.hooksPath={os.devnull}',
+            '-c', f'url.{url}.insteadOf={operand}', '-c', f'url.{url}.pushInsteadOf={operand}',
+            'push', '--force-with-lease=refs/heads/' + request.branch + ':' + 'a' * 40,
+            operand, ':refs/heads/' + request.branch))
+        git.reset_mock()
+        with self.assertRaises(RuntimeError):
+            delete_diagnostic_checkpoint(git, adapter, request, 'a' * 40,
+                target_digest='changed destination', revalidate=revalidate)
+        with self.assertRaises(RuntimeError):
+            delete_diagnostic_checkpoint(git, adapter, SimpleNamespace(branch='main'), 'a' * 40,
+                target_digest=hashlib.sha256(url.encode()).hexdigest(), revalidate=revalidate)
+        git.assert_not_called()
+
     def test_diagnostic_never_pushes_an_original_branch_or_unverified_origin(self):
         adapter = mock.Mock()
         with mock.patch.object(loop_manager, 'git') as git:
