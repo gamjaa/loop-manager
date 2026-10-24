@@ -143,7 +143,7 @@ python loop_manager.py manual submit /path/to/my-project \
 
 Manager가 완성된 G를 생성하고 별도 소유 branch에 source 이력과 함께 보존한다. 복수 G는 같은 최종 후보·PR을 공유하므로 내부 선행 Merge가 필요한 묶음은 분리 제출한다. 이후 수정은 안내된 소유 branch로 push한다. 최초 source의 새 변경은 같은 source·R 범위로 `submit`을 다시 실행해야 반영된다.
 
-`complete`·`submit`은 기본적으로 전체 verify와 읽기 전용 Review를 수행하고 실패하면 자동 교정·재검증한다. 외부 검증을 생략 근거로 쓰려면 해당 단계의 `--skip-verify`·`--skip-review`, 원격 commit의 전체 SHA인 `--expected-head`, `--skip-reason`을 함께 제공한다. 생략은 `SKIPPED_BY_USER`로 기록해 PASS와 구분한다. SHA·base·G/R·환경 또는 관련 단계 입력이 달라지면 기본 검증을 다시 실행한다. `submit`의 G 생성 commit도 SHA를 바꾸므로 source SHA의 생략 승인은 무효화된다.
+`complete`·`submit`은 기본적으로 전체 verify와 읽기 전용 Review를 수행하고 실패하면 자동 교정·재검증한다. 외부 검증을 생략하려면 해당 단계에 대응하는 `--skip-verify` 또는 `--skip-review`와 원격 commit 전체 SHA인 `--expected-head`를 제공한다. `--skip-reason`은 선택 입력이며, 생략·빈 문자열·공백은 감사·Reviewer·PR 설명에 `사유 미입력`으로 표시되고 입력한 사유는 `제공 사유`로 표시된다. 생략 옵션 없는 사유만의 지정은 거부한다. 생략은 `SKIPPED_BY_USER`로 기록해 PASS와 구분한다. SHA·base·G/R·환경 또는 관련 단계 입력이 달라지면 기본 검증을 다시 실행한다. `submit`의 G 생성 commit도 SHA를 바꾸므로 source SHA의 생략 승인은 무효화된다.
 
 | 종료 코드 | 의미 |
 |---|---|

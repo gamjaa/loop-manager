@@ -641,7 +641,7 @@ submit의 복수 G는 같은 최종 후보와 PR을 공유한다. 묶음 안에�
 
 반복 submit은 저장 후보와 생성 당시 원격 기준을 함께 보존한다. 같은 후보의 게시 또는 후속 이력이 확인된 뒤 재중단돼도 같은 요청·전체 G의 결과를 push 없이 확정한다. 확인한 게시 후보가 원격 재작성으로 제거되면 새 후보로 대체 게시하지 않고 이유와 작업물을 보존한다.
 
-complete/submit에서 검증을 생략하려면 해당 단계의 `--skip-verify`·`--skip-review`와 원격 commit 전체 SHA인 `--expected-head`, 비어 있지 않은 `--skip-reason`을 함께 지정한다. 수락 시 원격 HEAD가 다르면 거부한다. 생략은 `SKIPPED_BY_USER`로 기록해 실제 PASS와 구분하며, 같은 후보·단계의 실제 실패를 생략 옵션으로 지우거나 성공으로 바꾸지 않는다.
+complete/submit에서 검증을 생략하려면 해당 단계에 대응하는 `--skip-verify` 또는 `--skip-review`와 원격 commit 전체 SHA인 `--expected-head`를 지정한다. `--skip-reason`은 선택 입력이며, 생략·빈 문자열·공백은 감사·Reviewer·PR 설명에 `사유 미입력`으로 표시한다. 입력한 사유는 감사에 보존하고 후속 표시에서 `제공 사유`로 구분한다. 생략 옵션 없이 사유만 지정하면 거부하며, 수락 시 원격 HEAD가 다르면 계속 거부한다. 생략은 `SKIPPED_BY_USER`로 기록해 실제 PASS와 구분하며, 같은 후보·단계의 실제 실패를 생략 옵션으로 지우거나 성공으로 바꾸지 않는다.
 
 complete/submit의 verify와 Review 생략 근거는 후보·base·환경·현재 runtime 지침과 각 단계의 실제 운영 입력에 결합한다. verify 입력은 설정된 timeout·parallelism을 포함하고, Review 입력은 Reviewer provider·Model·Effort와 현재 verify 근거를 포함한다. 수락, 단계 실행, 최종 게시와 PR 대기 재평가는 같은 기준을 다시 관측한다.
 
