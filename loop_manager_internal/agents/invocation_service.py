@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
-from loop_manager_internal.storage.db_access import DatabaseWaitTimeout, open_connection
+from loop_manager_internal.storage.db_access import CoordinatedConnection, DatabaseWaitTimeout, open_connection
 import sqlite3
 import subprocess
 import time
@@ -35,6 +35,14 @@ class InvocationEffects:
     capture_git_snapshot: Callable[[Path], GitSnapshot]
     git: Callable[..., object]
     agent_provider: Callable[[str], AgentProvider]
+
+
+def _database_request(connection, operation):
+    """Replay only DB preparation, never a provider or caller callback."""
+    if isinstance(connection, CoordinatedConnection):
+        return connection.run_request(lambda current: operation())
+    # Repository methods retain transaction ownership on the public sqlite3 port.
+    return operation()
 
 
 @scheduled_call("agent")
@@ -68,14 +76,16 @@ def run_agent(
         if connection is None:
             state_dir.mkdir(parents=True, exist_ok=True)
             owned_connection = open_connection(state_dir / "loop-manager.db", timeout=5)
-        guidance_repository = GuidanceRepository(connection or owned_connection)
-        guidance_context = common_guidance.independent_context(
-            guidance_repository.connection, guidance_context, worktree,
-        )
+        guidance_connection = connection if connection is not None else owned_connection
+        guidance_repository = _database_request(
+            guidance_connection, lambda: GuidanceRepository(guidance_connection))
+        guidance_context = _database_request(guidance_connection, lambda: common_guidance.independent_context(
+            guidance_connection, guidance_context, worktree))
         guidance = common_guidance.resolve(
             guidance_repository, guidance_context, role_name, worktree, state_dir,
         )
-        session_task = (guidance_repository.session_task(guidance_context.repo, provider, session_id)
+        session_task = (_database_request(guidance_connection, lambda: guidance_repository.session_task(
+            guidance_context.repo, provider, session_id))
                         if session_id else None)
         if session_task is not None and session_task != guidance.task_id:
             raise common_guidance.GuidanceError("Agent session과 공통 지침 작업 identity가 다릅니다.")
@@ -116,16 +126,24 @@ def run_agent(
     execution_started = False
     execution_started_at: float | None = None
     scope_id = None
-    if connection is not None and invocation is not None:
-        try:
-            scope_id = ledger.invocation_scope_id(invocation.repo, role_name, str(worktree))
-        except (sqlite3.Error, KeyError, IndexError, TypeError, ValueError, RuntimeError):
-            pass  # Legacy/minimal records cannot grant reduced monitoring.
     if ledger is not None and invocation is not None and resolved is not None:
+        def prepare_invocation():
+            nonlocal scope_id
+            # Re-read the current scope on every rolled-back preparation attempt.
+            scope_id = None
+            try:
+                scope_id = ledger.invocation_scope_id(invocation.repo, role_name, str(worktree))
+            except DatabaseWaitTimeout:
+                raise
+            except (sqlite3.Error, KeyError, IndexError, TypeError, ValueError, RuntimeError):
+                pass  # Legacy/minimal records cannot grant reduced monitoring.
+            prepared_identity = effects.start_invocation(
+                ledger, invocation, role_name, provider, resolved, session_id, scope_id=scope_id)
+            ledger.bind_guidance(prepared_identity, guidance.task_id, guidance.content_hash)
+            return prepared_identity
+
         try:
-            identity = effects.start_invocation(ledger, invocation, role_name, provider,
-                                        resolved, session_id, scope_id=scope_id)
-            ledger.bind_guidance(identity, guidance.task_id, guidance.content_hash)
+            identity = _database_request(connection, prepare_invocation)
             collection_status = "pending"
         except DatabaseWaitTimeout:
             raise
@@ -155,7 +173,7 @@ def run_agent(
                 "Agent 격리 증거를 저장할 invocation 상태가 없습니다."
             )
         try:
-            ledger.record_isolation(identity, evidence)
+            _database_request(connection, lambda: ledger.record_isolation(identity, evidence))
         except DatabaseWaitTimeout:
             raise
         except sqlite3.Error as error:
@@ -167,7 +185,7 @@ def run_agent(
         if ledger is None or identity is None:
             raise agent_write_isolation.IsolationError('Agent 실제 실행 입력을 저장할 invocation이 없습니다.')
         try:
-            ledger.record_execution_identity(identity, value)
+            _database_request(connection, lambda: ledger.record_execution_identity(identity, value))
         except DatabaseWaitTimeout:
             raise
         except (sqlite3.Error, ValueError) as error:

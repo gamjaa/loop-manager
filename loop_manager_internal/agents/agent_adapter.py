@@ -70,11 +70,11 @@ def _start_agent_invocation(
     scope_id: str | None,
 ) -> str:
     gate = _runtime_handoff_signal.get()
-    if gate is None:
-        return ledger.start(invocation, role_name, provider, profile, session_id, scope_id=scope_id)
-    with gate.launch_lock:
+    if gate is not None:
+        # This is DB preparation, not process creation. Do not invert the DB
+        # request/launch lock order; the physical spawn still uses gate.popen.
         gate.check()
-        return ledger.start(invocation, role_name, provider, profile, session_id, scope_id=scope_id)
+    return ledger.start(invocation, role_name, provider, profile, session_id, scope_id=scope_id)
 
 
 @dataclass(frozen=True)

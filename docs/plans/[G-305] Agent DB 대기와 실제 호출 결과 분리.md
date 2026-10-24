@@ -48,6 +48,13 @@ Agent의 지침·session·격리/실행 identity·호출 기록 저장에서 DB 
 - [ ] 필수 준비·callback·종료 저장의 DB 요청 재시도와 물리 결과의 비중복 확정/재개
 - [ ] 최소 targeted 회귀와 중단 뒤 비중복 확정 검증
 
+### 준비 단계 중간 보존점
+
+- guidance 저장소 초기화·독립 작업 identity·기존 session 귀속 조회, invocation 생성/지침 결합, 격리·실행 identity 저장을 `CoordinatedConnection.run_request()`에 연결했다. 지침 파일 생성과 provider 실행·사용자 callback은 재시도 본문에 넣지 않았다. invocation 생성과 지침 결합은 같은 요청에서 rollback하며 소유 scope를 매번 다시 읽는다. 일반 sqlite3 연결은 기존 repository transaction 동작을 유지한다.
+- invocation 준비는 물리 프로세스 생성이 아니므로 `_start_agent_invocation()`에서 launch lock을 잡지 않고 handoff 확인만 수행한다. DB 요청에서 launch lock을 기다리는 순서 역전을 피하며 실제 subprocess 시작의 `gate.popen()` 경계는 유지한다.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest`에 `tests.test_agent_invocation.RunnerTests.` 아래 `test_invocation_preparation_retries_atomically_or_leaves_provider_unstarted`, `test_prelaunch_evidence_db_retry_does_not_replay_provider`, `test_guidance_database_wait_does_not_start_or_reclassify_provider`, `test_session_db_wait_keeps_completed_result_and_recoverable_binding`, `test_ledger_failure_does_not_change_agent_success`, `test_auxiliary_collection_error_keeps_success_and_usage_in_ledger`를 전달해 6개 모두 통과했다. launch lock 수정과 해당 assertion 추가 후 앞의 신규 두 case를 같은 runner로 실행해 2개 모두 통과했다. SQLite BUSY/LOCKED 주입은 실제 coordinated 요청의 rollback/retry를 사용하며 실제 Agent CLI는 호출하지 않았다. 전체 verify는 실행하지 않았다.
+- 아직 완료 후보가 아니다. launch/targeted 결합, 시작·종료 callback, session 및 ledger 종료 저장의 대기 보존·재시작 복구, 물리 호출을 반복하지 않는 같은 실행 재배정과 PRODUCT·ARCHITECTURE 정합화가 남아 있다. 이번 checkpoint의 준비 단계 결과로 실제 호출 결과의 영속 복구나 전체 Acceptance Criteria 충족을 주장하지 않는다.
+
 ## Decision Log
 
 - 이번 R-091 delta에서 요청 한도 소진을 다음 외부 실행 전용 pause로 고정하지 않는다. 같은 실행의 저장 재개에서도 실제 provider 결과·호출 identity·필수 증거 gate를 보존하며 기존 G-303 dependency와 독립된 DB 확정 목표를 유지한다. 대기열·단계 실패 정책은 G-297/G-313의 책임이며 새 순환 dependency를 만들지 않는다. 구현·테스트는 실행하지 않았다.

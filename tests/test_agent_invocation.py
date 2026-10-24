@@ -189,6 +189,115 @@ class RunnerTests(TestCase):
         provider.assert_not_called()
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 0)
 
+    def test_invocation_preparation_retries_atomically_or_leaves_provider_unstarted(self):
+        import threading
+        from loop_manager_internal.storage.db_access import open_connection, DatabaseWaitTimeout
+        from loop_manager_internal.runtime.handoff_gate import (
+            RuntimeHandoffGate, SelfMergeRuntimeHandoff, _runtime_handoff_signal,
+        )
+        gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
+        token = _runtime_handoff_signal.set(gate)
+        self.addCleanup(_runtime_handoff_signal.reset, token)
+        start = state.InvocationRepository.start
+        def start_without_launch_lock(repository, *args, **kwargs):
+            self.assertFalse(gate.launch_lock.locked())
+            self.assertTrue(repository.connection._request_running)
+            return start(repository, *args, **kwargs)
+
+        for stop in (None, DatabaseWaitTimeout('budget exhausted'), SelfMergeRuntimeHandoff()):
+            with self.subTest(stop=type(stop).__name__):
+                connection = open_connection(self.state_dir / (type(stop).__name__ + '.db'))
+                self.addCleanup(connection.close)
+                connection.row_factory = sqlite3.Row
+                with connection:
+                    state.ensure_schema(connection)
+                provider = mock.Mock()
+                provider.run.return_value = manager.AgentResult(0, 'actual result')
+                bind = state.InvocationRepository.bind_guidance
+                attempts = []
+
+                def busy_after_binding(repository, *args):
+                    bind(repository, *args)
+                    attempts.append(args[0])
+                    if len(attempts) == 1:
+                        error = sqlite3.OperationalError('database is locked')
+                        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                        def locked():
+                            raise error
+                        connection._call(locked)
+
+                with mock.patch.object(state.InvocationRepository, 'bind_guidance', busy_after_binding), \
+                     mock.patch.object(state.InvocationRepository, 'start', start_without_launch_lock), \
+                     mock.patch.object(state.InvocationRepository, 'invocation_scope_id', return_value=None) as scope, \
+                     mock.patch.object(manager, 'agent_provider', return_value=provider), \
+                     mock.patch('loop_manager_internal.storage.db_access._pause', side_effect=stop):
+                    def run():
+                        return manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                            'planner', 'prompt', read_only=True, connection=connection,
+                            invocation=invocation.InvocationContext('repo', None),
+                            resolved_profile=invocation.ResolvedProfile('model', 'high'))
+                    if stop is None:
+                        self.assertEqual(run().message, 'actual result')
+                        self.assertEqual((len(attempts), scope.call_count, provider.run.call_count), (2, 2, 1))
+                        rows = connection.execute('SELECT invocation_id, guidance_task_id FROM agent_invocations').fetchall()
+                        self.assertEqual(len(rows), 1)
+                        self.assertEqual(rows[0][0], attempts[-1])
+                        self.assertTrue(rows[0][1])
+                    else:
+                        with self.assertRaises(type(stop)):
+                            run()
+                        provider.run.assert_not_called()
+                        self.assertEqual(connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 0)
+                self.assertFalse(connection.in_transaction)
+                self.assertFalse(connection._held)
+
+    def test_prelaunch_evidence_db_retry_does_not_replay_provider(self):
+        from loop_manager_internal.storage.db_access import open_connection
+        from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
+        connection = open_connection(self.state_dir / 'evidence.db')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        with connection:
+            state.ensure_schema(connection)
+        evidence = IsolationEvidence('codex', 'version', 'environment', 'planner', '/worktree',
+                                     'repo', 'a' * 64, 'verified', snapshot_digest='b' * 64,
+                                     configuration_digest='c' * 64)
+        value = dict(provider='codex', model='model', effort='high', instruction='a' * 64,
+                     environment='b' * 64, policy='c' * 64)
+        provider_calls = []
+        class Provider:
+            def run(_, request):
+                provider_calls.append(request)
+                request.on_isolation_checked(evidence)
+                request.on_execution_identity(value)
+                request.on_process_started()
+                request.on_process_finished()
+                return manager.AgentResult(0, 'done')
+
+        execute = connection.execute
+        failures = []
+        def busy_once(sql, parameters=()):
+            result = execute(sql, parameters)
+            for marker in ('INSERT INTO agent_isolation_evidence', 'SET execution_identity=?'):
+                if marker in sql and marker not in failures:
+                    failures.append(marker)
+                    error = sqlite3.OperationalError('database is locked')
+                    error.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+                    def locked():
+                        raise error
+                    connection._call(locked)
+            return result
+        with mock.patch.object(connection, 'execute', side_effect=busy_once), \
+             mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'planner', 'prompt', read_only=True, connection=connection,
+                invocation=invocation.InvocationContext('repo', None),
+                resolved_profile=invocation.ResolvedProfile('model', 'high'))
+        self.assertEqual((result.code, len(provider_calls), len(failures)), (0, 1, 2))
+        row = connection.execute('SELECT execution_identity, execution_status FROM agent_invocations').fetchone()
+        self.assertEqual((json.loads(row[0]), row[1]), (value, 'executed'))
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM agent_isolation_evidence').fetchone()[0], 1)
+
     def test_log_start_follows_process_callback_and_preserves_each_attempt(self):
         from loop_manager_internal.runtime import operation_events as events
         from loop_manager_internal.agents.provider_adapters import _provider_log_path
