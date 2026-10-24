@@ -288,9 +288,9 @@ def run_agent_with_retries(
             )
 
         if result.code:
-            result = replace(
-                result, message=execution_path.append_path_recovery_hint(result.message),
-            )
+            message = execution_path.append_path_recovery_hint(result.message)
+            if message != result.message:
+                result = replace(result, message=message)
         if result.session_id:
             active_session_id = result.session_id
         if result.result_kind is AgentResultKind.SUCCESS:
