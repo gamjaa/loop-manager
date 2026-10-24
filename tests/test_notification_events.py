@@ -1108,6 +1108,23 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             )
             self.assertNotEqual(latin_one[1], latin_two[1])
 
+            # A repeated block inserted before g must not rename g's candidate.
+            git('checkout', 'main')
+            branches.write_text(
+                'def h():\n    before()\n    value = 0\n    after()\n\n'
+                + branches.read_text(encoding='utf-8'), encoding='utf-8',
+            )
+            git('commit', '-am', 'upstream adds identical context before g')
+            repeated_base = git('rev-parse', 'HEAD').stdout.strip()
+            git('checkout', 'candidate-second-function')
+            git('rebase', 'main')
+            repeated_head = git('rev-parse', 'HEAD').stdout.strip()
+            repeated_proof = handler._pr_review_candidate_proof(
+                context, {'validated_base_sha': repeated_base}, repeated_head,
+            )
+            self.assertNotEqual(else_branch[0], repeated_proof[0])
+            self.assertEqual(else_branch[1], repeated_proof[1])
+
             connection = self.connection()
             first = self.prepare_pr_candidate(
                 connection, repo=project_repo, base=base_before, head=head_before,
@@ -1182,6 +1199,17 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(len([row for row in self.events(connection)
                                   if row['event_type'] == 'pr_created']), 7)
             self.assertEqual(sent.call_count, 7)
+            self.prepare_pr_candidate(
+                connection, repo=project_repo, base=repeated_base, head=repeated_head,
+                review_input_identity=repeated_proof[1],
+            )
+            with connection:
+                notifications.enqueue_current_project_events(connection, project_repo)
+            self.assertEqual(notifications.dispatch_pending(
+                connection, 'token', 'chat', adapter=sent,
+            ), 0)
+            self.assertEqual(sent.call_count, 7)
+
 
     def test_planning_result_only_notifies_after_catalog_publication(self):
         from types import SimpleNamespace
