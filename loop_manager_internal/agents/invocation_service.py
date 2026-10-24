@@ -3,7 +3,7 @@ from __future__ import annotations
 from loop_manager_internal.runtime import operation_events as events
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 from pathlib import Path
 from loop_manager_internal.storage.db_access import CoordinatedConnection, DatabaseWaitTimeout, open_connection
@@ -150,15 +150,36 @@ def run_agent(
         except sqlite3.Error:
             collection_status = "error"
 
+    observations = {}
+    def remember(**facts):
+        nonlocal collection_status
+        observations.update(facts)
+        if prepared_launch is not None and identity is not None:
+            from .process_receipt import observe
+            try:
+                observe(prepared_launch, identity, observations)
+            except (OSError, ValueError, TypeError) as error:
+                collection_status = 'error'
+                events.emit('Agent 호출 관측 근거 보존 실패', level='WARN', invocation_id=identity,
+                            error_type=type(error).__name__)
+
+    def remember_outcome(kind, code, result_session, usage):
+        remember(outcome=dict(kind=kind, code=code, session_id=result_session, usage=asdict(usage),
+                              duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                              collection_status='error' if collection_status == 'error' else usage.status,
+                              observed_at=agent_invocation_state.utc_now()))
+
     def observe_session(started_session_id: str) -> None:
         nonlocal collection_status
+        remember(session_id=started_session_id)
         try:
-            guidance_repository.bind_session(guidance_context.repo, provider, started_session_id, guidance.task_id)
+            _database_request(guidance_connection, lambda: guidance_repository.bind_session(
+                guidance_context.repo, provider, started_session_id, guidance.task_id))
         except DatabaseWaitTimeout:
             collection_status = 'error'
         if ledger is not None and identity is not None:
             try:
-                ledger.observe_session(identity, started_session_id)
+                _database_request(connection, lambda: ledger.observe_session(identity, started_session_id))
             except sqlite3.Error:
                 collection_status = "error"
         if on_session_started is not None:
@@ -218,8 +239,11 @@ def run_agent(
 
     def observe_cli_process_started() -> None:
         nonlocal execution_started, execution_started_at, collection_status
+        if execution_started:
+            return
         execution_started = True
         execution_started_at = time.monotonic()
+        remember(started_at=agent_invocation_state.utc_now())
         events.emit("Agent 실제 실행 시작", invocation_id=identity,
                     provider=provider, model=resolved.model if resolved else None,
                     effort=resolved.effort if resolved else None,
@@ -228,7 +252,8 @@ def run_agent(
                     session_transition=invocation.transition if invocation else None)
         if ledger is not None and identity is not None:
             try:
-                ledger.mark_execution_started(identity)
+                _database_request(connection, lambda: ledger.mark_execution_started(
+                    identity, observed_at=observations['started_at']))
             except sqlite3.Error:
                 collection_status = "error"
         if notify_process_start:
@@ -238,10 +263,11 @@ def run_agent(
         nonlocal collection_status
         if ledger is None or identity is None or execution_started_at is None:
             return
+        if 'finished_at' not in observations:
+            remember(finished_at=agent_invocation_state.utc_now(),
+                     duration_ms=max(0, int((time.monotonic() - execution_started_at) * 1000)))
         try:
-            ledger.mark_execution_finished(
-                identity, max(0, int((time.monotonic() - execution_started_at) * 1000)),
-            )
+            _database_request(connection, lambda: ledger.apply_observation(identity, observations))
         except sqlite3.Error:
             collection_status = "error"
 
@@ -339,10 +365,11 @@ def run_agent(
                 raw = AgentResult(1, f"공통 지침 provider 준비 실패: {error}", session_id,
                                   AgentResultKind.PERMANENT_CONFIGURATION)
             completed = _coerce_agent_result(raw, session_id)
+            remember_outcome(completed.ledger_kind, completed.code, completed.session_id, completed.usage)
             if completed.session_id:
                 try:
-                    guidance_repository.bind_session(guidance_context.repo, provider,
-                                                     completed.session_id, guidance.task_id)
+                    _database_request(guidance_connection, lambda: guidance_repository.bind_session(
+                        guidance_context.repo, provider, completed.session_id, guidance.task_id))
                 except sqlite3.Error as error:
                     collection_status = 'error'
                     events.emit('Agent 실제 결과 보존; session 저장 대기', level='WARN',
@@ -356,13 +383,15 @@ def run_agent(
                     "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else
                     "timeout" if isinstance(error, subprocess.TimeoutExpired) else
                     "transient_failure" if isinstance(error, OSError) else "exception")
+            if completed is None:
+                remember_outcome(kind, None, observations.get('session_id', session_id), Usage())
+            else:
+                remember(outcome={**observations['outcome'], 'collection_status': 'error'})
             try:
-                ledger.finish(identity, kind, None,
-                              max(0, int((time.monotonic() - started) * 1000)),
-                              None, Usage(),
-                              execution_status="executed" if execution_started else "not_executed")
-            except sqlite3.Error:
-                pass
+                _database_request(connection, lambda: ledger.apply_observation(identity, observations))
+            except BaseException as storage_error:
+                events.emit('Agent 원래 예외 보존; 호출 종료 저장 대기', level='WARN', invocation_id=identity,
+                            error_type=type(storage_error).__name__, original_error_type=type(error).__name__)
         raise
     finally:
         if role_name == 'worker' and connection is not None and invocation is not None and invocation.plan_id:
@@ -400,17 +429,18 @@ def run_agent(
     if result.collection_status == "error":
         collection_status = "error"
     if ledger is not None and identity is not None:
+        if 'outcome' not in observations:
+            remember_outcome(result.ledger_kind, result.code, result.session_id, result.usage)
+        remember(outcome={**observations['outcome'],
+                          'collection_status': 'error' if collection_status == 'error' else result.usage.status})
         try:
-            ledger.finish(identity, result.ledger_kind, result.code,
-                          max(0, int((time.monotonic() - started) * 1000)),
-                          result.session_id, result.usage,
-                          "error" if collection_status == "error" else None,
-                          replace_session=True,
-                          execution_status="executed" if execution_started else "not_executed")
+            _database_request(connection, lambda: ledger.apply_observation(identity, observations))
             if collection_status != "error":
                 collection_status = result.usage.status
-        except sqlite3.Error:
+        except sqlite3.Error as error:
             collection_status = "error"
+            events.emit('Agent 실제 결과 보존; 호출 종료 저장 대기', level='WARN', invocation_id=identity,
+                        error_type=type(error).__name__)
     events.emit("Agent 호출 결과 관측", level="WARN" if result.code or collection_status == "error" else "INFO",
                 invocation_id=identity, result=result.ledger_kind, result_code=result.code,
                 execution_status="executed" if execution_started else "not_executed",

@@ -176,6 +176,118 @@ class RunnerTests(TestCase):
         with self.assertRaises(RuntimeError):
             repository.bind_session('repo', 'codex', 'completed-session', 'another-task')
 
+    def test_receipt_recovers_observed_result_and_exception_after_all_callback_storage_waits(self):
+        from loop_manager_internal.storage.db_access import open_connection, DatabaseWaitTimeout
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        from loop_manager_internal.agents import process_receipt
+        for mode in ('success', 'failure', 'exception'):
+            with self.subTest(mode=mode):
+                path = self.state_dir / (mode + '.db')
+                connection = open_connection(path)
+                self.addCleanup(connection.close)
+                connection.row_factory = sqlite3.Row
+                with connection:
+                    state.ensure_schema(connection)
+                launch = self.targeted_launch(mode)
+                original = OSError('original provider exception')
+                calls = []
+                class Provider:
+                    def run(_, request):
+                        calls.append(True)
+                        request.on_launch_prepared(launch)
+                        request.on_process_started()
+                        request.on_session_started('observed-session')
+                        request.on_process_finished()
+                        if mode == 'exception':
+                            raise original
+                        return manager.AgentResult(0 if mode == 'success' else 1, 'private actual text',
+                            'observed-session', usage=invocation.Usage(input_tokens=7))
+                callback = mock.Mock(side_effect=DatabaseWaitTimeout('caller DB wait'))
+                with mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+                     mock.patch.object(state.InvocationRepository, 'mark_execution_started', side_effect=DatabaseWaitTimeout('start wait')), \
+                     mock.patch.object(GuidanceRepository, 'bind_session', side_effect=DatabaseWaitTimeout('session wait')):
+                    def run():
+                        return manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                            'planner', 'private prompt', read_only=True, connection=connection,
+                            on_session_started=callback, invocation=invocation.InvocationContext('repo', None),
+                            resolved_profile=invocation.ResolvedProfile('model', 'high'))
+                    if mode == 'exception':
+                        with self.assertRaises(OSError) as raised:
+                            run()
+                        self.assertIs(raised.exception, original)
+                    else:
+                        result = run()
+                        self.assertEqual((result.message, result.usage.input_tokens), ('private actual text', 7))
+                callback.assert_called_once_with('observed-session')
+                row = connection.execute('SELECT * FROM agent_invocations').fetchone()
+                self.assertIsNone(row['finished_at'])
+                observed = process_receipt.observation(str(process_receipt.receipt_path(launch)), self.state_dir, row['invocation_id'])
+                self.assertNotIn('private', json.dumps(observed))
+                connection.close()
+                reopened = open_connection(path)
+                self.addCleanup(reopened.close)
+                reopened.row_factory = sqlite3.Row
+                repository = state.InvocationRepository(reopened)
+                self.assertEqual(repository.reconcile_interrupted(state_dir=self.state_dir), 0)
+                recovered = dict(reopened.execute('SELECT * FROM agent_invocations').fetchone())
+                expected_kind = {'success': 'success', 'failure': 'permanent_configuration', 'exception': 'transient_failure'}[mode]
+                self.assertEqual((recovered['result_kind'], recovered['session_id']), (expected_kind, 'observed-session'))
+                self.assertEqual((recovered['execution_started_at'], recovered['execution_finished_at']),
+                                 (observed['started_at'], observed['finished_at']))
+                self.assertEqual(recovered['input_tokens'], None if mode == 'exception' else 7)
+                self.assertEqual(GuidanceRepository(reopened).session_task('repo', 'codex', 'observed-session'), recovered['guidance_task_id'])
+                repository.reconcile_interrupted(state_dir=self.state_dir)
+                self.assertEqual(dict(reopened.execute('SELECT * FROM agent_invocations').fetchone()), recovered)
+                self.assertEqual(len(calls), 1)
+
+    def test_callback_database_requests_retry_without_replaying_the_session_callback(self):
+        from loop_manager_internal.storage.db_access import open_connection
+        connection = open_connection(self.state_dir / 'callbacks.db')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        with connection:
+            state.ensure_schema(connection)
+        launch = self.targeted_launch()
+        callback = mock.Mock()
+        calls = []
+        class Provider:
+            def run(_, request):
+                calls.append(True)
+                request.on_launch_prepared(launch)
+                request.on_process_started()
+                request.on_process_started()
+                request.on_session_started('session')
+                request.on_process_finished()
+                request.on_process_finished()
+                return manager.AgentResult(0, 'actual result', 'session')
+        failures = set()
+        execute = connection.execute
+        def busy_once(sql, parameters=()):
+            result = execute(sql, parameters)
+            for marker in ('execution_started_at = COALESCE', 'execution_finished_at = ?',
+                           'INSERT OR IGNORE INTO common_guidance_sessions'):
+                if marker in sql and marker not in failures:
+                    failures.add(marker)
+                    error = sqlite3.OperationalError('database is locked')
+                    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                    def locked():
+                        raise error
+                    connection._call(locked)
+            return result
+        with mock.patch.object(connection, 'execute', side_effect=busy_once), \
+             mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+             mock.patch('loop_manager_internal.agents.invocation_service.events.emit') as emitted:
+            result = manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'planner', 'prompt', read_only=True, connection=connection,
+                on_session_started=callback, invocation=invocation.InvocationContext('repo', None),
+                resolved_profile=invocation.ResolvedProfile('model', 'high'))
+        self.assertEqual((result.code, result.message, len(calls), len(failures)), (0, 'actual result', 1, 3))
+        callback.assert_called_once_with('session')
+        self.assertEqual(sum(call.args[0] == 'Agent 실제 실행 시작' for call in emitted.call_args_list), 1)
+        row = connection.execute('SELECT * FROM agent_invocations').fetchone()
+        self.assertEqual((row['session_id'], row['result_kind']), ('session', 'success'))
+        self.assertTrue(row['execution_finished_at'])
+
     def test_guidance_database_wait_does_not_start_or_reclassify_provider(self):
         from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
         from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
@@ -390,6 +502,20 @@ class RunnerTests(TestCase):
         self.assertIs(raised.exception, original)
         self.assertTrue(any(call.args[0] == 'Agent 미시작 근거 보존 실패'
                             and call.kwargs.get('error_type') == 'OSError' for call in emit.call_args_list))
+
+    def test_storage_handoff_does_not_replace_the_original_provider_exception(self):
+        from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
+        original = OSError('original provider exception')
+        provider = mock.Mock()
+        provider.run.side_effect = original
+        with mock.patch.object(manager, 'agent_provider', return_value=provider), \
+             mock.patch.object(state.InvocationRepository, 'apply_observation', side_effect=SelfMergeRuntimeHandoff()):
+            with self.assertRaises(OSError) as raised:
+                manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                    'planner', 'prompt', read_only=True, connection=self.connection,
+                    invocation=invocation.InvocationContext('repo', None),
+                    resolved_profile=invocation.ResolvedProfile('model', 'high'))
+        self.assertIs(raised.exception, original)
 
     def test_log_start_follows_process_callback_and_preserves_each_attempt(self):
         from loop_manager_internal.runtime import operation_events as events

@@ -184,19 +184,28 @@ def _confirmed(connection, row, state_dir):
 
 
 def confirmed(owner):
+    from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
     row=owner.connection.execute("SELECT * FROM task_call_reservations WHERE token=?",(owner.token,)).fetchone()
-    return row is not None and _confirmed(owner.connection,row,owner.state_dir)
+    pending = (InvocationRepository(owner.connection).reconcile_observations(
+        state_dir=owner.state_dir, invocation_id=row['invocation_id'])
+        if row is not None and row['invocation_id'] is not None else set())
+    return row is not None and row['invocation_id'] not in pending and _confirmed(owner.connection,row,owner.state_dir)
 
 
 def recover(connection, state_dir, *, tokens=None):
     """미시작 또는 기존 프로세스 종료 근거가 있는 자리만 회수한다."""
     from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
-    InvocationRepository(connection).reconcile_execution(state_dir=state_dir)
+    repository = InvocationRepository(connection)
     rows=connection.execute("SELECT * FROM task_call_reservations").fetchall()
     if tokens is not None:
         rows = [row for row in rows if row['token'] in tokens]
+    pending = set()
     for row in rows:
-        if _confirmed(connection,row,state_dir):
+        if row['kind'] == 'agent' and row['invocation_id'] is not None:
+            pending.update(repository.reconcile_observations(state_dir=state_dir, invocation_id=row['invocation_id']))
+    repository.reconcile_execution(state_dir=state_dir)
+    for row in rows:
+        if row['invocation_id'] not in pending and _confirmed(connection,row,state_dir):
             with connection:
                 connection.execute("DELETE FROM task_call_reservations WHERE token=?",(row["token"],))
     return tuple(row for row in connection.execute("SELECT * FROM task_call_reservations")

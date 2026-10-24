@@ -62,6 +62,23 @@ Agent의 지침·session·격리/실행 identity·호출 기록 저장에서 DB 
 - 이번 호출에서 공통 targeted runner로 다음 최소 case를 실행했다. `RunnerTests.test_launch_binding_wait_retries_db_only_and_preserves_proven_non_execution`은 예약 receipt·invocation receipt·targeted INSERT의 BUSY rollback과 해소/만료/handoff 9개 조합을 확인한다. `ProcessReceiptTest`의 신규 2개 case는 재시작의 미실행 복구와 기존 시작 근거 보존을 확인한다. 최초 3개 case 통과 후 예약 충돌 assertion과 targeted 소유권 회귀를 보강해 관련 6개 case를 통과했다. caller transaction 보존 추가 후 해당 case와 launch case 2개, 수집 모순 거부 추가 후 해당 case와 기존 재시작 회귀 2개, receipt 쓰기 실패의 원래 오류 보존 case 1개를 각각 통과했다. 실제 Agent·전체 verify·Windows native 검증은 실행하지 않았다.
 - 완료 후보가 아니다. 실제 시작 뒤 callback/session/ledger 종료 관측의 영속 보존·DB 확정 재개와 같은 실행 재배정, 독립 `on_targeted_prepared` 경로의 저장 대기, PRODUCT·ARCHITECTURE 계약 정합화가 남아 있다. 다음 작업은 관측 결과를 같은 invocation/receipt에 보존하고 선택적 수집 오류와 필수 후속 보류를 구별하는 경계다. provider 실행 재호출로 복구하지 않는다.
 
+### 실제 호출 관측 영속화 중간 보존점
+
+- `96db3fffd36ba40d88616d950657be6aedbc4be4`의 게시 확인 뒤 시작·종료·session callback과 정상/예외 종료의 DB 요청 재시도를 연결했다. 임의 `on_session_started` callback은 DB 요청 본문에 넣지 않는다. 반복 시작 callback은 첫 관측을 유지하며, 종료 시각·실행 시간·결과 시각은 DB 재시도 시각으로 바꾸지 않는다.
+- 기존 Manager 전용 process receipt의 `invocation_observation` version 1에 invocation ID, 관측 시작/종료 시각·실행 시간, session, 결과 종류·코드·관측 시각·사용량·수집 상태를 저장한다. prompt·결과 메시지·코드/문서 전문이나 새 ledger는 추가하지 않는다. 기존 프로세스 시작/종료 receipt 갱신은 이 필드를 보존한다. 경로·identity·필드·타입·사용량·시각을 검증하며 손상·다른 invocation 자료는 pending으로 남긴다.
+- `InvocationRepository.apply_observation()`은 같은 invocation의 ledger 확정만 수행한다. `reconcile_interrupted()`는 먼저 저장된 실제 관측을 반영해 원래 성공/실패/예외를 보존하고, 관측이 없을 때만 기존 interrupted 처리를 유지한다. DB 적용 대기·자료 오류가 있는 invocation은 interrupted로 덮지 않는다. 예약 확인/회수도 해당 invocation의 저장 재개를 먼저 수행하고 pending이면 예약을 유지한다. 기본 SQLite caller transaction에서도 관측 적용의 중간 commit 없이 rollback한다.
+- 실제 provider 결과를 확보한 뒤 session 저장에서 오류가 나면 이미 관측한 결과를 빈 예외 결과로 바꾸지 않는다. 원래 provider 예외를 처리하는 동안 저장이 handoff로 중단돼도 원래 예외와 저장 오류 종류를 함께 진단한다. session 결합과 ledger 종료가 모두 끊긴 경우, receipt의 실제 결과·사용량·시작/종료·session을 재개해 기존 완료 invocation 귀속 fallback으로 확인한다. 자료가 없는 과거 행은 채우지 않는다.
+- 공통 targeted runner로 신규 `RunnerTests.test_receipt_recovers_observed_result_and_exception_after_all_callback_storage_waits`(성공/실패/원래 예외 3개 재시작 조합), `test_callback_database_requests_retry_without_replaying_the_session_callback`(시작/session/종료 BUSY와 중복 callback), `test_storage_handoff_does_not_replace_the_original_provider_exception`, `ProcessReceiptTest.test_process_receipt_updates_preserve_the_invocation_observation`, `test_malformed_or_foreign_invocation_observation_preserves_pending_state_and_reservation`을 통과했다. 변경 경계에 맞춰 기존 session fallback·실행 시간·선택적 사용량 오류·receipt/caller transaction·미시작 모순·interrupted session 회귀를 함께 실행해 통과했다. scoped 예약 재수집과 중복 callback 보강 후 관련 최소 case를 재실행해 통과했다. 실제 CLI·전체 verify·Windows native 검증은 실행하지 않았다.
+- 신규 native caller rollback 회귀의 최초 실행은 fixture가 transaction을 시작하지 않아 1회 실패했다. 명시적 `BEGIN IMMEDIATE`로 caller transaction을 시작하도록 fixture를 교정하고 동일 assertion·명령으로 통과했다.
+
+  FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_invocation_state.InvocationRepositoryTests.test_observation_application_keeps_the_callers_atomic_rollback
+
+  RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_invocation_state.InvocationRepositoryTests.test_observation_application_keeps_the_callers_atomic_rollback
+
+  재실행 결과: 1개 통과, exit 0.
+
+- 아직 완료 후보가 아니다. 같은 실행의 요청 재배정에서 저장 완료 뒤 원래 역할 결과를 소비하는 연결과 결과 본문 근거 부족 시 provider를 재호출하지 않는 후속 보류, 직접 `on_targeted_prepared` 경계의 미시작 대기, PRODUCT·ARCHITECTURE 정합화가 남아 있다. 이번 receipt는 결과 본문을 새로 저장하지 않으므로 역할 응답을 그 metadata만으로 복원했다고 주장하지 않는다. 필요한 실제 원문은 기존 provider 자료에서만 확인하고 부족하면 후속 처리를 보류해야 한다.
+
 ## Decision Log
 
 - 이번 R-091 delta에서 요청 한도 소진을 다음 외부 실행 전용 pause로 고정하지 않는다. 같은 실행의 저장 재개에서도 실제 provider 결과·호출 identity·필수 증거 gate를 보존하며 기존 G-303 dependency와 독립된 DB 확정 목표를 유지한다. 대기열·단계 실패 정책은 G-297/G-313의 책임이며 새 순환 dependency를 만들지 않는다. 구현·테스트는 실행하지 않았다.
