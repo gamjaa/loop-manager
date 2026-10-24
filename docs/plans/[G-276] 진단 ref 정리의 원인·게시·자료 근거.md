@@ -40,6 +40,10 @@ priority: normal
 
 ## Progress
 
+Review의 `remote-identity-mismatch`를 교정했다. 실제 `managed_rebase_runtime.build_service`는 `Remote(repo, ...)`를 생성하므로 acceptance의 저장소 identity는 로컬 repo 키와 대조해야 한다. 해소 기록 저장과 준비 판정에서 origin 비교를 repo 비교로 바꾸고, 과거 checkpoint 해소의 origin은 연결된 게시 사용 기록에서 얻는다. 현재 등록 origin과 저장된 게시/해소 origin의 일치 검사는 유지한다. ARCHITECTURE에도 두 identity의 원본과 대조 책임을 명시했다.
+
+진단 fixture를 실제 acceptance 계약으로 고친 뒤 기존 COMPLETE 준비 case에서 해소 기록이 없는 실패를 재현했다. 수정 후 동일 명령이 1개 통과했으며 `tests.test_diagnostic_cleanup` 26개와 `tests.test_scope_block_revalidation.EvidenceFreeRebaseBlockTests.test_completed_scope_stage_result_adopts_after_restart_and_keeps_other_block` 1개도 통과했다(서로 다른 27개). COMPLETE·WAITING 후 COMPLETE·과거 generation 감사 경로가 로컬 repo identity로 준비되고 등록 origin이 보존됨을 확인했다. origin을 repository로 넣거나 다른 저장소 acceptance를 쓰면 저장/준비를 거부하는 회귀도 추가했다. 전체 verify는 수정 후 Manager 재실행 대상이며 Requirement·frontmatter는 변경하지 않았다. 아래는 이전 후보의 검증 이력이다.
+
 최신 관리 rebase의 HEAD `7fcbcbb818b0f1bdd3af42a40b028bad49cb02b6`와 base `4334a1e398ccb906163147885e034d55f9b066f4` 사이의 21개 파일 전체 diff, 현재 ExecPlan·R-083·PRODUCT·ARCHITECTURE를 다시 확인했다. 문서 설명의 의미는 유지하고 현재 patch hash로 최종 보고를 교정한다. 현재 후보에서 targeted runner로 cleanup module 25개, artifact recovery class 9개, compatibility export case·fixture import case·START scheduling case·launcher class 각 1개를 새로 실행해 총 38개가 통과했다. 제품 코드·Requirement·frontmatter는 변경하지 않았다. 전체 verify와 native 예제 통합은 Manager 경계에 남기며 아래 검증 기록은 이전 후보의 이력이다.
 
 Manager의 HEAD `1dd16b57cb39fe4da3c66eb07eee323d38e7dc25` 전체 verify 피드백 네 건을 교정했다. 새 compatibility export의 effect 타입 주석을 기존 문자열 계약에 맞추고, 두 진단 테스트가 공유하는 bundle fixture를 `tests/support/diagnostic.py`로 이동했다. START 재평가의 상태 전용 mock에는 실제 observation 계약의 빈 `files`를 명시했다. 기존 assertion·테스트·지원 경계는 유지했다.

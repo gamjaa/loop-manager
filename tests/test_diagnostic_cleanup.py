@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
-from loop_manager_internal.git.managed_rebase_validation import Remote
+from loop_manager_internal.git.managed_rebase_validation import Remote, fingerprint, valid_acceptance
 from loop_manager_internal.application.contracts import ProjectRunKind, ProjectRunResult
 from loop_manager_internal.application.project_runner import RunProjectResultEffects, run_project_result
 from loop_manager_internal.recovery import diagnostic_cleanup as cleanup, scoped_blocking
@@ -37,9 +37,11 @@ class DiagnosticCleanupTests(ArtifactRecoveryFixture, unittest.TestCase):
         self.record(self.saved, self.cause)
         expected = expectation(repo='repo', plan_id='G-047', branch='branch', worktree=self.worktree,
                                plan_path='docs/plans/[G-047] Runtime.md',
-                               remote=Remote('owner/repo', 'branch', 'remote'))
+                               remote=Remote('repo', 'branch', 'remote'))
         self.acceptance = decision_for(expected, observation(expected)).acceptance
         self.assertIsNotNone(self.acceptance)
+        self.assertEqual(self.acceptance['remote']['repository'], self.acceptance['repo'])
+        self.assertNotEqual(self.acceptance['remote']['repository'], 'owner/repo')
         self.current = GitSnapshot('after', 'branch', {}, {}, {}, {}, {}, {})
         self.normal = self.published
         self.diagnostic = self.saved['commit_oid']
@@ -80,6 +82,10 @@ class DiagnosticCleanupTests(ArtifactRecoveryFixture, unittest.TestCase):
 
     def test_ready_during_pr_wait_with_independent_block_and_no_side_effects(self):
         self.release()
+        resolution = self.connection.execute('SELECT * FROM diagnostic_cause_resolutions').fetchone()
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution['origin'], 'owner/repo')
+        self.assertEqual(json.loads(resolution['payload'])['acceptance'], self.acceptance)
         self.connection.execute("INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
             "VALUES ('repo', 'project', 'repository_state_unsafe', 'independent')")
         before = {table: [dict(row) for row in self.connection.execute('SELECT * FROM ' + table)]
@@ -106,6 +112,21 @@ class DiagnosticCleanupTests(ArtifactRecoveryFixture, unittest.TestCase):
         self.release(acceptance=False)
         self.assertIsNone(self.connection.execute('SELECT * FROM diagnostic_cause_resolutions').fetchone())
         self.assertFalse(self.prepare()[0]['ready'])
+
+    def test_foreign_acceptance_repository_cannot_resolve_or_prepare(self):
+        for repository in ('owner/repo', 'foreign-repository'):
+            with self.subTest(repository=repository):
+                foreign = json.loads(json.dumps(self.acceptance))
+                foreign['remote']['repository'] = repository
+                foreign['id'] = fingerprint({key: value for key, value in foreign.items() if key != 'id'})
+                self.assertTrue(valid_acceptance(foreign))
+                storage.record_diagnostic_cause_resolution(self.connection, self.block, foreign)
+                self.assertIsNone(self.connection.execute('SELECT * FROM diagnostic_cause_resolutions').fetchone())
+        self.release()
+        state = cleanup._snapshot(self.connection, 'repo', self.saved['ref'])
+        facts = cleanup._observe(self.effects, self.connection, self.state, state)
+        facts['resolutions'][self.cause]['acceptance'] = foreign
+        self.assertIsNotNone(cleanup.assess_ref(state, facts))
 
     def test_resolution_and_release_rollback_together(self):
         with self.assertRaises(KeyboardInterrupt), runtime_state._transaction(self.connection):
@@ -203,6 +224,8 @@ class DiagnosticCleanupTests(ArtifactRecoveryFixture, unittest.TestCase):
             prior_artifacts={'released_rebase_block': self.block})
         self.current = replace(self.current, head=self.published)
         self.assertTrue(self.prepare()[0]['ready'])
+        state = cleanup._snapshot(self.connection, 'repo', self.saved['ref'])
+        self.assertEqual(state['resolutions'][0]['origin'], 'owner/repo')
 
     def test_database_generation_change_during_observation_does_not_seal(self):
         self.release()

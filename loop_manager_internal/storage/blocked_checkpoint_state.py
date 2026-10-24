@@ -639,11 +639,12 @@ def record_diagnostic_cause_resolution(connection, block, acceptance, *, pending
     plan = connection.execute('SELECT branch, worktree FROM exec_plans WHERE repo=? AND plan_id=?',
                               (repo, owner)).fetchone()
     project = connection.execute('SELECT origin FROM projects WHERE repo=?', (repo,)).fetchone()
+    # Rebase Remote.repository is the local repo key; origin is separate publication evidence.
     if (plan is None or project is None or not project['origin']
             or not plan['branch'] or not plan['worktree']
             or complete and (acceptance['repo'], acceptance['plan_id'], acceptance['branch'], acceptance['worktree'],
                 acceptance['remote']['repository']) !=
-               (repo, owner, plan['branch'], plan['worktree'], project['origin'])):
+               (repo, owner, plan['branch'], plan['worktree'], repo)):
         return
     identities = {hashlib.sha256(json.dumps(dict(block), sort_keys=True).encode()).hexdigest()}
     if block['scope'] == 'project':

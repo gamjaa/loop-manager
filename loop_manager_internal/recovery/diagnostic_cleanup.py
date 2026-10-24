@@ -82,7 +82,7 @@ def _snapshot(connection, repo, ref):
                     or any(item['cause_identity'] == use['cause_identity'] for item in state['resolutions'])):
                 continue
             state['resolutions'].append(dict(repo=repo, scope=use['scope'], owner=use['owner'],
-                cause_identity=use['cause_identity'], origin=proof['remote']['repository'],
+                cause_identity=use['cause_identity'], origin=use['origin'],
                 original_branch=proof['branch'], worktree=proof['worktree'],
                 payload=json.dumps(dict(cause=cause, acceptance=proof, pending_work=True), sort_keys=True)))
     return state
@@ -231,7 +231,7 @@ def assess_ref(state, facts):
                 or use['cause_identity'] not in identities
                 or (proof['repo'], proof['plan_id'], proof['branch'], proof['worktree'],
                     proof['remote']['repository']) !=
-                   (state['repo'], use['owner'], use['original_branch'], plan['worktree'], use['origin'])):
+                   (state['repo'], use['owner'], use['original_branch'], plan['worktree'], state['repo'])):
             return '원인 해소 확정의 소유권 identity가 다릅니다.'
         owner = facts['owners'].get(use['owner'])
         if (owner is None or not plan['publication_remote_oid']
