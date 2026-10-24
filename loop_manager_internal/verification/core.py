@@ -201,7 +201,7 @@ def execute_manifest(modules, directory, writer, client, *, spawn, validate_repo
                     # Re-scan every worker before another reservation. A different
                     # worker may have completed while this assignment was starting.
                     if any(worker.module is not None and worker.report.is_file()
-                           and (not worker.job or worker.job.active() <= 1) for worker in workers):
+                           for worker in workers):
                         break
                 else:
                     rejected = True
