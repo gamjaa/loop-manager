@@ -28,10 +28,10 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/planning/planner_validation.py`의 `mutable_ready_snapshot()`·`_assert_mutable_ready_snapshot_current()`에서 일반 차단 상태와 catalog 복구 허용 집합의 책임을 분리한다. `catalog/remote_deletions.py:revisable_row()`·`recoverable_ids()`의 기존 PR/복구 보호와 `storage/work_claims.py`의 수동 소유 지문을 재사용한다. 상태 목록 전체를 느슨하게 하거나 새로운 개정 mode를 만들지 않는다.
-- [ ] 확인한 `planning/planning_catalog.py`의 실행 상태·수동 소유 snapshot 직렬화와 `storage/planning_publication_state.py:apply_mutable_catalog_changes()`의 실행 상태 CAS를 대조한다. 일반 차단 계획도 같은 manifest·게시 intent·현재 PR 재조회·짧은 확정 transaction을 사용하게 하고 기존 차단 row·질문·감사를 그대로 유지한다. 기존 지원으로 충족하는 코드는 변경하지 않는다.
-- [ ] 확인한 `planning/planner_publication.py`의 `_apply_general_planning_batch()`·복구 경로, `catalog/project_catalog_refresh.py`의 등록된 보류 선행 참조·최종 graph 검증을 소비한다. 개정 확정 자료를 G-319가 읽을 수 있는 기존 반영 경계에 남기되, 이 작업에서 원인별 재평가나 자동 해제를 추가하지 않는다.
-- [ ] 확인한 `tests/test_incremental_planning.py`·`tests/test_planning_publication.py`의 실제 SQLite·파일 및 모의 PR/Git fixture를 확장한다. PRODUCT의 기존 작업 개정 절과 ARCHITECTURE의 개정 snapshot 절에 실제 지원한 차단 계획 포함·보존 계약을 통합한다. 자동 역할 지침의 원본을 바꿀 필요가 있으면 `docs/AGENTS.planner.md`의 소유 절만 정합화하며 작업 prompt에 공통 규칙을 복제하지 않는다.
+- [x] 확인한 `loop_manager_internal/planning/planner_validation.py`의 `mutable_ready_snapshot()`·`_assert_mutable_ready_snapshot_current()`에서 일반 차단 상태와 catalog 복구 허용 집합의 책임을 분리한다. `catalog/remote_deletions.py:revisable_row()`·`recoverable_ids()`의 기존 PR/복구 보호와 `storage/work_claims.py`의 수동 소유 지문을 재사용한다. 상태 목록 전체를 느슨하게 하거나 새로운 개정 mode를 만들지 않는다.
+- [x] 확인한 `planning/planning_catalog.py`의 실행 상태·수동 소유 snapshot 직렬화와 `storage/planning_publication_state.py:apply_mutable_catalog_changes()`의 실행 상태 CAS를 대조한다. 일반 차단 계획도 같은 manifest·게시 intent·현재 PR 재조회·짧은 확정 transaction을 사용하게 하고 기존 차단 row·질문·감사를 그대로 유지한다. 기존 지원으로 충족하는 코드는 변경하지 않는다.
+- [x] 확인한 `planning/planner_publication.py`의 `_apply_general_planning_batch()`·복구 경로, `catalog/project_catalog_refresh.py`의 등록된 보류 선행 참조·최종 graph 검증을 소비한다. 개정 확정 자료를 G-319가 읽을 수 있는 기존 반영 경계에 남기되, 이 작업에서 원인별 재평가나 자동 해제를 추가하지 않는다.
+- [x] 확인한 `tests/test_incremental_planning.py`·`tests/test_planning_publication.py`의 실제 SQLite·파일 및 모의 PR/Git fixture를 확장한다. PRODUCT의 기존 작업 개정 절과 ARCHITECTURE의 개정 snapshot 절에 실제 지원한 차단 계획 포함·보존 계약을 통합한다. 자동 역할 지침의 원본을 바꿀 필요가 있으면 `docs/AGENTS.planner.md`의 소유 절만 정합화하며 작업 prompt에 공통 규칙을 복제하지 않는다.
 
 ## Validation
 
@@ -42,9 +42,10 @@ priority: high
 
 ## Progress
 
-- [x] 제공된 delta revision의 R-082 추가 조건과 snapshot 필터·개정 CAS·게시/복구·관련 회귀를 정적으로 대조했다. 일반 차단 상태를 복구 대상에 한정하는 필터가 남아 있으며 개정 저장의 기존 지원은 재사용할 수 있다. 구현·테스트는 실행하지 않았다.
-- [ ] 일반 차단 계획의 snapshot 포함과 기존 보호·실행 이력 보존
-- [ ] 게시/중단 회귀 및 관련 설계 설명 정합화
+- [x] 제공된 delta revision의 R-082 추가 조건과 snapshot 필터·개정 CAS·게시/복구·관련 회귀를 정적으로 대조해 일반 차단 상태 전용 제외 조건과 재사용 가능한 개정 저장 경계를 확인했다.
+- [x] 일반 `PLAN_BLOCKED` 상태를 삭제 복구 대상과 별도 필터링하던 조건을 제거하고 기존 catalog hold·실제 PR·수동 ownership 경계를 유지했다. SQLite·파일 회귀에서 시작 상태, 같은 ID·경로, 본문 Progress, 질문, 차단 사유, checkpoint, 세션, 실패·승격 이력을 확인했다.
+- [x] 삭제 목표 복구 hold 중인 blocked 계획의 snapshot·본문 개정·DB revision 반영을 확인하고 status와 미해결 catalog hold가 유지됨을 확인했다. publication intent 복구·멱등 반영, PR 재조회·조회 실패, 수동 시작 intent와 게시 경합 targeted test를 통과했다.
+- [x] PRODUCT의 일반 계획 개정 동작과 ARCHITECTURE의 snapshot·게시 보존 계약을 갱신했다. 원인별 재평가나 자동 해제는 추가하지 않았다.
 
 ## Decision Log
 

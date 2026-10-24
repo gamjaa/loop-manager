@@ -1672,15 +1672,73 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             [plan.plan_id for plan in snapshot.plans], ["G-001", "G-002"]
         )
 
+    def test_mutable_snapshot_includes_pr_free_blocked_plan(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED', ever_started=0 "
+            "WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        )
+        self.connection.commit()
+
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base,
+        )
+
+        self.assertIn('G-002', snapshot.by_id)
+        state = json.loads(snapshot.by_id['G-002'].execution_state)
+        self.assertEqual(state['status'], 'PLAN_BLOCKED')
+
     def test_started_revision_preserves_execution_audit_and_worker_level(self):
         from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from loop_manager_internal.storage import execplan_draft_state
+        from tests.support.catalog import draft_text
+
+        path = self.repo / self.paths['G-002']
+        original_text = draft_text('G-002', 'Second')
+        path.write_text(original_text, encoding='utf-8', newline='\n')
+        git(self.repo, 'remote', 'add', 'origin', 'https://github.com/example/project.git')
+        git(self.repo, 'add', self.paths['G-002'])
+        git(self.repo, 'commit', '-m', 'add blocked plan question')
+        self.base = git(self.repo, 'rev-parse', 'HEAD')
+        git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.base)
+        self.connection.execute(
+            'UPDATE projects SET active_sha=? WHERE repo=?', (self.base, str(self.repo)),
+        )
+        self.connection.commit()
+        self.assertTrue(loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), 'main',
+        ).usable)
+        original_draft = execplan_draft_state.evidence(self.connection, str(self.repo), 'G-002')
+
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED', "
+            "blocked_reason='원래 질문: 현재 구현을 진행해도 됩니까?' "
+            "WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        )
         self.connection.execute("UPDATE exec_plans SET ever_started=1, worker_session_id='saved', "
             "retry_count=2, effective_worker_level=8, review_failure_history='{\"issue\":2}' "
             "WHERE plan_id='G-002'")
+        self.connection.execute(
+            "UPDATE exec_plans SET blocked_fingerprint=?, last_error=?, verify_failure_history=?, "
+            "review_level_history=?, worker_result=?, verify_result=?, review_result=? "
+            "WHERE repo=? AND plan_id='G-002'",
+            ('blocked-input', '이전 실패', '{"verify":1}', '{"level":3}',
+             '기존 수행 기록', '이전 verify 실패', '이전 Review 실패', str(self.repo)),
+        )
+        checkpoint = ExecutionCheckpointRepository(self.connection).record(
+            str(self.repo), 'G-002', expected_generation=0, operation='worker',
+            expected_head=self.base, target_base_oid=self.base,
+            observed_remote_oid=self.base, snapshot={'stage': 'verify', 'evidence': 'saved'},
+        )
         self.connection.commit()
         snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
-        path = self.repo / self.paths['G-002']
-        path.write_text(path.read_text(encoding='utf-8') + '\n- 변경된 완료 조건을 확인한다.\n', encoding='utf-8')
+        revised_text = original_text.replace(
+            '- Keep the boundary explicit.',
+            '- Keep the boundary explicit.\n- Apply the updated completion condition.',
+        )
+        path.write_text(revised_text, encoding='utf-8', newline='\n')
         result = loop_manager.validate_planner_result(self.repo, self.base, [self.paths['G-002']],
             connection=self.connection, repo=str(self.repo), mutable_snapshot=snapshot)
         with self.connection:
@@ -1688,14 +1746,63 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                 snapshot_token=snapshot.token, plan_commit=self.base,
                 content_hash=lambda relative: hashlib.sha256((self.repo / relative).read_bytes()).hexdigest())
         row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()
-        self.assertEqual((row['status'], row['ever_started'], row['worker_session_id'], row['retry_count'],
-                          row['effective_worker_level'], row['review_failure_history']),
-                         ('READY', 1, 'saved', 2, 8, '{"issue":2}'))
+        self.assertEqual((row['plan_id'], row['path'], row['status'], row['ever_started'],
+                          row['worker_session_id'], row['blocked_reason'], row['blocked_fingerprint'],
+                          row['last_error'], row['retry_count'], row['effective_worker_level'],
+                          row['verify_failure_history'], row['review_failure_history'],
+                          row['review_level_history'], row['worker_result'], row['verify_result'],
+                          row['review_result']),
+                         ('G-002', self.paths['G-002'], 'PLAN_BLOCKED', 1, 'saved',
+                          '원래 질문: 현재 구현을 진행해도 됩니까?', 'blocked-input', '이전 실패', 2, 8,
+                          '{"verify":1}', '{"issue":2}', '{"level":3}',
+                          '기존 수행 기록', '이전 verify 실패', '이전 Review 실패'))
+        self.assertEqual(ExecutionCheckpointRepository(self.connection).get(str(self.repo), 'G-002'), checkpoint)
+        self.assertIn('## Progress\n\n- [ ] Pending', path.read_text(encoding='utf-8'))
+        current_draft = execplan_draft_state.evidence(self.connection, str(self.repo), 'G-002')
+        self.assertEqual(current_draft['question'], original_draft['question'])
+        self.assertIn('G-002', execplan_draft_state.pending_ids(self.connection, str(self.repo)))
+
+    def test_deleted_goal_recovery_snapshot_includes_blocked_plan(self):
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
+        self._remote_deletion()
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED', blocked_reason='recovery is pending' "
+            "WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        )
+        self.connection.commit()
+        row = self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        ).fetchone()
+        self.assertEqual(row['status'], 'PLAN_BLOCKED')
+        snapshot, validate = self._recovery_result()
+        self.assertEqual(json.loads(snapshot.by_id['G-002'].execution_state)['status'], 'PLAN_BLOCKED')
+        result = validate()
+        self.assertEqual([revision.snapshot.plan_id for revision in result.revisions], ['G-002'])
+        with self.connection:
+            apply_mutable_catalog_changes(
+                self.connection, str(self.repo), deletions=(), revisions=result.revisions,
+                snapshot_token=snapshot.token, plan_commit=self.base,
+                content_hash=lambda relative: hashlib.sha256((self.repo / relative).read_bytes()).hexdigest(),
+            )
+        revised = self.connection.execute(
+            "SELECT status, current_revision_sha FROM exec_plans WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        ).fetchone()
+        self.assertEqual((revised['status'], revised['current_revision_sha']), ('PLAN_BLOCKED', self.base))
+        self.assertEqual(loop_manager.scoped_blocking.catalog_held_plan_ids(
+            self.connection, str(self.repo),
+        ), {'G-002'})
 
     def test_actual_pr_appearance_prevents_started_snapshot_publication(self):
         from loop_manager_internal.planning.planner_validation import MutableReadyPRConflict
 
-        self.connection.execute("UPDATE exec_plans SET ever_started=1, branch='work' WHERE plan_id='G-002'")
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED', blocked_reason='block remains', "
+            "ever_started=1, branch='work' WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        )
         self.connection.commit()
         with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
             snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
@@ -1704,7 +1811,11 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                 loop_manager._assert_mutable_ready_snapshot_current(self.connection, snapshot)
 
     def test_pr_lookup_failure_does_not_reuse_mutable_snapshot(self):
-        self.connection.execute("UPDATE exec_plans SET ever_started=1, branch='work' WHERE plan_id='G-002'")
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED', blocked_reason='block remains', "
+            "ever_started=1, branch='work' WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        )
         self.connection.commit()
         with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
             snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
@@ -2164,6 +2275,11 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
     def test_mutable_snapshot_excludes_live_manual_owners_and_preparation_intents(self):
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
 
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo=?",
+            (self.repo,),
+        )
+        self.connection.commit()
         store = ManualWorkRepository(self.connection)
         start = store.create(
             self.repo, "start", "manual-start", (), self.base, self.base,
@@ -2249,6 +2365,11 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
         from loop_manager_internal.storage import work_claims
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
 
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo=?",
+            (self.repo,),
+        )
+        self.connection.commit()
         snapshot = self.mutable_snapshot()
         plan = snapshot.plans[0]
         before = dict(self.connection.execute(

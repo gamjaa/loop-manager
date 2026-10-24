@@ -1566,7 +1566,6 @@ def mutable_ready_snapshot(
             "AND g.state NOT IN ('MERGED','PREPARATION_CONFLICT')", (repo,))}
     for row in rows:
         if (str(row['plan_id']) in manual_owned or str(row["plan_id"]) in held - recovery
-                or (row["status"] == "PLAN_BLOCKED" and str(row["plan_id"]) not in recovery)
                 or not effects._row_is_mutable_ready(row)):
             continue
         if str(row["plan_id"]) in recovery and not (worktree / str(row["path"])).is_file():
