@@ -15,6 +15,7 @@ from loop_manager_internal.runtime.contracts import (ProcessLockBusyError, Works
                                                      PublicationSafetyError, GitLockError)
 from loop_manager_internal.storage import work_claims
 from loop_manager_internal.config.managed_config import fast_mode_scope
+from loop_manager_internal.runtime import operation_events as events
 
 from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.git import manager_git_journal, workspace
@@ -743,15 +744,48 @@ def resume_manual_work(effects: ManualWorkEffects, connection, state_dir, repo_p
 
 
 def manual_command(effects: ManualWorkEffects, args, state_dir, config_path, runtime_mutation=None):
-    with closing(effects.connect_database(state_dir)) as connection:
-        service=ManualWorkService(effects,connection,state_dir,Path(args.repository).expanduser().resolve(),
-                                  config_path,runtime_mutation=runtime_mutation)
-        try:
-            service.validate_repository()
-            if args.manual_command=='start':
-                return service.start(args.plan_id)
-            return service.complete(args) if args.manual_command=='complete' else service.submit(args)
-        except (RuntimeError,OSError,ValueError) as error:
-            from loop_manager_internal.execution.validation_feedback import redact_secrets
-            effects.operation_print(redact_secrets(f'수동 명령 실패: {error}; 저장된 intent와 작업물은 보존됨'))
-            return 1
+    repository = Path(args.repository).expanduser().resolve()
+    command = args.manual_command
+    plan_id = getattr(args, "plan_id", None)
+    target = plan_id or getattr(args, "branch", "project")
+    with events.log_context(project=str(repository), plan=plan_id, stage=f"MANUAL_{command.upper()}"):
+        with events.activity(
+            f"수동 {command} 처리", heartbeat=True, error_level="ERROR",
+            command=command, target=target,
+            requirement_count=len(getattr(args, "requirement", ())),
+            requirements=",".join(getattr(args, "requirement", ())),
+        ) as report:
+            with closing(effects.connect_database(state_dir)) as connection:
+                service=ManualWorkService(effects,connection,state_dir,repository,
+                                          config_path,runtime_mutation=runtime_mutation)
+                try:
+                    service.validate_repository()
+                    if command == 'start':
+                        result = service.start(args.plan_id)
+                    elif command == 'complete':
+                        result = service.complete(args)
+                    else:
+                        result = service.submit(args)
+                    report.update(
+                        result="수동 작업 준비 결과 기록" if command == "start"
+                        else "수락 또는 기존 게시 상태 확인",
+                        next_action=(
+                            "수동 작업 안내에 따라 구현 후 complete 실행" if command == "start"
+                            else "실제 검증·게시 결과는 이후 run에서 확인"
+                        ),
+                    )
+                    return result
+                except (RuntimeError, OSError, ValueError) as error:
+                    from loop_manager_internal.execution.validation_feedback import redact_secrets
+                    level = "WARN" if isinstance(error, ManualDependencyWait) else "ERROR"
+                    report.update(
+                        result="수동 명령 실패", reason=events.summary(error),
+                        next_action=("dependency Merge 확인 뒤 다시 실행"
+                                     if isinstance(error, ManualDependencyWait)
+                                     else "실패 원인 확인; 저장된 intent와 작업물 보존"),
+                        level=level,
+                    )
+                    effects.operation_print(redact_secrets(
+                        f'수동 명령 실패: {error}; 저장된 intent와 작업물은 보존됨'
+                    ))
+                    return 1

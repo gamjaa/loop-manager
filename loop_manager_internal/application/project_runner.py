@@ -76,10 +76,18 @@ def run_project_result(
                     "recovery_plan_id": recovery_plan_id,
                 } if recovery_request_id is not None else {}),
             )
-            report.update(result=outcome.kind.value, next_action=(
-                "작업별 재시도·조건 대기" if outcome.kind in {ProjectRunKind.TRANSIENT_PAUSE, ProjectRunKind.USAGE_LIMIT_PAUSE}
-                else "대기 조건 확인" if outcome.kind is ProjectRunKind.WAITING else "이번 프로젝트 처리 종료"),
-                reason=events.summary(outcome.detail), level="ERROR" if outcome.exit_code else "INFO")
+            next_action = {
+                ProjectRunKind.TRANSIENT_PAUSE: "다음 run에서 원인 재검사",
+                ProjectRunKind.USAGE_LIMIT_PAUSE: "사용 한도 조건 해소 뒤 다음 run에서 재검사",
+                ProjectRunKind.WAITING: "대기 조건을 다음 run에서 재확인",
+                ProjectRunKind.BLOCKED: "기록된 차단 원인과 해제 조건 확인",
+                ProjectRunKind.CONFIGURATION_ERROR: "설정 원인 교정 뒤 재실행",
+                ProjectRunKind.OPERATIONAL_ERROR: "실패 원인 확인 뒤 재실행",
+                ProjectRunKind.RUNTIME_HANDOFF: "부모가 선택한 runtime에서 이어서 확인",
+                ProjectRunKind.COMPLETED: "다음 프로젝트 처리 또는 다음 run 대기",
+            }[outcome.kind]
+            report.update(result=outcome.kind.value, next_action=next_action,
+                          reason=events.summary(outcome.detail), level=outcome.log_level)
             return outcome
         except SelfMergeRuntimeHandoff:
             outcome = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
@@ -260,7 +268,7 @@ def _run_project_result(
             )
             effects.operation_log(
                 f"일시적 Git lock 충돌 ({repo_arg}): {error}",
-                error=True,
+                level="WARN",
             )
             return ProjectRunResult(
                 ProjectRunKind.TRANSIENT_PAUSE,

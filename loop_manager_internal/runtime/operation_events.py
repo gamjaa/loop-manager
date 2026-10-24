@@ -91,7 +91,7 @@ def progress(label: str, *, describe=None, interval=None):
 
 
 @contextmanager
-def activity(label: str, *, heartbeat=False, **fields):
+def activity(label: str, *, heartbeat=False, error_level="WARN", **fields):
     """짧은 처리는 종료 한 줄, 긴 처리는 주기적 관측과 종료 결과를 기록한다."""
     from contextlib import nullcontext
     started, result = time.monotonic(), {}
@@ -100,7 +100,8 @@ def activity(label: str, *, heartbeat=False, **fields):
             yield result
     except BaseException as error:
         handoff = isinstance(error, SelfMergeRuntimeHandoff)
-        emit(f"{label} 종료", level="INFO" if handoff else "WARN",
+        level = "INFO" if handoff else error_level if isinstance(error, Exception) else "WARN"
+        emit(f"{label} 종료", level=level,
              result="runtime_handoff" if handoff else "미확인" if not isinstance(error, Exception) else "실패",
              error_type=type(error).__name__, elapsed_seconds=round(time.monotonic() - started, 1), **fields)
         raise
@@ -150,5 +151,9 @@ def operation_print(effects: OperationPrintEffects, *values: object, **kwargs: o
 
     output = kwargs.get("file", sys.stdout)
     separator = str(kwargs.get("sep", " "))
-    effects.operation_log(separator.join(str(value) for value in values),
-                          error=output is sys.stderr or bool(kwargs.get("error")))
+    level = kwargs.get("level")
+    effects.operation_log(
+        separator.join(str(value) for value in values),
+        error=output is sys.stderr or bool(kwargs.get("error")),
+        **({"level": level} if level is not None else {}),
+    )
