@@ -30,10 +30,10 @@ Codex native 지침 해석에서 확인한 설정 identity를 최종 격리·실
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/agents/provider_guidance.py:codex_arguments()`의 `native_lookup()`·설정 안정성 비교·`observe_instruction`을 재사용해 마지막 성공한 지침 해석의 설정 identity도 호출자가 보존하게 한다. `_developer_texts()`가 보존하는 전송 ID 제외 도구 정의와 지침 메시지의 구분·전후 비교·해시를 그대로 소비한다. 기존 callback/반환 계약의 최소 확장으로 처리하고 native 조회·설정 파서·도구 정의 비교·지침 합성을 별도로 구현하지 않는다.
-- [ ] 확인한 `agents/agent_write_isolation.py:refresh_configuration_evidence()`·`_checked_codex_configuration()`에 지침 해석이 확인한 설정과 현재 설정의 동일성 조건을 연결한다. `agents/provider_adapters.py:run_codex()`와 `agents/provider_execution.py:observe()` 모두 이 근거를 소비하게 하고, 불일치 때 증거 갱신·실행 identity 발행·process 시작 전에 거부한다. 기존 공통 설정의 안전한 생성 수용과 Manager/project/system 입력의 변경 거부를 분리한 구조를 유지한다.
-- [ ] 확인한 `storage/agent_invocation_state.py:InvocationRepository.record_isolation()`·`record_execution_identity()`와 `agents/invocation_service.py`의 호출 전 저장·거부 경계를 재사용한다. 완료된 호출을 수정하거나 DB schema·대기/재시도 정책을 바꾸지 않는다. `agents/agent_codex_sandbox.py:CodexLaunch.start()`로 전달하는 process handoff 재검사도 유지한다.
-- [ ] 확인한 `tests/test_provider_execution.py`와 `tests/support/provider_execution.py:ProviderExecutionFixture`의 실제 지침 조립·설정 검사·SQLite ledger를 사용해 누락된 경계의 최소 회귀를 추가한다. 필요할 때만 `tests/test_agent_write_isolation.py`의 refresh 직접 검사를 보강한다. PRODUCT의 공급자 설정 규칙과 ARCHITECTURE의 준비된 provider 실행 입력 절에는 실제 구현한 동일성 조건을 통합하고 Requirement·다른 ExecPlan은 변경하지 않는다.
+- [x] 확인한 `loop_manager_internal/agents/provider_guidance.py:codex_arguments()`의 `native_lookup()`·설정 안정성 비교·`observe_instruction`을 재사용해 마지막 성공한 지침 해석의 설정 identity도 호출자가 보존하게 한다. `_developer_texts()`가 보존하는 전송 ID 제외 도구 정의와 지침 메시지의 구분·전후 비교·해시를 그대로 소비한다. 기존 callback/반환 계약의 최소 확장으로 처리하고 native 조회·설정 파서·도구 정의 비교·지침 합성을 별도로 구현하지 않는다.
+- [x] 확인한 `agents/agent_write_isolation.py:refresh_configuration_evidence()`·`_checked_codex_configuration()`에 지침 해석이 확인한 설정과 현재 설정의 동일성 조건을 연결한다. `agents/provider_adapters.py:run_codex()`와 `agents/provider_execution.py:observe()` 모두 이 근거를 소비하게 하고, 불일치 때 증거 갱신·실행 identity 발행·process 시작 전에 거부한다. 기존 공통 설정의 안전한 생성 수용과 Manager/project/system 입력의 변경 거부를 분리한 구조를 유지한다.
+- [x] 확인한 `storage/agent_invocation_state.py:InvocationRepository.record_isolation()`·`record_execution_identity()`와 `agents/invocation_service.py`의 호출 전 저장·거부 경계를 재사용한다. 완료된 호출을 수정하거나 DB schema·대기/재시도 정책을 바꾸지 않는다. `agents/agent_codex_sandbox.py:CodexLaunch.start()`로 전달하는 process handoff 재검사도 유지한다.
+- [x] 확인한 `tests/test_provider_execution.py`와 `tests/support/provider_execution.py:ProviderExecutionFixture`의 실제 지침 조립·설정 검사·SQLite ledger를 사용해 누락된 경계의 최소 회귀를 추가한다. `additional_tools`의 전송 ID 차이는 실제/현재 identity에서 무시하고 도구 정의는 그 지문에 포함하며 developer instruction에는 합성하지 않는 회귀를 추가했다. PRODUCT의 공급자 설정 규칙과 ARCHITECTURE의 준비된 provider 실행 입력 절을 실제 구현과 맞췄고 Requirement·다른 ExecPlan은 변경하지 않았다.
 
 ## Validation
 
@@ -47,8 +47,9 @@ Codex native 지침 해석에서 확인한 설정 identity를 최종 격리·실
 ## Progress
 
 - [x] delta 기준 `e69a2399992a7e598217741cdcd3833d9b0257de`부터 `85c605033cb894c95b1171304831404ce87bf3c2`까지 변경과 활성 R-064/R-085/R-072/R-086, 관련 구현·회귀를 정적으로 대조했다. 조회 사이 재해석과 handoff 검사는 구현된 범위로 제외하고 완료된 지침 해석→증거 갱신 사이 동일성 누락만 식별했다. 실행 재현·테스트·verify는 하지 않았다.
-- [ ] 지침 해석의 설정 identity와 최종 증거 결합
-- [ ] 실행/현재 관측의 경계 회귀 및 관련 설계 문서 정합화
+- [x] 지침 해석의 설정 identity와 최종 증거 결합
+- [x] 실행/현재 관측의 경계 회귀 및 관련 설계 문서 정합화
+- [x] 2026-10-24 rebase 후보 `dc7b724`를 current parent `2f6c042`의 전체 diff와 재대조했다. 최신 R-064의 `additional_tools` 조건은 `_developer_texts()`와 runtime 단위 회귀에만 머물러 실행·현재 관측 identity가 정의를 해시하는지 확인하지 못해, 기존 `ProviderExecutionFixture`에 실제 호출·현재 관측·과거 기록을 연결하는 테스트를 추가했다. PRODUCT·ARCHITECTURE에도 native 도구 정의 보존과 지문 포함을 통합했다. 프로젝트 targeted runner로 `tests.test_provider_execution.ProviderExecutionTests` 20개, `test_codex_preserves_additional_tools_but_ignores_transport_ids` 1개, `test_malformed_tool_items_and_unknown_developer_items_are_rejected` 1개를 현재 후보에서 실행해 모두 통과했다. 전체 verify는 Manager 경계에 남겼다.
 
 ## Decision Log
 

@@ -809,7 +809,7 @@ CLI·OS별 실행 전제는 [인증과 실행 조건](OPERATIONS.md#인증과-�
 | 실행 직전 | 같은 환경의 인증·Model/Effort·Fast·native 지침을 확인하고 workspace·설정·CLI와 인증 링크를 재검사한다. native developer의 `additional_tools`는 전송 ID를 제외한 정의를 전후 비교하며 지침 메시지로 해석하지 않는다. 준비 조회가 안전한 설정을 바꿨으면 새 내용을 다시 검사해 최종 격리·실행 지문에 결합한다. 최종 증거를 invocation에 저장한 뒤 process handoff에서도 설정·workspace snapshot을 확인하고 실제 `codex exec`를 시작한다. |
 | 종료 | 프로세스 그룹 또는 Windows Job의 정리·wait 성공 뒤에만 종료 콜백을 호출한다. 시작·writer 종료·결과 성공·검증 성공은 별도 사실로 기록한다. |
 
-`provider_execution.observe`는 모델 실행 없이 현재 Codex Reviewer의 입력을 확인하거나 지정한 실제 invocation의 완료 기록을 읽는다. `execution_identity`의 문자열 필드는 `provider`·`model`·`effort`·`instruction`·`environment`·`policy`이며 지침·환경·정책은 지문으로 저장한다. 실제 호출 identity는 process 시작 전에 한 번 결합하고 현재 설정을 과거 행에 소급하지 않는다. credential 값·그 값의 해시·prompt 원문은 저장하지 않는다.
+`provider_execution.observe`는 모델 실행 없이 현재 Codex Reviewer의 입력을 확인하거나 지정한 실제 invocation의 완료 기록을 읽는다. `execution_identity`의 문자열 필드는 `provider`·`model`·`effort`·`instruction`·`environment`·`policy`이며, `instruction` 지문은 native developer 메시지와 전송 ID를 제외한 `additional_tools` 정의를 함께 포함한다. 도구 정의는 developer instruction에 합성하지 않는다. 지침·환경·정책은 지문으로 저장한다. 실제 호출 identity는 process 시작 전에 한 번 결합하고 현재 설정을 과거 행에 소급하지 않는다. credential 값·그 값의 해시·prompt 원문은 저장하지 않는다.
 
 준비 CLI 조회가 선택 state directory의 공통 `automation-codex/config.toml`을 안전하게 생성·교체하면 새 내용을 재검사해 현재 invocation의 격리·실행 지문에 반영할 수 있다. native 지침 해석은 마지막 성공 조회가 확인한 전체 설정 지문을 호출자에게 전달하며, 증거 갱신은 현재 전체 설정 지문이 그 값과 같을 때만 허용한다. 마지막 조회 뒤 공통 config가 바뀌면 설정이 안전해도 증거를 갱신하지 않고 실행을 거부하며 현재 Reviewer 관측도 identity를 반환하지 않는다. 이후 호출은 현재 설정에서 지침을 다시 해석한다. 이 비교는 기존 invocation의 완료 기록을 수정하지 않는다.
 

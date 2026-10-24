@@ -48,6 +48,29 @@ class ProviderExecutionTests(ProviderExecutionFixture, unittest.TestCase):
         self.assertNotIn('private-auth', row[0])
         self.assertNotIn('review this candidate', row[0])
 
+    def test_native_tool_definitions_are_bound_to_current_and_actual_instruction_identity(self):
+        self.native_tool_definitions = [{'name': 'project_tool', 'description': 'project tool',
+            'input_schema': {'type': 'object', 'properties': {'value': {'type': 'string'}}}}]
+        current = self.observe()
+        result = self.invoke()
+        self.assertEqual(result.code, 0)
+        actual = self.observe(invocation_id=result.isolation_invocation_id)
+        self.assertEqual(actual, current)
+
+        arguments = self.popen.call_args.args[0]
+        override = next(argument for argument in arguments
+                        if argument.startswith('developer_instructions='))
+        self.assertEqual(json.loads(override.partition('=')[2]),
+                         self.instruction_extra + '\n\n' + self.guidance.content)
+        self.assertNotIn('project_tool', override)
+
+        self.native_tool_transport_id = 'another-transport-id'
+        self.assertEqual(self.observe(), current)
+        self.native_tool_definitions[0]['name'] = 'changed_project_tool'
+        changed = self.observe()
+        self.assertNotEqual(changed['instruction'], actual['instruction'])
+        self.assertEqual(self.observe(invocation_id=result.isolation_invocation_id), actual)
+
     def test_unused_personal_config_does_not_change_selected_identity(self):
         original = self.observe()
         (self.parent_home / 'config.toml').write_text('hooks=["personal"]\n')
