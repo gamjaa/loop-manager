@@ -765,6 +765,8 @@ class WorkspaceHandler:
                 self.ports.state.check()
                 if (self.ports.state.active_execplan(self.ports.identity.repo)['catalog_generation']
                         != catalog_plan['catalog_generation']
+                        or not database.remote_work_adoption_allowed(
+                            self.ports.state.connection, self.ports.identity.repo, plan_id)
                         or self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
                         != observed_checkpoint):
                     raise CheckpointRace('원격 인수 PR 관측 중 catalog/checkpoint가 변경됐습니다.')
@@ -779,8 +781,7 @@ class WorkspaceHandler:
                 self.ports._fetch_latest_base()
                 remote_observed = self.ports._checkpoint_remote_oid(
                     self.ports.identity.repo_path, branch)
-                saved = self.ports.checkpoint.get(
-                    self.ports.identity.repo, plan_id).snapshot or {}
+                saved = observed_checkpoint.snapshot or {}
                 prior_adoption = saved.get('remote_adoption')
                 if prior_adoption is not None and (
                         not isinstance(prior_adoption, dict)
@@ -811,13 +812,13 @@ class WorkspaceHandler:
                 local_branch_exists = self.ports.git(
                     self.ports.identity.repo_path, 'show-ref', '--verify', '--quiet',
                     f'refs/heads/{branch}', check=False).returncode == 0
-                if local_branch_exists and prior_adoption is None and remote_observed is not None:
-                    local_head = self.ports.git(
-                        self.ports.identity.repo_path, 'rev-parse', '--verify',
-                        f'refs/heads/{branch}').stdout.strip()
-                    if local_head != remote_observed:
-                        raise self.ports.contract.WorkspaceOwnershipError(
-                            'DB 없는 환경의 기존 로컬 branch가 원격 작업 HEAD와 다릅니다.')
+                local_present = local_branch_exists or worktree.exists() or worktree.is_symlink()
+                if local_present and (prior_adoption is None or not workspace_reserved):
+                    raise self.ports.contract.WorkspaceOwnershipError(
+                        '원격 인수의 저장 intent와 예약 소유권 없는 로컬 자원이 이미 존재합니다.')
+                if prior_adoption is not None and remote_observed is None:
+                    raise RecoveryFailure(RecoveryReason.REMOTE_BRANCH_DELETED,
+                                          '인수 중 원격 작업 branch가 삭제됐습니다.')
                 if prior_adoption is not None and (local_branch_exists or worktree.is_dir()):
                     remote_start = str(prior_adoption['head'])
                     adoption_expected_head = remote_start
@@ -829,11 +830,6 @@ class WorkspaceHandler:
                         if local_head != remote_start:
                             raise self.ports.contract.WorkspaceOwnershipError(
                                 '중단된 원격 작업 인수의 로컬 branch가 저장된 HEAD와 다릅니다.')
-                    if remote_observed is None:
-                        raise RecoveryFailure(
-                            RecoveryReason.REMOTE_BRANCH_DELETED,
-                            '인수 중 원격 작업 branch가 삭제됐고 병합 PR도 확인되지 않습니다.',
-                        )
                 elif prior_adoption is not None:
                     remote_start = str(prior_adoption['head'])
                     start_point = remote_start
@@ -844,8 +840,8 @@ class WorkspaceHandler:
                     start_point = remote_start
                     adoption_expected_head = remote_start
                     adoption_pending = True
-                    current = self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
-                    self.ports.checkpoint.record(
+                    current = observed_checkpoint
+                    observed_checkpoint = self.ports.checkpoint.record(
                         self.ports.identity.repo, plan_id,
                         expected_generation=current.generation, operation=current.operation,
                         expected_head=current.expected_head, target_base_oid=current.target_base_oid,
@@ -868,6 +864,13 @@ class WorkspaceHandler:
                             RecoveryReason.REMOTE_SNAPSHOT_RACE,
                             '원격 작업 branch가 fetch 이후 변경됐습니다.',
                         )
+                self.ports.state.check()
+                if (self.ports.state.active_execplan(self.ports.identity.repo)['catalog_generation']
+                        != catalog_plan['catalog_generation']
+                        or not database.remote_work_adoption_allowed(
+                            self.ports.state.connection, self.ports.identity.repo, plan_id)
+                        or self.ports.checkpoint.get(self.ports.identity.repo, plan_id) != observed_checkpoint):
+                    raise CheckpointRace('원격 인수 fetch/로컬 관측 중 대상이 변경됐습니다.')
             adoption_reserved = bool(
                 adoption_pending and workspace_reserved
                 and (local_branch_exists or worktree.is_dir())
@@ -897,8 +900,10 @@ class WorkspaceHandler:
                 allow_rebase=resolving_rebase,
                 journal_state_dir=self.ports.identity.state_dir,
                 journal_owner=f'plan:{plan_id}',
+                **({'require_creation_evidence': True} if adoption_reserved else {}),
             )
             if remote_start is not None:
+                self._validate_registered_remote(worktree)
                 self.ports.validate_worker_workspace_scope(
                     self.ports.identity.repo_path, worktree, branch,
                     self.ports.identity.base, str(row['plan_path']), catalog_plan,
@@ -912,7 +917,13 @@ class WorkspaceHandler:
                         RecoveryReason.REMOTE_SNAPSHOT_RACE,
                         '관리 worktree 구성 중 원격 작업 branch가 변경됐습니다.',
                     )
-                current = self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
+                self.ports.state.check()
+                if (self.ports.state.active_execplan(self.ports.identity.repo)['catalog_generation']
+                        != catalog_plan['catalog_generation']
+                        or not database.remote_work_adoption_allowed(
+                            self.ports.state.connection, self.ports.identity.repo, plan_id)):
+                    raise CheckpointRace('원격 인수 worktree 생성 중 catalog/등록 대상이 변경됐습니다.')
+                current = observed_checkpoint
                 self.ports.checkpoint.record(
                     self.ports.identity.repo, plan_id,
                     expected_generation=current.generation, operation=None,

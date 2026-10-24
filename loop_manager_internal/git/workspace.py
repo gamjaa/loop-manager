@@ -142,6 +142,7 @@ def make_worktree(effects: MakeWorktreeEffects,
     before_create: Callable[[], None] | None = None,
     journal_state_dir: Path | None = None,
     journal_owner: str | None = None,
+    require_creation_evidence: bool = False,
 ) -> str:
     """Create, recover, or validate one owned ExecPlan worktree."""
 
@@ -169,6 +170,21 @@ def make_worktree(effects: MakeWorktreeEffects,
                 journal_state_dir, intent, "create",
             ),
         )
+    if require_creation_evidence:
+        if journal_state_dir is None or not journal_owner or not ownership_reserved:
+            raise WorkspaceOwnershipError('원격 인수 workspace의 생성 예약 근거가 없습니다.')
+        target = str(_canonical_path(worktree))
+        live = effects._managed_worktree_transition_state(repo, worktree)
+        if not any(
+            item['intent']['expected'] == item['result']['observed'] == live
+            and live.get('registration', {}).get('head') == expected_head
+            and live.get('registration', {}).get('branch') == f'refs/heads/{branch}'
+            for item in manager_git_journal.verified_managed_transitions(
+                journal_state_dir, str(_canonical_path(repo)), journal_owner,
+                kind='managed_worktree_create', target=target,
+            )
+        ):
+            raise WorkspaceOwnershipError('원격 인수 workspace의 Manager 생성 기록이 없습니다.')
     if worktree.is_dir():
         if not allow_existing:
             raise WorkspaceOwnershipError(
