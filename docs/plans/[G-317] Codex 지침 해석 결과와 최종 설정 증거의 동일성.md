@@ -50,6 +50,7 @@ Codex native 지침 해석에서 확인한 설정 identity를 최종 격리·실
 - [x] 지침 해석의 설정 identity와 최종 증거 결합
 - [x] 실행/현재 관측의 경계 회귀 및 관련 설계 문서 정합화
 - [x] 2026-10-24 rebase 후보 `dc7b724`를 current parent `2f6c042`의 전체 diff와 재대조했다. 최신 R-064의 `additional_tools` 조건은 `_developer_texts()`와 runtime 단위 회귀에만 머물러 실행·현재 관측 identity가 정의를 해시하는지 확인하지 못해, 기존 `ProviderExecutionFixture`에 실제 호출·현재 관측·과거 기록을 연결하는 테스트를 추가했다. PRODUCT·ARCHITECTURE에도 native 도구 정의 보존과 지문 포함을 통합했다. 프로젝트 targeted runner로 `tests.test_provider_execution.ProviderExecutionTests` 20개, `test_codex_preserves_additional_tools_but_ignores_transport_ids` 1개, `test_malformed_tool_items_and_unknown_developer_items_are_rejected` 1개를 현재 후보에서 실행해 모두 통과했다. 전체 verify는 Manager 경계에 남겼다.
+- [x] 2026-10-24 관리 rebase 후 HEAD `e2a54db`와 base `000ad57`의 전체 9개 파일 diff를 최신 계획·근거 입력과 재대조했다. 추가 구현 누락은 발견되지 않았다. 새 후보에서 `tests.test_provider_execution.ProviderExecutionTests` 20개와 native 도구 보존·잘못된 developer 형식 거부 회귀 2개를 targeted runner로 다시 실행해 모두 통과했다. 전체 verify는 Manager 경계에 남겼다.
 
 ## Decision Log
 
