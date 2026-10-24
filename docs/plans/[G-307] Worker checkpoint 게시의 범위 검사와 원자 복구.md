@@ -31,9 +31,9 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/git/publication_service.py`의 `persist()`·intent/완료 snapshot 적용과 `storage/execution_checkpoint_state.py`·`storage/runtime_state.py:_transaction()`을 G-303의 `CoordinatedConnection.run_request()`에 연결한다. transaction 밖에서 확인한 immutable Git 자료와 현재 DB 값을 구별하고 요청이 재준비할 DB 조회/판단만 callback에 둔다. 중첩 caller transaction을 임의 commit하거나 전체 게시 함수를 callback으로 감싸지 않는다.
-- [ ] 확인한 `execution/execution_ports.py:publish_worker_checkpoints()`·`execution/worker_checkpoint.py`·`execution/execution_workspace_handler.py`의 pending 복구와 결과 계약을 재사용해 DB 요청 소진/취소를 같은 intent/commit/session의 보존된 대기로 소비한다. 재관측 후 결과 저장만 재개하며 추가 모델 호출·commit·push를 만들지 않는다. `current_rebase_acceptance`가 가리키는 기존 최종 게시 반환은 DB 완료 callback 밖에 두고, 실제 push 확인·후속 입력 통합·재작성 후보의 최종 검증/게시를 혼합하지 않는다. 새로운 대기 엔진·ledger·설정은 추가하지 않는다.
-- [ ] 확인한 `tests/test_worker_checkpoint_publication.py`의 실제 SQLite·원격 게시 중단/범위 정책 fixture와 `tests/test_db_access.py`의 제한 요청 fixture를 재사용한다. PRODUCT·ARCHITECTURE의 checkpoint/DB 소유 절에는 실제 보완한 소비 계약만 통합한다. 공통 DB 엔진은 G-303, 수동/Agent 저장은 G-304/G-305에 남긴다.
+- [x] 확인한 `loop_manager_internal/git/publication_service.py`의 `persist()`·intent/완료 snapshot 적용과 `storage/execution_checkpoint_state.py`·`storage/runtime_state.py:_transaction()`을 G-303의 `CoordinatedConnection.run_request()`에 연결한다. transaction 밖에서 확인한 immutable Git 자료와 현재 DB 값을 구별하고 요청이 재준비할 DB 조회/판단만 callback에 둔다. 중첩 caller transaction을 임의 commit하거나 전체 게시 함수를 callback으로 감싸지 않는다.
+- [x] 확인한 `execution/execution_ports.py:publish_worker_checkpoints()`·`execution/worker_checkpoint.py`·`execution/execution_workspace_handler.py`의 pending 복구와 결과 계약을 재사용해 DB 요청 소진/취소를 같은 intent/commit/session의 보존된 대기로 소비한다. 재관측 후 결과 저장만 재개하며 추가 모델 호출·commit·push를 만들지 않는다. `current_rebase_acceptance`가 가리키는 기존 최종 게시 반환은 DB 완료 callback 밖에 두고, 실제 push 확인·후속 입력 통합·재작성 후보의 최종 검증/게시를 혼합하지 않는다. 새로운 대기 엔진·ledger·설정은 추가하지 않는다.
+- [x] 확인한 `tests/test_worker_checkpoint_publication.py`의 실제 SQLite·원격 게시 중단/범위 정책 fixture와 `tests/test_db_access.py`의 제한 요청 fixture를 재사용한다. PRODUCT·ARCHITECTURE의 checkpoint/DB 소유 절에는 실제 보완한 소비 계약만 통합한다. 공통 DB 엔진은 G-303, 수동/Agent 저장은 G-304/G-305에 남긴다.
 
 ## Validation
 
@@ -48,8 +48,19 @@ priority: high
 - [x] 5903c5aa의 commit별 게시·pending 복구·scope 진입과 기존 세 게시 회귀를 정적으로 대조했다. 직접 구현된 순차 push는 재구현 대상으로 제외했다.
 - [x] 현재 revision의 #294 직접 구현과 commit별 scope·원자 완료·push 후 context 재구성 및 관련 회귀를 정적으로 확인했다. 기존 두 미완료 항목 중 scope/원자 저장 자체는 재구현 대상에서 제외하고 G-303 요청 재시도 소비만 남겼다. 테스트 실행·성공을 뜻하지 않는다.
 - [x] 지정 delta의 유효 rebase acceptance/후속 commit을 최종 게시 경로로 넘기는 구현과 원격·checkpoint 불변 회귀를 정적으로 대조했다. 새로운 checkpoint 게시 구현이나 검증 성공으로 기록하지 않는다.
-- [ ] intent/완료 DB 요청의 제한 재시도와 대기/취소 소비 연결
-- [ ] 실제 경합·경쟁/중단 보존의 최소 targeted 회귀
+- [x] intent/완료 DB 요청의 제한 재시도와 대기/취소 소비 연결
+- [x] 실제 경합·경쟁/중단 보존의 최소 targeted 회귀
+
+
+### 구현·targeted 검증 결과 (2026-10-24)
+
+- `persist()`의 intent/완료 CAS를 각각 DB 전용 `run_request()`로 실행한다. 각 시도는 등록 origin/base·전체 실행 snapshot·checkpoint를 다시 읽고 경쟁 변경을 거부한다. 요청 밖에서 관측한 Git/PR 자료는 재실행하지 않으며 owner 메모리는 commit 성공 후 갱신한다. 일반 SQLite 연결의 기존 원자 transaction 경계도 유지한다.
+- 게시 port는 DB 대기 한도 소진만 `TRANSIENT_PAUSE`로 반환해 일반 복구·교정 횟수를 소비하지 않는다. runtime handoff와 비잠금 SQL 오류는 전파하고 기존 요청·session·pending intent를 보존한다. 기존 pending 복구·Worker 진입 gate와 재작성 acceptance의 최종 게시 반환은 재사용했다.
+- 프로젝트 Python `python3`와 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 `--unittest tests.test_worker_checkpoint_publication` 실행: 17 tests PASS. 신규 DB 회귀는 intent/완료 각각에서 실제 파일 SQLite reader가 COMMIT을 막는 경합을 발생시켜 rollback·재준비, generation/session 경쟁 변경 거부, 실제 deadline 소진, runtime 취소와 비잠금 SQL 오류 뒤 재진입을 확인했다. publication OID·PR head·checkpoint 감사의 원자성, 원래 요청/session 보존과 push 1회를 검사했다. Git/PR은 이 DB 조합에서 double이며 기존 모듈의 실제 Git 범위·lease·부분 게시·중단·rebase 회귀도 통과했다.
+- `--unittest tests.test_execution_worker_phase.ExecutionWorkerPhaseTests.test_pending_checkpoint_request_prevents_a_new_worker_turn`: 1 test PASS. pending 요청에서 새 Worker·verify 호출이 없고 요청을 보존함을 확인했다. 신규 production port 회귀는 timeout의 일시 대기와 SQL 오류/runtime handoff 전파 및 실행 row 불변을 확인했다.
+- Review 피드백 `speculative-state-on-retry`에서 production의 `state.update_project()`가 `ExecutionStatePort.expected`를 COMMIT 전에 갱신하는 누락을 확인했다. 기존 DB 조합의 직접 SQL double을 실제 `ExecutionStatePort`·runtime repository·`state.bind()`로 교체해 완료 COMMIT 경합의 snapshot 오류를 재현했다. 최초 해당 1개 test 실행은 1 failure·4 errors였으며 이 결과를 PASS로 사용하지 않는다.
+- `run_checkpoint_publication_request()`를 게시 effects에 연결했다. 각 시도 callback의 정상/예외 반환에서 실행 port snapshot을 원복하고 COMMIT 성공 후에만 갱신 snapshot을 확정한다. 동일 경합 test의 재실행은 PASS이며 수정 후 동일 runner의 `--unittest tests.test_worker_checkpoint_publication`도 17 tests PASS다. retry/timeout/cancel·generation/session 경쟁·SQL 오류와 재진입에서 port snapshot, checkpoint, publication OID와 PR head를 검증한다. DB 잠금은 실제 SQLite이고 Git/PR은 double이다.
+- 관련 테스트의 삭제·skip·assertion 약화는 없으며 전체 verify·Windows native 실행·게시·Merge 판정은 수행하지 않았다. Review 지적 수정의 전체 검증은 Manager가 수행한다.
 
 ## Decision Log
 

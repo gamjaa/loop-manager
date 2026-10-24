@@ -75,6 +75,29 @@ class ExecutionStatePort:
         row = self.repository.get(self.repo, self.plan_id)
         return {"last_error": row.last_error}
 
+    def run_checkpoint_publication_request(self, operation):
+        """Keep attempt-local snapshots out of commit retries and cancellation."""
+        from loop_manager_internal.storage.db_access import CoordinatedConnection
+        if self.connection.in_transaction:
+            raise runtime_state.RuntimeStateError('checkpoint publication requires transaction ownership')
+        expected = self.check()
+
+        def apply(connection):
+            try:
+                result = operation(connection)
+                return result, self.expected
+            finally:
+                # COMMIT and retry waiting happen after the callable returns.
+                self.expected = expected
+
+        if isinstance(self.connection, CoordinatedConnection):
+            result, updated = self.connection.run_request(apply)
+        else:
+            with runtime_state._transaction(self.connection):
+                result, updated = apply(self.connection)
+        self.expected = updated
+        return result
+
     def recover_rebase_checkpoint(self, checkpoints, service):
         from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
         from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
