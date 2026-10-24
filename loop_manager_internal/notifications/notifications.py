@@ -8,6 +8,7 @@ from .incidents import (_key, _remote_inspection_suffix, _queue_block,
                         recover_interrupted_starts)
 from .events import (enqueue_current_project_events,
                      record_pr_review_candidate,
+                     cancel_pr_review_events_for_plans,
                      cancel_pending_persistent_execution_failure_event,
                      suppress_persistent_failure_for_block, record_merged_plan,
                      enqueue_completion_if_ready, mark_work_available,

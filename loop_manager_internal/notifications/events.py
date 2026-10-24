@@ -9,7 +9,7 @@ from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
 from .policy import (is_current, cancel_stale_events, block_recovery,
-                     pr_review_candidate, SOURCE_ACTION_REASONS)
+                     cancel_event, pr_review_candidate, SOURCE_ACTION_REASONS)
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
@@ -78,6 +78,26 @@ def record_pr_review_candidate(
         "review_input_identity=excluded.review_input_identity",
         (repo, plan_id, publication_token, review_input_identity),
     )
+
+
+def cancel_pr_review_events_for_plans(
+    connection: sqlite3.Connection, repo: str, plan_ids,
+) -> None:
+    """Cancel pending notices when a conflict observation confirms a different PR head."""
+    stale_plan_ids = {str(plan_id) for plan_id in plan_ids}
+    if not stale_plan_ids:
+        return
+    for row in connection.execute(
+        "SELECT event_key, payload FROM notification_outbox "
+        "WHERE repo=? AND event_type='pr_created' "
+        "AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+    ).fetchall():
+        try:
+            payload = json.loads(str(row[1]))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and str(payload.get('execplan_id') or '') in stale_plan_ids:
+            cancel_event(connection, str(row[0]))
 
 
 def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) -> None:

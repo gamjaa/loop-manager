@@ -972,6 +972,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         from loop_manager_internal.execution.execution_review_handler import ReviewHandler
         from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 
+        project_repo = '/projects/alpha'
         with tempfile.TemporaryDirectory() as directory:
             repo_path = Path(directory) / 'repo'
             repo_path.mkdir()
@@ -1015,7 +1016,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             handler.ports = SimpleNamespace(
                 snapshot=lambda: SimpleNamespace(_definition_snapshot=definition),
                 git=git,
-                identity=SimpleNamespace(repo='/projects/alpha'),
+                identity=SimpleNamespace(repo=project_repo),
             )
             context = SimpleNamespace(
                 worktree=repo_path, plan=SimpleNamespace(plan_id='G-018'),
@@ -1039,22 +1040,22 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(before[1], after[1])
             connection = self.connection()
             first = self.prepare_pr_candidate(
-                connection, base=base_before, head=head_before,
+                connection, repo=project_repo, base=base_before, head=head_before,
                 review_input_identity=before[1],
             )
             self.assertEqual(first['candidate_publication_token'], before[0])
             with connection:
-                notifications.enqueue_current_project_events(connection, self.repo)
+                notifications.enqueue_current_project_events(connection, project_repo)
             sent = mock.Mock()
             self.assertEqual(notifications.dispatch_pending(
                 connection, 'token', 'chat', adapter=sent,
             ), 1)
             self.prepare_pr_candidate(
-                connection, base=base_after, head=head_after,
+                connection, repo=project_repo, base=base_after, head=head_after,
                 review_input_identity=after[1],
             )
             with connection:
-                notifications.enqueue_current_project_events(connection, self.repo)
+                notifications.enqueue_current_project_events(connection, project_repo)
             self.assertEqual(notifications.dispatch_pending(
                 connection, 'token', 'chat', adapter=sent,
             ), 0)

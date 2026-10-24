@@ -1659,9 +1659,10 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
 
     def test_pr_retry_waits_for_successful_observation_and_rechecks_closed_or_replaced(self):
         from types import SimpleNamespace
+        from loop_manager_internal.application.project_service import _stale_conflicting_pr_plan_ids
         from loop_manager_internal.recovery import waiting_pr_service
 
-        for outcome in ('lookup_failure', 'closed', 'replaced', 'still_open'):
+        for outcome in ('lookup_failure', 'closed', 'replaced', 'replaced_conflict', 'still_open'):
             with self.subTest(outcome=outcome):
                 connection = self.connection()
                 repo = self.repo
@@ -1697,7 +1698,7 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                         if outcome == 'lookup_failure':
                             raise RuntimeError('GitHub lookup unavailable')
                         state = 'CLOSED' if outcome == 'closed' else 'OPEN'
-                        observed_head = ('c' * 40 if outcome == 'replaced'
+                        observed_head = ('c' * 40 if outcome in {'replaced', 'replaced_conflict'}
                                          else candidate['candidate_head_oid'])
                         return {
                             'url': candidate['pr_url'], 'state': state,
@@ -1715,7 +1716,9 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                             ),
                         _recorded_base_fetch=lambda *args, **kwargs: None,
                         _resume_reopened_pull_request=lambda *args, **kwargs: None,
-                        classify_pull_request_mergeability=lambda _pr: 'mergeable',
+                        classify_pull_request_mergeability=lambda _pr: (
+                            'conflicting' if outcome == 'replaced_conflict' else 'mergeable'
+                        ),
                         complete_merged_execplan_worktree=lambda *args, **kwargs: None,
                         operation_log=lambda *args, **kwargs: None,
                         operation_print=lambda *args, **kwargs: None,
@@ -1729,10 +1732,16 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                         select_waiting_pull_request_conflict=lambda *args, **kwargs:
                             SimpleNamespace(step_result=None),
                     )
-                    observe_options = {
-                        'after_observation': lambda _observation:
-                            notifications.flush_observed_pr_events(connection, repo),
-                    }
+                    def after_observation(observation):
+                        stale_plan_ids = _stale_conflicting_pr_plan_ids(observation)
+                        if stale_plan_ids:
+                            with connection:
+                                notifications.cancel_pr_review_events_for_plans(
+                                    connection, repo, stale_plan_ids,
+                                )
+                        notifications.flush_observed_pr_events(connection, repo)
+
+                    observe_options = {'after_observation': after_observation}
                     if outcome == 'lookup_failure':
                         with self.assertRaisesRegex(RuntimeError, 'lookup unavailable'):
                             waiting_pr_service.synchronize_waiting_pull_requests(
@@ -1754,10 +1763,16 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                 else:
                     sent.assert_not_called()
                     self.assertIsNone(current['sent_at'])
-                    if outcome in {'closed', 'replaced'}:
+                    if outcome in {'closed', 'replaced', 'replaced_conflict'}:
                         self.assertIsNotNone(current['canceled_at'])
                     else:
                         self.assertIsNone(current['canceled_at'])
+                    if outcome == 'replaced_conflict':
+                        stored_head = connection.execute(
+                            "SELECT pr_head_oid FROM exec_plans WHERE repo=? AND plan_id='G-018'",
+                            (repo,),
+                        ).fetchone()[0]
+                        self.assertEqual(stored_head, candidate['candidate_head_oid'])
                     self.assertEqual(current['attempts'], 1)
                 connection.close()
 
