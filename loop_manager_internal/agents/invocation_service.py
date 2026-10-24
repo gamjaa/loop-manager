@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from pathlib import Path
-from loop_manager_internal.storage.db_access import CoordinatedConnection, DatabaseWaitTimeout, open_connection
+from loop_manager_internal.storage.db_access import CoordinatedConnection, DatabaseWaitTimeout, finish_implicit_request, open_connection
 import sqlite3
 import subprocess
 import time
@@ -41,6 +41,11 @@ class InvocationEffects:
 def _database_request(connection, operation):
     """Replay only DB preparation, never a provider or caller callback."""
     if isinstance(connection, CoordinatedConnection):
+        if (connection.in_transaction and not connection._depth and not connection._explicit_transaction
+                and connection._request_deadline is None):
+            # A completed callback may leave an implicit write. Confirm it once;
+            # the callback itself is never part of the replayable request.
+            finish_implicit_request(connection._gate.path)
         return connection.run_request(lambda current: operation())
     # Repository methods retain transaction ownership on the public sqlite3 port.
     return operation()

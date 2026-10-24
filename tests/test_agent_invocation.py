@@ -18,6 +18,30 @@ from tests.support.fixed_samples import PROJECT_FILES
 
 
 class RunnerTests(TestCase):
+    def test_database_request_confirms_implicit_writes_and_preserves_explicit_rollback(self):
+        from loop_manager_internal.agents.invocation_service import _database_request
+        from loop_manager_internal.storage.db_access import open_connection
+        connection = open_connection(self.state_dir / 'callback-boundary.db')
+        self.addCleanup(connection.close)
+        with connection:
+            connection.execute('CREATE TABLE sample(value INTEGER)')
+            connection.execute('INSERT INTO sample VALUES (0)')
+        connection.execute('UPDATE sample SET value=1')
+        self.assertTrue(connection.in_transaction)
+        operation = mock.Mock(side_effect=lambda: connection.execute('SELECT value FROM sample').fetchone()[0])
+        self.assertEqual(_database_request(connection, operation), 1)
+        operation.assert_called_once()
+        self.assertFalse(connection.in_transaction)
+        self.assertFalse(connection._held)
+        operation.reset_mock()
+        with self.assertRaisesRegex(ValueError, 'outer rollback'), connection:
+            connection.execute('UPDATE sample SET value=2')
+            with self.assertRaisesRegex(RuntimeError, 'transaction 밖'):
+                _database_request(connection, operation)
+            operation.assert_not_called()
+            raise ValueError('outer rollback')
+        self.assertEqual(connection.execute('SELECT value FROM sample').fetchone()[0], 1)
+
     def test_invalid_targeted_evidence_still_finishes_the_physical_invocation_ledger(self):
         class Provider:
             def run(self, request):
