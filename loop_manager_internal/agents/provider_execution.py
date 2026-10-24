@@ -72,7 +72,10 @@ def observe(connection, *, repo: str, plan_id: str | None, worktree: Path,
         context = ('-m', profile.model, '-c', f'model_reasoning_effort="{profile.effort}"',
             '-c', 'service_tier="fast"' if fast else 'service_tier="default"',
             '-c', f'features.fast_mode={str(fast).lower()}', *launch.arguments)
-        instructions = []
+        instruction_evidence = []
+
+        def observe_instruction(instruction_digest, configuration_digest):
+            instruction_evidence.append((instruction_digest, configuration_digest))
 
         def check_native_lookup():
             return agent_write_isolation.assert_preparation_lookup_current(
@@ -80,14 +83,19 @@ def observe(connection, *, repo: str, plan_id: str | None, worktree: Path,
                 environment_variables=launch.environment)
 
         provider_guidance.codex_arguments(guidance, worktree, environment=launch.environment,
-            context_arguments=context, observe_instruction=instructions.append,
+            context_arguments=context, observe_instruction=observe_instruction,
             on_lookup=check_native_lookup)
+        if (len(instruction_evidence) != 1
+                or not isinstance(instruction_evidence[0][1], str)
+                or not instruction_evidence[0][1]):
+            return None
         evidence = agent_write_isolation.refresh_configuration_evidence(
             checked[0], launch, worktree, state_dir, config_path, repo, True, snapshot_digest,
+            instruction_configuration_digest=instruction_evidence[0][1],
             environment_variables=launch.environment)
         agent_write_isolation.assert_current(evidence, worktree, state_dir, config_path,
             repo, True, snapshot_digest, environment_variables=launch.environment)
-        return execution_identity(evidence, launch, profile, instructions[0], read_only=True)
+        return execution_identity(evidence, launch, profile, instruction_evidence[0][0], read_only=True)
     except (RuntimeError, OSError, ValueError, TypeError, IndexError, sqlite3.Error):
         return None
     finally:

@@ -401,6 +401,7 @@ def refresh_configuration_evidence(evidence: IsolationEvidence, launch: CodexLau
                                    worktree: Path, state_dir: Path, config_path: Path,
                                    expected_repository: str | None, read_only: bool,
                                    snapshot_digest: Callable[[], str], *, session_id: str | None = None,
+                                   instruction_configuration_digest: str | None = None,
                                    environment_variables: dict[str, str] | None = None
                                    ) -> IsolationEvidence:
     """Bind safe settings written by preparation lookups before the final check."""
@@ -415,6 +416,9 @@ def refresh_configuration_evidence(evidence: IsolationEvidence, launch: CodexLau
         raise IsolationError('Agent 준비 중 worktree·repository·Git 상태가 변경됐습니다.')
     configuration, stable_configuration = _checked_codex_configuration(
         boundary.worktree, state_dir, config_path, environment_variables)
+    if (instruction_configuration_digest is not None and
+            configuration != instruction_configuration_digest):
+        raise IsolationError('Codex 설정이 지침 해석 뒤 변경됐습니다.')
     if stable_configuration != evidence.stable_configuration_digest:
         raise IsolationError('관리·프로젝트 Codex 설정이 준비 중 변경됐습니다.')
     if configuration == evidence.configuration_digest:

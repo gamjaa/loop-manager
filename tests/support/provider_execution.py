@@ -48,6 +48,8 @@ class ProviderExecutionFixture:
         self.parent_home.mkdir()
         self.lookups = []
         self.instruction_extra = 'native project instructions'
+        self.native_tool_definitions = None
+        self.native_tool_transport_id = 'native-tool-transport-id'
         self.calls = 0
         self.native_probe_hook = None
         self.before_handoff = None
@@ -86,8 +88,12 @@ class ProviderExecutionFixture:
         for arg in arguments:
             if arg.startswith('developer_instructions='):
                 text = json.loads(arg.partition('=')[2])
-        return json.dumps([{'type': 'message', 'role': 'developer',
-                            'content': [{'type': 'input_text', 'text': text}]}])
+        items = [{'type': 'message', 'role': 'developer',
+                  'content': [{'type': 'input_text', 'text': text}]}]
+        if self.native_tool_definitions is not None:
+            items.insert(0, {'type': 'additional_tools', 'role': 'developer',
+                'id': self.native_tool_transport_id, 'tools': self.native_tool_definitions})
+        return json.dumps(items)
 
     def start_launch(self, arguments, launch_process, **kwargs):
         if self.before_handoff is not None:
