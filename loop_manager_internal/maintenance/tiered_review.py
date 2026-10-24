@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from loop_manager_internal.application.result_normalization import bind_identity, tagged_json
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -190,8 +190,10 @@ class TieredReviewRepository:
             return Selection(required, mode, reasons, paths, index, roots, merged_count, selected_request,
                              base, root_source, placements, root_reviews, classifications)
 
+        root_review_required = bool(placements and root_reviews is None)
+
         if interval == 0 and not force_full and request_id is None:
-            return selected(False, "fast", ("disabled",), ())
+            return selected(False, "targeted" if root_review_required else "fast", ("disabled",), ())
         count = previous["full_merged_count"] if previous else None
         if count is not None and merged_count < count:
             raise TieredReviewError("전체 정밀 Merge 기준이 현재 이력보다 큽니다.")
@@ -201,8 +203,8 @@ class TieredReviewRepository:
         old = previous["records"]
         changed = {path for path in old.keys() | index.records.keys() if old.get(path) != index.records.get(path)}
         if not changed and list(roots) == previous["roots"]:
-            if root_reviews is None:
-                return selected(True, "fast", ("root_review_required",), ())
+            if root_review_required:
+                return selected(True, "targeted", ("root_review_required",), ())
             return selected(False, "fast", ("same_input",), ())
         reasons, risky = set(), set()
         for path in sorted(changed):
@@ -231,6 +233,10 @@ class TieredReviewRepository:
             if not risky:
                 risky.update(index.records)
         if not reasons:
+            if root_review_required:
+                # The module change remains eligible for the static fast path;
+                # only the missing root investigation needs a model unit.
+                return selected(True, "targeted", ("root_review_required",), ())
             return selected(True, "fast", ("known_incremental_change",), tuple(sorted(changed & index.records.keys())))
         affected = set(risky)
         for path in list(risky):
@@ -251,6 +257,9 @@ class TieredReviewRepository:
 
     def prepare(self, repo, cycle, selection: Selection, *, cycle_id=None, review_mode=None,
                 guidance_hash=None):
+        current_guidance = common_guidance.effective_planning_hash(self.connection, repo)
+        if selection.mode == "fast" and selection.root_placements and selection.root_reviews is None:
+            selection = replace(selection, mode="targeted", reasons=("root_review_required",), paths=())
         placements = list(selection.root_placements)
         root_reviews = selection.root_reviews
         if not placements:
@@ -262,8 +271,9 @@ class TieredReviewRepository:
             "review_mode": review_mode or selection.mode, "base": selection.base,
             "root_source": selection.root_source, "root_placements": placements,
             "root_reviews": list(root_reviews) if root_reviews is not None else None,
-            "root_classifications": list(selection.root_classifications)}
-        value["guidance_hash"] = guidance_hash or common_guidance.effective_planning_hash(self.connection, repo)
+            "root_classifications": list(selection.root_classifications),
+            "root_guidance_hash": current_guidance}
+        value["guidance_hash"] = guidance_hash or current_guidance
         value["digest"] = digest(value)
         row = self.connection.execute("SELECT cycle, source_revision, digest, assessment_json FROM tiered_maintenance_assessments "
                                       "WHERE repo = ?", (repo,)).fetchone()
@@ -274,18 +284,29 @@ class TieredReviewRepository:
             for key in ("base", "root_source", "root_placements", "root_classifications"):
                 if key in saved and saved[key] != value[key]:
                     raise TieredReviewError("같은 assessment identity의 루트 조사 범위가 달라졌습니다.")
+            saved_root_guidance = saved.get("root_guidance_hash", saved.get("guidance_hash"))
+            root_guidance_changed = bool(saved.get("root_placements")
+                                          and saved_root_guidance != value["root_guidance_hash"])
             if "root_reviews" in saved:
                 if (saved["root_reviews"] is not None and value["root_reviews"] is not None
-                        and saved["root_reviews"] != value["root_reviews"]):
+                        and not root_guidance_changed and saved["root_reviews"] != value["root_reviews"]):
                     raise TieredReviewError("같은 assessment identity의 루트 조사 결과가 달라졌습니다.")
-                value["root_reviews"] = saved["root_reviews"] if saved["root_reviews"] is not None else value["root_reviews"]
+                if saved["root_reviews"] is not None and not root_guidance_changed:
+                    value["root_reviews"] = saved["root_reviews"]
             upgraded_roots = any(key not in saved for key in
-                                 ("base", "root_source", "root_placements", "root_reviews", "root_classifications"))
-            if upgraded_roots:
+                                 ("base", "root_source", "root_placements", "root_reviews", "root_classifications",
+                                  "root_guidance_hash"))
+            mode_corrected = (saved.get("mode") == "fast" and value["mode"] == "targeted"
+                              and bool(value["root_placements"]) and value["root_reviews"] is None)
+            if upgraded_roots or root_guidance_changed or mode_corrected:
                 saved = {**saved, "base": value["base"], "root_source": value["root_source"],
                          "root_placements": value["root_placements"],
                          "root_reviews": value["root_reviews"],
-                         "root_classifications": value["root_classifications"]}
+                         "root_classifications": value["root_classifications"],
+                         "root_guidance_hash": value["root_guidance_hash"]}
+                if mode_corrected:
+                    saved.update({key: value[key] for key in
+                                  ("mode", "reasons", "paths", "review_mode", "root_reviews")})
                 saved.pop("digest", None)
                 saved["digest"] = digest(saved)
                 with self.connection:
@@ -308,6 +329,8 @@ class TieredReviewRepository:
                     self.connection.execute("UPDATE tiered_maintenance_assessments SET digest = ?, assessment_json = ? "
                         "WHERE repo = ?", (saved["digest"], code_index.encode(saved), repo))
             if saved.get('guidance_hash'):
+                if root_guidance_changed or mode_corrected:
+                    self._preserve_root_unit(repo, row[3], saved)
                 return saved
             # A legacy assessment is not evidence of the newly injected rules.
             # Keep its source/task scope and audit, but recheck its judgments.
@@ -320,6 +343,11 @@ class TieredReviewRepository:
         with self.connection:
             self.connection.execute("INSERT OR REPLACE INTO tiered_maintenance_assessments VALUES (?, ?, ?, ?, ?)",
                                     (repo, cycle, selection.index.revision, value["digest"], code_index.encode(value)))
+        if row and (row[0], row[1]) == (cycle, selection.index.revision):
+            old = json.loads(row[3])
+            if (old.get("mode") == "fast" and value.get("mode") == "targeted"
+                    and old.get("root_placements") and value.get("root_reviews") is None):
+                self._preserve_root_unit(repo, row[3], value)
         return value
 
     def active(self, repo, cycle, revision):
@@ -365,18 +393,51 @@ class TieredReviewRepository:
                  "request": assessment["request_id"], "roots": assessment["roots"], "version": code_index.VERSION,
                  "guidance_hash": assessment.get("guidance_hash"), "protocol": RESULT_PROTOCOL}
         units = [{"digest": digest({"parts": parts, "epoch": epoch}), "parts": parts} for parts in batches]
-        if assessment.get("root_reviews") is None and assessment.get("root_placements"):
-            source = assessment.get("root_source")
-            if not isinstance(source, dict) or assessment.get("base") is None:
-                raise TieredReviewError("루트 조사 source identity가 없습니다.")
-            root_epoch = {"assessment": assessment["digest"], "cycle": assessment["cycle"],
-                          "source": source, "placements": assessment["root_placements"],
-                          "guidance_hash": assessment.get("guidance_hash"),
-                          "protocol": ROOT_RESULT_PROTOCOL}
-            units.append({"digest": digest({"kind": "root_placement", "epoch": root_epoch}),
-                          "kind": "root_placement", "source": source,
-                          "placements": assessment["root_placements"]})
+        if assessment["mode"] == "fast" and assessment.get("root_placements") and assessment.get("root_reviews") is None:
+            raise TieredReviewError("fast 평가에는 미검토 루트 unit을 둘 수 없습니다.")
+        root_unit = _root_review_unit(assessment)
+        if root_unit is not None:
+            units.append(root_unit)
         return tuple(units)
+
+    def _preserve_root_unit(self, repo, prior_json, assessment):
+        """Carry a root result or session across a mode-only assessment correction."""
+        prior = json.loads(prior_json)
+        if (prior.get("root_reviews") is not None or assessment.get("root_reviews") is not None
+                or not prior.get("root_placements") or not assessment.get("root_placements")):
+            return
+        prior_guidance = prior.get("root_guidance_hash", prior.get("guidance_hash"))
+        same_guidance = prior_guidance == assessment.get("root_guidance_hash")
+        old_unit = _root_review_unit(prior)
+        new_unit = _root_review_unit(assessment)
+        if old_unit is None or new_unit is None or old_unit["digest"] == new_unit["digest"]:
+            return
+        row = self.connection.execute("SELECT session_id, result_json, error FROM tiered_maintenance_units "
+                                      "WHERE repo = ? AND digest = ?", (repo, old_unit["digest"])).fetchone()
+        if row is None:
+            return
+        if row[1] is not None:
+            if not same_guidance:
+                return
+            audit = self.connection.execute("SELECT protocol, scope_json, raw_result, normalized_result, source_revision "
+                "FROM tiered_maintenance_result_audit WHERE repo = ? AND digest = ?",
+                (repo, old_unit["digest"])).fetchone()
+            try:
+                if (audit is None or audit[0] != ROOT_RESULT_PROTOCOL or json.loads(audit[1]) != old_unit
+                        or audit[4] != assessment["source_revision"]
+                        or json.loads(audit[3]) != json.loads(row[1])):
+                    return
+            except (TypeError, ValueError):
+                return
+            try:
+                self.complete(repo, new_unit, audit[2], lambda _path: b"")
+            except TieredReviewError:
+                return
+            return
+        with self.connection:
+            self.connection.execute("INSERT OR IGNORE INTO tiered_maintenance_units "
+                "(repo, digest, session_id, error) VALUES (?, ?, ?, ?)",
+                (repo, new_unit["digest"], row[0], row[2]))
 
     def pending(self, repo, assessment):
         for unit in self.units(assessment):
@@ -544,7 +605,8 @@ class TieredReviewRepository:
             "assessment_digest, root_reviews_json, guidance_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (repo, code_index.encode(evidence["records"]), code_index.encode(evidence["roots"]),
              evidence["source_revision"], full_count, full_sha, evidence["digest"],
-             code_index.encode(evidence["root_reviews"]), evidence.get("guidance_hash")))
+             code_index.encode(evidence["root_reviews"]),
+             evidence.get("root_guidance_hash", evidence.get("guidance_hash"))))
         if evidence["request_id"]:
             self.connection.execute("DELETE FROM tiered_maintenance_requests WHERE repo = ? AND request_id = ?",
                                     (repo, evidence["request_id"]))
@@ -614,6 +676,21 @@ def _assessment_inventory(repo, assessment):
                     for path, record in sorted(assessment["records"].items()))
     classifications = tuple(ClassifiedPath(**item) for item in assessment.get("root_classifications", ()))
     return SourceInventory(revision, sources, classifications)
+
+
+def _root_review_unit(assessment):
+    if assessment.get("root_reviews") is not None or not assessment.get("root_placements"):
+        return None
+    source = assessment.get("root_source")
+    if not isinstance(source, dict) or assessment.get("base") is None:
+        raise TieredReviewError("루트 조사 source identity가 없습니다.")
+    root_epoch = {"assessment": assessment["digest"], "cycle": assessment["cycle"],
+                  "source": source, "placements": assessment["root_placements"],
+                  "guidance_hash": assessment.get("root_guidance_hash", assessment.get("guidance_hash")),
+                  "protocol": ROOT_RESULT_PROTOCOL}
+    return {"digest": digest({"kind": "root_placement", "epoch": root_epoch}),
+            "kind": "root_placement", "source": source,
+            "placements": assessment["root_placements"]}
 
 
 def parse_root_review_result(repo, assessment, unit, output, *, inventory=None, current=False):

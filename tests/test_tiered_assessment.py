@@ -182,6 +182,43 @@ class TieredAssessmentTest(PlanningCase):
         self.assertEqual(self.ports.tiered.repository.evidence("/repo", 1, self.sha)["receipts"], [])
         self.ports.agent.run_planner.assert_not_called()
 
+    def test_resumed_legacy_fast_root_scope_becomes_targeted_and_keeps_session(self):
+        from dataclasses import asdict
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.maintenance.maintenance_file_inventory import TrackedSource
+
+        root_source = asdict(TrackedSource(".", "d" * 64, "040000", self.sha, "root review source"))
+        placements = [{"path": "docs", "category": "documentation", "reason": "Tracked documentation root"}]
+        selection = replace(self.ports.tiered.select.return_value, mode="fast",
+            reasons=("known_incremental_change",), paths=tuple(self.contents),
+            roots=({"path": "docs", "category": "documentation"},), base="main",
+            root_source=root_source, root_placements=tuple(placements), root_reviews=None)
+        guidance = common_guidance.effective_planning_hash(self.connection, "/repo")
+        legacy = {"version": 1, "analysis_version": code_index.VERSION, "mode": "fast",
+            "reasons": list(selection.reasons), "records": selection.index.records,
+            "roots": list(selection.roots), "paths": list(selection.paths), "merged_count": 0,
+            "request_id": None, "source_revision": self.sha, "cycle": 0, "cycle_id": None,
+            "review_mode": "fast", "base": "main", "root_source": root_source,
+            "root_placements": placements, "root_reviews": None, "root_classifications": [],
+            "guidance_hash": guidance, "root_guidance_hash": guidance}
+        legacy["digest"] = tiered_review.digest(legacy)
+        self.connection.execute("INSERT INTO tiered_maintenance_assessments VALUES (?, ?, ?, ?, ?)",
+            ("/repo", 0, self.sha, legacy["digest"], code_index.encode(legacy)))
+        old_unit = tiered_review._root_review_unit(legacy)
+        self.connection.execute("INSERT INTO tiered_maintenance_units (repo, digest, session_id) VALUES (?, ?, ?)",
+            ("/repo", old_unit["digest"], "saved-root-session"))
+
+        assessment = self.ports.tiered.prepare(self.run, selection)
+        pending = self.ports.tiered.repository.pending("/repo", assessment)
+
+        self.assertEqual(assessment["mode"], "targeted")
+        self.assertEqual(assessment["paths"], [])
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["kind"], "root_placement")
+        self.assertEqual(pending["session_id"], "saved-root-session", [tuple(row) for row in
+            self.connection.execute("SELECT digest, session_id FROM tiered_maintenance_units")])
+        self.assertEqual(len(self.ports.tiered.repository.units(assessment)), 1)
+
     def test_confirmed_root_move_candidate_prevents_no_change_and_enters_plan_context(self):
         root = {"path": "notes.md", "category": "internal_implementation",
             "destination": "docs/notes.md", "reason": "Move confirmed internal notes to their safe destination.",
