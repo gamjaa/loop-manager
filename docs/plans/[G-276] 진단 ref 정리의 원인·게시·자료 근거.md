@@ -40,6 +40,8 @@ priority: normal
 
 ## Progress
 
+문서 보고 교정 호출에서 관리 rebase의 HEAD `36fb83be72a372444f6f3c8c95d9539d0071293c`와 base `e8e8aba1432742df7b740234f00322c0dfa37fbe`를 수용하고 21개 파일 전체 diff와 현재 sources를 다시 확인했다. PRODUCT·ARCHITECTURE의 기존 설명은 유효하며 현재 문서 patch hash로 최종 보고를 갱신한다. 이 후보에서 targeted runner로 cleanup 26개, artifact recovery 9개, rebase 완료·재시작 case 1개, launcher class 1개를 새로 실행해 총 37개가 통과했다. 전체 verify·native 예제 통합은 직접 실행하지 않았고 제품 코드·Requirement·frontmatter는 변경하지 않았다. 아래는 이전 후보들의 교정과 검증 이력이다.
+
 Review의 `remote-identity-mismatch`를 교정했다. 실제 `managed_rebase_runtime.build_service`는 `Remote(repo, ...)`를 생성하므로 acceptance의 저장소 identity는 로컬 repo 키와 대조해야 한다. 해소 기록 저장과 준비 판정에서 origin 비교를 repo 비교로 바꾸고, 과거 checkpoint 해소의 origin은 연결된 게시 사용 기록에서 얻는다. 현재 등록 origin과 저장된 게시/해소 origin의 일치 검사는 유지한다. ARCHITECTURE에도 두 identity의 원본과 대조 책임을 명시했다.
 
 진단 fixture를 실제 acceptance 계약으로 고친 뒤 기존 COMPLETE 준비 case에서 해소 기록이 없는 실패를 재현했다. 수정 후 동일 명령이 1개 통과했으며 `tests.test_diagnostic_cleanup` 26개와 `tests.test_scope_block_revalidation.EvidenceFreeRebaseBlockTests.test_completed_scope_stage_result_adopts_after_restart_and_keeps_other_block` 1개도 통과했다(서로 다른 27개). COMPLETE·WAITING 후 COMPLETE·과거 generation 감사 경로가 로컬 repo identity로 준비되고 등록 origin이 보존됨을 확인했다. origin을 repository로 넣거나 다른 저장소 acceptance를 쓰면 저장/준비를 거부하는 회귀도 추가했다. 전체 verify는 수정 후 Manager 재실행 대상이며 Requirement·frontmatter는 변경하지 않았다. 아래는 이전 후보의 검증 이력이다.
