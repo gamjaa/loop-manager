@@ -391,17 +391,24 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
     def test_node_lookup_failure_during_provider_preflight_keeps_original_output(self):
         config = profile_config(self)
+        from loop_manager_internal.config import execution_path
         auth = subprocess.CompletedProcess(
             ["claude", "auth", "status"], 127, stdout="node: command not found\n", stderr="",
         )
-        with mock.patch("loop_manager.shutil.which", return_value="/bin/claude"), \
-                mock.patch("loop_manager.command", return_value=auth), \
-                mock.patch("loop_manager.claude_model_efforts") as model_efforts:
-            with self.assertRaisesRegex(RuntimeError, "node: command not found") as failure:
-                loop_manager.validate_provider_runtime(config, "claude")
-        self.assertIn('bash scripts/setup.sh', str(failure.exception))
-        self.assertNotIn('인증되어 있지 않습니다', str(failure.exception))
-        model_efforts.assert_not_called()
+        for platform in ('linux', 'darwin', 'win32'):
+            with self.subTest(platform=platform), \
+                    mock.patch.object(execution_path.sys, 'platform', platform), \
+                    mock.patch("loop_manager.shutil.which", return_value="/bin/claude"), \
+                    mock.patch("loop_manager.command", return_value=auth), \
+                    mock.patch("loop_manager.claude_model_efforts") as model_efforts:
+                with self.assertRaisesRegex(RuntimeError, "node: command not found") as failure:
+                    loop_manager.validate_provider_runtime(config, "claude")
+                self.assertNotIn('인증되어 있지 않습니다', str(failure.exception))
+                if platform == 'linux':
+                    self.assertIn('bash scripts/setup.sh', str(failure.exception))
+                else:
+                    self.assertNotIn('bash scripts/setup.sh', str(failure.exception))
+                model_efforts.assert_not_called()
         authenticated = subprocess.CompletedProcess(
             ["claude", "auth", "status"], 0, stdout='{"loggedIn":true}'
         )

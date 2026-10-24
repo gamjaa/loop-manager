@@ -100,7 +100,6 @@ class ExecutionPathTests(unittest.TestCase):
             '/bin/sh: 1: node: not found',
             'env: ‘node’: No such file or directory',
             'Error: spawn node ENOENT',
-            "FileNotFoundError: [Errno 2] No such file or directory: 'node'",
         ):
             with self.subTest(output=output):
                 self.assertTrue(execution_path.command_lookup_failed(output))
@@ -111,6 +110,9 @@ class ExecutionPathTests(unittest.TestCase):
             'not logged in',
             'permission denied',
             'command failed with exit code 1',
+            "FileNotFoundError: [Errno 2] No such file or directory: '/home/user/settings.toml'",
+            "FileNotFoundError: [Errno 2] No such file or directory: '/home/user/auth.json'",
+            "FileNotFoundError: [Errno 2] No such file or directory: '/home/user/sessions/saved-session.json'",
         ):
             with self.subTest(output=output):
                 self.assertFalse(execution_path.command_lookup_failed(output))

@@ -25,10 +25,6 @@ _COMMAND_NOT_FOUND = (
         r"[A-Za-z0-9_.+-]+[\"'’]?:[ \t]*No such file or directory[ \t]*$"
     ),
     re.compile(r"(?im)^[ \t]*(?:Error:[ \t]*)?spawn(?:Sync)?[ \t]+[\"']?[A-Za-z0-9_./+-]+[\"']?[ \t]+ENOENT\b"),
-    re.compile(
-        r"(?im)^[ \t]*(?:FileNotFoundError: )?\[Errno 2\] No such file or directory: "
-        r"[\"'](?:[^\"']*/)?[A-Za-z0-9_.+-]+[\"']"
-    ),
 )
 
 
