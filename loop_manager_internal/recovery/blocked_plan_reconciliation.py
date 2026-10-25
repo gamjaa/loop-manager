@@ -23,6 +23,7 @@ from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCh
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage import planning_review_state
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -71,6 +72,7 @@ def slot_available(connection, repo, plan_id) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'general_planning_publications'").fetchone()
         and connection.execute('SELECT 1 FROM general_planning_publications WHERE repo = ?', (repo,)).fetchone())
     return bool(project is not None and runtime.recovery_slot_available(repo)
+                and not planning_review_state.general_pending(connection, repo)
                 and (not project['pr_conflict_recovery']
                      or projected is not None and projected['plan_id'] == plan_id)
                 and (active is None or active['plan_id'] == plan_id)
@@ -202,6 +204,7 @@ class RecoveryWorkspaceEffects:
 class PlanRecoveryEffects(RecoveryWorkspaceEffects):
     """Explicit effects for this service; persisted decisions remain in repositories."""
     ROOT: Path
+    git_bytes: Callable[..., bytes]
     _blocked_execplan_metadata_error: Callable[..., object]
     _complete_direct_rebase_checkpoint: Callable[..., object]
     _evaluate_remote_checkpoint_cause: Callable[..., object]
@@ -276,7 +279,30 @@ class BlockedPlanReconciler:
                        for field in ('reason_code', 'release_fingerprint', 'evidence'))
                 or self.ports.unmet_execplan_dependencies(self.connection, self.repo, plan_id)):
             raise RuntimeError('차단 계획의 identity·원인·dependency 또는 실행 자리가 변경됐습니다.')
+        if context.get('planning_input', {}) != planning_review_state.reassessment(self.connection, self.repo, plan_id):
+            raise InputChanged('차단 계획의 확정 planning 입력이 변경됐습니다.')
         return plan
+
+    def _confirmed_planning_identity(self, plan, context, planning_input):
+        from loop_manager_internal.catalog.execplan_catalog import parse_execplan_text, plan_content_hash
+        document_fields = ('content_hash', 'sources', 'depends_on')
+        identity = {field: plan[field] for field in IDENTITY_FIELDS}
+        if (any(identity[field] != context['identity'][field] for field in IDENTITY_FIELDS
+                if field not in document_fields)
+                or all(identity[field] == context['identity'][field] for field in document_fields)):
+            return context['identity']
+        confirmed = planning_input['confirmed_revision']
+        revision = plan['current_revision_sha']
+        if not revision or self.ports.git(self.repo_path, 'merge-base', '--is-ancestor',
+                                         revision, confirmed, check=False).returncode != 0:
+            raise InputChanged('문서 개정의 catalog revision이 확정 planning 이력에 없습니다.')
+        raw = self.ports.git_bytes(self.repo_path, 'show', f"{confirmed}:{plan['path']}")
+        declaration = parse_execplan_text(plan['path'], raw.decode('utf-8'), validate_sources=False)
+        if (plan_content_hash(raw) != plan['content_hash'] or declaration['id'] != plan['plan_id']
+                or declaration['sources'] != json.loads(plan['sources'])
+                or declaration['depends_on'] != json.loads(plan['depends_on'])):
+            raise InputChanged('확정된 ExecPlan 원문과 현재 catalog의 문서 identity가 다릅니다.')
+        return identity
 
     def _remote(self, context, *, allow_published=False):
         project = runtime_state.project_row(self.connection, self.repo)
@@ -533,6 +559,8 @@ class BlockedPlanReconciler:
         reason = context['block']['reason_code']
         assessment_plan = {**dict(plan), **context['artifacts'], 'blocked_reason': reason}
         if reason == BlockReasonCode.USER_DECISION_REQUIRED.value:
+            if context.get('comparison_revision'):
+                assessment_plan['comparison_revision'] = context['comparison_revision']
             resolved, detail, stage = self.ports._evaluate_remote_checkpoint_cause(
                 self.connection, self.repo_path, self.state_dir, self.repo, assessment_plan,
                 self.config_path, self.timeout)
@@ -674,8 +702,11 @@ class BlockedPlanReconciler:
             return 'deferred'
         saved = self.connection.execute('SELECT * FROM blocked_plan_reconciliations WHERE repo = ? AND plan_id = ?',
                                         (self.repo, plan_id)).fetchone()
+        planning_input = planning_review_state.reassessment(self.connection, self.repo, plan_id)
+        previous_context = json.loads(saved['context']) if saved else {}
+        previous_input = previous_context.get('planning_input', {})
         if saved is None or saved['stage'] in TERMINAL:
-            if not observations.pending_input(row):
+            if not observations.pending_input(row) and planning_input == previous_input:
                 if (self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value
                         or local_verify_recheck and self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value):
                     return 'unhandled'
@@ -689,13 +720,50 @@ class BlockedPlanReconciler:
             context = {field: row[field] for field in ('registered_origin', 'origin_url', 'base_ref',
                        'branch_ref', 'base_oid', 'branch_oid')}
             context.update(plan_id=plan_id, identity={field: plan[field] for field in IDENTITY_FIELDS},
-                           block=dict(block), artifacts={field: plan[field] for field in ARTIFACT_FIELDS})
-            key, stage = observations.input_identity(row), 'observed'
+                           block=dict(block), artifacts={field: plan[field] for field in ARTIFACT_FIELDS},
+                           planning_input=planning_input)
+            same_cause = all(previous_context.get('block', {}).get(field) == block[field]
+                             for field in ('reason_code', 'release_fingerprint', 'evidence'))
+            context['comparison_revision'] = (
+                previous_context.get('comparison_revision') if same_cause else None
+            ) or (plan['plan_sha'] if same_cause else None) or plan['active_sha'] or plan['plan_sha']
+            remote_key = observations.input_identity(row)
+            context['remote_input_identity'] = remote_key
+            key, stage = (json.dumps([remote_key, planning_input], sort_keys=True) if planning_input else remote_key), 'observed'
             context['input_identity'] = key
             self._save(plan_id, key, stage, context)
         else:
             key, stage, context = saved['input_identity'], saved['stage'], json.loads(saved['context'])
+            # Older saved contexts predate the independent comparison baseline.
+            context.setdefault('comparison_revision', self._plan(plan_id)['plan_sha'] or self._plan(plan_id)['active_sha'])
         try:
+            if saved is not None and saved['stage'] not in TERMINAL and planning_input != previous_input:
+                # Keep the owned Git operation and its original target. Only
+                # refresh assessment inputs and the next desired base; pending
+                # rebase completion remains _incorporate's responsibility.
+                observed_plan = self._plan(plan_id)
+                checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, plan_id)
+                identity = self._confirmed_planning_identity(observed_plan, context, planning_input)
+                with runtime_state._transaction(self.connection):
+                    current_saved = self.connection.execute(
+                        'SELECT * FROM blocked_plan_reconciliations WHERE repo=? AND plan_id=?',
+                        (self.repo, plan_id)).fetchone()
+                    if (dict(current_saved or {}) != dict(saved)
+                            or planning_review_state.reassessment(self.connection, self.repo, plan_id) != planning_input
+                            or dict(self._plan(plan_id)) != dict(observed_plan)
+                            or ExecutionCheckpointRepository(self.connection).get(self.repo, plan_id) != checkpoint):
+                        return 'deferred'
+                    context['planning_input'] = planning_input
+                    context['identity'] = identity
+                    self._check_owner(plan_id, context)
+                    context['base_oid'] = row['base_oid']
+                    context['remote_input_identity'] = observations.input_identity(row)
+                    key = json.dumps([context['remote_input_identity'], planning_input], sort_keys=True)
+                    context['input_identity'] = key
+                    context.pop('evaluation', None)
+                    if stage in {'incorporated', 'evaluated'}:
+                        stage = 'adopted'
+                    self._save(plan_id, key, stage, context)
             plan = self._check_owner(plan_id, context)
             if stage == 'adopted' and ExecutionCheckpointRepository(self.connection).get(
                     self.repo, plan_id).operation == 'rebase':
@@ -774,6 +842,7 @@ class BlockedPlanReconciler:
                 with runtime_state._transaction(self.connection):
                     self._save(plan_id, key, 'refused', context)
                     if not isinstance(error, InputChanged):
-                        observations.mark_processed(self.connection, self.repo, plan_id, key)
+                        observations.mark_processed(self.connection, self.repo, plan_id,
+                                                    context.get('remote_input_identity', key))
             return 'blocked'
         return 'blocked'

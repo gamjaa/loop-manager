@@ -313,9 +313,23 @@ class PlanningPublicationTest(PlanningCase):
         from loop_manager_internal.planning import planner_publication
         from loop_manager_internal.storage import planning_input_state, planning_review_state as reviews
         from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage import database
         for fail_clear in (False, True):
             with self.subTest(fail_clear=fail_clear):
                 connection = self._reviewed_publication_connection()
+                database._ensure_execplans_schema(connection)
+                connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('/repo', 'main')")
+                for plan_id in ('G-001', 'G-002'):
+                    connection.execute("INSERT INTO exec_plans "
+                        "(repo, plan_id, path, title, sources, depends_on, content_hash, status, priority) "
+                        "VALUES ('/repo', ?, ?, 'Work', '[]', '[]', 'unchanged', 'PLAN_BLOCKED', 'normal')",
+                        (plan_id, f'docs/plans/[{plan_id}] Work.md'))
+                relevance = dict(revision='base', plans=[dict(plan_id='G-001', requirements=[dict(
+                    source='docs/requirements/[R-002] Policy.md', reason='resolves the original choice',
+                    quote='Use ordinary calls.')])])
+                reviews.validate(connection, '/repo', 'base', 'BLOCKED_PLAN_INPUTS: ' + json.dumps(relevance), 'reviewed')
+                connection.commit()
+                self.assertEqual(reviews.reassessment(connection, '/repo', 'G-001'), {})
                 snapshot = MutableReadySnapshot('/repo', 'base', (), 'token')
                 result = loop_manager.ValidatedPlanningResult(plans=(), publication_paths=(), mutable_snapshot=snapshot)
                 intent = SimpleNamespace(stage='prepared', base_sha='base', commit_sha='commit',
@@ -326,6 +340,11 @@ class PlanningPublicationTest(PlanningCase):
                     baseline = connection.execute('SELECT guidance_hash FROM planning_input_baselines').fetchone()
                     self.assertEqual(baseline['guidance_hash'], 'pinned-guidance')
                     self.assertTrue(planning_input_state.matches(connection, '/repo', entries))
+                    queued = reviews.reassessment(connection, '/repo', 'G-001')
+                    self.assertEqual(queued['revision'], 'base')
+                    self.assertEqual(queued['confirmed_revision'], 'commit')
+                    self.assertEqual(queued['requirements'][0]['source'], relevance['plans'][0]['requirements'][0]['source'])
+                    self.assertEqual(reviews.reassessment(connection, '/repo', 'G-002'), {})
                     if fail_clear:
                         raise RuntimeError('clear interrupted')
                 effects = planner_publication.ApplyGeneralPlanningBatchEffects(
@@ -345,6 +364,92 @@ class PlanningPublicationTest(PlanningCase):
                 self.assertEqual(reviews.get(connection, '/repo', 'general') is None, fail_clear)
                 self.assertEqual(reviews.get(connection, '/repo', 'attempt') is not None, fail_clear)
                 self.assertEqual(planning_input_state.has_baseline(connection, '/repo'), not fail_clear)
+                self.assertEqual(bool(reviews.reassessment(connection, '/repo', 'G-001')), not fail_clear)
+                self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE plan_id='G-001'").fetchone()[0], 'PLAN_BLOCKED')
+
+    def test_planner_relevance_requires_pinned_remote_text_and_current_blocked_target(self):
+        from loop_manager_internal.planning.planning_document_relevance import validate_blocked_plan_inputs
+        source = 'docs/requirements/[R-002] Policy.md'
+        requirement = '# [R-002] Policy\n\nUse ordinary calls.\n'
+        inputs = dict(revision='remote', plans=[dict(plan_id='G-001', requirements=[dict(
+            source=source, reason='changes this task validation contract', quote='Use ordinary calls.')])])
+        rows = [dict(plan_id='G-001', status='PLAN_BLOCKED')]
+        for case in ('valid', 'revision', 'unknown_target', 'archive', 'quote', 'duplicate', 'duplicate_key'):
+            with self.subTest(case=case):
+                value = json.loads(json.dumps(inputs))
+                item = value['plans'][0]['requirements'][0]
+                if case == 'revision':
+                    value['revision'] = 'local'
+                elif case == 'unknown_target':
+                    value['plans'][0]['plan_id'] = 'G-002'
+                elif case == 'archive':
+                    item['source'] = source.replace('requirements/', 'requirements/archive/')
+                elif case == 'quote':
+                    item['quote'] = 'Invented approval.'
+                output = 'BLOCKED_PLAN_INPUTS: ' + json.dumps(value)
+                if case == 'duplicate':
+                    output += '\n' + output
+                elif case == 'duplicate_key':
+                    output = output.replace('"revision": "remote"', '"revision": "remote", "revision": "remote"')
+                git = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=requirement))
+                if case == 'valid':
+                    validate_blocked_plan_inputs(output, 'remote', rows, git, Path('/repo'))
+                    git.assert_called_once_with(Path('/repo'), 'show', f'remote:{source}')
+                else:
+                    with self.assertRaises(ValueError):
+                        validate_blocked_plan_inputs(output, 'remote', rows, git, Path('/repo'))
+
+    def test_confirmed_direct_revision_queues_reassessment_without_inferred_requirements(self):
+        from loop_manager_internal.storage import database, planning_review_state as reviews
+        connection = self._reviewed_publication_connection()
+        database._ensure_execplans_schema(connection)
+        connection.execute("INSERT INTO exec_plans "
+            "(repo, plan_id, path, title, sources, depends_on, content_hash, status, priority) "
+            "VALUES ('/repo', 'G-001', 'docs/plans/[G-001] Work.md', 'Work', '[]', '[]', 'revised', 'PLAN_BLOCKED', 'normal')")
+        connection.commit()
+        with connection:
+            reviews.confirm(connection, '/repo', 'base', 'published', revised_plan_ids=('G-001',))
+        self.assertEqual(reviews.reassessment(connection, '/repo', 'G-001'),
+                         dict(revision='base', confirmed_revision='published', requirements=[]))
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+
+    def test_published_planning_recovery_queues_saved_related_input_once(self):
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.storage import database, planning_review_state as reviews
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        connection = self._reviewed_publication_connection()
+        database._ensure_execplans_schema(connection)
+        connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('/repo', 'main')")
+        connection.execute("INSERT INTO exec_plans "
+            "(repo, plan_id, path, title, sources, depends_on, content_hash, status, priority) "
+            "VALUES ('/repo', 'G-001', 'docs/plans/[G-001] Work.md', 'Work', '[]', '[]', 'unchanged', 'PLAN_BLOCKED', 'normal')")
+        reviews.validate(connection, '/repo', 'base', 'BLOCKED_PLAN_INPUTS: ' + json.dumps(dict(
+            revision='base', plans=[dict(plan_id='G-001', requirements=[dict(
+                source='docs/requirements/[R-002] Policy.md', reason='changes the task contract', quote='Current policy.')])])), 'reviewed')
+        connection.commit()
+        snapshot = MutableReadySnapshot('/repo', 'base', (), 'token')
+        result = loop_manager.ValidatedPlanningResult(plans=(), publication_paths=(), mutable_snapshot=snapshot)
+        intent = SimpleNamespace(stage='prepared', base_sha='base', commit_sha='published', manifest='saved',
+            snapshot_token='token', specification_fingerprint='spec', planning_fingerprint='input')
+        apply = planner_publication.ApplyGeneralPlanningBatchEffects(
+            mock.Mock(), mock.Mock(), mock.Mock(return_value=False), mock.Mock(), mock.Mock(),
+            mock.Mock(return_value=intent), mock.Mock(return_value=False), mock.Mock(return_value={}))
+        recovery = planner_publication.RecoverGeneralPlanningBatchEffects(
+            _apply_general_planning_batch=lambda *args, **kwargs: planner_publication._apply_general_planning_batch(apply, *args, **kwargs),
+            _assert_remote_preserves_maintenance_batch=mock.Mock(), _clear_active_in_current_transaction=mock.Mock(),
+            _git_commit_is_ancestor=mock.Mock(return_value=True), _planning_result_from_manifest=mock.Mock(return_value=result),
+            _validate_general_planning_commit=mock.Mock(), general_planning_publication=mock.Mock(return_value=intent),
+            git=mock.Mock(return_value=SimpleNamespace(stdout='published')))
+        self.assertTrue(reviews.general_pending(connection, '/repo'))
+        self.assertEqual(reviews.reassessment(connection, '/repo', 'G-001'), {})
+        with mock.patch.object(planner_publication.planning_publication_state, 'apply_mutable_catalog_changes'), \
+             mock.patch('loop_manager_internal.catalog.remote_deletions.resolve_recovery'):
+            for _ in range(2):
+                self.assertEqual(planner_publication.recover_general_planning_batch(
+                    recovery, connection, '/repo', Path('/worktree'), 'main'), 'applied')
+                self.assertEqual(ExecutionCheckpointRepository(connection).get('/repo', 'G-001').generation, 1)
+        self.assertEqual(reviews.reassessment(connection, '/repo', 'G-001')['confirmed_revision'], 'published')
+        self.assertFalse(reviews.general_pending(connection, '/repo'))
 
     def test_no_change_confirms_review_and_guidance_with_cleanup_transaction(self):
         from loop_manager_internal.storage import planning_input_state, planning_review_state as reviews

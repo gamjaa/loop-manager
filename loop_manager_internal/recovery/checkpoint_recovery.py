@@ -623,12 +623,40 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
     from loop_manager_internal.storage import execplan_draft_state
     if str(blocked['plan_id']) in execplan_draft_state.pending_ids(connection, repo):
         return False, '저장된 draft 사용자 판단은 기존 출처·답변 검증 경로에서 확인합니다.', None
+    from loop_manager_internal.storage import planning_review_state
+    if planning_review_state.general_pending(connection, repo):
+        return False, '일반 planning의 원격·catalog·DB 반영 확정을 기다립니다.', None
+    checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    checkpoint = checkpoints.get(repo, str(blocked['plan_id']))
+    planning_input = (checkpoint.snapshot or {}).get('planning_reassessment', {})
+    related = planning_input.get('requirements', [])
+    general = planning_review_state.get(connection, repo, 'general')
+    general = dict(general) if general is not None else None
+    block = scoped_blocking.plan_block(connection, repo, str(blocked['plan_id']))
+    if block is None or block['reason_code'] != BlockReasonCode.USER_DECISION_REQUIRED.value:
+        raise RuntimeError('사용자 질문의 현재 차단 원인이 변경됐습니다.')
     project = runtime_state.project_row(connection, repo)
     revision = effects.git(repo_path, 'rev-parse', f"refs/remotes/origin/{project['base_branch']}").stdout.strip()
-    prior_revision = blocked['active_sha'] or blocked['plan_sha']
+    if planning_input:
+        confirmed = planning_input['confirmed_revision']
+        if effects.git(repo_path, 'merge-base', '--is-ancestor', confirmed, revision, check=False).returncode != 0:
+            raise RuntimeError('확정된 planning revision이 현재 원격 이력에 없습니다.')
+    if general is not None or planning_input:
+        latest_confirmation = general['confirmed_revision'] if general is not None else planning_input['confirmed_revision']
+        if effects.git(repo_path, 'merge-base', '--is-ancestor', latest_confirmation, revision, check=False).returncode != 0:
+            raise RuntimeError('최신 일반 planning 확정 revision이 현재 원격 이력에 없습니다.')
+        difference = effects.git(repo_path, 'diff', '--quiet', latest_confirmation, revision, '--',
+                                 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'docs/requirements', check=False)
+        if difference.returncode not in (0, 1):
+            raise RuntimeError('확정 planning 이후의 원격 명세 변경을 조회할 수 없습니다.')
+        if difference.returncode == 1:
+            return False, '후속 원격 명세 변경의 planning 확정을 기다립니다.', None
+    prior_revision = (blocked['comparison_revision'] if 'comparison_revision' in blocked.keys() else None
+                      ) or blocked['active_sha'] or blocked['plan_sha']
     declared_sources = set(json.loads(blocked['sources']))
-    paths = sorted(declared_sources | {blocked['path'], 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'})
-    current, changes = {}, {}
+    paths = sorted(declared_sources | {item['source'] for item in related}
+                   | {blocked['path'], 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'})
+    current, previous, changes, prior_presence = {}, {}, {}, {}
     requirement_documents = {}
     optional_product = 'docs/PRODUCT.md' not in declared_sources and blocked['path'] != 'docs/PRODUCT.md'
     def source(revision, path, *, optional=False):
@@ -661,8 +689,14 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         if path != SOURCE and not _safe_path(path):
             raise RuntimeError('차단 재평가 source 경로가 유효하지 않습니다.')
         is_optional_product = path == 'docs/PRODUCT.md' and optional_product
-        old = source(prior_revision, path, optional=is_optional_product)
         latest = source(revision, path, optional=is_optional_product)
+        from loop_manager_internal.catalog.requirement_sources import source_requirement_id
+        # A newly introduced Requirement has no historical text. The current
+        # required source must still resolve before historical absence is used.
+        old = source(prior_revision, path, optional=(
+            is_optional_product or source_requirement_id(path) is not None))
+        prior_presence[path] = old is not None
+        previous[path] = old
         current[path] = latest
         if old is None and latest is None:
             continue
@@ -676,16 +710,21 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         ))
     if not changes:
         return False, '기존 사용자 질문을 다시 판단할 명세·계획 본문 변경이 없습니다.', None
-    block = scoped_blocking.plan_block(connection, repo, str(blocked['plan_id']))
-    if block is None or block['reason_code'] != BlockReasonCode.USER_DECISION_REQUIRED.value:
-        raise RuntimeError('사용자 질문의 현재 차단 원인이 변경됐습니다.')
     question = str(block['evidence'])
-    identity = hashlib.sha256(json.dumps([question, current, changes], sort_keys=True).encode()).hexdigest()
-    checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
-    checkpoint = checkpoints.get(repo, str(blocked['plan_id']))
+    candidate = [blocked[key] for key in ('path', 'sources', 'content_hash', 'current_revision_sha')]
+    candidate.append(checkpoint.expected_head)
+    meaning_identity = hashlib.sha256(json.dumps([
+        question, candidate,
+        {path: meaning(value) if value is not None else None for path, value in current.items()},
+        {path: meaning(value) if value is not None else None for path, value in previous.items()},
+        [{key: item[key] for key in ('source', 'reason')} for item in related],
+    ], sort_keys=True).encode()).hexdigest()
+    identity = hashlib.sha256(json.dumps([meaning_identity, planning_input], sort_keys=True).encode()).hexdigest()
     saved = (checkpoint.snapshot or {}).get('user_decision_assessment', {})
-    if saved.get('identity') == identity:
-        return saved['resolved'], saved['detail'], None
+    reusable = (saved.get('identity') == identity or saved.get('meaning_identity') == meaning_identity)
+    reusable = reusable and all(isinstance(item, dict) and item.get('source') in current
+        and isinstance(current[item['source']], str) and isinstance(item.get('quote'), str)
+        and item['quote'] in current[item['source']] for item in saved.get('evidence', []))
     prompt = ("기존 사용자 판단 차단의 원인만 읽기 전용으로 재평가하라. "
         "문서 수정·질문 삭제·Planner 판단을 사용자 승인으로 간주하지 마라. "
         "최신 Requirement와 ExecPlan에서 기존 질문이 더는 필요 없거나 이미 명시적으로 결정된 경우만 resolved=true다. "
@@ -697,15 +736,23 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         "ExecPlan 이외의 상위 명세가 질문 해소를 뒷받침하는 인용이 모두 필요하다.\n"
         + json.dumps(dict(question=question, revision=revision, sources=paths,
                          source_presence={path: value is not None for path, value in current.items()},
+                         prior_source_presence=prior_presence,
+                         related_requirements=related, planning_confirmation=planning_input,
+                         related_source_texts={item['source']: current[item['source']] for item in related},
+                         prior_revision=prior_revision,
                          execplan=current[blocked['path']], changes=changes,
                          manager_inputs={path: current[path] for path in paths if path.startswith('manager:')}), ensure_ascii=False))
     worktree = Path(blocked['worktree'])
-    baseline = effects.capture_git_snapshot(worktree)
-    code, output = effects.run_agent(str(project['provider']), worktree, state_dir, config, 'reviewer', prompt,
-        read_only=True, connection=connection,
-        invocation=InvocationContext(repo, str(blocked['plan_id']), purpose='review', target=str(blocked['plan_id'])))
-    effects.validate_agent_scope('reviewer', worktree, baseline, effects.capture_git_snapshot(worktree),
-                                 external_worktree=repo_path)
+    if reusable:
+        code, output = 0, 'USER_DECISION_ASSESSMENT: ' + json.dumps(
+            {key: saved[key] for key in ('resolved', 'detail', 'evidence')})
+    else:
+        baseline = effects.capture_git_snapshot(worktree)
+        code, output = effects.run_agent(str(project['provider']), worktree, state_dir, config, 'reviewer', prompt,
+            read_only=True, connection=connection,
+            invocation=InvocationContext(repo, str(blocked['plan_id']), purpose='review', target=str(blocked['plan_id'])))
+        effects.validate_agent_scope('reviewer', worktree, baseline, effects.capture_git_snapshot(worktree),
+                                     external_worktree=repo_path)
     lines = [line.removeprefix('USER_DECISION_ASSESSMENT:').strip() for line in str(output).splitlines()
              if line.startswith('USER_DECISION_ASSESSMENT:')]
     if code or len(lines) != 1:
@@ -731,11 +778,22 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         latest_plan = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?",
                                          (repo, blocked['plan_id'])).fetchone()
         if (latest_plan is None or any(latest_plan[key] != blocked[key]
-                for key in ('status', 'path', 'sources', 'content_hash', 'current_revision_sha'))
+                for key in ('status', 'path', 'sources', 'content_hash', 'current_revision_sha',
+                            'branch', 'worktree', 'workspace_owned', 'active_sha', 'plan_sha', 'pr_url', 'pr_head_oid'))
                 or checkpoints.get(repo, str(blocked['plan_id'])) != checkpoint
+                or planning_review_state.general_pending(connection, repo)
+                or dict(planning_review_state.get(connection, repo, 'general') or {}) != (general or {})
+                or any(runtime_state.project_row(connection, repo)[key] != project[key]
+                       for key in ('base_branch', 'origin'))
                 or dict(scoped_blocking.plan_block(connection, repo, str(blocked['plan_id'])) or {}) != dict(block or {})):
             raise RuntimeError('사용자 질문 재평가 중 차단 원인 또는 checkpoint가 변경됐습니다.')
-        assessment = dict(identity=identity, revision=revision, question=question, **result)
+        if saved.get('identity') == identity:
+            return result['resolved'], result['detail'], None
+        assessment = dict(identity=identity, meaning_identity=meaning_identity,
+                          planning_confirmation=planning_input, revision=revision, question=question,
+                          prior_revision=prior_revision, prior_source_presence=prior_presence,
+                          source_presence={path: value is not None for path, value in current.items()},
+                          **result)
         checkpoints.record(repo, str(blocked['plan_id']), expected_generation=checkpoint.generation,
             operation=checkpoint.operation, expected_head=checkpoint.expected_head,
             target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,

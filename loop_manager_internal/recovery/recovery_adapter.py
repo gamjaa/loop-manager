@@ -260,6 +260,7 @@ class BlockedPlanReconciliationEffectsEffects:
     _worktree_state_signature: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     git: Callable[..., object]
+    git_bytes: Callable[..., bytes]
     github_repository: Callable[..., object]
     hydrate_execplan_project: Callable[..., object]
     load_managed_config: Callable[..., object]
@@ -292,6 +293,7 @@ def _blocked_plan_reconciliation_effects(effects: BlockedPlanReconciliationEffec
         _worktree_state_signature=effects._worktree_state_signature,
         capture_git_snapshot=effects.capture_git_snapshot,
         git=effects.git,
+        git_bytes=effects.git_bytes,
         github_repository=effects.github_repository,
         hydrate_execplan_project=effects.hydrate_execplan_project,
         load_managed_config=effects.load_managed_config,

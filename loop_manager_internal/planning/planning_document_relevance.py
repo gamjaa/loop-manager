@@ -10,6 +10,55 @@ from loop_manager_internal.catalog.execplan_catalog import parse_execplan_text
 from loop_manager_internal.git.command_adapter import revision_requirement_documents
 
 
+def blocked_plan_inputs(output: str, revision: str) -> dict[str, list[dict[str, str]]]:
+    """Read additive Planner relevance evidence; legacy results have none."""
+    from loop_manager_internal.application.result_normalization import normalize_markers, tagged_json
+    marker = 'BLOCKED_PLAN_INPUTS'
+    normalized = normalize_markers(output, (marker,))
+    if not re.search(rf'(?m)^{marker}:', normalized):
+        return {}
+    value = tagged_json(normalized, marker)
+    if (not isinstance(value, dict) or set(value) != {'revision', 'plans'}
+            or value['revision'] != revision or not isinstance(value['plans'], list)):
+        raise ValueError('차단 계획 영향 입력의 revision·형식이 유효하지 않습니다.')
+    plans = {}
+    for plan in value['plans']:
+        if (not isinstance(plan, dict) or set(plan) != {'plan_id', 'requirements'}
+                or not isinstance(plan['plan_id'], str)
+                or not re.fullmatch(r'G-\d{3,}', plan['plan_id'])
+                or plan['plan_id'] in plans
+                or not isinstance(plan['requirements'], list) or not plan['requirements']):
+            raise ValueError('차단 계획 영향 대상이 유효하지 않거나 중복됐습니다.')
+        sources = set()
+        for item in plan['requirements']:
+            if (not isinstance(item, dict) or set(item) != {'source', 'reason', 'quote'}
+                    or any(not isinstance(item[key], str) or not item[key].strip() for key in item)
+                    or requirement_sources.source_requirement_id(item['source']) is None
+                    or item['source'] in sources):
+                raise ValueError('차단 계획의 관련 활성 Requirement 근거가 유효하지 않습니다.')
+            sources.add(item['source'])
+        plans[plan['plan_id']] = sorted(plan['requirements'], key=lambda item: item['source'])
+    return plans
+
+
+def validate_blocked_plan_inputs(output: str, revision: str, rows, git, repository: Path) -> None:
+    """Validate relevance against pinned remote text, never the local workspace."""
+    from loop_manager_internal.git.command_adapter import revision_document_or_none
+    from loop_manager_internal.catalog.frontmatter import requirement_identity
+    plans = blocked_plan_inputs(output, revision)
+    targets = {str(row['plan_id']): row for row in rows}
+    for plan_id, requirements in plans.items():
+        target = targets.get(plan_id)
+        if target is None or target['status'] != 'PLAN_BLOCKED':
+            raise ValueError('영향 대상이 현재 차단 계획이 아닙니다: ' + plan_id)
+        for item in requirements:
+            contents = revision_document_or_none(git, repository, revision, item['source'])
+            if contents is None or item['quote'] not in contents:
+                raise ValueError('관련 Requirement의 현재 원격 인용을 확인할 수 없습니다: ' + item['source'])
+            if requirement_identity(contents)[0] != requirement_sources.source_requirement_id(item['source']):
+                raise ValueError('관련 Requirement의 경로·원문 ID가 다릅니다: ' + item['source'])
+
+
 def _blob(git, repository: Path, revision: str, path: str) -> str | None:
     result = git(repository, "rev-parse", "--verify", f"{revision}:{path}", check=False)
     return result.stdout.strip() if result.returncode == 0 else None

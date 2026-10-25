@@ -34,11 +34,43 @@ def _requeue_blocked_execplan(
     repo: str,
     plan_id: str,
     *, publication_remote_oid: str | None = None,
+    preserve_execution: bool = False, target_base_oid: str | None = None,
 ) -> None:
     plan = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
         (repo, plan_id),
     ).fetchone()
+    if preserve_execution:
+        from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
+        from loop_manager_internal.recovery.plan_recovery import recovery_admission
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+        with recovery_admission(connection, repo, plan_id), runtime_state._transaction(connection):
+            latest = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
+            current = checkpoints.get(repo, plan_id)
+            assessment = (current.snapshot or {}).get('user_decision_assessment', {})
+            block = scoped_blocking.plan_block(connection, repo, plan_id)
+            if (plan is None or latest is None or dict(latest) != dict(plan)
+                    or plan['status'] != 'PLAN_BLOCKED' or not target_base_oid
+                    or current.operation is not None or block is None
+                    or block['reason_code'] != BlockReasonCode.USER_DECISION_REQUIRED.value
+                    or scoped_blocking.project_block(connection, repo) is not None
+                    or not assessment.get('resolved') or assessment.get('question') != block['evidence']
+                    or assessment.get('planning_confirmation') != (current.snapshot or {}).get('planning_reassessment')):
+                raise RuntimeError('확정 planning의 사용자 질문 해소 근거 또는 현재 복구 상태가 변경됐습니다.')
+            values = revalidation_values(target_base_oid)
+            values.pop('phase')
+            values.update(status='IMPLEMENTING', blocked_reason=None, blocked_fingerprint=None,
+                          blocked_worktree_fingerprint=None, blocked_review_fingerprint=None,
+                          publication_remote_oid=publication_remote_oid)
+            checkpoints.record(repo, plan_id, expected_generation=current.generation,
+                operation=current.operation, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                snapshot={**(current.snapshot or {}), 'planning_resume_artifacts': {
+                    key: plan[key] for key in ('worker_result', 'verify_result', 'review_result')}})
+            runtime_state.RuntimeStateRepository(connection).transition(repo, plan_id,
+                plan_values=values, project_values={'phase': 'WORKING'}, expected_status='PLAN_BLOCKED', enqueue=False)
+            scoped_blocking.clear_plan_block(connection, repo, plan_id)
+        return
     initial_level = plan["initial_worker_level"] if plan is not None else None
     if plan is not None and plan["current_complexity"] and plan["current_risk"]:
         initial_level = worker_level({
@@ -393,14 +425,17 @@ def _resume_blocked_execplan_if_inputs_changed(
                 blocked_review_fingerprint is not None
                 and current_review_fingerprint != blocked_review_fingerprint
             )
+    from loop_manager_internal.storage import planning_review_state
+    related_input = planning_review_state.reassessment(connection, repo, str(plan['plan_id']))
     remote_input_changed = execplan_input_changed or review_input_changed
     if plan['blocked_reason'] == BlockReasonCode.USER_DECISION_REQUIRED.value:
-        if not remote_input_changed:
+        if not remote_input_changed and not related_input:
             return False
         resolved, _detail, _stage = effects._evaluate_remote_checkpoint_cause(
             connection, repo_path, state_dir, repo, plan, None, None)
-        if not resolved:
+        if not resolved or scoped_blocking.project_block(connection, repo) is not None:
             return False
+        remote_input_changed = True
     if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
         if not remote_input_changed:
             return False
@@ -717,5 +752,7 @@ def _resume_blocked_execplan_if_inputs_changed(
     effects.clear_agent_scope(connection, repo)
     effects._requeue_blocked_execplan(connection, repo, str(plan["plan_id"]),
                               publication_remote_oid=runtime_state.RuntimeStateRepository(connection).get(
-                                  repo, str(plan['plan_id'])).publication_remote_oid or owned_oid)
+                                  repo, str(plan['plan_id'])).publication_remote_oid or owned_oid,
+                              **({'preserve_execution': True, 'target_base_oid': target_base_oid}
+                                 if related_input and plan['blocked_reason'] == BlockReasonCode.USER_DECISION_REQUIRED.value else {}))
     return True
