@@ -86,6 +86,15 @@ class FileReviewPromptTest(unittest.TestCase):
 
 @isolated_git_test
 class ProvisionalFileReviewTest(unittest.TestCase):
+    def test_optional_reserved_root_cannot_be_accepted_as_move_candidate(self):
+        inventory = self.publish({".codex/config.toml": "[sandbox]\n", "src/a.py": "def a(): pass\n"})
+        roots = list(root_results_for(self.repo, inventory))
+        reserved = next(item for item in roots if item["path"] == ".codex")
+        reserved["category"] = "internal_implementation"
+        reserved["destination"] = "config/codex"
+        with self.assertRaisesRegex(maintenance_file_ledger.FileReviewLedgerError, "필수 루트 경로"):
+            maintenance_file_ledger.validate_root_reviews(self.repo, inventory, roots)
+
     def test_unchanged_source_review_survives_remote_revision_advance(self):
         first = self.publish({"src/a.py": "def calculate(): return 1\n"})
         source = first.sources[0]

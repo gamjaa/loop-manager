@@ -93,6 +93,20 @@ _DOCUMENT_NAMES = {"license", "license.txt", "notice", "notice.txt", "authors", 
 _ROOT_TOOL_PATHS = {".agents", "docs", "scripts"}
 _ROOT_EXECUTION_PATHS = {"config", "tests", ".github", ".gitignore"}
 _ROOT_ENTRY_NAMES = {"readme", "license", "notice", "authors", "contributors"}
+_OPTIONAL_RESERVED_PATHS = {
+    ".gitignore", ".codex/config.toml", ".claude/settings.json",
+    ".claude/settings.local.json",
+}
+
+
+def reserved_root_paths(inventory: SourceInventory) -> frozenset[str]:
+    """Return present reserved roots, including parents containing reserved files."""
+    paths = {item.path for item in inventory.classifications}
+    protected = set(_ROOT_TOOL_PATHS)
+    for path in paths:
+        if path in _OPTIONAL_RESERVED_PATHS or path.startswith(".codex/rules/"):
+            protected.add(path.split("/", 1)[0])
+    return frozenset(protected)
 
 
 def _git(repo: Path, *args: str) -> bytes:
@@ -241,7 +255,7 @@ def root_placement_inventory(inventory: SourceInventory) -> tuple[RootPlacement,
     placements = []
     for path, items in sorted(roots.items()):
         lowered = path.lower()
-        if path in _ROOT_TOOL_PATHS:
+        if path in reserved_root_paths(inventory):
             category, reason = "tool_required", "Loop Manager fixed root path"
         elif path in _ROOT_EXECUTION_PATHS:
             category, reason = "execution_build_deploy", "project execution, validation, or configuration root"
