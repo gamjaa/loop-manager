@@ -1696,7 +1696,6 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             release_fingerprint='unchanged', clear_projection=False,
             plan_values={'worktree': 'one', 'active_sha': 'before', 'worker_session_id': 'kept-session'})
         plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
-        block = dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
         source = 'docs/requirements/[R-002] New policy.md'
         text = '# [R-002] New policy\n\nOrdinary calls and mock checks are sufficient.\n'
         additional_source = 'docs/requirements/[R-003] Related validation.md'
@@ -1754,13 +1753,24 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         first = store.get('A', 'G-001')
         for race in ('remote', 'checkpoint', 'question'):
             with self.subTest(race=race):
+                before = dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
                 with self.assertRaises(RuntimeError):
                     assess()
                 self.assertNotIn('user_decision_assessment', store.get('A', 'G-001').snapshot)
+                after = dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
+                if race == 'question':
+                    self.assertEqual(after['evidence'], 'concurrent question')
+                    self.assertEqual(after['created_at'], before['created_at'])
+                else:
+                    self.assertEqual(after, before)
                 observed_revision = 'latest'
                 runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='original choice',
                     release_fingerprint='unchanged', clear_projection=False)
         race = None
+        # Fixture writers above legitimately change updated_at. From this
+        # restored state, read-only assessments must preserve the entire block.
+        block = dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
+        self.assertEqual(block['evidence'], 'original choice')
         self.assertTrue(assess()[0])
         self.assertTrue(assess()[0])
         self.assertEqual(effects.run_agent.call_count, 4)
