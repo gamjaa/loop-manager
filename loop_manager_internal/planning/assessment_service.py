@@ -205,9 +205,6 @@ class PlanningAssessmentService(PlanningService):
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
-                from loop_manager_internal.planning.common_defect_context import planning_context
-                reports = getattr(self._ports.state, "common_defect_reports", lambda _repo: [])(context.repo)
-                prompt += planning_context(reports, context.state_dir)
                 if row.planning_resume_plan_id:
                     active = self._ports.state.schedule(context.repo).active
                     prompt += ('\n현재 작업을 초기화하지 않고 일반 planning 뒤 재개한다: '
@@ -236,6 +233,12 @@ class PlanningAssessmentService(PlanningService):
                     )
                     prompt += instruction
                     self._ports.events.log(f"일반 planning 검토: purpose={attempt['purpose']}, revision={attempt['revision']}, 비교={attempt['comparison_revision']}, cycle={attempt['work_cycle']}")
+                from loop_manager_internal.planning.common_defect_context import planning_context
+                reports = getattr(self._ports.state, "common_defect_reports", lambda _repo: [])(context.repo)
+                if hasattr(self._ports.state, "bind_common_defect_snapshot"):
+                    self._ports.state.bind_common_defect_snapshot(context.repo, str(row.active_sha),
+                                                                 [int(item['id']) for item in reports])
+                prompt += planning_context(reports, context.state_dir)
                 if hasattr(self._ports, "retirement"):
                     from loop_manager_internal.planning.requirement_retirement import assessment_prompt
                     prompt += assessment_prompt(run.retirement_pending)
@@ -682,9 +685,24 @@ class PlanningAssessmentService(PlanningService):
                         )
                         run.dirty_files = sorted(set(dirty_files) | set(manager_paths))
             if not run.maintenance_planning and hasattr(self._ports.state, "planning_review") and attempt is not None:
-                self._ports.state.validate_planning_review(
-                    context.repo, str(row.active_sha), str(row.planning_result or ""), outcome,
-                )
+                from loop_manager_internal.planning.common_defect_links import validate as validate_links
+                try:
+                    links = []
+                    if 'COMMON_DEFECT_LINKS' in str(row.planning_result or '').upper():
+                        ids = json.loads(attempt['common_defect_snapshot']) if 'common_defect_snapshot' in attempt.keys() else []
+                        links = validate_links(str(row.planning_result or ''), str(row.active_sha),
+                            [item for item in self._ports.state.common_defect_reports(context.repo) if item['id'] in ids]
+                                if ids else [],
+                            self._ports.state.execplan_rows(context.repo), validated_result,
+                            self._ports.git.run, context.repo_path)
+                    if links and attempt['purpose'] == 'requirement':
+                        raise ValueError('Requirement 완료 점검에서 공통 교정 계획을 연결할 수 없습니다.')
+                    self._ports.state.validate_planning_review(
+                        context.repo, str(row.active_sha), str(row.planning_result or ""), outcome,
+                        **({'common_defect_links': links} if links else {}),
+                    )
+                except ValueError as error:
+                    raise PlanningResultInvalid(str(error)) from error
             if (
                 decision is not None
                 and not tiered_assessment.enabled(self._ports, run)

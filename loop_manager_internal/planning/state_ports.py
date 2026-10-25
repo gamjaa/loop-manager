@@ -156,9 +156,15 @@ class _PlanningStatePorts:
         with self.transaction():
             planning_review_state.begin(self._connection, repo, **values)
 
-    def validate_planning_review(self, repo: str, revision: str, result: str, outcome: str) -> None:
+    def bind_common_defect_snapshot(self, repo: str, revision: str, report_ids: list[int]) -> None:
         with self.transaction():
-            planning_review_state.validate(self._connection, repo, revision, result, outcome)
+            planning_review_state.bind_common_defect_snapshot(self._connection, repo, revision, report_ids)
+
+    def validate_planning_review(self, repo: str, revision: str, result: str, outcome: str,
+                                 *, common_defect_links=None) -> None:
+        with self.transaction():
+            planning_review_state.validate(self._connection, repo, revision, result, outcome,
+                                           common_defect_links=common_defect_links)
 
     def confirm_planning_review(self, repo: str, reviewed_revision: str, confirmed_revision: str) -> None:
         planning_review_state.confirm(self._connection, repo, reviewed_revision, confirmed_revision)

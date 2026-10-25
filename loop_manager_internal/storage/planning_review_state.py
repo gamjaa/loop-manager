@@ -22,6 +22,12 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         result TEXT, outcome TEXT, confirmed_revision TEXT,
         PRIMARY KEY (repo, slot)
     )""")
+    fields = {row[1] for row in connection.execute("PRAGMA table_info(planning_reviews)")}
+    for name in ("common_defect_snapshot", "common_defect_links"):
+        if name not in fields:
+            connection.execute(f"ALTER TABLE planning_reviews ADD COLUMN {name} TEXT NOT NULL DEFAULT '[]'")
+    from loop_manager_internal.storage import common_defect_state
+    common_defect_state.ensure_schema(connection)
 
 
 def work_cycle(connection: sqlite3.Connection, repo: str) -> str:
@@ -126,17 +132,34 @@ def begin(connection: sqlite3.Connection, repo: str, *, purpose: str,
         revision=excluded.revision, input_fingerprint=excluded.input_fingerprint,
         specification_fingerprint=excluded.specification_fingerprint,
         work_cycle=excluded.work_cycle, comparison_revision=excluded.comparison_revision,
-        result=NULL, outcome=NULL, confirmed_revision=NULL""",
+        result=NULL, outcome=NULL, confirmed_revision=NULL,
+        common_defect_snapshot='[]', common_defect_links='[]'""",
         (repo, purpose, revision, input_fingerprint, specification_fingerprint,
          work_cycle, comparison_revision))
 
 
-def validate(connection: sqlite3.Connection, repo: str, revision: str,
-             result: str, outcome: str) -> None:
+def bind_common_defect_snapshot(connection, repo, revision, report_ids):
     changed = connection.execute(
-        "UPDATE planning_reviews SET result = ?, outcome = ? "
+        "UPDATE planning_reviews SET common_defect_snapshot=?,result=NULL,outcome=NULL,common_defect_links='[]' "
+        "WHERE repo=? AND slot='attempt' AND revision=?",
+        (json.dumps(sorted(report_ids)), repo, revision))
+    if changed.rowcount != 1:
+        raise RuntimeError("공통 결함 보고를 전달할 planning 입력이 변경됐습니다.")
+
+
+def validate(connection: sqlite3.Connection, repo: str, revision: str,
+             result: str, outcome: str, *, common_defect_links=None) -> None:
+    from loop_manager_internal.storage import common_defect_state
+    if common_defect_links:
+        attempt = get(connection, repo, 'attempt')
+        delivered = set(json.loads(attempt['common_defect_snapshot'])) if attempt is not None else set()
+        if any(not set(link['reports']) <= delivered for link in common_defect_links):
+            raise ValueError('planning 호출에 전달되지 않은 공통 결함 보고를 연결할 수 없습니다.')
+        common_defect_state.check_reuse(connection, repo, common_defect_links)
+    changed = connection.execute(
+        "UPDATE planning_reviews SET result = ?, outcome = ?, common_defect_links = ? "
         "WHERE repo = ? AND slot = 'attempt' AND revision = ?",
-        (result, outcome, repo, revision),
+        (result, outcome, json.dumps(common_defect_links or [], sort_keys=True), repo, revision),
     )
     if changed.rowcount != 1:
         raise RuntimeError("일반 planning 검토 입력이 변경됐습니다.")
@@ -150,6 +173,12 @@ def confirm(connection: sqlite3.Connection, repo: str, reviewed_revision: str,
     if attempt["result"] is None or attempt["outcome"] is None:
         raise RuntimeError("검증되지 않은 일반 planning 검토를 확정할 수 없습니다.")
     if attempt['purpose'] != 'requirement':
+        from loop_manager_internal.storage import common_defect_state
+        try:
+            common_defect_state.confirm(connection, repo, reviewed_revision, confirmed_revision,
+                                        json.loads(attempt['common_defect_links']))
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
         _queue_reassessments(connection, repo, attempt, confirmed_revision, revised_plan_ids)
     slots = ["requirement"] if attempt["purpose"] == "requirement" else ["general"]
     if attempt["purpose"] == "final":
@@ -169,4 +198,7 @@ def confirm(connection: sqlite3.Connection, repo: str, reviewed_revision: str,
              attempt["input_fingerprint"], attempt["specification_fingerprint"],
              attempt["work_cycle"], attempt["comparison_revision"],
              attempt["result"], attempt["outcome"], confirmed_revision))
+        connection.execute("UPDATE planning_reviews SET common_defect_snapshot=?,common_defect_links=? "
+                           "WHERE repo=? AND slot=?",
+                           (attempt['common_defect_snapshot'], attempt['common_defect_links'], repo, slot))
     connection.execute("DELETE FROM planning_reviews WHERE repo = ? AND slot = 'attempt'", (repo,))

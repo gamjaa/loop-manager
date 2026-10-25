@@ -17,6 +17,8 @@ from loop_manager_internal.execution.common_defect_report import parse_report
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
+    from loop_manager_internal.storage import common_defect_state
+    common_defect_state.ensure_schema(connection)
     schema = """
         CREATE TABLE IF NOT EXISTS validation_results (
             id INTEGER PRIMARY KEY,
@@ -195,7 +197,9 @@ class ValidationFeedbackRepository:
             "FROM common_defect_reports c JOIN validation_results r ON r.id=c.result_id "
             "WHERE r.repo=? ORDER BY r.id", (repo,),
         ).fetchall()
+        from loop_manager_internal.storage import common_defect_state
         return [{**dict(row), "observation": json.loads(row["observation"]),
+                 "links": common_defect_state.links(self.connection, repo, row["id"]),
                  "report": json.loads(row["report"]) if row["report"] is not None else None}
                 for row in rows]
 

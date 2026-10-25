@@ -184,6 +184,7 @@ class CommonDefectPlanningTests(PlanningCase):
             ))
             rows = [{"id": 1, "plan_id": "G-001", "report": REPORT}]
             ports.state.common_defect_reports = mock.Mock(return_value=rows)
+            ports.state.bind_common_defect_snapshot = mock.Mock()
             coordinator = PlanningLifecycleCoordinator(ports)
             context = replace(self.context, state_dir=Path(directory))
             run = coordinator._new_run(context)
@@ -191,11 +192,13 @@ class CommonDefectPlanningTests(PlanningCase):
             self.assertIsNone(coordinator._assessment._run_planner_turn(run))
             self.assertEqual(ports.agent.run_count, 1)
             ports.state.common_defect_reports.assert_called_once_with("/repo")
+            ports.state.bind_common_defect_snapshot.assert_called_once_with("/repo", "base", [1])
             self.assertIn("공통 결함의 미확정 보고 snapshot:", ports.agent.prompts[0])
             self.assertIn("catalog", ports.agent.prompts[0])
             self.assertIsNone(coordinator._assessment._run_planner_turn(run))
             self.assertEqual(ports.agent.run_count, 1)
             ports.state.common_defect_reports.assert_called_once()
+            ports.state.bind_common_defect_snapshot.assert_called_once()
             self.assertEqual(len(list(Path(directory).rglob("*.json"))), 1)
 
     def test_report_presence_does_not_start_planning_or_write_empty_exports(self):
