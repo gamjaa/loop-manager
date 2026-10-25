@@ -1138,6 +1138,46 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
         self.assertIn('G-019', sent.call_args.args[2])
         self.assertNotIn('G-018', sent.call_args.args[2])
 
+    def test_id_at_confirmed_piece_end_is_not_resent_after_link_change(self):
+        connection = self.connection()
+        probe = notifications._message("draft_decisions", {
+            "project": "alpha",
+            "plans": [{"id": "G-018", "title": "x"},
+                      {"id": "G-019", "title": "Remaining question"}],
+            "status": "사용자 판단 대기",
+        })
+        target_id_end = probe.index("\n• G-019 · ") + len("\n• G-019")
+        first_title = "x" * (1 + notifications.MESSAGE_LIMIT - target_id_end)
+        with connection:
+            self.draft(connection, title=first_title, remote_revision="old-sha")
+            self.draft(connection, "G-019", "Remaining question", remote_revision="old-sha")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        old = self.events(connection)[0]
+        frozen = notifications._message("draft_decisions", json.loads(old["payload"]))
+        self.assertTrue(notifications._pieces(frozen)[0].endswith("G-019"))
+        self.assertTrue(frozen[notifications.MESSAGE_LIMIT:].startswith(" · "))
+
+        calls = []
+        def send(*args):
+            calls.append(args[2])
+            if len(calls) == 1:
+                with connection:
+                    connection.execute(
+                        "UPDATE exec_plans SET current_revision_sha='current-sha' WHERE repo=?",
+                        (self.repo,),
+                    )
+
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=send), 0)
+        canceled = self.events(connection)[0]
+        self.assertEqual(canceled["confirmed_pieces"], 1)
+        self.assertIsNotNone(canceled["canceled_at"])
+        self.assertEqual(len(calls), 1)
+        with connection:
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=send), 0)
+        self.assertEqual(len(calls), 1)
+
     def test_fully_confirmed_question_is_not_resent_when_link_changes(self):
         connection = self.connection()
         with connection:

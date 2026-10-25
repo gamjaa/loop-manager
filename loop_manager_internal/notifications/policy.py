@@ -313,7 +313,8 @@ def _confirmed_draft_question_keys(connection, repo, *, exclude_event_key=None):
             continue
         if not isinstance(payload, dict) or not isinstance(row['rendered_text'], str):
             continue
-        text = ''.join(_pieces(row['rendered_text'])[:int(row['confirmed_pieces'])])
+        rendered_text = row['rendered_text']
+        confirmed_text = ''.join(_pieces(rendered_text)[:int(row['confirmed_pieces'])])
         if row['event_type'] == 'draft_decisions':
             for item in payload.get('plans', []):
                 if not isinstance(item, dict):
@@ -323,8 +324,9 @@ def _confirmed_draft_question_keys(connection, repo, *, exclude_event_key=None):
                 if key is None or not _valid_draft_source_path(source_path, key[0]):
                     continue
                 marker = f"\n• {key[0]} · "
-                position = text.find(marker)
-                if position >= 0 and position + len('\n• ') + len(key[0]) <= len(text):
+                position = rendered_text.find(marker)
+                id_end = position + len(f"\n• {key[0]}")
+                if position >= 0 and id_end <= len(confirmed_text):
                     confirmed.add(key)
         else:
             key = _draft_question_key(payload)
@@ -332,7 +334,7 @@ def _confirmed_draft_question_keys(connection, repo, *, exclude_event_key=None):
             question = payload.get('question')
             if (key is not None and _valid_draft_source_path(source_path, key[0])
                     and isinstance(question, str) and question
-                    and f"{key[0]}: " in text and question in text):
+                    and f"{key[0]}: " in confirmed_text and question in confirmed_text):
                 confirmed.add(key)
     return confirmed
 

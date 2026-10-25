@@ -35,7 +35,7 @@ priority: normal
 ## Validation
 
 - Worker는 `tests/test_notification_events.py`·`test_notification_delivery.py`·`test_notification_incidents.py` 중 변경한 최소 unit을 실행한다. 실제 SQLite·현재 질문 선택·claim/confirm·renderer를 사용하고 Telegram 응답/원격 관측만 mock한다.
-- 미전송·일부 전송·전체 전송 각각에서 같은 질문의 링크만 바꾼다. 현재 링크의 표시 정합성, 이미 통지한 질문의 재전송 0회와 frozen 원문/cursor 보존을 확인한다. 단순 사건 수나 URL 문자열 비교만으로 질문 중복 방지를 대신하지 않는다.
+- 미전송·일부 전송·전체 전송 각각에서 같은 질문의 링크만 바꾼다. 현재 링크의 표시 정합성, 이미 통지한 질문의 재전송 0회와 frozen 원문/cursor 보존을 확인한다. 확인된 조각의 끝에 질문 ID 전체가 있고 다음 조각으로 제목 구분자가 넘어가는 경우에도 링크 변경 뒤 그 질문을 재발행하지 않는다. 단순 사건 수나 URL 문자열 비교만으로 질문 중복 방지를 대신하지 않는다.
 - 질문 해소/추가/내용 변경과 링크 변경을 섞고 첫 조각 뒤·claim 뒤·confirm 저장 실패·재시작을 제어한다. 해소된 질문 전송 0회, 실제 새 질문/행동만 1회, 이전 질문/결정/부분 전송 감사 보존을 확인한다.
 - legacy pending/revision은 같지만 질문 identity/출처가 현재 질문과 연결되지 않는 경우를 거부하고 유효한 legacy 질문은 계속 알린다. 현재 구현의 question 부재·reassessment 거부와 `tests/test_notification_delivery.py:DraftListNotificationTest`의 해소/identity/revision 변경 취소·재시작·분할 전송 회귀는 재사용하며 같은 조건을 복제하지 않는다. 기존 사용자 답변 검증·draft 보류·부분 전송/오류 보존 회귀는 유지한다. 과거 링크만 변경 시 전체 목록 재발행을 요구하던 assertion만 현행 계약으로 대체한다.
 - `tests/test_execplan_drafts.py::ExecPlanDraftCatalogTest.test_reassessment_coexists_with_user_question_list_and_new_question`는 재평가 후 새 질문을 알리면서 앞서 확인한 질문을 다시 싣지 않는 통합 회귀로 유지한다.
@@ -47,6 +47,8 @@ priority: normal
 - [x] 현재 질문 snapshot은 저장된 pending evidence, ExecPlan catalog 경로·revision, 등록 remote에서 계산한다. 생성·각 조각 claim에서 이 snapshot과 대조하고 outbox 고정 본문·확인 cursor에서 질문별 확인을 계산한다.
 - [x] Worker targeted test: `DraftListNotificationTest` 14개와 `tests.test_notification_events` 41개가 통과했다. 최초 delivery class 실행에서 URL 형식에 고정된 예전 assertion이 실패해 현재 catalog 경로 기반 URL을 assertion으로 반영하고 동일 명령을 재실행했다. 최초 event module 실행에서 identity/source 필드가 빠진 legacy fixture가 새 계약에 거부되어 유효한 legacy fixture와 거부 회귀를 추가한 뒤 동일 명령을 재실행했다. 두 재실행은 통과했다.
 - [x] Verify feedback에서 재평가 통합 회귀가 앞서 알린 G-002까지 재통지하는 이전 기대값을 확인했다. 테스트를 첫 알림의 G-002와 재평가 후 새 G-001만 각각 확인하도록 조정하고 같은 targeted test를 재실행해 통과했다.
+- [x] Review 회귀에서 확인된 조각 끝에 ID 전체만 있고 ` · `가 다음 조각에 있는 경우를 재현했다. 전체 frozen 본문에서 ID 범위를 찾고 그 끝 위치를 confirmed prefix 길이와 비교하도록 수정했으며, `DraftListNotificationTest` 15개가 통과했다.
+- [x] 관리 rebase 뒤 `origin/main`과 현재 후보의 전체 diff 및 PRODUCT·R-053·R-061·ARCHITECTURE 근거를 다시 대조했다. 현재 후보에서 `DraftListNotificationTest` 15개를 재실행해 통과했으며 이전 verify 성공은 재사용하지 않았다.
 
 ## Decision Log
 
