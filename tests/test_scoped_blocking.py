@@ -169,10 +169,33 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         self.assertEqual(checkpoint.expected_head, self.head)
 
     def test_merged_adoption_confirms_reservation_before_real_cleanup_and_releases_block(self):
+        self._merged_adoption_cleanup(clean=False)
+
+    def test_clean_merged_adoption_releases_reservation_lease_before_real_removal(self):
+        self._merged_adoption_cleanup(clean=True)
+
+    def _merged_adoption_cleanup(self, *, clean):
+        from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned
         from loop_manager_internal.storage import database
         from loop_manager_internal.application.contracts import CleanupAssessment
-        self.worktree = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        (self.worktree / 'preserved.txt').write_text('local materials')
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.worktree = root / 'G-001'
+        self.worktree.mkdir()
+        state_dir = root / 'state'
+        resume = lambda: loop_manager.resume_project_block_if_safe(
+            self.connection, Path(self.repo), state_dir, self.repo)
+        if clean:
+            self.enterContext(mock.patch('loop_manager_internal.recovery.plan_recovery.resource_locks',
+                                         side_effect=resource_locks))
+            self.enterContext(mock.patch.object(loop_manager, '_capture_local_worktree_state',
+                return_value=(self.head, self.branch, {}, {})))
+            self.enterContext(mock.patch.object(loop_manager, '_git_operation_entries', return_value={}))
+            self.enterContext(mock.patch.object(loop_manager, '_managed_worktree_marker', return_value=True))
+            self.enterContext(mock.patch.object(loop_manager, '_write_managed_worktree_receipt'))
+            self.live = {**self.live, 'index': 'c' * 40}
+            self.records = [{'intent': {'expected': self.live}, 'result': {'observed': self.live}}]
+        else:
+            (self.worktree / 'preserved.txt').write_text('local materials')
         with self.connection:
             self.connection.execute('CREATE TABLE manager_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
             self.connection.execute("INSERT INTO manager_metadata VALUES ('remote_adoption_bootstrap','null')")
@@ -186,31 +209,50 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
                 'base': 'main', 'branch': self.branch, 'head': self.head}})
         pr = {'url': 'https://github.com/fixture/repository/pull/1', 'headRefName': self.branch,
               'baseRefName': 'main', 'headRefOid': self.head, 'state': 'MERGED', 'mergedAt': 'merged'}
+        removals = []
         def git(_repo, *args, **_kwargs):
+            if args[:2] == ('worktree', 'remove'):
+                self.assertFalse(resource_owned(state_dir, self.repo, 'git:' + str(self.worktree),
+                                                owner='workspace-reservation-recovery'))
+                self.assertTrue(resource_owned(state_dir, self.repo, 'git:' + str(self.worktree), owner='plan:G-001'))
+                self.worktree.rmdir()
+                self.live = {'exists': False, 'registration': None, 'index': None}
+                removals.append(args)
+            elif args[:2] == ('worktree', 'unlock'):
+                self.live = {**self.live, 'registration': {**self.live['registration'], 'locked': None}}
+            elif clean and args[0] == 'show-ref':
+                self.assertTrue(resource_owned(state_dir, self.repo, 'git:' + str(self.worktree)))
             return mock.Mock(returncode=0, stdout=(
                 'https://github.com/fixture/repository.git' if args[0] == 'remote' else
-                'tree' if args[0] == 'rev-parse' else ''))
+                ('c' * 40 if clean else 'tree') if args[0] == 'rev-parse' else ''))
         with mock.patch.object(loop_manager, 'git', side_effect=git), \
              mock.patch.object(loop_manager, 'pr_for_branch', return_value=pr), \
              mock.patch.object(loop_manager, 'remote_base', return_value='b' * 40), \
-             mock.patch.object(loop_manager, 'assess_cleanup', return_value=CleanupAssessment('dirty', 'preserve materials')), \
+             mock.patch.object(loop_manager, 'assess_cleanup', return_value=(CleanupAssessment('safe', pr_head_oid=self.head, observation=('stable',))
+                 if clean else CleanupAssessment('dirty', 'preserve materials'))), \
              mock.patch.object(loop_manager, 'complete_merged_execplan_worktree',
                                wraps=loop_manager.complete_merged_execplan_worktree) as cleanup:
             records = self.records
             self.records = []
-            self.assertFalse(self.resume())
+            self.assertFalse(resume())
             cleanup.assert_not_called()
             self.records = records
-            self.assertTrue(self.resume())
+            self.assertTrue(resume())
             cleanup.assert_called_once()
         plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual((plan['status'], plan['workspace_owned']), ('MERGED', 1))
         self.assertEqual(plan['active_sha'], self.before['active_sha'])
         pending = self.connection.execute('SELECT * FROM cleanup_pending').fetchone()
-        self.assertEqual(pending['workspace_owned'], 1)
+        if clean:
+            self.assertIsNone(pending)
+            self.assertEqual(len(removals), 1)
+            self.assertFalse(self.worktree.exists())
+        else:
+            self.assertEqual(pending['workspace_owned'], 1)
         self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
-        self.assertEqual((self.worktree / 'preserved.txt').read_text(), 'local materials')
-        self.assertFalse(self.resume())
+        if not clean:
+            self.assertEqual((self.worktree / 'preserved.txt').read_text(), 'local materials')
+        self.assertFalse(resume())
 
     def test_owned_commit_rebase_and_recorded_dirty_output_preserve_workspace(self):
         import hashlib

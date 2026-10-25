@@ -15,7 +15,7 @@ from loop_manager_internal.git import managed_rebase_adoption
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.recovery import scoped_blocking
-from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
+from loop_manager_internal.recovery.plan_recovery import ReservedPullRequestCompletion, reserved_workspace_ownership
 from loop_manager_internal.storage.task_calls import CallDeferred
 from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -97,8 +97,15 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         return _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo)
     try:
         with reserved_workspace_ownership(connection, state_dir, repo, str(plan['plan_id'])) as owner:
-            return _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo,
-                                                 reservation_owner=owner)
+            result = _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo,
+                                                   reservation_owner=owner)
+        if isinstance(result, ReservedPullRequestCompletion):
+            with runtime_state.selected_execution(repo, result.plan_id, include_blocked=True):
+                effects.reconcile_existing_pull_request(
+                    connection, repo_path, state_dir, repo,
+                    runtime_state.project_row(connection, repo), result.pull_request)
+            return True
+        return result
     except (CallDeferred, ProcessLockBusyError, runtime_state.RuntimeStateError):
         return False
 
@@ -464,10 +471,7 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
         elif not planning_owns_slot:
             effects._clear_active_in_current_transaction(connection, repo)
     if terminal_pr is not None:
-        with runtime_state.selected_execution(repo, plan_id, include_blocked=True):
-            effects.reconcile_existing_pull_request(
-                connection, repo_path, state_dir, repo,
-                runtime_state.project_row(connection, repo), terminal_pr)
+        return ReservedPullRequestCompletion(plan_id, terminal_pr)
     return True
 
 

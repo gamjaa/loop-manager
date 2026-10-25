@@ -59,6 +59,13 @@ def _reservation_owners(connection, repo, plan_id):
 
 
 @dataclass(frozen=True)
+class ReservedPullRequestCompletion:
+    """Terminal handoff consumed only after reservation leases have closed."""
+    plan_id: str
+    pull_request: dict
+
+
+@dataclass(frozen=True)
 class ReservationOwnership:
     connection: object
     repo: str

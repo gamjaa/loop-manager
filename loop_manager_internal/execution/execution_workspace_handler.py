@@ -13,7 +13,7 @@ from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, va
 import sys
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery import checkpoint_ownership
-from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
+from loop_manager_internal.recovery.plan_recovery import ReservedPullRequestCompletion, reserved_workspace_ownership
 from loop_manager_internal.storage.task_calls import CallDeferred
 from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
@@ -714,11 +714,14 @@ class WorkspaceHandler:
         try:
             with reserved_workspace_ownership(self.ports.state.connection, self.ports.identity.state_dir,
                                               self.ports.identity.repo, str(plan['plan_id'])) as owner:
-                return self._prepare(reservation_owner=owner)
+                result = self._prepare(reservation_owner=owner)
+            if isinstance(result, ReservedPullRequestCompletion):
+                return self._terminal_adopted_pr(result.plan_id, result.pull_request)
+            return result
         except (CallDeferred, ProcessLockBusyError, RuntimeStateError) as error:
             return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE, detail=str(error))
 
-    def _prepare(self, *, reservation_owner=None) -> ExecutionContext | ExecutionOutcome:
+    def _prepare(self, *, reservation_owner=None) -> ExecutionContext | ExecutionOutcome | ReservedPullRequestCompletion:
         row = self.ports._row()
         branch = str(row['branch'] or '')
         worktree = Path(str(row['worktree'] or ''))
@@ -1030,7 +1033,7 @@ class WorkspaceHandler:
                 self.ports.state.connection, self.ports.identity.repo, plan_id)
             self._workspace_boundary(plan_id, row, pending=False)
             if reserved_terminal_pr is not None:
-                return self._terminal_adopted_pr(plan_id, reserved_terminal_pr)
+                return ReservedPullRequestCompletion(plan_id, reserved_terminal_pr)
         except RuntimeStateError as error:
             return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
                                     detail=f'원격 인수 중 실행 상태가 변경됐습니다: {error}')

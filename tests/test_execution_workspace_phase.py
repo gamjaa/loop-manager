@@ -310,14 +310,39 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
         self.pr = {'url': 'https://github.com/owner/repo/pull/1', 'state': 'MERGED',
                    'headRefName': 'loop-manager/G-047', 'baseRefName': 'main', 'headRefOid': self.head,
                    'mergedAt': 'merged', 'mergeCommit': {'oid': 'e' * 40}}
-        reconcile = mock.Mock(return_value=lm.PROJECT_STEP_PLANNING_PENDING)
+        from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned
+        from loop_manager_internal.git import manager_git_journal
+        state_dir = self.handler._identity.state_dir
+        def recover_workspace(*args, **kwargs):
+            self.assertTrue(resource_owned(state_dir, 'repo', 'git:' + str(self.worktree),
+                                           owner='workspace-reservation-recovery'))
+            return original(*args, **kwargs)
+        self.effects.workspace.make_worktree.side_effect = recover_workspace
+        def reconcile_terminal(*_args):
+            self.assertFalse(resource_owned(state_dir, 'repo', 'git:' + str(self.worktree)))
+            # Exercise the actual deletion journal lease, with Git observations doubled.
+            before = {'exists': True, 'registration': {'head': self.head,
+                'branch': 'refs/heads/loop-manager/G-047', 'locked': None}, 'index': 'c' * 40}
+            observed = dict(before)
+            def remove(_token):
+                self.assertTrue(resource_owned(state_dir, 'repo', 'git:' + str(self.worktree), owner='plan:G-047'))
+                self.worktree.rmdir()
+                observed.update(exists=False, registration=None, index=None)
+            self.assertEqual(manager_git_journal.execute(state_dir, repo='repo', owner='plan:G-047',
+                kind='managed_worktree_remove', target=str(self.worktree), before=before,
+                expected={'exists': False, 'registration': None, 'index': None},
+                observe=lambda: observed, apply=remove, marker=lambda _: True), 'applied')
+            return lm.PROJECT_STEP_PLANNING_PENDING
+        reconcile = mock.Mock(side_effect=reconcile_terminal)
         self.handler.effects = replace(self.effects, publication=replace(self.effects.publication,
             reconcile_existing_pull_request=reconcile))
-        with mock.patch.object(lm, 'validate_execplan_workspace_identity'):
+        with mock.patch.object(lm, 'validate_execplan_workspace_identity'), \
+             mock.patch('loop_manager_internal.recovery.plan_recovery.resource_locks', side_effect=resource_locks):
             result = self.handler.prepare()
         self.assertEqual(result.kind, ExecutionOutcomeKind.PLANNING_PENDING)
         self.assertEqual(reconcile.call_args.args[-1]['mergeCommit'], self.pr['mergeCommit'])
         self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 1)
+        self.assertFalse(self.worktree.exists())
         self.effects.agent.run_agent.assert_not_called()
 
     def test_local_branch_with_same_oid_has_no_adoption_intent(self):
