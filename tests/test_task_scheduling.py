@@ -1686,6 +1686,72 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
                 agent.assert_not_called()
 
+    def test_user_question_recheck_distinguishes_new_requirement_from_unreadable_source(self):
+        from loop_manager_internal.git import command_adapter
+        from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        requirement = 'docs/requirements/[R-002] New policy.md'
+        text = '# [R-002] New policy\n\nOrdinary calls and mock checks are sufficient.\n'
+        self.connection.execute("UPDATE exec_plans SET sources=? WHERE repo='A' AND plan_id='G-001'",
+                                (json.dumps([requirement]),))
+        self.connection.commit()
+        for case in ('new', 'current_missing', 'prior_ambiguous', 'prior_tree_failure'):
+            with self.subTest(case=case):
+                runtime.block_plan('A', 'G-001', reason_code='user_decision_required',
+                    evidence='original question ' + case, release_fingerprint='old', clear_projection=False,
+                    plan_values={'worktree': 'one', 'active_sha': 'before'})
+                plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+                saved = checkpoints.get('A', 'G-001')
+                block = dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
+                def git(_repo, *args, **_options):
+                    if args[0] == 'rev-parse':
+                        return SimpleNamespace(returncode=0, stdout='latest')
+                    if args[0] == 'show':
+                        revision, path = args[1].split(':', 1)
+                        if path == requirement:
+                            return SimpleNamespace(returncode=0 if revision == 'latest' and case != 'current_missing' else 1,
+                                                   stdout=text if revision == 'latest' and case != 'current_missing' else '')
+                        return SimpleNamespace(returncode=0, stdout='Unchanged plan and architecture.')
+                    if args[0] == 'ls-tree':
+                        if case == 'prior_tree_failure' and 'before' in args:
+                            raise RuntimeError('historical tree lookup failed')
+                        return SimpleNamespace(returncode=0, stdout='')
+                    raise AssertionError(args)
+                result = dict(resolved=True, detail='new current policy resolves the question',
+                              evidence=[dict(source=requirement, quote='Ordinary calls and mock checks are sufficient.')])
+                agent = mock.Mock(return_value=(0, 'USER_DECISION_ASSESSMENT: ' + json.dumps(result)))
+                effects = SimpleNamespace(git=git, capture_git_snapshot=mock.Mock(), run_agent=agent,
+                                          validate_agent_scope=mock.Mock())
+                def documents(_git, _repo, revision):
+                    if revision == 'before' and case == 'prior_ambiguous':
+                        return {f'docs/requirements/[R-002] {name}.md': text for name in ('First', 'Second')}
+                    return {}
+                def assess():
+                    return _assess_user_decision_cause(effects, self.connection, Path('A'), self.directory,
+                                                     'A', plan, self.config_path)
+                with mock.patch.object(command_adapter, 'revision_requirement_documents', side_effect=documents):
+                    if case == 'new':
+                        self.assertTrue(assess()[0])
+                        self.assertTrue(assess()[0])
+                        agent.assert_called_once()
+                        payload = json.loads(agent.call_args.args[5].splitlines()[-1])
+                        self.assertFalse(payload['prior_source_presence'][requirement])
+                        self.assertTrue(payload['source_presence'][requirement])
+                        self.assertIn('--- /dev/null', payload['changes'][requirement])
+                        stored = checkpoints.get('A', 'G-001').snapshot['user_decision_assessment']
+                        self.assertEqual(stored['prior_revision'], 'before')
+                        self.assertFalse(stored['prior_source_presence'][requirement])
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            assess()
+                        agent.assert_not_called()
+                        self.assertEqual(checkpoints.get('A', 'G-001'), saved)
+                self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001')), block)
+                self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+
     def test_user_question_recheck_resolves_renamed_requirement_by_existing_r_id(self):
         from loop_manager_internal.git import command_adapter
         from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause

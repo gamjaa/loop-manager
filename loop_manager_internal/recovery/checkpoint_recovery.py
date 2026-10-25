@@ -628,7 +628,7 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
     prior_revision = blocked['active_sha'] or blocked['plan_sha']
     declared_sources = set(json.loads(blocked['sources']))
     paths = sorted(declared_sources | {blocked['path'], 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'})
-    current, changes = {}, {}
+    current, changes, prior_presence = {}, {}, {}
     requirement_documents = {}
     optional_product = 'docs/PRODUCT.md' not in declared_sources and blocked['path'] != 'docs/PRODUCT.md'
     def source(revision, path, *, optional=False):
@@ -661,8 +661,13 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         if path != SOURCE and not _safe_path(path):
             raise RuntimeError('차단 재평가 source 경로가 유효하지 않습니다.')
         is_optional_product = path == 'docs/PRODUCT.md' and optional_product
-        old = source(prior_revision, path, optional=is_optional_product)
         latest = source(revision, path, optional=is_optional_product)
+        from loop_manager_internal.catalog.requirement_sources import source_requirement_id
+        # A newly introduced Requirement has no historical text. The current
+        # required source must still resolve before historical absence is used.
+        old = source(prior_revision, path, optional=(
+            is_optional_product or source_requirement_id(path) is not None))
+        prior_presence[path] = old is not None
         current[path] = latest
         if old is None and latest is None:
             continue
@@ -697,6 +702,7 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         "ExecPlan 이외의 상위 명세가 질문 해소를 뒷받침하는 인용이 모두 필요하다.\n"
         + json.dumps(dict(question=question, revision=revision, sources=paths,
                          source_presence={path: value is not None for path, value in current.items()},
+                         prior_source_presence=prior_presence,
                          execplan=current[blocked['path']], changes=changes,
                          manager_inputs={path: current[path] for path in paths if path.startswith('manager:')}), ensure_ascii=False))
     worktree = Path(blocked['worktree'])
@@ -735,7 +741,10 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
                 or checkpoints.get(repo, str(blocked['plan_id'])) != checkpoint
                 or dict(scoped_blocking.plan_block(connection, repo, str(blocked['plan_id'])) or {}) != dict(block or {})):
             raise RuntimeError('사용자 질문 재평가 중 차단 원인 또는 checkpoint가 변경됐습니다.')
-        assessment = dict(identity=identity, revision=revision, question=question, **result)
+        assessment = dict(identity=identity, revision=revision, question=question,
+                          prior_revision=prior_revision, prior_source_presence=prior_presence,
+                          source_presence={path: value is not None for path, value in current.items()},
+                          **result)
         checkpoints.record(repo, str(blocked['plan_id']), expected_generation=checkpoint.generation,
             operation=checkpoint.operation, expected_head=checkpoint.expected_head,
             target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
