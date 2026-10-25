@@ -355,7 +355,7 @@ def _cleanup_ref(effects, connection, state_dir, repo, ref):
                 reason=diagnostic_preservation.redact_detail(str(error)))
 
 
-def cleanup_recorded(effects: CleanupEffects, connection, state_dir, repo):
+def cleanup_recorded(effects: 'CleanupEffects', connection, state_dir, repo):
     """One bounded attempt per recorded ready ref; failures never gate work."""
     if connection.in_transaction or getattr(connection, '_depth', 0):
         return  # Caller owns uncommitted work; never commit it to start cleanup.

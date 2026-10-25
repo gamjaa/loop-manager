@@ -45,6 +45,8 @@ R-083의 충돌 해결 진단 ref에 한해, 원인 해소·해결 결과의 정
 
 ## Progress
 
+Manager의 전체 verify 피드백 `verify:961fc1cb84519e2c64325de33b660d665b10f7a0a5e6ff973b935eefdc6012e7`에서 compatibility export가 effects 주석을 모듈 내 타입 이름 문자열로 조회하는 계약을 확인했다. 새 `cleanup_recorded`의 주석만 기존 `prepare_recorded`와 같은 문자열 형식으로 교정했다. 기존 export 회귀 `tests.test_project_services.ProjectServiceCompositionTests.test_compatibility_exports_bind_the_matching_named_effect_contract`를 지정 targeted runner로 실행해 1개 통과했다. runtime 동작·검사 assertion·Requirement·frontmatter는 변경하지 않았으며 전체 verify 재실행은 Manager에 남긴다. 아래 결과는 이전 구현·교정 호출의 이력이다.
+
 G-276의 준비 판정·원문 복구·run 경계를 재사용해 자원 잠금 아래 삭제 직전 재관측, 저장 OID의 정확한 lease 삭제, 원격 부재 확인과 중단 재개를 구현했다. `diagnostic_cleanup_attempts`에 basis별 intent·시도 예약·단계/실패 감사를 보존하고 같은 근거의 일시 시도는 최대 3회, lease/정책 거부는 재push하지 않는다. 보존·프로젝트 진단 게시가 같은 ref 잠금을 공유하며 정리된 과거 원인의 재생성과 현재 원격 게시 성공 오보를 막는다. PRODUCT·ARCHITECTURE에 제품 수명·호환 저장 계약을 반영했다. 기존 사용자 판단·선언은 변경하지 않았다.
 
 Worker targeted 결과: 삭제/준비·보존·게시 인자 단위 61개, 기존 프로젝트 게시 단위 11개, 삭제 직전 generation 경쟁·과거 프로젝트 intent·알림 경계 3개, pending handoff 1개를 실행했다. 추가로 복수 원인·미게시 작업물·WAITING→COMPLETE·독립 차단의 실제 삭제 경로 4개를 좁혀 검증했다. 실패한 두 실행은 각각 새 checkpoint fixture 필수 인자 누락과 프로젝트 fixture tree 불일치였으며 교정 뒤 동일 명령으로 통과했다. 최초 34개 준비/삭제 실행의 재실행도 통과했다. 전체 verify와 Windows/실제 Git 실행 성공을 주장하지 않는다. 후속 결과 검증에서 최종 보고의 FAILED_COMMAND와 RERUN 사이에 본래 실패 결과를 빠뜨린 형식 오류를 확인했다. 원본 targeted JSONL의 76개 test ID를 시각순으로 대조해 두 과거 오류 모두 최신 success임을 확인했고, 실패 결과를 명령 뒤·재실행 앞에 명시한 전체 보고를 실제 parse_worker_result가 수용함을 확인했다. 제품 코드나 검증 조건은 바꾸지 않았으며 이미 성공한 unit test는 반복하지 않았다.
