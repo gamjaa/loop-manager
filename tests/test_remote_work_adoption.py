@@ -91,6 +91,10 @@ class RemoteAdoptionGitTests(TestCase):
             self.addCleanup(connection.close)
             runtime = lm.runtime_state.RuntimeStateRepository(connection)
             runtime.activate(str(repo), 'G-047', activation_sha=base, branch=branch, worktree=str(worktree))
+            # This scenario has no concurrent planning attempt holding cleanup.
+            connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+            connection.commit()
+            self.assertTrue(runtime.recovery_slot_available(str(repo)))
             project = connection.execute('SELECT * FROM projects').fetchone()
             pr = {'url': 'https://github.com/fixture/project/pull/1', 'state': 'MERGED',
                   'headRefName': branch, 'baseRefName': 'main', 'headRefOid': head,
@@ -100,3 +104,4 @@ class RemoteAdoptionGitTests(TestCase):
             self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'MERGED')
             self.assertEqual(git_command(repo, 'rev-parse', 'origin/main'), base)
             self.assertFalse(worktree.exists())
+            self.assertIsNone(connection.execute('SELECT * FROM cleanup_pending').fetchone())

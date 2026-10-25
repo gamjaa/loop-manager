@@ -602,6 +602,31 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
 
 
 class MergedTerminalBoundaryTests(unittest.TestCase):
+    def test_planning_defers_cleanup_until_slot_is_released(self):
+        fixture, state_dir = self._fixture()
+        fixture.connection.execute("UPDATE projects SET planning_attempt_fingerprint='planning-owner'")
+        fixture.connection.commit()
+        plan = fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+        with mock.patch.object(loop_manager, '_assess_missing_managed_cleanup') as cleanup:
+            assessment = loop_manager.complete_merged_execplan_worktree(
+                fixture.connection, Path('/repo'), 'repo', state_dir, plan, plan['pr_url'], 'b' * 40)
+        self.assertEqual(assessment.status, 'deferred')
+        cleanup.assert_not_called()
+        restarted = self._assert_merged(fixture)
+        self.assertEqual(fixture.connection.execute(
+            'SELECT reason FROM cleanup_pending').fetchone()[0], 'planning 실행 자리 보존')
+        fixture.connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+        fixture.connection.commit()
+        with mock.patch.object(loop_manager, '_assess_missing_managed_cleanup',
+                               return_value=loop_manager.CleanupAssessment('missing')) as cleanup:
+            assessment = loop_manager.complete_merged_execplan_worktree(
+                fixture.connection, Path('/repo'), 'repo', state_dir, restarted,
+                restarted['pr_url'], restarted['pr_head_oid'])
+        cleanup.assert_called_once()
+        self.assertEqual(assessment.status, 'missing')
+        self.assertIsNone(fixture.connection.execute('SELECT * FROM cleanup_pending').fetchone())
+        self._assert_merged(fixture)
+
     def _fixture(self):
         from tests.support.execution import execution_fixture
         fixture = execution_fixture(self)
