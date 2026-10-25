@@ -568,7 +568,8 @@ def run_project_tasks(service, *, newly_activated):
                             "blocked_fingerprint FROM exec_plans WHERE repo=? AND status='PLAN_BLOCKED' ORDER BY plan_id",
                             (repo,)).fetchall()
                         for row in blocked:
-                            key = tuple(row)
+                            from loop_manager_internal.storage.planning_review_state import reassessment_key
+                            key = (*tuple(row), reassessment_key(connection, repo, str(row['plan_id'])))
                             if key in rechecked_blocks or str(row['plan_id']) in running:
                                 continue
                             from loop_manager_internal.recovery.plan_recovery import target_available

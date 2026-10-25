@@ -662,7 +662,8 @@ def _apply_general_planning_batch(
         requirement_only = review is not None and review['purpose'] == 'requirement'
         previous = (connection.execute('SELECT processed_sha, specification_fingerprint, planning_fingerprint '
                                        'FROM projects WHERE repo=?', (repo,)).fetchone() if requirement_only else None)
-        planning_review_state.confirm(connection, repo, snapshot.active_sha, plan_commit)
+        planning_review_state.confirm(connection, repo, snapshot.active_sha, plan_commit,
+                                      revised_plan_ids=tuple(item.snapshot.plan_id for item in result.revisions))
         if not requirement_only:
             planning_input_state.record_general(
                 connection, repo, plan_commit, effects.plan_declarations(worktree, plan_commit),

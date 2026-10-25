@@ -55,6 +55,55 @@ def get(connection: sqlite3.Connection, repo: str, slot: str):
     ).fetchone()
 
 
+def general_pending(connection: sqlite3.Connection, repo: str) -> bool:
+    """Unconfirmed planning cannot supply cause-resolution evidence."""
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    return bool(
+        ('planning_reviews' in tables and connection.execute(
+            "SELECT 1 FROM planning_reviews WHERE repo=? AND slot='attempt'", (repo,)).fetchone())
+        or ('general_planning_publications' in tables and connection.execute(
+            'SELECT 1 FROM general_planning_publications WHERE repo=?', (repo,)).fetchone()))
+
+
+def reassessment(connection: sqlite3.Connection, repo: str, plan_id: str) -> dict:
+    from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+    return (ExecutionCheckpointRepository(connection).get(repo, plan_id).snapshot or {}).get('planning_reassessment', {})
+
+
+def reassessment_key(connection: sqlite3.Connection, repo: str, plan_id: str) -> str:
+    return json.dumps(reassessment(connection, repo, plan_id), sort_keys=True, ensure_ascii=False)
+
+
+def _queue_reassessments(connection, repo, attempt, confirmed_revision, revised_plan_ids):
+    from loop_manager_internal.planning.planning_document_relevance import blocked_plan_inputs
+    from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+    inputs = blocked_plan_inputs(attempt['result'], attempt['revision'])
+    if not inputs and not revised_plan_ids:
+        return
+    # The same publication transaction has already applied revised catalog rows.
+    rows = connection.execute("SELECT plan_id, current_revision_sha FROM exec_plans "
+                              "WHERE repo=? AND status='PLAN_BLOCKED'", (repo,)).fetchall()
+    checkpoints = ExecutionCheckpointRepository(connection)
+    for row in rows:
+        plan_id = str(row['plan_id'])
+        if plan_id not in inputs and plan_id not in revised_plan_ids:
+            continue
+        current = checkpoints.get(repo, plan_id)
+        previous = (current.snapshot or {}).get('planning_reassessment', {})
+        related = {item['source']: item for item in previous.get('requirements', [])}
+        related.update({item['source']: dict(item, revision=attempt['revision'],
+                                           confirmed_revision=confirmed_revision)
+                        for item in inputs.get(plan_id, [])})
+        pending = dict(revision=attempt['revision'], confirmed_revision=confirmed_revision,
+                       requirements=[related[path] for path in sorted(related)])
+        if previous == pending:
+            continue
+        checkpoints.record(repo, plan_id, expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**(current.snapshot or {}), 'planning_reassessment': pending})
+
+
 def current_final(connection: sqlite3.Connection, repo: str):
     final = get(connection, repo, "final")
     general = get(connection, repo, "general")
@@ -94,12 +143,14 @@ def validate(connection: sqlite3.Connection, repo: str, revision: str,
 
 
 def confirm(connection: sqlite3.Connection, repo: str, reviewed_revision: str,
-            confirmed_revision: str) -> None:
+            confirmed_revision: str, *, revised_plan_ids=()) -> None:
     attempt = get(connection, repo, "attempt")
     if attempt is None or attempt["revision"] != reviewed_revision:
         return  # Legacy publication recovery has no review receipt.
     if attempt["result"] is None or attempt["outcome"] is None:
         raise RuntimeError("검증되지 않은 일반 planning 검토를 확정할 수 없습니다.")
+    if attempt['purpose'] != 'requirement':
+        _queue_reassessments(connection, repo, attempt, confirmed_revision, revised_plan_ids)
     slots = ["requirement"] if attempt["purpose"] == "requirement" else ["general"]
     if attempt["purpose"] == "final":
         slots.append("final")

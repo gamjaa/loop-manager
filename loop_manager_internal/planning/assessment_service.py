@@ -594,6 +594,15 @@ class PlanningAssessmentService(PlanningService):
                         if (attempt['purpose'] == 'requirement' and validated_result is not None
                                 and (validated_result.revisions or validated_result.deletions)):
                             raise PlanningResultInvalid('Requirement 완료 점검은 진행 중인 다른 작업을 개정할 수 없습니다.')
+                        if attempt['purpose'] != 'requirement':
+                            from loop_manager_internal.planning.planning_document_relevance import validate_blocked_plan_inputs
+                            try:
+                                validate_blocked_plan_inputs(
+                                    str(row.planning_result or ''), str(row.active_sha),
+                                    self._ports.state.execplan_rows(context.repo), self._ports.git.run,
+                                    context.repo_path)
+                            except ValueError as error:
+                                raise PlanningResultInvalid(str(error)) from error
                         outcome = (validate_final(attempt, str(row.planning_result or ""), validated_result,
                                    self._ports.git, context.repo_path,
                                    manager_source_validator=lambda path, plan:

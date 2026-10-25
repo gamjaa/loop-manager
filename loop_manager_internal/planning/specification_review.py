@@ -100,6 +100,14 @@ def review_instruction(attempt, git, repo) -> str:
                  "파일 경로의 비어 있지 않은 배열, reason은 경로·규칙·확인 사실의 요약이며 비밀값이나 원문을 "
                  "포함하지 마라. fulfilled에는 미충족 계획·draft를 "
                  "남길 수 없다. followup에는 source에 연결된 새 계획, needs_decision에는 새 draft가 필요하다.")
+    if attempt['purpose'] != 'requirement':
+        text += ("\n차단 작업에 직접 sources 밖 활성 Requirement가 목표·검증·dependency상 실질적으로 "
+                 "영향을 주면 그 관계도 확인하라. 한 줄 BLOCKED_PLAN_INPUTS: JSON 객체를 반환하라. "
+                 "revision은 위 검토 revision, plans는 [{plan_id, requirements:[{source, reason, quote}]}]다. "
+                 "source는 현재 활성 Requirement의 정확한 경로, reason은 해당 작업에 미치는 실질적 영향, "
+                 "quote는 현재 원격 원문의 정확한 인용이다. 영향 대상이 없으면 plans: []로 반환하라. "
+                 "모든 변경을 모든 차단 작업에 연결하지 마라. 이는 재평가 입력이며 질문 해소·사용자 승인 "
+                 "판단이 아니다. 작업 문서 개정이나 직접 source 추가가 없어도 확인한 관계를 포함하라.")
     return text
 
 

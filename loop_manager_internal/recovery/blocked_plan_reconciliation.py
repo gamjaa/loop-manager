@@ -23,6 +23,7 @@ from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCh
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage import planning_review_state
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -71,6 +72,7 @@ def slot_available(connection, repo, plan_id) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'general_planning_publications'").fetchone()
         and connection.execute('SELECT 1 FROM general_planning_publications WHERE repo = ?', (repo,)).fetchone())
     return bool(project is not None and runtime.recovery_slot_available(repo)
+                and not planning_review_state.general_pending(connection, repo)
                 and (not project['pr_conflict_recovery']
                      or projected is not None and projected['plan_id'] == plan_id)
                 and (active is None or active['plan_id'] == plan_id)
@@ -276,6 +278,8 @@ class BlockedPlanReconciler:
                        for field in ('reason_code', 'release_fingerprint', 'evidence'))
                 or self.ports.unmet_execplan_dependencies(self.connection, self.repo, plan_id)):
             raise RuntimeError('차단 계획의 identity·원인·dependency 또는 실행 자리가 변경됐습니다.')
+        if context.get('planning_input', {}) != planning_review_state.reassessment(self.connection, self.repo, plan_id):
+            raise InputChanged('차단 계획의 확정 planning 입력이 변경됐습니다.')
         return plan
 
     def _remote(self, context, *, allow_published=False):
@@ -674,8 +678,10 @@ class BlockedPlanReconciler:
             return 'deferred'
         saved = self.connection.execute('SELECT * FROM blocked_plan_reconciliations WHERE repo = ? AND plan_id = ?',
                                         (self.repo, plan_id)).fetchone()
+        planning_input = planning_review_state.reassessment(self.connection, self.repo, plan_id)
+        previous_input = json.loads(saved['context']).get('planning_input', {}) if saved else {}
         if saved is None or saved['stage'] in TERMINAL:
-            if not observations.pending_input(row):
+            if not observations.pending_input(row) and planning_input == previous_input:
                 if (self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value
                         or local_verify_recheck and self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value):
                     return 'unhandled'
@@ -689,8 +695,11 @@ class BlockedPlanReconciler:
             context = {field: row[field] for field in ('registered_origin', 'origin_url', 'base_ref',
                        'branch_ref', 'base_oid', 'branch_oid')}
             context.update(plan_id=plan_id, identity={field: plan[field] for field in IDENTITY_FIELDS},
-                           block=dict(block), artifacts={field: plan[field] for field in ARTIFACT_FIELDS})
-            key, stage = observations.input_identity(row), 'observed'
+                           block=dict(block), artifacts={field: plan[field] for field in ARTIFACT_FIELDS},
+                           planning_input=planning_input)
+            remote_key = observations.input_identity(row)
+            context['remote_input_identity'] = remote_key
+            key, stage = (json.dumps([remote_key, planning_input], sort_keys=True) if planning_input else remote_key), 'observed'
             context['input_identity'] = key
             self._save(plan_id, key, stage, context)
         else:
@@ -774,6 +783,7 @@ class BlockedPlanReconciler:
                 with runtime_state._transaction(self.connection):
                     self._save(plan_id, key, 'refused', context)
                     if not isinstance(error, InputChanged):
-                        observations.mark_processed(self.connection, self.repo, plan_id, key)
+                        observations.mark_processed(self.connection, self.repo, plan_id,
+                                                    context.get('remote_input_identity', key))
             return 'blocked'
         return 'blocked'

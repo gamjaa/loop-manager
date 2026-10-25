@@ -1686,6 +1686,159 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
                 agent.assert_not_called()
 
+    def test_user_question_recheck_uses_confirmed_indirect_requirement_and_rejects_races(self):
+        from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.storage import planning_review_state as reviews
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='original choice',
+            release_fingerprint='unchanged', clear_projection=False,
+            plan_values={'worktree': 'one', 'active_sha': 'before', 'worker_session_id': 'kept-session'})
+        plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+        block = dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
+        source = 'docs/requirements/[R-002] New policy.md'
+        text = '# [R-002] New policy\n\nOrdinary calls and mock checks are sufficient.\n'
+        additional_source = 'docs/requirements/[R-003] Related validation.md'
+        additional_text = '# [R-003] Related validation\n\nRetain failure diagnostics.\n'
+        requirements = [dict(source=source, reason='defines sufficient validation for this task',
+                             quote='Ordinary calls and mock checks are sufficient.')]
+        inputs = 'BLOCKED_PLAN_INPUTS: ' + json.dumps(dict(revision='latest', plans=[
+            dict(plan_id='G-001', requirements=requirements)]))
+        reviews.begin(self.connection, 'A', purpose='delta', revision='latest', input_fingerprint='input',
+                      specification_fingerprint='spec', work_cycle='cycle', comparison_revision='before')
+        reviews.validate(self.connection, 'A', 'latest', inputs, 'reviewed')
+        self.connection.commit()
+        observed_revision, race = 'latest', None
+        store = ExecutionCheckpointRepository(self.connection)
+        def git(_repo, *args, **_options):
+            self.assertFalse(self.connection.in_transaction)
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(returncode=0, stdout=observed_revision)
+            if args[0] in {'merge-base', 'diff', 'ls-tree'}:
+                return SimpleNamespace(returncode=0, stdout='')
+            if args[0] == 'show':
+                revision, path = args[1].split(':', 1)
+                if path in {source, additional_source}:
+                    return SimpleNamespace(returncode=1 if revision == 'before' else 0,
+                                           stdout='' if revision == 'before' else text if path == source else additional_text)
+                return SimpleNamespace(returncode=0, stdout='Existing plan and architecture.')
+            raise AssertionError(args)
+        def run_agent(*_args, **_kwargs):
+            nonlocal observed_revision
+            self.assertFalse(self.connection.in_transaction)
+            if race == 'remote':
+                observed_revision = 'advanced'
+            elif race == 'checkpoint':
+                current = store.get('A', 'G-001')
+                with self.connection:
+                    store.record('A', 'G-001', expected_generation=current.generation, operation=current.operation,
+                        expected_head='concurrent-head', target_base_oid=current.target_base_oid,
+                        observed_remote_oid=current.observed_remote_oid, snapshot=current.snapshot)
+            elif race == 'question':
+                runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='concurrent question',
+                    release_fingerprint='unchanged', clear_projection=False)
+            return 0, 'USER_DECISION_ASSESSMENT: ' + json.dumps(dict(resolved=True, detail='policy resolves choice',
+                evidence=[dict(source=source, quote=requirements[0]['quote'])]))
+        effects = SimpleNamespace(git=git, capture_git_snapshot=mock.Mock(), run_agent=mock.Mock(side_effect=run_agent),
+                                  validate_agent_scope=mock.Mock())
+        def assess():
+            return _assess_user_decision_cause(effects, self.connection, Path('A'), self.directory,
+                                             'A', plan, self.config_path)
+        self.assertFalse(assess()[0])  # Push/DB application is not confirmed yet.
+        effects.run_agent.assert_not_called()
+        self.assertEqual(reviews.reassessment(self.connection, 'A', 'G-001'), {})
+        with self.connection:
+            reviews.confirm(self.connection, 'A', 'latest', 'latest')
+        self.assertEqual(reviews.reassessment(self.connection, 'A', 'G-002'), {})
+        first = store.get('A', 'G-001')
+        for race in ('remote', 'checkpoint', 'question'):
+            with self.subTest(race=race):
+                with self.assertRaises(RuntimeError):
+                    assess()
+                self.assertNotIn('user_decision_assessment', store.get('A', 'G-001').snapshot)
+                observed_revision = 'latest'
+                runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='original choice',
+                    release_fingerprint='unchanged', clear_projection=False)
+        race = None
+        self.assertTrue(assess()[0])
+        self.assertTrue(assess()[0])
+        self.assertEqual(effects.run_agent.call_count, 4)
+        previous_identity = store.get('A', 'G-001').snapshot['user_decision_assessment']['identity']
+        with self.connection:
+            reviews.begin(self.connection, 'A', purpose='delta', revision=observed_revision,
+                input_fingerprint='related-input', specification_fingerprint='other-spec',
+                work_cycle='cycle', comparison_revision='latest')
+            reviews.validate(self.connection, 'A', observed_revision,
+                'BLOCKED_PLAN_INPUTS: ' + json.dumps(dict(revision=observed_revision, plans=[dict(
+                    plan_id='G-001', requirements=[dict(source=additional_source,
+                        reason='adds an applicable validation constraint', quote='Retain failure diagnostics.')])])), 'reviewed')
+            reviews.confirm(self.connection, 'A', observed_revision, observed_revision)
+        self.assertTrue(assess()[0])
+        self.assertTrue(assess()[0])
+        self.assertEqual(effects.run_agent.call_count, 5)
+
+        self.assertNotEqual(store.get('A', 'G-001').snapshot['user_decision_assessment']['identity'], previous_identity)
+        prompt = effects.run_agent.call_args.args[5]
+        payload = json.loads(prompt.splitlines()[-1])
+        self.assertEqual(payload['related_source_texts'][source], text)
+        self.assertEqual(payload['related_requirements'][0]['reason'], requirements[0]['reason'])
+        self.assertEqual(payload['planning_confirmation']['confirmed_revision'], 'latest')
+        self.assertFalse(payload['prior_source_presence'][source])
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'A', 'G-001')), block)
+        self.assertEqual(runtime.get('A', 'G-001').worker_session_id, 'kept-session')
+        self.assertGreater(store.get('A', 'G-001').generation, first.generation)
+        # An unrelated, confirmed Requirement change does not repeat the model.
+        observed_revision = 'after-unrelated-change'
+        with self.connection:
+            reviews.begin(self.connection, 'A', purpose='delta', revision=observed_revision,
+                input_fingerprint='other-input', specification_fingerprint='other-spec',
+                work_cycle='cycle', comparison_revision='latest')
+            reviews.validate(self.connection, 'A', observed_revision,
+                'BLOCKED_PLAN_INPUTS: ' + json.dumps(dict(revision=observed_revision, plans=[])), 'reviewed')
+            reviews.confirm(self.connection, 'A', observed_revision, observed_revision)
+        self.assertTrue(assess()[0])
+        self.assertEqual(effects.run_agent.call_count, 5)
+
+    def test_confirmed_question_resume_preserves_sessions_failure_audit_and_previous_results(self):
+        from loop_manager_internal.recovery.blocked_plan_service import _requeue_blocked_execplan
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='original question',
+            release_fingerprint='old', clear_projection=False, plan_values={
+                'worker_session_id': 'worker-session', 'reviewer_session_id': 'reviewer-session',
+                'worker_result': 'previous work', 'verify_result': 'old verify', 'verify_token': 'old-token',
+                'verify_failure_history': '{"failure":3}', 'effective_worker_level': 6})
+        independent = runtime.get('A', 'G-002')
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        confirmation = dict(revision='reviewed', confirmed_revision='published', requirements=[])
+        with self.connection:
+            checkpoints.record('A', 'G-001', expected_generation=0, operation=None, expected_head='candidate',
+                target_base_oid='published', observed_remote_oid='candidate', snapshot={
+                    'planning_reassessment': confirmation, 'user_decision_assessment': dict(
+                        resolved=True, question='original question', planning_confirmation=confirmation)})
+        _requeue_blocked_execplan(SimpleNamespace(), self.connection, 'A', 'G-001',
+                                 preserve_execution=True, target_base_oid='published')
+        resumed = runtime.get('A', 'G-001')
+        self.assertEqual(resumed.status, 'IMPLEMENTING')
+        self.assertEqual(resumed.worker_session_id, 'worker-session')
+        self.assertEqual(resumed.reviewer_session_id, 'reviewer-session')
+        audit = self.connection.execute("SELECT effective_worker_level, verify_failure_history FROM exec_plans "
+                                        "WHERE repo='A' AND plan_id='G-001'").fetchone()
+        self.assertEqual(audit['effective_worker_level'], 6)
+        self.assertEqual(audit['verify_failure_history'], '{"failure":3}')
+        self.assertIsNone(resumed.verify_token)
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
+        self.assertEqual(checkpoints.get('A', 'G-001').snapshot['planning_resume_artifacts']['worker_result'], 'previous work')
+        self.assertEqual(runtime.get('A', 'G-002'), independent)
+        runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='new question',
+                           release_fingerprint='new', clear_projection=False)
+        with self.assertRaises(RuntimeError):
+            _requeue_blocked_execplan(SimpleNamespace(), self.connection, 'A', 'G-001',
+                                     preserve_execution=True, target_base_oid='published')
+        self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+
     def test_user_question_recheck_distinguishes_new_requirement_from_unreadable_source(self):
         from loop_manager_internal.git import command_adapter
         from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause

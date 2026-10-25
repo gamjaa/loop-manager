@@ -1384,6 +1384,44 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
 
 
 class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_confirmed_planning_rechecks_processed_target_and_preserves_independent_state(self):
+        from loop_manager_internal.storage import planning_review_state as reviews
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        with self.connection:
+            blocked_remote_observation.mark_processed(self.connection, self.repo, 'G-106',
+                                                       blocked_remote_observation.input_identity(self.row()))
+        self.assertFalse(blocked_remote_observation.pending_input(self.row()))
+        independent = dict(self.plan('G-107'))
+        inputs = 'BLOCKED_PLAN_INPUTS: ' + json.dumps(dict(revision=self.base, plans=[
+            dict(plan_id='G-106', requirements=[dict(source='docs/requirements/[R-002] Policy.md',
+                reason='changes the failed validation contract', quote='Current policy.')])]))
+        with self.connection:
+            reviews.begin(self.connection, self.repo, purpose='delta', revision=self.base,
+                input_fingerprint='input', specification_fingerprint='spec', work_cycle='cycle', comparison_revision=None)
+            reviews.validate(self.connection, self.repo, self.base, inputs, 'reviewed')
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'deferred')
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+        with self.connection:
+            reviews.confirm(self.connection, self.repo, self.base, self.base)
+        with (mock.patch.object(self.coordinator, '_publish', side_effect=KeyboardInterrupt),
+              mock.patch.object(self.coordinator, '_incorporate', wraps=self.coordinator._incorporate) as incorporate):
+            with self.assertRaises(KeyboardInterrupt):
+                self.coordinator.reconcile('G-106')
+            incorporate.assert_called_once()
+        self.assertEqual(self.ports._evaluate_remote_checkpoint_cause.call_count, 2)
+        with (mock.patch.object(self.coordinator, '_publish'),
+              mock.patch.object(self.coordinator, '_incorporate') as incorporate):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+            incorporate.assert_not_called()
+        self.assertEqual(self.ports._evaluate_remote_checkpoint_cause.call_count, 2)
+        self.assertEqual(dict(self.plan('G-107')), independent)
+        self.assertEqual(reviews.reassessment(self.connection, self.repo, 'G-107'), {})
+        self.assertEqual(self.plan()['verify_failure_history'], '{"failure":3}')
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')['evidence'],
+                         'original verify failure')
+
     def test_adopted_base_conflict_reobserves_successor_before_incorporation_after_restart(self):
         self.published_successor()
         store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)

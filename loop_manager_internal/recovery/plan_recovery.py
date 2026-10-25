@@ -11,6 +11,9 @@ _selected_recovery = ContextVar("selected_plan_recovery", default=frozenset())
 
 
 def target_available(connection, repo, plan_id):
+    from loop_manager_internal.storage.planning_review_state import general_pending
+    if general_pending(connection, repo):
+        return False
     runtime = runtime_state.RuntimeStateRepository(connection)
     if not runtime.recovery_slot_available(repo):
         return False
