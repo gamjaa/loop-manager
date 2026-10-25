@@ -252,8 +252,6 @@ class VerifyInputObservationTest(unittest.TestCase):
         patterns = inputs.parse((root / inputs.MANIFEST).read_bytes())
         for path in ('loop_manager.py', 'loop_manager_internal/verification/runner.py',
                      'loop_manager_internal/catalog/frontmatter.py',
-                     'docs/AGENTS.common.md', 'docs/AGENTS.planner.md', 'docs/AGENTS.planner_check.md',
-                     'docs/AGENTS.worker.md', 'docs/AGENTS.reviewer.md', 'docs/AGENTS.ponytail.md',
                      'tests/support/origin.py', 'tests/fixtures/project-files/AGENTS.md',
                      'tests/fixtures/project-files/docs/AGENTS.common.md',
                      'tests/fixtures/project-files/docs/AGENTS.planner.md',
@@ -274,6 +272,9 @@ class VerifyInputObservationTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(any(inputs.matches(path, pattern) for pattern in patterns))
         for path in ('AGENTS.md', 'README.md', 'config/config.ini.example',
+                     'docs/AGENTS.common.md', 'docs/AGENTS.planner.md',
+                     'docs/AGENTS.planner_check.md', 'docs/AGENTS.worker.md',
+                     'docs/AGENTS.reviewer.md', 'docs/AGENTS.ponytail.md',
                      'docs/PLANS.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md',
                      'docs/FUTURE_IDEAS.md', 'docs/VERIFY.md',
                      'docs/PRODUCT.template.md', 'docs/ARCHITECTURE.template.md',
@@ -407,16 +408,17 @@ class WorkerExclusionReviewTests(unittest.TestCase):
         self.root = Path(temporary.name)
         (self.root / 'scripts').mkdir()
         (self.root / 'src').mkdir()
+        (self.root / 'docs').mkdir()
         (self.root / 'src/app.py').write_text('VALUE = 1')
         for name in ('verify.sh', 'verify.ps1'):
             (self.root / 'scripts' / name).write_text('custom native verify')
         (self.root / inputs.MANIFEST).write_text(json.dumps(
             dict(version=1, paths=['src/**', 'scripts/**'])))
-        self.document = self.root / 'README.md'
-        self.document.write_text('unused guidance')
+        self.document = self.root / 'docs/AGENTS.worker.md'
+        self.document.write_text('test-owned runtime guidance')
         self.review = inputs.exclusion_request(self.root, ('scripts/verify.sh', 'scripts/verify.ps1'),
                                                 ('config/operating.ini',))
-        self.review['basis'] = 'Both custom scripts consume only src; README and operating config are never read.'
+        self.review['basis'] = 'Both custom scripts consume only src; runtime guidance is never read.'
 
     def observe(self, review=None, entrypoint='scripts/verify.sh'):
         return inputs.reconfirm_worker_exclusions(self.root, (entrypoint,), review or self.review)
@@ -472,7 +474,7 @@ class WorkerExclusionReviewTests(unittest.TestCase):
         manifest = self.root / inputs.MANIFEST
         manifest.write_text(json.dumps(dict(version=1, paths=['src/**', 'scripts/**', 'config/**'])))
         review = inputs.exclusion_request(self.root, ('scripts/verify.sh',), ('config/operating.ini',))
-        review['basis'] = 'README only is unconsumed; configuration is selected.'
+        review['basis'] = 'Runtime guidance is unconsumed; configuration is selected.'
         current = self.observe(review)
         self.assertTrue(current.proven, current.reason)
         self.assertIn('config/operating.ini', {item[0] for item in current.files})
@@ -518,6 +520,6 @@ class WorkerExclusionReviewTests(unittest.TestCase):
                 self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
                 observed = result_validation.observe_verify_inputs(self.root, worker_result=message)
                 self.assertTrue(observed.proven, observed.reason)
-                (self.root / 'scripts' / script).write_text('now consumes README.md')
+                (self.root / 'scripts' / script).write_text('now consumes runtime guidance')
                 self.assertFalse(result_validation.observe_verify_inputs(self.root, worker_result=message).proven)
                 (self.root / 'scripts' / script).write_text('custom native verify')

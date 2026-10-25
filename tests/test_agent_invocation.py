@@ -1217,33 +1217,43 @@ class CommonGuidanceInvocationTests(TestCase):
             resolved_profile=invocation.ResolvedProfile('model', 'high'),
         )
 
-    def test_real_worker_prompts_deliver_static_rules_only_in_pinned_instruction(self):
-        root = Path(__file__).resolve().parents[1]
-        for filename in self.guidance_module.GUIDANCE_PATHS:
-            (self.runtime / filename).write_bytes((root / filename).read_bytes())
+    def test_worker_prompts_deliver_owned_guidance_without_prompt_duplication(self):
         path = 'docs/plans/[G-147] Instruction.md'
         prompts = (
             manager.worker_prompt(path, None),
             manager.worker_prompt(path, 'new correction', session_resume=True),
             manager.worker_prompt(path, None, 'PRIVATE OLD WORKER RESULT', session_recovery=True),
         )
-        for prompt in prompts:
-            result = self.invoke(prompt=prompt)
-            self.assertEqual(result.code, 0)
-            request = self.requests[-1]
-            instruction = request.common_guidance.content
-            self.assertEqual(request.prompt, prompt)
-            for rule in ('최소 범위의 targeted unit test만', '개별 test case·class·module',
-                         '공백을 정규화한 뒤 정확히 같아야', 'Worker는 Git add·commit·fetch·rebase·push·PR',
-                         'frontmatter는 직접 변경하지', 'sources 문자열은 보존',
-                         '모든 Requirement', 'Ponytail', 'User Decision',
-                         'VERIFY_INPUT_EXCLUSIONS:', '--review-request .',
-                         '어떤 내용이어도 소비되지 않음',
-                         '스크립트와 같은 디렉터리의 `inputs.py`'):
-                self.assertIn(rule, instruction)
-                self.assertNotIn(rule, prompt)
-            self.assertNotIn('PRIVATE OLD WORKER RESULT', prompt)
-            self.assertNotIn('AGENTS.md', prompt)
+        read = self.guidance_module._read
+
+        def read_owned_guidance(source):
+            source = source.resolve()
+            runtime = self.runtime.resolve()
+            snapshots = (self.state_dir / 'agent-instructions').resolve()
+            self.assertTrue(source.is_relative_to(runtime) or source.is_relative_to(snapshots), source)
+            return read(source)
+
+        with mock.patch.object(self.guidance_module, '_read', side_effect=read_owned_guidance):
+            for prompt in prompts:
+                result = self.invoke(prompt=prompt)
+                self.assertEqual(result.code, 0)
+                request = self.requests[-1]
+                instruction = request.common_guidance.content
+                self.assertEqual(request.prompt, prompt)
+                self.assertEqual(
+                    instruction,
+                    '자동 지침 "quoted" \\path\n두 번째 줄\n\n'
+                    '정적 역할: docs/AGENTS.worker.md\n\nPonytail fixture\n',
+                )
+                self.assertEqual(
+                    request.common_guidance.content_hash,
+                    hashlib.sha256(instruction.encode('utf-8')).hexdigest(),
+                )
+                self.assertNotIn('자동 지침', prompt)
+                self.assertNotIn('정적 역할:', prompt)
+                self.assertNotIn('Ponytail fixture', prompt)
+                self.assertNotIn('PRIVATE OLD WORKER RESULT', prompt)
+                self.assertNotIn('AGENTS.md', prompt)
         self.assertNotIn(path, prompts[1])
         self.assertEqual(len({r.common_guidance.content_hash for r in self.requests}), 1)
 

@@ -25,25 +25,12 @@ class PublicFacadeTest(unittest.TestCase):
             "main", "실행 가능한 관련 targeted unit test가 없습니다: 문서 변경만 포함합니다.",
         )
 
-        instruction = (Path(__file__).resolve().parents[1] / 'docs/AGENTS.worker.md').read_text(encoding='utf-8')
-        for phrase in ('최소 범위의 targeted unit test만', '개별 test case·class·module',
-                       '같은 세션에서 수정하고 동일 테스트로 재검증', '구체적인 사유',
-                       '전체 test suite·integration·end-to-end test', '프로젝트 전체 lint·build·type check',
-                       '소유된 rebase 충돌 해결 중에는 frontmatter를 복원하지 않는다',
-                       'Manager가 Git rebase 완료 후 고정 base의 frontmatter를 복원한다'):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, instruction)
-                self.assertNotIn(phrase, worker)
         self.assertNotIn("targeted: PASS", reviewer)
         self.assertNotIn("verify: PASS", reviewer)
         self.assertIn("문서 변경만 포함합니다", no_test_reviewer)
         self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer)
         self.assertIn("ISSUE_ID: relative/path::stable-symbol-or-test::category-slug", reviewer)
         self.assertIn("이전과 정확히 같은 ID", reviewer)
-        self.assertIn("RERUN:", instruction)
-        self.assertIn("FAILED_COMMAND:", instruction)
-        self.assertIn("공백을 정규화한 뒤 정확히 같아야", instruction)
-        self.assertIn("성공·실패가 섞인 요약", instruction)
         self.assertIn("COMMIT_TITLE:", worker)
         self.assertIn("PR_SUMMARY:", worker)
         self.assertIn("TARGETED_TESTS:", worker)
