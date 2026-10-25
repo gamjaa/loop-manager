@@ -46,6 +46,7 @@ priority: normal
 - [x] 평가 mode·루트 조사 필요 조건·재개 경계 교정
 - [x] 최소 targeted unit 회귀와 관련 문서 정합성
 - 2026-10-24: 현재 rebase 후보에서 fast 무호출·유효 근거 재사용과 선택/저장 사이 지침 hash 재검사·legacy 근거 거부·저장된 root result/session 재연결·root-only targeted 성공 기준·source drift 관련 범위와 실제 root citation 회귀를 targeted unit test로 확인했다. 전체 verify는 Manager가 수행한다.
+- 2026-10-25: `af88a3811b3a1ad90526b11f3660f21fd6c5b3e2` 후보에서 관련 targeted unit 18개를 개별 재실행해 통과했고 base 대비 diff whitespace 검사도 통과했다. 전체 verify는 Manager가 수행한다.
 
 ## Decision Log
 
