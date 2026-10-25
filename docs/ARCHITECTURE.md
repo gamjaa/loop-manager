@@ -953,6 +953,8 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 
 수동 명령의 준비·수락은 `application/manual_work.py`와 `manual_concurrency.py`가 소유하며 [PRODUCT의 명령별 역할·결과](PRODUCT.md#수동-명령의-준비와-수락)를 따른다. `start`의 진입 상태는 `READY`·`PLAN_BLOCKED`·기존 `MANUAL_WORKING`이고, 차단 인계는 `verify_retry_exhausted`·`review_retry_exhausted`·`review_protocol_exhausted`·`worker_output_invalid`로 한정한다. draft·catalog hold·프로젝트 차단·활성 유지보수와 계획·자원 소유권을 별도로 검사하며 기존 수동 준비 재호출은 저장된 작업을 재사용한다.
 
+공유 수동 PR의 Merge 확정은 `manual_work_publications`의 PR URL·게시 HEAD·request identity를 현재 묶음과 대조한다. 실제 PR의 URL·head/base branch·HEAD·Merge 관측과 전체 구성 G의 branch·PR·HEAD 및 verify·Review 게시 근거가 일치해야 하며, 소유권·dependency 검증도 유지한다. 미반영 수락 source 후보나 근거 불일치가 있으면 완료를 확정하지 않고 작업물과 기존 근거를 보존한다. 재검증 전환으로 현재 단계 근거가 무효화돼도 확인된 게시 근거와 실제 Merge를 대조하는 경계는 유지한다.
+
 반복 수동 제출의 저장 후보는 생성 당시 원격 OID·incoming 부모와 결합한다. exact 게시 전이 또는 후보를 포함하는 후속 이력의 equal 관측은 같은 저장소·소유자·종류·대상 ref로 검증한다. equal intent는 정확한 OID 관측 뒤 저장되므로 결과 저장 전 재중단과 후속 관측으로 종료된 전이에도 게시 근거를 유지한다. 종료된 exact 전이의 aborted receipt는 소유 intent·빈 기준 근거·원격 후속 계보를 검증해 원문 그대로 확정한다.
 
 그 관측에 후보가 포함돼 있으면 다음 equal intent가 없어도 게시 후보 제거를 감지한다. 완료 receipt는 변경하지 않으며, 원격에서 게시 후보가 제거되면 새 lease나 대체 후보를 만들지 않는다.
@@ -1020,7 +1022,9 @@ rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업�
 
 rebase target은 바꾸지 않으며 원격 재전진은 기존 operation 완료 후 반영한다. 문서 전용 충돌은 Manager가 continue/skip하고 혼합 충돌의 나머지 파일과 autostash 충돌은 기존 Worker 교정 경계에 남긴다. 문서 Progress는 현재 후보의 실행·검증 성공 증거가 아니며 완료 후의 입력 재평가·verify·Review·게시 gate는 유지한다
 
-완료 결과는 HEAD·branch ref·worktree 등록·target ancestry, clean index·미해결 operation 부재, 현재 역할·선택 ExecPlan 및 archive 계약에 맞는 최종 변경과 정확한 원격 lease를 확인한 뒤 현재 상태·입력 지문과 SQLite generation에 결합해 한 번만 반영한다. 원본 commit 내용·개수·순서의 변화 자체를 거부하지 않으며 Git 완료 뒤 저장 전 중단도 같은 검사로 복구한다
+완료 결과는 HEAD·branch ref·worktree 등록·target ancestry, clean index·미해결 operation 부재, 현재 역할·선택 ExecPlan 및 archive 계약에 맞는 최종 변경과 정확한 원격 lease를 확인한 뒤 현재 상태·입력 지문과 SQLite generation에 결합해 한 번만 반영한다. 원본 commit 내용·개수·순서의 변화 자체를 거부하지 않으며 Git 완료 뒤 저장 전 중단도 같은 검사로 복구한다.
+
+복구 진입에서는 Worker checkpoint 요청·게시 대기가 남아 있어도 완료 가능한 rebase를 먼저 관측한다. 완료 조건을 충족하면 기존 journal 결과 기록과 현재 상태 채택·DB 확정을 일반 Worker checkpoint 처리보다 먼저 수행하고, 갱신된 실행 상태와 checkpoint로 요청·게시를 재개한다. 저장된 rebase 교정 Worker 결과의 `pending=stage/continue`는 기존 입력·결과 검증과 완료 경로를 유지하며, 일반 Worker 게시 검사가 미확정 rebase operation만을 이유로 그 완료 경로를 막지 않는다. 진행 중이거나 불일치하면 operation·target·작업물·index·commit·session과 감사를 보존하며, operation 값만 지우거나 과거 기준선으로 작업물을 되돌려 완료를 만들지 않는다.
 
 rebase 채택의 한 검사 구간에서는 `ManagedRebaseService.adopt`가 안정된 이중 관측을 읽기 전용 소유권 소비자에 전달한다. 소비자는 전체 `RebaseExpectation`과 checkpoint generation이 일치할 때만 이를 사용하고 게시 owner를 별도로 검증한다. SQLite 확정에서는 새 이중 관측으로 다시 확인하며 Git·Agent·verify·게시 및 재시작 경계를 넘어 전달 결과를 저장하지 않는다.
 
@@ -1395,6 +1399,8 @@ DB 없는 원격 branch 인수 표식은 두 단계로 저장한다. `manager_me
 | `mergeable` | 문자열 또는 `null`. `CONFLICTING`은 충돌, `MERGEABLE`은 충돌 없음이며 나머지는 미확정으로 해석한다. |
 
 조회 실패·잘못된 JSON·필수 키 누락·형식 오류는 관측 실패이며 PR 부재로 바꾸지 않는다. 저장 PR의 identity 불일치도 정상 연결로 수용하지 않는다. 생성 전 기존 PR이 있으면 SQLite에 연결하며, 생성 직후 저장 전에 중단돼도 다음 실행에서 같은 PR을 찾아 중복 생성을 피한다. Closed PR은 같은 PR의 reopen을 기다리며 프로그램이 새 PR로 대체하거나 자동 Merge하지 않는다.
+
+저장된 PR의 terminal 상태 확인은 자동 재검증 단계 선택보다 앞선다. 수동 묶음이 `AUTOMATIC`이고 구성 G가 `MANUAL_PENDING` 또는 구현·verify·Review·게시 단계여도 일반 PR 상태 동기화와 기존 실행 복구에서 PR 관측을 유지한다. 실제 MERGED와 해당 작업의 게시 근거가 일치하면 재검증을 시작하지 않고 완료를 확정하며, 미병합 CLOSED는 기존 보류·reopen 정책을 따른다. OPEN일 때만 자동 재검증을 계속한다.
 
 등록된 Open PR은 매 상태 동기화에서 Merge 가능 여부를 확인한다. 미확정이면 다음 조회에서 확인하고, Git 충돌이 확정됐을 때 관리 worktree에서 최신 원격 base를 rebase한다. 실제 구현 교정에 필요한 Worker·targeted test와 현재 후보의 전체 verify·읽기 전용 Review 뒤 같은 PR identity·원격 head를 재확인해 안전한 lease로 기존 branch를 갱신한다. 승인·필수 check 대기는 rebase로 해소할 충돌로 간주하지 않는다.
 
