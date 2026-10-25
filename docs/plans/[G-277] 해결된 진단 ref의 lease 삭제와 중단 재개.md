@@ -45,6 +45,10 @@ R-083의 충돌 해결 진단 ref에 한해, 원인 해소·해결 결과의 정
 
 ## Progress
 
+후속 Worker 결과 검증에서 TARGETED_TESTS의 테스트 설명 “조회 실패 재개 회귀” 중 “실패”가 미해결 결과로 해석된 보고 문제를 확인했다. 직전 호출의 원본 targeted JSONL에서 신규 2개·기존 2개 모두 success임을 확인했고, 설명을 “조회 복구 회귀”로 교정한 전체 보고를 실제 parse_worker_result가 수용했다. 재삭제 교정·회귀·assertion은 그대로 보존하며 제품 코드나 이미 통과한 테스트를 반복 변경·실행하지 않았다.
+
+Reviewer의 `completed-intent-redelete` 피드백을 교정했다. 완료 기록은 현재 basis에 한정하지 않고 같은 repo·ref·저장 게시 OID의 과거 complete에서 원인·입력·origin·원래 branch·tree/commit·확정 OID로 게시 사용을 대조한다. 모든 현재 사용이 이미 완료됐으면 무관한 차단이나 generation 변경으로 basis가 달라져도 복원된 ref를 다시 삭제하지 않는다. 새로운 원인·게시 사용이 있으면 기존 현재성·해소 조건을 모두 확인한 뒤 별도로 정리한다. 프로젝트 Python과 지정 targeted runner로 복원 후 basis 변경·새 사용의 후속 정리 신규 회귀 2개와 단계별 중단·삭제 후 조회 실패 재개 기존 회귀 2개를 실행해 4개 통과했다. PRODUCT·ARCHITECTURE의 기존 재삭제 금지 계약과 schema·필수 검증은 유지하며 전체 verify·Review는 Manager에 인계한다.
+
 Manager의 전체 verify 피드백 `verify:961fc1cb84519e2c64325de33b660d665b10f7a0a5e6ff973b935eefdc6012e7`에서 compatibility export가 effects 주석을 모듈 내 타입 이름 문자열로 조회하는 계약을 확인했다. 새 `cleanup_recorded`의 주석만 기존 `prepare_recorded`와 같은 문자열 형식으로 교정했다. 기존 export 회귀 `tests.test_project_services.ProjectServiceCompositionTests.test_compatibility_exports_bind_the_matching_named_effect_contract`를 지정 targeted runner로 실행해 1개 통과했다. runtime 동작·검사 assertion·Requirement·frontmatter는 변경하지 않았으며 전체 verify 재실행은 Manager에 남긴다. 아래 결과는 이전 구현·교정 호출의 이력이다.
 
 G-276의 준비 판정·원문 복구·run 경계를 재사용해 자원 잠금 아래 삭제 직전 재관측, 저장 OID의 정확한 lease 삭제, 원격 부재 확인과 중단 재개를 구현했다. `diagnostic_cleanup_attempts`에 basis별 intent·시도 예약·단계/실패 감사를 보존하고 같은 근거의 일시 시도는 최대 3회, lease/정책 거부는 재push하지 않는다. 보존·프로젝트 진단 게시가 같은 ref 잠금을 공유하며 정리된 과거 원인의 재생성과 현재 원격 게시 성공 오보를 막는다. PRODUCT·ARCHITECTURE에 제품 수명·호환 저장 계약을 반영했다. 기존 사용자 판단·선언은 변경하지 않았다.

@@ -318,12 +318,20 @@ def _cleanup_ref(effects, connection, state_dir, repo, ref):
         reason = assess_ref(state, facts)
         if reason is not None or _observe(effects, connection, state_dir, state) != facts:
             return
+        # Completion belongs to immutable publication uses, not to incidental
+        # changes in blocks/checkpoints or the preparation's overall basis.
+        keys = ('scope', 'owner', 'cause_identity', 'input_identity', 'origin',
+                'original_branch', 'tree_oid', 'commit_oid', 'confirmed_oid')
+        pending = {tuple(use[key] for key in keys) for use in state['uses']}
+        for completed in connection.execute('SELECT payload FROM diagnostic_cleanup_attempts '
+                "WHERE repo=? AND ref=? AND expected_oid=? AND status='complete'",
+                (repo, ref, state['uses'][0]['confirmed_oid'])).fetchall():
+            pending.difference_update(tuple(use[key] for key in keys)
+                for use in json.loads(completed['payload'])['state']['uses'])
+        if not pending:
+            return
         row = connection.execute('SELECT * FROM diagnostic_cleanup_attempts '
             'WHERE repo=? AND ref=? AND basis=?', (repo, ref, _digest(state))).fetchone()
-        # A completed intent must never remove a later recreation. A policy
-        # refusal or three transient attempts needs changed evidence, not a loop.
-        if row and row['status'] == 'complete':
-            return
         if facts['remote_oid'] is None:
             _record_attempt(connection, state, facts, 'absent')
             _record_attempt(connection, state, facts, 'complete')

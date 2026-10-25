@@ -398,6 +398,53 @@ class DiagnosticCleanupTests(ArtifactRecoveryFixture, unittest.TestCase):
         self.assertTrue(payload['historical_publication'])
         self.assertIsNone(self.store.cleanup_receipt('repo', self.saved['ref'], 'new conflict'))
 
+    def test_completed_publication_is_not_redeleted_after_unrelated_basis_change(self):
+        self.release()
+        self.enable_delete()
+        self.delete()
+        completed = dict(self.cleanup_row())
+        self.diagnostic = self.saved['commit_oid']
+        self.effects.git.reset_mock()
+        self.connection.execute("INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
+            "VALUES ('repo', 'project', 'repository_state_unsafe', 'independent')")
+        self.connection.execute('UPDATE diagnostic_ref_uses SET generation=generation+1')
+        self.connection.commit()
+        state = cleanup._snapshot(self.connection, 'repo', self.saved['ref'])
+        self.assertNotEqual(cleanup._digest(state), completed['basis'])
+        self.delete()
+        self.assertEqual(self.diagnostic, self.saved['commit_oid'])
+        self.assertFalse(any('push' in call.args for call in self.effects.git.call_args_list))
+        self.assertEqual([dict(row) for row in self.connection.execute(
+            'SELECT * FROM diagnostic_cleanup_attempts')], [completed])
+
+    def test_new_publication_use_can_be_cleaned_after_prior_completion(self):
+        self.release()
+        self.enable_delete()
+        self.delete()
+        original_ref = self.saved['ref']
+        self.identity = 'b' * 64
+        self.bundle = self.bundle.parent / self.identity
+        self.saved = dict(self.saved, input_identity=self.identity)
+        self.seal()
+        second = dict(self.block, evidence='new conflict after cleanup')
+        columns = ','.join(second)
+        self.connection.execute('INSERT INTO execplan_blocks (' + columns + ') VALUES (' +
+            ','.join('?' for _ in second) + ')', tuple(second.values()))
+        cause = hashlib.sha256(json.dumps(second, sort_keys=True).encode()).hexdigest()
+        self.record(self.saved, cause)
+        self.assertEqual(self.saved['ref'], original_ref)
+        self.diagnostic = self.saved['commit_oid']
+        self.effects.git.reset_mock()
+        self.delete()
+        self.assertFalse(any('push' in call.args for call in self.effects.git.call_args_list))
+        self.block = second
+        self.release()
+        self.delete()
+        self.assertIsNone(self.diagnostic)
+        self.assertEqual(sum('push' in call.args for call in self.effects.git.call_args_list), 1)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM diagnostic_cleanup_attempts "
+            "WHERE status='complete'").fetchone()[0], 2)
+
     def test_absence_needs_no_push_and_ambiguous_query_is_not_absence(self):
         self.release()
         self.diagnostic = None
