@@ -53,6 +53,7 @@ class ResumeProjectBlockIfSafeEffects:
     git: Callable[..., object]
     github_repository: Callable[..., object]
     pr_for_branch: Callable[..., object]
+    reconcile_existing_pull_request: Callable[..., object]
     hydrate_execplan_project: Callable[..., object]
     validate_agent_scope: Callable[..., object]
     validate_blocked_agent_scope: Callable[..., object]
@@ -292,6 +293,17 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                 adoption_observation = reservation_owner.remote_adoption(
                     plan, checkpoint, repo_path, worktree, git=effects.git,
                     github_repository=effects.github_repository, pr_for_branch=effects.pr_for_branch)
+                adopted_pr = dict(adoption_observation or ())
+                if adopted_pr and (str(adopted_pr.get('state') or '').upper() in {'CLOSED', 'MERGED'}
+                                   or adopted_pr.get('mergedAt')):
+                    reservation_owner.check()
+                    if execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id) != checkpoint:
+                        return False
+                    with runtime_state.selected_execution(repo, plan_id, include_blocked=True):
+                        effects.reconcile_existing_pull_request(
+                            connection, repo_path, state_dir, repo,
+                            runtime_state.project_row(connection, repo), adopted_pr)
+                    return False
                 def rebase_source(snapshot):
                     if checkpoint.operation != 'rebase':
                         return None

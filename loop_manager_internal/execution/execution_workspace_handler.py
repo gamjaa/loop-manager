@@ -903,6 +903,14 @@ class WorkspaceHandler:
                         self.ports.identity.repo_path, worktree, git=self.ports.git,
                         github_repository=self.ports.github_repository, pr_for_branch=self.ports.pr_for_branch)
                 adoption_observation = observe_adoption()
+                adopted_pr = dict(adoption_observation or ())
+                if adopted_pr and (str(adopted_pr.get('state') or '').upper() in {'CLOSED', 'MERGED'}
+                                   or adopted_pr.get('mergedAt')):
+                    self.ports.state.check()
+                    reservation_owner.check()
+                    if self.ports.checkpoint.get(self.ports.identity.repo, plan_id) != reserved_checkpoint:
+                        raise CheckpointRace('기존 인수 PR 관측 중 checkpoint가 변경됐습니다.')
+                    return self._terminal_adopted_pr(plan_id, adopted_pr)
                 scopes = reservation_owner.agent_scopes(row, reserved_checkpoint)
                 def reservation_validator(live):
                     snapshot = self.ports.capture_git_snapshot(worktree)

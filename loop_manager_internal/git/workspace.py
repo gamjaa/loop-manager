@@ -267,8 +267,9 @@ def validate_reserved_worktree_history(
                     'base': base, 'head': creation_head}.items())):
             return False
         # The unchanged creation path retains its existing no-history contract.
-        if created == live and snapshot.head == creation_head and not snapshot.dirty:
-            return checkpoint.operation is None
+        if (created == live and snapshot.head == creation_head and not snapshot.dirty
+                and checkpoint.operation is None):
+            return True
         if not snapshot.dirty and not owned_rebase and live.get('index') != git(repo, 'rev-parse', f'{snapshot.head}^{{tree}}').stdout.strip():
             return False
         reachable = {clean(creation_head)}
@@ -284,10 +285,13 @@ def validate_reserved_worktree_history(
                     kind='managed_rebase', target=str(_canonical_path(worktree)), include_current_rebase=True):
                 if item['intent']['expected']['branch'] == branch:
                     if item['result'].get('status') == 'current_state':
-                        # Current-policy receipts authorize the accepted head;
-                        # derive its clean index from Git, not stored file data.
+                        # COMPLETE permits preserved unstaged/untracked files.
+                        # Keep their sealed signatures with the Git-derived index.
+                        observed = item['result']['observed']
+                        accepted = json.loads(clean(observed['head']))
+                        accepted['dirty'] = observed['dirty']
                         current_rebases.append((item['intent']['expected']['before_head'],
-                                                clean(item['result']['observed']['head'])))
+                                                local(accepted)))
                     else:
                         edges.append((local(item['intent']['before']), local(item['result']['observed'])))
         commits = [(saved.get('before_head'), saved.get('after_head') or (
@@ -311,7 +315,15 @@ def validate_reserved_worktree_history(
         while True:
             previous = len(reachable)
             reachable.update(after for before, after in edges if before in reachable)
-            heads = {json.loads(state)['head'] for state in reachable}
+            states = [json.loads(state) for state in reachable]
+            heads = {state['head'] for state in states}
+            if checkpoint.operation == 'commit' and snapshot.head == checkpoint.expected_head:
+                # Staging changes index/kinds, never the recorded file bytes.
+                signatures = {path: value[1] for path, value in snapshot.dirty.items()}
+                if any(state['head'] == snapshot.head
+                       and {path: value[1] for path, value in state['dirty'].items()} == signatures
+                       and not state['operations'] for state in states):
+                    reachable.add(local(snapshot))
             reachable.update(after for before, after in commit_edges if before in heads)
             if len(reachable) == previous:
                 return local(snapshot) in reachable

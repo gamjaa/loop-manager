@@ -281,6 +281,44 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
         self.effects.workspace.make_worktree.assert_not_called()
         self.effects.agent.run_agent.assert_not_called()
 
+    def test_existing_reserved_adoption_routes_terminal_pr_before_workspace_recovery(self):
+        original = self.effects.workspace.make_worktree.side_effect
+        def interrupt(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError('interrupted after creation')
+        self.effects.workspace.make_worktree.side_effect = interrupt
+        self.assertEqual(self.handler.prepare().kind, ExecutionOutcomeKind.RETRY)
+        self.effects.workspace.make_worktree.reset_mock()
+        self.pr = {'url': 'https://github.com/owner/repo/pull/1', 'state': 'CLOSED',
+                   'headRefName': 'loop-manager/G-047', 'baseRefName': 'main', 'headRefOid': self.head}
+        with mock.patch.object(lm, 'validate_execplan_workspace_identity'):
+            result = self.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(self.connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+        self.effects.workspace.make_worktree.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_existing_reserved_adoption_routes_merged_pr_to_terminal_sync(self):
+        original = self.effects.workspace.make_worktree.side_effect
+        def interrupt(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError('interrupted after creation')
+        self.effects.workspace.make_worktree.side_effect = interrupt
+        self.assertEqual(self.handler.prepare().kind, ExecutionOutcomeKind.RETRY)
+        self.effects.workspace.make_worktree.reset_mock()
+        self.pr = {'url': 'https://github.com/owner/repo/pull/1', 'state': 'MERGED',
+                   'headRefName': 'loop-manager/G-047', 'baseRefName': 'main', 'headRefOid': self.head,
+                   'mergedAt': 'merged', 'mergeCommit': {'oid': 'e' * 40}}
+        reconcile = mock.Mock(return_value=lm.PROJECT_STEP_PLANNING_PENDING)
+        self.handler.effects = replace(self.effects, publication=replace(self.effects.publication,
+            reconcile_existing_pull_request=reconcile))
+        with mock.patch.object(lm, 'validate_execplan_workspace_identity'):
+            result = self.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.PLANNING_PENDING)
+        self.assertEqual(reconcile.call_args.args[-1]['mergeCommit'], self.pr['mergeCommit'])
+        self.effects.workspace.make_worktree.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+
     def test_local_branch_with_same_oid_has_no_adoption_intent(self):
         self.local = self.head
         result = self.handler.prepare()

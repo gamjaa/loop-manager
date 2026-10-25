@@ -77,6 +77,7 @@ def register(assembly: Composition) -> None:
             _current_rebase_service=assembly.callback('_current_rebase_service'),
             github_repository=assembly.callback('github_repository'),
             pr_for_branch=assembly.callback('pr_for_branch'),
+            reconcile_existing_pull_request=assembly.callback('reconcile_existing_pull_request'),
             _agent_git_resources=assembly.callback('_agent_git_resources'),
             _managed_worktree_marker=assembly.callback('_managed_worktree_marker'),
             _managed_worktree_transition_state=assembly.callback('_managed_worktree_transition_state'),

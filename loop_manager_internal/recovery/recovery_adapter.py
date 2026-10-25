@@ -127,6 +127,7 @@ class ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects:
     git: Callable[..., object]
     github_repository: Callable[..., object]
     pr_for_branch: Callable[..., object]
+    reconcile_existing_pull_request: Callable[..., object]
     hydrate_execplan_project: Callable[..., object]
     validate_agent_scope: Callable[..., object]
     validate_blocked_agent_scope: Callable[..., object]
@@ -140,6 +141,7 @@ def _scope_reconciliation_effects_resume_project_block_if_safe(effects: ScopeRec
         _current_rebase_service=effects._current_rebase_service,
         github_repository=effects.github_repository,
         pr_for_branch=effects.pr_for_branch,
+        reconcile_existing_pull_request=effects.reconcile_existing_pull_request,
         _agent_git_resources=effects._agent_git_resources,
         _managed_worktree_marker=effects._managed_worktree_marker,
         _managed_worktree_transition_state=effects._managed_worktree_transition_state,

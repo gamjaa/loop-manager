@@ -67,6 +67,24 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         return loop_manager.resume_project_block_if_safe(
             self.connection, Path(self.repo), Path('/state'), self.repo)
 
+    def test_owned_rebase_start_recovers_unchanged_clean_creation(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        self.checkpoints.record(self.repo, 'G-001', expected_generation=0, operation='rebase',
+            expected_head=self.head, target_base_oid='b' * 40, observed_remote_oid=None,
+            snapshot={'before_head': self.head, 'target_base': 'b' * 40, 'rebase_policy': 'current_state'})
+        checkpoint = self.checkpoints.get(self.repo, 'G-001')
+        service = mock.Mock(expected=SimpleNamespace(generation=checkpoint.generation,
+            before_head=self.head, target_base_oid='b' * 40))
+        service.observe.return_value = (SimpleNamespace(head=self.head, branch=self.branch,
+            index=(), files=(), operations=()), SimpleNamespace(status=RebaseStatus.START))
+        with mock.patch.object(loop_manager, '_current_rebase_service', return_value=service):
+            self.assertTrue(self.resume())
+        after = self.checkpoints.get(self.repo, 'G-001')
+        self.assertEqual((after.operation, after.expected_head, after.target_base_oid),
+                         (checkpoint.operation, checkpoint.expected_head, checkpoint.target_base_oid))
+        service.adopt.assert_not_called()
+
     def test_owned_detached_rebase_recovers_reservation_without_completing_operation(self):
         from types import SimpleNamespace
         from loop_manager_internal.git.managed_rebase_validation import IndexEntry, WorktreeFile, RebaseStatus
@@ -126,6 +144,18 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
             self.assertFalse(self.resume())
             self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 2)
             pr_query.side_effect = None
+            with mock.patch.object(loop_manager, 'reconcile_existing_pull_request') as reconcile:
+                for state, merged_at in (('CLOSED', None), ('MERGED', 'merged'), ('CLOSED', 'merged')):
+                    terminal = {**pr, 'state': state, 'mergedAt': merged_at}
+                    pr_query.return_value = terminal
+                    self.assertFalse(self.resume())
+                    self.assertEqual(reconcile.call_args.args[-1]['state'], state)
+                    self.assertEqual(reconcile.call_args.args[-2]['branch'], self.branch)
+                    self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 2)
+                self.assertEqual(reconcile.call_count, 3)
+            pr_query.return_value = {**pr, 'state': 'UNKNOWN'}
+            self.assertFalse(self.resume())
+            pr_query.return_value = pr
             grant = self.connection.execute("SELECT value FROM manager_metadata WHERE key LIKE 'remote_adoption:%'").fetchone()[0]
             with self.connection:
                 self.connection.execute("UPDATE manager_metadata SET value='{}' WHERE key LIKE 'remote_adoption:%'")

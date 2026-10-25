@@ -1,4 +1,5 @@
 """Unit ownership proof and Manager-only native Git regression for remote adoption."""
+import json
 from pathlib import Path
 from dataclasses import replace
 from tempfile import TemporaryDirectory
@@ -11,6 +12,57 @@ from tests.support.git import git_command, isolated_git_test, local_github_origi
 
 
 class RemoteCreationEvidenceTests(TestCase):
+    def test_interrupted_staging_and_completed_rebase_keep_recorded_file_state(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRecord
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            branch, before, after, tree, blob = 'loop-manager/G-047', 'a' * 40, 'b' * 40, 'c' * 40, 'd' * 40
+            created = {'exists': True, 'index': 'initial-tree', 'registration': {
+                'head': before, 'branch': 'refs/heads/' + branch, 'locked': 'marker'}}
+            start = lm.GitSnapshot(before, branch, {'base.txt': (f'H 100644 {blob} 0',)}, {}, {}, {}, {}, {})
+            output = replace(start, dirty={'new.txt': (('untracked',), 'owned-bytes'),
+                                           'base.txt': (('unstaged',), 'edited-bytes')})
+            staged = replace(output, index={**start.index, 'new.txt': (f'H 100644 {blob} 0',)},
+                             dirty={**output.dirty, 'new.txt': (('staged',), 'owned-bytes')})
+            rebased = replace(output, head=after)
+            checkpoint = CheckpointRecord(1, 'commit', before, None, None, {
+                'before_head': before, 'commit_message': 'Owned commit', 'commit_tree_oid': tree})
+            live = {**created, 'index': tree}
+            receipts = []
+            def transitions(*_args, **kwargs):
+                if kwargs['kind'] == 'managed_worktree_create':
+                    return [{'intent': {'expected': created}, 'result': {'observed': created}}]
+                return receipts if kwargs.get('agent_session_id') is None else []
+            def git(_repo, *args, **_kwargs):
+                self.assertEqual(args[0], 'ls-tree')
+                return mock.Mock(stdout=f'100644 blob {blob}\tbase.txt\0')
+            def validate(snapshot, checkpoint, scopes):
+                return workspace.validate_reserved_worktree_history(root, root, root, branch, 'G-047',
+                    live, snapshot, checkpoint=checkpoint, git=git, base='main', agent_scopes=scopes)
+            with mock.patch.object(workspace.manager_git_journal, 'verified_managed_transitions', side_effect=transitions):
+                self.assertEqual(validate(staged, checkpoint, ((start, output),)), before)
+                with self.assertRaises(lm.WorkspaceOwnershipError):
+                    validate(staged, checkpoint, ())
+                with self.assertRaises(lm.WorkspaceOwnershipError):
+                    validate(replace(staged, dirty={**staged.dirty, 'new.txt': (('staged',), 'foreign-bytes')}),
+                             checkpoint, ((start, output),))
+                live = {**live, 'index': 'foreign-tree'}
+                with self.assertRaises(lm.WorkspaceOwnershipError):
+                    validate(staged, checkpoint, ((start, output),))
+                live = {**created, 'registration': {**created['registration'], 'head': after}}
+                checkpoint = CheckpointRecord()
+                receipts.append({'intent': {'expected': {'branch': branch, 'before_head': before}},
+                                 'result': {'status': 'current_state',
+                                            'observed': json.loads(rebased.serialize())}})
+                # The only Worker output predates rebase; no post-rebase scope hides lost dirty data.
+                self.assertEqual(validate(rebased, checkpoint, ((start, output),)), before)
+                with self.assertRaises(lm.WorkspaceOwnershipError):
+                    validate(replace(rebased, dirty={**rebased.dirty, 'new.txt': (('untracked',), 'foreign-bytes')}),
+                             checkpoint, ((start, output),))
+                receipts.clear()
+                with self.assertRaises(lm.WorkspaceOwnershipError):
+                    validate(rebased, checkpoint, ((start, output),))
+
     def test_reserved_registration_observes_unmerged_index_without_write_tree(self):
         from loop_manager_internal.runtime import bootstrap_adapter
         with TemporaryDirectory() as directory:

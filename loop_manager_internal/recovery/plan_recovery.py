@@ -95,7 +95,9 @@ class ReservationOwnership:
                 or (pr is not None and (pr.get('headRefName') != plan['branch']
                                         or pr.get('baseRefName') != self.observed[6][3]))):
             raise WorkspaceOwnershipError('기존 예약의 원격 인수 PR 연결이 다릅니다.')
-        return tuple((key, pr.get(key)) for key in ('url', 'headRefName', 'baseRefName', 'headRefOid', 'state')) if pr else ()
+        if pr is not None and not pr.get('mergedAt') and str(pr.get('state') or '').upper() not in {'OPEN', 'CLOSED', 'MERGED'}:
+            raise WorkspaceOwnershipError('기존 예약의 PR 상태를 확인할 수 없습니다.')
+        return tuple((key, pr.get(key)) for key in ('url', 'headRefName', 'baseRefName', 'headRefOid', 'state', 'mergedAt', 'mergeCommit')) if pr else ()
 
     def agent_scopes(self, plan, checkpoint):
         """Offer recorded local outputs only for physically stopped owned calls."""
