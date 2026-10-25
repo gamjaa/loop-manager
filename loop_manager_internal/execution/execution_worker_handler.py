@@ -31,6 +31,7 @@ from loop_manager_internal.storage.rebase_correction_state import CorrectionRace
 from loop_manager_internal.execution.validation_feedback import is_validation_error, render_delta
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.execution.worker_outcome import WorkerOutcome, WorkerOutcomeError, parse_worker_outcome
+from loop_manager_internal.execution.common_defect_report import has_report, result_observation
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
@@ -544,6 +545,21 @@ class WorkerHandler:
             session_id=active_session_id,
         )
         code, message = result
+        if feedback_repo is not None and has_report(message):
+            observation = result_observation(context,
+                invocation_id=result.isolation_invocation_id, session_id=result.session_id)
+            try:
+                observed = self.ports.capture_git_snapshot(context.worktree)
+            except (RuntimeError, OSError) as error:
+                observation['candidate_observation_error'] = redact_secrets(str(error))
+            else:
+                observation.update(result_observation(context, candidate_head=observed.head,
+                    candidate_snapshot=observed.serialize()))
+            feedback_repo.record_result(
+                self.ports.identity.repo, context.plan.plan_id, context.plan.definition_revision_sha,
+                'worker', 'returned' if code == 0 else 'failure', message,
+                observation=observation,
+            )
         if feedback_repo is not None and delivery is not None and result.session_id:
             feedback_repo.bind_session(delivery.attempt_id, result.session_id)
         if result.session_id and observed_session_id != result.session_id:

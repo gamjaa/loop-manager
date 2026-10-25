@@ -107,6 +107,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             "ADD COLUMN recovery INTEGER NOT NULL DEFAULT 0"
         )
     for table, fields in {
+        'validation_results': {'observation': "TEXT NOT NULL DEFAULT '{}'"},
         'validation_delivery_attempts': {'context': "TEXT NOT NULL DEFAULT '{}'"},
         'validation_delivery_cursors': {'context': "TEXT NOT NULL DEFAULT '{}'",
                                         'context_order': 'INTEGER NOT NULL DEFAULT 0'},
@@ -147,14 +148,15 @@ class ValidationFeedbackRepository:
 
     def _result(self, repo: str, plan_id: str, revision: str | None,
                 stage: str, classification: str, raw: str,
-                feedback: tuple[Feedback, ...]) -> int:
+                feedback: tuple[Feedback, ...], observation: dict[str, str] | None = None) -> int:
         now = datetime.now(timezone.utc).isoformat()
         cursor = self.connection.execute(
             "INSERT INTO validation_results "
-            "(repo,plan_id,definition_revision,stage,classification,raw_output,identities,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "(repo,plan_id,definition_revision,stage,classification,raw_output,identities,created_at,observation) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (repo, plan_id, revision, stage, classification, redact_secrets(raw),
-             json.dumps([item.identity for item in feedback]), now),
+             json.dumps([item.identity for item in feedback]), now,
+             json.dumps({key: redact_secrets(value) for key, value in (observation or {}).items()}, sort_keys=True)),
         )
         result_id = cursor.lastrowid
         assert result_id is not None
@@ -177,11 +179,25 @@ class ValidationFeedbackRepository:
 
     def record_result(self, repo: str, plan_id: str, revision: str | None,
                       stage: str, classification: str, raw: str,
-                      feedback: tuple[Feedback, ...] = ()) -> None:
+                      feedback: tuple[Feedback, ...] = (), *,
+                      observation: dict[str, str] | None = None) -> None:
         """Audit an invalid or failed Agent result without changing feedback."""
         with _transaction(self.connection):
-            self._mark_migrated(repo, plan_id)
-            self._result(repo, plan_id, revision, stage, classification, raw, feedback)
+            if stage in {"verify", "review"}:
+                self._mark_migrated(repo, plan_id)
+            self._result(repo, plan_id, revision, stage, classification, raw, feedback, observation)
+
+    def common_defect_reports(self, repo: str) -> list[dict[str, object]]:
+        """Read separate observations; delivery never consumes or resolves them."""
+        rows = self.connection.execute(
+            "SELECT r.id,r.plan_id,r.definition_revision,r.stage,r.classification,"
+            "r.raw_output,r.created_at,r.observation,c.report,c.error "
+            "FROM common_defect_reports c JOIN validation_results r ON r.id=c.result_id "
+            "WHERE r.repo=? ORDER BY r.id", (repo,),
+        ).fetchall()
+        return [{**dict(row), "observation": json.loads(row["observation"]),
+                 "report": json.loads(row["report"]) if row["report"] is not None else None}
+                for row in rows]
 
     def _mark_migrated(self, repo: str, plan_id: str) -> None:
         self.connection.execute(
@@ -191,14 +207,15 @@ class ValidationFeedbackRepository:
 
     def observe(self, repo: str, plan_id: str, revision: str | None,
                 stage: str, passed: bool, raw: str,
-                feedback: tuple[Feedback, ...] = ()) -> int:
+                feedback: tuple[Feedback, ...] = (), *,
+                observation: dict[str, str] | None = None) -> int:
         """Append an execution and replace only the materialized active view."""
         if stage not in {"verify", "review"}:
             raise ValueError(stage)
         with _transaction(self.connection):
             self._mark_migrated(repo, plan_id)
             result_id = self._result(repo, plan_id, revision, stage,
-                                     "success" if passed else "failure", raw, feedback)
+                                     "success" if passed else "failure", raw, feedback, observation)
             identities = {item.identity for item in feedback}
             previous = self.connection.execute(
                 "SELECT * FROM validation_feedback_current "
@@ -386,6 +403,7 @@ class ValidationFeedbackRepository:
                     # audits may be a partial import from an older implementation.
                     if self.connection.execute(
                         "SELECT 1 FROM validation_results WHERE repo=? AND plan_id=? "
+                        "AND stage IN ('verify','review') "
                         "AND classification != 'legacy_failure' LIMIT 1",
                         (repo, plan_id),
                     ).fetchone():

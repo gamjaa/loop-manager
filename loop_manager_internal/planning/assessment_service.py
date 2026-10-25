@@ -205,6 +205,9 @@ class PlanningAssessmentService(PlanningService):
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
+                from loop_manager_internal.planning.common_defect_context import planning_context
+                reports = getattr(self._ports.state, "common_defect_reports", lambda _repo: [])(context.repo)
+                prompt += planning_context(reports, context.state_dir)
                 if row.planning_resume_plan_id:
                     active = self._ports.state.schedule(context.repo).active
                     prompt += ('\n현재 작업을 초기화하지 않고 일반 planning 뒤 재개한다: '

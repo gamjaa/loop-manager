@@ -10,6 +10,26 @@ from loop_manager_internal.execution.validation_feedback import redact_secrets
 MARKER = "COMMON_DEFECT_REPORT"
 
 
+def has_report(message: str) -> bool:
+    return re.search(rf"(?m)^{MARKER}:", normalize_markers(message, (MARKER,))) is not None
+
+
+def result_observation(context, *, candidate_head=None, invocation_id=None, session_id=None,
+                       candidate_snapshot=None) -> dict[str, str]:
+    """Bind Manager-observed scope to a result without filling unknown identities."""
+    values = {
+        "plan_path": context.plan.path,
+        "sources": "\n".join(context.plan.sources),
+        "remote_revision": context.active_sha,
+        "branch": context.branch,
+        "candidate_head": candidate_head,
+        "candidate_snapshot": candidate_snapshot,
+        "invocation_id": invocation_id,
+        "session_id": session_id,
+    }
+    return {key: redact_secrets(value) for key, value in values.items() if isinstance(value, str)}
+
+
 def parse_report(message: str) -> dict[str, object] | None:
     """Return one bounded observation, rejecting ambiguous or unsafe fields.
 

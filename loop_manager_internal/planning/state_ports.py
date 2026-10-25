@@ -398,6 +398,10 @@ class _PlanningStatePorts:
     def compact_catalog(self, repo: str) -> str:
         return self._effects.compact_execplan_catalog(self._connection, repo)
 
+    def common_defect_reports(self, repo: str) -> list[dict[str, object]]:
+        from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
+        return ValidationFeedbackRepository(self._connection).common_defect_reports(repo)
+
     def execplan_rows(self, repo: str) -> list[sqlite3.Row]:
         return self._effects.prerequisite_validation_rows(self._connection, repo)
 

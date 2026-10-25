@@ -144,14 +144,16 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         self.effects.validation.verify.side_effect = None
         self.effects.validation.verify.return_value = (
             False, lm.VerifyOutput(
-                'progress\n전체 verify 시간 초과: verify_timeout_seconds=2',
+                'progress\nCOMMON_DEFECT_REPORT: {"problem":"shared failure","scope":"outside selected work",'
+                '"evidence":"traceback","locations":[{"path":"runner.py","line":12}]}\n'
+                '전체 verify 시간 초과: verify_timeout_seconds=2',
                 timed_out=True,
             ),
         )
         self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(
             blocked=False, fingerprint='timeout',
         )
-        outcome, output = self.handler._verify_once(self.context('VERIFYING'))
+        outcome, output = self.handler._verify_once(self.context('VERIFYING'), 'candidate-head')
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
         self.assertIn('전체 verify 시간 초과:', output)
         first = lm.validation_failure_fingerprints('verify', output)[0][0]
@@ -160,6 +162,10 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         )[0][0]
         self.assertEqual(first, second)
         self.effects.validation.transition_validation_failure.assert_called_once()
+        report, = feedback.common_defect_reports('repo')
+        self.assertEqual(report['stage'], 'verify')
+        self.assertEqual(report['observation']['candidate_head'], 'candidate-head')
+        self.assertEqual(report['observation']['remote_revision'], 'base')
 
     def test_verify_failure_redacts_transition_and_operation_output(self):
         secret = 'verify-handler-secret'

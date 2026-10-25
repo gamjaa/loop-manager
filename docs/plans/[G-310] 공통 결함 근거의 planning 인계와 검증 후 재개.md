@@ -53,7 +53,9 @@ priority: high
 
 - [x] 첫 보존 단위: 선택적 `COMMON_DEFECT_REPORT`의 제한된 관측 계약과 `validation_results`에 연결된 불변 저장을 추가했다. verify·Review의 기존 결과 저장은 보고를 같은 transaction에 보존하며 잘못된 보고는 원문·형식 오류를 유지한다. 보고 유사성에 따른 병합이나 기존 판정 변경은 하지 않는다. PRODUCT·ARCHITECTURE에는 이 저장 경계만 반영했다.
 - [x] `tests.test_common_defect_recovery`의 5개 unit으로 형식/경로/크기·비밀값 정제·실제 SQLite 재시작·작업별 분리·불변성·동시 rollback을 확인했다. 최초 실행의 2개 실패는 기존 정제 규칙에 없는 `token=`을 사용한 fixture 오류였으며 기존 대상인 `API_KEY=`로 교정한 같은 명령의 재실행은 5개 통과했다. 기존 피드백 재발/해소, native 관측의 legacy 재수입 방지, JSON 비밀값 저장 회귀도 각각 최소 unit 1개씩 통과했다. 전체 verify는 실행하지 않았다.
-- [ ] 후속 구현: Worker 결과의 실제 invocation/후보/선택 범위와 원래 질문을 연결하고 역할별 보고 지침을 반영해야 한다. 현재 저장만으로 Worker 인계가 연결된 것으로 판단하지 않는다. 일반 planning 입력·확인된 원인/계획 연결·게시 확정·실제 Merge/검증 뒤 대상별 재평가도 아직 구현하지 않았다. 아래 전체 구현/완료 체크는 유지한다.
+- [x] 두 번째 보존 단위: Worker 반환 보고의 실제 invocation·session·선택 문서·후보 형상을 원래 결과에 연결하고, verify·Review의 결과 감사에 관측 문맥을 추가했다. 알려지지 않은 과거 identity는 보완하지 않으며 후보 관측 실패도 원래 보고와 함께 보존한다. 기존 일반 planning의 prompt 조립에서만 프로젝트별 보고 snapshot을 현재 catalog와 전달하고 새 호출 조건·보고 소비·계획 적용 표시는 만들지 않았다. 공통·Planner 역할 지침과 두 설계 문서를 이 전달 범위에 맞췄다.
+- [x] 두 번째 단위의 targeted 검증: `tests.test_common_defect_recovery` 10개, Worker 보고/checkpoint 연결·후보 관측 불가 보존 2개, 기존 timeout verify·Review 보고/해소·Review 반환별 감사·범위 거부 감사 4개와 legacy 피드백 보존·재수입 방지 2개가 최종 통과했다. Worker 연결 assertion의 fixture 경로 참조 오류와 Review 후보 HEAD 기대값 오류를 각각 교정하고 동일 명령을 재실행했다. 최종 검토에서 Worker 보고가 legacy 검증 실패 이관을 가리지 않도록 native 검증 관측의 단계를 한정하고 과거 실패·Worker 감사의 동시 보존 assertion을 유지했다. 전체 verify는 실행하지 않았다.
+- [ ] 후속 구현: 기존 명세가 정한 구현 교정의 사용자 질문 경로를 일반 인계로 분리하고, 확인된 원인·source·완료 조건에 따른 교정 계획 연결을 게시/catalog/DB 확정과 결합해야 한다. 실제 Merge·필요한 검증 근거 뒤 G-319의 원인별 재평가로 전달하는 소비와 독립 차단 유지도 미구현이다. 현재 보고 전달만으로 전체 구현·재개 완료를 판단하지 않으며 아래 전체 구현/완료 체크는 유지한다.
 - [x] revision `9f877ad110999e0f198f7977d23d31d6b8eb5d89`의 R-055 추가 조건, Worker 결과 계약·verify/Review 실패 저장·일반 planning 호출 판단·현재 질문 의미 재평가를 정적으로 대조했다. 공통 원인과 교정 계획/검증 반영을 연결하는 인계가 없음을 확인했으며 구현·테스트·운영 상태 변경은 하지 않았다.
 - [ ] 보고·확인 근거의 durable 보존과 기존 일반 planning의 교정 목표 연결
 - [ ] 실제 검증/반영 뒤 대상별 원인 재평가·최소 회귀와 설계 정합화
