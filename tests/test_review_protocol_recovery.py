@@ -21,8 +21,9 @@ class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
     def test_corrected_protocol_failure_retries_without_stage_notice(self):
         connection = self.connection()
         repo = '/projects/alpha'
-        context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-018', definition_revision_sha='revision'),
-                                  worktree=Path(repo), branch='branch')
+        context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-018', definition_revision_sha='revision',
+                                                       path='plan.md', sources=()),
+                                  worktree=Path(repo), branch='branch', active_sha='base')
         snapshot = SimpleNamespace(plan={'id': 'G-018', 'title': 'Reliable notices'}, level=1,
                                    catalog_plan={'path': 'plan.md', 'current_revision_sha': 'revision'},
                                    _definition_snapshot=mock.Mock())

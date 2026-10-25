@@ -3,6 +3,7 @@ from contextlib import closing
 
 from tests.support.execution import ExecutionFixture
 from dataclasses import replace
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -886,6 +887,19 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertEqual([tuple(row) for row in audit],
                          [('transient_failure', raw), ('success', 'VERDICT: PASS')])
 
+
+    def test_review_tuple_failure_preserves_audit_without_inventing_session(self):
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        result = (1, 'original tuple failure')
+        self.effects.agent.run_agent.side_effect = None
+        self.effects.agent.run_agent.return_value = result
+        self.assertIs(self.handler._run_reviewer_attempt(self.review_context()), result)
+        audit = self.connection.execute(
+            "SELECT classification,raw_output,observation FROM validation_results"
+        ).fetchone()
+        self.assertEqual(audit['classification'], 'agent_failure')
+        self.assertEqual(audit['raw_output'], result[1])
+        self.assertNotIn('session_id', json.loads(audit['observation']))
 
     def test_review_post_call_rejections_audit_each_execution_once(self):
         self._with_feedback(ValidationFeedbackRepository(self.connection))

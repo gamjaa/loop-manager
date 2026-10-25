@@ -312,6 +312,7 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
             BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
             BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
             BlockReasonCode.USER_DECISION_REQUIRED,
+            BlockReasonCode.COMMON_DEFECT_PENDING,
             BlockReasonCode.PULL_REQUEST_CLOSED,
             BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
             BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION,

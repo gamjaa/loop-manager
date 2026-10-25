@@ -96,7 +96,7 @@ class ReviewHandler:
                 'review', getattr(result, 'ledger_kind', 'agent_failure'), raw,
                 observation=result_observation(context,
                     invocation_id=getattr(result, 'isolation_invocation_id', None),
-                    session_id=result.session_id),
+                    session_id=getattr(result, 'session_id', None)),
             )
         return result
 
