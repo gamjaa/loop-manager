@@ -84,10 +84,16 @@ def observe_waiting_pull_requests(
 ) -> WaitingPullRequestObservation:
     """Commit every merge-wait observation before source or conflict work."""
 
+    from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+    manual_store=ManualWorkRepository(connection)
     rows = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND "
         "(status = 'PR_OPEN' OR (status = 'PLAN_BLOCKED' AND (blocked_reason = ? "
-        "OR (blocked_reason = ? AND pr_url IS NOT NULL)))) "
+        "OR (blocked_reason = ? AND pr_url IS NOT NULL))) "
+        "OR (status IN ('MANUAL_PENDING','IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') "
+        "AND pr_url IS NOT NULL AND EXISTS (SELECT 1 FROM manual_work_members m "
+        "JOIN manual_work_groups g ON g.repo=m.repo AND g.group_id=m.group_id "
+        "WHERE m.repo=exec_plans.repo AND m.plan_id=exec_plans.plan_id AND g.state='AUTOMATIC'))) "
         "ORDER BY plan_id",
         (repo, PR_CLOSED_BLOCK_REASON, BlockReasonCode.REMOTE_BRANCH_DELETED.value),
     ).fetchall()
@@ -102,13 +108,11 @@ def observe_waiting_pull_requests(
     conflicts: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
     merged = False
     merged_pr_urls: list[str] = []
-    from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
-    manual_store=ManualWorkRepository(connection)
     seen_groups=set()
     for stored in rows:
         current = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                                      (repo,stored['plan_id'])).fetchone()
-        if current and current['status'] not in {'PR_OPEN','PLAN_BLOCKED'}:
+        if current and current['status'] == 'MERGED':
             continue  # Shared cleanup already completed atomically.
         stored=current or stored
         group=manual_store.for_plan(repo,stored['plan_id'])
@@ -182,6 +186,8 @@ def observe_waiting_pull_requests(
                     file=sys.stderr,
                 )
             continue
+        if group and group['state']=='AUTOMATIC' and state == 'OPEN':
+            continue
         if stored['blocked_reason'] == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
             continue
         from loop_manager_internal.recovery.work_branch_integration import published_branch
@@ -201,7 +207,7 @@ def observe_waiting_pull_requests(
                         BlockReasonCode.REMOTE_BRANCH_DELETED, str(error), None)
                 continue
         if state == "CLOSED":
-            if stored["status"] == "PR_OPEN":
+            if stored["status"] != "PLAN_BLOCKED":
                 effects._block_closed_pull_request(connection, repo, stored, url, head_oid)
             continue
         if state != "OPEN":

@@ -220,6 +220,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_checkpoint_multiconflict_skip_restart_verify_review(self):
         self._lifecycle(with_pr=False, sealed_restart=(False, True))
 
+    def test_completed_rebase_restart_preserves_uncommitted_worker_files(self):
+        self._lifecycle(with_pr=False, sealed_restart=True, uncommitted_worker=True)
+
     def test_pr_multiconflict_skip_restart_verify_review(self):
         self._lifecycle(with_pr=True, sealed_restart=(False, True))
 
@@ -295,7 +298,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False,
                    manual=False, missing_journal=False, latest_base_advanced=False,
                    publication_interruption=None, cumulative=False, definition_change=None, documents=None,
-                   missing_checkpoint=False):
+                   missing_checkpoint=False, uncommitted_worker=False):
         # Reuse only the deterministic service bundle, not the policy fixture's
         # substituted Manager rebase methods or its substituted journal writer.
         real_begin = journal.begin_rebase
@@ -876,6 +879,17 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     self.assertEqual(effects.checkpoint.get(repo_key, 'G-047').operation, 'rebase')
                     audit_row = handler.rebase_corrections.get(repo_key, 'G-047')
                     audit_before = audit_row.audit if audit_row else ()
+                    if uncommitted_worker:
+                        (worktree / 'app.txt').write_text((worktree / 'app.txt').read_text()+'worker draft\n')
+                        (worktree / 'worker-draft.txt').write_text('untracked Worker work\n')
+                        preserved_worker = (git(worktree, 'rev-parse', 'HEAD').stdout,
+                            git(worktree, 'ls-files', '--stage', '-z').stdout,
+                            (worktree / 'app.txt').read_bytes(), (worktree / 'worker-draft.txt').read_bytes())
+                        pending=effects.checkpoint.get(repo_key,'G-047')
+                        effects.checkpoint.record(repo_key,'G-047',expected_generation=pending.generation,
+                            operation=pending.operation,expected_head=pending.expected_head,
+                            target_base_oid=pending.target_base_oid,observed_remote_oid=pending.observed_remote_oid,
+                            snapshot={**pending.snapshot,'worker_checkpoint_request':{'saved':'worker'}})
                     handler = restart()
 
                     def no_repeated_rebase(path, *args, **kwargs):
@@ -971,6 +985,18 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                             effects.checkpoint.get(repo_key, 'G-047'),
                         ))
                     self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
+                    if uncommitted_worker:
+                        self.assertEqual((git(worktree, 'rev-parse', 'HEAD').stdout,
+                            git(worktree, 'ls-files', '--stage', '-z').stdout,
+                            (worktree / 'app.txt').read_bytes(), (worktree / 'worker-draft.txt').read_bytes()),
+                            preserved_worker)
+                        self.assertEqual(completed_checkpoint.snapshot['worker_checkpoint_request'],{'saved':'worker'})
+                        handler=restart()
+                        handler.recover(handler._context())
+                        self.assertEqual(effects.checkpoint.get(repo_key,'G-047'),completed_checkpoint)
+                        self.assertNotIn('verify',events)
+                        self.assertNotIn('reviewer',events)
+                        return
                     audit_row = handler.rebase_corrections.get(repo_key, 'G-047')
                     self.assertEqual(audit_row.audit if audit_row else (), audit_before)
                     self.assertEqual(len(resolutions), resolution_count)

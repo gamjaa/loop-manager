@@ -16,6 +16,37 @@ from tests.support.database import runtime_connection
 
 
 class ProjectServiceCompositionTests(unittest.TestCase):
+    def test_manual_revalidation_defers_only_open_pr_reconciliation(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        for state in ('OPEN','CLOSED','MERGED'):
+            with self.subTest(state=state):
+                connection=runtime_connection()
+                self.addCleanup(connection.close)
+                connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+                connection.commit()
+                repository=loop_manager.runtime_state.RuntimeStateRepository(connection)
+                repository.activate('repo','G-047',activation_sha='base',
+                    branch='loop-manager/G-047',worktree='/state/G-047')
+                repository.update_project('repo',{'phase':'VERIFYING','pr_url':'https://example/pull/1'})
+                effects=SimpleNamespace(_project_pr_merge_confirmed=mock.Mock(return_value=False),
+                    _plan_id_from_path=mock.Mock(return_value='G-047'),
+                    pr_for_branch=mock.Mock(return_value={'url':'https://example/pull/1','state':state}),
+                    reconcile_existing_pull_request=mock.Mock(return_value=73))
+                identity=project_service.ProjectIdentity(connection,Path('/state'),'repo',
+                    Path('/config.ini'),None,False,None,True,None,20,600,None)
+                service=project_service.ProjectService(effects,identity)
+                service.state.repo='repo'
+                service.state.row=connection.execute('SELECT * FROM projects').fetchone()
+                with mock.patch.object(service,'_recover_pending_pr_checkpoint',return_value=None), \
+                     mock.patch.object(ManualWorkRepository,'for_plan',return_value={'state':'AUTOMATIC'}):
+                    result=service._resume_existing_execution()
+                if state=='OPEN':
+                    self.assertIsNone(result)
+                    effects.reconcile_existing_pull_request.assert_not_called()
+                else:
+                    self.assertEqual(result,73)
+                    effects.reconcile_existing_pull_request.assert_called_once()
+
     def test_planning_updates_keep_nested_transaction_and_rollback(self):
         for fail in (False, True):
             with self.subTest(fail=fail):

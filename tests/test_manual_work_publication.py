@@ -17,6 +17,77 @@ from tests.support.manual_work_case import ManualWorkCase
 
 @isolated_git_test
 class ManualWorkTest(ManualWorkCase):
+    def test_external_merge_during_revalidation_is_observed_without_active_slot(self):
+        self._assert_external_merge_during_revalidation(active=False)
+
+    def test_external_merge_during_active_revalidation_precedes_verify(self):
+        self._assert_external_merge_during_revalidation(active=True)
+
+    def _assert_external_merge_during_revalidation(self, *, active):
+        from loop_manager_internal.recovery.manual_work_recovery import revalidate_waiting
+        self.enterContext(mock.patch(
+            'loop_manager_internal.execution.execution_publication_handler.common_guidance_report',
+            return_value=''))
+        self.enterContext(mock.patch(
+            'loop_manager_internal.execution.execution_verify_handler.common_guidance_report',
+            return_value=''))
+        with tempfile.TemporaryDirectory() as directory:
+            service,group,_=self.submitted(directory)
+            members=json.loads(group['members'])
+            result,_,_=self.step(service,review='\n'.join(
+                [f'MANUAL_PLAN_RESULT: {member} PASS' for member in members]+['VERDICT: PASS']))
+            self.assertEqual(result,0)
+            stored=service.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                (service.repo,group['owner_id'])).fetchone()
+            pr={'url':stored['pr_url'],'headRefName':group['branch'],'baseRefName':'main',
+                'headRefOid':stored['pr_head_oid'],'state':'OPEN'}
+            service.config_path.write_text(service.config_path.read_text().replace(
+                'verify_timeout_seconds=600','verify_timeout_seconds=601'),encoding='utf-8')
+            self.assertTrue(revalidate_waiting(service.connection,service.repo,stored,pr,
+                git_command(service.repo_path,'rev-parse','origin/main'),config_path=service.config_path,
+                provider=service.project['provider'],resolve_profile=service.effects.resolve_profile))
+            self.assertTrue(all(service.runtime.get(service.repo,key).status=='MANUAL_PENDING' for key in members))
+            if active:
+                service.runtime.update_plan(service.repo,group['owner_id'],
+                    plan_values={'status':'VERIFYING'},enqueue=False)
+                service.runtime.hydrate(service.repo,group['owner_id'])
+            service.connection.commit()
+            # 실제 Merge 전 HEAD 불일치와 단순 CLOSED는 완료 근거가 아니다.
+            if not active:
+                with mock.patch('loop_manager.pr_for_branch',return_value={
+                        **pr,'state':'MERGED','mergedAt':'now','headRefOid':'foreign'}):
+                    with self.assertRaises(loop_manager.PublicationSafetyError):
+                        loop_manager.observe_waiting_pull_requests(service.connection,service.repo_path,
+                            service.state_dir,service.repo)
+                self.assertTrue(all(service.runtime.get(service.repo,key).status=='MANUAL_PENDING' for key in members))
+                with mock.patch('loop_manager.pr_for_branch',return_value={**pr,'state':'CLOSED'}):
+                    loop_manager.observe_waiting_pull_requests(service.connection,service.repo_path,
+                        service.state_dir,service.repo)
+                self.assertTrue(all(service.runtime.get(service.repo,key).status=='PLAN_BLOCKED' for key in members))
+            git_command(service.repo_path,'merge','--no-ff',group['branch'],'-m','External Merge')
+            git_command(service.repo_path,'push','origin','main')
+            merged={**pr,'state':'MERGED','mergedAt':'now'}
+            with mock.patch('loop_manager.remove_cleanup_worktree',wraps=loop_manager.remove_cleanup_worktree) as cleanup:
+                if active:
+                    # Merge 복구 이후의 별도 READY/Planner 배정은 이 회귀의 경계 밖이다.
+                    with mock.patch('loop_manager_internal.application.project_service.ProjectService._run_coordinators',
+                                    return_value=0):
+                        _,verify,agent=self.step(service,pr=merged)
+                    verify.assert_not_called()
+                    agent.assert_not_called()
+                else:
+                    with mock.patch('loop_manager.pr_for_branch',return_value=merged):
+                        loop_manager.observe_waiting_pull_requests(service.connection,service.repo_path,
+                            service.state_dir,service.repo)
+                self.assertEqual(cleanup.call_count,1)
+                self.assertTrue(all(service.runtime.get(service.repo,key).status=='MERGED' for key in members))
+                self.assertEqual(service.store.get(service.repo,group['group_id'])['state'],'MERGED')
+                with mock.patch('loop_manager.pr_for_branch',return_value=merged) as lookup:
+                    loop_manager.observe_waiting_pull_requests(service.connection,service.repo_path,
+                        service.state_dir,service.repo)
+                    lookup.assert_not_called()
+                self.assertEqual(cleanup.call_count,1)
+
     def test_publication_stage_tokens_are_absent_without_manual_request(self):
         with tempfile.TemporaryDirectory() as directory:
             service,_,worktree=self.fixture(directory)
