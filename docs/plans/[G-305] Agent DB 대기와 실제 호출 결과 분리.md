@@ -142,6 +142,12 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_
 
 최종 동일 명령 결과: 2개 unit success, exit 0. 두 unit의 미해결 failure/error는 없다. 전체 verify·실제 Agent CLI·Windows native 검증은 실행하지 않았으며 현재 변경의 전체 verify와 Review 확인은 Manager에게 인계한다.
 
+### 관리 rebase 후 후보 재확인 (2026-10-25)
+
+- 현재 HEAD `459dee8a242dc219411e83ec7520053626a66f77`과 base `2deb833836ed2ca82c769c67045155fdd3bdd684`의 최종 diff 15개 파일, 선택 계획·R-091/R-073·PRODUCT·ARCHITECTURE 및 G-303의 transaction 계약을 다시 대조했다. 코드·테스트 수정은 필요하지 않았으며 선택 frontmatter와 Requirement는 보존했다. 문서 보고는 이 base/head의 실제 patch 해시로 교정한다.
+- 현재 후보에서 공통 targeted runner로 개별 unit 12개를 실행해 모두 success(exit 0)였다. 준비 원자 재시도, launch/targeted 결합의 BUSY·만료·handoff, 실제 관측·원문·요청 session 복구, caller rollback, 전달 표식 실패 뒤 재개, 실제 종료 뒤 독립 작업 배정과 종료 불명 보존, 손상 receipt 거부, targeted caller transaction 및 기존 scope/Planner 중단 재개를 확인했다. 이전 후보의 성공 결과를 이번 실행 근거로 재사용하지 않았다.
+- base/head 전체 `git diff --check`도 통과했다. 전체 verify·실제 Agent CLI·Windows native 검증은 실행하지 않았으며 현재 후보의 전체 verify와 Review는 Manager에게 인계한다.
+
 ## Decision Log
 
 - 이번 R-091 delta에서 요청 한도 소진을 다음 외부 실행 전용 pause로 고정하지 않는다. 같은 실행의 저장 재개에서도 실제 provider 결과·호출 identity·필수 증거 gate를 보존하며 기존 G-303 dependency와 독립된 DB 확정 목표를 유지한다. 대기열·단계 실패 정책은 G-297/G-313의 책임이며 새 순환 dependency를 만들지 않는다. 구현·테스트는 실행하지 않았다.
