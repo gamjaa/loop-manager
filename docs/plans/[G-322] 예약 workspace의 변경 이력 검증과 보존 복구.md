@@ -95,6 +95,10 @@ R-055 W01–W03·W06의 예약 workspace를 승인된 생성·후속 변경 근�
 
   재실행 결과: 6개 통과. 최초 실패 assertion을 삭제·약화하지 않고 직렬화된 실제 계약과 일치시켰다.
 
+
+- Manager 전체 verify `verify:20e95d3791c454d97e755e25eb1d7929a1cd04bae22b48551a81d2b444336228` occurrence 1/revision 1의 실제 worker log를 확인했다. `ManagedRebaseLifecycleTests`의 sealed_restart=True 오류 6건은 모두 완료 receipt에서 `observed.metadata`를 조회하는 같은 위치의 KeyError였다. 새 acceptance 결합 투영이 기존 journal의 metadata 필드를 생략한 것이 원인이었다. 공용 투영에서 동일한 판정 관측의 metadata를 기존 object/null 형식으로 보존하고, 기록/조회 검증의 fingerprint 비교에도 포함했다. 별도 Git 재관측이나 acceptance 약화 없이 실행·직접 복구 양쪽에 적용된다. 기존 실제 Git 회귀와 assertion은 변경하지 않았다.
+- 이번 targeted 명령 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_managed_mutation_evidence.ManagedTransitionTests.test_current_rebase_receipt_is_available_only_to_exact_reservation_history tests.test_managed_mutation_evidence.ManagedTransitionTests.test_execution_rebase_receipt_uses_accepted_observation_without_second_snapshot tests.test_managed_mutation_evidence.ManagedTransitionTests.test_direct_rebase_result_recovers_after_git_before_journal_result`의 3개 unit case가 통과했다. 완료 metadata=null, 진행 metadata object 투영, 저장 metadata 변조 거부, 별도 관측 없이 실행·직접 복구의 실제 journal 기록을 확인했다. 전체 verify와 보고된 실제 Git lifecycle 6개는 Worker 범위 밖이므로 실행하지 않았고 Manager 재검증에 남겼다.
+
 ## Decision Log
 
 - G-189의 기존 전수 감사와 G-297의 배정 직전 자격 검사는 이 생성→변경 이력의 예약 복구를 구현하지 않는다. 신규 작업은 R-055 W01–W03·W06의 남은 경계를 맡고, G-323은 그 판정으로 차단 범위를 정하며 G-189는 두 작업 뒤 후속 소비만 감사한다. 직접 구현에 소급 ExecPlan이나 검증 성공을 만들지 않는다.

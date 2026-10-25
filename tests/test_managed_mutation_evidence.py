@@ -47,6 +47,9 @@ class ManagedTransitionTests(unittest.TestCase):
             decision = decision_for(expected, observed)
             before = {'head': OLD, 'branch': BRANCH, 'index': {}, 'dirty': {}, 'operations': {}}
             after = json.loads(json.dumps(journal_observation(observed)))
+            self.assertIsNone(after['metadata'])
+            waiting = journal_observation(replace(observed, metadata=(('head-name', f'refs/heads/{BRANCH}'),)))
+            self.assertEqual(waiting['metadata'], {'head-name': f'refs/heads/{BRANCH}'})
             journal.begin_current_rebase(state, owner='plan:G-091', repo=REPO, target=target,
                 before=before, expected={'branch': BRANCH, 'before_head': OLD,
                                         'target_base_oid': TREE, 'remote_oid': None})
@@ -70,13 +73,15 @@ class ManagedTransitionTests(unittest.TestCase):
             slot = journal._slot(state, REPO, 'managed_rebase', target)
             result = next(slot.glob('*.result.json'))
             saved = journal._read(result)
-            for mutation in ('dirty', 'payload', 'missing-binding', 'head'):
+            for mutation in ('dirty', 'payload', 'missing-binding', 'metadata', 'head'):
                 altered = copy.deepcopy(saved)
                 if mutation == 'dirty':
                     altered['observed']['dirty']['notes.txt'][1] = 'foreign-bytes'
                 elif mutation == 'payload':
                     altered['observed']['validation_observation']['files'][0]['signature'] = 'foreign-bytes'
                     altered['observed']['dirty']['notes.txt'][1] = 'foreign-bytes'
+                elif mutation == 'metadata':
+                    altered['observed']['metadata'] = {'head-name': 'foreign-branch'}
                 elif mutation == 'missing-binding':
                     del altered['observed']['validation_observation']
                 else:

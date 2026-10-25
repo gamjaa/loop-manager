@@ -134,7 +134,8 @@ def _journal_local_state(observed):
             'dirty': {file['path']: (tuple(kind for kind in file['kinds'] if kind != 'ignored'),
                                      file['signature'])
                       for file in observed['files'] if tuple(file['kinds']) != ('ignored',)},
-            'operations': dict(observed['operations'])}
+            'operations': dict(observed['operations']),
+            'metadata': dict(observed['metadata']) if observed['metadata'] is not None else None}
 
 
 def journal_observation(observed: RebaseObservation) -> dict:
@@ -150,7 +151,7 @@ def valid_journal_observation(observed, acceptance) -> bool:
         return (valid_acceptance(acceptance)
                 and fingerprint(payload) == acceptance['state_fingerprint']
                 and fingerprint(_journal_local_state(payload)) == fingerprint(
-                    {key: observed[key] for key in ('head', 'branch', 'index', 'dirty', 'operations')}))
+                    {key: observed[key] for key in ('head', 'branch', 'index', 'dirty', 'operations', 'metadata')}))
     except (KeyError, TypeError, ValueError):
         return False
 
