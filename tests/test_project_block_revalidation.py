@@ -496,6 +496,33 @@ class ProjectCheckpointPublicationTests(ProjectRemoteRecoveryFixture, unittest.T
         self.assertEqual(scoped_blocking.project_block(self.connection, self.repo)['evidence'], 'original project cause')
 
 
+    def test_retired_project_intent_is_not_recreated_or_reported_as_published(self):
+        context = self.diagnostic_context()
+        self.record_diagnostic_publication(context)
+        row = self.connection.execute('SELECT * FROM blocked_diagnostic_publications').fetchone()
+        uses = [dict(use) for use in self.connection.execute('SELECT * FROM diagnostic_ref_uses')]
+        self.connection.execute('INSERT INTO diagnostic_cleanup_attempts VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (self.repo, row['ref'], 'basis', self.head, 'complete', 1,
+             json.dumps(dict(state=dict(uses=uses), events=[]))))
+        self.connection.commit()
+        adapter = self.ports._BlockedCheckpointAdapter.return_value
+        adapter.observe_remote.reset_mock()
+        # The saved intent's tree must match the current candidate's tree.
+        self.ports.git.side_effect = lambda path, *args, **kwargs: SimpleNamespace(returncode=0,
+            stdout='c' * 40 if args[:2] == ('rev-parse', 'HEAD^{tree}') else self.head)
+        with mock.patch.object(self.coordinator, '_remote', return_value=None):
+            self.coordinator._publish(self.plan(), context)
+        adapter.observe_remote.assert_not_called()
+        self.ports.push_diagnostic_checkpoint.assert_not_called()
+        payload = json.loads(self.connection.execute('SELECT payload FROM project_checkpoint_results').fetchone()[0])
+        self.assertEqual(payload['result'], 'published')
+        from loop_manager_internal.notifications.incidents import _project_checkpoint
+        current = _project_checkpoint(self.connection, self.repo, 'G-106')
+        self.assertEqual(current['result'], 'local_only')
+        self.assertEqual(current['remote_state'], 'absent')
+        self.assertTrue(current['historical_publication'])
+        self.assertEqual(self.connection.execute('SELECT confirmed_oid FROM blocked_diagnostic_publications').fetchone()[0], self.head)
+
     def test_diagnostic_ref_collision_never_pushes_or_changes_original_ref(self):
         self.ports._BlockedCheckpointAdapter.return_value.observe_remote.return_value = 'c' * 40
         with mock.patch.object(self.coordinator, '_remote', return_value=None):

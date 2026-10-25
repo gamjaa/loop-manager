@@ -16,7 +16,7 @@ from loop_manager_internal.recovery import waiting_pr_service
 
 
 def register(assembly: Composition) -> None:
-    assembly.bind('prepare_diagnostic_cleanup', diagnostic_cleanup.prepare_recorded,
+    assembly.bind('cleanup_diagnostics', diagnostic_cleanup.cleanup_recorded,
         lambda: diagnostic_cleanup.CleanupEffects(
             git=assembly.callback('git'),
             capture_git_snapshot=assembly.callback('capture_git_snapshot'),

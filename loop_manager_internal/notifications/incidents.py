@@ -340,7 +340,8 @@ def _project_checkpoint(connection, repo, plan_id):
         (repo, plan_id)).fetchone()
     if block is None or row is None or row[0] != scoped_blocking.project_cause_identity(block):
         return None
-    result = json.loads(row[1])
+    from loop_manager_internal.storage.blocked_checkpoint_state import current_diagnostic_payload
+    result = current_diagnostic_payload(connection, repo, json.loads(row[1]), cause_identity=row[0])
     origin = connection.execute('SELECT origin FROM projects WHERE repo = ?', (repo,)).fetchone()
     if result.get('result') == 'published':
         result['branch_url'] = _checkpoint_link(origin[0] if origin else None, result.get('commit_oid'))
@@ -372,6 +373,8 @@ def _preservation_checkpoint(connection, repo, scope, owner):
     for row in rows:
         payload = json.loads(row[0])
         if payload.get('cause_identity') == cause:
+            from loop_manager_internal.storage.blocked_checkpoint_state import current_diagnostic_payload
+            payload = current_diagnostic_payload(connection, repo, payload)
             origin = connection.execute('SELECT origin FROM projects WHERE repo = ?', (repo,)).fetchone()
             if payload.get('result') == 'published':
                 payload['branch_url'] = _checkpoint_link(origin[0] if origin else None, payload.get('commit_oid'))

@@ -355,28 +355,34 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
         repository = DiagnosticPublicationRepository(self.connection)
         if context['diagnostic']:
             tree = self.ports.git(Path(plan['worktree']), 'rev-parse', 'HEAD^{tree}').stdout.strip()
-            intent = repository.intent(request, base_oid=context['base_oid'], head_oid=head,
-                                       tree_oid=tree, cause=context['project_block']['evidence'])
-            target = replace(request, branch=intent['ref'])
-            try:
-                oid = adapter.observe_remote(target)
-            except (OSError, RuntimeError) as error:
-                raise AssessmentPending('진단 ref 원격 조회를 재시도합니다.') from error
-            decision = decide_diagnostic_push(head, oid)
-            if decision.mode is PushMode.REJECT:
-                raise RuntimeError(decision.reason)
-            self._candidate_unchanged(plan, context)
-            if decision.mode is PushMode.CREATE:
-                self.ports.push_diagnostic_checkpoint(adapter, target, head)
-            try:
-                confirmed = adapter.observe_remote(target)
-            except (OSError, RuntimeError) as error:
-                raise AssessmentPending('진단 ref push 결과 조회를 재시도합니다.') from error
-            if confirmed != head:
-                raise AssessmentPending('진단 ref push 결과의 OID를 확인할 수 없습니다.')
-            payload = dict(result='published', diagnostic=True, branch=intent['ref'], commit_oid=head,
-                           original_branch=request.branch, base_oid=context['base_oid'])
-            repository.result(self.repo, plan['plan_id'], context['cause_identity'], payload, intent=intent)
+            ref = blocked_checkpoint.diagnostic_branch(request.repo, request.plan_id,
+                request.branch, context['base_oid'], head, tree)
+            with resource_locks(self.state_dir, self.repo, ['diagnostic:' + ref], owner='diagnostic-publication'):
+                retired = repository.cleanup_receipt(self.repo, ref, context['cause_identity'])
+                if retired is not None:
+                    return  # Read-side projection retains the historical receipt.
+                intent = repository.intent(request, base_oid=context['base_oid'], head_oid=head,
+                                           tree_oid=tree, cause=context['project_block']['evidence'])
+                target = replace(request, branch=intent['ref'])
+                try:
+                    oid = adapter.observe_remote(target)
+                except (OSError, RuntimeError) as error:
+                    raise AssessmentPending('진단 ref 원격 조회를 재시도합니다.') from error
+                decision = decide_diagnostic_push(head, oid)
+                if decision.mode is PushMode.REJECT:
+                    raise RuntimeError(decision.reason)
+                self._candidate_unchanged(plan, context)
+                if decision.mode is PushMode.CREATE:
+                    self.ports.push_diagnostic_checkpoint(adapter, target, head)
+                try:
+                    confirmed = adapter.observe_remote(target)
+                except (OSError, RuntimeError) as error:
+                    raise AssessmentPending('진단 ref push 결과 조회를 재시도합니다.') from error
+                if confirmed != head:
+                    raise AssessmentPending('진단 ref push 결과의 OID를 확인할 수 없습니다.')
+                payload = dict(result='published', diagnostic=True, branch=intent['ref'], commit_oid=head,
+                               original_branch=request.branch, base_oid=context['base_oid'])
+                repository.result(self.repo, plan['plan_id'], context['cause_identity'], payload, intent=intent)
         else:
             store.refresh(request, expected_remote_oid=expected)
             request = store.get(self.repo, plan['plan_id'])

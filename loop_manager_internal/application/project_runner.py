@@ -29,7 +29,7 @@ class RunProjectResultEffects:
     """Named effects for run_project_result; no entry-point/module access."""
     _blocked_recovery_subjects: Callable[..., object]
     _run_project_result: Callable[..., object]
-    prepare_diagnostic_cleanup: Callable[..., object] | None = None
+    cleanup_diagnostics: Callable[..., object] | None = None
 
 
 def run_project_result(
@@ -94,12 +94,12 @@ def run_project_result(
             outcome = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
             raise
         finally:
-            if (effects.prepare_diagnostic_cleanup is not None and outcome is not None
+            if (effects.cleanup_diagnostics is not None and outcome is not None
                     and outcome.kind is not ProjectRunKind.RUNTIME_HANDOFF):
                 try:
-                    effects.prepare_diagnostic_cleanup(connection, state_dir, repo)
+                    effects.cleanup_diagnostics(connection, state_dir, repo)
                 except (OSError, RuntimeError, ValueError, sqlite3.Error):
-                    pass  # Optional preparation never changes the run's outcome.
+                    pass  # Diagnostic retirement never changes the run's outcome.
             # Failure observations are saved in their recovery transaction.  This
             # boundary only resolves an execution that reached a stable outcome.
             with connection:
