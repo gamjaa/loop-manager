@@ -10,6 +10,54 @@ from tests.support.git import git_command, isolated_git_test, local_github_origi
 
 
 class RemoteCreationEvidenceTests(TestCase):
+    def test_reserved_owned_commit_uses_shared_history_without_clean_reset(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRecord
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, worktree = root / 'repo', root / 'G-047'
+            worktree.mkdir()
+            (worktree / 'preserved.txt').write_text('unfinished\n')
+            created_head, head, tree, branch = 'a' * 40, 'b' * 40, 'c' * 40, 'loop-manager/G-047'
+            blob = 'd' * 40
+            (worktree / 'new.txt').write_text('new committed content\n')
+            created = {'exists': True, 'index': 'initial-tree', 'registration': {
+                'head': created_head, 'branch': 'refs/heads/' + branch, 'locked': 'owned-marker'}}
+            live = {**created, 'index': tree, 'registration': {**created['registration'], 'head': head}}
+            checkpoint = CheckpointRecord(1, None, head, None, None, {
+                'before_head': created_head, 'after_head': head,
+                'commit_message': 'Owned commit', 'commit_tree_oid': tree})
+            snapshot = lm.GitSnapshot(head, branch, {
+                'preserved.txt': (f'H 100644 {blob} 0',), 'new.txt': (f'H 100644 {blob} 0',)}, {}, {}, {}, {}, {})
+            def git(_repo, *args, **_kwargs):
+                output = {('ls-tree', '-r', '--full-tree', '-z', created_head): f'100644 blob {blob}\tpreserved.txt\0',
+                          ('ls-tree', '-r', '--full-tree', '-z', head): f'100644 blob {blob}\tpreserved.txt\0' + f'100644 blob {blob}\tnew.txt\0',
+                          ('rev-parse', f'{head}^{{tree}}'): tree,
+                          ('show', '-s', '--format=%P', head): created_head,
+                          ('show', '-s', '--format=%B', head): 'Owned commit\n'}[args]
+                return mock.Mock(returncode=0, stdout=output)
+            effects = workspace.MakeWorktreeEffects(
+                _managed_worktree_marker=mock.Mock(), _managed_worktree_transition_state=mock.Mock(return_value=live),
+                _worktree_catalog=mock.Mock(), _write_managed_worktree_receipt=mock.Mock(),
+                git=mock.Mock(side_effect=git), validate_managed_worktree=mock.Mock(), validate_reserved_worktree=mock.Mock())
+            validator = lambda current: workspace.validate_reserved_worktree_history(
+                root / 'state', repo, worktree, branch, 'G-047', current, snapshot,
+                checkpoint=checkpoint, git=effects.git, base='main')
+            with mock.patch.object(workspace.manager_git_journal, 'recover_active'), \
+                 mock.patch.object(workspace.manager_git_journal, 'verified_managed_transitions',
+                    side_effect=lambda *_a, **kwargs: ([{'intent': {'expected': created}, 'result': {'observed': created}}]
+                        if kwargs['kind'] == 'managed_worktree_create' else [])):
+                self.assertEqual(workspace.make_worktree(effects, repo, worktree, branch, 'main',
+                    ownership_reserved=True, expected_head=created_head, journal_state_dir=root / 'state',
+                    journal_owner='plan:G-047', reservation_validator=validator), 'existing')
+                effects.validate_reserved_worktree.assert_not_called()
+                effects._write_managed_worktree_receipt.assert_not_called()
+                # Same visible HEAD cannot authorize a different commit intent.
+                checkpoint.snapshot['commit_message'] = 'Unapproved message'
+                with self.assertRaises(lm.WorkspaceOwnershipError):
+                    validator(live)
+            self.assertEqual((worktree / 'preserved.txt').read_text(), 'unfinished\n')
+            self.assertTrue(all(call.args[1] in {'ls-tree', 'show', 'rev-parse'} for call in effects.git.call_args_list))
+
     def test_reserved_registration_and_index_are_reobserved_after_validation(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -120,10 +168,24 @@ class RemoteAdoptionGitTests(TestCase):
             options = dict(ownership_reserved=True, expected_head=head, require_creation_evidence=True,
                 allow_create_branch=False, journal_state_dir=state_dir, journal_owner='plan:G-047')
             self.assertEqual(lm.make_worktree(repo, worktree, branch, 'main', **options), 'existing')
+            before_output = lm.capture_git_snapshot(worktree)
             user_file = worktree / 'preserved.txt'
             user_file.write_text('unfinished local work\n')
             with self.assertRaises(lm.WorkspaceOwnershipError):
                 lm.make_worktree(repo, worktree, branch, 'main', **options)
+            self.assertEqual(user_file.read_text(), 'unfinished local work\n')
+            # The policy unit tests bind outputs to a stopped invocation. This
+            # native slice checks preservation with those prevalidated inputs.
+            from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRecord
+            recorded_output = lm.capture_git_snapshot(worktree)
+            validator = lambda live: workspace.validate_reserved_worktree_history(
+                state_dir, repo, worktree, branch, 'G-047', live, lm.capture_git_snapshot(worktree),
+                checkpoint=CheckpointRecord(), git=lm.git, base='main',
+                agent_scopes=((before_output, recorded_output),))
+            self.assertEqual(lm.make_worktree(repo, worktree, branch, 'main',
+                **options, reservation_validator=validator), 'existing')
+            self.assertEqual(git_command(worktree, 'rev-parse', 'HEAD'), head)
+            self.assertEqual(lm.capture_git_snapshot(worktree).index, before_output.index)
             self.assertEqual(user_file.read_text(), 'unfinished local work\n')
             user_file.unlink()
             git_command(repo, 'push', 'origin', '--delete', branch)

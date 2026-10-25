@@ -47,22 +47,98 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
             'index': 'tree'}
         self.snapshot = loop_manager.GitSnapshot(self.head, self.branch, {}, {}, {}, {}, {}, {})
         self.records = [{'intent': {'expected': self.live}, 'result': {'observed': self.live}}]
+        self.rebases = []
         self.enterContext(mock.patch.object(Path, 'is_dir', return_value=True))
         self.enterContext(mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'))
         self.enterContext(mock.patch.object(loop_manager, 'validate_managed_worktree'))
-        self.enterContext(mock.patch.object(loop_manager, 'git', return_value=mock.Mock(returncode=0)))
+        self.enterContext(mock.patch.object(loop_manager, 'git', return_value=mock.Mock(returncode=0, stdout='')))
         self.enterContext(mock.patch.object(loop_manager, '_managed_worktree_transition_state',
                                            side_effect=lambda *_: self.live))
         self.capture = self.enterContext(mock.patch.object(loop_manager, 'capture_git_snapshot',
                                                            side_effect=lambda *_: self.snapshot))
         self.journal = self.enterContext(mock.patch(
             'loop_manager_internal.git.manager_git_journal.verified_managed_transitions',
-            side_effect=lambda *_a, **_k: self.records))
+            side_effect=lambda *_a, **kwargs: self.records if kwargs.get('kind') == 'managed_worktree_create' else [
+                item for item in self.rebases
+                if item['intent']['expected'].get('agent_session_id') == kwargs.get('agent_session_id')]))
         self.enterContext(mock.patch('loop_manager_internal.git.manager_git_journal.recover_active'))
 
     def resume(self):
         return loop_manager.resume_project_block_if_safe(
             self.connection, Path(self.repo), Path('/state'), self.repo)
+
+    def test_owned_commit_rebase_and_recorded_dirty_output_preserve_workspace(self):
+        import hashlib
+        from loop_manager_internal.storage import agent_invocation_state
+        agent_invocation_state.ensure_schema(self.connection)
+        self.worktree = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        files = {'base.txt': b'committed\n', 'staged.txt': b'staged\n',
+                 'unstaged.txt': b'unstaged\n', 'untracked.txt': b'untracked\n'}
+        for path, data in files.items():
+            (self.worktree / path).write_bytes(data)
+        created, committed, rebased, tree, blob = self.head, 'c' * 40, 'd' * 40, 'e' * 40, 'f' * 40
+        clean_index = {'base.txt': (f'H 100644 {blob} 0',)}
+        clean_commit = replace(self.snapshot, head=committed, index=clean_index)
+        start = replace(clean_commit, head=rebased)
+        start = replace(start, scope_id='owned-scope',
+                        scope_start_digest=hashlib.sha256(start.serialize().encode()).hexdigest())
+        accepted = replace(start, index={**clean_index, 'staged.txt': (f'H 100644 {blob} 0',)},
+                           dirty={path: ((kind,), loop_manager._path_signature(self.worktree, path))
+                                  for path, kind in (('staged.txt', 'staged'), ('unstaged.txt', 'unstaged'),
+                                                     ('untracked.txt', 'untracked'))})
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET worktree=?,agent_role='worker',agent_snapshot=?,agent_result_snapshot=?",
+                                    (str(self.worktree), start.serialize(), accepted.serialize()))
+            self.connection.execute("""INSERT INTO agent_invocations
+                (invocation_id,repo,plan_id,scope_id,role,provider,model,effort,session_id,transition,attempt,
+                 started_at,execution_status,execution_started_at,execution_finish_evidence,finished_at)
+                VALUES ('writer',?,'G-001','owned-scope','worker','codex','model','high','saved-session',
+                        'resume',1,'start','executed','started','provider_process_finished','finished')""", (self.repo,))
+        self.before = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.checkpoints.record(self.repo, 'G-001', expected_generation=0, operation=None,
+            expected_head=rebased, target_base_oid='b' * 40, observed_remote_oid=committed,
+            snapshot={'before_head': created, 'after_head': committed, 'commit_message': 'Owned commit',
+                      'commit_tree_oid': tree})
+        self.live = {**self.live, 'registration': {**self.live['registration'], 'head': rebased}, 'index': 'staged-tree'}
+        self.rebases = [{'intent': {'expected': {'branch': self.branch}, 'before': json.loads(clean_commit.serialize())},
+                         'result': {'observed': json.loads(replace(start, scope_id=None, scope_start_digest=None).serialize())}}]
+        def git(_repo, *args, **_kwargs):
+            if args[:1] == ('ls-tree',):
+                output = '' if args[-1] == created else f'100644 blob {blob}\tbase.txt\0'
+            elif args == ('show', '-s', '--format=%P', committed):
+                output = created
+            elif args == ('show', '-s', '--format=%B', committed):
+                output = 'Owned commit\n'
+            elif args == ('rev-parse', f'{committed}^{{tree}}'):
+                output = tree
+            elif args[:1] == ('show-ref',):
+                output = ''
+            else:
+                raise AssertionError(args)
+            return mock.Mock(returncode=0, stdout=output)
+        with mock.patch.object(loop_manager, 'git', side_effect=git):
+            # Matching HEAD never excuses a missing transition or changed file.
+            self.snapshot = accepted
+            rebase_evidence = self.rebases
+            self.rebases = []
+            self.assertFalse(self.resume())
+            self.rebases = rebase_evidence
+            self.snapshot = replace(accepted, dirty={**accepted.dirty, 'untracked.txt': (('untracked',), 'foreign')})
+            self.assertFalse(self.resume())
+            self.snapshot = accepted
+            with mock.patch.object(ExecutionCheckpointRepository, 'record', side_effect=sqlite3.OperationalError('write failed')):
+                with self.assertRaisesRegex(sqlite3.OperationalError, 'write failed'):
+                    self.resume()
+            self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+            self.assertTrue(self.resume())
+        after = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.assertEqual(after['workspace_owned'], 1)
+        for key in ('active_sha', 'worker_session_id', 'retry_count', 'agent_snapshot', 'agent_result_snapshot',
+                    'worker_result', 'verify_token', 'review_token'):
+            self.assertEqual(after[key], self.before[key], key)
+        self.assertEqual({path: (self.worktree / path).read_bytes() for path in files}, files)
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertFalse(self.resume())
 
     def test_unconfirmed_writer_prevents_git_observation_and_reservation_release(self):
         from loop_manager_internal.storage import task_calls

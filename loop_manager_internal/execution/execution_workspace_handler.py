@@ -6,6 +6,7 @@ from pathlib import Path
 from dataclasses import asdict
 import re
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.git.workspace import validate_reserved_worktree_history
 from loop_manager_internal.agents.agent_scope_decision import _same_local_snapshot
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
@@ -899,6 +900,14 @@ class WorkspaceHandler:
                                    if workspace_reserved and self.ports.checkpoint is not None else None)
             reserved_observation = (self.ports.capture_git_snapshot(worktree)
                                     if workspace_reserved and worktree.is_dir() else None)
+            reservation_validator = None
+            if reserved_observation is not None and reservation_owner is not None and reserved_checkpoint is not None:
+                scopes = reservation_owner.agent_scopes(row, reserved_checkpoint)
+                reservation_validator = lambda live: validate_reserved_worktree_history(
+                    self.ports.identity.state_dir, self.ports.identity.repo_path, worktree, branch, plan_id,
+                    live, self.ports.capture_git_snapshot(worktree), checkpoint=reserved_checkpoint,
+                    git=self.ports.git, base=self.ports.identity.base, session=row['worker_session_id'],
+                    sessions=reservation_owner.worker_sessions, agent_scopes=scopes)
             self.ports.make_worktree(
                 self.ports.identity.repo_path,
                 worktree,
@@ -922,6 +931,7 @@ class WorkspaceHandler:
                 journal_state_dir=self.ports.identity.state_dir,
                 journal_owner=f'plan:{plan_id}',
                 **({'require_creation_evidence': True} if adoption_reserved else {}),
+                **({'reservation_validator': reservation_validator} if reservation_validator is not None else {}),
             )
             if remote_start is not None:
                 self._validate_registered_remote(worktree)

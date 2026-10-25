@@ -276,8 +276,6 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
         )
         if int(plan['workspace_owned']) == WORKSPACE_RESERVED and worktree.is_dir():
             try:
-                if checkpoint.operation is not None:
-                    return False
                 manager_git_journal.recover_active(
                     state_dir, repo=str(repo_path.resolve()), kind='managed_worktree_create',
                     target=str(worktree.resolve()),
@@ -285,24 +283,13 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                     marker=lambda intent: effects._managed_worktree_marker(state_dir, intent, 'create'),
                 )
                 live = effects._managed_worktree_transition_state(repo_path, worktree)
-                head = workspace.reserved_worktree_creation_head(
-                    state_dir, repo_path, worktree, branch, f'plan:{plan_id}', live,
-                )
                 checked = effects.capture_git_snapshot(worktree)
-                if checked.head != head or checked.dirty or checked.operations:
-                    return False
-                saved = checkpoint.snapshot or {}
-                if (saved.get('worktree', str(worktree)) != str(worktree)
-                        or saved.get('branch', branch) != branch):
-                    return False
-                adoption = saved.get('remote_adoption')
-                if adoption is not None and (
-                    not isinstance(adoption, dict)
-                    or adoption.get('repo') != repo or adoption.get('plan_id') != plan_id
-                    or adoption.get('branch') != branch or adoption.get('head') != head
-                    or adoption.get('base') != project['base_branch']
-                ):
-                    return False
+                head = workspace.validate_reserved_worktree_history(
+                    state_dir, repo_path, worktree, branch, plan_id, live, checked,
+                    checkpoint=checkpoint, git=effects.git, base=str(project['base_branch']),
+                    session=plan['worker_session_id'],
+                    sessions=reservation_owner.worker_sessions if reservation_owner else (),
+                    agent_scopes=reservation_owner.agent_scopes(plan, checkpoint) if reservation_owner else ())
                 reserved_recovered = True
             except (RuntimeError, OSError, ValueError):
                 return False
@@ -330,6 +317,7 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
     worktree = Path(str(plan["worktree"] or ""))
     branch = str(plan["branch"] or "")
     try:
+        reservation_snapshot = checked if reserved_recovered else None
         checked = effects.capture_git_snapshot(worktree)
         effects.validate_execplan_workspace_identity(
             state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree
@@ -339,10 +327,10 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
             worktree,
             branch,
         )
-        if reserved_recovered and (checked.head != head or checked.dirty or checked.operations
+        if reserved_recovered and (not agent_scope_decision._same_local_snapshot(checked, reservation_snapshot)
                 or effects._managed_worktree_transition_state(repo_path, worktree) != live):
             return False
-        if plan["agent_snapshot"]:
+        if plan["agent_snapshot"] and not reserved_recovered:
             effects.validate_blocked_agent_scope(
                 connection, repo_path, repo, str(project['base_branch']),
                 worktree, str(plan['path']), saved_plan=plan,

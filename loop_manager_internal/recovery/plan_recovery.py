@@ -1,7 +1,8 @@
 """차단 재평가의 대상 소유권과 자원 예약을 작업별로 분리한다."""
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
 import json
 from pathlib import Path
 
@@ -39,7 +40,7 @@ def _reservation_owners(connection, repo, plan_id):
         'SELECT * FROM task_call_reservations WHERE repo=? AND plan_id=? ORDER BY token',
         (repo, plan_id))) if 'task_call_reservations' in tables else ())
     invocations = (tuple(dict(row) for row in connection.execute(
-        'SELECT invocation_id,execution_status,execution_started_at,execution_finish_evidence,'
+        'SELECT invocation_id,scope_id,role,session_id,execution_status,execution_started_at,execution_finish_evidence,'
         'process_receipt_path,finished_at FROM agent_invocations WHERE repo=? AND plan_id=? ORDER BY invocation_id',
         (repo, plan_id))) if 'agent_invocations' in tables else ())
     return (plan['branch'], plan['worktree'], plan['workspace_owned'], manual, calls, invocations)
@@ -51,6 +52,29 @@ class ReservationOwnership:
     repo: str
     plan_id: str
     observed: tuple
+
+    @property
+    def worker_sessions(self):
+        return tuple(dict.fromkeys(call['session_id'] for call in self.observed[-1] if call['role'] == 'worker'))
+
+    def agent_scopes(self, plan, checkpoint):
+        """Offer recorded local outputs only for physically stopped owned calls."""
+        from loop_manager_internal.agents.scope_contracts import GitSnapshot
+        records = [dict(plan), *(checkpoint.snapshot or {}).get('retired_agent_scopes', ())]
+        scopes = []
+        for record in records:
+            if (not isinstance(record, dict) or record.get('agent_role') != 'worker'
+                    or not record.get('agent_snapshot') or not record.get('agent_result_snapshot')):
+                continue
+            start = GitSnapshot.deserialize(record['agent_snapshot'])
+            result = GitSnapshot.deserialize(record['agent_result_snapshot'])
+            digest = hashlib.sha256(replace(start, scope_id=None, scope_start_digest=None).serialize().encode()).hexdigest()
+            calls = [call for call in self.observed[-1] if call['scope_id'] == start.scope_id]
+            if (start.scope_id and start.scope_start_digest == digest and calls
+                    and all(call['role'] == 'worker' for call in calls)
+                    and result.scope_id in (None, start.scope_id)):
+                scopes.append((start, result))
+        return tuple(scopes)
 
     def check(self):
         """CAS-side check: no Git, process observation or waiting under the writer."""
