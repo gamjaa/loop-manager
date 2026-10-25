@@ -404,7 +404,11 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         notifications.enqueue_draft_decisions(self.connection, 'repo')
         self.connection.commit()
         self.assertEqual(notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=sent), 1)
-        self.assertIn('draft 작업 2건', sent.call_args.args[2])
+        messages = [call.args[2] for call in sent.call_args_list]
+        self.assertEqual(len(messages), 2)
+        self.assertIn('• G-002 · Retry', messages[0])
+        self.assertIn('• G-001 · Decision', messages[1])
+        self.assertNotIn('• G-002', messages[1])
 
     def test_only_remote_explicit_current_decision_releases_draft(self):
         revision = self.waiting()["revision"]

@@ -38,6 +38,7 @@ priority: normal
 - 미전송·일부 전송·전체 전송 각각에서 같은 질문의 링크만 바꾼다. 현재 링크의 표시 정합성, 이미 통지한 질문의 재전송 0회와 frozen 원문/cursor 보존을 확인한다. 단순 사건 수나 URL 문자열 비교만으로 질문 중복 방지를 대신하지 않는다.
 - 질문 해소/추가/내용 변경과 링크 변경을 섞고 첫 조각 뒤·claim 뒤·confirm 저장 실패·재시작을 제어한다. 해소된 질문 전송 0회, 실제 새 질문/행동만 1회, 이전 질문/결정/부분 전송 감사 보존을 확인한다.
 - legacy pending/revision은 같지만 질문 identity/출처가 현재 질문과 연결되지 않는 경우를 거부하고 유효한 legacy 질문은 계속 알린다. 현재 구현의 question 부재·reassessment 거부와 `tests/test_notification_delivery.py:DraftListNotificationTest`의 해소/identity/revision 변경 취소·재시작·분할 전송 회귀는 재사용하며 같은 조건을 복제하지 않는다. 기존 사용자 답변 검증·draft 보류·부분 전송/오류 보존 회귀는 유지한다. 과거 링크만 변경 시 전체 목록 재발행을 요구하던 assertion만 현행 계약으로 대체한다.
+- `tests/test_execplan_drafts.py::ExecPlanDraftCatalogTest.test_reassessment_coexists_with_user_question_list_and_new_question`는 재평가 후 새 질문을 알리면서 앞서 확인한 질문을 다시 싣지 않는 통합 회귀로 유지한다.
 
 ## Progress
 
@@ -45,6 +46,7 @@ priority: normal
 - [x] 현재 R-053 전문의 링크만 변경 시 중복 금지와 R-061·목록/legacy claim 경계를 정적으로 대조했다. `e69a2399992a7e598217741cdcd3833d9b0257de`에서 공통 정책 이동과 legacy question/reassessment 검사는 구현된 범위로 제외했다. URL 현재성·개별 질문 identity/출처·질문별 통지 확인은 남아 있으며 URL을 사건 identity에 추가하지 않고 질문과 표시를 분리한다. 실행 검증은 하지 않았다.
 - [x] 현재 질문 snapshot은 저장된 pending evidence, ExecPlan catalog 경로·revision, 등록 remote에서 계산한다. 생성·각 조각 claim에서 이 snapshot과 대조하고 outbox 고정 본문·확인 cursor에서 질문별 확인을 계산한다.
 - [x] Worker targeted test: `DraftListNotificationTest` 14개와 `tests.test_notification_events` 41개가 통과했다. 최초 delivery class 실행에서 URL 형식에 고정된 예전 assertion이 실패해 현재 catalog 경로 기반 URL을 assertion으로 반영하고 동일 명령을 재실행했다. 최초 event module 실행에서 identity/source 필드가 빠진 legacy fixture가 새 계약에 거부되어 유효한 legacy fixture와 거부 회귀를 추가한 뒤 동일 명령을 재실행했다. 두 재실행은 통과했다.
+- [x] Verify feedback에서 재평가 통합 회귀가 앞서 알린 G-002까지 재통지하는 이전 기대값을 확인했다. 테스트를 첫 알림의 G-002와 재평가 후 새 G-001만 각각 확인하도록 조정하고 같은 targeted test를 재실행해 통과했다.
 
 ## Decision Log
 
