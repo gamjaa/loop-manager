@@ -9,6 +9,7 @@ from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
 from .policy import (is_current, cancel_stale_events, block_recovery,
+                     draft_questions_for_notice,
                      cancel_event, pr_review_candidate, SOURCE_ACTION_REASONS)
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
@@ -625,39 +626,31 @@ def record_planning_publication(connection, repo, plans, revision):
 
 
 def enqueue_draft_decisions(connection, repo):
-    from loop_manager_internal.storage import execplan_draft_state
     if not _enabled(connection):
         return
-    plans = []
-    for plan_id in sorted(execplan_draft_state.user_question_ids(connection, repo)):
-        saved = execplan_draft_state.evidence(connection, repo, plan_id)
-        plan = connection.execute("SELECT title FROM exec_plans WHERE repo = ? AND plan_id = ?",
-                                  (repo, plan_id)).fetchone()
-        if saved and saved.get("pending") and plan:
-            plans.append({"id": plan_id, "title": str(plan[0]), "url": saved.get("url"),
-                          "decision_identity": saved.get("identity"), "decision_revision": saved["revision"]})
-    if not plans:
-        ensure_schema(connection)
-        connection.execute(
-            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
-            "WHERE repo = ? AND event_type = 'draft_decisions' "
-            "AND sent_at IS NULL AND canceled_at IS NULL", (repo,))
-        return
-    if plans:
-        ensure_schema(connection)
-        previous = connection.execute(
-            "SELECT event_key, payload, canceled_at FROM notification_outbox WHERE repo = ? "
-            "AND event_type = 'draft_decisions' ORDER BY rowid DESC LIMIT 1", (repo,),
-        ).fetchone()
-        def decisions(items):
-            return [(plan["id"], plan["decision_identity"], plan["decision_revision"]) for plan in items]
-        if previous and not previous[2] and decisions(json.loads(previous[1])["plans"]) == decisions(plans):
+    ensure_schema(connection)
+    previous = connection.execute(
+        "SELECT event_key, payload, canceled_at, sent_at FROM notification_outbox WHERE repo = ? "
+        "AND event_type = 'draft_decisions' ORDER BY rowid DESC LIMIT 1", (repo,),
+    ).fetchone()
+    if previous and not previous[2] and not previous[3]:
+        try:
+            payload = json.loads(previous[1])
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and is_current(
+                connection, repo, "draft_decisions", payload, event_key=str(previous[0])):
             return
-        identity = str(previous[0] if previous else "") + "\0" + json.dumps(decisions(plans), ensure_ascii=False)
-        connection.execute(
-            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
-            "WHERE repo = ? AND event_type = 'draft_decisions' "
-            "AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
-        )
-        enqueue_progress(connection, repo, "draft_decisions", identity,
-                         plans=plans, status="사용자 판단 대기", silent=False)
+
+    connection.execute(
+        "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, delivery_started_at = NULL "
+        "WHERE repo = ? AND event_type = 'draft_decisions' "
+        "AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+    )
+    plans = draft_questions_for_notice(connection, repo)
+    if not plans:
+        return
+    decisions = [(plan["id"], plan["decision_identity"], plan["decision_revision"]) for plan in plans]
+    identity = str(previous[0] if previous else "") + "\0" + json.dumps(decisions, ensure_ascii=False)
+    enqueue_progress(connection, repo, "draft_decisions", identity,
+                     plans=plans, status="사용자 판단 대기", silent=False)

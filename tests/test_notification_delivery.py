@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
+from urllib.parse import quote
 from unittest import mock
 
 import loop_manager
@@ -978,20 +979,26 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
 class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
     repo = "/projects/alpha"
 
-    def draft(self, connection, plan_id="G-018", title="보존 정책", *, revision="revision", url=True):
+    def draft(self, connection, plan_id="G-018", title="보존 정책", *, revision="revision",
+              remote_revision="remote-sha", url=True):
         from loop_manager_internal.storage import execplan_draft_state
         execplan_draft_state.ensure_schema(connection)
         path = f"docs/plans/[{plan_id}] {title}.md"
+        connection.execute("UPDATE projects SET origin='https://github.com/org/repo' WHERE repo=?",
+                           (self.repo,))
         connection.execute(
             "INSERT OR REPLACE INTO exec_plans "
-            "(repo, plan_id, path, title, sources, depends_on, priority, content_hash, status) "
-            "VALUES (?, ?, ?, ?, '[]', '[]', 'normal', 'hash', 'READY')",
-            (self.repo, plan_id, path, title),
+            "(repo, plan_id, path, title, sources, depends_on, priority, content_hash, "
+            "current_revision_sha, status) "
+            "VALUES (?, ?, ?, ?, '[]', '[]', 'normal', 'hash', ?, 'READY')",
+            (self.repo, plan_id, path, title, remote_revision if url else None),
         )
         saved = {"pending": True, "identity": "question-" + plan_id, "revision": revision,
-                 "question": "Question: Which storage policy?"}
+                 "question": "Question: Which storage policy?", "path": path,
+                 "remote_revision": remote_revision, "remote_url": "https://github.com/org/repo"}
         if url:
-            saved["url"] = "https://github.com/org/repo/blob/sha/" + plan_id
+            saved["url"] = ("https://github.com/org/repo/blob/" + remote_revision + "/"
+                            + quote(path, safe="/"))
         connection.execute("INSERT OR REPLACE INTO execplan_drafts VALUES (?, ?, 1, ?)",
                            (self.repo, plan_id, json.dumps(saved)))
 
@@ -1071,6 +1078,120 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
             notifications.enqueue_draft_decisions(connection, self.repo)
         self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
 
+    def test_link_change_refreshes_unsent_snapshot_without_reidentifying_question(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, remote_revision="old-sha")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+            old = self.events(connection)[0]
+            self.draft(connection, remote_revision="current-sha")
+        sent = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 0)
+        sent.assert_not_called()
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+        with connection:
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        rows = self.events(connection)
+        self.assertEqual(len(rows), 2)
+        self.assertIsNotNone(rows[0]['canceled_at'])
+        self.assertEqual(json.loads(rows[1]['payload'])['plans'][0]['decision_identity'], 'question-G-018')
+        self.assertEqual(json.loads(rows[1]['payload'])['plans'][0]['decision_revision'], 'revision')
+        self.assertIn('/blob/current-sha/', json.loads(rows[1]['payload'])['plans'][0]['url'])
+        self.assertEqual(old['confirmed_pieces'], 0)
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
+        self.assertEqual(len(self.events(connection)), 2)
+
+    def test_partial_list_link_change_keeps_confirmed_question_and_refreshes_remaining_one(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, title="Large title " * 500, remote_revision="old-sha")
+            self.draft(connection, "G-019", "Remaining question", remote_revision="old-sha")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        old = self.events(connection)[0]
+        calls = []
+
+        def send(*args):
+            calls.append(args[2])
+            if len(calls) == 1:
+                with connection:
+                    connection.execute(
+                        "UPDATE exec_plans SET current_revision_sha='current-sha' WHERE repo=?",
+                        (self.repo,),
+                    )
+
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=send), 0)
+        canceled = self.events(connection)[0]
+        self.assertEqual(canceled['confirmed_pieces'], 1)
+        self.assertIsNotNone(canceled['canceled_at'])
+        self.assertEqual(canceled['rendered_text'], notifications._message(
+            "draft_decisions", json.loads(old['payload']),
+        ))
+        with connection:
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        rows = self.events(connection)
+        current = json.loads(rows[-1]['payload'])
+        self.assertEqual([item['id'] for item in current['plans']], ['G-019'])
+        self.assertIn('/blob/current-sha/', current['plans'][0]['url'])
+        sent = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
+        self.assertEqual(len(sent.call_args_list), 1)
+        self.assertIn('G-019', sent.call_args.args[2])
+        self.assertNotIn('G-018', sent.call_args.args[2])
+
+    def test_id_at_confirmed_piece_end_is_not_resent_after_link_change(self):
+        connection = self.connection()
+        probe = notifications._message("draft_decisions", {
+            "project": "alpha",
+            "plans": [{"id": "G-018", "title": "x"},
+                      {"id": "G-019", "title": "Remaining question"}],
+            "status": "사용자 판단 대기",
+        })
+        target_id_end = probe.index("\n• G-019 · ") + len("\n• G-019")
+        first_title = "x" * (1 + notifications.MESSAGE_LIMIT - target_id_end)
+        with connection:
+            self.draft(connection, title=first_title, remote_revision="old-sha")
+            self.draft(connection, "G-019", "Remaining question", remote_revision="old-sha")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        old = self.events(connection)[0]
+        frozen = notifications._message("draft_decisions", json.loads(old["payload"]))
+        self.assertTrue(notifications._pieces(frozen)[0].endswith("G-019"))
+        self.assertTrue(frozen[notifications.MESSAGE_LIMIT:].startswith(" · "))
+
+        calls = []
+        def send(*args):
+            calls.append(args[2])
+            if len(calls) == 1:
+                with connection:
+                    connection.execute(
+                        "UPDATE exec_plans SET current_revision_sha='current-sha' WHERE repo=?",
+                        (self.repo,),
+                    )
+
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=send), 0)
+        canceled = self.events(connection)[0]
+        self.assertEqual(canceled["confirmed_pieces"], 1)
+        self.assertIsNotNone(canceled["canceled_at"])
+        self.assertEqual(len(calls), 1)
+        with connection:
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=send), 0)
+        self.assertEqual(len(calls), 1)
+
+    def test_fully_confirmed_question_is_not_resent_when_link_changes(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, remote_revision="old-sha")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        sent = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
+        with connection:
+            self.draft(connection, remote_revision="current-sha")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 0)
+        self.assertEqual(sent.call_count, 1)
+
     def test_resolved_or_changed_evidence_cancels_unsent_list(self):
         for change in ("resolved", "revision", "identity", "added"):
             with self.subTest(change=change):
@@ -1119,8 +1240,14 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
                 raw = text.encode("utf-16-le")
                 linked_id = raw[entity["offset"] * 2:(entity["offset"] + entity["length"]) * 2].decode("utf-16-le")
                 links.append((linked_id, entity["url"]))
-        self.assertEqual(links, [("G-018", "https://github.com/org/repo/blob/sha/G-018"),
-                                 ("G-020", "https://github.com/org/repo/blob/sha/G-020")])
+        expected_links = []
+        for plan_id in ("G-018", "G-020"):
+            saved = json.loads(connection.execute(
+                "SELECT evidence FROM execplan_drafts WHERE repo=? AND plan_id=?",
+                (self.repo, plan_id),
+            ).fetchone()[0])
+            expected_links.append((plan_id, saved["url"]))
+        self.assertEqual(links, expected_links)
 
     def test_link_crossing_piece_boundary_keeps_both_id_fragments(self):
         from loop_manager_internal.notifications import rendering
@@ -1165,11 +1292,19 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
 
     def test_legacy_split_retry_preserves_payload_text_and_cursor(self):
         connection = self.connection()
+        question = 'Question: ' + 'Large legacy question ' * 500
         with connection:
             self.draft(connection)
+            saved = json.loads(connection.execute(
+                "SELECT evidence FROM execplan_drafts WHERE repo=? AND plan_id='G-018'", (self.repo,),
+            ).fetchone()[0])
+            saved['question'] = question
+            connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo=? AND plan_id='G-018'",
+                               (json.dumps(saved), self.repo))
             notifications.enqueue_progress(connection, self.repo, 'draft_decision', 'legacy-split',
-                execplan_id='G-018', question='Question: ' + 'Large legacy question ' * 500,
-                url='https://example.test/original', decision_revision='revision', silent=False)
+                execplan_id='G-018', question=question, url=saved['url'],
+                decision_identity=saved['identity'], decision_revision=saved['revision'],
+                source_path=saved['path'], silent=False)
         original = self.events(connection)[0]
         calls = []
         def send(*args):
@@ -1194,15 +1329,45 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
         connection = self.connection()
         with connection:
             self.draft(connection)
+            saved = json.loads(connection.execute(
+                "SELECT evidence FROM execplan_drafts WHERE repo=? AND plan_id='G-018'", (self.repo,),
+            ).fetchone()[0])
             notifications.enqueue_progress(connection, self.repo, "draft_decision", "legacy",
-                execplan_id="G-018", question="Question: Which storage policy?", url="https://example.test/old",
-                decision_revision="revision", status="사용자 판단 대기", silent=False)
+                execplan_id="G-018", question=saved['question'], url=saved['url'],
+                decision_identity=saved['identity'], decision_revision=saved['revision'],
+                source_path=saved['path'], status="사용자 판단 대기", silent=False)
         payload = self.events(connection)[0]["payload"]
         original = notifications._message("draft_decision", json.loads(payload))
         sent = mock.Mock()
         self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
         self.assertEqual(sent.call_args.args[2], original)
         self.assertEqual(self.events(connection)[0]["payload"], payload)
+
+    def test_legacy_notice_without_current_identity_or_source_is_canceled(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection)
+            base = {
+                "project": "alpha", "execplan_id": "G-018",
+                "question": "Question: Which storage policy?", "decision_revision": "revision",
+                "silent": False,
+            }
+            notifications._insert(connection, "legacy-unlinked", self.repo, "draft_decision", {
+                **base, "url": "https://example.test/old",
+            })
+            notifications._insert(connection, "legacy-wrong-source", self.repo, "draft_decision", {
+                **base, "url": "https://github.com/org/repo/blob/remote-sha/docs/plans/%5BG-018%5D%20보존%20정책.md",
+                "decision_identity": "question-G-018", "source_path": "docs/plans/[G-019] 다른 계획.md",
+            })
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        legacy = {row['event_key']: row for row in self.events(connection)}
+        sent = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
+        for key in ('legacy-unlinked', 'legacy-wrong-source'):
+            row = next(row for row in self.events(connection) if row['event_key'] == key)
+            self.assertIsNotNone(row['canceled_at'])
+            self.assertEqual(row['payload'], legacy[key]['payload'])
+        self.assertIn("draft 작업 1건", sent.call_args.args[2])
 
 
 class TelegramEntityTransportTest(unittest.TestCase):
