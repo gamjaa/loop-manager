@@ -242,13 +242,27 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
             self.assertEqual(service.runtime.get(service.repo, 'G-013').status, 'READY')
 
     def test_publication_validation_and_intent_are_atomic_against_manual_start(self):
+        from loop_manager_internal.storage.db_access import (
+            CoordinatedConnection, DatabaseWaitTimeout, open_connection,
+        )
         with tempfile.TemporaryDirectory() as directory:
             service, _, path = self.fixture(directory)
             candidate = self.publication(service)
             database = Path(directory) / 'state.db'
             with closing(sqlite3.connect(database)) as target, target:
                 service.connection.backup(target)
-            checked, fetched, release = threading.Event(), threading.Event(), threading.Event()
+            checked, blocked, release = threading.Event(), threading.Event(), threading.Event()
+
+            class SignalBusyConnection(CoordinatedConnection):
+                def execute(self, sql, parameters=()):
+                    try:
+                        return super().execute(sql, parameters)
+                    except sqlite3.OperationalError as error:
+                        if (sql.strip().upper() == 'BEGIN IMMEDIATE'
+                                and isinstance(error, DatabaseWaitTimeout)):
+                            blocked.set()
+                        raise
+
             real_check = manager._assert_mutable_ready_snapshot_current
             def pause(connection, snapshot):
                 real_check(connection, snapshot)
@@ -260,15 +274,11 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                     connection.row_factory = sqlite3.Row
                     return manager.record_general_planning_publication_intent(connection, service.repo,
                         candidate[0], candidate[1], candidate[2], 'spec', 'planning')
-            real_fetch = service.effects.fetch_base
-            def after_fetch(*args, **kwargs):
-                result = real_fetch(*args, **kwargs)
-                fetched.set()
-                return result
             def start():
-                with closing(sqlite3.connect(database)) as connection, connection:
+                with closing(open_connection(
+                        database, timeout=2, factory=SignalBusyConnection)) as connection:
                     connection.row_factory = sqlite3.Row
-                    command = ManualWorkService(replace(service.effects, fetch_base=after_fetch), connection,
+                    command = ManualWorkService(service.effects, connection,
                         service.state_dir, service.repo_path, service.config_path)
                     return command.start('G-012')
             with mock.patch.object(manager, '_assert_mutable_ready_snapshot_current', side_effect=pause), \
@@ -277,7 +287,8 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                 try:
                     self.assertTrue(checked.wait(10))
                     manual = executor.submit(start)
-                    self.assertTrue(fetched.wait(10))
+                    # Start snapshots DB state before Git observation; confirm it meets the held DB turn.
+                    self.assertTrue(blocked.wait(10))
                 finally:
                     release.set()
                 publication.result(timeout=10)

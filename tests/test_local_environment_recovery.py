@@ -403,12 +403,14 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             with connection:
                 local_recovery_state.consume_recheck(connection, request.request_id, 'G-001', 'verify')
             raise RuntimeError('interrupted after durable check')
-        self.assertEqual(self.scheduled_recovery_run(interrupted), 1)
         def resumed(connection, *_args, **kwargs):
             self.assertEqual(kwargs['recovery_request_id'], request.request_id)
-            self.assertFalse(local_recovery_state.consume_recheck(connection, request.request_id, 'G-001', 'verify'))
+            self.assertTrue(local_recovery_state.recheck_consumed(connection, request.request_id, 'G-001', 'verify'))
             return ProjectRunResult(ProjectRunKind.WAITING, 0)
-        self.assertEqual(self.scheduled_recovery_run(resumed), 0)
+        # This case verifies recovery request persistence; verify transport is not exercised.
+        with mock.patch('loop_manager_internal.application.scheduler.VerifyCoordinator'):
+            self.assertEqual(self.scheduled_recovery_run(interrupted), 1)
+            self.assertEqual(self.scheduled_recovery_run(resumed), 0)
 
     def test_selected_plan_waits_for_planning_and_maintenance_slots(self):
         self.config_path.write_text('[loop]\n', encoding='utf-8')
@@ -563,7 +565,8 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
                 checked.append('planning')
                 self.assertEqual(context.recovery_request_id, request_id)
                 self.assertTrue(context.local_environment_recheck)
-                connection.execute("UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,))
+                with connection:
+                    connection.execute("UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,))
                 return PlanningOutcome(PlanningOutcomeKind.NO_CHANGE)
             with mock.patch.object(service, '_refresh_catalog', return_value='base'), \
                  mock.patch.object(service, '_dispatch_execution', side_effect=AssertionError('unexpected execution')), \
@@ -617,11 +620,12 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
         def run(connection, *_args, **_kwargs):
             from loop_manager_internal.storage import recovery_state
-            repository = recovery_state.RecoveryRepository(connection)
-            before = repository.external_run_snapshot(str(self.repository.resolve()))
-            loop_manager._record_project_recovery(
-                connection, str(self.repository.resolve()), RecoveryReason.GIT_LOCK, "Git lock")
-            repository.observe_external_run(str(self.repository.resolve()), before)
+            with connection:
+                repository = recovery_state.RecoveryRepository(connection)
+                before = repository.external_run_snapshot(str(self.repository.resolve()))
+                loop_manager._record_project_recovery(
+                    connection, str(self.repository.resolve()), RecoveryReason.GIT_LOCK, "Git lock")
+                repository.observe_external_run(str(self.repository.resolve()), before)
             return ProjectRunResult(ProjectRunKind.COMPLETED, 0)
         self.assertEqual(recover_local_environment(
             self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
@@ -698,7 +702,8 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             service.state.row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
             def planning(context):
                 self.assertTrue(context.local_environment_recheck)
-                connection.execute("UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,))
+                with connection:
+                    connection.execute("UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,))
                 return PlanningOutcome(PlanningOutcomeKind.NO_CHANGE)
             with mock.patch.object(service, "_prepare_repository", return_value=None), \
                  mock.patch.object(service, "_reconcile_catalog_and_cleanup", return_value=None), \
