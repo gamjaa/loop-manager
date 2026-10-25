@@ -93,8 +93,11 @@ def observation(path: str, state_dir: Path, identity: str) -> dict | None:
     if (not isinstance(value, dict) or type(value.get('version')) is not int
             or value['version'] != 1 or value.get('identity') != identity
             or set(value) - {'version', 'identity', 'started_at', 'finished_at', 'duration_ms', 'session_id', 'outcome',
-                             'database_pending', 'request_sha256', 'message_sha256'}):
+                             'database_pending', 'request_sha256', 'message_sha256', 'request_session_id'}):
         raise ValueError('invocation 관측 identity 또는 형식이 다릅니다.')
+    if ('request_session_id' in value and value['request_session_id'] is not None
+            and (not isinstance(value['request_session_id'], str) or not value['request_session_id'])):
+        raise ValueError('invocation 요청 session 형식이 다릅니다.')
     if 'database_pending' in value and type(value['database_pending']) is not bool:
         raise ValueError('invocation 저장 대기 형식이 다릅니다.')
     for key in ('request_sha256', 'message_sha256'):

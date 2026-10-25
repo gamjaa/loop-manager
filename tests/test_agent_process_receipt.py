@@ -79,11 +79,12 @@ class ProcessReceiptTest(TestCase):
         with self.connection:
             self.connection.execute('UPDATE task_call_reservations SET invocation_id=?, receipt_path=?',
                                     (self.identity, str(self.path)))
-        for mode in ('foreign', 'malformed'):
+        for mode in ('foreign', 'malformed', 'malformed_request_session'):
             with self.subTest(mode=mode):
                 self.path.unlink(missing_ok=True)
                 identity = 'other-invocation' if mode == 'foreign' else self.identity
-                facts = {} if mode == 'foreign' else {'outcome': {'kind': 'success'}}
+                facts = ({} if mode == 'foreign' else {'request_session_id': 3}
+                         if mode == 'malformed_request_session' else {'outcome': {'kind': 'success'}})
                 process_receipt.observe(self.path, identity, facts)
                 process_receipt.finished(self.launch, SimpleNamespace(pid=1234))
                 self.assertEqual(self.repository.reconcile_interrupted(state_dir=self.state), 0)

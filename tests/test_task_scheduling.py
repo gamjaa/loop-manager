@@ -376,20 +376,29 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 1)
 
-    def test_delivery_marker_failure_defers_until_acknowledged_and_next_request_runs(self):
+    def test_delivery_marker_retry_keeps_the_managed_request_and_next_call_runs(self):
         from loop_manager_internal.agents import common_guidance, process_receipt
         from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, AgentResult
-        from loop_manager_internal.storage.task_calls import CallDeferred
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
         from tests.support.fixed_samples import PROJECT_FILES
         from uuid import uuid4
         import shutil
         scheduler = self.scheduler(max_workers=1)
+        repository = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            repository.activate('A', 'G-001', activation_sha='base', branch='one', worktree='/worktree')
+        before = repository.get('A', 'G-001')
+        service = ProjectService(SimpleNamespace(activate_ready_execplan=mock.Mock(return_value=None), resume_manual_work=None),
+            ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                            True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base', provider='codex')
         runtime = self.directory / 'agent-runtime' / uuid4().hex
         runtime.mkdir(parents=True)
         self.addCleanup(shutil.rmtree, runtime)
-        launches = []
+        launches, dispatched, prompts, waits = [], [], [], []
         class Provider:
             def run(_, request):
+                prompts.append(request.prompt)
                 attempt = runtime / str(len(launches))
                 attempt.mkdir()
                 launch = SimpleNamespace(runtime=runtime, attempt=attempt)
@@ -400,40 +409,108 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 request.on_process_started()
                 request.on_process_finished()
                 return AgentResult(0, message)
-        def invoke(prompt):
-            return loop_manager.run_agent('codex', Path('/worktree'), self.directory, self.config_path,
-                'reviewer', prompt, read_only=True, connection=self.connection,
-                invocation=InvocationContext('A', 'G-001'), resolved_profile=ResolvedProfile('model', 'high'))
+        def execute(child, owned_repository, **options):
+            dispatched.append(True)
+            def invoke(prompt):
+                current = owned_repository.get('A', 'G-001')
+                return loop_manager.run_agent('codex', Path('/worktree'), self.directory, self.config_path,
+                    'worker', prompt + str(current.last_error or ''), read_only=False,
+                    connection=child.identity.connection, invocation=InvocationContext('A', 'G-001'),
+                    resolved_profile=ResolvedProfile('model', 'high'))
+            first = invoke('first prompt')
+            self.assertEqual(first.message, 'result-1')
+            second = invoke('next prompt')
+            self.assertEqual(second.message, 'result-2')
+            self.assertNotEqual(first.isolation_invocation_id, second.isolation_invocation_id)
+            self.assertEqual(owned_repository.get('A', 'G-001').last_error, before.last_error)
+            owned_repository.transition_from_snapshot(owned_repository.projected('A'),
+                plan_values={'status': 'PR_OPEN'}, project_values=runtime_state.clear_project_values())
+            return 0
+        original_write = process_receipt._write
+        acknowledgements = []
+        def fail_delivery(path, root):
+            if root.get('invocation_observation', {}).get('database_pending') is False:
+                acknowledgements.append(True)
+                if len(acknowledgements) <= 2:
+                    raise OSError('delivery marker unavailable')
+            return original_write(path, root)
+        def wait(_seconds):
+            waits.append(True)
+            self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+            task = scheduling.current_task.get()
+            self.assertEqual(runtime_state.RuntimeStateRepository(task.connection).get('A', 'G-001').last_error,
+                             before.last_error)
         token = scheduling.current_scheduler.set(scheduler)
-        selected = scheduling.current_task.set(scheduling.Task('A', 'G-001', self.connection))
         try:
-            with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+            with fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute), \
+                 mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
                  mock.patch.object(loop_manager, 'agent_provider', return_value=Provider()), \
-                 mock.patch.object(process_receipt, 'recover', return_value={'finished_at': 'proof'}):
-                original_write = process_receipt._write
-                def fail_delivery(path, root):
-                    if root.get('invocation_observation', {}).get('database_pending') is False:
-                        raise OSError('delivery marker unavailable')
-                    return original_write(path, root)
-                with mock.patch.object(process_receipt, '_write', side_effect=fail_delivery):
-                    with self.assertRaisesRegex(CallDeferred, '전달 표식'):
-                        invoke('first prompt')
-                row = self.connection.execute('SELECT invocation_id,process_receipt_path FROM agent_invocations').fetchone()
-                self.assertTrue(process_receipt.observation(row[1], self.directory, row[0])['database_pending'])
-                self.assertEqual(len(launches), 1)
-                recovered = invoke('first prompt')
-                self.assertEqual((recovered.message, recovered.isolation_invocation_id), ('result-1', row[0]))
-                self.assertFalse(process_receipt.observation(row[1], self.directory, row[0])['database_pending'])
-                self.assertEqual(len(launches), 1)
-                fresh = invoke('next prompt')
-                self.assertEqual(fresh.message, 'result-2')
-                self.assertNotEqual(fresh.isolation_invocation_id, row[0])
-                self.assertEqual(len(launches), 2)
+                 mock.patch.object(process_receipt, 'recover', return_value={'finished_at': 'proof'}), \
+                 mock.patch.object(process_receipt, '_write', side_effect=fail_delivery), \
+                 mock.patch.object(scheduler.condition, 'wait', side_effect=wait):
+                self.assertEqual(scheduling.run_project_tasks(service, newly_activated=True), 0)
         finally:
-            scheduling.current_task.reset(selected)
             scheduling.current_scheduler.reset(token)
+        self.assertEqual((len(dispatched), len(launches), len(waits)), (1, 2, 2))
+        self.assertEqual(prompts, ['first prompt', 'next prompt'])
+        for row in self.connection.execute('SELECT invocation_id,process_receipt_path FROM agent_invocations'):
+            self.assertFalse(process_receipt.observation(row[1], self.directory, row[0])['database_pending'])
         self.assertEqual(sum(scheduler.running['agent'].values()), 0)
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+
+    def test_restart_uses_the_worker_session_saved_by_the_start_callback(self):
+        from loop_manager_internal.agents import common_guidance, process_receipt
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, AgentResult
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        from tests.support.fixed_samples import PROJECT_FILES
+        from uuid import uuid4
+        import shutil
+        repository = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            repository.activate('A', 'G-001', activation_sha='base', branch='one', worktree='/worktree')
+        runtime = self.directory / 'agent-runtime' / uuid4().hex
+        attempt = runtime / 'attempt'
+        attempt.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, runtime)
+        launch = SimpleNamespace(runtime=runtime, attempt=attempt)
+        (attempt / 'last-message.txt').write_text('original result', encoding='utf-8')
+        class Provider:
+            def run(_, request):
+                self.assertIsNone(request.session_id)
+                request.on_launch_prepared(launch)
+                request.on_process_started()
+                request.on_session_started('saved-session')
+                request.on_process_finished()
+                return AgentResult(0, 'original result', 'saved-session')
+        def save_session(session):
+            repository.observe_worker_session(repository.get('A', 'G-001'), None, session, 'binding')
+        def invoke(connection, session, callback=None):
+            return loop_manager.run_agent('codex', Path('/worktree'), self.directory, self.config_path,
+                'worker', 'original prompt', read_only=False, connection=connection, session_id=session,
+                on_session_started=callback, invocation=InvocationContext('A', 'G-001'),
+                resolved_profile=ResolvedProfile('model', 'high'))
+        with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+             mock.patch.object(process_receipt, 'recover', return_value={'finished_at': 'proof'}):
+            with mock.patch.object(loop_manager, 'agent_provider', return_value=Provider()), \
+                 mock.patch.object(InvocationRepository, 'finish', side_effect=KeyboardInterrupt('restart')):
+                with self.assertRaises(KeyboardInterrupt):
+                    invoke(self.connection, repository.get('A', 'G-001').worker_session_id, save_session)
+            row = self.connection.execute('SELECT invocation_id,process_receipt_path FROM agent_invocations').fetchone()
+            saved = process_receipt.observation(row[1], self.directory, row[0])
+            self.assertIsNone(saved['request_session_id'])
+            self.assertTrue(saved['database_pending'])
+            with closing(database.connect_database(self.directory, run_migrations=False)) as reopened:
+                restarted = runtime_state.RuntimeStateRepository(reopened).get('A', 'G-001')
+                self.assertEqual(restarted.worker_session_id, 'saved-session')
+                provider = mock.Mock()
+                provider.run.side_effect = AssertionError('completed provider must not run after restart')
+                with mock.patch.object(loop_manager, 'agent_provider', return_value=provider):
+                    recovered = invoke(reopened, restarted.worker_session_id)
+                provider.run.assert_not_called()
+                self.assertEqual((recovered.message, recovered.session_id, recovered.isolation_invocation_id),
+                                 ('original result', 'saved-session', row[0]))
+                self.assertEqual(reopened.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 1)
+                self.assertFalse(process_receipt.observation(row[1], self.directory, row[0])['database_pending'])
 
     def test_scheduled_agent_preparation_wait_retries_without_a_provider_failure(self):
         from loop_manager_internal.agents import common_guidance

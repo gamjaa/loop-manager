@@ -134,12 +134,14 @@ def run_agent(
             # A real adapter still resolves and validates before launching CLI.
             collection_status = "error"
     ledger = agent_invocation_state.InvocationRepository(connection) if connection is not None else None
-    request_sha256 = hashlib.sha256(json.dumps([
-        provider, role_name, str(worktree.resolve()), prompt, read_only, level, persist_session, session_id,
-        guidance.task_id, guidance.content_hash, invocation.definition_revision if invocation else None,
-        invocation.purpose if invocation else None, invocation.target if invocation else None,
-        asdict(resolved) if resolved else None,
-    ], ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+    def request_fingerprint(request_session):
+        return hashlib.sha256(json.dumps([
+            provider, role_name, str(worktree.resolve()), prompt, read_only, level, persist_session, request_session,
+            guidance.task_id, guidance.content_hash, invocation.definition_revision if invocation else None,
+            invocation.purpose if invocation else None, invocation.target if invocation else None,
+            asdict(resolved) if resolved else None,
+        ], ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+    request_sha256 = request_fingerprint(session_id)
     if ledger is not None and invocation is not None:
         from .process_receipt import observation, result_message, delivered
         from loop_manager_internal.storage.task_calls import CallDeferred
@@ -162,11 +164,15 @@ def run_agent(
                     continue
                 if 'started_at' not in saved and saved.get('outcome', {}).get('kind') == 'database_wait':
                     continue  # No physical invocation to replay or consume.
-                if saved.get('request_sha256') != request_sha256:
-                    raise ValueError('저장 대기한 Agent 호출의 요청 입력이 다릅니다.')
                 outcome = saved.get('outcome')
                 if outcome is None or outcome['code'] is None:
                     raise ValueError('저장 대기한 Agent 호출의 역할 결과가 부족합니다.')
+                original_session = saved.get('request_session_id', session_id)
+                if (session_id != original_session and (session_id is None
+                        or session_id not in (saved.get('session_id'), outcome['session_id']))):
+                    raise ValueError('저장 대기한 Agent 호출과 다른 session 요청입니다.')
+                if saved.get('request_sha256') != request_fingerprint(original_session):
+                    raise ValueError('저장 대기한 Agent 호출의 요청 입력이 다릅니다.')
                 if ledger.reconcile_observations(state_dir=state_dir, invocation_id=previous_identity):
                     raise DatabaseWaitTimeout('기존 Agent 호출의 DB 확정 대기')
                 stored = connection.execute('''SELECT result_kind, result_code, session_id,
@@ -223,7 +229,7 @@ def run_agent(
         except sqlite3.Error:
             collection_status = "error"
 
-    observations = {'request_sha256': request_sha256}
+    observations = {'request_sha256': request_sha256, 'request_session_id': session_id}
     def remember(**facts):
         nonlocal collection_status
         observations.update(facts)

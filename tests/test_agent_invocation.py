@@ -282,7 +282,8 @@ class RunnerTests(TestCase):
         from loop_manager_internal.storage.db_access import open_connection, DatabaseWaitTimeout
         from loop_manager_internal.storage.task_calls import CallDeferred
         from loop_manager_internal.agents import process_receipt
-        for mode in ('matching', 'missing', 'changed_request', 'changed_session', 'observed_session',
+        for mode in ('matching', 'legacy_matching', 'legacy_observed_session', 'missing',
+                     'changed_request', 'changed_session', 'observed_session',
                      'changed_message', 'changed_ledger', 'changed_session_owner', 'exception'):
             with self.subTest(mode=mode):
                 path = self.state_dir / (mode + '.db')
@@ -323,7 +324,12 @@ class RunnerTests(TestCase):
                 reopened.row_factory = sqlite3.Row
                 state.InvocationRepository(reopened).reconcile_interrupted(state_dir=self.state_dir)
                 kwargs['connection'] = reopened
-                if mode in {'changed_session', 'observed_session'}:
+                if mode in {'legacy_matching', 'legacy_observed_session'}:
+                    receipt = process_receipt.receipt_path(launch)
+                    root = json.loads(receipt.read_text(encoding='utf-8'))
+                    del root['invocation_observation']['request_session_id']
+                    receipt.write_text(json.dumps(root), encoding='utf-8')
+                if mode in {'changed_session', 'observed_session', 'legacy_observed_session'}:
                     from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
                     repository = GuidanceRepository(reopened)
                     task_id = repository.session_task('repo', 'codex', 'session')
@@ -342,7 +348,7 @@ class RunnerTests(TestCase):
                 provider = mock.Mock()
                 provider.run.side_effect = AssertionError('provider must not be repeated')
                 with mock.patch.object(manager, 'agent_provider', return_value=provider):
-                    if mode == 'matching':
+                    if mode in {'matching', 'legacy_matching', 'observed_session'}:
                         result = manager.run_agent(*arguments, 'prompt', **kwargs)
                         self.assertEqual((result.code, result.message, result.usage.input_tokens, result.isolation_invocation_id),
                                          (0, 'original role result', 7, identity))
@@ -352,7 +358,7 @@ class RunnerTests(TestCase):
                 provider.run.assert_not_called()
                 self.assertEqual(reopened.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 1)
                 saved = process_receipt.observation(str(process_receipt.receipt_path(launch)), self.state_dir, identity)
-                self.assertEqual(saved['database_pending'], mode != 'matching')
+                self.assertEqual(saved['database_pending'], mode not in {'matching', 'legacy_matching', 'observed_session'})
 
     def test_callback_database_requests_retry_without_replaying_the_session_callback(self):
         from loop_manager_internal.storage.db_access import open_connection

@@ -444,7 +444,12 @@ def scheduled_call(kind):
                                 except (OSError, ValueError, TypeError) as error:
                                     events.emit('Agent 결과 전달 표식 저장 실패', level='WARN', invocation_id=identity,
                                                 error_type=type(error).__name__)
-                                    raise task_calls.CallDeferred('Agent 결과 전달 표식 저장 대기') from error
+                                    # Keep the original response and request on this stack;
+                                    # an outer task retry would add last_error to its prompt.
+                                    scheduler.check_project(task.repo)
+                                    with scheduler.condition:
+                                        scheduler.condition.wait(.2)
+                                    continue
                     return result
                 except DatabaseWaitTimeout:
                     if raised and not isinstance(raised[-1], DatabaseWaitTimeout):

@@ -148,6 +148,15 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_
 - 현재 후보에서 공통 targeted runner로 개별 unit 12개를 실행해 모두 success(exit 0)였다. 준비 원자 재시도, launch/targeted 결합의 BUSY·만료·handoff, 실제 관측·원문·요청 session 복구, caller rollback, 전달 표식 실패 뒤 재개, 실제 종료 뒤 독립 작업 배정과 종료 불명 보존, 손상 receipt 거부, targeted caller transaction 및 기존 scope/Planner 중단 재개를 확인했다. 이전 후보의 성공 결과를 이번 실행 근거로 재사용하지 않았다.
 - base/head 전체 `git diff --check`도 통과했다. 전체 verify·실제 Agent CLI·Windows native 검증은 실행하지 않았으며 현재 후보의 전체 verify와 Review는 Manager에게 인계한다.
 
+### Review 재교정: 관리 재진입 입력 보존 (2026-10-25)
+
+- `review:loop_manager_internal/agents/invocation_service.py::run_agent::restart-request-session-loss`(occurrence 1, revision 1)과 `review:loop_manager_internal/application/task_scheduling.py::scheduled_call::delivery-acknowledgement-loss`(occurrence 2, revision 2)을 교정했다. 앞선 session 정확 일치와 전달 표식 `CallDeferred` 방식은 실제 재진입을 막았으므로 이번 구현으로 대체한다.
+- 원래 요청 session을 기존 receipt의 `request_session_id`(신규 요청은 null)에 보존한다. 현재 session이 원래 값 또는 같은 invocation의 callback·결과 관측 값일 때만 원래 요청 session으로 지문을 재계산한다. 다른 session·다른 입력·결과/귀속 충돌의 보류는 유지한다. 필드는 null/비어 있지 않은 문자열만 허용하며, 구형 관측은 현재 session으로 원래 지문이 일치할 때만 복구하고 원래 값을 추정하지 않는다.
+- 관리 전달 표식 오류는 응답과 요청을 현재 스택에 유지하고 local pause/handoff 확인과 짧은 대기 뒤 표식만 재시도한다. `run_project_tasks()`의 일반 예외 처리로 넘겨 `last_error`와 Worker prompt를 변경하지 않으며, provider 재호출·추가 invocation·실행 자리 재점유 없이 확정 뒤 응답을 반환한다. 중단 시 기존 미전달 receipt와 결과 원문을 보존한다. PRODUCT·ARCHITECTURE의 소유 계약도 이 구현으로 정합화했다.
+- 기존 직접 호출 테스트 `test_delivery_marker_failure_defers_until_acknowledged_and_next_request_runs`를 `test_delivery_marker_retry_keeps_the_managed_request_and_next_call_runs`로 대체했다. 전자의 별도 재호출은 실제 관리 예외 경계를 검증하지 못했다. 대체 회귀는 실제 `run_project_tasks()`·작업 연결·예약·receipt 쓰기를 거쳐 표식 두 번 실패 뒤 같은 dispatch의 응답 전달, `last_error`·prompt 불변, 다음 요청 새 실행·호출 ID, 최종 pending 해제와 자리 정리를 확인한다. 불필요해진 전용 fixture는 없다.
+- 신규 `TaskSchedulingTests.test_restart_uses_the_worker_session_saved_by_the_start_callback`은 실제 `observe_worker_session()` callback 저장 뒤 결과 DB 확정에서 중단하고 새 DB 연결의 Worker 상태에서 session을 읽어 재진입한다. 원래 요청 null과 관측 session의 관계, 같은 invocation/응답 복구와 provider 비재실행을 확인한다. 기존 복구 unit은 같은 작업의 다른 session 거부와 결과 session 허용, 구형 요청 session metadata의 정확 일치/추정 거부를 함께 확인한다. 손상 receipt unit은 잘못된 요청 session 타입의 pending 보존을 확인한다.
+- 공통 targeted runner로 위 신규 2개 unit과 `RunnerTests.test_storage_pending_restart_consumes_existing_message_or_holds_without_provider`, `ProcessReceiptTest.test_malformed_or_foreign_invocation_observation_preserves_pending_state_and_reservation`을 실행해 4개 success를 기록했다. 구형 metadata 회귀 보강 뒤 복구 unit 하나를 같은 runner로 다시 실행해 success(exit 0)였다. 이번 호출의 본문 failure/error는 없으며 전체 verify·실제 Agent CLI·Windows native 검증은 실행하지 않았다.
+
 ## Decision Log
 
 - 이번 R-091 delta에서 요청 한도 소진을 다음 외부 실행 전용 pause로 고정하지 않는다. 같은 실행의 저장 재개에서도 실제 provider 결과·호출 identity·필수 증거 gate를 보존하며 기존 G-303 dependency와 독립된 DB 확정 목표를 유지한다. 대기열·단계 실패 정책은 G-297/G-313의 책임이며 새 순환 dependency를 만들지 않는다. 구현·테스트는 실행하지 않았다.
