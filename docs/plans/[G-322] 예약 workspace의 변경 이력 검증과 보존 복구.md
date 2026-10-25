@@ -77,6 +77,9 @@ R-055 W01–W03·W06의 예약 workspace를 승인된 생성·후속 변경 근�
 
   재실행 결과: 3개 통과. journal fixture의 plan_id와 plan_path가 서로 다른 오류를 교정했다. 이후 실제 runtime factory의 예약 관측/기존 경계, 미완료 commit·push·PR intent와 unmerged 관측, 사용자 operation 비재구성, 현대/기존 rebase 연결 및 원격 PR 경쟁은 관련 최소 case에서 통과했다. `git diff --check`도 통과했다.
 
+- Manager 전체 verify 피드백 `verify:4b4aa95b47be19e975e0e174148c21194e3ac6e546a144bc30268c71af71154e` occurrence 1/revision 1의 실패 원문을 확인했다. 실제 Git 예약 복구 두 case의 공통 원인은 `workspace_service.make_worktree()`의 `reservation_validator` 인자/전달 누락이었다. 공용 adapter를 교정하고 기존 공통 판정 unit case가 `loop_manager.make_worktree()` 공개 조립 경로를 거치도록 변경했다. 수동 journal 경합 실패는 같은 thread의 임의 Git lease까지 재사용한 것이 원인이어서, 열린 handle의 owner도 추적하고 생성 kind·예약 복구 owner·명시적 plan owner가 맞을 때만 journal 중첩 호출을 허용하도록 제한했다. 거부 assertion이나 native 회귀를 제거·약화하지 않았다.
+- 이 피드백 수정의 targeted runner 명령은 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_remote_work_adoption.RemoteCreationEvidenceTests.test_reserved_owned_commit_uses_shared_history_without_clean_reset tests.test_task_scheduling.TaskSchedulingTests.test_journal_rejects_same_thread_lease_from_another_owner tests.test_task_scheduling.TaskSchedulingTests.test_reserved_workspace_reuses_only_open_same_thread_resource_leases`이며 3개가 통과했다. Git 관측만 double로 제공하는 공개 adapter 경로와, 실제 lease에서 다른 owner/plan의 apply 0회·정상 생성 journal 재사용을 검증했다. `git diff --check` 통과. Worker는 보고된 native Git 통합 case와 전체 verify를 재실행하지 않았고, 이 피드백의 전체 verify 해소 판정은 Manager 재검증에 남아 있다.
+
 ## Decision Log
 
 - G-189의 기존 전수 감사와 G-297의 배정 직전 자격 검사는 이 생성→변경 이력의 예약 복구를 구현하지 않는다. 신규 작업은 R-055 W01–W03·W06의 남은 경계를 맡고, G-323은 그 판정으로 차단 범위를 정하며 G-189는 두 작업 뒤 후속 소비만 감사한다. 직접 구현에 소급 ExecPlan이나 검증 성공을 만들지 않는다.

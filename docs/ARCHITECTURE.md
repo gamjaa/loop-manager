@@ -340,7 +340,7 @@ Agent preflight의 digest는 현재 역할·canonical worktree·repository·작�
 
 등록 관측은 선택 자원의 존재·HEAD·branch·lock과 index tree를 담는다. unmerged index는 `write-tree` 대신 NUL 구분 stage 원문을 보존한 관측으로 표현하고, 전체 snapshot의 stage·파일·operation도 함께 재확인한다. 근거가 없거나 손상·불일치한 상태는 소유권을 확정하지 않으며 reset·강제 checkout·일괄 파일 복원·사용자 operation abort로 우회하지 않는다.
 
-`recovery/plan_recovery.py`가 대상 plan·branch·worktree·Git 자원 lease와 writer 종료/미시작을 먼저 확인한다. 현재 process/thread의 열린 handle로 확인되는 기존 lease만 이어 쓰고, 다른 복구·수동 묶음·게시 claim과 종료 불명 호출은 보존·거부한다. Git·프로세스·원격 관측은 DB 쓰기 처리 밖에서 수행한다. 확정 직전의 local 자원·PR 관측과 짧은 transaction의 작업·checkpoint generation·호출 예약·invocation·인수 grant/소유 claim 재검사로 낡은 결과의 반영을 막는다. DB 실패에는 소유권/해제 변경을 함께 rollback하고 기존 예약·경쟁 변경·session·실패·성공 감사를 보존한다. 복구만으로 단계 성공이나 최신 base 수용을 기록하지 않는다.
+`recovery/plan_recovery.py`가 대상 plan·branch·worktree·Git 자원 lease와 writer 종료/미시작을 먼저 확인한다. 현재 process/thread의 열린 handle로 확인되는 기존 lease만 이어 쓴다. journal의 중첩 생성·생성 복구 호출은 `workspace-reservation-recovery` 소유 Git lease에 한정하고, 생성 owner가 명시되면 해당 plan lease도 확인한다. 같은 thread가 가진 다른 소유자의 Git lease는 빌리지 않으며 다른 복구·수동 묶음·게시 claim과 종료 불명 호출은 보존·거부한다. Git·프로세스·원격 관측은 DB 쓰기 처리 밖에서 수행한다. 확정 직전의 local 자원·PR 관측과 짧은 transaction의 작업·checkpoint generation·호출 예약·invocation·인수 grant/소유 claim 재검사로 낡은 결과의 반영을 막는다. DB 실패에는 소유권/해제 변경을 함께 rollback하고 기존 예약·경쟁 변경·session·실패·성공 감사를 보존한다. 복구만으로 단계 성공이나 최신 base 수용을 기록하지 않는다.
 
 ### 기본 worktree 동기화
 

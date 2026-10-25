@@ -57,17 +57,18 @@ class RemoteCreationEvidenceTests(TestCase):
             validator = lambda current: workspace.validate_reserved_worktree_history(
                 root / 'state', repo, worktree, branch, 'G-047', current, snapshot,
                 checkpoint=checkpoint, git=effects.git, base='main')
-            with mock.patch.object(workspace.manager_git_journal, 'recover_active'), \
+            with mock.patch.object(lm, '_workspace_effects_make_worktree', return_value=effects), \
+                 mock.patch.object(workspace.manager_git_journal, 'recover_active'), \
                  mock.patch.object(workspace.manager_git_journal, 'verified_managed_transitions',
                     side_effect=lambda *_a, **kwargs: ([{'intent': {'expected': created}, 'result': {'observed': created}}]
                         if kwargs['kind'] == 'managed_worktree_create' else [])):
-                self.assertEqual(workspace.make_worktree(effects, repo, worktree, branch, 'main',
+                self.assertEqual(lm.make_worktree(repo, worktree, branch, 'main',
                     ownership_reserved=True, expected_head=created_head, journal_state_dir=root / 'state',
                     journal_owner='plan:G-047', reservation_validator=validator), 'existing')
                 effects.validate_reserved_worktree.assert_not_called()
                 effects._write_managed_worktree_receipt.assert_not_called()
                 checkpoint = replace(checkpoint, operation='commit', expected_head=created_head)
-                self.assertEqual(workspace.make_worktree(effects, repo, worktree, branch, 'main',
+                self.assertEqual(lm.make_worktree(repo, worktree, branch, 'main',
                     ownership_reserved=True, expected_head=created_head, journal_state_dir=root / 'state',
                     journal_owner='plan:G-047', reservation_validator=validator), 'existing')
                 self.assertEqual(checkpoint.operation, 'commit')
