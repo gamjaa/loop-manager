@@ -12,6 +12,33 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKi
 
 
 class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
+    def test_reserved_live_writer_stops_before_worktree_preparation(self):
+        from loop_manager_internal.storage import task_calls
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        owner = task_calls.reserve(self.connection, Path('/state'), 'repo', 'G-047', 'agent', 'run')
+        task_calls.mark_uncertain(owner)
+        result = self.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.effects.workspace.make_worktree.assert_not_called()
+        self.effects.agent.capture_git_snapshot.assert_not_called()
+        self.effects.workspace.mark_execplan_workspace_owned.assert_not_called()
+
+    def test_reserved_new_writer_before_confirmation_keeps_ownership_pending(self):
+        from loop_manager_internal.storage import task_calls
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.effects.workspace.make_worktree.side_effect = lambda *_a, **_k: task_calls.reserve(
+            self.connection, Path('/state'), 'repo', 'G-047', 'agent', 'new-run')
+        result = self.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.effects.workspace.mark_execplan_workspace_owned.assert_not_called()
+        self.assertEqual(self.state.active_execplan('repo')['workspace_owned'], lm.WORKSPACE_RESERVED)
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM task_call_reservations').fetchone())
+
     def test_reserved_resource_race_does_not_confirm_ownership(self):
         worktree = str(Path('/state/G-047').resolve())
         initial = lm.GitSnapshot('owned-head', 'loop-manager/G-047', {}, {}, {},

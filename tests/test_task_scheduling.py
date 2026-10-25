@@ -54,6 +54,34 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         return scheduling.TaskScheduler(replace(self.config, **values), database.connect_database,
                                          self.directory, self.connection)
 
+    def test_reserved_workspace_reuses_only_open_same_thread_resource_leases(self):
+        from contextvars import Context, copy_context
+        from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
+        from loop_manager_internal.runtime.contracts import ProcessLockBusyError
+        from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned
+        worktree = str((self.directory / 'reserved').resolve())
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET workspace_owned=2,branch='reserved',worktree=? "
+                                    "WHERE repo='A' AND plan_id='G-001'", (worktree,))
+        resources = ['plan:G-001', 'branch:reserved', 'worktree:' + worktree]
+        with resource_locks(self.directory, 'A', resources, owner='task-execution'):
+            with reserved_workspace_ownership(self.connection, self.directory, 'A', 'G-001') as proof:
+                proof.check()
+            inherited = copy_context()
+            observed = []
+            thread = threading.Thread(target=lambda: observed.append(
+                inherited.run(resource_owned, self.directory, 'A', 'plan:G-001')))
+            thread.start()
+            thread.join(2)
+            self.assertEqual(observed, [False])
+            saved = copy_context()
+            def other_recovery():
+                with self.assertRaises(ProcessLockBusyError):
+                    with reserved_workspace_ownership(self.connection, self.directory, 'A', 'G-001'):
+                        self.fail('another recovery acquired the held plan')
+            Context().run(other_recovery)
+        self.assertFalse(saved.run(resource_owned, self.directory, 'A', 'plan:G-001'))
+
     def test_parallel_block_uses_selected_plan_and_preserves_representative(self):
         from loop_manager_internal.recovery import block_service
         from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason, decide

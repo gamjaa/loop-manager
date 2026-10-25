@@ -64,6 +64,116 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         return loop_manager.resume_project_block_if_safe(
             self.connection, Path(self.repo), Path('/state'), self.repo)
 
+    def test_unconfirmed_writer_prevents_git_observation_and_reservation_release(self):
+        from loop_manager_internal.storage import task_calls
+        task_calls.ensure_schema(self.connection)
+        self.connection.commit()
+        owner = task_calls.reserve(self.connection, Path('/state'), self.repo, 'G-001', 'agent', 'run')
+        task_calls.mark_uncertain(owner)
+        self.assertFalse(self.resume())
+        self.capture.assert_not_called()
+        self.journal.assert_not_called()
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM task_call_reservations').fetchone())
+
+    def test_not_started_writer_is_preserved_while_reservation_is_confirmed(self):
+        from loop_manager_internal.storage import task_calls
+        task_calls.ensure_schema(self.connection)
+        self.connection.commit()
+        owner = task_calls.reserve(self.connection, Path('/state'), self.repo, 'G-001', 'verify', 'run')
+        self.assertTrue(self.resume())
+        self.assertEqual(self.connection.execute('SELECT token FROM task_call_reservations').fetchone()[0], owner.token)
+        self.assertEqual(self.connection.execute('SELECT active_sha FROM exec_plans').fetchone()[0], self.before['active_sha'])
+
+    def test_writer_reservation_added_during_observation_preserves_gate(self):
+        from loop_manager_internal.storage import task_calls
+        task_calls.ensure_schema(self.connection)
+        self.connection.commit()
+        calls = 0
+        def observe(*_):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                task_calls.reserve(self.connection, Path('/state'), self.repo, 'G-001', 'agent', 'new-run')
+            return self.snapshot
+        self.capture.side_effect = observe
+        self.assertFalse(self.resume())
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+
+    def test_result_and_session_without_physical_agent_exit_do_not_release_reservation(self):
+        from loop_manager_internal.storage import agent_invocation_state
+        agent_invocation_state.ensure_schema(self.connection)
+        with self.connection:
+            self.connection.execute("""INSERT INTO agent_invocations
+                (invocation_id,repo,plan_id,role,provider,model,effort,session_id,transition,attempt,
+                 started_at,execution_status,execution_started_at,finished_at,result_kind,result_code)
+                VALUES ('writer',?,'G-001','worker','codex','model','high','saved-session',
+                        'resume',1,'start','executed','started','result-collected','success',0)""", (self.repo,))
+        self.assertFalse(self.resume())
+        self.capture.assert_not_called()
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+        with self.connection:
+            self.connection.execute("UPDATE agent_invocations SET execution_finish_evidence='provider_process_finished'")
+        self.assertTrue(self.resume())
+
+    def test_owned_call_proves_prepared_agent_did_not_start(self):
+        from loop_manager_internal.storage import agent_invocation_state, task_calls
+        agent_invocation_state.ensure_schema(self.connection)
+        task_calls.ensure_schema(self.connection)
+        self.connection.commit()
+        task_calls.reserve(self.connection, Path('/state'), self.repo, 'G-001', 'agent', 'run')
+        with self.connection:
+            self.connection.execute("""INSERT INTO agent_invocations
+                (invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at,execution_status)
+                VALUES ('writer',?,'G-001','worker','codex','model','high','start',1,'start','prepared')""", (self.repo,))
+            self.connection.execute("UPDATE task_call_reservations SET invocation_id='writer'")
+        self.assertTrue(self.resume())
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM task_call_reservations').fetchone())
+        self.assertIsNone(self.connection.execute('SELECT execution_started_at FROM agent_invocations').fetchone()[0])
+
+    def test_other_plan_claiming_same_resource_is_not_a_recovery_owner(self):
+        self.plan('G-002', 'IMPLEMENTING', branch=self.branch)
+        self.assertFalse(self.resume())
+        self.capture.assert_not_called()
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()), self.before)
+
+    def test_manual_owner_prevents_reserved_resource_observation(self):
+        from loop_manager_internal.storage import manual_work_state
+        manual_work_state.ensure_schema(self.connection)
+        with self.connection:
+            self.connection.execute("""INSERT INTO manual_work_groups
+                (repo,group_id,kind,source_branch,requirements,source_head,base_sha,state,members,documents,owner_id)
+                VALUES (?,'manual','existing','source','[]','head','base','MANUAL_WORKING','["G-001"]','[]','G-001')""",
+                (self.repo,))
+            self.connection.execute("INSERT INTO manual_work_members VALUES (?,'G-001','manual')", (self.repo,))
+        self.assertFalse(self.resume())
+        self.capture.assert_not_called()
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+        # A group can reserve the resource before its execution rows exist.
+        with self.connection:
+            self.connection.execute('DELETE FROM manual_work_members')
+            self.connection.execute("UPDATE manual_work_groups SET members='[]',owner_id=NULL,branch=?,worktree=?",
+                                    (self.branch, str(self.worktree)))
+        self.assertFalse(self.resume())
+        self.capture.assert_not_called()
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+
+    def test_publication_owner_prevents_reserved_resource_observation(self):
+        import hashlib
+        from loop_manager_internal.storage.database import GENERAL_PLANNING_PUBLICATIONS_SCHEMA
+        self.connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+        manifest = json.dumps({'plans': [['plan.md', {'id': 'G-001'}]],
+                               'revisions': [], 'deletions': [], 'publication_paths': []})
+        with self.connection:
+            self.connection.execute("""INSERT INTO general_planning_publications
+                (repo,stage,base_sha,commit_sha,snapshot_token,specification_fingerprint,planning_fingerprint,manifest,manifest_hash)
+                VALUES (?,'prepared','base','head','snapshot','spec','planning',?,?)""",
+                (self.repo, manifest, hashlib.sha256(manifest.encode()).hexdigest()))
+        self.assertFalse(self.resume())
+        self.capture.assert_not_called()
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+
     def test_reserved_creation_releases_stale_project_block_without_changing_execution_basis(self):
         self.assertTrue(self.resume())
         after = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())

@@ -15,6 +15,9 @@ from loop_manager_internal.git import managed_rebase_adoption
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
+from loop_manager_internal.storage.task_calls import CallDeferred
+from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.scoped_blocking import GUIDANCE_BLOCK_REASON
 from loop_manager_internal.recovery.scoped_blocking import PR_CLOSED_BLOCK_REASON
@@ -83,6 +86,20 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
     state_dir: Path,
     repo: str,
 ) -> bool:
+    block = scoped_blocking.project_block(connection, repo)
+    plan = (connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                               (repo, block['plan_id'])).fetchone() if block is not None and block['plan_id'] else None)
+    if plan is None or int(plan['workspace_owned']) != WORKSPACE_RESERVED:
+        return _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo)
+    try:
+        with reserved_workspace_ownership(connection, state_dir, repo, str(plan['plan_id'])) as owner:
+            return _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo,
+                                                 reservation_owner=owner)
+    except (CallDeferred, ProcessLockBusyError, runtime_state.RuntimeStateError):
+        return False
+
+
+def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo, *, reservation_owner=None):
     """Release only a project block whose original safety boundary is restored."""
 
     block = scoped_blocking.project_block(connection, repo)
@@ -209,6 +226,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
     if (scoped_blocking.is_scope_baseline_block(block) and not plan['worktree']
             and plan['status'] not in {*ACTIVE_EXECPLAN_STATUSES, 'PLAN_BLOCKED'}):
         with runtime_state._transaction(connection):
+            if reservation_owner is not None:
+                reservation_owner.check()
             if (not scoped_blocking.project_cause_matches(connection, block)
                     or dict(runtime_state.project_row(connection, repo)) != dict(project)
                     or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
@@ -292,6 +311,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                 return False
             status = str(plan["status"])
             with runtime_state._transaction(connection):
+                if reservation_owner is not None:
+                    reservation_owner.check()
                 if (not scoped_blocking.project_cause_matches(connection, block)
                         or dict(runtime_state.project_row(connection, repo)) != dict(project)
                         or dict(connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
@@ -344,6 +365,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                         confirmed, checked))):
             return False
         if reserved_recovered:
+            if reservation_owner is not None:
+                reservation_owner.check()
             repository = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
             if repository.get(repo, plan_id) != checkpoint:
                 return False

@@ -12,6 +12,9 @@ from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, va
 import sys
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
+from loop_manager_internal.storage.task_calls import CallDeferred
+from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.execution.execution_checkpoint import CheckpointAction, assess, observe
@@ -711,6 +714,17 @@ class WorkspaceHandler:
             )
 
     def prepare(self) -> ExecutionContext | ExecutionOutcome:
+        plan = self.ports.state.active_execplan(self.ports.identity.repo)
+        if plan is None or int(plan['workspace_owned']) != self.ports.contract.WORKSPACE_RESERVED:
+            return self._prepare()
+        try:
+            with reserved_workspace_ownership(self.ports.state.connection, self.ports.identity.state_dir,
+                                              self.ports.identity.repo, str(plan['plan_id'])) as owner:
+                return self._prepare(reservation_owner=owner)
+        except (CallDeferred, ProcessLockBusyError, RuntimeStateError) as error:
+            return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE, detail=str(error))
+
+    def _prepare(self, *, reservation_owner=None) -> ExecutionContext | ExecutionOutcome:
         row = self.ports._row()
         branch = str(row['branch'] or '')
         worktree = Path(str(row['worktree'] or ''))
@@ -958,6 +972,8 @@ class WorkspaceHandler:
                             or reserved_observation.worktrees[resource] != confirmed.worktrees.get(resource)):
                         raise RuntimeStateError('예약 workspace 검증 중 대상 Git 자원이 변경됐습니다.')
                 with runtime_state._transaction(self.ports.state.connection):
+                    if reservation_owner is not None:
+                        reservation_owner.check()
                     self.ports.state.check()
                     if (dict(self.ports.state.active_execplan(self.ports.identity.repo)) != dict(catalog_plan)
                             or (reserved_checkpoint is not None
@@ -965,7 +981,10 @@ class WorkspaceHandler:
                         raise RuntimeStateError('예약 workspace 검증 중 작업/checkpoint가 변경됐습니다.')
                     self.ports.mark_execplan_workspace_owned(self.ports.identity.repo, plan_id)
             else:
-                self.ports.mark_execplan_workspace_owned(self.ports.identity.repo, plan_id)
+                with runtime_state._transaction(self.ports.state.connection):
+                    if reservation_owner is not None:
+                        reservation_owner.check()
+                    self.ports.mark_execplan_workspace_owned(self.ports.identity.repo, plan_id)
             database.record_execplan_workspace_seen(
                 self.ports.state.connection, self.ports.identity.repo, plan_id)
             self._workspace_boundary(plan_id, row, pending=False)
