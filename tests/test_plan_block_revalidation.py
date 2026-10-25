@@ -1386,6 +1386,7 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
 class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
     def test_new_planning_input_after_interruption_finishes_owned_rebase_before_new_target(self):
         from loop_manager_internal.storage import planning_review_state as reviews
+        from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
         store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
         old_target = 'c' * 40
         independent = dict(self.plan('G-107'))
@@ -1398,14 +1399,49 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                 self.coordinator.reconcile('G-106')
         saved = self.connection.execute("SELECT * FROM blocked_plan_reconciliations WHERE plan_id='G-106'").fetchone()
         self.assertEqual(saved['stage'], 'adopted')
+        revised = (b'---\nid: G-106\ntitle: Work\nsources:\n  - docs/PRODUCT.md\ndepends_on: []\n'
+                   b'complexity: low\nrisk: low\npriority: critical\n---\n\nRevised validation contract.\n')
+        revised_hash = plan_content_hash(revised)
         with self.connection:
+            self.connection.execute("UPDATE exec_plans SET content_hash=?, sources=?, current_revision_sha=? "
+                                    "WHERE plan_id='G-106'", (revised_hash, '["docs/PRODUCT.md"]', self.base))
             reviews.begin(self.connection, self.repo, purpose='delta', revision=self.base,
                 input_fingerprint='new', specification_fingerprint='spec', work_cycle='cycle', comparison_revision=None)
             reviews.validate(self.connection, self.repo, self.base, 'BLOCKED_PLAN_INPUTS: ' + json.dumps(dict(
                 revision=self.base, plans=[dict(plan_id='G-106', requirements=[dict(
                     source='docs/requirements/[R-002] Policy.md', reason='new validation policy', quote='Current policy.')])])), 'reviewed')
-            reviews.confirm(self.connection, self.repo, self.base, self.base)
+            reviews.confirm(self.connection, self.repo, self.base, self.base, revised_plan_ids=('G-106',))
         self.assertEqual(store.get(self.repo, 'G-106').target_base_oid, old_target)
+        def document(*_args):
+            self.assertFalse(self.connection.in_transaction)
+            return revised
+        self.ports.git_bytes.side_effect = document
+        for case in ('mismatched_blob', 'mismatched_dependency', 'changed_branch', 'checkpoint_race'):
+            with self.subTest(case=case):
+                def lookup(*_args):
+                    self.assertFalse(self.connection.in_transaction)
+                    if case == 'checkpoint_race':
+                        current = store.get(self.repo, 'G-106')
+                        with self.connection:
+                            store.record(self.repo, 'G-106', expected_generation=current.generation,
+                                operation=current.operation, expected_head=current.expected_head,
+                                target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                                snapshot={**current.snapshot, 'concurrent_audit': 'kept'})
+                    return revised + b'unconfirmed edit' if case == 'mismatched_blob' else revised
+                self.ports.git_bytes.side_effect = lookup
+                with self.connection:
+                    if case == 'mismatched_dependency':
+                        self.connection.execute("UPDATE exec_plans SET depends_on='[\"G-107\"]' WHERE plan_id='G-106'")
+                    elif case == 'changed_branch':
+                        self.connection.execute("UPDATE exec_plans SET branch='unowned-branch' WHERE plan_id='G-106'")
+                self.assertEqual(self.coordinator.reconcile('G-106'), 'deferred' if case == 'checkpoint_race' else 'blocked')
+                self.assertEqual(store.get(self.repo, 'G-106').operation, 'rebase')
+                self.assertEqual(store.get(self.repo, 'G-106').target_base_oid, old_target)
+                current_context = self.connection.execute("SELECT context FROM blocked_plan_reconciliations WHERE plan_id='G-106'").fetchone()[0]
+                self.assertEqual(json.loads(current_context)['identity'], json.loads(saved['context'])['identity'])
+                with self.connection:
+                    self.connection.execute("UPDATE exec_plans SET depends_on='[]', branch='loop-manager/G-106' WHERE plan_id='G-106'")
+        self.ports.git_bytes.side_effect = document
         steps = []
         def finish(*_args, **_kwargs):
             current = store.get(self.repo, 'G-106')
@@ -1424,7 +1460,8 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.ports._complete_direct_rebase_checkpoint.side_effect = finish
         self.ports._journaled_direct_rebase.side_effect = start
         self.ports.git.side_effect = lambda path, *args, **kwargs: (
-            SimpleNamespace(returncode=1, stdout='') if args[:1] == ('merge-base',) else self.git(path, *args, **kwargs))
+            SimpleNamespace(returncode=0 if args[-1] == self.base else 1, stdout='')
+            if args[:1] == ('merge-base',) else self.git(path, *args, **kwargs))
         with mock.patch.object(self.coordinator, '_publish'):
             self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
             self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
@@ -1432,7 +1469,13 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
         self.assertIsNone(store.get(self.repo, 'G-106').operation)
         self.assertEqual(store.get(self.repo, 'G-106').snapshot['audit'], 'kept')
+        self.assertEqual(store.get(self.repo, 'G-106').snapshot['concurrent_audit'], 'kept')
         self.assertEqual(dict(self.plan('G-107')), independent)
+        final_context = json.loads(self.connection.execute(
+            "SELECT context FROM blocked_plan_reconciliations WHERE plan_id='G-106'").fetchone()[0])
+        self.assertEqual(final_context['identity']['content_hash'], revised_hash)
+        self.assertEqual(final_context['identity']['sources'], '["docs/PRODUCT.md"]')
+        self.assertEqual(final_context['comparison_revision'], 'before-docs')
 
     def test_question_assessment_uses_pre_rebase_revision_after_active_sha_advances(self):
         from loop_manager_internal.storage import planning_review_state as reviews, runtime_state

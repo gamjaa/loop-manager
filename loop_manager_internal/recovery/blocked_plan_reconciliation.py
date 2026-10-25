@@ -204,6 +204,7 @@ class RecoveryWorkspaceEffects:
 class PlanRecoveryEffects(RecoveryWorkspaceEffects):
     """Explicit effects for this service; persisted decisions remain in repositories."""
     ROOT: Path
+    git_bytes: Callable[..., bytes]
     _blocked_execplan_metadata_error: Callable[..., object]
     _complete_direct_rebase_checkpoint: Callable[..., object]
     _evaluate_remote_checkpoint_cause: Callable[..., object]
@@ -281,6 +282,27 @@ class BlockedPlanReconciler:
         if context.get('planning_input', {}) != planning_review_state.reassessment(self.connection, self.repo, plan_id):
             raise InputChanged('차단 계획의 확정 planning 입력이 변경됐습니다.')
         return plan
+
+    def _confirmed_planning_identity(self, plan, context, planning_input):
+        from loop_manager_internal.catalog.execplan_catalog import parse_execplan_text, plan_content_hash
+        document_fields = ('content_hash', 'sources', 'depends_on')
+        identity = {field: plan[field] for field in IDENTITY_FIELDS}
+        if (any(identity[field] != context['identity'][field] for field in IDENTITY_FIELDS
+                if field not in document_fields)
+                or all(identity[field] == context['identity'][field] for field in document_fields)):
+            return context['identity']
+        confirmed = planning_input['confirmed_revision']
+        revision = plan['current_revision_sha']
+        if not revision or self.ports.git(self.repo_path, 'merge-base', '--is-ancestor',
+                                         revision, confirmed, check=False).returncode != 0:
+            raise InputChanged('문서 개정의 catalog revision이 확정 planning 이력에 없습니다.')
+        raw = self.ports.git_bytes(self.repo_path, 'show', f"{confirmed}:{plan['path']}")
+        declaration = parse_execplan_text(plan['path'], raw.decode('utf-8'), validate_sources=False)
+        if (plan_content_hash(raw) != plan['content_hash'] or declaration['id'] != plan['plan_id']
+                or declaration['sources'] != json.loads(plan['sources'])
+                or declaration['depends_on'] != json.loads(plan['depends_on'])):
+            raise InputChanged('확정된 ExecPlan 원문과 현재 catalog의 문서 identity가 다릅니다.')
+        return identity
 
     def _remote(self, context, *, allow_published=False):
         project = runtime_state.project_row(self.connection, self.repo)
@@ -719,14 +741,20 @@ class BlockedPlanReconciler:
                 # Keep the owned Git operation and its original target. Only
                 # refresh assessment inputs and the next desired base; pending
                 # rebase completion remains _incorporate's responsibility.
+                observed_plan = self._plan(plan_id)
+                checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, plan_id)
+                identity = self._confirmed_planning_identity(observed_plan, context, planning_input)
                 with runtime_state._transaction(self.connection):
                     current_saved = self.connection.execute(
                         'SELECT * FROM blocked_plan_reconciliations WHERE repo=? AND plan_id=?',
                         (self.repo, plan_id)).fetchone()
                     if (dict(current_saved or {}) != dict(saved)
-                            or planning_review_state.reassessment(self.connection, self.repo, plan_id) != planning_input):
+                            or planning_review_state.reassessment(self.connection, self.repo, plan_id) != planning_input
+                            or dict(self._plan(plan_id)) != dict(observed_plan)
+                            or ExecutionCheckpointRepository(self.connection).get(self.repo, plan_id) != checkpoint):
                         return 'deferred'
                     context['planning_input'] = planning_input
+                    context['identity'] = identity
                     self._check_owner(plan_id, context)
                     context['base_oid'] = row['base_oid']
                     context['remote_input_identity'] = observations.input_identity(row)

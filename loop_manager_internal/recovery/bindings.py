@@ -157,6 +157,7 @@ def register(assembly: Composition) -> None:
             _worktree_state_signature=assembly.callback('_worktree_state_signature'),
             capture_git_snapshot=assembly.callback('capture_git_snapshot'),
             git=assembly.callback('git'),
+            git_bytes=assembly.callback('git_bytes'),
             github_repository=assembly.callback('github_repository'),
             hydrate_execplan_project=assembly.callback('hydrate_execplan_project'),
             load_managed_config=assembly.callback('load_managed_config'),
