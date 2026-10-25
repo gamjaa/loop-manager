@@ -80,6 +80,7 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         repo = str(self.repository.resolve())
         with closing(loop_manager.connect_database(self.state_dir)) as connection:
             request = local_recovery_state.begin_request(connection, repo, None)
+            observed = local_recovery_state.snapshot(connection, repo, None)
 
         busy = threading.Event()
 
@@ -105,7 +106,9 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             with closing(open_connection(database, timeout=2, factory=SignalBusyConnection)) as owner:
                 owner.row_factory = sqlite3.Row
                 try:
-                    outcome.append(local_recovery_state.complete_request(owner, request, 'resolved'))
+                    outcome.append(local_recovery_state.complete_request(
+                        owner, request, 'resolved', observed,
+                    ))
                 except BaseException as error:
                     outcome.append(error)
 
@@ -132,6 +135,50 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             self.assertEqual(connection.execute(
                 'SELECT planning_error FROM projects WHERE repo=?', (repo,),
             ).fetchone()[0], 'competing planning state')
+
+    def test_complete_rejects_change_between_result_snapshot_and_finalization(self):
+        from loop_manager_internal.application import commands as commands_app
+        from loop_manager_internal.storage.db_access import open_connection
+        from loop_manager_internal.storage.local_recovery_state import LocalRecoveryRequestError
+        repo = str(self.repository.resolve())
+        database = self.state_dir / 'loop-manager.db'
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            request = local_recovery_state.begin_request(connection, repo, None)
+            run = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.COMPLETED, 0))
+            effects = commands_app.LocalRecoveryExecutionEffects(
+                operation_print=mock.Mock(), run_project_result=run,
+            )
+            complete = local_recovery_state.complete_request
+
+            def compete_then_complete(db, current_request, result, after):
+                self.assertEqual(result, 'resolved')
+                self.assertIsNone(after['planning_error_sha256'])
+                with closing(open_connection(database, timeout=2)) as other, other:
+                    other.execute(
+                        "UPDATE projects SET planning_error='new unresolved cause' WHERE repo=?",
+                        (repo,),
+                    )
+                return complete(db, current_request, result, after)
+
+            with mock.patch.object(
+                    local_recovery_state, 'complete_request', side_effect=compete_then_complete):
+                with self.assertRaisesRegex(LocalRecoveryRequestError, '결과 판단 뒤'):
+                    commands_app.execute_local_recovery_request(
+                        effects, connection, self.state_dir, request, self.config_path,
+                        planner_mutex=threading.Lock(), refactoring_review_interval=20,
+                        verify_timeout_seconds=600,
+                    )
+
+            run.assert_called_once()
+            effects.operation_print.assert_not_called()
+            saved = connection.execute(
+                'SELECT status,result,after_state FROM local_environment_recovery_requests '
+                'WHERE request_id=?', (request.request_id,),
+            ).fetchone()
+            self.assertEqual(tuple(saved), ('pending', None, None))
+            self.assertEqual(connection.execute(
+                'SELECT planning_error FROM projects WHERE repo=?', (repo,),
+            ).fetchone()[0], 'new unresolved cause')
 
     def test_record_progress_preserves_pending_request_when_target_changed(self):
         from dataclasses import replace
@@ -384,7 +431,9 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
                     connection.execute("INSERT INTO local_environment_recovery_requests "
                                        "(request_id, repo, plan_id, status, before_state) VALUES (?, ?, ?, 'pending', '{}')",
                                        ('duplicate', repo, scope))
-            local_recovery_state.complete_request(connection, legacy, 'unresolved')
+            local_recovery_state.complete_request(
+                connection, legacy, 'unresolved', local_recovery_state.snapshot(connection, repo, 'G-001'),
+            )
             renewed = local_recovery_state.begin_request(connection, repo, 'G-001')
             self.assertNotEqual(renewed.request_id, legacy.request_id)
             self.assertFalse(local_recovery_state.recheck_consumed(connection, renewed.request_id, 'G-001', 'verify'))

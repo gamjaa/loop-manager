@@ -221,17 +221,15 @@ def _require_pending_request(connection, request: LocalRecoveryRequest) -> None:
 
 def complete_request(
     connection: sqlite3.Connection, request: LocalRecoveryRequest,
-    result: str,
+    result: str, after: dict,
 ) -> dict:
     from .db_access import run_database_request
 
-    observed = snapshot(connection, request.repo, request.plan_id)
-
     def complete(db):
         _require_pending_request(db, request)
-        after = snapshot(db, request.repo, request.plan_id)
-        if after != observed:
-            raise LocalRecoveryRequestError("로컬 재검사 관측 뒤 대상 상태가 변경됐습니다.")
+        current = snapshot(db, request.repo, request.plan_id)
+        if current != after:
+            raise LocalRecoveryRequestError("결과 판단 뒤 로컬 재검사 대상 상태가 변경됐습니다.")
         serialized = json.dumps(after, sort_keys=True, separators=(",", ":"))
         changed = db.execute(
             "UPDATE local_environment_recovery_requests SET status = 'completed', "
