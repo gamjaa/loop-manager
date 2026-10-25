@@ -67,6 +67,9 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         with resource_locks(self.directory, 'A', resources, owner='task-execution'):
             with reserved_workspace_ownership(self.connection, self.directory, 'A', 'G-001') as proof:
                 proof.check()
+                from loop_manager_internal.git import manager_git_journal
+                self.assertFalse(manager_git_journal.recover_active(self.directory, repo='A', target=worktree,
+                    kind='managed_worktree_create', observe=lambda: self.fail('no active mutation'), marker=lambda *_: False))
             inherited = copy_context()
             observed = []
             thread = threading.Thread(target=lambda: observed.append(

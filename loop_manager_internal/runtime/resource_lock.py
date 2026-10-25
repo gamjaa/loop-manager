@@ -100,6 +100,8 @@ def resource_locks(state_dir: Path, repo: str, resources, *, owner: str):
 def journal_resource(function):
     @wraps(function)
     def guarded(state_dir, *, repo, target, **kwargs):
+        if resource_owned(state_dir, repo, 'git:' + target):
+            return function(state_dir, repo=repo, target=target, **kwargs)
         with resource_locks(state_dir, repo, ['git:' + target],
                             owner=kwargs.get('owner', 'git-recovery')):
             return function(state_dir, repo=repo, target=target, **kwargs)

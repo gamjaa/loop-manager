@@ -5,6 +5,7 @@ from pathlib import Path
 from contextlib import ExitStack
 from dataclasses import replace
 import copy
+import json
 from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry
 from tests.support.current_rebase import current_rebase_case
 import sqlite3
@@ -31,6 +32,42 @@ BRANCH = 'loop-manager/G-091'
 
 
 class ManagedTransitionTests(unittest.TestCase):
+    def test_current_rebase_receipt_is_available_only_to_exact_reservation_history(self):
+        from tests.support.rebase_observations import expectation, observation, decision_for
+        from loop_manager_internal.git.managed_rebase_validation import Remote
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            target = str((state / 'worktree').resolve())
+            expected = expectation(repo=REPO, plan_id='G-091', branch=BRANCH, worktree=target,
+                plan_path='docs/plans/[G-091] Work.md',
+                before_head=OLD, target_base_oid=TREE, remote=Remote(REPO, BRANCH, None))
+            observed = observation(expected, head=NEW, branch_ref=(NEW, ''),
+                registration=(f'HEAD={NEW}', f'branch=refs/heads/{BRANCH}'))
+            decision = decision_for(expected, observed)
+            before = {'head': OLD, 'branch': BRANCH, 'index': {}, 'dirty': {}, 'operations': {}}
+            after = {**before, 'head': NEW}
+            journal.begin_current_rebase(state, owner='plan:G-091', repo=REPO, target=target,
+                before=before, expected={'branch': BRANCH, 'before_head': OLD,
+                                        'target_base_oid': TREE, 'remote_oid': None})
+            self.assertTrue(journal.record_current_rebase_result(state, repo=REPO, target=target,
+                owner='plan:G-091', decision=decision, observed=after))
+            options = {'kind': 'managed_rebase', 'target': target}
+            self.assertEqual(journal.verified_managed_transitions(state, REPO, 'plan:G-091', **options), [])
+            history = journal.verified_managed_transitions(state, REPO, 'plan:G-091',
+                **options, include_current_rebase=True)
+            self.assertEqual(history[0]['intent']['before'], before)
+            self.assertEqual(history[0]['result']['observed'], after)
+            self.assertEqual(journal.verified_managed_transitions(state, REPO, 'plan:G-092',
+                **options, include_current_rebase=True), [])
+            slot = journal._slot(state, REPO, 'managed_rebase', target)
+            result = next(slot.glob('*.result.json'))
+            saved = journal._read(result)
+            saved['observed']['head'] = 'foreign-head'
+            result.write_text(json.dumps(saved), encoding='utf-8')
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.verified_managed_transitions(state, REPO, 'plan:G-091',
+                    **options, include_current_rebase=True)
+
     def test_unlocked_cleanup_recovery_accepts_changed_head_without_git_write(self):
         before = {'exists': True, 'registration': {
             'head': OLD, 'branch': f'refs/heads/{BRANCH}', 'locked': None,
@@ -1270,6 +1307,31 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     """The production factory's identity/input adapters, with no Git process."""
     _plan_text = ('---\nid: G-047\ntitle: Runtime\nsources:\n  - docs/PRODUCT.md\n'
                   'depends_on: []\ncomplexity: medium\nrisk: medium\n---\n\nOriginal body.\n')
+
+    def test_reserved_rebase_observation_keeps_checkpoint_and_requires_saved_operation(self):
+        from loop_manager_internal.git.managed_rebase_runtime import build_service
+        from tests.support.runtime import runtime_rebase_fixture
+        ports, previous = self._user_document_service()
+        connection, runtime, checkpoints, *_ = runtime_rebase_fixture(self)
+        runtime.update_plan('repo', 'G-047', plan_values={
+            'workspace_owned': 2, 'worktree': previous.expected.worktree}, enqueue=False)
+        before = checkpoints.get('repo', 'G-047')
+        arguments = (ports, connection, Path(REPO), Path('/state'), 'repo', 'G-047',
+                     Path(previous.expected.worktree), 'loop-manager/G-047')
+        with self.assertRaises(journal.MutationEvidenceError):
+            build_service(*arguments)
+        service = build_service(*arguments, allow_reserved=True)
+        service.adapters.validate_identity(service.expected)
+        self.assertEqual(service.expected.before_head, before.expected_head)
+        self.assertEqual(service.expected.target_base_oid, before.target_base_oid)
+        self.assertEqual(service.expected.generation, before.generation)
+        self.assertEqual(checkpoints.get('repo', 'G-047'), before)
+        self.assertEqual(runtime.get('repo', 'G-047').workspace_owned, 2)
+        checkpoints.record('repo', 'G-047', expected_generation=before.generation,
+            operation=None, expected_head=before.expected_head, target_base_oid=before.target_base_oid,
+            observed_remote_oid=before.observed_remote_oid, snapshot=before.snapshot)
+        with self.assertRaises(journal.MutationEvidenceError):
+            build_service(*arguments, allow_reserved=True)
 
     def test_missing_checkpoint_uses_current_metadata_and_live_remote_for_validation(self):
         from loop_manager_internal.git.managed_rebase_runtime import build_service

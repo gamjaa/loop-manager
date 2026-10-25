@@ -114,6 +114,7 @@ class ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects:
     _agent_git_resources: Callable[..., object]
     _managed_worktree_marker: Callable[..., object]
     _managed_worktree_transition_state: Callable[..., object]
+    _current_rebase_service: Callable[..., object]
     _clear_active_in_current_transaction: Callable[..., object]
     _clear_project_block_without_losing_planning_error: Callable[..., object]
     _reconcile_rebase_evidence_block: Callable[..., object]
@@ -124,6 +125,8 @@ class ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects:
     _normalize_legacy_ignored_snapshot: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     git: Callable[..., object]
+    github_repository: Callable[..., object]
+    pr_for_branch: Callable[..., object]
     hydrate_execplan_project: Callable[..., object]
     validate_agent_scope: Callable[..., object]
     validate_blocked_agent_scope: Callable[..., object]
@@ -134,6 +137,9 @@ class ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects:
 
 def _scope_reconciliation_effects_resume_project_block_if_safe(effects: ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects, ) -> scope_reconciliation.ResumeProjectBlockIfSafeEffects:
     return scope_reconciliation.ResumeProjectBlockIfSafeEffects(
+        _current_rebase_service=effects._current_rebase_service,
+        github_repository=effects.github_repository,
+        pr_for_branch=effects.pr_for_branch,
         _agent_git_resources=effects._agent_git_resources,
         _managed_worktree_marker=effects._managed_worktree_marker,
         _managed_worktree_transition_state=effects._managed_worktree_transition_state,

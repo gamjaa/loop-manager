@@ -67,6 +67,77 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         return loop_manager.resume_project_block_if_safe(
             self.connection, Path(self.repo), Path('/state'), self.repo)
 
+    def test_owned_detached_rebase_recovers_reservation_without_completing_operation(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.git.managed_rebase_validation import IndexEntry, WorktreeFile, RebaseStatus
+        current = 'd' * 40
+        self.checkpoints.record(self.repo, 'G-001', expected_generation=0, operation='rebase',
+            expected_head=self.head, target_base_oid='b' * 40, observed_remote_oid=None,
+            snapshot={'before_head': self.head, 'target_base': 'b' * 40, 'rebase_policy': 'current_state'})
+        checkpoint = self.checkpoints.get(self.repo, 'G-001')
+        self.snapshot = replace(self.snapshot, head=current, branch=None,
+            index={'app.py': ('M 100644 conflict 2',)}, dirty={'app.py': (('unstaged',), 'preserved-conflict')},
+            operations={'rebase-merge': 'owned-rebase'})
+        self.live = {**self.live, 'index': {'unmerged': 'conflict-stage'},
+                     'registration': {**self.live['registration'], 'head': current, 'branch': None}}
+        observed = SimpleNamespace(head=current, branch=None,
+            index=(IndexEntry('app.py', '100644', 'conflict', 2, 'M', 0x2000),),
+            files=(WorktreeFile('app.py', ('unstaged',), '100644', 'preserved-conflict'),),
+            operations=tuple(self.snapshot.operations.items()))
+        service = mock.Mock(expected=SimpleNamespace(generation=checkpoint.generation,
+            before_head=self.head, target_base_oid='b' * 40))
+        service.observe.return_value = (observed, SimpleNamespace(status=RebaseStatus.WAITING))
+        with mock.patch.object(loop_manager, '_current_rebase_service', return_value=service) as factory:
+            service.expected.target_base_oid = 'foreign-target'
+            self.assertFalse(self.resume())
+            service.expected.target_base_oid = 'b' * 40
+            self.assertTrue(self.resume())
+            self.assertTrue(factory.call_args.kwargs['allow_reserved'])
+        after = self.checkpoints.get(self.repo, 'G-001')
+        self.assertEqual(after.operation, 'rebase')
+        self.assertEqual(after.expected_head, checkpoint.expected_head)
+        self.assertEqual(after.target_base_oid, checkpoint.target_base_oid)
+        self.assertEqual(self.connection.execute('SELECT active_sha FROM exec_plans').fetchone()[0], self.before['active_sha'])
+        service.adopt.assert_not_called()
+        service.normalize_frontmatter.assert_not_called()
+
+    def test_existing_adoption_checks_grant_pr_and_keeps_original_head(self):
+        from loop_manager_internal.storage import database
+        with self.connection:
+            self.connection.execute('CREATE TABLE manager_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            self.connection.execute("INSERT INTO manager_metadata VALUES ('remote_adoption_bootstrap','null')")
+            self.connection.execute("UPDATE projects SET origin='fixture/repository'")
+        database.record_remote_work_adoption_catalog(self.connection, self.repo, self.head, ('G-001',))
+        self.connection.commit()
+        self.checkpoints.record(self.repo, 'G-001', expected_generation=0, operation=None,
+            expected_head=self.head, target_base_oid='b' * 40, observed_remote_oid=self.head,
+            snapshot={'remote_adoption': {'repo': self.repo, 'plan_id': 'G-001', 'version': 1,
+                'base': 'main', 'branch': self.branch, 'head': self.head}})
+        pr = {'url': 'https://github.com/fixture/repository/pull/1', 'headRefName': self.branch,
+              'baseRefName': 'main', 'headRefOid': self.head, 'state': 'OPEN'}
+        with mock.patch.object(loop_manager, 'git', return_value=mock.Mock(returncode=0,
+                stdout='https://github.com/fixture/repository.git')), \
+             mock.patch.object(loop_manager, 'pr_for_branch', return_value={**pr, 'baseRefName': 'foreign'}):
+            self.assertFalse(self.resume())
+        with mock.patch.object(loop_manager, 'git', return_value=mock.Mock(returncode=0,
+                stdout='https://github.com/fixture/repository.git')), \
+             mock.patch.object(loop_manager, 'pr_for_branch', return_value=pr) as pr_query:
+            pr_query.side_effect = [pr, {**pr, 'headRefOid': 'foreign-head'}]
+            self.assertFalse(self.resume())
+            self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 2)
+            pr_query.side_effect = None
+            grant = self.connection.execute("SELECT value FROM manager_metadata WHERE key LIKE 'remote_adoption:%'").fetchone()[0]
+            with self.connection:
+                self.connection.execute("UPDATE manager_metadata SET value='{}' WHERE key LIKE 'remote_adoption:%'")
+            self.assertFalse(self.resume())
+            with self.connection:
+                self.connection.execute("UPDATE manager_metadata SET value=? WHERE key LIKE 'remote_adoption:%'", (grant,))
+            self.assertTrue(self.resume())
+        checkpoint = self.checkpoints.get(self.repo, 'G-001')
+        self.assertEqual(checkpoint.snapshot['remote_adoption']['head'], self.head)
+        self.assertEqual(checkpoint.snapshot['accepted_work_branch'], self.head)
+        self.assertEqual(checkpoint.expected_head, self.head)
+
     def test_owned_commit_rebase_and_recorded_dirty_output_preserve_workspace(self):
         import hashlib
         from loop_manager_internal.storage import agent_invocation_state
@@ -130,6 +201,9 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
                 with self.assertRaisesRegex(sqlite3.OperationalError, 'write failed'):
                     self.resume()
             self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+            self.rebases = [{'intent': {'expected': {'branch': self.branch, 'before_head': committed}},
+                             'result': {'status': 'current_state',
+                                        'observed': json.loads(replace(start, scope_id=None, scope_start_digest=None).serialize())}}]
             self.assertTrue(self.resume())
         after = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
         self.assertEqual(after['workspace_owned'], 1)

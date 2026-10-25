@@ -870,6 +870,10 @@ PR 이력 전체의 repository·base·head 관계를 대조한 뒤 실제 MERGED
 
 #### 작업 공간과 ignored 파일 보존
 
+Manager가 생성했지만 DB 소유권 확정 전에 중단된 ExecPlan 예약은 생성·승인된 후속 변경 근거와 현재 등록·HEAD·index·파일·operation이 연결되면 기존 자원에서 확정·재개한다. 생성 HEAD와 실행·검증 기준 `active_sha`는 독립적으로 보존한다. 최신 base 포함이나 깨끗한 작업 공간을 소유권 복구의 일괄 조건으로 요구하지 않으며 commit·staged·unstaged·untracked 작업물·session·실패 감사를 유지한다. 이름·동일 HEAD만으로 승인하지 않고, 설명되지 않는 변경이나 손상·다른 소유자는 자료를 보존해 보류한다.
+
+예약 복구는 이전 writer의 실제 종료 또는 미시작, 해당 작업·자원의 실행/복구 소유권, 수동·게시 충돌과 확정 직전 경쟁을 확인한다. 기존 원격 인수 자격·대상·시작 HEAD·PR 연결은 생성 근거로 대체하지 않는다. 소유 Manager operation은 저장된 target·intent·파일 보존 검증을 거쳐 기존 복구 흐름으로 이어가며 사용자 operation을 자동 완료·abort하지 않는다. 소유권 확정만으로 Worker·verify·Review·rebase·게시 성공을 만들거나 기존 성공·실패를 초기화하지 않는다. 이후 필요한 base 반영·후보 검증은 정상 실행 흐름에서 판단한다.
+
 - 시작 ignore 규칙으로 증명된 index-free ignored 파일의 생성·수정·삭제는 역할별 결과·planning·검증 입력 오류의 단독 원인이 아니다. tracked·staged·non-ignored 후보와 실제 Git 작업의 index 안전 조건·대상 연결·원격 lease는 계속 확인한다.
 - Worker targeted test → Manager verify → Reviewer는 같은 ExecPlan worktree에서 이어간다. ignored 확장자 allowlist·원상 복원 의무·별도 검증 worktree를 추가하지 않는다. 활성 ignored 파일과 들어오는 tracked 경로가 겹치면 파일을 보존하고 해당 Git 쓰기만 보류한다.
 - 원격 작업 통합은 최종 diff에서 사라진 중간 replay 경로와 대소문자·부모/자식 별칭도 보호한다. 보존 commit의 HEAD/index 적용·rebase 시작과 후속 입력의 소유 abort 직전에 현재 충돌을 다시 확인한다. 충돌이나 관측 실패에는 파일·진행 operation·보존 intent를 유지하며 완료 결과의 기록 수용은 쓰기를 반복하지 않는다.

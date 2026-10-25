@@ -12,6 +12,22 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKi
 
 
 class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
+    def test_reserved_user_rebase_does_not_reconstruct_manager_checkpoint(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        factory = mock.Mock(side_effect=AssertionError('reservation is not owned'))
+        self.effects = replace(self.effects, checkpoint=checkpoint,
+            workspace=replace(self.effects.workspace, current_rebase_service=factory))
+        self.handler.effects = self.effects
+        self.effects.workspace.is_directory.return_value = True
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        self.handler._update_snapshot(catalog_plan=self.state.active_execplan('repo'))
+        before = checkpoint.get('repo', 'G-047')
+        self.assertFalse(self.handler._resolving_rebase(self.state.row()))
+        factory.assert_not_called()
+        self.assertEqual(checkpoint.get('repo', 'G-047'), before)
+
     def test_reserved_live_writer_stops_before_worktree_preparation(self):
         from loop_manager_internal.storage import task_calls
         self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
@@ -163,6 +179,7 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
+        self.worktree = root / 'G-047'
         self.handler._identity = replace(self.handler._identity, state_dir=root)
         self.state.update_project('repo', worktree=str(root / 'G-047'))
         self.connection.executescript(
@@ -178,6 +195,10 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
         self.local = None
         self.pr = None
         self.checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects.agent.capture_git_snapshot.side_effect = lambda *_a, **_k: lm.GitSnapshot(
+            self.local or self.head, 'loop-manager/G-047', {}, {}, {},
+            {str(self.worktree.resolve()): (f'HEAD={self.local or self.head}',
+                                          'branch=refs/heads/loop-manager/G-047')}, {}, {})
         workspace = replace(self.effects.workspace,
             reserve_execplan_workspace=self.state.bind(lm.reserve_execplan_workspace, connected=True, mutates=True),
             mark_execplan_workspace_owned=self.state.bind(lm.mark_execplan_workspace_owned, connected=True, mutates=True))

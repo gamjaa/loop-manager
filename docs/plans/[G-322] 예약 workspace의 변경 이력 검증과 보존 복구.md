@@ -30,10 +30,10 @@ R-055 W01–W03·W06의 예약 workspace를 승인된 생성·후속 변경 근�
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/git/workspace.py`의 생성 근거 조회·예약 검증과 `runtime/bootstrap_adapter.py:_managed_worktree_transition_state()`의 등록/index 관측을 재사용한다. 생성 identity와 현재 변경의 설명 가능성을 구분하는 판정을 두 준비/복구 소비자가 공유하게 한다. `git/manager_git_journal.py:verified_managed_transitions()`의 봉인된 kind/owner/target 검증과 기존 managed rebase·checkpoint commit 근거를 사용하고 범용 journal·새 상태 원본을 만들지 않는다. 과거 Git snapshot을 Agent 접근 권한 gate로 복원하지 않는다.
-- [ ] 확인한 `execution/execution_workspace_handler.py:WorkspaceHandler.prepare()`와 `recovery/scope_reconciliation.py:resume_project_block_if_safe()`에 후속 변경·operation·원격 인수 근거와 최종 자원 재확인을 연결한다. `storage/execution_checkpoint_state.py`의 generation 및 `catalog/project_selection.py:mark_execplan_workspace_owned()`의 중첩 transaction을 유지한다. 기존 `remote_adoption`·commit/rebase·복구 감사는 새 근거 기록으로 덮어쓰지 않는다.
-- [ ] 확인한 `application/task_scheduling.py`의 작업 lease, `storage/task_calls.py:execution_confirmed()`와 `runtime/resource_lock.py`를 재사용해 호출자와 비동기 복구의 writer/자원 소유 조건을 확인한다. 이미 보유한 동일 소유 경계를 이어 쓰고 잠금 탈취·자기 대기·종료 불명 예약 회수를 하지 않는다. 필요한 effects는 기존 `recovery/bindings.py`·`recovery/recovery_adapter.py`의 명시적 조립으로 전달한다.
-- [ ] 아래 기존 fixture의 정상/거부·경쟁·중단 사례를 확장한다. PRODUCT의 차단 해제·작업 공간 보존과 ARCHITECTURE의 Git/worktree·상태 복구 절에는 실제 구현한 예약 근거·현재 상태·재개 경계를 통합한다. 차단 scope 전환·알림 정책과 배정기 자체는 이 작업에서 구현하지 않는다.
+- [x] 확인한 `loop_manager_internal/git/workspace.py`의 생성 근거 조회·예약 검증과 `runtime/bootstrap_adapter.py:_managed_worktree_transition_state()`의 등록/index 관측을 재사용한다. 생성 identity와 현재 변경의 설명 가능성을 구분하는 판정을 두 준비/복구 소비자가 공유하게 한다. `git/manager_git_journal.py:verified_managed_transitions()`의 봉인된 kind/owner/target 검증과 기존 managed rebase·checkpoint commit 근거를 사용하고 범용 journal·새 상태 원본을 만들지 않는다. 과거 Git snapshot을 Agent 접근 권한 gate로 복원하지 않는다.
+- [x] 확인한 `execution/execution_workspace_handler.py:WorkspaceHandler.prepare()`와 `recovery/scope_reconciliation.py:resume_project_block_if_safe()`에 후속 변경·operation·원격 인수 근거와 최종 자원 재확인을 연결한다. `storage/execution_checkpoint_state.py`의 generation 및 `catalog/project_selection.py:mark_execplan_workspace_owned()`의 중첩 transaction을 유지한다. 기존 `remote_adoption`·commit/rebase·복구 감사는 새 근거 기록으로 덮어쓰지 않는다.
+- [x] 확인한 `application/task_scheduling.py`의 작업 lease, `storage/task_calls.py:execution_confirmed()`와 `runtime/resource_lock.py`를 재사용해 호출자와 비동기 복구의 writer/자원 소유 조건을 확인한다. 이미 보유한 동일 소유 경계를 이어 쓰고 잠금 탈취·자기 대기·종료 불명 예약 회수를 하지 않는다. 필요한 effects는 기존 `recovery/bindings.py`·`recovery/recovery_adapter.py`의 명시적 조립으로 전달한다.
+- [x] 아래 기존 fixture의 정상/거부·경쟁·중단 사례를 확장한다. PRODUCT의 차단 해제·작업 공간 보존과 ARCHITECTURE의 Git/worktree·상태 복구 절에는 실제 구현한 예약 근거·현재 상태·재개 경계를 통합한다. 차단 scope 전환·알림 정책과 배정기 자체는 이 작업에서 구현하지 않는다.
 
 ## Validation
 
@@ -58,8 +58,24 @@ R-055 W01–W03·W06의 예약 workspace를 승인된 생성·후속 변경 근�
   RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_scoped_blocking.ReservedWorkspaceRecoveryTests tests.test_remote_work_adoption.RemoteCreationEvidenceTests tests.test_execution_workspace_phase.ExecutionWorkspacePhaseTests`
 
   재실행 결과: 24개 통과. 새 case는 별도 최소 실행 및 관련 변경 뒤 재실행에서 2개 통과했다. 전체 verify는 실행하지 않았다. 진행 중 Manager rebase·기타 operation 연결, 원격 인수 자격/PR 연결의 공유 판정과 PRODUCT·ARCHITECTURE 반영은 아직 남아 있으므로 완료 후보가 아니다.
-- [ ] 승인된 후속 변경·writer/복구 소유권·현재 자원의 공유 검증과 보존 재개
-- [ ] 최소 unit·기존 실제 Git 보존 회귀 및 제품/설계 정합성
+- [x] 승인된 후속 변경·writer/복구 소유권·현재 자원의 공유 검증과 보존 재개
+- [x] 최소 unit·기존 실제 Git 보존 회귀 fixture 확장 및 제품/설계 정합성 (실제 Git 실행은 Manager 전체 검증에 남김)
+
+- [x] 최종 구현 단위에서 기존 예약의 원격 인수를 신규 인수와 분리했다. 최초 catalog grant·version/repository/작업/base/branch/원래 HEAD·fetch/push origin·PR 연결을 재확인하고, 작업 확정 transaction에서 grant와 호출/소유 claim도 다시 대조한다. 원격 PR이 관측 중 바뀌거나 grant가 손상되면 확정하지 않는다. 저장된 인수 원문·기존 expected/target·성공 근거는 보존하며 미확정 초기 인수의 원래 remote baseline만 채운다.
+- [x] 저장된 rebase는 기존 현재 상태 service를 읽기 전용 관측하는 한정된 예약 경로로 연결했다. unmerged stage는 write-tree 없이 관측하며 commit·push·PR 생성·중간 게시 intent를 보존한다. 현재 정책의 봉인된 완료 receipt는 정확한 예약 자원 조회에서만 소비하고 수락 HEAD의 clean index는 실제 Git tree에서 읽는다. 사용자 rebase metadata만으로 Manager checkpoint를 재구성하지 않는다. 대상 Git lease와 journal 경계는 같은 열린 process/thread handle을 이어 써 자기 대기를 피한다. PRODUCT의 보존 보장과 ARCHITECTURE의 identity/변경 근거·operation·관측/CAS 계약을 구현에 맞춰 통합했다.
+- 이번 호출에서 기존 준비·복구·원격 인수의 33개 case와 공통 생성/변경 판정·실제 lease·현재 rebase 정책/adapter·journal의 변경 관련 최소 case를 실행했다. 모두 고유 case 기준 45개이며, 변경 뒤 필요한 해당 case만 다시 실행했다. 아래 두 최초 오류는 각각 실제 GitSnapshot 계약과 잘못된 테스트 계획 경로를 교정한 뒤 동일 명령으로 통과했다. 실제 CLI·전체 verify·실제 Git fixture·Windows 회귀는 실행하지 않았다. 전체 verify와 Reviewer 검토는 Manager에 남아 있다. Worker 구현 및 targeted 검증 후보이며 PR Merge/전체 완료를 선언하지 않는다.
+
+  FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_scoped_blocking.ReservedWorkspaceRecoveryTests tests.test_execution_workspace_phase.ExecutionWorkspacePhaseTests tests.test_execution_workspace_phase.RemoteAdoptionPhaseTests`
+
+  RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_scoped_blocking.ReservedWorkspaceRecoveryTests tests.test_execution_workspace_phase.ExecutionWorkspacePhaseTests tests.test_execution_workspace_phase.RemoteAdoptionPhaseTests`
+
+  재실행 결과: 33개 통과. 초기 인수 후 재시작 fixture의 불완전한 SimpleNamespace를 실제 등록/metadata 필드를 가진 GitSnapshot으로 교정했다. 기존 거부 assertion을 약화하지 않았다.
+
+  FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_managed_mutation_evidence.ManagedTransitionTests.test_current_rebase_receipt_is_available_only_to_exact_reservation_history tests.test_scoped_blocking.ReservedWorkspaceRecoveryTests.test_existing_adoption_checks_grant_pr_and_keeps_original_head tests.test_scoped_blocking.ReservedWorkspaceRecoveryTests.test_owned_detached_rebase_recovers_reservation_without_completing_operation`
+
+  RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_managed_mutation_evidence.ManagedTransitionTests.test_current_rebase_receipt_is_available_only_to_exact_reservation_history tests.test_scoped_blocking.ReservedWorkspaceRecoveryTests.test_existing_adoption_checks_grant_pr_and_keeps_original_head tests.test_scoped_blocking.ReservedWorkspaceRecoveryTests.test_owned_detached_rebase_recovers_reservation_without_completing_operation`
+
+  재실행 결과: 3개 통과. journal fixture의 plan_id와 plan_path가 서로 다른 오류를 교정했다. 이후 실제 runtime factory의 예약 관측/기존 경계, 미완료 commit·push·PR intent와 unmerged 관측, 사용자 operation 비재구성, 현대/기존 rebase 연결 및 원격 PR 경쟁은 관련 최소 case에서 통과했다. `git diff --check`도 통과했다.
 
 ## Decision Log
 

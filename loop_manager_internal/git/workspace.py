@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.agents.agent_scope_decision import index_security_flags
 from loop_manager_internal.recovery.checkpoint_ownership import committed_tree_matches_intent
+from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from pathlib import Path
@@ -51,6 +53,20 @@ class ValidateExecplanWorkspaceIdentityEffects:
     """Only the effects consumed by this boundary; no Manager module access."""
     _validate_managed_path_boundary: Callable[..., object]
     expected_execplan_workspace: Callable[..., object]
+
+
+def validate_registered_remote(repo, worktree, origin, *, git, github_repository):
+    """Bind both fetch and push URLs to the registered repository identity."""
+    if not origin or github_repository is None:
+        raise WorkspaceOwnershipError('등록 origin을 확인할 수 없습니다.')
+    for location in (repo, worktree):
+        if location is None:
+            continue
+        for arguments in (('remote', 'get-url', '--all', 'origin'),
+                          ('remote', 'get-url', '--push', '--all', 'origin')):
+            urls = git(location, *arguments).stdout.splitlines()
+            if len(urls) != 1 or github_repository(urls[0]) != origin:
+                raise WorkspaceOwnershipError('등록 origin과 원격 작업 branch 저장소가 다릅니다.')
 
 
 def validate_managed_worktree(effects: ValidateManagedWorktreeEffects,
@@ -132,7 +148,7 @@ def validate_reserved_worktree(effects: ValidateReservedWorktreeEffects,
 def reserved_worktree_creation_head(
     state_dir: Path, repo: Path, worktree: Path, branch: str, owner: str,
     live: dict[str, object],
-    *, explain: Callable[[dict], bool] | None = None,
+    *, explain: Callable[[dict], bool] | None = None, allow_detached=False,
 ) -> str:
     """Resolve one reservation from sealed creation evidence for this resource."""
     for item in manager_git_journal.verified_managed_transitions(
@@ -148,16 +164,40 @@ def reserved_worktree_creation_head(
             matches = created == live
         else:
             matches = (all(live['registration'].get(key) == value
-                           for key, value in created['registration'].items() if key != 'head')
+                           for key, value in created['registration'].items()
+                           if key != 'head' and not (allow_detached and key == 'branch'))
                        and explain(created))
         if matches:
             return str(created['registration']['head'])
     raise WorkspaceOwnershipError('예약 workspace의 Manager 생성 기록이 현재 상태와 다릅니다.')
 
 
+def reserved_rebase_before_head(service, checkpoint, snapshot):
+    """Observe the saved rebase without adopting, correcting or completing it."""
+    observed, decision = service.observe(checkpoint=checkpoint)
+    expected = service.expected
+    if (checkpoint.operation != 'rebase' or expected.generation != checkpoint.generation
+            or expected.before_head != checkpoint.expected_head
+            or expected.target_base_oid != checkpoint.target_base_oid
+            or decision.status not in {RebaseStatus.START, RebaseStatus.WAITING, RebaseStatus.COMPLETE}):
+        raise WorkspaceOwnershipError('예약 workspace의 현재 rebase 소유권을 확인할 수 없습니다.')
+    index = {}
+    for entry in observed.index:
+        index.setdefault(entry.path, []).append(f'{entry.tag} {entry.mode} {entry.oid} {entry.stage}')
+    dirty = {file.path: (tuple(kind for kind in file.kinds if kind != 'ignored'), file.signature)
+             for file in observed.files if file.kinds != ('ignored',)}
+    if (observed.head != snapshot.head or observed.branch != snapshot.branch
+            or dict(observed.operations) != snapshot.operations
+            or {path: tuple(sorted(entries)) for path, entries in index.items()} != snapshot.index
+            or dirty != snapshot.dirty):
+        raise WorkspaceOwnershipError('예약 rebase 관측 중 파일·index·operation이 변경됐습니다.')
+    return checkpoint.expected_head
+
+
 def validate_reserved_worktree_history(
     state_dir, repo, worktree, branch, plan_id, live, snapshot, *,
-    checkpoint, git, base, session=None, sessions=(), agent_scopes=(),
+    checkpoint, git, base, session=None, sessions=(), agent_scopes=(), adoption_eligible=False,
+    rebase_before_head=None,
 ):
     """Explain this local state from sealed creation and existing owned effects.
 
@@ -165,15 +205,29 @@ def validate_reserved_worktree_history(
     Callers hold the resource leases and CAS the selected checkpoint afterward.
     """
     saved = checkpoint.snapshot or {}
+    owned_rebase = bool(checkpoint.operation == 'rebase' and rebase_before_head
+                        and rebase_before_head == checkpoint.expected_head and checkpoint.target_base_oid)
     if (re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', snapshot.head) is None
-            or snapshot.branch != branch or not snapshot.shared_metadata_complete
+            or (snapshot.branch != branch and not owned_rebase) or not snapshot.shared_metadata_complete
             or not isinstance(live.get('registration'), dict)
             or live['registration'].get('head') != snapshot.head
-            or snapshot.operations or checkpoint.operation not in {None, 'commit'}
+            or (controlling_git_operation(snapshot.operations) and not owned_rebase)
+            or checkpoint.operation not in ({'rebase'} if owned_rebase else {None, 'commit', 'push', 'pr_create', 'rebase_publish'})
             or saved.get('worktree', str(worktree)) != str(worktree)
             or saved.get('branch', branch) != branch
             or any(index_security_flags(entries) for entries in snapshot.index.values())):
         raise WorkspaceOwnershipError('예약 workspace의 현재 자원 또는 operation 근거가 유효하지 않습니다.')
+    if checkpoint.operation in {'push', 'pr_create'} and (
+            checkpoint.expected_head != snapshot.head or saved.get('head') != snapshot.head
+            or saved.get('phase') != 'PUBLISHING' or 'remote_before' not in saved
+            or saved['remote_before'] != checkpoint.observed_remote_oid):
+        raise WorkspaceOwnershipError('예약 workspace의 게시 intent가 현재 후보와 다릅니다.')
+    if checkpoint.operation == 'rebase_publish':
+        intent = checkpoint.rebase_publication_intent()
+        if intent is None or any(intent[key] != value for key, value in {
+                'repo': str(repo), 'plan_id': plan_id, 'branch': branch,
+                'worktree': str(worktree), 'head': snapshot.head}.items()):
+            raise WorkspaceOwnershipError('예약 workspace의 rebase 게시 intent가 다릅니다.')
     if checkpoint.operation == 'commit' and (
             saved.get('before_head') != checkpoint.expected_head
             or not saved.get('commit_message') or not saved.get('commit_tree_oid')
@@ -183,8 +237,11 @@ def validate_reserved_worktree_history(
         raise WorkspaceOwnershipError('예약 workspace의 Manager commit intent가 현재 상태와 다릅니다.')
 
     def local(value):
-        return json.dumps({key: (value[key] if isinstance(value, dict) else getattr(value, key))
-                           for key in ('head', 'branch', 'index', 'dirty', 'operations')}, sort_keys=True)
+        state = {key: (value[key] if isinstance(value, dict) else getattr(value, key))
+                 for key in ('head', 'branch', 'index', 'dirty', 'operations')}
+        if not controlling_git_operation(state['operations']):
+            state['operations'] = {}
+        return json.dumps(state, sort_keys=True)
 
     clean_states = {}
     def clean(head):
@@ -204,7 +261,7 @@ def validate_reserved_worktree_history(
         creation_head = str(created['registration']['head'])
         adoption = saved.get('remote_adoption')
         if adoption is not None and (
-                not isinstance(adoption, dict) or adoption.get('version') != 1
+                not adoption_eligible or not isinstance(adoption, dict) or adoption.get('version') != 1
                 or any(adoption.get(key) != value for key, value in {
                     'repo': str(repo), 'plan_id': plan_id, 'branch': branch,
                     'base': base, 'head': creation_head}.items())):
@@ -212,20 +269,27 @@ def validate_reserved_worktree_history(
         # The unchanged creation path retains its existing no-history contract.
         if created == live and snapshot.head == creation_head and not snapshot.dirty:
             return checkpoint.operation is None
-        if not snapshot.dirty and live.get('index') != git(repo, 'rev-parse', f'{snapshot.head}^{{tree}}').stdout.strip():
+        if not snapshot.dirty and not owned_rebase and live.get('index') != git(repo, 'rev-parse', f'{snapshot.head}^{{tree}}').stdout.strip():
             return False
         reachable = {clean(creation_head)}
         edges = [(local(start), local(result)) for start, result in agent_scopes
                  if start.head == result.head and start.branch == result.branch == branch
                  and start.operations == result.operations
                  and start.shared_metadata_complete and result.shared_metadata_complete]
+        current_rebases = []
         for owned_session in dict.fromkeys((None, session, *sessions)):
             for item in manager_git_journal.verified_managed_transitions(
                     state_dir, str(_canonical_path(repo)), f'plan:{plan_id}',
                     agent_session_id=owned_session, git=git,
-                    kind='managed_rebase', target=str(_canonical_path(worktree))):
+                    kind='managed_rebase', target=str(_canonical_path(worktree)), include_current_rebase=True):
                 if item['intent']['expected']['branch'] == branch:
-                    edges.append((local(item['intent']['before']), local(item['result']['observed'])))
+                    if item['result'].get('status') == 'current_state':
+                        # Current-policy receipts authorize the accepted head;
+                        # derive its clean index from Git, not stored file data.
+                        current_rebases.append((item['intent']['expected']['before_head'],
+                                                clean(item['result']['observed']['head'])))
+                    else:
+                        edges.append((local(item['intent']['before']), local(item['result']['observed'])))
         commits = [(saved.get('before_head'), saved.get('after_head') or (
                     snapshot.head if checkpoint.operation == 'commit' else None), saved)]
         for request in saved.get('worker_checkpoint_requests', ()):
@@ -234,12 +298,14 @@ def validate_reserved_worktree_history(
                 commits.append((request.get('start_head'), request.get('head'), {
                     'before_head': request.get('start_head'), 'commit_message': request.get('title'),
                     'commit_tree_oid': request.get('tree')}))
-        commit_edges = []
+        commit_edges = current_rebases
         for before, after, intent in commits:
             if (isinstance(before, str) and isinstance(after, str)
                     and all(re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', oid) for oid in (before, after))
                     and committed_tree_matches_intent(repo, before, after, intent, git)):
                 commit_edges.append((before, clean(after)))
+        if owned_rebase:
+            commit_edges.append((rebase_before_head, local(snapshot)))
         # ponytail: the task-local receipt scan is quadratic; use adjacency
         # queues if long-lived task histories make this observation expensive.
         while True:
@@ -251,7 +317,8 @@ def validate_reserved_worktree_history(
                 return local(snapshot) in reachable
 
     return reserved_worktree_creation_head(
-        state_dir, repo, worktree, branch, f'plan:{plan_id}', live, explain=explain)
+        state_dir, repo, worktree, branch, f'plan:{plan_id}', live, explain=explain,
+        allow_detached=owned_rebase and snapshot.branch is None)
 
 
 def make_worktree(effects: MakeWorktreeEffects,

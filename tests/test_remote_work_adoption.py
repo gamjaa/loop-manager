@@ -1,5 +1,6 @@
 """Unit ownership proof and Manager-only native Git regression for remote adoption."""
 from pathlib import Path
+from dataclasses import replace
 from tempfile import TemporaryDirectory
 from unittest import TestCase, mock
 
@@ -10,6 +11,20 @@ from tests.support.git import git_command, isolated_git_test, local_github_origi
 
 
 class RemoteCreationEvidenceTests(TestCase):
+    def test_reserved_registration_observes_unmerged_index_without_write_tree(self):
+        from loop_manager_internal.runtime import bootstrap_adapter
+        with TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            raw_index = '100644 ' + 'a' * 40 + ' 2\tapp.py\0'
+            git = mock.Mock(return_value=mock.Mock(stdout=raw_index))
+            effects = bootstrap_adapter.ManagedWorktreeTransitionStateEffects(
+                _canonical_path=lambda path: path.resolve(),
+                _worktree_catalog=lambda *_: [{'worktree': str(worktree), 'HEAD': 'head', 'detached': True}],
+                git=git)
+            observed = bootstrap_adapter._managed_worktree_transition_state(effects, worktree, worktree)
+            self.assertEqual(observed['index'], {'unmerged': raw_index})
+            git.assert_called_once_with(worktree, 'ls-files', '-u', '-z')
+
     def test_reserved_owned_commit_uses_shared_history_without_clean_reset(self):
         from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRecord
         with TemporaryDirectory() as directory:
@@ -51,6 +66,16 @@ class RemoteCreationEvidenceTests(TestCase):
                     journal_owner='plan:G-047', reservation_validator=validator), 'existing')
                 effects.validate_reserved_worktree.assert_not_called()
                 effects._write_managed_worktree_receipt.assert_not_called()
+                checkpoint = replace(checkpoint, operation='commit', expected_head=created_head)
+                self.assertEqual(workspace.make_worktree(effects, repo, worktree, branch, 'main',
+                    ownership_reserved=True, expected_head=created_head, journal_state_dir=root / 'state',
+                    journal_owner='plan:G-047', reservation_validator=validator), 'existing')
+                self.assertEqual(checkpoint.operation, 'commit')
+                for operation in ('push', 'pr_create'):
+                    checkpoint = replace(checkpoint, operation=operation, expected_head=head,
+                        snapshot={**checkpoint.snapshot, 'phase': 'PUBLISHING', 'head': head, 'remote_before': None})
+                    self.assertEqual(validator(live), created_head)
+                    self.assertEqual(checkpoint.operation, operation)
                 # Same visible HEAD cannot authorize a different commit intent.
                 checkpoint.snapshot['commit_message'] = 'Unapproved message'
                 with self.assertRaises(lm.WorkspaceOwnershipError):
