@@ -33,7 +33,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
                            "SELECT RAISE(ABORT, 'common defect audit is immutable'); END")
 
 
-def _verification(connection, plan, head):
+def _individual_verification(connection, plan, head):
     from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
     from loop_manager_internal.execution.result_validation import parse_reviewer_result, ParseReviewerResultEffects, ReviewerProtocolError
     from loop_manager_internal.storage import verify_receipts
@@ -65,6 +65,68 @@ def _verification(connection, plan, head):
                     definition_sha256=hashlib.sha256(plan['definition_snapshot'].encode()).hexdigest(), base=base)
     except (KeyError, IndexError, TypeError, ValueError, ReviewerProtocolError):
         return None
+
+
+def _verification(connection, plan, head):
+    from loop_manager_internal.application.contracts import VerifyOutput
+    from loop_manager_internal.storage.manual_work_state import ManualWorkRepository, digest
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'manual_work_groups' not in tables:
+        return _individual_verification(connection, plan, head)
+    store = ManualWorkRepository(connection)
+    group = store.for_plan(plan['repo'], plan['plan_id'])
+    if group is None:
+        return _individual_verification(connection, plan, head)
+    try:
+        store.workspace_owner(plan['repo'], plan['plan_id'])
+        publication = connection.execute('SELECT * FROM manual_work_publications WHERE repo=? AND group_id=?',
+                                         (plan['repo'], group['group_id'])).fetchone()
+        if (publication is None or group['pending_source_head']
+                or publication['request_id'] != group['request_id'] or not publication['request_id']
+                or publication['head'] != head or publication['pr_url'] != plan['pr_url']
+                or plan['pr_head_oid'] != head or publication['base_sha'] != plan['validated_base_sha']):
+            return None
+        members = json.loads(group['members'])
+        evidence = json.loads(publication['evidence'])
+        required = {(member, stage) for member in members for stage in ('verify', 'review')}
+        if required != {(row['plan_id'], row['stage']) for row in evidence}:
+            return None
+        verify_outputs = set()
+        for row in evidence:
+            if row['result'] != 'PASS':
+                return None
+            receipt = connection.execute('SELECT * FROM manual_work_results WHERE repo=? AND group_id=? '
+                'AND plan_id=? AND stage=? AND head=? AND base_sha=? AND input_token=? AND result=? AND request_id=?',
+                (plan['repo'], group['group_id'], row['plan_id'], row['stage'], head,
+                 publication['base_sha'], row['input_token'], 'PASS', row['request_id'])).fetchone()
+            if receipt is None:
+                return None
+            if row['stage'] == 'verify':
+                verify_outputs.add(receipt['detail'])
+            if row['stage'] == 'review':
+                from loop_manager_internal.execution.result_validation import parse_reviewer_result, ParseReviewerResultEffects
+                if (parse_reviewer_result(ParseReviewerResultEffects(lambda _: ()), receipt['detail'])[0] not in {'PASS', 'FAIL'}
+                        or [result for member, result in re.findall(
+                            r'(?m)^MANUAL_PLAN_RESULT: (G-\d{3,}) (PASS|FAIL)\s*$', receipt['detail'])
+                            if member == row['plan_id']] != ['PASS']):
+                    return None
+        # One native full run covers the shared candidate; every member still
+        # needs its own explicit Review PASS in the confirmed publication.
+        plans = [connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                                    (plan['repo'], member)).fetchone() for member in members]
+        for selected in plans:
+            if (selected is None or selected['pr_url'] != publication['pr_url']
+                    or selected['pr_head_oid'] != head or selected['validated_base_sha'] != publication['base_sha']):
+                return None
+        for selected in plans:
+            proof = _individual_verification(connection, selected, head)
+            if proof is not None and all(output == selected['verify_result']
+                    or str(VerifyOutput(output)) == selected['verify_result'] for output in verify_outputs):
+                return dict(proof, group_id=group['group_id'], member_id=plan['plan_id'],
+                            execution_plan_id=selected['plan_id'], publication_sha256=digest(dict(publication)))
+    except (KeyError, IndexError, TypeError, ValueError, RuntimeError):
+        return None
+    return None
 
 
 def record_merge(connection, repo, plan_id, pr_url, head, merge_oid):
@@ -119,6 +181,8 @@ def reassessment(connection, repo, plan_id):
     if not current:
         return None
     corrections = []
+    owner_execution = True
+    owns_correction = False
     for row in current.values():
         target = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                                     (repo, row['correction_plan_id'])).fetchone()
@@ -129,12 +193,23 @@ def reassessment(connection, repo, plan_id):
                 or target['pr_url'] != merge['pr_url'] or target['pr_head_oid'] != merge['head']):
             merge = None
         evidence = json.loads(row['evidence'])
+        report = connection.execute('SELECT definition_revision FROM validation_results WHERE id=?',
+                                    (row['result_id'],)).fetchone()
+        owner = (target is not None and target['plan_id'] == plan_id and target['status'] == 'PLAN_BLOCKED'
+                 and target['path'] == evidence['target_path'] and bool(report['definition_revision'])
+                 and (target['current_revision_sha'] or target['plan_sha']) ==
+                     (evidence['target_revision'] or row['confirmed_revision'])
+                 and (target['current_revision_sha'] or target['plan_sha']) != report['definition_revision']
+                 and evidence['source'] in json.loads(target['sources']))
+        owner_execution = owner_execution and (owner or merge is not None)
+        owns_correction = owns_correction or owner
         corrections.append(dict(result_id=row['result_id'], goal_key=row['goal_key'],
             plan_id=row['correction_plan_id'], source=evidence['source'], quote=evidence['quote'],
             cause=evidence['cause'], completion=evidence['completion'],
             confirmed_revision=row['confirmed_revision'], merge=dict(merge) if merge is not None else None))
-    return dict(ready=all(item['merge'] is not None for item in corrections)
-                and reports <= {item['result_id'] for item in corrections}, corrections=corrections)
+    covered = reports <= {item['result_id'] for item in corrections}
+    return dict(ready=all(item['merge'] is not None for item in corrections) and covered,
+                owner_execution=owner_execution and owns_correction and covered, corrections=corrections)
 
 
 def goal_key(link: dict) -> str:

@@ -1384,6 +1384,25 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
 
 
 class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_revised_correction_owner_resumes_worker_without_its_own_merge(self):
+        from loop_manager_internal.storage import common_defect_state, runtime_state
+        runtime_state.RuntimeStateRepository(self.connection).block_plan(self.repo, 'G-106',
+            reason_code='common_defect_pending', evidence='shared correction', release_fingerprint='input', clear_projection=False)
+        correction = dict(ready=False, owner_execution=True,
+                          corrections=[dict(plan_id='G-106', merge=None, confirmed_revision=self.base)])
+        independent = dict(self.plan('G-107'))
+        with mock.patch.object(common_defect_state, 'reassessment', return_value=correction), \
+             mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'resumed')
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.assertEqual(self.plan('G-106')['status'], 'IMPLEMENTING')
+        self.assertEqual(dict(self.plan('G-107')), independent)
+        context = dict(block=dict(reason_code='user_decision_required'), common_defect_input=correction, artifacts={})
+        self.assertFalse(self.coordinator._evaluate(self.plan('G-106'), context)['resolved'])
+        context.update(block=dict(reason_code='common_defect_pending'), base_oid=self.base)
+        with mock.patch.object(self.ports, 'git', return_value=SimpleNamespace(returncode=1)):
+            self.assertFalse(self.coordinator._evaluate(self.plan('G-106'), context)['resolved'])
+
     def test_verified_common_correction_rechecks_only_affected_processed_task(self):
         from loop_manager_internal.storage import common_defect_state, runtime_state
         runtime_state.RuntimeStateRepository(self.connection).block_plan(self.repo, 'G-106',

@@ -561,6 +561,14 @@ class BlockedPlanReconciler:
     def _evaluate(self, plan, context):
         reason = context['block']['reason_code']
         correction = context.get('common_defect_input')
+        if (correction and correction.get('owner_execution') and reason in {
+                BlockReasonCode.COMMON_DEFECT_PENDING.value, BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
+                BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value, BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED.value}):
+            if any(self.ports.git(self.repo_path, 'merge-base', '--is-ancestor',
+                    item['confirmed_revision'] if item['plan_id'] == plan['plan_id'] else item['merge']['merge_oid'],
+                    context['base_oid'], check=False).returncode != 0 for item in correction['corrections']):
+                return dict(resolved=False, detail='현재 원격에 확정된 교정 개정·다른 교정 Merge가 없습니다.', stage=None)
+            return dict(resolved=True, detail='확정된 개정의 공통 교정 소유 작업을 Worker부터 실행합니다.', stage='worker')
         if ((reason == BlockReasonCode.COMMON_DEFECT_PENDING.value and not correction)
                 or correction and not correction['ready']):
             return dict(resolved=False, detail='공통 교정의 실제 Merge·검증 반영을 기다립니다.', stage=None)

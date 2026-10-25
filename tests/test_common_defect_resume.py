@@ -90,6 +90,89 @@ class CommonDefectResumeTests(unittest.TestCase):
         self.assertFalse(self.evaluate()[0])
         self.effects.run_agent.assert_not_called()
 
+    def test_confirmed_self_revision_allows_owner_execution_without_claiming_merge(self):
+        self.feedback.record_result('repo', 'G-048', 'original-definition', 'worker', 'returned', self.raw)
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET current_revision_sha='revised' WHERE plan_id='G-048'")
+            common_defect_state.confirm(self.connection, 'repo', 'revised', 'revised', [dict(
+                reports=[3], plan_id='G-048', target_path='docs/plans/[G-048] Affected.md', target_revision=None,
+                source='docs/PRODUCT.md', quote='Required contract.', cause='owner guard', completion='guard fixed',
+                code=[dict(path='shared.py', quote='return broken')])])
+        state = common_defect_state.reassessment(self.connection, 'repo', 'G-048')
+        self.assertTrue(state['owner_execution'])
+        self.assertFalse(state['ready'])
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET current_revision_sha='unconfirmed' WHERE plan_id='G-048'")
+        self.assertFalse(common_defect_state.reassessment(self.connection, 'repo', 'G-048')['owner_execution'])
+
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET current_revision_sha='revised' WHERE plan_id='G-048'")
+            common_defect_state.confirm(self.connection, 'repo', self.base, self.base, [dict(
+                reports=[3], plan_id='G-047', target_path=self.definition.path, target_revision='plan-sha',
+                source='docs/PRODUCT.md', quote='Required contract.', cause='another guard', completion='other guard fixed',
+                code=[dict(path='shared.py', quote='return broken')])])
+        self.assertFalse(common_defect_state.reassessment(self.connection, 'repo', 'G-048')['owner_execution'])
+
+    def test_manual_member_merge_uses_shared_run_and_its_published_review(self):
+        from loop_manager_internal.application.contracts import VerifyOutput
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        store = ManualWorkRepository(self.connection)
+        raw_verify = 'full verify log\n' * 1000 + 'full verify passed\n'
+        bounded_verify = str(VerifyOutput(raw_verify))
+        with self.connection:
+            self.connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,plan_sha) "
+                "VALUES ('repo','G-050','docs/plans/[G-050] Member.md','Member','[\"docs/PRODUCT.md\"]','[]','normal','hash','MANUAL_PENDING','member-revision')")
+            group = store.create('repo', 'submit', 'shared', [], self.head, self.base, members=('G-047', 'G-050'))
+            group = store.update(group, owner_id='G-047', branch='shared', state='AUTOMATIC')
+            store.accept(group, head=self.head, base=self.base, input_token='candidate')
+            group = store.get('repo', group['group_id'])
+            review = 'MANUAL_PLAN_RESULT: G-047 PASS\nMANUAL_PLAN_RESULT: G-050 PASS\nVERDICT: PASS'
+            self.connection.execute("UPDATE exec_plans SET review_result=?,verify_result=?,verify_token=? WHERE plan_id='G-047'",
+                (review, bounded_verify, self.definition.verify_token(self.base, self.head, bounded_verify)))
+            self.connection.execute('UPDATE verify_receipts SET result=?', (bounded_verify,))
+        store.record(group, 'verify', self.head, self.base, 'verify-input', 'PASS', raw_verify)
+        store.record(group, 'review', self.head, self.base, 'review-input', 'PASS', review)
+        with self.connection:
+            store.publish_group('repo', 'G-047', dict(pr_url='https://example/pr/1', pr_head_oid=self.head,
+                publication_remote_oid=self.head), stage_tokens=dict(verify='verify-input', review='review-input'))
+            link = json.loads(self.connection.execute('SELECT evidence FROM common_defect_links LIMIT 1').fetchone()[0])
+            link.update(reports=[2], plan_id='G-050', target_path='docs/plans/[G-050] Member.md', target_revision='member-revision',
+                        cause='manual member guard')
+            common_defect_state.confirm(self.connection, 'repo', self.base, self.base, [link])
+            self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id IN ('G-047','G-050')")
+            common_defect_state.record_merge(self.connection, 'repo', 'G-050', 'https://example/pr/1', self.head, self.merge)
+        member = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-050'").fetchone()
+        self.assertIsNone(member['verify_token'])
+        proof = common_defect_state._verification(self.connection, member, self.head)
+        self.assertEqual(proof['member_id'], 'G-050')
+        self.assertEqual(proof['execution_plan_id'], 'G-047')
+        # Both linked corrections must actually be merged and verified.
+        self.observe_merge()
+        self.assertTrue(common_defect_state.reassessment(self.connection, 'repo', 'G-049')['ready'])
+        publication = self.connection.execute('SELECT * FROM manual_work_publications').fetchone()
+        original = publication['evidence']
+        for mutation in ('waiver', 'missing', 'foreign-token', 'wrong-request'):
+            evidence = json.loads(original)
+            if mutation == 'waiver':
+                evidence[-1]['result'] = 'SKIPPED_BY_USER'
+            elif mutation == 'missing':
+                evidence.pop()
+            elif mutation == 'foreign-token':
+                evidence[-1]['input_token'] = 'foreign'
+            else:
+                evidence[-1]['request_id'] = 'foreign'
+            with self.subTest(mutation=mutation), self.connection:
+                self.connection.execute('UPDATE manual_work_publications SET evidence=?', (json.dumps(evidence),))
+                self.assertIsNone(common_defect_state._verification(self.connection, member, self.head))
+        with self.connection:
+            self.connection.execute('UPDATE manual_work_publications SET evidence=?', (original,))
+            self.connection.execute("UPDATE manual_work_results SET detail='VERDICT: PASS' WHERE plan_id='G-050' AND stage='review'")
+        self.assertIsNone(common_defect_state._verification(self.connection, member, self.head))
+        with self.connection:
+            self.connection.execute("UPDATE manual_work_results SET detail=? WHERE plan_id='G-050' AND stage='review'", (review,))
+            self.connection.execute("UPDATE verify_receipts SET status='failure'")
+        self.assertIsNone(common_defect_state._verification(self.connection, member, self.head))
+
     def test_native_merge_and_own_full_verification_feed_assessment_without_resetting_tasks(self):
         before = [dict(row) for row in self.connection.execute("SELECT * FROM exec_plans WHERE plan_id IN ('G-048','G-049')")]
         self.observe_merge()
