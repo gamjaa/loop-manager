@@ -11,7 +11,7 @@ from uuid import uuid4
 from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
 from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
-from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+from loop_manager_internal.storage.runtime_state import RuntimeStateRepository, _transaction
 from loop_manager_internal.storage import common_guidance_state
 
 
@@ -145,23 +145,23 @@ class InvocationRepository:
                  context.attempt, utc_now(), scope_id, "prepared"))
         return identity
 
-    def mark_execution_started(self, identity: str) -> None:
+    def mark_execution_started(self, identity: str, *, observed_at: str | None = None) -> None:
         """Record only the provider callback reached after successful process creation."""
-        with self.connection:
+        with _transaction(self.connection):
             self.connection.execute("""UPDATE agent_invocations SET
                 execution_status = 'executed',
                 execution_started_at = COALESCE(execution_started_at, ?)
                 WHERE invocation_id = ? AND finished_at IS NULL""",
-                (utc_now(), identity))
+                (observed_at or utc_now(), identity))
 
-    def mark_execution_finished(self, identity: str, duration_ms: int) -> None:
-        with self.connection:
+    def mark_execution_finished(self, identity: str, duration_ms: int, *, observed_at: str | None = None) -> None:
+        with _transaction(self.connection):
             self.connection.execute("""UPDATE agent_invocations SET
                 execution_finished_at = ?, execution_duration_ms = ?,
                 execution_finish_evidence = 'provider_process_finished'
-                WHERE invocation_id = ? AND finished_at IS NULL
+                WHERE invocation_id = ? AND finished_at IS NULL AND execution_finished_at IS NULL
                   AND execution_status = 'executed'""",
-                (utc_now(), max(0, duration_ms), identity))
+                (observed_at or utc_now(), max(0, duration_ms), identity))
 
     def bind_process_receipt(self, identity: str, path: str) -> None:
         with self.connection:
@@ -179,8 +179,12 @@ class InvocationRepository:
             if proof is not None:
                 with _transaction(self.connection):
                     self.connection.execute('''UPDATE agent_invocations SET execution_finished_at=?,
-                        execution_finish_evidence=? WHERE invocation_id=? AND execution_finished_at IS NULL''',
-                        (proof['finished_at'], json.dumps(proof, sort_keys=True), identity))
+                        execution_finish_evidence=?,
+                        execution_status=CASE WHEN ?='not_started' THEN 'not_executed' ELSE execution_status END
+                        WHERE invocation_id=? AND execution_finished_at IS NULL
+                        AND (?!='not_started' OR execution_started_at IS NULL)''',
+                        (proof['finished_at'], json.dumps(proof, sort_keys=True), proof.get('evidence'),
+                         identity, proof.get('evidence', '')))
 
     def verified_scope(self, scope_id: str, *, repo: str, plan_id: str | None,
                        role: str, provider: str, session_id: str | None,
@@ -214,7 +218,7 @@ class InvocationRepository:
         return rows[-1]['session_id'] == session_id
 
     def observe_session(self, identity: str, session_id: str) -> None:
-        with self.connection:
+        with _transaction(self.connection):
             self.connection.execute("""UPDATE agent_invocations SET session_id = ?
                 WHERE invocation_id = ? AND finished_at IS NULL""", (session_id, identity))
 
@@ -326,8 +330,9 @@ class InvocationRepository:
                duration_ms: int, session_id: str | None, usage: Usage,
                collection_status: str | None = None, *,
                replace_session: bool = False,
-               execution_status: str | None = None) -> None:
-        with self.connection:
+               execution_status: str | None = None,
+               observed_at: str | None = None) -> None:
+        with _transaction(self.connection):
             session_update = "session_id = ?" if replace_session else "session_id = COALESCE(?, session_id)"
             cursor = self.connection.execute(f"""UPDATE agent_invocations SET
                 finished_at = ?, duration_ms = ?, result_kind = ?, result_code = ?,
@@ -336,7 +341,7 @@ class InvocationRepository:
                 input_tokens = ?, cached_input_tokens = ?, cache_write_input_tokens = ?,
                 output_tokens = ?, reasoning_output_tokens = ?
                 WHERE invocation_id = ? AND finished_at IS NULL""",
-                (utc_now(), duration_ms, kind, code, session_id,
+                (observed_at or utc_now(), duration_ms, kind, code, session_id,
                  collection_status or usage.status, execution_status,
                  usage.input_tokens, usage.cached_input_tokens,
                  usage.cache_write_input_tokens, usage.output_tokens,
@@ -346,16 +351,58 @@ class InvocationRepository:
                     SET status = 'invalidated', reason = 'agent_attempt_not_successful'
                     WHERE invocation_id = ? AND status IN ('verified', 'prepared')""", (identity,))
 
+    def apply_observation(self, identity: str, value: dict) -> None:
+        """Apply already observed facts to this invocation; never execute a provider."""
+        with _transaction(self.connection):
+            if 'started_at' in value:
+                self.mark_execution_started(identity, observed_at=value['started_at'])
+            if 'finished_at' in value:
+                self.mark_execution_finished(identity, value['duration_ms'], observed_at=value['finished_at'])
+            if 'session_id' in value:
+                self.observe_session(identity, value['session_id'])
+            if 'outcome' in value:
+                outcome = value['outcome']
+                self.finish(identity, outcome['kind'], outcome['code'], outcome['duration_ms'],
+                            outcome['session_id'], Usage(**outcome['usage']), outcome['collection_status'],
+                            replace_session=True, observed_at=outcome['observed_at'],
+                            execution_status='executed' if 'started_at' in value else 'not_executed')
+
+    def reconcile_observations(self, *, state_dir, repo: str | None = None,
+                               invocation_id: str | None = None) -> set[str]:
+        """Recover receipt observations first; leave unreadable/pending records intact."""
+        from loop_manager_internal.agents.process_receipt import observation
+        from loop_manager_internal.storage.db_access import CoordinatedConnection
+        from loop_manager_internal.runtime import operation_events as events
+        pending = set()
+        rows = self.connection.execute('''SELECT invocation_id, process_receipt_path FROM agent_invocations
+            WHERE finished_at IS NULL AND process_receipt_path IS NOT NULL AND (? IS NULL OR repo=?)
+            AND (? IS NULL OR invocation_id=?)''', (repo, repo, invocation_id, invocation_id)).fetchall()
+        for identity, path in rows:
+            try:
+                value = observation(path, state_dir, identity)
+                if value is None:
+                    continue
+                if isinstance(self.connection, CoordinatedConnection) and not self.connection.in_transaction:
+                    self.connection.run_request(lambda current: self.apply_observation(identity, value))
+                else:
+                    self.apply_observation(identity, value)
+            except (OSError, ValueError, TypeError, sqlite3.Error) as error:
+                pending.add(identity)
+                events.emit('Agent 호출 관측 저장 재개 대기', level='WARN', invocation_id=identity,
+                            error_type=type(error).__name__)
+        return pending
+
     def reconcile_interrupted(self, *, state_dir=None) -> int:
         from .runtime_state import _transaction
         from .work_claims import live_manual_tasks
         count = 0
+        observations_pending = self.reconcile_observations(state_dir=state_dir) if state_dir is not None else set()
         with _transaction(self.connection):
             protected = live_manual_tasks(self.connection, state_dir) if state_dir is not None else frozenset()
             pending = self.connection.execute(
                 'SELECT invocation_id,guidance_task_id FROM agent_invocations WHERE finished_at IS NULL').fetchall()
             for identity, task in pending:
-                if task in protected:
+                if task in protected or identity in observations_pending:
                     continue
                 self.connection.execute("""UPDATE agent_isolation_evidence
                     SET status = 'invalidated', reason = 'agent_attempt_interrupted'

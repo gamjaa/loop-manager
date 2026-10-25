@@ -87,10 +87,13 @@ class TaskScheduler:
         self.limits = {"agent": config.max_workers, "verify": config.verify_concurrency}
         self.uncertain=Counter()
         self.retained={}
+        self.storage_waiting = set()
         for call in task_calls.recover(connection,state_dir):
-            self.running[call['kind']][call['repo']]+=1
-            self.uncertain[call['kind']]+=1
-            self.retained[(call['repo'],call['plan_id'],call['kind'])]=dict(call)
+            storage_only = task_calls.execution_confirmed(connection, call, state_dir)
+            if not storage_only:
+                self.running[call['kind']][call['repo']]+=1
+                self.uncertain[call['kind']]+=1
+            self.retained[(call['repo'],call['plan_id'],call['kind'])]={**dict(call), 'storage_only': storage_only}
         connection.execute("CREATE TABLE IF NOT EXISTS task_scheduling_cursor "
                            "(kind TEXT PRIMARY KEY, repo TEXT NOT NULL)")
         self.cursor = dict(connection.execute("SELECT kind,repo FROM task_scheduling_cursor"))
@@ -116,6 +119,25 @@ class TaskScheduler:
             task.resumed = True
             self.condition.notify_all()
         events.emit("작업 RETRY 우선 재배정", project=task.repo, plan=task.plan_id)
+
+    def finish_agent_storage(self, task, operation, *, stopped):
+        """Keep the role result on its stack while retrying only its DB confirmation."""
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        owner = task_calls.current_call.get()
+        if stopped and owner is not None and owner.kind == 'agent':
+            with self.condition:
+                if owner.token not in self.storage_waiting:
+                    self.storage_waiting.add(owner.token)
+                    self.running['agent'][task.repo] -= 1
+                    self.condition.notify_all()
+        while True:
+            self.check_project(task.repo)
+            try:
+                return operation()
+            except DatabaseWaitTimeout:
+                events.emit('Agent 결과 DB 확정 재시도 대기', level='WARN', project=task.repo, plan=task.plan_id)
+                with self.condition:
+                    self.condition.wait(.2)
 
     def wait_retry(self, connection, repo, plan_id=None, *, resume=False):
         from loop_manager_internal.storage import recovery_state
@@ -168,15 +190,22 @@ class TaskScheduler:
             return False
         while keys:
             self.check_project(repo)
-            live = {row['token'] for row in task_calls.recover(
+            live = {row['token']: row for row in task_calls.recover(
                 connection, self.state_dir, tokens={value['token'] for value in keys.values()})}
+            stopped = {token for token, row in live.items()
+                       if task_calls.execution_confirmed(connection, row, self.state_dir)}
             with self.condition:
                 for key, value in tuple(keys.items()):
                     if value['token'] not in live:
                         self.retained.pop(key, None)
+                        if not value.get('storage_only'):
+                            self.running[key[2]][key[0]] -= 1
+                            self.uncertain[key[2]] -= 1
+                        del keys[key]
+                    elif value['token'] in stopped and not value.get('storage_only'):
                         self.running[key[2]][key[0]] -= 1
                         self.uncertain[key[2]] -= 1
-                        del keys[key]
+                        value['storage_only'] = True
                 if keys:
                     self.condition.wait(1)
                 self.condition.notify_all()
@@ -301,11 +330,16 @@ class TaskScheduler:
             finally:
                 try:
                     with self.condition:
+                        storage_only = owner.token in self.storage_waiting
+                        self.storage_waiting.discard(owner.token)
                         if released:
-                            self.running[kind][task.repo] -= 1
+                            if not storage_only:
+                                self.running[kind][task.repo] -= 1
                         else:
-                            self.uncertain[kind] += 1
-                            self.retained[(task.repo, task.plan_id, kind)] = {"token": owner.token}
+                            if not storage_only:
+                                self.uncertain[kind] += 1
+                            self.retained[(task.repo, task.plan_id, kind)] = {"token": owner.token,
+                                                                          'storage_only': storage_only}
                         task.resumed = True
                         task.retry_order = None
                         self.condition.notify_all()
@@ -326,16 +360,17 @@ class TaskScheduler:
 
 def scheduled_call(kind):
     def decorate(function):
-        @wraps(function)
-        def call(*args, **kwargs):
-            observe_runtime()
-            scheduler, task = current_scheduler.get(), current_task.get()
+        def call_once(args, kwargs, returned, raised, bound_task, request_state, retried):
+            if not retried:
+                observe_runtime()
+            scheduler, task = current_scheduler.get(), bound_task or current_task.get()
             role = kwargs.get("role_name", args[4] if len(args) > 4 else None)
             preflight = current_verify_preflight.get() if kind == "verify" else None
             if scheduler is None:
                 if preflight is not None:
                     preflight()
-                observe_runtime()
+                if not retried:
+                    observe_runtime()
                 return function(*args, **kwargs)
             if kind == "agent" and role not in {"worker", "reviewer"}:
                 return function(*args, **kwargs)
@@ -354,8 +389,14 @@ def scheduled_call(kind):
                         if row is not None:
                             task = Task(row["repo"], row["plan_id"], connection)
                 if task is not None:
+                    if current_task.get() is None:
+                        stack.callback(current_task.reset, current_task.set(task))
                     runtime = runtime_state.RuntimeStateRepository(task.connection)
                     expected = runtime.get(task.repo, task.plan_id)
+                    if request_state and request_state[0] != expected:
+                        raise TaskRecheckRequired('DB 재시도 대기 중 작업 입력이 변경됐습니다.')
+                    if not request_state:
+                        request_state.append(expected)
                     stack.enter_context(scheduler.slot(kind, task))
                     from loop_manager_internal.recovery import scoped_blocking
                     from loop_manager_internal.storage import execplan_draft_state
@@ -367,8 +408,74 @@ def scheduled_call(kind):
                         raise task_calls.CallDeferred('호출 대기 중 차단·catalog/draft 보류가 확인됐습니다.')
                 if preflight is not None:
                     preflight()
-                observe_runtime()
-                return function(*args, **kwargs)
+                if not retried:
+                    observe_runtime()
+                try:
+                    result = function(*args, **kwargs)
+                    returned.append(result)
+                    return result
+                except BaseException as error:
+                    raised.append(error)
+                    raise
+
+        @wraps(function)
+        def call(*args, **kwargs):
+            from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+            scheduler = current_scheduler.get()
+            invocation = kwargs.get('invocation')
+            task = current_task.get()
+            if task is None and invocation is not None and invocation.plan_id and kwargs.get('connection') is not None:
+                task = Task(invocation.repo, invocation.plan_id, kwargs['connection'])
+            role = kwargs.get('role_name', args[4] if len(args) > 4 else None)
+            returned, raised, request_state = [], [], []
+            retried = False
+            while True:
+                try:
+                    result = returned[-1] if returned else call_once(args, kwargs, returned, raised, task, request_state, retried)
+                    if scheduler is not None and task is not None and kind == 'agent':
+                        identity = getattr(result, 'isolation_invocation_id', None)
+                        if identity:
+                            row = task.connection.execute('SELECT process_receipt_path FROM agent_invocations '
+                                'WHERE invocation_id=?', (identity,)).fetchone()
+                            if row is not None and row[0]:
+                                from loop_manager_internal.agents.process_receipt import delivered
+                                try:
+                                    delivered(row[0], scheduler.state_dir, identity)
+                                except (OSError, ValueError, TypeError) as error:
+                                    events.emit('Agent 결과 전달 표식 저장 실패', level='WARN', invocation_id=identity,
+                                                error_type=type(error).__name__)
+                                    # Keep the original response and request on this stack;
+                                    # an outer task retry would add last_error to its prompt.
+                                    scheduler.check_project(task.repo)
+                                    with scheduler.condition:
+                                        scheduler.condition.wait(.2)
+                                    continue
+                    return result
+                except DatabaseWaitTimeout:
+                    if raised and not isinstance(raised[-1], DatabaseWaitTimeout):
+                        raise raised[-1]
+                    if kind != 'agent' or scheduler is None or (task is None and invocation is None):
+                        raise
+                    request_scope = task or invocation
+                    retried = True
+                    scheduler.check_project(request_scope.repo)
+                    events.emit('Agent 요청 DB 재시도 대기', level='WARN', project=request_scope.repo, plan=request_scope.plan_id)
+                    with scheduler.condition:
+                        scheduler.condition.wait(.2)
+                    try:
+                        if task is not None:
+                            scheduler.wait_existing_call(task.connection, task.repo, task.plan_id)
+                    except DatabaseWaitTimeout:
+                        continue
+                    if task is not None:
+                        scheduler.requeue(task)
+                    raised.clear()
+                except BaseException as error:
+                    if raised and not isinstance(raised[-1], DatabaseWaitTimeout) and raised[-1] is not error:
+                        events.emit('Agent 원래 예외 보존; 예약 정리 실패', level='WARN',
+                                    error_type=type(error).__name__, original_error_type=type(raised[-1]).__name__)
+                        raise raised[-1]
+                    raise
         return call
     return decorate
 

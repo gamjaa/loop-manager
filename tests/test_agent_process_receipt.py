@@ -62,6 +62,66 @@ class ProcessReceiptTest(TestCase):
         self.assertEqual(self.recover(), 0)
         self.assertEqual(dict(self.row()), first)
 
+    def test_process_receipt_updates_preserve_the_invocation_observation(self):
+        facts = dict(started_at='2026-10-24T12:00:00+00:00', session_id='session')
+        process_receipt.observe(self.path, self.identity, facts)
+        process_receipt.started(self.launch, SimpleNamespace(pid=1234))
+        self.assertEqual(process_receipt.observation(str(self.path), self.state, self.identity)['session_id'], 'session')
+        process_receipt.finished(self.launch, SimpleNamespace(pid=1234))
+        value = process_receipt.observation(str(self.path), self.state, self.identity)
+        self.assertEqual(value, dict(version=1, identity=self.identity, **facts))
+        self.assertTrue(process_receipt.recover(str(self.path), self.state)['finished_at'])
+
+    def test_malformed_or_foreign_invocation_observation_preserves_pending_state_and_reservation(self):
+        from loop_manager_internal.storage import task_calls
+        task_calls.ensure_schema(self.connection)
+        owner = task_calls.reserve(self.connection, self.state, 'repo', 'G-1', 'agent', 'run')
+        with self.connection:
+            self.connection.execute('UPDATE task_call_reservations SET invocation_id=?, receipt_path=?',
+                                    (self.identity, str(self.path)))
+        for mode in ('foreign', 'malformed', 'malformed_request_session'):
+            with self.subTest(mode=mode):
+                self.path.unlink(missing_ok=True)
+                identity = 'other-invocation' if mode == 'foreign' else self.identity
+                facts = ({} if mode == 'foreign' else {'request_session_id': 3}
+                         if mode == 'malformed_request_session' else {'outcome': {'kind': 'success'}})
+                process_receipt.observe(self.path, identity, facts)
+                process_receipt.finished(self.launch, SimpleNamespace(pid=1234))
+                self.assertEqual(self.repository.reconcile_interrupted(state_dir=self.state), 0)
+                self.assertIsNone(self.row()['finished_at'])
+                self.assertFalse(task_calls.confirmed(owner))
+                self.assertEqual(len(task_calls.recover(self.connection, self.state)), 1)
+
+    def test_prelaunch_rejection_is_recovered_as_non_execution_without_a_result(self):
+        with self.connection:
+            self.connection.execute("UPDATE agent_invocations SET execution_status='prepared', execution_started_at=NULL")
+        process_receipt.not_started(self.path)
+        self.repository.reconcile_interrupted(state_dir=self.state)
+        first = dict(self.row())
+        self.assertEqual((first['execution_status'], first['result_code']), ('not_executed', None))
+        self.assertEqual(json.loads(first['execution_finish_evidence'])['evidence'], 'not_started')
+        self.repository.reconcile_interrupted(state_dir=self.state)
+        self.assertEqual(dict(self.row()), first)
+
+    def test_non_execution_proof_cannot_replace_a_process_start_or_downgrade_the_ledger(self):
+        from loop_manager_internal.storage import task_calls
+        self.started()
+        original = self.path.read_bytes()
+        process_receipt.not_started(self.path)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.path.unlink()
+        process_receipt.not_started(self.path)
+        self.repository.reconcile_interrupted(state_dir=self.state)
+        self.assertEqual(self.row()['execution_status'], 'executed')
+        self.assertIsNone(self.row()['execution_finished_at'])
+        task_calls.ensure_schema(self.connection)
+        owner = task_calls.reserve(self.connection, self.state, 'repo', 'G-1', 'agent', 'run')
+        with self.connection:
+            self.connection.execute('UPDATE task_call_reservations SET invocation_id=?, receipt_path=?',
+                                    (self.identity, str(self.path)))
+        self.assertFalse(task_calls.confirmed(owner))
+        self.assertEqual(len(task_calls.recover(self.connection, self.state)), 1)
+
     def test_live_group_and_missing_or_malformed_proof_stay_unknown(self):
         self.recover()
         self.assertIsNone(self.row()['execution_finished_at'])

@@ -17,6 +17,66 @@ from tests.support.workspace import native_developer_texts
 
 @isolated_git_test
 class PlannerInterruptionRecoveryTest(unittest.TestCase):
+    def test_completed_planner_restart_rebuilds_the_original_query_prompt(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.agents.agent_invocation import AgentResult, ResolvedProfile
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        from loop_manager_internal.agents import process_receipt
+        from loop_manager_internal.planning.agent_ports import _PlanningAgentPorts
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / 'state'
+            state_dir.mkdir()
+            config = profile_config(self)
+            runtime = state_dir / 'agent-runtime' / 'fixture'
+            attempt = runtime / 'attempt'
+            attempt.mkdir(parents=True)
+            launch = SimpleNamespace(runtime=runtime, attempt=attempt)
+            (attempt / 'last-message.txt').write_text('stop after recovered result', encoding='utf-8')
+            requests, sessions = [], []
+            class Provider:
+                def run(_, request):
+                    requests.append(request)
+                    self.assertIsNone(request.session_id)
+                    self.assertIn('--path <상대경로>', request.prompt)
+                    request.on_launch_prepared(launch)
+                    request.on_process_started()
+                    request.on_session_started('observed-session')
+                    request.on_process_finished()
+                    return AgentResult(1, 'stop after recovered result', 'observed-session')
+            original = _PlanningAgentPorts.prompt_session
+            def prompt_session(port, session):
+                value = original(port, session)
+                sessions.append((session, value))
+                return value
+            with mock.patch('loop_manager.validate_repository', return_value=repo), \
+                 mock.patch('loop_manager.remote_base', return_value='main'), \
+                 mock.patch('loop_manager.ensure_safe_base_worktree'), \
+                 mock.patch('loop_manager.validate_provider_runtime'), \
+                 mock.patch('loop_manager._agent_profile', return_value=ResolvedProfile('test-strong', 'xhigh')), \
+                 mock.patch('loop_manager.agent_provider', return_value=Provider()), \
+                 mock.patch.object(_PlanningAgentPorts, 'prompt_session', prompt_session):
+                with closing(loop_manager.connect_database(state_dir, create=True)) as connection:
+                    with mock.patch.object(InvocationRepository, 'finish', side_effect=KeyboardInterrupt('restart')):
+                        with self.assertRaises(KeyboardInterrupt):
+                            loop_manager.run_project(connection, state_dir, str(repo), config, 'main', False)
+                    before = dict(connection.execute('SELECT * FROM agent_invocations').fetchone())
+                    self.assertEqual(connection.execute('SELECT planner_session_id FROM projects WHERE repo=?',
+                                     (str(repo),)).fetchone()[0], 'observed-session')
+                with closing(loop_manager.connect_database(state_dir)) as connection:
+                    self.assertEqual(loop_manager.run_project(connection, state_dir, str(repo), config, 'main', False), 1)
+                    row = dict(connection.execute('SELECT * FROM agent_invocations').fetchone())
+                    self.assertEqual(connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 1)
+                    self.assertEqual((row['invocation_id'], row['session_id'], row['result_code']),
+                                     (before['invocation_id'], 'observed-session', 1))
+                    self.assertFalse(process_receipt.observation(row['process_receipt_path'], state_dir,
+                                     row['invocation_id'])['database_pending'])
+                    port = _PlanningAgentPorts(None, connection, SimpleNamespace(repo=str(repo), state_dir=state_dir), None)
+                    self.assertEqual(port.prompt_session('observed-session'), 'observed-session')
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(sessions, [(None, None), ('observed-session', None),
+                                        ('observed-session', 'observed-session')])
+
     @dummy_worker_sessions
     def test_planner_commit_failure_preserves_valid_result_without_retry_penalty(self):
         roles = []

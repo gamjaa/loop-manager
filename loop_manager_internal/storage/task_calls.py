@@ -171,27 +171,46 @@ def _confirmed(connection, row, state_dir):
     if row["kind"]=="verify":
         return _verify_recovered(row,state_dir)
     from loop_manager_internal.agents.process_receipt import recover as recover_agent
-    if recover_agent(row["receipt_path"],Path(state_dir)) is not None:
+    proof = recover_agent(row["receipt_path"],Path(state_dir))
+    if proof is not None:
+        if proof.get('evidence') == 'not_started' and row['invocation_id'] is not None:
+            invocation = connection.execute('SELECT execution_started_at FROM agent_invocations '
+                'WHERE invocation_id=?', (row['invocation_id'],)).fetchone()
+            return invocation is not None and invocation[0] is None
         return True
     invocation=connection.execute("SELECT execution_status,execution_finish_evidence "
         "FROM agent_invocations WHERE invocation_id=?",(row["invocation_id"],)).fetchone()
     return bool(invocation and invocation[1])
 
 
+def execution_confirmed(connection, row, state_dir):
+    """Physical termination is independent of pending observation persistence."""
+    return _confirmed(connection, row, state_dir)
+
+
 def confirmed(owner):
+    from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
     row=owner.connection.execute("SELECT * FROM task_call_reservations WHERE token=?",(owner.token,)).fetchone()
-    return row is not None and _confirmed(owner.connection,row,owner.state_dir)
+    pending = (InvocationRepository(owner.connection).reconcile_observations(
+        state_dir=owner.state_dir, invocation_id=row['invocation_id'])
+        if row is not None and row['invocation_id'] is not None else set())
+    return row is not None and row['invocation_id'] not in pending and execution_confirmed(owner.connection,row,owner.state_dir)
 
 
 def recover(connection, state_dir, *, tokens=None):
     """미시작 또는 기존 프로세스 종료 근거가 있는 자리만 회수한다."""
     from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
-    InvocationRepository(connection).reconcile_execution(state_dir=state_dir)
+    repository = InvocationRepository(connection)
     rows=connection.execute("SELECT * FROM task_call_reservations").fetchall()
     if tokens is not None:
         rows = [row for row in rows if row['token'] in tokens]
+    pending = set()
     for row in rows:
-        if _confirmed(connection,row,state_dir):
+        if row['kind'] == 'agent' and row['invocation_id'] is not None:
+            pending.update(repository.reconcile_observations(state_dir=state_dir, invocation_id=row['invocation_id']))
+    repository.reconcile_execution(state_dir=state_dir)
+    for row in rows:
+        if row['invocation_id'] not in pending and execution_confirmed(connection,row,state_dir):
             with connection:
                 connection.execute("DELETE FROM task_call_reservations WHERE token=?",(row["token"],))
     return tuple(row for row in connection.execute("SELECT * FROM task_call_reservations")

@@ -476,6 +476,8 @@ class PlanningGitPort(Protocol):
 class PlanningAgentPort(Protocol):
     """Planner CLI and Agent scope boundary."""
 
+    def prompt_session(self, session_id: str | None) -> str | None: ...
+
     def begin_scope(self, role: str, worktree: Path) -> Any: ...
 
     def run_planner(

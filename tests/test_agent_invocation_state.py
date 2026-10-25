@@ -11,6 +11,25 @@ from loop_manager_internal.agents.scope_contracts import GitSnapshot
 
 
 class InvocationRepositoryTests(TestCase):
+    def test_observation_application_keeps_the_callers_atomic_rollback(self):
+        from dataclasses import asdict
+        identity = self.repository.start(InvocationContext('repo', None), 'planner', 'codex',
+                                         ResolvedProfile('model', 'high'), 'old-session')
+        timestamp = '2026-10-24T12:00:00+00:00'
+        facts = dict(started_at=timestamp, finished_at=timestamp, duration_ms=7, session_id='new-session',
+                     outcome=dict(kind='success', code=0, duration_ms=9, session_id='new-session',
+                                  usage=asdict(Usage(input_tokens=3)), collection_status='known', observed_at=timestamp))
+        with self.assertRaisesRegex(RuntimeError, 'outer'), self.connection:
+            self.connection.execute('BEGIN IMMEDIATE')
+            self.repository.apply_observation(identity, facts)
+            raise RuntimeError('outer')
+        row = self.connection.execute('SELECT * FROM agent_invocations').fetchone()
+        self.assertEqual((row['execution_status'], row['session_id']), ('prepared', 'old-session'))
+        self.assertIsNone(row['execution_started_at'])
+        self.assertIsNone(row['execution_finished_at'])
+        self.assertIsNone(row['finished_at'])
+        self.assertIsNone(row['input_tokens'])
+
     def test_scope_binding_requires_matching_role_workspace_and_saved_snapshot(self):
         for field in ('agent_role', 'worktree', 'agent_snapshot'):
             self.connection.execute(f'ALTER TABLE projects ADD COLUMN {field} TEXT')

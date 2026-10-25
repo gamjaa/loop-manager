@@ -101,6 +101,27 @@ class _PlanningAgentPorts:
         self._context = context
         self._planner_mutex = planner_mutex
 
+    def prompt_session(self, session_id: str | None) -> str | None:
+        """Rebuild session-dependent prompt parts from an undelivered request."""
+        from loop_manager_internal.agents.process_receipt import observation
+        tables = {row[0] for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'agent_invocations' not in tables:
+            return session_id
+        # ponytail: O(n) role receipt scan, as in run_agent; index pending receipts if long histories become costly.
+        rows = self._connection.execute('''SELECT invocation_id, process_receipt_path FROM agent_invocations
+            WHERE repo=? AND plan_id IS NULL AND role='planner' AND process_receipt_path IS NOT NULL
+            ORDER BY rowid DESC''', (self._context.repo,)).fetchall()
+        for identity, path in rows:
+            saved = observation(path, self._context.state_dir, identity)
+            if saved is None or not saved.get('database_pending'):
+                continue
+            original = saved.get('request_session_id', session_id)
+            if (session_id == original or session_id is not None
+                    and session_id in (saved.get('session_id'), saved.get('outcome', {}).get('session_id'))):
+                return original
+            break  # The invocation service must reject an unrelated pending request.
+        return session_id
+
     def begin_scope(self, role: str, worktree: Path) -> GitSnapshot:
         return self._effects.begin_agent_scope(
             self._connection, self._context.repo, worktree, role,

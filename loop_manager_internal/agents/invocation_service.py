@@ -3,10 +3,11 @@ from __future__ import annotations
 from loop_manager_internal.runtime import operation_events as events
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
+import json
 from pathlib import Path
-from loop_manager_internal.storage.db_access import DatabaseWaitTimeout, open_connection
+from loop_manager_internal.storage.db_access import CoordinatedConnection, DatabaseWaitTimeout, finish_implicit_request, open_connection
 import sqlite3
 import subprocess
 import time
@@ -22,7 +23,7 @@ from loop_manager_internal.agents import agent_profiles
 from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
 from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
-from loop_manager_internal.application.task_scheduling import scheduled_call
+from loop_manager_internal.application.task_scheduling import scheduled_call, current_scheduler, current_task
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,23 @@ class InvocationEffects:
     capture_git_snapshot: Callable[[Path], GitSnapshot]
     git: Callable[..., object]
     agent_provider: Callable[[str], AgentProvider]
+
+
+def _database_request(connection, operation):
+    """Replay only DB preparation, never a provider or caller callback."""
+    if isinstance(connection, CoordinatedConnection):
+        if connection._request_deadline is None and (connection._depth or connection._explicit_transaction):
+            # Join caller ownership without replaying or committing its body.
+            with connection:
+                return operation()
+        if (connection.in_transaction and not connection._depth and not connection._explicit_transaction
+                and connection._request_deadline is None):
+            # A completed callback may leave an implicit write. Confirm it once;
+            # the callback itself is never part of the replayable request.
+            finish_implicit_request(connection._gate.path)
+        return connection.run_request(lambda current: operation())
+    # Repository methods retain transaction ownership on the public sqlite3 port.
+    return operation()
 
 
 @scheduled_call("agent")
@@ -68,21 +86,24 @@ def run_agent(
         if connection is None:
             state_dir.mkdir(parents=True, exist_ok=True)
             owned_connection = open_connection(state_dir / "loop-manager.db", timeout=5)
-        guidance_repository = GuidanceRepository(connection or owned_connection)
-        guidance_context = common_guidance.independent_context(
-            guidance_repository.connection, guidance_context, worktree,
-        )
+        guidance_connection = connection if connection is not None else owned_connection
+        guidance_repository = _database_request(
+            guidance_connection, lambda: GuidanceRepository(guidance_connection))
+        guidance_context = _database_request(guidance_connection, lambda: common_guidance.independent_context(
+            guidance_connection, guidance_context, worktree))
         guidance = common_guidance.resolve(
             guidance_repository, guidance_context, role_name, worktree, state_dir,
         )
-        session_task = (guidance_repository.session_task(guidance_context.repo, provider, session_id)
+        session_task = (_database_request(guidance_connection, lambda: guidance_repository.session_task(
+            guidance_context.repo, provider, session_id))
                         if session_id else None)
         if session_task is not None and session_task != guidance.task_id:
             raise common_guidance.GuidanceError("Agent session과 공통 지침 작업 identity가 다릅니다.")
-    except (common_guidance.GuidanceError, sqlite3.Error, OSError) as error:
+    except BaseException as error:
         if owned_connection is not None:
             owned_connection.close()
-        if isinstance(error, DatabaseWaitTimeout):
+        if isinstance(error, DatabaseWaitTimeout) or not isinstance(
+                error, (common_guidance.GuidanceError, sqlite3.Error, OSError)):
             raise
         return AgentResult(1, f"공통 지침 호출 준비 실패: {error}", session_id,
                            AgentResultKind.PERMANENT_CONFIGURATION)
@@ -90,6 +111,7 @@ def run_agent(
     collection_status = "unknown"
     adapter = effects.agent_provider(provider)
     prepared_launch = None
+    observation_receipt = None
     prepare = getattr(type(adapter), 'prepare_environment', None)
     if invocation is not None and resolved is None and callable(prepare):
         try:
@@ -112,35 +134,155 @@ def run_agent(
             # A real adapter still resolves and validates before launching CLI.
             collection_status = "error"
     ledger = agent_invocation_state.InvocationRepository(connection) if connection is not None else None
+    def request_fingerprint(request_session):
+        return hashlib.sha256(json.dumps([
+            provider, role_name, str(worktree.resolve()), prompt, read_only, level, persist_session, request_session,
+            guidance.task_id, guidance.content_hash, invocation.definition_revision if invocation else None,
+            invocation.purpose if invocation else None, invocation.target if invocation else None,
+            asdict(resolved) if resolved else None,
+        ], ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+    request_sha256 = request_fingerprint(session_id)
+    if ledger is not None and invocation is not None:
+        from .process_receipt import observation, result_message, delivered
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        # ponytail: O(n) receipt scan within one task/role; add a pending index
+        # only if long sessions make this costly, without duplicating the ledger.
+        try:
+            previous = _database_request(connection, lambda: connection.execute('''
+                SELECT invocation_id, process_receipt_path FROM agent_invocations
+                WHERE repo=? AND plan_id IS ? AND role=? AND process_receipt_path IS NOT NULL
+                ORDER BY rowid DESC''', (invocation.repo, invocation.plan_id, role_name)).fetchall())
+        except DatabaseWaitTimeout:
+            raise
+        except sqlite3.Error:
+            previous = []
+            collection_status = 'error'
+        for previous_identity, path in previous:
+            try:
+                saved = observation(path, state_dir, previous_identity)
+                if saved is None or not saved.get('database_pending'):
+                    continue
+                if 'started_at' not in saved and saved.get('outcome', {}).get('kind') == 'database_wait':
+                    continue  # No physical invocation to replay or consume.
+                outcome = saved.get('outcome')
+                if outcome is None or outcome['code'] is None:
+                    raise ValueError('저장 대기한 Agent 호출의 역할 결과가 부족합니다.')
+                original_session = saved.get('request_session_id', session_id)
+                if (session_id != original_session and (session_id is None
+                        or session_id not in (saved.get('session_id'), outcome['session_id']))):
+                    raise ValueError('저장 대기한 Agent 호출과 다른 session 요청입니다.')
+                if saved.get('request_sha256') != request_fingerprint(original_session):
+                    raise ValueError('저장 대기한 Agent 호출의 요청 입력이 다릅니다.')
+                if ledger.reconcile_observations(state_dir=state_dir, invocation_id=previous_identity):
+                    raise DatabaseWaitTimeout('기존 Agent 호출의 DB 확정 대기')
+                stored = connection.execute('''SELECT result_kind, result_code, session_id,
+                    input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens, reasoning_output_tokens
+                    FROM agent_invocations WHERE invocation_id=?''', (previous_identity,)).fetchone()
+                if stored is None or tuple(stored) != (outcome['kind'], outcome['code'], outcome['session_id'],
+                        *(outcome['usage'][key] for key in ('input_tokens', 'cached_input_tokens',
+                          'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens'))):
+                    raise ValueError('기존 Agent 관측과 확정된 invocation 결과가 다릅니다.')
+                if outcome['session_id']:
+                    _database_request(guidance_connection, lambda: guidance_repository.bind_session(
+                        guidance_context.repo, provider, outcome['session_id'], guidance.task_id))
+                message = result_message(path, saved['message_sha256'])
+                pending = False
+                if role_name == 'worker' and invocation.plan_id:
+                    from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+                    pending = TargetedTestRepository(connection).pending(invocation.repo, invocation.plan_id)
+                result = AgentResult(outcome['code'], message, outcome['session_id'],
+                    AgentResultKind.TRANSIENT_FAILURE if outcome['kind'] == 'timeout' else
+                    AgentResultKind(outcome['kind']), Usage(**outcome['usage']),
+                    outcome['collection_status'], previous_identity, pending)
+                if current_scheduler.get() is None or current_task.get() is None:
+                    delivered(path, state_dir, previous_identity)
+                return result
+            except DatabaseWaitTimeout:
+                raise
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+                raise CallDeferred('기존 Agent 결과의 저장·원문 확인 대기: ' + type(error).__name__) from error
     identity: str | None = None
     execution_started = False
     execution_started_at: float | None = None
     scope_id = None
-    if connection is not None and invocation is not None:
-        try:
-            scope_id = ledger.invocation_scope_id(invocation.repo, role_name, str(worktree))
-        except (sqlite3.Error, KeyError, IndexError, TypeError, ValueError, RuntimeError):
-            pass  # Legacy/minimal records cannot grant reduced monitoring.
     if ledger is not None and invocation is not None and resolved is not None:
+        def prepare_invocation():
+            nonlocal scope_id
+            # Re-read the current scope on every rolled-back preparation attempt.
+            scope_id = None
+            try:
+                scope_id = ledger.invocation_scope_id(invocation.repo, role_name, str(worktree))
+            except DatabaseWaitTimeout:
+                raise
+            except (sqlite3.Error, KeyError, IndexError, TypeError, ValueError, RuntimeError):
+                pass  # Legacy/minimal records cannot grant reduced monitoring.
+            prepared_identity = effects.start_invocation(
+                ledger, invocation, role_name, provider, resolved, session_id, scope_id=scope_id)
+            ledger.bind_guidance(prepared_identity, guidance.task_id, guidance.content_hash)
+            return prepared_identity
+
         try:
-            identity = effects.start_invocation(ledger, invocation, role_name, provider,
-                                        resolved, session_id, scope_id=scope_id)
-            ledger.bind_guidance(identity, guidance.task_id, guidance.content_hash)
+            identity = _database_request(connection, prepare_invocation)
             collection_status = "pending"
         except DatabaseWaitTimeout:
             raise
         except sqlite3.Error:
             collection_status = "error"
 
+    observations = {'request_sha256': request_sha256, 'request_session_id': session_id}
+    def remember(**facts):
+        nonlocal collection_status
+        observations.update(facts)
+        if observation_receipt is not None and identity is not None:
+            from .process_receipt import observe
+            try:
+                observe(observation_receipt, identity, observations)
+            except (OSError, ValueError, TypeError) as error:
+                collection_status = 'error'
+                events.emit('Agent 호출 관측 근거 보존 실패', level='WARN', invocation_id=identity,
+                            error_type=type(error).__name__)
+
+    def remember_outcome(kind, code, result_session, usage):
+        remember(database_pending=True, outcome=dict(kind=kind, code=code, session_id=result_session, usage=asdict(usage),
+                              duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                              collection_status='error' if collection_status == 'error' else usage.status,
+                              observed_at=agent_invocation_state.utc_now()))
+
+    def confirm_observations():
+        def operation():
+            try:
+                _database_request(connection, lambda: ledger.apply_observation(identity, observations))
+            except DatabaseWaitTimeout:
+                raise
+            except sqlite3.Error:
+                # An unavailable optional callback column must not discard an
+                # already observed provider outcome. Missing safety proof stays missing.
+                outcome = observations['outcome']
+                _database_request(connection, lambda: ledger.finish(
+                    identity, outcome['kind'], outcome['code'], outcome['duration_ms'], outcome['session_id'],
+                    Usage(**outcome['usage']), 'error', replace_session=True,
+                    execution_status='executed' if execution_started else 'not_executed',
+                    observed_at=outcome['observed_at']))
+        try:
+            operation()
+        except DatabaseWaitTimeout:
+            from loop_manager_internal.storage.task_calls import current_call
+            scheduler, task, owner = current_scheduler.get(), current_task.get(), current_call.get()
+            if scheduler is None or invocation is None or (owner is not None and owner.connection is not connection):
+                raise
+            scheduler.finish_agent_storage(task or invocation, operation, stopped='finished_at' in observations)
+
     def observe_session(started_session_id: str) -> None:
         nonlocal collection_status
+        remember(session_id=started_session_id)
         try:
-            guidance_repository.bind_session(guidance_context.repo, provider, started_session_id, guidance.task_id)
+            _database_request(guidance_connection, lambda: guidance_repository.bind_session(
+                guidance_context.repo, provider, started_session_id, guidance.task_id))
         except DatabaseWaitTimeout:
             collection_status = 'error'
         if ledger is not None and identity is not None:
             try:
-                ledger.observe_session(identity, started_session_id)
+                _database_request(connection, lambda: ledger.observe_session(identity, started_session_id))
             except sqlite3.Error:
                 collection_status = "error"
         if on_session_started is not None:
@@ -155,7 +297,7 @@ def run_agent(
                 "Agent 격리 증거를 저장할 invocation 상태가 없습니다."
             )
         try:
-            ledger.record_isolation(identity, evidence)
+            _database_request(connection, lambda: ledger.record_isolation(identity, evidence))
         except DatabaseWaitTimeout:
             raise
         except sqlite3.Error as error:
@@ -167,7 +309,7 @@ def run_agent(
         if ledger is None or identity is None:
             raise agent_write_isolation.IsolationError('Agent 실제 실행 입력을 저장할 invocation이 없습니다.')
         try:
-            ledger.record_execution_identity(identity, value)
+            _database_request(connection, lambda: ledger.record_execution_identity(identity, value))
         except DatabaseWaitTimeout:
             raise
         except (sqlite3.Error, ValueError) as error:
@@ -200,8 +342,11 @@ def run_agent(
 
     def observe_cli_process_started() -> None:
         nonlocal execution_started, execution_started_at, collection_status
+        if execution_started:
+            return
         execution_started = True
         execution_started_at = time.monotonic()
+        remember(started_at=agent_invocation_state.utc_now())
         events.emit("Agent 실제 실행 시작", invocation_id=identity,
                     provider=provider, model=resolved.model if resolved else None,
                     effort=resolved.effort if resolved else None,
@@ -210,7 +355,8 @@ def run_agent(
                     session_transition=invocation.transition if invocation else None)
         if ledger is not None and identity is not None:
             try:
-                ledger.mark_execution_started(identity)
+                _database_request(connection, lambda: ledger.mark_execution_started(
+                    identity, observed_at=observations['started_at']))
             except sqlite3.Error:
                 collection_status = "error"
         if notify_process_start:
@@ -220,10 +366,11 @@ def run_agent(
         nonlocal collection_status
         if ledger is None or identity is None or execution_started_at is None:
             return
+        if 'finished_at' not in observations:
+            remember(finished_at=agent_invocation_state.utc_now(),
+                     duration_ms=max(0, int((time.monotonic() - execution_started_at) * 1000)))
         try:
-            ledger.mark_execution_finished(
-                identity, max(0, int((time.monotonic() - execution_started_at) * 1000)),
-            )
+            _database_request(connection, lambda: ledger.apply_observation(identity, observations))
         except sqlite3.Error:
             collection_status = "error"
 
@@ -241,7 +388,17 @@ def run_agent(
 
     notify_process_start = (role_name in {"worker", "planner", "planner_check", "maintenance_planner"}
                             and has_notification_session and invocation is not None)
+
+    def bind_receipt(receipt):
+        from loop_manager_internal.storage import task_calls
+        task_calls.bind_agent_receipt(receipt)
+        if identity is not None:
+            task_calls.bind_agent(identity)
+        if ledger is not None and identity is not None:
+            ledger.bind_process_receipt(identity, str(receipt))
+
     def observe_targeted(directory, receipt):
+        nonlocal observation_receipt
         if role_name != 'worker' or invocation is None or not invocation.plan_id:
             return
         if ledger is None or identity is None:
@@ -249,24 +406,40 @@ def run_agent(
         from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
         try:
             TargetedTestRepository(connection).bind(identity, directory, receipt, state_dir=state_dir)
-            ledger.bind_process_receipt(identity, str(receipt))
+            observation_receipt = Path(receipt)
+            _database_request(connection, lambda: bind_receipt(receipt))
         except DatabaseWaitTimeout:
+            # bind validates this Manager-owned path before attempting SQL.
+            observation_receipt = Path(receipt)
+            from .process_receipt import not_started
+            try:
+                not_started(observation_receipt)
+            except OSError as error:
+                events.emit('Agent 미시작 근거 보존 실패', level='WARN', invocation_id=identity,
+                            error_type=type(error).__name__)
             raise
         except (OSError, ValueError, sqlite3.Error) as error:
             raise agent_write_isolation.IsolationError('targeted test 호출 결합 저장 실패') from error
 
     def observe_launch(launch):
-        nonlocal prepared_launch
+        nonlocal prepared_launch, observation_receipt
         prepared_launch = launch
         from .process_receipt import receipt_path
-        from loop_manager_internal.storage import task_calls
-        task_calls.bind_agent_receipt(receipt_path(launch))
-        if identity is not None:
-            task_calls.bind_agent(identity)
-        if ledger is not None and identity is not None:
-            from .process_receipt import receipt_path
-            ledger.bind_process_receipt(identity, str(receipt_path(launch)))
-        observe_targeted(launch.attempt, receipt_path(launch))
+        receipt = receipt_path(launch)
+        observation_receipt = receipt
+        try:
+            _database_request(guidance_connection, lambda: bind_receipt(receipt))
+            observe_targeted(launch.attempt, receipt)
+        except BaseException:
+            # This callback has not returned to the adapter: no spawn can have
+            # occurred. Preserve that fact even if the DB is still unavailable.
+            from .process_receipt import not_started
+            try:
+                not_started(receipt)
+            except OSError as error:
+                events.emit('Agent 미시작 근거 보존 실패', level='WARN', invocation_id=identity,
+                            error_type=type(error).__name__)
+            raise
 
     request = AgentRequest(
         worktree=worktree,
@@ -302,16 +475,20 @@ def run_agent(
                               "최소 문맥으로 새 session에서 작업을 이어가야 합니다.", session_id)
         else:
             try:
+                from loop_manager_internal.runtime.handoff_gate import observe_runtime
+                observe_runtime()  # DB preparation is complete; this is an actual stage entry.
                 with events.log_context(invocation_id=identity):
                     raw = adapter.run(request)
             except common_guidance.GuidanceError as error:
                 raw = AgentResult(1, f"공통 지침 provider 준비 실패: {error}", session_id,
                                   AgentResultKind.PERMANENT_CONFIGURATION)
             completed = _coerce_agent_result(raw, session_id)
+            remember(message_sha256=hashlib.sha256(completed.message.encode('utf-8')).hexdigest())
+            remember_outcome(completed.ledger_kind, completed.code, completed.session_id, completed.usage)
             if completed.session_id:
                 try:
-                    guidance_repository.bind_session(guidance_context.repo, provider,
-                                                     completed.session_id, guidance.task_id)
+                    _database_request(guidance_connection, lambda: guidance_repository.bind_session(
+                        guidance_context.repo, provider, completed.session_id, guidance.task_id))
                 except sqlite3.Error as error:
                     collection_status = 'error'
                     events.emit('Agent 실제 결과 보존; session 저장 대기', level='WARN',
@@ -321,16 +498,21 @@ def run_agent(
                     result=type(error).__name__, execution_status="executed" if execution_started else "not_executed",
                     elapsed_seconds=round(time.monotonic() - started, 1))
         if ledger is not None and identity is not None:
-            kind = ("interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else
+            kind = ("database_wait" if isinstance(error, DatabaseWaitTimeout) and not execution_started else
+                    "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else
                     "timeout" if isinstance(error, subprocess.TimeoutExpired) else
                     "transient_failure" if isinstance(error, OSError) else "exception")
+            if completed is None:
+                remember_outcome(kind, None, observations.get('session_id', session_id), Usage())
+            else:
+                remember(outcome={**observations['outcome'], 'collection_status': 'error'})
             try:
-                ledger.finish(identity, kind, None,
-                              max(0, int((time.monotonic() - started) * 1000)),
-                              None, Usage(),
-                              execution_status="executed" if execution_started else "not_executed")
-            except sqlite3.Error:
-                pass
+                confirm_observations()
+                if completed is None:
+                    remember(database_pending=False)
+            except BaseException as storage_error:
+                events.emit('Agent 원래 예외 보존; 호출 종료 저장 대기', level='WARN', invocation_id=identity,
+                            error_type=type(storage_error).__name__, original_error_type=type(error).__name__)
         raise
     finally:
         if role_name == 'worker' and connection is not None and invocation is not None and invocation.plan_id:
@@ -368,17 +550,20 @@ def run_agent(
     if result.collection_status == "error":
         collection_status = "error"
     if ledger is not None and identity is not None:
+        if 'outcome' not in observations:
+            remember_outcome(result.ledger_kind, result.code, result.session_id, result.usage)
+        remember(outcome={**observations['outcome'],
+                          'collection_status': 'error' if collection_status == 'error' else result.usage.status})
         try:
-            ledger.finish(identity, result.ledger_kind, result.code,
-                          max(0, int((time.monotonic() - started) * 1000)),
-                          result.session_id, result.usage,
-                          "error" if collection_status == "error" else None,
-                          replace_session=True,
-                          execution_status="executed" if execution_started else "not_executed")
+            confirm_observations()
             if collection_status != "error":
                 collection_status = result.usage.status
-        except sqlite3.Error:
+            if current_scheduler.get() is None or current_task.get() is None:
+                remember(database_pending=False)
+        except sqlite3.Error as error:
             collection_status = "error"
+            events.emit('Agent 실제 결과 보존; 호출 종료 저장 대기', level='WARN', invocation_id=identity,
+                        error_type=type(error).__name__)
     events.emit("Agent 호출 결과 관측", level="WARN" if result.code or collection_status == "error" else "INFO",
                 invocation_id=identity, result=result.ledger_kind, result_code=result.code,
                 execution_status="executed" if execution_started else "not_executed",

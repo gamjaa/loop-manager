@@ -691,9 +691,33 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 
 실제 retry·usage는 `executed`에 한해 집계한다. 사용량의 입력·캐시 입력·캐시 기록 입력·출력·추론 출력 토큰은 각각 정수 또는 `null`이며 누락을 0으로 대체하지 않는다. 수집된 값만 합산하므로 일부 값이 없는 합계는 전체 사용량의 증거가 아니다. 캐시 비율은 필요한 값이 함께 확인된 호출만 사용한다. Codex의 입력 토큰에는 캐시 입력을 포함하고 Claude의 입력 토큰은 비캐시 입력으로 취급하며 공급자별 의미를 보존한다.
 
-ledger의 `duration_ms`는 호출 처리 전체 경과 시간이고 `execution_duration_ms`는 프로세스 시작부터 종료 확인까지의 시간이다. 집계 결과의 `duration_ms`는 후자를 합산한다. 시작은 확인됐지만 종료 대기가 실패하면 `executed`를 유지하고 종료 시각·실행 시간은 미확인으로 둔다. 재시작의 종료 근거 복구는 writer 종료만 증명하며 결과·사용량·실행 시간을 합성하지 않는다. 기존 행에 목적·대상·실행을 역으로 추론하지 않는다.
+ledger의 `duration_ms`는 호출 처리 전체 경과 시간이고 `execution_duration_ms`는 프로세스 시작부터 종료 확인까지의 시간이다. 집계 결과의 `duration_ms`는 후자를 합산한다. 시작은 확인됐지만 종료 대기가 실패하면 `executed`를 유지하고 종료 시각·실행 시간은 미확인으로 둔다. 프로세스 종료 근거 자체는 writer 종료만 증명한다. 별도로 보존한 실제 호출 관측이 있을 때만 원래 결과·사용량·실행 시간을 복구하며, 기존 행에 목적·대상·실행을 역으로 추론하지 않는다.
 
 선택적 실행 관측·부가 기록 실패는 수집 상태로 격리해 Agent 결과를 보존한다. 필수 상태·격리·소유권·검증 증거의 저장 실패는 기존 실행·검증 경계로 처리하며, Worker targeted test 결과 수집 실패를 성공으로 바꾸지 않는다. ledger에는 prompt·비밀값·인증 자료·코드·문서 전문을 추가하지 않으며, 호출별 provider 상세 파일은 [기록 원본과 보호](#기록-원본과-보호)의 별도 진단 기록으로 연결한다.
+
+#### DB 대기와 호출 결과 확정
+
+DB 전용 준비·확정은 `CoordinatedConnection.run_request()`의 공통 예산·rollback/재조회를 사용한다. invocation 생성과 지침 결합, launch의 예약/receipt 결합은 각각 원자 요청이고, 격리·실행 identity·targeted 결합도 CLI 시작 전에 확정한다. targeted 경로·device/inode 검사는 SQL 재시도 밖에서 수행하고 SQL은 미시작·미완료 Worker 소유권을 다시 확인한다. provider·Git·파일 생성·임의 session callback은 이 요청에서 replay하지 않는다. invocation 준비는 launch lock을 잡지 않으며 실제 spawn의 handoff gate는 유지한다. 완료된 callback의 암시적 쓰기는 기존 요청 종료 경계에서 한 번 확정한 뒤 재시도 요청을 연다. 명시적 caller transaction에서는 savepoint로 합류해 DB 연산을 한 번만 수행하며 바깥 본문을 replay하거나 중간 commit하지 않는다.
+
+Manager 전용 process receipt는 기존 PID·호스트/boot·종료 근거와 별도로 `invocation_observation`을 원자 저장한다. 시작·종료 receipt 갱신은 이 관측을 보존하며 경로·platform·invocation identity·형식을 검증한다. 필드는 다음과 같고 관측하지 않은 값은 추가하지 않는다.
+
+| 필드 | version 1 계약 |
+|---|---|
+| `version`, `identity` | 정수 `1`과 결합된 invocation ID. 다른 버전·identity·알 수 없는 필드는 거부한다. |
+| `started_at`, `finished_at`, `duration_ms` | timezone을 포함한 ISO 8601 시각과 0 이상의 정수 실행 시간. 종료 관측은 시작과 실행 시간을 함께 요구하며 첫 관측 시각을 DB 재시도 시각으로 바꾸지 않는다. |
+| `session_id` | 관측한 비어 있지 않은 session 문자열. 귀속 충돌은 계속 거부한다. |
+| `request_session_id` | 원래 요청 session의 비어 있지 않은 문자열 또는 신규 요청을 뜻하는 null. callback·결과의 session으로 덮지 않으며 원래 요청 지문 검증에 사용한다. |
+| `outcome` | 필수 key는 `kind`, `code`, `duration_ms`, `session_id`, `usage`, `collection_status`, `observed_at`이다. 각각 종류·정수/null 코드·0 이상 정수 처리 시간·session 문자열/null·사용량·문자열 수집 상태·timezone 포함 시각이다. 종류는 `success`, `transient_failure`, `usage_limit`, `permanent_configuration`, `timeout`, `exception`, `interrupted`, `database_wait`이고 성공 코드는 0이다. |
+| `database_pending` | 저장/전달 확정 대기의 boolean. 관리 호출은 예약 정리와 결과 전달 경계를 지난 뒤 해제한다. |
+| `request_sha256`, `message_sha256` | 소문자 16진수 64자리 지문. 요청은 요청 session ID(null은 신규 요청)·prompt·역할/provider/profile·작업 공간·지침·definition/목적/target 등 현재 호출 입력을 결합한다. 메시지는 실제 역할 응답의 지문이며 원문을 새 감사 자료에 복사하지 않는다. |
+
+`usage`는 `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`의 0 이상 정수/null과 `status`의 `unknown`·`known`·`partial`·`invalid`를 요구한다. 관측 object의 version/identity 외 필드는 부분 관측 수집을 위해 선택 사항이며, 역할 응답 전달에는 outcome과 요청/메시지 지문을 모두 요구한다.
+
+`apply_observation()`은 같은 invocation의 ledger만 확정한다. 재시작 정리는 먼저 이 관측을 적용하고 실제 결과가 없을 때 기존 interrupted 처리를 사용한다. 손상·identity 충돌·DB 적용 대기는 해당 행과 예약을 보존한다. 선택적 callback 관측의 일반 SQL 오류에서는 저장 가능한 원래 outcome을 수집 오류로 남기되 누락된 안전 증거를 채우지 않는다. 일시 DB 대기는 이 fallback 대신 같은 관측의 원자 요청을 재시도한다. 미시작 DB 대기의 `database_wait`는 provider 실패 분류와 구별한다. launch callback이 반환되기 전에 거부된 경우에만 `not_started` 종료 근거를 남기며, 기존 receipt나 시작 기록과 모순되는 미시작 근거로 종료·예약 회수·targeted 수집을 확정하지 않는다. 관측 필드가 없는 구형 receipt는 기존 종료 근거로만 취급한다.
+
+관리 실행의 준비 대기 만료는 현재 작업 입력을 재확인한 RETRY 배정으로 이어간다. 결과를 확보한 호출은 원래 스택의 응답/예외를 유지하며 DB 확정만 다시 요청하고, 예약 정리가 대기해도 반환된 응답을 보존한다. `TaskScheduler`는 확인된 실제 종료와 저장 대기를 구분해 실행 개수만 먼저 반환할 수 있다. 이 구분은 재시작 때 같은 프로세스 종료 근거로 복원하고 저장 대기 예약·관리 작업은 유지한다. 종료 불명은 실행 개수도 유지한다. 대기 중에는 local pause/handoff만 확인하고 runtime 원격 관측은 DB 준비 후 실제 단계 진입에서 수행한다.
+
+재시작의 응답 전달은 대기 표식이 있는 기존 호출에 한정한다. 요청 지문에는 원래 요청 session을 포함하고 그 값을 `request_session_id`로 보존한다. 재진입 session은 원래 요청 값 또는 같은 invocation의 callback·결과에서 관측한 session만 허용한다. 따라서 신규 요청 뒤 callback이 저장한 Worker/Planner session으로 재시작해도 원래 요청 session을 사용해 나머지 입력 지문을 검증하며 다른 session 요청은 보류한다. 일반 Planner의 session별 조회 안내 구성은 prompt를 만들기 전에 같은 미전달 receipt의 원래 요청 session으로 판단한다. 실제 재진입 session은 유지하고 복원한 전체 prompt도 기존 지문 검사에 통과해야 하므로, 정상 callback 전이만으로 안내가 빠지는 문제를 막으면서 다른 prompt 변경의 거부는 유지한다. 전달 확정 뒤의 새 Planner 요청은 현재 session으로 안내 구성을 판단한다. `request_session_id`가 없는 구형 관측은 현재 입력으로 원래 지문이 그대로 일치할 때만 전달하며 원래 session을 추정하지 않는다. session 입력 자체가 빠진 구형 요청 지문도 일치로 추정하지 않는다. 요청 지문, ledger의 원래 결과·session·사용량과 session 귀속을 확인하고, 기존 attempt의 `last-message.txt` 원문 또는 그 양끝 공백을 제거한 값이 메시지 지문과 일치할 때만 같은 invocation의 `AgentResult`를 전달한다. 원문 부재·교체·지문 불일치·입력 변경·예외 원문 부족은 `CallDeferred`로 후속 처리를 보류하며 provider를 재호출하지 않는다. 관리 호출은 예약 정리 뒤 응답 반환 전에 기존 receipt의 `database_pending`을 해제한다. 표식 쓰기가 실패하면 원래 요청·응답을 현재 스택에 유지한 채 표식 확정만 재시도한다. 재시도 중 local pause/handoff를 확인하고 이미 반환한 실행 자리를 다시 점유하지 않으며 provider·작업 dispatch를 반복하거나 일반 예외의 `last_error`로 prompt를 바꾸지 않는다. 중단 시 관측 결과는 미전달 상태로 유지하고 재시작은 기존 입력 검증 뒤 복구한다. 전달된 결과를 계속 복구 대상으로 남겨 중복 응답이나 다음 요청의 영구 보류를 만들지 않는다. 이는 호출 성공 재사용·검증/게시 승인과 별개이며 기존 안전 gate와 targeted pending을 유지한다.
 
 ### Planner의 입력과 쓰기 범위
 

@@ -245,7 +245,8 @@ class PlanningAssessmentService(PlanningService):
                         + "\n이 근거를 최신 입력과 대조하고 일반 Planner 권한 안에서 판단하라."
                     )
                 from loop_manager_internal.maintenance.tiered_ports import query_instruction
-                if not row.planner_session_id:
+                prompt_session = getattr(self._ports.agent, 'prompt_session', lambda session: session)(row.planner_session_id)
+                if not prompt_session:
                     prompt += (self._ports.tiered.query_context(context.repo_path, context.base_branch,
                         str(row.active_sha), context.state_dir) if hasattr(self._ports, "tiered") else query_instruction())
             def save_final_session(session_id):
