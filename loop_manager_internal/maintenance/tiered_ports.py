@@ -115,7 +115,9 @@ class TieredMaintenancePort:
             review_mode = (active or prior).get("review_mode", (active or prior)["mode"])
         elif (prior is not None and prior.get("cycle_id") == cycle.cycle_id
                 and prior["source_revision"] != str(run.row.active_sha)):
-            paths = set(prior["paths"])
+            root_only_resume = (prior["mode"] == "fast" and selection.mode == "targeted"
+                                and selection.reasons == ("root_review_required",) and not selection.paths)
+            paths = set() if root_only_resume else set(prior["paths"])
             changed = {path for path in paths if prior["records"].get(path) != selection.index.records.get(path)}
             for path in changed:
                 for records in (prior["records"], selection.index.records):

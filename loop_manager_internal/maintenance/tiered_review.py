@@ -254,7 +254,7 @@ class TieredReviewRepository:
         if not selected:
             selected = tuple(index.records)
         return Selection(True, "targeted", tuple(sorted(reasons)), selected, index, roots, merged_count,
-                         None, base, root_source, placements, root_reviews, classifications)
+                         None, base, root_source, placements, root_reviews, classifications, root_guidance_hash)
 
     def prepare(self, repo, cycle, selection: Selection, *, cycle_id=None, review_mode=None,
                 guidance_hash=None):

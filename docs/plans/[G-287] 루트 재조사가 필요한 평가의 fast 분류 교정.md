@@ -47,6 +47,7 @@ priority: normal
 - [x] 최소 targeted unit 회귀와 관련 문서 정합성
 - 2026-10-24: 현재 rebase 후보에서 fast 무호출·유효 근거 재사용과 선택/저장 사이 지침 hash 재검사·legacy 근거 거부·저장된 root result/session 재연결·root-only targeted 성공 기준·source drift 관련 범위와 실제 root citation 회귀를 targeted unit test로 확인했다. 전체 verify는 Manager가 수행한다.
 - 2026-10-25: `af88a3811b3a1ad90526b11f3660f21fd6c5b3e2` 후보에서 관련 targeted unit 18개를 개별 재실행해 통과했고 base 대비 diff whitespace 검사도 통과했다. 전체 verify는 Manager가 수행한다.
+- 2026-10-25: 리뷰 delta에서 찾은 두 재개 경계를 보완했다. 이전 fast의 저장 경로가 남아 있는 source drift가 새 `root_review_required` 선택이면 root unit만 만들고, 위험 변경 targeted 선택은 선택 시점 root guidance hash를 보존해 `prepare()`의 변경 재검사를 받는다. 두 신규 회귀와 기존 source-drift·prepare guidance 재검사 unit을 현재 후보에서 실행해 통과했다.
 
 ## Decision Log
 

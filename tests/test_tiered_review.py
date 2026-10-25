@@ -441,6 +441,38 @@ class TieredReviewTest(unittest.TestCase):
         self.assertEqual(assessment["root_guidance_hash"], "current-guidance")
         self.assertEqual([unit["kind"] for unit in self.repository.units(assessment)], ["root_placement"])
 
+    def test_risky_targeted_selection_carries_root_guidance_hash_into_prepare(self):
+        from loop_manager_internal.agents import common_guidance
+
+        self.complete(self.select())
+        root = {"path": "docs", "category": "documentation"}
+        placement = SimpleNamespace(path="docs", category="documentation", reason="Tracked documentation root")
+        source = TrackedSource(".", "d" * 64, "040000", "new-sha", "root review source")
+        inv = inventory(self.sources, "new-sha")
+        actual = SourceInventory("new-sha", tuple(
+            TrackedSource(item.path, item.content_hash, item.mode, "new-sha", "source")
+            for item in inv.sources), tuple(
+            ClassifiedPath(path, "source", "source") for path in self.sources))
+        with mock.patch.object(tiered_review, "cached_source_inventory", return_value=actual), \
+                mock.patch.object(tiered_review, "root_placement_inventory", return_value=(placement,)), \
+                mock.patch.object(code_index, "git", side_effect=lambda _repo, _command, value:
+                    self.sources[value.split(":", 1)[1]]), \
+                mock.patch.object(common_guidance, "effective_planning_hash",
+                                  side_effect=("selected-guidance", "current-guidance")), \
+                mock.patch.object(maintenance_file_ledger, "root_review_source", return_value=source), \
+                mock.patch.object(maintenance_file_ledger.FileReviewRepository,
+                                  "reusable_root_reviews", return_value=(root,)):
+            selection = self.repository.select("repo", Path("/repo"), "main", "new-sha", 20, 0)
+            assessment = self.repository.prepare("repo", 2, selection)
+
+        self.assertEqual(selection.mode, "targeted")
+        self.assertTrue(selection.paths)
+        self.assertEqual(selection.root_reviews, (root,))
+        self.assertEqual(selection.root_guidance_hash, "selected-guidance")
+        self.assertEqual(assessment["root_guidance_hash"], "current-guidance")
+        self.assertIsNone(assessment["root_reviews"])
+        self.assertIn("root_placement", [unit.get("kind") for unit in self.repository.units(assessment)])
+
 
 class TieredRootReviewTest(MaintenancePlanningCase):
     def test_root_only_targeted_success_keeps_full_baseline_and_reuses_current_root_evidence(self):

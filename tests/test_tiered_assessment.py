@@ -648,6 +648,38 @@ Run targeted unit tests, full verify, and a read-only Review.
         self.assertEqual(resumed["mode"], "targeted")
         self.assertIsNone(self.ports.tiered.repository.success("/repo"))
 
+    def test_fast_source_drift_keeps_root_only_targeted_scope(self):
+        from loop_manager_internal.agents import common_guidance
+
+        root = {"path": "docs", "category": "documentation"}
+        root_source = {"path": ".", "content_hash": "d" * 64, "mode": "040000",
+                       "revision": self.sha, "reason": "root review source"}
+        placement = {**root, "reason": "Tracked documentation root"}
+        guidance = common_guidance.effective_planning_hash(self.connection, "/repo")
+        previous_fast = replace(self.ports.tiered.select.return_value, mode="fast",
+            reasons=("known_incremental_change",), paths=tuple(self.contents), roots=(root,), base="main",
+            root_source=root_source, root_placements=(placement,), root_reviews=(root,),
+            root_guidance_hash=guidance)
+        self.ports.tiered.repository.prepare("/repo", self.run.maintenance_cycle.revision,
+            previous_fast, cycle_id=self.run.maintenance_cycle.cycle_id)
+
+        revision = "b" * 40
+        index = code_index.build_index(self.connection, "/repo:remote", inventory(self.contents, revision),
+            lambda source: self.contents[source.path])
+        current_root_source = dict(root_source, revision=revision)
+        root_only = tiered_review.Selection(True, "targeted", ("root_review_required",), (), index,
+            (root,), 0, None, "main", current_root_source, (placement,), None, (), guidance)
+        self.run.row = replace(self.run.row, active_sha=revision)
+        self.run.maintenance_cycle = replace(self.run.maintenance_cycle, revision=2)
+
+        resumed = self.ports.tiered.prepare(self.run, root_only)
+
+        self.assertEqual(resumed["mode"], "targeted")
+        self.assertEqual(resumed["reasons"], ["resume_related_scope"])
+        self.assertEqual(resumed["paths"], [])
+        self.assertEqual([unit["kind"] for unit in self.ports.tiered.repository.units(resumed)],
+                         ["root_placement"])
+
     def test_unrelated_source_drift_reuses_receipts_without_claiming_current_full_review(self):
         self.model()
         self.turn()
