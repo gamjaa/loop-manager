@@ -656,9 +656,12 @@ class PrForBranchEffects:
 
 
 def pr_for_branch(effects: PrForBranchEffects, repo: Path, branch: str,
-                  url: str | None = None, *, history: bool = False) -> dict[str, object] | None:
+                  url: str | None = None, *, history: bool = False,
+                  expected_repository: str | None = None,
+                  expected_base: str | None = None) -> dict[str, object] | None:
     return github_observation.pr_for_branch(
         effects._github_observation_effects_pr_for_branch(), repo, branch, url, history=history,
+        expected_repository=expected_repository, expected_base=expected_base,
     )
 
 

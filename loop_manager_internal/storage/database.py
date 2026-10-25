@@ -6,6 +6,7 @@ existing order and connection-local initialization marker.
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sqlite3
 
 from loop_manager_internal.runtime import project_registry
@@ -551,6 +552,9 @@ def connect_database(
         connection.execute(
             "INSERT OR IGNORE INTO manager_metadata(key, value) VALUES ('created_from_absence', '1')"
         )
+        connection.execute(
+            "INSERT INTO manager_metadata(key, value) VALUES ('remote_adoption_bootstrap', 'null')"
+        )
         connection.commit()
     if not run_migrations:
         # Scheduler workers inherit the schema initialized by the parent.
@@ -629,22 +633,66 @@ def connect_database(
     return connection
 
 
+def has_remote_work_adoption_bootstrap(connection: sqlite3.Connection) -> bool:
+    """Distinguish absent-DB initialization from legacy runtime migration."""
+    return (connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_metadata'"
+    ).fetchone() is not None and connection.execute(
+        "SELECT 1 FROM manager_metadata WHERE key='remote_adoption_bootstrap'"
+    ).fetchone() is not None)
+
+
 def remote_work_adoption_allowed(connection: sqlite3.Connection, repo: str, plan_id: str) -> bool:
-    """Allow only first-workspace adoption in a database initialized from absence."""
+    """Require a declaration-bound grant issued by the first recovery catalog."""
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_metadata'"
     ).fetchone() is None:
         return False
-    created = connection.execute(
-        "SELECT value FROM manager_metadata WHERE key='created_from_absence'"
+    grant = connection.execute(
+        "SELECT value FROM manager_metadata WHERE key=?",
+        (f"remote_adoption:{repo}:{plan_id}",),
     ).fetchone()
-    if created is None or created[0] != "1":
+    if grant is None:
         return False
-    seen = connection.execute(
-        "SELECT 1 FROM manager_metadata WHERE key=?",
-        (f"workspace_seen:{repo}:{plan_id}",),
+    row = connection.execute(
+        "SELECT p.origin, p.base_branch, e.path, e.content_hash, e.plan_sha "
+        "FROM projects p JOIN exec_plans e ON e.repo=p.repo "
+        "WHERE p.repo=? AND p.registered=1 AND e.plan_id=?", (repo, plan_id),
     ).fetchone()
-    return seen is None
+    return row is not None and json.loads(grant[0])['identity'] == list(row)
+
+
+def record_remote_work_adoption_catalog(connection: sqlite3.Connection, repo: str,
+                                       revision: str, plan_ids: tuple[str, ...]) -> None:
+    """Freeze bootstrap scope and issue grants once, inside catalog's CAS transaction."""
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_metadata'"
+    ).fetchone() is None:
+        return
+    bootstrap = connection.execute(
+        "SELECT value FROM manager_metadata WHERE key='remote_adoption_bootstrap'"
+    ).fetchone()
+    if bootstrap is None:
+        return
+    scope = json.loads(bootstrap[0])
+    if scope is None:
+        scope = {row[0]: False for row in connection.execute(
+            'SELECT repo FROM projects WHERE registered=1')}
+    if repo not in scope or scope[repo]:
+        return
+    scope[repo] = True
+    connection.execute("UPDATE manager_metadata SET value=? WHERE key='remote_adoption_bootstrap'",
+                       (json.dumps(scope),))
+    for plan_id in plan_ids:
+        row = connection.execute(
+            "SELECT p.origin, p.base_branch, e.path, e.content_hash, e.plan_sha "
+            "FROM projects p JOIN exec_plans e ON e.repo=p.repo "
+            "WHERE p.repo=? AND p.registered=1 AND e.plan_id=?", (repo, plan_id),
+        ).fetchone()
+        if row is not None and row[0]:
+            connection.execute('INSERT INTO manager_metadata(key, value) VALUES (?, ?)',
+                (f'remote_adoption:{repo}:{plan_id}',
+                 json.dumps({'revision': revision, 'identity': list(row)})))
 
 
 def record_execplan_workspace_seen(connection: sqlite3.Connection, repo: str, plan_id: str) -> None:
@@ -655,6 +703,8 @@ def record_execplan_workspace_seen(connection: sqlite3.Connection, repo: str, pl
         "INSERT OR IGNORE INTO manager_metadata(key, value) VALUES (?, '1')",
         (f"workspace_seen:{repo}:{plan_id}",),
     )
+    connection.execute('DELETE FROM manager_metadata WHERE key=?',
+                       (f'remote_adoption:{repo}:{plan_id}',))
     connection.commit()
 
 

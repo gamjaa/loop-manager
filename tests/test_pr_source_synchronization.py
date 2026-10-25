@@ -599,3 +599,139 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
             self.assertEqual(self._source_checkout_snapshot(repo), source_before)
             self.assertEqual(pushes, [])
             agent.assert_not_called()
+
+
+class MergedTerminalBoundaryTests(unittest.TestCase):
+    def test_planning_defers_cleanup_until_slot_is_released(self):
+        fixture, state_dir = self._fixture()
+        fixture.connection.execute("UPDATE projects SET planning_attempt_fingerprint='planning-owner'")
+        fixture.connection.commit()
+        plan = fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+        with mock.patch.object(loop_manager, '_assess_missing_managed_cleanup') as cleanup:
+            assessment = loop_manager.complete_merged_execplan_worktree(
+                fixture.connection, Path('/repo'), 'repo', state_dir, plan, plan['pr_url'], 'b' * 40)
+        self.assertEqual(assessment.status, 'deferred')
+        cleanup.assert_not_called()
+        restarted = self._assert_merged(fixture)
+        self.assertEqual(fixture.connection.execute(
+            'SELECT reason FROM cleanup_pending').fetchone()[0], 'planning 실행 자리 보존')
+        fixture.connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+        fixture.connection.commit()
+        with mock.patch.object(loop_manager, '_assess_missing_managed_cleanup',
+                               return_value=loop_manager.CleanupAssessment('missing')) as cleanup:
+            assessment = loop_manager.complete_merged_execplan_worktree(
+                fixture.connection, Path('/repo'), 'repo', state_dir, restarted,
+                restarted['pr_url'], restarted['pr_head_oid'])
+        cleanup.assert_called_once()
+        self.assertEqual(assessment.status, 'missing')
+        self.assertIsNone(fixture.connection.execute('SELECT * FROM cleanup_pending').fetchone())
+        self._assert_merged(fixture)
+
+    def _fixture(self):
+        from tests.support.execution import execution_fixture
+        fixture = execution_fixture(self)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state_dir = Path(directory.name)
+        fixture.state.update_project('repo', worktree=str(state_dir / 'missing'),
+                                     pr_url='https://github.com/owner/repo/pull/1',
+                                     pr_head_oid='a' * 40)
+        fixture.connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+        fixture.connection.commit()
+        loop_manager._ensure_cleanup_pending_schema(fixture.connection)
+        return fixture, state_dir
+
+    def _assert_merged(self, fixture):
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        plan = fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(plan['status'], 'MERGED')
+        self.assertEqual(plan['pr_url'], 'https://github.com/owner/repo/pull/1')
+        self.assertEqual(plan['pr_head_oid'], 'b' * 40)
+        self.assertIsNone(RuntimeStateRepository(fixture.connection).active('repo'))
+        self.assertFalse(fixture.connection.in_transaction)
+        self.assertIn('G-047', loop_manager.execplan_catalog_state._merged_execplan_ids(
+            fixture.connection, 'repo'))
+        fixture.effects.agent.run_agent.assert_not_called()
+        return plan
+
+    def test_fetch_failure_follows_durable_merge_and_completion_audit(self):
+        fixture, state_dir = self._fixture()
+        project = fixture.state.row()
+        pr = {'state': 'MERGED', 'headRefName': project['branch'], 'baseRefName': 'main',
+              'url': project['pr_url'], 'headRefOid': 'b' * 40, 'mergedAt': '2026-10-24'}
+        def fetch(*_a, **_k):
+            self._assert_merged(fixture)
+            self.assertEqual(fixture.connection.execute(
+                'SELECT last_completed_plan_id FROM project_completion_cycles').fetchone()[0], 'G-047')
+            raise RuntimeError('fetch unavailable; branch already deleted')
+        with mock.patch.object(loop_manager, '_assess_missing_managed_cleanup',
+                               return_value=loop_manager.CleanupAssessment('missing')), \
+             mock.patch.object(loop_manager, 'remote_base', side_effect=fetch) as remote:
+            result = loop_manager.reconcile_existing_pull_request(
+                fixture.connection, Path('/repo'), state_dir, 'repo', project, pr)
+        self.assertEqual(result, loop_manager.PROJECT_STEP_RETRY)
+        remote.assert_called_once()
+        self._assert_merged(fixture)
+
+    def test_cleanup_failure_preserves_pending_and_restarts_without_worker(self):
+        fixture, state_dir = self._fixture()
+        plan = fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+        def fail_cleanup(*_a):
+            self._assert_merged(fixture)
+            raise RuntimeError('cleanup observation unavailable')
+        with mock.patch.object(loop_manager, '_assess_missing_managed_cleanup', side_effect=fail_cleanup):
+            with self.assertRaisesRegex(RuntimeError, 'cleanup observation'):
+                loop_manager.complete_merged_execplan_worktree(
+                    fixture.connection, Path('/repo'), 'repo', state_dir, plan, plan['pr_url'], 'b' * 40)
+        pending = fixture.connection.execute('SELECT * FROM cleanup_pending').fetchone()
+        self.assertEqual(pending['pr_head_oid'], 'b' * 40)
+        restarted = self._assert_merged(fixture)
+        with mock.patch.object(loop_manager, '_assess_missing_managed_cleanup',
+                               return_value=loop_manager.CleanupAssessment('missing')):
+            assessment = loop_manager.complete_merged_execplan_worktree(
+                fixture.connection, Path('/repo'), 'repo', state_dir, restarted,
+                restarted['pr_url'], restarted['pr_head_oid'])
+        self.assertEqual(assessment.status, 'missing')
+        self.assertIsNone(fixture.connection.execute('SELECT * FROM cleanup_pending').fetchone())
+        self._assert_merged(fixture)
+
+    def test_changed_owner_during_merge_validation_cannot_be_completed(self):
+        fixture, state_dir = self._fixture()
+        plan = fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+        def changed(*_a, **_k):
+            fixture.connection.execute("UPDATE exec_plans SET worker_session_id='competing'")
+            fixture.connection.commit()
+        with mock.patch('loop_manager_internal.recovery.manual_work_recovery.validate_merge', side_effect=changed), \
+             mock.patch.object(loop_manager, '_assess_missing_managed_cleanup') as cleanup:
+            with self.assertRaisesRegex(loop_manager.WorkspaceOwnershipError, 'identity/소유'):
+                loop_manager.complete_merged_execplan_worktree(
+                    fixture.connection, Path('/repo'), 'repo', state_dir, plan, plan['pr_url'], 'b' * 40)
+        cleanup.assert_not_called()
+        self.assertEqual(fixture.connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'IMPLEMENTING')
+        self.assertIsNone(fixture.connection.execute('SELECT * FROM cleanup_pending').fetchone())
+
+    def test_coordinated_merge_releases_database_before_cleanup_observation(self):
+        from loop_manager_internal.storage.db_access import open_connection
+        fixture, state_dir = self._fixture()
+        database_path = state_dir / 'state.db'
+        with sqlite3.connect(database_path) as destination:
+            fixture.connection.backup(destination)
+        connection = open_connection(database_path, timeout=1)
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        fixture.connection = connection
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        def cleanup(*_args):
+            self._assert_merged(fixture)
+            other = open_connection(database_path, timeout=1)
+            try:
+                with other:
+                    self.assertEqual(other.execute('SELECT status FROM exec_plans').fetchone()[0], 'MERGED')
+                    other.execute("UPDATE projects SET planning_fingerprint='other writer'")
+            finally:
+                other.close()
+            return loop_manager.CleanupAssessment('missing')
+        with mock.patch.object(loop_manager, '_assess_missing_managed_cleanup', side_effect=cleanup):
+            result = loop_manager.complete_merged_execplan_worktree(
+                connection, Path('/repo'), 'repo', state_dir, plan, plan['pr_url'], 'b' * 40)
+        self.assertEqual(result.status, 'missing')

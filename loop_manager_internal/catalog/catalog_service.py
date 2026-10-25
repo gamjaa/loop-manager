@@ -11,7 +11,7 @@ from loop_manager_internal.notifications import notifications
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.scoped_blocking import PR_CLOSED_BLOCK_REASON
-from loop_manager_internal.storage import execplan_catalog_state
+from loop_manager_internal.storage import database, execplan_catalog_state
 from pathlib import Path
 from types import SimpleNamespace
 import os
@@ -496,7 +496,10 @@ def reconcile_execplan_catalog(
         "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ? "
         "UNION SELECT 1 FROM execplan_catalog_views WHERE repo = ?", (repo, repo),
     ).fetchone() is None
-    if legacy and not repository.has_publication_intent(repo):
+    # A bootstrap catalog intentionally has no baseline or legacy runtime rows.
+    # Let reconciliation issue its bounded grants before prepare observes PRs.
+    if (legacy and not database.has_remote_work_adoption_bootstrap(connection)
+            and not repository.has_publication_intent(repo)):
         # Initial migration and declaration reconciliation share a rollback
         # boundary. Validate the remote graph before recovering runtime rows.
         try:

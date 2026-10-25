@@ -1544,6 +1544,8 @@ class RuntimeStateRepository:
         *,
         project_values: Mapping[str, object] | None = None,
         enqueue: bool = False,
+        pr_url: str | None = None,
+        pr_head_oid: str | None = None,
     ) -> ExecutionSnapshot:
         values: dict[str, object] = {
             "status": "MERGED",
@@ -1552,6 +1554,8 @@ class RuntimeStateRepository:
             "pr_conflict_head_oid": None,
             "pr_conflict_base_oid": None,
         }
+        if pr_url is not None:
+            values.update(pr_url=pr_url, pr_head_oid=pr_head_oid)
         if project_values:
             return self.transition(
                 repo,

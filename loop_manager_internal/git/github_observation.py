@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from collections.abc import Mapping
 from pathlib import Path
 import json
+import re
 
 
 @dataclass(frozen=True)
@@ -14,10 +15,13 @@ class PrForBranchEffects:
     command: Callable[..., object]
 
 def pr_for_branch(effects: PrForBranchEffects, repo: Path, branch: str, url: str | None = None,
-                  *, history: bool = False) -> dict[str, object] | None:
+                  *, history: bool = False, expected_repository: str | None = None,
+                  expected_base: str | None = None) -> dict[str, object] | None:
+    if history and (not expected_repository or not expected_base):
+        raise RuntimeError("PR 이력 조회에는 등록 repository와 base가 필요합니다.")
     fields = "url,state,mergedAt,headRefOid,headRefName,baseRefName,mergeable"
     if history:
-        fields += ",mergeCommit"
+        fields += ",mergeCommit,isCrossRepository"
     if url:
         result = effects.command(["gh", "pr", "view", url, "--json", fields], cwd=repo)
     else:
@@ -65,6 +69,14 @@ def pr_for_branch(effects: PrForBranchEffects, repo: Path, branch: str, url: str
                 and not isinstance(merge_commit.get("oid"), str))):
             raise RuntimeError("GitHub PR mergeCommit 응답이 유효하지 않습니다.")
     if history:
+        for item in pull_requests:
+            identity = re.fullmatch(r"https://github\.com/([^/]+/[^/]+)/pull/[1-9][0-9]*", item['url'])
+            if (identity is None or identity[1].lower() != expected_repository.lower()
+                    or item['headRefName'] != branch or item['baseRefName'] != expected_base
+                    or item.get('isCrossRepository') is not False
+                    or not isinstance(item['headRefOid'], str)
+                    or re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', item['headRefOid']) is None):
+                raise RuntimeError("PR 이력의 repository/base/head identity가 등록 대상과 다릅니다.")
         merged = [item for item in pull_requests if item["state"] == "MERGED" or item["mergedAt"]]
         if merged:
             return merged[0]

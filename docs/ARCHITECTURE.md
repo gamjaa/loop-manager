@@ -1424,9 +1424,13 @@ Worker가 종료하면 기존 scope 검사와 선택 frontmatter의 부분 복�
 
 최초 원격 인수는 아직 소유하지 않은 worktree에만 적용한다. 기존 소유 worktree와 현재 Git·원격 근거로 checkpoint 및 소유권을 복구한 rebase는 `workspace_seen` 표식이 없어도 기존 작업 재개 경로를 사용한다.
 
-DB 없는 원격 branch 인수 표식은 두 단계로 저장한다. `manager_metadata.created_from_absence=1`은 DB 파일이 없던 초기화에서만 생성되고, `workspace_seen:{repo}:{plan_id}`는 해당 계획의 관리 worktree 준비가 완료되면 저장된다. 기존·손상 DB와 일부 행의 부재는 이 경로로 전환하지 않는다. worktree 생성 전 `execution_checkpoints.snapshot.remote_adoption`에는 version 1과 repository·plan ID·정확한 branch·등록 base·전체 head OID를 저장한다. 재시작은 표식의 모든 identity를 다시 대조하며 기존 local branch/worktree가 있을 때 저장된 HEAD와 일치하지 않으면 연결하거나 덮어쓰지 않는다. 새 worktree는 저장한 전체 OID에서 생성한다.
+DB 부재 초기화에서만 `manager_metadata.remote_adoption_bootstrap`을 JSON `null`로 생성한다. 최초 성공한 catalog CAS가 당시 등록 프로젝트 경로를 키, 프로젝트별 첫 catalog 소비 여부를 bool 값으로 갖는 객체로 고정한다. 프로젝트의 기존 실행 행이 없을 때 첫 catalog의 새 활성 작업에만 `remote_adoption:{repo}:{plan_id}` 자격을 발급한다. 값은 관측 `revision`과 `identity` 배열이며 배열 순서는 등록 GitHub origin·base·active path·본문 hash·plan SHA다. 등록·선언이 이 값과 다르거나 실행 행이 없으면 자격을 쓰지 않는다. 새 행 삽입은 이전 자격을 지우며, 관리 worktree 준비 완료는 `workspace_seen` 기록과 함께 자격을 소비한다. 이후 catalog·추가 등록·반복 init은 소비한 범위를 다시 열지 않는다. 기존 `created_from_absence`는 감사 표식으로만 남고 기존 DB에는 bootstrap 자격을 소급 발급하지 않는다.
 
-원격 인수 시 `gh pr list --head <branch> --state all`로 branch의 전체 PR 이력을 확인한다. 목록이 상한에 도달하거나 조회가 실패하면 PR 부재로 추정하지 않는다. 해당 branch의 실제 MERGED 기록은 merge commit의 현재 base 조상 여부와 원격 branch 존속에 관계없이 완료로 넘기고 Worker를 시작하지 않는다. 정확히 일치하는 OPEN PR 하나는 기존 URL과 branch를 재연결하며 여러 OPEN PR·repository/base/head 불일치·불명 상태는 보류한다. CLOSED unmerged만 있으면 기존 PR의 reopen 또는 명시적 재개 판단을 기다린다. 새 환경은 DB 검증 증거를 승계하지 않으므로 검증·Review gate에서 현재 후보에 필요한 단계를 다시 수행한다. 원격 OID·lease는 동시 환경 조율을 제공하지 않으며 이전 환경의 writer 종료 뒤 순차 인수만 지원한다.
+새 bootstrap DB의 등록과 최초 catalog 갱신은 같은 DB 부재 초기화 표식을 확인해 legacy 단건 PR 이관을 생략한다. 등록에서 baseline을 만들지 않은 것은 기존 runtime 이관의 근거가 아니다. 고정 catalog의 선언 검증과 CAS가 활성 행·제한된 인수 자격을 함께 등록한 뒤 인수 handler가 PR 이력과 원격 HEAD를 확인한다. 기존 DB의 legacy 이관과 archive 문서 기반 복구는 각 기존 계약을 유지한다.
+
+`execution_checkpoints.snapshot.remote_adoption` version 1은 등록 프로젝트 경로인 `repo`, `plan_id`, 정확한 관리 `branch`, 등록 `base`, 전체 `head` OID를 보존한다. 최초 인수는 로컬 자원이 없는 곳에서 관측 OID를 start point로 사용한다. 기존 자원이 있는 중단 재개는 같은 intent·예약과 Git 등록·HEAD·clean 상태를 요구한다. `make_worktree(require_creation_evidence=True)`는 기존 journal의 봉인된 생성 intent/result·receipt와 현재 등록·잠금·index를 대조한 뒤 재사용하므로 같은 이름·OID의 사용자 자원을 소유 근거로 바꾸지 않는다. 관측 전후 execution snapshot·catalog generation·등록 자격·checkpoint generation을 대조하며 경쟁한 기록을 최신 intent로 소급 수용하지 않는다. 원격 재전진은 원래 인수 HEAD를 보존하고 단계 coordinator의 기존 원격 입력 통합을 Worker dispatch보다 먼저 수행한다. branch 삭제와 미확정 관측에서는 로컬 자료를 덮지 않는다.
+
+PR 이력은 fetch 전에 `gh pr list --head <branch> --state all --limit 1000`으로 관측한다. 목록 상한 도달·조회/응답 실패는 불완전 이력이다. 전체 응답의 URL repository·등록 base·정확한 head branch·전체 head OID·`isCrossRepository=false`를 검증한 뒤 MERGED를 우선하고, MERGED가 없을 때 OPEN 하나를 선택한다. 대상 불일치·복수 OPEN·불명 상태는 거부하며 CLOSED unmerged는 기존 PR의 reopen 또는 명시적 재개 판단을 기다린다. 기본 저장 URL 조회와 수동 제출 연결 정책은 유지한다. 새 환경에는 기존 verify receipt·Review 승인·Worker session을 합성하지 않으며 새 Worker와 정상 검증 gate를 사용한다. 원격 OID·lease는 동시 환경 조율을 제공하지 않는다.
 
 | 게시 대상 | 원격 반영과 PR |
 |---|---|
@@ -1451,7 +1455,7 @@ DB 없는 원격 branch 인수 표식은 두 단계로 저장한다. `manager_me
 
 PR 없는 원격 branch의 rebase 복구도 SQLite에 저장된 동일 Manager 소유 branch일 때만 검증된 원격 기대값의 `--force-with-lease`를 허용한다. 게시 직전 최신 base와 후보의 verify·Review token·현재 입력을 대조한다. base·HEAD 변경은 근거별 재판정 사유이며 완료 Worker 결과·verify receipt·일반 선행 Review를 일괄 폐기하거나 일괄 재사용하지 않는다. 조건을 만족하지 않는 근거만 필요한 검증·Review를 다시 수행한다.
 
-Merge 확인·worktree 제거·branch 정리·ExecPlan archive는 각각 결과를 기록한다. Merge 사실을 정리 성공으로 추정하거나 정리 보류로 MERGED를 되돌리지 않는다.
+실제 Merge 관측과 worktree 제거·branch 정리·ExecPlan archive는 각각 확정한다. 공통 plan별 완료 helper는 기존 수동 제출 검증 뒤 현재 선언·소유 상태를 다시 읽고 PR URL/head·MERGED·완료 감사·cleanup_pending을 먼저 짧은 DB 요청으로 저장한다. 운영 연결은 DB-only callable을 공통 요청 재시도 경계에 전달하며 외부 효과를 replay하지 않는다. 그 뒤 Git 정리와 fetch를 수행하므로 오류·중단에도 완료와 dependency 근거·정리 대기가 남는다. 현재 base ancestry나 branch 존재를 완료 gate로 추가하지 않으며 정상 실행의 catalog 동기화·정리 재검사·archive 게시가 남은 처리를 이어간다. Merge 사실을 정리 성공으로 추정하거나 정리 보류로 MERGED를 되돌리지 않는다.
 
 `assess_cleanup`은 tracked·staged·non-ignored 변경, index flag·Git operation과 PR head OID·commit object·로컬 HEAD의 포함 관계를 검사한다. 정리 소유권은 계획·등록 worktree·branch와 관리 경로를 대조한다. `remove_cleanup_worktree`는 판정 뒤 HEAD·branch·index·파일·operation을 다시 확인하고, 관리 journal로 잠금 해제·제거·확정을 복구하며 강제 옵션을 사용하지 않는다. ignored-only는 정리를 막지 않는다. Merge 방식·base ancestry·원격 branch 존재만으로 안전성을 추정하지 않는다.
 

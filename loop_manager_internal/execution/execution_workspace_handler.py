@@ -106,7 +106,7 @@ class WorkspaceHandler:
 
     def _terminal_adopted_pr(self, plan_id, pull_request):
         result = self.ports.reconcile_existing_pull_request(
-            self.ports.state.connection, self.ports.identity.repo_path,
+            self.ports.identity.repo_path,
             self.ports.identity.state_dir, self.ports.identity.repo,
             self.ports._row(), pull_request,
         )
@@ -115,6 +115,9 @@ class WorkspaceHandler:
                 ExecutionOutcomeKind.PLANNING_PENDING,
                 detail='기존 PR 병합 완료를 반영하고 base/catalog 동기화를 예약했습니다.',
             )
+        if result == self.ports.contract.PROJECT_STEP_RETRY:
+            return ExecutionOutcome(ExecutionOutcomeKind.RETRY,
+                                    detail='기존 terminal PR의 후속 처리를 재시도합니다.')
         return ExecutionOutcome(
             ExecutionOutcomeKind.FINAL_BLOCK,
             detail=('병합되지 않은 닫힌 PR의 명시적 재개 결정을 기다립니다.'
@@ -755,14 +758,30 @@ class WorkspaceHandler:
                     raise self.ports.contract.WorkspaceOwnershipError(
                         '활성 ExecPlan의 정확한 관리 branch identity가 아닙니다.')
                 self._validate_registered_remote()
-                self.ports._fetch_latest_base()
-                remote_observed = self.ports._checkpoint_remote_oid(
-                    self.ports.identity.repo_path, branch)
+                observed_checkpoint = self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
                 adopted_pr = self.ports.pr_for_branch(
                     self.ports.identity.repo_path, branch, history=True,
                 )
-                saved = self.ports.checkpoint.get(
-                    self.ports.identity.repo, plan_id).snapshot or {}
+                self.ports.state.check()
+                if (self.ports.state.active_execplan(self.ports.identity.repo)['catalog_generation']
+                        != catalog_plan['catalog_generation']
+                        or not database.remote_work_adoption_allowed(
+                            self.ports.state.connection, self.ports.identity.repo, plan_id)
+                        or self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
+                        != observed_checkpoint):
+                    raise CheckpointRace('원격 인수 PR 관측 중 catalog/checkpoint가 변경됐습니다.')
+                if adopted_pr is not None and (
+                        adopted_pr.get('headRefName') != branch
+                        or adopted_pr.get('baseRefName') != self.ports.identity.base):
+                    raise self.ports.contract.WorkspaceOwnershipError(
+                        '원격 작업 PR의 head/base가 등록 대상과 다릅니다.')
+                if adopted_pr is not None and (
+                        adopted_pr.get('state') in {'MERGED', 'CLOSED'} or adopted_pr.get('mergedAt')):
+                    return self._terminal_adopted_pr(plan_id, adopted_pr)
+                self.ports._fetch_latest_base()
+                remote_observed = self.ports._checkpoint_remote_oid(
+                    self.ports.identity.repo_path, branch)
+                saved = observed_checkpoint.snapshot or {}
                 prior_adoption = saved.get('remote_adoption')
                 if prior_adoption is not None and (
                         not isinstance(prior_adoption, dict)
@@ -776,12 +795,7 @@ class WorkspaceHandler:
                     raise self.ports.contract.WorkspaceOwnershipError(
                         '중단된 원격 작업 인수의 저장 identity가 유효하지 않습니다.')
                 if adopted_pr is not None:
-                    if adopted_pr.get('headRefName') != branch:
-                        raise self.ports.contract.WorkspaceOwnershipError(
-                            '원격 작업 branch PR의 head가 현재 작업과 다릅니다.')
                     pr_state = str(adopted_pr.get('state') or '').upper()
-                    if pr_state in {'CLOSED', 'MERGED'} or adopted_pr.get('mergedAt'):
-                        return self._terminal_adopted_pr(plan_id, adopted_pr)
                     if (pr_state != 'OPEN' or adopted_pr.get('baseRefName') != self.ports.identity.base
                             or remote_observed is None
                             or adopted_pr.get('headRefOid') != remote_observed):
@@ -798,13 +812,13 @@ class WorkspaceHandler:
                 local_branch_exists = self.ports.git(
                     self.ports.identity.repo_path, 'show-ref', '--verify', '--quiet',
                     f'refs/heads/{branch}', check=False).returncode == 0
-                if local_branch_exists and prior_adoption is None and remote_observed is not None:
-                    local_head = self.ports.git(
-                        self.ports.identity.repo_path, 'rev-parse', '--verify',
-                        f'refs/heads/{branch}').stdout.strip()
-                    if local_head != remote_observed:
-                        raise self.ports.contract.WorkspaceOwnershipError(
-                            'DB 없는 환경의 기존 로컬 branch가 원격 작업 HEAD와 다릅니다.')
+                local_present = local_branch_exists or worktree.exists() or worktree.is_symlink()
+                if local_present and (prior_adoption is None or not workspace_reserved):
+                    raise self.ports.contract.WorkspaceOwnershipError(
+                        '원격 인수의 저장 intent와 예약 소유권 없는 로컬 자원이 이미 존재합니다.')
+                if prior_adoption is not None and remote_observed is None:
+                    raise RecoveryFailure(RecoveryReason.REMOTE_BRANCH_DELETED,
+                                          '인수 중 원격 작업 branch가 삭제됐습니다.')
                 if prior_adoption is not None and (local_branch_exists or worktree.is_dir()):
                     remote_start = str(prior_adoption['head'])
                     adoption_expected_head = remote_start
@@ -816,11 +830,6 @@ class WorkspaceHandler:
                         if local_head != remote_start:
                             raise self.ports.contract.WorkspaceOwnershipError(
                                 '중단된 원격 작업 인수의 로컬 branch가 저장된 HEAD와 다릅니다.')
-                    if remote_observed is None:
-                        raise RecoveryFailure(
-                            RecoveryReason.REMOTE_BRANCH_DELETED,
-                            '인수 중 원격 작업 branch가 삭제됐고 병합 PR도 확인되지 않습니다.',
-                        )
                 elif prior_adoption is not None:
                     remote_start = str(prior_adoption['head'])
                     start_point = remote_start
@@ -831,8 +840,8 @@ class WorkspaceHandler:
                     start_point = remote_start
                     adoption_expected_head = remote_start
                     adoption_pending = True
-                    current = self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
-                    self.ports.checkpoint.record(
+                    current = observed_checkpoint
+                    observed_checkpoint = self.ports.checkpoint.record(
                         self.ports.identity.repo, plan_id,
                         expected_generation=current.generation, operation=current.operation,
                         expected_head=current.expected_head, target_base_oid=current.target_base_oid,
@@ -855,6 +864,13 @@ class WorkspaceHandler:
                             RecoveryReason.REMOTE_SNAPSHOT_RACE,
                             '원격 작업 branch가 fetch 이후 변경됐습니다.',
                         )
+                self.ports.state.check()
+                if (self.ports.state.active_execplan(self.ports.identity.repo)['catalog_generation']
+                        != catalog_plan['catalog_generation']
+                        or not database.remote_work_adoption_allowed(
+                            self.ports.state.connection, self.ports.identity.repo, plan_id)
+                        or self.ports.checkpoint.get(self.ports.identity.repo, plan_id) != observed_checkpoint):
+                    raise CheckpointRace('원격 인수 fetch/로컬 관측 중 대상이 변경됐습니다.')
             adoption_reserved = bool(
                 adoption_pending and workspace_reserved
                 and (local_branch_exists or worktree.is_dir())
@@ -884,8 +900,10 @@ class WorkspaceHandler:
                 allow_rebase=resolving_rebase,
                 journal_state_dir=self.ports.identity.state_dir,
                 journal_owner=f'plan:{plan_id}',
+                **({'require_creation_evidence': True} if adoption_reserved else {}),
             )
             if remote_start is not None:
+                self._validate_registered_remote(worktree)
                 self.ports.validate_worker_workspace_scope(
                     self.ports.identity.repo_path, worktree, branch,
                     self.ports.identity.base, str(row['plan_path']), catalog_plan,
@@ -899,7 +917,13 @@ class WorkspaceHandler:
                         RecoveryReason.REMOTE_SNAPSHOT_RACE,
                         '관리 worktree 구성 중 원격 작업 branch가 변경됐습니다.',
                     )
-                current = self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
+                self.ports.state.check()
+                if (self.ports.state.active_execplan(self.ports.identity.repo)['catalog_generation']
+                        != catalog_plan['catalog_generation']
+                        or not database.remote_work_adoption_allowed(
+                            self.ports.state.connection, self.ports.identity.repo, plan_id)):
+                    raise CheckpointRace('원격 인수 worktree 생성 중 catalog/등록 대상이 변경됐습니다.')
+                current = observed_checkpoint
                 self.ports.checkpoint.record(
                     self.ports.identity.repo, plan_id,
                     expected_generation=current.generation, operation=None,
@@ -920,6 +944,9 @@ class WorkspaceHandler:
             database.record_execplan_workspace_seen(
                 self.ports.state.connection, self.ports.identity.repo, plan_id)
             self._workspace_boundary(plan_id, row, pending=False)
+        except RuntimeStateError as error:
+            return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
+                                    detail=f'원격 인수 중 실행 상태가 변경됐습니다: {error}')
         except self.ports.contract.WorkspaceOwnershipError as error:
             workspace_error = f"관리 workspace 소유권/복구 검증 실패: {error}"
             outcome = self.ports._recover(
@@ -937,35 +964,41 @@ class WorkspaceHandler:
                 classify_exception(error, operation=RecoveryReason.WORKTREE_RECOVERY_FAILED),
                 detail,
             )
-        if int(row['pr_conflict_recovery']):
-            recovery_rebase = self.ports.resume_pr_conflict_rebase(self.ports.identity.repo_path, self.ports.identity.repo, row, worktree, branch)
-            if recovery_rebase == 1:
-                return self.ports._final()
-            if recovery_rebase == self.ports.contract.PROJECT_STEP_RETRY:
-                return self.ports._recover(
-                    RecoveryReason.REBASE_CONTINUE_FAILED,
-                    str(self.ports._row()['last_error'] or 'PR rebase 복구 재시도'),
-                )
-            row = self.ports._row()
-            resolving_rebase = self.ports._resolving_rebase(row)
-        rebase_error = str(row['last_error'] or '')
-        rebase_recovery = bool(
-            row['phase'] == 'WORKING' and (rebase_error == self.ports.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.ports.contract.REBASE_CONFLICT_PREFIX)),
-        )
-        if rebase_recovery and (not resolving_rebase) and (not int(row['pr_conflict_recovery'])):
-            resume_status = str(row['revision_resume_status'] or 'VERIFYING')
-            resume_phase = 'WORKING' if resume_status == 'IMPLEMENTING' else resume_status
-            self.ports.state.update_project(
-                self.ports.identity.repo,
-                phase=resume_phase,
-                revision_resume_status=None,
-                last_error=None,
+        try:
+            if int(row['pr_conflict_recovery']):
+                recovery_rebase = self.ports.resume_pr_conflict_rebase(self.ports.identity.repo_path, self.ports.identity.repo, row, worktree, branch)
+                if recovery_rebase == 1:
+                    return self.ports._final()
+                if recovery_rebase == self.ports.contract.PROJECT_STEP_RETRY:
+                    return self.ports._recover(
+                        RecoveryReason.REBASE_CONTINUE_FAILED,
+                        str(self.ports._row()['last_error'] or 'PR rebase 복구 재시도'),
+                    )
+                row = self.ports._row()
+                resolving_rebase = self.ports._resolving_rebase(row)
+            rebase_error = str(row['last_error'] or '')
+            rebase_recovery = bool(
+                row['phase'] == 'WORKING' and (rebase_error == self.ports.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.ports.contract.REBASE_CONFLICT_PREFIX)),
             )
-            row = self.ports._row()
-        assert catalog_plan is not None
-        self.ports.update_snapshot(plan=self.ports._cached_plan(catalog_plan))
-        self.ports.update_snapshot(level=self.ports.ensure_worker_level_state(
-            self.ports.identity.repo, self.ports.snapshot().plan
-        ))
-        self.ports.update_snapshot(catalog_plan=catalog_plan)
-        return self.ports._context()
+            if rebase_recovery and (not resolving_rebase) and (not int(row['pr_conflict_recovery'])):
+                resume_status = str(row['revision_resume_status'] or 'VERIFYING')
+                resume_phase = 'WORKING' if resume_status == 'IMPLEMENTING' else resume_status
+                self.ports.state.update_project(
+                    self.ports.identity.repo,
+                    phase=resume_phase,
+                    revision_resume_status=None,
+                    last_error=None,
+                )
+                row = self.ports._row()
+            assert catalog_plan is not None
+            self.ports.update_snapshot(plan=self.ports._cached_plan(catalog_plan))
+            self.ports.update_snapshot(level=self.ports.ensure_worker_level_state(
+                self.ports.identity.repo, self.ports.snapshot().plan
+            ))
+            self.ports.update_snapshot(catalog_plan=catalog_plan)
+            return self.ports._context()
+        except (RecoveryFailure, manager_git_journal.MutationEvidenceError) as error:
+            return self.ports._recover(
+                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                str(error),
+            )

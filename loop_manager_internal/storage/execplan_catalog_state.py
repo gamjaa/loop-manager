@@ -546,6 +546,12 @@ def insert_published_plan_row(
         verify_input_requests.validate_new_priority(plan.get("sources", ()), plan.get("priority"))
     sources, dependencies, priority = serialize_plan_metadata(plan)
     initial_level = _worker_level(str(plan["complexity"]), str(plan["risk"]))
+    # A recreated row must not inherit a lost row's bootstrap grant.
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_metadata'"
+    ).fetchone():
+        connection.execute('DELETE FROM manager_metadata WHERE key=?',
+                           (f"remote_adoption:{repo}:{plan['id']}",))
     connection.execute(
         """
         INSERT INTO exec_plans (
@@ -1029,6 +1035,12 @@ class DefinitionStateRepository:
                         "revision_sha=excluded.revision_sha, catalog_fingerprint=excluded.catalog_fingerprint, "
                         "updated_at=CURRENT_TIMESTAMP", (repo, pinned.revision_sha, fingerprint),
                     )
+                from . import database
+                database.record_remote_work_adoption_catalog(
+                    self.connection, repo, pinned.revision_sha,
+                    tuple(plan_id for plan_id in new_plan_ids
+                          if plan_id in pinned.snapshot.active) if not expected.rows else (),
+                )
         except _StaleCatalogSnapshot:
             return None
         return tuple(changed)

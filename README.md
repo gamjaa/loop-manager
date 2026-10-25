@@ -78,6 +78,8 @@ Windows:
 
 `init`은 최초 한 번, `add`는 프로젝트마다 실행한다. provider 생략 시 `codex`, base 생략 시 `origin/HEAD`를 사용한다. Planner의 계획 게시에는 base branch 직접 push 권한이 필요하고 구현은 `loop-manager/<execplan-id>` branch의 PR로 제출한다.
 
+새 환경에서 기존 원격 작업을 이어갈 때는 [순차 환경 전환과 최초 복구 범위](docs/OPERATIONS.md#새-환경에서-원격-작업-이어하기)를 먼저 확인한다.
+
 ## 기본 사용법
 
 아래 `python`은 설치한 `.venv`의 Python으로 실행한다. `--help`로 각 명령의 옵션을 확인할 수 있다.

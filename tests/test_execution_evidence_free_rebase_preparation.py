@@ -187,3 +187,39 @@ class EvidenceFreeRebasePreparationTests(TestCase):
         self.case.observed = replace(self.case.observed, remote=replace(remote, pull_request=None))
         with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
             self.case.handler._context()
+
+    def test_prepare_recovers_when_final_context_rebase_observation_changes(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+        from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
+        self.pending()
+        case = self.case
+        case.fixture.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        case.state.update_project('repo', worker_session_id='preserved-session', worker_result='saved work')
+        before = dict(case.state.row())
+        checkpoint = case.checkpoint.get('repo', 'G-047')
+        observed = case.observed
+        service = mock.Mock()
+        service.require_owned.side_effect = (
+            (observed, SimpleNamespace(status=RebaseStatus.WAITING)),
+            MutationEvidenceError('current rebase rejected: state_changed: Git, remote or inputs changed'),
+        )
+        case.handler._current_rebase_service = mock.Mock(return_value=service)
+
+        result = case.handler.prepare()
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(result.recovery.observation.reason, RecoveryReason.STATUS_FAILED)
+        self.assertIn('state_changed', result.detail)
+        self.assertEqual(service.require_owned.call_count, 2)
+        self.assertEqual(case.observed, observed)
+        current = case.checkpoint.get('repo', 'G-047')
+        for field in ('operation', 'expected_head', 'target_base_oid', 'observed_remote_oid'):
+            self.assertEqual(getattr(current, field), getattr(checkpoint, field))
+        for field in ('worker_session_id', 'worker_result', 'branch', 'worktree'):
+            self.assertEqual(case.state.row()[field], before[field])
+        case.fixture.effects.agent.run_agent.assert_not_called()
+        case.fixture.effects.blocking.block_active_execplan_from_revision.assert_not_called()

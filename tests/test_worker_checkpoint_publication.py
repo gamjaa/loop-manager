@@ -15,30 +15,234 @@ from tests.support.git import git_command, git_test_environment, local_github_or
 
 
 class RemoteWorkAdoptionDatabaseTests(unittest.TestCase):
-    def test_only_a_database_created_from_absence_can_adopt_first_workspace(self):
+    def _database(self, *, fresh=True):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state_dir = Path(directory.name)
+        connection = database.connect_database(
+            state_dir, create=True, mark_created_from_absence=fresh)
+        self.addCleanup(connection.close)
+        connection.execute("INSERT INTO projects(repo, base_branch, origin) VALUES ('repo', 'main', 'owner/repo')")
+        connection.commit()
+        return connection, state_dir
+
+    def _catalog(self, connection, *, repo='repo', ids=('G-001',), revision='a' * 40):
+        from tests.support.catalog import active_snapshot, execplan_header, FakeDefinitionPort
+        from loop_manager_internal.storage import execplan_catalog_state as catalog
+        pinned = active_snapshot(revision, {
+            f'docs/plans/[{plan_id}] Resume.md': execplan_header(plan_id, 'Resume')
+            for plan_id in ids})
+        result = catalog.CatalogReconciliationService(
+            catalog.DefinitionStateRepository(connection), FakeDefinitionPort(pinned)).reconcile(repo)
+        self.assertTrue(result.usable, repr(result))
+        return pinned
+
+    def test_first_catalog_grant_survives_restart_and_is_consumed_by_workspace(self):
+        connection, state_dir = self._database()
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+        self._catalog(connection)
+        self.assertTrue(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+        reopened = database.connect_database(state_dir, create=True, mark_created_from_absence=True)
+        self.addCleanup(reopened.close)
+        self.assertTrue(database.remote_work_adoption_allowed(reopened, 'repo', 'G-001'))
+        database.record_execplan_workspace_seen(reopened, 'repo', 'G-001')
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+        self._catalog(connection)
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_later_plan_project_and_lost_row_do_not_inherit_grants(self):
+        connection, _ = self._database()
+        self._catalog(connection)
+        connection.execute("UPDATE exec_plans SET worker_session_id='preserved', verify_result='evidence'")
+        connection.commit()
+        self._catalog(connection, ids=('G-001', 'G-002'))
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-002'))
+        self.assertEqual(tuple(connection.execute(
+            "SELECT worker_session_id, verify_result FROM exec_plans WHERE plan_id='G-001'").fetchone()),
+            ('preserved', 'evidence'))
+        connection.execute("INSERT INTO projects(repo, base_branch, origin) VALUES ('later', 'main', 'owner/later')")
+        connection.commit()
+        self._catalog(connection, repo='later')
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'later', 'G-001'))
+        connection.execute("DELETE FROM exec_plans WHERE repo='repo' AND plan_id='G-001'")
+        connection.commit()
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+        self._catalog(connection, ids=('G-001', 'G-002'))
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_existing_and_legacy_absence_marker_do_not_authorize_adoption(self):
+        for legacy_marker in (False, True):
+            with self.subTest(legacy_marker=legacy_marker):
+                connection, state_dir = self._database(fresh=False)
+                if legacy_marker:
+                    connection.execute("INSERT INTO manager_metadata VALUES ('created_from_absence', '1')")
+                    connection.commit()
+                reinitialized = database.connect_database(state_dir, create=True, mark_created_from_absence=True)
+                reinitialized.close()
+                self._catalog(connection)
+                self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_changed_registration_or_declaration_does_not_match_grant(self):
+        connection, _ = self._database()
+        self._catalog(connection)
+        for table, field, value in (('projects', 'origin', 'other/repo'),
+                                    ('projects', 'base_branch', 'other'),
+                                    ('exec_plans', 'content_hash', 'changed')):
+            with self.subTest(field=field):
+                connection.execute('SAVEPOINT changed_identity')
+                connection.execute(f'UPDATE {table} SET {field}=?', (value,))
+                self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+                connection.execute('ROLLBACK TO changed_identity')
+                connection.execute('RELEASE changed_identity')
+        self.assertTrue(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_stale_catalog_does_not_consume_bootstrap_scope(self):
+        from loop_manager_internal.storage import execplan_catalog_state as catalog
+        from tests.support.catalog import active_snapshot, execplan_header
+        connection, _ = self._database()
+        repository = catalog.DefinitionStateRepository(connection)
+        pinned = active_snapshot('a' * 40, {'docs/plans/[G-001] Resume.md': execplan_header('G-001', 'Resume')})
+        changed = repository.apply('repo', pinned, repository.capture('repo'),
+                                   revision_is_current=lambda: False, new_plan_ids=('G-001',))
+        self.assertIsNone(changed)
+        self.assertEqual(connection.execute("SELECT value FROM manager_metadata WHERE key='remote_adoption_bootstrap'").fetchone()[0], 'null')
+        self._catalog(connection)
+        self.assertTrue(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
+
+    def test_fresh_registration_defers_active_pr_observation_to_recovery_catalog(self):
+        from loop_manager_internal.runtime import registration_service
+        from tests.support.catalog import active_snapshot, execplan_header
+        for fresh, pr_state in ((False, None), (True, None), (True, 'OPEN'), (True, 'CLOSED')):
+            with self.subTest(fresh=fresh, pr_state=pr_state):
+                connection, state_dir = self._database(fresh=fresh)
+                root = state_dir / 'project'
+                root.mkdir()
+                pinned = active_snapshot('a' * 40, {
+                    'docs/plans/[G-047] Runtime.md': execplan_header('G-047', 'Runtime')})
+                migrate = mock.Mock()
+                effects = registration_service.AddRegisteredProjectEffects(
+                    _ensure_execplans_schema=database._ensure_execplans_schema,
+                    _merged_execplan_ids=lambda *_: frozenset(),
+                    git=mock.Mock(return_value=SimpleNamespace(stdout=pinned.revision_sha)),
+                    inspect_project_registration=mock.Mock(return_value=SimpleNamespace(
+                        root=root, base_branch='main', provider='codex', agents_hash=None,
+                        agents_approved=False, origin='owner/repo', source_revision=pinned.revision_sha)),
+                    migrate_legacy_execplans=migrate,
+                    revision_execplan_snapshot=mock.Mock(return_value=pinned.snapshot))
+                registration_service.add_registered_project(effects, connection, root,
+                    config_path=state_dir / 'config.ini', provider='codex',
+                    requested_base='main', approve_agents_mismatch=False)
+                if fresh:
+                    migrate.assert_not_called()
+                    self.assertIsNone(connection.execute(
+                        'SELECT 1 FROM exec_plans WHERE repo=?', (str(root),)).fetchone())
+                    self._refresh_catalog(connection, root, pinned, migrate)
+                    migrate.assert_not_called()
+                    self.assertTrue(database.remote_work_adoption_allowed(connection, str(root), 'G-047'))
+                    self._prepare_registered_remote_work(connection, state_dir, root, pr_state)
+                else:
+                    self.assertEqual(migrate.call_count, 2)
+
+    def _refresh_catalog(self, connection, root, pinned, migrate):
+        from loop_manager_internal.catalog import catalog_service
+        from tests.support.catalog import FakeDefinitionPort
+        effects = catalog_service.ReconcileExecplanCatalogEffects(
+            _GitCatalogDefinitionPort=lambda *_a, **_kw: FakeDefinitionPort(pinned),
+            _catalog_archive_conflict_ids=mock.Mock(return_value=frozenset()),
+            _plan_id_from_path=mock.Mock(return_value='G-047'),
+            backfill_plan_shas=mock.Mock(),
+            git=mock.Mock(return_value=SimpleNamespace(stdout=pinned.revision_sha)),
+            migrate_legacy_execplans=migrate)
+        result = catalog_service.reconcile_execplan_catalog(
+            effects, connection, root, str(root), 'main', remote_sha=pinned.revision_sha)
+        self.assertTrue(result.usable, repr(result))
+
+    def test_existing_database_first_catalog_keeps_legacy_migration(self):
+        from tests.support.catalog import active_snapshot, execplan_header
+        connection, _ = self._database(fresh=False)
+        pinned = active_snapshot('a' * 40, {
+            'docs/plans/[G-047] Runtime.md': execplan_header('G-047', 'Runtime')})
+        migrate = mock.Mock()
+        self._refresh_catalog(connection, Path('repo'), pinned, migrate)
+        self.assertEqual(migrate.call_count, 2)
+        self.assertTrue(migrate.call_args_list[0].kwargs['prepare_only'])
+        self.assertFalse(migrate.call_args_list[1].kwargs['manage_transaction'])
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-047'))
+
+    def _prepare_registered_remote_work(self, connection, state_dir, root, pr_state):
+        from dataclasses import replace
+        import loop_manager as lm
+        from tests.support.execution import execution_fixture
+        from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcomeKind
+        fixture = execution_fixture(self, repo=str(root))
+        fixture.state.connection = connection
+        fixture.state.repository = lm.runtime_state.RuntimeStateRepository(connection)
+        branch, worktree = lm.expected_execplan_workspace(state_dir, str(root), 'G-047')
+        fixture.state.repository.activate(str(root), 'G-047', activation_sha='base',
+                                         branch=branch, worktree=str(worktree))
+        fixture.state.expected = fixture.state.repository.projected(str(root))
+        head = 'b' * 40
+        pr = None if pr_state is None else dict(url='https://github.com/owner/repo/pull/1',
+            state=pr_state, headRefName=branch, baseRefName='main', headRefOid=head)
+        workspace = replace(fixture.effects.workspace,
+            reserve_execplan_workspace=fixture.state.bind(lm.reserve_execplan_workspace, connected=True, mutates=True),
+            mark_execplan_workspace_owned=fixture.state.bind(lm.mark_execplan_workspace_owned, connected=True, mutates=True))
+        publication = replace(fixture.effects.publication, github_repository=lm.github_repository,
+            reconcile_existing_pull_request=fixture.state.bind(lm.reconcile_existing_pull_request,
+                                                              connected=True, mutates=True))
+        publication.pr_for_branch.return_value = pr
+        workspace._plan_id_from_path.return_value = 'G-047'
+        def git(_repo, *args, **kwargs):
+            if args[0] == 'remote':
+                return SimpleNamespace(stdout='https://github.com/owner/repo.git', returncode=0)
+            if args[0] == 'show-ref':
+                return SimpleNamespace(stdout='', returncode=1)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(stdout=f'{head}\trefs/heads/{branch}', returncode=0)
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(stdout='base' if 'origin/main' in args[-1] else head, returncode=0)
+            return fixture.git(_repo, *args, **kwargs)
+        workspace.git.side_effect = git
+        def create(_repo, target, _branch, _base, **options):
+            options['before_create']()
+            target.mkdir(parents=True)
+            return 'created'
+        workspace.make_worktree.side_effect = create
+        effects = replace(fixture.effects, workspace=workspace, publication=publication,
+                          checkpoint=ExecutionCheckpointRepository(connection))
+        handler = type(fixture.handler)(effects, repo=str(root), repo_path=root, state_dir=state_dir,
+            base='main', base_sha='base', provider='codex', config_path=state_dir / 'config.ini',
+            newly_activated=True)
+        handler._resolving_rebase = mock.Mock(return_value=False)
+        handler._fetch_latest_base = mock.Mock(return_value='base')
+        handler._checkpoint_remote_oid = mock.Mock(return_value=head)
+        result = handler.prepare()
+        publication.pr_for_branch.assert_called_once_with(root, branch, history=True)
+        if pr_state == 'CLOSED':
+            self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+            workspace.make_worktree.assert_not_called()
+            self.assertEqual(connection.execute(
+                'SELECT status FROM exec_plans WHERE repo=?', (str(root),)).fetchone()[0], 'PLAN_BLOCKED')
+        else:
+            self.assertIsInstance(result, ExecutionContext)
+            self.assertEqual(workspace.make_worktree.call_args.kwargs['start_point'], head)
+            self.assertEqual(result.pr_url, pr['url'] if pr else None)
+            self.assertIsNone(result.worker_session_id)
+            row = fixture.state.active_execplan(str(root))
+            self.assertEqual(row['workspace_owned'], lm.WORKSPACE_OWNED)
+            self.assertEqual(row['pr_url'], pr['url'] if pr else None)
+            for field in ('worker_result', 'verify_result', 'review_result'):
+                self.assertIsNone(row[field], field)
+        effects.agent.run_agent.assert_not_called()
+
+    def test_corrupt_database_is_preserved_by_explicit_init(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
-            connection = database.connect_database(
-                state_dir, create=True, mark_created_from_absence=True,
-            )
-            try:
-                self.assertTrue(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
-                database.record_execplan_workspace_seen(connection, 'repo', 'G-001')
-                self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-001'))
-            finally:
-                connection.close()
-
-            existing_dir = state_dir / 'existing'
-            existing_dir.mkdir()
-            existing_path = existing_dir / 'loop-manager.db'
-            existing = sqlite3.connect(existing_path)
-            existing.executescript(database.SCHEMA)
-            existing.close()
-            existing = database.connect_database(existing_dir)
-            try:
-                self.assertFalse(database.remote_work_adoption_allowed(existing, 'repo', 'G-001'))
-            finally:
-                existing.close()
+            path = state_dir / 'loop-manager.db'
+            path.write_bytes(b'corrupt database')
+            with self.assertRaises(sqlite3.DatabaseError):
+                database.connect_database(state_dir, create=True, mark_created_from_absence=True)
+            self.assertEqual(path.read_bytes(), b'corrupt database')
 
 
 class PullRequestHistoryTests(unittest.TestCase):
@@ -68,15 +272,29 @@ class PullRequestHistoryTests(unittest.TestCase):
                     with self.assertRaises(type(error)):
                         ports.effects.publication.publish_worker_checkpoints(context)
                 self.assertEqual(dict(ports.effects.state.row()), before)
+    def _pr(self, **changes):
+        return {'url': 'https://github.com/owner/repo/pull/1', 'state': 'OPEN',
+                'mergedAt': None, 'headRefOid': 'a' * 40,
+                'headRefName': 'loop-manager/G-047', 'baseRefName': 'main',
+                'mergeable': 'MERGEABLE', 'isCrossRepository': False, **changes}
+
+    def _lookup(self, payload):
+        effects = github_observation.PrForBranchEffects(command=mock.Mock(return_value=
+            subprocess.CompletedProcess([], 0, json.dumps(payload), '')))
+        return github_observation.pr_for_branch(
+            effects, Path('/repo'), 'loop-manager/G-047', history=True,
+            expected_repository='owner/repo', expected_base='main')
 
     def test_production_ports_forward_history_and_preserve_default_lookup(self):
         import loop_manager
         from tests.support.execution import execution_fixture
 
         fixture = execution_fixture(self)
+        fixture.connection.execute("UPDATE projects SET origin='owner/repo'")
+        fixture.connection.commit()
         repo_path = Path('/repo')
         branch = 'loop-manager/G-047'
-        pull_request = {'url': 'existing-pr', 'state': 'OPEN'}
+        pull_request = self._pr()
         with mock.patch.object(loop_manager, 'pr_for_branch', return_value=pull_request) as lookup:
             ports = loop_manager._ExecutionLifecyclePorts(
                 fixture.connection, fixture.repository,
@@ -84,55 +302,150 @@ class PullRequestHistoryTests(unittest.TestCase):
                 base='main', base_sha='base', provider='codex',
                 config_path=Path('/config'), newly_activated=False,
             )
-            for url in (None, 'existing-pr'):
+            for url in (None, pull_request['url']):
                 for history in (False, True):
                     with self.subTest(url=url, history=history):
                         args = (repo_path, branch, url) if url else (repo_path, branch)
-                        options = {'history': True} if history else {}
-                        result = ports.effects.publication.pr_for_branch(*args, **options)
+                        options = ({'history': True, 'expected_repository': 'owner/repo',
+                                    'expected_base': 'main'} if history else {})
+                        result = ports.effects.publication.pr_for_branch(*args, history=history)
                         self.assertEqual(result, pull_request)
                         lookup.assert_called_once_with(*args, **options)
                         lookup.reset_mock()
+            fixture.connection.execute("UPDATE projects SET base_branch='other'")
+            with self.assertRaisesRegex(RuntimeError, '등록 repository/base'):
+                ports.effects.publication.pr_for_branch(repo_path, branch, history=True)
+            lookup.assert_not_called()
 
-    def test_merged_history_wins_over_an_open_pr_for_the_same_branch(self):
-        effects = github_observation.PrForBranchEffects(command=mock.Mock(return_value=subprocess.CompletedProcess(
-            [], 0, json.dumps([
-                {'url': 'open', 'state': 'OPEN', 'mergedAt': None, 'headRefOid': 'a' * 40,
-                 'headRefName': 'loop-manager/G-001', 'baseRefName': 'main', 'mergeable': 'MERGEABLE'},
-                {'url': 'merged-old', 'state': 'MERGED', 'mergedAt': '2026-01-01T00:00:00Z',
-                 'headRefOid': 'b' * 40, 'headRefName': 'loop-manager/G-001',
-                 'baseRefName': 'develop', 'mergeable': None,
-                 'mergeCommit': {'oid': 'c' * 40}},
-            ]), '')))
+    def test_merged_history_wins_only_after_all_identities_match(self):
+        merged = self._pr(url='https://github.com/owner/repo/pull/2', state='MERGED',
+                          mergedAt='2026-01-01T00:00:00Z', headRefOid='b' * 40,
+                          mergeCommit={'oid': 'c' * 40})
+        self.assertEqual(self._lookup([self._pr(), merged]), merged)
+        # No ancestry or live branch observation is needed for a real Merge.
+        for changes in ({'baseRefName': 'develop'}, {'headRefName': 'other'},
+                        {'url': 'https://github.com/other/repo/pull/2'},
+                        {'isCrossRepository': True}, {'isCrossRepository': None},
+                        {'headRefOid': 'short'}, {'headRefOid': None}):
+            for invalid_index in (0, 1):
+                with self.subTest(changes=changes, invalid_index=invalid_index):
+                    records = [self._pr(), merged]
+                    records[invalid_index] = {**records[invalid_index], **changes}
+                    with self.assertRaisesRegex(RuntimeError, 'identity'):
+                        self._lookup(records)
 
-        result = github_observation.pr_for_branch(
-            effects, Path('/repo'), 'loop-manager/G-001', history=True,
-        )
+    def _prepare_fixture(self):
+        from dataclasses import replace
+        import loop_manager
+        from tests.support.execution import execution_fixture
 
-        self.assertEqual(result['url'], 'merged-old')
-        arguments = effects.command.call_args.args[0]
-        self.assertEqual(arguments[:5], ['gh', 'pr', 'list', '--head', 'loop-manager/G-001'])
-        self.assertIn('--state', arguments)
-        self.assertEqual(arguments[arguments.index('--state') + 1], 'all')
+        fixture = execution_fixture(self)
+        fixture.connection.executescript(
+            "CREATE TABLE manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "INSERT INTO manager_metadata VALUES ('remote_adoption_bootstrap', 'null');"
+            "UPDATE projects SET origin='owner/repo';"
+            "UPDATE exec_plans SET workspace_owned=0;")
+        database.record_remote_work_adoption_catalog(fixture.connection, 'repo', 'a' * 40, ('G-047',))
+        fixture.connection.commit()
+        fixture.state.expected = fixture.repository.projected('repo')
+        ports = loop_manager._ExecutionLifecyclePorts(
+            fixture.connection, fixture.repository,
+            repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'),
+            base='main', base_sha='base', provider='codex',
+            config_path=Path('/config'), newly_activated=True)
+        fixture.handler.effects = replace(fixture.effects,
+            checkpoint=ExecutionCheckpointRepository(fixture.connection),
+            publication=replace(fixture.effects.publication,
+                pr_for_branch=ports.effects.publication.pr_for_branch,
+                reconcile_existing_pull_request=ports.effects.publication.reconcile_existing_pull_request,
+                github_repository=loop_manager.github_repository))
+        fixture.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        fixture.effects.workspace.git.side_effect = lambda *_a, **_k: SimpleNamespace(
+            stdout='https://github.com/owner/repo.git', returncode=0)
+        return fixture
 
-    def test_incomplete_history_and_multiple_open_prs_are_not_guessed(self):
-        saturated = github_observation.PrForBranchEffects(command=mock.Mock(return_value=
-            subprocess.CompletedProcess([], 0, '[]', '')))
-        saturated.command.return_value.stdout = json.dumps([{}] * 1000)
+    def test_prepare_rejects_mismatched_merged_history_before_terminal_or_workspace_effects(self):
+        import loop_manager
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+        fixture = self._prepare_fixture()
+        for changes in ({'baseRefName': 'other'}, {'headRefName': 'other'},
+                        {'url': 'https://github.com/other/repo/pull/1'}):
+            with self.subTest(changes=changes), \
+                    mock.patch.object(fixture.handler, '_resolving_rebase', return_value=False), \
+                    mock.patch.object(fixture.handler, '_fetch_latest_base', return_value='b' * 40), \
+                    mock.patch.object(fixture.handler, '_checkpoint_remote_oid', return_value=None), \
+                    mock.patch.object(loop_manager, 'command', return_value=subprocess.CompletedProcess(
+                        [], 0, json.dumps([self._pr(state='MERGED', **changes)]), '')) as command:
+                result = fixture.handler.prepare()
+                self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+                command.assert_called_once()
+                fixture.effects.workspace.make_worktree.assert_not_called()
+                fixture.effects.agent.run_agent.assert_not_called()
+                self.assertEqual(fixture.state.active_execplan('repo')['status'], 'IMPLEMENTING')
+
+    def test_prepare_merged_uses_real_terminal_binding_before_fetch(self):
+        import loop_manager
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+        for failed_fetch in (False, True):
+            with self.subTest(failed_fetch=failed_fetch):
+                fixture = self._prepare_fixture()
+                fixture.connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+                fixture.connection.commit()
+                pr = self._pr(state='MERGED', headRefOid='b' * 40,
+                              mergeCommit={'oid': 'c' * 40})
+                with mock.patch.object(fixture.handler, '_resolving_rebase', return_value=False), \
+                     mock.patch.object(fixture.handler, '_fetch_latest_base') as fetch, \
+                     mock.patch.object(fixture.handler, '_checkpoint_remote_oid') as branch, \
+                     mock.patch.object(loop_manager, 'command', return_value=subprocess.CompletedProcess(
+                         [], 0, json.dumps([pr]), '')), \
+                     mock.patch.object(loop_manager, '_assess_missing_managed_cleanup',
+                                       return_value=loop_manager.CleanupAssessment('missing')), \
+                     mock.patch.object(loop_manager, 'remote_base',
+                                       side_effect=RuntimeError('fetch unavailable') if failed_fetch else None):
+                    result = fixture.handler.prepare()
+                self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY if failed_fetch
+                                 else ExecutionOutcomeKind.PLANNING_PENDING)
+                fetch.assert_not_called()
+                branch.assert_not_called()
+                fixture.effects.workspace.make_worktree.assert_not_called()
+                fixture.effects.agent.run_agent.assert_not_called()
+                saved = fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+                self.assertEqual((saved['status'], saved['pr_url'], saved['pr_head_oid']),
+                                 ('MERGED', pr['url'], 'b' * 40))
+
+    def test_prepare_preserves_competing_owner_during_terminal_observation(self):
+        import loop_manager
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+        fixture = self._prepare_fixture()
+        def competing(*_a, **_k):
+            fixture.connection.execute('UPDATE exec_plans SET workspace_owned=1')
+            fixture.connection.commit()
+            return subprocess.CompletedProcess([], 0, json.dumps([self._pr(state='MERGED')]), '')
+        with mock.patch.object(fixture.handler, '_resolving_rebase', return_value=False), \
+             mock.patch.object(loop_manager, 'command', side_effect=competing), \
+             mock.patch.object(loop_manager, 'complete_merged_execplan_worktree') as complete:
+            result = fixture.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        complete.assert_not_called()
+        fixture.effects.workspace.make_worktree.assert_not_called()
+        saved = fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((saved['status'], saved['workspace_owned']), ('IMPLEMENTING', 1))
+
+    def test_absent_open_closed_and_incomplete_history(self):
+        self.assertIsNone(self._lookup([]))
+        self.assertEqual(self._lookup([self._pr()]), self._pr())
+        closed = self._pr(state='CLOSED')
+        self.assertEqual(self._lookup([closed]), closed)
         with self.assertRaisesRegex(RuntimeError, '목록 응답'):
-            github_observation.pr_for_branch(
-                saturated, Path('/repo'), 'loop-manager/G-001', history=True,
-            )
-
-        opened = [{'url': f'open-{i}', 'state': 'OPEN', 'mergedAt': None, 'headRefOid': 'a' * 40,
-                   'headRefName': 'loop-manager/G-001', 'baseRefName': 'main', 'mergeable': 'MERGEABLE'}
-                  for i in range(2)]
-        ambiguous = github_observation.PrForBranchEffects(command=mock.Mock(return_value=
-            subprocess.CompletedProcess([], 0, json.dumps(opened), '')))
+            self._lookup([{}] * 1000)
         with self.assertRaisesRegex(RuntimeError, '열린 PR이 여러 개'):
+            self._lookup([self._pr(), self._pr(url='https://github.com/owner/repo/pull/2')])
+        with self.assertRaisesRegex(RuntimeError, '필드'):
+            self._lookup([self._pr(state='UNKNOWN')])
+        with self.assertRaisesRegex(RuntimeError, '등록 repository'):
             github_observation.pr_for_branch(
-                ambiguous, Path('/repo'), 'loop-manager/G-001', history=True,
-            )
+                github_observation.PrForBranchEffects(command=mock.Mock()),
+                Path('/repo'), 'loop-manager/G-047', history=True)
 
 
 class WorkerCheckpointPublicationTests(unittest.TestCase):

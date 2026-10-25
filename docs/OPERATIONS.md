@@ -195,6 +195,12 @@ SQLite가 없거나 손상되면 일반 `run`은 자동 초기화하지 않는�
 
 Merge 확인 후 clean하고 PR head에 없는 로컬 commit이 없는 worktree만 Merge·Squash·Rebase 방식과 관계없이 정리한다. 불확실한 작업 공간은 `cleanup_pending`으로 보존한다. 다음 작업·프로젝트 완료를 막지 않으며 안전 조건 충족·경로 부재 시 자동 해제된다.
 
+### 새 환경에서 원격 작업 이어하기
+
+이전 환경의 Worker와 Git writer를 먼저 종료하고 checkpoint가 원격에 게시됐는지 확인한다. 새 환경은 같은 저장소·base로 clone한 뒤 [등록과 첫 실행](../README.md#3-등록과-첫-실행)의 기존 `config init`·`add` 절차를 따른다. 복구할 프로젝트는 첫 `run` 전에 모두 등록한다. 최초 catalog에 고정한 프로젝트·활성 작업만 인수하며, 이후 추가한 작업이나 기존 DB의 일부 행 유실을 원격 인수로 복원하지 않는다. 손상·읽기 불가 DB는 먼저 백업 복원 또는 별도 보관이 필요하며 기존 DB를 덮지 않는다.
+
+일치하는 OPEN PR은 같은 URL·branch로 이어가고 새 Worker와 필요한 검증·Review를 수행한다. PR 없는 작업은 정확한 원격 HEAD에서 시작한다. 이름이나 OID만 같은 기존 로컬 branch/worktree는 인수하지 않으며 미게시 로컬 전용 작업은 새 환경 복구 대상이 아니다. 실제 MERGED는 branch가 삭제됐어도 완료로 남고 동기화·정리·archive 실패는 다음 실행에서 남은 처리만 재시도한다. CLOSED unmerged는 같은 PR을 다시 열거나 명시적인 처리 결정을 내릴 때까지 보류하며, 새 작업으로 재시작하기로 결정하면 새 ExecPlan ID를 사용한다. 여러 환경의 동시 실행은 지원하지 않는다.
+
 ## Verify 배정과 진단
 
 Worker는 관련 targeted unit test와 verify 스크립트를 준비하고 전체 verify는 Manager가 Agent 밖에서 실행한다. Windows는 `scripts/verify.ps1`, Linux·macOS는 `scripts/verify.sh`를 사용한다. Loop Manager 자체 스크립트는 `.venv`를 우선 사용하고 어디서 호출해도 저장소 루트에서 실행한다. 공통 runner가 전체 unittest·compile을 수행하며 테스트 프로세스의 실제 Agent CLI·외부 API 연결은 차단된다.

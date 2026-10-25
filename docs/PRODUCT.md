@@ -862,7 +862,11 @@ Worker는 의미 있는 작업 단위의 checkpoint를 요청하고 종료한다
 
 원격 작업 branch가 먼저 전진하면 Manager는 저장소·작업·branch 소유권과 정확한 원격 OID를 재확인한다. 안전한 충돌 없는 rebase를 할 수 있으면 원격 commit을 보존해 통합한 뒤 변경된 후보의 검증·Review 근거를 다시 판단한다. 충돌·lease 경쟁·소유권 불명에서는 양쪽 commit을 보존하고 작업을 보류한다.
 
-전체 프로젝트 DB가 없는 새 환경만 기존 원격 branch를 인수할 수 있다. 활성 ExecPlan 선언·작업 ID·등록 저장소·base·정확한 `loop-manager/{G ID}` branch와 원격 HEAD가 일치해야 하며 PR이 있으면 저장소·base·head도 일치해야 한다. 열린 PR은 같은 PR과 branch를 이어가고 검증 근거가 없으면 필요한 검증과 Review를 다시 수행한다. MERGED PR은 merge 결과가 현재 base에 포함됐는지와 무관하게 완료 처리하고 Worker를 실행하지 않는다. 닫혔지만 merge되지 않은 PR은 자동 재사용하지 않고 명시적인 재개 결정을 기다린다. 이 인수는 이전 환경의 Worker가 멈춘 순차 전환을 전제로 하며 동시 개발을 지원하지 않는다.
+DB 전체가 없어 명시적으로 초기화·재등록한 새 환경은 최초 복구 catalog에 한정해 기존 원격 작업을 인수한다. 첫 catalog 반영 시 등록돼 있던 프로젝트와 각 프로젝트의 첫 catalog에서 새로 확인한 활성 작업만 대상이며, 이후 추가한 프로젝트·작업이나 유실된 개별 행은 이 자격을 받지 않는다. 기존 DB의 생성 표식만으로 자격을 확대하거나 `config init` 반복으로 다시 열지 않는다. 기존 DB·session·검증 근거를 덮어쓰지 않으며 손상 DB를 자동 재생성하지 않는다.
+
+활성 ExecPlan 선언·작업 ID·등록 저장소·base·정확한 `loop-manager/{G ID}` branch와 전체 원격 HEAD가 일치해야 한다. 로컬 branch/worktree가 이미 있으면 저장된 인수 intent·예약·실제 Manager 생성 근거와 현재 HEAD·작업물을 함께 검증하며 이름·동일 OID만으로 인수하지 않는다. 중단과 원격 전진에서는 저장 intent·양쪽 작업물을 보존하고, 실행 전에 기존 원격 입력 통합·검증 경계를 거친다.
+
+PR 이력 전체의 repository·base·head 관계를 대조한 뒤 실제 MERGED를 우선한다. 조회 실패·불완전 이력·복수 OPEN·불명 상태·대상 불일치는 PR 부재나 완료로 바꾸지 않는다. 정확한 OPEN 하나는 같은 PR과 branch로 이어가며 과거 검증 근거가 없으면 새 Worker와 필요한 targeted test·verify·Review를 거친다. CLOSED unmerged는 같은 PR의 reopen 또는 명시적인 처리 결정을 기다린다. MERGED는 현재 base ancestry·원격 head branch 존속과 관계없이 Worker 없이 먼저 완료로 보존한다. 후속 fetch·catalog 동기화·안전한 정리·archive가 실패해도 완료를 되돌리지 않고 남은 처리를 재시도한다. 인수는 이전 환경의 Worker·Git writer가 멈춘 순차 전환만 지원한다. 운영 절차는 [새 환경에서 원격 작업 이어하기](OPERATIONS.md#새-환경에서-원격-작업-이어하기)를 따른다.
 
 #### 작업 공간과 ignored 파일 보존
 
