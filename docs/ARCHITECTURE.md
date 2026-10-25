@@ -1307,6 +1307,14 @@ manifest·이벤트·결과는 version·run·단계·단위/테스트 identity�
 
 Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현재 명세 입력과 base로 결합하며 검증 출력·Agent 세션은 진전으로 보지 않는다. 보고 교정 후에도 verify token의 출력 결합과 입력 재관측·receipt·Review gate를 유지한다.
 
+### 공통 결함 보고의 감사 보존
+
+`ValidationFeedbackRepository`는 결과 감사와 공통 결함 관측을 같은 transaction에 추가한다. `common_defect_reports.result_id`는 불변 `validation_results`를 참조하며 프로젝트·작업·명세 revision·단계·원래 판정과 정제된 원문을 연결한다. 보고와 결과의 수정·삭제는 거부한다. 이후 verify 성공으로 활성 피드백이 해소돼도 과거 보고는 유지한다.
+
+선택적 `COMMON_DEFECT_REPORT:` JSON은 `problem`, `scope`, `evidence`, `locations`만 받는다. 앞의 세 필드는 비어 있지 않은 2,000자 이하 문자열이고 `locations`는 1~8개의 `{path, line}` 객체다. `path`는 traversal·빈 구성 요소·역슬래시·콜론·줄바꿈·탭이 없는 저장소 상대 경로이며 `line`은 1~2,147,483,647의 정수다. 전체 JSON은 UTF-8 12,000바이트 이하이며 중복 선언·중복 key·추가 필드·잘못된 타입은 거부한다. 기존 결과 포맷 정규화와 비밀값 정제를 재사용하며 거부 시 원본 결과와 비밀값을 포함하지 않는 형식 오류를 함께 보존한다. 선택적 보고 오류로 기존 verify·Review 판정을 변경하지 않는다.
+
+`scope`·진단 위치·근거는 보고자의 미확정 관측이다. 저장 시 파일 존재·원인 동일성·명세 인용의 유효성을 확정하지 않으며 서로 다른 결과의 같은 보고도 합치지 않는다. 이 저장 경계는 Planner 호출·계획 채택·차단 해제·검증 성공을 만들지 않는다.
+
 ### targeted test와 실패 수집
 
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다

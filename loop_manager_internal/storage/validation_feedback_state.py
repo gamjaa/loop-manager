@@ -13,6 +13,7 @@ from loop_manager_internal.execution.validation_feedback import (
     Feedback, bounded_diagnostic, normalize_feedback, redact_secrets,
 )
 from loop_manager_internal.storage.runtime_state import _transaction
+from loop_manager_internal.execution.common_defect_report import parse_report
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
@@ -39,6 +40,13 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             revision INTEGER NOT NULL,
             diagnostic TEXT NOT NULL,
             active INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS common_defect_reports (
+            result_id INTEGER PRIMARY KEY REFERENCES validation_results(id),
+            report TEXT,
+            error TEXT,
+            CHECK ((report IS NOT NULL AND error IS NULL)
+                   OR (report IS NULL AND error IS NOT NULL))
         );
         CREATE TABLE IF NOT EXISTS validation_feedback_current (
             repo TEXT NOT NULL,
@@ -115,7 +123,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS validation_delivery_attempts_cursor "
         "ON validation_delivery_attempts(repo,plan_id,session_id,status,sequence)"
     )
-    for table in ("validation_results", "validation_feedback_events"):
+    for table in ("validation_results", "validation_feedback_events", "common_defect_reports"):
         for action in ("UPDATE", "DELETE"):
             connection.execute(
                 f"CREATE TRIGGER IF NOT EXISTS {table}_{action.lower()}_immutable "
@@ -150,6 +158,21 @@ class ValidationFeedbackRepository:
         )
         result_id = cursor.lastrowid
         assert result_id is not None
+        # Preserve rejected observations beside the original audit. A malformed
+        # optional report cannot change a verify/Review verdict or retry policy.
+        try:
+            report = parse_report(raw)
+        except ValueError as error:
+            self.connection.execute(
+                "INSERT INTO common_defect_reports (result_id,error) VALUES (?,?)",
+                (result_id, str(error)),
+            )
+        else:
+            if report is not None:
+                self.connection.execute(
+                    "INSERT INTO common_defect_reports (result_id,report) VALUES (?,?)",
+                    (result_id, json.dumps(report, ensure_ascii=False, sort_keys=True)),
+                )
         return result_id
 
     def record_result(self, repo: str, plan_id: str, revision: str | None,
