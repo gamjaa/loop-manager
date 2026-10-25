@@ -537,6 +537,8 @@ class BlockedPlanReconciler:
         reason = context['block']['reason_code']
         assessment_plan = {**dict(plan), **context['artifacts'], 'blocked_reason': reason}
         if reason == BlockReasonCode.USER_DECISION_REQUIRED.value:
+            if context.get('comparison_revision'):
+                assessment_plan['comparison_revision'] = context['comparison_revision']
             resolved, detail, stage = self.ports._evaluate_remote_checkpoint_cause(
                 self.connection, self.repo_path, self.state_dir, self.repo, assessment_plan,
                 self.config_path, self.timeout)
@@ -679,7 +681,8 @@ class BlockedPlanReconciler:
         saved = self.connection.execute('SELECT * FROM blocked_plan_reconciliations WHERE repo = ? AND plan_id = ?',
                                         (self.repo, plan_id)).fetchone()
         planning_input = planning_review_state.reassessment(self.connection, self.repo, plan_id)
-        previous_input = json.loads(saved['context']).get('planning_input', {}) if saved else {}
+        previous_context = json.loads(saved['context']) if saved else {}
+        previous_input = previous_context.get('planning_input', {})
         if saved is None or saved['stage'] in TERMINAL:
             if not observations.pending_input(row) and planning_input == previous_input:
                 if (self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value
@@ -697,6 +700,11 @@ class BlockedPlanReconciler:
             context.update(plan_id=plan_id, identity={field: plan[field] for field in IDENTITY_FIELDS},
                            block=dict(block), artifacts={field: plan[field] for field in ARTIFACT_FIELDS},
                            planning_input=planning_input)
+            same_cause = all(previous_context.get('block', {}).get(field) == block[field]
+                             for field in ('reason_code', 'release_fingerprint', 'evidence'))
+            context['comparison_revision'] = (
+                previous_context.get('comparison_revision') if same_cause else None
+            ) or (plan['plan_sha'] if same_cause else None) or plan['active_sha'] or plan['plan_sha']
             remote_key = observations.input_identity(row)
             context['remote_input_identity'] = remote_key
             key, stage = (json.dumps([remote_key, planning_input], sort_keys=True) if planning_input else remote_key), 'observed'
@@ -704,7 +712,30 @@ class BlockedPlanReconciler:
             self._save(plan_id, key, stage, context)
         else:
             key, stage, context = saved['input_identity'], saved['stage'], json.loads(saved['context'])
+            # Older saved contexts predate the independent comparison baseline.
+            context.setdefault('comparison_revision', self._plan(plan_id)['plan_sha'] or self._plan(plan_id)['active_sha'])
         try:
+            if saved is not None and saved['stage'] not in TERMINAL and planning_input != previous_input:
+                # Keep the owned Git operation and its original target. Only
+                # refresh assessment inputs and the next desired base; pending
+                # rebase completion remains _incorporate's responsibility.
+                with runtime_state._transaction(self.connection):
+                    current_saved = self.connection.execute(
+                        'SELECT * FROM blocked_plan_reconciliations WHERE repo=? AND plan_id=?',
+                        (self.repo, plan_id)).fetchone()
+                    if (dict(current_saved or {}) != dict(saved)
+                            or planning_review_state.reassessment(self.connection, self.repo, plan_id) != planning_input):
+                        return 'deferred'
+                    context['planning_input'] = planning_input
+                    self._check_owner(plan_id, context)
+                    context['base_oid'] = row['base_oid']
+                    context['remote_input_identity'] = observations.input_identity(row)
+                    key = json.dumps([context['remote_input_identity'], planning_input], sort_keys=True)
+                    context['input_identity'] = key
+                    context.pop('evaluation', None)
+                    if stage in {'incorporated', 'evaluated'}:
+                        stage = 'adopted'
+                    self._save(plan_id, key, stage, context)
             plan = self._check_owner(plan_id, context)
             if stage == 'adopted' and ExecutionCheckpointRepository(self.connection).get(
                     self.repo, plan_id).operation == 'rebase':

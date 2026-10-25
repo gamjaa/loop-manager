@@ -651,7 +651,8 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
             raise RuntimeError('확정 planning 이후의 원격 명세 변경을 조회할 수 없습니다.')
         if difference.returncode == 1:
             return False, '후속 원격 명세 변경의 planning 확정을 기다립니다.', None
-    prior_revision = blocked['active_sha'] or blocked['plan_sha']
+    prior_revision = (blocked['comparison_revision'] if 'comparison_revision' in blocked.keys() else None
+                      ) or blocked['active_sha'] or blocked['plan_sha']
     declared_sources = set(json.loads(blocked['sources']))
     paths = sorted(declared_sources | {item['source'] for item in related}
                    | {blocked['path'], 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'})

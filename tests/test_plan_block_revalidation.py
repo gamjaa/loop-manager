@@ -1384,6 +1384,104 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
 
 
 class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_new_planning_input_after_interruption_finishes_owned_rebase_before_new_target(self):
+        from loop_manager_internal.storage import planning_review_state as reviews
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        old_target = 'c' * 40
+        independent = dict(self.plan('G-107'))
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET active_sha='before-docs' WHERE plan_id='G-106'")
+            store.record(self.repo, 'G-106', expected_generation=0, operation='rebase',
+                expected_head=self.head, target_base_oid=old_target, observed_remote_oid=None, snapshot={'audit': 'kept'})
+        with mock.patch.object(self.ports, '_complete_direct_rebase_checkpoint', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.coordinator.reconcile('G-106')
+        saved = self.connection.execute("SELECT * FROM blocked_plan_reconciliations WHERE plan_id='G-106'").fetchone()
+        self.assertEqual(saved['stage'], 'adopted')
+        with self.connection:
+            reviews.begin(self.connection, self.repo, purpose='delta', revision=self.base,
+                input_fingerprint='new', specification_fingerprint='spec', work_cycle='cycle', comparison_revision=None)
+            reviews.validate(self.connection, self.repo, self.base, 'BLOCKED_PLAN_INPUTS: ' + json.dumps(dict(
+                revision=self.base, plans=[dict(plan_id='G-106', requirements=[dict(
+                    source='docs/requirements/[R-002] Policy.md', reason='new validation policy', quote='Current policy.')])])), 'reviewed')
+            reviews.confirm(self.connection, self.repo, self.base, self.base)
+        self.assertEqual(store.get(self.repo, 'G-106').target_base_oid, old_target)
+        steps = []
+        def finish(*_args, **_kwargs):
+            current = store.get(self.repo, 'G-106')
+            steps.append(('complete', current.target_base_oid))
+            with self.connection:
+                store.record(self.repo, 'G-106', expected_generation=current.generation, operation=None,
+                    expected_head=self.head, target_base_oid=current.target_base_oid,
+                    observed_remote_oid=None, snapshot=current.snapshot)
+        def start(*args, **_kwargs):
+            steps.append(('start', args[6]))
+            current = store.get(self.repo, 'G-106')
+            with self.connection:
+                store.record(self.repo, 'G-106', expected_generation=current.generation, operation='rebase',
+                    expected_head=self.head, target_base_oid=args[6], observed_remote_oid=None, snapshot=current.snapshot)
+            return SimpleNamespace(returncode=0, stdout='rebased')
+        self.ports._complete_direct_rebase_checkpoint.side_effect = finish
+        self.ports._journaled_direct_rebase.side_effect = start
+        self.ports.git.side_effect = lambda path, *args, **kwargs: (
+            SimpleNamespace(returncode=1, stdout='') if args[:1] == ('merge-base',) else self.git(path, *args, **kwargs))
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(steps, [('complete', old_target), ('start', self.base), ('complete', self.base)])
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+        self.assertIsNone(store.get(self.repo, 'G-106').operation)
+        self.assertEqual(store.get(self.repo, 'G-106').snapshot['audit'], 'kept')
+        self.assertEqual(dict(self.plan('G-107')), independent)
+
+    def test_question_assessment_uses_pre_rebase_revision_after_active_sha_advances(self):
+        from loop_manager_internal.storage import planning_review_state as reviews, runtime_state
+        from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan(self.repo, 'G-106', reason_code='user_decision_required', evidence='original question',
+            release_fingerprint='input', clear_projection=False, plan_values={'active_sha': 'before-docs'})
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        source = 'docs/requirements/[R-002] Policy.md'
+        policy = 'Ordinary calls and mock checks are sufficient.'
+        with self.connection:
+            store.record(self.repo, 'G-106', expected_generation=0, operation='rebase', expected_head=self.head,
+                target_base_oid=self.base, observed_remote_oid=None, snapshot={})
+            reviews.begin(self.connection, self.repo, purpose='delta', revision=self.base,
+                input_fingerprint='new', specification_fingerprint='spec', work_cycle='cycle', comparison_revision=None)
+            reviews.validate(self.connection, self.repo, self.base, 'BLOCKED_PLAN_INPUTS: ' + json.dumps(dict(
+                revision=self.base, plans=[dict(plan_id='G-106', requirements=[dict(
+                    source=source, reason='resolves validation choice', quote=policy)])])), 'reviewed')
+            reviews.confirm(self.connection, self.repo, self.base, self.base)
+        def finish(*_args, **_kwargs):
+            current = store.get(self.repo, 'G-106')
+            with self.connection:
+                store.record(self.repo, 'G-106', expected_generation=current.generation, operation=None,
+                    expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None, snapshot=current.snapshot)
+                runtime.update_plan(self.repo, 'G-106', plan_values={'active_sha': self.base})
+        self.ports._complete_direct_rebase_checkpoint.side_effect = finish
+        def git(_root, *args, **_kwargs):
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(returncode=0, stdout=self.base)
+            if args[0] in {'merge-base', 'diff'}:
+                return SimpleNamespace(returncode=0, stdout='')
+            if args[0] == 'show':
+                revision, path = args[1].split(':', 1)
+                text = (policy if revision == self.base else 'Choose a validation strategy.') if path == source else 'Unchanged document.'
+                return SimpleNamespace(returncode=0, stdout=text)
+            raise AssertionError(args)
+        agent = mock.Mock(return_value=(0, 'USER_DECISION_ASSESSMENT: ' + json.dumps(dict(
+            resolved=True, detail='Current policy resolves the choice.', evidence=[dict(source=source, quote=policy)]))))
+        effects = SimpleNamespace(git=git, run_agent=agent, capture_git_snapshot=mock.Mock(), validate_agent_scope=mock.Mock())
+        self.ports._evaluate_remote_checkpoint_cause.side_effect = lambda db, root, state, repo, plan, *_args: (
+            _assess_user_decision_cause(effects, db, root, state, repo, plan, None))
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'resumed')
+        agent.assert_called_once()
+        payload = json.loads(agent.call_args.args[5].splitlines()[-1])
+        self.assertEqual(payload['prior_revision'], 'before-docs')
+        self.assertIn('+Ordinary calls', payload['changes'][source])
+        self.assertEqual(self.plan()['active_sha'], self.base)
+        self.assertEqual(store.get(self.repo, 'G-106').snapshot['user_decision_assessment']['prior_revision'], 'before-docs')
+
     def test_confirmed_planning_rechecks_processed_target_and_preserves_independent_state(self):
         from loop_manager_internal.storage import planning_review_state as reviews
         with mock.patch.object(self.coordinator, '_publish'):
