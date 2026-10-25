@@ -11,6 +11,30 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKi
 
 
 class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
+    def test_reserved_checkpoint_race_does_not_confirm_ownership(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.connection.execute("UPDATE exec_plans SET workspace_owned=2")
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        def competing(*_args, **_kwargs):
+            current = checkpoint.get('repo', 'G-047')
+            checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+                              operation=current.operation, expected_head=current.expected_head,
+                              target_base_oid=current.target_base_oid,
+                              observed_remote_oid=current.observed_remote_oid,
+                              snapshot={**current.snapshot, 'competing': True})
+        self.effects.workspace.make_worktree.side_effect = competing
+
+        result = self.handler.prepare()
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(self.state.active_execplan('repo')['workspace_owned'], lm.WORKSPACE_RESERVED)
+        self.effects.workspace.mark_execplan_workspace_owned.assert_not_called()
+        self.assertTrue(checkpoint.get('repo', 'G-047').snapshot['competing'])
+
     def test_worktree_recovery_failure_keeps_durable_pending_boundary(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)

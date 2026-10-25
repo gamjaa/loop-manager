@@ -25,24 +25,33 @@ class RemoteCreationEvidenceTests(TestCase):
                 _worktree_catalog=mock.Mock(), _write_managed_worktree_receipt=mock.Mock(),
                 git=mock.Mock(), validate_managed_worktree=mock.Mock(), validate_reserved_worktree=mock.Mock())
             stale = {'intent': {'expected': {**live, 'index': 'c' * 40}}, 'result': {'observed': live}}
-            for name, records, accepted in (('missing', [], False), ('matching', [evidence], True),
-                                             ('stale', [stale], False)):
+            for name, records, accepted, strict, basis in (
+                ('missing', [], False, True, head),
+                ('matching', [evidence], True, True, head),
+                ('stale', [stale], False, True, head),
+                ('ordinary-reservation-with-new-basis', [evidence], True, False, 'd' * 40),
+                ('adoption-with-wrong-basis', [evidence], False, True, 'd' * 40),
+                ('ordinary-without-creation-proof', [], False, False, head),
+            ):
                 with self.subTest(evidence=name), \
                      mock.patch.object(workspace.manager_git_journal, 'recover_active'), \
                      mock.patch.object(workspace.manager_git_journal, 'verified_managed_transitions',
                                        return_value=records):
-                    options = dict(ownership_reserved=True, expected_head=head,
+                    effects.validate_reserved_worktree.reset_mock()
+                    options = dict(ownership_reserved=True, expected_head=basis,
                         journal_state_dir=root / 'state', journal_owner='plan:G-047',
-                        require_creation_evidence=True)
+                        require_creation_evidence=strict)
                     if accepted:
                         self.assertEqual(workspace.make_worktree(effects, repo, worktree,
                             'loop-manager/G-047', 'main', **options), 'existing')
+                        effects.validate_reserved_worktree.assert_called_once_with(
+                            repo, worktree, 'loop-manager/G-047', head)
                     else:
-                        with self.assertRaisesRegex(lm.WorkspaceOwnershipError, '생성 기록'):
+                        with self.assertRaises(lm.WorkspaceOwnershipError):
                             workspace.make_worktree(effects, repo, worktree,
                                 'loop-manager/G-047', 'main', **options)
+                        effects.validate_reserved_worktree.assert_not_called()
             effects.git.assert_not_called()
-            effects.validate_reserved_worktree.assert_called_once_with(repo, worktree, 'loop-manager/G-047', head)
 
 
 @isolated_git_test

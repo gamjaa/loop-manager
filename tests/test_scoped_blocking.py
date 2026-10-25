@@ -18,6 +18,118 @@ from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, Bloc
 
 
 from tests.support.scoped_recovery import ScopedGateFixture
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+
+
+class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.worktree = Path('/state/G-001').resolve()
+        self.branch = 'loop-manager/G-001'
+        self.head = 'a' * 40
+        self.plan('G-001', 'IMPLEMENTING', branch=self.branch)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET workspace_owned=2, worktree=?, active_sha=?, "
+                "worker_session_id='saved-session', retry_count=2 WHERE repo=?",
+                (str(self.worktree), 'b' * 40, self.repo))
+            self.connection.execute(
+                "UPDATE projects SET phase='WORKING', plan_path='docs/plans/[G-001] Work.md' WHERE repo=?",
+                (self.repo,))
+            scoped_blocking.record_project_block(
+                self.connection, self.repo, BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
+                'reservation HEAD differs from active_sha', 'saved',
+                plan_id='G-001', previous_phase='WORKING')
+        self.checkpoints = ExecutionCheckpointRepository(self.connection)
+        self.before = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.live = {'exists': True, 'registration': {
+            'head': self.head, 'branch': 'refs/heads/' + self.branch, 'locked': 'owned-marker'},
+            'index': 'tree'}
+        self.snapshot = loop_manager.GitSnapshot(self.head, self.branch, {}, {}, {}, {}, {}, {})
+        self.records = [{'intent': {'expected': self.live}, 'result': {'observed': self.live}}]
+        self.enterContext(mock.patch.object(Path, 'is_dir', return_value=True))
+        self.enterContext(mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'))
+        self.enterContext(mock.patch.object(loop_manager, 'validate_managed_worktree'))
+        self.enterContext(mock.patch.object(loop_manager, 'git', return_value=mock.Mock(returncode=0)))
+        self.enterContext(mock.patch.object(loop_manager, '_managed_worktree_transition_state',
+                                           side_effect=lambda *_: self.live))
+        self.capture = self.enterContext(mock.patch.object(loop_manager, 'capture_git_snapshot',
+                                                           side_effect=lambda *_: self.snapshot))
+        self.journal = self.enterContext(mock.patch(
+            'loop_manager_internal.git.manager_git_journal.verified_managed_transitions',
+            side_effect=lambda *_a, **_k: self.records))
+        self.enterContext(mock.patch('loop_manager_internal.git.manager_git_journal.recover_active'))
+
+    def resume(self):
+        return loop_manager.resume_project_block_if_safe(
+            self.connection, Path(self.repo), Path('/state'), self.repo)
+
+    def test_reserved_creation_releases_stale_project_block_without_changing_execution_basis(self):
+        self.assertTrue(self.resume())
+        after = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        for field in ('active_sha', 'worker_session_id', 'retry_count', 'worker_result',
+                      'verify_token', 'review_token', 'verify_result', 'review_result'):
+            self.assertEqual(after[field], self.before[field], field)
+        self.assertEqual(after['workspace_owned'], 1)
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        saved = self.checkpoints.get(self.repo, 'G-001')
+        self.assertEqual(saved.snapshot['workspace_reservation_recovered']['head'], self.head)
+        self.assertFalse(self.resume())
+        self.assertEqual(self.checkpoints.get(self.repo, 'G-001'), saved)
+
+    def test_missing_creation_evidence_preserves_reservation_and_project_gate(self):
+        self.records = []
+        self.assertFalse(self.resume())
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+
+    def test_changed_registration_or_files_are_not_approved_by_matching_head(self):
+        for changed in (
+            {**self.live, 'index': 'foreign-tree'},
+            {**self.live, 'registration': {**self.live['registration'], 'locked': 'foreign-marker'}},
+        ):
+            with self.subTest(live=changed):
+                with mock.patch.object(loop_manager, '_managed_worktree_transition_state', return_value=changed):
+                    self.assertFalse(self.resume())
+        self.snapshot = replace(self.snapshot, dirty={'user.txt': (('untracked',), 'user-data')})
+        self.assertFalse(self.resume())
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+
+    def test_checkpoint_race_does_not_confirm_or_release_reservation(self):
+        calls = 0
+        def observe(*_):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                previous = self.checkpoints.get(self.repo, 'G-001')
+                self.checkpoints.record(self.repo, 'G-001', expected_generation=previous.generation,
+                                        operation=None, expected_head=previous.expected_head,
+                                        target_base_oid=previous.target_base_oid,
+                                        observed_remote_oid=previous.observed_remote_oid,
+                                        snapshot={'new-input': True})
+            return self.snapshot
+        self.capture.side_effect = observe
+        self.assertFalse(self.resume())
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+
+
+    def test_checkpoint_write_failure_rolls_back_ownership_and_gate_release(self):
+        with mock.patch.object(ExecutionCheckpointRepository, 'record', side_effect=sqlite3.OperationalError('write failed')):
+            with self.assertRaisesRegex(sqlite3.OperationalError, 'write failed'):
+                self.resume()
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+
+    def test_conflicting_remote_adoption_is_not_replaced_by_creation_journal(self):
+        previous = self.checkpoints.get(self.repo, 'G-001')
+        self.checkpoints.record(self.repo, 'G-001', expected_generation=previous.generation,
+                                operation=None, expected_head=self.head, target_base_oid='b' * 40,
+                                observed_remote_oid=self.head, snapshot={'remote_adoption': {
+                                    'repo': 'different-repository', 'plan_id': 'G-001',
+                                    'branch': self.branch, 'head': self.head, 'base': 'main'}})
+        self.assertFalse(self.resume())
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), self.before)
 
 
 class LegacyBlockedScopeUnitTests(unittest.TestCase):

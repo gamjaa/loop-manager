@@ -126,6 +126,21 @@ def validate_reserved_worktree(effects: ValidateReservedWorktreeEffects,
         )
 
 
+def reserved_worktree_creation_head(
+    state_dir: Path, repo: Path, worktree: Path, branch: str, owner: str,
+    live: dict[str, object],
+) -> str:
+    """Resolve one reservation from sealed creation evidence for this resource."""
+    for item in manager_git_journal.verified_managed_transitions(
+        state_dir, str(_canonical_path(repo)), owner,
+        kind="managed_worktree_create", target=str(_canonical_path(worktree)),
+    ):
+        if (item['intent']['expected'] == item['result']['observed'] == live
+                and live.get('registration', {}).get('branch') == f'refs/heads/{branch}'):
+            return str(live['registration']['head'])
+    raise WorkspaceOwnershipError('예약 workspace의 Manager 생성 기록이 현재 상태와 다릅니다.')
+
+
 def make_worktree(effects: MakeWorktreeEffects,
     repo: Path,
     worktree: Path,
@@ -146,10 +161,6 @@ def make_worktree(effects: MakeWorktreeEffects,
 ) -> str:
     """Create, recover, or validate one owned ExecPlan worktree."""
 
-    if ownership_reserved and not expected_head:
-        raise WorkspaceOwnershipError(
-            "예약 ExecPlan workspace의 기준 commit SHA가 없습니다."
-        )
     if start_point is not None and (
         ownership_reserved or expected_head is not None
         or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", start_point)
@@ -170,21 +181,21 @@ def make_worktree(effects: MakeWorktreeEffects,
                 journal_state_dir, intent, "create",
             ),
         )
-    if require_creation_evidence:
+    if require_creation_evidence or (
+        ownership_reserved and journal_state_dir is not None and worktree.is_dir()
+    ):
         if journal_state_dir is None or not journal_owner or not ownership_reserved:
             raise WorkspaceOwnershipError('원격 인수 workspace의 생성 예약 근거가 없습니다.')
-        target = str(_canonical_path(worktree))
         live = effects._managed_worktree_transition_state(repo, worktree)
-        if not any(
-            item['intent']['expected'] == item['result']['observed'] == live
-            and live.get('registration', {}).get('head') == expected_head
-            and live.get('registration', {}).get('branch') == f'refs/heads/{branch}'
-            for item in manager_git_journal.verified_managed_transitions(
-                journal_state_dir, str(_canonical_path(repo)), journal_owner,
-                kind='managed_worktree_create', target=target,
-            )
-        ):
-            raise WorkspaceOwnershipError('원격 인수 workspace의 Manager 생성 기록이 없습니다.')
+        created_head = reserved_worktree_creation_head(
+            journal_state_dir, repo, worktree, branch, journal_owner, live,
+        )
+        if require_creation_evidence and created_head != expected_head:
+            raise WorkspaceOwnershipError('원격 인수 workspace의 생성 HEAD가 인수 기준과 다릅니다.')
+        # 실행 기준은 생성 후 전진할 수 있으므로 봉인된 생성 결과로 예약을 확인한다.
+        expected_head = created_head
+    if ownership_reserved and not expected_head:
+        raise WorkspaceOwnershipError("예약 ExecPlan workspace의 기준 commit SHA가 없습니다.")
     if worktree.is_dir():
         if not allow_existing:
             raise WorkspaceOwnershipError(

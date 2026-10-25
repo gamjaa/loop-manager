@@ -112,6 +112,8 @@ def _pull_request_recovery_effects_resume_pr_conflict_rebase(effects: PullReques
 class ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects:
     """Named effects for _scope_reconciliation_effects_resume_project_block_if_safe; no entry-point/module access."""
     _agent_git_resources: Callable[..., object]
+    _managed_worktree_marker: Callable[..., object]
+    _managed_worktree_transition_state: Callable[..., object]
     _clear_active_in_current_transaction: Callable[..., object]
     _clear_project_block_without_losing_planning_error: Callable[..., object]
     _reconcile_rebase_evidence_block: Callable[..., object]
@@ -133,6 +135,8 @@ class ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects:
 def _scope_reconciliation_effects_resume_project_block_if_safe(effects: ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects, ) -> scope_reconciliation.ResumeProjectBlockIfSafeEffects:
     return scope_reconciliation.ResumeProjectBlockIfSafeEffects(
         _agent_git_resources=effects._agent_git_resources,
+        _managed_worktree_marker=effects._managed_worktree_marker,
+        _managed_worktree_transition_state=effects._managed_worktree_transition_state,
         _clear_active_in_current_transaction=effects._clear_active_in_current_transaction,
         _clear_project_block_without_losing_planning_error=effects._clear_project_block_without_losing_planning_error,
         _reconcile_rebase_evidence_block=effects._reconcile_rebase_evidence_block,

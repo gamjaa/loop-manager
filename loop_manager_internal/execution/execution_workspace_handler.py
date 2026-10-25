@@ -23,6 +23,7 @@ from loop_manager_internal.execution.execution_session import ExecutionIdentity,
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.storage import database
+from loop_manager_internal.storage import runtime_state
 
 @dataclass(frozen=True)
 class WorkspaceHandlerPorts:
@@ -878,6 +879,8 @@ class WorkspaceHandler:
             adoption_create_branch = bool(
                 adoption_pending and not local_branch_exists and not worktree.is_dir()
             )
+            reserved_checkpoint = (self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
+                                   if workspace_reserved and self.ports.checkpoint is not None else None)
             self.ports.make_worktree(
                 self.ports.identity.repo_path,
                 worktree,
@@ -940,7 +943,16 @@ class WorkspaceHandler:
                         self.ports.identity.repo, pr_url=str(adopted_pr['url']),
                         pr_head_oid=remote_start,
                     )
-            self.ports.mark_execplan_workspace_owned(self.ports.identity.repo, plan_id)
+            if workspace_reserved and remote_start is None:
+                with runtime_state._transaction(self.ports.state.connection):
+                    self.ports.state.check()
+                    if (dict(self.ports.state.active_execplan(self.ports.identity.repo)) != dict(catalog_plan)
+                            or (reserved_checkpoint is not None
+                                and self.ports.checkpoint.get(self.ports.identity.repo, plan_id) != reserved_checkpoint)):
+                        raise RuntimeStateError('예약 workspace 검증 중 작업/checkpoint가 변경됐습니다.')
+                    self.ports.mark_execplan_workspace_owned(self.ports.identity.repo, plan_id)
+            else:
+                self.ports.mark_execplan_workspace_owned(self.ports.identity.repo, plan_id)
             database.record_execplan_workspace_seen(
                 self.ports.state.connection, self.ports.identity.repo, plan_id)
             self._workspace_boundary(plan_id, row, pending=False)

@@ -75,6 +75,8 @@ def register(assembly: Composition) -> None:
     assembly.bind('_scope_reconciliation_effects_resume_project_block_if_safe', recovery_adapter._scope_reconciliation_effects_resume_project_block_if_safe,
         lambda: recovery_adapter.ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects(
             _agent_git_resources=assembly.callback('_agent_git_resources'),
+            _managed_worktree_marker=assembly.callback('_managed_worktree_marker'),
+            _managed_worktree_transition_state=assembly.callback('_managed_worktree_transition_state'),
             _clear_active_in_current_transaction=assembly.callback('_clear_active_in_current_transaction'),
             _clear_project_block_without_losing_planning_error=assembly.callback('_clear_project_block_without_losing_planning_error'),
             _reconcile_rebase_evidence_block=assembly.callback('_reconcile_rebase_evidence_block'),

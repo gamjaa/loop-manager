@@ -72,7 +72,7 @@ def mark_execplan_workspace_owned(
     repo: str,
     plan_id: str,
 ) -> None:
-    with connection:
+    with runtime_state._transaction(connection):
         try:
             runtime_state.RuntimeStateRepository(connection).update_plan(
                 repo,

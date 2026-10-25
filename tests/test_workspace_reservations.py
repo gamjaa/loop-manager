@@ -483,6 +483,11 @@ class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
             self.assertTrue(worktree.is_dir())
             interrupted_agent.assert_not_called()
 
+            # 생성 뒤 실행 기준이 달라져도 생성 journal의 HEAD는 그대로다.
+            with connection:
+                connection.execute("UPDATE exec_plans SET active_sha = ? WHERE repo = ?",
+                                   (git_command(repo, "rev-parse", "HEAD^"), str(repo)))
+
             with mock.patch(
                 "loop_manager.validate_repository",
                 return_value=repo,
