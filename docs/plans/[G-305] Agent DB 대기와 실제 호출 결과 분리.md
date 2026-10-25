@@ -157,6 +157,18 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_
 - 신규 `TaskSchedulingTests.test_restart_uses_the_worker_session_saved_by_the_start_callback`은 실제 `observe_worker_session()` callback 저장 뒤 결과 DB 확정에서 중단하고 새 DB 연결의 Worker 상태에서 session을 읽어 재진입한다. 원래 요청 null과 관측 session의 관계, 같은 invocation/응답 복구와 provider 비재실행을 확인한다. 기존 복구 unit은 같은 작업의 다른 session 거부와 결과 session 허용, 구형 요청 session metadata의 정확 일치/추정 거부를 함께 확인한다. 손상 receipt unit은 잘못된 요청 session 타입의 pending 보존을 확인한다.
 - 공통 targeted runner로 위 신규 2개 unit과 `RunnerTests.test_storage_pending_restart_consumes_existing_message_or_holds_without_provider`, `ProcessReceiptTest.test_malformed_or_foreign_invocation_observation_preserves_pending_state_and_reservation`을 실행해 4개 success를 기록했다. 구형 metadata 회귀 보강 뒤 복구 unit 하나를 같은 runner로 다시 실행해 success(exit 0)였다. 이번 호출의 본문 failure/error는 없으며 전체 verify·실제 Agent CLI·Windows native 검증은 실행하지 않았다.
 
+### Review 재교정: Planner prompt 구성 복원 (2026-10-25)
+
+- `review:loop_manager_internal/agents/invocation_service.py::run_agent::restart-request-session-loss`(occurrence 2, revision 2)을 교정했다. 앞선 Worker 상태 재연결 회귀는 고정 prompt여서 일반 Planner가 session 저장 뒤 조회 안내를 생략하는 실제 경계를 확인하지 못했다. Planner agent port는 기존 미전달 receipt에서 같은 호출의 원래 요청 session을 읽고, assessment는 prompt 작성 시 조회 안내 포함 여부를 그 값으로 판단한다. 실제 재진입 session과 전체 요청 지문·session 귀속 검사는 유지하며 임의 prompt 변경은 계속 거부한다. 전달 확정 뒤에는 현재 session으로 안내 구성을 판단한다.
+- 신규 `PlannerInterruptionRecoveryTest.test_completed_planner_restart_rebuilds_the_original_query_prompt`는 실제 `run_project()`·assessment prompt 구성·agent port·SQLite 재연결을 거친다. 최초 provider double에서 조회 안내를 확인하고 시작 callback으로 session을 저장한 뒤 결과 DB 확정에서 중단한다. 재시작은 원래 조회 안내를 복원해 같은 invocation의 응답·session·코드를 회수하며 provider 호출은 한 번이다. 전달 확정 뒤 원래 session 복원 없이 현재 session을 사용하는 것도 확인한다. provider의 fixture 응답 코드 1은 무관한 게시·후속 실행 전에 멈추기 위한 값이며 unit 성공/실패와 구분한다. 기존 Worker 상태 회귀·Planner 실행 중 중단 회귀·다른 요청/자료 거부 회귀는 유지했다.
+- 최초 신규 unit 실행은 success였다. 전달 확정 뒤의 정상 session 검사 추가 후 테스트 관측 목록에서 그 세 번째 호출을 빠뜨려 아래 명령이 1개 failure/2개 success였다. 실제 복구 assertion을 유지하고 기대 관측 목록에 정상 session 검사를 반영한 뒤 동일 명령을 재실행했다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_interruption_recovery.PlannerInterruptionRecoveryTest.test_completed_planner_restart_rebuilds_the_original_query_prompt tests.test_planner_interruption_recovery.PlannerInterruptionRecoveryTest.test_interrupted_planner_persists_started_session_and_resumes tests.test_agent_invocation.RunnerTests.test_storage_pending_restart_consumes_existing_message_or_holds_without_provider
+
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_interruption_recovery.PlannerInterruptionRecoveryTest.test_completed_planner_restart_rebuilds_the_original_query_prompt tests.test_planner_interruption_recovery.PlannerInterruptionRecoveryTest.test_interrupted_planner_persists_started_session_and_resumes tests.test_agent_invocation.RunnerTests.test_storage_pending_restart_consumes_existing_message_or_holds_without_provider
+
+최종 결과: 3개 unit success, exit 0. PRODUCT·ARCHITECTURE에 일반 Planner의 조회 안내 복원 책임과 전달 후 정상 구성을 반영했다. 전체 verify·실제 Agent CLI·Windows native 검증은 실행하지 않았으며 Manager의 다음 검증으로 남긴다.
+
 ## Decision Log
 
 - 이번 R-091 delta에서 요청 한도 소진을 다음 외부 실행 전용 pause로 고정하지 않는다. 같은 실행의 저장 재개에서도 실제 provider 결과·호출 identity·필수 증거 gate를 보존하며 기존 G-303 dependency와 독립된 DB 확정 목표를 유지한다. 대기열·단계 실패 정책은 G-297/G-313의 책임이며 새 순환 dependency를 만들지 않는다. 구현·테스트는 실행하지 않았다.

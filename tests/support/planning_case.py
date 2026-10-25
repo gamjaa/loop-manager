@@ -521,6 +521,9 @@ class FakeGitPort:
 
 
 class FakeAgentPort:
+    def prompt_session(self, session_id):
+        return session_id
+
     def __init__(self):
         self.run_count = 0
         self.resumed_session = None
