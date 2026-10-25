@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
+from urllib.parse import quote
 from unittest import mock
 
 import loop_manager
@@ -755,14 +756,21 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         connection = self.connection()
         from loop_manager_internal.storage import execplan_draft_state
         execplan_draft_state.ensure_schema(connection)
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        url = 'https://github.com/org/repo/blob/draft-sha/' + quote(path, safe='/')
+        connection.execute("UPDATE projects SET origin='https://github.com/org/repo' WHERE repo='/projects/alpha'")
+        connection.execute("UPDATE exec_plans SET path=?, current_revision_sha='draft-sha' "
+                           "WHERE repo='/projects/alpha' AND plan_id='G-018'", (path,))
         connection.execute("INSERT INTO execplan_drafts VALUES (?, 'G-018', 1, ?)",
-            ('/projects/alpha', json.dumps({'pending': True, 'question': 'Which retention policy?', 'revision': 'question-revision'})))
+            ('/projects/alpha', json.dumps({'pending': True, 'question': 'Which retention policy?',
+                'identity': 'retention-question', 'revision': 'question-revision', 'path': path, 'url': url})))
         cause = 'request rejected\n{"password": "first-private\\nsecond-private"}\nBearer bearer-private\n' + 'sk-' + 'a' * 24
         for identity in ('first-error', 'first-error', 'second-error'):
             with connection:
                 notifications.enqueue_progress(connection, '/projects/alpha', 'draft_decision', identity,
-                    execplan_id='G-018', decision_revision='question-revision', operation='Planner', cause=cause,
-                    status='자동 교정 대기', silent=True)
+                    execplan_id='G-018', question='Which retention policy?', url=url,
+                    decision_identity='retention-question', decision_revision='question-revision',
+                    source_path=path, operation='Planner', cause=cause, status='자동 교정 대기', silent=True)
         events = self.events(connection)
         self.assertEqual(len(events), 2)
         for row in events:
@@ -831,10 +839,14 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
                 'draft': True, 'draft_scope': 'scope', 'draft_question':
                 'Question: Choose A or B?\nOptions: A, B\nImpact: A retains history',
                 'draft_question_identity': 'question-1'}
+        plan_path = 'docs/plans/[G-018] Reliable notices.md'
         with connection:
-            execplan_draft_state.observe(connection, repo, 'docs/plans/choice.md', plan, 'hash', 'remote-sha',
+            connection.execute("UPDATE projects SET origin='https://github.com/org/repo' WHERE repo=?", (repo,))
+            connection.execute("UPDATE exec_plans SET path=?, title=?, current_revision_sha='remote-sha' "
+                               "WHERE repo=? AND plan_id='G-018'", (plan_path, plan['title'], repo))
+            execplan_draft_state.observe(connection, repo, plan_path, plan, 'hash', 'remote-sha',
                                         remote_url='https://github.com/org/repo')
-            notifications.record_planning_publication(connection, repo, [('docs/plans/choice.md', plan)], 'remote-sha')
+            notifications.record_planning_publication(connection, repo, [(plan_path, plan)], 'remote-sha')
             notifications.enqueue_current_project_events(connection, repo)
         snapshot = work_exhaustion.collect(connection, repo, cycle='cycle', active_requirements=())
         self.assertIsNotNone(snapshot)
@@ -864,8 +876,12 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
                 'draft': True, 'draft_scope': 'scope', 'draft_question':
                 'Question: Choose A or B?\nFacts: known\nOptions: A, B\nImpact: history',
                 'draft_question_identity': 'question-1'}
+        plan_path = 'docs/plans/[G-018] Reliable notices.md'
         with connection:
-            execplan_draft_state.observe(connection, repo, 'docs/plans/choice.md', plan, 'hash', 'remote-sha',
+            connection.execute("UPDATE projects SET origin='https://github.com/org/repo' WHERE repo=?", (repo,))
+            connection.execute("UPDATE exec_plans SET path=?, title=?, current_revision_sha='remote-sha' "
+                               "WHERE repo=? AND plan_id='G-018'", (plan_path, plan['title'], repo))
+            execplan_draft_state.observe(connection, repo, plan_path, plan, 'hash', 'remote-sha',
                                         remote_url='https://github.com/org/repo')
             notifications.enqueue_current_project_events(connection, repo)
         first = self.events(connection)[0]
@@ -875,6 +891,8 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         saved['identity'] = 'question-2'
         saved['url'] = saved['url'].replace('remote-sha', 'new-sha')
         with connection:
+            connection.execute("UPDATE exec_plans SET current_revision_sha='new-sha' "
+                               "WHERE repo=? AND plan_id='G-018'", (repo,))
             connection.execute('UPDATE execplan_drafts SET evidence=? WHERE repo=? AND plan_id=?',
                                (json.dumps(saved), repo, 'G-018'))
         delivered = mock.Mock()

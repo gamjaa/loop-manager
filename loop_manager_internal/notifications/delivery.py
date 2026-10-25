@@ -67,7 +67,7 @@ def _claim_piece(
                 (event_key,),
             )
             return None
-        if not is_current(connection, str(row[0]), str(row[1]), payload):
+        if not is_current(connection, str(row[0]), str(row[1]), payload, event_key=event_key):
             cancel_event(connection, event_key)
             return None
         if row[1] == "blocked":

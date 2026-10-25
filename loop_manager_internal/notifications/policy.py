@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
+import re
+from urllib.parse import quote, unquote, urlsplit
 
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.storage import execplan_draft_state
+from .rendering import _checkpoint_link, _pieces
 
 
 SOURCE_ACTION_REASONS = frozenset({'guidance_approval_required', 'review_specification_deadlock'})
@@ -217,7 +220,166 @@ def block_action(connection, repo, payload):
         return None
 
 
-def is_current(connection, repo, kind, payload):
+def _draft_question_key(item):
+    plan_id = item.get('id', item.get('execplan_id'))
+    identity = item.get('decision_identity')
+    revision = item.get('decision_revision')
+    if not all(isinstance(value, str) and value.strip()
+               for value in (plan_id, identity, revision)):
+        return None
+    return plan_id, identity, revision
+
+
+def _draft_source_path(item):
+    path = item.get('source_path', item.get('path'))
+    if isinstance(path, str) and path:
+        return path
+    url = item.get('url')
+    if not isinstance(url, str):
+        return None
+    parsed = urlsplit(url)
+    parts = unquote(parsed.path).lstrip('/').split('/')
+    if parsed.scheme != 'https' or parsed.netloc.lower() != 'github.com' or len(parts) < 5:
+        return None
+    if parts[2] != 'blob' or not parts[3]:
+        return None
+    return '/'.join(parts[4:])
+
+
+def _valid_draft_source_path(path, plan_id):
+    return isinstance(path, str) and bool(re.fullmatch(
+        rf'docs/plans/\[{re.escape(plan_id)}\] .+\.md', path,
+    ))
+
+
+def _current_draft_question(connection, repo, plan_id):
+    try:
+        saved = execplan_draft_state.evidence(connection, repo, plan_id)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    if (not isinstance(saved, dict) or not saved.get('pending')
+            or not isinstance(saved.get('question'), str) or not saved['question'].strip()
+            or saved.get('reassessment')):
+        return None
+    key = _draft_question_key({
+        'id': plan_id, 'decision_identity': saved.get('identity'),
+        'decision_revision': saved.get('revision'),
+    })
+    if key is None:
+        return None
+    plan = connection.execute(
+        'SELECT path, title, COALESCE(current_revision_sha, plan_sha) AS revision '
+        'FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id),
+    ).fetchone()
+    project = connection.execute('SELECT origin FROM projects WHERE repo=?', (repo,)).fetchone()
+    if (plan is None or project is None or saved.get('path') != plan['path']
+            or not _valid_draft_source_path(str(plan['path']), plan_id)):
+        return None
+    revision = str(plan['revision'] or '')
+    link = _checkpoint_link(project['origin'], revision)
+    url = None
+    if link:
+        origin = link.split('/tree/', 1)[0]
+        url = f"{origin}/blob/{revision}/{quote(str(plan['path']), safe='/')}"
+    return {
+        'id': plan_id, 'title': str(plan['title']), 'url': url,
+        'source_path': str(plan['path']), 'decision_identity': key[1],
+        'decision_revision': key[2],
+    }
+
+
+def _current_draft_questions(connection, repo):
+    try:
+        plan_ids = sorted(execplan_draft_state.user_question_ids(connection, repo))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return []
+    return [snapshot for plan_id in plan_ids
+            if (snapshot := _current_draft_question(connection, repo, plan_id)) is not None]
+
+
+def _confirmed_draft_question_keys(connection, repo, *, exclude_event_key=None):
+    rows = connection.execute(
+        "SELECT event_key, event_type, payload, rendered_text, confirmed_pieces "
+        "FROM notification_outbox WHERE repo=? AND event_type IN ('draft_decisions', 'draft_decision')",
+        (repo,),
+    ).fetchall()
+    confirmed = set()
+    for row in rows:
+        if str(row['event_key']) == exclude_event_key or int(row['confirmed_pieces'] or 0) <= 0:
+            continue
+        try:
+            payload = json.loads(str(row['payload']))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or not isinstance(row['rendered_text'], str):
+            continue
+        text = ''.join(_pieces(row['rendered_text'])[:int(row['confirmed_pieces'])])
+        if row['event_type'] == 'draft_decisions':
+            for item in payload.get('plans', []):
+                if not isinstance(item, dict):
+                    continue
+                key = _draft_question_key(item)
+                source_path = _draft_source_path(item)
+                if key is None or not _valid_draft_source_path(source_path, key[0]):
+                    continue
+                marker = f"\n• {key[0]} · "
+                position = text.find(marker)
+                if position >= 0 and position + len('\n• ') + len(key[0]) <= len(text):
+                    confirmed.add(key)
+        else:
+            key = _draft_question_key(payload)
+            source_path = _draft_source_path(payload)
+            question = payload.get('question')
+            if (key is not None and _valid_draft_source_path(source_path, key[0])
+                    and isinstance(question, str) and question
+                    and f"{key[0]}: " in text and question in text):
+                confirmed.add(key)
+    return confirmed
+
+
+def _pending_legacy_draft_question_keys(connection, repo):
+    rows = connection.execute(
+        "SELECT payload FROM notification_outbox WHERE repo=? AND event_type='draft_decision' "
+        "AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+    ).fetchall()
+    pending = set()
+    for row in rows:
+        try:
+            payload = json.loads(str(row['payload']))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        plan_id = payload.get('execplan_id')
+        current = (_current_draft_question(connection, repo, plan_id)
+                   if isinstance(plan_id, str) else None)
+        if current and _matches_current_draft_item(connection, repo, payload, current, legacy=True):
+            pending.add(_draft_question_key(current))
+    return pending
+
+
+def draft_questions_for_notice(connection, repo):
+    """Current questions not already confirmed or owned by a valid legacy notice."""
+    confirmed = _confirmed_draft_question_keys(connection, repo)
+    legacy = _pending_legacy_draft_question_keys(connection, repo)
+    return [item for item in _current_draft_questions(connection, repo)
+            if _draft_question_key(item) not in confirmed | legacy]
+
+
+def _matches_current_draft_item(connection, repo, item, current, *, legacy=False):
+    if _draft_question_key(item) != _draft_question_key(current):
+        return False
+    source_path = _draft_source_path(item)
+    if source_path != current['source_path'] or item.get('url') != current['url']:
+        return False
+    if legacy:
+        return item.get('question') == (execplan_draft_state.evidence(
+            connection, repo, current['id'],
+        ) or {}).get('question')
+    return item.get('title') == current['title']
+
+
+def is_current(connection, repo, kind, payload, *, event_key=None):
     """Shared creation/claim boundary; callers provide already recorded facts."""
     try:
         if kind == 'blocked':
@@ -233,18 +395,32 @@ def is_current(connection, repo, kind, payload):
             ))
         if kind == 'draft_decisions':
             plans = payload['plans']
-            if not plans or {item['id'] for item in plans} != execplan_draft_state.user_question_ids(connection, repo):
+            if not isinstance(plans, list) or not plans:
                 return False
-            for item in plans:
-                saved = execplan_draft_state.evidence(connection, repo, item['id'])
-                if (not isinstance(saved, dict) or not saved.get('pending') or saved['revision'] != item['decision_revision']
-                        or saved.get('identity') != item['decision_identity']):
-                    return False
+            confirmed = _confirmed_draft_question_keys(connection, repo, exclude_event_key=event_key)
+            legacy = _pending_legacy_draft_question_keys(connection, repo)
+            expected = [item for item in _current_draft_questions(connection, repo)
+                        if _draft_question_key(item) not in confirmed | legacy]
+            if len(plans) != len(expected) or any(
+                    not isinstance(item, dict) or not _matches_current_draft_item(
+                        connection, repo, item, current,
+                    )
+                    for item, current in zip(plans, expected)):
+                return False
+            if [item.get('id') for item in plans] != sorted(item['id'] for item in plans):
+                return False
             return True
         if kind == 'draft_decision':
-            saved = execplan_draft_state.evidence(connection, repo, payload['execplan_id'])
-            return bool(isinstance(saved, dict) and saved.get('pending') and saved.get('question')
-                        and not saved.get('reassessment') and saved['revision'] == payload.get('decision_revision'))
+            plan_id = payload.get('execplan_id')
+            current = (_current_draft_question(connection, repo, plan_id)
+                       if isinstance(plan_id, str) else None)
+            if current is None or not _matches_current_draft_item(
+                    connection, repo, payload, current, legacy=True):
+                return False
+            saved = execplan_draft_state.evidence(connection, repo, plan_id)
+            if payload.get('question') != saved.get('question'):
+                return False
+            return True
     except (AttributeError, KeyError, TypeError, ValueError):
         # Malformed or unconfirmed evidence is preserved but cannot authorize a send.
         return False
@@ -265,5 +441,6 @@ def cancel_stale_events(connection, repo):
             payload = json.loads(row[2])
         except (TypeError, ValueError):
             payload = None
-        if not isinstance(payload, dict) or not is_current(connection, repo, row[1], payload):
+        if not isinstance(payload, dict) or not is_current(
+                connection, repo, row[1], payload, event_key=str(row[0])):
             cancel_event(connection, row[0])

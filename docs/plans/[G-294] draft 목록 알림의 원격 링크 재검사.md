@@ -28,9 +28,9 @@ priority: normal
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/notifications/events.py:enqueue_draft_decisions()`와 `storage/execplan_draft_state.py`의 현재 질문 집합·identity/revision·검증한 원격 위치를 재사용한다. 실제 질문/행동의 통지 확인과 링크를 포함한 표시 snapshot을 구별하는 최소 기록을 기존 사건/질문 경계에 연결한다. 별도 판단 DB·알림 서비스나 URL 기반 사용자 승인 identity는 만들지 않는다.
-- [ ] 확인한 `notifications/policy.py:is_current()`의 목록/개별 draft 분기에 질문 identity/출처·현재 링크 검사를 보완하고, `events.py`의 생성과 `delivery.py:_claim_piece()`가 기존 공통 판정을 계속 사용하게 한다. `delivery.py`의 claim/confirm에는 질문별 실제 통지 확인을 연결한다. 전체 목록을 재발행해 기전송 질문을 다시 통지하지 않고, 알리지 않은 현재 질문만 현재 표현으로 이어간다. 취소/전송 확인이 교차해도 실제 확인 기록을 잃지 않는다. G-226의 공통 취소·동일 blocked 조치의 `continued_from`/늦은 확인 처리는 유지하며, 그 blocked 전용 계보를 draft 질문의 통지 증명으로 대신 쓰지 않는다.
-- [ ] 확인한 `notifications/repository.py`·`rendering.py`·`tests/support/notification.py`의 frozen text·cursor·사건/질문 fixture를 재사용한다. 원격 URL 검증 실패를 새 질문으로 바꾸지 않는다. PRODUCT·ARCHITECTURE의 draft 알림 소유 절에 질문 identity/표시 분리를 통합한다. R-061의 답변 출처 검증·질문 해소·Planner/Manager 권한은 바꾸지 않는다.
+- [x] `events.py`·`execplan_draft_state.py`의 현재 질문 identity/revision과 ExecPlan catalog·등록 remote에서 계산한 링크를 재사용했다. 질문 통지와 제목·경로·URL 표시 snapshot을 기존 outbox payload·고정 본문·확인 cursor 경계에 연결했으며 별도 판단 저장소와 URL 기반 identity는 추가하지 않았다.
+- [x] `policy.is_current()`가 목록·legacy 사건에서 질문 ID/identity/revision·출처·현재 링크를 대조하고 생성과 `_claim_piece()`의 공통 판정으로 동작한다. 확인된 ID가 포함된 outbox 조각에서 질문별 실제 통지를 계산해 이미 통지된 질문은 새 목록에서 제외한다. URL 변경·취소·늦은 확인에도 이전 payload·고정 본문·cursor·attempt/error를 보존한다. G-226의 공통 취소와 blocked 전용 `continued_from` 동작은 변경하지 않았다.
+- [x] 기존 `repository.py`의 outbox frozen text/cursor와 renderer 링크 entity, 질문 evidence를 재사용했다. 현재 링크가 없거나 불일치해도 질문 identity는 변경하지 않는다. PRODUCT·ARCHITECTURE의 draft 알림 계약을 구현에 맞게 갱신했고 R-061의 사용자 답변 검증·질문 해소·Planner/Manager 권한은 변경하지 않았다.
 
 ## Validation
 
@@ -43,8 +43,8 @@ priority: normal
 
 - [x] 비교 기준 `656432eb4c384eb1146665a87d4342f5e42712fb`부터 현재 `191fde0b15510f80879784b1ec0f1fcd2f516962`까지의 문서·알림·draft 상태·관련 회귀 변경을 정적으로 대조했다. URL을 payload에 저장하지만 생성/전송 identity 비교에는 포함하지 않는 잔여 범위를 확인했다. 구현·테스트·verify는 실행하지 않았다.
 - [x] 현재 R-053 전문의 링크만 변경 시 중복 금지와 R-061·목록/legacy claim 경계를 정적으로 대조했다. `e69a2399992a7e598217741cdcd3833d9b0257de`에서 공통 정책 이동과 legacy question/reassessment 검사는 구현된 범위로 제외했다. URL 현재성·개별 질문 identity/출처·질문별 통지 확인은 남아 있으며 URL을 사건 identity에 추가하지 않고 질문과 표시를 분리한다. 실행 검증은 하지 않았다.
-- [ ] 현재 질문/표시 분리와 조각별 링크·유효성 재검사
-- [ ] 부분 전송·legacy·링크만 변경의 최소 targeted 회귀
+- [x] 현재 질문 snapshot은 저장된 pending evidence, ExecPlan catalog 경로·revision, 등록 remote에서 계산한다. 생성·각 조각 claim에서 이 snapshot과 대조하고 outbox 고정 본문·확인 cursor에서 질문별 확인을 계산한다.
+- [x] Worker targeted test: `DraftListNotificationTest` 14개와 `tests.test_notification_events` 41개가 통과했다. 최초 delivery class 실행에서 URL 형식에 고정된 예전 assertion이 실패해 현재 catalog 경로 기반 URL을 assertion으로 반영하고 동일 명령을 재실행했다. 최초 event module 실행에서 identity/source 필드가 빠진 legacy fixture가 새 계약에 거부되어 유효한 legacy fixture와 거부 회귀를 추가한 뒤 동일 명령을 재실행했다. 두 재실행은 통과했다.
 
 ## Decision Log
 
