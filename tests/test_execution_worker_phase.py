@@ -25,6 +25,30 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_common_correction_wait_keeps_work_without_creating_a_user_question(self):
+        from loop_manager_internal.notifications import policy
+        self._decision_workspace()
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        raw = ('COMMON_DEFECT_REPORT: {"problem":"shared failure","scope":"outside selected work",'
+               '"evidence":"traceback","locations":[{"path":"shared.py","line":1}]}\n'
+               'WORKER_OUTCOME: {"kind":"common_defect_pending"}')
+        observed = lm.GitSnapshot('candidate', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
+        self.effects.agent.capture_git_snapshot.return_value = observed
+        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(0, raw, 'worker-session')
+        with mock.patch.object(lm, 'capture_git_snapshot', return_value=observed):
+            outcome = self.handler.run(self.context())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        plan = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-047'").fetchone()
+        self.assertEqual(plan['blocked_reason'], 'common_defect_pending')
+        self.assertEqual(plan['worker_result'], raw)
+        self.assertEqual(feedback.common_defect_reports('repo')[0]['stage'], 'worker')
+        self.assertIsNone(policy.block_action(self.connection, 'repo',
+            {'scope': 'plan', 'execplan_id': 'G-047', 'reason_code': 'common_defect_pending',
+             'cause': self.connection.execute("SELECT evidence FROM execplan_blocks WHERE plan_id='G-047'").fetchone()[0]}))
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+
     def test_common_defect_report_binds_actual_worker_invocation_before_checkpoint(self):
         from loop_manager_internal.execution import worker_checkpoint
         feedback = ValidationFeedbackRepository(self.connection)

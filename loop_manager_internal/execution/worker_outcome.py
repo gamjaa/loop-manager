@@ -82,6 +82,15 @@ def parse_worker_outcome(
     if not isinstance(value, dict):
         raise WorkerOutcomeError("Worker 결과 선언은 JSON 객체여야 합니다.")
     kind = value.get("kind")
+    if kind == "common_defect_pending":
+        from loop_manager_internal.execution.common_defect_report import parse_report
+        try:
+            report = parse_report(message)
+        except ValueError as error:
+            raise WorkerOutcomeError(str(error)) from error
+        if set(value) != {"kind"} or report is None or _PUBLICATION.search(message):
+            raise WorkerOutcomeError("공통 교정 대기는 유효한 결함 보고를 요구하며 완료·사용자 질문과 혼합할 수 없습니다.")
+        return WorkerOutcome(kind)
     if kind == "ready_for_validation":
         if set(value) != {"kind"}:
             raise WorkerOutcomeError("완료 후보 결과 선언에 결정 대기 필드가 섞였습니다.")
@@ -145,6 +154,8 @@ def worker_outcome_instruction() -> str:
         "결정 대기에는 완료 제목이나 성공한 targeted test를 요구하지 않는다. "
         "locations는 선택된 ExecPlan, 해당 sources, PRODUCT, ARCHITECTURE의 "
         "실제로 존재하는 경로·절만 사용하라."
+        ' 기존 명세가 정한 범위 밖 공통 교정 때문에 미완료라면 유효한 COMMON_DEFECT_REPORT와 '
+        'WORKER_OUTCOME: {"kind":"common_defect_pending"}만 보고하고 완료 publication 선언은 쓰지 마라. '
         ' 중간 보존점만 요청한다면 WORKER_OUTCOME: {"kind":"checkpoint",'
         '"plan_id":"선택 G-ID","start_head":"이번 호출 시작 HEAD"} 와 '
         'COMMIT_TITLE: 구체적인 보존점 제목만 반환하라. PR_SUMMARY·TARGETED_TESTS와 '

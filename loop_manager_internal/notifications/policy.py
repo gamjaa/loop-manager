@@ -140,6 +140,8 @@ def _block_action(connection, repo, payload):
         if revision and recovery['plan_revision'] and revision != recovery['plan_revision']:
             return None
     reason = block[0]
+    if reason == 'common_defect_pending':
+        return None  # A correction condition is not a user action.
     action = None
     if (plan is not None and reason == 'user_decision_required' and evidence is not None
             and recovery['reason_code'] == 'user_decision'):

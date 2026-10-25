@@ -255,6 +255,7 @@ def complete_merged_execplan_worktree(
     plan: sqlite3.Row,
     pr_url: str,
     pr_head_oid: str | None,
+    *, merge_commit_oid: str | None = None,
 ) -> CleanupAssessment:
     """Complete exactly one merge-wait plan without hydrating another plan."""
 
@@ -289,7 +290,11 @@ def complete_merged_execplan_worktree(
             repo, plan_id, project_values=project_values, enqueue=False,
             pr_url=pr_url, pr_head_oid=pr_head_oid,
         )
+        from loop_manager_internal.storage import common_defect_state
         manual_store.mark_group_merged(repo, plan_id)
+        group = manual_store.for_plan(repo, plan_id)
+        for member in json.loads(group['members']) if group else (plan_id,):
+            common_defect_state.record_merge(current_connection, repo, member, pr_url, pr_head_oid, merge_commit_oid)
         scoped_blocking.clear_plan_block(current_connection, repo, plan_id)
         notifications.record_merged_plan(current_connection, repo, plan_id, str(current['title']))
         notifications.enqueue_current_project_events(current_connection, repo)

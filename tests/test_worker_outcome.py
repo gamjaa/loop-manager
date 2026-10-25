@@ -32,6 +32,19 @@ def parse(message):
 
 
 class WorkerOutcomeTests(unittest.TestCase):
+    def test_common_correction_wait_requires_a_report_and_never_changes_a_real_question(self):
+        report = ('COMMON_DEFECT_REPORT: {"problem":"shared failure","scope":"outside selected work",'
+                  '"evidence":"traceback","locations":[{"path":"shared.py","line":1}]}')
+        raw = report + '\nWORKER_OUTCOME: {"kind":"common_defect_pending"}'
+        self.assertEqual(parse(raw).kind, 'common_defect_pending')
+        self.assertEqual(parse(report + '\n' + decision()).kind, 'needs_user_decision')
+        for invalid in ('WORKER_OUTCOME: {"kind":"common_defect_pending"}',
+                        raw + '\nCOMMIT_TITLE: premature', raw + '\nPR_SUMMARY: incomplete',
+                        raw + '\nTARGETED_TESTS: PASS', raw.replace('"line":1', '"line":false'),
+                        raw.replace('"kind":"common_defect_pending"', '"kind":"common_defect_pending","question":"x"')):
+            with self.subTest(invalid=invalid), self.assertRaises(WorkerOutcomeError):
+                parse(invalid)
+
     def test_checkpoint_is_a_bounded_request_and_never_a_completion(self):
         raw = ('WORKER_OUTCOME: {"kind":"checkpoint","plan_id":"G-096",'
                '"start_head":"' + 'a' * 40 + '"}\nCOMMIT_TITLE: Preserve request parser')

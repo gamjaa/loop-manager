@@ -18,6 +18,7 @@ from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage import common_defect_state
 from loop_manager_internal.storage.execplan_catalog_state import worker_level
 from pathlib import Path
 import sqlite3
@@ -55,6 +56,7 @@ def _requeue_blocked_execplan(
                     or block['reason_code'] != BlockReasonCode.USER_DECISION_REQUIRED.value
                     or scoped_blocking.project_block(connection, repo) is not None
                     or not assessment.get('resolved') or assessment.get('question') != block['evidence']
+                    or assessment.get('common_defect_input') != common_defect_state.reassessment(connection, repo, plan_id)
                     or assessment.get('planning_confirmation') != (current.snapshot or {}).get('planning_reassessment')):
                 raise RuntimeError('확정 planning의 사용자 질문 해소 근거 또는 현재 복구 상태가 변경됐습니다.')
             values = revalidation_values(target_base_oid)
@@ -386,6 +388,10 @@ def _resume_blocked_execplan_if_inputs_changed(
         return False
     if plan['blocked_reason'] == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
         return False
+    correction = common_defect_state.reassessment(connection, repo, str(plan['plan_id']))
+    if (plan['blocked_reason'] == BlockReasonCode.COMMON_DEFECT_PENDING.value
+            or correction and not correction['ready']):
+        return False  # Common correction waits use the owned remote reconciliation boundary.
     if plan_id is not None:
         effects.hydrate_execplan_project(connection, repo, plan)
     stored = str(plan["blocked_fingerprint"])
@@ -429,7 +435,7 @@ def _resume_blocked_execplan_if_inputs_changed(
     related_input = planning_review_state.reassessment(connection, repo, str(plan['plan_id']))
     remote_input_changed = execplan_input_changed or review_input_changed
     if plan['blocked_reason'] == BlockReasonCode.USER_DECISION_REQUIRED.value:
-        if not remote_input_changed and not related_input:
+        if not remote_input_changed and not related_input and not correction:
             return False
         resolved, _detail, _stage = effects._evaluate_remote_checkpoint_cause(
             connection, repo_path, state_dir, repo, plan, None, None)

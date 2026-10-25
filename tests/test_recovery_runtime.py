@@ -153,6 +153,12 @@ class RecoveryPolicyTests(unittest.TestCase):
             require_final(decide(observation(RecoveryReason.GIT_LOCK)))
         final = decide(observation(RecoveryReason.NO_CHANGE))
         self.assertIs(require_final(final), final)
+        waiting = decide(observation(RecoveryReason.COMMON_DEFECT))
+        self.assertEqual(waiting.disposition, RecoveryDisposition.CONDITION_WAIT)
+        self.assertEqual(waiting.block_reason, BlockReasonCode.COMMON_DEFECT_PENDING)
+        self.assertIs(require_final(waiting), waiting)
+        with self.assertRaises(ValueError):
+            require_final(replace(waiting, block_reason=BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED))
 
     def test_every_legacy_block_reason_keeps_its_cause_and_scope(self):
         for block_reason in BlockReasonCode:

@@ -546,6 +546,8 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
                 plan,
                 url,
                 head_oid,
+                **({'merge_commit_oid': pull_request['mergeCommit']['oid']}
+                   if isinstance(pull_request.get('mergeCommit'), dict) and pull_request['mergeCommit'].get('oid') else {}),
             )
         except WorkspaceOwnershipError as error:
             persisted = connection.execute(

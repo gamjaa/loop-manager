@@ -5,7 +5,8 @@ import json
 import re
 
 from loop_manager_internal.application.result_normalization import normalize_markers, tagged_json
-from loop_manager_internal.git.command_adapter import revision_document_or_none
+from loop_manager_internal.git.command_adapter import revision_document_or_none, revision_requirement_documents
+from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 
@@ -52,6 +53,7 @@ def validate(output, revision, reports, catalog, result, git, repository) -> lis
             targets.pop(deletion.snapshot.plan_id, None)
     links = []
     seen = set()
+    requirements = None
     for raw in value["links"]:
         if not isinstance(raw, dict) or set(raw) != {"reports", "plan_id", "plan_path", "source", "quote", "cause", "completion", "code"}:
             raise ValueError("공통 교정 연결 필드가 유효하지 않습니다.")
@@ -71,6 +73,13 @@ def validate(output, revision, reports, catalog, result, git, repository) -> lis
         if source not in sources or not (source == "docs/PRODUCT.md" or re.fullmatch(r"docs/requirements/[^/]+\.md", source)):
             raise ValueError("공통 교정은 교정 계획의 현재 활성 source에 속해야 합니다.")
         contents = revision_document_or_none(git, repository, revision, source)
+        if contents is None and requirement_sources.source_requirement_id(source) is not None:
+            if requirements is None:
+                requirements = revision_requirement_documents(
+                    lambda root, *args: git(root, *args).stdout.encode('utf-8'), repository, revision)
+            resolved = requirement_sources.resolve_requirement_source(source, requirements, allow_archive=False)
+            if resolved.status is requirement_sources.ResolutionStatus.RESOLVED:
+                contents = resolved.contents
         if contents is None or quote not in contents:
             raise ValueError("공통 교정의 현재 명세 인용을 확인할 수 없습니다.")
         code = raw["code"]

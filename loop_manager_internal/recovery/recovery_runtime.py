@@ -15,6 +15,7 @@ class RecoveryDisposition(str, Enum):
     STATE_RECONCILE = "state_reconcile"
     AGENT_CORRECTION = "agent_correction"
     USER_ACTION_REQUIRED = "user_action_required"
+    CONDITION_WAIT = "condition_wait"
 
 
 class RecoveryAction(str, Enum):
@@ -71,6 +72,7 @@ class RecoveryReason(str, Enum):
     PLAN_INPUT_INVALID = "plan_input_invalid"
     CATALOG_INVALID = "catalog_invalid"
     USER_DECISION = "user_decision"
+    COMMON_DEFECT = "common_defect"
 
 
 TRANSIENT = frozenset({
@@ -119,6 +121,7 @@ BLOCK_REASON = {
     RecoveryReason.PLAN_INPUT_INVALID: BlockReasonCode.PLAN_INPUT_INVALID,
     RecoveryReason.CATALOG_INVALID: BlockReasonCode.EXECPLAN_CATALOG_INVALID,
     RecoveryReason.USER_DECISION: BlockReasonCode.USER_DECISION_REQUIRED,
+    RecoveryReason.COMMON_DEFECT: BlockReasonCode.COMMON_DEFECT_PENDING,
     RecoveryReason.ARCHIVE_MOVE_MISMATCH: BlockReasonCode.PLAN_INPUT_INVALID,
     RecoveryReason.REBASE_CONFLICT: BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
     RecoveryReason.WORKER_CORRECTION: BlockReasonCode.WORKER_OUTPUT_INVALID,
@@ -146,6 +149,7 @@ RECOVERY_REASON_BY_BLOCK = {
     BlockReasonCode.SHARED_GIT_CONFIG_MUTATION: RecoveryReason.SHARED_GIT_CONFIG_MUTATION,
     BlockReasonCode.LEGACY_UNSCOPED_BLOCK: RecoveryReason.LEGACY_UNSCOPED_BLOCK,
     BlockReasonCode.USER_DECISION_REQUIRED: RecoveryReason.USER_DECISION,
+    BlockReasonCode.COMMON_DEFECT_PENDING: RecoveryReason.COMMON_DEFECT,
     BlockReasonCode.PLAN_INPUT_INVALID: RecoveryReason.PLAN_INPUT_INVALID,
     BlockReasonCode.EXECPLAN_CATALOG_INVALID: RecoveryReason.CATALOG_INVALID,
 }
@@ -249,6 +253,9 @@ def decide(
     elif reason is RecoveryReason.TARGETED_TEST_CORRECTION:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.PAUSE if attempts else RecoveryAction.CORRECT
+    elif reason is RecoveryReason.COMMON_DEFECT:
+        disposition = RecoveryDisposition.CONDITION_WAIT
+        action = RecoveryAction.FINAL_BLOCK
     elif reason in CORRECTION and occurrence < correction_limit:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.CORRECT
@@ -264,6 +271,10 @@ def decide(
 
 
 def require_final(decision: RecoveryDecision) -> RecoveryDecision:
-    if decision.disposition is not RecoveryDisposition.USER_ACTION_REQUIRED or decision.action is not RecoveryAction.FINAL_BLOCK or decision.block_reason is None:
+    condition_wait = (decision.disposition is RecoveryDisposition.CONDITION_WAIT
+        and decision.observation.reason is RecoveryReason.COMMON_DEFECT
+        and decision.block_reason is BlockReasonCode.COMMON_DEFECT_PENDING)
+    if (decision.action is not RecoveryAction.FINAL_BLOCK or decision.block_reason is None
+            or decision.disposition is not RecoveryDisposition.USER_ACTION_REQUIRED and not condition_wait):
         raise ValueError("final blocking requires USER_ACTION_REQUIRED")
     return decision

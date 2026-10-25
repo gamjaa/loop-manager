@@ -5,6 +5,7 @@ import sqlite3
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from loop_manager_internal.planning.common_defect_links import validate
 from loop_manager_internal.storage import common_defect_state, planning_review_state
@@ -205,3 +206,21 @@ class CommonDefectPlanningLinksTests(unittest.TestCase):
         attempt = planning_review_state.get(self.connection, 'repo', 'attempt')
         self.assertIsNone(attempt['result'])
         self.assertEqual(json.loads(attempt['common_defect_links']), [])
+
+    def test_renamed_requirement_uses_existing_resolver_without_rewriting_declared_source(self):
+        source = 'docs/requirements/[R-002] Previous.md'
+        current = 'docs/requirements/[R-002] Current.md'
+        document = '# [R-002] Current\n\nRequired shared contract.'
+        self.connection.execute('UPDATE exec_plans SET sources=?', (json.dumps([source]),))
+        self.connection.commit()
+        output = dict(revision='base', links=[{**self.link, 'source': source}])
+        with mock.patch('loop_manager_internal.planning.common_defect_links.revision_requirement_documents',
+                        return_value={current: document}):
+            links = self.validated(output)
+        self.assertEqual(links[0]['source'], source)
+        for documents in ({current.replace('requirements/', 'requirements/archive/'): document},
+                          {current: document, 'docs/requirements/[R-002] Duplicate.md': '# [R-002] Duplicate\nRequired shared contract.'}):
+            with self.subTest(documents=documents), mock.patch(
+                    'loop_manager_internal.planning.common_defect_links.revision_requirement_documents', return_value=documents):
+                with self.assertRaises(ValueError):
+                    self.validated(output)

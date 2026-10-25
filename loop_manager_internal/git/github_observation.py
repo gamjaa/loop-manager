@@ -19,9 +19,9 @@ def pr_for_branch(effects: PrForBranchEffects, repo: Path, branch: str, url: str
                   expected_base: str | None = None) -> dict[str, object] | None:
     if history and (not expected_repository or not expected_base):
         raise RuntimeError("PR 이력 조회에는 등록 repository와 base가 필요합니다.")
-    fields = "url,state,mergedAt,headRefOid,headRefName,baseRefName,mergeable"
+    fields = "url,state,mergedAt,headRefOid,headRefName,baseRefName,mergeable,mergeCommit"
     if history:
-        fields += ",mergeCommit,isCrossRepository"
+        fields += ",isCrossRepository"
     if url:
         result = effects.command(["gh", "pr", "view", url, "--json", fields], cwd=repo)
     else:

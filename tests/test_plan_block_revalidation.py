@@ -1384,6 +1384,41 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
 
 
 class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_verified_common_correction_rechecks_only_affected_processed_task(self):
+        from loop_manager_internal.storage import common_defect_state, runtime_state
+        runtime_state.RuntimeStateRepository(self.connection).block_plan(self.repo, 'G-106',
+            reason_code='common_defect_pending', evidence='shared correction', release_fingerprint='input', clear_projection=False)
+        correction = [dict(ready=False, corrections=[dict(plan_id='G-108', merge=None)])]
+        independent = dict(self.plan('G-107'))
+        self.ports._evaluate_remote_checkpoint_cause.return_value = (True, 'actual cause resolved', None)
+        with mock.patch.object(common_defect_state, 'reassessment', side_effect=lambda *_: correction[0]), \
+             mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+            self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+            with self.connection:
+                blocked_remote_observation.mark_processed(self.connection, self.repo, 'G-106',
+                                                          blocked_remote_observation.input_identity(self.row()))
+            correction[0] = dict(ready=True, corrections=[dict(plan_id='G-108', merge={'id': 1})])
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'resumed')
+            self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+        self.assertEqual(self.plan('G-106')['status'], 'IMPLEMENTING')
+        self.assertEqual(dict(self.plan('G-107')), independent)
+
+    def test_common_correction_change_during_probe_keeps_original_block(self):
+        from loop_manager_internal.storage import common_defect_state, runtime_state
+        runtime_state.RuntimeStateRepository(self.connection).block_plan(self.repo, 'G-106',
+            reason_code='common_defect_pending', evidence='shared correction', release_fingerprint='input', clear_projection=False)
+        correction = [dict(ready=True, corrections=[dict(plan_id='G-108', merge={'id': 1})])]
+        def changed(*_):
+            correction[0] = dict(ready=False, corrections=[dict(plan_id='G-108', merge=None)])
+            return True, 'stale assessment', None
+        self.ports._evaluate_remote_checkpoint_cause.side_effect = changed
+        with mock.patch.object(common_defect_state, 'reassessment', side_effect=lambda *_: correction[0]), \
+             mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.plan('G-106')['status'], 'PLAN_BLOCKED')
+        self.assertEqual(self.plan('G-106')['blocked_reason'], 'common_defect_pending')
+
     def test_new_planning_input_after_interruption_finishes_owned_rebase_before_new_target(self):
         from loop_manager_internal.storage import planning_review_state as reviews
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
