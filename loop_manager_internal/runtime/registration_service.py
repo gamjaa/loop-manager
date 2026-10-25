@@ -7,7 +7,7 @@ from loop_manager_internal.agents.agent_profiles import AGENT_PROVIDERS
 from loop_manager_internal.application.contracts import ProjectRegistrationInspection
 from loop_manager_internal.config import execution_path
 from loop_manager_internal.runtime import project_registry
-from loop_manager_internal.storage import execplan_catalog_state
+from loop_manager_internal.storage import database, execplan_catalog_state
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
@@ -306,11 +306,7 @@ def add_registered_project(
     pinned = None
     prepared = None
     before_project = connection.execute('SELECT * FROM projects WHERE repo=?', (project.repo,)).fetchone()
-    bootstrap = (connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_metadata'"
-    ).fetchone() is not None and connection.execute(
-        "SELECT 1 FROM manager_metadata WHERE key='remote_adoption_bootstrap'"
-    ).fetchone() is not None)
+    bootstrap = database.has_remote_work_adoption_bootstrap(connection)
     if inspection.root.is_dir():
         current_sha = effects.git(inspection.root, 'rev-parse', '--verify',
             f'refs/remotes/origin/{project.base_branch}^{{commit}}').stdout.strip()

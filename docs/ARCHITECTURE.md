@@ -1426,7 +1426,7 @@ Worker가 종료하면 기존 scope 검사와 선택 frontmatter의 부분 복�
 
 DB 부재 초기화에서만 `manager_metadata.remote_adoption_bootstrap`을 JSON `null`로 생성한다. 최초 성공한 catalog CAS가 당시 등록 프로젝트 경로를 키, 프로젝트별 첫 catalog 소비 여부를 bool 값으로 갖는 객체로 고정한다. 프로젝트의 기존 실행 행이 없을 때 첫 catalog의 새 활성 작업에만 `remote_adoption:{repo}:{plan_id}` 자격을 발급한다. 값은 관측 `revision`과 `identity` 배열이며 배열 순서는 등록 GitHub origin·base·active path·본문 hash·plan SHA다. 등록·선언이 이 값과 다르거나 실행 행이 없으면 자격을 쓰지 않는다. 새 행 삽입은 이전 자격을 지우며, 관리 worktree 준비 완료는 `workspace_seen` 기록과 함께 자격을 소비한다. 이후 catalog·추가 등록·반복 init은 소비한 범위를 다시 열지 않는다. 기존 `created_from_absence`는 감사 표식으로만 남고 기존 DB에는 bootstrap 자격을 소급 발급하지 않는다.
 
-새 bootstrap DB의 등록은 legacy 단건 PR 이관을 생략해 실행 상태를 미리 추정하지 않는다. 실행의 고정 catalog 검증이 활성 행을 등록한 뒤 인수 handler가 PR 이력과 원격 HEAD를 확인한다. 기존 DB의 legacy 이관과 archive 문서 기반 복구는 각 기존 계약을 유지한다.
+새 bootstrap DB의 등록과 최초 catalog 갱신은 같은 DB 부재 초기화 표식을 확인해 legacy 단건 PR 이관을 생략한다. 등록에서 baseline을 만들지 않은 것은 기존 runtime 이관의 근거가 아니다. 고정 catalog의 선언 검증과 CAS가 활성 행·제한된 인수 자격을 함께 등록한 뒤 인수 handler가 PR 이력과 원격 HEAD를 확인한다. 기존 DB의 legacy 이관과 archive 문서 기반 복구는 각 기존 계약을 유지한다.
 
 `execution_checkpoints.snapshot.remote_adoption` version 1은 등록 프로젝트 경로인 `repo`, `plan_id`, 정확한 관리 `branch`, 등록 `base`, 전체 `head` OID를 보존한다. 최초 인수는 로컬 자원이 없는 곳에서 관측 OID를 start point로 사용한다. 기존 자원이 있는 중단 재개는 같은 intent·예약과 Git 등록·HEAD·clean 상태를 요구한다. `make_worktree(require_creation_evidence=True)`는 기존 journal의 봉인된 생성 intent/result·receipt와 현재 등록·잠금·index를 대조한 뒤 재사용하므로 같은 이름·OID의 사용자 자원을 소유 근거로 바꾸지 않는다. 관측 전후 execution snapshot·catalog generation·등록 자격·checkpoint generation을 대조하며 경쟁한 기록을 최신 intent로 소급 수용하지 않는다. 원격 재전진은 원래 인수 HEAD를 보존하고 단계 coordinator의 기존 원격 입력 통합을 Worker dispatch보다 먼저 수행한다. branch 삭제와 미확정 관측에서는 로컬 자료를 덮지 않는다.
 

@@ -633,6 +633,15 @@ def connect_database(
     return connection
 
 
+def has_remote_work_adoption_bootstrap(connection: sqlite3.Connection) -> bool:
+    """Distinguish absent-DB initialization from legacy runtime migration."""
+    return (connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manager_metadata'"
+    ).fetchone() is not None and connection.execute(
+        "SELECT 1 FROM manager_metadata WHERE key='remote_adoption_bootstrap'"
+    ).fetchone() is not None)
+
+
 def remote_work_adoption_allowed(connection: sqlite3.Connection, repo: str, plan_id: str) -> bool:
     """Require a declaration-bound grant issued by the first recovery catalog."""
     if connection.execute(

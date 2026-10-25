@@ -112,13 +112,13 @@ class RemoteWorkAdoptionDatabaseTests(unittest.TestCase):
     def test_fresh_registration_defers_active_pr_observation_to_recovery_catalog(self):
         from loop_manager_internal.runtime import registration_service
         from tests.support.catalog import active_snapshot, execplan_header
-        for fresh in (False, True):
-            with self.subTest(fresh=fresh):
+        for fresh, pr_state in ((False, None), (True, None), (True, 'OPEN'), (True, 'CLOSED')):
+            with self.subTest(fresh=fresh, pr_state=pr_state):
                 connection, state_dir = self._database(fresh=fresh)
                 root = state_dir / 'project'
                 root.mkdir()
                 pinned = active_snapshot('a' * 40, {
-                    'docs/plans/[G-001] Resume.md': execplan_header('G-001', 'Resume')})
+                    'docs/plans/[G-047] Runtime.md': execplan_header('G-047', 'Runtime')})
                 migrate = mock.Mock()
                 effects = registration_service.AddRegisteredProjectEffects(
                     _ensure_execplans_schema=database._ensure_execplans_schema,
@@ -134,10 +134,106 @@ class RemoteWorkAdoptionDatabaseTests(unittest.TestCase):
                     requested_base='main', approve_agents_mismatch=False)
                 if fresh:
                     migrate.assert_not_called()
-                    self._catalog(connection, repo=str(root))
-                    self.assertTrue(database.remote_work_adoption_allowed(connection, str(root), 'G-001'))
+                    self.assertIsNone(connection.execute(
+                        'SELECT 1 FROM exec_plans WHERE repo=?', (str(root),)).fetchone())
+                    self._refresh_catalog(connection, root, pinned, migrate)
+                    migrate.assert_not_called()
+                    self.assertTrue(database.remote_work_adoption_allowed(connection, str(root), 'G-047'))
+                    self._prepare_registered_remote_work(connection, state_dir, root, pr_state)
                 else:
                     self.assertEqual(migrate.call_count, 2)
+
+    def _refresh_catalog(self, connection, root, pinned, migrate):
+        from loop_manager_internal.catalog import catalog_service
+        from tests.support.catalog import FakeDefinitionPort
+        effects = catalog_service.ReconcileExecplanCatalogEffects(
+            _GitCatalogDefinitionPort=lambda *_a, **_kw: FakeDefinitionPort(pinned),
+            _catalog_archive_conflict_ids=mock.Mock(return_value=frozenset()),
+            _plan_id_from_path=mock.Mock(return_value='G-047'),
+            backfill_plan_shas=mock.Mock(),
+            git=mock.Mock(return_value=SimpleNamespace(stdout=pinned.revision_sha)),
+            migrate_legacy_execplans=migrate)
+        result = catalog_service.reconcile_execplan_catalog(
+            effects, connection, root, str(root), 'main', remote_sha=pinned.revision_sha)
+        self.assertTrue(result.usable, repr(result))
+
+    def test_existing_database_first_catalog_keeps_legacy_migration(self):
+        from tests.support.catalog import active_snapshot, execplan_header
+        connection, _ = self._database(fresh=False)
+        pinned = active_snapshot('a' * 40, {
+            'docs/plans/[G-047] Runtime.md': execplan_header('G-047', 'Runtime')})
+        migrate = mock.Mock()
+        self._refresh_catalog(connection, Path('repo'), pinned, migrate)
+        self.assertEqual(migrate.call_count, 2)
+        self.assertTrue(migrate.call_args_list[0].kwargs['prepare_only'])
+        self.assertFalse(migrate.call_args_list[1].kwargs['manage_transaction'])
+        self.assertFalse(database.remote_work_adoption_allowed(connection, 'repo', 'G-047'))
+
+    def _prepare_registered_remote_work(self, connection, state_dir, root, pr_state):
+        from dataclasses import replace
+        import loop_manager as lm
+        from tests.support.execution import execution_fixture
+        from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcomeKind
+        fixture = execution_fixture(self, repo=str(root))
+        fixture.state.connection = connection
+        fixture.state.repository = lm.runtime_state.RuntimeStateRepository(connection)
+        branch, worktree = lm.expected_execplan_workspace(state_dir, str(root), 'G-047')
+        fixture.state.repository.activate(str(root), 'G-047', activation_sha='base',
+                                         branch=branch, worktree=str(worktree))
+        fixture.state.expected = fixture.state.repository.projected(str(root))
+        head = 'b' * 40
+        pr = None if pr_state is None else dict(url='https://github.com/owner/repo/pull/1',
+            state=pr_state, headRefName=branch, baseRefName='main', headRefOid=head)
+        workspace = replace(fixture.effects.workspace,
+            reserve_execplan_workspace=fixture.state.bind(lm.reserve_execplan_workspace, connected=True, mutates=True),
+            mark_execplan_workspace_owned=fixture.state.bind(lm.mark_execplan_workspace_owned, connected=True, mutates=True))
+        publication = replace(fixture.effects.publication, github_repository=lm.github_repository,
+            reconcile_existing_pull_request=fixture.state.bind(lm.reconcile_existing_pull_request,
+                                                              connected=True, mutates=True))
+        publication.pr_for_branch.return_value = pr
+        workspace._plan_id_from_path.return_value = 'G-047'
+        def git(_repo, *args, **kwargs):
+            if args[0] == 'remote':
+                return SimpleNamespace(stdout='https://github.com/owner/repo.git', returncode=0)
+            if args[0] == 'show-ref':
+                return SimpleNamespace(stdout='', returncode=1)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(stdout=f'{head}\trefs/heads/{branch}', returncode=0)
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(stdout='base' if 'origin/main' in args[-1] else head, returncode=0)
+            return fixture.git(_repo, *args, **kwargs)
+        workspace.git.side_effect = git
+        def create(_repo, target, _branch, _base, **options):
+            options['before_create']()
+            target.mkdir(parents=True)
+            return 'created'
+        workspace.make_worktree.side_effect = create
+        effects = replace(fixture.effects, workspace=workspace, publication=publication,
+                          checkpoint=ExecutionCheckpointRepository(connection))
+        handler = type(fixture.handler)(effects, repo=str(root), repo_path=root, state_dir=state_dir,
+            base='main', base_sha='base', provider='codex', config_path=state_dir / 'config.ini',
+            newly_activated=True)
+        handler._resolving_rebase = mock.Mock(return_value=False)
+        handler._fetch_latest_base = mock.Mock(return_value='base')
+        handler._checkpoint_remote_oid = mock.Mock(return_value=head)
+        result = handler.prepare()
+        publication.pr_for_branch.assert_called_once_with(root, branch, history=True)
+        if pr_state == 'CLOSED':
+            self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+            workspace.make_worktree.assert_not_called()
+            self.assertEqual(connection.execute(
+                'SELECT status FROM exec_plans WHERE repo=?', (str(root),)).fetchone()[0], 'PLAN_BLOCKED')
+        else:
+            self.assertIsInstance(result, ExecutionContext)
+            self.assertEqual(workspace.make_worktree.call_args.kwargs['start_point'], head)
+            self.assertEqual(result.pr_url, pr['url'] if pr else None)
+            self.assertIsNone(result.worker_session_id)
+            row = fixture.state.active_execplan(str(root))
+            self.assertEqual(row['workspace_owned'], lm.WORKSPACE_OWNED)
+            self.assertEqual(row['pr_url'], pr['url'] if pr else None)
+            for field in ('worker_result', 'verify_result', 'review_result'):
+                self.assertIsNone(row[field], field)
+        effects.agent.run_agent.assert_not_called()
 
     def test_corrupt_database_is_preserved_by_explicit_init(self):
         with tempfile.TemporaryDirectory() as directory:
