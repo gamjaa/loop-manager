@@ -19,6 +19,55 @@ from tests.support.execution_assertions import _assert_manual_autostash_recovery
 class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
     """Real handler/CAS policies with immutable fake Git observations only."""
 
+    def test_completed_rebase_is_adopted_before_worker_checkpoint_recovery(self):
+        for marker in ('worker_checkpoint_pending', 'worker_checkpoint_request'):
+            with self.subTest(marker=marker):
+                case = current_rebase_case(self)
+                case._prepare_current_checkpoint_recovery()
+                current = case.checkpoint.get('repo', 'G-047')
+                case.checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+                    operation='rebase', expected_head=current.expected_head,
+                    target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**current.snapshot, marker: {'saved': 'worker'}})
+                with mock.patch.object(case.handler, '_complete_rebase_intent',
+                        wraps=case.handler._complete_rebase_intent) as complete:
+                    result = case.handler.recover(case.fixture.context())
+                    self.assertIsInstance(result, ExecutionContext)
+                    complete.assert_called_once()
+                saved = case.checkpoint.get('repo', 'G-047')
+                self.assertIsNone(saved.operation)
+                self.assertEqual(saved.snapshot[marker], {'saved': 'worker'})
+                self.assertEqual(saved.expected_head, 'owned-head')
+                self.assertEqual(case.state.row()['worker_session_id'], 'saved-worker')
+                case.handler._complete_rebase_intent(result)
+                self.assertEqual(case.checkpoint.get('repo', 'G-047'), saved)
+                case.fixture.effects.agent.run_agent.assert_not_called()
+                case.fixture.effects.validation.verify.assert_not_called()
+
+    def test_worker_request_does_not_override_rebase_ownership_or_index(self):
+        from loop_manager_internal.git.managed_rebase_validation import FileChange
+        for invalid in ('remote','index'):
+            with self.subTest(invalid=invalid):
+                case=current_rebase_case(self)
+                case._prepare_current_checkpoint_recovery()
+                current=case.checkpoint.get('repo','G-047')
+                saved=case.checkpoint.record('repo','G-047',expected_generation=current.generation,
+                    operation='rebase',expected_head=current.expected_head,
+                    target_base_oid=current.target_base_oid,observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**current.snapshot,'worker_checkpoint_request':{'saved':'worker'}})
+                if invalid=='remote':
+                    case.observed=replace(case.observed,remote=replace(case.observed.remote,oid='foreign'))
+                else:
+                    case.observed=replace(case.observed,index_clean=False,
+                        staged=(FileChange('app.py','100644','100644','old','new','M'),))
+                before=case.observed
+                result=case.handler.recover(case.fixture.context())
+                self.assertIsInstance(result,handlers.ExecutionOutcome)
+                self.assertEqual(case.checkpoint.get('repo','G-047'),saved)
+                self.assertEqual(case.observed,before)
+                self.assertEqual(case.state.row()['worker_session_id'],'saved-worker')
+                case.fixture.effects.agent.run_agent.assert_not_called()
+
     def test_pending_intermediate_push_keeps_adopted_owner_with_superseded_block(self):
         self._prepare_current_checkpoint_recovery()
         self.handler._complete_rebase_intent(self.fixture.context())

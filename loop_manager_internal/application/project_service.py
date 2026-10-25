@@ -757,7 +757,9 @@ class ProjectService:
             manual = ManualWorkRepository(self.identity.connection).for_plan(
                 self.state.repo, self.effects._plan_id_from_path(str(self.state.row['plan_path'] or '')))
             defer_manual_pr = bool(manual and manual['state']=='AUTOMATIC'
-                                   and self.state.row['phase']!='PUBLISHING')
+                                   and self.state.row['phase']!='PUBLISHING'
+                                   and existing_pr and existing_pr.get('state') == 'OPEN'
+                                   and not existing_pr.get('mergedAt'))
             if existing_pr and not defer_manual_pr:
                 try:
                     reconciliation = self.effects.reconcile_existing_pull_request(
