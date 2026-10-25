@@ -374,7 +374,6 @@ def register(assembly: Composition) -> None:
         lambda: direct_rebase_service.FinishOwnedDirectRebaseEffects(
             _canonical_path=assembly.callback('_canonical_path'),
             _current_rebase_service=assembly.callback('_current_rebase_service'),
-            _owned_rebase_journal_state=assembly.callback('_owned_rebase_journal_state'),
         ),
     )
 

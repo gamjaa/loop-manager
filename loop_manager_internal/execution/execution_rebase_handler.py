@@ -418,11 +418,12 @@ class RebaseHandler:
         if self.ports._unmerged_stages(context.worktree) and not self.ports._rebase_metadata(context):
             return False
         self.ports._current_rebase_service(context).normalize_frontmatter()
-        _, decision = self.ports._current_rebase_service(context).require_owned()
+        observed, decision = self.ports._current_rebase_service(context).require_owned()
+        from loop_manager_internal.git.managed_rebase_validation import journal_observation
         return manager_git_journal.record_current_rebase_result(
             self.ports.identity.state_dir, repo=str(self.ports.identity.repo_path.resolve()),
             target=str(context.worktree.resolve()), owner=f'plan:{context.plan.plan_id}',
-            decision=decision, observed=lambda: self.ports._rebase_journal_state(context))
+            decision=decision, observed=lambda: journal_observation(observed))
 
     def _run_managed_rebase(self, context, target_oid, *, autostash=False):
         if self.ports.current_rebase_service is not None:

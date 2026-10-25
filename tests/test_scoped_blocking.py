@@ -145,14 +145,14 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
             self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 2)
             pr_query.side_effect = None
             with mock.patch.object(loop_manager, 'reconcile_existing_pull_request') as reconcile:
-                for state, merged_at in (('CLOSED', None), ('MERGED', 'merged'), ('CLOSED', 'merged')):
+                for state, merged_at in (('CLOSED', None),):
                     terminal = {**pr, 'state': state, 'mergedAt': merged_at}
                     pr_query.return_value = terminal
                     self.assertFalse(self.resume())
                     self.assertEqual(reconcile.call_args.args[-1]['state'], state)
                     self.assertEqual(reconcile.call_args.args[-2]['branch'], self.branch)
                     self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 2)
-                self.assertEqual(reconcile.call_count, 3)
+                self.assertEqual(reconcile.call_count, 1)
             pr_query.return_value = {**pr, 'state': 'UNKNOWN'}
             self.assertFalse(self.resume())
             pr_query.return_value = pr
@@ -167,6 +167,50 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         self.assertEqual(checkpoint.snapshot['remote_adoption']['head'], self.head)
         self.assertEqual(checkpoint.snapshot['accepted_work_branch'], self.head)
         self.assertEqual(checkpoint.expected_head, self.head)
+
+    def test_merged_adoption_confirms_reservation_before_real_cleanup_and_releases_block(self):
+        from loop_manager_internal.storage import database
+        from loop_manager_internal.application.contracts import CleanupAssessment
+        self.worktree = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        (self.worktree / 'preserved.txt').write_text('local materials')
+        with self.connection:
+            self.connection.execute('CREATE TABLE manager_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            self.connection.execute("INSERT INTO manager_metadata VALUES ('remote_adoption_bootstrap','null')")
+            self.connection.execute("UPDATE projects SET origin='fixture/repository'")
+            self.connection.execute('UPDATE exec_plans SET worktree=?', (str(self.worktree),))
+        database.record_remote_work_adoption_catalog(self.connection, self.repo, self.head, ('G-001',))
+        self.connection.commit()
+        self.checkpoints.record(self.repo, 'G-001', expected_generation=0, operation=None,
+            expected_head=self.head, target_base_oid='b' * 40, observed_remote_oid=self.head,
+            snapshot={'remote_adoption': {'repo': self.repo, 'plan_id': 'G-001', 'version': 1,
+                'base': 'main', 'branch': self.branch, 'head': self.head}})
+        pr = {'url': 'https://github.com/fixture/repository/pull/1', 'headRefName': self.branch,
+              'baseRefName': 'main', 'headRefOid': self.head, 'state': 'MERGED', 'mergedAt': 'merged'}
+        def git(_repo, *args, **_kwargs):
+            return mock.Mock(returncode=0, stdout=(
+                'https://github.com/fixture/repository.git' if args[0] == 'remote' else
+                'tree' if args[0] == 'rev-parse' else ''))
+        with mock.patch.object(loop_manager, 'git', side_effect=git), \
+             mock.patch.object(loop_manager, 'pr_for_branch', return_value=pr), \
+             mock.patch.object(loop_manager, 'remote_base', return_value='b' * 40), \
+             mock.patch.object(loop_manager, 'assess_cleanup', return_value=CleanupAssessment('dirty', 'preserve materials')), \
+             mock.patch.object(loop_manager, 'complete_merged_execplan_worktree',
+                               wraps=loop_manager.complete_merged_execplan_worktree) as cleanup:
+            records = self.records
+            self.records = []
+            self.assertFalse(self.resume())
+            cleanup.assert_not_called()
+            self.records = records
+            self.assertTrue(self.resume())
+            cleanup.assert_called_once()
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((plan['status'], plan['workspace_owned']), ('MERGED', 1))
+        self.assertEqual(plan['active_sha'], self.before['active_sha'])
+        pending = self.connection.execute('SELECT * FROM cleanup_pending').fetchone()
+        self.assertEqual(pending['workspace_owned'], 1)
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual((self.worktree / 'preserved.txt').read_text(), 'local materials')
+        self.assertFalse(self.resume())
 
     def test_owned_commit_rebase_and_recorded_dirty_output_preserve_workspace(self):
         import hashlib

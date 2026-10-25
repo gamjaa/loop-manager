@@ -258,6 +258,7 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
             and block['reason_code'] != BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value):
         return False
     reserved_recovered = False
+    terminal_pr = None
     if (
         block["reason_code"]
         == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value
@@ -294,8 +295,10 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                     plan, checkpoint, repo_path, worktree, git=effects.git,
                     github_repository=effects.github_repository, pr_for_branch=effects.pr_for_branch)
                 adopted_pr = dict(adoption_observation or ())
-                if adopted_pr and (str(adopted_pr.get('state') or '').upper() in {'CLOSED', 'MERGED'}
+                if adopted_pr and (str(adopted_pr.get('state') or '').upper() == 'MERGED'
                                    or adopted_pr.get('mergedAt')):
+                    terminal_pr = adopted_pr
+                elif adopted_pr and str(adopted_pr.get('state') or '').upper() == 'CLOSED':
                     reservation_owner.check()
                     if execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id) != checkpoint:
                         return False
@@ -460,6 +463,11 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                 repo, runtime_state.ExecutionSnapshot.from_row(plan))
         elif not planning_owns_slot:
             effects._clear_active_in_current_transaction(connection, repo)
+    if terminal_pr is not None:
+        with runtime_state.selected_execution(repo, plan_id, include_blocked=True):
+            effects.reconcile_existing_pull_request(
+                connection, repo_path, state_dir, repo,
+                runtime_state.project_row(connection, repo), terminal_pr)
     return True
 
 

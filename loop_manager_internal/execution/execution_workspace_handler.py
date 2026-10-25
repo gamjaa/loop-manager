@@ -756,6 +756,7 @@ class WorkspaceHandler:
             start_point = None
             adoption_expected_head = None
             adopted_pr = None
+            reserved_terminal_pr = None
             adoption_pending = False
             local_branch_exists = False
             existing_adoption = bool(workspace_reserved and worktree.is_dir() and self.ports.checkpoint is not None
@@ -904,8 +905,10 @@ class WorkspaceHandler:
                         github_repository=self.ports.github_repository, pr_for_branch=self.ports.pr_for_branch)
                 adoption_observation = observe_adoption()
                 adopted_pr = dict(adoption_observation or ())
-                if adopted_pr and (str(adopted_pr.get('state') or '').upper() in {'CLOSED', 'MERGED'}
+                if adopted_pr and (str(adopted_pr.get('state') or '').upper() == 'MERGED'
                                    or adopted_pr.get('mergedAt')):
+                    reserved_terminal_pr = adopted_pr
+                elif adopted_pr and str(adopted_pr.get('state') or '').upper() == 'CLOSED':
                     self.ports.state.check()
                     reservation_owner.check()
                     if self.ports.checkpoint.get(self.ports.identity.repo, plan_id) != reserved_checkpoint:
@@ -1026,6 +1029,8 @@ class WorkspaceHandler:
             database.record_execplan_workspace_seen(
                 self.ports.state.connection, self.ports.identity.repo, plan_id)
             self._workspace_boundary(plan_id, row, pending=False)
+            if reserved_terminal_pr is not None:
+                return self._terminal_adopted_pr(plan_id, reserved_terminal_pr)
         except RuntimeStateError as error:
             return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
                                     detail=f'원격 인수 중 실행 상태가 변경됐습니다: {error}')

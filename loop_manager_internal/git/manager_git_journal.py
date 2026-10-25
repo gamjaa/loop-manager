@@ -1139,6 +1139,10 @@ def record_current_rebase_result(state_dir, *, repo, target, owner, decision, ob
         return False
     # 기록 대상이 확인된 뒤에만 비용이 큰 현재 Git 상태를 수집한다.
     observed = observed() if callable(observed) else observed
+    if decision.status is RebaseStatus.COMPLETE:
+        from loop_manager_internal.git.managed_rebase_validation import valid_journal_observation
+        if not valid_journal_observation(observed, decision.acceptance):
+            raise MutationEvidenceError('current rebase observation differs from accepted state')
     # A result sealed by an older policy is audit data. Do not rewrite it.
     result_path = slot / f"{intent['id']}.result.json"
     if result_path.exists():
@@ -1333,7 +1337,7 @@ def verified_managed_transitions(
             if not isinstance(result.get("observed"), dict):
                 raise MutationEvidenceError("Manager Git 저장 결과 상태가 불완전합니다.")
             if current_result:
-                from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
+                from loop_manager_internal.git.managed_rebase_validation import valid_journal_observation
                 candidates = result['candidates']
                 observed = result['observed']
                 accepted = candidates.get('acceptance') if isinstance(candidates, dict) else None
@@ -1346,7 +1350,7 @@ def verified_managed_transitions(
                         or (candidates['status'] == 'complete' and (
                             observed.get('branch') != intent['expected']['branch']
                             or controlling_git_operation(observed.get('operations'))
-                            or not valid_acceptance(accepted) or any(accepted[key] != value for key, value in {
+                            or not valid_journal_observation(observed, accepted) or any(accepted[key] != value for key, value in {
                                 'repo': repo, 'plan_id': owner.removeprefix('plan:'), 'worktree': intent['target'],
                                 'branch': intent['expected']['branch'],
                                 'target_base_oid': intent['expected']['target_base_oid'], 'head': observed['head']}.items())))):

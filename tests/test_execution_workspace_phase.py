@@ -306,6 +306,7 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
         self.effects.workspace.make_worktree.side_effect = interrupt
         self.assertEqual(self.handler.prepare().kind, ExecutionOutcomeKind.RETRY)
         self.effects.workspace.make_worktree.reset_mock()
+        self.effects.workspace.make_worktree.side_effect = original
         self.pr = {'url': 'https://github.com/owner/repo/pull/1', 'state': 'MERGED',
                    'headRefName': 'loop-manager/G-047', 'baseRefName': 'main', 'headRefOid': self.head,
                    'mergedAt': 'merged', 'mergeCommit': {'oid': 'e' * 40}}
@@ -316,7 +317,7 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
             result = self.handler.prepare()
         self.assertEqual(result.kind, ExecutionOutcomeKind.PLANNING_PENDING)
         self.assertEqual(reconcile.call_args.args[-1]['mergeCommit'], self.pr['mergeCommit'])
-        self.effects.workspace.make_worktree.assert_not_called()
+        self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 1)
         self.effects.agent.run_agent.assert_not_called()
 
     def test_local_branch_with_same_oid_has_no_adoption_intent(self):

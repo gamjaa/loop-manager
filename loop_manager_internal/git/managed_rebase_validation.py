@@ -124,6 +124,37 @@ class RebaseObservation:
         return fingerprint(asdict(self))
 
 
+def _journal_local_state(observed):
+    index = {}
+    for entry in observed['index']:
+        index.setdefault(entry['path'], []).append(
+            f"{entry['tag']} {entry['mode']} {entry['oid']} {entry['stage']}")
+    return {'head': observed['head'], 'branch': observed['branch'],
+            'index': {path: tuple(sorted(entries)) for path, entries in index.items()},
+            'dirty': {file['path']: (tuple(kind for kind in file['kinds'] if kind != 'ignored'),
+                                     file['signature'])
+                      for file in observed['files'] if tuple(file['kinds']) != ('ignored',)},
+            'operations': dict(observed['operations'])}
+
+
+def journal_observation(observed: RebaseObservation) -> dict:
+    """Project the very observation accepted by policy, without another Git read."""
+    payload = asdict(observed)
+    return {**_journal_local_state(payload), 'validation_observation': payload}
+
+
+def valid_journal_observation(observed, acceptance) -> bool:
+    """Bind stored local file/index data to the complete accepted observation."""
+    try:
+        payload = observed['validation_observation']
+        return (valid_acceptance(acceptance)
+                and fingerprint(payload) == acceptance['state_fingerprint']
+                and fingerprint(_journal_local_state(payload)) == fingerprint(
+                    {key: observed[key] for key in ('head', 'branch', 'index', 'dirty', 'operations')}))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 @dataclass(frozen=True)
 class ObservationFailure:
     area: str
