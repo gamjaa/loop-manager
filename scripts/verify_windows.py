@@ -5,7 +5,7 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import signal
 import subprocess
@@ -19,6 +19,61 @@ import uuid
 
 CLEANUP_SECONDS = 10
 HEARTBEAT_SECONDS = 5
+WINDOWS_TEMP_VARIABLES = ('TEMP', 'TMP', 'TMPDIR')
+
+
+def windows_temporary_directory():
+    selected = os.environ.get('LOOP_MANAGER_VERIFY_TEMP_DIR')
+    if not selected:
+        raise RuntimeError('자체 Windows verify 임시 경로가 지정되지 않았습니다.')
+    try:
+        if not Path(selected).is_absolute():
+            raise RuntimeError(f'자체 Windows verify 임시 경로가 절대 경로가 아닙니다: {selected}')
+        expected = Path(selected).resolve(strict=True)
+        actual = Path(tempfile.gettempdir()).resolve(strict=True)
+        supplied = []
+        for name in WINDOWS_TEMP_VARIABLES:
+            value = Path(os.environ[name])
+            if not value.is_absolute():
+                raise RuntimeError(f'{name} 임시 경로가 절대 경로가 아닙니다: {value}')
+            supplied.append(value.resolve(strict=True))
+    except (KeyError, OSError) as error:
+        raise RuntimeError(f'자체 Windows verify 임시 경로를 사용할 수 없습니다: {selected}: {error}') from error
+    if not expected.is_dir() or any(not path.is_dir() for path in supplied):
+        raise RuntimeError(f'자체 Windows verify 임시 경로가 디렉터리가 아닙니다: {selected}')
+    normalized = os.path.normcase(os.fspath(expected))
+    if (os.path.normcase(os.fspath(actual)) != normalized
+            or any(os.path.normcase(os.fspath(path)) != normalized for path in supplied)):
+        raise RuntimeError(
+            '자체 Windows verify의 실제 Python 임시 경로와 TEMP·TMP·TMPDIR 선택이 다릅니다: '
+            f'선택={expected}, Python={actual}')
+    return str(actual)
+
+
+def wsl_temporary_directory(directory):
+    try:
+        summary = json.loads((Path(directory) / 'summary.json').read_text(encoding='utf-8'))
+        value = summary['metadata']['execution_context']['temporary_directory']
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f'WSL 임시 경로를 진단에서 확인할 수 없습니다: {error}') from error
+    path = PurePosixPath(value) if isinstance(value, str) else PurePosixPath()
+    if not path.is_absolute() or not path.is_relative_to(PurePosixPath('/tmp')):
+        raise RuntimeError(f'WSL verify 임시 경로가 전용 /tmp 아래가 아닙니다: {value}')
+    return str(path)
+
+
+def native_temporary_directory(directory):
+    try:
+        summary = json.loads((Path(directory) / 'summary.json').read_text(encoding='utf-8'))
+        value = summary['temporary_directory']
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f'Windows 핵심 회귀 임시 경로를 진단에서 확인할 수 없습니다: {error}') from error
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise RuntimeError(f'Windows 핵심 회귀 임시 경로 진단이 절대 경로가 아닙니다: {value}')
+    selected = windows_temporary_directory()
+    if os.path.normcase(os.path.realpath(value)) != os.path.normcase(os.path.realpath(selected)):
+        raise RuntimeError(f'Windows 핵심 회귀의 실제 임시 경로가 launcher 선택과 다릅니다: {value}')
+    return selected
 
 
 def lifecycle(directory, state, **values):
@@ -256,6 +311,7 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
 
 def native_main(root, entrypoint, directory, python):
     root, entrypoint, directory = Path(root), Path(entrypoint), Path(directory)
+    temporary_directory = windows_temporary_directory()
     sys.path.insert(0, str(entrypoint.parents[2]))
     from loop_manager_internal.verification import unittest_adapter as adapter
     from loop_manager_internal.verification.guard import install_guard
@@ -287,7 +343,8 @@ def native_main(root, entrypoint, directory, python):
     writer = EventWriter(directory / 'runner.jsonl', identity=identity)
     passed = False
     try:
-        writer.emit('run_start', mode='windows-core', coordinated=coordinator is None)
+        writer.emit('run_start', mode='windows-core', coordinated=coordinator is None,
+                    temporary_directory=temporary_directory)
         with writer.activate(), phase('verify'):
             modules, _python = adapter.collect_project(connection, stage, directory, session,
                 entrypoint, None, execute_command, writer, client)
@@ -299,10 +356,17 @@ def native_main(root, entrypoint, directory, python):
         writer.close()
         if coordinator:
             coordinator.finish(session, stopped=not coordinator.reservations)
-        print(diagnostic(directory), flush=True)
+        details = diagnostic(directory)
+        summary_path = directory / 'summary.json'
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text(encoding='utf-8'))
+            summary['temporary_directory'] = temporary_directory
+            atomic_json(summary_path, summary)
+        print(details, flush=True)
 
 
 def windows_main(root):
+    temporary_directory = windows_temporary_directory()
     entrypoint, runtime_python = runtime(root)
     from loop_manager_internal.execution.verify_process import run_verify_process
     from loop_manager_internal.verification.timing import EventWriter, atomic_json, diagnostic, phase
@@ -323,13 +387,17 @@ def windows_main(root):
     session = os.environ.get('LOOP_MANAGER_VERIFY_SESSION', uuid.uuid4().hex)
     if os.environ.get('LOOP_MANAGER_VERIFY_PARTIAL_BASE'):
         atomic_json(directory / 'partial-result.json', {'version': 1, 'kind': 'partial_verify',
-            'run_id': session, 'status': 'FALLBACK', 'selection': {'fallback': ['self_windows_requires_full']}})
+            'run_id': session, 'status': 'FALLBACK', 'selection': {'fallback': ['self_windows_requires_full']},
+            'temporary_directories': {'windows_launcher': temporary_directory, 'wsl': None,
+                                      'windows_native': None}})
         from loop_manager_internal.verification.timing import diagnostic
         print(diagnostic(directory), flush=True)
         return 0
     writer = EventWriter(directory / 'launcher.jsonl', identity={'run_id': session})
     report = {'kind': 'loop_manager_windows_verify', 'run_id': session, 'passed': False,
               'wsl': 'NOT_RUN', 'windows': 'NOT_RUN',
+              'temporary_directories': {'windows_launcher': temporary_directory,
+                                        'wsl': None, 'windows_native': None},
               'wsl_run_id': None, 'windows_run_id': None}
     started = time.monotonic()
     budget = ExecutionClock()
@@ -351,6 +419,7 @@ def windows_main(root):
             with phase('wsl-full'):
                 passed = run_wsl(root, bundle, wsl_logs,
                                  budget.remaining(timeout), cap, session)
+            report['temporary_directories']['wsl'] = wsl_temporary_directory(wsl_logs)
             try:
                 wsl_summary = json.loads((wsl_logs / 'summary.json').read_text(encoding='utf-8'))
                 wsl_metadata = wsl_summary.get('metadata', {}) if isinstance(wsl_summary, dict) else {}
@@ -374,6 +443,7 @@ def windows_main(root):
                      str(entrypoint), str(native_logs), str(getattr(sys, '_base_executable', sys.executable))],
                     root, timeout, environment=native_environment, job_scope=True, execution_clock=budget)
                 print(output, flush=True)
+            report['temporary_directories']['windows_native'] = native_temporary_directory(native_logs)
             try:
                 native_summary = json.loads((native_logs / 'summary.json').read_text(encoding='utf-8'))
                 native_metadata = native_summary.get('metadata', {})

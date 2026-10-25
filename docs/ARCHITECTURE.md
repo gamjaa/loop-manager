@@ -1283,7 +1283,7 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
   - Windows: `scripts/verify.ps1`
   - Linux: `scripts/verify.sh`
 - verify 스크립트는 프로젝트 전체 검증을 수행하고 실패 시 0이 아닌 종료 코드를 반환한다
-- 자체 Windows verify는 checkout·runtime·상태 DB 위치와 무관한 `%USERPROFILE%\.cache\loop-manager\verify\tmp\`를 생성하고 `TEMP`·`TMP`·`TMPDIR`로 자식 프로세스에 전달한다. AppData 리다이렉션을 피하며 종료 시 기존 환경을 복원하고, 병렬 실행의 파일을 보존하기 위해 공유 임시 폴더 전체를 삭제하지 않는다. Defender 설정은 스크립트가 변경하지 않고 [운영 안내](OPERATIONS.md#windows-defender와-테스트-임시-폴더)에 따라 사용자가 선택한다
+- 자체 Windows verify의 `LOOP_MANAGER_VERIFY_TEMP_DIR` 입력은 launcher 실행 시 선택할 임시 경로다. 미지정이면 `%USERPROFILE%\.cache\loop-manager\verify\tmp\`를 쓰고, 상대 경로는 checkout을 기준으로 절대화한다. Python 조회·실행보다 먼저 경로를 생성하고 쓰기 가능성을 확인한 뒤 `TEMP`·`TMP`·`TMPDIR`에 전달한다. 드라이버와 native 자식은 Python의 실제 `tempfile.gettempdir()`가 선택 경로와 일치하는지 확인하고, launcher `result.json`, native `summary.json`, WSL `summary.json`에 각각의 실효 경로를 기록한다. WSL의 전용 `/tmp/` 경로는 Windows 선택값과 분리하며, 부분 요청 FALLBACK에는 launcher 경로만 기록하고 미실행 단계는 비워 둔다. 경로 선택·사용 실패는 fallback 없이 verify 실패이며 종료 시 기존 환경·cwd를 복원한다. 병렬 실행의 파일을 보존하기 위해 공유 임시 폴더 전체를 삭제하지 않는다. Defender 설정은 스크립트가 변경하지 않고 [운영 안내](OPERATIONS.md#windows-defender와-테스트-임시-폴더)에 따라 사용자가 선택한다
 - 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check는 verify 스크립트만 실행한다
 - 프로그램은 verify 스크립트를 AI Agent 밖에서 실행한다
 - 프로그램은 verify 성공 시 Worker를 다시 호출하거나 성공 출력을 전달하지 않는다

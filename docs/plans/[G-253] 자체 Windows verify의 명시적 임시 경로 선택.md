@@ -29,9 +29,9 @@ priority: normal
 
 ## Implementation
 
-- [ ] 확인한 `scripts/verify.ps1`의 초기 환경 저장·checkout 이동·temp 생성·finally 복원을 확장한다. 자체 launcher에 한 가지 문서화된 선택 입력을 제공하고 Manager 호출에서도 같은 입력을 사용한다. 운영 설정 전체나 공통 adapter 선언에 무관한 설정을 추가하지 않는다.
-- [ ] 확인한 `scripts/verify_windows.py:snapshot()`·`windows_main()`·`native_main()`의 bundle 생성과 native 자식, `wsl_main()`의 별도 TMPDIR/TMP/TEMP 적용을 대조한다. Windows 실효 경로와 WSL 전용 경로를 기존 진단에 연결하고 경로 사용 실패를 정상 FALLBACK이나 다른 디스크 선택으로 숨기지 않는다. 별도 임시 경로 관리 서비스나 두 단계 launcher를 새로 만들지 않는다.
-- [ ] 확인한 `tests/test_verify_windows.py`의 환경 복원/native 연결 회귀와 `tests/test_verify_windows_launcher.py`의 snapshot·부분 FALLBACK·정리 fixture를 재사용한다. G-248의 단계별 진단 연결과 G-295의 전체 시간 상한 처리는 각각의 기존 경계를 소비하며 이 작업에서 재구현하지 않는다. 관련 ARCHITECTURE·VERIFY·OPERATIONS 설명만 실제 선택 계약에 맞춘다.
+- [x] 확인한 `scripts/verify.ps1`의 초기 환경 저장·checkout 이동·temp 생성·finally 복원을 확장한다. 자체 launcher에 한 가지 문서화된 선택 입력을 제공하고 Manager 호출에서도 같은 입력을 사용한다. 운영 설정 전체나 공통 adapter 선언에 무관한 설정을 추가하지 않는다.
+- [x] 확인한 `scripts/verify_windows.py:snapshot()`·`windows_main()`·`native_main()`의 bundle 생성과 native 자식, `wsl_main()`의 별도 TMPDIR/TMP/TEMP 적용을 대조한다. Windows 실효 경로와 WSL 전용 경로를 기존 진단에 연결하고 경로 사용 실패를 정상 FALLBACK이나 다른 디스크 선택으로 숨기지 않는다. 별도 임시 경로 관리 서비스나 두 단계 launcher를 새로 만들지 않는다.
+- [x] 확인한 `tests/test_verify_windows.py`의 환경 복원/native 연결 회귀와 `tests/test_verify_windows_launcher.py`의 snapshot·부분 FALLBACK·정리 fixture를 재사용한다. G-248의 단계별 진단 연결과 G-295의 전체 시간 상한 처리는 각각의 기존 경계를 소비하며 이 작업에서 재구현하지 않는다. 관련 PRODUCT·ARCHITECTURE·VERIFY·OPERATIONS 설명을 실제 선택 계약에 맞춘다.
 
 ## Validation
 
@@ -42,7 +42,9 @@ priority: normal
 ## Progress
 
 - [x] 2026-10-10 50c699c8f9c149cecb0ddf9b081527942d8e2289의 R-067, 고정 profile temp를 설정하는 verify.ps1·runner metadata와 기존 launcher 회귀를 정적으로 읽었다. 구현·테스트·Windows 측정·verify는 실행하지 않았다.
-- [ ] 경로 선택/실패/복원·안내·targeted unit 검증
+- [x] 2026-10-23 선택 입력·경로 오류·실제 Python 임시 경로 일치·단계별 진단을 구현하고 PRODUCT·ARCHITECTURE·VERIFY·OPERATIONS 안내를 맞췄다. targeted runner의 `WindowsVerifyPipelineTests`는 통과했고 Windows 전용 PowerShell 회귀 두 건은 Linux에서 skip됐다. 최초 실행에서 mock WSL summary 누락으로 검증 오류가 나와 fixture를 보완한 뒤 같은 invocation을 다시 실행해 통과했다.
+- [x] 2026-10-24 rebase 복구에서 G-248 부모·하위 run ID 진단과 선택 임시 경로 보고를 결합하고 두 경로의 회귀를 함께 확인했다. 첫 실행에서 G-248 인자·WSL summary 형식과 fixture가 맞지 않는 오류를 찾아 조정한 뒤 같은 targeted 명령으로 11개 테스트를 다시 실행해 통과했다(Windows 전용 두 건은 Linux에서 skip).
+- [x] 2026-10-24 PowerShell 5.1 소스 인코딩 호환성을 위해 경로 오류 진단을 ASCII로 바꾸고 오류 assertion도 맞췄다. ASCII 진단 회귀는 통과했고 Windows native 오류 회귀는 Linux에서 skip됐다.
 - [ ] Manager 전체 verify·실제 Windows 연결·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

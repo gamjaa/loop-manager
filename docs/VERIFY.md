@@ -6,6 +6,8 @@ Loop Manager 자체 검증은 `scripts/verify.json`으로 공통 runner를 선�
 
 자체 저장소에서는 기존 `scripts/verify.sh` 또는 `scripts/verify.ps1`을 사용한다. Manager는 자신의 Python과 절대 경로 runner, protocol version, session·timeout·조율 정보를 launcher에 전달한다. launcher가 선택한 프로젝트 Python으로 수집·테스트·compile을 실행하고, 자원 배정은 Manager runtime에서 수행한다. 프로젝트에 Manager 패키지나 설정·비밀값을 복사하지 않는다. venv interpreter의 symlink를 실제 시스템 executable로 바꾸지 않아 프로젝트 의존성 환경을 유지한다.
 
+자체 Windows `scripts/verify.ps1`은 단독 실행과 Manager 실행에서 `LOOP_MANAGER_VERIFY_TEMP_DIR`로 임시 경로를 선택한다. 입력이 없으면 `%USERPROFILE%\.cache\loop-manager\verify\tmp`를 쓰고, 상대 경로는 checkout 기준으로 절대화한다. launcher는 Python을 조회·실행하기 전에 경로를 만들고 쓰기 가능한지 확인한 뒤 `TEMP`·`TMP`·`TMPDIR`에 설정한다. 실제 Python 임시 경로가 다르거나 선택한 경로를 사용할 수 없으면 실패하며 다른 경로로 fallback하지 않는다. launcher 결과와 Windows native/WSL 단계의 진단은 각 단계가 실제 관측한 경로를 구분해 보존한다. WSL은 실행별 `/tmp/` 복사본과 임시 경로를 계속 사용한다. 부분 verify가 `self_windows_requires_full`로 FALLBACK하면 경로 준비와 환경 복원만 하고 WSL/native를 실행하지 않으며, 실행하지 않은 단계의 경로를 진단에 만들지 않는다. 설정 예시는 [Windows 임시 폴더 안내](OPERATIONS.md#windows-defender와-테스트-임시-폴더)를 따른다.
+
 단독 호출은 설치해 둔 Loop Manager runtime의 위치와 Python을 명시한다. 자동 설치나 새로운 PATH 탐색은 하지 않는다. 선택된 프로젝트 루트에서 다음과 같이 호출한다.
 
 ```sh
