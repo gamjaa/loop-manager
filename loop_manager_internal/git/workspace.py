@@ -181,6 +181,7 @@ def make_worktree(effects: MakeWorktreeEffects,
                 journal_state_dir, intent, "create",
             ),
         )
+    reserved_state = None
     if require_creation_evidence or (
         ownership_reserved and journal_state_dir is not None and worktree.is_dir()
     ):
@@ -194,6 +195,7 @@ def make_worktree(effects: MakeWorktreeEffects,
             raise WorkspaceOwnershipError('원격 인수 workspace의 생성 HEAD가 인수 기준과 다릅니다.')
         # 실행 기준은 생성 후 전진할 수 있으므로 봉인된 생성 결과로 예약을 확인한다.
         expected_head = created_head
+        reserved_state = live
     if ownership_reserved and not expected_head:
         raise WorkspaceOwnershipError("예약 ExecPlan workspace의 기준 commit SHA가 없습니다.")
     if worktree.is_dir():
@@ -204,6 +206,9 @@ def make_worktree(effects: MakeWorktreeEffects,
             )
         if ownership_reserved:
             effects.validate_reserved_worktree(repo, worktree, branch, str(expected_head))
+            if (reserved_state is not None
+                    and effects._managed_worktree_transition_state(repo, worktree) != reserved_state):
+                raise WorkspaceOwnershipError('예약 workspace 검증 중 Git 등록 또는 index가 변경됐습니다.')
         else:
             effects.validate_managed_worktree(
                 repo, worktree, branch, allow_rebase=allow_rebase

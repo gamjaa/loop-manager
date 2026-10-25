@@ -4,6 +4,7 @@ from tests.support.execution import ExecutionFixture
 from dataclasses import replace
 from pathlib import Path
 from unittest import TestCase
+from unittest import mock
 
 import loop_manager as lm
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
@@ -11,6 +12,49 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKi
 
 
 class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
+    def test_reserved_resource_race_does_not_confirm_ownership(self):
+        worktree = str(Path('/state/G-047').resolve())
+        initial = lm.GitSnapshot('owned-head', 'loop-manager/G-047', {}, {}, {},
+                                {worktree: ('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047')}, {}, {})
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        for changed in (
+            replace(initial, head='foreign-head'),
+            replace(initial, index={'app.py': ('foreign-stage',)}),
+            replace(initial, dirty={'user.txt': (('untracked',), 'preserved-data')}),
+            replace(initial, operations={'merge': 'user-operation'}),
+            replace(initial, worktrees={}),
+            replace(initial, worktrees={worktree: ('HEAD=owned-head', 'locked=foreign')}),
+            replace(initial, shared_metadata_complete=False),
+        ):
+            with self.subTest(changed=changed), mock.patch.object(Path, 'is_dir', return_value=True):
+                self.effects.agent.capture_git_snapshot.return_value = initial
+                self.effects.workspace.make_worktree.side_effect = lambda *_a, **_k: setattr(
+                    self.effects.agent.capture_git_snapshot, 'return_value', changed)
+                result = self.handler.prepare()
+                self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+                self.assertEqual(self.state.active_execplan('repo')['workspace_owned'], lm.WORKSPACE_RESERVED)
+                self.effects.workspace.mark_execplan_workspace_owned.assert_not_called()
+
+    def test_reserved_confirmation_ignores_other_worktree_and_ref_changes(self):
+        worktree = str(Path('/state/G-047').resolve())
+        initial = lm.GitSnapshot('owned-head', 'loop-manager/G-047', {}, {}, {},
+                                {worktree: ('HEAD=owned-head',)}, {}, {})
+        changed = replace(initial, refs={'refs/heads/other': ('new-head', '')},
+                          worktrees={**initial.worktrees, '/state/other': ('HEAD=new-head',)})
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        self.effects.agent.capture_git_snapshot.return_value = initial
+        self.effects.workspace.make_worktree.side_effect = lambda *_a, **_k: setattr(
+            self.effects.agent.capture_git_snapshot, 'return_value', changed)
+        with mock.patch.object(Path, 'is_dir', return_value=True):
+            self.handler.prepare()
+        self.effects.workspace.mark_execplan_workspace_owned.assert_called_once()
+
     def test_reserved_checkpoint_race_does_not_confirm_ownership(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)

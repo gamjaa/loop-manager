@@ -46,6 +46,8 @@ R-055 W01–W03·W06의 예약 workspace를 승인된 생성·후속 변경 근�
 ## Progress
 
 - [x] revision `26140c614cf5881242ce8e3abbcdd060d6cd68c6`와 비교 기준 `b31e33c291b8fb550f1c5cd2f88aff13a5a43d33`의 R-055·직접 코드/회귀를 정적으로 대조했다. 깨끗한 예약 복구와 실행 기준 분리·checkpoint 경쟁/rollback은 구현된 범위로 제외했다. 구현·테스트·verify를 실행하지 않았다.
+- [x] 첫 구현 단위로 일반 준비의 예약 검증 전/확정 직전 local snapshot과 대상 worktree 등록을 대조했다. HEAD·index·파일·operation·등록 변경과 불완전한 관측은 DB 소유권 확정 전에 보류하고, 다른 작업의 ref/worktree 변화는 비교에서 제외한다. `make_worktree()`도 생성 증거 검증 뒤 등록/index를 재관측한다. 기존 생성 증거 판정과 변경 거부 조건은 유지한다.
+- 이 구현 단위의 targeted runner 실행은 `ExecutionWorkspacePhaseTests.test_reserved_resource_race_does_not_confirm_ownership`, `test_reserved_confirmation_ignores_other_worktree_and_ref_changes`, `test_reserved_checkpoint_race_does_not_confirm_ownership`과 `RemoteCreationEvidenceTests`의 두 case, 총 5개가 통과했다. 전체 verify와 실제 Git 통합 회귀는 실행하지 않았다. 승인된 후속 변경 이력·writer 종료/복구 소유권·공유 판정 및 제품/설계 반영은 아직 구현하지 않았으며 이 보존점은 완료 후보가 아니다.
 - [ ] 승인된 후속 변경·writer/복구 소유권·현재 자원의 공유 검증과 보존 재개
 - [ ] 최소 unit·기존 실제 Git 보존 회귀 및 제품/설계 정합성
 

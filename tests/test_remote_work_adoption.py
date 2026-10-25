@@ -10,6 +10,37 @@ from tests.support.git import git_command, isolated_git_test, local_github_origi
 
 
 class RemoteCreationEvidenceTests(TestCase):
+    def test_reserved_registration_and_index_are_reobserved_after_validation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / 'G-047'
+            worktree.mkdir()
+            repo = root / 'repo'
+            head = 'a' * 40
+            live = {'exists': True, 'index': 'tree',
+                    'registration': {'head': head, 'branch': 'refs/heads/loop-manager/G-047',
+                                     'locked': 'loop-manager-worktree:receipt'}}
+            effects = workspace.MakeWorktreeEffects(
+                _managed_worktree_marker=mock.Mock(), _managed_worktree_transition_state=mock.Mock(),
+                _worktree_catalog=mock.Mock(), _write_managed_worktree_receipt=mock.Mock(),
+                git=mock.Mock(), validate_managed_worktree=mock.Mock(), validate_reserved_worktree=mock.Mock())
+            for changed in (
+                {**live, 'index': 'foreign-tree'},
+                {**live, 'registration': None},
+                {**live, 'registration': {**live['registration'], 'locked': 'foreign-marker'}},
+            ):
+                with self.subTest(changed=changed), \
+                     mock.patch.object(workspace.manager_git_journal, 'recover_active'), \
+                     mock.patch.object(workspace.manager_git_journal, 'verified_managed_transitions',
+                                       return_value=[{'intent': {'expected': live}, 'result': {'observed': live}}]):
+                    effects._managed_worktree_transition_state.side_effect = [live, changed]
+                    with self.assertRaisesRegex(lm.WorkspaceOwnershipError, '검증 중'):
+                        workspace.make_worktree(effects, repo, worktree, 'loop-manager/G-047', 'main',
+                            ownership_reserved=True, expected_head=head,
+                            journal_state_dir=root / 'state', journal_owner='plan:G-047')
+            effects.git.assert_not_called()
+            effects._write_managed_worktree_receipt.assert_not_called()
+
     def test_reserved_resume_requires_sealed_creation_matching_live_resource(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

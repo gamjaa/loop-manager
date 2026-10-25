@@ -6,6 +6,8 @@ from pathlib import Path
 from dataclasses import asdict
 import re
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.agents.agent_scope_decision import _same_local_snapshot
+from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
 import sys
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -881,6 +883,8 @@ class WorkspaceHandler:
             )
             reserved_checkpoint = (self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
                                    if workspace_reserved and self.ports.checkpoint is not None else None)
+            reserved_observation = (self.ports.capture_git_snapshot(worktree)
+                                    if workspace_reserved and worktree.is_dir() else None)
             self.ports.make_worktree(
                 self.ports.identity.repo_path,
                 worktree,
@@ -944,6 +948,15 @@ class WorkspaceHandler:
                         pr_head_oid=remote_start,
                     )
             if workspace_reserved and remote_start is None:
+                if reserved_observation is not None:
+                    confirmed = self.ports.capture_git_snapshot(worktree)
+                    resource = str(_canonical_path(worktree))
+                    if (not _same_local_snapshot(reserved_observation, confirmed)
+                            or not reserved_observation.shared_metadata_complete
+                            or not confirmed.shared_metadata_complete
+                            or resource not in reserved_observation.worktrees
+                            or reserved_observation.worktrees[resource] != confirmed.worktrees.get(resource)):
+                        raise RuntimeStateError('예약 workspace 검증 중 대상 Git 자원이 변경됐습니다.')
                 with runtime_state._transaction(self.ports.state.connection):
                     self.ports.state.check()
                     if (dict(self.ports.state.active_execplan(self.ports.identity.repo)) != dict(catalog_plan)
