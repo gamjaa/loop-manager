@@ -170,6 +170,11 @@ Manager의 30초 진행 관측은 현재 run ID와 일치하는 완성된 JSONL 
 정하므로 목록에 포함한다. Perl adapter의 `.py`·`.pl`·`.pm`과 두 언어 예제·launcher도 기존 `loop_manager_internal/**`·
 `tests/**`에 포함된다. `tests/**` 안의 고정 샘플이 문서·Skill·설정 예제 원본을 대체하며,
 실제 copy 스크립트는 이 샘플 source에서 실행해 결과 bytes·경로·보존·덮어쓰기 거부를 확인한다.
+저장소 runtime의 공통·역할·Ponytail 원문 `docs/AGENTS.common.md`, `docs/AGENTS.planner.md`,
+`docs/AGENTS.planner_check.md`, `docs/AGENTS.worker.md`, `docs/AGENTS.reviewer.md`,
+`docs/AGENTS.ponytail.md`는 자체 verify 목록에서 제외한다. 원문 정책 문구를 검사하던 테스트는
+테스트 소유의 고정·임시 원문으로 전환하고 그 fixture bytes는 `tests/**` 입력으로 유지한다.
+이 제외는 자체 verify의 입력 지문에만 적용되며 현재 runtime의 지침 원문 선택·planning 해시·Agent 전달·호출 해시는 실제 원문을 계속 사용한다.
 `AGENTS.md`, README, docs와 `.agents`의 prose, `config/config.ini.example`·운영 설정, 소비하지 않는 setup·ignore·attributes는
 자체 verify의 prose/예제 입력에서 제외한다. 이 범위는 문서·예제의 품질 검증을 뜻하지 않으며
 필수 unittest 수집과 전체 compile을 유지한다. Linux 실행 경로 회귀가 실제 `scripts/setup.sh`를

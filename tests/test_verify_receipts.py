@@ -393,10 +393,11 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         (self.root / 'scripts/verify.sh').write_text('custom native verify')
         (self.root / inputs.MANIFEST).write_text(json.dumps(
             {'version': 1, 'paths': ['src/**', 'scripts/**']}))
-        document = self.root / 'README.md'
+        document = self.root / 'docs/AGENTS.worker.md'
+        document.parent.mkdir(exist_ok=True)
         document.write_text('not consumed')
         review = inputs.exclusion_request(self.root, ('scripts/verify.sh',))
-        review['basis'] = 'Custom script consumes src only, never README contents.'
+        review['basis'] = 'Custom script consumes src only, never runtime guidance contents.'
         message = READY_WORKER_RESULT + '\n' + inputs.EXCLUSION_MARKER + json.dumps(review)
         self.state.update_project('repo', worktree=str(self.root), worker_result=message)
         production = loop_manager._ExecutionLifecyclePorts(
@@ -427,7 +428,7 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(self.calls.count('verify'), 1)
         self.assertEqual((reused['kind'], reused['origin_id'], reused['head']),
                          ('reuse', run['id'], 'new-head'))
-        (self.root / 'scripts/verify.sh').write_text('now consumes README')
+        (self.root / 'scripts/verify.sh').write_text('now consumes docs/AGENTS.worker.md')
         self.ready()
         self.state.update_project('repo', worker_result=message)
         self.verify()

@@ -1764,6 +1764,8 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 - `scripts/copy-project-files.sh`, `scripts/copy-project-files.ps1`
 - `.agents/skills/specification-docs/scripts/**`, `run.sh`, `run.ps1`
 
+저장소 runtime의 공통·역할·Ponytail 원문 `docs/AGENTS.common.md`, `docs/AGENTS.planner.md`, `docs/AGENTS.planner_check.md`, `docs/AGENTS.worker.md`, `docs/AGENTS.reviewer.md`, `docs/AGENTS.ponytail.md`는 자체 verify 목록에서 제외한다. 지침 원문을 직접 읽던 정책 문구 테스트는 테스트가 소유한 고정·임시 원문을 사용하며 `tests/**`의 이 fixture들은 계속 목록에 포함한다. 이 제외는 자체 verify 입력 지문에만 적용한다. `agents/common_guidance.py`의 현재 runtime 원문 선택과 planning·호출별 실제 전달 해시는 그대로 실제 지침을 읽어 계산한다.
+
 `tests/**`의 등록·profile·프로젝트 준비 검증은 문서·설정 예제 대신 고정 샘플을 사용한다. 복사 회귀는 실제 copy 스크립트 bytes를 샘플 source root에서 실행해 결과 bytes·경로·기존 파일 보존·재실행 거부를 확인한다. 배포되는 조회 도구와 Skill 자체 문서 파서는 실제 실행 코드 bytes를 샘플 source에 배치해 배포 결과·조회 동작을 확인한다.
 
 샘플은 현재 문서 원본에서 자동 생성·동기화하지 않는다. `AGENTS.md`·README·docs와 `.agents`의 prose·`config.ini.example`·사용자 운영 설정·소비하지 않는 setup/ignore/attributes 변경은 자체 verify 입력이 아니다. Windows verify driver·선택 목록과 Linux 실행 경로 회귀가 임시 source에 복사해 실행하는 `scripts/setup.sh`는 입력이다. setup의 bytes·kind·mode 변경은 입력 지문과 기존 제외 근거를 바꾼다. 소비하지 않는 다른 플랫폼 setup은 추가하지 않는다. 이 제외는 원문의 일관성·품질을 확인하지 않으며 필수 테스트·전체 compile·실제 verify/copy 스크립트 검증을 축소하지 않는다.

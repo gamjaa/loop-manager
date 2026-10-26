@@ -27,25 +27,26 @@ revision `ce0b989bda05fc89d6405d2577d7a3bb199e6259`에서 일반 verify의 코�
 
 ## Implementation
 
-- [ ] 확인한 `tests/test_loop_manager.py:PublicFacadeTest.test_worker_and_reviewer_prompts_define_test_execution_boundary`, `tests/test_verify_contract.py:EntrypointAndGuidanceTests.test_role_prompts_only_link_declaration_and_support_context`, `tests/test_agent_invocation.py:CommonGuidanceInvocationTests.test_real_worker_prompts_deliver_static_rules_only_in_pinned_instruction`의 실제 원문 읽기와 정책 문구 assertion을 정리한다. 혼합 테스트의 결과 형식·미실행 사유·후보별 검증 근거·prompt delta 검사는 보존하고, 소유한 fixture 내용의 전달/비중복·provider 요청을 검사한다. 순수 정책 검사만 제거할 때는 제거 대상과 남은 기능 회귀를 대응시킨다.
-- [ ] 확인한 `tests/support/fixed_samples.py`의 `PROJECT_FILES`·`use_fixed_guidance()`, `tests/support/workspace.py:pin_common_guidance()`와 `tests/fixtures/project-files/docs/AGENTS.*.md`를 우선 재사용한다. `CommonGuidanceInvocationTests`가 이미 만드는 임시 runtime과 `tests/test_support_fixtures.py`의 원본 읽기 경계 회귀도 재사용한다. 부족한 입력은 필요한 짧은 고정 값만 보완하며 실제 원문 복사·언어별 지침 사본·새 fixture 엔진을 만들지 않는다.
-- [ ] 확인한 `loop_manager_internal/agents/common_guidance.py`의 `RUNTIME_ROOT`·`resolve()`·전체 원본/실제 전달 해시 소비자를 테스트 준비부터 후속 해시·재개까지 대조한다. 제품의 현재 runtime 원문 선택은 바꾸지 않고 테스트만 소유한 입력을 사용한다. 다른 테스트의 원문 소비가 발견되면 같은 목표에 필요한 부분만 함께 전환한다.
-- [ ] 확인한 `scripts/verify-inputs.json`과 `tests/test_verify_inputs.py:test_repository_manifest_covers_execution_inputs_and_fixed_samples`를 소비 제거 결과에 맞춘다. `loop_manager_internal/verification/inputs.py`·`manager_adapter.py`, `loop_manager_internal/execution/result_validation.py`·`execution_ports.py`의 현재 관측·제외 재확인·Worker 근거 전달과 `loop_manager_internal/storage/verify_receipts.py`의 실제 run/CAS를 재사용하며 일반 verify 재사용을 다시 구현하지 않는다.
-- [ ] PRODUCT·ARCHITECTURE와 `docs/VERIFY.md`의 소유 절에 실제 입력 범위와 지침 기능 검증/정책 문구 검토의 경계를 통합한다. 지침 파일 자체의 정책이나 Requirement·다른 ExecPlan은 변경하지 않는다. G-227의 Reviewer prompt 중복 제거와 G-183의 최종 Review 재사용은 해당 작업에 남긴다.
+- [x] 확인한 `tests/test_loop_manager.py:PublicFacadeTest.test_worker_and_reviewer_prompts_define_test_execution_boundary`, `tests/test_verify_contract.py:EntrypointAndGuidanceTests.test_planner_and_reviewer_prompts_include_verify_support_context`, `tests/test_agent_invocation.py:CommonGuidanceInvocationTests.test_worker_prompts_deliver_owned_guidance_without_prompt_duplication`의 실제 원문 읽기와 정책 문구 assertion을 정리한다. 추가 소비자 조사에서 확인한 `tests/test_requirement_archiving.py:RequirementArchiveEligibilityTest.test_worker_prompt_defers_requirement_retirement`의 실제 원문 읽기도 제거한다. 혼합 테스트의 결과 형식·미실행 사유·후보별 검증 근거·prompt delta 검사는 보존하고, 소유한 fixture 내용의 전달/비중복·provider 요청을 검사한다. 순수 정책 검사만 제거할 때는 제거 대상과 남은 기능 회귀를 대응시킨다.
+- [x] 확인한 `tests/support/fixed_samples.py`의 `PROJECT_FILES`·`use_fixed_guidance()`, `tests/support/workspace.py:pin_common_guidance()`와 `tests/fixtures/project-files/docs/AGENTS.*.md`를 우선 재사용한다. `CommonGuidanceInvocationTests`가 이미 만드는 임시 runtime과 `tests/test_support_fixtures.py`의 원본 읽기 경계 회귀도 재사용한다. 부족한 입력은 필요한 짧은 고정 값만 보완하며 실제 원문 복사·언어별 지침 사본·새 fixture 엔진을 만들지 않는다.
+- [x] 확인한 `loop_manager_internal/agents/common_guidance.py`의 `RUNTIME_ROOT`·`resolve()`·전체 원본/실제 전달 해시 소비자를 테스트 준비부터 후속 해시·재개까지 대조한다. 제품의 현재 runtime 원문 선택은 바꾸지 않고 테스트만 소유한 입력을 사용한다. 다른 테스트의 원문 소비가 발견되면 같은 목표에 필요한 부분만 함께 전환한다.
+- [x] 확인한 `scripts/verify-inputs.json`과 `tests/test_verify_inputs.py:test_repository_manifest_covers_execution_inputs_and_fixed_samples`를 소비 제거 결과에 맞춘다. `loop_manager_internal/verification/inputs.py`·`manager_adapter.py`, `loop_manager_internal/execution/result_validation.py`·`execution_ports.py`의 현재 관측·제외 재확인·Worker 근거 전달과 `loop_manager_internal/storage/verify_receipts.py`의 실제 run/CAS를 재사용하며 일반 verify 재사용을 다시 구현하지 않는다.
+- [x] PRODUCT·ARCHITECTURE와 `docs/VERIFY.md`의 소유 절에 실제 입력 범위와 지침 기능 검증/정책 문구 검토의 경계를 통합한다. 지침 파일 자체의 정책이나 Requirement·다른 ExecPlan은 변경하지 않는다. G-227의 Reviewer prompt 중복 제거와 G-183의 최종 Review 재사용은 해당 작업에 남긴다.
 
 ## Validation
 
-- Worker는 위 세 소비 테스트와 `tests/test_verify_inputs.py`·`tests/test_support_fixtures.py`의 변경 관련 최소 unit case를 실행한다. 실제 저장소 지침 읽기를 거부하는 기존 mock 경계를 재사용해 준비·provider 요청·후속 해시까지 고정 샘플만 소비하는지 확인한다. 실제 source 파일을 변경하거나 실제 Agent를 호출하지 않는다.
+- Worker는 위 네 소비 테스트와 `tests/test_verify_inputs.py`·`tests/test_support_fixtures.py`의 변경 관련 최소 unit case를 실행한다. 실제 저장소 지침 읽기를 거부하는 기존 mock 경계를 재사용해 준비·provider 요청·후속 해시까지 테스트 소유 원문만 소비하는지 확인한다. 실제 source 파일을 변경하거나 실제 Agent를 호출하지 않는다.
 - 같은 호출 fixture에서 common/역할/Ponytail 합성 bytes·해시·Worker 한 번 추가·다른 역할 제외, 신규/재개/새 세션·현재 원본 오류와 후보 편집본 미채택을 계속 검사한다. `CommonGuidanceInvocationTests`의 기존 역할 변경·원본 누락·과거 snapshot 보존/미사용 회귀와 `tests/test_agent_invocation_state.py`를 재사용하며 같은 조건/assertion을 복제하지 않는다.
-- `tests/test_verify_inputs.py`의 실제 임시 파일 관측에서 지침 prose만의 bytes/mode 변경은 코드 지문을 바꾸지 않고 현재 제외 근거를 갱신하는지 확인한다. 반대로 고정 샘플·실행 코드·manifest·진입점/판정 규칙 변경과 새 목록 밖 코드·불명확한 소비는 기존 선언/성공 재사용을 거부해야 한다. 입력 범위 축소 전의 token을 새 기준 성공으로 옮기지 않는다.
+- `tests/test_verify_inputs.py`와 `tests/test_verify_receipts.py`의 실제 임시 파일 관측에서 `docs/AGENTS.worker.md` 원문 bytes/mode 변경은 코드 지문을 바꾸지 않고 현재 Worker 제외 근거를 갱신하며, 소비 코드·manifest·진입점/판정 규칙 변경과 새 목록 밖 코드·불명확한 소비는 기존 선언/성공 재사용을 거부하는지 확인한다. 입력 범위 축소 전의 token을 새 기준 성공으로 옮기지 않는다.
 - `tests/test_verify_receipts.py`의 production port·실제 SQLite fixture로 같은 작업 주기의 원래 run 연결, 문서 재확인, 새 실패/중단·경쟁 거부를 유지한다. planning/Worker/Review의 지침 입력 갱신과 verify의 코드 입력 비교를 구별하고 Review 승인·invocation·전체 실행 성공을 합성하지 않는다. 관련 대상만 보강하며 기존 전체 receipt·가드·수집/fixture·필수 compile 회귀는 유지한다.
 - 제거한 정책 문구 assertion과 계속 검증하는 전달·오류·protocol case를 Worker 결과에 남긴다. 실제 지침의 내용·정합성은 변경 diff와 명세를 읽는 Review 대상으로 유지하고 자동 테스트에 문구 검사를 다시 넣지 않는다.
 
 ## Progress
 
-- [x] 지정 revision의 PRODUCT·ARCHITECTURE와 활성 Requirement 29개 전문, 선택 adapter/환경·지원 계약, 관련 비종료 계획과 위 코드·테스트를 정적으로 대조했다. 실제 원문 소비 세 곳과 입력 목록 6개를 확인했으며 구현·테스트·전체 verify는 실행하지 않았다.
-- [ ] 실제 지침 원문 소비와 정책 문구 assertion의 고정 샘플 전환
-- [ ] 입력 목록·문서 정합화 및 기능/재사용 회귀 보존
+- [x] 지정 revision의 PRODUCT·ARCHITECTURE와 활성 Requirement 29개 전문, 선택 adapter/환경·지원 계약, 관련 비종료 계획과 코드를 정적으로 대조했다. 최초 확인한 원문 소비 외에 `tests/test_requirement_archiving.py`의 추가 소비도 찾아 함께 제거했다.
+- [x] 실제 지침 원문 소비와 정책 문구 assertion을 자체 임시 원문·기존 고정 fixture로 전환하고 호출·해시·재개·오류 회귀를 보존했다.
+- [x] 입력 목록에서 저장소 지침 원문 6개를 제외하고 Product·Architecture·Verify 문서를 갱신했다. 고정 샘플과 verify 실행 경로·선택 목록·setup/copy/launcher 입력은 유지했다.
+- [x] 관련 targeted unit test 21개가 최종 재실행에서 통과했고, runtime 역할 지침 변경과 동일 원문 해시 회귀 2개도 통과했다. 전체 verify는 Manager가 실행한다.
 
 ## Decision Log
 

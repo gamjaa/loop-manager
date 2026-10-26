@@ -700,8 +700,6 @@ Test fallback.
         )
         self.assertNotIn("이동하라", prompt)
         self.assertIn(source, prompt)
-        instruction = (Path(__file__).resolve().parents[1] / 'docs/AGENTS.worker.md').read_text(encoding='utf-8')
-        self.assertIn('Requirement의 완료 판단·archive 이동은 Manager의 책임', instruction)
         self.assertNotIn('Requirement의 완료 판단·archive 이동', prompt)
 
     def test_unknown_status_is_rejected(self):

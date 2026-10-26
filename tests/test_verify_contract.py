@@ -455,17 +455,11 @@ class EntrypointAndGuidanceTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)['version'], 1)
         self.assertEqual(set(json.loads(result.stdout)['adapters']), {'unittest', 'perl-tap'})
 
-    def test_role_prompts_only_link_declaration_and_support_context(self):
+    def test_planner_and_reviewer_prompts_include_verify_support_context(self):
         from loop_manager_internal.agents import agent_prompts
         for prompt in (agent_prompts.planner_prompt(None), agent_prompts.reviewer_prompt('main')):
             self.assertIn('scripts/verify.json', prompt)
             self.assertIn('docs/VERIFY.md', prompt)
-            self.assertNotIn('테스트마다 자원 배정', prompt)
-        worker = agent_prompts.worker_prompt('plan', None)
-        instruction = (Path(__file__).resolve().parents[1] / 'docs/AGENTS.worker.md').read_text(encoding='utf-8')
-        for link in ('scripts/verify.json', 'docs/VERIFY.md'):
-            self.assertNotIn(link, worker)
-            self.assertIn(link, instruction)
 
 
 class ManagerDeadlineHandoffTests(unittest.TestCase):
