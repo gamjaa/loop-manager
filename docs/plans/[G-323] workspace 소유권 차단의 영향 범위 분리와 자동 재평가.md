@@ -53,6 +53,10 @@ R-055 W04–W06에 따라 workspace 소유권 문제의 실제 영향 범위를 
 - [x] 프로젝트 Python `python3`와 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 workspace 실행 class 10개, 소유권 연결 신규 unit 9개, 알림 연결 unit 1개와 기존 scope/선택/예약/관리 한도의 관련 개별 회귀를 실행했다. 기존 예약 복구 class 20개는 최초 요청 부재 처리 오류 수정 후 같은 명령으로 재실행해 통과했다. 독립 질문 보존의 초기화 순서 오류도 동일 개별 명령 재실행으로 통과했으며 미해결 targeted 실패는 없다. gate 삭제 직후 실패의 rollback·재개, checkpoint/공유 상태 경쟁, 관측 중 원인 교체, A/C/D 보류와 B 선택·D 활성화 거부, 저장 단계 재개·admission 및 후보/감사 보존을 확인했다.
 - [x] `scripts/verify.json`의 unittest/launcher·독립 수집·compile 계약과 기존 `scripts/verify-inputs.json`의 코드/테스트 glob을 유지했다. 새 검증 파일·의존성은 추가하지 않았다. 전체 verify·프로젝트 전체 lint/build/type check와 Windows native 검증은 Worker에서 실행하지 않았으며 Manager의 전체 검증·Review가 남아 있다. 목록 밖 입력의 미소비를 확정하지 않아 VERIFY_INPUT_EXCLUSIONS는 선언하지 않는다.
 
+
+- [x] Manager 전체 verify `verify:f0ca3e959372885829a18aab107c0bb47a7150862c8eb72bfc177a3fe3456d11` occurrence=1/revision=1의 실패를 교정했다. 일반 프로젝트 복구에서 소유권 전용 게시 요청 조회를 분리해 최소 planning DB 호환을 유지하고, 활성화는 READY 상태 오류를 자원 대기보다 먼저 검사한다. 원인 매핑 회귀는 기존 code의 기본 round-trip assertion을 유지하면서 새 local code에 기본 project 판정·명시적 plan 선택을 함께 검사한다.
+- [x] 해당 delta의 `tests.test_origin_isolation.OriginIsolationScopeTest.test_saved_scope_block_reopens_only_for_exact_runtime_delta`(mixed 두 조건), `tests.test_recovery_runtime.RecoveryPolicyTests.test_every_legacy_block_reason_keeps_its_cause_and_scope`, `tests.test_runtime_state.RuntimeStateRepositoryTest.test_expected_status_mismatch_rejects_second_activation`을 각각 targeted runner로 실행해 통과했다. `ReservedWorkspaceRecoveryTests.test_shrunk_gate_selects_only_independent_ready_and_keeps_resource_owner`와 `test_local_residual_narrows_gate_and_restarts_from_saved_phase`도 통과했다. Manager 전체 verify의 실패 기록은 보존하며 전체 verify 성공으로 대체하지 않는다. 전체 verify 재실행·Review는 Manager에 인계한다.
+
 ## Decision Log
 
 - G-322가 예약의 생성/변경 근거와 writer/자원 소유권을 먼저 완성한다. 이 작업은 그 결과를 차단·후속 소비에 연결하므로 G-322의 실제 Merge를 선행으로 요구한다. G-297의 배정기 보완과 G-189의 전수 감사는 별도 목표이며 기존 PLAN_BLOCKED 독립 진행을 이 작업으로 소급 계획하지 않는다.

@@ -1378,12 +1378,14 @@ class RuntimeStateRepository:
         from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
         if plan_id in catalog_held_plan_ids(self.connection, repo):
             raise RuntimeStateError("catalog 오류로 보류된 ExecPlan을 activate할 수 없습니다.")
+        selected = self.get(repo, plan_id)
+        if selected.status != 'READY':
+            raise RuntimeStateError("READY ExecPlan의 현재 상태가 변경되었습니다.")
         from loop_manager_internal.recovery.scoped_blocking import workspace_held_resources, workspace_resource_conflicts
         from loop_manager_internal.storage.task_calls import CallDeferred
         if workspace_resource_conflicts(workspace_held_resources(self.connection, repo),
                 plan_id=plan_id, branch=branch, worktree=worktree):
             raise CallDeferred('workspace 원인 작업의 충돌 자원 해소를 기다립니다.')
-        selected = self.get(repo, plan_id)
         from loop_manager_internal.config.managed_config import fast_mode_settings
         from loop_manager_internal.runtime.project_registry import task_limit
         from loop_manager_internal.storage.task_calls import managed_count

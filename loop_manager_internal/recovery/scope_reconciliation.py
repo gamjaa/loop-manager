@@ -215,7 +215,10 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
         return False
     original_block = block
     expected_plan_block = scoped_blocking.plan_block(connection, repo, block['plan_id'])
-    expected_request = blocked_checkpoint_state.scope_request_row(connection, repo, block['plan_id'])
+    ownership_cause = (workspace_block is not None
+                       or block['reason_code'] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value)
+    expected_request = (blocked_checkpoint_state.scope_request_row(connection, repo, block['plan_id'])
+                        if ownership_cause else None)
     admission = (recovery_admission(connection, repo, block['plan_id'])
                  if workspace_block is not None and expected_plan_block is not None
                  and expected_plan_block['reason_code'] == BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL.value
@@ -226,10 +229,10 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
         block = {**dict(block), 'reason_code': BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value}
 
     def cause_matches():
-        current_request = blocked_checkpoint_state.scope_request_row(connection, repo, block['plan_id'])
-        if block['reason_code'] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value and (
-                (dict(current_request) if current_request else None) != (dict(expected_request) if expected_request else None)):
-            return False
+        if ownership_cause:
+            current_request = blocked_checkpoint_state.scope_request_row(connection, repo, block['plan_id'])
+            if (dict(current_request) if current_request else None) != (dict(expected_request) if expected_request else None):
+                return False
         if workspace_block is None:
             return scoped_blocking.project_cause_matches(connection, block)
         if scoped_blocking.project_block(connection, repo) is not None:
