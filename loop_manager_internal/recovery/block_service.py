@@ -537,6 +537,9 @@ def block_active_execplan_from_revision(
         "agent_result_snapshot": preserved_agent_result_snapshot,
         "agent_manager_snapshot": None,
     }
+    if reason in {BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL}:
+        # Ownership uncertainty does not invalidate recorded candidate evidence.
+        plan_values = {'last_error': error}
     if blocked_reason is not None:
         plan_values["blocked_reason"] = blocked_reason
     plan_id = str(plan["plan_id"])

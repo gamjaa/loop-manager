@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -142,6 +142,169 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
     def resume(self):
         return loop_manager.resume_project_block_if_safe(
             self.connection, Path(self.repo), Path('/state'), self.repo)
+
+    def isolated_missing_creation(self):
+        self.snapshot = replace(self.snapshot,
+            refs={'refs/heads/' + self.branch: (self.head, '')},
+            worktrees={self.repo: ('HEAD=base', 'branch=refs/heads/main'),
+                       str(self.worktree): ('HEAD=' + self.head, 'branch=refs/heads/' + self.branch)})
+        self.connection.execute('UPDATE exec_plans SET agent_snapshot=? WHERE plan_id=?',
+                                (self.snapshot.serialize(), 'G-001'))
+        self.connection.commit()
+        self.records = []
+
+    def resume_local(self):
+        return loop_manager.resume_plan_blocks(self.connection, Path(self.repo), Path('/state'),
+                                                self.repo, 'main', plan_id='G-001')
+
+    def test_local_residual_narrows_gate_and_restarts_from_saved_phase(self):
+        self.isolated_missing_creation()
+        before = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.assertTrue(self.resume())
+        block = scoped_blocking.plan_block(self.connection, self.repo, 'G-001')
+        self.assertEqual(block['reason_code'], 'workspace_ownership_local')
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertFalse(self.resume_local())
+        self.records = [{'intent': {'expected': self.live}, 'result': {'observed': self.live}}]
+        from loop_manager_internal.application.task_scheduling import current_scheduler
+        scheduler = mock.Mock()
+        scheduler.admission.side_effect = lambda task: nullcontext()
+        token = current_scheduler.set(scheduler)
+        try:
+            self.assertTrue(self.resume_local())
+        finally:
+            current_scheduler.reset(token)
+        scheduler.admission.assert_called_once()
+        self.assertTrue(scheduler.admission.call_args.args[0].resumed)
+        after = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((after['status'], after['workspace_owned']), ('IMPLEMENTING', 1))
+        for key in ('active_sha', 'worker_session_id', 'retry_count', 'verify_token', 'review_token'):
+            self.assertEqual(after[key], before[key], key)
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-001'))
+        self.assertNotIn('workspace_ownership_hold', self.checkpoints.get(self.repo, 'G-001').snapshot)
+        self.assertFalse(self.resume_local())
+        self.assertEqual(blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).pending(self.repo), ())
+
+    def test_ownership_block_preserves_recorded_candidate_artifacts(self):
+        self.connection.execute("UPDATE exec_plans SET agent_result_snapshot='recorded-output',agent_manager_snapshot='recorded-manager',verify_result='prior verify',blocked_review_fingerprint='prior review' WHERE plan_id='G-001'")
+        self.connection.commit()
+        with mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='same-input'):
+            loop_manager.block_active_execplan_from_revision(self.connection, Path(self.repo), self.repo,
+                'base', 'local ownership uncertain', reason=BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL)
+        after = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
+        self.assertEqual((after['agent_result_snapshot'], after['agent_manager_snapshot'],
+                          after['verify_result'], after['blocked_review_fingerprint']),
+                         ('recorded-output', 'recorded-manager', 'prior verify', 'prior review'))
+
+    def test_shrunk_gate_selects_only_independent_ready_and_keeps_resource_owner(self):
+        self.isolated_missing_creation()
+        self.plan('G-002')
+        self.plan('G-003', dependencies=('G-001',))
+        self.plan('G-004', branch=self.branch)
+        self.connection.execute("UPDATE exec_plans SET workspace_owned=0 WHERE plan_id='G-004'")
+        self.connection.commit()
+        self.assertTrue(self.resume())
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        with self.assertRaises(CallDeferred):
+            RuntimeStateRepository(self.connection).activate(self.repo, 'G-004',
+                activation_sha='base', branch=self.branch, worktree='/state/G-004')
+        self.assertEqual(loop_manager.select_ready_execplan(self.connection, self.repo)['plan_id'], 'G-002')
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-002'")
+        self.connection.commit()
+        self.assertIsNone(loop_manager.select_ready_execplan(self.connection, self.repo))
+        self.assertEqual(self.connection.execute("SELECT workspace_owned FROM exec_plans WHERE plan_id='G-001'").fetchone()[0], 2)
+
+    def test_ready_resource_claim_with_unknown_call_is_not_treated_as_dormant(self):
+        from loop_manager_internal.storage import task_calls
+        self.isolated_missing_creation()
+        self.plan('G-004', branch=self.branch)
+        self.connection.execute("UPDATE exec_plans SET workspace_owned=0 WHERE plan_id='G-004'")
+        task_calls.reserve(self.connection, Path('/state'), self.repo, 'G-004', 'agent', 'unknown-writer')
+        self.connection.commit()
+        self.capture.reset_mock()
+        self.assertFalse(self.resume())
+        self.capture.assert_not_called()
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+
+    def test_narrowing_preserves_independent_question_and_its_recovery_proof(self):
+        self.isolated_missing_creation()
+        scoped_blocking.record_plan_block(self.connection, self.repo, 'G-001',
+            BlockReasonCode.USER_DECISION_REQUIRED, 'independent question', 'question-fingerprint')
+        original = dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-001'))
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        recovery = dict(RecoveryRepository(self.connection).row(self.repo, 'G-001'))
+        self.assertTrue(self.resume())
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-001')), original)
+        self.assertEqual(dict(RecoveryRepository(self.connection).row(self.repo, 'G-001')), recovery)
+        self.records = [{'intent': {'expected': self.live}, 'result': {'observed': self.live}}]
+        self.assertTrue(self.resume_local())
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-001')), original)
+        self.assertEqual(self.connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+
+    def test_narrowing_checkpoint_failure_rolls_back_plan_block_and_gate(self):
+        self.isolated_missing_creation()
+        original = dict(scoped_blocking.project_block(self.connection, self.repo))
+        with mock.patch.object(ExecutionCheckpointRepository, 'record', side_effect=sqlite3.OperationalError('injected rollback')):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.resume()
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-001'))
+        self.assertEqual(dict(scoped_blocking.project_block(self.connection, self.repo)), original)
+        self.assertTrue(self.resume())
+
+    def test_gate_clear_failure_rolls_back_residual_hold_and_original_request(self):
+        self.isolated_missing_creation()
+        original = dict(scoped_blocking.project_block(self.connection, self.repo))
+        clear = loop_manager._clear_project_block_without_losing_planning_error
+        def fail_after_clear(*args):
+            clear(*args)
+            raise sqlite3.OperationalError('injected failure after gate deletion')
+        with mock.patch.object(loop_manager, '_clear_project_block_without_losing_planning_error', side_effect=fail_after_clear):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.resume()
+        self.assertEqual(dict(scoped_blocking.project_block(self.connection, self.repo)), original)
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-001'))
+        self.assertFalse((self.checkpoints.get(self.repo, 'G-001').snapshot or {}).get('workspace_ownership_hold'))
+        self.assertTrue(self.resume())
+
+    def test_plan_release_competing_cause_is_preserved(self):
+        self.isolated_missing_creation()
+        self.assertTrue(self.resume())
+        self.records = [{'intent': {'expected': self.live}, 'result': {'observed': self.live}}]
+        changed = False
+        def observe(*_):
+            nonlocal changed
+            if not changed:
+                changed = True
+                scoped_blocking.record_plan_block(self.connection, self.repo, 'G-001',
+                    BlockReasonCode.USER_DECISION_REQUIRED, 'competing question', 'new-question')
+            return self.snapshot
+        self.capture.side_effect = observe
+        self.assertFalse(self.resume_local())
+        block = scoped_blocking.plan_block(self.connection, self.repo, 'G-001')
+        self.assertEqual((block['reason_code'], block['evidence']), ('user_decision_required', 'competing question'))
+        self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 2)
+        self.assertIn('workspace_ownership_hold', self.checkpoints.get(self.repo, 'G-001').snapshot)
+
+    def test_shared_change_and_checkpoint_race_keep_project_gate(self):
+        self.isolated_missing_creation()
+        baseline = self.snapshot
+        self.snapshot = replace(baseline, config={'local:core.hooksPath': ('unknown',)})
+        self.assertFalse(self.resume())
+        self.snapshot = baseline
+        calls = 0
+        def observe(*_):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                old = self.checkpoints.get(self.repo, 'G-001')
+                self.checkpoints.record(self.repo, 'G-001', expected_generation=old.generation,
+                    operation=None, expected_head='race', target_base_oid=None, observed_remote_oid=None, snapshot={})
+            return self.snapshot
+        self.capture.side_effect = observe
+        self.assertFalse(self.resume())
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-001'))
 
     def test_owned_rebase_start_recovers_unchanged_clean_creation(self):
         from types import SimpleNamespace

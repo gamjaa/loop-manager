@@ -65,15 +65,26 @@ def _reservation_owners(connection, repo, plan_id):
     if owned or plan_id in ids or {plan['path'], *json.loads(plan['sources'])} & paths:
         raise task_calls.CallDeferred('예약 workspace에 수동 또는 게시 소유자가 있습니다.')
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    claims = list(connection.execute('SELECT branch,worktree FROM exec_plans WHERE repo=? AND plan_id<>?',
+    claims = list(connection.execute('SELECT plan_id,status,workspace_owned,branch,worktree FROM exec_plans WHERE repo=? AND plan_id<>?',
                                      (repo, plan_id)))
     if 'manual_work_groups' in tables:
-        claims.extend(connection.execute("SELECT branch,worktree FROM manual_work_groups WHERE repo=? "
+        claims.extend(connection.execute("SELECT NULL AS plan_id,state AS status,1 AS workspace_owned,branch,worktree FROM manual_work_groups WHERE repo=? "
                                          "AND state NOT IN ('PR_OPEN','CLOSED','MERGED')", (repo,)))
+    pending_claims = []
     for other in claims:
         if ((plan['branch'] and plan['branch'] == other['branch'])
                 or (plan['worktree'] and other['worktree']
                     and Path(plan['worktree']).resolve() == Path(other['worktree']).resolve())):
+            dormant = other['status'] == 'READY' and not other['workspace_owned'] and other['plan_id'] not in ids
+            for table, predicate in (('task_call_reservations', '1'), ('agent_invocations',
+                    'finished_at IS NULL OR (execution_started_at IS NOT NULL AND execution_finish_evidence IS NULL)')):
+                if dormant and table in tables and connection.execute(
+                        f'SELECT 1 FROM {table} WHERE repo=? AND plan_id=? AND ({predicate}) LIMIT 1',
+                        (repo, other['plan_id'])).fetchone():
+                    dormant = False
+            if dormant:
+                pending_claims.append(dict(other))
+                continue  # A dormant claimant waits behind this resource owner.
             raise task_calls.CallDeferred('예약 workspace에 다른 작업의 자원 소유자가 있습니다.')
     calls = (tuple(dict(row) for row in connection.execute(
         'SELECT * FROM task_call_reservations WHERE repo=? AND plan_id=? ORDER BY token',
@@ -92,7 +103,7 @@ def _reservation_owners(connection, repo, plan_id):
         raise runtime_state.RuntimeStateError('저장된 원격 인수 자격이 손상됐습니다.') from error
     adoption = (grant[0] if grant else None, eligible,
                 project['origin'], project['base_branch'])
-    return (plan['branch'], plan['worktree'], plan['workspace_owned'], manual, calls, invocations, adoption)
+    return (plan['branch'], plan['worktree'], plan['workspace_owned'], manual, calls, invocations, adoption, tuple(pending_claims))
 
 
 @dataclass(frozen=True)
@@ -176,7 +187,7 @@ def reserved_workspace_ownership(connection, state_dir, repo, plan_id):
     """Hold the existing task/resource boundary before observing reserved Git."""
     from loop_manager_internal.agents.process_receipt import recover
     observed = _reservation_owners(connection, repo, plan_id)
-    branch, worktree, _, _, calls, invocations, _adoption = observed
+    branch, worktree, _, _, calls, invocations, _adoption, _pending_claims = observed
     resources = ['plan:' + plan_id]
     resources += [prefix + value for prefix, value in (('branch:', branch), ('worktree:', worktree)) if value]
     if worktree:

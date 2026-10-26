@@ -30,10 +30,10 @@ R-055 W04–W06에 따라 workspace 소유권 문제의 실제 영향 범위를 
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/recovery/recovery_runtime.py`의 원인/최종 scope 결정, `scoped_blocking.py`의 단일 code-scope 검증과 plan/project 저장, `recovery/block_service.py` 및 `execution/execution_workspace_handler.py`의 실패 전달을 대조한다. G-322의 판정과 현재 자원 관계로 plan/project 결과를 명시적으로 연결하고 기존 project 원인을 단순히 plan으로 재분류하지 않는다. 필요한 구분은 기존 호환 저장·감사 구조 안에서 구현하며 비호환 schema나 범용 새 상태 모델을 도입하지 않는다.
-- [ ] 확인한 `recovery/scope_reconciliation.py:resume_project_block_if_safe()`·`project_block_service.py`와 `storage/recovery_state.py:resolve_rebase_block()`·`execution_checkpoint_state.py`의 원인 일치·CAS·감사를 재사용한다. 잔여 작업 차단과 프로젝트 gate 축소, 해소된 확인/게시 요청 처리를 함께 확정하고 무관한 차단 row·현재 승인·실패 근거를 덮어쓰지 않는다. `project_blocked_recovery.py`의 기존 재평가와 충돌하거나 과거 요청이 원인을 재생하지 않도록 소비 경계를 연결한다.
-- [ ] 확인한 `application/task_scheduling.py`, `storage/task_calls.py`, `catalog/project_selection.py`와 `recovery/blocked_plan_reconciliation.py`의 기존 작업 lease·관리 개수·dependency 선택을 사용한다. 새로운 배정기·한도·polling이나 G-297의 admission/명세 drain·재시도 구조를 만들지 않는다. 원인·대기 대상·충돌 자원과 scope 판단 근거는 기존 복구 snapshot/로그에 남기고 새 조회 CLI는 추가하지 않는다.
-- [ ] 확인한 `notifications/policy.py`·`incidents.py`·`delivery.py`의 현재 조치·잔여 조각 취소를 이 원인의 해소/범위 전환과 연결한다. 이미 구현된 공통 무통지·outbox 엔진을 중복 구현하지 않고 실제 누락 소비자만 보완한다. PRODUCT의 계획/프로젝트 차단 해제와 ARCHITECTURE의 원인 code·프로젝트 복구 절에는 실제 동작·호환 판정을 통합한다.
+- [x] 확인한 `loop_manager_internal/recovery/recovery_runtime.py`의 원인/최종 scope 결정, `scoped_blocking.py`의 단일 code-scope 검증과 plan/project 저장, `recovery/block_service.py` 및 `execution/execution_workspace_handler.py`의 실패 전달을 대조한다. G-322의 판정과 현재 자원 관계로 plan/project 결과를 명시적으로 연결하고 기존 project 원인을 단순히 plan으로 재분류하지 않는다. 필요한 구분은 기존 호환 저장·감사 구조 안에서 구현하며 비호환 schema나 범용 새 상태 모델을 도입하지 않는다.
+- [x] 확인한 `recovery/scope_reconciliation.py:resume_project_block_if_safe()`·`project_block_service.py`와 `storage/recovery_state.py:resolve_rebase_block()`·`execution_checkpoint_state.py`의 원인 일치·CAS·감사를 재사용한다. 잔여 작업 차단과 프로젝트 gate 축소, 해소된 확인/게시 요청 처리를 함께 확정하고 무관한 차단 row·현재 승인·실패 근거를 덮어쓰지 않는다. `project_blocked_recovery.py`의 기존 재평가와 충돌하거나 과거 요청이 원인을 재생하지 않도록 소비 경계를 연결한다.
+- [x] 확인한 `application/task_scheduling.py`, `storage/task_calls.py`, `catalog/project_selection.py`와 `recovery/blocked_plan_reconciliation.py`의 기존 작업 lease·관리 개수·dependency 선택을 사용한다. 새로운 배정기·한도·polling이나 G-297의 admission/명세 drain·재시도 구조를 만들지 않는다. 원인·대기 대상·충돌 자원과 scope 판단 근거는 기존 복구 snapshot/로그에 남기고 새 조회 CLI는 추가하지 않는다.
+- [x] 확인한 `notifications/policy.py`·`incidents.py`·`delivery.py`의 현재 조치·잔여 조각 취소를 이 원인의 해소/범위 전환과 연결한다. 이미 구현된 공통 무통지·outbox 엔진을 중복 구현하지 않고 실제 누락 소비자만 보완한다. PRODUCT의 계획/프로젝트 차단 해제와 ARCHITECTURE의 원인 code·프로젝트 복구 절에는 실제 동작·호환 판정을 통합한다.
 
 ## Validation
 
@@ -46,11 +46,12 @@ R-055 W04–W06에 따라 workspace 소유권 문제의 실제 영향 범위를 
 ## Progress
 
 - [x] revision `26140c614cf5881242ce8e3abbcdd060d6cd68c6`의 R-055 W04–W06·R-091·R-053과 고정 project scope·깨끗한 예약 해제·기존 작업별 선택/복구/통지 경계를 정적으로 대조했다. 구현·테스트·verify를 실행하지 않았다.
-- [x] 첫 구현 단위: `plan_recovery.workspace_ownership_isolated()`에 완전한 공유 metadata·선택 branch/ref/등록·기본 checkout 연결·다른 자원 불변 검사를 추가했다. 선택 자원의 설명되지 않은 파일·index·operation은 소유권 승인과 구별하고, 공유 근거 누락·변경·다른 worktree의 같은 branch 사용에는 범위를 축소하지 않는다. 호출자는 신뢰할 수 있는 대상 연결 baseline과 예약 lease를 제공하고 writer 종료·최종 CAS를 별도로 확인해야 한다.
-- [x] `workspace_ownership_uncertain`의 기존 project scope를 유지하며 고정 plan scope인 `workspace_ownership_local`과 기존 typed recovery 원인으로의 호환 연결을 추가했다. 이 단계에서는 실행·프로젝트 차단 재평가 소비자를 연결하지 않았으므로 실제 차단/재개 동작은 아직 바뀌지 않는다.
-- [x] 프로젝트 Python `python3`와 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 `tests.test_scoped_blocking.WorkspaceOwnershipImpactTests`의 4개 test 및 `tests.test_scoped_blocking.ScopedBlockingGateTests.test_reason_mapping_and_atomic_plan_project_records`의 1개 test를 실행해 모두 통과했다. 전체 verify·integration·Agent 실행은 하지 않았다.
-- [ ] 실제 영향 범위 판정의 실행/재평가 소비자 연결·호환 차단 저장과 기존 프로젝트 차단의 원자적 축소/해제. 기존 다른 계획 원인·checkpoint generation·요청·감사를 보존하는 전환과 실패/경쟁/재시작 회귀가 남아 있다.
-- [ ] 요청·독립 선택·알림 소비의 최소 unit 회귀 및 제품/설계 정합성
+- [x] 복구점 `9f5287f1c91cc613b54243e7f6b86317ea222c00`에서 공유 metadata·branch/ref/등록의 독립성 판정과 고정 plan 원인 `workspace_ownership_local`을 보존했다. 기존 `workspace_ownership_uncertain`의 project 의미는 유지했다. 해당 단계의 판정 4개·단일 code-scope/저장 1개 unit이 통과했다.
+- [x] 실행 실패와 기존 프로젝트 차단의 재평가에 판정을 연결했다. 예약 lease·실제 writer 종료/미시작을 먼저 확인하고 외부 관측 뒤 작업·프로젝트/계획 원인·복구 기록·게시 요청·checkpoint generation·자원 claim을 짧은 transaction에서 다시 확인한다. 잔여 plan block/추가 hold와 감사 저장 후 project gate를 해제하며 독립 승인·질문·Review block row와 recovery snapshot은 보존한다.
+- [x] 같은 입력의 계획 재평가는 일반 질문/입력 처리보다 추가 hold를 먼저 해소하고 G-322 복구기를 재사용한다. 단독 원인 해소는 저장 단계로 복원하고 기존 recovery admission·관리 한도를 거친다. READY 선택과 활성화도 같은 충돌 자원 검사를 사용한다. 미착수 READY claim은 호출/미종료 invocation/게시 소유가 없을 때만 영향 대기로 구분하고, 종료 불명 호출 자리와 실제 소유 예약은 보존한다.
+- [x] 소유권 차단만으로 기록된 후보·verify/Review·session·실패 근거를 지우지 않으며, 해소된 원인의 게시 요청과 Telegram 잔여 조각만 종료한다. 원래 요청과 scope 전환 근거·충돌 대기 claim은 checkpoint 감사에 남긴다. PRODUCT의 차단 해제와 ARCHITECTURE의 프로젝트 복구 계약을 구현과 함께 갱신했다.
+- [x] 프로젝트 Python `python3`와 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 workspace 실행 class 10개, 소유권 연결 신규 unit 9개, 알림 연결 unit 1개와 기존 scope/선택/예약/관리 한도의 관련 개별 회귀를 실행했다. 기존 예약 복구 class 20개는 최초 요청 부재 처리 오류 수정 후 같은 명령으로 재실행해 통과했다. 독립 질문 보존의 초기화 순서 오류도 동일 개별 명령 재실행으로 통과했으며 미해결 targeted 실패는 없다. gate 삭제 직후 실패의 rollback·재개, checkpoint/공유 상태 경쟁, 관측 중 원인 교체, A/C/D 보류와 B 선택·D 활성화 거부, 저장 단계 재개·admission 및 후보/감사 보존을 확인했다.
+- [x] `scripts/verify.json`의 unittest/launcher·독립 수집·compile 계약과 기존 `scripts/verify-inputs.json`의 코드/테스트 glob을 유지했다. 새 검증 파일·의존성은 추가하지 않았다. 전체 verify·프로젝트 전체 lint/build/type check와 Windows native 검증은 Worker에서 실행하지 않았으며 Manager의 전체 검증·Review가 남아 있다. 목록 밖 입력의 미소비를 확정하지 않아 VERIFY_INPUT_EXCLUSIONS는 선언하지 않는다.
 
 ## Decision Log
 

@@ -7,13 +7,14 @@ from dataclasses import asdict
 import re
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.git.workspace import validate_reserved_worktree_history, validate_registered_remote, reserved_rebase_before_head
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.agents.agent_scope_decision import _same_local_snapshot
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
 import sys
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery import checkpoint_ownership
-from loop_manager_internal.recovery.plan_recovery import ReservedPullRequestCompletion, reserved_workspace_ownership
+from loop_manager_internal.recovery.plan_recovery import ReservedPullRequestCompletion, reserved_workspace_ownership, workspace_ownership_isolated
 from loop_manager_internal.storage.task_calls import CallDeferred
 from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
@@ -741,6 +742,7 @@ class WorkspaceHandler:
         workspace_ownership = int(catalog_plan['workspace_owned'] if catalog_plan else 0)
         workspace_owned = workspace_ownership == self.ports.contract.WORKSPACE_OWNED
         workspace_reserved = workspace_ownership == self.ports.contract.WORKSPACE_RESERVED
+        identity_validated = False
         try:
             if plan_id is None:
                 raise self.ports.contract.WorkspaceOwnershipError('활성 ExecPlan 경로에서 ID를 확인할 수 없습니다.')
@@ -753,6 +755,7 @@ class WorkspaceHandler:
                 branch,
                 worktree,
             )
+            identity_validated = True
             self._workspace_boundary(plan_id, row, pending=True)
             remote_start = None
             remote_observed = None
@@ -1039,10 +1042,42 @@ class WorkspaceHandler:
                                     detail=f'원격 인수 중 실행 상태가 변경됐습니다: {error}')
         except self.ports.contract.WorkspaceOwnershipError as error:
             workspace_error = f"관리 workspace 소유권/복구 검증 실패: {error}"
-            outcome = self.ports._recover(
-                RecoveryReason.OWNERSHIP_UNCERTAIN, workspace_error,
-                from_revision=True,
-            )
+            reason = BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN
+            expected_checkpoint = self.ports.checkpoint.get(self.ports.identity.repo, plan_id) if self.ports.checkpoint else None
+            try:
+                if identity_validated and reservation_owner is not None and self.ports.checkpoint is not None and catalog_plan['agent_snapshot']:
+                    baseline = GitSnapshot.deserialize(catalog_plan['agent_snapshot'])
+                    observed = self.ports.capture_git_snapshot(worktree)
+                    if (workspace_ownership_isolated(baseline, observed,
+                            repo_path=self.ports.identity.repo_path, worktree=worktree,
+                            branch=branch, base=self.ports.identity.base)
+                            and self.ports.capture_git_snapshot(worktree) == observed):
+                        reason = BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL
+            except (RuntimeError, OSError, ValueError, TypeError, KeyError):
+                pass
+            with runtime_state._transaction(self.ports.state.connection):
+                if reservation_owner is not None:
+                    reservation_owner.check()
+                self.ports.state.check()
+                if (dict(self.ports.state.active_execplan(self.ports.identity.repo)) != dict(catalog_plan)
+                        or (self.ports.checkpoint and self.ports.checkpoint.get(
+                            self.ports.identity.repo, plan_id) != expected_checkpoint)):
+                    return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
+                                            detail='소유권 차단 관측 중 작업/checkpoint가 변경됐습니다.')
+                if reason is BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL:
+                    self.ports.checkpoint.record(self.ports.identity.repo, plan_id,
+                        expected_generation=expected_checkpoint.generation,
+                        operation=expected_checkpoint.operation, expected_head=expected_checkpoint.expected_head,
+                        target_base_oid=expected_checkpoint.target_base_oid,
+                        observed_remote_oid=expected_checkpoint.observed_remote_oid,
+                        snapshot={**(expected_checkpoint.snapshot or {}), 'workspace_scope_audit': [
+                            *(expected_checkpoint.snapshot or {}).get('workspace_scope_audit', ()),
+                            {'scope': 'plan', 'plan_id': plan_id, 'branch': branch, 'worktree': str(worktree),
+                             'baseline': baseline.serialize(), 'observation': observed.serialize()}]})
+                outcome = self.ports._recover(
+                    RecoveryReason.OWNERSHIP_UNCERTAIN, workspace_error,
+                    from_revision=True, final_block_reason=reason,
+                )
             self.ports.operation_print(workspace_error, file=sys.stderr)
             return outcome
         except RecoveryFailure as error:

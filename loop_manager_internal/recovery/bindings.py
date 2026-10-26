@@ -102,6 +102,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_scope_reconciliation_effects_resume_plan_blocks', recovery_adapter._scope_reconciliation_effects_resume_plan_blocks,
         lambda: recovery_adapter.ScopeReconciliationEffectsResumePlanBlocksEffects(
+            _scope_reconciliation_effects_resume_project_block_if_safe=assembly.callback('_scope_reconciliation_effects_resume_project_block_if_safe'),
             ROOT=assembly.value('ROOT'),
             _blocked_plan_reconciliation_effects=assembly.callback('_blocked_plan_reconciliation_effects'),
             _clear_active_in_current_transaction=assembly.callback('_clear_active_in_current_transaction'),

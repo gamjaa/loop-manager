@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 import sqlite3
 import hashlib
 import json
@@ -184,6 +185,27 @@ def plan_block(
         "SELECT * FROM execplan_blocks WHERE repo = ? AND plan_id = ?",
         (repo, plan_id),
     ).fetchone()
+
+
+def workspace_held_resources(connection, repo):
+    """Return residual workspace owners, including a hold beside another cause."""
+    ids = {row[0] for row in connection.execute(
+        "SELECT plan_id FROM execplan_blocks WHERE repo=? AND reason_code=?",
+        (repo, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL.value))}
+    for row in connection.execute('SELECT plan_id,snapshot FROM execution_checkpoints WHERE repo=?', (repo,)):
+        saved = json.loads(row['snapshot'] or '{}')
+        if saved.get('workspace_ownership_hold'):
+            ids.add(row['plan_id'])
+    rows = connection.execute('SELECT plan_id,status,workspace_owned,branch,worktree FROM exec_plans WHERE repo=?', (repo,))
+    return tuple(dict(row) for row in rows if row['plan_id'] in ids
+                 or row['workspace_owned'] and row['status'] in {'IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING','PLAN_BLOCKED','PR_OPEN'})
+
+
+def workspace_resource_conflicts(owners, *, plan_id, branch, worktree):
+    return tuple(owner for owner in owners if owner['plan_id'] == plan_id
+                 or branch and branch == owner['branch']
+                 or worktree and owner['worktree']
+                 and Path(worktree).resolve() == Path(owner['worktree']).resolve())
 
 
 def project_block(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
