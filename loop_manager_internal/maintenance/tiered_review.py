@@ -64,6 +64,10 @@ def digest(value) -> str:
     return hashlib.sha256(code_index.encode(value).encode()).hexdigest()
 
 
+def _review_scope(unit):
+    return {key: value for key, value in unit.items() if key not in {"session_id", "error"}}
+
+
 def plan_content_hash(contents: bytes) -> str:
     """Keep ExecPlan identity stable across the publication path's LF/CRLF conversion."""
     return hashlib.sha256(contents.replace(b"\r\n", b"\n")).hexdigest()
@@ -427,11 +431,11 @@ class TieredReviewRepository:
                 "FROM tiered_maintenance_result_audit WHERE repo = ? AND digest = ?",
                 (repo, old_unit["digest"])).fetchone()
             try:
-                if (audit is None or audit[0] != ROOT_RESULT_PROTOCOL or json.loads(audit[1]) != old_unit
+                if (audit is None or audit[0] != ROOT_RESULT_PROTOCOL or _review_scope(json.loads(audit[1])) != old_unit
                         or audit[4] != assessment["source_revision"]
                         or json.loads(audit[3]) != json.loads(row[1])):
                     return
-            except (TypeError, ValueError):
+            except (AttributeError, TypeError, ValueError):
                 return
             try:
                 self.complete(repo, new_unit, audit[2], lambda _path: b"")
@@ -465,9 +469,10 @@ class TieredReviewRepository:
         expected = (next((candidate for candidate in self.units(active)
                           if candidate["digest"] == unit.get("digest")), None)
                     if active is not None else None)
-        supplied = {key: value for key, value in unit.items() if key not in {"session_id", "error"}}
+        supplied = _review_scope(unit)
         if active is None or expected != supplied:
             raise TieredReviewError("정밀 결과의 scope가 현재 assessment와 다릅니다.")
+        unit = supplied
         is_root = unit.get("kind") == "root_placement"
         if is_root:
             value = parse_root_review_result(repo, active, unit, output, current=True)
@@ -516,7 +521,10 @@ class TieredReviewRepository:
                 is_root = unit.get("kind") == "root_placement"
                 expected_protocol = ROOT_RESULT_PROTOCOL if is_root else RESULT_PROTOCOL
                 expected_scope = unit if is_root else unit["parts"]
-                if (audit is None or audit[0] != expected_protocol or json.loads(audit[1]) != expected_scope
+                stored_scope = json.loads(audit[1]) if audit is not None else None
+                if is_root and isinstance(stored_scope, dict):
+                    stored_scope = _review_scope(stored_scope)
+                if (audit is None or audit[0] != expected_protocol or stored_scope != expected_scope
                         or not isinstance(audit[4], str) or not audit[4].strip()
                         or is_root and audit[4] != assessment["source_revision"]):
                     raise ValueError("result audit scope differs")

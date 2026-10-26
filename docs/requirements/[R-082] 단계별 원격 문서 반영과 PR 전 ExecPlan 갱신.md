@@ -2,7 +2,7 @@
 
 ## Summary
 
-명세 변경의 작업 구성·개정은 프로젝트 일반 Planner에 모으고 원격 게시·catalog·DB 반영을 현재 작업 재개보다 먼저 확정한다. ExecPlan·코드 변경만으로 Planner를 호출하지 않으며 `PLAN_BLOCKED`를 포함한 관련 작업은 PR 등록 전까지 같은 ID·작업물·기록을 보존해 갱신한다. 개정 후에도 차단은 원인별 근거로 재평가하며 문서 변경 자체를 해제로 간주하지 않는다. Worker는 선택 작업 본문과 허용 설계 문서만 수정하고, 최신 조건·진행 기록·문서 충돌을 구분해 필요한 구현·검증·Review를 이어간다. 최신 base의 무관한 Requirement·ExecPlan 채택만으로 Worker·verify·Reviewer를 재호출하지 않고 R-072의 단계별 성공 재사용을 적용한다. rebase 시작에는 소유 자원·보존 조건을 확인하고 Worker 종료와 Git 완료 후 각각 실제 변경·최종 선언을 검증한다. 오래된 시작 HEAD나 base에만 유입된 문서를 Worker 수정으로 판정하지 않는 비교·복구 기준은 R-055를 따른다. 마지막 연결 작업 Merge 뒤에는 해당 Requirement를 바로 재확인한다. 보류 중인 선행 ExecPlan에 의존하는 신규·허용 개정도 유효한 관계이면 등록하되, 선행의 실제 Merge 전에는 실행하지 않고 기존 보류를 보존한다. 병렬 작업의 신규·후속 배정을 중단하고 실행 중 호출이 반환한 뒤 planning을 반영한다.
+명세 변경의 작업 구성·개정은 프로젝트 일반 Planner에 모으고 원격 게시·catalog·DB 반영을 현재 작업 재개보다 먼저 확정한다. ExecPlan·코드 변경만으로 Planner를 호출하지 않으며 `PLAN_BLOCKED`를 포함한 관련 작업은 PR 등록 전까지 같은 ID·작업물·기록을 보존해 갱신한다. 개정 후에도 차단은 원인별 근거로 재평가하며 문서 변경 자체를 해제로 간주하지 않는다. 일반·유지보수 검토 범위에서는 session·이전 error를 제외하되 실제 입력 변경의 감지와 검증·게시 보호 조건을 유지한다. Worker는 선택 작업 본문과 허용 설계 문서만 수정하고, 최신 조건·진행 기록·문서 충돌을 구분해 필요한 구현·검증·Review를 이어간다. 최신 base의 무관한 Requirement·ExecPlan 채택만으로 Worker·verify·Reviewer를 재호출하지 않고 R-072의 단계별 성공 재사용을 적용한다. rebase 시작에는 소유 자원·보존 조건을 확인하고 Worker 종료와 Git 완료 후 각각 실제 변경·최종 선언을 검증한다. 오래된 시작 HEAD나 base에만 유입된 문서를 Worker 수정으로 판정하지 않는 비교·복구 기준은 R-055를 따른다. 마지막 연결 작업 Merge 뒤에는 해당 Requirement를 바로 재확인한다. 보류 중인 선행 ExecPlan에 의존하는 신규·허용 개정도 유효한 관계이면 등록하되, 선행의 실제 Merge 전에는 실행하지 않고 기존 보류를 보존한다. 병렬 작업의 신규·후속 배정을 중단하고 실행 중 호출이 반환한 뒤 planning을 반영한다.
 
 ## Context
 
@@ -81,6 +81,7 @@ Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소
 
 ### ExecPlan 갱신 경계
 
+- 일반·유지보수 Planner의 검토 범위 일치에서는 호출 재개용 session·이전 호출 error를 제외하고 실행 기록으로 보존한다. 기존 결과에도 같은 기준을 적용하되 실제 문서·코드·지침·검토 identity·원문 근거의 검증은 유지한다. 작업 문서·관련 명세가 바뀌면 기존 변경 감지와 원인별 차단 재검증을 수행하며 게시 권한·소유권·동시 변경 보호는 완화하지 않는다.
 - Worker는 선택된 ExecPlan의 구현·검증 기록 등 본문만 수정한다. frontmatter와 다른 ExecPlan, 활성·archive를 포함한 모든 Requirement는 수정하지 않는다. Worker는 현재 작업에 필요한 PRODUCT·ARCHITECTURE·FUTURE_IDEAS를 수정할 수 있다. Requirement 추가·삭제·rename·이동과 archive 후보 지정에 따른 Worker 수정 예외도 허용하지 않는다. frontmatter 변경은 Planner·Manager가 검증하고 공식 선언·catalog·DB에 반영한 뒤 실행 입력으로 사용한다.
 - 기존 source 경로의 rename 조회 호환은 R-071대로 유지한다. 누락·모호한 source나 잘못된 선언은 Worker 시작 전에 Manager가 확정 가능한 규칙으로 정합화하고, 확정할 수 없으면 원인과 작업을 보존해 기존 사용자 판단·복구 경로로 보류한다. ExecPlan 변경만으로 Planner를 호출하거나 Worker의 경로 수정·metadata 비교 완화로 우회하지 않는다. 교정은 기존 구현·문서·테스트·실행 기록을 보존하며 완료·verify 성공·차단 해제를 뜻하지 않는다. 소유 rebase의 시작·중간 worktree에 남은 과거 선언은 아래 검사 시점을 따르며 최신 target 선언과의 불일치만으로 rebase나 충돌 교정 진입을 막지 않는다.
 - 일반 Planner는 PR 등록 전인 ExecPlan을 관련 Requirement 변경에 맞춰 갱신한다. `PLAN_BLOCKED`도 현재 선언·소유권과 실제 PR 부재가 확인되면 일반 개정 대상에 포함하며, 삭제·참조 복구 대상인지 여부나 차단 상태만으로 후보에서 제외하지 않는다. 최초 실행 여부, READY 복귀, 기존 branch·worktree·세션 또는 원격 checkpoint 존재만으로도 제외하지 않으며 수동 소유·실행 중 writer·원격 게시 권한 등 독립 보호 조건은 유지한다.
@@ -203,6 +204,8 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 - 문서 변경 또는 rebase 완료만으로 사용자 승인 대기, 명세 충돌, 독립적인 차단·실패 원인이나 실패·Worker level 이력을 초기화하지 않는다.
 
 ## Acceptance Criteria
+
+- 일반·유지보수 검토 결과는 session·이전 error만 달라져도 유효한 원문·identity·범위를 보존해 재사용한다. 기존 저장 결과에도 적용하며 실제 범위·원문·revision 불일치는 거부하고, 작업 문서·관련 명세 변경에 따른 차단 재검증과 게시 권한·소유권 검사는 유지한다.
 
 - 위 Planner 실행 조건만 자동 호출을 시작한다. 다른 독립적인 호출 조건이 없는 ExecPlan 변경만의 경우와 코드·테스트·설정 전용 변경의 READY 있음·없음·dependency 대기 조합에서 일반·점검·작업별 문서 영향 Planner가 호출되지 않으며, Manager 선언 검증과 Worker의 최신 코드·작업 조건 반영이 유지된다.
 - 조건이 바뀐 ExecPlan의 구현 적합성은 기존 Worker 세션에서 필요한 보완과 함께 확인한다. 순수 수행 기록·이미 확인한 조건은 재호출하지 않고 새 조건을 확인하지 않은 채 과거 verify·Review 성공으로 게시하지 않는다.

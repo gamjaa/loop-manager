@@ -572,7 +572,12 @@ class TieredRootReviewTest(MaintenancePlanningCase):
                         [dict(reviews[0], references=[{"path": ".", "excerpt": "forged root citation"}]), *reviews[1:]]):
             with self.subTest(invalid=invalid), self.assertRaises(tiered_review.TieredReviewError):
                 repository.complete(str(self.repo), unit, output(invalid), lambda _path: b"")
-        repository.complete(str(self.repo), unit, output(reviews), lambda _path: b"")
+        repository.session(str(self.repo), unit, "resumed-root-session")
+        repository.fail(str(self.repo), unit, "previous-call-error")
+        pending = repository.pending(str(self.repo), assessment)
+        self.assertEqual(pending["session_id"], "resumed-root-session")
+        self.assertEqual(pending["error"], "previous-call-error")
+        repository.complete(str(self.repo), pending, output(reviews), lambda _path: b"")
         evidence = repository.evidence(str(self.repo), 1, revision)
         self.assertEqual(evidence["receipts"], [])
         self.assertEqual({item["path"] for item in evidence["root_reviews"]}, {"docs", "scratch.png"})
@@ -584,6 +589,19 @@ class TieredRootReviewTest(MaintenancePlanningCase):
         self.assertEqual(audit[0], tiered_review.ROOT_RESULT_PROTOCOL)
         self.assertEqual(audit[1], revision)
         self.assertEqual(json.loads(audit[2]), unit)
+        legacy_scope = {**unit, "session_id": "old-session", "error": "old-error"}
+        self.connection.execute("UPDATE tiered_maintenance_result_audit SET scope_json = ? WHERE digest = ?",
+                                (json.dumps(legacy_scope), unit["digest"]))
+        restarted = tiered_review.TieredReviewRepository(self.connection)
+        self.assertEqual(restarted.evidence(str(self.repo), 1, revision), evidence)
+        for field, value in (("placements", []), ("unexpected", None)):
+            with self.subTest(field=field):
+                self.connection.execute("UPDATE tiered_maintenance_result_audit SET scope_json = ? WHERE digest = ?",
+                                        (json.dumps({**legacy_scope, field: value}), unit["digest"]))
+                with self.assertRaises(tiered_review.TieredReviewError):
+                    restarted.evidence(str(self.repo), 1, revision)
+        self.connection.execute("UPDATE tiered_maintenance_result_audit SET scope_json = ? WHERE digest = ?",
+                                (json.dumps(legacy_scope), unit["digest"]))
         self.connection.execute("UPDATE tiered_maintenance_result_audit SET source_revision = 'stale' WHERE digest = ?",
                                 (unit["digest"],))
         with self.assertRaises(tiered_review.TieredReviewError):

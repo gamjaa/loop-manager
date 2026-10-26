@@ -643,6 +643,8 @@ Manager는 최신 원격 추적 파일의 경로·내용 hash·mode와 분석 �
 
 루트 protocol·scope audit는 모듈 receipt와 분리되며, 정적 inventory나 모듈 결과만으로 루트 완료를 만들지 않는다. 같은 guidance·revision의 검증된 파일별 root review 또는 이전 tiered 성공 결과만 재사용한다. 이전 tiered 성공의 root review는 성공 row에 보존된 루트 지침 hash가 현재 지침 identity와 같고 source revision도 일치할 때만 재사용한다. legacy 성공 row에 루트 조사 근거 또는 지침 identity가 없으면 재사용하지 않고 필요한 루트 unit을 다시 검토한다.
 
+일반 planning의 검토 지문은 원격 파일 내용·지침으로 계산하며 DB의 호출 session·error를 포함하지 않는다. 유지보수 unit의 `session_id`·`error`도 실행 기록으로만 보존하고, 루트 결과의 저장·재검증·기존 assessment 결과 연결에서는 이 두 필드를 제외한 unit을 scope로 사용한다. 기존 audit의 `scope_json`에 두 필드가 포함돼 있어도 원문·정규화 결과와 protocol·source revision·나머지 scope가 모두 유효하면 재사용하며 원래 audit는 덮어쓰지 않는다. 다른 추가 필드·실제 scope 변경·원문 불일치는 계속 거부한다. 작업 문서·참조 명세의 변경 감지와 차단 재평가 입력, 게시 직전 실행·소유권 CAS는 이 범위 정규화와 분리한다.
+
 이동 후보의 링크는 후보 조사 hash와 계획 경로·본문 hash를 별도 저장하고 새 계획 또는 비종료 계획의 보존·검증 조건을 확인한다. 최종 Planner disposition에서는 후보 연결을 임시 보관하고, 전체 planning result 검증이 통과한 뒤 신규 계획 연결에만 ID allocation을 적용하며 allocation의 원본 경로가 임시 계획 경로와 일치하는지 확인한다. 기존 계획 연결은 allocation의 ID가 같아도 원래 ID·경로를 보존한다.
 
 READY barrier dependency 편집이 반영된 최종 계획 ID·경로·본문 hash에 연결한다. collect·intent 저장은 작업 worktree의 최종 계획 본문을 검사하며 promote는 게시 revision의 blob과 catalog의 비종료 계획을 다시 대조한 뒤에만 root review를 성공 baseline에 포함한다. 필수 도구·문서 경로 보호와 기존 cycle·한 번 평가 cadence는 `validate_root_reviews`와 기존 publication 경계에 남긴다.

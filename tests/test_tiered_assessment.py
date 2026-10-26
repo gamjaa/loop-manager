@@ -273,7 +273,8 @@ class TieredAssessmentTest(PlanningCase):
             ("/repo", old_unit["digest"], code_index.encode(result)))
         self.connection.execute("INSERT INTO tiered_maintenance_result_audit VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("/repo", old_unit["digest"], tiered_review.ROOT_RESULT_PROTOCOL, self.sha,
-             code_index.encode(old_unit), output, code_index.encode(result)))
+             code_index.encode({**old_unit, "session_id": "old-session", "error": "old-error"}),
+             output, code_index.encode(result)))
 
         def parse_in_transaction(*_args, **_kwargs):
             self.assertTrue(self.connection.in_transaction)
