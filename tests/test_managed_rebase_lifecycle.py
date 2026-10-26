@@ -9,6 +9,7 @@ from tests.support.recovery_boundary import RecoveryBoundary
 
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
+import base64
 import hashlib
 import json
 import os
@@ -682,7 +683,15 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 self.assertEqual(record['target'], target)
                 self.assertTrue(record['originals'])
                 self.assertTrue(record['blobs'])
-                self.assertTrue(record['history'], 'later replay must preserve earlier originals')
+                if documents == 'proven':
+                    self.assertEqual(record['history'], [], 'one document conflict has no earlier replay')
+                    for label, text in (('before', original_plan.replace('[ ]', '[x]')),
+                                        ('base', expected_plan)):
+                        preserved = record['originals'][plan_path][label]
+                        self.assertEqual(preserved['blob'], hashlib.sha256(text.encode()).hexdigest())
+                        self.assertEqual(base64.b64decode(record['blobs'][preserved['blob']]), text.encode())
+                else:
+                    self.assertTrue(record['history'], 'later replay must preserve earlier originals')
                 self.assertEqual(events, [], 'document resolution never invokes an Agent')
                 self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
                 effects.validation.verify.assert_not_called()
