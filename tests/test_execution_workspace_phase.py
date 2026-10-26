@@ -21,18 +21,21 @@ class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
              target: ('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047')}, {}, {})
         self.effects = replace(self.effects, checkpoint=ExecutionCheckpointRepository(self.connection))
         self.handler.effects = self.effects
-        self.connection.execute('UPDATE exec_plans SET workspace_owned=2,agent_snapshot=?', (baseline.serialize(),))
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2,agent_snapshot=NULL')
         self.connection.commit()
         self.state.expected = self.repository.projected('repo')
         self.effects.workspace._plan_id_from_path.return_value = 'G-047'
         self.effects.workspace.make_worktree.side_effect = lm.WorkspaceOwnershipError('missing creation proof')
-        for current, expected in (
-            (baseline, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL),
-            (replace(baseline, config={'local:core.hooksPath': ('unknown',)}),
+        changed = replace(baseline, config={'local:core.hooksPath': ('current',)})
+        for observations, expected in (
+            ([baseline] * 20, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL),
+            ([changed] * 20, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL),
+            ([baseline, changed] * 10, BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
+            ([replace(baseline, shared_metadata_complete=False)] * 20,
              BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
         ):
             with self.subTest(expected=expected), mock.patch.object(Path, 'is_dir', return_value=True):
-                self.effects.agent.capture_git_snapshot.return_value = current
+                self.effects.agent.capture_git_snapshot.side_effect = observations
                 self.effects.blocking.block_active_execplan_from_revision.reset_mock()
                 result = self.handler.prepare()
                 self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)

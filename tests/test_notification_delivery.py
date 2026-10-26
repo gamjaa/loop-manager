@@ -80,6 +80,152 @@ class WorkspaceOwnershipDeliveryTest(ScopedGateFixture, unittest.TestCase):
         self.assertTrue(ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-001').snapshot['workspace_ownership_hold'])
 
 
+class PrCreationPublicationTest(unittest.TestCase):
+    def prepare(self, *, proof=False):
+        from tests.support.execution import execution_fixture
+        case = execution_fixture(self)
+        case.review_context()
+        from dataclasses import replace
+        definition = replace(case.handler._definition_snapshot, complexity='low', risk='low')
+        case.handler._definition_snapshot = definition
+        notifications.configure_session(case.connection, enabled=True)
+        case.state.update_project(case.repo, phase='PUBLISHING',
+            definition_snapshot=definition.serialize(), review_result='PASS',
+            review_token=definition.review_token('base', 'base'),
+            publication_token=definition.publication_token('base', 'base'))
+        if proof:
+            notifications.record_pr_review_candidate(case.connection, case.repo, 'G-047',
+                publication_token=definition.publication_token('base', 'base'),
+                review_input_identity='initial')
+            case.connection.commit()
+        return case, definition
+
+    def publish(self, case):
+        with notifications.immediate_delivery(case.connection, 'token', 'chat', case.repo), \
+                mock.patch.object(delivery, 'send_telegram') as sent:
+            result = case.handler._publish_new_pull_request(case.context(), case.state.row())
+        self.assertEqual(result.kind.value, 'success')
+        self.assertTrue(case.connection.execute("SELECT 1 FROM notification_outbox WHERE event_type='pr_created'").fetchone(),
+            (dict(case.connection.execute('SELECT * FROM exec_plans').fetchone()),
+             [dict(row) for row in case.connection.execute('SELECT * FROM pr_creation_publications')]))
+        return sent
+
+    def test_creation_without_diff_proof_runs_publication_outbox_and_claim(self):
+        case, _ = self.prepare()
+        sent = self.publish(case)
+        sent.assert_called_once()
+        self.assertEqual(case.connection.execute('SELECT COUNT(*) FROM pr_review_candidates').fetchone()[0], 0)
+        original = dict(case.connection.execute("SELECT * FROM notification_outbox WHERE event_type='pr_created'").fetchone())
+        self.assertIsNotNone(original['sent_at'])
+        self.assertEqual(json.loads(original['payload'])['notice_kind'], 'creation')
+        # 재시작 연결에서도 생성 이력과 완료된 Outbox를 그대로 재사용한다.
+        restarted = sqlite3.connect(':memory:')
+        self.addCleanup(restarted.close)
+        case.connection.backup(restarted)
+        restarted.row_factory = sqlite3.Row
+        notifications.configure_session(restarted, enabled=True)
+        with restarted:
+            notifications.enqueue_current_project_events(restarted, case.repo)
+            notifications.enqueue_current_project_events(restarted, case.repo)
+        self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='pr_created'").fetchone()[0], 1)
+        self.assertEqual(notifications.dispatch_new_pr_notifications(restarted, 'token', 'chat', case.repo, adapter=sent), 0)
+        sent.assert_called_once()
+
+    def test_creation_retry_and_terminal_cancel_preserve_audit_and_cursor(self):
+        for terminal in ('MERGED', 'PLAN_BLOCKED', None):
+            with self.subTest(terminal=terminal):
+                case, _ = self.prepare()
+                with notifications.immediate_delivery(case.connection, 'token', 'chat', case.repo), \
+                        mock.patch.object(delivery, 'send_telegram', side_effect=RuntimeError('offline')):
+                    case.handler._publish_new_pull_request(case.context(), case.state.row())
+                original = dict(case.connection.execute("SELECT * FROM notification_outbox WHERE event_type='pr_created'").fetchone())
+                self.assertEqual(original['attempts'], 1)
+                with case.connection:
+                    case.connection.execute("UPDATE notification_outbox SET rendered_text='confirmed\npending', confirmed_pieces=1")
+                    if terminal:
+                        case.connection.execute('UPDATE exec_plans SET status=?', (terminal,))
+                with notifications.immediate_delivery(case.connection, 'token', 'chat', case.repo), \
+                        mock.patch.object(delivery, '_pieces', return_value=['confirmed', 'pending']), \
+                        mock.patch.object(delivery, 'send_telegram') as sent:
+                    notifications.flush_observed_pr_events(case.connection, case.repo)
+                row = case.connection.execute('SELECT * FROM notification_outbox').fetchone()
+                self.assertEqual(row['payload'], original['payload'])
+                if terminal:
+                    sent.assert_not_called()
+                    self.assertIsNotNone(row['canceled_at'])
+                    self.assertEqual((row['attempts'], row['last_error'], row['confirmed_pieces']),
+                                     (1, original['last_error'], 1))
+                else:
+                    sent.assert_called_once()
+                    self.assertIsNotNone(row['sent_at'])
+                    self.assertEqual(row['confirmed_pieces'], 2)
+
+    def test_existing_publication_distinguishes_new_candidate_and_rebase(self):
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        case, definition = self.prepare(proof=True)
+        sent = self.publish(case)
+        repository = RuntimeStateRepository(case.connection)
+        for head, identity, expected_count in (
+                ('rebased', 'initial', 1), ('changed', 'new-input', 2), ('rebased-again', 'new-input', 2)):
+            snapshot = repository.get(case.repo, 'G-047')
+            repository.transition(case.repo, 'G-047', plan_values={
+                'status': 'PUBLISHING', 'validated_base_sha': 'base',
+                'review_token': definition.review_token('base', head),
+                'publication_token': definition.publication_token('base', head)},
+                project_values={**snapshot.project_values(), 'phase': 'PUBLISHING',
+                    'review_token': definition.review_token('base', head),
+                    'publication_token': definition.publication_token('base', head)}, enqueue=False)
+            notifications.record_pr_review_candidate(case.connection, case.repo, 'G-047',
+                publication_token=definition.publication_token('base', head), review_input_identity=identity)
+            case.connection.commit()
+            repository.open_pull_request(case.repo, pr_head_oid=head)
+            notifications.dispatch_new_pr_notifications(case.connection, 'token', 'chat', case.repo, adapter=sent)
+            self.assertEqual(sent.call_count, expected_count)
+
+    def test_existing_pr_without_proof_is_never_promoted_to_creation(self):
+        case, _ = self.prepare()
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        RuntimeStateRepository(case.connection).open_pull_request(case.repo,
+            pr_url='https://example/pr/existing', pr_head_oid='base')
+        self.assertEqual(case.connection.execute('SELECT COUNT(*) FROM pr_creation_publications').fetchone()[0], 0)
+        self.assertEqual(case.connection.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0], 0)
+
+    def test_recovered_creation_requires_owned_creation_intent_and_sends_once(self):
+        from dataclasses import fields
+        from loop_manager_internal.recovery.pull_request_recovery import (
+            ReconcileExistingPullRequestEffects, reconcile_existing_pull_request)
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        for operation, saved_url, head, expected in (
+                ('pr_create', None, 'base', 1),
+                ('pr_create', 'https://example/pr/1', 'base', 1),
+                ('push', None, 'base', 0),
+                ('pr_create', None, 'other-head', 0)):
+            with self.subTest(operation=operation, saved_url=saved_url, head=head):
+                case, _ = self.prepare()
+                if saved_url:
+                    case.state.update_project(case.repo, pr_url=saved_url)
+                checkpoints = ExecutionCheckpointRepository(case.connection)
+                checkpoints.record(case.repo, 'G-047', expected_generation=0,
+                    operation=operation, expected_head='base', target_base_oid='base',
+                    observed_remote_oid='base', snapshot={})
+                effects = ReconcileExistingPullRequestEffects(**{
+                    field.name: mock.Mock(return_value=None) for field in fields(ReconcileExistingPullRequestEffects)})
+                effects._plan_id_from_path.return_value = 'G-047'
+                effects.project_execplan.side_effect = lambda *_: case.connection.execute('SELECT * FROM exec_plans').fetchone()
+                effects.update_project.side_effect = lambda _conn, repo, **values: loop_manager.update_project(_conn, repo, **values)
+                pr = {'url': 'https://example/pr/1', 'state': 'OPEN', 'headRefOid': head,
+                      'headRefName': 'loop-manager/G-047', 'baseRefName': 'main'}
+                with notifications.immediate_delivery(case.connection, 'token', 'chat', case.repo), \
+                        mock.patch.object(delivery, 'send_telegram') as sent:
+                    reconcile_existing_pull_request(effects, case.connection, Path('/repo'), Path('/state'),
+                        case.repo, case.state.row(), pr)
+                    with case.connection:
+                        notifications.enqueue_current_project_events(case.connection, case.repo)
+                    notifications.flush_observed_pr_events(case.connection, case.repo)
+                self.assertEqual(sent.call_count, expected)
+                self.assertEqual(case.connection.execute('SELECT COUNT(*) FROM pr_creation_publications').fetchone()[0], expected)
+
+
 class TelegramTransportTest(unittest.TestCase):
     def test_send_encodes_payload_and_checks_response(self):
         response = mock.MagicMock()

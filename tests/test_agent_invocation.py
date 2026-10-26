@@ -1257,6 +1257,34 @@ class CommonGuidanceInvocationTests(TestCase):
         self.assertNotIn(path, prompts[1])
         self.assertEqual(len({r.common_guidance.content_hash for r in self.requests}), 1)
 
+    def test_reviewer_invocations_keep_static_rules_in_instruction_and_candidate_facts_in_prompt(self):
+        reviewer_path = self.guidance_module.ROLE_PATHS['reviewer']
+        static_rule = '테스트 command·전체 verify·lint·build·type check를 다시 실행하지 않는다.'
+        self.role_texts[reviewer_path] = static_rule + '\n전달된 결과로 테스트 누락과 회귀를 판단한다.\n'
+        (self.runtime / reviewer_path).write_text(self.role_texts[reviewer_path], encoding='utf-8')
+
+        previous_sessions = {'codex': None, 'claude': None}
+        for provider in ('codex', 'claude'):
+            for invocation_number in range(2):
+                session = previous_sessions[provider] if invocation_number else None
+                prompt = manager.reviewer_prompt(
+                    'main', 'targeted test: PASS', verify_evidence='Manager 전체 verify PASS',
+                )
+                result = self.invoke(
+                    role='reviewer', plan='G-227', task='review', provider=provider,
+                    session=session, prompt=prompt,
+                )
+                self.assertEqual(result.code, 0)
+                request = self.requests[-1]
+                self.assertEqual(request.session_id, session)
+                previous_sessions[provider] = result.session_id
+                self.assertIn(static_rule, request.common_guidance.content)
+                self.assertIn('전달된 결과로 테스트 누락과 회귀를 판단한다.', request.common_guidance.content)
+                self.assertNotIn(static_rule, request.prompt)
+                self.assertIn('targeted test: PASS', request.prompt)
+                self.assertIn('Manager 전체 verify PASS', request.prompt)
+                self.assertNotIn('테스트 command와 scripts/verify를 실행하지 말고', request.prompt)
+
     def test_always_adds_ponytail_only_to_worker_without_plugin_queries_and_records_hash(self):
         self.assertEqual(self.invoke().code, 0)
         selected = self.requests[-1].common_guidance

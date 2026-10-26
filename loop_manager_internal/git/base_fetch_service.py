@@ -256,6 +256,11 @@ def _recorded_project_fetch(
                 input="".join(f"refs/heads/{branch}\n" for branch in sorted(changed)),
             )
             received = _fetched_branch_oids(effects.git, repo) if not result.returncode else None
+            if (received is not None and received.keys() == changed.keys()
+                    and received.get(base, branches[base]) == branches[base]):
+                # 다른 작업 branch는 실제 수신 OID를 기록하고 선택한 base만 고정한다.
+                changed = received
+                branches = {**branches, **received}
             if result.returncode or received != changed:
                 if attempt == 0:
                     refreshed = _remote_branch_oids(effects.git, repo)

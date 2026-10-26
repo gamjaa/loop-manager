@@ -7,7 +7,6 @@ from dataclasses import asdict
 import re
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.git.workspace import validate_reserved_worktree_history, validate_registered_remote, reserved_rebase_before_head
-from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.agents.agent_scope_decision import _same_local_snapshot
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
@@ -1045,8 +1044,8 @@ class WorkspaceHandler:
             reason = BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN
             expected_checkpoint = self.ports.checkpoint.get(self.ports.identity.repo, plan_id) if self.ports.checkpoint else None
             try:
-                if identity_validated and reservation_owner is not None and self.ports.checkpoint is not None and catalog_plan['agent_snapshot']:
-                    baseline = GitSnapshot.deserialize(catalog_plan['agent_snapshot'])
+                if identity_validated and reservation_owner is not None and self.ports.checkpoint is not None:
+                    baseline = self.ports.capture_git_snapshot(worktree)
                     observed = self.ports.capture_git_snapshot(worktree)
                     if (workspace_ownership_isolated(baseline, observed,
                             repo_path=self.ports.identity.repo_path, worktree=worktree,

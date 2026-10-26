@@ -180,6 +180,16 @@ class ProjectService:
                     result = step()
                     report.update(result="다음 경계로 진행" if result is None else result)
             except recovery_runtime.RecoveryFailure as error:
+                if error.reason is recovery_runtime.RecoveryReason.GIT_INPUT_UNCERTAIN:
+                    self.effects._record_project_recovery(self.identity.connection, self.state.repo,
+                                                          error.reason, str(error))
+                    if stage in {'synchronize_pull_requests', 'resume_existing_execution'}:
+                        if self.effects.active_execplan(self.identity.connection, self.state.repo) is None:
+                            with self.identity.connection:
+                                self.effects._clear_active_in_current_transaction(self.identity.connection, self.state.repo)
+                        self.state.row = runtime_state.project_row(self.identity.connection, self.state.repo)
+                        continue
+                    return ProjectStepResult(PROJECT_STEP_TRANSIENT_PAUSE)
                 if error.reason not in recovery_runtime.TRANSIENT | recovery_runtime.RECONCILE:
                     raise
                 self.effects._record_project_recovery(self.identity.connection, self.state.repo,

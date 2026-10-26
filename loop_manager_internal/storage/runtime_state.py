@@ -1511,6 +1511,7 @@ class RuntimeStateRepository:
         self,
         repo: str,
         *,
+        new_pr: bool = False,
         pr_url: str | None = None,
         pr_head_oid: str | None = None,
         publication_remote_oid: str | None = None,
@@ -1537,6 +1538,9 @@ class RuntimeStateRepository:
             values["pr_conflict_head_oid"] = pr_conflict_head_oid
             values["pr_conflict_base_oid"] = pr_conflict_base_oid
         with _transaction(self.connection):
+            if new_pr:
+                from loop_manager_internal.notifications import notifications
+                notifications.record_pr_creation(self.connection, repo, snapshot.plan_id, pr_url)
             result = self.transition_and_clear(repo, snapshot.plan_id, plan_values=values)
             from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
             ManualWorkRepository(self.connection).publish_group(repo,snapshot.plan_id,

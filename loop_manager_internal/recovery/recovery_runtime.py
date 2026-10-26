@@ -37,6 +37,7 @@ class RecoveryReason(str, Enum):
     WORKTREE_RECOVERY_FAILED = "worktree_recovery_failed"
     PUBLICATION_RETRY = "publication_retry"
     REMOTE_SNAPSHOT_RACE = "remote_snapshot_race"
+    GIT_INPUT_UNCERTAIN = "git_input_uncertain"
     BASE_BEHIND = "base_behind"
     CATALOG_CACHE_STALE = "catalog_cache_stale"
     CHECKPOINT_STALE = "checkpoint_stale"
@@ -254,6 +255,9 @@ def decide(
     elif reason is RecoveryReason.TARGETED_TEST_CORRECTION:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.PAUSE if attempts else RecoveryAction.CORRECT
+    elif reason is RecoveryReason.GIT_INPUT_UNCERTAIN:
+        disposition = RecoveryDisposition.CONDITION_WAIT
+        action = RecoveryAction.PAUSE
     elif reason is RecoveryReason.COMMON_DEFECT:
         disposition = RecoveryDisposition.CONDITION_WAIT
         action = RecoveryAction.FINAL_BLOCK

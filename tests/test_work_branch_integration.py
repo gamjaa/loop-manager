@@ -19,6 +19,100 @@ from loop_manager_internal.git import managed_rebase_validation as rebase_policy
 from loop_manager_internal.git import git_adapter
 from loop_manager_internal.recovery import work_branch_integration as integration
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+from tests.support.database import runtime_connection
+
+
+class RemoteIntegrationAnchorTests(unittest.TestCase):
+    def setUp(self):
+        self.connection = runtime_connection()
+        self.addCleanup(self.connection.close)
+        self.connection.execute("UPDATE projects SET origin='owner/repo' WHERE repo='repo'")
+        self.connection.commit()
+        self.store = ExecutionCheckpointRepository(self.connection)
+        self.branch = 'loop-manager/G-047'
+        self.head = '9' * 40
+        self.remote = self.head
+        self.plan = dict(plan_id='G-047', branch=self.branch, worktree='/owned',
+                         publication_remote_oid=None, active_sha='newer-base', pr_url=None,
+                         status='IMPLEMENTING', worker_result=None)
+        self.adoption = dict(version=1, repo='repo', plan_id='G-047',
+                             branch=self.branch, base='main', head=self.head)
+        self.store.record('repo', 'G-047', expected_generation=0, operation=None,
+            expected_head=None, target_base_oid=None, observed_remote_oid=None,
+            snapshot={'remote_adoption': self.adoption, 'audit': 'keep'})
+        self.snapshot = GitSnapshot(self.head, self.branch, {}, {}, {}, {}, {}, {})
+        self.effects = SimpleNamespace(git=mock.Mock(side_effect=self.git),
+            github_repository=lambda url: 'owner/repo',
+            validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+            _blocked_execplan_revision_metadata_error=mock.Mock(return_value=None),
+            capture_git_snapshot=mock.Mock(side_effect=lambda _: self.snapshot))
+        self.ancestor = True
+        self.integration = self.enterContext(mock.patch.object(integration, 'integrate',
+            side_effect=lambda *args: replace(self.snapshot, head='integrated')))
+
+    def git(self, path, *args, **kwargs):
+        if args[0] == 'remote':
+            output = 'https://github.com/owner/repo'
+        elif args[0] == 'fetch':
+            output = ''
+        elif args[0] == 'rev-parse':
+            output = self.remote
+        elif args[0] == 'ls-remote':
+            output = f'{self.remote}\trefs/heads/{self.branch}\n'
+        elif args[:2] == ('merge-base', '--is-ancestor'):
+            if args[2:] == (self.head, self.remote):
+                return subprocess.CompletedProcess([], 0 if self.ancestor else 1, '')
+            return subprocess.CompletedProcess([], 1, '')
+        elif args[0] == 'merge-base':
+            output = 'common-base'
+        else:
+            raise AssertionError(args)
+        return subprocess.CompletedProcess([], 0, output)
+
+    def synchronize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            return integration.synchronize(self.effects, self.connection, Path('/repo'),
+                Path(directory), 'repo', self.plan, self.remote, None)
+
+    def test_adopted_remote_uses_its_own_history_instead_of_newer_base(self):
+        for _ in range(4):
+            self.assertFalse(self.synchronize())
+        saved = self.store.get('repo', 'G-047')
+        self.assertEqual(saved.snapshot['accepted_work_branch'], self.head)
+        self.assertEqual(saved.snapshot['audit'], 'keep')
+        self.integration.assert_not_called()
+        self.assertFalse(any('newer-base' in call.args for call in self.effects.git.call_args_list))
+
+    def test_user_successor_is_integrated_and_checkpoint_keeps_old_evidence(self):
+        self.remote = 'a' * 40
+        self.assertTrue(self.synchronize())
+        self.integration.assert_called_once()
+        saved = self.store.get('repo', 'G-047')
+        self.assertEqual(saved.snapshot['accepted_work_branch'], self.remote)
+        self.assertEqual(saved.snapshot['remote_adoption'], self.adoption)
+        self.assertEqual(saved.expected_head, 'integrated')
+
+    def test_unconnected_history_waits_without_rewriting_or_retry_classification(self):
+        self.remote, self.ancestor = 'a' * 40, False
+        saved = self.store.get('repo', 'G-047')
+        with self.assertRaises(RecoveryFailure) as failure:
+            self.synchronize()
+        self.assertEqual(failure.exception.reason, RecoveryReason.GIT_INPUT_UNCERTAIN)
+        self.assertEqual(self.store.get('repo', 'G-047'), saved)
+        self.integration.assert_not_called()
+
+    def test_adoption_for_another_target_is_not_accepted(self):
+        self.adoption['branch'] = 'other'
+        saved = self.store.get('repo', 'G-047')
+        self.store.record('repo', 'G-047', expected_generation=saved.generation, operation=None,
+            expected_head=None, target_base_oid=None, observed_remote_oid=None,
+            snapshot={'remote_adoption': self.adoption})
+        with self.assertRaises(RecoveryFailure) as failure:
+            self.synchronize()
+        self.assertEqual(failure.exception.reason, RecoveryReason.GIT_INPUT_UNCERTAIN)
+        self.effects.git.assert_not_called()
+
 
 
 class WorkBranchIntegrationUnitTests(unittest.TestCase):

@@ -20,7 +20,7 @@ _selected_recovery = ContextVar("selected_plan_recovery", default=frozenset())
 def workspace_ownership_isolated(before, current, *, repo_path, worktree, branch, base):
     """Bound unresolved local history without accepting that history.
 
-    The caller supplies a trusted, target-linked baseline and holds the existing
+    The caller supplies a live, target-linked baseline and holds the existing
     reservation leases. This comparison neither proves writer termination nor
     authorizes a scope transition: both remain CAS-side caller obligations.
     Missing shared evidence is deliberately project-wide uncertainty.

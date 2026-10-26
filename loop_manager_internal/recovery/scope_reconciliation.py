@@ -146,17 +146,17 @@ def _cancel_workspace_checkpoint(connection, repo, plan_id, block):
 
 def _narrow_workspace_project_block(effects, connection, repo_path, state_dir, repo, block, plan, owner, checkpoint, project, recovery, request):
     """Preserve a local unresolved cause before atomically removing its gate."""
-    if (block['reason_code'] != BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value
-            or not plan['agent_snapshot']):
+    if block['reason_code'] != BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value:
         return False
     checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     existing = scoped_blocking.plan_block(connection, repo, plan['plan_id'])
     try:
-        baseline = GitSnapshot.deserialize(plan['agent_snapshot'])
         worktree = Path(plan['worktree'])
         effects.validate_execplan_workspace_identity(state_dir, repo,
             manual_workspace_owner(connection, repo, plan['plan_id']), plan['branch'], worktree)
         effects.validate_managed_worktree(repo_path, worktree, plan['branch'])
+        # 과거 Agent 감사 대신 이번 관측 구간의 공유 자원 안정성을 확인한다.
+        baseline = effects.capture_git_snapshot(worktree)
         observed = effects.capture_git_snapshot(worktree)
         if not workspace_ownership_isolated(baseline, observed, repo_path=repo_path,
                 worktree=worktree, branch=plan['branch'], base=project['base_branch']):

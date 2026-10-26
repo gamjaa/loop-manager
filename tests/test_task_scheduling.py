@@ -1516,6 +1516,43 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(current['recovery_counts'], saved['recovery_counts'])
         self.assertEqual(current['detail'], 'original failure')
 
+    def test_exhausted_remote_race_does_not_restart_from_a_timer(self):
+        from loop_manager_internal.storage import recovery_state
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        scheduler = self.scheduler()
+        repository = recovery_state.RecoveryRepository(self.connection)
+        repository.observe(RecoveryObservation(RecoveryReason.REMOTE_SNAPSHOT_RACE, 'A', 'G-001',
+            'WORKING', 'revision', 'base', 'same-input', 'same-head', 'race'), attempts=3)
+        self.connection.commit()
+        before = dict(repository.row('A', 'G-001'))
+        with mock.patch.object(scheduler.condition, 'wait') as wait:
+            self.assertFalse(scheduler.wait_retry(self.connection, 'A', 'G-001'))
+        wait.assert_not_called()
+        self.assertEqual(dict(repository.row('A', 'G-001')), before)
+
+    def test_unproven_pr_history_releases_projection_and_continues_other_work(self):
+        from loop_manager_internal.application.project_service import ProjectService
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE repo='A' AND plan_id='G-001'")
+        self.connection.execute("UPDATE projects SET phase='PR_OPEN' WHERE repo='A'")
+        self.connection.commit()
+        before = [tuple(row) for row in self.connection.execute("SELECT * FROM exec_plans WHERE repo='A'")]
+        effects = SimpleNamespace(_record_project_recovery=mock.Mock(), active_execplan=mock.Mock(return_value=None),
+            _clear_active_in_current_transaction=lambda connection, repo: runtime_state.RuntimeStateRepository(connection).clear(repo))
+        identity = SimpleNamespace(repo_arg='A', connection=self.connection, recovery_request_id=None)
+        service = ProjectService(effects, identity)
+        service.state.repo = 'A'
+        for name in ('_prepare_repository', '_reconcile_catalog_and_cleanup', '_resume_manual_work', '_resume_existing_execution'):
+            self.enterContext(mock.patch.object(service, name, return_value=None))
+        self.enterContext(mock.patch.object(service, '_synchronize_pull_requests',
+            side_effect=RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN, 'unconnected PR history')))
+        dispatch = self.enterContext(mock.patch.object(service, '_run_coordinators', return_value=0))
+        self.assertEqual(service.run().code, 0)
+        dispatch.assert_called_once()
+        effects._record_project_recovery.assert_called_once()
+        self.assertIsNone(service.state.row['phase'])
+        self.assertEqual([tuple(row) for row in self.connection.execute("SELECT * FROM exec_plans WHERE repo='A'")], before)
+
     def test_call_condition_wait_reclaims_only_its_confirmed_reservation(self):
         from loop_manager_internal.storage import task_calls
         target = task_calls.reserve(self.connection, self.directory, 'A', 'G-001', 'verify', 'run')

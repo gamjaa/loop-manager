@@ -32,10 +32,10 @@ Reviewer의 정적 검증 책임은 매 호출 현재 선택 runtime의 common+r
 
 ## Implementation
 
-- [ ] `agents/agent_prompts.py`와 실제 Review/checkpoint 호출의 기존 prompt 조합을 확인해 instruction에 이미 있는 검증 규칙의 반복을 제거한다. 결과 형식과 후보별 사실은 사용자 메시지에 유지하고, 기존 common_guidance/provider의 현재 원본 선택·실행용 파일 검증·read_only 경계를 재사용한다. 작업별 snapshot 선택·복원은 추가하지 않는다.
-- [ ] `docs/AGENTS.common.md`·`docs/AGENTS.reviewer.md`의 현재 책임을 보존한다. 결과 전달을 위해 원본을 재작성하지 않으며 후보 worktree 편집본을 실행 입력으로 사용하지 않는다. 대응 테스트에서 사용자 메시지에 금지 문구를 요구하던 기대값을 실제 instruction과 결과 문맥 검사로 분리한다.
-- [ ] 확인한 `tests/support/fixed_samples.py`의 `PROJECT_FILES`·`use_fixed_guidance()`와 `tests/test_agent_invocation.py`의 임시 runtime/provider fixture를 재사용한다. 지침 원문 의존성을 제거한 선행 결과 위에서 고정 지침의 합성·실제 요청 전달과 후보별 사실을 검사하며, 자체 verify 입력 목록에 실제 지침 prose를 다시 추가하지 않는다.
-- [ ] Worker의 초기/delta/복구 prompt는 현재 `worker_prompt`·`execution_worker_handler.py`와 `storage/validation_feedback_state.py`의 직접 구현을 유지한다. 이 계획은 Worker session cursor, Review 성공 재사용, receipt 정책과 알림을 추가 구현하지 않는다. PRODUCT·ARCHITECTURE의 현재 단일 전달 계약은 유지하고 필요한 관련 설명만 정합하게 갱신한다.
+- [x] `agents/agent_prompts.py`와 실제 Review/checkpoint 호출의 기존 prompt 조합을 확인해 instruction에 이미 있는 검증 규칙의 반복을 제거한다. 결과 형식과 후보별 사실은 사용자 메시지에 유지하고, 기존 common_guidance/provider의 현재 원본 선택·실행용 파일 검증·read_only 경계를 재사용한다. 작업별 snapshot 선택·복원은 추가하지 않는다.
+- [x] `docs/AGENTS.common.md`·`docs/AGENTS.reviewer.md`의 현재 책임을 보존한다. 결과 전달을 위해 원본을 재작성하지 않으며 후보 worktree 편집본을 실행 입력으로 사용하지 않는다. 대응 테스트에서 사용자 메시지에 금지 문구를 요구하던 기대값을 실제 instruction과 결과 문맥 검사로 분리한다.
+- [x] 확인한 `tests/support/fixed_samples.py`의 `PROJECT_FILES`·`use_fixed_guidance()`와 `tests/test_agent_invocation.py`의 임시 runtime/provider fixture를 재사용한다. 지침 원문 의존성을 제거한 선행 결과 위에서 고정 지침의 합성·실제 요청 전달과 후보별 사실을 검사하며, 자체 verify 입력 목록에 실제 지침 prose를 다시 추가하지 않는다.
+- [x] Worker의 초기/delta/복구 prompt는 현재 `worker_prompt`·`execution_worker_handler.py`와 `storage/validation_feedback_state.py`의 직접 구현을 유지한다. 이 계획은 Worker session cursor, Review 성공 재사용, receipt 정책과 알림을 추가 구현하지 않는다. PRODUCT·ARCHITECTURE의 현재 단일 전달 계약은 유지하고 필요한 관련 설명만 정합하게 갱신한다.
 
 ## Validation
 
@@ -46,7 +46,8 @@ Reviewer의 정적 검증 책임은 매 호출 현재 선택 runtime의 common+r
 ## Progress
 
 - [x] 2026-10-09 제공된 delta revision에서 R-003·R-064, 실제 prompt·instruction 합성·Review gate와 관련 테스트를 정적으로 대조했다. 구현·테스트는 실행하지 않았다.
-- [ ] Reviewer prompt 정합화와 관련 targeted unit 검증
+- [x] Reviewer prompt 정합화와 관련 targeted unit 검증
+- 2026-10-26: Reviewer 사용자 prompt에서 테스트·전체 verify·lint·build·type check 재실행 금지 문장을 제거하고, 실제 Codex·Claude 신규/재개 요청의 instruction/증거 문맥 분리를 targeted unit test로 확인했다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

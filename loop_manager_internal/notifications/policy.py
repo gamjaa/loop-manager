@@ -15,7 +15,7 @@ SOURCE_ACTION_REASONS = frozenset({'guidance_approval_required', 'review_specifi
 PR_REVIEW_ACTION = 'review_merge'
 
 
-def pr_review_candidate(connection, repo, plan_id, pr_url=None):
+def pr_review_candidate(connection, repo, plan_id, pr_url=None, *, creation=False):
     """Return a confirmed published review candidate and its remaining user action."""
     try:
         row = connection.execute(
@@ -43,8 +43,27 @@ def pr_review_candidate(connection, repo, plan_id, pr_url=None):
             'SELECT publication_token, review_input_identity FROM pr_review_candidates '
             'WHERE repo=? AND plan_id=?', (repo, plan_id),
         ).fetchone()
-        if (proof is None or proof['publication_token'] != publication_token
-                or not proof['review_input_identity']):
+        valid_proof = bool(proof and proof['publication_token'] == publication_token
+                           and proof['review_input_identity'])
+        if creation:
+            saved = connection.execute(
+                'SELECT review_input_identity FROM pr_creation_publications '
+                'WHERE repo=? AND plan_id=? AND pr_url=?',
+                (repo, plan_id, row['pr_url']),
+            ).fetchone()
+            if saved is None:
+                return None
+            # 최초 identity가 없으면 이후 증명만으로 후보 변경을 단정할 수 없다.
+            if (saved[0] and valid_proof and proof['review_input_identity'] != saved[0]):
+                return None
+            return {
+                'notice_kind': 'creation',
+                'candidate_identity': 'creation:' + str(row['pr_url']),
+                'candidate_head_oid': head,
+                'candidate_publication_token': publication_token,
+                'user_action': PR_REVIEW_ACTION,
+            }
+        if not valid_proof:
             return None
         return {
             'candidate_identity': str(proof['review_input_identity']),
@@ -392,6 +411,7 @@ def is_current(connection, repo, kind, payload, *, event_key=None):
         if kind == 'pr_created':
             candidate = pr_review_candidate(
                 connection, repo, payload.get('execplan_id'), payload.get('pr_url'),
+                creation=payload.get('notice_kind') == 'creation',
             )
             return bool(candidate and all(
                 payload.get(key) == candidate[key]

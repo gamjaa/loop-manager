@@ -247,7 +247,7 @@ origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
 {verify_context}
 {recovery}
 {correction}
-테스트 command와 scripts/verify를 실행하지 말고, 코드·테스트·verify 스크립트의 diff와 위에 전달된 검증 결과로 테스트 누락·회귀 위험·검증 약화를 판단하라.
+코드·테스트·verify 스크립트의 diff와 위에 전달된 검증 결과로 테스트 누락·회귀 위험·검증 약화를 판단하라.
 blocking issue마다 설명 직전에 `ISSUE_ID: relative/path::stable-symbol-or-test::category-slug`를 한 줄로 기록하라.
 relative/path는 `/`로 구분한 실제 저장소 상대 경로이며 공백과 대괄호를 허용하지만, 절대 경로·빈 구성요소·`.`·`..`·역슬래시·colon·제어문자는 허용하지 않는다.
 ISSUE_ID에는 줄 번호나 자연어 설명을 넣지 말고, 같은 issue가 재발하면 위치·표현이 바뀌어도 이전과 정확히 같은 ID를 사용하라.

@@ -286,12 +286,33 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 2)
         self.assertIn('workspace_ownership_hold', self.checkpoints.get(self.repo, 'G-001').snapshot)
 
+    def test_historical_shared_changes_and_missing_agent_audit_do_not_keep_project_gate(self):
+        self.isolated_missing_creation()
+        self.snapshot = replace(self.snapshot,
+            config={'local:core.hooksPath': ('current-hooks',)},
+            refs={**self.snapshot.refs, 'refs/heads/independent': ('new', '')},
+            worktrees={**self.snapshot.worktrees,
+                       self.repo: ('HEAD=new-base', 'branch=refs/heads/main')})
+        self.connection.execute("UPDATE exec_plans SET agent_snapshot=NULL WHERE plan_id='G-001'")
+        self.connection.commit()
+        self.assertTrue(self.resume())
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-001')['reason_code'],
+                         'workspace_ownership_local')
+        self.assertFalse(self.resume_local())
+        self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 2)
+
     def test_shared_change_and_checkpoint_race_keep_project_gate(self):
         self.isolated_missing_creation()
         baseline = self.snapshot
-        self.snapshot = replace(baseline, config={'local:core.hooksPath': ('unknown',)})
+        observations = 0
+        def concurrent_change(*_):
+            nonlocal observations
+            observations += 1
+            return (baseline if observations % 2 else
+                    replace(baseline, config={'local:core.hooksPath': ('unknown',)}))
+        self.capture.side_effect = concurrent_change
         self.assertFalse(self.resume())
-        self.snapshot = baseline
         calls = 0
         def observe(*_):
             nonlocal calls

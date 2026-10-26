@@ -537,7 +537,7 @@ class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
             self.assertIn("Manager 확인: 전체 verify PASS", reviewer_prompt)
             self.assertIn("candidate HEAD=", reviewer_prompt)
             self.assertNotIn("verify: PASS", reviewer_prompt)
-            self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer_prompt)
+            self.assertNotIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer_prompt)
 
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
