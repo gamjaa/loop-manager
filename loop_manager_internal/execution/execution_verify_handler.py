@@ -412,9 +412,6 @@ class VerifyHandler:
             self.ports.state.update_project(self.ports.identity.repo, phase='WORKING',
                                             validated_base_sha=None, last_error=str(error))
             return self.ports._recover(RecoveryReason.WORKER_CORRECTION, str(error), context=context)
-        partial_outcome = self._maybe_partial(context, candidate_head)
-        if partial_outcome is not None:
-            return partial_outcome
         targeted_outcome = self._targeted_test_gate(self.ports._context())
         if targeted_outcome is not None:
             return targeted_outcome
@@ -459,6 +456,17 @@ class VerifyHandler:
             self.ports.operation_log(f"전체 verify 재사용: {plan_id}, 원래 run={origin['id']}, 입력={observation.fingerprint}")
             self.ports.update_snapshot(_latest_verify_output=output)
             return self._finish_verified(context)
+        partial_outcome = self._maybe_partial(context, candidate_head)
+        if partial_outcome is not None:
+            return partial_outcome
+        targeted_outcome = self._targeted_test_gate(self.ports._context())
+        if targeted_outcome is not None:
+            return targeted_outcome
+        # Partial verification can change generated inputs and validation state.
+        # The actual full run must observe its inputs after that attempt.
+        context = self.ports._context()
+        observation = self._observe(context.worktree)
+        selection = verify_receipts.selected(connection, repo, plan_id)
         # A new invocation invalidates any previous success marker first. If
         # this run fails before replacing its output, stale evidence cannot be
         # paired with the new candidate or a later scope block.

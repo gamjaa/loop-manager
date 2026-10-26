@@ -328,6 +328,7 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
 
     def test_reconnected_worker_uses_original_full_run_without_worker_or_verify_call(self):
         from loop_manager_internal.execution import stage_results
+        from tests.test_preliminary_review import IDENTITY
         definition, _origin = self.adopted_origin(full_success=True)
         self.assertTrue(stage_results.reconnect_worker(self.ports, self.context(), definition))
         self.dirty = False
@@ -338,8 +339,11 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
         self.effects.workspace.git.side_effect = lambda root, *args, **kwargs: (
             SimpleNamespace(stdout='new-head', returncode=0) if args == ('rev-parse', 'HEAD')
             else original_git(root, *args, **kwargs))
+        partial = mock.Mock(side_effect=AssertionError('a matching full success must precede new partial work'))
         self.handler.effects = replace(self.handler.effects, checkpoint=self.checkpoints,
             validation=replace(self.handler.effects.validation,
+                partial_verify_enabled=lambda _: True, partial_verify=partial,
+                pre_review_identity=lambda _, **kwargs: dict(IDENTITY),
                 observe_verify_inputs=lambda _: inputs.InputObservation('original-code')))
         with mock.patch.object(self.handler, '_post_effect_guard', side_effect=lambda context: context):
             outcome = self.handler.verify(self.context(), SimpleNamespace(reconcile=lambda *args: None))
@@ -353,6 +357,9 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
         self.assertIsNone(self.state.row()['publication_token'])
         self.effects.validation.verify.assert_not_called()
         self.effects.agent.run_agent.assert_not_called()
+        partial.assert_not_called()
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM preliminary_reviews WHERE repo='repo' AND plan_id='G-047'").fetchone())
 
 
 class CleanRebaseFixtureTest(unittest.TestCase):

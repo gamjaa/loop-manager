@@ -261,7 +261,7 @@ class PreliminaryReviewTests(ExecutionFixture, unittest.TestCase):
 
     def test_unattested_preliminary_pass_still_requires_actual_full_run(self):
         from loop_manager_internal.verification.inputs import InputObservation
-        self.effects.validation.observe_verify_inputs.return_value = InputObservation('fixture-review-inputs')
+        self.effects.validation.observe_verify_inputs.return_value = InputObservation('changed-inputs-requiring-preliminary')
         self.verify()
         self.effects.agent.run_agent.return_value = lm.AgentResult(0, 'VERDICT: PASS')
         self.review()
@@ -271,6 +271,24 @@ class PreliminaryReviewTests(ExecutionFixture, unittest.TestCase):
         self.assertEqual(self.saved()['status'], 'review_invalidated')
         self.review()
         self.assertEqual(self.effects.agent.run_agent.call_count, 2)
+
+    def test_preliminary_pass_requires_new_full_run_even_with_matching_old_success(self):
+        from loop_manager_internal.verification.inputs import InputObservation
+        observation = InputObservation('changed-inputs-requiring-preliminary')
+        self.effects.validation.observe_verify_inputs.return_value = observation
+        self.early_pass()
+        selection = verify_receipts.selected(self.connection, self.repo, 'G-047')
+        original, selection = verify_receipts.record(self.connection, selection,
+            head='prior-candidate', observation=observation, kind='run', reason='earlier full run')
+        verify_receipts.complete(self.connection, selection, original, passed=True, output='earlier success')
+        self.connection.commit()
+        self.verify()
+        self.effects.validation.verify.assert_called_once()
+        self.assertEqual(self.partial.call_count, 1)
+        receipt = verify_receipts.current_receipt(self.connection,
+            verify_receipts.selected(self.connection, self.repo, 'G-047'))
+        self.assertEqual((receipt['kind'], receipt['status']), ('run', 'success'))
+        self.assertNotEqual(receipt['id'], original)
 
     def test_full_failure_invalidates_preliminary_approval(self):
         self.early_pass()

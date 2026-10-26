@@ -72,9 +72,13 @@ priority: high
 
 ## Handoff
 
-Manager 전체 verify가 `test_document_record_conflict_reconnects_original_worker_after_restart`의 공통 history assertion에서 FAIL했다(identity `verify:92ca8caa290f28e6166254048775cdca8b3c549dfd12f7bdffd3acfb513540fe`, occurrence 1, revision 1). 새 `proven` fixture는 선택 ExecPlan 기록 충돌이 한 번이므로 이전 replay history가 비어 있는 것이 맞다. 이 사례는 빈 history와 `originals`/`blobs`에 보존한 충돌 전 Worker 원문·고정 base 원문의 SHA-256 및 실제 bytes를 확인하도록 교정했다. 여러 문서 commit을 replay하는 기존 사례의 history 보존 assertion은 유지한다. 이 integration의 교정 후 실행은 Worker 역할 제한에 따라 Manager가 수행해야 하며 아직 성공으로 기록하지 않는다.
+Manager 전체 verify가 `test_document_record_conflict_reconnects_original_worker_after_restart`의 공통 history assertion에서 FAIL했다(identity `verify:92ca8caa290f28e6166254048775cdca8b3c549dfd12f7bdffd3acfb513540fe`, occurrence 1, revision 1). 새 `proven` fixture는 선택 ExecPlan 기록 충돌이 한 번이므로 이전 replay history가 비어 있는 것이 맞다. 이 사례는 빈 history와 `originals`/`blobs`에 보존한 충돌 전 Worker 원문·고정 base 원문의 SHA-256 및 실제 bytes를 확인하도록 교정했다. 여러 문서 commit을 replay하는 기존 사례의 history 보존 assertion은 유지한다. 이 integration은 Worker에서 재실행하지 않았으며, 후속 Reviewer 피드백에 Manager 전체 verify PASS가 전달됐다. 이 결과는 이번 추가 코드 교정 후의 전체 verify 성공을 뜻하지 않는다.
 
 교정 후 targeted runner로 같은 모듈의 `tests.test_managed_rebase_lifecycle.RebaseObservationFailureTests.test_restarted_fixture_updates_audit_on_current_connection_and_keeps_checkpoint`를 실행해 1 test PASS를 확인했다. 이는 모듈 import와 실제 SQLite 재시작을 확인한 unit 결과이며 실패한 실제 Git lifecycle 또는 전체 verify의 성공을 뜻하지 않는다.
+
+Reviewer 피드백 `review:loop_manager_internal/execution/execution_verify_handler.py::verifyhandler.verify::partial-before-reuse`(occurrence 1, revision 1)에 따라 새 부분 검증보다 전체 성공 receipt 재사용을 먼저 판단하도록 순서를 교정했다. 기존 일반 선행 PASS/승인 무효화 뒤 실제 full run 요구는 유지하고, 부분 검증 뒤 전체 실행으로 이어지는 경우 입력·현재 context·receipt selection을 다시 관측한다. 재연결 회귀는 부분 검증과 유효한 Reviewer identity를 활성화해 partial/full/Agent 호출 0 및 선행 Review 자료 미생성을 확인한다. 별도 회귀는 선행 PASS 뒤 동일 입력의 과거 성공이 있어도 새 실제 full run을 실행하는지 확인한다.
+
+이번 targeted 결과는 `--unittest tests.test_verify_receipts` 41 tests PASS, `--unittest tests.test_preliminary_review.PreliminaryReviewTests` 22 tests PASS다. 후자는 최초 22 tests 중 1 FAIL·1 ERROR였으며, 기존 동일 full 성공이 남아 있던 fixture를 실제 입력이 변경된 선행 검증 조건으로 교정한 동일 명령 재실행에서 22 tests PASS였다. 선행 PASS 뒤 실제 full 실행 assertion은 유지했다. 전체 verify·integration은 재실행하지 않았다.
 
 구현 완료 후보이며 Manager 전체 verify·실제 Git lifecycle·Reviewer 확인이 남아 있다. 최종 Review 승인 receipt 생성·동일성 판단·재사용과 최종 Reviewer 호출 0 통합 판정은 G-183의 범위로 유지한다. 이 작업의 자료 보존이나 Worker/verify 연결을 최종 Review·게시·사용자 Merge 성공으로 선언하지 않는다.
 
