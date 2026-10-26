@@ -12,6 +12,38 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKi
 
 
 class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
+    def test_reserved_failure_uses_current_shared_evidence_for_scope(self):
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+        target = str(Path('/state/G-047').resolve())
+        baseline = lm.GitSnapshot('owned-head', 'loop-manager/G-047', {}, {},
+            {'refs/heads/loop-manager/G-047': ('owned-head', '')},
+            {str(Path('/repo').resolve()): ('HEAD=base', 'branch=refs/heads/main'),
+             target: ('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047')}, {}, {})
+        self.effects = replace(self.effects, checkpoint=ExecutionCheckpointRepository(self.connection))
+        self.handler.effects = self.effects
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2,agent_snapshot=NULL')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.effects.workspace.make_worktree.side_effect = lm.WorkspaceOwnershipError('missing creation proof')
+        changed = replace(baseline, config={'local:core.hooksPath': ('current',)})
+        for observations, expected in (
+            ([baseline] * 20, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL),
+            ([changed] * 20, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL),
+            ([baseline, changed] * 10, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL),
+            ([baseline, replace(baseline, dirty={'user.txt': (('untracked',), 'new-output')})] * 10,
+             BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
+            ([replace(baseline, shared_metadata_complete=False)] * 20,
+             BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
+        ):
+            with self.subTest(expected=expected), mock.patch.object(Path, 'is_dir', return_value=True):
+                self.effects.agent.capture_git_snapshot.side_effect = observations
+                self.effects.blocking.block_active_execplan_from_revision.reset_mock()
+                result = self.handler.prepare()
+                self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+                self.assertEqual(self.effects.blocking.block_active_execplan_from_revision.call_args.kwargs['reason'], expected)
+        self.effects.workspace.mark_execplan_workspace_owned.assert_not_called()
+
     def test_reserved_user_rebase_does_not_reconstruct_manager_checkpoint(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         factory = mock.Mock(side_effect=AssertionError('reservation is not owned'))

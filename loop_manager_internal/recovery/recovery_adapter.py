@@ -168,6 +168,7 @@ def _scope_reconciliation_effects_resume_project_block_if_safe(effects: ScopeRec
 class ScopeReconciliationEffectsResumePlanBlocksEffects:
     """Named effects for _scope_reconciliation_effects_resume_plan_blocks; no entry-point/module access."""
     ROOT: Path
+    _scope_reconciliation_effects_resume_project_block_if_safe: Callable[..., object]
     _blocked_plan_reconciliation_effects: Callable[..., object]
     _clear_active_in_current_transaction: Callable[..., object]
     _reconcile_published_blocked_checkpoint: Callable[..., object]
@@ -190,6 +191,7 @@ class ScopeReconciliationEffectsResumePlanBlocksEffects:
 def _scope_reconciliation_effects_resume_plan_blocks(effects: ScopeReconciliationEffectsResumePlanBlocksEffects, ) -> scope_reconciliation.ResumePlanBlocksEffects:
     return scope_reconciliation.ResumePlanBlocksEffects(
         ROOT=effects.ROOT,
+        workspace_recovery_effects=effects._scope_reconciliation_effects_resume_project_block_if_safe,
         load_managed_config=effects.load_managed_config,
         plan_recovery_effects=effects._blocked_plan_reconciliation_effects,
         _clear_active_in_current_transaction=effects._clear_active_in_current_transaction,

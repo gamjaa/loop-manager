@@ -22,6 +22,64 @@ from loop_manager_internal.storage.recovery_state import RecoveryRepository
 from tests.support.notification import NotificationFixture
 
 
+from tests.support.scoped_recovery import ScopedGateFixture
+
+
+class WorkspaceOwnershipDeliveryTest(ScopedGateFixture, unittest.TestCase):
+    def test_scope_transition_cancels_only_legacy_project_pieces_and_keeps_question_audit(self):
+        from tests.support.notification import NotificationFixture
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        self.plan('G-001', 'IMPLEMENTING', branch='loop-manager/G-001')
+        self.plan('G-002')
+        worktree = Path('/state/G-001').resolve()
+        head = 'a' * 40
+        snapshot = loop_manager.GitSnapshot(head, 'loop-manager/G-001', {}, {},
+            {'refs/heads/loop-manager/G-001': (head, '')},
+            {self.repo: ('HEAD=base', 'branch=refs/heads/main'),
+             str(worktree): ('HEAD=' + head, 'branch=refs/heads/loop-manager/G-001')}, {}, {})
+        with self.connection:
+            notifications.configure_session(self.connection, enabled=True)
+            self.connection.execute("UPDATE exec_plans SET worktree=?,workspace_owned=2,agent_snapshot=? WHERE plan_id='G-001'",
+                                    (str(worktree), snapshot.serialize()))
+            self.connection.execute("UPDATE projects SET phase='WORKING',plan_path='docs/plans/[G-001] Work.md'")
+            NotificationFixture.decision_block(self.connection, repo=self.repo, plan_id='G-002')
+        question_sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=question_sender), 1)
+        question = dict(self.connection.execute('SELECT * FROM notification_outbox').fetchone())
+        with self.connection:
+            scoped_blocking.record_project_block(self.connection, self.repo,
+                scoped_blocking.BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
+                'missing creation evidence', 'original', plan_id='G-001', previous_phase='WORKING')
+            NotificationFixture.legacy_project_notice(self.connection, repo=self.repo)
+            self.connection.execute("UPDATE notification_outbox SET sent_at=NULL,attempts=2,last_error='old send failure',rendered_text='preserved fragments' WHERE event_key<>?", (question['event_key'],))
+        legacy = dict(self.connection.execute('SELECT * FROM notification_outbox WHERE event_key<>?', (question['event_key'],)).fetchone())
+        live = {'exists': True, 'registration': {'head': head, 'branch': 'refs/heads/loop-manager/G-001'}, 'index': 'tree'}
+        with ExitStack() as stack:
+            for patch in (
+                mock.patch.object(Path, 'is_dir', return_value=True),
+                mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+                mock.patch.object(loop_manager, 'validate_managed_worktree'),
+                mock.patch.object(loop_manager, 'git', return_value=mock.Mock(returncode=0, stdout='')),
+                mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
+                mock.patch.object(loop_manager, '_managed_worktree_transition_state', return_value=live),
+                mock.patch('loop_manager_internal.git.manager_git_journal.recover_active'),
+                mock.patch('loop_manager_internal.git.manager_git_journal.verified_managed_transitions', return_value=[]),
+            ):
+                stack.enter_context(patch)
+            self.assertTrue(loop_manager.resume_project_block_if_safe(self.connection, Path(self.repo), Path('/state'), self.repo))
+            self.assertFalse(loop_manager.resume_plan_blocks(self.connection, Path(self.repo), Path('/state'), self.repo, 'main', plan_id='G-001'))
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=sender), 0)
+        sender.assert_not_called()
+        after = dict(self.connection.execute('SELECT * FROM notification_outbox WHERE event_key=?', (legacy['event_key'],)).fetchone())
+        self.assertIsNotNone(after['canceled_at'])
+        for key in ('attempts', 'confirmed_pieces', 'last_error', 'rendered_text'):
+            self.assertEqual(after[key], legacy[key], key)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM notification_outbox WHERE event_key=?', (question['event_key'],)).fetchone()), question)
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-002')['reason_code'], 'user_decision_required')
+        self.assertTrue(ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-001').snapshot['workspace_ownership_hold'])
+
+
 class PrCreationPublicationTest(unittest.TestCase):
     def prepare(self, *, proof=False):
         from tests.support.execution import execution_fixture

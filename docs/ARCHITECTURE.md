@@ -1148,7 +1148,13 @@ rebase나 사용자 입력으로 후보 HEAD가 바뀌면 후보에 결합된 ve
 
 `PROJECT_BLOCKED` 해제는 원래 차단 원인을 현재 repository·계획·worktree·소유권·runtime 연결과 대조하고 원인별 안전 조건을 통과한 경우에만 수행한다. 기본 checkout·사용자 branch·공유 metadata의 정상적인 변화를 원상복원하거나 과거 snapshot과 일치시키는 조건을 두지 않는다. 실제 대상·소유권·sandbox 정책의 문제와 독립 차단은 유지하며 `refs/codex/turn-diffs/*`의 순변경은 해제 조건을 무효화하지 않는다.
 
-프로젝트 차단이 해제돼도 별도 계획 원인이 남은 ExecPlan은 `PLAN_BLOCKED`를 유지하며 다른 차단 계획의 fingerprint·작업 공간을 바꾸지 않는다.
+소유권 원인은 고정 code-scope 계약을 유지한다. 기존 `workspace_ownership_uncertain`은 계속 project 범위이며 저장된 행을 일괄 재분류하지 않는다. `workspace_ownership_local`은 plan 범위이고 동일한 typed recovery 원인 `ownership_uncertain`으로 연결한다. `plan_recovery.workspace_ownership_isolated()`는 이번 재평가에서 연속 관측한 현재 metadata로 기본 checkout의 등록, 선택 branch/ref/HEAD·고유 worktree 연결과 lock identity를 확인한다. 확인 구간에도 무관한 ref·다른 worktree·Git 설정의 변경 자체로 범위 축소를 거부하지 않는다. 과거 Agent snapshot의 유무·내용이나 과거 공유 상태와의 일치는 진입 조건이 아니다. 호출자는 대상 HEAD·branch·index·파일·operation의 안정성을 확인하며 대상 등록·lock 변경, 동일 branch의 중복 등록과 현재 근거 누락에는 project 범위를 유지한다. 선택 자원의 설명되지 않은 파일·index·operation은 그 작업의 미해결 원인으로 남으며 이 비교로 소유권을 승인하지 않는다. 이 비교는 미해소 원인의 범위 축소에만 사용하며 전체 원인 해소와 G-322 소유권 복구의 추가 gate로 사용하지 않는다.
+
+`scope_reconciliation`은 G-322의 예약 lease·writer 종료 검증과 공통 이력 복구를 먼저 소비한다. 완전 해소가 안 되고 작업 범위만 입증되면 현재 프로젝트/계획 원인·작업·복구 기록·게시 요청·checkpoint generation과 자원 claim을 짧은 transaction에서 다시 확인한다. 계획 보류와 checkpoint의 `workspace_ownership_hold`를 저장한 뒤 프로젝트 gate를 해제하며 실패에는 함께 rollback한다. 이 선택적 JSON object는 원래 `block`, `resume_status`, 판정에 사용한 현재 관측 쌍 `baseline`·`observation`을 보존한다. 기존 기록의 `baseline`이 과거 Agent snapshot인 경우에도 감사로만 읽고 재개 허가로 사용하지 않는다. 별도 계획 원인이 있으면 해당 block row와 `recovery_snapshot`을 교체하지 않고 추가 hold만 둔다. `workspace_scope_audit`에는 원인 작업·충돌 자원·대기 claim과 교체 전의 일치하는 게시 요청을 남긴다. 기존 DB는 이 필드가 없는 상태로 계속 읽으며 누락 근거로 새 허가를 만들지 않는다.
+
+계획 재평가는 추가 hold를 일반 질문·입력 해제보다 먼저 처리하고 같은 예약 복구기를 사용한다. 실제 소유권 해소 후 추가 hold만 제거하며, 단독 소유권 차단은 저장 단계로 복원하고 별개 계획 원인은 `PLAN_BLOCKED`로 유지한다. 현재 원인과 일치하는 미완료 checkpoint 요청은 원자적으로 종료하며 게시 영수증·통지의 전송/실패/취소 감사는 보존한다. 해소된 원인이 낡은 요청으로 재게시되지 않고 scope 자체가 사용자 조치나 새 Telegram을 만들지 않는다. 후보·session·실패/승격·성공 token을 소유권 판정으로 교체하지 않으며 다른 작업의 투영과 planning 오류도 유지한다.
+
+READY 선택과 활성화 transaction은 같은 branch·canonical worktree의 보유 작업을 확인한다. 생성 예약이 없는 READY claim은 호출 예약·미종료 invocation·게시 claim이 없을 때만 영향 대기로 취급하며 그 상태도 CAS에 포함한다. 실제 소유자·종료 불명 writer는 이 예외를 사용하지 않는다. 원인 작업의 보류는 기존 관리 개수 제외와 dependency gate를 사용하고, 실제 Agent/verify 호출 자리나 자원 예약은 회수하지 않는다. 프로젝트 차단이 해제돼도 다른 차단 계획의 fingerprint·작업 공간과 독립된 사용자 조치 근거는 바꾸지 않는다.
 
 | 보존·게시 경로 | 허용 조건과 결과 |
 |---|---|

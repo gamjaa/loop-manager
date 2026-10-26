@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage.task_calls import CallDeferred
 from pathlib import Path
 import hashlib
 import json
@@ -103,7 +104,7 @@ def activate_ready_execplan(
                     and not effects.is_unowned_ready(selected)
                 ),
             )
-    except runtime_state.TaskLimitReached:
+    except (runtime_state.TaskLimitReached, CallDeferred):
         return None
     except runtime_state.RuntimeStateError as error:
         raise RuntimeError(

@@ -171,6 +171,12 @@ class RecoveryPolicyTests(unittest.TestCase):
             with self.subTest(block_reason=block_reason):
                 reason = reason_from_block(block_reason)
                 decision = decide(observation(reason))
+                if block_reason is BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL:
+                    # A current isolation proof selects this new code explicitly;
+                    # the shared typed cause must retain its legacy project gate.
+                    self.assertEqual(decision.block_reason, BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN)
+                    self.assertEqual(decision.scope, BlockScope.PROJECT)
+                    decision = decide(observation(reason), final_block_reason=block_reason)
                 self.assertEqual(decision.action, RecoveryAction.FINAL_BLOCK)
                 self.assertEqual(decision.block_reason, block_reason)
                 self.assertEqual(decision.scope, reason_scope(block_reason))

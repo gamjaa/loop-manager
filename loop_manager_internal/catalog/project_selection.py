@@ -344,12 +344,22 @@ def catalog_schedule_decision(
     ]
     priorities = effective_priorities(execution_rows, verified_history)
     candidates = []
+    workspace_holds = scoped_blocking.workspace_held_resources(connection, repo)
+    resource_waiting_ids = set()
+    # ponytail: candidate/owner scans are quadratic; index canonical resource
+    # claims if large catalogs make this selection expensive.
     for row in ready:
+        branch = row['branch'] or f"loop-manager/{row['plan_id']}"
+        if scoped_blocking.workspace_resource_conflicts(workspace_holds,
+                plan_id=row['plan_id'], branch=branch, worktree=row['worktree']):
+            resource_waiting_ids.add(row['plan_id'])
+            continue
         if str(row["plan_id"]) not in priorities:
             continue
         dependencies = json.loads(row["depends_on"])
         if all(dependency not in held and statuses.get(dependency) == "MERGED" for dependency in dependencies):
             candidates.append(row)
+    execution_rows = [row for row in execution_rows if row['plan_id'] not in resource_waiting_ids]
     selected = None
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
     project = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()

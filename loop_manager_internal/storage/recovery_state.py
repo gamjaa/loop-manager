@@ -493,6 +493,21 @@ class RecoveryRepository:
             return
         self._resolve_rebase_failure(repo, subject, saved)
 
+    def resolve_workspace_block(self, repo, plan_id, block):
+        """Resolve one ownership cause, preserving unrelated recovery evidence."""
+        if block['reason_code'] not in {'workspace_ownership_uncertain', 'workspace_ownership_local'}:
+            return
+        saved = self.row(repo, plan_id)
+        if (saved is None or saved['reason_code'] != RecoveryReason.OWNERSHIP_UNCERTAIN.value
+                or saved['detail'] != block['evidence'] or saved['pending_action'] != 'final_block'):
+            return
+        try:
+            final = json.loads(saved['final_evidence'])
+        except (ValueError, TypeError):
+            return
+        if isinstance(final, dict) and final.get('block_reason_code') == block['reason_code']:
+            self._resolve_rebase_failure(repo, self._subject(plan_id), saved)
+
     def resolve_rebase_block(self, repo, plan_id, block):
         """Resolve the released cause without using past session/progress as a gate."""
         from loop_manager_internal.git.rebase_block_reconciliation import REBASE_BLOCK_REASONS
