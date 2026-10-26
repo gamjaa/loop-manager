@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest import mock
@@ -12,9 +13,263 @@ from tests.support.execution import ExecutionFixture, READY_WORKER_RESULT, execu
 from loop_manager_internal.execution import execution_handlers as handlers
 from loop_manager_internal.execution.execution_revision import ExecPlanBodyHash
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
-from loop_manager_internal.storage import verify_receipts
+from loop_manager_internal.storage import runtime_state, verify_receipts
 from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRace
 from loop_manager_internal.verification import inputs
+
+
+class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        self.checkpoints = ExecutionCheckpointRepository(self.connection)
+        self.state.update_project('repo', phase='PUBLISHING',
+            worker_result=READY_WORKER_RESULT, verify_result='original full PASS',
+            review_result='original final Review', review_token='original-review-token',
+            validated_base_sha='original-base', worker_session_id='original-session')
+        self.raw = ':100644 100755 ' + 'a' * 40 + ' ' + 'b' * 40 + ' M\0src/app.py\0'
+        self.observation = {'head': 'original-head', 'dirty': '', 'raw': self.raw}
+        self.git_port = mock.Mock(side_effect=self.observe)
+        self.ports = SimpleNamespace(state=self.state, checkpoint=self.checkpoints,
+            identity=SimpleNamespace(repo='repo'), git=self.git_port)
+
+    def observe(self, _root, *args):
+        self.assertFalse(self.connection.in_transaction)
+        if args == ('rev-parse', 'HEAD'):
+            value = self.observation['head']
+        elif args == ('status', '--porcelain'):
+            value = self.observation['dirty']
+        else:
+            self.assertEqual(args[0], 'diff')
+            self.assertEqual(args[-3:], ('base', 'original-head', '--'))
+            value = self.observation['raw']
+        return SimpleNamespace(stdout=value, returncode=0)
+
+    def test_preserves_candidate_base_modes_and_results_once_without_success_or_invocation(self):
+        from loop_manager_internal.execution import stage_results
+        before = dict(self.state.row())
+        origin = stage_results.preserve(self.ports, self.context(), reason='rebase_start')
+        saved = self.checkpoints.get('repo', 'G-047')
+        evidence = saved.snapshot['stage_result_origins'][origin]['evidence']
+        self.assertEqual((evidence['active_sha'], evidence['observed_head']), ('base', 'original-head'))
+        self.assertEqual((evidence['changes'][0]['old_mode'], evidence['changes'][0]['new_mode']),
+                         ('100644', '100755'))
+        self.assertEqual(evidence['review_result'], 'original final Review')
+        self.assertEqual(evidence['worker_session_id'], 'original-session')
+        self.assertEqual(evidence['verify_selection'],
+                         verify_receipts.selected(self.connection, 'repo', 'G-047'))
+        self.assertIsNone(evidence['verify_receipt'])
+        self.assertEqual(stage_results.preserve(self.ports, self.context(), reason='revision_invalidation'), origin)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), saved)
+        self.assertEqual(dict(self.state.row()), before)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM verify_receipts').fetchone()[0], 0)
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_unknown_or_dirty_changes_preserve_results_without_fabricating_comparison(self):
+        from loop_manager_internal.execution import stage_results
+        for invalid in ('dirty', 'raw'):
+            with self.subTest(invalid=invalid):
+                self.observation[invalid] = 'unconfirmed'
+                origin = stage_results.preserve(self.ports, self.context(), reason='rebase_start')
+                evidence = self.checkpoints.get('repo', 'G-047').snapshot['stage_result_origins'][origin]['evidence']
+                self.assertIsNone(evidence['changes'])
+                self.assertIsNone(evidence['observed_head'])
+                self.assertEqual(evidence['review_result'], 'original final Review')
+                self.assertIn('observation_error', evidence)
+                self.observation[invalid] = '' if invalid == 'dirty' else self.raw
+
+    def test_checkpoint_and_receipt_completion_races_do_not_store_stale_provenance(self):
+        from loop_manager_internal.execution import stage_results
+        for race in ('checkpoint', 'receipt'):
+            with self.subTest(race=race):
+                verify_receipts.start_cycle(self.connection, 'repo', 'G-047')
+                selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+                identifier, selection = verify_receipts.record(self.connection, selection,
+                    head='original-head', observation=inputs.InputObservation('original-input'),
+                    kind='run', reason='pending actual run')
+                self.connection.commit()
+                def observe(root, *args):
+                    result = self.observe(root, *args)
+                    if args[0] == 'diff':
+                        if race == 'checkpoint':
+                            current = self.checkpoints.get('repo', 'G-047')
+                            self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+                                operation=current.operation, expected_head=current.expected_head,
+                                target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                                snapshot={'concurrent': True})
+                        else:
+                            verify_receipts.complete(self.connection, selection, identifier,
+                                passed=False, output='actual failure')
+                        self.connection.commit()
+                    return result
+                self.git_port.side_effect = observe
+                with self.assertRaisesRegex(runtime_state.RuntimeStateError, 'provenance changed'):
+                    stage_results.preserve(self.ports, self.context(), reason='rebase_start')
+                self.assertNotIn('stage_result_origins', self.checkpoints.get('repo', 'G-047').snapshot or {})
+                self.assertEqual(self.state.row()['review_result'], 'original final Review')
+
+    def adopted_origin(self, *, full_success=False):
+        from loop_manager_internal.execution import stage_results
+        from loop_manager_internal.storage import planning_review_state
+        from tests.support.revision import definition
+        from tests.support.rebase_observations import expectation, observation, decision_for
+        from loop_manager_internal.git.managed_rebase_validation import Remote
+        original = definition(path=self.state.row()['plan_path'])
+        self.state.update_project('repo', definition_snapshot=original.serialize(),
+            worker_input_token=original.worker_token, archive_token=original.archive_token)
+        if full_success:
+            selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+            identifier, selection = verify_receipts.record(self.connection, selection,
+                head='original-head', observation=inputs.InputObservation('original-code'),
+                kind='run', reason='completed full verify fixture')
+            verify_receipts.complete(self.connection, selection, identifier,
+                                     passed=True, output='original full PASS')
+            self.connection.commit()
+        self.checkpoints.record('repo', 'G-047', expected_generation=0,
+            expected_head='original-head', operation=None, target_base_oid=None,
+            observed_remote_oid=None, snapshot={
+                'worker_candidate_token': original.worker_candidate_token('original-head')})
+        origin = stage_results.preserve(self.ports, self.context(), reason='rebase_start')
+        current = self.checkpoints.get('repo', 'G-047')
+        current = self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head='original-head', target_base_oid='new-base',
+            observed_remote_oid=None, snapshot={**current.snapshot, 'rebase_stage_origin': origin})
+        expected = expectation(repo='repo', plan_id='G-047', plan_path=original.path,
+            branch=self.state.row()['branch'], worktree=self.state.row()['worktree'],
+            before_head='original-head', target_base_oid='new-base', generation=current.generation,
+            remote=Remote('owner/repo', self.state.row()['branch'], 'remote'))
+        accepted = decision_for(expected, observation(expected, head='new-head',
+            branch_ref=('new-head', ''),
+            registration=('HEAD=new-head', 'branch=refs/heads/' + expected.branch))).acceptance
+        self.checkpoints.accept_current_rebase('repo', 'G-047', acceptance=accepted)
+        self.state.update_project('repo', phase='WORKING', active_sha='new-base',
+            worker_result=None, worker_input_token=None, archive_token=None,
+            verify_result=None, verify_token=None, review_result=None, review_token=None)
+        planning_review_state.begin(self.connection, 'repo', purpose='full', revision='new-base',
+            input_fingerprint='planning-inputs', specification_fingerprint='specifications',
+            work_cycle='project-cycle', comparison_revision='base')
+        planning_review_state.validate(self.connection, 'repo', 'new-base', 'general assessment', 'unchanged')
+        planning_review_state.confirm(self.connection, 'repo', 'new-base', 'new-base')
+        self.connection.commit()
+        self.rebased = self.raw
+        self.base_delta = ':000000 100644 ' + '0' * 40 + ' ' + 'c' * 40 + ' A\0docs/plans/[G-999] Other.md\0'
+        def observe(_root, *args, **kwargs):
+            self.assertFalse(self.connection.in_transaction)
+            if args == ('rev-parse', 'HEAD'):
+                value = 'new-head'
+            elif args == ('status', '--porcelain') or args[0] == 'merge-base':
+                value = ''
+            elif args[-3:] == ('base', 'new-base', '--'):
+                value = self.base_delta
+            elif args[-3:] == ('new-base', 'new-head', '--'):
+                value = self.rebased
+            else:
+                raise AssertionError(args)
+            return SimpleNamespace(stdout=value, returncode=0)
+        self.git_port.side_effect = observe
+        return replace(original, revision_sha='new-base'), origin
+
+    def test_restart_reconnects_only_original_worker_with_same_changes_and_confirmed_planning(self):
+        from loop_manager_internal.execution import stage_results
+        definition, origin = self.adopted_origin()
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        self.assertTrue(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        row = self.state.row()
+        self.assertEqual((row['phase'], row['worker_result'], row['worker_session_id']),
+                         ('VERIFYING', READY_WORKER_RESULT, 'original-session'))
+        self.assertEqual(row['worker_input_token'], definition.worker_token)
+        self.assertIsNone(row['verify_token'])
+        self.assertIsNone(row['review_token'])
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(saved.snapshot['worker_reconnection']['origin'], origin)
+        self.assertEqual(saved.snapshot['worker_candidate_token'], definition.worker_candidate_token('new-head'))
+        self.assertEqual(verify_receipts.selected(self.connection, 'repo', 'G-047'), selection)
+        self.effects.agent.run_agent.assert_not_called()
+        # A later correction cannot replay this rebase's prior Worker result.
+        self.state.update_project('repo', phase='WORKING', worker_result=None)
+        self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+
+    def test_worker_reconnection_rejects_changed_patch_path_mode_and_unproven_inputs(self):
+        from loop_manager_internal.execution import stage_results
+        definition, _origin = self.adopted_origin()
+        baseline = self.rebased
+        for altered in (baseline.replace('src/app.py', 'src/renamed.py'),
+                        baseline.replace('100755', '100644'),
+                        baseline.replace('b' * 40, 'd' * 40), ''):
+            with self.subTest(raw=altered):
+                self.rebased = altered
+                self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        self.rebased = baseline
+        self.base_delta = self.base_delta.replace('docs/plans/[G-999] Other.md', 'src/shared.py')
+        self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        self.base_delta = ''
+        self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(),
+                         replace(definition, depends_on=('G-998',))))
+        self.state.update_project('repo', worker_session_id='new-correction-session')
+        self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        self.state.update_project('repo', worker_session_id='original-session')
+        with mock.patch('loop_manager_internal.storage.planning_review_state.general_pending', return_value=True):
+            self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        with mock.patch('loop_manager_internal.storage.planning_review_state.get', return_value=None):
+            self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        verify_receipts.start_cycle(self.connection, 'repo', 'G-047')
+        self.connection.commit()
+        self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertNotIn('worker_reconnection', self.checkpoints.get('repo', 'G-047').snapshot)
+
+    def test_worker_reconnection_rechecks_checkpoint_after_git_observation(self):
+        from loop_manager_internal.execution import stage_results
+        definition, _origin = self.adopted_origin()
+        original_git = self.git_port.side_effect
+        statuses = 0
+        def drift(root, *args, **kwargs):
+            nonlocal statuses
+            result = original_git(root, *args, **kwargs)
+            if args == ('status', '--porcelain'):
+                statuses += 1
+                if statuses == 2:
+                    current = self.checkpoints.get('repo', 'G-047')
+                    self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+                        operation=current.operation, expected_head=current.expected_head,
+                        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                        snapshot={**current.snapshot, 'concurrent_owner_observation': True})
+                    self.connection.commit()
+            return result
+        self.git_port.side_effect = drift
+        self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertTrue(saved.snapshot['concurrent_owner_observation'])
+        self.assertNotIn('worker_reconnection', saved.snapshot)
+        self.assertIsNone(self.state.row()['worker_result'])
+
+    def test_reconnected_worker_uses_original_full_run_without_worker_or_verify_call(self):
+        from loop_manager_internal.execution import stage_results
+        definition, _origin = self.adopted_origin(full_success=True)
+        self.assertTrue(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        self.dirty = False
+        self.remote = 'new-base'
+        self.handler.catalog_plan = self.repository.active_row('repo')
+        self.handler._definition_snapshot = definition
+        original_git = self.effects.workspace.git.side_effect
+        self.effects.workspace.git.side_effect = lambda root, *args, **kwargs: (
+            SimpleNamespace(stdout='new-head', returncode=0) if args == ('rev-parse', 'HEAD')
+            else original_git(root, *args, **kwargs))
+        self.handler.effects = replace(self.handler.effects, checkpoint=self.checkpoints,
+            validation=replace(self.handler.effects.validation,
+                observe_verify_inputs=lambda _: inputs.InputObservation('original-code')))
+        with mock.patch.object(self.handler, '_post_effect_guard', side_effect=lambda context: context):
+            outcome = self.handler.verify(self.context(), SimpleNamespace(reconcile=lambda *args: None))
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        receipts = [dict(row) for row in self.connection.execute('SELECT * FROM verify_receipts ORDER BY rowid')]
+        self.assertEqual([receipt['kind'] for receipt in receipts], ['run', 'reuse'])
+        self.assertEqual(receipts[1]['origin_id'], receipts[0]['id'])
+        self.assertEqual(receipts[1]['head'], 'new-head')
+        self.assertEqual(self.state.row()['phase'], 'REVIEWING')
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertIsNone(self.state.row()['publication_token'])
+        self.effects.validation.verify.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
 
 
 class CleanRebaseFixtureTest(unittest.TestCase):
@@ -287,6 +542,46 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertIsNone(self.state.row()['review_token'])
         self.assertEqual(self.state.row()['verify_token'],
                          self.definition.verify_token('base', 'new-head', 'OK'))
+
+    def test_verify_reconnection_preserves_original_review_without_reapproving_it(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        self.verify()
+        self.ready()
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.handler.effects, checkpoint=checkpoints)
+        self.state.update_project('repo', review_result='original approved review with invocation identity',
+                                  review_token='original-review-token')
+        self.verify()
+        saved = checkpoints.get('repo', 'G-047')
+        origins = list(saved.snapshot['stage_result_origins'].values())
+        origin = next(item['evidence'] for item in origins if item['reason'] == 'verify_reconnection')
+        self.assertEqual(origin['review_result'], 'original approved review with invocation identity')
+        self.assertEqual(origin['review_token'], 'original-review-token')
+        self.assertEqual(origin['verify_receipt']['id'], self.receipts()[0]['id'])
+        self.assertEqual(self.calls.count('verify'), 1)
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertIsNone(self.state.row()['review_result'])
+        self.assertEqual(self.state.row()['phase'], 'REVIEWING')
+
+    def test_revision_invalidation_preserves_original_results_and_definition(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        self.verify()
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.handler.effects, checkpoint=checkpoints)
+        self.state.update_project('repo', review_result='original review', review_token='original-review-token')
+        original = self.state.row()['definition_snapshot']
+        self.effects.revision.body_hash.return_value = 'new implementation conditions'
+        self.handler.guard(self.context())
+        saved = checkpoints.get('repo', 'G-047')
+        origin = next(item['evidence'] for item in saved.snapshot['stage_result_origins'].values()
+                      if item['reason'] == 'revision_invalidation')
+        self.assertEqual(origin['definition_snapshot'], original)
+        self.assertEqual(origin['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(origin['verify_result'], 'OK')
+        self.assertEqual(origin['review_result'], 'original review')
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertIsNone(self.state.row()['review_token'])
 
     def test_environment_and_revision_changes_reuse_original_run(self):
         self.verify()

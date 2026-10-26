@@ -436,6 +436,8 @@ class VerifyHandler:
         if preliminary_review.active(self.ports, context, {'review_pass', 'review_invalidated'}):
             origin = None  # General preliminary PASS always requires an actual full run.
         if origin is not None:
+            from loop_manager_internal.execution import stage_results
+            stage_results.preserve(self.ports, context, reason='verify_reconnection')
             confirmed_observation = self._observe(context.worktree)
             confirmed_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
             confirmed_dirty = self.ports.git(context.worktree, 'status', '--porcelain').stdout.strip()
@@ -465,6 +467,8 @@ class VerifyHandler:
         def prepare_full_verify():
             nonlocal identifier, selection
             self._defer_targeted_verify(context)
+            from loop_manager_internal.execution import stage_results
+            stage_results.preserve(self.ports, context, reason='verify_run')
             with runtime_state._transaction(connection):
                 self.ports.state.check_context(context)
                 identifier, selection = verify_receipts.record(connection, selection,

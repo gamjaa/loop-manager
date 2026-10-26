@@ -70,6 +70,7 @@ class LatestBaseHandler:
         """Persist rebase intent, observe Git, then record the applied base."""
         prefix = '게시 직전 ' if publishing else ''
         events.emit("최신 base 반영 시작", old_base=row['active_sha'], target_base=latest_sha)
+        self.ports._record_rebase_intent(context, latest_sha)
         self.ports.state.update_project(
             self.ports.identity.repo,
             phase='WORKING',
@@ -78,7 +79,6 @@ class LatestBaseHandler:
             pr_conflict_base_oid=latest_sha if int(row['pr_conflict_recovery']) else row['pr_conflict_base_oid'],
             last_error=self.ports.contract.REBASE_IN_PROGRESS_ERROR,
         )
-        self.ports._record_rebase_intent(context, latest_sha)
         with events.activity("최신 base rebase", heartbeat=True) as report:
             rebased = self.ports._run_managed_rebase(context, latest_sha)
             report.update(result_code=rebased.returncode, result="Git 결과 수신")
