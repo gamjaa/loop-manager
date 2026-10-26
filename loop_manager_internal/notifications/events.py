@@ -79,6 +79,32 @@ def record_pr_review_candidate(
         "review_input_identity=excluded.review_input_identity",
         (repo, plan_id, publication_token, review_input_identity),
     )
+    connection.execute(
+        "UPDATE pr_creation_publications SET review_input_identity=? "
+        "WHERE repo=? AND plan_id=? AND publication_token=? AND review_input_identity IS NULL",
+        (review_input_identity, repo, plan_id, publication_token),
+    )
+
+
+def record_pr_creation(connection, repo, plan_id, pr_url):
+    """생성 성공 또는 소유권을 확인한 pr_create 복구 경계에서만 기록한다."""
+    ensure_schema(connection)
+    row = connection.execute(
+        "SELECT publication_token FROM exec_plans WHERE repo=? AND plan_id=?",
+        (repo, plan_id),
+    ).fetchone()
+    if row is None or not row['publication_token'] or not pr_url:
+        return
+    proof = connection.execute(
+        "SELECT review_input_identity FROM pr_review_candidates "
+        "WHERE repo=? AND plan_id=? AND publication_token=?",
+        (repo, plan_id, row['publication_token']),
+    ).fetchone()
+    connection.execute(
+        "INSERT OR IGNORE INTO pr_creation_publications "
+        "(repo, plan_id, pr_url, publication_token, review_input_identity) VALUES (?, ?, ?, ?, ?)",
+        (repo, plan_id, pr_url, row['publication_token'], proof[0] if proof else None),
+    )
 
 
 def cancel_pr_review_events_for_plans(
@@ -134,6 +160,8 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         (repo,),
     ).fetchall():
         candidate = pr_review_candidate(
+            connection, repo, str(plan[0]), str(plan[2]), creation=True,
+        ) or pr_review_candidate(
             connection, repo, str(plan[0]), str(plan[2]),
         )
         if candidate is None:

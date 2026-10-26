@@ -48,6 +48,17 @@ CREATE TABLE IF NOT EXISTS pr_review_candidates (
     FOREIGN KEY (repo) REFERENCES projects(repo)
 )
 """
+PR_CREATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pr_creation_publications (
+    repo TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    pr_url TEXT NOT NULL,
+    publication_token TEXT NOT NULL,
+    review_input_identity TEXT,
+    PRIMARY KEY (repo, plan_id, pr_url),
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
 BLOCK_INCIDENT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS notified_block_incidents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +112,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(COMPLETION_SCHEMA)
     connection.execute(WORK_REASON_SCHEMA)
     connection.execute(PR_REVIEW_CANDIDATE_SCHEMA)
+    connection.execute(PR_CREATION_SCHEMA)
     connection.execute(BLOCK_INCIDENT_SCHEMA)
     connection.execute(BLOCK_NOTICE_SCHEMA)
     incident_columns = {

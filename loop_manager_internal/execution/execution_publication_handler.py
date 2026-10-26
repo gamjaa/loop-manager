@@ -859,7 +859,7 @@ class PublicationHandler:
             )
         url = created.stdout.strip().splitlines()[-1]
         self.ports.state.open_pull_request(
-            self.ports.identity.repo, context=context, pr_url=url, pr_head_oid=head_oid,
+            self.ports.identity.repo, context=context, new_pr=True, pr_url=url, pr_head_oid=head_oid,
         )
         self._complete_publication_intent(context)
         notifications.flush_new_pr_events(

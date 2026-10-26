@@ -106,6 +106,17 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
     head_oid = str(head_value) if head_value else project["pr_head_oid"]
     state = str(pull_request.get("state") or "OPEN").upper()
 
+    recovered_creation = False
+    if project['phase'] == 'PUBLISHING' and not int(project['pr_conflict_recovery']):
+        plan_id = effects._plan_id_from_path(str(project["plan_path"] or ""))
+        creation_intent = (execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+                           if plan_id is not None else None)
+        recovered_creation = bool(
+            creation_intent is not None and creation_intent.operation == 'pr_create'
+            and creation_intent.expected_head == head_oid
+            and creation_intent.observed_remote_oid == head_oid
+        )
+
     def manual_stage_tokens():
         if effects.manual_publication_stage_tokens is None:
             return None
@@ -139,7 +150,8 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
         return PROJECT_STEP_RETRY
 
     if (state == 'OPEN' and project['phase'] == 'PUBLISHING'
-            and project['pr_url'] and not int(project['pr_conflict_recovery'])):
+            and project['pr_url'] and not recovered_creation
+            and not int(project['pr_conflict_recovery'])):
         try:
             if effects.recover_confirmed_pr_conflict_push(
                     connection, repo_path, state_dir, repo, project, pull_request,
@@ -519,6 +531,7 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
             try:
                 runtime_state.RuntimeStateRepository(connection).open_pull_request(
                     repo,
+                    new_pr=recovered_creation,
                     pr_url=url,
                     pr_head_oid=head_oid,
                     manual_stage_tokens=manual_stage_tokens(),
@@ -530,6 +543,9 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
                     f"현재 설정으로 수동 PR 게시 근거를 확인할 수 없습니다: {error}"
                 ) from error
         effects.operation_print(f"Merge 대기 중: {url}")
+        if recovered_creation:
+            from loop_manager_internal.notifications import notifications
+            notifications.flush_new_pr_events(connection, repo)
         return 0
 
     if state == "MERGED" or pull_request.get("mergedAt"):

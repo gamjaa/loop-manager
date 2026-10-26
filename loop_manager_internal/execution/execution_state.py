@@ -298,13 +298,16 @@ class ExecutionStatePort:
         return self.repository.transition_from_snapshot(
             expected, plan_values=values, project_values=values)
 
-    def open_pull_request(self, repo, *, context=None, **values):
+    def open_pull_request(self, repo, *, context=None, new_pr=False, **values):
         if repo != self.repo:
             raise runtime_state.RuntimeStateError("execution repository identity 불일치")
         with runtime_state._transaction(self.connection):
             expected = self.check()
             if expected is None:
                 raise runtime_state.RuntimeStateError("execution projection이 없습니다.")
+            if new_pr:
+                from loop_manager_internal.notifications import notifications
+                notifications.record_pr_creation(self.connection, repo, self.plan_id, values.get('pr_url'))
             result = self.repository.transition_from_snapshot(
                 expected,
                 plan_values={"status": "PR_OPEN", "last_error": None, **values},
