@@ -242,13 +242,27 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
             self.assertEqual(service.runtime.get(service.repo, 'G-013').status, 'READY')
 
     def test_publication_validation_and_intent_are_atomic_against_manual_start(self):
+        from loop_manager_internal.storage.db_access import (
+            CoordinatedConnection, DatabaseWaitTimeout, open_connection,
+        )
         with tempfile.TemporaryDirectory() as directory:
             service, _, path = self.fixture(directory)
             candidate = self.publication(service)
             database = Path(directory) / 'state.db'
             with closing(sqlite3.connect(database)) as target, target:
                 service.connection.backup(target)
-            checked, fetched, release = threading.Event(), threading.Event(), threading.Event()
+            checked, blocked, release = threading.Event(), threading.Event(), threading.Event()
+
+            class SignalBusyConnection(CoordinatedConnection):
+                def execute(self, sql, parameters=()):
+                    try:
+                        return super().execute(sql, parameters)
+                    except sqlite3.OperationalError as error:
+                        if (sql.strip().upper() == 'BEGIN IMMEDIATE'
+                                and isinstance(error, DatabaseWaitTimeout)):
+                            blocked.set()
+                        raise
+
             real_check = manager._assert_mutable_ready_snapshot_current
             def pause(connection, snapshot):
                 real_check(connection, snapshot)
@@ -260,15 +274,11 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                     connection.row_factory = sqlite3.Row
                     return manager.record_general_planning_publication_intent(connection, service.repo,
                         candidate[0], candidate[1], candidate[2], 'spec', 'planning')
-            real_fetch = service.effects.fetch_base
-            def after_fetch(*args, **kwargs):
-                result = real_fetch(*args, **kwargs)
-                fetched.set()
-                return result
             def start():
-                with closing(sqlite3.connect(database)) as connection, connection:
+                with closing(open_connection(
+                        database, timeout=2, factory=SignalBusyConnection)) as connection:
                     connection.row_factory = sqlite3.Row
-                    command = ManualWorkService(replace(service.effects, fetch_base=after_fetch), connection,
+                    command = ManualWorkService(service.effects, connection,
                         service.state_dir, service.repo_path, service.config_path)
                     return command.start('G-012')
             with mock.patch.object(manager, '_assert_mutable_ready_snapshot_current', side_effect=pause), \
@@ -277,7 +287,8 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                 try:
                     self.assertTrue(checked.wait(10))
                     manual = executor.submit(start)
-                    self.assertTrue(fetched.wait(10))
+                    # Start snapshots DB state before Git observation; confirm it meets the held DB turn.
+                    self.assertTrue(blocked.wait(10))
                 finally:
                     release.set()
                 publication.result(timeout=10)
@@ -383,6 +394,119 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                     service.complete(manual_tests.completion())
                 self.assertEqual(dict(service.store.request(group)), accepted)
                 self.assertEqual(service.store.for_plan(service.repo, 'G-012')['last_error'], 'competing request')
+
+    def test_complete_rejects_plan_revision_changed_during_profile_observation(self):
+        from loop_manager_internal.agents.agent_invocation import ResolvedProfile
+        from loop_manager_internal.storage.db_access import open_connection
+        with tempfile.TemporaryDirectory() as directory:
+            original, _, _ = self.fixture(directory)
+            path = Path(directory) / 'manual.db'
+            with closing(open_connection(path)) as connection:
+                connection.row_factory = sqlite3.Row
+                original.connection.backup(connection)
+                service = ManualWorkService(original.effects, connection, original.state_dir,
+                                            original.repo_path, original.config_path)
+                service.start('G-012')
+
+                def change_revision(*_args):
+                    self.assertFalse(connection.in_transaction)
+                    self.assertFalse(connection._held)
+                    with closing(open_connection(path, timeout=.5)) as other, other:
+                        other.execute(
+                            "UPDATE exec_plans SET current_revision_sha='competing-revision' "
+                            "WHERE repo=? AND plan_id='G-012'", (service.repo,),
+                        )
+                    return ResolvedProfile('fixture-reviewer', 'medium')
+
+                service.effects.resolve_profile.side_effect = change_revision
+                with self.assertRaisesRegex(ManualWorkError, '구성 G·리비전·소유권'):
+                    service.complete(manual_tests.completion())
+                group = service.store.for_plan(service.repo, 'G-012')
+                self.assertIsNone(service.store.request(group))
+                self.assertEqual(group['state'], 'MANUAL_WORKING')
+                self.assertEqual(connection.execute(
+                    "SELECT current_revision_sha FROM exec_plans WHERE repo=? AND plan_id='G-012'",
+                    (service.repo,),
+                ).fetchone()[0], 'competing-revision')
+
+    def test_start_rejects_plan_revision_changed_during_git_observation(self):
+        from loop_manager_internal.storage.db_access import open_connection
+        with tempfile.TemporaryDirectory() as directory:
+            original, _, worktree = self.fixture(directory)
+            path = Path(directory) / 'manual.db'
+            with closing(open_connection(path)) as connection:
+                connection.row_factory = sqlite3.Row
+                original.connection.backup(connection)
+                service = ManualWorkService(original.effects, connection, original.state_dir,
+                                            original.repo_path, original.config_path)
+                fetch_base = service.effects.fetch_base
+
+                def fetch_and_change(*args, **kwargs):
+                    self.assertFalse(connection.in_transaction)
+                    self.assertFalse(connection._held)
+                    result = fetch_base(*args, **kwargs)
+                    with closing(open_connection(path, timeout=.5)) as other, other:
+                        other.execute(
+                            "UPDATE exec_plans SET current_revision_sha='competing-revision' "
+                            "WHERE repo=? AND plan_id='G-012'", (service.repo,),
+                        )
+                    return result
+
+                service.effects = replace(service.effects, fetch_base=fetch_and_change)
+                with self.assertRaisesRegex(ManualWorkError, '요청·소유권이 변경'):
+                    service.start('G-012')
+                self.assertIsNone(service.store.for_plan(service.repo, 'G-012'))
+                self.assertFalse(worktree.exists())
+                self.assertEqual(connection.execute(
+                    "SELECT current_revision_sha FROM exec_plans WHERE repo=? AND plan_id='G-012'",
+                    (service.repo,),
+                ).fetchone()[0], 'competing-revision')
+
+    def test_submit_rejects_reserved_plan_revision_changed_during_profile_observation(self):
+        from loop_manager_internal.agents.agent_invocation import ResolvedProfile
+        from loop_manager_internal.storage.db_access import open_connection
+        with tempfile.TemporaryDirectory() as directory:
+            original, _, _ = self.fixture(directory)
+            git(original.repo_path, 'branch', 'source')
+            git(original.repo_path, 'push', 'origin', 'source')
+            path = Path(directory) / 'manual.db'
+            with closing(open_connection(path)) as connection:
+                connection.row_factory = sqlite3.Row
+                original.connection.backup(connection)
+                service = ManualWorkService(original.effects, connection, original.state_dir,
+                                            original.repo_path, original.config_path)
+                service.effects.generate_plans.return_value = json.dumps(
+                    {'plans': [manual_tests.generated('Submitted')]},
+                )
+
+                def change_revision(*_args):
+                    group = service.store.for_source(
+                        service.repo, 'source', ['docs/requirements/Active.md'],
+                    )
+                    member = json.loads(group['members'])[0]
+                    self.assertFalse(connection.in_transaction)
+                    self.assertFalse(connection._held)
+                    with closing(open_connection(path, timeout=.5)) as other, other:
+                        other.execute(
+                            'UPDATE exec_plans SET current_revision_sha=? WHERE repo=? AND plan_id=?',
+                            ('competing-revision', service.repo, member),
+                        )
+                    return ResolvedProfile('fixture-reviewer', 'medium')
+
+                service.effects.resolve_profile.side_effect = change_revision
+                args = manual_tests.completion(
+                    branch='source', requirement=['docs/requirements/Active.md'],
+                )
+                with self.assertRaisesRegex(ManualWorkError, '구성 G·리비전·소유권'):
+                    service.submit(args)
+                group = service.store.for_source(service.repo, 'source', args.requirement)
+                member = json.loads(group['members'])[0]
+                self.assertIsNone(group['request_id'])
+                self.assertEqual(connection.execute(
+                    'SELECT current_revision_sha FROM exec_plans WHERE repo=? AND plan_id=?',
+                    (service.repo, member),
+                ).fetchone()[0], 'competing-revision')
+                self.assertTrue(group['prepared_head'])
 
     def test_submit_prepares_and_pushes_during_independent_verify(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -522,7 +522,7 @@ def execute_local_recovery_request(
     if result == "in_progress":
         local_recovery_state.record_progress(connection, request, after)
     else:
-        local_recovery_state.complete_request(connection, request, result)
+        local_recovery_state.complete_request(connection, request, result, after)
     request_action = "재개" if request.resumed else "요청"
     effects.operation_print(
         f"로컬 환경 재검사 {'완료' if result_code == 0 else '진행 중' if result == 'in_progress' else '미해결'}: "

@@ -209,22 +209,40 @@ def consume_recheck(connection: sqlite3.Connection, request_id: str, subject: st
     return changed.rowcount == 1
 
 
+def _require_pending_request(connection, request: LocalRecoveryRequest) -> None:
+    row = connection.execute(
+        'SELECT repo,plan_id,status FROM local_environment_recovery_requests WHERE request_id=?',
+        (request.request_id,),
+    ).fetchone()
+    if (row is None or row['repo'] != request.repo or row['plan_id'] != request.plan_id
+            or row['status'] != 'pending'):
+        raise LocalRecoveryRequestError("로컬 재검사 요청 대상 또는 상태가 변경됐습니다.")
+
+
 def complete_request(
     connection: sqlite3.Connection, request: LocalRecoveryRequest,
-    result: str,
+    result: str, after: dict,
 ) -> dict:
-    after = snapshot(connection, request.repo, request.plan_id)
-    serialized = json.dumps(after, sort_keys=True, separators=(",", ":"))
-    with connection:
-        changed = connection.execute(
+    from .db_access import run_database_request
+
+    def complete(db):
+        _require_pending_request(db, request)
+        current = snapshot(db, request.repo, request.plan_id)
+        if current != after:
+            raise LocalRecoveryRequestError("결과 판단 뒤 로컬 재검사 대상 상태가 변경됐습니다.")
+        serialized = json.dumps(after, sort_keys=True, separators=(",", ":"))
+        changed = db.execute(
             "UPDATE local_environment_recovery_requests SET status = 'completed', "
             "after_state = ?, result = ?, updated_at = CURRENT_TIMESTAMP, "
-            "completed_at = CURRENT_TIMESTAMP WHERE request_id = ? AND status = 'pending'",
-            (serialized, result, request.request_id),
+            "completed_at = CURRENT_TIMESTAMP WHERE request_id = ? AND repo = ? "
+            "AND plan_id IS ? AND status = 'pending'",
+            (serialized, result, request.request_id, request.repo, request.plan_id),
         )
         if changed.rowcount != 1:
-            raise LocalRecoveryRequestError("로컬 재검사 요청 상태가 변경됐습니다.")
-    return after
+            raise LocalRecoveryRequestError("로컬 재검사 요청 대상 또는 상태가 변경됐습니다.")
+        return after
+
+    return run_database_request(connection, complete)
 
 
 def record_progress(
@@ -232,13 +250,21 @@ def record_progress(
     after: dict,
 ) -> None:
     """Keep an unfinished bounded request resumable without issuing a new identity."""
-    serialized = json.dumps(after, sort_keys=True, separators=(",", ":"))
-    with connection:
-        changed = connection.execute(
+    from .db_access import run_database_request
+
+    def record(db):
+        _require_pending_request(db, request)
+        current = snapshot(db, request.repo, request.plan_id)
+        if current != after:
+            raise LocalRecoveryRequestError("로컬 재검사 진행 관측 뒤 대상 상태가 변경됐습니다.")
+        serialized = json.dumps(current, sort_keys=True, separators=(",", ":"))
+        changed = db.execute(
             "UPDATE local_environment_recovery_requests SET after_state = ?, "
-            "result = 'in_progress', updated_at = CURRENT_TIMESTAMP "
-            "WHERE request_id = ? AND status = 'pending'",
-            (serialized, request.request_id),
+            "result = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE request_id = ? "
+            "AND repo = ? AND plan_id IS ? AND status = 'pending'",
+            (serialized, request.request_id, request.repo, request.plan_id),
         )
         if changed.rowcount != 1:
-            raise LocalRecoveryRequestError("로컬 재검사 요청 상태가 변경됐습니다.")
+            raise LocalRecoveryRequestError("로컬 재검사 요청 대상 또는 상태가 변경됐습니다.")
+
+    run_database_request(connection, record)

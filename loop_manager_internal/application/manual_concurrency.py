@@ -25,7 +25,8 @@ def group_resources(group):
     return resources
 
 
-def preparation_gate(service, *, plan_ids=(), group=None, requirements=(), inspect_workspace=True):
+def preparation_gate(service, *, plan_ids=(), group=None, requirements=(), inspect_workspace=True,
+                     check_git_journal=True):
     connection, repo = service.connection, service.repo
     if scoped_blocking.project_block(connection, repo):
         raise ManualConflictError('프로젝트 승인·차단 gate가 활성 상태입니다. 수락되지 않았습니다.')
@@ -92,8 +93,8 @@ def preparation_gate(service, *, plan_ids=(), group=None, requirements=(), inspe
     def recoverable(intent):
         return intent['owner'] == f"plan:{group['owner_id']}" and intent['kind'] in {
             'managed_worktree_create', 'manual_branch_push'}
-    if manager_git_journal.has_pending_project_mutation(service.state_dir, repo,
-                                                       targets=targets, recoverable=recoverable):
+    if check_git_journal and manager_git_journal.has_pending_project_mutation(
+            service.state_dir, repo, targets=targets, recoverable=recoverable):
         raise ManualConflictError('미완료 Git operation과 충돌: ' + ', '.join(sorted(targets)))
     path = Path(group['worktree'])
     if inspect_workspace and path.is_dir() and group['workspace_created']:
