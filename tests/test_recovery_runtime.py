@@ -26,6 +26,12 @@ def observation(reason, detail="same RuntimeError"):
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_unproven_git_history_waits_without_user_action_or_timer_retry(self):
+        decision = decide(observation(RecoveryReason.GIT_INPUT_UNCERTAIN), attempts=4001)
+        self.assertEqual(decision.disposition, RecoveryDisposition.CONDITION_WAIT)
+        self.assertEqual(decision.action, RecoveryAction.PAUSE)
+        self.assertIsNone(decision.block_reason)
+
     def test_verified_rebase_can_resolve_final_record_without_erasing_failure_history(self):
         connection = sqlite3.connect(':memory:')
         connection.row_factory = sqlite3.Row

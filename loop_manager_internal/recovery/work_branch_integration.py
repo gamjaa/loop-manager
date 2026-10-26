@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import tempfile
 from pathlib import Path
 from loop_manager_internal.runtime.resource_lock import resource_locks
@@ -208,6 +209,17 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
     known = (plan['publication_remote_oid'] or published_branch(connection, repo, plan)
              or (current.snapshot or {}).get('accepted_work_branch')
              or (acceptance.get('remote') or {}).get('oid'))
+    adoption = (current.snapshot or {}).get('remote_adoption')
+    if not known and adoption is not None:
+        project = connection.execute('SELECT base_branch FROM projects WHERE repo=?', (repo,)).fetchone()
+        if (not isinstance(adoption, dict) or adoption.get('version') != 1
+                or any(adoption.get(key) != value for key, value in {
+                    'repo': repo, 'plan_id': str(plan['plan_id']), 'branch': branch,
+                    'base': project['base_branch']}.items())
+                or not isinstance(adoption.get('head'), str)
+                or re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', adoption['head']) is None):
+            raise RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN, '저장된 원격 인수 identity가 현재 작업과 다릅니다.')
+        known = adoption['head']
     integration = (current.snapshot or {}).get('work_branch_integration') or {}
     pending = bool(integration and integration.get('phase') != 'complete')
     if remote == (current.snapshot or {}).get('accepted_work_branch') and not pending:
@@ -230,8 +242,8 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
                               '전진한 원격 branch와 저장된 작업 이력을 연결할 수 없습니다.')
     relation = effects.git(repo_path, 'merge-base', '--is-ancestor', anchor, fetched, check=False)
     if relation.returncode == 1:
-        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                              '원격 작업 branch가 마지막으로 확인한 commit에서 전진하지 않았습니다.')
+        raise RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN,
+                              f'원격 작업 branch의 이력 연결을 확인할 수 없습니다: {anchor} -> {fetched}')
     if relation.returncode:
         raise RecoveryFailure(RecoveryReason.STATUS_FAILED,
                               '원격 작업 branch의 fast-forward 관계를 확인할 수 없습니다.')

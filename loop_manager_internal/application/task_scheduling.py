@@ -151,6 +151,9 @@ class TaskScheduler:
         if (saved is None or saved['reason_code'] not in eligible or saved['pending_action'] == 'final_block'
                 or resume and saved['retry_after'] is None):
             return False
+        if (saved['reason_code'] == RecoveryReason.REMOTE_SNAPSHOT_RACE.value
+                and saved['pending_action'] == 'pause' and saved['attempts'] >= 3):
+            return False
         saved = repository.defer_retry(repo, plan_id)
         events.emit('작업 재시도 대기', project=repo, plan=plan_id, reason_code=saved['reason_code'],
                     retry_after=saved['retry_after'])

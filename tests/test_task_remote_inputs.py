@@ -137,7 +137,7 @@ class TaskRemoteInputTests(TestCase):
         with self.assertRaises(RecoveryFailure) as caught:
             self.sync(remote)
 
-        self.assertIs(caught.exception.reason, RecoveryReason.REMOTE_SNAPSHOT_RACE)
+        self.assertIs(caught.exception.reason, RecoveryReason.GIT_INPUT_UNCERTAIN)
         after = lm.capture_git_snapshot(self.fx.worktree)
         self.assertEqual((after.head, after.branch, after.index, after.dirty, after.operations),
                          (before.head, before.branch, before.index, before.dirty, before.operations))

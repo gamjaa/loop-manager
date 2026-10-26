@@ -172,6 +172,14 @@ class ProjectFetchBranchDeletionTest(unittest.TestCase):
         self.assertEqual(len(self.fetches), 2)
         self.assertEqual(self.updates, [])
 
+    def test_advancing_other_task_does_not_hold_selected_base(self):
+        self.remote[self.branch] = self.old
+        self.on_fetch = lambda: self.remote.update({self.branch: 'c' * 40})
+        self.run_fetch()
+        self.assertEqual(self.tracking, {'main': self.oid, self.branch: 'c' * 40})
+        self.assertEqual(len(self.fetches), 1)
+        self.assertEqual(len(self.queries()), 1)
+
     def test_invalid_duplicate_and_missing_receive_entries_preserve_refs(self):
         for text in ('invalid', f"{self.oid}\t\tbranch 'main' of fixture\n" * 2, ''):
             def receive():

@@ -73,6 +73,10 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
             self.assertEqual(stored["pr_conflict_recovery"], 0)
             self.assertEqual(pushes, [])
             agent.assert_not_called()
+            recovery = connection.execute(
+                'SELECT disposition, pending_action FROM recovery_records WHERE repo=? AND subject=?',
+                (str(repo), 'G-026')).fetchone()
+            self.assertEqual(tuple(recovery), ('condition_wait', 'pause'))
 
     @dummy_worker_sessions(fixed_guidance=True)
     def test_lease_competition_reobserves_without_overwriting_remote_head(self):

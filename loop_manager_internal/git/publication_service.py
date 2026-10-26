@@ -141,7 +141,7 @@ def record_remote_publication_branch(
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
     if (checkpoint.snapshot or {}).get('accepted_work_branch') == remote_oid:
         return
-    raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+    raise RecoveryFailure(RecoveryReason.CHECKPOINT_STALE,
         "PR이 없는 원격 branch가 현재 관리 HEAD 또는 저장된 게시 OID와 "
         f"일치하지 않아 갱신을 거부합니다: {branch}"
     )
@@ -214,7 +214,7 @@ def push_managed_publication_branch(
                 refreshed["publication_remote_oid"] if refreshed else ""
             )
         if recorded_oid != remote_oid and (checkpoint.snapshot or {}).get('accepted_work_branch') != remote_oid:
-            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+            raise RecoveryFailure(RecoveryReason.CHECKPOINT_STALE,
                 "저장된 원격 branch OID와 fetch 결과가 달라 강제 갱신을 거부합니다."
             )
         live = effects.git(repo_path, 'ls-remote', '--heads', 'origin',
