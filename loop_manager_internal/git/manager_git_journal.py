@@ -1139,6 +1139,10 @@ def record_current_rebase_result(state_dir, *, repo, target, owner, decision, ob
         return False
     # 기록 대상이 확인된 뒤에만 비용이 큰 현재 Git 상태를 수집한다.
     observed = observed() if callable(observed) else observed
+    if decision.status is RebaseStatus.COMPLETE:
+        from loop_manager_internal.git.managed_rebase_validation import valid_journal_observation
+        if not valid_journal_observation(observed, decision.acceptance):
+            raise MutationEvidenceError('current rebase observation differs from accepted state')
     # A result sealed by an older policy is audit data. Do not rewrite it.
     result_path = slot / f"{intent['id']}.result.json"
     if result_path.exists():
@@ -1288,12 +1292,15 @@ def verified_managed_transitions(
     agent_session_id: str | None = None,
     git: Callable[..., Any] | None = None,
     kind: str | None = None, target: str | None = None,
+    include_current_rebase: bool = False,
 ) -> list[dict[str, Any]]:
     """Offer G-092 sealed per-operation evidence, not a live-state allowance."""
     root = state_dir / "manager-git-journal"
     if not root.exists():
         return []
     transitions = []
+    if include_current_rebase and kind != 'managed_rebase':
+        raise MutationEvidenceError('current rebase history requires an exact resource filter')
     if (kind is None) != (target is None):
         raise MutationEvidenceError('Manager Git resource filter requires kind and target')
     slots = root.iterdir() if kind is None else (_slot(state_dir, repo, kind, target),)
@@ -1307,7 +1314,8 @@ def verified_managed_transitions(
             result = _read(result_path)
             # A pending operation must not hide earlier sealed evidence. Its
             # own result remains unavailable until active-intent cleanup ends.
-            if result.get("id") == active_id or result.get("status") != "complete":
+            current_result = include_current_rebase and result.get('status') == 'current_state'
+            if result.get("id") == active_id or (result.get("status") != "complete" and not current_result):
                 continue
             intent = _read(slot / f"{result.get('id')}.intent.json",
                            require_rebase_branch=True)
@@ -1328,6 +1336,28 @@ def verified_managed_transitions(
                 raise MutationEvidenceError("Manager Git 전이 결과 identity가 다릅니다.")
             if not isinstance(result.get("observed"), dict):
                 raise MutationEvidenceError("Manager Git 저장 결과 상태가 불완전합니다.")
+            if current_result:
+                from loop_manager_internal.git.managed_rebase_validation import valid_journal_observation
+                candidates = result['candidates']
+                observed = result['observed']
+                accepted = candidates.get('acceptance') if isinstance(candidates, dict) else None
+                if (operation_kind != 'managed_rebase' or not isinstance(candidates, dict)
+                        or candidates.get('kind') != 'current_rebase_observation'
+                        or candidates.get('status') not in {'waiting', 'complete'}
+                        or not all(key in intent['before'] and key in observed for key in
+                                   ('head', 'branch', 'index', 'dirty', 'operations'))
+                        or (candidates['status'] == 'waiting' and accepted is not None)
+                        or (candidates['status'] == 'complete' and (
+                            observed.get('branch') != intent['expected']['branch']
+                            or controlling_git_operation(observed.get('operations'))
+                            or not valid_journal_observation(observed, accepted) or any(accepted[key] != value for key, value in {
+                                'repo': repo, 'plan_id': owner.removeprefix('plan:'), 'worktree': intent['target'],
+                                'branch': intent['expected']['branch'],
+                                'target_base_oid': intent['expected']['target_base_oid'], 'head': observed['head']}.items())))):
+                    raise MutationEvidenceError('Manager current rebase 저장 전이 identity가 다릅니다.')
+                if candidates['status'] == 'complete':
+                    transitions.append({'intent': intent, 'result': result})
+                continue
             if operation_kind in {"managed_worktree_create", "managed_worktree_remove"}:
                 action = "create" if operation_kind.endswith("create") else "remove"
                 receipt = state_dir / "managed-worktree-intents" / f"{intent['id']}.{action}.json"

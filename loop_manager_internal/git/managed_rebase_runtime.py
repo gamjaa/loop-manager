@@ -3,7 +3,7 @@ from __future__ import annotations
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from dataclasses import dataclass
 from collections.abc import Callable
-from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
+from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED, WORKSPACE_RESERVED
 import os
 import hashlib
 import stat
@@ -48,13 +48,16 @@ _UNSET = object()
 
 
 def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir, repo, plan_id,
-                  worktree, branch, *, target=None, remote_oid=_UNSET, normalizing_frontmatter=False):
+                  worktree, branch, *, target=None, remote_oid=_UNSET, normalizing_frontmatter=False,
+                  allow_reserved=False):
     """Check checkpoint-bound declarations and exact live leases before revision adoption."""
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                               (repo, plan_id)).fetchone()
     if plan is None:
         raise MutationEvidenceError('current rebase plan is missing')
     checkpoint = ExecutionCheckpointRepository(connection).get(repo, plan_id)
+    reserved = bool(allow_reserved and int(plan['workspace_owned']) == WORKSPACE_RESERVED
+                    and checkpoint.operation == 'rebase')
     saved = checkpoint.snapshot or {}
     proof = saved.get('current_rebase_acceptance') or saved.get('completed_rebase') or saved.get('blocked_resume') or {}
     recovered_metadata = None
@@ -95,7 +98,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         remote = Remote(repo, branch, expected_oid, pr)
     if (str(plan['branch'] or '') != branch
             or str(plan['worktree'] or '') != str(worktree)
-            or (int(plan['workspace_owned']) != WORKSPACE_OWNED and recovered_metadata is None)):
+            or (int(plan['workspace_owned']) != WORKSPACE_OWNED and not reserved and recovered_metadata is None)):
         raise MutationEvidenceError('current rebase reservation differs')
     project = connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()
     common_dir = ports.git(repo_path, 'rev-parse', '--git-common-dir').stdout.strip()
@@ -131,7 +134,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         repo=repo, repository_identity=identity, plan_id=plan_id,
         plan_path=str(plan['path']), worktree=str(worktree.resolve()), branch=branch,
         target_base_oid=target, generation=checkpoint.generation,
-        workspace_owned=int(plan['workspace_owned']) == WORKSPACE_OWNED or recovered_metadata is not None,
+        workspace_owned=int(plan['workspace_owned']) == WORKSPACE_OWNED or reserved or recovered_metadata is not None,
         input_fingerprint=inputs, scope_fingerprint=policy, remote=remote,
         autostash_oid=saved.get('stash_oid') if checkpoint.operation == 'rebase' else None,
         before_head=(recovered_metadata.get('orig-head') if recovered_metadata is not None else

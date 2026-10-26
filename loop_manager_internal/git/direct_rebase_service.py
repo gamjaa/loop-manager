@@ -132,7 +132,6 @@ class FinishOwnedDirectRebaseEffects:
     """Named effects for _finish_owned_direct_rebase; no entry-point/module access."""
     _canonical_path: Callable[..., object]
     _current_rebase_service: Callable[..., object]
-    _owned_rebase_journal_state: Callable[..., object]
 
 
 def _finish_owned_direct_rebase(
@@ -148,13 +147,14 @@ def _finish_owned_direct_rebase(
     if service.normalize_frontmatter():
         service = effects._current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch)
-    _, decision = service.require_owned()
+    observed, decision = service.require_owned()
     if decision.status.value == 'ready_to_start':
         return False
+    from loop_manager_internal.git.managed_rebase_validation import journal_observation
     return manager_git_journal.record_current_rebase_result(
         state_dir, repo=str(effects._canonical_path(repo_path)),
         target=str(effects._canonical_path(worktree)), owner=f'plan:{plan_id}',
-        decision=decision, observed=lambda: effects._owned_rebase_journal_state(worktree, branch),
+        decision=decision, observed=lambda: journal_observation(observed),
     )
 
 

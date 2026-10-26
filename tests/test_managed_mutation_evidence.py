@@ -5,7 +5,8 @@ from pathlib import Path
 from contextlib import ExitStack
 from dataclasses import replace
 import copy
-from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry
+import json
+from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry, WorktreeFile, journal_observation
 from tests.support.current_rebase import current_rebase_case
 import sqlite3
 import tempfile
@@ -31,6 +32,87 @@ BRANCH = 'loop-manager/G-091'
 
 
 class ManagedTransitionTests(unittest.TestCase):
+    def test_current_rebase_receipt_is_available_only_to_exact_reservation_history(self):
+        from tests.support.rebase_observations import expectation, observation, decision_for
+        from loop_manager_internal.git.managed_rebase_validation import Remote
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            target = str((state / 'worktree').resolve())
+            expected = expectation(repo=REPO, plan_id='G-091', branch=BRANCH, worktree=target,
+                plan_path='docs/plans/[G-091] Work.md',
+                before_head=OLD, target_base_oid=TREE, remote=Remote(REPO, BRANCH, None))
+            observed = observation(expected, head=NEW, branch_ref=(NEW, ''),
+                registration=(f'HEAD={NEW}', f'branch=refs/heads/{BRANCH}'),
+                files=(WorktreeFile('notes.txt', ('untracked',), '100644', 'owned-bytes'),))
+            decision = decision_for(expected, observed)
+            before = {'head': OLD, 'branch': BRANCH, 'index': {}, 'dirty': {}, 'operations': {}}
+            after = json.loads(json.dumps(journal_observation(observed)))
+            self.assertIsNone(after['metadata'])
+            waiting = journal_observation(replace(observed, metadata=(('head-name', f'refs/heads/{BRANCH}'),)))
+            self.assertEqual(waiting['metadata'], {'head-name': f'refs/heads/{BRANCH}'})
+            journal.begin_current_rebase(state, owner='plan:G-091', repo=REPO, target=target,
+                before=before, expected={'branch': BRANCH, 'before_head': OLD,
+                                        'target_base_oid': TREE, 'remote_oid': None})
+            # Reobserving files after acceptance must not seal a different state.
+            changed = journal_observation(replace(observed, files=(
+                WorktreeFile('notes.txt', ('untracked',), '100644', 'foreign-bytes'),)))
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.record_current_rebase_result(state, repo=REPO, target=target,
+                    owner='plan:G-091', decision=decision, observed=changed)
+            self.assertTrue((journal._slot(state, REPO, 'managed_rebase', target) / 'active.json').exists())
+            self.assertTrue(journal.record_current_rebase_result(state, repo=REPO, target=target,
+                owner='plan:G-091', decision=decision, observed=after))
+            options = {'kind': 'managed_rebase', 'target': target}
+            self.assertEqual(journal.verified_managed_transitions(state, REPO, 'plan:G-091', **options), [])
+            history = journal.verified_managed_transitions(state, REPO, 'plan:G-091',
+                **options, include_current_rebase=True)
+            self.assertEqual(history[0]['intent']['before'], before)
+            self.assertEqual(history[0]['result']['observed'], after)
+            self.assertEqual(journal.verified_managed_transitions(state, REPO, 'plan:G-092',
+                **options, include_current_rebase=True), [])
+            slot = journal._slot(state, REPO, 'managed_rebase', target)
+            result = next(slot.glob('*.result.json'))
+            saved = journal._read(result)
+            for mutation in ('dirty', 'payload', 'missing-binding', 'metadata', 'head'):
+                altered = copy.deepcopy(saved)
+                if mutation == 'dirty':
+                    altered['observed']['dirty']['notes.txt'][1] = 'foreign-bytes'
+                elif mutation == 'payload':
+                    altered['observed']['validation_observation']['files'][0]['signature'] = 'foreign-bytes'
+                    altered['observed']['dirty']['notes.txt'][1] = 'foreign-bytes'
+                elif mutation == 'metadata':
+                    altered['observed']['metadata'] = {'head-name': 'foreign-branch'}
+                elif mutation == 'missing-binding':
+                    del altered['observed']['validation_observation']
+                else:
+                    altered['observed']['head'] = 'foreign-head'
+                result.write_text(json.dumps(altered), encoding='utf-8')
+                with self.subTest(mutation=mutation), self.assertRaises(journal.MutationEvidenceError):
+                    journal.verified_managed_transitions(state, REPO, 'plan:G-091',
+                        **options, include_current_rebase=True)
+
+    def test_execution_rebase_receipt_uses_accepted_observation_without_second_snapshot(self):
+        case = current_rebase_case(self)
+        case.fixture.journal_start.stop()
+        case.expected = replace(case.expected, repo=REPO)
+        case.observed = replace(case.observed, repo=REPO)
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            case.handler._identity = replace(case.handler._identity, state_dir=state_dir)
+            context = case.fixture.context()
+            target = str(context.worktree.resolve())
+            journal.begin_current_rebase(state_dir, owner='plan:G-047', repo=REPO, target=target,
+                before={'head': 'before', 'branch': 'loop-manager/G-047', 'index': {}, 'dirty': {}, 'operations': {}},
+                expected={'branch': 'loop-manager/G-047', 'before_head': 'before',
+                          'target_base_oid': 'base', 'remote_oid': 'remote'})
+            case.handler._rebase_journal_state.side_effect = AssertionError('must use accepted observation')
+            self.assertTrue(ExecutionHandlers._finish_rebase_journal(case.handler, context))
+            case.handler._rebase_journal_state.assert_not_called()
+            history = journal.verified_managed_transitions(state_dir, REPO, 'plan:G-047',
+                kind='managed_rebase', target=target, include_current_rebase=True)
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]['result']['observed']['head'], case.observed.head)
+
     def test_unlocked_cleanup_recovery_accepts_changed_head_without_git_write(self):
         before = {'exists': True, 'registration': {
             'head': OLD, 'branch': f'refs/heads/{BRANCH}', 'locked': None,
@@ -848,7 +930,8 @@ class ManagedTransitionTests(unittest.TestCase):
             with (
                 mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=state_dir),
                 mock.patch.object(loop_manager, '_current_rebase_service', side_effect=lambda *_a, **_k: case.factory(None)),
-                mock.patch.object(loop_manager, '_owned_rebase_journal_state', return_value={'head': 'owned-head'}),
+                mock.patch.object(loop_manager, '_owned_rebase_journal_state',
+                                  side_effect=AssertionError('must use accepted observation')) as second_observation,
                 # This case owns rebase acceptance; publication has its own
                 # lease, interruption and staging tests with durable owners.
                 mock.patch.object(loop_manager, '_publish_direct_rebase_checkpoint'),
@@ -857,6 +940,7 @@ class ManagedTransitionTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, 'crash'):
                         loop_manager._finish_owned_direct_rebase(state_dir, case.fixture.connection,
                             Path(REPO), 'repo', 'G-047', Path('/state/G-047').resolve(), 'loop-manager/G-047')
+                second_observation.assert_not_called()
                 loop_manager._complete_direct_rebase_checkpoint(case.fixture.connection, 'repo', 'G-047',
                     Path('/state/G-047').resolve(), 'base', repo_path=Path(REPO), branch='loop-manager/G-047',
                     agent_session_id='replacement')
@@ -1270,6 +1354,31 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     """The production factory's identity/input adapters, with no Git process."""
     _plan_text = ('---\nid: G-047\ntitle: Runtime\nsources:\n  - docs/PRODUCT.md\n'
                   'depends_on: []\ncomplexity: medium\nrisk: medium\n---\n\nOriginal body.\n')
+
+    def test_reserved_rebase_observation_keeps_checkpoint_and_requires_saved_operation(self):
+        from loop_manager_internal.git.managed_rebase_runtime import build_service
+        from tests.support.runtime import runtime_rebase_fixture
+        ports, previous = self._user_document_service()
+        connection, runtime, checkpoints, *_ = runtime_rebase_fixture(self)
+        runtime.update_plan('repo', 'G-047', plan_values={
+            'workspace_owned': 2, 'worktree': previous.expected.worktree}, enqueue=False)
+        before = checkpoints.get('repo', 'G-047')
+        arguments = (ports, connection, Path(REPO), Path('/state'), 'repo', 'G-047',
+                     Path(previous.expected.worktree), 'loop-manager/G-047')
+        with self.assertRaises(journal.MutationEvidenceError):
+            build_service(*arguments)
+        service = build_service(*arguments, allow_reserved=True)
+        service.adapters.validate_identity(service.expected)
+        self.assertEqual(service.expected.before_head, before.expected_head)
+        self.assertEqual(service.expected.target_base_oid, before.target_base_oid)
+        self.assertEqual(service.expected.generation, before.generation)
+        self.assertEqual(checkpoints.get('repo', 'G-047'), before)
+        self.assertEqual(runtime.get('repo', 'G-047').workspace_owned, 2)
+        checkpoints.record('repo', 'G-047', expected_generation=before.generation,
+            operation=None, expected_head=before.expected_head, target_base_oid=before.target_base_oid,
+            observed_remote_oid=before.observed_remote_oid, snapshot=before.snapshot)
+        with self.assertRaises(journal.MutationEvidenceError):
+            build_service(*arguments, allow_reserved=True)
 
     def test_missing_checkpoint_uses_current_metadata_and_live_remote_for_validation(self):
         from loop_manager_internal.git.managed_rebase_runtime import build_service

@@ -117,14 +117,17 @@ def _managed_worktree_transition_state(effects: ManagedWorktreeTransitionStateEf
                    if effects._canonical_path(Path(str(item.get("worktree", ""))))
                    == effects._canonical_path(worktree)), None)
     exists = worktree.exists() or worktree.is_symlink()
+    index = None
+    if exists and record is not None:
+        unmerged = effects.git(worktree, 'ls-files', '-u', '-z').stdout
+        index = {'unmerged': unmerged} if unmerged else effects.git(worktree, 'write-tree').stdout.strip()
     return {
         "exists": exists,
         "registration": ({"head": record.get("HEAD"),
                           "branch": record.get("branch"),
                           "locked": record.get("locked")}
                          if record is not None else None),
-        "index": (effects.git(worktree, "write-tree").stdout.strip()
-                  if exists and record is not None else None),
+        "index": index,
     }
 
 

@@ -6,12 +6,18 @@ from pathlib import Path
 from dataclasses import asdict
 import re
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.git.workspace import validate_reserved_worktree_history, validate_registered_remote, reserved_rebase_before_head
+from loop_manager_internal.agents.agent_scope_decision import _same_local_snapshot
+from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
 import sys
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.recovery.plan_recovery import ReservedPullRequestCompletion, reserved_workspace_ownership
+from loop_manager_internal.storage.task_calls import CallDeferred
+from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
-from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind
+from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind, ExecutionPlanMetadata
 from loop_manager_internal.execution.execution_checkpoint import CheckpointAction, assess, observe
 from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRace
 from loop_manager_internal.storage.runtime_state import RuntimeStateError
@@ -19,7 +25,7 @@ from loop_manager_internal.git.rebase_correction import CorrectionAction, next_a
 from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract
-from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
+from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot, RebaseWorkspaceContext
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.storage import database
@@ -94,16 +100,9 @@ class WorkspaceHandler:
                 or not project['origin'] or self.ports.github_repository is None):
             raise self.ports.contract.WorkspaceOwnershipError(
                 '등록 저장소·base와 원격 인수 조건을 확인할 수 없습니다.')
-        for location in (self.ports.identity.repo_path, worktree):
-            if location is None or (location != self.ports.identity.repo_path and not location.is_dir()):
-                continue
-            for arguments in (('remote', 'get-url', '--all', 'origin'),
-                              ('remote', 'get-url', '--push', '--all', 'origin')):
-                urls = self.ports.git(location, *arguments).stdout.splitlines()
-                if (len(urls) != 1
-                        or self.ports.github_repository(urls[0]) != project['origin']):
-                    raise self.ports.contract.WorkspaceOwnershipError(
-                        '등록 origin과 원격 작업 branch 저장소가 다릅니다.')
+        validate_registered_remote(self.ports.identity.repo_path,
+            worktree if worktree is not None and worktree.is_dir() else None, project['origin'],
+            git=self.ports.git, github_repository=self.ports.github_repository)
 
     def _terminal_adopted_pr(self, plan_id, pull_request):
         result = self.ports.reconcile_existing_pull_request(
@@ -709,6 +708,20 @@ class WorkspaceHandler:
             )
 
     def prepare(self) -> ExecutionContext | ExecutionOutcome:
+        plan = self.ports.state.active_execplan(self.ports.identity.repo)
+        if plan is None or int(plan['workspace_owned']) != self.ports.contract.WORKSPACE_RESERVED:
+            return self._prepare()
+        try:
+            with reserved_workspace_ownership(self.ports.state.connection, self.ports.identity.state_dir,
+                                              self.ports.identity.repo, str(plan['plan_id'])) as owner:
+                result = self._prepare(reservation_owner=owner)
+            if isinstance(result, ReservedPullRequestCompletion):
+                return self._terminal_adopted_pr(result.plan_id, result.pull_request)
+            return result
+        except (CallDeferred, ProcessLockBusyError, RuntimeStateError) as error:
+            return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE, detail=str(error))
+
+    def _prepare(self, *, reservation_owner=None) -> ExecutionContext | ExecutionOutcome | ReservedPullRequestCompletion:
         row = self.ports._row()
         branch = str(row['branch'] or '')
         worktree = Path(str(row['worktree'] or ''))
@@ -746,11 +759,14 @@ class WorkspaceHandler:
             start_point = None
             adoption_expected_head = None
             adopted_pr = None
+            reserved_terminal_pr = None
             adoption_pending = False
             local_branch_exists = False
+            existing_adoption = bool(workspace_reserved and worktree.is_dir() and self.ports.checkpoint is not None
+                and (self.ports.checkpoint.get(self.ports.identity.repo, plan_id).snapshot or {}).get('remote_adoption'))
             can_adopt = (
                 self.ports.checkpoint is not None
-                and not workspace_owned
+                and not workspace_owned and not existing_adoption
                 and database.remote_work_adoption_allowed(
                     self.ports.state.connection, self.ports.identity.repo, plan_id)
             )
@@ -881,6 +897,41 @@ class WorkspaceHandler:
             )
             reserved_checkpoint = (self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
                                    if workspace_reserved and self.ports.checkpoint is not None else None)
+            reserved_observation = (self.ports.capture_git_snapshot(worktree)
+                                    if workspace_reserved and worktree.is_dir() else None)
+            reservation_validator = None
+            adoption_observation = None
+            if reserved_observation is not None and reservation_owner is not None and reserved_checkpoint is not None:
+                def observe_adoption():
+                    return reservation_owner.remote_adoption(catalog_plan, reserved_checkpoint,
+                        self.ports.identity.repo_path, worktree, git=self.ports.git,
+                        github_repository=self.ports.github_repository, pr_for_branch=self.ports.pr_for_branch)
+                adoption_observation = observe_adoption()
+                adopted_pr = dict(adoption_observation or ())
+                if adopted_pr and (str(adopted_pr.get('state') or '').upper() == 'MERGED'
+                                   or adopted_pr.get('mergedAt')):
+                    reserved_terminal_pr = adopted_pr
+                elif adopted_pr and str(adopted_pr.get('state') or '').upper() == 'CLOSED':
+                    self.ports.state.check()
+                    reservation_owner.check()
+                    if self.ports.checkpoint.get(self.ports.identity.repo, plan_id) != reserved_checkpoint:
+                        raise CheckpointRace('기존 인수 PR 관측 중 checkpoint가 변경됐습니다.')
+                    return self._terminal_adopted_pr(plan_id, adopted_pr)
+                scopes = reservation_owner.agent_scopes(row, reserved_checkpoint)
+                def reservation_validator(live):
+                    snapshot = self.ports.capture_git_snapshot(worktree)
+                    before_head = None
+                    if reserved_checkpoint.operation == 'rebase':
+                        context = RebaseWorkspaceContext(ExecutionPlanMetadata(plan_id=plan_id, title='',
+                            path=str(row['plan_path']), plan_sha=None), worktree, branch)
+                        before_head = reserved_rebase_before_head(self.ports._current_rebase_service(
+                            context, allow_reserved=True), reserved_checkpoint, snapshot)
+                    return validate_reserved_worktree_history(
+                        self.ports.identity.state_dir, self.ports.identity.repo_path, worktree, branch, plan_id,
+                        live, snapshot, checkpoint=reserved_checkpoint,
+                        git=self.ports.git, base=self.ports.identity.base, session=row['worker_session_id'],
+                        sessions=reservation_owner.worker_sessions, agent_scopes=scopes,
+                        adoption_eligible=reservation_owner.adoption_eligible, rebase_before_head=before_head)
             self.ports.make_worktree(
                 self.ports.identity.repo_path,
                 worktree,
@@ -896,6 +947,7 @@ class WorkspaceHandler:
                 ownership_reserved=(workspace_reserved and not adoption_pending) or adoption_reserved,
                 expected_head=(
                     adoption_expected_head if adoption_reserved else
+                    reserved_checkpoint.snapshot['remote_adoption']['head'] if existing_adoption else
                     str(row['active_sha'] or '') if remote_start is None else None
                 ),
                 start_point=start_point,
@@ -903,7 +955,8 @@ class WorkspaceHandler:
                 allow_rebase=resolving_rebase,
                 journal_state_dir=self.ports.identity.state_dir,
                 journal_owner=f'plan:{plan_id}',
-                **({'require_creation_evidence': True} if adoption_reserved else {}),
+                **({'require_creation_evidence': True} if adoption_reserved or existing_adoption else {}),
+                **({'reservation_validator': reservation_validator} if reservation_validator is not None else {}),
             )
             if remote_start is not None:
                 self._validate_registered_remote(worktree)
@@ -944,18 +997,43 @@ class WorkspaceHandler:
                         pr_head_oid=remote_start,
                     )
             if workspace_reserved and remote_start is None:
+                if reservation_validator is not None and observe_adoption() != adoption_observation:
+                    raise RuntimeStateError('예약 workspace 검증 중 원격 인수 PR이 변경됐습니다.')
+                if reserved_observation is not None:
+                    confirmed = self.ports.capture_git_snapshot(worktree)
+                    resource = str(_canonical_path(worktree))
+                    if (not _same_local_snapshot(reserved_observation, confirmed)
+                            or not reserved_observation.shared_metadata_complete
+                            or not confirmed.shared_metadata_complete
+                            or resource not in reserved_observation.worktrees
+                            or reserved_observation.worktrees[resource] != confirmed.worktrees.get(resource)):
+                        raise RuntimeStateError('예약 workspace 검증 중 대상 Git 자원이 변경됐습니다.')
                 with runtime_state._transaction(self.ports.state.connection):
+                    if reservation_owner is not None:
+                        reservation_owner.check()
                     self.ports.state.check()
                     if (dict(self.ports.state.active_execplan(self.ports.identity.repo)) != dict(catalog_plan)
                             or (reserved_checkpoint is not None
                                 and self.ports.checkpoint.get(self.ports.identity.repo, plan_id) != reserved_checkpoint)):
                         raise RuntimeStateError('예약 workspace 검증 중 작업/checkpoint가 변경됐습니다.')
                     self.ports.mark_execplan_workspace_owned(self.ports.identity.repo, plan_id)
+                    if existing_adoption and 'accepted_work_branch' not in (reserved_checkpoint.snapshot or {}):
+                        self.ports.checkpoint.record(self.ports.identity.repo, plan_id,
+                            expected_generation=reserved_checkpoint.generation, operation=reserved_checkpoint.operation,
+                            expected_head=reserved_checkpoint.expected_head, target_base_oid=reserved_checkpoint.target_base_oid,
+                            observed_remote_oid=reserved_checkpoint.observed_remote_oid,
+                            snapshot={**reserved_checkpoint.snapshot,
+                                      'accepted_work_branch': reserved_checkpoint.snapshot['remote_adoption']['head']})
             else:
-                self.ports.mark_execplan_workspace_owned(self.ports.identity.repo, plan_id)
+                with runtime_state._transaction(self.ports.state.connection):
+                    if reservation_owner is not None:
+                        reservation_owner.check()
+                    self.ports.mark_execplan_workspace_owned(self.ports.identity.repo, plan_id)
             database.record_execplan_workspace_seen(
                 self.ports.state.connection, self.ports.identity.repo, plan_id)
             self._workspace_boundary(plan_id, row, pending=False)
+            if reserved_terminal_pr is not None:
+                return ReservedPullRequestCompletion(plan_id, reserved_terminal_pr)
         except RuntimeStateError as error:
             return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
                                     detail=f'원격 인수 중 실행 상태가 변경됐습니다: {error}')

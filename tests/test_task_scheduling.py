@@ -54,6 +54,57 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         return scheduling.TaskScheduler(replace(self.config, **values), database.connect_database,
                                          self.directory, self.connection)
 
+    def test_journal_rejects_same_thread_lease_from_another_owner(self):
+        from loop_manager_internal.git import manager_git_journal
+        from loop_manager_internal.runtime.contracts import ProcessLockBusyError
+        from loop_manager_internal.runtime.resource_lock import resource_locks
+        target = 'refs/heads/shared'
+        apply = mock.Mock()
+        with resource_locks(self.directory, 'A', ['git:' + target], owner='automatic-push'):
+            with self.assertRaisesRegex(ProcessLockBusyError, 'automatic-push'):
+                manager_git_journal.execute(self.directory, repo='A', target=target,
+                    owner='manual-push', kind='manual_branch_push',
+                    before={'oid': None}, expected={'oid': 'a' * 40},
+                    observe=lambda: {'oid': None}, apply=apply, marker=lambda _: True)
+        apply.assert_not_called()
+
+    def test_reserved_workspace_reuses_only_open_same_thread_resource_leases(self):
+        from contextvars import Context, copy_context
+        from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
+        from loop_manager_internal.runtime.contracts import ProcessLockBusyError
+        from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned
+        worktree = str((self.directory / 'reserved').resolve())
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET workspace_owned=2,branch='reserved',worktree=? "
+                                    "WHERE repo='A' AND plan_id='G-001'", (worktree,))
+        resources = ['plan:G-001', 'branch:reserved', 'worktree:' + worktree]
+        with resource_locks(self.directory, 'A', resources, owner='task-execution'):
+            with reserved_workspace_ownership(self.connection, self.directory, 'A', 'G-001') as proof:
+                proof.check()
+                from loop_manager_internal.git import manager_git_journal
+                self.assertFalse(manager_git_journal.recover_active(self.directory, repo='A', target=worktree,
+                    kind='managed_worktree_create', observe=lambda: self.fail('no active mutation'), marker=lambda *_: False))
+                apply = mock.Mock()
+                with self.assertRaises(ProcessLockBusyError):
+                    manager_git_journal.execute(self.directory, repo='A', target=worktree,
+                        owner='plan:G-999', kind='managed_worktree_create',
+                        before={}, expected={}, observe=lambda: {}, apply=apply, marker=lambda _: True)
+                apply.assert_not_called()
+            inherited = copy_context()
+            observed = []
+            thread = threading.Thread(target=lambda: observed.append(
+                inherited.run(resource_owned, self.directory, 'A', 'plan:G-001')))
+            thread.start()
+            thread.join(2)
+            self.assertEqual(observed, [False])
+            saved = copy_context()
+            def other_recovery():
+                with self.assertRaises(ProcessLockBusyError):
+                    with reserved_workspace_ownership(self.connection, self.directory, 'A', 'G-001'):
+                        self.fail('another recovery acquired the held plan')
+            Context().run(other_recovery)
+        self.assertFalse(saved.run(resource_owned, self.directory, 'A', 'plan:G-001'))
+
     def test_parallel_block_uses_selected_plan_and_preserves_representative(self):
         from loop_manager_internal.recovery import block_service
         from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason, decide

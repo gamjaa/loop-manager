@@ -375,11 +375,12 @@ class ManagerGitTransitionTests(unittest.TestCase):
 
 class CurrentRebaseAuditTests(unittest.TestCase):
     def test_unused_journal_does_not_observe_and_active_failure_preserves_intent(self):
-        from tests.support.rebase_observations import decision_for
+        from tests.support.rebase_observations import decision_for, observation
+        from loop_manager_internal.git.managed_rebase_validation import journal_observation
         from unittest import mock
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
-            observe = mock.Mock(return_value={'head': 'after'})
+            observe = mock.Mock(return_value=journal_observation(observation()))
             arguments = dict(repo='/repo', target='/owned', owner='plan:G-108',
                              decision=decision_for(), observed=observe)
             self.assertFalse(journal.record_current_rebase_result(state, **arguments))
@@ -399,14 +400,15 @@ class CurrentRebaseAuditTests(unittest.TestCase):
             self.assertEqual(observe.call_count, 2)
 
     def test_current_observation_preserves_old_result_without_fabricating_receipts(self):
-        from tests.support.rebase_observations import decision_for
+        from tests.support.rebase_observations import decision_for, observation
+        from loop_manager_internal.git.managed_rebase_validation import journal_observation
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             token = journal.begin_rebase(state, owner='plan:G-108', repo='/repo',
                 target='/owned', before={'head': 'before'}, expected={'branch': 'loop-manager/G-108'})
             slot = journal._slot(state, '/repo', 'managed_rebase', '/owned')
             old_intent = (slot / f'{token}.intent.json').read_bytes()
-            observed = {'head': 'after'}
+            observed = journal_observation(observation())
             self.assertTrue(journal.record_current_rebase_result(state, repo='/repo',
                 target='/owned', owner='plan:G-108', decision=decision_for(), observed=observed))
             self.assertEqual((slot / f'{token}.intent.json').read_bytes(), old_intent)

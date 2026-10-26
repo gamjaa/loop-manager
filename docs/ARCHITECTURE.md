@@ -322,9 +322,25 @@ due 유지보수의 선택·진행 작업의 비선점 정책은 PRODUCT의 [작
 
 작업·동기화·복구가 관여하는 branch는 등록한 base와 소유권을 확인한 Loop Manager 생성 branch다. 그 밖의 사용자 branch는 생성·수정·삭제를 되돌리거나 자동 복구 대상으로 삼지 않으며, 그 변화만으로 계획·프로젝트를 차단하지 않는다. 이름이 비슷하다는 이유로 관리 branch로 간주하지 않는다. 실제 사용 중인 origin·관리 branch·worktree 등 공유 자원의 안전 검사는 유지한다.
 
-Agent snapshot과 격리 ledger는 원문을 감사로 보존한다. 공유 ref·config·다른 worktree 변화나 과거 실행·격리 기록의 부재는 접근 권한 판정 또는 재개 조건으로 사용하지 않는다. Manager의 현재 작업 대상 연결과 Git 쓰기의 충돌·보존·lease 조건은 실제 동작 경계에서 검증한다.
+Agent snapshot과 격리 ledger는 원문을 감사로 보존한다. 공유 ref·config·다른 worktree 변화나 과거 실행·격리 기록의 부재를 Agent 접근 권한 판정에 사용하지 않는다. Manager의 현재 작업 대상 연결과 Git 쓰기의 충돌·보존·lease 조건은 실제 동작 경계에서 검증하며, 예약 자원의 변경 귀속은 아래의 소유권 복구 경계에서 별도로 증명한다.
 
-Agent preflight의 digest는 현재 역할·canonical worktree·repository·작업 identity에 결합한다. mutable Git snapshot을 digest에 넣거나 과거 OID와 일치시키지 않으며, provider가 실제 적용한 sandbox 정책과 설정 identity는 호출·재개·fallback마다 확인한다. 저장된 시작·결과 snapshot은 역할별 결과 유효성과 성공 후보의 재사용 근거로만 사용한다. 현재 후보가 바뀌면 이전 verify·Review·게시 token을 무효화하고 필요한 단계부터 수행한다.
+Agent preflight의 digest는 현재 역할·canonical worktree·repository·작업 identity에 결합한다. mutable Git snapshot을 digest에 넣거나 과거 OID와 일치시키지 않으며, provider가 실제 적용한 sandbox 정책과 설정 identity는 호출·재개·fallback마다 확인한다. 저장된 시작·결과 snapshot은 역할별 결과 유효성·성공 후보의 재사용과 실제 호출에 연결된 예약 workspace의 변경 귀속 증명에 사용한다. snapshot 일치만으로 접근 권한이나 성공을 만들지 않으며 현재 후보가 바뀌면 이전 verify·Review·게시 token을 무효화하고 필요한 단계부터 수행한다.
+
+### 예약 workspace의 소유권 복구
+
+일반 실행 준비와 프로젝트 소유권 차단 재평가는 `git/workspace.py`의 같은 변경 이력 판정을 사용한다. `workspace_owned=2`는 생성 예약이며 실행 기준 `active_sha`를 생성 HEAD로 사용하지 않는다. 봉인된 version 1 `managed_worktree_create`의 owner(`plan:{G-ID}`)·canonical repository/target·branch·생성 HEAD·index와 현재 자원을 대조하고, 현재 branch/lock identity를 유지한 승인된 전이만 연결한다. 다른 작업의 ref/worktree 변화는 이 자원의 비교 대상이 아니다.
+
+| 변경 근거 | 검증과 보존 계약 |
+|---|---|
+| Manager commit·Worker checkpoint | 기존 checkpoint의 before/after HEAD·message·tree와 실제 commit의 단일 parent·message·tree를 대조한다. 저장된 Worker checkpoint는 repository·작업·branch·worktree도 일치해야 한다. |
+| 봉인된 rebase | 기존 managed rebase 검증 결과를 소비한다. 현재 정책의 완료 receipt는 정확한 kind/owner/target과 acceptance identity를 검증한 예약 이력 조회에만 추가 제공한다. `observed.validation_observation`에 판정에 사용한 관측 전체를 저장하고 그 fingerprint가 acceptance의 `state_fingerprint`와 같은지, HEAD·branch·index·dirty·operation·metadata가 이 관측의 투영과 같은지 기록·조회 경계에서 확인한다. metadata는 기존 journal과 동일하게 진행 중이면 object, 없으면 null로 유지한다. 실행·직접 복구 모두 판정 뒤 파일을 별도로 재관측해 receipt를 만들지 않는다. 결합 자료가 없거나 불일치하는 기존 기록은 보존하되 승인된 파일 전이로 사용하지 않는다. 수락 HEAD의 clean index는 Git tree에서 읽고 완료 관측에 봉인된 unstaged/untracked 파일 서명을 함께 이어 사용한다. operation이 해제돼도 이 보존 상태는 이력에 남으며 별도의 rebase 이후 Worker 출력을 요구하지 않는다. |
+| 미커밋 Worker 출력 | 저장된 시작 digest·scope와 실제 종료한 invocation의 scope/role을 연결한다. 승인된 시작 상태에서 기록된 결과까지 HEAD·branch·index·파일 서명·operation을 대조한다. 이 자료는 소유권 복구 근거이며 Agent 접근 권한 gate가 아니다. |
+| 미완료 Manager operation | commit·push·PR 생성·중간 rebase 게시는 해당 checkpoint intent와 현재 후보를 대조한다. commit 전 staging 중단은 저장된 tree와 현재 index가 같고 도달 가능한 Worker 출력의 파일 서명이 보존된 경우에 연결한다. rebase는 저장된 원래 HEAD·target·generation으로 기존 현재 상태 검증기를 읽기 전용 호출해 원격 lease·파일·index·operation까지 검증한다. Git 실행 전 clean 상태의 START도 이 판정을 거치며 소유권 확정 시 operation을 완료 처리하지 않는다. |
+| 기존 원격 인수 | version 1 `remote_adoption`의 repository·작업·base·branch·시작 HEAD를 생성 근거와 대조하고 최초 catalog의 선언별 grant·현재 origin fetch/push URL·PR 연결을 확인한다. 병합되지 않은 CLOSED PR은 workspace 확정 전에 기존 보류 처리로 보낸다. MERGED 또는 mergedAt이 확인된 기존 예약은 공통 이력 검증·최종 재관측·CAS로 소유권을 확정하고 예약 복구 lease를 반환한 뒤 기존 terminal 완료·cleanup helper로 보내고 Worker는 재개하지 않는다. 두 소비 경로는 terminal 처리 대상을 반환값으로 인계하며, cleanup은 자신의 삭제 journal lease와 기존 자원 재검증으로 진행한다. 생성 kind에 한정한 중첩 lease 재사용을 삭제로 확대하지 않는다. cleanup은 확정된 소유권과 미커밋 자료를 보존하며, 불명 PR 상태는 보류한다. 기존 예약을 신규 인수로 바꾸거나 원래 시작 HEAD·PR·검증 이력을 덮어쓰지 않는다. |
+
+등록 관측은 선택 자원의 존재·HEAD·branch·lock과 index tree를 담는다. unmerged index는 `write-tree` 대신 NUL 구분 stage 원문을 보존한 관측으로 표현하고, 전체 snapshot의 stage·파일·operation도 함께 재확인한다. 근거가 없거나 손상·불일치한 상태는 소유권을 확정하지 않으며 reset·강제 checkout·일괄 파일 복원·사용자 operation abort로 우회하지 않는다.
+
+`recovery/plan_recovery.py`가 대상 plan·branch·worktree·Git 자원 lease와 writer 종료/미시작을 먼저 확인한다. 현재 process/thread의 열린 handle로 확인되는 기존 lease만 이어 쓴다. journal의 중첩 생성·생성 복구 호출은 `workspace-reservation-recovery` 소유 Git lease에 한정하고, 생성 owner가 명시되면 해당 plan lease도 확인한다. 같은 thread가 가진 다른 소유자의 Git lease는 빌리지 않으며 다른 복구·수동 묶음·게시 claim과 종료 불명 호출은 보존·거부한다. Git·프로세스·원격 관측은 DB 쓰기 처리 밖에서 수행한다. 확정 직전의 local 자원·PR 관측과 짧은 transaction의 작업·checkpoint generation·호출 예약·invocation·인수 grant/소유 claim 재검사로 낡은 결과의 반영을 막는다. DB 실패에는 소유권/해제 변경을 함께 rollback하고 기존 예약·경쟁 변경·session·실패·성공 감사를 보존한다. 복구만으로 단계 성공이나 최신 base 수용을 기록하지 않는다.
 
 ### 기본 worktree 동기화
 

@@ -4,6 +4,7 @@ from tests.support.execution import ExecutionFixture
 from dataclasses import replace
 from pathlib import Path
 from unittest import TestCase
+from unittest import mock
 
 import loop_manager as lm
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
@@ -11,6 +12,92 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKi
 
 
 class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
+    def test_reserved_user_rebase_does_not_reconstruct_manager_checkpoint(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        factory = mock.Mock(side_effect=AssertionError('reservation is not owned'))
+        self.effects = replace(self.effects, checkpoint=checkpoint,
+            workspace=replace(self.effects.workspace, current_rebase_service=factory))
+        self.handler.effects = self.effects
+        self.effects.workspace.is_directory.return_value = True
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        self.handler._update_snapshot(catalog_plan=self.state.active_execplan('repo'))
+        before = checkpoint.get('repo', 'G-047')
+        self.assertFalse(self.handler._resolving_rebase(self.state.row()))
+        factory.assert_not_called()
+        self.assertEqual(checkpoint.get('repo', 'G-047'), before)
+
+    def test_reserved_live_writer_stops_before_worktree_preparation(self):
+        from loop_manager_internal.storage import task_calls
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        owner = task_calls.reserve(self.connection, Path('/state'), 'repo', 'G-047', 'agent', 'run')
+        task_calls.mark_uncertain(owner)
+        result = self.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.effects.workspace.make_worktree.assert_not_called()
+        self.effects.agent.capture_git_snapshot.assert_not_called()
+        self.effects.workspace.mark_execplan_workspace_owned.assert_not_called()
+
+    def test_reserved_new_writer_before_confirmation_keeps_ownership_pending(self):
+        from loop_manager_internal.storage import task_calls
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.effects.workspace.make_worktree.side_effect = lambda *_a, **_k: task_calls.reserve(
+            self.connection, Path('/state'), 'repo', 'G-047', 'agent', 'new-run')
+        result = self.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.effects.workspace.mark_execplan_workspace_owned.assert_not_called()
+        self.assertEqual(self.state.active_execplan('repo')['workspace_owned'], lm.WORKSPACE_RESERVED)
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM task_call_reservations').fetchone())
+
+    def test_reserved_resource_race_does_not_confirm_ownership(self):
+        worktree = str(Path('/state/G-047').resolve())
+        initial = lm.GitSnapshot('owned-head', 'loop-manager/G-047', {}, {}, {},
+                                {worktree: ('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047')}, {}, {})
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        for changed in (
+            replace(initial, head='foreign-head'),
+            replace(initial, index={'app.py': ('foreign-stage',)}),
+            replace(initial, dirty={'user.txt': (('untracked',), 'preserved-data')}),
+            replace(initial, operations={'merge': 'user-operation'}),
+            replace(initial, worktrees={}),
+            replace(initial, worktrees={worktree: ('HEAD=owned-head', 'locked=foreign')}),
+            replace(initial, shared_metadata_complete=False),
+        ):
+            with self.subTest(changed=changed), mock.patch.object(Path, 'is_dir', return_value=True):
+                self.effects.agent.capture_git_snapshot.return_value = initial
+                self.effects.workspace.make_worktree.side_effect = lambda *_a, **_k: setattr(
+                    self.effects.agent.capture_git_snapshot, 'return_value', changed)
+                result = self.handler.prepare()
+                self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+                self.assertEqual(self.state.active_execplan('repo')['workspace_owned'], lm.WORKSPACE_RESERVED)
+                self.effects.workspace.mark_execplan_workspace_owned.assert_not_called()
+
+    def test_reserved_confirmation_ignores_other_worktree_and_ref_changes(self):
+        worktree = str(Path('/state/G-047').resolve())
+        initial = lm.GitSnapshot('owned-head', 'loop-manager/G-047', {}, {}, {},
+                                {worktree: ('HEAD=owned-head',)}, {}, {})
+        changed = replace(initial, refs={'refs/heads/other': ('new-head', '')},
+                          worktrees={**initial.worktrees, '/state/other': ('HEAD=new-head',)})
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.connection.execute('UPDATE exec_plans SET workspace_owned=2')
+        self.connection.commit()
+        self.state.expected = self.repository.projected('repo')
+        self.effects.agent.capture_git_snapshot.return_value = initial
+        self.effects.workspace.make_worktree.side_effect = lambda *_a, **_k: setattr(
+            self.effects.agent.capture_git_snapshot, 'return_value', changed)
+        with mock.patch.object(Path, 'is_dir', return_value=True):
+            self.handler.prepare()
+        self.effects.workspace.mark_execplan_workspace_owned.assert_called_once()
+
     def test_reserved_checkpoint_race_does_not_confirm_ownership(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
@@ -92,6 +179,7 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
+        self.worktree = root / 'G-047'
         self.handler._identity = replace(self.handler._identity, state_dir=root)
         self.state.update_project('repo', worktree=str(root / 'G-047'))
         self.connection.executescript(
@@ -107,6 +195,10 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
         self.local = None
         self.pr = None
         self.checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects.agent.capture_git_snapshot.side_effect = lambda *_a, **_k: lm.GitSnapshot(
+            self.local or self.head, 'loop-manager/G-047', {}, {}, {},
+            {str(self.worktree.resolve()): (f'HEAD={self.local or self.head}',
+                                          'branch=refs/heads/loop-manager/G-047')}, {}, {})
         workspace = replace(self.effects.workspace,
             reserve_execplan_workspace=self.state.bind(lm.reserve_execplan_workspace, connected=True, mutates=True),
             mark_execplan_workspace_owned=self.state.bind(lm.mark_execplan_workspace_owned, connected=True, mutates=True))
@@ -187,6 +279,70 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
         row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual((row['status'], row['pr_url']), ('PLAN_BLOCKED', self.pr['url']))
         self.effects.workspace.make_worktree.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_existing_reserved_adoption_routes_terminal_pr_before_workspace_recovery(self):
+        original = self.effects.workspace.make_worktree.side_effect
+        def interrupt(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError('interrupted after creation')
+        self.effects.workspace.make_worktree.side_effect = interrupt
+        self.assertEqual(self.handler.prepare().kind, ExecutionOutcomeKind.RETRY)
+        self.effects.workspace.make_worktree.reset_mock()
+        self.pr = {'url': 'https://github.com/owner/repo/pull/1', 'state': 'CLOSED',
+                   'headRefName': 'loop-manager/G-047', 'baseRefName': 'main', 'headRefOid': self.head}
+        with mock.patch.object(lm, 'validate_execplan_workspace_identity'):
+            result = self.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(self.connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+        self.effects.workspace.make_worktree.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_existing_reserved_adoption_routes_merged_pr_to_terminal_sync(self):
+        original = self.effects.workspace.make_worktree.side_effect
+        def interrupt(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError('interrupted after creation')
+        self.effects.workspace.make_worktree.side_effect = interrupt
+        self.assertEqual(self.handler.prepare().kind, ExecutionOutcomeKind.RETRY)
+        self.effects.workspace.make_worktree.reset_mock()
+        self.effects.workspace.make_worktree.side_effect = original
+        self.pr = {'url': 'https://github.com/owner/repo/pull/1', 'state': 'MERGED',
+                   'headRefName': 'loop-manager/G-047', 'baseRefName': 'main', 'headRefOid': self.head,
+                   'mergedAt': 'merged', 'mergeCommit': {'oid': 'e' * 40}}
+        from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned
+        from loop_manager_internal.git import manager_git_journal
+        state_dir = self.handler._identity.state_dir
+        def recover_workspace(*args, **kwargs):
+            self.assertTrue(resource_owned(state_dir, 'repo', 'git:' + str(self.worktree),
+                                           owner='workspace-reservation-recovery'))
+            return original(*args, **kwargs)
+        self.effects.workspace.make_worktree.side_effect = recover_workspace
+        def reconcile_terminal(*_args):
+            self.assertFalse(resource_owned(state_dir, 'repo', 'git:' + str(self.worktree)))
+            # Exercise the actual deletion journal lease, with Git observations doubled.
+            before = {'exists': True, 'registration': {'head': self.head,
+                'branch': 'refs/heads/loop-manager/G-047', 'locked': None}, 'index': 'c' * 40}
+            observed = dict(before)
+            def remove(_token):
+                self.assertTrue(resource_owned(state_dir, 'repo', 'git:' + str(self.worktree), owner='plan:G-047'))
+                self.worktree.rmdir()
+                observed.update(exists=False, registration=None, index=None)
+            self.assertEqual(manager_git_journal.execute(state_dir, repo='repo', owner='plan:G-047',
+                kind='managed_worktree_remove', target=str(self.worktree), before=before,
+                expected={'exists': False, 'registration': None, 'index': None},
+                observe=lambda: observed, apply=remove, marker=lambda _: True), 'applied')
+            return lm.PROJECT_STEP_PLANNING_PENDING
+        reconcile = mock.Mock(side_effect=reconcile_terminal)
+        self.handler.effects = replace(self.effects, publication=replace(self.effects.publication,
+            reconcile_existing_pull_request=reconcile))
+        with mock.patch.object(lm, 'validate_execplan_workspace_identity'), \
+             mock.patch('loop_manager_internal.recovery.plan_recovery.resource_locks', side_effect=resource_locks):
+            result = self.handler.prepare()
+        self.assertEqual(result.kind, ExecutionOutcomeKind.PLANNING_PENDING)
+        self.assertEqual(reconcile.call_args.args[-1]['mergeCommit'], self.pr['mergeCommit'])
+        self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 1)
+        self.assertFalse(self.worktree.exists())
         self.effects.agent.run_agent.assert_not_called()
 
     def test_local_branch_with_same_oid_has_no_adoption_intent(self):

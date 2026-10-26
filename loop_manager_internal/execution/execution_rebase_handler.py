@@ -73,6 +73,9 @@ class RebaseHandler:
                 and self.ports.current_rebase_service is not None
                 and self.ports.is_directory(worktree)):
             current = checkpoint.get(self.ports.identity.repo, self.ports.snapshot().catalog_plan['plan_id'])
+            if (int(self.ports.snapshot().catalog_plan['workspace_owned']) == self.ports.contract.WORKSPACE_RESERVED
+                    and current.operation != 'rebase'):
+                return False
             if (current.operation == 'rebase'
                     or self.ports._rebase_in_progress_for_branch(worktree, str(row['branch'] or ''))
                     or (int(row['pr_conflict_recovery']) and self.ports._unmerged_stages(worktree))):
@@ -83,7 +86,9 @@ class RebaseHandler:
                         plan_id=str(self.ports.snapshot().catalog_plan['plan_id']), title='', path='', plan_sha=None),
                     worktree=worktree, branch=str(row['branch'] or ''))
                 try:
-                    service = self.ports._current_rebase_service(context)
+                    options = ({'allow_reserved': True} if current.operation == 'rebase'
+                               and int(self.ports.snapshot().catalog_plan['workspace_owned']) == self.ports.contract.WORKSPACE_RESERVED else {})
+                    service = self.ports._current_rebase_service(context, **options)
                     if current.generation == 0:
                         _, decision = self.ports.state.recover_rebase_checkpoint(checkpoint, service)
                     else:
@@ -98,7 +103,7 @@ class RebaseHandler:
                             # Rebuild once against those current inputs and run
                             # the complete ownership check again; never treat a
                             # changed fingerprint as ownership evidence.
-                            service = self.ports._current_rebase_service(context)
+                            service = self.ports._current_rebase_service(context, **options)
                             _, decision = service.require_owned(checkpoint=current)
                 except manager_git_journal.MutationEvidenceError as error:
                     if current.generation != 0:
@@ -413,11 +418,12 @@ class RebaseHandler:
         if self.ports._unmerged_stages(context.worktree) and not self.ports._rebase_metadata(context):
             return False
         self.ports._current_rebase_service(context).normalize_frontmatter()
-        _, decision = self.ports._current_rebase_service(context).require_owned()
+        observed, decision = self.ports._current_rebase_service(context).require_owned()
+        from loop_manager_internal.git.managed_rebase_validation import journal_observation
         return manager_git_journal.record_current_rebase_result(
             self.ports.identity.state_dir, repo=str(self.ports.identity.repo_path.resolve()),
             target=str(context.worktree.resolve()), owner=f'plan:{context.plan.plan_id}',
-            decision=decision, observed=lambda: self.ports._rebase_journal_state(context))
+            decision=decision, observed=lambda: journal_observation(observed))
 
     def _run_managed_rebase(self, context, target_oid, *, autostash=False):
         if self.ports.current_rebase_service is not None:

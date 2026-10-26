@@ -187,8 +187,16 @@ def make_worktree(
     journal_state_dir: Path | None = None,
     journal_owner: str | None = None,
     require_creation_evidence: bool = False,
+    reservation_validator: Callable[[dict], str] | None = None,
 ) -> str:
-    return workspace.make_worktree(effects._workspace_effects_make_worktree(), repo, worktree, branch, base, allow_recovery=allow_recovery, allow_existing=allow_existing, allow_rebase=allow_rebase, allow_create_branch=allow_create_branch, ownership_reserved=ownership_reserved, expected_head=expected_head, start_point=start_point, before_create=before_create, journal_state_dir=journal_state_dir, journal_owner=journal_owner, **({'require_creation_evidence': True} if require_creation_evidence else {}))
+    return workspace.make_worktree(
+        effects._workspace_effects_make_worktree(), repo, worktree, branch, base,
+        allow_recovery=allow_recovery, allow_existing=allow_existing, allow_rebase=allow_rebase,
+        allow_create_branch=allow_create_branch, ownership_reserved=ownership_reserved,
+        expected_head=expected_head, start_point=start_point, before_create=before_create,
+        journal_state_dir=journal_state_dir, journal_owner=journal_owner,
+        **({'require_creation_evidence': True} if require_creation_evidence else {}),
+        **({'reservation_validator': reservation_validator} if reservation_validator is not None else {}))
 
 
 @dataclass(frozen=True)

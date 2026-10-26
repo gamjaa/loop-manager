@@ -2,14 +2,27 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from functools import wraps
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
+from threading import get_ident
 
 from .contracts import ProcessLockBusyError
 from .process_lock import process_lock, _held_process_lock_identity
+
+
+_resource_leases = ContextVar('resource_leases', default=())
+
+
+def resource_owned(state_dir, repo, resource, *, owner=None):
+    """Reuse only an open lease acquired by this process and thread's scope."""
+    key = (str(Path(state_dir).resolve()), repo, resource, os.getpid(), get_ident())
+    return any(identity == key and not handle.closed and (owner is None or owner == held_owner)
+               for identity, handle, held_owner in _resource_leases.get())
 
 
 def resource_lock_name(repo, resource):
@@ -36,10 +49,12 @@ def resource_locks(state_dir: Path, repo: str, resources, *, owner: str):
     waiting = False
     while True:
         stack = ExitStack()
+        leases = []
         try:
             for resource in resources:
-                stack.enter_context(process_lock(state_dir / 'resource-locks',
+                handle = stack.enter_context(process_lock(state_dir / 'resource-locks',
                     identity=json.dumps(owner, ensure_ascii=True), name=resource_lock_name(repo, resource)))
+                leases.append(((str(state_dir.resolve()), repo, resource, os.getpid(), get_ident()), handle, owner))
             break
         except ProcessLockBusyError as error:
             stack.close()
@@ -75,12 +90,20 @@ def resource_locks(state_dir: Path, repo: str, resources, *, owner: str):
             # must not reject it while it waits for or acquires the fetch lock.
             if current_task.get() is not None and owner != 'base-fetch':
                 scheduler.check_project(repo)
-        yield
+        token = _resource_leases.set((*_resource_leases.get(), *leases))
+        try:
+            yield
+        finally:
+            _resource_leases.reset(token)
 
 
 def journal_resource(function):
     @wraps(function)
     def guarded(state_dir, *, repo, target, **kwargs):
+        if (kwargs.get('kind') == 'managed_worktree_create'
+                and resource_owned(state_dir, repo, 'git:' + target, owner='workspace-reservation-recovery')
+                and (kwargs.get('owner') is None or resource_owned(state_dir, repo, kwargs['owner']))):
+            return function(state_dir, repo=repo, target=target, **kwargs)
         with resource_locks(state_dir, repo, ['git:' + target],
                             owner=kwargs.get('owner', 'git-recovery')):
             return function(state_dir, repo=repo, target=target, **kwargs)
