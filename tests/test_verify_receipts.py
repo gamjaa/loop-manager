@@ -328,7 +328,7 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
 
     def test_reconnected_worker_uses_original_full_run_without_worker_or_verify_call(self):
         from loop_manager_internal.execution import stage_results
-        from tests.test_preliminary_review import IDENTITY
+        from tests.support.execution import REVIEW_IDENTITY
         definition, _origin = self.adopted_origin(full_success=True)
         self.assertTrue(stage_results.reconnect_worker(self.ports, self.context(), definition))
         self.dirty = False
@@ -343,7 +343,7 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
         self.handler.effects = replace(self.handler.effects, checkpoint=self.checkpoints,
             validation=replace(self.handler.effects.validation,
                 partial_verify_enabled=lambda _: True, partial_verify=partial,
-                pre_review_identity=lambda _, **kwargs: dict(IDENTITY),
+                pre_review_identity=lambda _, **kwargs: dict(REVIEW_IDENTITY),
                 observe_verify_inputs=lambda _: inputs.InputObservation('original-code')))
         with mock.patch.object(self.handler, '_post_effect_guard', side_effect=lambda context: context):
             outcome = self.handler.verify(self.context(), SimpleNamespace(reconcile=lambda *args: None))

@@ -82,6 +82,8 @@ Reviewer 피드백 `review:loop_manager_internal/execution/execution_verify_hand
 
 구현 완료 후보이며 Manager 전체 verify·실제 Git lifecycle·Reviewer 확인이 남아 있다. 최종 Review 승인 receipt 생성·동일성 판단·재사용과 최종 Reviewer 호출 0 통합 판정은 G-183의 범위로 유지한다. 이 작업의 자료 보존이나 Worker/verify 연결을 최종 Review·게시·사용자 Merge 성공으로 선언하지 않는다.
 
+Manager 후속 verify는 `test_tests_and_support_do_not_import_test_fixtures`에서 FAIL했다(identity `verify:0d4a47df435bca78680bbfa2d7d7808645c2ccf9c158d4ad995a7eae635d1488`, occurrence 1, revision 1). 재연결 회귀가 다른 테스트 모듈의 Reviewer identity를 import한 것이 원인이다. 동일 값을 기존 `tests.support.execution.REVIEW_IDENTITY`로 옮겨 두 테스트가 support만 소비하도록 교정했다. 기존 assertion과 실제 실행 조건은 유지했다. targeted runner로 해당 import 경계 검사, `tests.test_verify_receipts.StageResultProvenanceTest.test_reconnected_worker_uses_original_full_run_without_worker_or_verify_call`, `tests.test_preliminary_review.PreliminaryReviewTests.test_preliminary_pass_requires_new_full_run_even_with_matching_old_success`를 각각 실행해 각 1 test PASS를 확인했다. 이번 교정 뒤 전체 verify는 Manager 재실행이 필요하다.
+
 ## Decision Log
 
 - G-183의 기존 최종 Review 목표를 중복 계획하지 않는다. 이 작업은 그 승인 원문을 보존하는 기반과 Worker/verify의 연결을 먼저 Merge할 수 있고, G-183은 실제 Reviewer identity·선택 작업 PR 변경·최종 승인과 게시를 결합한다. G-315가 제거하는 자체 verify의 prose 의존성을 선행으로 소비하며 단순 clean rebase Worker 보존·코드 receipt 재사용을 소급 작업으로 만들지 않는다.

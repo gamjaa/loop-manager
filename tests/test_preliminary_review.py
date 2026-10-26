@@ -11,11 +11,7 @@ from loop_manager_internal.execution import preliminary_review
 from loop_manager_internal.execution.result_validation import evaluate_review_worker_level
 from loop_manager_internal.storage import pre_review, review_correction_state, verify_receipts
 from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRace
-from tests.support.execution import ExecutionFixture
-
-
-IDENTITY = {'provider': 'codex', 'model': 'model', 'effort': 'high',
-            'instruction': 'actual-instruction', 'environment': 'confirmed-environment', 'policy': 'confirmed-policy'}
+from tests.support.execution import ExecutionFixture, REVIEW_IDENTITY as IDENTITY
 
 
 class PreliminaryReviewTests(ExecutionFixture, unittest.TestCase):

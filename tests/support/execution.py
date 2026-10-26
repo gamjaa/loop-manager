@@ -18,6 +18,8 @@ import json
 
 READY_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nresult'
 VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid result'
+REVIEW_IDENTITY = {'provider': 'codex', 'model': 'model', 'effort': 'high',
+                   'instruction': 'actual-instruction', 'environment': 'confirmed-environment', 'policy': 'confirmed-policy'}
 
 
 def recovered_rebase_workspace(workspace, *, connection, repo_path, state_dir,
