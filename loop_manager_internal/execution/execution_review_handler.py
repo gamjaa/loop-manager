@@ -17,6 +17,7 @@ from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, classify_exception
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.execution.validation_feedback import normalize_feedback, redact_secrets
+from loop_manager_internal.execution.common_defect_report import result_observation
 from loop_manager_internal.documents.reviewer_specification import SpecificationDeadlock, validate_locations
 from loop_manager_internal.execution import stage_documents
 from loop_manager_internal.execution import preliminary_review
@@ -93,6 +94,9 @@ class ReviewHandler:
             self.ports.feedback.repository.record_result(
                 self.ports.identity.repo, context.plan.plan_id, context.plan.definition_revision_sha,
                 'review', getattr(result, 'ledger_kind', 'agent_failure'), raw,
+                observation=result_observation(context,
+                    invocation_id=getattr(result, 'isolation_invocation_id', None),
+                    session_id=getattr(result, 'session_id', None)),
             )
         return result
 
@@ -453,6 +457,11 @@ class ReviewHandler:
                 session_id=row['reviewer_session_id'],
             )
             code, review = review_result
+            observation = result_observation(context, candidate_head=candidate_head,
+                invocation_id=getattr(review_result, 'isolation_invocation_id', None),
+                session_id=review_result.session_id,
+                candidate_snapshot=(reviewer_scope_before.serialize()
+                                    if isinstance(reviewer_scope_before, GitSnapshot) else None))
             review = redact_secrets(str(review))
             # Nonzero returned attempts are already audited before retries;
             # post-call rejection records classify only unaudited zero exits.
@@ -475,6 +484,7 @@ class ReviewHandler:
                     feedback_repo.record_result(
                         self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
                         'review', 'scope_failure', review,
+                        observation=observation,
                     )
                 scope_error = str(error)
                 self.ports._block_final(
@@ -491,6 +501,7 @@ class ReviewHandler:
                     feedback_repo.record_result(
                         self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
                         'review', 'scope_failure', review,
+                        observation=observation,
                     )
                 detail = f"Reviewer workspace 상태 조회 재시도: {error}"
                 self.ports.operation_print(detail, file=sys.stderr)
@@ -505,7 +516,8 @@ class ReviewHandler:
                 if feedback_repo is not None and not code:
                     feedback_repo.record_result(
                         self.ports.identity.repo, str(self.ports.snapshot().plan['id']),
-                        context.plan.definition_revision_sha, 'review', 'stale_result', review)
+                        context.plan.definition_revision_sha, 'review', 'stale_result', review,
+                        observation=observation)
                 self.ports.state.update_project(
                     self.ports.identity.repo, phase='VERIFYING', validated_base_sha=None,
                     verify_token=None, review_token=None, publication_token=None,
@@ -525,6 +537,7 @@ class ReviewHandler:
                     feedback_repo.record_result(
                         self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
                         'review', 'stale_result', review,
+                        observation=observation,
                     )
                 return guarded
             context = guarded
@@ -594,6 +607,7 @@ class ReviewHandler:
                     feedback_repo.record_result(
                         self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
                         'review', 'protocol_failure', review,
+                        observation=observation,
                     )
                 protocol_error = str(error)
                 reviewer_error = f"Reviewer 결과 프로토콜 오류: {protocol_error}"
@@ -676,6 +690,7 @@ class ReviewHandler:
                 self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
                 'review', verdict == 'PASS', review,
                 normalize_feedback('review', review) if verdict == 'FAIL' else (),
+                observation=observation,
             )
         if verdict == 'FAIL':
             final_preliminary = pre_review.current(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id)

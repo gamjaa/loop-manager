@@ -31,6 +31,7 @@ from loop_manager_internal.storage.rebase_correction_state import CorrectionRace
 from loop_manager_internal.execution.validation_feedback import is_validation_error, render_delta
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.execution.worker_outcome import WorkerOutcome, WorkerOutcomeError, parse_worker_outcome
+from loop_manager_internal.execution.common_defect_report import has_report, result_observation
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
@@ -185,6 +186,14 @@ class WorkerHandler:
             user_targets=tuple(locations),
             worker_result=message, worker_decision=evidence,
         )
+
+    def _common_defect_pending(self, context, message):
+        from loop_manager_internal.execution.common_defect_report import parse_report
+        report = parse_report(message)
+        assert report is not None
+        return self.ports._recover(RecoveryReason.COMMON_DEFECT,
+            '범위 밖 공통 교정 반영 대기: ' + str(report['problem']), context=context,
+            final_block_reason=BlockReasonCode.COMMON_DEFECT_PENDING, worker_result=message)
 
     def run(self, context: ExecutionContext) -> ExecutionOutcome:
         self.ports.state.check_context(context)
@@ -544,6 +553,21 @@ class WorkerHandler:
             session_id=active_session_id,
         )
         code, message = result
+        if feedback_repo is not None and has_report(message):
+            observation = result_observation(context,
+                invocation_id=result.isolation_invocation_id, session_id=result.session_id)
+            try:
+                observed = self.ports.capture_git_snapshot(context.worktree)
+            except (RuntimeError, OSError) as error:
+                observation['candidate_observation_error'] = redact_secrets(str(error))
+            else:
+                observation.update(result_observation(context, candidate_head=observed.head,
+                    candidate_snapshot=observed.serialize()))
+            feedback_repo.record_result(
+                self.ports.identity.repo, context.plan.plan_id, context.plan.definition_revision_sha,
+                'worker', 'returned' if code == 0 else 'failure', message,
+                observation=observation,
+            )
         if feedback_repo is not None and delivery is not None and result.session_id:
             feedback_repo.bind_session(delivery.attempt_id, result.session_id)
         if result.session_id and observed_session_id != result.session_id:
@@ -685,6 +709,8 @@ class WorkerHandler:
             return ExecutionOutcome(outcome, detail=worker_error, error=True)
         try:
             disposition = self._parse_worker_outcome(context, message)
+            if disposition.kind == 'common_defect_pending':
+                return self._common_defect_pending(context, message)
             if disposition.kind == 'needs_user_decision':
                 return self._block_worker_decision(context, message, disposition)
             if disposition.kind == 'checkpoint':
@@ -927,6 +953,8 @@ class WorkerHandler:
                 context, saved.worker_result,
                 allow_legacy_ready=saved.outcome_contract_version == 0,
             )
+            if disposition.kind == 'common_defect_pending':
+                return self._common_defect_pending(context, saved.worker_result)
             if disposition.kind == 'needs_user_decision':
                 return self._block_worker_decision(
                     context, saved.worker_result, disposition,

@@ -733,5 +733,10 @@ class MergedTerminalBoundaryTests(unittest.TestCase):
             return loop_manager.CleanupAssessment('missing')
         with mock.patch.object(loop_manager, '_assess_missing_managed_cleanup', side_effect=cleanup):
             result = loop_manager.complete_merged_execplan_worktree(
-                connection, Path('/repo'), 'repo', state_dir, plan, plan['pr_url'], 'b' * 40)
+                connection, Path('/repo'), 'repo', state_dir, plan, plan['pr_url'], 'b' * 40,
+                merge_commit_oid='c' * 40)
         self.assertEqual(result.status, 'missing')
+        observed = connection.execute('SELECT * FROM common_defect_merges').fetchone()
+        self.assertEqual(observed['merge_oid'], 'c' * 40)
+        self.assertEqual(observed['head'], 'b' * 40)
+        self.assertIsNone(json.loads(observed['verification']))  # This fixture has no actual full-run receipt.

@@ -3,6 +3,7 @@ from contextlib import closing
 
 from tests.support.execution import ExecutionFixture
 from dataclasses import replace
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -822,13 +823,19 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             blocked=False, fingerprint='fingerprint',
         )
         fail = ('ISSUE_ID: z.py::f::bug\nFix Z\n'
-                'ISSUE_ID: a.py::g::bug\nFix A\nVERDICT: FAIL')
+                'ISSUE_ID: a.py::g::bug\nFix A\n'
+                'COMMON_DEFECT_REPORT: {"problem":"shared failure","scope":"outside selected work",'
+                '"evidence":"traceback","locations":[{"path":"runner.py","line":12}]}\nVERDICT: FAIL')
         self.effects.agent.run_agent.side_effect = [
-            lm.AgentResult(0, fail, session_id='review-session'),
+            lm.AgentResult(0, fail, session_id='review-session', isolation_invocation_id='review-invocation'),
             lm.AgentResult(0, 'VERDICT: PASS', session_id='review-session'),
         ]
 
         self.handler.review(self.review_context())
+        report, = feedback.common_defect_reports('repo')
+        self.assertEqual(report['observation']['invocation_id'], 'review-invocation')
+        self.assertEqual(report['observation']['session_id'], 'review-session')
+        self.assertEqual(report['observation']['candidate_head'], 'base')
         self.assertEqual([row['identity'] for row in feedback.prepare(
             'repo', 'G-047', 'worker-session',
         ).rows], ['review:a.py::g::bug', 'review:z.py::f::bug'])
@@ -880,6 +887,19 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertEqual([tuple(row) for row in audit],
                          [('transient_failure', raw), ('success', 'VERDICT: PASS')])
 
+
+    def test_review_tuple_failure_preserves_audit_without_inventing_session(self):
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        result = (1, 'original tuple failure')
+        self.effects.agent.run_agent.side_effect = None
+        self.effects.agent.run_agent.return_value = result
+        self.assertIs(self.handler._run_reviewer_attempt(self.review_context()), result)
+        audit = self.connection.execute(
+            "SELECT classification,raw_output,observation FROM validation_results"
+        ).fetchone()
+        self.assertEqual(audit['classification'], 'agent_failure')
+        self.assertEqual(audit['raw_output'], result[1])
+        self.assertNotIn('session_id', json.loads(audit['observation']))
 
     def test_review_post_call_rejections_audit_each_execution_once(self):
         self._with_feedback(ValidationFeedbackRepository(self.connection))

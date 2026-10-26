@@ -26,6 +26,7 @@ class BlockReasonCode(str, Enum):
     REVIEW_SPECIFICATION_DEADLOCK = "review_specification_deadlock"
     GUIDANCE_APPROVAL_REQUIRED = "guidance_approval_required"
     USER_DECISION_REQUIRED = "user_decision_required"
+    COMMON_DEFECT_PENDING = "common_defect_pending"
     PULL_REQUEST_CLOSED = "pull_request_closed"
     MANAGED_WORKTREE_CONFLICT = "managed_worktree_conflict"
     MANAGED_WORKTREE_SCOPE_VIOLATION = "managed_worktree_scope_violation"
@@ -58,6 +59,7 @@ _PLAN_REASONS = frozenset(
         BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
         BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
         BlockReasonCode.USER_DECISION_REQUIRED,
+        BlockReasonCode.COMMON_DEFECT_PENDING,
         BlockReasonCode.PULL_REQUEST_CLOSED,
         BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
         BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION,

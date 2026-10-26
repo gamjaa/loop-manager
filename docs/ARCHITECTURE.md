@@ -1309,6 +1309,32 @@ manifest·이벤트·결과는 version·run·단계·단위/테스트 identity�
 
 Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현재 명세 입력과 base로 결합하며 검증 출력·Agent 세션은 진전으로 보지 않는다. 보고 교정 후에도 verify token의 출력 결합과 입력 재관측·receipt·Review gate를 유지한다.
 
+### 공통 결함 보고의 감사 보존
+
+`ValidationFeedbackRepository`는 결과 감사와 공통 결함 관측을 같은 transaction에 추가한다. `common_defect_reports.result_id`는 불변 `validation_results`를 참조하며 프로젝트·작업·명세 revision·단계·원래 판정과 정제된 원문을 연결한다. 보고와 결과의 수정·삭제는 거부한다. 이후 verify 성공으로 활성 피드백이 해소돼도 과거 보고는 유지한다.
+
+선택적 `COMMON_DEFECT_REPORT:` JSON은 `problem`, `scope`, `evidence`, `locations`만 받는다. 앞의 세 필드는 비어 있지 않은 2,000자 이하 문자열이고 `locations`는 1~8개의 `{path, line}` 객체다. `path`는 traversal·빈 구성 요소·역슬래시·콜론·줄바꿈·탭이 없는 저장소 상대 경로이며 `line`은 1~2,147,483,647의 정수다. 전체 JSON은 UTF-8 12,000바이트 이하이며 중복 선언·중복 key·추가 필드·잘못된 타입은 거부한다. 기존 결과 포맷 정규화와 비밀값 정제를 재사용하며 거부 시 원본 결과와 비밀값을 포함하지 않는 형식 오류를 함께 보존한다. 선택적 보고 오류로 기존 verify·Review 판정을 변경하지 않는다.
+
+`scope`·진단 위치·근거는 보고자의 미확정 관측이다. 저장 시 파일 존재·원인 동일성·명세 인용의 유효성을 확정하지 않으며 서로 다른 결과의 같은 보고도 합치지 않는다. 이 저장 경계는 Planner 호출·계획 채택·차단 해제·검증 성공을 만들지 않는다.
+
+`validation_results.observation`은 Manager가 확보한 문자열 값의 JSON 객체다. 선택 `plan_path`·줄바꿈으로 구분한 `sources`·`remote_revision`·`branch`와 확인 가능한 `candidate_head`, 직렬화된 `candidate_snapshot`, `invocation_id`, `session_id`를 담으며 알 수 없는 필드는 생략한다. 기존 감사 행에는 빈 객체만 추가하고 과거 identity를 만들지 않는다. Worker 보고는 CLI 반환 직후 실제 invocation·session과 반환 시 작업 형상을 연결한다. 후보 관측 실패는 `candidate_observation_error`로 남겨 원래 보고를 보존하며 후보 성공을 추정하지 않는다. Reviewer의 반환 실패·범위/프로토콜 거부·최종 판정과 verify의 원래 결과도 확보한 문맥을 함께 보존한다. 원래 사용자 질문·실패는 결과 원문에 남으며 관측 저장은 기존 결과 해석이나 교정 전이를 대체하지 않는다.
+
+일반 planning은 기존 호출 판단을 통과한 새 turn의 prompt 조립에서만 해당 프로젝트 보고를 읽는다. DB 조회 후 `common-defect-evidence/<SHA-256>.json`에 version 1의 `{version, reports}` snapshot을 원자 교체로 내보내며 경로·digest·보고 수만 현재 catalog prompt에 더한다. snapshot은 보고별 원본 결과·관측 문맥·정상 보고 또는 거부 이유와 기존 채택 연결을 보존한다. 실제 전달 보고 ID는 해당 revision의 planning 검토 attempt에 결합하며 새 호출에서는 이전 결과·연결 제안을 초기화하고 이번 전달 범위를 기록한다. 성공한 general/final receipt와 원본 보고는 보존한다. DB 쓰기 잠금 안에서 파일/Git을 관측하지 않으며 export 실패·결과 재처리에도 보고를 소비·삭제하지 않는다. 새 보고·코드 변경에 따른 호출 조건·polling은 추가하지 않는다.
+
+`COMMON_DEFECT_LINKS`는 `{revision, links}` 형식의 선택적 Planner 결과다. 각 연결은 `reports`(이번 전달 범위의 유효 정수 ID 배열), `plan_id`·`plan_path`, `source`·`quote`, `cause`·`completion`, `code`(`{path, quote}` 배열 1~8개)를 갖는다. 연결은 64개 이하, JSON은 UTF-8 64,000바이트 이하이며 문자열은 비어 있지 않은 4,000자 이하 값이다. 중복 key·중복 보고/동일 목표 연결·추가 필드·잘못된 타입·경로·비밀값은 거부한다. source는 교정 계획이 소유한 현재 PRODUCT 또는 활성 Requirement이고 명세·코드 인용은 고정한 검토 revision의 실제 원문과 대조한다. Requirement rename은 기존 resolver의 고유 활성 R-ID 조회를 재사용하고 source 문자열을 유지하며 archive만 남거나 모호한 입력으로 새 연결을 채택하지 않는다. 계획은 현재 catalog 또는 검증된 생성/개정 결과에 있어야 하며 삭제 결과는 제외한다. ID 재배정은 원래 ID와 경로를 함께 대조해 최종 ID·경로로 결합한다. 이 인용/identity 검증은 Planner의 원인 의미 판단을 대신하지 않는다.
+
+검증된 연결 제안은 기존 planning review receipt에 저장하고 일반 publication 또는 문서 변경 없는 확인의 원격/catalog 확정 transaction에서만 `common_defect_links`에 채택한다. 채택 직전에 대상 계획의 경로·소유 source·정의 revision을 다시 확인하며 새/개정 계획은 실제 게시 revision과 일치해야 한다. source·원인·완료 조건의 명시적 목표 identity가 같으면 READY·draft·미Merge PR을 포함한 현재 소유 계획을 재사용한다. 다른 원인·미확정 보고는 자동 합치지 않는다. 연결 감사는 원본 result ID·목표·교정 계획·검토/게시 revision·인용 근거를 불변으로 유지하며 동일 게시 재처리는 멱등이다. 게시 전 실패·DB rollback·catalog 경쟁에서는 제안과 원래 보고를 보존하고 채택을 확정하지 않는다. 계획 연결은 실제 코드 교정 Merge·필수 검증 또는 차단 해제의 근거와 구분한다.
+
+`common_defect_pending` Worker 결과는 kind 외 필드 없이 유효한 `COMMON_DEFECT_REPORT`를 요구하고 완료 publication 선언을 거부한다. Manager는 `common_defect` 원인의 `condition_wait`로 해당 계획만 보존하며 사용자 판단과 구분한다. `common_defect_pending` 차단만 이 disposition의 저장을 허용하고 다른 승인/안전 차단에는 적용하지 않는다. Worker의 명시적 `needs_user_decision`과 저장 질문·draft·User Decision은 변환하지 않으며 알림 정책은 공통 교정 대기를 사용자 조치로 선택하지 않는다.
+
+`common_defect_merges`는 실제 PR Merge를 관측한 Manager의 완료 transaction에서 PR URL·후보 HEAD·`mergeCommit` OID와 검증 근거를 불변으로 기록한다. 일반 PR 조회도 mergeCommit을 요청하며 squash Merge의 원래 PR HEAD와 실제 Merge OID를 구분한다. 검증 근거는 같은 프로젝트·계획·실행 주기의 전체 run receipt 또는 확인된 재사용과 원래 실제 run, 후보/출력 verify token·PASS review token·정의 digest를 대조한다. `verification`은 이 receipt/origin ID·run/reuse 구분·token·정의 SHA-256·검증 base를 담은 JSON이며 불명이면 JSON null이다. manual 묶음은 `manual_work_publications`의 같은 request·PR·HEAD·base와 전체 구성원별 PASS를 원래 `manual_work_results`에 대조한다. 각 G의 명시적인 개별 Review PASS와 공유 후보를 실제로 실행한 구성원의 native 전체 run/reuse·Review token을 함께 확인하며, 구성원별 자동 token의 부재를 실패로 간주하지 않는다. 묶음 proof는 group/member/execution-plan ID와 게시 영수증 digest를 추가로 보존한다. 사용자 생략이나 구성원 누락·영수증 불일치는 근거로 인정하지 않는다. archive 문서에 근거한 MERGED 상태·면제·부분/미완료/실패·다른 작업의 receipt·후보 불일치·Merge OID 불명은 검증된 교정 반영을 만들지 않는다. 외부 Git·파일·모델 관측을 DB 쓰기 잠금 안에서 하지 않으며 근거 수집이 새 전체 verify 실행을 만들지 않는다.
+
+재평가 입력은 해당 작업의 현재 Worker 원문에 일치하는 최신 보고와 활성 validation feedback의 원본 result에 연결된 목표만 선택한다. 피드백 event가 없는 verify/Review 거부도 해당 차단 단계의 최신 원본 결과에 보고가 있을 때만 연결하며, 뒤의 다른 실패에 과거 보고를 붙이지 않는다. 보고·목표별 최신 채택 연결과 실제 Merge/검증 근거를 기존 차단 reconciliation의 input identity에 포함해 반영 뒤 영향 작업만 다시 검사한다. 같은 근거의 무진전 재호출은 기존 완료 관측과 assessment cache로 억제한다. 연결·Merge·검증이 미충족이면 보류하며 평가/적용 직전 같은 원인·후보·checkpoint generation·소유권·공통 교정 입력을 다시 확인한다. 다른 프로젝트·계획은 기존 lease·배정 경계를 유지한다.
+
+확정 연결이 차단 작업 자신을 교정 소유자로 지정하면, 현재 경로·source·개정이 채택된 대상과 일치하고 보고 당시 정의에서 전진했는지 확인한다. 모든 현재 보고가 연결되고 다른 미반영 교정이 없을 때만 `owner_execution`으로 기존 reconciliation의 원격·소유권·후보·generation/CAS와 Worker 재검증 전환을 사용한다. 이 경로는 구현/verify/Review 교정 차단만 실행으로 전환하며 사용자 질문·독립 차단과 완료 판정을 유지한다. `ready`와 Merge 근거는 생성하지 않는다.
+
+공통 교정과 기존 사용자 질문의 의미 판단은 G-319의 `_assess_user_decision_cause` reader·원격 재확인·CAS를 함께 사용한다. 교정 Merge OID가 현재 원격 이력에 있어야 하며 원래 질문/실패·관련 상위 명세·현재/이전 원인 코드와 실제 부재·검증 근거를 전달한다. 문서는 기존 의미 정규화를 사용하고 코드는 들여쓰기·리터럴 공백도 입력이므로 원문으로 비교한다. 공통 교정 해소에는 현재 상위 명세 인용과 존재하는 원인 코드 인용을 요구하며, 원인 코드가 전부 삭제됐으면 실제 부재를 보존해 명세와 대조한다. 기존 사용자 질문도 현재 상위 명세가 구체적 선택을 해소한 인용이 있어야 한다. 교정으로 원인이 제거되면 명세 원문이 그대로여도 평가할 수 있지만 Merge·코드 인용만으로 사용자 선택을 승인하지 않는다. `common_defect_assessment`와 기존 `user_decision_assessment`의 질문·입력·인용·history를 구분해 보존하며 불확실한 결과는 해제하지 않는다. 해소 뒤 기존 reconciliation이 작업물·이력을 보존하고 Worker부터 재검증하므로 교정의 성공을 영향 작업의 성공으로 넘기지 않는다.
+
 ### targeted test와 실패 수집
 
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다

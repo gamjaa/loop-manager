@@ -16,6 +16,7 @@ from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, Reco
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind, LatestBaseCheckpoint
 from loop_manager_internal.execution.validation_feedback import normalize_feedback, redact_secrets
 from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
+from loop_manager_internal.execution.common_defect_report import result_observation
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
@@ -252,6 +253,7 @@ class VerifyHandler:
                     self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
                     'verify', 'success' if passed else 'failure', raw_output,
                     feedback_items,
+                    observation=result_observation(context, candidate_head=candidate_head),
                 )
         try:
             self.ports.update_snapshot(plan=self.ports.validate_worker_workspace_scope(
@@ -303,6 +305,7 @@ class VerifyHandler:
             feedback_repo.observe(
                 self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
                 'verify', passed, raw_output, feedback_items,
+                observation=result_observation(context, candidate_head=candidate_head),
             )
         if not passed:
             self.ports.operation_log(

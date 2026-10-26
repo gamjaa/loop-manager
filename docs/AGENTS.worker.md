@@ -47,6 +47,13 @@
 "proposal":"필요한 변경과 영향","locations":[{"path":"실제 문서 경로","section":"실제 절 제목"}],
 "question":"사용자가 답해야 할 질문"}`을 보고한다. locations는 선택된 ExecPlan, 그 sources,
 PRODUCT·ARCHITECTURE의 실제 경로·절만 사용하고 완료 publication 선언과 혼합하지 않는다.
+기존 명세가 정한 범위 밖 공통 교정 때문에 현재 구현을 마칠 수 없으면 유효한
+`COMMON_DEFECT_REPORT`와 `WORKER_OUTCOME: {"kind":"common_defect_pending"}`를 보고한다.
+이 결과에는 COMMIT_TITLE·PR_SUMMARY·TARGETED_TESTS나 사용자 질문 필드를 섞지 않는다.
+Manager가 원본 작업·실패와 보고를 보존해 기존 일반 planning에 인계하며 실제 교정 반영을
+기다린다. 보고만으로 원인·교정 계획·검증 성공을 확정하거나 다른 작업을 수정하지 않는다.
+실제 제품 선택·명세 충돌·권한 불명은 기존 `needs_user_decision`으로 구분하며,
+이미 저장된 질문·draft·User Decision을 이 대기로 대체하지 않는다.
 checkpoint·판단 대기는 완료 후보와 구분하며 Manager의 검증·Review를 대신하지 않는다.
 검증 adapter 문맥은 scripts/verify.json의 선택 adapter·환경과 docs/VERIFY.md에서 확인한다.
 

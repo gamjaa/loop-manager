@@ -397,6 +397,8 @@ class ValidationFeedbackStateTests(unittest.TestCase):
             ("repo", "G-040", "old-revision", "legacy raw", None,
              history, "{}", "old-session"),
         )
+        # A Worker observation does not supersede an older verify failure.
+        self.repo.record_result("repo", "G-040", "new-revision", "worker", "returned", "Worker report")
         self.repo.migrate_legacy()
         self.repo.migrate_legacy()
         self.assertEqual(self.pending("old-session").rows[0]["identity"],
@@ -406,9 +408,9 @@ class ValidationFeedbackStateTests(unittest.TestCase):
         self.assertEqual((row["verify_result"], row["verify_failure_history"],
                           row["worker_session_id"]),
                          ("legacy raw", history, "old-session"))
-        self.assertEqual(self.connection.execute(
-            "SELECT COUNT(*) FROM validation_results"
-        ).fetchone()[0], 1)
+        self.assertEqual([tuple(row) for row in self.connection.execute(
+            "SELECT stage,classification,raw_output FROM validation_results ORDER BY id"
+        )], [('worker', 'returned', 'Worker report'), ('verify', 'legacy_failure', 'legacy raw')])
 
     def test_new_observation_is_not_reimported_as_legacy_on_restart(self):
         self.connection.execute(

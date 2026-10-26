@@ -174,6 +174,14 @@ class ExternalOwnershipObservationTests(TestCase):
         effects = PrForBranchEffects(command=lambda *args, **kwargs:
             SimpleNamespace(returncode=0, stdout='[]'))
         self.assertIsNone(pr_for_branch(effects, Path('/repo'), 'loop-manager/G-001'))
+        valid = {**json.loads(malformed_fields)[0], 'state': 'MERGED', 'mergeCommit': {'oid': 'c' * 40}}
+        commands = []
+        def command(argv, **kwargs):
+            commands.append(argv)
+            return SimpleNamespace(returncode=0, stdout=json.dumps([valid]))
+        observed = pr_for_branch(PrForBranchEffects(command=command), Path('/repo'), 'loop-manager/G-001')
+        self.assertEqual(observed['mergeCommit']['oid'], 'c' * 40)
+        self.assertIn('mergeCommit', commands[0][commands[0].index('--json') + 1].split(','))
         failed = PrForBranchEffects(command=lambda *args, **kwargs:
             SimpleNamespace(returncode=1, stdout='[]'))
         with self.assertRaises(RuntimeError):

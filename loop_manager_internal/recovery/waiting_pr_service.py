@@ -174,6 +174,8 @@ def observe_waiting_pull_requests(
                 stored,
                 url,
                 str(head_oid) if head_oid else None,
+                **({'merge_commit_oid': pull_request['mergeCommit']['oid']}
+                   if isinstance(pull_request.get('mergeCommit'), dict) and pull_request['mergeCommit'].get('oid') else {}),
             )
             merged = True
             merged_pr_urls.append(url)
