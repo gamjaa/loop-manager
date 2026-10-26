@@ -76,8 +76,17 @@ class TieredMaintenancePort:
     def prepare(self, run, selection=None):
         context, cycle = run.context, run.maintenance_cycle
         active = self.repository.active(context.repo, cycle.revision, str(run.row.active_sha))
+        from loop_manager_internal.agents import common_guidance
+        current_guidance = common_guidance.effective_planning_hash(self.connection, context.repo)
+        active_root_guidance = (active.get("root_guidance_hash", active.get("guidance_hash"))
+                                if active is not None else None)
+        active_root_stale = bool(active is not None and active.get("root_placements")
+                                 and active_root_guidance != current_guidance)
+        active_fast_needs_root = bool(active is not None and active.get("mode") == "fast"
+                                      and active.get("root_placements") and active.get("root_reviews") is None)
         if (active is not None and active.get("analysis_version", 1) == code_index.VERSION
-                and {"base", "root_source", "root_placements", "root_reviews", "root_classifications"} <= active.keys()):
+                and {"base", "root_source", "root_placements", "root_reviews", "root_classifications"} <= active.keys()
+                and not active_root_stale and not active_fast_needs_root):
             return active
         selection = selection or self.select(context, str(run.row.active_sha))
         if not selection.required:
@@ -86,9 +95,29 @@ class TieredMaintenancePort:
             selection = replace(selection, merged_count=cycle.cycle_start_merged_count)
         prior = self.repository.latest(context.repo)
         review_mode = None
-        if (prior is not None and prior.get("cycle_id") == cycle.cycle_id
+        same_assessment = (prior is not None and prior.get("cycle_id") == cycle.cycle_id
+                           and prior["source_revision"] == str(run.row.active_sha))
+        if same_assessment and active is not None and active.get("mode") == "fast" and active.get("root_placements"):
+            # A resumed fast assessment may predate the no-root-call rule. Reuse
+            # only current root evidence; otherwise keep its module scope empty.
+            if selection.root_reviews is None:
+                selection = replace(selection, required=True, mode="targeted",
+                    reasons=("root_review_required",), paths=(), request_id=active["request_id"])
+            else:
+                selection = replace(selection, required=True, mode="fast", reasons=tuple(active["reasons"]),
+                    paths=tuple(active["paths"]), request_id=active["request_id"])
+            review_mode = active.get("review_mode", active["mode"])
+        elif same_assessment:
+            selection = replace(selection, required=True, mode=active["mode"] if active else prior["mode"],
+                reasons=tuple(active["reasons"] if active else prior["reasons"]),
+                paths=tuple(active["paths"] if active else prior["paths"]),
+                request_id=active["request_id"] if active else prior["request_id"])
+            review_mode = (active or prior).get("review_mode", (active or prior)["mode"])
+        elif (prior is not None and prior.get("cycle_id") == cycle.cycle_id
                 and prior["source_revision"] != str(run.row.active_sha)):
-            paths = set(prior["paths"])
+            root_only_resume = (prior["mode"] == "fast" and selection.mode == "targeted"
+                                and selection.reasons == ("root_review_required",) and not selection.paths)
+            paths = set() if root_only_resume else set(prior["paths"])
             changed = {path for path in paths if prior["records"].get(path) != selection.index.records.get(path)}
             for path in changed:
                 for records in (prior["records"], selection.index.records):

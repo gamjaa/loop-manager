@@ -615,7 +615,7 @@ Manager는 최신 원격 추적 파일의 경로·내용 hash·mode와 분석 �
 
 값 변경·재활성화에서도 같은 Merge 기준을 보존하고, 요청은 다음 안전한 경계에서 기존 pause·실제 Open PR·프로젝트 안전 gate를 준수해 한 번 소비한다. 활성 cycle 중 접수된 새 요청은 다음 cycle의 시작까지 보존한다.
 
-새 cycle의 진입 판단과 평가 범위 선택은 분리한다. 주기 도달·명시적 요청으로 새 cycle을 시작하면 `full`을 강제한다. 전체 점검 성공 이력의 부재나 정적 비교 결과만으로 최초 실행에서 유지보수를 시작하지 않는다. 평가 엔진은 `fast`·`targeted`·`full`을 지원하며 재개 시에는 저장된 범위와 필요한 관련 근거만 다시 확인한다. `fast`는 모듈 검토 묶음을 만들지 않지만, 필수 루트 조사 근거가 없으면 별도 루트 unit의 모델 검토를 수행한다.
+새 cycle의 진입 판단과 평가 범위 선택은 분리한다. 주기 도달·명시적 요청으로 새 cycle을 시작하면 `full`을 강제한다. 전체 점검 성공 이력의 부재나 정적 비교 결과만으로 최초 실행에서 유지보수를 시작하지 않는다. 평가 엔진은 `fast`·`targeted`·`full`을 지원하며 재개 시에는 저장된 범위와 필요한 관련 근거만 다시 확인한다. `fast`는 루트·모듈 검토 unit과 새 의미 receipt가 없는 모델 무호출 경로다. 현재 원본·지침에 검증된 루트 조사 근거가 없으면 정적 fast 조건에 해당하는 모듈 범위는 비운 `targeted`로 분류하고 루트 unit만 생성한다. 모듈 정밀 검토가 필요하거나 기존 전체 점검 조건이 적용되면 그 범위와 루트 unit을 `targeted` 또는 `full`로 함께 처리한다. 미완료 fast assessment 재개도 같은 분류를 적용하고 기존 원문·session·audit를 보존한다.
 
 정밀 점검은 관련 파일을 모듈 단위의 제한된 묶음으로 구성하고, 원본·mode·정적 사실·분석 버전·평가 조건에 결합된 묶음 identity의 성공 결과를 재사용한다. 전체 점검의 성공 Merge 기준과 최신 정적·부분 평가 기준은 따로 보존한다.
 
@@ -623,9 +623,9 @@ Manager는 최신 원격 추적 파일의 경로·내용 hash·mode와 분석 �
 
 모듈 의미 검토는 읽기 전용 Planner 호출로 필요한 원본과 보존 조건을 확인한다. Manager는 묶음 범위·판단·발견과 실제 원본 인용을 검증해 잠정 결과로 보존한다. 모듈 발견과 루트 이동 후보가 모두 없고 일반 계획도 필요하지 않으면 추가 종합·계획 호출 없이 no-change 결과를 준비한다. 모듈 발견은 새 계획·기존 비종료 계획·근거 있는 제외에, 루트 이동 후보는 새 계획 또는 해당 목표를 포함한 비종료 계획에 연결한다. 저장된 검토를 사용하며 파일별 검토·관계 확인·종합 페이지를 다시 기본 단계로 실행하지 않는다.
 
-같은 tiered assessment에는 별도 `.` 루트 조사 unit을 둔다. unit identity는 `root_review_source`의 원격 tree hash·mode·revision, 모든 root placement와 현재 runtime 지침에 결합하고, 기존 `parse_review`·`validate_root_reviews` 계약으로 제외 분류된 문서·자산·manifest·설정까지 실제 인용을 검증한다.
+같은 tiered assessment에는 별도 `.` 루트 조사 unit을 둔다. unit identity는 `root_review_source`의 원격 tree hash·mode·revision, 모든 root placement와 현재 runtime 지침에 결합하고, 기존 `parse_review`·`validate_root_reviews` 계약으로 제외 분류된 문서·자산·manifest·설정까지 실제 인용을 검증한다. 모듈 receipt는 assessment의 `guidance_hash`, 루트 unit은 현재 지침의 64자리 소문자 SHA-256 fingerprint인 optional `root_guidance_hash`에 결합한다. 성공 row는 그 루트 fingerprint를 기존 `guidance_hash` 필드에 보존한다. `root_guidance_hash`가 없는 legacy assessment는 이전 `guidance_hash`를 root identity로 사용하고, 지침 identity가 없거나 성공 row의 root receipt가 nullable이면 재사용하지 않는다. 이 분리로 같은 cycle 재개에서 완료한 모듈 판단을 보존하면서 지침이 바뀐 루트 근거만 새 unit으로 검토할 수 있다. 분류 교정은 기존 fast 평가의 관련 모듈 범위를 넓히지 않으며, assessment identity 갱신과 pending session 또는 검증된 동일 지침의 root result 연결은 한 SQLite transaction에서 수행하고 이전 원문·audit도 보존한다.
 
-루트 protocol·scope audit는 모듈 receipt와 분리되며, 정적 inventory나 모듈 결과만으로 루트 완료를 만들지 않는다. 같은 guidance·revision의 검증된 파일별 root review 또는 이전 tiered 성공 결과만 재사용한다. 이전 tiered 성공의 root review는 성공 row에 보존된 guidance hash가 현재 지침 identity와 같고 source revision도 일치할 때만 재사용한다.
+루트 protocol·scope audit는 모듈 receipt와 분리되며, 정적 inventory나 모듈 결과만으로 루트 완료를 만들지 않는다. 같은 guidance·revision의 검증된 파일별 root review 또는 이전 tiered 성공 결과만 재사용한다. 이전 tiered 성공의 root review는 성공 row에 보존된 루트 지침 hash가 현재 지침 identity와 같고 source revision도 일치할 때만 재사용한다. legacy 성공 row에 루트 조사 근거 또는 지침 identity가 없으면 재사용하지 않고 필요한 루트 unit을 다시 검토한다.
 
 이동 후보의 링크는 후보 조사 hash와 계획 경로·본문 hash를 별도 저장하고 새 계획 또는 비종료 계획의 보존·검증 조건을 확인한다. 최종 Planner disposition에서는 후보 연결을 임시 보관하고, 전체 planning result 검증이 통과한 뒤 신규 계획 연결에만 ID allocation을 적용하며 allocation의 원본 경로가 임시 계획 경로와 일치하는지 확인한다. 기존 계획 연결은 allocation의 ID가 같아도 원래 ID·경로를 보존한다.
 

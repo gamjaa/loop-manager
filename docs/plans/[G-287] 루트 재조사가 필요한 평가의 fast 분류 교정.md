@@ -27,10 +27,10 @@ priority: normal
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/maintenance/tiered_review.py`의 `select()`·`prepare()`·`units()`에서 정적 fast 가능 조건과 루트 조사 필요 조건을 함께 판정한다. 기존 `Selection`·`root_review_source`·검증된 재사용 근거와 module/root protocol을 사용하고 별도 mode·설정·cache는 추가하지 않는다. 강제/첫/주기 전체 평가는 기존 조건을 유지한다.
-- [ ] 확인한 `loop_manager_internal/maintenance/tiered_ports.py:TieredMaintenancePort.prepare()`의 활성 assessment 재사용·같은 cycle 관련 범위 재개와 legacy 확장을 대조한다. 이미 저장된 fast 평가에 미완료 root unit이 있는 경우도 모델 없는 완료로 취급하지 않는다. 필요한 mode 교정은 기존 assessment identity 검증을 사용하고 원문·audit·완료한 판단·session의 보존과 실제 재사용 가능 여부를 구분한다.
-- [ ] 확인한 `loop_manager_internal/planning/tiered_assessment.py:prepare_turn()`의 호출·진행 문구·최종 계획 인계가 교정된 mode를 소비하게 한다. root 후보가 있으면 기존 계획 연결 경로로 계속 인계한다. `tiered_review.py:promote()`의 전체/부분 성공 기준과 `storage/maintenance_state.py`의 cycle 진입·종료 주기는 바꾸지 않는다.
-- [ ] 확인한 `tests/test_tiered_review.py`·`tests/test_tiered_assessment.py`의 기존 지침 hash 불일치·fast 무호출·소스 없는 조사 fixture를 조합해 아래 회귀를 추가한다. 필요할 때만 `tests/test_tiered_publication.py`의 성공 기준 보존 assertion을 확장한다. PRODUCT의 `### 유지보수 평가`와 ARCHITECTURE의 `### 유지보수 분석과 성공 근거`에는 실제 보완한 경계만 통합한다.
+- [x] 확인한 `loop_manager_internal/maintenance/tiered_review.py`의 `select()`·`prepare()`·`units()`에서 정적 fast 가능 조건과 루트 조사 필요 조건을 함께 판정한다. 기존 `Selection`·`root_review_source`·검증된 재사용 근거와 module/root protocol을 사용하고 별도 mode·설정·cache는 추가하지 않는다. 강제/첫/주기 전체 평가는 기존 조건을 유지한다.
+- [x] 확인한 `loop_manager_internal/maintenance/tiered_ports.py:TieredMaintenancePort.prepare()`의 활성 assessment 재사용·같은 cycle 관련 범위 재개와 legacy 확장을 대조한다. 이미 저장된 fast 평가에 미완료 root unit이 있는 경우도 모델 없는 완료로 취급하지 않는다. 필요한 mode 교정은 기존 assessment identity 검증을 사용하고 원문·audit·완료한 판단·session의 보존과 실제 재사용 가능 여부를 구분한다.
+- [x] 확인한 `loop_manager_internal/planning/tiered_assessment.py:prepare_turn()`의 호출·진행 문구·최종 계획 인계가 교정된 mode를 소비하게 한다. root 후보가 있으면 기존 계획 연결 경로로 계속 인계한다. `tiered_review.py:promote()`의 전체/부분 성공 기준과 `storage/maintenance_state.py`의 cycle 진입·종료 주기는 바꾸지 않는다.
+- [x] 확인한 `tests/test_tiered_review.py`·`tests/test_tiered_assessment.py`의 기존 지침 hash 불일치·fast 무호출·소스 없는 조사 fixture를 조합해 아래 회귀를 추가한다. 필요할 때만 `tests/test_tiered_publication.py`의 성공 기준 보존 assertion을 확장한다. PRODUCT의 `### 유지보수 평가`와 ARCHITECTURE의 `### 유지보수 분석과 성공 근거`에는 실제 보완한 경계만 통합한다.
 
 ## Validation
 
@@ -43,8 +43,11 @@ priority: normal
 ## Progress
 
 - [x] `d73e16632a5646dc6aa77482f7a2eb92cdec1e13` 이후 `5f0dc1c2af8027aed3bf13501f3d5c223f375215`의 변경, PRODUCT·ARCHITECTURE 관련 절, R-028·R-074와 현재 selector/unit/turn·테스트 원본을 정적으로 대조했다. 기존 비종료 catalog에 이 mode 조합을 담당하는 작업은 없다.
-- [ ] 평가 mode·루트 조사 필요 조건·재개 경계 교정
-- [ ] 최소 targeted unit 회귀와 관련 문서 정합성
+- [x] 평가 mode·루트 조사 필요 조건·재개 경계 교정
+- [x] 최소 targeted unit 회귀와 관련 문서 정합성
+- 2026-10-24: 현재 rebase 후보에서 fast 무호출·유효 근거 재사용과 선택/저장 사이 지침 hash 재검사·legacy 근거 거부·저장된 root result/session 재연결·root-only targeted 성공 기준·source drift 관련 범위와 실제 root citation 회귀를 targeted unit test로 확인했다. 전체 verify는 Manager가 수행한다.
+- 2026-10-25: `af88a3811b3a1ad90526b11f3660f21fd6c5b3e2` 후보에서 관련 targeted unit 18개를 개별 재실행해 통과했고 base 대비 diff whitespace 검사도 통과했다. 전체 verify는 Manager가 수행한다.
+- 2026-10-25: 리뷰 delta에서 찾은 두 재개 경계를 보완했다. 이전 fast의 저장 경로가 남아 있는 source drift가 새 `root_review_required` 선택이면 root unit만 만들고, 위험 변경 targeted 선택은 선택 시점 root guidance hash를 보존해 `prepare()`의 변경 재검사를 받는다. 두 신규 회귀와 기존 source-drift·prepare guidance 재검사 unit을 현재 후보에서 실행해 통과했다.
 
 ## Decision Log
 

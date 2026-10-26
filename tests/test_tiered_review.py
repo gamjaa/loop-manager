@@ -366,13 +366,180 @@ class TieredReviewTest(unittest.TestCase):
                 mock.patch.object(maintenance_file_ledger, "validate_root_reviews",
                                   side_effect=AssertionError("stale guidance must not reuse tiered roots")):
             selection = self.repository.select("repo", Path("/repo"), "main", "sha", 20, 0)
+            self.connection.execute("UPDATE tiered_maintenance_success SET root_reviews_json = NULL, "
+                                    "guidance_hash = NULL WHERE repo = ?", ("repo",))
+            legacy = self.repository.select("repo", Path("/repo"), "main", "sha", 20, 0)
 
         self.assertTrue(selection.required)
+        self.assertEqual(selection.mode, "targeted")
         self.assertEqual(selection.reasons, ("root_review_required",))
+        self.assertEqual(selection.paths, ())
         self.assertIsNone(selection.root_reviews)
+        self.assertEqual((legacy.mode, legacy.reasons, legacy.paths),
+                         ("targeted", ("root_review_required",), ()))
+        assessment = self.repository.prepare("repo", 2, selection)
+        units = self.repository.units(assessment)
+        self.assertEqual([unit["kind"] for unit in units], ["root_placement"])
+
+    def test_low_risk_module_change_with_missing_root_evidence_is_root_only_targeted(self):
+        from loop_manager_internal.agents import common_guidance
+
+        self.complete(self.select())
+        self.connection.execute("UPDATE tiered_maintenance_success SET roots_json = ?, root_reviews_json = ? "
+                                "WHERE repo = ?", (code_index.encode([{"path": "docs", "category": "documentation"}]),
+                                code_index.encode([{"path": "docs"}]), "repo"))
+        self.sources["pkg/a.py"] = b"def calculate(value):\n    return value + 2\n"
+        inv = inventory(self.sources, "new-sha")
+        actual = SourceInventory("new-sha", tuple(
+            TrackedSource(source.path, source.content_hash, source.mode, "new-sha", "source")
+            for source in inv.sources), tuple(
+            ClassifiedPath(path, "source", "source") for path in self.sources))
+        placement = SimpleNamespace(path="docs", category="documentation", reason="Tracked documentation root")
+        source = TrackedSource(".", "d" * 64, "040000", "new-sha", "root review source")
+        with mock.patch.object(tiered_review, "cached_source_inventory", return_value=actual), \
+                mock.patch.object(tiered_review, "root_placement_inventory", return_value=(placement,)), \
+                mock.patch.object(code_index, "git", side_effect=lambda _repo, _command, value:
+                    self.sources[value.split(":", 1)[1]]), \
+                mock.patch.object(common_guidance, "effective_planning_hash", return_value="current-guidance"), \
+                mock.patch.object(maintenance_file_ledger, "root_review_source", return_value=source), \
+                mock.patch.object(maintenance_file_ledger.FileReviewRepository,
+                                  "reusable_root_reviews", return_value=None):
+            selection = self.repository.select("repo", Path("/repo"), "main", "new-sha", 20, 0)
+            assessment = self.repository.prepare("repo", 2, selection)
+
+        self.assertEqual(selection.mode, "targeted")
+        self.assertEqual(selection.reasons, ("root_review_required",))
+        self.assertEqual(selection.paths, ())
+        units = self.repository.units(assessment)
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0]["kind"], "root_placement")
+
+    def test_fast_assessment_rejects_unreviewed_root_unit_instead_of_calling_model(self):
+        selection = self.select()
+        selection = replace(selection, mode="fast", root_placements=({"path": "docs",
+            "category": "documentation", "reason": "Tracked documentation root"},),
+            root_reviews=None, root_source={"path": ".", "content_hash": "d" * 64,
+                "mode": "040000", "revision": "sha", "reason": "root review source"}, base="main")
+        assessment = self.repository.prepare("repo", 1, selection)
+        self.assertEqual(assessment["mode"], "targeted")
+        self.assertEqual([unit["kind"] for unit in self.repository.units(assessment)], ["root_placement"])
+
+    def test_prepare_rechecks_root_evidence_guidance_before_binding_it(self):
+        from loop_manager_internal.agents import common_guidance
+
+        root = {"path": "docs", "category": "documentation"}
+        selection = replace(self.select(), mode="fast", roots=(root,), base="main",
+            root_source={"path": ".", "content_hash": "d" * 64, "mode": "040000",
+                "revision": "sha", "reason": "root review source"},
+            root_placements=({**root, "reason": "Tracked documentation root"},),
+            root_reviews=(root,), root_guidance_hash="selected-guidance")
+        with mock.patch.object(common_guidance, "effective_planning_hash", return_value="current-guidance"):
+            assessment = self.repository.prepare("repo", 1, selection)
+
+        self.assertEqual(assessment["mode"], "targeted")
+        self.assertIsNone(assessment["root_reviews"])
+        self.assertEqual(assessment["root_guidance_hash"], "current-guidance")
+        self.assertEqual([unit["kind"] for unit in self.repository.units(assessment)], ["root_placement"])
+
+    def test_risky_targeted_selection_carries_root_guidance_hash_into_prepare(self):
+        from loop_manager_internal.agents import common_guidance
+
+        self.complete(self.select())
+        root = {"path": "docs", "category": "documentation"}
+        placement = SimpleNamespace(path="docs", category="documentation", reason="Tracked documentation root")
+        source = TrackedSource(".", "d" * 64, "040000", "new-sha", "root review source")
+        inv = inventory(self.sources, "new-sha")
+        actual = SourceInventory("new-sha", tuple(
+            TrackedSource(item.path, item.content_hash, item.mode, "new-sha", "source")
+            for item in inv.sources), tuple(
+            ClassifiedPath(path, "source", "source") for path in self.sources))
+        with mock.patch.object(tiered_review, "cached_source_inventory", return_value=actual), \
+                mock.patch.object(tiered_review, "root_placement_inventory", return_value=(placement,)), \
+                mock.patch.object(code_index, "git", side_effect=lambda _repo, _command, value:
+                    self.sources[value.split(":", 1)[1]]), \
+                mock.patch.object(common_guidance, "effective_planning_hash",
+                                  side_effect=("selected-guidance", "current-guidance")), \
+                mock.patch.object(maintenance_file_ledger, "root_review_source", return_value=source), \
+                mock.patch.object(maintenance_file_ledger.FileReviewRepository,
+                                  "reusable_root_reviews", return_value=(root,)):
+            selection = self.repository.select("repo", Path("/repo"), "main", "new-sha", 20, 0)
+            assessment = self.repository.prepare("repo", 2, selection)
+
+        self.assertEqual(selection.mode, "targeted")
+        self.assertTrue(selection.paths)
+        self.assertEqual(selection.root_reviews, (root,))
+        self.assertEqual(selection.root_guidance_hash, "selected-guidance")
+        self.assertEqual(assessment["root_guidance_hash"], "current-guidance")
+        self.assertIsNone(assessment["root_reviews"])
+        self.assertIn("root_placement", [unit.get("kind") for unit in self.repository.units(assessment)])
 
 
 class TieredRootReviewTest(MaintenancePlanningCase):
+    def test_root_only_targeted_success_keeps_full_baseline_and_reuses_current_root_evidence(self):
+        repository = tiered_review.TieredReviewRepository(self.connection)
+        selection = repository.select(str(self.repo), self.repo, "main", self.base_sha, 20, 1, force_full=True)
+        assessment = repository.prepare(str(self.repo), 1, selection)
+        inventory = tracked_source_inventory(self.repo, "main", self.base_sha, include_uncertain=True)
+        root_reviews = list(root_results_for(self.repo, inventory))
+
+        def root_output(unit, reviews):
+            source = unit["source"]
+            return FILE_REVIEW_PREFIX + json.dumps({"path": source["path"],
+                "content_hash": source["content_hash"], "mode": source["mode"],
+                "source_revision": source["revision"], "root_reviews": reviews})
+
+        for unit in repository.units(assessment):
+            if unit.get("kind") == "root_placement":
+                output = root_output(unit, root_reviews)
+            else:
+                reviews = []
+                for part in unit["parts"]:
+                    path = next(iter(part["records"]))
+                    excerpt = (self.repo / path).read_text(encoding="utf-8").strip()
+                    reviews.append({"module": part["module"],
+                        "summary": "The module responsibility and source relation were reviewed.",
+                        "citations": [{"path": path, "excerpt": excerpt}]})
+                output = tiered_review.RESULT_PREFIX + json.dumps({"digest": unit["digest"],
+                    "reviews": reviews, "findings": []})
+            repository.complete(str(self.repo), unit, output, lambda path: (self.repo / path).read_bytes())
+
+        full_evidence = repository.evidence(str(self.repo), 1, self.base_sha)
+        repository.promote(str(self.repo), full_evidence)
+        self.connection.commit()
+        full_success = repository.success(str(self.repo))
+        self.assertEqual(full_success["full_source_revision"], self.base_sha)
+
+        fast = repository.select(str(self.repo), self.repo, "main", self.base_sha, 20, 1)
+        fast_assessment = repository.prepare(str(self.repo), 2, fast)
+        self.assertEqual((fast.required, fast.mode), (False, "fast"))
+        self.assertEqual(repository.units(fast_assessment), ())
+
+        product = self.repo / "docs/PRODUCT.md"
+        product.write_text(product.read_text(encoding="utf-8") + "\nroot content changed\n",
+                           encoding="utf-8", newline="\n")
+        git(self.repo, "add", "docs/PRODUCT.md")
+        git(self.repo, "commit", "-m", "Change root documentation")
+        revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "push", "origin", "HEAD:main")
+        selection = repository.select(str(self.repo), self.repo, "main", revision, 20, 1)
+        targeted = repository.prepare(str(self.repo), 3, selection)
+        units = repository.units(targeted)
+        self.assertEqual((selection.mode, selection.reasons, selection.paths),
+                         ("targeted", ("root_review_required",), ()))
+        self.assertEqual([unit["kind"] for unit in units], ["root_placement"])
+        current_inventory = tracked_source_inventory(self.repo, "main", revision, include_uncertain=True)
+        current_reviews = list(root_results_for(self.repo, current_inventory))
+        unit = units[0]
+        repository.complete(str(self.repo), unit, root_output(unit, current_reviews),
+                            lambda path: (self.repo / path).read_bytes())
+        evidence = repository.evidence(str(self.repo), 3, revision)
+        repository.promote(str(self.repo), evidence)
+
+        success = repository.success(str(self.repo))
+        self.assertEqual(success["source_revision"], revision)
+        self.assertEqual(success["full_merged_count"], full_success["full_merged_count"])
+        self.assertEqual(success["full_source_revision"], self.base_sha)
+
     def test_asset_only_assessment_requires_exact_complete_root_investigation(self):
         for path in ("legacy/module.py", "refactored/adapter.py"):
             (self.repo / path).unlink()
