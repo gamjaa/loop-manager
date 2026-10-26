@@ -1045,13 +1045,32 @@ class RuntimeStateRepository:
                 raise RuntimeStateError('checkpoint changed during rebase recheck')
             if already_applied:
                 return expected
+            from loop_manager_internal.storage import verify_receipts
+            verify_selection = verify_receipts.selected(self.connection, repo, plan_id)
+            prior_artifacts = {key: getattr(expected, key) for key in (
+                'active_sha', 'validated_base_sha', 'definition_snapshot',
+                'status', 'branch', 'worktree', 'pr_url', 'pr_head_oid',
+                'worker_session_id', 'worker_session_binding',
+                'worker_session_transition', 'reviewer_session_id',
+                'agent_input_fingerprint', 'agent_input_plan',
+                'agent_result_plan', 'agent_result_snapshot',
+                'worker_result', 'worker_input_token', 'archive_token',
+                'verify_result', 'review_result', 'verify_token',
+                'review_token', 'publication_token', 'last_error',
+            )}
+            # Missing legacy inputs remain unknown. Adoption preserves source
+            # evidence without approving it for the accepted candidate.
+            prior_artifacts.update(
+                version=1, repo=repo, plan_id=plan_id,
+                before_head=current.expected_head,
+                target_base_oid=current.target_base_oid,
+                checkpoint_generation=current.generation,
+                verify_selection=verify_selection,
+                verify_receipt=verify_receipts.current_receipt(
+                    self.connection, verify_selection),
+            )
             checkpoint_repository.accept_current_rebase(
-                repo, plan_id, acceptance=dict(acceptance), prior_artifacts={
-                    key: getattr(expected, key) for key in (
-                        'worker_result', 'worker_input_token', 'archive_token',
-                        'verify_result', 'review_result', 'verify_token',
-                        'review_token', 'publication_token', 'last_error',
-                    )},
+                repo, plan_id, acceptance=dict(acceptance), prior_artifacts=prior_artifacts,
             )
             self._fault('after_rebase_acceptance')
             plan_values = dict(values)

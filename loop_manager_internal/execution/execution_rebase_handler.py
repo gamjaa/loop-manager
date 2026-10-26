@@ -287,12 +287,15 @@ class RebaseHandler:
         if (current.observed_remote_oid not in (None, remote_oid)
                 or live != remote_oid or (pr_head and pr_head != remote_oid)):
             raise manager_git_journal.MutationEvidenceError('rebase start remote or PR lease differs')
+        from loop_manager_internal.execution import stage_results
+        origin = stage_results.preserve(self.ports, context, reason='rebase_start')
+        current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
         saved = json.loads(json.dumps(current.snapshot or {}))
         if saved:
             saved['rebase_operation_history'] = [
                 *saved.get('rebase_operation_history', ()),
                 {key: value for key, value in current.snapshot.items()
-                 if key != 'rebase_operation_history'}]
+                 if key not in {'rebase_operation_history', 'stage_result_origins'}}]
         if 'current_rebase_acceptance' in saved:
             saved.setdefault('current_rebase_acceptance_history', []).append(saved.pop('current_rebase_acceptance'))
         for key in ('pending', 'stage_evidence', 'worker_result', 'stash_oid', 'after_head'):
@@ -302,7 +305,8 @@ class RebaseHandler:
             operation='rebase', expected_head=head, target_base_oid=target_oid,
             observed_remote_oid=remote_oid,
             snapshot={**saved, 'before_head': head, 'target_base': target_oid,
-                      'rebase_remote_oid': remote_oid, 'rebase_policy': 'current_state'},
+                      'rebase_remote_oid': remote_oid, 'rebase_policy': 'current_state',
+                      'rebase_stage_origin': origin},
         )
         manager_git_journal.begin_current_rebase(
             self.ports.identity.state_dir, owner=f'plan:{context.plan.plan_id}',

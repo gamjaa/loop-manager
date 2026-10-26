@@ -21,7 +21,7 @@ priority: high
 
 최신 base에만 유입된 무관한 Requirement·ExecPlan 변경 뒤에도 원래 Worker·targeted test·전체 verify·최종 Review 근거를 보존하고, 단계별 입력을 확인해 현재 후보에 다시 연결한다. 이 작업은 관련 입력의 비교·근거 보존과 Worker/verify의 재연결을 담당한다. 마지막 최종 Review의 승인 receipt 생성·동일성 판단·재사용은 기존 G-183이 이 결과를 소비해 완성한다.
 
-현재 clean rebase의 Worker 보존과 `verify_receipts`의 동일 코드 입력 재사용은 구현돼 있다. 남은 문제는 `managed_rebase_adoption.revalidation_values()`의 일괄 초기화, revision gate의 base/HEAD token 변화에 따른 단계 복귀와 `VerifyHandler` 재사용 경로의 Review 근거 삭제다. 또한 `stage_documents.related_paths()`와 source 지문만으로는 직접 sources 밖의 실제 관련성과 무관한 base 유입을 모두 증명하지 못한다. 이미 구현된 재사용 엔진을 다시 만들지 않고 이 소비 경계를 연결한다.
+착수 시점에 clean rebase의 Worker 보존과 `verify_receipts`의 동일 코드 입력 재사용은 구현돼 있었다. 이 작업의 연결 대상은 `managed_rebase_adoption.revalidation_values()`의 일괄 초기화, revision gate의 base/HEAD token 변화에 따른 단계 복귀와 `VerifyHandler` 재사용 경로의 Review 근거 삭제다. 또한 `stage_documents.related_paths()`와 source 지문만으로는 직접 sources 밖의 실제 관련성과 무관한 base 유입을 모두 증명하지 못한다. 이미 구현된 재사용 엔진을 다시 만들지 않고 이 소비 경계를 연결한다.
 
 ## Acceptance Criteria
 
@@ -35,10 +35,10 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/execution/execution_revision.py`·`execution_revision_handler.py`·`plan_validation.py`와 `stage_documents.py`의 definition/source/문서 변화 경계를 통합한다. base 유입과 각 후보의 실제 작업 변경을 구분하고, 이미 확정된 프로젝트 planning 및 관련 입력 근거를 소비한다. 선언·source·dependency·사용자 판단·적용 규칙·실제 코드 소비를 확인한 관계만 비교에 사용한다. 새 범용 의존성 그래프나 작업별 영향 Planner를 추가하지 않는다.
-- [ ] 확인한 `git/managed_rebase_adoption.py`·`execution/execution_rebase_handler.py`·`execution_workspace_handler.py`와 `execution_state.py`의 기존 checkpoint/CAS에 원래 성공 근거 보존·단계별 재판정을 연결한다. 직접 구현된 `retain_clean_rebase_worker()`·완료 rebase 선처리·공식 선언 복원·Worker checkpoint 게시 순서를 재사용한다. 진행 중 operation·target·사용자 index/파일을 초기화하거나 중간 형상을 최종 후보로 승인하지 않는다.
-- [ ] 확인한 `execution/execution_verify_handler.py`·`storage/verify_receipts.py`와 기존 입력 관측을 재사용해 코드가 같은 후보의 원래 run 연결을 유지한다. verify 재연결 중 G-183이 필요한 마지막 승인 자료를 삭제하지 않되 현재 Review token은 별도 승인 확인 전 사용할 수 없게 한다. 호환 근거가 없는 과거 행은 현재 값으로 보충하지 않고 필요한 실제 단계를 실행한다.
-- [ ] 확인한 `tests/test_execution_revision_gate.py`·`tests/test_verify_receipts.py`·`tests/test_execution_current_rebase_adoption_phase.py`의 모의 Git/실제 SQLite fixture와 `tests/test_managed_rebase_lifecycle.py`의 효과 회귀를 재사용한다. G-315의 prose 원본 의존성 제거·G-241의 코드 입력 receipt·G-242의 문서 반영을 중복 구현하지 않는다. PRODUCT의 `#### 후보 갱신과 성공 결과 재사용`, ARCHITECTURE의 단계별 문서 반영·rebase·성공 receipt 설명은 실제 구현에 맞게 소유 절에 통합한다.
+- [x] 확인한 `loop_manager_internal/execution/execution_revision.py`·`execution_revision_handler.py`·`plan_validation.py`와 `stage_documents.py`의 definition/source/문서 변화 경계를 통합한다. base 유입과 각 후보의 실제 작업 변경을 구분하고, 이미 확정된 프로젝트 planning 및 관련 입력 근거를 소비한다. 선언·source·dependency·사용자 판단·적용 규칙·실제 코드 소비를 확인한 관계만 비교에 사용한다. 새 범용 의존성 그래프나 작업별 영향 Planner를 추가하지 않는다.
+- [x] 확인한 `git/managed_rebase_adoption.py`·`execution/execution_rebase_handler.py`·`execution_workspace_handler.py`와 `execution_state.py`의 기존 checkpoint/CAS에 원래 성공 근거 보존·단계별 재판정을 연결한다. 직접 구현된 `retain_clean_rebase_worker()`·완료 rebase 선처리·공식 선언 복원·Worker checkpoint 게시 순서를 재사용한다. 진행 중 operation·target·사용자 index/파일을 초기화하거나 중간 형상을 최종 후보로 승인하지 않는다.
+- [x] 확인한 `execution/execution_verify_handler.py`·`storage/verify_receipts.py`와 기존 입력 관측을 재사용해 코드가 같은 후보의 원래 run 연결을 유지한다. verify 재연결 중 G-183이 필요한 마지막 승인 자료를 삭제하지 않되 현재 Review token은 별도 승인 확인 전 사용할 수 없게 한다. 호환 근거가 없는 과거 행은 현재 값으로 보충하지 않고 필요한 실제 단계를 실행한다.
+- [x] 확인한 `tests/test_execution_revision_gate.py`·`tests/test_verify_receipts.py`·`tests/test_execution_current_rebase_adoption_phase.py`의 모의 Git/실제 SQLite fixture와 `tests/test_managed_rebase_lifecycle.py`의 효과 회귀를 재사용한다. G-315의 prose 원본 의존성 제거·G-241의 코드 입력 receipt·G-242의 문서 반영을 중복 구현하지 않는다. PRODUCT의 `#### 후보 갱신과 성공 결과 재사용`, ARCHITECTURE의 단계별 문서 반영·rebase·성공 receipt 설명은 실제 구현에 맞게 소유 절에 통합한다.
 
 ## Validation
 
@@ -49,9 +49,40 @@ priority: high
 
 ## Progress
 
-- [x] revision `296da23b69e3bc76df27264eeb978c46d7caa100`의 R-072/R-082 delta, 기존 Worker/verify 재사용과 남은 초기화·revision 소비 경계를 정적으로 대조했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 관련 입력 비교와 원래 성공 근거 보존
-- [ ] Worker/verify 재연결·중단 복구 및 최소 회귀
+- [x] 착수 revision `296da23b69e3bc76df27264eeb978c46d7caa100`의 R-072/R-082 delta와 기존 Worker·receipt·문서 반영 경계를 대조했다. Manager가 확인한 checkpoint `4feca9d056d898ca7d34d37bd5652618c6a1112f`, `4b8a68c9faff9bb915e8d06cdb0d3ec6e39238a4`의 보존 구현을 이어 완성했다.
+- [x] `rebase_revalidation_audit`와 `stage_result_origins`에 원래 definition·base/HEAD·단계 결과/token·session·Agent 입력/결과·verify cycle/실제 receipt와 raw 변경을 보존한다. rebase intent는 단계 초기화 전에 기록하며 revision·문서 판단·verify·게시 직전 재판정도 이전 근거를 보존한다. 조회 불명·누락·호환되지 않는 origin을 현재 입력으로 보충하지 않는다.
+- [x] 후보마다 자기 base와의 경로·mode·blob·변경 종류를 비교한다. 선택 ExecPlan의 순수 기록은 기존 Worker 본문 정규화로만 분리하고 Review용 raw 변경은 유지한다. 확정 일반 planning을 소비하며 그 뒤의 내용·mode 보존 archive/순수 기록만 기존 판정기로 비교한다. 다른 ID·직접 sources 밖이라는 이유로 관련성을 추정하거나 새 Planner를 호출하지 않는다.
+- [x] PR 전 채택 후보의 작업·lease에 결합된 acceptance·generation·session·Worker token·같은 cycle의 selection·확정 planning과 실제 변경을 재확인해 VERIFYING으로 연결한다. 같은 acceptance는 한 번만 연결하며 이후 교정·실패를 덮지 않는다. 기존 verify 엔진은 원래 full run을 현재 후보에 연결하며 새 invocation·성공 실행·실패 초기화를 만들지 않는다. Review·publication 승인은 별도 gate로 유지한다.
+- [x] PRODUCT와 ARCHITECTURE의 소유 절에 단계별 보존·재연결과 기록/Review 비교의 구분을 반영했다. verify 입력 목록은 기존 `loop_manager_internal/**`·`tests/**`가 변경 코드·fixture를 포함하므로 수정하지 않았다.
+
+### Targeted validation
+
+- 최초 보존 checkpoint에서 `tests.test_runtime_state.CurrentRebaseRuntimeTests`의 `test_adoption_preserves_original_stage_provenance_without_reapproving_it`, `test_current_acceptance_rolls_back_checkpoint_plan_project_and_outbox`, `test_current_acceptance_is_atomic_idempotent_and_never_execution_proof`와 `tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_manual_completion_without_journal_invalidates_worker_and_validation_once` 각 1 test PASS를 확인했다.
+- 최종 연결 작업에서 targeted runner의 `--unittest tests.test_verify_receipts`는 40 tests PASS였다. origin 호환성 거부를 추가한 뒤 변경 관련 `--unittest tests.test_verify_receipts.StageResultProvenanceTest`는 11 tests PASS였다. Worker 재연결 뒤 실제 VerifyHandler의 원래 full run 재사용, Worker·verify 호출 0, 원래 Review 보존과 현재 승인 token 부재를 검사한다. 변경 코드·누락·실패/중단·다른 cycle의 거부와 production 문서 재관측 회귀를 유지했다.
+- `tests.test_preliminary_review.PreliminaryReviewTests.test_early_pass_full_run_and_final_approval_with_one_reviewer`, `tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_rebase_start_preserves_stage_source_before_validation_is_cleared`, `tests.test_managed_rebase_lifecycle.RebaseObservationFailureTests.test_restarted_fixture_updates_audit_on_current_connection_and_keeps_checkpoint` 각 1 test PASS다. 마지막 case는 모의 Git과 실제 SQLite만 사용하는 unit이며 실제 Git lifecycle 실행이 아니다.
+- 이전 checkpoint에서 clean rebase·revision 복구 marker·operation history의 관련 unit도 PASS했다. 실제 Git의 선택 ExecPlan 기록 충돌 자동 채택·SQLite 재시작 뒤 Worker 재연결 효과는 기존 lifecycle fixture의 `test_document_record_conflict_reconnects_original_worker_after_restart`에 추가했다. 이 integration과 전체 verify는 Worker 실행 금지 범위이므로 Manager가 실행해야 한다. 실제 CLI·Windows native 검증을 실행한 것으로 기록하지 않는다.
+
+### Resolved targeted failures
+
+모든 실패는 fixture/assertion의 잘못된 가정을 교정했으며 구현의 검증 조건을 약화하지 않았다. 실행 명령은 모두 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_verify_receipts.StageResultProvenanceTest`였다.
+
+- 기존 cycle을 빈 receipt와 혼동한 assertion으로 3 tests 중 1 FAIL 후, 동일 명령 재실행 3 tests PASS.
+- 새 재연결 fixture의 원격 branch가 대상과 달라 5 tests 중 2 ERROR 후, 동일 명령 재실행 5 tests PASS. 후속 확장 class는 7 tests PASS.
+- raw diff의 정렬 순서를 잘못 가정한 assertion으로 10 tests 중 1 FAIL 후, 경로와 원래 blob을 확인하도록 고친 동일 명령 재실행 10 tests PASS. 최종 호환성 사례 추가 뒤 동일 class 11 tests PASS.
+
+## Handoff
+
+Manager 전체 verify가 `test_document_record_conflict_reconnects_original_worker_after_restart`의 공통 history assertion에서 FAIL했다(identity `verify:92ca8caa290f28e6166254048775cdca8b3c549dfd12f7bdffd3acfb513540fe`, occurrence 1, revision 1). 새 `proven` fixture는 선택 ExecPlan 기록 충돌이 한 번이므로 이전 replay history가 비어 있는 것이 맞다. 이 사례는 빈 history와 `originals`/`blobs`에 보존한 충돌 전 Worker 원문·고정 base 원문의 SHA-256 및 실제 bytes를 확인하도록 교정했다. 여러 문서 commit을 replay하는 기존 사례의 history 보존 assertion은 유지한다. 이 integration은 Worker에서 재실행하지 않았으며, 후속 Reviewer 피드백에 Manager 전체 verify PASS가 전달됐다. 이 결과는 이번 추가 코드 교정 후의 전체 verify 성공을 뜻하지 않는다.
+
+교정 후 targeted runner로 같은 모듈의 `tests.test_managed_rebase_lifecycle.RebaseObservationFailureTests.test_restarted_fixture_updates_audit_on_current_connection_and_keeps_checkpoint`를 실행해 1 test PASS를 확인했다. 이는 모듈 import와 실제 SQLite 재시작을 확인한 unit 결과이며 실패한 실제 Git lifecycle 또는 전체 verify의 성공을 뜻하지 않는다.
+
+Reviewer 피드백 `review:loop_manager_internal/execution/execution_verify_handler.py::verifyhandler.verify::partial-before-reuse`(occurrence 1, revision 1)에 따라 새 부분 검증보다 전체 성공 receipt 재사용을 먼저 판단하도록 순서를 교정했다. 기존 일반 선행 PASS/승인 무효화 뒤 실제 full run 요구는 유지하고, 부분 검증 뒤 전체 실행으로 이어지는 경우 입력·현재 context·receipt selection을 다시 관측한다. 재연결 회귀는 부분 검증과 유효한 Reviewer identity를 활성화해 partial/full/Agent 호출 0 및 선행 Review 자료 미생성을 확인한다. 별도 회귀는 선행 PASS 뒤 동일 입력의 과거 성공이 있어도 새 실제 full run을 실행하는지 확인한다.
+
+이번 targeted 결과는 `--unittest tests.test_verify_receipts` 41 tests PASS, `--unittest tests.test_preliminary_review.PreliminaryReviewTests` 22 tests PASS다. 후자는 최초 22 tests 중 1 FAIL·1 ERROR였으며, 기존 동일 full 성공이 남아 있던 fixture를 실제 입력이 변경된 선행 검증 조건으로 교정한 동일 명령 재실행에서 22 tests PASS였다. 선행 PASS 뒤 실제 full 실행 assertion은 유지했다. 전체 verify·integration은 재실행하지 않았다.
+
+구현 완료 후보이며 Manager 전체 verify·실제 Git lifecycle·Reviewer 확인이 남아 있다. 최종 Review 승인 receipt 생성·동일성 판단·재사용과 최종 Reviewer 호출 0 통합 판정은 G-183의 범위로 유지한다. 이 작업의 자료 보존이나 Worker/verify 연결을 최종 Review·게시·사용자 Merge 성공으로 선언하지 않는다.
+
+Manager 후속 verify는 `test_tests_and_support_do_not_import_test_fixtures`에서 FAIL했다(identity `verify:0d4a47df435bca78680bbfa2d7d7808645c2ccf9c158d4ad995a7eae635d1488`, occurrence 1, revision 1). 재연결 회귀가 다른 테스트 모듈의 Reviewer identity를 import한 것이 원인이다. 동일 값을 기존 `tests.support.execution.REVIEW_IDENTITY`로 옮겨 두 테스트가 support만 소비하도록 교정했다. 기존 assertion과 실제 실행 조건은 유지했다. targeted runner로 해당 import 경계 검사, `tests.test_verify_receipts.StageResultProvenanceTest.test_reconnected_worker_uses_original_full_run_without_worker_or_verify_call`, `tests.test_preliminary_review.PreliminaryReviewTests.test_preliminary_pass_requires_new_full_run_even_with_matching_old_success`를 각각 실행해 각 1 test PASS를 확인했다. 이번 교정 뒤 전체 verify는 Manager 재실행이 필요하다.
 
 ## Decision Log
 

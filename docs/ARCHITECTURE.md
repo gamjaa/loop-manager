@@ -1022,9 +1022,17 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 
 Worker 결과와 작업 범위를 확인한 뒤 최신 `origin/<base-branch>`를 fetch하고 소유 변경을 commit하여 필요한 rebase를 완료한 다음 게시 후보 HEAD에서 검증 근거와 Review를 판단한다. `RevisionHandler`·`LatestBaseHandler`의 정상 rebase 호출이 충돌 없이 완료되면 기존 Worker 구현 입력 token·archive token·완료 결과를 대조한다. Worker 입력은 구현 조건·sources·dependency·archive·현재 runtime 지침에 결합하며 원본 명세의 내용 지문만의 변화는 제외한다. 명세 지문은 verify·Review의 입력 증명에 별도로 유지한다.
 
-일치하는 결과만 현재 수용 HEAD의 `worker_candidate_token`에 checkpoint CAS와 runtime transaction으로 연결해 VERIFYING으로 이어간다. `decide_revision_gate()`가 현재 후보 확인 불일치 등으로 IMPLEMENTING을 요구하면 clean 완료도 그 판정을 유지한다. 구현 교정 중인 작업, 실제 조건 변경, 충돌·미완료·중단 뒤 수용에는 이 예외를 적용하지 않는다.
+일치하는 결과만 현재 수용 HEAD의 `worker_candidate_token`에 checkpoint CAS와 runtime transaction으로 연결해 VERIFYING으로 이어간다. `decide_revision_gate()`가 실제 조건 변경·미완료·교정으로 IMPLEMENTING을 요구하면 clean 완료도 그 판정을 유지한다. 진행 중인 Git operation의 중간 형상을 완료 Worker로 승인하지 않는다.
+
+문서 자동 채택·중단 뒤의 PR 전 후보는 `execution/stage_results.py`가 보존한 원래 결과로 별도 재연결할 수 있다. 현재 acceptance의 작업·branch·worktree·target·HEAD, 같은 verify cycle의 selection, 원래 완료 Worker·후보 token·archive·session과 현재 definition을 대조한다. 원래 base가 원래 후보와 현재 base의 조상인지 확인하고 각 후보를 자기 base와 비교한 경로·mode·blob·변경 종류가 같은지 검사한다. base의 코드 변경이나 직접 수정한 다른 문서의 차이를 무관한 문서로 제외하지 않는다. 선택 ExecPlan은 기존 본문 정규화가 증명하는 순수 기록만 Worker 비교에서 분리하며 frontmatter와 mode는 유지한다.
+
+관련성 판단은 게시·catalog·DB 확정된 일반 `planning_reviews` 결과를 소비한다. 최신 base에서 확정된 결과가 없으면 그 확정 revision 이후의 전체 delta가 내용·mode를 보존하는 Requirement/ExecPlan archive 이동과 선택 ExecPlan의 순수 기록인지 기존 archive 판정기와 본문 정규화로 증명한다. 다른 추가·수정·삭제·경로 변경, 미확정 planning과 비교 불명은 새 복구 연결에 사용하지 않는다. 직접 sources 밖의 관계를 파일 ID로 추정하거나 별도 영향 Planner를 호출하지 않는다. 기존 dependency·사용자 결정·원격 소유권 gate는 유지한다.
+
+Git 조회 후 짧은 transaction에서 실행 row·checkpoint generation·verify selection·확정 planning을 다시 대조하고 원래 origin과 현재 HEAD·definition·planning delta를 `worker_reconnection`에 결합한다. 같은 acceptance의 연결은 한 번만 적용해 이후 교정이나 실패를 과거 결과로 덮지 않는다. Worker 연결은 VERIFYING으로만 전이하며 verify·Review·publication token을 만들거나 실패 이력을 초기화하지 않는다. 새 연결 근거가 없는 과거 checkpoint는 현재 값으로 보충하지 않고 기존 단계 판정을 따른다.
 
 같은 게시 lease·중간 checkpoint 경계를 유지하며 새 후보에 대한 verify·Review·publication 근거는 각각의 입력 증명·재사용 규칙으로 다시 판단한다. Worker 결과의 연결만으로 다른 단계의 성공을 만들지 않는다.
+
+원래 단계 자료는 승인 token 초기화 전에 checkpoint의 `stage_result_origins`에 보존한다. version 1 항목은 canonical JSON evidence의 SHA-256을 key로 사용하고 `evidence`와 최초 보존 `reason`을 가진다. evidence에는 repo·plan·base·관측 HEAD, 원래 definition·단계 결과/token·session·Agent 입력/결과 snapshot, 원래 verify cycle selection과 실제 receipt, raw 변경 및 Worker용 기록 정규화 변경을 구분해 저장한다. 관측할 수 없는 입력은 null과 오류 종류로 남긴다. rebase intent의 `rebase_stage_origin`은 이 key를 참조하며 operation history에는 origin 집합을 중첩 복사하지 않는다. 채택 transaction의 `rebase_revalidation_audit`도 원래 definition·session·receipt 출처를 보존한다. 일반 revision 무효화와 verify 실행/재연결 역시 이전 Review 원문을 보존하되 현재 Review token은 비운다. 실제 Reviewer 호출 identity·관측은 기존 validation 결과와 invocation ledger에 남으며, 보존 자료만으로 최종 Review 승인을 생성하지 않는다.
 
 #### 구현 조건과 실행 기록의 구분
 
@@ -1870,7 +1878,7 @@ source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 �
 
 일반 activation은 새 주기를 만들고 유지보수의 기존 작업 재개는 주기를 보존한다. 구형 활성 작업은 새 주기로 시작하며 과거 성공 token을 receipt로 합성하지 않는다. 실행 전후 입력·HEAD·작업 파일·runtime 소유 상태를 대조하고 성공 receipt·후보 token을 같은 transaction에서 확정한다. 저장 경쟁·실패는 현재 후보의 성공으로 인정하지 않는다.
 
-재사용은 현재 주기에 선택된 실제 전체 성공 run과 현재 저장소 코드 입력 관측이 일치할 때만 허용한다. 목록·fingerprint 계산이나 verify 성공 자체로 목록 밖 코드 입력 누락을 해소하지 않는다. 환경 재현성·외부 동적 입력의 동일성은 요구하지 않는다. 실제 지원 범위는 [운영 입력 관측 adapter](#운영-입력-관측-adapter)를 따른다. 일반 선행 PASS 뒤에는 별도로 연결된 실제 전체 run이 필요하다.
+재사용은 현재 주기에 선택된 실제 전체 성공 run과 현재 저장소 코드 입력 관측이 일치할 때만 허용하며 새 부분 검증 시작보다 먼저 판단한다. 이미 진행한 일반 선행 Review의 PASS·승인 무효화 뒤에는 동일 입력의 과거 성공이 있어도 별도로 연결된 실제 전체 run이 필요하다. 재사용할 성공이 없으면 기존 부분 검증 경로를 따르고, 부분 검증에서 전체 실행으로 이어질 때 입력과 현재 단계 상태를 다시 관측한다. 목록·fingerprint 계산이나 verify 성공 자체로 목록 밖 코드 입력 누락을 해소하지 않는다. 환경 재현성·외부 동적 입력의 동일성은 요구하지 않는다. 실제 지원 범위는 [운영 입력 관측 adapter](#운영-입력-관측-adapter)를 따른다.
 
 | 수동 complete/submit 면제 조건 | 적용 |
 |---|---|

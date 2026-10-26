@@ -741,6 +741,35 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
                             for entry in current.snapshot['rebase_operation_history']))
         self.assertLess(len(json.dumps(current.snapshot)), first_size * 9)
 
+    def test_rebase_start_preserves_stage_source_before_validation_is_cleared(self):
+        current = self.checkpoint.get('repo', 'G-047')
+        self.checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+            operation=None, expected_head='original-head', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={})
+        self.state.update_project('repo', phase='PUBLISHING', validated_base_sha='original-verified-base',
+                                  review_token='original-review-token')
+        self.fixture.effects.workspace.remote_branch_oid.return_value = 'remote'
+        def git(_root, *args, **kwargs):
+            self.assertFalse(self.fixture.connection.in_transaction)
+            return SimpleNamespace(stdout='original-head' if args == ('rev-parse', 'HEAD') else '', returncode=0)
+        self.fixture.effects.workspace.git.side_effect = git
+        with mock.patch.object(self.handler, '_legacy_current_rebase', return_value=False), \
+             mock.patch.object(handlers.manager_git_journal, 'live_remote_branch_oid', return_value='remote'), \
+             mock.patch.object(handlers.manager_git_journal, 'begin_current_rebase', return_value='audit'):
+            self.handler._record_rebase_intent(self.handler._context(), 'new-base')
+        saved = self.checkpoint.get('repo', 'G-047')
+        origin = saved.snapshot['stage_result_origins'][saved.snapshot['rebase_stage_origin']]['evidence']
+        self.assertEqual((origin['phase'], origin['active_sha'], origin['observed_head']),
+                         ('PUBLISHING', 'base', 'original-head'))
+        self.assertEqual(origin['validated_base_sha'], 'original-verified-base')
+        self.assertEqual(origin['review_token'], 'original-review-token')
+        self.assertEqual(origin['review_result'], 'old review')
+        self.assertEqual((saved.operation, saved.expected_head, saved.target_base_oid),
+                         ('rebase', 'original-head', 'new-base'))
+        self.assertEqual(self.state.row()['phase'], 'PUBLISHING')
+        self.fixture.effects.agent.run_agent.assert_not_called()
+        self.fixture.effects.validation.verify.assert_not_called()
+
     def test_only_confirmed_worker_patch_carries_candidate_token_to_manager_commit(self):
         from tests.support.revision import definition
         self.handler._complete_rebase_intent(self.fixture.context())

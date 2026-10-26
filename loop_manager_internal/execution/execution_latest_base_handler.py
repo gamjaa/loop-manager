@@ -40,6 +40,7 @@ class LatestBaseHandlerPorts:
     _retry: Callable[..., ExecutionOutcome]
     _row: Callable[[], Mapping[str, object]]
     _run_managed_rebase: Callable[..., Any]
+    checkpoint: Any = None
 
 
 class LatestBaseHandler:
@@ -70,6 +71,7 @@ class LatestBaseHandler:
         """Persist rebase intent, observe Git, then record the applied base."""
         prefix = '게시 직전 ' if publishing else ''
         events.emit("최신 base 반영 시작", old_base=row['active_sha'], target_base=latest_sha)
+        self.ports._record_rebase_intent(context, latest_sha)
         self.ports.state.update_project(
             self.ports.identity.repo,
             phase='WORKING',
@@ -78,7 +80,6 @@ class LatestBaseHandler:
             pr_conflict_base_oid=latest_sha if int(row['pr_conflict_recovery']) else row['pr_conflict_base_oid'],
             last_error=self.ports.contract.REBASE_IN_PROGRESS_ERROR,
         )
-        self.ports._record_rebase_intent(context, latest_sha)
         with events.activity("최신 base rebase", heartbeat=True) as report:
             rebased = self.ports._run_managed_rebase(context, latest_sha)
             report.update(result_code=rebased.returncode, result="Git 결과 수신")
@@ -181,6 +182,8 @@ class LatestBaseHandler:
                     return self.ports._final(no_change_error)
                 return self.ports._retry('최신 rebase 후보의 verify 입력과 Review를 다시 확인합니다.')
             else:
+                from loop_manager_internal.execution import stage_results
+                stage_results.preserve(self.ports, context, reason='publication_base_revalidation')
                 self.ports.state.update_project(
                     self.ports.identity.repo,
                     validated_base_sha=None,
@@ -215,6 +218,8 @@ class LatestBaseHandler:
                 if outcome is not None:
                     return outcome
                 return self.ports._retry('최신 rebase 후보의 verify 입력과 Review를 다시 확인합니다.')
+            from loop_manager_internal.execution import stage_results
+            stage_results.preserve(self.ports, context, reason='publication_candidate_revalidation')
             self.ports.state.update_project(
                 self.ports.identity.repo, active_sha=latest_sha, validated_base_sha=None,
                 phase='VERIFYING', verify_result=None, review_result=None,

@@ -143,14 +143,15 @@ class RevisionHandler:
     def _install_revision_state(
         self, snapshot, decision, latest_sha, *, legacy_baseline=False
     ):
+        values = self._revision_state_values(
+            snapshot, decision, latest_sha, legacy_baseline=legacy_baseline)
+        if any(key in values and values[key] is None
+               for key in ('worker_result', 'verify_result', 'review_result')):
+            from loop_manager_internal.execution import stage_results
+            stage_results.preserve(self.ports, self.ports._context(), reason='revision_invalidation')
         self.ports.state.update_project(
             self.ports.identity.repo,
-            **self._revision_state_values(
-                snapshot,
-                decision,
-                latest_sha,
-                legacy_baseline=legacy_baseline,
-            ),
+            **values,
         )
         if decision.phase == 'VERIFYING' and self.ports.checkpoint is not None:
             row = self.ports._row()
@@ -256,8 +257,8 @@ class RevisionHandler:
         }
         if int(row['pr_conflict_recovery']):
             refresh_values['pr_conflict_base_oid'] = latest_sha
-        self.ports.state.update_project(self.ports.identity.repo, **refresh_values)
         self.ports._record_rebase_intent(context, latest_sha)
+        self.ports.state.update_project(self.ports.identity.repo, **refresh_values)
         rebased = self.ports._run_managed_rebase(context, latest_sha, autostash=True)
         conflict = self.ports._post_rebase_observation(context, latest_sha, rebased.stdout)
         if conflict is not None:
@@ -495,6 +496,10 @@ class RevisionHandler:
                 context, f"ExecPlan revision gate 확인 실패: {error}"
             )
 
+        from loop_manager_internal.execution import stage_results
+        if not unmet and stage_results.reconnect_worker(self.ports, context, snapshot):
+            self.ports.update_snapshot(_definition_snapshot=snapshot)
+            return self.ports._retry('보존한 Worker 결과와 현재 rebase 후보 입력을 확인해 verify 단계로 연결했습니다.')
         row = self.ports._row()
         if previous is not None and row['worker_input_token'] == previous.legacy_worker_token:
             self.ports.state.update_project(self.ports.identity.repo, worker_input_token=previous.worker_token)
@@ -533,6 +538,7 @@ class RevisionHandler:
                     values.update(worker_result=document_revision['worker_result'],
                                   worker_input_token=snapshot.worker_token, archive_token=snapshot.archive_token)
                 candidate = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+                stage_results.preserve(self.ports, context, reason='document_decision_revalidation')
                 with runtime_state._transaction(self.ports.state.connection):
                     self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True, **values)
                     current = self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
@@ -668,6 +674,8 @@ class RevisionHandler:
             ):
                 # Keep the applied definition and rebase target until recovery
                 # completes; changed inputs require fresh Worker validation.
+                from loop_manager_internal.execution import stage_results
+                stage_results.preserve(self.ports, context, reason='rebase_conditions_changed')
                 self.ports.state.update_project(
                     self.ports.identity.repo,
                     phase='WORKING',
