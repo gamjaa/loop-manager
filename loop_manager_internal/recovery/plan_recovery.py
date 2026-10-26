@@ -17,6 +17,43 @@ from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 _selected_recovery = ContextVar("selected_plan_recovery", default=frozenset())
 
 
+def workspace_ownership_isolated(before, current, *, repo_path, worktree, branch, base):
+    """Bound unresolved local history without accepting that history.
+
+    The caller supplies a trusted, target-linked baseline and holds the existing
+    reservation leases. This comparison neither proves writer termination nor
+    authorizes a scope transition: both remain CAS-side caller obligations.
+    Missing shared evidence is deliberately project-wide uncertainty.
+    """
+    root, target = str(Path(repo_path).resolve()), str(Path(worktree).resolve())
+    if (root == target or not branch or not base or branch == base
+            or not before.shared_metadata_complete or not current.shared_metadata_complete
+            or before.branch != branch or current.branch != branch):
+        return False
+    ref = f'refs/heads/{branch}'
+    for snapshot in (before, current):
+        registration = snapshot.worktrees.get(target, ())
+        if (not snapshot.head or snapshot.refs.get(ref) != (snapshot.head, '')
+                or not any(field.startswith('HEAD=') and field != 'HEAD='
+                           for field in snapshot.worktrees.get(root, ()))
+                or f'HEAD={snapshot.head}' not in registration
+                or f'branch={ref}' not in registration
+                or any(field == 'detached' or field.startswith(('detached=', 'prunable='))
+                       for field in registration)
+                or any(path != target and f'branch={ref}' in fields
+                       for path, fields in snapshot.worktrees.items())):
+            return False
+    # A local ownership failure may explain changes to the selected resource,
+    # never a change to shared config, other refs or another worktree.
+    return (before.config == current.config
+            and {key: value for key, value in before.refs.items() if key != ref}
+            == {key: value for key, value in current.refs.items() if key != ref}
+            and {key: value for key, value in before.worktrees.items() if key != target}
+            == {key: value for key, value in current.worktrees.items() if key != target}
+            and tuple(field for field in before.worktrees[target] if not field.startswith('HEAD='))
+            == tuple(field for field in current.worktrees[target] if not field.startswith('HEAD=')))
+
+
 def _reservation_owners(connection, repo, plan_id):
     """Read only this reservation's writer and durable resource claims."""
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',

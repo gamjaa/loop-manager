@@ -33,6 +33,7 @@ class BlockReasonCode(str, Enum):
     PLAN_INPUT_INVALID = "plan_input_invalid"
     WORKER_OUTPUT_INVALID = "worker_output_invalid"
     REMOTE_BRANCH_DELETED = "remote_branch_deleted"
+    WORKSPACE_OWNERSHIP_LOCAL = "workspace_ownership_local"
 
     DEFAULT_WORKTREE_MUTATION = "default_worktree_mutation"
     SHARED_REF_MUTATION = "shared_ref_mutation"
@@ -66,6 +67,7 @@ _PLAN_REASONS = frozenset(
         BlockReasonCode.PLAN_INPUT_INVALID,
         BlockReasonCode.WORKER_OUTPUT_INVALID,
         BlockReasonCode.REMOTE_BRANCH_DELETED,
+        BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL,
     }
 )
 

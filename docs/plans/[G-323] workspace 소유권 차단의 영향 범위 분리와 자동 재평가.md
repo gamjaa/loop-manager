@@ -46,7 +46,10 @@ R-055 W04–W06에 따라 workspace 소유권 문제의 실제 영향 범위를 
 ## Progress
 
 - [x] revision `26140c614cf5881242ce8e3abbcdd060d6cd68c6`의 R-055 W04–W06·R-091·R-053과 고정 project scope·깨끗한 예약 해제·기존 작업별 선택/복구/통지 경계를 정적으로 대조했다. 구현·테스트·verify를 실행하지 않았다.
-- [ ] 실제 영향 범위 판정·호환 차단 저장과 기존 프로젝트 차단의 원자적 축소/해제
+- [x] 첫 구현 단위: `plan_recovery.workspace_ownership_isolated()`에 완전한 공유 metadata·선택 branch/ref/등록·기본 checkout 연결·다른 자원 불변 검사를 추가했다. 선택 자원의 설명되지 않은 파일·index·operation은 소유권 승인과 구별하고, 공유 근거 누락·변경·다른 worktree의 같은 branch 사용에는 범위를 축소하지 않는다. 호출자는 신뢰할 수 있는 대상 연결 baseline과 예약 lease를 제공하고 writer 종료·최종 CAS를 별도로 확인해야 한다.
+- [x] `workspace_ownership_uncertain`의 기존 project scope를 유지하며 고정 plan scope인 `workspace_ownership_local`과 기존 typed recovery 원인으로의 호환 연결을 추가했다. 이 단계에서는 실행·프로젝트 차단 재평가 소비자를 연결하지 않았으므로 실제 차단/재개 동작은 아직 바뀌지 않는다.
+- [x] 프로젝트 Python `python3`와 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 `tests.test_scoped_blocking.WorkspaceOwnershipImpactTests`의 4개 test 및 `tests.test_scoped_blocking.ScopedBlockingGateTests.test_reason_mapping_and_atomic_plan_project_records`의 1개 test를 실행해 모두 통과했다. 전체 verify·integration·Agent 실행은 하지 않았다.
+- [ ] 실제 영향 범위 판정의 실행/재평가 소비자 연결·호환 차단 저장과 기존 프로젝트 차단의 원자적 축소/해제. 기존 다른 계획 원인·checkpoint generation·요청·감사를 보존하는 전환과 실패/경쟁/재시작 회귀가 남아 있다.
 - [ ] 요청·독립 선택·알림 소비의 최소 unit 회귀 및 제품/설계 정합성
 
 ## Decision Log

@@ -21,6 +21,82 @@ from tests.support.scoped_recovery import ScopedGateFixture
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
 
+class WorkspaceOwnershipImpactTests(unittest.TestCase):
+    def setUp(self):
+        self.root = str(Path('/project').resolve())
+        self.target = str(Path('/state/G-001').resolve())
+        self.branch = 'loop-manager/G-001'
+        self.ref = 'refs/heads/' + self.branch
+        self.before = loop_manager.GitSnapshot('old', self.branch, {}, {},
+            {self.ref: ('old', ''), 'refs/remotes/origin/main': ('base', '')},
+            {self.root: ('HEAD=base', 'branch=refs/heads/main'),
+             self.target: ('HEAD=old', 'branch=' + self.ref, 'locked=manager')},
+            {'local:remote.origin.url': ('registered-origin',)}, {})
+        self.current = replace(self.before, head='new',
+            refs={**self.before.refs, self.ref: ('new', '')},
+            worktrees={**self.before.worktrees,
+                self.target: ('HEAD=new', 'branch=' + self.ref, 'locked=manager')},
+            dirty={'app.py': (('unstaged',), 'unexplained-output')})
+
+    def isolated(self, current=None, before=None, **changes):
+        from loop_manager_internal.recovery.plan_recovery import workspace_ownership_isolated
+        return workspace_ownership_isolated(before or self.before, current or self.current,
+            **{'repo_path': self.root, 'worktree': self.target,
+               'branch': self.branch, 'base': 'main', **changes})
+
+    def test_unexplained_local_history_is_not_shared_ownership_uncertainty(self):
+        self.assertTrue(self.isolated())
+        self.assertTrue(self.isolated(replace(self.current,
+            index={'app.py': ('M 100644 conflict 2',)}, operations={'merge': 'user-operation'})))
+        # Isolation never claims that local files or operations are acceptable.
+        self.assertEqual(self.current.dirty['app.py'][1], 'unexplained-output')
+
+    def test_missing_or_changed_shared_evidence_cannot_narrow_scope(self):
+        for changed in (
+            replace(self.current, shared_metadata_complete=False),
+            replace(self.current, config={}),
+            replace(self.current, refs={**self.current.refs, 'refs/heads/other': ('unknown', '')}),
+            replace(self.current, worktrees={**self.current.worktrees,
+                self.root: ('HEAD=unknown', 'branch=refs/heads/main')}),
+            replace(self.current, worktrees={self.target: self.current.worktrees[self.target]}),
+            replace(self.current, worktrees={**self.current.worktrees, self.root: ()}),
+            replace(self.current, worktrees={**self.current.worktrees,
+                '/other': ('HEAD=new', 'branch=' + self.ref)}),
+        ):
+            with self.subTest(changed=changed):
+                self.assertFalse(self.isolated(changed))
+        self.assertFalse(self.isolated(before=replace(self.before, shared_metadata_complete=False)))
+
+    def test_current_target_identity_and_registration_must_remain_connected(self):
+        for changed in (
+            replace(self.current, branch='other'),
+            replace(self.current, refs={self.ref: ('foreign', '')}),
+            replace(self.current, worktrees={**self.current.worktrees,
+                self.target: ('HEAD=new', 'branch=' + self.ref, 'locked=other')}),
+            replace(self.current, worktrees={**self.current.worktrees,
+                self.target: ('HEAD=new', 'detached')}),
+            replace(self.current, worktrees={**self.current.worktrees,
+                self.target: ('HEAD=new', 'branch=' + self.ref, 'prunable=missing')}),
+        ):
+            with self.subTest(changed=changed):
+                self.assertFalse(self.isolated(changed))
+        self.assertFalse(self.isolated(base=self.branch))
+        self.assertFalse(self.isolated(worktree=self.root))
+
+    def test_legacy_project_reason_and_new_plan_reason_have_distinct_fixed_scopes(self):
+        from loop_manager_internal.recovery.recovery_runtime import (
+            RecoveryObservation, RecoveryReason, decide, reason_from_block,
+        )
+        observation = RecoveryObservation(RecoveryReason.OWNERSHIP_UNCERTAIN,
+            'repo', 'G-001', 'WORKING', 'revision', 'base', 'fingerprint', 'progress')
+        self.assertEqual(decide(observation).scope, BlockScope.PROJECT)
+        local = decide(observation, final_block_reason=BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL)
+        self.assertEqual(local.scope, BlockScope.PLAN)
+        self.assertEqual(reason_from_block(local.block_reason), RecoveryReason.OWNERSHIP_UNCERTAIN)
+        self.assertEqual(scoped_blocking.reason_scope(BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
+                         BlockScope.PROJECT)
+
+
 class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -680,6 +756,7 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         scoped_blocking.validate_records(self.connection, self.repo)
 
         expected_plan_reasons = {
+            BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL,
             BlockReasonCode.REMOTE_BRANCH_DELETED,
             BlockReasonCode.VERIFY_RETRY_EXHAUSTED,
             BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT,
