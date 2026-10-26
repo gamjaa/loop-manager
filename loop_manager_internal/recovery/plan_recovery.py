@@ -43,14 +43,8 @@ def workspace_ownership_isolated(before, current, *, repo_path, worktree, branch
                 or any(path != target and f'branch={ref}' in fields
                        for path, fields in snapshot.worktrees.items())):
             return False
-    # A local ownership failure may explain changes to the selected resource,
-    # never a change to shared config, other refs or another worktree.
-    return (before.config == current.config
-            and {key: value for key, value in before.refs.items() if key != ref}
-            == {key: value for key, value in current.refs.items() if key != ref}
-            and {key: value for key, value in before.worktrees.items() if key != target}
-            == {key: value for key, value in current.worktrees.items() if key != target}
-            and tuple(field for field in before.worktrees[target] if not field.startswith('HEAD='))
+    # 무관한 ref·worktree·설정 변경은 대상 자원의 소유권 변경이 아니다.
+    return (tuple(field for field in before.worktrees[target] if not field.startswith('HEAD='))
             == tuple(field for field in current.worktrees[target] if not field.startswith('HEAD=')))
 
 

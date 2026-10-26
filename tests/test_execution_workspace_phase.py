@@ -30,7 +30,9 @@ class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
         for observations, expected in (
             ([baseline] * 20, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL),
             ([changed] * 20, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL),
-            ([baseline, changed] * 10, BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
+            ([baseline, changed] * 10, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL),
+            ([baseline, replace(baseline, dirty={'user.txt': (('untracked',), 'new-output')})] * 10,
+             BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
             ([replace(baseline, shared_metadata_complete=False)] * 20,
              BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
         ):

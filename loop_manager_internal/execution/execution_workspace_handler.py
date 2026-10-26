@@ -1050,7 +1050,7 @@ class WorkspaceHandler:
                     if (workspace_ownership_isolated(baseline, observed,
                             repo_path=self.ports.identity.repo_path, worktree=worktree,
                             branch=branch, base=self.ports.identity.base)
-                            and self.ports.capture_git_snapshot(worktree) == observed):
+                            and _same_local_snapshot(baseline, observed)):
                         reason = BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL
             except (RuntimeError, OSError, ValueError, TypeError, KeyError):
                 pass

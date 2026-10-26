@@ -155,14 +155,12 @@ def _narrow_workspace_project_block(effects, connection, repo_path, state_dir, r
         effects.validate_execplan_workspace_identity(state_dir, repo,
             manual_workspace_owner(connection, repo, plan['plan_id']), plan['branch'], worktree)
         effects.validate_managed_worktree(repo_path, worktree, plan['branch'])
-        # 과거 Agent 감사 대신 이번 관측 구간의 공유 자원 안정성을 확인한다.
+        # 과거 Agent 감사 대신 이번 관측 구간의 대상 자원 안정성을 확인한다.
         baseline = effects.capture_git_snapshot(worktree)
         observed = effects.capture_git_snapshot(worktree)
-        if not workspace_ownership_isolated(baseline, observed, repo_path=repo_path,
-                worktree=worktree, branch=plan['branch'], base=project['base_branch']):
-            return False
-        confirmed = effects.capture_git_snapshot(worktree)
-        if observed != confirmed:
+        if (not workspace_ownership_isolated(baseline, observed, repo_path=repo_path,
+                worktree=worktree, branch=plan['branch'], base=project['base_branch'])
+                or not agent_scope_decision._same_local_snapshot(baseline, observed)):
             return False
     except (RuntimeError, OSError, ValueError, TypeError, KeyError):
         return False

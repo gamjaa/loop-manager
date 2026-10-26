@@ -51,13 +51,16 @@ class WorkspaceOwnershipImpactTests(unittest.TestCase):
         # Isolation never claims that local files or operations are acceptable.
         self.assertEqual(self.current.dirty['app.py'][1], 'unexplained-output')
 
-    def test_missing_or_changed_shared_evidence_cannot_narrow_scope(self):
+    def test_unrelated_refs_worktrees_and_config_do_not_prevent_isolation(self):
+        self.assertTrue(self.isolated(replace(self.current,
+            config={}, refs={**self.current.refs, 'refs/heads/other': ('new', '')},
+            worktrees={**self.current.worktrees,
+                self.root: ('HEAD=new-base', 'branch=refs/heads/main'),
+                '/independent': ('HEAD=other', 'branch=refs/heads/other')})))
+
+    def test_missing_or_conflicting_registration_cannot_narrow_scope(self):
         for changed in (
             replace(self.current, shared_metadata_complete=False),
-            replace(self.current, config={}),
-            replace(self.current, refs={**self.current.refs, 'refs/heads/other': ('unknown', '')}),
-            replace(self.current, worktrees={**self.current.worktrees,
-                self.root: ('HEAD=unknown', 'branch=refs/heads/main')}),
             replace(self.current, worktrees={self.target: self.current.worktrees[self.target]}),
             replace(self.current, worktrees={**self.current.worktrees, self.root: ()}),
             replace(self.current, worktrees={**self.current.worktrees,
@@ -302,7 +305,29 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         self.assertFalse(self.resume_local())
         self.assertEqual(self.connection.execute('SELECT workspace_owned FROM exec_plans').fetchone()[0], 2)
 
-    def test_shared_change_and_checkpoint_race_keep_project_gate(self):
+    def test_concurrent_unrelated_changes_do_not_keep_project_gate(self):
+        self.isolated_missing_creation()
+        self.plan('G-002')
+        observations = 0
+        def unrelated_change(*_):
+            nonlocal observations
+            observations += 1
+            oid = str(observations)
+            return replace(self.snapshot,
+                config={'local:core.autocrlf': (oid,)},
+                refs={**self.snapshot.refs, 'refs/heads/other': (oid, '')},
+                worktrees={**self.snapshot.worktrees,
+                    self.repo: ('HEAD=' + oid, 'branch=refs/heads/main'),
+                    '/independent': ('HEAD=' + oid, 'branch=refs/heads/other')})
+        self.capture.side_effect = unrelated_change
+        self.assertTrue(self.resume())
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-001')['reason_code'],
+                         'workspace_ownership_local')
+        self.assertEqual(loop_manager.select_ready_execplan(self.connection, self.repo)['plan_id'], 'G-002')
+        self.assertEqual(self.connection.execute("SELECT workspace_owned FROM exec_plans WHERE plan_id='G-001'").fetchone()[0], 2)
+
+    def test_target_change_and_checkpoint_race_keep_project_gate(self):
         self.isolated_missing_creation()
         baseline = self.snapshot
         observations = 0
@@ -310,7 +335,7 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
             nonlocal observations
             observations += 1
             return (baseline if observations % 2 else
-                    replace(baseline, config={'local:core.hooksPath': ('unknown',)}))
+                    replace(baseline, dirty={'user.txt': (('untracked',), 'new-output')}))
         self.capture.side_effect = concurrent_change
         self.assertFalse(self.resume())
         calls = 0

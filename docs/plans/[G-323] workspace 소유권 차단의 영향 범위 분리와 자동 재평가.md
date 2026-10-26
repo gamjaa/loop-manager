@@ -45,6 +45,7 @@ R-055 W04–W06에 따라 workspace 소유권 문제의 실제 영향 범위를 
 
 ## Progress
 
+- [x] 사용자 확인에 따라 확인 구간에도 무관한 ref·다른 worktree·Git 설정의 일괄 일치 검사를 제거했다. 실행 실패와 프로젝트 차단 축소는 같은 대상 등록·branch/ref/HEAD·lock 및 로컬 작업물 안정성만 비교하며 writer 종료·예약 lease·checkpoint/CAS·rollback 검사는 유지한다. 무관한 Git 변경이 매 관측마다 계속돼도 독립 READY가 선택되고 대상 파일·등록·checkpoint 경쟁에는 적용을 보류한다. WSL 격리 복사본 관련 회귀 302개와 Windows 최소 회귀 18개가 통과했으며 전체 verify는 실행하지 않았다.
 - [x] `11261321c5e88f581430e3bbe3889a972a8b8cc0`의 문서 변경과 이를 포함한 기준 `9ba8b64c`의 Git 이력 재구성·무진전 억제 구현을 통합했다. 과거 Agent snapshot의 존재·공유 상태 일치 조건을 제거하고 현재 관측 쌍으로 범위를 판정한다. 확인 구간의 공유 자원 안정성·writer 종료·예약 lease·CAS·rollback은 유지한다. 과거 공유 변경·snapshot 부재의 범위 축소와 실제 관측 경쟁의 차단 유지를 확인했으며 WSL `/tmp` 전용 복사본의 관련 회귀 300개와 Windows 최소 회귀 16개가 통과했다. 전용 복사본·임시 폴더는 정리했고 이번 점검에서 전체 verify는 실행하지 않았다.
 - [x] revision `26140c614cf5881242ce8e3abbcdd060d6cd68c6`의 R-055 W04–W06·R-091·R-053과 고정 project scope·깨끗한 예약 해제·기존 작업별 선택/복구/통지 경계를 정적으로 대조했다. 구현·테스트·verify를 실행하지 않았다.
 - [x] 복구점 `9f5287f1c91cc613b54243e7f6b86317ea222c00`에서 공유 metadata·branch/ref/등록의 독립성 판정과 고정 plan 원인 `workspace_ownership_local`을 보존했다. 기존 `workspace_ownership_uncertain`의 project 의미는 유지했다. 해당 단계의 판정 4개·단일 code-scope/저장 1개 unit이 통과했다.
