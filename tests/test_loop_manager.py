@@ -28,7 +28,7 @@ class PublicFacadeTest(unittest.TestCase):
         self.assertNotIn("targeted: PASS", reviewer)
         self.assertNotIn("verify: PASS", reviewer)
         self.assertIn("문서 변경만 포함합니다", no_test_reviewer)
-        self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer)
+        self.assertNotIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer)
         self.assertIn("ISSUE_ID: relative/path::stable-symbol-or-test::category-slug", reviewer)
         self.assertIn("이전과 정확히 같은 ID", reviewer)
         self.assertIn("COMMIT_TITLE:", worker)
