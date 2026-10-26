@@ -50,6 +50,9 @@ priority: high
 ## Progress
 
 - [x] revision `296da23b69e3bc76df27264eeb978c46d7caa100`의 R-072/R-082 delta, 기존 Worker/verify 재사용과 남은 초기화·revision 소비 경계를 정적으로 대조했다. 구현·테스트·verify는 실행하지 않았다.
+- rebase 채택의 기존 `rebase_revalidation_audit`에 원래 definition·base·작업/session·Agent 입력/결과 snapshot과 checkpoint generation, 선택 verify cycle 및 실제 receipt를 함께 보존했다. 현재 후보 token 초기화와 소유권/CAS 경계는 유지하며 과거 자료가 없으면 현재 값으로 보충하지 않는다. 이 중간 변경은 재사용 승인을 추가하지 않는다.
+- targeted runner로 `tests.test_runtime_state.CurrentRebaseRuntimeTests`의 `test_adoption_preserves_original_stage_provenance_without_reapproving_it`, `test_current_acceptance_rolls_back_checkpoint_plan_project_and_outbox`, `test_current_acceptance_is_atomic_idempotent_and_never_execution_proof`와 `tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_manual_completion_without_journal_invalidates_worker_and_validation_once`를 각각 실행해 4개 모두 PASS했다. 새 회귀는 성공·실패·미완료·면제·기록 부재와 새 cycle에서 과거 성공을 승격하지 않는 조건을 확인한다. 전체 verify는 Worker에서 실행하지 않았다.
+- 남은 구현은 rebase 시작 전 근거 보존, 일반 planning의 관련성 근거 소비, 후보별 실제 변경/입력 비교, revision gate·verify 재연결 및 중단 복구다. PRODUCT·ARCHITECTURE의 최종 동작 반영과 완료 회귀는 해당 연결 구현 뒤 수행한다.
 - [ ] 관련 입력 비교와 원래 성공 근거 보존
 - [ ] Worker/verify 재연결·중단 복구 및 최소 회귀
 

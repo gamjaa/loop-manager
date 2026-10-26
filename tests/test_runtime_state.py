@@ -19,6 +19,67 @@ from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 
 class CurrentRebaseRuntimeTests(unittest.TestCase):
 
+    def test_adoption_preserves_original_stage_provenance_without_reapproving_it(self):
+        from loop_manager_internal.storage import verify_receipts
+        from loop_manager_internal.verification.inputs import InputObservation
+        from tests.support.revision import definition
+
+        for receipt_status in ('success', 'failure', 'pending', 'waived', 'missing'):
+            with self.subTest(receipt_status=receipt_status):
+                connection, runtime, checkpoint, original, _expected, decision = runtime_rebase_fixture(self)
+                values = {
+                    'definition_snapshot': definition().serialize(),
+                    'validated_base_sha': 'original-verified-base',
+                    'worker_session_binding': 'original-binding',
+                    'reviewer_session_id': 'original-review-session',
+                    'review_result': json.dumps({'invocation_id': 'original-review', 'result': 'PASS'}),
+                    'agent_input_fingerprint': 'original-inputs',
+                    'agent_input_plan': 'original-plan',
+                    'agent_result_plan': 'completed-plan',
+                    'agent_result_snapshot': 'completed-snapshot',
+                }
+                original = runtime.transition_from_snapshot(original, plan_values=values, project_values=values)
+                if receipt_status != 'missing':
+                    verify_receipts.start_cycle(connection, 'repo', 'G-047')
+                    selection = verify_receipts.selected(connection, 'repo', 'G-047')
+                    identifier, selection = verify_receipts.record(connection, selection,
+                        head='original-verified-head', observation=InputObservation('original-code'),
+                        kind='run', reason='actual run')
+                    if receipt_status != 'pending':
+                        verify_receipts.complete(connection, selection, identifier,
+                            passed=receipt_status != 'failure', output='original verify output',
+                            executed=receipt_status != 'waived')
+                selection = verify_receipts.selected(connection, 'repo', 'G-047')
+                receipt = verify_receipts.current_receipt(connection, selection)
+                before = checkpoint.get('repo', 'G-047')
+                connection.commit()
+
+                result = runtime.complete_rebase(original, checkpoint, acceptance=decision.acceptance,
+                    project_values={'phase': 'WORKING'}, reobserve=lambda: decision)
+
+                saved = checkpoint.get('repo', 'G-047')
+                audit = saved.snapshot['rebase_revalidation_audit'][0]
+                self.assertEqual((audit['version'], audit['repo'], audit['plan_id']), (1, 'repo', 'G-047'))
+                for field in (*values, 'active_sha', 'status', 'worker_session_id',
+                              'worker_result', 'worker_input_token', 'verify_result', 'review_token'):
+                    self.assertEqual(audit[field], getattr(original, field), field)
+                self.assertEqual(audit['before_head'], before.expected_head)
+                self.assertEqual(audit['target_base_oid'], before.target_base_oid)
+                self.assertEqual(audit['checkpoint_generation'], before.generation)
+                self.assertEqual(audit['verify_selection'], selection)
+                self.assertEqual(audit['verify_receipt'], receipt)
+                for field in ('worker_result', 'verify_result', 'review_result',
+                              'worker_input_token', 'verify_token', 'review_token', 'publication_token'):
+                    self.assertIsNone(getattr(result, field), field)
+                self.assertEqual(verify_receipts.selected(connection, 'repo', 'G-047'), selection)
+                # A new cycle cannot rewrite the preserved provenance or make
+                # the original run a success in the new cycle.
+                verify_receipts.start_cycle(connection, 'repo', 'G-047')
+                connection.commit()
+                self.assertEqual(checkpoint.get('repo', 'G-047'), saved)
+                self.assertIsNone(verify_receipts.success(connection,
+                    verify_receipts.selected(connection, 'repo', 'G-047'), InputObservation('original-code')))
+
     def test_current_acceptance_is_atomic_idempotent_and_never_execution_proof(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
