@@ -29,6 +29,7 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
             validated_base_sha='original-base', worker_session_id='original-session')
         self.raw = ':100644 100755 ' + 'a' * 40 + ' ' + 'b' * 40 + ' M\0src/app.py\0'
         self.observation = {'head': 'original-head', 'dirty': '', 'raw': self.raw}
+        self.blobs = {}
         self.git_port = mock.Mock(side_effect=self.observe)
         self.ports = SimpleNamespace(state=self.state, checkpoint=self.checkpoints,
             identity=SimpleNamespace(repo='repo'), git=self.git_port)
@@ -39,6 +40,8 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
             value = self.observation['head']
         elif args == ('status', '--porcelain'):
             value = self.observation['dirty']
+        elif args[:2] == ('cat-file', 'blob'):
+            value = self.blobs[args[2]]
         else:
             self.assertEqual(args[0], 'diff')
             self.assertEqual(args[-3:], ('base', 'original-head', '--'))
@@ -108,13 +111,21 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
                 self.assertNotIn('stage_result_origins', self.checkpoints.get('repo', 'G-047').snapshot or {})
                 self.assertEqual(self.state.row()['review_result'], 'original final Review')
 
-    def adopted_origin(self, *, full_success=False):
+    def adopted_origin(self, *, full_success=False, plan_records=False):
         from loop_manager_internal.execution import stage_results
         from loop_manager_internal.storage import planning_review_state
         from tests.support.revision import definition
         from tests.support.rebase_observations import expectation, observation, decision_for
         from loop_manager_internal.git.managed_rebase_validation import Remote
         original = definition(path=self.state.row()['plan_path'])
+        if plan_records:
+            text = '---\nid: G-047\n---\n## Purpose\nImplement\n## Progress\n- [ ] Completed unit check\n'
+            body = ExecPlanBodyHash(text)
+            original = replace(original, body_hash=str(body), body_text=text)
+            self.blobs.update({'d' * 40: text, 'e' * 40: text.replace('[ ]', '[x]'),
+                               'f' * 40: text.replace('[ ]', '[X]')})
+            plan_change = ':100644 100644 ' + 'd' * 40 + ' ' + 'e' * 40 + ' M\0' + original.path + '\0'
+            self.observation['raw'] = self.raw + plan_change
         self.state.update_project('repo', definition_snapshot=original.serialize(),
             worker_input_token=original.worker_token, archive_token=original.archive_token)
         if full_success:
@@ -163,11 +174,64 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
                 value = self.base_delta
             elif args[-3:] == ('new-base', 'new-head', '--'):
                 value = self.rebased
+            elif args[:2] == ('cat-file', 'blob'):
+                value = self.blobs[args[2]]
             else:
                 raise AssertionError(args)
             return SimpleNamespace(stdout=value, returncode=0)
         self.git_port.side_effect = observe
+        if plan_records:
+            self.base_delta += ':100644 100644 ' + 'd' * 40 + ' ' + 'f' * 40 + ' M\0' + original.path + '\0'
+            text = self.blobs['f' * 40]
+            original = replace(original, body_hash=str(ExecPlanBodyHash(text)), body_text=text)
         return replace(original, revision_sha='new-base'), origin
+
+    def test_selected_plan_record_adoption_preserves_raw_review_scope_and_reconnects_worker(self):
+        from loop_manager_internal.execution import stage_results
+        definition, origin = self.adopted_origin(plan_records=True)
+        evidence = self.checkpoints.get('repo', 'G-047').snapshot['stage_result_origins'][origin]['evidence']
+        selected = next(change for change in evidence['changes'] if change['path'] == definition.path)
+        self.assertEqual(selected['new_oid'], 'e' * 40)
+        self.assertEqual(len(evidence['implementation_changes']), 1)
+        self.assertTrue(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['stage_result_origins'][origin]['evidence'], evidence)
+
+    def test_confirmed_planning_survives_only_exact_archive_delta(self):
+        from loop_manager_internal.execution import stage_results
+        definition, _origin = self.adopted_origin()
+        self.connection.execute("UPDATE planning_reviews SET revision='base', confirmed_revision='base' "
+                                "WHERE repo='repo' AND slot='general'")
+        self.connection.commit()
+        # A different ID alone does not justify reusing stale planning.
+        self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        archive = ''
+        for directory, name in (('requirements', '[R-999] Other.md'), ('plans', '[G-999] Other.md')):
+            archive += ':100644 000000 ' + 'c' * 40 + ' ' + '0' * 40 + ' D\0docs/' + directory + '/' + name + '\0'
+            archive += ':000000 100644 ' + '0' * 40 + ' ' + 'c' * 40 + ' A\0docs/' + directory + '/archive/' + name + '\0'
+        self.base_delta = archive.replace('000000 100644', '000000 100755')
+        self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        self.base_delta = archive.replace('c' * 40 + ' A', 'e' * 40 + ' A')
+        self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        self.base_delta = archive
+        self.assertTrue(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        self.assertEqual(len(self.checkpoints.get('repo', 'G-047').snapshot['worker_reconnection']['planning_delta']), 4)
+
+    def test_plan_record_comparison_keeps_new_constraints_header_and_mode(self):
+        from loop_manager_internal.execution import stage_results
+        from loop_manager_internal.git.managed_rebase_observation import parse_raw_changes
+        path = self.context().plan.path
+        text = '---\nid: G-047\n---\n## Progress\n- [ ] Completed unit check\n'
+        self.blobs = {'d' * 40: text, 'e' * 40: text.replace('[ ]', '[x]')}
+        raw = ':100644 100644 ' + 'd' * 40 + ' ' + 'e' * 40 + ' M\0' + path + '\0'
+        changes = parse_raw_changes(raw)
+        self.assertEqual(stage_results.implementation_changes(self.ports, self.context(), changes, path), [])
+        for changed in (text + '- New validation requirement\n', text.replace('G-047', 'G-048')):
+            self.blobs['e' * 40] = changed
+            self.assertEqual(len(stage_results.implementation_changes(self.ports, self.context(), changes, path)), 1)
+        self.blobs['e' * 40] = text.replace('[ ]', '[x]')
+        self.assertEqual(len(stage_results.implementation_changes(self.ports, self.context(),
+            parse_raw_changes(raw.replace('100644 100644', '100644 100755')), path)), 1)
 
     def test_restart_reconnects_only_original_worker_with_same_changes_and_confirmed_planning(self):
         from loop_manager_internal.execution import stage_results
@@ -242,6 +306,25 @@ class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
         self.assertTrue(saved.snapshot['concurrent_owner_observation'])
         self.assertNotIn('worker_reconnection', saved.snapshot)
         self.assertIsNone(self.state.row()['worker_result'])
+
+    def test_missing_or_incompatible_origins_use_existing_revalidation(self):
+        from loop_manager_internal.execution import stage_results
+        definition, origin_id = self.adopted_origin()
+        snapshot = self.checkpoints.get('repo', 'G-047').snapshot
+        original = snapshot['stage_result_origins'][origin_id]['evidence']
+        variants = (None, [], {}, {origin_id: None},
+            {origin_id: {'evidence': {**original, 'version': 2}}},
+            {origin_id: {'evidence': {key: value for key, value in original.items() if key != 'active_sha'}}})
+        for origins in variants:
+            with self.subTest(origins=origins):
+                current = self.checkpoints.get('repo', 'G-047')
+                saved = self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+                    operation=current.operation, expected_head=current.expected_head,
+                    target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**snapshot, 'stage_result_origins': origins})
+                self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), saved)
+                self.assertIsNone(self.state.row()['worker_result'])
 
     def test_reconnected_worker_uses_original_full_run_without_worker_or_verify_call(self):
         from loop_manager_internal.execution import stage_results
@@ -582,6 +665,24 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(self.state.row()['phase'], 'WORKING')
         self.assertIsNone(self.state.row()['worker_result'])
         self.assertIsNone(self.state.row()['review_token'])
+
+    def test_publication_revalidation_preserves_review_for_both_stale_base_paths(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        self.verify()
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.handler.effects, checkpoint=checkpoints)
+        for active, validated, reason in (('base', 'older-base', 'publication_base_revalidation'),
+                                          ('older-base', 'base', 'publication_candidate_revalidation')):
+            with self.subTest(reason=reason):
+                self.state.update_project('repo', phase='PUBLISHING', active_sha=active,
+                    validated_base_sha=validated, review_result='original review', review_token='old-approval')
+                self.handler._latest_before_publication(self.context())
+                origins = checkpoints.get('repo', 'G-047').snapshot['stage_result_origins'].values()
+                evidence = next(item['evidence'] for item in origins if item['reason'] == reason)
+                self.assertEqual((evidence['active_sha'], evidence['validated_base_sha']), (active, validated))
+                self.assertEqual(evidence['review_result'], 'original review')
+                self.assertIsNone(self.state.row()['review_token'])
+                self.assertIsNone(self.state.row()['publication_token'])
 
     def test_environment_and_revision_changes_reuse_original_run(self):
         self.verify()

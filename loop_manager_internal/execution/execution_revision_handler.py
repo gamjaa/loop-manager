@@ -538,6 +538,7 @@ class RevisionHandler:
                     values.update(worker_result=document_revision['worker_result'],
                                   worker_input_token=snapshot.worker_token, archive_token=snapshot.archive_token)
                 candidate = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+                stage_results.preserve(self.ports, context, reason='document_decision_revalidation')
                 with runtime_state._transaction(self.ports.state.connection):
                     self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True, **values)
                     current = self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)

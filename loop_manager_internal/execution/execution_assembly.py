@@ -430,6 +430,7 @@ def latest_base(effects: ExecutionEffects, identity: ExecutionIdentity,
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> LatestBaseHandler:
     return LatestBaseHandler(LatestBaseHandlerPorts(
         identity=identity,
+        checkpoint=effects.checkpoint,
         snapshot=snapshot,
         contract=ExecutionContract.from_source(effects.contract),
         state=effects.state,

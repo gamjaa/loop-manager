@@ -40,6 +40,7 @@ class LatestBaseHandlerPorts:
     _retry: Callable[..., ExecutionOutcome]
     _row: Callable[[], Mapping[str, object]]
     _run_managed_rebase: Callable[..., Any]
+    checkpoint: Any = None
 
 
 class LatestBaseHandler:
@@ -181,6 +182,8 @@ class LatestBaseHandler:
                     return self.ports._final(no_change_error)
                 return self.ports._retry('최신 rebase 후보의 verify 입력과 Review를 다시 확인합니다.')
             else:
+                from loop_manager_internal.execution import stage_results
+                stage_results.preserve(self.ports, context, reason='publication_base_revalidation')
                 self.ports.state.update_project(
                     self.ports.identity.repo,
                     validated_base_sha=None,
@@ -215,6 +218,8 @@ class LatestBaseHandler:
                 if outcome is not None:
                     return outcome
                 return self.ports._retry('최신 rebase 후보의 verify 입력과 Review를 다시 확인합니다.')
+            from loop_manager_internal.execution import stage_results
+            stage_results.preserve(self.ports, context, reason='publication_candidate_revalidation')
             self.ports.state.update_project(
                 self.ports.identity.repo, active_sha=latest_sha, validated_base_sha=None,
                 phase='VERIFYING', verify_result=None, review_result=None,

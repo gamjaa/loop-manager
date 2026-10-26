@@ -17,6 +17,7 @@ from tests.support.fixed_samples import PROJECT_FILES
 
 def seed_validated_candidate(
     connection: sqlite3.Connection, repo: Path, worktree: Path, plan_id: str,
+    *, base_revision: str | None = None,
 ) -> DefinitionSnapshot:
     """Seed exact candidate evidence; return the definition for publication tokens."""
 
@@ -24,7 +25,7 @@ def seed_validated_candidate(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
         (str(repo), plan_id),
     ).fetchone()
-    base_sha = git_command(repo, "rev-parse", "origin/main")
+    base_sha = base_revision or git_command(repo, "rev-parse", "origin/main")
     candidate_head = git_command(worktree, "rev-parse", "HEAD")
     body = loop_manager._revision_execplan_body_hash(repo, base_sha, str(row["path"]))
     with mock.patch('loop_manager_internal.agents.common_guidance.RUNTIME_ROOT', PROJECT_FILES):

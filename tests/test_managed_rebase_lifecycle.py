@@ -271,6 +271,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_document_only_replay_never_invokes_conflict_worker(self):
         self._lifecycle(with_pr=False, documents='only')
 
+    def test_document_record_conflict_reconnects_original_worker_after_restart(self):
+        self._lifecycle(with_pr=False, documents='proven')
+
     def test_mixed_conflict_adopts_documents_and_keeps_code_for_worker(self):
         self._lifecycle(with_pr=False, documents='mixed')
 
@@ -324,7 +327,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 'depends_on: []\ncomplexity: low\nrisk: low\npriority: normal\n---\n'
                 '\n## Purpose\nResolve current changes.\n' +
                 ('\n## Progress\n- [ ] Required targeted unit test\n## Decision Log\n'
-                 if definition_change else ''))
+                 if definition_change or documents == 'proven' else ''))
             (repo / 'app.txt').write_text(''.join(lines))
             (repo / 'skip.txt').write_text('initial\n')
             (repo / 'scripts').mkdir()
@@ -364,7 +367,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 git(worktree, 'commit', '-m', title)
 
             commit('notes.txt', 'independent\n', 'Independent first commit')
-            if documents:
+            if documents == 'proven':
+                commit(plan_path, original_plan.replace('[ ]', '[x]'), 'Record completed Worker check')
+            elif documents:
                 commit(requirement_path, '# [R-001] Condition\n\nworker-old\n', 'Old conditions')
                 commit(plan_path, original_plan.replace('Resolve current changes.', 'Old Worker goal.'), 'Old task goal')
                 commit(requirement_path, '# [R-001] Condition\n\nworker-later\n', 'Later replayed old conditions')
@@ -381,13 +386,16 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             original = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
             git(worktree, 'push', 'origin', branch)
             upstream = lines.copy()
-            upstream[0] = 'value=base\n'
+            if documents != 'proven':
+                upstream[0] = 'value=base\n'
             (repo / 'app.txt').write_text(''.join(upstream))
-            (repo / 'skip.txt').write_text('base\n')
+            (repo / 'skip.txt').write_text('initial\n' if documents == 'proven' else 'base\n')
             git(repo, 'add', '.')
             if documents and documents != 'worker-only':
                 expected_requirement = b'# [R-001] Condition\n\nlatest remote\n'
                 expected_plan = original_plan.replace('Resolve current changes.', 'Latest remote goal.') + '\n## Progress\n- [x] Base verification\n'
+                if documents == 'proven':
+                    expected_plan = original_plan.replace('[ ]', '[X]')
                 destination = requirement_path
                 if documents == 'delete':
                     (repo / requirement_path).unlink()
@@ -520,13 +528,30 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 return fixture.plan
 
             effects.agent.validate_worker_workspace_scope.side_effect = validate_worker
-            if definition_change:
+            if definition_change or documents == 'proven':
                 effects.revision.body_hash.side_effect = lm._revision_execplan_body_hash
                 effects.revision.source_fingerprint.side_effect = lm._revision_execplan_source_fingerprint
                 effects.revision.changed_paths.side_effect = lm._revision_changed_paths
                 from tests.support.publication import seed_validated_candidate
-                seed_validated_candidate(connection, repo, worktree, 'G-047')
+                definition = seed_validated_candidate(connection, repo, worktree, 'G-047',
+                    **({'base_revision': base} if documents == 'proven' else {}))
                 effects.state.expected = effects.state.repository.projected(repo_key)
+                if documents == 'proven':
+                    current = effects.checkpoint.get(repo_key, 'G-047')
+                    effects.checkpoint.record(repo_key, 'G-047', expected_generation=current.generation,
+                        operation=current.operation, expected_head=current.expected_head,
+                        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                        snapshot={**current.snapshot,
+                            'worker_candidate_token': definition.worker_candidate_token(original)})
+                    from loop_manager_internal.storage import planning_review_state, verify_receipts
+                    verify_receipts.start_cycle(connection, repo_key, 'G-047')
+                    planning_review_state.begin(connection, repo_key, purpose='full', revision=target,
+                        input_fingerprint='fixture-inputs', specification_fingerprint='fixture-specifications',
+                        work_cycle='fixture-cycle', comparison_revision=base)
+                    planning_review_state.validate(connection, repo_key, target,
+                        'Unrelated Requirement; selected implementation conditions unchanged.', 'unchanged')
+                    planning_review_state.confirm(connection, repo_key, target, target)
+                    connection.commit()
 
             def agent(_provider, path, _state, _config, role, *_args, **kwargs):
                 events.append(role)
@@ -679,7 +704,20 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     self.assertEqual(git(worktree, 'ls-files', '-u').stdout, '')
                     self.assertEqual((worktree / 'notes.txt').read_text(), 'independent\n')
                     self.assertEqual((worktree / 'app.txt').read_text(), ''.join(upstream))
-                    self.assertIsNone(effects.state.row()['worker_result'], 'base Progress is not Worker success')
+                    if documents == 'proven':
+                        origin = saved.snapshot['rebase_stage_origin']
+                        handler = restart()
+                        outcome = handler.guard(handler._context())
+                        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+                        self.assertEqual(effects.state.row()['phase'], 'VERIFYING')
+                        self.assertEqual(effects.state.row()['worker_result'], policy_fixture.READY_WORKER_RESULT)
+                        self.assertEqual(effects.checkpoint.get(repo_key, 'G-047').snapshot[
+                            'worker_reconnection']['origin'], origin)
+                        self.assertEqual(events, [])
+                        effects.validation.verify.assert_not_called()
+                        self.assertIsNone(effects.state.row()['review_token'])
+                    else:
+                        self.assertIsNone(effects.state.row()['worker_result'], 'base Progress is not Worker success')
                 return
             if publication_interruption:
                 # 게시 경계만 검사할 때는 실제 Git으로 후보와 pending SQLite를
