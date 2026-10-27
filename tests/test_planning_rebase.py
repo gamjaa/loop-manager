@@ -402,6 +402,7 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
         from loop_manager_internal.planning.planning_runtime import PlanningLifecycleCoordinator, PlanningOutcomeKind
         from tests.support.planning_case import PlanningCase, FakePorts, planning_snapshot
         case = PlanningCase()
+        self.addCleanup(case.doCleanups)
         case.setUp()
         ports = FakePorts(planning_snapshot(
             phase="PLANNING", active_sha="base", worktree="/planning",
