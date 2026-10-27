@@ -22,6 +22,7 @@ from loop_manager_internal.execution.execution_state import ExecutionStatePort a
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.git import workspace
 from loop_manager_internal.recovery import recovery_runtime
 from loop_manager_internal.runtime.contracts import GitLockError
 from loop_manager_internal.runtime.contracts import PROJECT_STEP_PLANNING_PENDING
@@ -377,6 +378,9 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             github_repository=dependencies.github_repository,
             validate_execplan_workspace_identity=dependencies.validate_execplan_workspace_identity,
             validate_managed_worktree=dependencies.validate_managed_worktree,
+            validate_registered_remote=lambda repo_path, worktree, origin: workspace.validate_registered_remote(
+                repo_path, worktree, origin, git=dependencies.git,
+                github_repository=dependencies.github_repository),
             update_project=lambda _connection, repo, **values: state.update_project(repo, preserve_transaction=True, **values),
             run_request=state.run_checkpoint_publication_request,
         )

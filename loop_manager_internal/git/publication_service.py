@@ -6,9 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.git import managed_rebase_adoption
+from loop_manager_internal.git import workspace
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.runtime.contracts import PublicationSafetyError
+from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import runtime_state
@@ -285,6 +287,7 @@ class WorkerCheckpointPublicationEffects:
     github_repository: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    validate_registered_remote: Callable[..., object]
     update_project: Callable[..., object]
     run_request: Callable[..., object] | None = None
 
@@ -326,12 +329,10 @@ def push_worker_checkpoint_commits(
     )
     effects.validate_managed_worktree(repo_path, worktree, branch)
     def validate_origin():
-        for location in (repo_path, worktree):
-            for arguments in (('remote', 'get-url', '--all', 'origin'),
-                              ('remote', 'get-url', '--push', '--all', 'origin')):
-                urls = effects.git(location, *arguments).stdout.splitlines()
-                if len(urls) != 1 or effects.github_repository(urls[0]) != project['origin']:
-                    raise PublicationSafetyError('등록 origin과 Worker checkpoint 대상이 다릅니다.')
+        try:
+            effects.validate_registered_remote(repo_path, worktree, project['origin'])
+        except WorkspaceOwnershipError as error:
+            raise PublicationSafetyError('등록 origin과 Worker checkpoint 대상이 다릅니다.') from error
     validate_origin()
     branch_head = effects.git(worktree, 'symbolic-ref', '--quiet', '--short', 'HEAD', check=False)
     head = effects.git(worktree, 'rev-parse', 'HEAD').stdout.strip()

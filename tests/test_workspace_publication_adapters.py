@@ -14,6 +14,7 @@ from loop_manager_internal.catalog import archive_git, execplan_archive
 from loop_manager_internal.git import command_adapter, git_adapter, manager_git_journal, source_sync, workspace
 from loop_manager_internal.recovery import pull_request_recovery
 from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot, WorkspaceOwnershipError
+from loop_manager_internal.runtime.contracts import PublicationSafetyError
 from loop_manager_internal.storage.execplan_archive_state import MergedArchiveCandidate
 from tests.support.database import runtime_connection
 
@@ -250,6 +251,31 @@ class WorkspaceEffectBoundaryTests(unittest.TestCase):
 
 
 class PublicationObservationBoundaryTests(unittest.TestCase):
+    def test_worker_checkpoint_origin_uses_shared_validator_and_maps_failure_before_push(self):
+        from loop_manager_internal.git import publication_service
+
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repo_path, worktree = Path('/repo'), Path('/worktree')
+        effects = publication_service.WorkerCheckpointPublicationEffects(
+            active_execplan=lambda *_: plan, git=mock.Mock(), remote_branch_oid=mock.Mock(),
+            pr_for_branch=mock.Mock(return_value=None), github_repository=mock.Mock(),
+            validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+            validate_registered_remote=mock.Mock(side_effect=WorkspaceOwnershipError('unsafe')),
+            update_project=mock.Mock())
+        connection.execute("UPDATE projects SET origin='owner/repo', base_branch='main'")
+        connection.commit()
+        connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch=?, worktree=?",
+                           ('loop-manager/G-047', str(worktree)))
+        connection.commit()
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        with self.assertRaises(PublicationSafetyError):
+            publication_service.push_worker_checkpoint_commits(
+                effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
+                'loop-manager/G-047', worktree, 'main', None, None)
+        effects.validate_registered_remote.assert_called_once_with(repo_path, worktree, 'owner/repo')
+        effects.git.assert_not_called()
+
     def test_archive_requires_the_current_regular_file_and_original_hash(self):
         effects = fake_effects(archive_git.ArchiveGitEffects)
         adapter = archive_git.ExecPlanArchiveGitPort(Path('/repo'), Path('/state'), 'repo', effects=lambda: effects)
