@@ -15,6 +15,7 @@ from loop_manager_internal.agents import common_guidance
 from loop_manager_internal.storage import agent_invocation_state as state
 import loop_manager as manager
 from tests.support.fixed_samples import PROJECT_FILES
+from tests.support.provider_execution import ProviderExecutionFixture
 
 
 class RunnerTests(TestCase):
@@ -1169,6 +1170,127 @@ class RunnerTests(TestCase):
         self.assertEqual((row["session_id"], row["result_kind"]),
                          ("observed", "interrupted"))
         self.assertIsNotNone(row["finished_at"])
+
+
+class InvocationResponseArtifactTests(ProviderExecutionFixture, TestCase):
+    def test_reviewer_response_is_recovered_from_its_attempt_after_database_wait(self):
+        from loop_manager_internal.agents import invocation_service, process_receipt, provider_adapters
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+
+        usage = {'input_tokens': 10, 'cached_input_tokens': 4, 'output_tokens': 2}
+        with mock.patch.object(state.InvocationRepository, 'finish',
+                               side_effect=DatabaseWaitTimeout('finish wait')):
+            result = self.invoke(usage=usage)
+        self.assertEqual((result.code, result.message, result.collection_status),
+                         (0, 'VERDICT: PASS', 'error'))
+
+        row = self.connection.execute('SELECT * FROM agent_invocations').fetchone()
+        self.assertIsNone(row['finished_at'])
+        receipt = Path(row['process_receipt_path'])
+        self.assertEqual(receipt.parent, self.state / 'agent-runtime' / 'reviewer')
+        saved = process_receipt.observation(str(receipt), self.state, row['invocation_id'])
+        source = receipt.parent / receipt.name.removesuffix('.process.json') / 'last-message.txt'
+        self.assertEqual(source.read_text(encoding='utf-8'), 'VERDICT: PASS')
+        self.assertTrue(saved['database_pending'])
+        self.assertEqual(saved['message_sha256'], hashlib.sha256(b'VERDICT: PASS').hexdigest())
+        self.assertEqual(saved['outcome']['usage']['input_tokens'], 10)
+        self.assertEqual(saved['outcome']['usage']['cached_input_tokens'], 4)
+        latest = provider_adapters._provider_log_directory(self.worktree, self.state) / 'reviewer-last.txt'
+        self.assertEqual(latest.read_text(encoding='utf-8'), 'VERDICT: PASS')
+
+        state.InvocationRepository(self.connection).reconcile_interrupted(state_dir=self.state)
+        stored = self.connection.execute('SELECT * FROM agent_invocations').fetchone()
+        self.assertEqual((stored['result_kind'], stored['result_code'], stored['session_id'],
+                          stored['input_tokens'], stored['cached_input_tokens']),
+                         ('success', 0, 'review-session', 10, 4))
+
+        with mock.patch.object(provider_adapters.CodexAgentAdapter, 'run',
+                               side_effect=AssertionError('provider must not be repeated')) as run:
+            recovered = invocation_service.run_agent(
+                'codex', self.worktree, self.state, self.config, 'reviewer', 'review this candidate',
+                read_only=True, persist_session=True, connection=self.connection,
+                invocation=invocation.InvocationContext(self.repo, self.plan_id),
+                effects=self.invoke_effects)
+        run.assert_not_called()
+        self.assertEqual((recovered.message, recovered.session_id, recovered.usage.input_tokens,
+                          recovered.usage.cached_input_tokens, recovered.isolation_invocation_id),
+                         ('VERDICT: PASS', 'review-session', 10, 4, row['invocation_id']))
+        self.assertFalse(process_receipt.observation(str(receipt), self.state,
+                                                    row['invocation_id'])['database_pending'])
+
+    def test_failed_attempt_write_does_not_fall_back_to_shared_latest_response(self):
+        from loop_manager_internal.agents import invocation_service, process_receipt, provider_adapters
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.storage.task_calls import CallDeferred
+
+        with mock.patch.object(provider_adapters, '_write_attempt_message', side_effect=OSError('disk full')), \
+             mock.patch.object(state.InvocationRepository, 'finish',
+                               side_effect=DatabaseWaitTimeout('finish wait')):
+            result = self.invoke()
+        self.assertEqual((result.code, result.message, result.collection_status),
+                         (0, 'VERDICT: PASS', 'error'))
+
+        row = self.connection.execute('SELECT * FROM agent_invocations').fetchone()
+        receipt = Path(row['process_receipt_path'])
+        source = receipt.parent / receipt.name.removesuffix('.process.json') / 'last-message.txt'
+        self.assertFalse(source.exists())
+        saved = process_receipt.observation(str(receipt), self.state, row['invocation_id'])
+        self.assertTrue(saved['database_pending'])
+        self.assertEqual(saved['message_sha256'], hashlib.sha256(b'VERDICT: PASS').hexdigest())
+        latest = provider_adapters._provider_log_directory(self.worktree, self.state) / 'reviewer-last.txt'
+        self.assertEqual(latest.read_text(encoding='utf-8'), 'VERDICT: PASS')
+
+        state.InvocationRepository(self.connection).reconcile_interrupted(state_dir=self.state)
+        with mock.patch.object(provider_adapters.CodexAgentAdapter, 'run',
+                               side_effect=AssertionError('provider must not be repeated')) as run:
+            with self.assertRaises(CallDeferred):
+                invocation_service.run_agent(
+                    'codex', self.worktree, self.state, self.config, 'reviewer', 'review this candidate',
+                    read_only=True, persist_session=True, connection=self.connection,
+                    invocation=invocation.InvocationContext(self.repo, self.plan_id),
+                    effects=self.invoke_effects)
+        run.assert_not_called()
+        self.assertTrue(process_receipt.observation(str(receipt), self.state,
+                                                    row['invocation_id'])['database_pending'])
+
+    def test_saved_reviewer_result_with_pending_delivery_marker_is_replayed_once(self):
+        from loop_manager_internal.agents import invocation_service, process_receipt, provider_adapters
+
+        original_observe = process_receipt.observe
+
+        def fail_delivery_marker(path, identity, facts):
+            if facts.get('database_pending') is False:
+                raise OSError('receipt update unavailable')
+            return original_observe(path, identity, facts)
+
+        with mock.patch.object(process_receipt, 'observe', side_effect=fail_delivery_marker):
+            first = self.invoke(usage={'input_tokens': 8, 'output_tokens': 3})
+        self.assertEqual((first.code, first.message, first.collection_status),
+                         (0, 'VERDICT: PASS', 'error'))
+
+        row = self.connection.execute('SELECT * FROM agent_invocations').fetchone()
+        self.assertEqual((row['result_kind'], row['result_code'], row['session_id'],
+                          row['input_tokens'], row['output_tokens']),
+                         ('success', 0, 'review-session', 8, 3))
+        receipt = Path(row['process_receipt_path'])
+        saved = process_receipt.observation(str(receipt), self.state, row['invocation_id'])
+        self.assertTrue(saved['database_pending'])
+        source = receipt.parent / receipt.name.removesuffix('.process.json') / 'last-message.txt'
+        self.assertEqual(source.read_text(encoding='utf-8'), 'VERDICT: PASS')
+
+        with mock.patch.object(provider_adapters.CodexAgentAdapter, 'run',
+                               side_effect=AssertionError('provider must not be repeated')) as run:
+            recovered = invocation_service.run_agent(
+                'codex', self.worktree, self.state, self.config, 'reviewer', 'review this candidate',
+                read_only=True, persist_session=True, connection=self.connection,
+                invocation=invocation.InvocationContext(self.repo, self.plan_id),
+                effects=self.invoke_effects)
+        run.assert_not_called()
+        self.assertEqual((recovered.message, recovered.session_id, recovered.usage.input_tokens,
+                          recovered.usage.output_tokens, recovered.isolation_invocation_id),
+                         ('VERDICT: PASS', 'review-session', 8, 3, row['invocation_id']))
+        self.assertFalse(process_receipt.observation(str(receipt), self.state,
+                                                    row['invocation_id'])['database_pending'])
 
 
 class CommonGuidanceInvocationTests(TestCase):

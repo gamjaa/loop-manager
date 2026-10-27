@@ -114,11 +114,16 @@ class ProviderExecutionFixture:
             resolve_profile=self.resolve, validate_runtime=self.validate,
             snapshot_digest=lambda: 'current-snapshot', **kwargs)
 
-    def invoke(self, *, result_code=0, resolved=None):
+    def invoke(self, *, result_code=0, resolved=None, usage=None):
         process = mock.Mock(pid=4321)
         process.stdin = io.StringIO()
-        process.stdout = io.StringIO(json.dumps({'type': 'thread.started', 'thread_id': 'review-session'}) + '\n' +
-            json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: PASS'}}) + '\n')
+        events = [
+            {'type': 'thread.started', 'thread_id': 'review-session'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: PASS'}},
+        ]
+        if usage is not None:
+            events.append({'type': 'turn.completed', 'usage': usage})
+        process.stdout = io.StringIO(''.join(json.dumps(event) + '\n' for event in events))
         process.wait.return_value = result_code
         popen = mock.Mock(return_value=process)
         self.popen = popen
@@ -128,6 +133,7 @@ class ProviderExecutionFixture:
             lambda ledger, context, role, provider, profile, session, **kwargs:
                 ledger.start(context, role, provider, profile, session, **kwargs),
             lambda _: GitSnapshot('base', 'loop-manager/'+self.plan_id, {}, {}, {}, {}, {}, {}), mock.Mock(), lambda _: adapter)
+        self.invoke_effects = invoke_effects
         result = invocation_service.run_agent('codex', self.worktree, self.state, self.config,
             'reviewer', 'review this candidate', read_only=True, persist_session=True,
             connection=self.connection, invocation=InvocationContext(self.repo, self.plan_id),
