@@ -456,52 +456,6 @@ class PlannerValidationRecoveryTest(unittest.TestCase):
             self.assertEqual(final["planning_retry_count"], 0)
             self.assertIsNone(final["planning_validation_error"])
 
-    @dummy_worker_sessions
-    def test_saved_third_retry_is_validated_without_a_fourth_planner_call(self):
-        def invalid_planner(worktree, *_args, **_kwargs):
-            (worktree / "unexpected.txt").write_text("invalid\n", encoding="utf-8")
-            return loop_manager.CodexResult(0, "", "planner-session")
-
-        with tempfile.TemporaryDirectory() as directory:
-            repo = make_remote_repository(directory)
-            state_dir = Path(directory) / "state"
-            connection = sqlite3.connect(":memory:")
-            connection.row_factory = sqlite3.Row
-            connection.execute(loop_manager.SCHEMA)
-
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.run_codex", side_effect=invalid_planner
-            ) as planner:
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    ),
-                    1,
-                )
-                loop_manager.update_project(
-                    connection,
-                    str(repo),
-                    planning_retry_count=loop_manager.MAX_PLANNER_VALIDATION_RETRIES,
-                )
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    ),
-                    1,
-                )
-
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
-            ).fetchone()
-            self.assertEqual(planner.call_count, 1)
-            self.assertEqual(row["planning_retry_count"], 3)
-            self.assertIsNotNone(row["planning_error"])
 
 
 class RequirementRecoveryUnitTests(unittest.TestCase):

@@ -1043,6 +1043,53 @@ class PlanningRecoveryTest(PlanningCase):
             )
             self.assertEqual(ports.state.snapshot.active_sha, "new-base")
 
+    @mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess"))
+    def test_saved_third_retry_is_validated_without_a_fourth_planner_call(self, _popen):
+        from loop_manager_internal.storage import runtime_state
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "planning"
+            worktree.mkdir()
+            invalid = worktree / "unexpected.txt"
+            invalid.write_text("invalid\n", encoding="utf-8")
+            connection = loop_manager.connect_database(root, create=True)
+            self.addCleanup(connection.close)
+            repo = str(root / "repo")
+            connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
+            runtime = runtime_state.RuntimeStateRepository(connection)
+            runtime.update_project(repo, {
+                "phase": "PLANNING", "active_sha": "base", "worktree": str(worktree),
+                "planning_attempt_fingerprint": "fingerprint", "planning_workspace_owned": 1,
+                "planner_session_id": "planner-session", "planning_retry_count": 3,
+                "planning_validation_error": "previous invalid result",
+            })
+            ports = FakePorts(planning_snapshot())
+            ports.state = loop_manager._PlanningStatePorts(
+                connection, runtime, maintenance_state.MaintenanceRepository(connection), root,
+            )
+            ports.validation = loop_manager._PlanningValidationPorts(connection)
+            context = replace(self.context, repo=repo, repo_path=Path(repo), state_dir=root)
+            coordinator = PlanningLifecycleCoordinator(ports)
+            run = coordinator._new_run(context)
+            run.planning_worktree = worktree
+            run.current_fingerprint = "fingerprint"
+            run.mutable_ready_snapshot = MutableReadySnapshot(
+                repo=repo, active_sha="base", plans=(),
+                token=mutable_snapshot_token(repo, "base", ()),
+            )
+            with mock.patch.object(loop_manager, "changed_files", return_value=[]):
+                self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+                run.dirty_files = ["unexpected.txt"]
+                outcome = coordinator._assessment._validate_planner_result(run)
+            saved = runtime.planning(repo)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+            self.assertEqual(ports.agent.run_count, 0)
+            self.assertEqual(saved.planning_retry_count, 3)
+            self.assertIsNotNone(saved.planning_error)
+            self.assertFalse(saved.planning_result_pending_validation)
+            self.assertEqual(saved.planner_session_id, "planner-session")
+            self.assertEqual(invalid.read_text(encoding="utf-8"), "invalid\n")
+
     def test_validation_retry_resumes_session_and_persists_retry_transition(self):
         ports = FakePorts(
             planning_snapshot(
