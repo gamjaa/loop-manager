@@ -9,6 +9,9 @@ from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import runtime_state, planning_input_state, planner_check_state, planning_review_state
 from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
+from loop_manager_internal.storage import planning_publication_state, execplan_catalog_state
+from loop_manager_internal.storage.db_access import run_database_request
+from loop_manager_internal.planning.planning_contracts import PlanningPublicationRelease
 from loop_manager_internal.planning.planning_workspace import legacy_release_identity
 from pathlib import Path
 import sqlite3
@@ -68,6 +71,56 @@ class _PlanningStatePorts:
 
     def planning(self, repo: str) -> runtime_state.PlanningSnapshot:
         return self._runtime_repository.planning(repo)
+
+    def retain_planning_after_publication(self, repo: str, revision: str, **values) -> None:
+        planning_publication_state.retain_planning_after_publication(self._connection, repo, revision, **values)
+
+    def pending_publication_release(self, repo: str) -> PlanningPublicationRelease | None:
+        with self.transaction():
+            project = self._connection.execute("SELECT * FROM projects WHERE repo=?", (repo,)).fetchone()
+            if project is None or project['phase'] != 'PLANNING' or not project['publication_remote_oid']:
+                return None
+            if not (project['worktree'] and project['planning_attempt_fingerprint']
+                    and project['active_sha'] and project['planning_workspace_owned'] == 1):
+                raise runtime_state.RuntimeStateError('게시 후 planning 정리의 소유 근거가 없습니다.')
+            cycle = self._maintenance_repository.get(repo)
+            intent = self.general_publication(repo)
+            revision = str(project['publication_remote_oid'])
+            if intent is not None:
+                requirement_review = planning_review_state.get(self._connection, repo, 'requirement')
+                requirement_applied = (requirement_review is not None
+                    and requirement_review['revision'] == intent.base_sha
+                    and requirement_review['confirmed_revision'] == revision
+                    and requirement_review['result'] is not None and requirement_review['outcome'] is not None)
+                general_applied = (
+                    project['processed_sha'], project['specification_fingerprint'], project['planning_fingerprint'],
+                ) == (revision, intent.specification_fingerprint, intent.planning_fingerprint)
+                if (revision != intent.commit_sha or project['active_sha'] != intent.base_sha
+                        or not (requirement_applied or general_applied)):
+                    raise runtime_state.RuntimeStateError('planning 정리와 publication intent가 다릅니다.')
+            elif revision not in {project['active_sha'], cycle.publication_remote_oid, cycle.last_cycle_commit}:
+                raise runtime_state.RuntimeStateError('planning 정리의 적용된 게시 근거가 없습니다.')
+            catalog = execplan_catalog_state.DefinitionStateRepository(self._connection).capture(repo)
+            tables = {row[0] for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'",
+            ).fetchall()}
+            manual = tuple((table, tuple(tuple(row) for row in self._connection.execute(
+                f"SELECT * FROM {table} WHERE repo=? ORDER BY rowid", (repo,),
+            ).fetchall())) for table in ('manual_work_groups', 'manual_work_members') if table in tables)
+            return PlanningPublicationRelease(repo, Path(str(project['worktree'])), str(project['active_sha']),
+                revision, str(project['planning_attempt_fingerprint']), (tuple(project), cycle, intent, catalog, manual))
+
+    def validate_publication_release(self, release: PlanningPublicationRelease) -> None:
+        if (self.pending_publication_release(release.repo) != release
+                or self.planning_release_pending(release.repo)):
+            raise runtime_state.RuntimeStateError('게시 후 planning 정리의 소유권·catalog·호출 상태가 변경됐습니다.')
+
+    def complete_publication_release(self, release: PlanningPublicationRelease) -> None:
+        def apply(_connection):
+            self.validate_publication_release(release)
+            self.clear_active_in_transaction(release.repo)
+            planning_publication_state.delete_general_planning_publication(self._connection, release.repo)
+        run_database_request(self._connection, apply)
 
     def pause_execution_for_planning(self, expected, plan_id: str) -> None:
         if self.planning_release_pending(expected.repo):
@@ -395,8 +448,13 @@ class _PlanningStatePorts:
 
     def record_general_plan_declarations(
         self, repo: str, revision: str, entries: dict[str, tuple[str, str]],
+        *, guidance_hash: str | None = None,
     ) -> None:
-        planning_input_state.record_general(self._connection, repo, revision, entries)
+        planning_input_state.record_general(self._connection, repo, revision, entries, guidance_hash=guidance_hash)
+
+    def publication_guidance_hash(self, repo: str) -> str:
+        from loop_manager_internal.agents import common_guidance
+        return common_guidance.planning_content_hash(self._connection, repo) or common_guidance.runtime_content_hash()
 
     def clear_validation(self, repo: str) -> None:
         self._effects.clear_planning_validation_state(self._connection, repo)
@@ -537,6 +595,7 @@ class _PlanningStatePorts:
             base,
             validated_result,
             plan_commit,
+            retain_planning=True,
         )
 
     def register_execplans(
@@ -606,4 +665,5 @@ class _PlanningStatePorts:
             plan_commit,
             specification_fingerprint,
             planning_fingerprint,
+            retain_planning=True,
         )

@@ -662,11 +662,13 @@ def _apply_general_planning_batch(
     plan_commit: str,
     specification_fingerprint: str,
     planning_fingerprint: str,
-    *, allow_legacy_priority: bool = False,
+    *, allow_legacy_priority: bool = False, retain_planning: bool = False,
 ) -> None:
     snapshot = result.mutable_snapshot
     if snapshot is None or snapshot.repo != repo:
         raise PlannerValidationError("general planning snapshot 대상이 다릅니다.")
+    project = connection.execute("SELECT * FROM projects WHERE repo=?", (repo,)).fetchone()
+    project_identity = tuple(project) if project is not None else None
     expected_intent = effects.general_planning_publication(connection, repo)
     prepared_rows = effects._prepare_execplan_rows(worktree, list(result.plans), plan_commit)
     affected_snapshot = work_claims.affected_snapshot(result)
@@ -689,6 +691,9 @@ def _apply_general_planning_batch(
         except (OSError, UnicodeError) as error:
             raise PlannerValidationError(str(error)) from error
     with runtime_state._transaction(connection):
+        current_project = connection.execute("SELECT * FROM projects WHERE repo=?", (repo,)).fetchone()
+        if (tuple(current_project) if current_project is not None else None) != project_identity:
+            raise PlannerValidationError("게시 준비 이후 프로젝트 소유 상태가 변경됐습니다.")
         intent = effects.general_planning_publication(connection, repo)
         if intent != expected_intent:
             raise PlannerValidationError("게시 준비 이후 general planning publication intent가 변경됐습니다.")
@@ -775,13 +780,15 @@ def _apply_general_planning_batch(
             planning_input_state.record_general(
                 connection, repo, plan_commit, declarations, guidance_hash=guidance_hash,
             )
-        effects._clear_active_in_current_transaction(
-            connection,
-            repo,
+        clear_values = dict(
             processed_sha=previous['processed_sha'] if requirement_only else plan_commit,
             specification_fingerprint=previous['specification_fingerprint'] if requirement_only else specification_fingerprint,
             planning_fingerprint=previous['planning_fingerprint'] if requirement_only else planning_fingerprint,
         )
+        if retain_planning:
+            planning_publication_state.retain_planning_after_publication(connection, repo, plan_commit, **clear_values)
+        else:
+            effects._clear_active_in_current_transaction(connection, repo, **clear_values)
         for source in result.retirement_moves:
             changed = connection.execute(
                 "UPDATE requirement_move_receipts SET stage = 'published', "
@@ -793,7 +800,8 @@ def _apply_general_planning_batch(
                 raise PlannerValidationError(
                     f"Requirement 이동 영수증을 확인할 수 없습니다: {source}"
                 )
-        planning_publication_state.delete_general_planning_publication(connection, repo)
+        if not retain_planning:
+            planning_publication_state.delete_general_planning_publication(connection, repo)
 
 
 @dataclass(frozen=True)
@@ -813,6 +821,7 @@ def publish_general_planning_batch(
     plan_commit: str,
     specification_fingerprint: str,
     planning_fingerprint: str,
+    *, retain_planning: bool = False,
 ) -> None:
     remote = effects.git(
         worktree,
@@ -833,6 +842,7 @@ def publish_general_planning_batch(
         plan_commit,
         specification_fingerprint,
         planning_fingerprint,
+        **({"retain_planning": True} if retain_planning else {}),
     )
 
 

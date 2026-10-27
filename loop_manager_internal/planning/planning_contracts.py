@@ -22,6 +22,16 @@ WORKSPACE_OWNED = 1
 WORKSPACE_RESERVED = 2
 
 
+@dataclass(frozen=True)
+class PlanningPublicationRelease:
+    repo: str
+    worktree: Path
+    base_revision: str
+    revision: str
+    fingerprint: str
+    identity: tuple
+
+
 class PlanningPhase(str, Enum):
     """Ordered planning lifecycle phases owned by the coordinator."""
 
@@ -156,6 +166,21 @@ class PlanningScopeResult:
 
 class PlanningStatePort(Protocol):
     """Durable planning and maintenance repository boundary."""
+
+    def pending_publication_release(self, repo: str) -> PlanningPublicationRelease | None: ...
+
+    def validate_publication_release(self, release: PlanningPublicationRelease) -> None: ...
+
+    def complete_publication_release(self, release: PlanningPublicationRelease) -> None: ...
+
+    def retain_planning_after_publication(self, repo: str, revision: str, **values) -> None: ...
+
+    def publication_guidance_hash(self, repo: str) -> str: ...
+
+    def record_general_plan_declarations(
+        self, repo: str, revision: str, entries: dict[str, tuple[str, str]], *,
+        guidance_hash: str | None = None,
+    ) -> None: ...
 
     def reconcile_catalog(
         self, repo: str, repository: Path, base_branch: str, revision: str,
@@ -397,6 +422,12 @@ class PlanningStatePort(Protocol):
 
 class PlanningGitPort(Protocol):
     """Git and managed planning-worktree boundary."""
+
+    def confirm_publication_release(
+        self, repository: Path, base: str, base_revision: str, revision: str,
+    ) -> None: ...
+
+    def validate_publication_release(self, repo: str, worktree: Path, revision: str) -> None: ...
 
     def fetch_base(self, repo_path: Path, base: str) -> str: ...
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sqlite3
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -45,6 +46,106 @@ from tests.support.planning_case import (
 )
 
 class PlanningPublicationTest(PlanningCase):
+    def test_applied_publication_recovers_after_cleanup_before_db_release(self):
+        from loop_manager_internal.storage import database, runtime_state
+        from loop_manager_internal.storage.db_access import open_connection
+        database_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(database_directory.cleanup)
+        database_path = Path(database_directory.name) / 'state.db'
+        connection = open_connection(database_path)
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        connection.execute(loop_manager.SCHEMA)
+        database._ensure_execplans_schema(connection)
+        maintenance_state.ensure_schema(connection)
+        connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+        with connection:
+            connection.execute('CREATE TABLE independent(value INTEGER)')
+            connection.execute('INSERT INTO independent VALUES (0)')
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / 'planning'
+            worktree.mkdir()
+            connection.execute(
+                "INSERT INTO projects(repo,base_branch,phase,active_sha,worktree,planning_workspace_owned,"
+                "planning_attempt_fingerprint,planner_session_id,planning_result,planning_result_completed) "
+                "VALUES ('/repo','main','PLANNING','base',?,1,'attempt','saved-session','saved result',1)",
+                (str(worktree),))
+            snapshot = MutableReadySnapshot('/repo', 'base', (), mutable_snapshot_token('/repo', 'base', ()))
+            result = loop_manager.ValidatedPlanningResult((), (), mutable_snapshot=snapshot)
+            manifest = loop_manager._planning_result_manifest(result)
+            record_general_planning_publication(connection, GeneralPlanningPublication(
+                '/repo', 'prepared', 'base', 'commit', snapshot.token, 'spec', 'input', manifest,
+                hashlib.sha256(manifest.encode()).hexdigest()))
+            connection.commit()
+            state = loop_manager._PlanningStatePorts(connection, runtime_state.RuntimeStateRepository(connection),
+                maintenance_state.MaintenanceRepository(connection), Path(directory))
+            with state.transaction():
+                state.retain_planning_after_publication('/repo', 'commit', processed_sha='commit',
+                    specification_fingerprint='spec', planning_fingerprint='input')
+            ports = FakePorts(state.planning('/repo'))
+            ports.state = state
+            coordinator = PlanningLifecycleCoordinator(ports)
+            git = ports.git.run
+            removed = []
+            entered, updated = threading.Event(), threading.Event()
+            errors = []
+            def independent_request():
+                try:
+                    self.assertTrue(entered.wait(5))
+                    other = open_connection(database_path)
+                    try:
+                        with other:
+                            other.execute('UPDATE independent SET value=1')
+                    finally:
+                        other.close()
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    updated.set()
+            worker = threading.Thread(target=independent_request)
+            worker.start()
+            self.addCleanup(worker.join, 6)
+            self.addCleanup(entered.set)
+            def remove(repository, *args, **kwargs):
+                self.assertFalse(connection.in_transaction)
+                self.assertFalse(connection._held)
+                if args[:2] == ('worktree', 'remove'):
+                    entered.set()
+                    self.assertTrue(updated.wait(5))
+                    removed.append(args)
+                    worktree.rmdir()
+                return git(repository, *args, **kwargs)
+            ports.git.run = remove
+            with mock.patch.object(state, 'complete_publication_release', side_effect=RuntimeError('release interrupted')):
+                failed = coordinator._publication._recover_publication(coordinator._new_run(self.context))
+            self.assertEqual(failed.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            self.assertFalse(worktree.exists())
+            self.assertEqual(state.planning('/repo').planner_session_id, 'saved-session')
+            self.assertIsNotNone(state.pending_publication_release('/repo'))
+            self.assertIsNotNone(state.general_publication('/repo'))
+            request = connection.run_request
+            def retry_release(operation):
+                with self.assertRaisesRegex(RuntimeError, 'DB retry'), connection:
+                    operation(connection)
+                    raise RuntimeError('DB retry')
+                self.assertIsNotNone(state.pending_publication_release('/repo'))
+                return request(operation)
+            with mock.patch.object(loop_manager, 'publish_general_planning_batch', side_effect=AssertionError('republish')), \
+                    mock.patch.object(loop_manager, 'recover_general_planning_batch', side_effect=AssertionError('reapply')), \
+                    mock.patch.object(connection, 'run_request', side_effect=retry_release) as retried:
+                recovered = coordinator._publication._recover_publication(coordinator._new_run(self.context))
+                retried.assert_called_once()
+            self.assertEqual(recovered.kind, PlanningOutcomeKind.PUBLICATION_RECOVERY)
+            self.assertEqual(len(removed), 1)
+            worker.join(6)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(connection.execute('SELECT value FROM independent').fetchone()[0], 1)
+            self.assertEqual(ports.agent.run_count, 0)
+            self.assertIsNone(state.pending_publication_release('/repo'))
+            self.assertIsNone(state.general_publication('/repo'))
+            self.assertEqual(state.planning('/repo').processed_sha, 'commit')
+
     def test_new_manager_source_publication_requires_critical_before_db_confirmation(self):
         from loop_manager_internal.catalog import execplan_catalog, manager_sources
         from loop_manager_internal.planning import planner_publication
@@ -461,7 +562,7 @@ class PlanningPublicationTest(PlanningCase):
         self.assertEqual(reviews.reassessment(connection, '/repo', 'G-001')['confirmed_revision'], 'published')
         self.assertFalse(reviews.general_pending(connection, '/repo'))
 
-    def test_no_change_confirms_review_and_guidance_with_cleanup_transaction(self):
+    def test_no_change_confirms_review_and_guidance_before_cleanup_release(self):
         from loop_manager_internal.storage import planning_input_state, planning_review_state as reviews
         from loop_manager_internal.agents import common_guidance
         for fail_cleanup in (False, True):
@@ -471,20 +572,21 @@ class PlanningPublicationTest(PlanningCase):
                 ports = FakePorts(planning_snapshot(phase='PLANNING', active_sha='base',
                     worktree=directory, planning_attempt_fingerprint='input', planning_workspace_owned=1))
                 ports.state.confirm_planning_review = lambda *args: reviews.confirm(connection, *args)
-                ports.state.record_general_plan_declarations = lambda *args: planning_input_state.record_general(connection, *args)
+                ports.state.record_general_plan_declarations = lambda *args, **kwargs: planning_input_state.record_general(connection, *args, **kwargs)
+                ports.state.publication_guidance_hash = lambda repo: common_guidance.planning_content_hash(connection, repo)
                 original_transaction = ports.state.transaction
                 @contextmanager
                 def transaction():
                     with original_transaction(), connection:
                         yield
                 ports.state.transaction = transaction
-                original_clear = ports.state.clear_active_in_transaction
+                original_clear = ports.state.retain_planning_after_publication
                 def clear(*args, **kwargs):
                     self.assertEqual(reviews.get(connection, '/repo', 'general')['confirmed_revision'], 'base')
                     self.assertEqual(connection.execute('SELECT guidance_hash FROM planning_input_baselines')
                                      .fetchone()[0], 'pinned-guidance')
                     original_clear(*args, **kwargs)
-                ports.state.clear_active_in_transaction = clear
+                ports.state.retain_planning_after_publication = clear
                 if fail_cleanup:
                     ports.git.remove_error = RuntimeError('cleanup interrupted')
                 coordinator = PlanningLifecycleCoordinator(ports)
@@ -498,9 +600,10 @@ class PlanningPublicationTest(PlanningCase):
                     self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
                 else:
                     self.assertIsNone(outcome)
-                self.assertEqual(reviews.get(connection, '/repo', 'general') is None, fail_cleanup)
-                self.assertEqual(reviews.get(connection, '/repo', 'attempt') is not None, fail_cleanup)
-                self.assertEqual(planning_input_state.has_baseline(connection, '/repo'), not fail_cleanup)
+                self.assertIsNotNone(reviews.get(connection, '/repo', 'general'))
+                self.assertIsNone(reviews.get(connection, '/repo', 'attempt'))
+                self.assertTrue(planning_input_state.has_baseline(connection, '/repo'))
+                self.assertEqual(ports.state.pending_publication_release('/repo') is not None, fail_cleanup)
                 if fail_cleanup:
                     self.assertEqual(ports.state.snapshot.worktree, directory)
                     self.assertEqual(ports.state.snapshot.phase, 'PLANNING')
@@ -891,16 +994,7 @@ class PlanningPublicationTest(PlanningCase):
             )
             ports.state.general_recovery_result = "pending"
             def apply_batch(*_args):
-                ports.state.general_intent = None
-                ports.state.clear_active("/repo")
-                ports.state.update(
-                    "/repo",
-                    planning_validation_error=None,
-                    planner_session_id=None,
-                    planning_result=None,
-                    planning_result_pending_validation=False,
-                    planning_result_completed=False,
-                )
+                ports.state.retain_planning_after_publication('/repo', 'plan-commit')
             ports.state.publish_general_batch = mock.Mock(side_effect=apply_batch)
             ports.git.dirty_files = ["docs/plans/[G-001] Plan.md"]
             ports.git.advance_remote_on_push = True
@@ -995,14 +1089,7 @@ class PlanningPublicationTest(PlanningCase):
             ports.git.advance_remote_on_push = True
             ports.git.remove_error = RuntimeError("cleanup failed")
             def apply_batch(*_args):
-                ports.state.clear_active("/repo")
-                ports.state.update(
-                    "/repo",
-                    planning_validation_error=None,
-                    planner_session_id=None,
-                    planning_result=None,
-                    planning_result_completed=False,
-                )
+                ports.state.retain_planning_after_publication('/repo', 'plan-commit')
             ports.state.publish_maintenance_batch = mock.Mock(side_effect=apply_batch)
             coordinator = PlanningLifecycleCoordinator(ports)
             run = coordinator._new_run(self.context)
@@ -1132,7 +1219,8 @@ class PlanningPublicationTest(PlanningCase):
             self.assertEqual(ports.state.snapshot.planner_session_id,
                              "saved-session")
             self.assertTrue(ports.state.snapshot.planning_result_completed)
-            self.assertEqual(ports.state.cycle, cycle)
+            self.assertEqual(ports.state.cycle, replace(cycle, phase=maintenance_state.MaintenancePhase.PREREQUISITE_WAIT))
+            self.assertIsNotNone(ports.state.pending_publication_release('/repo'))
             self.assertTrue(worktree.exists())
             ports.state.transition_maintenance.assert_called_once()
 

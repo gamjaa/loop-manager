@@ -312,6 +312,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_PlanningGitPorts', git_ports._PlanningGitPorts,
         lambda: git_ports.PlanningGitPortsEffects(
+            _assert_remote_preserves_maintenance_batch=assembly.callback('_assert_remote_preserves_maintenance_batch'),
             _capture_local_worktree_state=assembly.callback('_capture_local_worktree_state'),
             _git_operation_entries=assembly.callback('_git_operation_entries'),
             _ignored_worktree_paths=assembly.callback('_ignored_worktree_paths'),

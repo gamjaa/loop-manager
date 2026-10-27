@@ -17,7 +17,7 @@ from loop_manager_internal.maintenance.maintenance_planning import MaintenancePl
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 from loop_manager_internal.storage import maintenance_file_ledger
 from loop_manager_internal.storage import maintenance_state
-from loop_manager_internal.storage import runtime_state, work_claims
+from loop_manager_internal.storage import runtime_state, work_claims, planning_publication_state
 from pathlib import Path
 import hashlib
 import json
@@ -581,7 +581,7 @@ def publish_maintenance_planning_batch(
     base_branch: str,
     result: ValidatedPlanningResult,
     plan_commit: str,
-    *, allow_legacy_priority: bool = False,
+    *, allow_legacy_priority: bool = False, retain_planning: bool = False,
 ) -> maintenance_state.MaintenanceCycle:
     """Atomically publish catalog revisions after a confirmed remote push.
 
@@ -601,9 +601,11 @@ def publish_maintenance_planning_batch(
         return effects._apply_maintenance_planning_batch(
             connection, repo, worktree, base_branch, result, plan_commit,
             allow_legacy_priority=True,
+            **({"retain_planning": True} if retain_planning else {}),
         )
     return effects._apply_maintenance_planning_batch(
-        connection, repo, worktree, base_branch, result, plan_commit
+        connection, repo, worktree, base_branch, result, plan_commit,
+        **({"retain_planning": True} if retain_planning else {}),
     )
 
 
@@ -632,7 +634,7 @@ def _apply_maintenance_planning_batch(
     result: ValidatedPlanningResult,
     plan_commit: str,
     *, current_remote: str | None = None,
-    allow_legacy_priority: bool = False,
+    allow_legacy_priority: bool = False, retain_planning: bool = False,
 ) -> maintenance_state.MaintenanceCycle:
     """Apply one already-confirmed maintenance batch in a SQLite transaction."""
 
@@ -817,13 +819,15 @@ def _apply_maintenance_planning_batch(
         from loop_manager_internal.storage import planning_input_state
         if include_general_planning:
             planning_input_state.record_general(connection, repo, plan_commit, after, guidance_hash=guidance_hash)
-        effects._clear_active_in_current_transaction(
-            connection,
-            repo,
+        clear_values = dict(
             processed_sha=plan_commit if include_general_planning else None,
             specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
         )
+        if retain_planning:
+            planning_publication_state.retain_planning_after_publication(connection, repo, plan_commit, **clear_values)
+        else:
+            effects._clear_active_in_current_transaction(connection, repo, **clear_values)
         if not include_general_planning:
             planning_input_state.advance_verified_delta(
                 connection, repo, plan_commit,

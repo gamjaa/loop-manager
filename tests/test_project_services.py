@@ -127,6 +127,30 @@ class ProjectServiceCompositionTests(unittest.TestCase):
                     self.assertEqual(port.execution_blocks_planning(Path(directory)), pending)
             self.assertTrue(port.execution_blocks_planning(Path(directory) / 'missing'))
 
+    def test_publication_release_checks_remote_head_and_missing_worktree_registration(self):
+        effects = git_ports.PlanningGitPortsEffects(**{field.name: mock.Mock()
+            for field in fields(git_ports.PlanningGitPortsEffects)})
+        port = git_ports._PlanningGitPorts(effects, None, Path('/repo'), Path('/state'))
+        effects.git.return_value = SimpleNamespace(stdout='new-remote')
+        port.confirm_publication_release(Path('/repo'), 'main', 'base', 'published')
+        effects._assert_remote_preserves_maintenance_batch.assert_called_once_with(
+            Path('/repo'), 'base', 'published', 'new-remote')
+        effects._git_operation_entries.return_value = {}
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch('loop_manager_internal.git.manager_git_journal.has_pending_project_mutation', return_value=False):
+            worktree = Path(directory)
+            effects.git.side_effect = lambda _repo, *args, **kwargs: SimpleNamespace(
+                stdout='' if args[:1] == ('ls-files',) else 'changed-head')
+            with self.assertRaisesRegex(loop_manager.PlanningWorkspaceOwnershipError, 'HEAD'):
+                port.validate_publication_release('/repo', worktree, 'published')
+            missing = worktree / 'missing'
+            effects.git.side_effect = None
+            effects.git.return_value = SimpleNamespace(stdout=f'worktree {missing}\0HEAD published\0\0')
+            with self.assertRaisesRegex(loop_manager.PlanningWorkspaceOwnershipError, 'Git 등록'):
+                port.validate_publication_release('/repo', missing, 'published')
+            effects.git.return_value = SimpleNamespace(stdout='')
+            port.validate_publication_release('/repo', missing, 'published')
+
     def test_relocated_workspace_boundary_accepts_owned_path_and_rejects_mismatch(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / 'state'

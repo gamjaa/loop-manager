@@ -25,6 +25,7 @@ class PlanningGitPortsEffects:
     _planning_input_fingerprint: Callable[..., object]
     _nonplan_input_fingerprint: Callable[..., object]
     _nul_git_paths: Callable[..., object]
+    _assert_remote_preserves_maintenance_batch: Callable[..., object]
     plan_declarations: Callable[..., object]
     _specification_input_fingerprint: Callable[..., object]
     changed_files: Callable[..., object]
@@ -83,6 +84,20 @@ class _PlanningGitPorts:
         return self._effects._recorded_base_fetch(
             repo_path, self._state_dir, base, owner="project",
         )
+
+    def confirm_publication_release(
+        self, repository: Path, base: str, base_revision: str, revision: str,
+    ) -> None:
+        self.fetch_base(repository, base)
+        remote = self._effects.git(repository, 'rev-parse', '--verify',
+                                   f'refs/remotes/origin/{base}^{{commit}}').stdout.strip()
+        if remote != revision:
+            self._effects._assert_remote_preserves_maintenance_batch(repository, base_revision, revision, remote)
+
+    def validate_publication_release(self, repo: str, worktree: Path, revision: str) -> None:
+        self.validate_planning_release(repo, worktree, allow_missing=True)
+        if worktree.exists() and self._effects.git(worktree, 'rev-parse', '--verify', 'HEAD^{commit}').stdout.strip() != revision:
+            raise PlanningWorkspaceOwnershipError('게시 후 planning worktree HEAD가 변경됐습니다.')
 
     def save_planning_correction(
         self, repo: str, worktree: Path, target: str,

@@ -397,3 +397,22 @@ def apply_mutable_catalog_changes(
 
 def delete_general_planning_publication(connection: sqlite3.Connection, repo: str) -> None:
     connection.execute("DELETE FROM general_planning_publications WHERE repo = ?", (repo,))
+
+
+def retain_planning_after_publication(
+    connection: sqlite3.Connection, repo: str, revision: str, *,
+    processed_sha: str | None = None, specification_fingerprint: str | None = None,
+    planning_fingerprint: str | None = None,
+) -> None:
+    """Keep the owned planning slot until external worktree cleanup completes."""
+    changed = connection.execute(
+        "UPDATE projects SET publication_remote_oid=?, "
+        "processed_sha=COALESCE(?, processed_sha), "
+        "specification_fingerprint=COALESCE(?, specification_fingerprint), "
+        "planning_fingerprint=COALESCE(?, planning_fingerprint) "
+        "WHERE repo=? AND phase='PLANNING' AND planning_workspace_owned=1 "
+        "AND worktree IS NOT NULL AND planning_attempt_fingerprint IS NOT NULL",
+        (revision, processed_sha, specification_fingerprint, planning_fingerprint, repo),
+    )
+    if changed.rowcount != 1:
+        raise PlannerValidationError("게시 후 정리할 planning 소유 상태가 변경됐습니다.")

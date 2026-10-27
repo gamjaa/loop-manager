@@ -32,6 +32,38 @@ from tests.support.git import isolated_git_test
 
 @isolated_git_test
 class MaintenancePublicationTest(MaintenancePlanningCase):
+    def test_applied_maintenance_batch_retains_planning_until_cleanup_release(self):
+        from loop_manager_internal.storage import runtime_state
+        from loop_manager_internal.storage.database import GENERAL_PLANNING_PUBLICATIONS_SCHEMA
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        with self.connection:
+            self.connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+            self.connection.execute("UPDATE projects SET phase='PLANNING', active_sha=?, worktree=?, "
+                "planning_workspace_owned=1, planning_attempt_fingerprint='attempt', planner_session_id='saved-session'",
+                (self.base_sha, str(self.repo)))
+        git(self.repo, 'add', 'docs/plans')
+        git(self.repo, 'commit', '-m', 'Prepare maintenance cleanup release fixture')
+        commit = git(self.repo, 'rev-parse', 'HEAD')
+        loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), self.repo, 'main', result, commit)
+        git(self.repo, 'push', 'origin', 'HEAD:main')
+        git(self.repo, 'fetch', 'origin')
+        state = loop_manager._PlanningStatePorts(self.connection, runtime_state.RuntimeStateRepository(self.connection),
+            maintenance_state.MaintenanceRepository(self.connection), self.repo / 'state')
+        cycle = state.publish_maintenance_batch(str(self.repo), self.repo, 'main', result, commit)
+        release = state.pending_publication_release(str(self.repo))
+        self.assertIsNotNone(release)
+        self.assertEqual(release.revision, commit)
+        self.assertEqual(cycle.publication_stage, 'remote_confirmed')
+        self.assertEqual(state.planning(str(self.repo)).phase, 'PLANNING')
+        self.assertEqual(state.planning(str(self.repo)).planner_session_id, 'saved-session')
+        state.complete_publication_release(release)
+        self.assertIsNone(state.planning(str(self.repo)).phase)
+        self.assertIsNone(state.pending_publication_release(str(self.repo)))
+        self.assertEqual(state.maintenance_cycle(str(self.repo)), cycle)
+
     def test_batch_observes_git_files_and_success_fingerprints_before_transaction(self):
         from loop_manager_internal.agents import common_guidance
         from loop_manager_internal.catalog import execplan_drafts
