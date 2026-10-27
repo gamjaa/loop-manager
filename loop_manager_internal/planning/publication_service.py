@@ -240,6 +240,10 @@ class PlanningPublicationService(PlanningService):
                         run.maintenance_cycle.revision, str(row.active_sha),
                     )
             try:
+                if run.maintenance_planning and evidence is not None:
+                    evidence = self._ports.state.prepare_file_assessment(
+                        context.repo, context.repo_path, context.base_branch, str(row.active_sha), evidence,
+                    )
                 with self._ports.state.transaction():
                     if run.maintenance_planning:
                         if evidence is not None:

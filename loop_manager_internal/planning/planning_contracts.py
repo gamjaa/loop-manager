@@ -323,6 +323,10 @@ class PlanningStatePort(Protocol):
         cycle_revision: int, source_sha: str,
     ) -> Any: ...
 
+    def prepare_file_assessment(
+        self, repo: str, repository: Path, base_branch: str, source_sha: str, evidence: Any,
+    ) -> Any: ...
+
     def complete_file_assessment(
         self, repo: str, repository: Path, base_branch: str,
         cycle_revision: int, source_sha: str, evidence: Any,

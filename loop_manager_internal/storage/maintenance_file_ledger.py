@@ -60,9 +60,19 @@ class ReviewedSource:
 @dataclass(frozen=True)
 class PreparedAssessment:
     selected: tuple[TrackedSource, ...]
-    placements: tuple[dict, ...]
+    placements_json: str
     remote_revision: str
     legacy: bool
+    repo: str
+    base_branch: str
+    inventory: SourceInventory
+    reviewed: tuple[ReviewedSource, ...]
+    guidance_hash: str
+    db_identity: tuple
+
+    @property
+    def placements(self) -> tuple[dict, ...]:
+        return tuple(json.loads(self.placements_json))
 
 
 ROOT_REVIEW_PATH = "."
@@ -226,6 +236,16 @@ def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
         connection.execute(f"RELEASE {name}")
 
 
+def release_observation_access(connection: sqlite3.Connection) -> None:
+    """Finish implicit coordinated writes; explicit callers must prepare earlier."""
+    from loop_manager_internal.storage.db_access import CoordinatedConnection, finish_implicit_request
+    if isinstance(connection, CoordinatedConnection):
+        try:
+            finish_implicit_request(connection._gate.path)
+        except RuntimeError as error:
+            raise FileReviewLedgerError("평가 근거 관측은 명시적 DB transaction 밖에서 준비해야 합니다.") from error
+
+
 class FileReviewRepository:
     """Read source identity and record only a fully reviewed selected set."""
 
@@ -312,6 +332,18 @@ class FileReviewRepository:
                                       (repo,)).fetchone()
         return row is not None and row[0] == common_guidance.effective_planning_hash(self.connection, repo)
 
+    def _evidence_identity(self, repo: str) -> tuple:
+        """DB-only CAS for selection, ownership, cycle and durable publication."""
+        tables = ("projects", "maintenance_cycles", "file_assessment_publications",
+                  "file_review_ledger", "root_placement_reviews", "file_assessment_successes",
+                  "successful_code_maps", "tiered_maintenance_success", "tiered_maintenance_assessments",
+                  "tiered_maintenance_units", "tiered_maintenance_result_audit",
+                  "tiered_maintenance_requests", "tiered_maintenance_root_plan_links")
+        return tuple((table, tuple(tuple(row) for row in self.connection.execute(
+            f"SELECT * FROM {table} WHERE repo = ? ORDER BY rowid", (repo,))))
+            for table in tables if self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
+
     def _prepare_evidence(
         self, repo: str, repository_path: str, base_branch: str,
         inventory: SourceInventory, reviewed: Sequence[ReviewedSource],
@@ -319,6 +351,11 @@ class FileReviewRepository:
         legacy_publication_commit: str | None = None,
     ) -> PreparedAssessment:
         """Validate source, root, and review evidence before any ledger write."""
+        release_observation_access(self.connection)
+        reviewed = tuple(reviewed)
+        root_reviews = deepcopy(root_reviews)
+        identity = self._evidence_identity(repo)
+        guidance_hash = common_guidance.effective_planning_hash(self.connection, repo)
         source_repo = Path(repository_path)
         if Path(repo).resolve() != source_repo.resolve():
             raise FileReviewLedgerError("프로젝트와 원격 Git 저장소 경로가 다릅니다.")
@@ -389,7 +426,12 @@ class FileReviewRepository:
             raise FileReviewLedgerError("선정된 파일의 검토가 누락됐습니다.")
         # Keep the first validated decision independent of caller-owned root
         # dictionaries, including their nested reference evidence.
-        return PreparedAssessment(selected, deepcopy(placements), remote_revision, legacy)
+        if common_guidance.effective_planning_hash(self.connection, repo) != guidance_hash:
+            raise FileReviewLedgerError("평가 근거 준비 중 검토 지침이 변경됐습니다.")
+        verify_remote_revision(source_repo, base_branch, remote_revision)
+        return PreparedAssessment(selected, json.dumps(placements, ensure_ascii=False, sort_keys=True),
+                                  remote_revision, legacy, repo, base_branch, inventory,
+                                  tuple(reviewed), guidance_hash, identity)
 
     def record_success(
         self, repo: str, repository_path: str, base_branch: str,
@@ -397,13 +439,27 @@ class FileReviewRepository:
         *, published_revision: str | None = None, root_reviews: Sequence[dict] | None = None,
         legacy_publication_commit: str | None = None,
     ) -> AssessmentSuccess:
-        """Commit prepared evidence and recheck publication inside the transaction."""
-        options = dict(published_revision=published_revision, root_reviews=root_reviews,
-                       legacy_publication_commit=legacy_publication_commit)
-        prepared = self._prepare_evidence(repo, repository_path, base_branch, inventory, reviewed, **options)
-        source_repo = Path(repository_path)
+        """Observe once outside DB access, then atomically apply the snapshot."""
+        prepared = self._prepare_evidence(
+            repo, repository_path, base_branch, inventory, reviewed,
+            published_revision=published_revision, root_reviews=root_reviews,
+            legacy_publication_commit=legacy_publication_commit,
+        )
+        if (root_reviews is not None and tuple(root_reviews) != prepared.placements
+            or tuple(reviewed) != prepared.reviewed):
+            raise FileReviewLedgerError("게시 직전 평가 근거 또는 선정 파일이 변경됐습니다.")
+        return self.apply_success(prepared)
+
+    def apply_success(self, prepared: PreparedAssessment) -> AssessmentSuccess:
+        """DB-only application; safe to join a caller's publication transaction."""
+        repo, base_branch, inventory = prepared.repo, prepared.base_branch, prepared.inventory
         with _transaction(self.connection):
-            if self._prepare_evidence(repo, repository_path, base_branch, inventory, reviewed, **options) != prepared:
+            project = self.connection.execute(
+                "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
+            ).fetchone()
+            if project is None or str(project[0]) != base_branch:
+                raise FileReviewLedgerError("등록된 프로젝트의 base branch가 다릅니다.")
+            if self._evidence_identity(repo) != prepared.db_identity:
                 raise FileReviewLedgerError("게시 직전 평가 근거 또는 선정 파일이 변경됐습니다.")
             selected, placements, legacy = prepared.selected, prepared.placements, prepared.legacy
             reviewed_at = datetime.now(timezone.utc).isoformat()
@@ -452,12 +508,11 @@ class FileReviewRepository:
                 "source_revision = excluded.source_revision, reviewed_at = excluded.reviewed_at, "
                 "guidance_hash = excluded.guidance_hash",
                 (repo, inventory.revision, reviewed_at,
-                 None if legacy else common_guidance.effective_planning_hash(self.connection, repo)),
+                 None if legacy else prepared.guidance_hash),
             )
-            project = self.connection.execute(
+            current_project = self.connection.execute(
                 "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
             ).fetchone()
-            if project is None or str(project[0]) != base_branch:
+            if current_project is None or str(current_project[0]) != base_branch:
                 raise FileReviewLedgerError("등록된 프로젝트의 base branch가 다릅니다.")
-            verify_remote_revision(source_repo, base_branch, prepared.remote_revision)
         return AssessmentSuccess(inventory.revision, reviewed_at)

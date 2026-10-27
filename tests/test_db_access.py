@@ -25,6 +25,103 @@ class DatabaseAccessTests(unittest.TestCase):
             self.connection.execute('CREATE TABLE sample(id INTEGER PRIMARY KEY, value INTEGER)')
             self.connection.executemany('INSERT INTO sample VALUES (?,0)', [(1,), (2,), (3,)])
 
+    def test_maintenance_observation_releases_access_before_waiting(self):
+        from loop_manager_internal.storage import maintenance_file_ledger as ledger
+        from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory
+        from tests.support.fixed_samples import use_fixed_guidance
+        use_fixed_guidance(self)
+        repo = str(self.path.parent)
+        self.connection.execute('CREATE TABLE projects(repo TEXT PRIMARY KEY, base_branch TEXT, generation INTEGER)')
+        self.connection.execute("INSERT INTO projects VALUES (?, 'main', 0)", (repo,))
+        repository = ledger.FileReviewRepository(self.connection)
+        inventory = SourceInventory('a' * 40, (), ())
+        entered, updated = threading.Event(), threading.Event()
+        errors = []
+
+        def other_request():
+            try:
+                self.assertTrue(entered.wait(5))
+                with closing(open_connection(self.path)) as other, other:
+                    other.execute('UPDATE sample SET value=9 WHERE id=1')
+                updated.set()
+            except BaseException as error:
+                errors.append(error)
+                updated.set()
+
+        def observe(*args):
+            self.assertFalse(self.connection.in_transaction)
+            self.assertFalse(self.connection._held)
+            entered.set()
+            self.assertTrue(updated.wait(5))
+            return inventory
+
+        worker = threading.Thread(target=other_request)
+        worker.start()
+        try:
+            with mock.patch.object(ledger, 'tracked_source_inventory', side_effect=observe) as observer, \
+                    mock.patch.object(ledger, 'assessment_input_tree', return_value=()), \
+                    mock.patch.object(ledger, 'verify_remote_revision') as remote:
+                prepared = repository._prepare_evidence(repo, repo, 'main', inventory, (), root_reviews=())
+                observer.assert_called_once()
+                remote.assert_called_once()
+            with mock.patch.object(ledger, '_git', side_effect=AssertionError('Git during apply')), \
+                    mock.patch.object(ledger.common_guidance, 'effective_planning_hash',
+                                      side_effect=AssertionError('guidance observation during apply')):
+                for _ in range(2):
+                    with self.assertRaisesRegex(RuntimeError, 'rollback'), self.connection:
+                        repository.apply_success(prepared)
+                        raise RuntimeError('rollback')
+                    self.assertIsNone(repository.last_success(repo))
+                repository.apply_success(prepared)
+            self.assertIsNotNone(repository.last_success(repo))
+            self.assertEqual(self.connection.execute('SELECT value FROM sample WHERE id=1').fetchone()[0], 9)
+        finally:
+            entered.set()
+            worker.join(6)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_maintenance_prepared_success_rejects_db_races_and_nested_observation(self):
+        from loop_manager_internal.storage import maintenance_file_ledger as ledger
+        from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory
+        from tests.support.fixed_samples import use_fixed_guidance
+        use_fixed_guidance(self)
+        repo = str(self.path.parent)
+        with self.connection:
+            self.connection.execute('CREATE TABLE projects(repo TEXT PRIMARY KEY, base_branch TEXT, owner TEXT, generation INTEGER)')
+            self.connection.execute("INSERT INTO projects VALUES (?, 'main', 'owner', 0)", (repo,))
+            self.connection.execute('CREATE TABLE maintenance_cycles(repo TEXT, revision INTEGER, scope TEXT)')
+            self.connection.execute("INSERT INTO maintenance_cycles VALUES (?, 1, 'full')", (repo,))
+            self.connection.execute('CREATE TABLE file_assessment_publications(repo TEXT, evidence_json TEXT)')
+            self.connection.execute("INSERT INTO file_assessment_publications VALUES (?, 'original intent')", (repo,))
+        repository = ledger.FileReviewRepository(self.connection)
+        inventory = SourceInventory('a' * 40, (), ())
+        mutations = (
+            "UPDATE projects SET owner='competitor'",
+            "UPDATE projects SET generation=generation+1",
+            "UPDATE maintenance_cycles SET revision=revision+1",
+            "UPDATE maintenance_cycles SET scope='targeted'",
+            "UPDATE file_assessment_publications SET evidence_json='competing intent'",
+            "INSERT INTO file_assessment_successes(repo,source_revision,reviewed_at) SELECT repo,'prior','prior' FROM projects",
+        )
+        with mock.patch.object(ledger, 'tracked_source_inventory', return_value=inventory) as observer, \
+                mock.patch.object(ledger, 'assessment_input_tree', return_value=()), \
+                mock.patch.object(ledger, 'verify_remote_revision'):
+            for mutation in mutations:
+                with self.subTest(mutation=mutation):
+                    prepared = repository._prepare_evidence(repo, repo, 'main', inventory, (), root_reviews=())
+                    with self.connection:
+                        self.connection.execute(mutation)
+                    before = repository._evidence_identity(repo)
+                    with self.assertRaises(ledger.FileReviewLedgerError):
+                        repository.apply_success(prepared)
+                    self.assertEqual(repository._evidence_identity(repo), before)
+                    self.assertEqual(repository.reviews(repo), ())
+            observer.reset_mock()
+            with self.connection, self.assertRaisesRegex(ledger.FileReviewLedgerError, 'transaction'):
+                repository.record_success(repo, repo, 'main', inventory, (), root_reviews=())
+            observer.assert_not_called()
+
     def test_existing_only_writer_cannot_create_missing_database(self):
         missing = self.path.parent / 'missing.db'
         with self.assertRaises(sqlite3.OperationalError):

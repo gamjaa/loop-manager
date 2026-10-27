@@ -51,6 +51,33 @@ class TieredPublicationTest(MaintenancePlanningCase):
         result = code_map_artifact.prepare(self.connection, str(self.repo), context, self.repo, evidence, None)
         return context, repository, evidence, result
 
+    def test_prepared_tiered_promotion_applies_without_observation_and_rejects_audit_race(self):
+        context, repository, evidence, _ = self.prepare()
+        self.connection.commit()
+        def observe(*args):
+            self.assertFalse(self.connection.in_transaction)
+            return True
+        with mock.patch.object(maintenance_file_publication, 'sources_match_remote', side_effect=observe), \
+                mock.patch.object(maintenance_file_inventory, 'verify_remote_revision') as remote:
+            prepared = maintenance_file_publication.prepare_promotion(
+                self.connection, str(self.repo), self.repo, 'main', self.base_sha, evidence)
+            remote.assert_called_once()
+        with mock.patch.object(maintenance_file_ledger, '_git', side_effect=AssertionError('Git during apply')), \
+                mock.patch.object(tiered_review, 'parse_root_review_result',
+                                  side_effect=AssertionError('root observation during apply')):
+            with self.assertRaisesRegex(RuntimeError, 'rollback'), maintenance_state._transaction(self.connection):
+                maintenance_file_publication.apply_promotion(self.connection, prepared)
+                self.assertIsNotNone(repository.success(str(self.repo)))
+                raise RuntimeError('rollback')
+            self.assertIsNone(repository.success(str(self.repo)))
+            with self.connection:
+                self.connection.execute("UPDATE tiered_maintenance_result_audit SET raw_result='competing audit'")
+            with self.assertRaises(maintenance_file_publication.FileAssessmentPublicationError):
+                maintenance_file_publication.apply_promotion(self.connection, prepared)
+            self.assertIsNone(repository.success(str(self.repo)))
+            self.assertEqual(self.connection.execute(
+                'SELECT DISTINCT raw_result FROM tiered_maintenance_result_audit').fetchone()[0], 'competing audit')
+
     def test_artifact_collection_checks_plans_in_the_planning_worktree(self):
         context = self._begin_barrier()
         state = object.__new__(_PlanningStatePorts)
@@ -81,7 +108,19 @@ class TieredPublicationTest(MaintenancePlanningCase):
         self.assertIsNone(repository.success(str(self.repo)))
         git(self.repo, "push", "origin", "HEAD:main")
         git(self.repo, "fetch", "origin")
-        cycle = loop_manager.publish_maintenance_planning_batch(self.connection, str(self.repo), self.repo, "main", result, commit)
+        prepare = maintenance_file_publication.prepare_promotion
+        apply = maintenance_file_publication.apply_promotion
+        def observe(*args, **kwargs):
+            self.assertFalse(self.connection.in_transaction)
+            return prepare(*args, **kwargs)
+        def write(*args, **kwargs):
+            self.assertTrue(self.connection.in_transaction)
+            with mock.patch.object(maintenance_file_ledger, '_git', side_effect=AssertionError('Git during apply')):
+                return apply(*args, **kwargs)
+        with mock.patch.object(maintenance_file_publication, 'prepare_promotion', side_effect=observe), \
+                mock.patch.object(maintenance_file_publication, 'apply_promotion', side_effect=write):
+            cycle = loop_manager.publish_maintenance_planning_batch(
+                self.connection, str(self.repo), self.repo, "main", result, commit)
         self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.IDLE)
         self.assertEqual(repository.success(str(self.repo))["full_merged_count"], 1)
         self.assertIsNone(maintenance_file_ledger.FileReviewRepository(self.connection).last_success(str(self.repo)))

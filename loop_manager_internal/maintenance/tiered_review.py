@@ -608,6 +608,10 @@ class TieredReviewRepository:
             raise TieredReviewError("보존된 정밀 근거가 현재 평가와 다릅니다.")
         _validate_root_plan_links(evidence["root_reviews"], evidence.get("root_plan_links"),
                                   required=bool(_root_move_candidates(evidence["root_reviews"])))
+        self._write_success(repo, evidence)
+
+    def _write_success(self, repo, evidence):
+        """DB-only write after the publication preparation and identity CAS."""
         prior = self.success(repo)
         full_count = evidence["merged_count"] if evidence["mode"] == "full" else prior["full_merged_count"] if prior else None
         full_sha = evidence["source_revision"] if evidence["mode"] == "full" else prior["full_source_revision"] if prior else None

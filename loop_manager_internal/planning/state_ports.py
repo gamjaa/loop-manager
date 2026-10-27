@@ -458,21 +458,30 @@ class _PlanningStatePorts:
             cycle_revision, source_sha,
         )
 
+    def prepare_file_assessment(
+        self, repo: str, repository: Path, base_branch: str, source_sha: str,
+        evidence: maintenance_file_publication.AssessmentEvidence,
+    ) -> maintenance_file_publication.PreparedPromotion:
+        return maintenance_file_publication.prepare_promotion(
+            self._connection, repo, repository, base_branch, source_sha, evidence,
+        )
+
     def complete_file_assessment(
         self, repo: str, repository: Path, base_branch: str,
         cycle_revision: int, source_sha: str,
-        evidence: maintenance_file_publication.AssessmentEvidence,
+        evidence: maintenance_file_publication.AssessmentEvidence | maintenance_file_publication.PreparedPromotion,
     ) -> None:
+        prepared = (evidence if isinstance(evidence, maintenance_file_publication.PreparedPromotion)
+                    else self.prepare_file_assessment(repo, repository, base_branch, source_sha, evidence))
+        if prepared.repo != repo or prepared.published_revision != source_sha:
+            raise maintenance_file_publication.FileAssessmentPublicationError("준비된 평가의 게시 identity가 다릅니다.")
         with runtime_state._transaction(self._connection):
-            maintenance_file_publication.promote(
-                self._connection, repo, repository, base_branch, source_sha,
-                evidence,
-            )
-            if evidence.tiered is not None:
+            maintenance_file_publication.apply_promotion(self._connection, prepared)
+            if prepared.ledger is None:
                 return
             self._maintenance_repository.advance_file_assessment_success_baseline(
                 repo, expected_revision=cycle_revision, source_sha=source_sha,
-                expected_merged_count=evidence.merged_count,
+                expected_merged_count=prepared.evidence.merged_count,
                 bump_revision=False,
             )
 

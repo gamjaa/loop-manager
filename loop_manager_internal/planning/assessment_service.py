@@ -360,10 +360,13 @@ class PlanningAssessmentService(PlanningService):
         )
         if evidence.reviewed:
             raise PlanningResultInvalid("빈 선정 집합의 검토 결과가 예상과 다릅니다.")
+        prepared = self._ports.state.prepare_file_assessment(
+            context.repo, context.repo_path, context.base_branch, str(row.active_sha), evidence,
+        )
         with self._ports.state.transaction():
             self._ports.state.complete_file_assessment(
                 context.repo, context.repo_path, context.base_branch,
-                run.maintenance_cycle.revision, str(row.active_sha), evidence,
+                run.maintenance_cycle.revision, str(row.active_sha), prepared,
             )
             self._ports.state.advance_success_baseline(
                 context.repo,
