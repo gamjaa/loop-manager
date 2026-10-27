@@ -44,7 +44,7 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 16·19·
 
 - [x] 저장된 7건의 fixture 발견과 기존 Git/cleanup helper·플랫폼 진입 계약을 대조했다. 구현·테스트·verify는 실행하지 않았다.
 - [x] revision `8d19ea8aed39dd70b4a49546d0bde312c8a0aac0`의 G-328 변경과 현재 소비자를 정적으로 대조했다. `tests/support/guidance.py:active_connection`과 전용 repository 준비는 삭제됐고 코드·테스트의 호출도 없어 해당 factory 수명 교정만 잔여 범위에서 제외했다. 나머지 Git 격리·직접 연결 cleanup·파일 DB helper의 예외 정리·launcher 목표는 유지하며 실행 검증 성공을 추가하지 않는다.
-- [ ] 준비·격리·자원 수명 정렬과 최소 unit/native 회귀 검증
+- [x] 준비·격리·연결 수명과 launcher fixture를 정렬하고 직접 연결의 즉시 cleanup 등록 및 정상·예외 종료를 확인했다. Git 환경 복원, 파일 DB 단계별 예외 정리, POSIX launcher 단위도 통과했다. Windows native 회귀는 실행하지 않았으며 전체 verify는 Manager가 수행한다.
 
 ## Decision Log
 

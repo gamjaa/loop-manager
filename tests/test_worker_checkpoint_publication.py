@@ -11,7 +11,7 @@ from unittest import mock
 from loop_manager_internal.git import github_observation, publication_service
 from loop_manager_internal.storage import database
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
-from tests.support.git import git_command, git_test_environment, local_github_origin, make_remote_repository
+from tests.support.git import git_command, git_test_environment, isolated_git_test, local_github_origin, make_remote_repository
 
 
 class RemoteWorkAdoptionDatabaseTests(unittest.TestCase):
@@ -448,6 +448,7 @@ class PullRequestHistoryTests(unittest.TestCase):
                 Path('/repo'), 'loop-manager/G-047', history=True)
 
 
+@isolated_git_test
 class WorkerCheckpointPublicationTests(unittest.TestCase):
     def test_accepted_rebase_and_later_commit_wait_for_final_publication(self):
         from loop_manager_internal.git.managed_rebase_validation import Remote

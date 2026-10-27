@@ -1,3 +1,4 @@
+from tests.support.lifecycle import register_connection_cleanup
 from tests.support.git import isolated_git_test
 from tests.support.workspace import WorkspaceFixture
 import sqlite3
@@ -364,6 +365,7 @@ class WorkspaceMissingRecoveryTest(WorkspaceFixture, unittest.TestCase):
             commit_and_push(repo, "Add recovery safety plan")
             plan_sha = git_command(repo, "rev-parse", "origin/main")
             connection = sqlite3.connect(":memory:")
+            register_connection_cleanup(self, connection)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(

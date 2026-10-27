@@ -87,9 +87,11 @@ class PlatformCompatibilityTests(unittest.TestCase):
             package.mkdir(parents=True)
             (package.parent / "__init__.py").touch()
             (package / "__init__.py").touch()
-            (package / "runner.py").write_text(
+            entrypoint = scripts / "verify_windows.py" if os.name == "nt" else package / "runner.py"
+            root_parent = 1 if os.name == "nt" else 2
+            entrypoint.write_text(
                 "import os, sys\nfrom pathlib import Path\n"
-                "assert Path.cwd() == Path(__file__).resolve().parents[2]\n"
+                f"assert Path.cwd() == Path(__file__).resolve().parents[{root_parent}]\n"
                 "assert Path(sys.prefix) == Path.cwd() / '.venv'\n"
                 "assert os.environ['PYTHONIOENCODING'] == 'utf-8'\n"
                 "print('검증 진입점')\nraise SystemExit(37)\n", encoding="utf-8")

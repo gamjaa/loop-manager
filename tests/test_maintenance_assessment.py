@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.catalog import plan_text
 import hashlib
 import json
@@ -28,6 +29,7 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 
 from tests.support.maintenance_planning_case import MaintenancePlanningCase, git
 
+@isolated_git_test
 class MaintenanceAssessmentTest(MaintenancePlanningCase):
 
 
