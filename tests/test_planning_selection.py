@@ -1572,12 +1572,15 @@ class FailedSpecificationPlanningTest(PlanningCase):
                 return SimpleNamespace(stdout=source + '\0', returncode=0)
             if args[:4] == ('ls-tree', '-r', '-z', '--name-only'):
                 return SimpleNamespace(stdout='\0'.join(path for path in documents if path.startswith('docs/plans/')), returncode=0)
-            if args[0] == 'show' or args[:2] == ('rev-parse', '--verify') and ':' in args[-1]:
+            if args[:3] == ('ls-tree', '-z', '--full-tree'):
+                revision, path = args[3], args[5]
+                content = ('old requirement' if revision == 'old-base' else 'changed requirement') if path == source else documents.get(path)
+                oid = hashlib.sha256(content.encode()).hexdigest() if content is not None else ''
+                return SimpleNamespace(stdout=f'100644 blob {oid}\t{path}\0' if oid else '', returncode=0)
+            if args[0] == 'show':
                 revision, path = args[-1].split(':', 1)
                 content = ('old requirement' if revision == 'old-base' else 'changed requirement') if path == source else documents.get(path)
-                if content is None:
-                    return SimpleNamespace(stdout='', returncode=1)
-                return SimpleNamespace(stdout=content if args[0] == 'show' else hashlib.sha256(content.encode()).hexdigest(), returncode=0)
+                return SimpleNamespace(stdout=content or '', returncode=0 if content is not None else 1)
             return original_run(repo, *args, **kwargs)
         ports.git.run = remote_document_git
         ports.git.relevant_document_changes = mock.Mock(side_effect=lambda *args, **kwargs:

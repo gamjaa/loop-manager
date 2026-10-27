@@ -12,9 +12,21 @@ from loop_manager_internal.planning.planning_rebase import (
     PlanningRebaseError, accept_resolved_stash_conflict, complete_planning_rebase,
     rebase_planning_worktree,
 )
-from loop_manager_internal.planning.planning_document_relevance import relevant_document_changes
+from loop_manager_internal.planning.planning_document_relevance import relevant_document_changes as actual_relevant_document_changes
 from tests.support.catalog import execplan_header, write_execplan
 from tests.support.git import isolated_git_test
+
+
+def relevant_document_changes(git, *args, **kwargs):
+    # Existing fixtures model object IDs; expose them as successful tree reads.
+    def tree_git(repo, *arguments, **options):
+        if arguments[:3] == ("ls-tree", "-z", "--full-tree"):
+            revision, path = arguments[3], arguments[5]
+            result = git(repo, "rev-parse", "--verify", f"{revision}:{path}", check=False)
+            oid = hashlib.sha1(result.stdout.encode()).hexdigest()
+            return SimpleNamespace(stdout=f"100644 blob {oid}\t{path}\0" if result.returncode == 0 else "", returncode=0)
+        return git(repo, *arguments, **options)
+    return actual_relevant_document_changes(tree_git, *args, **kwargs)
 
 
 class PlanningGitDouble:
@@ -355,6 +367,64 @@ class PlanningRebaseTest(unittest.TestCase):
 
 
 class PlanningDocumentRelevanceTest(unittest.TestCase):
+    def test_tree_observation_distinguishes_absence_and_errors(self):
+        from loop_manager_internal.git.command_adapter import ExternalObservationError
+        path = "docs/PRODUCT.md"
+        oid = "a" * 40
+        for old, new, expected in (("found", "found", ()), ("absent", "absent", ()),
+                                   ("found", "absent", (path,)), ("absent", "found", (path,)),
+                                   ("error", "error", None), ("error", "absent", None),
+                                   ("absent", "error", None), ("found", "error", None),
+                                   ("invalid", "found", None), ("oserror", "found", None),
+                                   ("wrong_type", "found", None)):
+            with self.subTest(old=old, new=new):
+                def git(_repo, *args, check=True):
+                    if args[0] == "diff":
+                        return SimpleNamespace(stdout=path + "\0", returncode=0)
+                    state = {"old": old, "new": new}[args[3]]
+                    if state == "oserror":
+                        raise OSError("I/O failure")
+                    if state == "invalid":
+                        raise RuntimeError("invalid revision")
+                    if state == "error":
+                        return SimpleNamespace(stdout="", returncode=1)
+                    kind = "tree" if state == "wrong_type" else "blob"
+                    record = f"100644 {kind} {oid}\t{path}\0" if state in ("found", "wrong_type") else ""
+                    return SimpleNamespace(stdout=record, returncode=0)
+                arguments = (git, Path("/repo"), Path("/repo"), "old", "new", [], ())
+                if expected is None:
+                    with self.assertRaises((ExternalObservationError, RuntimeError)):
+                        actual_relevant_document_changes(*arguments)
+                else:
+                    self.assertEqual(actual_relevant_document_changes(*arguments), expected)
+
+    def test_observation_error_preserves_completed_result_and_session(self):
+        from loop_manager_internal.planning.planning_runtime import PlanningLifecycleCoordinator, PlanningOutcomeKind
+        from tests.support.planning_case import PlanningCase, FakePorts, planning_snapshot
+        case = PlanningCase()
+        self.addCleanup(case.doCleanups)
+        case.setUp()
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_result="saved result", planning_result_completed=True,
+            planning_error="original failure", last_error="original failure",
+            planning_retry_count=2,
+        ))
+        ports.git.remote = "new-base"
+        ports.git.relevant_document_changes = mock.Mock(side_effect=RuntimeError("tree I/O failure"))
+        ports.git.rebase_planning_workspace = mock.Mock()
+        coordinator = PlanningLifecycleCoordinator(ports)
+        outcome = coordinator._workspace._prepare_workspace(coordinator._new_run(case.context))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+        self.assertIn("tree I/O failure", outcome.detail)
+        saved = ports.state.snapshot
+        self.assertEqual((saved.active_sha, saved.planner_session_id, saved.planning_result,
+                          saved.planning_error, saved.last_error, saved.planning_retry_count),
+                         ("base", "saved-session", "saved result", "original failure", "original failure", 2))
+        self.assertTrue(saved.planning_result_completed)
+        ports.git.rebase_planning_workspace.assert_not_called()
+
     def test_general_target_rechecks_new_active_requirement_outside_its_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

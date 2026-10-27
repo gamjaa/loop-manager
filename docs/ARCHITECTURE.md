@@ -536,7 +536,7 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 이전 버전의 단일 현재 계획 개정 후보는 기존 소유 detached worktree와 execution checkpoint에서 복구한다. Manager가 구조·source·dependency·기존 ID·경로·실제 PR 부재와 게시 사실을 재검증하고 미완료 적용부터 이어간다. 실행 중 구현 worktree는 수정하지 않으며 PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다. 이전 문서 영향 Planner checkpoint는 이 복구·감사에 사용하며 새로운 작업별 Planner 호출을 만들지 않는다.
 
-진행 중인 일반·유지보수 planning은 원격 base 전진 시 staged·unstaged·untracked 변경과 세션을 관리 worktree에 보존해 반영하고 최신 catalog·SQLite 권한에서 재검증한다. 시작 revision의 READY 원본과 Planner가 작성한 결과를 구분하며, 관련 근거·의존 문서의 실제 내용이 바뀐 경우에만 해당 계획을 다시 확인한다. 무관한 문서 변경과 내용 보존 이동은 재확인을 만들지 않는다.
+진행 중인 일반·유지보수 planning은 원격 base 전진 시 staged·unstaged·untracked 변경과 세션을 관리 worktree에 보존해 반영하고 최신 catalog·SQLite 권한에서 재검증한다. 시작 revision의 READY 원본과 Planner가 작성한 결과를 구분하며, 관련 근거·의존 문서의 실제 내용이 바뀐 경우에만 해당 계획을 다시 확인한다. 무관한 문서 변경과 내용 보존 이동은 재확인을 만들지 않는다. 관련성 비교는 성공한 revision tree 조회로 정확한 경로의 blob 또는 부재를 확인한다. 조회 실패·잘못된 객체는 부재나 동일 내용으로 축약하지 않고 기존 원격 반영 보류 경계로 전달해 작업물·세션·실패 근거와 미확정 결과를 보존한다.
 
 `DOCUMENT_RESULT`는 기존 legacy checkpoint 복구에서 `application.result_normalization.tagged_json`으로 marker·공백·구분자·다중 줄 JSON을 정규화한다. 중복 marker·JSON key와 필드·evidence 의미 오류는 거부한다. 저장된 원문과 정규화된 판단을 후보 revision·문서 경로·Worker snapshot에 결합하고, 호출 입력이 바뀌면 이전 원문·판단을 superseded 근거로 보존해 새 판단에서 제외한다. 기존 checkpoint는 원문 필드가 없어도 원래 stage·후보·게시 사실을 확인해 복구하며 새 결과에 identity metadata를 일괄 요구하지 않는다.
 
