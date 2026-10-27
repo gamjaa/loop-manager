@@ -27,6 +27,42 @@ from tests.support.origin import OriginScopeFixture
 
 
 class SupportFixtureTests(unittest.TestCase):
+    def test_missing_workspace_direct_connection_registers_cleanup_immediately(self):
+        from tests.support.lifecycle import register_connection_cleanup
+
+        source = Path(__file__).with_name('test_workspace_missing_recovery.py').read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        method = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.FunctionDef)
+                      and node.name == 'test_missing_worktree_and_branch_blocks_without_recreation')
+        body = next(node.body for node in ast.walk(method) if isinstance(node, ast.With)
+                    and any(isinstance(item, ast.Assign) and any(
+                        isinstance(target, ast.Name) and target.id == 'connection'
+                        for target in item.targets) for item in node.body))
+        index = next(i for i, item in enumerate(body) if isinstance(item, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == 'connection'
+                             for target in item.targets))
+        setup = ast.Module(body=body[index:index + 2], type_ignores=[])
+        self.assertEqual(ast.unparse(setup.body[0]), "connection = sqlite3.connect(':memory:')")
+        self.assertEqual(ast.unparse(setup.body[1]), 'register_connection_cleanup(self, connection)')
+        code = compile(ast.fix_missing_locations(setup), '<workspace connection setup>', 'exec')
+        for outcome in ('normal', 'assertion', 'initialization'):
+            with self.subTest(outcome=outcome):
+                namespace = {'sqlite3': sqlite3, 'register_connection_cleanup': register_connection_cleanup}
+                try:
+                    with ExitStack() as cleanup:
+                        namespace['self'] = SimpleNamespace(addCleanup=cleanup.callback)
+                        exec(code, namespace)
+                        self.assertEqual(namespace['connection'].execute('SELECT 1').fetchone()[0], 1)
+                        if outcome == 'assertion':
+                            raise AssertionError('assertion')
+                        if outcome == 'initialization':
+                            raise RuntimeError('initialization')
+                except (AssertionError, RuntimeError) as error:
+                    self.assertEqual(str(error), outcome)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    namespace['connection'].execute('SELECT 1')
+
     def test_interrupted_worker_closes_database_on_initialization_failures(self):
         from tests.support import scope
 
