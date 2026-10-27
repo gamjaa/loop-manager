@@ -1813,7 +1813,7 @@ class FileReviewLedgerTest(unittest.TestCase):
 
         placements = {item.path: item for item in self.ledger.root_placements(str(self.repo))}
         self.assertEqual(placements[".agents"].category, "tool_required")
-        self.assertEqual(placements["AGENTS.md"].category, "tool_required")
+        self.assertEqual(placements["AGENTS.md"].category, "uncertain")
         self.assertEqual(placements["docs"].category, "tool_required")
         self.assertEqual(placements["README.md"].category, "uncertain")
         self.assertEqual(placements["config"].category, "uncertain")

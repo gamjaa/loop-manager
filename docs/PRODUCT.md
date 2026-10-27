@@ -612,6 +612,7 @@ Skill과 Manager가 프로젝트 안에서 고정 위치로 조회·작성하는
 
 이 경로들의 루트 `.agents/`·`docs/`·`scripts/`도 고정한다. 프로젝트의 `.gitignore`·`.codex/config.toml`·`.codex/rules/`·`.claude/settings.json`·
 `.claude/settings.local.json`은 존재할 때 CLI 입력·격리 검사에 사용되는 위치를 유지한다.
+루트 이동 검토도 이 경로들이 원격 inventory에 실제 있을 때 해당 경로와 부모 루트를 필수 위치로 보호한다. 비슷한 이름의 파일·폴더만 있거나 예약 경로가 없으면 보호 대상을 추가하지 않는다.
 Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager 상태 경로는
 프로젝트 예약 경로가 아니며 프로젝트에 복사하거나 생성하도록 요구하지 않는다.
 

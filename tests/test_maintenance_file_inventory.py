@@ -166,6 +166,36 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         self.assertEqual(placements["engine.py"].category, "internal_implementation")
         self.assertIn("entry path, references, owner", placements["engine.py"].reason)
 
+    def test_optional_reserved_paths_protect_only_present_exact_paths(self):
+        reserved_paths = (
+            ".gitignore", ".codex/config.toml", ".codex/rules/team.md",
+            ".claude/settings.json", ".claude/settings.local.json",
+        )
+        for path in reserved_paths:
+            with self.subTest(path=path):
+                inventory = source_inventory.SourceInventory(
+                    "a" * 40, (), (source_inventory.ClassifiedPath(path, "excluded", "fixture"),),
+                )
+                placements = {
+                    item.path: item for item in source_inventory.root_placement_inventory(inventory)
+                }
+                root = path.split("/", 1)[0]
+                self.assertEqual(placements[root].category, "tool_required")
+
+        lookalikes = (
+            ".codex/config.toml.backup", ".codex/rules-notes/guide.md", ".codex/other.txt",
+            ".claude/settings.json.backup", ".claude/other.txt",
+        )
+        for path in lookalikes:
+            with self.subTest(path=path):
+                inventory = source_inventory.SourceInventory(
+                    "a" * 40, (), (source_inventory.ClassifiedPath(path, "excluded", "fixture"),),
+                )
+                placements = {
+                    item.path: item for item in source_inventory.root_placement_inventory(inventory)
+                }
+                self.assertNotEqual(placements[path.split("/", 1)[0]].category, "tool_required")
+
     def test_revision_drift_and_invalid_revision_fail_before_inventory(self):
         self.write("main.go", b"package main\n")
         first = self.publish()

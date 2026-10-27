@@ -44,7 +44,7 @@ def root_results_for(repository, inventory):
                     if line.split("\t", 1)[1].split("/", 1)[0] == item.path)
         results.append({
             "path": item.path,
-            "category": "tool_required" if item.path in {".agents", "docs", "scripts", "AGENTS.md"} else "uncertain",
+            "category": "tool_required" if item.category == "tool_required" else "uncertain",
             "references": [{"path": ".", "excerpt": line}],
             "user_path": "No user entry contract is established in this fixture.",
             "ownership": "No accountable owner is established in this fixture.",

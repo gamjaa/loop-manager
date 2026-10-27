@@ -83,9 +83,39 @@ class FileReviewPromptTest(unittest.TestCase):
                 else:
                     self.assertIn("원본 시작\n" + content.decode() + "\n원본 끝", prompt)
 
+class RootReviewValidatorTest(unittest.TestCase):
+    def test_each_optional_reserved_root_is_rejected_as_a_move_candidate(self):
+        for path in (
+            ".gitignore", ".codex/config.toml", ".codex/rules/team.md",
+            ".claude/settings.json", ".claude/settings.local.json",
+        ):
+            with self.subTest(path=path):
+                revision = "a" * 40
+                inventory = maintenance_file_inventory.SourceInventory(
+                    revision, (),
+                    (maintenance_file_inventory.ClassifiedPath(path, "excluded", "fixture"),),
+                )
+                root = path.split("/", 1)[0]
+                result = {
+                    "path": root,
+                    "category": "internal_implementation",
+                    "references": [],
+                    "user_path": "No user entry contract is established in this fixture.",
+                    "ownership": "No accountable owner is established in this fixture.",
+                    "destination": "config/moved",
+                    "reason": "The reserved root must remain in place.",
+                }
+                with mock.patch.object(maintenance_file_ledger, "_git", return_value=b"") as git:
+                    with self.assertRaisesRegex(
+                        maintenance_file_ledger.FileReviewLedgerError, "필수 루트 경로",
+                    ):
+                        maintenance_file_ledger.validate_root_reviews(Path("."), inventory, [result])
+                git.assert_called_once_with(Path("."), "ls-tree", revision)
+
 
 @isolated_git_test
 class ProvisionalFileReviewTest(unittest.TestCase):
+
     def test_unchanged_source_review_survives_remote_revision_advance(self):
         first = self.publish({"src/a.py": "def calculate(): return 1\n"})
         source = first.sources[0]
