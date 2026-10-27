@@ -1090,6 +1090,121 @@ class PlanningRecoveryTest(PlanningCase):
             self.assertEqual(saved.planner_session_id, "planner-session")
             self.assertEqual(invalid.read_text(encoding="utf-8"), "invalid\n")
 
+    def test_first_planner_validation_retry_resumes_session_and_clears_state(self):
+        from loop_manager_internal.storage import runtime_state
+        from tests.support.catalog import make_catalog_root, planner_git_observations, write_execplan
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = make_catalog_root(str(root / "planning"))
+            connection = loop_manager.connect_database(root, create=True)
+            self.addCleanup(connection.close)
+            repo = str(root / "repo")
+            connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
+            runtime = runtime_state.RuntimeStateRepository(connection)
+            runtime.update_project(repo, {
+                "phase": "PLANNING", "active_sha": "base", "worktree": str(worktree),
+                "planning_attempt_fingerprint": "fingerprint", "planning_workspace_owned": 1,
+            })
+            ports = FakePorts(planning_snapshot())
+            state = loop_manager._PlanningStatePorts(
+                connection, runtime, maintenance_state.MaintenanceRepository(connection), root,
+            )
+            ports.state.planning = state.planning
+            ports.state.update = state.update
+            real_validation = loop_manager._PlanningValidationPorts(connection)
+            ports.validation.validate_general_result = real_validation.validate_general_result
+            context = replace(self.context, repo=repo, repo_path=Path(repo), state_dir=root)
+            coordinator = PlanningLifecycleCoordinator(ports)
+            snapshot = MutableReadySnapshot(repo=repo, active_sha="base", plans=(),
+                                           token=mutable_snapshot_token(repo, "base", ()))
+            plan = worktree / "docs/plans/[G-001] Generated.md"
+            plan_path = plan.relative_to(worktree).as_posix()
+            def planner(_worktree, _prompt, session, _save_session, **_kwargs):
+                ports.agent.run_count += 1
+                ports.agent.resumed_session = session
+                ports.agent.prompts.append(_prompt)
+                write_execplan(worktree, "G-001", "Generated", depends_on=("G-999",) if session is None else ())
+                ports.git.dirty_files = [plan_path]
+                return PlanningAgentResult(0, "", "planner-session", PlanningAgentResultKind.SUCCESS)
+            ports.agent.run_planner = planner
+            with planner_git_observations({"docs/PRODUCT.md": "# Product\n"}), \
+                 mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=False):
+                run = coordinator._new_run(context)
+                run.planning_worktree = worktree
+                run.mutable_ready_snapshot = snapshot
+                run.current_fingerprint = "fingerprint"
+                self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+                first = coordinator._assessment._validate_planner_result(run)
+                saved = runtime.planning(repo)
+                self.assertEqual(first.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+                self.assertEqual(saved.planning_retry_count, 0)
+                self.assertEqual(saved.planner_session_id, "planner-session")
+                self.assertIn("존재하지 않는 depends_on ID", saved.planning_validation_error)
+                self.assertIsNone(saved.planning_error)
+                self.assertFalse(saved.planning_result_pending_validation)
+                error = saved.planning_validation_error
+                run = coordinator._new_run(context)
+                run.planning_worktree = worktree
+                run.mutable_ready_snapshot = snapshot
+                run.current_fingerprint = "fingerprint"
+                self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+                self.assertEqual(ports.agent.run_count, 2)
+                self.assertEqual(ports.agent.resumed_session, "planner-session")
+                self.assertIn(error, ports.agent.prompts[-1])
+                self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+                self.assertEqual(run.validated_result.plans[0][1]["id"], "G-001")
+                self.assertTrue(plan.is_file())
+
+    @mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess"))
+    def test_planner_cli_failure_does_not_consume_validation_retry(self, _popen):
+        from loop_manager_internal.storage import runtime_state
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "planning"
+            worktree.mkdir()
+            invalid = worktree / "unexpected.txt"
+            invalid.write_text("invalid\n", encoding="utf-8")
+            connection = loop_manager.connect_database(root, create=True)
+            self.addCleanup(connection.close)
+            repo = str(root / "repo")
+            connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
+            runtime = runtime_state.RuntimeStateRepository(connection)
+            runtime.update_project(repo, {
+                "phase": "PLANNING", "active_sha": "base", "worktree": str(worktree),
+                "planning_attempt_fingerprint": "fingerprint", "planning_workspace_owned": 1,
+                "planner_session_id": "planner-session", "planning_validation_error": "invalid result",
+            })
+            ports = FakePorts(planning_snapshot())
+            state = loop_manager._PlanningStatePorts(
+                connection, runtime, maintenance_state.MaintenanceRepository(connection), root,
+            )
+            ports.state.planning = state.planning
+            ports.state.update = state.update
+            context = replace(self.context, repo=repo, repo_path=Path(repo), state_dir=root)
+            coordinator = PlanningLifecycleCoordinator(ports)
+            ports.agent.result = PlanningAgentResult(
+                1, "planner timeout", "planner-session", PlanningAgentResultKind.TRANSIENT_FAILURE,
+            )
+            snapshot = MutableReadySnapshot(
+                repo=repo, active_sha="base", plans=(),
+                token=mutable_snapshot_token(repo, "base", ()),
+            )
+            for attempt in range(4):
+                run = coordinator._new_run(context)
+                run.planning_worktree = worktree
+                run.mutable_ready_snapshot = snapshot
+                outcome = coordinator._assessment._run_planner_turn(run)
+                saved = runtime.planning(repo)
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+                self.assertEqual(ports.agent.run_count, attempt + 1)
+                self.assertEqual(ports.agent.resumed_session, "planner-session")
+                self.assertEqual(saved.planning_retry_count, 0)
+                self.assertEqual(saved.planning_validation_error, "invalid result")
+                self.assertIsNone(saved.planning_error)
+                self.assertFalse(saved.planning_result_pending_validation)
+                self.assertEqual(saved.last_error, "planner timeout")
+                self.assertEqual(invalid.read_text(encoding="utf-8"), "invalid\n")
+
     def test_validation_retry_resumes_session_and_persists_retry_transition(self):
         ports = FakePorts(
             planning_snapshot(
