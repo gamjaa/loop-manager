@@ -273,14 +273,18 @@ class TaskScheduler:
             self.condition.notify_all()
         try:
             while True:
-                rank = task.rank(self.priority_reader)
                 with self.condition:
-                    entry[1] = rank
+                    capacity = sum(self.running[kind].values()) < self.limits[kind]
+                if capacity:
+                    rank = task.rank(self.priority_reader)
+                with self.condition:
+                    if capacity:
+                        entry[1] = rank
                     self.check_project(task.repo)
                     if ((task.repo,task.plan_id,kind) in self.retained
                             or self.uncertain[kind]>=self.limits[kind]):
                         raise task_calls.CallDeferred("기존 호출의 종료가 확인되지 않아 실제 실행 자리를 보존합니다.")
-                    if sum(self.running[kind].values()) < self.limits[kind] and self._next(kind) is entry:
+                    if capacity and sum(self.running[kind].values()) < self.limits[kind] and self._next(kind) is entry:
                         allocation = ("retry" if entry[1][0] == 1 else "manual" if entry[1][0] == 0 else "resume" if entry[1][0] == 2
                                       else "basic" if not self.running[kind][task.repo] else "priority")
                         self.running[kind][task.repo] += 1

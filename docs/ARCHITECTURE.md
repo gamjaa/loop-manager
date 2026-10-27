@@ -569,6 +569,8 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 공유 `TaskScheduler`가 관리 배정과 실제 호출 배정을 구분한다. 관리 선택은 프로젝트별 유효 상한 안에서 수동 제출·기존 작업·일반 신규 순서로 확정하며, 일반 신규는 기본 자리 없는 프로젝트부터 순환하고 이후 유효 priority를 사용한다. Worker·Reviewer 호출은 전체 `max_workers`, verify는 별도 `verify_concurrency`를 사용하고 프로젝트 조율·Planner mutex 대기는 이 호출 자리를 사용하지 않는다. 한 자동 실행의 Planner는 직렬이다.
 
+실제 호출 자리가 꽉 찬 동안에는 대기 작업의 유효 우선순위를 반복 계산하지 않는다. 대기 중 프로젝트 중단·종료 불명 예약 확인은 유지하고, 빈자리가 생기면 현재 우선순위를 다시 읽어 기존 배정 순서로 판단한다. 우선순위 계산과 DB 조회는 scheduler condition 잠금 밖에서 수행하고 배정 직전에 자리·중단 조건을 다시 확인한다.
+
 배정기의 공통 condition 안에서는 대기열·메모리 실행 자리만 갱신한다. 호출 자리를 먼저 확보하고 공통 condition을 놓은 뒤 DB에서 호출 예약과 배정 cursor를 같은 transaction으로 확정하며, 실패하면 미시작 자리를 반환한다. 종료 시 DB 예약 반환이 확인된 뒤 메모리 자리를 비우고 확인 실패는 종료 불명으로 보존한다. 호출 대기 중 rank를 갱신하고 실제 호출 직전 작업 snapshot·프로젝트 차단·catalog/draft 보류를 재검사한다. 입력 변경은 실패 횟수를 늘리지 않고 단계 재준비로 돌리며, 지속되는 차단·보류는 해당 작업의 대기로 반환한다.
 
 수동 start·complete·submit은 Git·profile 관측 전에 group, 요청, 구성원별 `exec_plans` 전체 행과 수동 소유 fingerprint를 짧은 공통 DB 요청에서 snapshot으로 확보한다. 외부 관측 뒤 적용 요청은 그 snapshot과 후보 입력을 다시 비교하고, `preparation_gate`의 현재 자원·게시 예약을 함께 검사해 소유권·계획 리비전·상태가 그대로일 때만 예약·수락을 원자 적용한다. 차이가 있으면 충돌로 거부해 경쟁 상태와 기존 작업물을 보존한다. `run_database_request`는 이 DB 전용 재확인·적용만 rollback 후 다시 읽어 재시도하며 Git·profile·Agent·검증·게시를 감싸거나 반복하지 않는다.
@@ -1155,6 +1157,8 @@ rebase나 사용자 입력으로 후보 HEAD가 바뀌면 후보에 결합된 ve
 소유권 원인은 고정 code-scope 계약을 유지한다. 기존 `workspace_ownership_uncertain`은 계속 project 범위이며 저장된 행을 일괄 재분류하지 않는다. `workspace_ownership_local`은 plan 범위이고 동일한 typed recovery 원인 `ownership_uncertain`으로 연결한다. `plan_recovery.workspace_ownership_isolated()`는 이번 재평가에서 연속 관측한 현재 metadata로 기본 checkout의 등록, 선택 branch/ref/HEAD·고유 worktree 연결과 lock identity를 확인한다. 확인 구간에도 무관한 ref·다른 worktree·Git 설정의 변경 자체로 범위 축소를 거부하지 않는다. 과거 Agent snapshot의 유무·내용이나 과거 공유 상태와의 일치는 진입 조건이 아니다. 호출자는 대상 HEAD·branch·index·파일·operation의 안정성을 확인하며 대상 등록·lock 변경, 동일 branch의 중복 등록과 현재 근거 누락에는 project 범위를 유지한다. 선택 자원의 설명되지 않은 파일·index·operation은 그 작업의 미해결 원인으로 남으며 이 비교로 소유권을 승인하지 않는다. 이 비교는 미해소 원인의 범위 축소에만 사용하며 전체 원인 해소와 G-322 소유권 복구의 추가 gate로 사용하지 않는다.
 
 `scope_reconciliation`은 G-322의 예약 lease·writer 종료 검증과 공통 이력 복구를 먼저 소비한다. 완전 해소가 안 되고 작업 범위만 입증되면 현재 프로젝트/계획 원인·작업·복구 기록·게시 요청·checkpoint generation과 자원 claim을 짧은 transaction에서 다시 확인한다. 계획 보류와 checkpoint의 `workspace_ownership_hold`를 저장한 뒤 프로젝트 gate를 해제하며 실패에는 함께 rollback한다. 이 선택적 JSON object는 원래 `block`, `resume_status`, 판정에 사용한 현재 관측 쌍 `baseline`·`observation`을 보존한다. 기존 기록의 `baseline`이 과거 Agent snapshot인 경우에도 감사로만 읽고 재개 허가로 사용하지 않는다. 별도 계획 원인이 있으면 해당 block row와 `recovery_snapshot`을 교체하지 않고 추가 hold만 둔다. `workspace_scope_audit`에는 원인 작업·충돌 자원·대기 claim과 교체 전의 일치하는 게시 요청을 남긴다. 기존 DB는 이 필드가 없는 상태로 계속 읽으며 누락 근거로 새 허가를 만들지 않는다.
+
+배정 조회는 checkpoint 본문을 읽거나 해석하지 않고 `execution_checkpoints.workspace_ownership_held`의 0/1 표식을 사용한다. 이 값은 본문의 `workspace_ownership_hold` 존재·비어 있지 않음을 투영하며 checkpoint 저장의 generation CAS와 같은 SQL 변경으로 갱신한다. `(repo, workspace_ownership_held, plan_id)` 인덱스로 별도 계획 원인과 함께 남은 보류도 조회하고 기존 활성 작업 공간 소유자와 합친다. 상세 보류 증거·해제 판단의 원본은 checkpoint 본문이다. 기존 DB는 표식 추가 시 본문을 작업별로 한 번 읽어 채우며 실패하면 schema 변경·표식 갱신을 함께 rollback한다. 본문·generation·감사 이력은 변경하지 않고 이후 초기화에서는 재해석하지 않는다.
 
 계획 재평가는 추가 hold를 일반 질문·입력 해제보다 먼저 처리하고 같은 예약 복구기를 사용한다. 실제 소유권 해소 후 추가 hold만 제거하며, 단독 소유권 차단은 저장 단계로 복원하고 별개 계획 원인은 `PLAN_BLOCKED`로 유지한다. 현재 원인과 일치하는 미완료 checkpoint 요청은 원자적으로 종료하며 게시 영수증·통지의 전송/실패/취소 감사는 보존한다. 해소된 원인이 낡은 요청으로 재게시되지 않고 scope 자체가 사용자 조치나 새 Telegram을 만들지 않는다. 후보·session·실패/승격·성공 token을 소유권 판정으로 교체하지 않으며 다른 작업의 투영과 planning 오류도 유지한다.
 

@@ -713,15 +713,13 @@ class PublicationRebaseLeaseTests(PublicationRebaseRecoveryTestFixture, unittest
         }
         pr = {'url': plan['pr_url'], 'state': 'OPEN', 'headRefName': branch, 'headRefOid': old}
         calls = []
-        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
-
         def git(_path, *arguments, **_kwargs):
             calls.append(arguments)
             return subprocess.CompletedProcess(arguments, 0,
                 new + '\n' if arguments[0] == 'rev-parse' else old + '\trefs/heads/' + branch + '\n' if arguments[0] == 'ls-remote' else '')
 
         with (
-            mock.patch.object(ExecutionCheckpointRepository, 'get', return_value=SimpleNamespace(snapshot={})),
+            mock.patch('loop_manager_internal.git.publication_service.execution_checkpoint_state.ExecutionCheckpointRepository') as checkpoints,
             mock.patch('loop_manager._owned_publication_plan', return_value=plan),
             mock.patch('loop_manager.active_execplan', return_value=plan),
             mock.patch('loop_manager.validate_execplan_workspace_identity'),
@@ -732,6 +730,7 @@ class PublicationRebaseLeaseTests(PublicationRebaseRecoveryTestFixture, unittest
             mock.patch('loop_manager.pr_for_branch', return_value=pr),
             mock.patch('loop_manager.git', side_effect=git),
         ):
+            checkpoints.return_value.get.return_value = SimpleNamespace(snapshot={})
             self.assertEqual(loop_manager.push_owned_pr_conflict_recovery(
                 connection, Path('/repo'), Path('/state'), 'repo', branch,
                 Path('/managed'), pr, new), new)

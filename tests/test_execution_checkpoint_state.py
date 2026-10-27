@@ -2,9 +2,11 @@
 
 import sqlite3
 import unittest
+import json
+from unittest import mock
 
 from loop_manager_internal.storage.execution_checkpoint_state import (
-    CheckpointRace, ExecutionCheckpointRepository,
+    CheckpointRace, ExecutionCheckpointRepository, SCHEMA,
 )
 from loop_manager_internal.storage import runtime_state
 from tests.support.database import runtime_connection
@@ -12,6 +14,70 @@ from tests.support.rebase_observations import decision_for, expectation, observa
 
 
 class CheckpointRepositoryTests(unittest.TestCase):
+    def test_legacy_workspace_hold_backfill_is_atomic_and_preserves_checkpoints(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        connection.execute(SCHEMA.replace('    workspace_ownership_held INTEGER NOT NULL DEFAULT 0,\n', ''))
+        for plan_id, snapshot in (('G-001', {'workspace_ownership_hold': {'block': 'held'}, 'audit': 'preserved'}),
+                                  ('G-002', {'workspace_ownership_hold': {}}), ('G-003', None)):
+            connection.execute('INSERT INTO execution_checkpoints(repo,plan_id,generation,snapshot) VALUES (?,?,7,?)',
+                               ('repo', plan_id, json.dumps(snapshot)))
+        connection.commit()
+        before = [tuple(row) for row in connection.execute('SELECT * FROM execution_checkpoints ORDER BY plan_id')]
+        with mock.patch('loop_manager_internal.storage.execution_checkpoint_state.json.loads', side_effect=ValueError('bad checkpoint')):
+            with self.assertRaisesRegex(ValueError, 'bad checkpoint'):
+                ExecutionCheckpointRepository(connection)
+        self.assertNotIn('workspace_ownership_held', {row[1] for row in connection.execute('PRAGMA table_info(execution_checkpoints)')})
+        ExecutionCheckpointRepository(connection)
+        after = [tuple(row) for row in connection.execute('SELECT * FROM execution_checkpoints ORDER BY plan_id')]
+        self.assertEqual([row[:-1] for row in after], before)
+        self.assertEqual([row[-1] for row in after], [1, 0, 0])
+        with mock.patch('loop_manager_internal.storage.execution_checkpoint_state.json.loads', side_effect=AssertionError('repeat backfill')):
+            ExecutionCheckpointRepository(connection)
+
+    def test_workspace_hold_projection_tracks_generation_and_outer_rollback(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        repository = ExecutionCheckpointRepository(connection)
+        def save(generation, snapshot):
+            return repository.record('repo', 'G-001', expected_generation=generation, operation=None,
+                expected_head=None, target_base_oid=None, observed_remote_oid=None, snapshot=snapshot)
+        def held():
+            return connection.execute('SELECT workspace_ownership_held FROM execution_checkpoints').fetchone()[0]
+        save(0, {'workspace_ownership_hold': {'block': 'held'}})
+        connection.commit()
+        with self.assertRaises(CheckpointRace):
+            save(0, {})
+        self.assertEqual(held(), 1)
+        with self.assertRaisesRegex(RuntimeError, 'rollback'):
+            with connection:
+                connection.execute('BEGIN')
+                save(1, {})
+                self.assertEqual(held(), 0)
+                raise RuntimeError('rollback')
+        self.assertEqual(held(), 1)
+        save(1, None)
+        self.assertEqual(held(), 0)
+
+    def test_workspace_owner_selection_never_reads_checkpoint_body(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repository = ExecutionCheckpointRepository(connection)
+        repository.record('repo', 'G-047', expected_generation=0, operation=None,
+            expected_head=None, target_base_oid=None, observed_remote_oid=None,
+            snapshot={'workspace_ownership_hold': {'block': 'held'}, 'audit': 'x' * 1_000_000})
+        def authorize(operation, table, column, *_):
+            if operation == sqlite3.SQLITE_READ and table == 'execution_checkpoints' and column == 'snapshot':
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        connection.set_authorizer(authorize)
+        self.addCleanup(connection.set_authorizer, None)
+        self.assertEqual([row['plan_id'] for row in scoped_blocking.workspace_held_resources(connection, 'repo')], ['G-047'])
+        self.assertEqual(scoped_blocking.workspace_held_resources(connection, 'other'), ())
+
     def test_current_acceptance_is_generation_bound_and_preserves_legacy_audit(self):
         connection = sqlite3.connect(':memory:')
         connection.row_factory = sqlite3.Row

@@ -54,6 +54,24 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         return scheduling.TaskScheduler(replace(self.config, **values), database.connect_database,
                                          self.directory, self.connection)
 
+    def test_full_call_slots_skip_priority_refresh_until_capacity_returns(self):
+        self.connection.commit()
+        scheduler = self.scheduler(verify_concurrency=1)
+        scheduler.running['verify']['A'] = 1
+        task = scheduling.Task('A', 'G-001', self.connection)
+        reads = mock.Mock(side_effect=[(2, '', (3, 1)), (2, '', (0, 1))])
+        waits = []
+        def waiting(_timeout):
+            waits.append(True)
+            self.assertEqual(reads.call_count, 1)
+            if len(waits) == 3:
+                scheduler.running['verify']['A'] = 0
+        with mock.patch.object(task, 'rank', reads), mock.patch.object(scheduler.condition, 'wait', side_effect=waiting):
+            with scheduler.slot('verify', task):
+                self.assertEqual(reads.call_count, 2)
+                self.assertEqual(scheduler.waiters['verify'], [])
+        self.assertEqual(len(waits), 3)
+
     def test_journal_rejects_same_thread_lease_from_another_owner(self):
         from loop_manager_internal.git import manager_git_journal
         from loop_manager_internal.runtime.contracts import ProcessLockBusyError

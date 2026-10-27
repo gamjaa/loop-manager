@@ -493,6 +493,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     targeted_test_schema(connection)
     validation_feedback_state.ValidationFeedbackRepository(connection).migrate_legacy()
     scoped_blocking.ensure_schema(connection)
+    from .execution_checkpoint_state import ensure_schema as checkpoint_schema
+    checkpoint_schema(connection)
     if not getattr(connection, "execplans_schema_ready", False):
         recovery_state.ensure_schema(connection)
     blocked_checkpoint_state.ensure_schema(connection)

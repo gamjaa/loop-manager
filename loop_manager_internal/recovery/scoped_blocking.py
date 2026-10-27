@@ -192,10 +192,8 @@ def workspace_held_resources(connection, repo):
     ids = {row[0] for row in connection.execute(
         "SELECT plan_id FROM execplan_blocks WHERE repo=? AND reason_code=?",
         (repo, BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL.value))}
-    for row in connection.execute('SELECT plan_id,snapshot FROM execution_checkpoints WHERE repo=?', (repo,)):
-        saved = json.loads(row['snapshot'] or '{}')
-        if saved.get('workspace_ownership_hold'):
-            ids.add(row['plan_id'])
+    ids.update(row[0] for row in connection.execute(
+        'SELECT plan_id FROM execution_checkpoints WHERE repo=? AND workspace_ownership_held=1', (repo,)))
     rows = connection.execute('SELECT plan_id,status,workspace_owned,branch,worktree FROM exec_plans WHERE repo=?', (repo,))
     return tuple(dict(row) for row in rows if row['plan_id'] in ids
                  or row['workspace_owned'] and row['status'] in {'IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING','PLAN_BLOCKED','PR_OPEN'})

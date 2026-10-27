@@ -19,9 +19,30 @@ CREATE TABLE IF NOT EXISTS execution_checkpoints (
     target_base_oid TEXT,
     observed_remote_oid TEXT,
     snapshot TEXT,
+    workspace_ownership_held INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo, plan_id)
 )
 """
+
+
+def ensure_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(SCHEMA)
+    if 'workspace_ownership_held' not in {row[1] for row in connection.execute('PRAGMA table_info(execution_checkpoints)')}:
+        connection.execute('SAVEPOINT checkpoint_workspace_hold')
+        try:
+            connection.execute('ALTER TABLE execution_checkpoints ADD COLUMN workspace_ownership_held INTEGER NOT NULL DEFAULT 0')
+            keys = connection.execute('SELECT repo,plan_id FROM execution_checkpoints').fetchall()
+            for repo, plan_id in keys:
+                row = connection.execute('SELECT snapshot FROM execution_checkpoints WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
+                snapshot = json.loads(row[0]) if row[0] else {}
+                connection.execute('UPDATE execution_checkpoints SET workspace_ownership_held=? WHERE repo=? AND plan_id=?',
+                                   (int(bool((snapshot or {}).get('workspace_ownership_hold'))), repo, plan_id))
+            connection.execute('RELEASE SAVEPOINT checkpoint_workspace_hold')
+        except BaseException:
+            connection.execute('ROLLBACK TO SAVEPOINT checkpoint_workspace_hold')
+            connection.execute('RELEASE SAVEPOINT checkpoint_workspace_hold')
+            raise
+    connection.execute('CREATE INDEX IF NOT EXISTS checkpoint_workspace_holds ON execution_checkpoints(repo,workspace_ownership_held,plan_id)')
 
 
 class CheckpointRace(RecoveryFailure):
@@ -90,7 +111,7 @@ class CheckpointRecord:
 class ExecutionCheckpointRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
-        connection.execute(SCHEMA)
+        ensure_schema(connection)
 
     def get(self, repo: str, plan_id: str) -> CheckpointRecord:
         row = self.connection.execute(
@@ -137,25 +158,26 @@ class ExecutionCheckpointRepository:
             if not same_candidate or not (pending or confirmed):
                 raise CheckpointRace('intermediate publication must finish before another Git operation')
         payload = json.dumps(snapshot, sort_keys=True) if snapshot is not None else None
+        workspace_held = int(bool((snapshot or {}).get('workspace_ownership_hold')))
         self.connection.execute("SAVEPOINT execution_checkpoint_record")
         try:
             if expected_generation == 0:
                 result = self.connection.execute(
                     "INSERT OR IGNORE INTO execution_checkpoints "
                     "(repo, plan_id, generation, operation, expected_head, "
-                    "target_base_oid, observed_remote_oid, snapshot) "
-                    "VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+                    "target_base_oid, observed_remote_oid, snapshot, workspace_ownership_held) "
+                    "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)",
                     (repo, plan_id, operation, expected_head, target_base_oid,
-                     observed_remote_oid, payload),
+                     observed_remote_oid, payload, workspace_held),
                 )
             else:
                 result = self.connection.execute(
                     "UPDATE execution_checkpoints SET generation = generation + 1, "
                     "operation = ?, expected_head = ?, target_base_oid = ?, "
-                    "observed_remote_oid = ?, snapshot = ? WHERE repo = ? "
+                    "observed_remote_oid = ?, snapshot = ?, workspace_ownership_held = ? WHERE repo = ? "
                     "AND plan_id = ? AND generation = ?",
                     (operation, expected_head, target_base_oid, observed_remote_oid,
-                     payload, repo, plan_id, expected_generation),
+                     payload, workspace_held, repo, plan_id, expected_generation),
                 )
             if result.rowcount != 1:
                 raise CheckpointRace("execution checkpoint generation changed")
