@@ -1337,7 +1337,7 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 |---|---|
 | 선언 검사: `verification/contract.py` | `scripts/verify.json`의 version 1·정적 adapter registry·프로젝트 interpreter·수집 옵션·순서 있는 단계를 검증한다. |
 | Manager 연결과 launcher | `manager_adapter`가 고정 runtime의 Python·절대 진입점·protocol version·run/session·timeout과 기존 인스턴스 coordinator를 전달하고 launcher가 프로젝트 interpreter를 선택한다. standalone도 같은 `entrypoint.py`·선언을 사용하며 로컬 관측만 조율한다. |
-| 단계 실행과 공통 core | `runner.py`가 단계 순서를 유지하고 `core.py`가 도구별 결과 validator·worker IPC를 받아 자원 배정·예약·프로세스 시작·재사용·종료 확인을 수행한다. unittest 타입이나 자체 compile 경로는 소유하지 않는다. 수집과 직렬 command에도 예약·전체 timeout을 적용한다. |
+| 단계 실행과 공통 core | `runner.py`가 단계 순서를 유지하고 `core.py`가 도구별 결과 validator·worker callback을 받아 자원 배정·예약·프로세스 재사용·종료 확인을 수행한다. `worker_transport.py`는 공통 worker 생성·IPC와 직렬 예약 제한을 소유한다. unittest 타입이나 자체 compile 경로는 소유하지 않는다. 수집과 직렬 command에도 예약·전체 timeout을 적용한다. |
 | unittest: `unittest_adapter.py` | 프로젝트 interpreter의 discovery/`load_tests`·재수집·fixture·native reporter와 명시한 Python compile 범위를 소유한다. 자식 import·Python 경로는 후보 worktree를 선택하며 Manager runtime 패키지가 후보 코드를 대신하지 않는다. |
 | Perl: `perl_adapter.py` | 파일 suite 수집·재대조와 native TAP 결과 완결성을 소유한다. 정적 registry의 Perl executable은 Manager Python과 분리하고 공통 Python worker IPC·예약·종료 helper를 재사용한다. |
 

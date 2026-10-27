@@ -10,7 +10,7 @@ import traceback
 from loop_manager_internal.verification.contract import ContractError, inside, validate_manifest
 from loop_manager_internal.verification.manifest import Module
 from loop_manager_internal.verification.timing import EventWriter, atomic_json, phase
-from loop_manager_internal.verification import unittest_adapter
+from loop_manager_internal.verification.worker_transport import start_worker, SerialClient
 from loop_manager_internal.verification.core import execute_manifest, stop_worker, failure_output
 
 REPORTER = Path(__file__).with_name('perl_reporter.pl')
@@ -140,24 +140,13 @@ def execute(connection, stage, modules, directory, writer, client, run_id, entry
     parent_run_id = os.environ.get('LOOP_MANAGER_VERIFY_PARENT_RUN_ID')
     if parent_run_id:
         event_identity['parent_run_id'] = parent_run_id
-    # Reuse the unittest worker's transport only; no unittest discovery/reporter semantics.
     def spawn(token, number, logs):
-        return unittest_adapter.start_worker(token, number, logs,
+        return start_worker(token, number, logs,
             command=[sys.executable, '-u', str(entrypoint), '--perl-worker'], cwd=connection.root / stage['cwd'],
             environment=dict(os.environ, LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(connection.root),
                 LOOP_MANAGER_VERIFY_PERL=str(connection.tool)), identity=event_identity)
-    parent = client
     if stage['execution'] == 'serial':
-        class SerialClient:
-            def request(self, operation, **data):
-                if operation == 'acquire' and 'token' not in data and active[0]:
-                    return {'granted': False, 'reason': 'serial stage'}
-                reply = parent.request(operation, **data)
-                if operation == 'acquire' and reply['granted']:
-                    active[0] = True
-                return reply
-        active = [False]
-        client = SerialClient()
+        client = SerialClient(client)
     return execute_manifest(modules, directory, writer, client, spawn=spawn,
         validate_report=lambda unit, report: validate_report(unit, report, identity),
         stop_worker=stop_worker, failure_output=failure_output, coverage=lambda unit, report: report['completed'])
