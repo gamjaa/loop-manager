@@ -17,7 +17,7 @@ priority: high
 
 R-055 W04–W06에 따라 workspace 소유권 문제의 실제 영향 범위를 판정해 작업·의존 작업·충돌 자원만 보류하고, 기존 프로젝트 차단도 현재 근거로 해제·축소한다. G-322의 예약/현재 소유권 판정과 기존 작업별 실행·복구·알림 경계를 소비하며, 원인 작업과 그 영향으로 기다리는 작업을 구분한다.
 
-현재 `recovery/scoped_blocking.py:reason_scope()`는 `workspace_ownership_uncertain`을 항상 project 범위로 분류한다. `execution/execution_workspace_handler.py`의 소유권 실패도 그 공통 원인으로 전달된다. `scope_reconciliation.py`는 깨끗한 예약의 원인 해소를 확인하면 프로젝트 gate를 해제하지만, 미해소 문제가 한 작업에만 남은 경우의 범위 축소는 제공하지 않는다. R-091의 기존 PLAN_BLOCKED 관리 개수 제외·독립 선택과 대상별 lease를 재구현하지 않고 이 실패의 입력·전환만 연결한다.
+기존 `workspace_ownership_uncertain`의 project 범위는 유지하며, `execution/execution_workspace_handler.py`는 현재 영향 범위가 입증된 실패만 `workspace_ownership_local`의 plan 범위로 전달한다. `scope_reconciliation.py`의 예약 복구·범위 축소와 소유권 확정 작업의 차단 재평가를 함께 소비한다. 과거 깨끗한 예약만 해제하던 경로와 현재 원인별 해제 경계를 구분하고, 미완료 Git 처리를 차단 원인 해소나 단계 성공과 혼동하지 않는다. R-091의 기존 PLAN_BLOCKED 관리 개수 제외·독립 선택과 대상별 lease를 재구현하지 않고 이 실패의 입력·전환만 연결한다.
 
 ## Acceptance Criteria
 
@@ -25,7 +25,7 @@ R-055 W04–W06에 따라 workspace 소유권 문제의 실제 영향 범위를 
 - 공유 Git 설정·ref 소유권·다른 worktree 쓰기 등 프로젝트 전체의 안전을 확정하지 못하면 구체적 근거와 원인을 보존하고 프로젝트 차단을 유지한다. 오류 code·예외 문자열·작업 ID 존재만으로 scope를 축소하지 않는다. 원인 작업과 영향받는 호출 대기를 구분해 기존 로그·저장 근거로 확인할 수 있다.
 - R-055 W05: 기존 `workspace_ownership_uncertain` 프로젝트 차단은 원격 문서 변경이나 수동 DB 수정 없이 현재 자원·원인·G-322의 복구 근거로 재평가한다. 완전 해소면 해당 원인과 연결된 대기/확인 요청만 해소하고, 작업 범위의 미해소면 그 작업 차단을 보존한 채 프로젝트 gate만 축소한다. 별개 계획 차단·승인·Review 실패·planning 오류·다른 작업의 투영과 감사를 변경하지 않는다.
 - 범위 전환은 현재 작업·자원 소유·프로젝트/작업 차단 원인·checkpoint generation을 다시 확인한 뒤 기존 짧은 transaction/CAS에서 적용한다. 중단·DB rollback·재시작에 작업 차단 없이 프로젝트 gate만 사라지는 틈·중복 실행·해소된 원인의 재차단이 없어야 한다. 경쟁 변경은 보존하고 현재 적용만 보류한다. 기존 project 원인 code와 저장 기록의 해석을 일괄 변경하지 않는다.
-- R-055 W06: 예약 확정·차단 축소/해제는 Worker·verify·Review·rebase·게시 성공이나 사용자 승인·실패 초기화가 아니다. 실제 저장 단계·현재 후보와 유효한 성공 근거에 따른 필요한 단계를 유지하며, 해소된 요청을 낡은 원인으로 다시 게시하지 않는다.
+- R-055 W06: 예약 확정·차단 축소/해제는 Worker·verify·Review·rebase·게시 성공이나 사용자 승인·실패 초기화가 아니다. 이미 소유권이 확정된 작업도 포함하며, 현재 소유권과 원인 해소가 검증되면 미완료 Manager rebase의 시작·완료를 해제 전제로 요구하지 않는다. 원래 HEAD·target·checkpoint·파일·index를 유지해 Manager가 이어간다. 실제 저장 단계·현재 후보와 유효한 성공 근거에 따른 필요한 단계를 유지하며, 해소된 요청을 낡은 원인으로 다시 게시하지 않는다.
 - R-053: 정상적인 자동 재평가·작업 대기·차단 축소/해제·독립 작업 재개에 일반/무음 Telegram을 만들지 않는다. 해소된 원인의 미전송/잔여 조각은 현재 조치 판정으로 취소하고 전송·실패·취소 감사는 보존한다. 실제 미해결 사용자 판단·권한 조치·PR 검토와 복구 불가 중단·확인된 무진전 지속 장애는 별도 현재 원인으로 유지하며, scope 자체로 사용자 조치 필요를 합성하지 않는다.
 
 ## Implementation
@@ -41,6 +41,7 @@ R-055 W04–W06에 따라 workspace 소유권 문제의 실제 영향 범위를 
 - 한 작업 A의 예약 근거 부족·독립성이 검증된 B·A에 의존한 C·충돌 자원을 공유한 D를 둔다. B만 적격 한도 내에서 진행하고 A/C/D의 보류 근거에서 원인과 영향 대기를 구분해야 한다. 같은 오류 code라도 공유 config/ref·다른 worktree의 안전 미확정이면 프로젝트 gate를 유지한다. 종료 불명 호출의 자리/자원 예약과 PLAN_BLOCKED 관리 개수 제외는 기존 `tests/test_task_scheduling.py` 회귀를 재사용해 실제 다음 선택까지 확인한다.
 - 완전 해소와 작업 범위 미해소를 나누어 프로젝트 차단 재평가→원인별 해제/축소→다음 선택을 검사한다. 새 문서 변경 없이 재시작하고, 작업 차단 저장·프로젝트 gate 해제·checkpoint/요청 확정의 중간 DB 실패와 원인/generation/자원 경쟁을 주입한다. rollback·멱등 재개·독립 승인/Review 실패·session/retry·현재 후보 보존과 성공 token 미생성을 확인한다. 이미 다른 원인의 plan block이 있는 경우 그 근거를 잃으면 실패다.
 - `tests/test_notification_incidents.py`·`tests/test_notification_delivery.py`의 실제 outbox/부분 전송 fixture에서 해소된 원인만 취소되는 최소 연결 회귀를 둔다. 작업 범위 대기·재개·같은 입력 재관측은 전송 0건이고, 별개 미해결 사용자 행동과 과거 전송/실패 감사는 남아야 한다. 같은 공통 알림 정책 조합을 반복하지 않는다.
+- 이미 소유권이 확정된 작업에 `START`·detached `WAITING` rebase와 별개 사용자 질문을 둔다. 현재 rebase 관측과 원래 HEAD·target의 결합이 검증되면 프로젝트 소유권 차단만 해제하고 원래 작업 row·checkpoint·독립 질문을 보존해야 한다. 대상 불일치·종료 불명 writer·checkpoint/원인/복구 기록 경쟁에는 적용하지 않고, rebase 수용·완료·frontmatter 수정이나 성공 token을 만들지 않는다.
 - 이 변경의 고유 회귀는 scope 판단·저장·선택·통지 연결이다. 실제 worktree 생성·파일 보존은 G-322의 기존 Git 회귀를 소비하고 새 Git lifecycle을 복제하지 않는다. 선택 adapter·수집/fixture·Agent guard·필수 compile 및 부분/전체 결과 구분을 유지한다.
 
 ## Progress
@@ -58,6 +59,13 @@ R-055 W04–W06에 따라 workspace 소유권 문제의 실제 영향 범위를 
 
 - [x] Manager 전체 verify `verify:f0ca3e959372885829a18aab107c0bb47a7150862c8eb72bfc177a3fe3456d11` occurrence=1/revision=1의 실패를 교정했다. 일반 프로젝트 복구에서 소유권 전용 게시 요청 조회를 분리해 최소 planning DB 호환을 유지하고, 활성화는 READY 상태 오류를 자원 대기보다 먼저 검사한다. 원인 매핑 회귀는 기존 code의 기본 round-trip assertion을 유지하면서 새 local code에 기본 project 판정·명시적 plan 선택을 함께 검사한다.
 - [x] 해당 delta의 `tests.test_origin_isolation.OriginIsolationScopeTest.test_saved_scope_block_reopens_only_for_exact_runtime_delta`(mixed 두 조건), `tests.test_recovery_runtime.RecoveryPolicyTests.test_every_legacy_block_reason_keeps_its_cause_and_scope`, `tests.test_runtime_state.RuntimeStateRepositoryTest.test_expected_status_mismatch_rejects_second_activation`을 각각 targeted runner로 실행해 통과했다. `ReservedWorkspaceRecoveryTests.test_shrunk_gate_selects_only_independent_ready_and_keeps_resource_owner`와 `test_local_residual_narrows_gate_and_restarts_from_saved_phase`도 통과했다. Manager 전체 verify의 실패 기록은 보존하며 전체 verify 성공으로 대체하지 않는다. 전체 verify 재실행·Review는 Manager에 인계한다.
+
+- [x] 2026-10-27 직접 핫픽스: 소유권 확정 작업의 해제에도 기존 writer 종료·자원 lease를 적용하고, 남은 Manager rebase는 기존 현재 상태 판정으로 검증하되 수용·완료하지 않는다. 원래 작업·checkpoint·독립 질문을 보존하며 checkpoint·독립 계획 차단·복구 기록·연결 요청의 경쟁을 짧은 확정 처리에서 거부한다. 관련 4개 모듈의 unit 130개가 통과했다. Linux에서 `bash scripts/verify.sh` 전체 검증이 통과했다(256개 모듈, 성공 4,968개·skip 8개, compile 통과). 첫 sandbox 실행은 bootstrap 통합의 `Operation not permitted`로 중단했으며, 같은 코드를 제한 밖에서 재실행한 결과다. Windows native와 실제 운영 rebase 완료·게시 성공을 확인한 결과는 아니다.
+
+## 남은 해제 경계 점검
+
+- [ ] `_restore_checkpoint_workspace()`는 아직 미완료 operation 또는 planning 소유 상태가 있으면 실행 자원 혼선 복구를 보류한다. R-055 T38–T39에 따라 해당 작업의 checkpoint·승인된 자원 근거와 현재 operation을 결합해 복구할 수 있는 경우를 후속 확인한다. 단순 operation 삭제나 planning 결과 덮어쓰기로 통과시키지 않는다.
+- [ ] `project_block_service._reconcile_rebase_evidence_block()`·`RuntimeStateRepository.resume_rebase_block()`와 `project_blocked_recovery.project_slot_available()`의 다른 활성/대표 작업에 의한 일괄 보류는 R-091의 대상별 복구 의도와 대조가 더 필요하다. 대상 lease·공유 planning/게시 충돌과 실제 호출 종료를 확인한 독립 재평가까지 막지 않도록 하되, Git 쓰기·후보 수용·실제 재개 배정은 각각 기존 gate를 유지한다. 현재 핫픽스의 소유권 원인 해제와 이 후보 수용 경로를 같은 완료로 기록하지 않는다.
 
 ## Decision Log
 

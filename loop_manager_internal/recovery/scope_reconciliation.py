@@ -119,7 +119,11 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                     return False
             except (CallDeferred, ProcessLockBusyError, runtime_state.RuntimeStateError):
                 return False
-    if plan is None or int(plan['workspace_owned']) != WORKSPACE_RESERVED:
+    ownership_block = block is not None and block['reason_code'] in {
+        BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value,
+        BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL.value}
+    if (plan is None or int(plan['workspace_owned']) != WORKSPACE_RESERVED
+            and not (ownership_block and int(plan['workspace_owned']) == WORKSPACE_OWNED)):
         return _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo,
                                                    workspace_block=block if workspace_plan_id else None)
     try:
@@ -131,7 +135,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             result = _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo,
                                                    reservation_owner=owner,
                                                    workspace_block=block if workspace_plan_id else None)
-            if not result and workspace_plan_id is None:
+            if (not result and workspace_plan_id is None
+                    and int(plan['workspace_owned']) == WORKSPACE_RESERVED):
                 result = _narrow_workspace_project_block(effects, connection, repo_path, state_dir,
                                                         repo, block, plan, owner, expected_checkpoint, expected_project, expected_recovery, expected_request)
         if isinstance(result, ReservedPullRequestCompletion):
@@ -283,6 +288,8 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                        or block['reason_code'] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value)
     expected_request = (blocked_checkpoint_state.scope_request_row(connection, repo, block['plan_id'])
                         if ownership_cause else None)
+    expected_recovery = (recovery_state.RecoveryRepository(connection).row(repo, block['plan_id'])
+                         if ownership_cause else None)
     admission = (recovery_admission(connection, repo, block['plan_id'])
                  if workspace_block is not None and expected_plan_block is not None
                  and expected_plan_block['reason_code'] == BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL.value
@@ -295,7 +302,13 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
     def cause_matches():
         if ownership_cause:
             current_request = blocked_checkpoint_state.scope_request_row(connection, repo, block['plan_id'])
-            if (dict(current_request) if current_request else None) != (dict(expected_request) if expected_request else None):
+            current_recovery = recovery_state.RecoveryRepository(connection).row(repo, block['plan_id'])
+            current_block = scoped_blocking.plan_block(connection, repo, block['plan_id'])
+            if (execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+                    repo, str(block['plan_id'] or '')) != workspace_checkpoint
+                    or (dict(current_request) if current_request else None) != (dict(expected_request) if expected_request else None)
+                    or (dict(current_recovery) if current_recovery else None) != (dict(expected_recovery) if expected_recovery else None)
+                    or (dict(current_block) if current_block else None) != (dict(expected_plan_block) if expected_plan_block else None)):
                 return False
         if workspace_block is None:
             return scoped_blocking.project_cause_matches(connection, block)
@@ -360,15 +373,15 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                                                                   repo, block, project, plan)
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, str(block['plan_id'] or ''))
-    reservation_recovery = bool(reservation_owner is not None
+    workspace_recovery = bool(reservation_owner is not None
         and block['reason_code'] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value)
     recovery = recovery_state.RecoveryRepository(connection).row(repo, str(block['plan_id'] or ''))
-    if not reservation_recovery and (rebase_block_reconciliation.could_be_rebase_evidence_block(block, recovery, checkpoint)
+    if not workspace_recovery and (rebase_block_reconciliation.could_be_rebase_evidence_block(block, recovery, checkpoint)
             or scoped_blocking.is_scope_baseline_block(block) and checkpoint.operation == 'rebase'):
         return effects._reconcile_rebase_evidence_block(
             connection, repo_path, state_dir, repo, block, plan_block=False,
         )
-    if (not reservation_recovery and block['plan_id'] and block['reason_code'] in rebase_block_reconciliation.REBASE_BLOCK_REASONS
+    if (not workspace_recovery and block['plan_id'] and block['reason_code'] in rebase_block_reconciliation.REBASE_BLOCK_REASONS
             and checkpoint.operation == 'rebase'):
         # A pending rebase cannot borrow the generic branch-only release path
         # when its stored safety cause cannot be connected to this operation.
@@ -491,6 +504,13 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
     if (not scoped_blocking.is_scope_baseline_block(block)
             and block['reason_code'] != BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value):
         return False
+    def rebase_source(snapshot):
+        if checkpoint.operation != 'rebase':
+            return None
+        return workspace.reserved_rebase_before_head(effects._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id, worktree, branch,
+            allow_reserved=True), checkpoint, snapshot)
+
     reserved_recovered = False
     terminal_pr = None
     if (
@@ -541,12 +561,6 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                             connection, repo_path, state_dir, repo,
                             runtime_state.project_row(connection, repo), adopted_pr)
                     return False
-                def rebase_source(snapshot):
-                    if checkpoint.operation != 'rebase':
-                        return None
-                    return workspace.reserved_rebase_before_head(effects._current_rebase_service(
-                        connection, repo_path, state_dir, repo, plan_id, worktree, branch,
-                        allow_reserved=True), checkpoint, snapshot)
                 head = workspace.validate_reserved_worktree_history(
                     state_dir, repo_path, worktree, branch, plan_id, live, checked,
                     checkpoint=checkpoint, git=effects.git, base=str(project['base_branch']),
@@ -591,8 +605,10 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
             repo_path,
             worktree,
             branch,
-            **({'allow_rebase': True} if reserved_recovered and checkpoint.operation == 'rebase' else {}),
+            **({'allow_rebase': True} if ownership_cause and checkpoint.operation == 'rebase' else {}),
         )
+        if ownership_cause and checkpoint.operation == 'rebase' and not reserved_recovered:
+            rebase_source(checked)
         if reserved_recovered and (not agent_scope_decision._same_local_snapshot(checked, reservation_snapshot)
                 or effects._managed_worktree_transition_state(repo_path, worktree) != live):
             return False
@@ -608,7 +624,7 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
     except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
         return False
     confirmed = effects.capture_git_snapshot(worktree) if checked is not None else None
-    if reserved_recovered:
+    if ownership_cause and checkpoint.operation == 'rebase':
         try:
             rebase_source(confirmed)
         except (RuntimeError, OSError, ValueError):
@@ -623,6 +639,8 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
     if reserved_recovered and effects._managed_worktree_transition_state(repo_path, worktree) != live:
         return False
     with admission, runtime_state._transaction(connection):
+        if reservation_owner is not None:
+            reservation_owner.check()
         if (not cause_matches()
                 or dict(runtime_state.project_row(connection, repo)) != dict(project)
                 or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',

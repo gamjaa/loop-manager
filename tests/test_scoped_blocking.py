@@ -146,6 +146,87 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         return loop_manager.resume_project_block_if_safe(
             self.connection, Path(self.repo), Path('/state'), self.repo)
 
+    def owned_pending_rebase(self, *, detached=False):
+        from types import SimpleNamespace
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, WorktreeFile
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET workspace_owned=1,status='VERIFYING', "
+                "agent_snapshot=NULL,worker_result='implemented',verify_token='saved-token' "
+                "WHERE plan_id='G-001'")
+            self.checkpoints.record(self.repo, 'G-001', expected_generation=0, operation='rebase',
+                expected_head=self.head, target_base_oid='b' * 40, observed_remote_oid='remote',
+                snapshot={'branch': self.branch, 'worktree': str(self.worktree), 'prior': 'audit'})
+        self.snapshot = replace(self.snapshot, branch=None if detached else self.branch,
+            dirty={'app.py': (('unstaged',), 'saved-output')},
+            operations={'rebase-merge': 'owned'} if detached else {})
+        checkpoint = self.checkpoints.get(self.repo, 'G-001')
+        service = mock.Mock(expected=SimpleNamespace(generation=checkpoint.generation,
+            before_head=checkpoint.expected_head, target_base_oid=checkpoint.target_base_oid))
+        service.observe.return_value = (SimpleNamespace(head=self.snapshot.head, branch=self.snapshot.branch,
+            index=(), files=(WorktreeFile('app.py', ('unstaged',), '100644', 'saved-output'),),
+            operations=tuple(self.snapshot.operations.items())),
+            SimpleNamespace(status=RebaseStatus.WAITING if detached else RebaseStatus.START))
+        self.enterContext(mock.patch.object(loop_manager, '_current_rebase_service', return_value=service))
+        return service, checkpoint
+
+    def test_owned_rebase_start_releases_only_ownership_cause_and_keeps_pending_work(self):
+        service, checkpoint = self.owned_pending_rebase()
+        with self.connection:
+            scoped_blocking.record_plan_block(self.connection, self.repo, 'G-001',
+                BlockReasonCode.USER_DECISION_REQUIRED, 'separate question', 'question')
+        plan = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        block = dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-001'))
+        self.assertTrue(self.resume())
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()), plan)
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-001')), block)
+        self.assertEqual(self.checkpoints.get(self.repo, 'G-001'), checkpoint)
+        service.adopt.assert_not_called()
+        service.normalize_frontmatter.assert_not_called()
+        self.assertFalse(self.resume())
+
+    def test_owned_detached_rebase_is_returned_to_manager_without_completing_it(self):
+        service, checkpoint = self.owned_pending_rebase(detached=True)
+        plan = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertTrue(self.resume())
+        self.assertEqual(self.checkpoints.get(self.repo, 'G-001'), checkpoint)
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()), plan)
+        loop_manager.validate_managed_worktree.assert_called_with(
+            Path(self.repo), self.worktree, self.branch, allow_rebase=True)
+        service.adopt.assert_not_called()
+        service.normalize_frontmatter.assert_not_called()
+
+    def test_owned_rebase_release_rejects_wrong_target_and_changed_local_state(self):
+        service, checkpoint = self.owned_pending_rebase()
+        service.expected.target_base_oid = 'foreign-target'
+        self.assertFalse(self.resume())
+        service.expected.target_base_oid = checkpoint.target_base_oid
+        observed, decision = service.observe.return_value
+        # A complete observation is still needed; changed bytes cannot borrow its verdict.
+        service.observe.return_value = (type(observed)(**{**vars(observed), 'head': 'foreign'}), decision)
+        self.assertFalse(self.resume())
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(self.checkpoints.get(self.repo, 'G-001'), checkpoint)
+
+    def test_owned_workspace_release_rechecks_checkpoint_and_writer_ownership(self):
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        service, checkpoint = self.owned_pending_rebase()
+        with mock.patch('loop_manager_internal.recovery.scope_reconciliation.reserved_workspace_ownership',
+                        side_effect=CallDeferred('writer still running')):
+            self.assertFalse(self.resume())
+        def changed(_worktree):
+            current = self.checkpoints.get(self.repo, 'G-001')
+            if current == checkpoint:
+                with self.connection:
+                    self.checkpoints.record(self.repo, 'G-001', expected_generation=current.generation,
+                        operation='rebase', expected_head=current.expected_head, target_base_oid='new-target',
+                        observed_remote_oid=current.observed_remote_oid, snapshot=current.snapshot)
+            return self.snapshot
+        self.capture.side_effect = changed
+        self.assertFalse(self.resume())
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(self.checkpoints.get(self.repo, 'G-001').target_base_oid, 'new-target')
+
     def corrupt_owned_workspace(self):
         self.isolated_missing_creation()
         self.snapshot = replace(self.snapshot, dirty={'app.py': (('unstaged',), 'saved-output')})
