@@ -27,6 +27,33 @@ from tests.support.origin import OriginScopeFixture
 
 
 class SupportFixtureTests(unittest.TestCase):
+    def test_interrupted_worker_closes_database_on_initialization_failures(self):
+        from tests.support import scope
+
+        for stage in ("schema", "git", "parse", "register", "update", "success"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                database = mock.MagicMock()
+                database.__enter__.return_value = database
+                if stage == "schema":
+                    database.execute.side_effect = RuntimeError(stage)
+                elif stage == "update":
+                    database.execute.side_effect = [None, None, RuntimeError(stage)]
+                def result(name, value):
+                    return mock.Mock(side_effect=RuntimeError(name)) if stage == name else mock.Mock(return_value=value)
+                with (mock.patch.object(scope.sqlite3, "connect", return_value=database),
+                      mock.patch.object(scope, "git_command", result("git", "sha")),
+                      mock.patch.object(scope.loop_manager, "_parse_execplan", result("parse", {})),
+                      mock.patch.object(scope.loop_manager, "register_execplans", result("register", None)),
+                      mock.patch.object(scope.loop_manager, "planning_input_fingerprint", return_value="fingerprint")):
+                    call = lambda: scope.AgentScopeFixture()._persist_interrupted_worker(
+                        Path(directory) / "state", Path(directory), "plan.md", mock.Mock())
+                    if stage == "success":
+                        call()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, stage):
+                            call()
+                database.close.assert_called_once_with()
+
     def test_fixed_guidance_covers_digest_and_baseline_until_cleanup(self):
         from tests.support.fixed_samples import PROJECT_FILES, use_fixed_guidance
         from loop_manager_internal.agents import common_guidance

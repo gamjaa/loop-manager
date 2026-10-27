@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 import json
 import sqlite3
 import subprocess
@@ -738,6 +739,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(connection.execute('SELECT planning_error FROM projects').fetchone()[0], 'Planner output remained invalid')
 
 
+@isolated_git_test
 class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
     def test_progress_kinds_never_create_even_silent_outbox_rows(self):
         connection = self.connection()
