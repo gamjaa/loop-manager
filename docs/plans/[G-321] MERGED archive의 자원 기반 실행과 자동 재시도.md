@@ -10,6 +10,13 @@ sources:
   - docs/requirements/[R-074] 유지보수 1회 평가와 즉시 종료.md
 depends_on:
   - G-297
+  - G-327
+  - G-329
+  - G-331
+  - G-332
+  - G-333
+  - G-334
+  - G-335
 complexity: high
 risk: high
 priority: normal

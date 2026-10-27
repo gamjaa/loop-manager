@@ -25,6 +25,13 @@ depends_on:
   - G-295
   - G-297
   - G-309
+  - G-327
+  - G-329
+  - G-331
+  - G-332
+  - G-333
+  - G-334
+  - G-335
 complexity: medium
 risk: high
 priority: normal

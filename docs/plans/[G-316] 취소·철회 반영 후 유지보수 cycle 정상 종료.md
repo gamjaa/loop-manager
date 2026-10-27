@@ -9,6 +9,13 @@ sources:
 depends_on:
   - G-226
   - G-260
+  - G-327
+  - G-329
+  - G-331
+  - G-332
+  - G-333
+  - G-334
+  - G-335
 complexity: medium
 risk: medium
 priority: high

@@ -11,6 +11,13 @@ sources:
   - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
 depends_on:
   - G-236
+  - G-327
+  - G-329
+  - G-331
+  - G-332
+  - G-333
+  - G-334
+  - G-335
 complexity: medium
 risk: high
 priority: high
