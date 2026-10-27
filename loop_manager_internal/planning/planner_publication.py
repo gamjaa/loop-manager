@@ -30,6 +30,43 @@ class RegisterExecplanRowsEffects:
     git_bytes: Callable[..., object]
 
 
+@dataclass(frozen=True)
+class PreparedExecplanRows:
+    """Invocation-local publication inputs; applying them performs no observation."""
+    worktree: Path
+    plan_commit: str
+    plans_json: str
+    hashes: tuple[tuple[str, str, str], ...]
+    draft_inputs: tuple[tuple[str, str], ...]
+    remote_url: str | None
+
+
+def _prepare_execplan_rows(
+    effects: RegisterExecplanRowsEffects, worktree: Path,
+    plans: list[tuple[str, dict[str, object]]], plan_commit: str,
+) -> PreparedExecplanRows:
+    plans_json = json.dumps(plans, ensure_ascii=False, sort_keys=True)
+    remote_url = None
+    if any(plan.get("draft") for _path, plan in plans):
+        from loop_manager_internal.notifications.rendering import _checkpoint_link
+        origin = effects.git(worktree, "remote", "get-url", "origin").stdout.strip()
+        link = _checkpoint_link(origin, plan_commit)
+        remote_url = link.split("/tree/", 1)[0] if link else None
+    hashes = tuple(
+        (path, effects.file_hash(worktree / path), hashlib.sha256(
+            effects.git_bytes(worktree, "show", f"{plan_commit}:{path}")
+        ).hexdigest()) for path, _plan in plans
+    )
+    draft_inputs = tuple(
+        (path, json.dumps(execplan_drafts.input_digests(worktree, plan),
+                          ensure_ascii=False, sort_keys=True))
+        for path, plan in plans if plan.get("draft")
+    )
+    return PreparedExecplanRows(
+        worktree, plan_commit, plans_json, hashes, draft_inputs, remote_url,
+    )
+
+
 def _register_execplan_rows(
     effects: RegisterExecplanRowsEffects, connection: sqlite3.Connection,
     repo: str,
@@ -37,34 +74,38 @@ def _register_execplan_rows(
     plans: list[tuple[str, dict[str, object]]],
     plan_commit: str,
     *, allow_legacy_priority: bool = False,
+    prepared: PreparedExecplanRows | None = None,
 ) -> None:
     """Apply the new-row part shared by normal and maintenance batches."""
 
+    # Direct catalog callers retain their facade; batch owners prepare before
+    # entering their transaction and pass the same value on a DB-only retry.
+    if prepared is None:
+        prepared = _prepare_execplan_rows(effects, worktree, plans, plan_commit)
+    if (prepared.worktree != worktree or prepared.plan_commit != plan_commit
+            or prepared.plans_json != json.dumps(plans, ensure_ascii=False, sort_keys=True)):
+        raise PlannerValidationError("준비한 ExecPlan 등록 입력이 게시 batch와 다릅니다.")
     effects._ensure_execplans_schema(connection)
-    remote_url = None
-    if any(plan.get("draft") for _path, plan in plans):
-        from loop_manager_internal.notifications.rendering import _checkpoint_link
-        origin = effects.git(worktree, "remote", "get-url", "origin").stdout.strip()
-        link = _checkpoint_link(origin, plan_commit)
-        remote_url = link.split("/tree/", 1)[0] if link else None
-    for path, plan in plans:
+    hashes = {path: (content, publication) for path, content, publication in prepared.hashes}
+    draft_inputs = dict(prepared.draft_inputs)
+    for path, plan in json.loads(prepared.plans_json):
+        content_hash, publication_hash = hashes[path]
         execplan_catalog_state.register_published_plan_row(
-            connection, repo, path, plan, effects.file_hash(worktree / path), plan_commit,
-            publication_content_hash=hashlib.sha256(
-                effects.git_bytes(worktree, "show", f"{plan_commit}:{path}")
-            ).hexdigest(),
+            connection, repo, path, plan, content_hash, plan_commit,
+            publication_content_hash=publication_hash,
             allow_legacy_priority=allow_legacy_priority,
         )
         if plan.get("draft"):
             execplan_draft_state.observe(connection, repo, path, plan,
-                effects.file_hash(worktree / path), plan_commit, inputs=execplan_drafts.input_digests(worktree, plan),
-                remote_url=remote_url, agent=True)
+                content_hash, plan_commit, inputs=json.loads(draft_inputs[path]),
+                remote_url=prepared.remote_url, agent=True)
 
 
 @dataclass(frozen=True)
 class RegisterExecplansEffects:
     """Named effects for register_execplans; no entry-point/module access."""
     _register_execplan_rows: Callable[..., object]
+    _prepare_execplan_rows: Callable[..., PreparedExecplanRows]
 
 
 def register_execplans(
@@ -77,8 +118,10 @@ def register_execplans(
 ) -> None:
     """Register one published Planner batch atomically and idempotently."""
 
+    prepared = effects._prepare_execplan_rows(worktree, plans, plan_commit)
     with connection:
-        effects._register_execplan_rows(connection, repo, worktree, plans, plan_commit)
+        effects._register_execplan_rows(connection, repo, worktree, plans, plan_commit,
+                                       prepared=prepared)
         runtime_state.RuntimeStateRepository(connection).clear(
             repo,
             processed_sha=plan_commit,
@@ -575,6 +618,7 @@ class ApplyGeneralPlanningBatchEffects:
     general_planning_publication: Callable[..., object]
     is_loop_manager_repository: Callable[..., object]
     plan_declarations: Callable[..., object]
+    _prepare_execplan_rows: Callable[..., PreparedExecplanRows]
 
 
 def _apply_general_planning_batch(
@@ -590,6 +634,7 @@ def _apply_general_planning_batch(
     snapshot = result.mutable_snapshot
     if snapshot is None or snapshot.repo != repo:
         raise PlannerValidationError("general planning snapshot 대상이 다릅니다.")
+    prepared_rows = effects._prepare_execplan_rows(worktree, list(result.plans), plan_commit)
     with runtime_state._transaction(connection):
         intent = effects.general_planning_publication(connection, repo)
         if intent is None:
@@ -635,10 +680,12 @@ def _apply_general_planning_batch(
             effects._register_execplan_rows(
                 connection, repo, worktree, list(result.plans), plan_commit,
                 allow_legacy_priority=True,
+                prepared=prepared_rows,
             )
         else:
             effects._register_execplan_rows(
                 connection, repo, worktree, list(result.plans), plan_commit,
+                prepared=prepared_rows,
             )
         from loop_manager_internal.notifications import notifications
         notifications.record_planning_publication(connection, repo, result.plans, plan_commit)

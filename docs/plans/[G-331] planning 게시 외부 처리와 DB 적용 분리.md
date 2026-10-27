@@ -44,6 +44,10 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 4는 `pl
 
 - [x] 저장된 발견·관련 게시 계획과 R-082/R-091 계약을 대조해 ledger 선행과 나머지 batch 경계를 확정했다. 구현·테스트·verify는 실행하지 않았다.
 - [ ] 외부 처리/DB 적용 분리와 중단·경쟁 회귀 검증
+- [x] 공유 신규 row 등록의 호출 내 준비 값과 DB 적용 경계를 구현했다. `_prepare_execplan_rows`는 경로·선언·게시 commit, 로컬 내용 hash·게시 blob hash, draft 입력 지문과 원격 링크를 불변 값으로 준비한다. 일반·유지보수 batch와 `register_execplans`는 자체 transaction 전에 준비하고 `_register_execplan_rows`에 전달한다. 직접 catalog 호출의 기존 facade는 유지한다.
+- 등록 준비와 적용 사이 worktree·commit·선언 identity가 달라지면 쓰기 전에 거부한다. 혼합 draft/일반 등록의 두 번째 row에서 중단을 주입해 첫 row와 draft의 원자 rollback을 확인하고, 같은 준비 값을 재사용한 적용·재적용에서 파일·Git·draft 원문 관측을 금지했다. 개별 targeted runner로 이 두 case와 일반 게시 5 case, Requirement 이동 영수증 1 case, 유지보수 게시 2 case, tiered 원자 게시 1 case를 확인했다. 전체 verify는 실행하지 않았다.
+- 일반 legacy intent 복구 fixture에 transaction 경계 assertion을 추가한 실행은 fixture의 미종료 transaction 때문에 1회 FAIL이었다. intent 저장 뒤 fixture가 commit하도록 교정한 동일 개별 명령 재실행은 PASS였다. 이 결과는 상위 서비스 transaction의 해소를 뜻하지 않는다.
+- 남은 작업은 서비스의 상위 transaction 제거와 소유 worktree 정리 전후 복구, snapshot의 PR 관측/DB CAS 분리, 개정·문서 draft·선언/성공 지문·멱등 판정의 외부 관측 준비, publication intent/cycle/catalog identity 경쟁 검증, ARCHITECTURE 반영이다. 현재 서비스의 상위 transaction은 여전히 준비 호출을 감싸므로 이 보존점만으로 외부 처리 중 독립 DB 접근을 보장하지 않는다. 게시·정리 실패 시 보존 계약과 기존 전체 Acceptance Criteria를 그대로 유지하며 완료 후보로 선언하지 않는다.
 
 ## Decision Log
 

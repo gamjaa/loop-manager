@@ -575,6 +575,7 @@ class ApplyMaintenancePlanningBatchEffects:
     _planning_input_fingerprint: Callable[..., object]
     plan_declarations: Callable[..., object]
     _register_execplan_rows: Callable[..., object]
+    _prepare_execplan_rows: Callable[..., object]
     _specification_input_fingerprint: Callable[..., object]
     file_hash: Callable[..., object]
     is_loop_manager_repository: Callable[..., object]
@@ -598,6 +599,7 @@ def _apply_maintenance_planning_batch(
             "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
         )
     repository = maintenance_state.MaintenanceRepository(connection)
+    prepared_rows = effects._prepare_execplan_rows(worktree, list(result.plans), plan_commit)
     already_applied = effects._maintenance_publication_already_applied(
         connection, repo, worktree, result, plan_commit,
     )
@@ -628,10 +630,12 @@ def _apply_maintenance_planning_batch(
             effects._register_execplan_rows(
                 connection, repo, worktree, list(result.plans), plan_commit,
                 allow_legacy_priority=True,
+                prepared=prepared_rows,
             )
         else:
             effects._register_execplan_rows(
-                connection, repo, worktree, list(result.plans), plan_commit
+                connection, repo, worktree, list(result.plans), plan_commit,
+                prepared=prepared_rows,
             )
         from loop_manager_internal.notifications import notifications
         notifications.record_planning_publication(connection, repo, result.plans, plan_commit)

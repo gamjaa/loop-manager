@@ -86,10 +86,14 @@ class PlanningPublicationTest(PlanningCase):
                 git=mock.Mock(),
                 git_bytes=mock.Mock(return_value=text.encode("utf-8")),
             )
+            def prepare_rows(*args):
+                self.assertFalse(connection.in_transaction)
+                return planner_publication._prepare_execplan_rows(row_effects, *args)
             effects = planner_publication.RegisterExecplansEffects(
-                _register_execplan_rows=lambda db, target_repo, root, plans, commit:
+                _prepare_execplan_rows=prepare_rows,
+                _register_execplan_rows=lambda db, target_repo, root, plans, commit, **kwargs:
                     planner_publication._register_execplan_rows(
-                        row_effects, db, target_repo, root, plans, commit,
+                        row_effects, db, target_repo, root, plans, commit, **kwargs,
                     ),
             )
             planner_publication.register_execplans(
@@ -174,6 +178,7 @@ class PlanningPublicationTest(PlanningCase):
             manifest, hashlib.sha256(manifest.encode("utf-8")).hexdigest(),
         )
         planning_publication_state.record_general_planning_publication(connection, publication)
+        connection.commit()
 
         worktree = Path("/published")
         row_effects = planner_publication.RegisterExecplanRowsEffects(
@@ -182,7 +187,11 @@ class PlanningPublicationTest(PlanningCase):
             git=mock.Mock(),
             git_bytes=lambda *_args: text.encode("utf-8"),
         )
+        def prepare_rows(*args):
+            self.assertFalse(connection.in_transaction)
+            return planner_publication._prepare_execplan_rows(row_effects, *args)
         apply_effects = planner_publication.ApplyGeneralPlanningBatchEffects(
+            _prepare_execplan_rows=prepare_rows,
             _assert_mutable_ready_snapshot_current=mock.Mock(),
             _clear_active_in_current_transaction=mock.Mock(),
             _general_planning_batch_already_applied=mock.Mock(return_value=False),
@@ -295,7 +304,7 @@ class PlanningPublicationTest(PlanningCase):
         clear = mock.Mock()
         effects = planner_publication.ApplyGeneralPlanningBatchEffects(
             mock.Mock(), clear, mock.Mock(return_value=False), mock.Mock(), mock.Mock(),
-            mock.Mock(return_value=intent), mock.Mock(return_value=False), mock.Mock())
+            mock.Mock(return_value=intent), mock.Mock(return_value=False), mock.Mock(), mock.Mock())
         with mock.patch.object(planner_publication.planning_publication_state, 'apply_mutable_catalog_changes'), \
              mock.patch('loop_manager_internal.catalog.remote_deletions.resolve_recovery'):
             planner_publication._apply_general_planning_batch(effects, connection, '/repo',
@@ -349,7 +358,7 @@ class PlanningPublicationTest(PlanningCase):
                         raise RuntimeError('clear interrupted')
                 effects = planner_publication.ApplyGeneralPlanningBatchEffects(
                     mock.Mock(), clear, mock.Mock(return_value=False), mock.Mock(), mock.Mock(),
-                    mock.Mock(return_value=intent), mock.Mock(return_value=False), mock.Mock(return_value=entries))
+                    mock.Mock(return_value=intent), mock.Mock(return_value=False), mock.Mock(return_value=entries), mock.Mock())
                 with mock.patch.object(planner_publication.planning_publication_state, 'apply_mutable_catalog_changes'), \
                      mock.patch('loop_manager_internal.catalog.remote_deletions.resolve_recovery'), \
                      mock.patch.object(common_guidance, 'planning_content_hash', return_value='pinned-guidance'), \
@@ -433,7 +442,7 @@ class PlanningPublicationTest(PlanningCase):
             snapshot_token='token', specification_fingerprint='spec', planning_fingerprint='input')
         apply = planner_publication.ApplyGeneralPlanningBatchEffects(
             mock.Mock(), mock.Mock(), mock.Mock(return_value=False), mock.Mock(), mock.Mock(),
-            mock.Mock(return_value=intent), mock.Mock(return_value=False), mock.Mock(return_value={}))
+            mock.Mock(return_value=intent), mock.Mock(return_value=False), mock.Mock(return_value={}), mock.Mock())
         recovery = planner_publication.RecoverGeneralPlanningBatchEffects(
             _apply_general_planning_batch=lambda *args, **kwargs: planner_publication._apply_general_planning_batch(apply, *args, **kwargs),
             _assert_remote_preserves_maintenance_batch=mock.Mock(), _clear_active_in_current_transaction=mock.Mock(),

@@ -122,6 +122,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_apply_maintenance_planning_batch', maintenance_publication._apply_maintenance_planning_batch,
         lambda: maintenance_publication.ApplyMaintenancePlanningBatchEffects(
+            _prepare_execplan_rows=assembly.callback('_prepare_execplan_rows'),
             _assert_maintenance_context_current=assembly.callback('_assert_maintenance_context_current'),
             _assert_maintenance_publication_intent=assembly.callback('_assert_maintenance_publication_intent'),
             _clear_active_in_current_transaction=assembly.callback('_clear_active_in_current_transaction'),

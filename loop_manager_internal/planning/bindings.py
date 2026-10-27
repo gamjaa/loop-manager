@@ -161,6 +161,15 @@ def register(assembly: Composition) -> None:
         ),
     )
 
+    assembly.bind('_prepare_execplan_rows', planner_publication._prepare_execplan_rows,
+        lambda: planner_publication.RegisterExecplanRowsEffects(
+            _ensure_execplans_schema=assembly.callback('_ensure_execplans_schema'),
+            file_hash=assembly.callback('file_hash'),
+            git_bytes=assembly.callback('git_bytes'),
+            git=assembly.callback('git'),
+        ),
+    )
+
     assembly.bind('_register_execplan_rows', planner_publication._register_execplan_rows,
         lambda: planner_publication.RegisterExecplanRowsEffects(
             _ensure_execplans_schema=assembly.callback('_ensure_execplans_schema'),
@@ -171,7 +180,9 @@ def register(assembly: Composition) -> None:
     )
 
     assembly.bind('register_execplans', planner_publication.register_execplans,
-        lambda: planner_publication.RegisterExecplansEffects(_register_execplan_rows=assembly.callback('_register_execplan_rows')),
+        lambda: planner_publication.RegisterExecplansEffects(
+            _register_execplan_rows=assembly.callback('_register_execplan_rows'),
+            _prepare_execplan_rows=assembly.callback('_prepare_execplan_rows')),
     )
 
     assembly.bind('_planning_result_manifest', planner_publication._planning_result_manifest,
@@ -212,6 +223,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_apply_general_planning_batch', planner_publication._apply_general_planning_batch,
         lambda: planner_publication.ApplyGeneralPlanningBatchEffects(
+            _prepare_execplan_rows=assembly.callback('_prepare_execplan_rows'),
             _assert_mutable_ready_snapshot_current=assembly.callback('_assert_mutable_ready_snapshot_current'),
             _clear_active_in_current_transaction=assembly.callback('_clear_active_in_current_transaction'),
             _general_planning_batch_already_applied=assembly.callback('_general_planning_batch_already_applied'),
