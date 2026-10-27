@@ -98,8 +98,13 @@ class _PlanningStatePorts:
                 if (revision != intent.commit_sha or project['active_sha'] != intent.base_sha
                         or not (requirement_applied or general_applied)):
                     raise runtime_state.RuntimeStateError('planning 정리와 publication intent가 다릅니다.')
-            elif revision not in {project['active_sha'], cycle.publication_remote_oid, cycle.last_cycle_commit}:
+            elif revision not in {project['active_sha'], cycle.publication_remote_oid, cycle.last_cycle_commit,
+                                  cycle.publication_commit_sha if cycle.publication_stage == 'prepared' else None}:
                 raise runtime_state.RuntimeStateError('planning 정리의 적용된 게시 근거가 없습니다.')
+            if (intent is None and cycle.publication_stage == 'prepared'
+                    and revision == cycle.publication_commit_sha
+                    and project['active_sha'] != cycle.publication_base_sha):
+                raise runtime_state.RuntimeStateError('재평가 정리와 publication 원본 기준이 다릅니다.')
             catalog = execplan_catalog_state.DefinitionStateRepository(self._connection).capture(repo)
             tables = {row[0] for row in self._connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'",
@@ -108,16 +113,24 @@ class _PlanningStatePorts:
                 f"SELECT * FROM {table} WHERE repo=? ORDER BY rowid", (repo,),
             ).fetchall())) for table in ('manual_work_groups', 'manual_work_members') if table in tables)
             return PlanningPublicationRelease(repo, Path(str(project['worktree'])), str(project['active_sha']),
-                revision, str(project['planning_attempt_fingerprint']), (tuple(project), cycle, intent, catalog, manual))
+                revision, str(project['planning_attempt_fingerprint']), (tuple(project), cycle, intent, catalog, manual),
+                restart=(intent is None and cycle.publication_stage == 'prepared'
+                         and revision == cycle.publication_commit_sha))
 
     def validate_publication_release(self, release: PlanningPublicationRelease) -> None:
         if (self.pending_publication_release(release.repo) != release
                 or self.planning_release_pending(release.repo)):
             raise runtime_state.RuntimeStateError('게시 후 planning 정리의 소유권·catalog·호출 상태가 변경됐습니다.')
 
-    def complete_publication_release(self, release: PlanningPublicationRelease) -> None:
+    def complete_publication_release(self, release: PlanningPublicationRelease, *, restart_revision: str | None = None) -> None:
         def apply(_connection):
             self.validate_publication_release(release)
+            if release.restart:
+                if not restart_revision:
+                    raise runtime_state.RuntimeStateError('재평가 정리의 원격 기준이 없습니다.')
+                self._maintenance_repository.restart_prepared_batch(
+                    release.repo, expected=release.identity[1], new_base_sha=restart_revision,
+                )
             self.clear_active_in_transaction(release.repo)
             planning_publication_state.delete_general_planning_publication(self._connection, release.repo)
         run_database_request(self._connection, apply)
@@ -560,7 +573,7 @@ class _PlanningStatePorts:
         self, repo: str, worktree: Path, base: str
     ) -> maintenance_state.MaintenanceCycle:
         return self._effects.recover_maintenance_planning_batch(
-            self._connection, repo, worktree, base
+            self._connection, repo, worktree, base, retain_planning=True
         )
 
     def record_maintenance_intent(
@@ -624,7 +637,7 @@ class _PlanningStatePorts:
         self, repo: str, worktree: Path, base: str
     ) -> str:
         return self._effects.recover_general_planning_batch(
-            self._connection, repo, worktree, base
+            self._connection, repo, worktree, base, retain_planning=True
         )
 
     def record_general_intent(

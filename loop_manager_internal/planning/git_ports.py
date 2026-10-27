@@ -87,12 +87,13 @@ class _PlanningGitPorts:
 
     def confirm_publication_release(
         self, repository: Path, base: str, base_revision: str, revision: str,
-    ) -> None:
+    ) -> str:
         self.fetch_base(repository, base)
         remote = self._effects.git(repository, 'rev-parse', '--verify',
                                    f'refs/remotes/origin/{base}^{{commit}}').stdout.strip()
         if remote != revision:
             self._effects._assert_remote_preserves_maintenance_batch(repository, base_revision, revision, remote)
+        return remote
 
     def validate_publication_release(self, repo: str, worktree: Path, revision: str) -> None:
         self.validate_planning_release(repo, worktree, allow_missing=True)

@@ -52,7 +52,7 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         git(self.repo, 'fetch', 'origin')
         state = loop_manager._PlanningStatePorts(self.connection, runtime_state.RuntimeStateRepository(self.connection),
             maintenance_state.MaintenanceRepository(self.connection), self.repo / 'state')
-        cycle = state.publish_maintenance_batch(str(self.repo), self.repo, 'main', result, commit)
+        cycle = state.recover_maintenance_batch(str(self.repo), self.repo, 'main')
         release = state.pending_publication_release(str(self.repo))
         self.assertIsNotNone(release)
         self.assertEqual(release.revision, commit)
@@ -65,6 +65,9 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         self.assertEqual(state.maintenance_cycle(str(self.repo)), cycle)
 
     def test_batch_observes_git_files_and_success_fingerprints_before_transaction(self):
+        from loop_manager_internal.maintenance import maintenance_publication as publication
+        from loop_manager_internal.storage.db_access import run_database_request
+        from loop_manager_internal.storage.runtime_state import _transaction
         from loop_manager_internal.agents import common_guidance
         from loop_manager_internal.catalog import execplan_drafts
         context = self._begin_barrier()
@@ -75,12 +78,29 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         git(self.repo, 'add', 'docs/plans')
         git(self.repo, 'commit', '-m', 'Prepare publication boundary fixture')
         commit = git(self.repo, 'rev-parse', 'HEAD')
+        applying = False
+        requests = []
+        def replay_after_rollback(connection, operation):
+            nonlocal applying
+            before = tuple(connection.iterdump())
+            applying = True
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'publication DB retry'), _transaction(connection):
+                    operation(connection)
+                    raise RuntimeError('publication DB retry')
+                self.assertEqual(tuple(connection.iterdump()), before)
+                requests.append(operation)
+                return run_database_request(connection, operation)
+            finally:
+                applying = False
         def outside_transaction(function):
             def observe(*args, **kwargs):
+                self.assertFalse(applying, "DB 재시도는 외부 관측을 반복하면 안 됩니다.")
                 self.assertFalse(self.connection.in_transaction)
                 return function(*args, **kwargs)
             return observe
         with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(publication, "run_database_request", side_effect=replay_after_rollback))
             for name in ('git', 'git_bytes', 'file_hash', 'plan_declarations', 'is_loop_manager_repository',
                          '_planning_input_fingerprint', '_specification_input_fingerprint'):
                 stack.enter_context(mock.patch.object(loop_manager, name,
@@ -100,6 +120,41 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         self.assertEqual(first, second)
         self.assertEqual(first.publication_stage, 'remote_confirmed')
         self.assertEqual(self.connection.execute('SELECT processed_sha FROM projects').fetchone()[0], commit)
+        self.assertEqual(len(requests), 3)
+
+    def test_maintenance_db_retry_rejects_cycle_change_without_repeating_preparation(self):
+        from loop_manager_internal.maintenance import maintenance_publication
+        from loop_manager_internal.storage.runtime_state import _transaction
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, 'add', 'docs/plans')
+        git(self.repo, 'commit', '-m', 'Prepare DB retry CAS fixture')
+        commit = git(self.repo, 'rev-parse', 'HEAD')
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), self.repo, 'main', result, commit)
+        before = tuple(self.connection.iterdump())
+        def replay_with_cycle_race(connection, operation):
+            with self.assertRaisesRegex(RuntimeError, 'DB retry'), _transaction(connection):
+                operation(connection)
+                raise RuntimeError('DB retry')
+            self.assertEqual(tuple(connection.iterdump()), before)
+            with _transaction(connection):
+                connection.execute('UPDATE maintenance_cycles SET revision=revision+1')
+            with _transaction(connection):
+                return operation(connection)
+        with mock.patch.object(maintenance_publication, 'run_database_request', side_effect=replay_with_cycle_race), \
+                mock.patch.object(loop_manager, '_prepare_execplan_rows', wraps=loop_manager._prepare_execplan_rows) as prepare, \
+                self.assertRaisesRegex(loop_manager.MaintenancePlanningError, '게시 준비 이후'):
+            loop_manager._apply_maintenance_planning_batch(
+                self.connection, str(self.repo), self.repo, 'main', result, commit)
+        prepare.assert_called_once()
+        cycle = maintenance_state.MaintenanceRepository(self.connection).get(str(self.repo))
+        self.assertEqual(cycle.revision, intent.revision + 1)
+        self.assertEqual(cycle.publication_commit_sha, intent.publication_commit_sha)
+        self.assertEqual(cycle.publication_stage, 'prepared')
+        self.assertEqual([row[0] for row in self.connection.execute(
+            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-000', 'G-001'])
 
     def test_batch_rejects_cycle_owner_and_catalog_races_during_observation(self):
         from loop_manager_internal.maintenance import maintenance_publication
@@ -663,6 +718,10 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
 
     def test_published_batch_recovers_after_remote_tip_advances(self):
         context = self._begin_barrier()
+        with maintenance_state._transaction(self.connection):
+            self.connection.execute("UPDATE projects SET phase='PLANNING', active_sha=?, worktree=?, "
+                "planning_workspace_owned=1, planning_attempt_fingerprint='attempt'",
+                (self.base_sha, str(self.repo)))
         self._write_barrier_batch()
         result = self._validate_barrier(context)
         git(self.repo, "add", "docs/plans")
@@ -680,7 +739,7 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         git(self.repo, "fetch", "origin")
 
         recovered = loop_manager.recover_maintenance_planning_batch(
-            self.connection, str(self.repo), self.repo, "main"
+            self.connection, str(self.repo), self.repo, "main", retain_planning=True,
         )
         repeated = loop_manager.recover_maintenance_planning_batch(
             self.connection, str(self.repo), self.repo, "main"
@@ -701,6 +760,8 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
             ["G-000", "G-001", "G-002", "G-003"],
         )
         self.assertNotEqual(recovered, intent)
+        self.assertEqual(tuple(self.connection.execute(
+            'SELECT phase, publication_remote_oid FROM projects').fetchone()), ('PLANNING', plan_commit))
 
     def test_legacy_pushed_intent_recovers_after_restart_without_claiming_root_review(self):
         plan_commit, _intent, inventory = self._prepare_pushed_file_assessment_batch(legacy=True)

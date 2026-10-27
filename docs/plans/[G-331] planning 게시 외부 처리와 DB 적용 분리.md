@@ -27,11 +27,11 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 4는 `pl
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/planning/publication_service.py`의 복구 요청 읽기, DB 밖 복구·정리, 결과 확정을 나눈다. `planning/state_ports.py`·`git_ports.py` 및 기존 effects/repository를 재사용하며, transaction만 외곽으로 옮기고 helper 내부에서 다시 잡는 우회가 없게 한다.
-- [ ] 확인한 `planning/planner_publication.py`·`storage/planning_publication_state.py`의 snapshot 검증·`_register_execplan_rows`에서 PR/Git blob 관측을 DB 밖의 준비 단계로 모은다. 검증한 경로·원문·hash/mode·공식 선언·게시 revision을 불변 입력으로 넘기고 실제 등록·mutable CAS·관계/감사 반영은 기존 원자 transaction 안에 둔다. 조회 실패·누락 입력·identity 충돌은 현재 거부를 유지한다.
-- [ ] 확인한 `loop_manager_internal/maintenance/maintenance_publication.py`의 같은 등록 경계를 재사용한다. G-330의 ledger prepare/apply와 tiered promote의 외부 원본 관측을 batch 밖에서 준비하고, 확정에는 검증한 근거와 현재 DB 입력만 전달한다. root plan link·barrier 최종 본문 hash·게시 blob 대조와 성공 기준 확정 순서를 보존한다.
-- [ ] 확인한 `tests/test_planning_publication.py`·`tests/test_maintenance_publication.py`·`tests/test_tiered_publication.py`의 rollback·재적용·push 후 중단 fixture를 재사용한다. 새 범용 transaction runner·publication 엔진·전역 공유 관측 cache는 추가하지 않는다.
-- [ ] 구현한 관측/적용·정리 복구 책임을 ARCHITECTURE의 계획 게시·단계별 반영 절에 통합한다. 실패 planning 자리/독립 선택은 G-278, 실패 원인 소비는 G-189에 남긴다.
+- [x] 확인한 `loop_manager_internal/planning/publication_service.py`의 복구 요청 읽기, DB 밖 복구·정리, 결과 확정을 나눈다. `planning/state_ports.py`·`git_ports.py` 및 기존 effects/repository를 재사용하며, transaction만 외곽으로 옮기고 helper 내부에서 다시 잡는 우회가 없게 한다.
+- [x] 확인한 `planning/planner_publication.py`·`storage/planning_publication_state.py`의 snapshot 검증·`_register_execplan_rows`에서 PR/Git blob 관측을 DB 밖의 준비 단계로 모은다. 검증한 경로·원문·hash/mode·공식 선언·게시 revision을 불변 입력으로 넘기고 실제 등록·mutable CAS·관계/감사 반영은 기존 원자 transaction 안에 둔다. 조회 실패·누락 입력·identity 충돌은 현재 거부를 유지한다.
+- [x] 확인한 `loop_manager_internal/maintenance/maintenance_publication.py`의 같은 등록 경계를 재사용한다. G-330의 ledger prepare/apply와 tiered promote의 외부 원본 관측을 batch 밖에서 준비하고, 확정에는 검증한 근거와 현재 DB 입력만 전달한다. root plan link·barrier 최종 본문 hash·게시 blob 대조와 성공 기준 확정 순서를 보존한다.
+- [x] 확인한 `tests/test_planning_publication.py`·`tests/test_maintenance_publication.py`·`tests/test_tiered_publication.py`의 rollback·재적용·push 후 중단 fixture를 재사용한다. 새 범용 transaction runner·publication 엔진·전역 공유 관측 cache는 추가하지 않는다.
+- [x] 구현한 관측/적용·정리 복구 책임을 ARCHITECTURE의 계획 게시·단계별 반영 절에 통합한다. 실패 planning 자리/독립 선택은 G-278, 실패 원인 소비는 G-189에 남긴다.
 
 ## Validation
 
@@ -43,7 +43,7 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 4는 `pl
 ## Progress
 
 - [x] 저장된 발견·관련 게시 계획과 R-082/R-091 계약을 대조해 ledger 선행과 나머지 batch 경계를 확정했다.
-- [ ] 외부 처리/DB 적용 분리와 중단·경쟁 회귀 검증
+- [x] 외부 처리/DB 적용 분리와 중단·경쟁 회귀 검증
 - [x] 공유 신규 row 등록의 호출 내 준비 값과 DB 적용 경계를 구현했다. `_prepare_execplan_rows`는 경로·선언·게시 commit, 로컬 내용 hash·게시 blob hash, draft 입력 지문과 원격 링크를 불변 값으로 준비한다. 일반·유지보수 batch와 `register_execplans`는 자체 transaction 전에 준비하고 `_register_execplan_rows`에 전달한다. 직접 catalog 호출의 기존 facade는 유지한다.
 - 등록 준비와 적용 사이 worktree·commit·선언 identity가 달라지면 쓰기 전에 거부한다. 혼합 draft/일반 등록의 두 번째 row에서 중단을 주입해 첫 row와 draft의 원자 rollback을 확인하고, 같은 준비 값을 재사용한 적용·재적용에서 파일·Git·draft 원문 관측을 금지했다. 개별 targeted runner로 이 두 case와 일반 게시 5 case, Requirement 이동 영수증 1 case, 유지보수 게시 2 case, tiered 원자 게시 1 case를 확인했다. 전체 verify는 실행하지 않았다.
 - 일반 legacy intent 복구 fixture에 transaction 경계 assertion을 추가한 실행은 fixture의 미종료 transaction 때문에 1회 FAIL이었다. intent 저장 뒤 fixture가 commit하도록 교정한 동일 개별 명령 재실행은 PASS였다. 이 결과는 상위 서비스 transaction의 해소를 뜻하지 않는다.
@@ -59,7 +59,12 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 4는 `pl
 - 정리 실패 테스트는 원격에서 검증한 DB 적용을 rollback하는 기대 대신 적용 완료·planning 소유권 유지·해제 대기와 결과/session/진단 보존을 검사하도록 갱신했다. prerequisite scope도 게시 적용 뒤 유지한 채 정리 대기임을 검사한다. 실행 재개는 정리와 최종 CAS 뒤에만 허용하며 기존 원자 등록/개정 rollback 검사는 유지한다.
 - 슬롯 해제 보존점에서 개별 targeted 13 case의 최종 PASS를 확인했다. 실제 coordinated SQLite에서 제거 double이 대기하는 동안 독립 연결의 쓰기가 완료됐고, 효과 진입의 transaction·공통 접근 소유가 없음을 확인했다. 제거 뒤 DB 중단·재시작과 최종 해제 rollback/재시도에서도 제거 1회·게시/Planner 재호출 0회를 확인했다. 준비 후 owner·catalog generation·수동 membership 변경은 해제를 거부하고 경쟁 데이터를 보존했다. HEAD 변경·삭제 경로의 Git 등록 잔존 거부, 일반/유지보수 적용 후 슬롯 보존과 기존 서비스 실패/재개·조립 회귀도 확인했다. 전체 verify는 실행하지 않았다.
 - 새 제거/DB 해제 중단 fixture는 초기 INSERT의 미종료 transaction에 따른 FAIL 1회를 발견했다. intent 저장을 commit한 동일 개별 명령 재실행은 PASS였다. 이후 coordinated 연결과 독립 쓰기·DB-only 재시도 검사로 확장한 동일 test도 PASS였다.
-- 남은 작업은 **초기 prepared intent 복구**의 상위 transaction 제거다. `publication_service._recover_publication`의 두 기존 recovery transaction은 아직 복구/Git 제거를 감싼다. 원격 게시된 batch 복구와 미게시/원본 변경 restart의 정리·DB 확정 및 중단 복구를 이 경계로 연결해야 한다. catalog batch/intent 확정과 변경 없음 완료의 DB-only 재시도, 준비 값 재사용·effect 비반복 검증을 마치고 ARCHITECTURE를 반영해야 한다. 현재 보존점은 전체 서비스의 외부 처리/DB 분리 완료 후보가 아니다.
+- [x] 초기 prepared intent 복구의 두 상위 transaction을 제거했다. 일반·유지보수 복구는 원격 게시된 결과를 DB에 적용한 뒤 같은 정리/해제 경계를 사용한다. 복구 관측 전 프로젝트·intent 또는 cycle·catalog·수동 소유 근거를 잡고 적용 시 다시 비교한다. 미게시 후보는 기존 소유 worktree 원격 반영 경계를 유지하며, 복구 관측 중 게시 사실이 달라지면 후보와 intent를 보존한다.
+- 게시 뒤 원본이 변경된 유지보수 재평가는 prepared cycle·기존 게시 OID·intent를 보존한 정리 대기로 처리한다. 최종 CAS가 재평가 cycle 재시작과 planning 해제를 함께 확정한다. 원본 관측 중 owner 변경은 정리 대기 저장 전에 거부하며, 최종 해제 중단은 cycle·intent·session을 rollback한다. 다음 해제에는 원본 관측·catalog 적용을 반복하지 않는다.
+- 공유 등록·일반/유지보수 intent 예약과 batch 적용·legacy restart 확정은 기존 `run_database_request`에 DB-only closure를 넘긴다. 외부 관측은 closure 전에 준비하며 첫 적용 rollback 뒤 같은 closure를 재실행해도 관측을 반복하지 않는다. 재시도 사이 owner·cycle이 바뀌면 기존 intent와 경쟁 데이터를 보존하고 적용을 거부한다. 변경 없음 완료도 선언·지침·승격 근거를 준비한 뒤 DB-only transaction으로 적용하고, 제거·해제는 분리한 경계를 사용한다.
+- 이번 호출은 개별 targeted 19 case의 최종 PASS를 확인했다. 일반/유지보수 intent·batch rollback/재시도와 owner·cycle 경쟁, 초기 복구의 상위 transaction 금지, 게시된 원본 변경 재평가와 해제 중단, 기존 coordinated DB 독립 쓰기·제거 후 재시작, 혼합 catalog·draft 등록·유지보수 원자 rollback, 변경 없음·prerequisite 범위 보존·Git 정리 검증을 포함한다. 전체 verify는 실행하지 않았으며 Manager 검증에 인계한다.
+- 재시도 fixture 2 case는 autocommit 연결에 transaction을 시작하지 않아 rollback 검사가 각각 1회 FAIL이었다. 명시적 transaction으로 고친 동일 명령 재실행은 PASS였다. 유지보수 초기 복구 case는 옵션의 잘못된 전달 위치와 중복 전달로 연속 2회 ERROR였고, 호출 분기를 교정한 동일 명령 재실행은 PASS였다. 실패·재실행 기록을 보존했다.
+- [x] ARCHITECTURE의 계획 게시·단계별 반영 절을 실제 준비/DB CAS/외부 정리/최종 해제와 중단 복구 책임에 맞게 통합했다. schema·intent/감사 JSON, ID/draft 경계와 일반/유지보수 성공 기준을 보존했다. 구현은 검증 후보이며 전체 verify와 Review는 Manager가 수행한다.
 
 ## Decision Log
 

@@ -1,5 +1,6 @@
 """planning planner publication boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage.db_access import run_database_request
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
@@ -119,7 +120,7 @@ def register_execplans(
     """Register one published Planner batch atomically and idempotently."""
 
     prepared = effects._prepare_execplan_rows(worktree, plans, plan_commit)
-    with connection:
+    def apply(connection):
         effects._register_execplan_rows(connection, repo, worktree, plans, plan_commit,
                                        prepared=prepared)
         runtime_state.RuntimeStateRepository(connection).clear(
@@ -128,6 +129,7 @@ def register_execplans(
             planning_fingerprint=planning_fingerprint,
             enqueue=False,
         )
+    return run_database_request(connection, apply)
 
 
 @dataclass(frozen=True)
@@ -488,7 +490,7 @@ def record_general_planning_publication_intent(
             raise PlannerValidationError(str(error)) from error
     manifest = effects._planning_result_manifest(result)
     manifest_hash = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
-    with runtime_state._transaction(connection):
+    def apply(connection):
         current_project = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
         if (tuple(current_project) if current_project is not None else None) != project_identity:
             raise PlannerValidationError("publication 준비 이후 프로젝트 소유 상태가 변경됐습니다.")
@@ -516,6 +518,8 @@ def record_general_planning_publication_intent(
                 specification_fingerprint, planning_fingerprint, manifest, manifest_hash,
             ),
         )
+
+    return run_database_request(connection, apply)
 
 
 @dataclass(frozen=True)
@@ -663,6 +667,7 @@ def _apply_general_planning_batch(
     specification_fingerprint: str,
     planning_fingerprint: str,
     *, allow_legacy_priority: bool = False, retain_planning: bool = False,
+    recovery_identity: tuple | None = None,
 ) -> None:
     snapshot = result.mutable_snapshot
     if snapshot is None or snapshot.repo != repo:
@@ -690,11 +695,13 @@ def _apply_general_planning_batch(
                           for path, _plan in result.plans}
         except (OSError, UnicodeError) as error:
             raise PlannerValidationError(str(error)) from error
-    with runtime_state._transaction(connection):
+    def apply(connection):
         current_project = connection.execute("SELECT * FROM projects WHERE repo=?", (repo,)).fetchone()
         if (tuple(current_project) if current_project is not None else None) != project_identity:
             raise PlannerValidationError("게시 준비 이후 프로젝트 소유 상태가 변경됐습니다.")
         intent = effects.general_planning_publication(connection, repo)
+        if recovery_identity is not None and (project_identity, intent) != recovery_identity:
+            raise PlannerValidationError("복구 관측 이후 general planning 소유권·intent가 변경됐습니다.")
         if intent != expected_intent:
             raise PlannerValidationError("게시 준비 이후 general planning publication intent가 변경됐습니다.")
         if intent is None:
@@ -803,6 +810,8 @@ def _apply_general_planning_batch(
         if not retain_planning:
             planning_publication_state.delete_general_planning_publication(connection, repo)
 
+    return run_database_request(connection, apply)
+
 
 @dataclass(frozen=True)
 class PublishGeneralPlanningBatchEffects:
@@ -864,6 +873,7 @@ def recover_general_planning_batch(
     repo: str,
     worktree: Path,
     base_branch: str,
+    *, retain_planning: bool = False,
 ) -> str:
     """Return pending, applied, or restart for one durable general intent."""
 
@@ -872,6 +882,8 @@ def recover_general_planning_batch(
         raise PlannerValidationError(
             "복구할 general planning publication intent가 없습니다."
         )
+    project = connection.execute("SELECT * FROM projects WHERE repo=?", (repo,)).fetchone()
+    recovery_identity = (tuple(project) if project is not None else None, intent)
     result = effects._planning_result_from_manifest(intent.manifest)
     if result.mutable_snapshot is None or (
         result.mutable_snapshot.token != intent.snapshot_token
@@ -905,13 +917,21 @@ def recover_general_planning_batch(
             intent.specification_fingerprint,
             intent.planning_fingerprint,
             allow_legacy_priority=True,
+            **({"retain_planning": True, "recovery_identity": recovery_identity} if retain_planning else {}),
         )
         return "applied"
     if not effects._git_commit_is_ancestor(worktree, intent.base_sha, remote):
         raise PlannerValidationError(
             "general planning publication base가 origin/base 이력에 없습니다."
         )
-    with runtime_state._transaction(connection):
+    if retain_planning:
+        raise PlannerValidationError("복구 관측 중 원격 게시 결과가 변경되어 planning intent를 보존합니다.")
+    def restart(connection):
+        project = connection.execute("SELECT * FROM projects WHERE repo=?", (repo,)).fetchone()
+        if (tuple(project) if project is not None else None,
+                effects.general_planning_publication(connection, repo)) != recovery_identity:
+            raise PlannerValidationError("재시작 준비 이후 general planning 소유권·intent가 변경됐습니다.")
         planning_publication_state.delete_general_planning_publication(connection, repo)
         effects._clear_active_in_current_transaction(connection, repo)
+    run_database_request(connection, restart)
     return "restart"

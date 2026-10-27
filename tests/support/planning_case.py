@@ -394,6 +394,8 @@ class FakeStatePort:
 
     def recover_maintenance_batch(self, repo, worktree, base):
         self.recover_calls.append((repo, worktree, base))
+        self.cycle = self.recovered_cycle
+        self.retain_planning_after_publication(repo, self.recovered_cycle.publication_remote_oid or self.recovered_cycle.publication_commit_sha)
         return self.recovered_cycle
 
     def record_maintenance_intent(self, *_args, **_kwargs):
@@ -410,7 +412,7 @@ class FakeStatePort:
 
     def recover_general_batch(self, *_args):
         if self.general_recovery_result != "pending":
-            self.clear_active("/repo")
+            self.retain_planning_after_publication("/repo", self.general_intent.commit_sha)
         return self.general_recovery_result
 
     def supersede_unpublished_general_intent(self, _repo):
@@ -526,7 +528,7 @@ class FakeGitPort:
             raise self.ownership_error
 
     def confirm_publication_release(self, _repository, _base, _base_revision, _revision):
-        pass
+        return self.remote
 
     def validate_publication_release(self, _repo, _worktree, _revision):
         pass

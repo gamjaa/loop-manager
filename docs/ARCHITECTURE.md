@@ -444,7 +444,12 @@ Planner의 표준 결과는 `FINAL_SPECIFICATION_REVIEW: <JSON object>` 하나�
 3. 검증된 전체 변경을 planning worktree의 한 commit으로 만든다.
 4. 아직 게시하지 않은 동안 원격 base가 전진하면 변경·session을 보존해 반영하고 최신 catalog·대상 권한과 관련 문서를 재검증한다. 충돌·원격 재작성·소유권 불명확은 작업을 보존해 복구 경계로 보낸다.
 5. 기준과 mutable READY snapshot이 그대로면 복구 가능한 publication intent를 저장하고 base에 fast-forward push한다.
-6. 원격 commit을 확인한 뒤 생성 row 등록·개정 cache 갱신·삭제 row 제거와 ID 취소 감사·두 성공 지문·planning 정리를 한 SQLite transaction으로 반영한다. FUTURE_IDEAS-only 변경은 실행 상태를 만들지 않는다.
+6. 원격 commit을 확인한 뒤 생성 row 등록·개정 cache 갱신·삭제 row 제거와 ID 취소 감사·해당 모드의 성공 기준을 한 SQLite transaction으로 반영한다. 기존 프로젝트의 `publication_remote_oid`에 적용 revision을 저장하고 planning 소유권·결과·session을 유지한다. 일반 publication intent도 최종 해제까지 보존한다. FUTURE_IDEAS-only 변경은 실행 상태를 만들지 않는다.
+7. DB 밖에서 원격 이력과 게시 경로 보존, 소유 worktree의 HEAD·index·Git operation을 확인하고 worktree를 정리한다. 프로젝트·cycle·intent·catalog·수동 membership과 미종료 호출을 다시 확인한 별도 DB CAS가 planning 자리를 해제한다. 적용 뒤 정리 실패는 성공 기준을 되돌리지 않으며 작업 재개는 최종 해제 뒤에만 허용한다.
+
+PR·Git blob·로컬 원문/hash·draft 입력·공식 선언·root 계획 연결과 승격 근거는 DB 적용 전에 호출 내 불변 입력으로 준비한다. DB 확정은 준비한 snapshot·branch/generation·소유권·cycle·intent와 현재 상태를 대조하고 등록·관계·감사를 원자 적용한다. 기존 DB 요청 runner의 재시도는 같은 준비 값을 사용하며 Git·Planner·worktree 제거를 실행하지 않는다. 지침 hash와 성공 지문도 준비 값으로 전달해 DB 적용 중 원본을 다시 읽지 않는다.
+
+복구는 적용 revision이 남은 정리 대기를 prepared intent보다 먼저 처리한다. 제거 뒤 DB 해제가 중단되면 소유 경로의 부재와 Git 등록 제거, 실제 원격 게시 보존을 확인하고 남은 CAS만 수행한다. 게시 후 원본 변경으로 유지보수 재평가가 필요한 경우에는 prepared cycle과 게시 OID를 함께 유지해 재시작 정리 대기를 구분한다. 정리 뒤의 CAS가 cycle 재시작과 자리 해제를 함께 확정하므로 중단 시 기존 intent·결과로 이어갈 수 있다. 아직 게시하지 않은 후보는 기존 소유 worktree의 원격 반영 경계를 따르며, 관측 중 게시 사실이 달라지면 intent와 작업물을 보존한다. SQLite schema와 publication intent·감사 JSON 형식은 유지한다.
 
 #### 정규화 기록과 작업 공간
 
@@ -520,6 +525,8 @@ Planning rebase 교정 journal은 역할 결과 검증을 통과한 계획·`FUT
 ### 단계별 원격 문서 반영
 
 Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종료 후 안전한 경계에서 최신 원본과 작업 branch를 확인한다. 필요한 프로젝트 planning·게시·DB 적용을 먼저 마치고 Worker·Reviewer가 해당 단계에 반영된 최신 작업 문서를 사용한다.
+
+planning 게시의 외부 관측·복구·worktree 정리는 공통 DB 접근 밖에서 수행하고, 준비한 결과의 현재성 검사와 원자 적용만 짧은 DB 요청으로 실행한다. [계획 게시와 작업 공간](#계획-게시와-작업-공간)의 적용·정리·해제 경계를 모두 마친 뒤 원래 실행 단계를 재개한다.
 
 | 변경·확인 결과 | 처리 주체와 다음 단계 |
 |---|---|

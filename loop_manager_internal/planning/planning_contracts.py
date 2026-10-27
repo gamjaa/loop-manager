@@ -30,6 +30,7 @@ class PlanningPublicationRelease:
     revision: str
     fingerprint: str
     identity: tuple
+    restart: bool = False
 
 
 class PlanningPhase(str, Enum):
@@ -171,7 +172,7 @@ class PlanningStatePort(Protocol):
 
     def validate_publication_release(self, release: PlanningPublicationRelease) -> None: ...
 
-    def complete_publication_release(self, release: PlanningPublicationRelease) -> None: ...
+    def complete_publication_release(self, release: PlanningPublicationRelease, *, restart_revision: str | None = None) -> None: ...
 
     def retain_planning_after_publication(self, repo: str, revision: str, **values) -> None: ...
 
@@ -425,7 +426,7 @@ class PlanningGitPort(Protocol):
 
     def confirm_publication_release(
         self, repository: Path, base: str, base_revision: str, revision: str,
-    ) -> None: ...
+    ) -> str: ...
 
     def validate_publication_release(self, repo: str, worktree: Path, revision: str) -> None: ...
 

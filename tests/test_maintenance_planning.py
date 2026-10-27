@@ -114,6 +114,9 @@ class MaintenanceSnapshotResumeTest(unittest.TestCase):
 class MaintenancePublicationTransactionTest(unittest.TestCase):
     def test_stale_publication_restart_rolls_back_if_workspace_cleanup_fails(self):
         connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
         connection.execute("CREATE TABLE marker (value TEXT)")
         connection.execute("INSERT INTO marker (value) VALUES ('preserved')")
         connection.commit()

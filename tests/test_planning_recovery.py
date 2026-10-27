@@ -1213,6 +1213,7 @@ class PlanningRecoveryTest(PlanningCase):
             planning_error_fingerprint="fingerprint"))
         ports.state.general_intent = SimpleNamespace(base_sha="base", commit_sha="candidate")
         ports.state.general_recovery_result = "applied"
+        ports.state.transaction = mock.Mock(side_effect=AssertionError('external recovery inside outer transaction'))
         ports.state.activate_ready = mock.Mock(side_effect=AssertionError("new Worker"))
         outcome = PlanningLifecycleCoordinator(ports).run(
             replace(self.context, local_environment_recheck=True))

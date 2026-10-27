@@ -1512,7 +1512,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                                     "planning_result='saved result'", (str(self.repo),))
         state = loop_manager._PlanningStatePorts(self.connection, runtime_state.RuntimeStateRepository(self.connection),
             maintenance_state.MaintenanceRepository(self.connection), self.repo / 'state')
-        state.publish_general_batch(str(self.repo), self.repo, 'main', result, commit, specification, planning)
+        self.assertEqual(state.recover_general_batch(str(self.repo), self.repo, 'main'), 'applied')
         release = state.pending_publication_release(str(self.repo))
         self.assertIsNotNone(release)
         self.assertEqual(release.revision, commit)
@@ -1543,15 +1543,35 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertEqual(state.planning(str(self.repo)).processed_sha, commit)
 
     def test_general_batch_observes_git_and_files_before_its_transaction(self):
+        from loop_manager_internal.planning import planner_publication as publication
+        from loop_manager_internal.storage.db_access import run_database_request
+        from loop_manager_internal.storage.runtime_state import _transaction
         from loop_manager_internal.agents import common_guidance
         from loop_manager_internal.catalog import execplan_drafts
         result, commit, specification, planning = self.prepare_batch(record_intent=False)
+        applying = False
+        requests = []
+        def replay_after_rollback(connection, operation):
+            nonlocal applying
+            before = tuple(connection.iterdump())
+            applying = True
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'publication DB retry'), _transaction(connection):
+                    operation(connection)
+                    raise RuntimeError('publication DB retry')
+                self.assertEqual(tuple(connection.iterdump()), before)
+                requests.append(operation)
+                return run_database_request(connection, operation)
+            finally:
+                applying = False
         def outside_transaction(function):
             def observe(*args, **kwargs):
+                self.assertFalse(applying, "DB 재시도는 외부 관측을 반복하면 안 됩니다.")
                 self.assertFalse(self.connection.in_transaction)
                 return function(*args, **kwargs)
             return observe
         with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(publication, "run_database_request", side_effect=replay_after_rollback))
             for name in ('git', 'git_bytes', 'file_hash', 'plan_declarations', 'is_loop_manager_repository'):
                 stack.enter_context(mock.patch.object(loop_manager, name,
                     side_effect=outside_transaction(getattr(loop_manager, name))))
@@ -1567,6 +1587,33 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                 self.connection, str(self.repo), self.repo, 'main', result, commit, specification, planning)
         self.assertEqual(self.connection.execute(
             "SELECT processed_sha FROM projects WHERE repo=?", (str(self.repo),)).fetchone()[0], commit)
+        self.assertEqual(len(requests), 3)
+
+    def test_general_db_retry_rejects_owner_change_without_repeating_preparation(self):
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.storage.runtime_state import _transaction
+        result, commit, specification, planning = self.prepare_batch()
+        intent = loop_manager.general_planning_publication(self.connection, str(self.repo))
+        before = tuple(self.connection.iterdump())
+        def replay_with_owner_race(connection, operation):
+            with self.assertRaisesRegex(RuntimeError, 'DB retry'), _transaction(connection):
+                operation(connection)
+                raise RuntimeError('DB retry')
+            self.assertEqual(tuple(connection.iterdump()), before)
+            with _transaction(connection):
+                connection.execute("UPDATE projects SET planner_session_id='retry-competitor'")
+            with _transaction(connection):
+                return operation(connection)
+        with mock.patch.object(planner_publication, 'run_database_request', side_effect=replay_with_owner_race), \
+                mock.patch.object(loop_manager, '_prepare_execplan_rows', wraps=loop_manager._prepare_execplan_rows) as prepare, \
+                self.assertRaisesRegex(loop_manager.PlannerValidationError, '프로젝트 소유 상태'):
+            loop_manager._apply_general_planning_batch(
+                self.connection, str(self.repo), self.repo, result, commit, specification, planning)
+        prepare.assert_called_once()
+        self.assertEqual(loop_manager.general_planning_publication(self.connection, str(self.repo)), intent)
+        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'retry-competitor')
+        self.assertEqual([row[0] for row in self.connection.execute(
+            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-002'])
 
     def test_general_batch_rejects_publication_intent_changed_during_observation(self):
         result, commit, specification, planning = self.prepare_batch()
@@ -1623,6 +1670,14 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'apply-competitor')
         self.assertEqual([row[0] for row in self.connection.execute(
             'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-002'])
+        with self.connection:
+            self.connection.execute('UPDATE projects SET planner_session_id=NULL')
+        with mock.patch.object(loop_manager, '_validate_general_planning_commit', side_effect=observe), \
+                self.assertRaisesRegex(loop_manager.PlannerValidationError, '복구 관측 이후'):
+            loop_manager.recover_general_planning_batch(
+                self.connection, str(self.repo), self.repo, 'main', retain_planning=True)
+        self.assertEqual(loop_manager.general_planning_publication(self.connection, str(self.repo)), intent)
+        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'competitor')
 
     def test_mixed_batch_updates_catalog_and_cancellation_audit_atomically(self):
         result, commit, specification, planning = self.prepare_batch()

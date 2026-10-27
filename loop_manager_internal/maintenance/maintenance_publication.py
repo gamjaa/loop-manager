@@ -1,5 +1,6 @@
 """maintenance maintenance publication boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage.db_access import run_database_request
 from loop_manager_internal.agents import common_guidance
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -290,19 +291,20 @@ def _assert_remote_preserves_maintenance_batch(
 
 
 def _maintenance_publication_db_identity(
-    connection: sqlite3.Connection, repo: str, result: ValidatedPlanningResult,
+    connection: sqlite3.Connection, repo: str, result: ValidatedPlanningResult | None,
 ) -> tuple:
     """Capture the cycle, owner, catalog and affected manual claims for CAS."""
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
     project = connection.execute("SELECT * FROM projects WHERE repo=?", (repo,)).fetchone()
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=? ORDER BY plan_id", (repo,)).fetchall()
     by_id = {str(row["plan_id"]): row for row in rows}
-    affected = {str(plan["id"]) for _path, plan in result.plans}
-    affected.update(revision.snapshot.plan_id for revision in result.revisions)
+    affected = ({str(plan["id"]) for _path, plan in result.plans} if result is not None else set(by_id))
+    if result is not None:
+        affected.update(revision.snapshot.plan_id for revision in result.revisions)
     manual = []
     for plan_id in sorted(affected):
         state, owned = work_claims.manual_plan_ownership(connection, repo, plan_id, by_id.get(plan_id))
-        if owned:
+        if owned and result is not None:
             raise MaintenancePlanningError(f"게시 대상에 수동 소유권이 있습니다: {plan_id}")
         manual.append((plan_id, state))
     return cycle, tuple(project) if project is not None else None, tuple(tuple(row) for row in rows), tuple(manual)
@@ -361,7 +363,7 @@ def record_maintenance_publication_intent(
             repo, context.cycle_revision, context.active_sha, plan_commit, evidence,
             plan_repository=worktree,
         )
-    with runtime_state._transaction(connection):
+    def apply(connection):
         if _maintenance_publication_db_identity(connection, repo, result) != db_identity:
             raise MaintenancePlanningError("intent 준비 이후 cycle·프로젝트 소유권·catalog·수동 소유권이 변경됐습니다.")
         effects._assert_maintenance_context_current(connection, context)
@@ -390,6 +392,8 @@ def record_maintenance_publication_intent(
                 plan_commit, evidence, plan_repository=worktree, prepared=prepared_intent,
             )
         return intent
+
+    return run_database_request(connection, apply)
 
 
 @dataclass(frozen=True)
@@ -582,6 +586,7 @@ def publish_maintenance_planning_batch(
     result: ValidatedPlanningResult,
     plan_commit: str,
     *, allow_legacy_priority: bool = False, retain_planning: bool = False,
+    recovery_identity: tuple | None = None,
 ) -> maintenance_state.MaintenanceCycle:
     """Atomically publish catalog revisions after a confirmed remote push.
 
@@ -602,10 +607,12 @@ def publish_maintenance_planning_batch(
             connection, repo, worktree, base_branch, result, plan_commit,
             allow_legacy_priority=True,
             **({"retain_planning": True} if retain_planning else {}),
+            **({"recovery_identity": recovery_identity} if recovery_identity is not None else {}),
         )
     return effects._apply_maintenance_planning_batch(
         connection, repo, worktree, base_branch, result, plan_commit,
         **({"retain_planning": True} if retain_planning else {}),
+        **({"recovery_identity": recovery_identity} if recovery_identity is not None else {}),
     )
 
 
@@ -635,6 +642,7 @@ def _apply_maintenance_planning_batch(
     plan_commit: str,
     *, current_remote: str | None = None,
     allow_legacy_priority: bool = False, retain_planning: bool = False,
+    recovery_identity: tuple | None = None,
 ) -> maintenance_state.MaintenanceCycle:
     """Apply one already-confirmed maintenance batch in a SQLite transaction."""
 
@@ -675,7 +683,10 @@ def _apply_maintenance_planning_batch(
         prepared_assessment = maintenance_file_publication.prepare_promotion(
             connection, repo, Path(repo), base_branch, current_remote or plan_commit, evidence,
         )
-    with runtime_state._transaction(connection):
+    def apply(connection):
+        if (recovery_identity is not None
+                and _maintenance_publication_db_identity(connection, repo, None) != recovery_identity):
+            raise MaintenancePlanningError("복구 관측 이후 cycle·소유권·catalog가 변경됐습니다.")
         repository = maintenance_state.MaintenanceRepository(connection)
         if _maintenance_publication_db_identity(connection, repo, result) != db_identity:
             raise MaintenancePlanningError("게시 준비 이후 cycle·프로젝트 소유권·catalog·수동 소유권이 변경됐습니다.")
@@ -835,6 +846,8 @@ def _apply_maintenance_planning_batch(
             )
         return next_cycle
 
+    return run_database_request(connection, apply)
+
 
 @dataclass(frozen=True)
 class RestartStaleMaintenancePublicationEffects:
@@ -858,6 +871,7 @@ def restart_stale_maintenance_publication(
     """
     repository = maintenance_state.MaintenanceRepository(connection)
     cycle = repository.get(repo)
+    db_identity = _maintenance_publication_db_identity(connection, repo, None)
     if (
         cycle.publication_stage != "prepared"
         or not cycle.publication_base_sha
@@ -888,12 +902,15 @@ def restart_stale_maintenance_publication(
     }
     if any(base_tree.get(path) != remote_tree.get(path) for path in batch_paths):
         raise MaintenancePlanningError("원격 파일이 보존된 batch와 겹쳐 재시작할 수 없습니다.")
-    with runtime_state._transaction(connection):
+    def restart(connection):
+        if _maintenance_publication_db_identity(connection, repo, None) != db_identity:
+            raise MaintenancePlanningError("재시작 준비 이후 cycle·소유권·catalog가 변경됐습니다.")
         restarted = repository.restart_prepared_batch(
             repo, expected=cycle, new_base_sha=remote
         )
         effects._clear_active_in_current_transaction(connection, repo)
         return restarted
+    return run_database_request(connection, restart)
 
 
 @dataclass(frozen=True)
@@ -918,6 +935,7 @@ def recover_maintenance_planning_batch(
     repo: str,
     worktree: Path,
     base_branch: str,
+    *, retain_planning: bool = False,
 ) -> maintenance_state.MaintenanceCycle:
     """Recover a pushed batch from its SQLite intent and remote commit."""
 
@@ -956,6 +974,7 @@ def recover_maintenance_planning_batch(
         raise MaintenancePlanningError(
             "복구할 maintenance publication intent가 없습니다."
         )
+    recovery_identity = _maintenance_publication_db_identity(connection, repo, None)
     base_sha = cycle.publication_base_sha
     plan_commit = cycle.publication_commit_sha
     current_remote = effects.git(
@@ -976,6 +995,8 @@ def recover_maintenance_planning_batch(
             )
             remote_advanced_after_publication = True
         else:
+            if retain_planning:
+                raise MaintenancePlanningError("복구 관측 중 원격 게시 결과가 변경되어 planning intent를 보존합니다.")
             return effects.restart_stale_maintenance_publication(
                 connection, repo, worktree, base_branch
             )
@@ -994,14 +1015,20 @@ def recover_maintenance_planning_batch(
         ):
             # The plans remain published. A later catalog reconciliation imports
             # them, while this assessment must inspect the new source revision.
-            with runtime_state._transaction(connection):
-                restarted = maintenance_state.MaintenanceRepository(
-                    connection
-                ).restart_prepared_batch(
+            def restart(connection):
+                if _maintenance_publication_db_identity(connection, repo, None) != recovery_identity:
+                    raise MaintenancePlanningError("재평가 정리 준비 이후 cycle·소유권·catalog가 변경됐습니다.")
+                if retain_planning:
+                    # The prepared cycle plus the published OID marks a restart
+                    # awaiting cleanup; keep its intent until the release CAS.
+                    planning_publication_state.retain_planning_after_publication(connection, repo, plan_commit)
+                    return cycle
+                restarted = maintenance_state.MaintenanceRepository(connection).restart_prepared_batch(
                     repo, expected=cycle, new_base_sha=current_remote,
                 )
                 effects._clear_active_in_current_transaction(connection, repo)
                 return restarted
+            return run_database_request(connection, restart)
     context = effects._maintenance_context_at_revision(
         connection, repo, worktree, base_sha, cycle
     )
@@ -1035,6 +1062,7 @@ def recover_maintenance_planning_batch(
             connection, repo, worktree, base_branch, result, plan_commit,
             current_remote=current_remote,
             allow_legacy_priority=True,
+            **({"retain_planning": True, "recovery_identity": recovery_identity} if retain_planning else {}),
         )
     return effects.publish_maintenance_planning_batch(
         connection,
@@ -1044,4 +1072,5 @@ def recover_maintenance_planning_batch(
         result,
         plan_commit,
         allow_legacy_priority=True,
+        **({"retain_planning": True, "recovery_identity": recovery_identity} if retain_planning else {}),
     )

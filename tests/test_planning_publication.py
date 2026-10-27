@@ -895,6 +895,7 @@ class PlanningPublicationTest(PlanningCase):
             publication_remote_oid="published-base",
         )
 
+        ports.state.transaction = mock.Mock(side_effect=AssertionError('external recovery inside outer transaction'))
         outcome = PlanningLifecycleCoordinator(ports).run(self.context)
 
         self.assertEqual(
