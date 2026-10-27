@@ -15,7 +15,6 @@ from loop_manager_internal.git import command_adapter, git_adapter, manager_git_
 from loop_manager_internal.recovery import pull_request_recovery
 from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot, WorkspaceOwnershipError
 from loop_manager_internal.storage.execplan_archive_state import MergedArchiveCandidate
-from loop_manager_internal.documents.guidance_approval import GuidanceDocument
 from tests.support.database import runtime_connection
 
 

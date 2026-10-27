@@ -15,7 +15,6 @@ from loop_manager_internal.application import project_service
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.recovery import blocked_checkpoint, checkpoint_adapter, project_block_service
 from loop_manager_internal.storage import agent_invocation_state, blocked_checkpoint_state
-from loop_manager_internal.documents.guidance_approval import GuidanceDocument
 from tests.support.database import runtime_connection
 
 

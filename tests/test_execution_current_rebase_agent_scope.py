@@ -60,18 +60,23 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         self.assertEqual(connection.execute("SELECT agent_snapshot FROM projects WHERE repo='repo'").fetchone()[0],
                          self.original.serialize())
 
-    def test_persisted_actual_agent_result_still_rejects_shared_ref_violation(self):
+    def test_saved_result_shared_ref_change_returns_current_snapshot_and_preserves_audit(self):
         connection = self.case.fixture.connection
         lm.begin_agent_scope(connection, 'repo', Path('/state/G-047'), 'worker')
+        saved_result = replace(self.current,
+            refs={**self.current.refs, 'refs/heads/other': ('foreign', '')})
         connection.execute("UPDATE projects SET agent_result_snapshot = ? WHERE repo = 'repo'",
-                           (self.current.serialize(),))
-        self.assertEqual(lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo'), self.current)
-        violation = replace(self.current, refs={**self.current.refs, 'refs/heads/other': ('foreign', '')})
-        connection.execute("UPDATE projects SET agent_result_snapshot = ? WHERE repo = 'repo'",
-                           (violation.serialize(),))
-        with self.subTest():
-            lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo')
-        self.assertEqual(connection.execute("SELECT agent_snapshot FROM projects WHERE repo = 'repo'").fetchone()[0], self.original.serialize())
+                           (saved_result.serialize(),))
+
+        self.assertEqual(
+            lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo'),
+            self.current,
+        )
+        row = connection.execute(
+            "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo = 'repo'"
+        ).fetchone()
+        self.assertEqual(row['agent_snapshot'], self.original.serialize())
+        self.assertEqual(row['agent_result_snapshot'], saved_result.serialize())
 
     def test_persisted_rebase_keeps_only_revision_eligible_requirement_archive_paths(self):
         connection = self.case.fixture.connection
