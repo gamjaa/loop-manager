@@ -56,6 +56,25 @@ def _provider_log_path(worktree: Path, state_dir: Path, provider: str, role: str
     return _provider_log_directory(worktree, state_dir) / f"{prefix}{role}{suffix}.log"
 
 
+def _write_attempt_message(path: Path, message: str) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(message)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
 def _json_object(line: str) -> tuple[dict[str, object] | None, bool]:
     try:
         event = json.loads(line)
@@ -501,6 +520,11 @@ def run_codex(
         message = ""
         collection_status = "error"
     if role_name == "reviewer" and message:
+        if codex_launch is not None:
+            try:
+                _write_attempt_message(provider_last_message, message)
+            except (OSError, UnicodeError):
+                collection_status = "error"
         try:
             last_message.write_text(message, encoding="utf-8")
         except (OSError, UnicodeError):

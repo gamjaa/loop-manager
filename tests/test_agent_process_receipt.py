@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -41,6 +42,49 @@ class ProcessReceiptTest(TestCase):
              mock.patch.object(process_receipt, '_linux_host', return_value='host'), \
              mock.patch.object(process_receipt, '_boot', return_value='boot'):
             process_receipt.started(self.launch, SimpleNamespace(pid=1234))
+
+    def test_result_message_uses_only_the_matching_attempt_artifact(self):
+        self.launch.attempt.mkdir()
+        source = self.launch.attempt / 'last-message.txt'
+        source.write_text('original response\n', encoding='utf-8')
+        expected = hashlib.sha256(b'original response').hexdigest()
+        self.assertEqual(process_receipt.result_message(str(self.path), expected), 'original response')
+
+        shared = (self.state / 'logs' / hashlib.sha256(str(Path('/worktree')).encode()).hexdigest()[:16]
+                  / 'reviewer-last.txt')
+        shared.parent.mkdir(parents=True)
+        shared.write_text('another invocation response', encoding='utf-8')
+        source.unlink()
+        with self.assertRaises(FileNotFoundError):
+            process_receipt.result_message(str(self.path), expected)
+
+        source.write_text('replacement response', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, '지문이 다릅니다'):
+            process_receipt.result_message(str(self.path), expected)
+
+    def test_result_message_rejects_symlinked_attempt_artifacts(self):
+        self.launch.attempt.mkdir()
+        source = self.launch.attempt / 'last-message.txt'
+        target = self.state / 'response.txt'
+        target.write_text('original response', encoding='utf-8')
+        try:
+            source.symlink_to(target)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f'symlink creation unavailable: {type(error).__name__}')
+        with self.assertRaisesRegex(ValueError, '경로가 변경되었습니다'):
+            process_receipt.result_message(str(self.path), hashlib.sha256(b'original response').hexdigest())
+
+        source.unlink()
+        self.launch.attempt.rmdir()
+        substituted = self.state / 'substituted-attempt'
+        substituted.mkdir()
+        (substituted / 'last-message.txt').write_text('original response', encoding='utf-8')
+        try:
+            self.launch.attempt.symlink_to(substituted, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f'directory symlink creation unavailable: {type(error).__name__}')
+        with self.assertRaisesRegex(ValueError, '경로가 변경되었습니다'):
+            process_receipt.result_message(str(self.path), hashlib.sha256(b'original response').hexdigest())
 
     def recover(self, *, live=False, boot='boot'):
         with mock.patch.object(process_receipt.sys, 'platform', 'linux'), \
