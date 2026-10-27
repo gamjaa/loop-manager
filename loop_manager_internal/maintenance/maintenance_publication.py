@@ -597,6 +597,22 @@ def _apply_maintenance_planning_batch(
         raise MaintenancePlanningError(
             "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
         )
+    repository = maintenance_state.MaintenanceRepository(connection)
+    already_applied = effects._maintenance_publication_already_applied(
+        connection, repo, worktree, result, plan_commit,
+    )
+    cycle = repository.get(repo)
+    prepared_assessment = None
+    if (not already_applied and context.mode is MaintenancePlanMode.BARRIER
+        and ((cycle.file_assessment_start_merged_count is not None
+              and (not effects.is_loop_manager_repository(Path(repo)) or cycle.full_assessment_completed))
+             or tiered_review.has_assessment(connection, repo, context.cycle_revision, context.active_sha))):
+        evidence = maintenance_file_publication.saved_intent(
+            connection, repo, context.cycle_revision, context.active_sha, plan_commit,
+        )
+        prepared_assessment = maintenance_file_publication.prepare_promotion(
+            connection, repo, Path(repo), base_branch, current_remote or plan_commit, evidence,
+        )
     with runtime_state._transaction(connection):
         repository = maintenance_state.MaintenanceRepository(connection)
         if effects._maintenance_publication_already_applied(
@@ -691,10 +707,9 @@ def _apply_maintenance_planning_batch(
                 connection, repo, context.cycle_revision, context.active_sha,
                 plan_commit,
             )
-            maintenance_file_publication.promote(
-                connection, repo, Path(repo), base_branch,
-                current_remote or plan_commit, evidence,
-            )
+            if prepared_assessment is None:
+                raise MaintenancePlanningError("게시 전에 준비한 평가 근거가 없습니다.")
+            maintenance_file_publication.apply_promotion(connection, prepared_assessment)
             if evidence.tiered is None:
                 repository.advance_file_assessment_success_baseline(
                     repo, expected_revision=context.cycle_revision,

@@ -11,7 +11,7 @@ from loop_manager_internal.maintenance.maintenance_file_inventory import (
     ClassifiedPath, SourceInventory, TrackedSource, cached_source_inventory,
     tracked_source_inventory,
 )
-from loop_manager_internal.storage.maintenance_file_ledger import FileReviewRepository, ReviewedSource, assessment_input_tree, root_move_candidates
+from loop_manager_internal.storage.maintenance_file_ledger import FileReviewRepository, ReviewedSource, PreparedAssessment, release_observation_access, assessment_input_tree, root_move_candidates
 from loop_manager_internal.maintenance.maintenance_file_review import ProvisionalReviewRepository
 from loop_manager_internal.maintenance.maintenance_reconciliation import (
     ReconciliationRepository, SynthesisRepository, _valid_map_shape,
@@ -59,9 +59,7 @@ def _validate_tiered_root_links(tiered: dict) -> tuple[dict, ...]:
     return normalized
 
 
-def _verify_root_plan_files(repository: Path, tiered: dict, *, revision: str | None = None,
-                            connection: sqlite3.Connection | None = None,
-                            repo_key: str | None = None) -> None:
+def _verify_root_plan_files(repository: Path, tiered: dict, *, revision: str | None = None) -> None:
     links = _validate_tiered_root_links(tiered)
     from loop_manager_internal.maintenance.tiered_ports import _root_move_plan_covers
     from loop_manager_internal.maintenance.maintenance_file_inventory import _git
@@ -91,12 +89,15 @@ def _verify_root_plan_files(repository: Path, tiered: dict, *, revision: str | N
             raise FileAssessmentPublicationError("루트 이동 계획이 UTF-8 문서가 아닙니다.") from error
         if not _root_move_plan_covers(item["path"], item["destination"], plan_text):
             raise FileAssessmentPublicationError("루트 이동 계획의 보존·검증 조건이 부족합니다.")
-        if connection is not None:
-            row = connection.execute("SELECT path, status FROM exec_plans WHERE repo = ? AND plan_id = ?",
-                                     (repo_key or str(repository), item["plan_id"])).fetchone()
-            if (row is None or str(row[0]) != item["plan_path"]
-                    or str(row[1]) in {"MERGED", "CANCELLED"}):
-                raise FileAssessmentPublicationError("루트 이동 계획이 게시 catalog의 비종료 계획과 다릅니다.")
+
+
+def _verify_root_plan_rows(connection: sqlite3.Connection, repo: str, tiered: dict) -> None:
+    for item in _validate_tiered_root_links(tiered):
+        row = connection.execute("SELECT path, status FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                                 (repo, item["plan_id"])).fetchone()
+        if (row is None or str(row[0]) != item["plan_path"]
+                or str(row[1]) in {"MERGED", "CANCELLED"}):
+            raise FileAssessmentPublicationError("루트 이동 계획이 게시 catalog의 비종료 계획과 다릅니다.")
 
 
 def sources_match_remote(
@@ -231,8 +232,12 @@ def saved_intent(
     ).fetchone()
     if row is None:
         raise FileAssessmentPublicationError("검증된 파일 평가 publication intent가 없습니다.")
+    return _decode_evidence(row[0], source_revision)
+
+
+def _decode_evidence(raw: str, source_revision: str) -> AssessmentEvidence:
     try:
-        value = json.loads(row[0])
+        value = json.loads(raw)
         inventory = SourceInventory(
             value["inventory"]["revision"],
             tuple(TrackedSource(**item) for item in value["inventory"]["sources"]),
@@ -255,16 +260,28 @@ def saved_intent(
         raise FileAssessmentPublicationError("파일 평가 publication intent가 손상됐습니다.") from error
 
 
-def promote(
+def prepare_promotion(
     connection: sqlite3.Connection, repo: str, repository: Path,
     base_branch: str, published_revision: str, evidence: AssessmentEvidence,
-) -> None:
-    """Caller owns the transaction that also advances the assessment baseline."""
+) -> PreparedPromotion:
+    """Observe publication inputs before entering the batch transaction."""
+    release_observation_access(connection)
+    ledger = FileReviewRepository(connection)
+    identity = ledger._evidence_identity(repo)
+    if Path(repo).resolve() != repository.resolve():
+        raise FileAssessmentPublicationError("프로젝트와 원격 Git 저장소 경로가 다릅니다.")
+    project = connection.execute("SELECT base_branch FROM projects WHERE repo = ?", (repo,)).fetchone()
+    if project is None or str(project[0]) != base_branch:
+        raise FileAssessmentPublicationError("등록된 프로젝트의 base branch가 다릅니다.")
+    payload = asdict(evidence)
+    if evidence.root_reviews is None:
+        payload.pop("root_reviews")
+    evidence_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    evidence = _decode_evidence(evidence_json, evidence.inventory.revision)
     if evidence.tiered is not None:
         if not sources_match_remote(repository, base_branch, published_revision, evidence):
             raise FileAssessmentPublicationError("정적 코드맵·정밀 근거의 원본이 게시된 원본과 다릅니다.")
-        _verify_root_plan_files(repository, evidence.tiered, revision=published_revision,
-                                connection=connection, repo_key=repo)
+        _verify_root_plan_files(repository, evidence.tiered, revision=published_revision)
         expected = {source.path: (source.content_hash, source.mode) for source in evidence.inventory.sources}
         records = evidence.tiered.get("records", {})
         if (not isinstance(records, dict) or {path: (record.get("content_hash"), record.get("mode"))
@@ -272,8 +289,12 @@ def promote(
             or evidence.tiered.get("source_revision") != evidence.inventory.revision):
             raise FileAssessmentPublicationError("정밀 평가와 정적 코드맵의 원본 범위가 다릅니다.")
         from loop_manager_internal.maintenance.tiered_review import TieredReviewRepository
-        TieredReviewRepository(connection).promote(repo, evidence.tiered)
-        return
+        if TieredReviewRepository(connection).evidence(
+                repo, evidence.tiered["cycle"], evidence.inventory.revision) != evidence.tiered:
+            raise FileAssessmentPublicationError("보존된 정밀 근거가 현재 평가와 다릅니다.")
+        from loop_manager_internal.maintenance.maintenance_file_inventory import verify_remote_revision
+        verify_remote_revision(repository, base_branch, published_revision)
+        return PreparedPromotion(repo, evidence.inventory.revision, published_revision, evidence_json, identity, None)
     selected = {item.path: item for item in evidence.reviewed}
     if (len(selected) != len(evidence.reviewed)
         or len({path for path, _ in evidence.code_maps}) != len(evidence.code_maps)
@@ -297,18 +318,60 @@ def promote(
         if row is None or saved_intent(connection, repo, int(row[0]), str(row[1]), str(row[2])) != evidence:
             raise FileAssessmentPublicationError("이전 publication 원본 증거를 확인할 수 없습니다.")
         legacy_commit = str(row[2])
-    FileReviewRepository(connection).record_success(
+    prepared = ledger._prepare_evidence(
         repo, str(repository), base_branch, evidence.inventory, evidence.reviewed,
         published_revision=published_revision, root_reviews=evidence.root_reviews,
         legacy_publication_commit=legacy_commit,
     )
-    for path, raw in evidence.code_maps:
-        source = selected[path]
-        connection.execute(
-            "INSERT INTO successful_code_maps "
-            "(repo, path, content_hash, mode, code_map_json) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(repo, path) DO UPDATE SET "
-            "content_hash = excluded.content_hash, mode = excluded.mode, "
-            "code_map_json = excluded.code_map_json",
-            (repo, path, source.content_hash, source.mode, raw),
-        )
+    return PreparedPromotion(repo, evidence.inventory.revision, published_revision, evidence_json, identity, prepared)
+
+
+@dataclass(frozen=True)
+class PreparedPromotion:
+    repo: str
+    source_revision: str
+    published_revision: str
+    evidence_json: str
+    db_identity: tuple
+    ledger: PreparedAssessment | None
+
+    @property
+    def evidence(self) -> AssessmentEvidence:
+        return _decode_evidence(self.evidence_json, self.source_revision)
+
+
+def apply_promotion(connection: sqlite3.Connection, prepared: PreparedPromotion) -> None:
+    """Apply observed evidence within the caller's atomic batch."""
+    from loop_manager_internal.storage import runtime_state
+    with runtime_state._transaction(connection):
+        repo = prepared.repo
+        ledger = FileReviewRepository(connection)
+        if ledger._evidence_identity(repo) != prepared.db_identity:
+            raise FileAssessmentPublicationError("게시 직전 평가 소유권·선정 범위·intent가 변경됐습니다.")
+        evidence = prepared.evidence
+        if evidence.tiered is not None:
+            _verify_root_plan_rows(connection, repo, evidence.tiered)
+            from loop_manager_internal.maintenance.tiered_review import TieredReviewRepository
+            TieredReviewRepository(connection)._write_success(repo, evidence.tiered)
+            return
+        ledger.apply_success(prepared.ledger)
+        selected = {item.path: item for item in evidence.reviewed}
+        for path, raw in evidence.code_maps:
+            source = selected[path]
+            connection.execute(
+                "INSERT INTO successful_code_maps "
+                "(repo, path, content_hash, mode, code_map_json) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(repo, path) DO UPDATE SET "
+                "content_hash = excluded.content_hash, mode = excluded.mode, "
+                "code_map_json = excluded.code_map_json",
+                (repo, path, source.content_hash, source.mode, raw),
+            )
+
+
+def promote(
+    connection: sqlite3.Connection, repo: str, repository: Path,
+    base_branch: str, published_revision: str, evidence: AssessmentEvidence,
+) -> None:
+    """Compatibility facade; batch callers prepare before their transaction."""
+    prepared = prepare_promotion(connection, repo, repository, base_branch, published_revision, evidence)
+    apply_promotion(connection, prepared)

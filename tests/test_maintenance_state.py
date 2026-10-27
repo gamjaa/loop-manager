@@ -2008,7 +2008,8 @@ class FileReviewLedgerTest(unittest.TestCase):
             maintenance_state.MaintenanceRepository(self.connection),
             Path("/unused"),
         )
-        with mock.patch.object(
+        prepared = port.prepare_file_assessment(str(self.repo), self.repo, "main", source, evidence)
+        with mock.patch.object(maintenance_file_ledger, '_git', side_effect=AssertionError('Git during apply')), mock.patch.object(
             port._maintenance_repository,
             "advance_file_assessment_success_baseline",
             side_effect=maintenance_state.MaintenanceStateError("injected"),
@@ -2016,7 +2017,7 @@ class FileReviewLedgerTest(unittest.TestCase):
             with self.assertRaisesRegex(maintenance_state.MaintenanceStateError, "injected"):
                 with self.connection:
                     port.complete_file_assessment(
-                        str(self.repo), self.repo, "main", 1, source, evidence,
+                        str(self.repo), self.repo, "main", 1, source, prepared,
                     )
         self.assertEqual(self.ledger.reviews(str(self.repo)), ())
         self.assertIsNone(self.connection.execute(
@@ -2024,7 +2025,7 @@ class FileReviewLedgerTest(unittest.TestCase):
         ).fetchone())
         with self.connection:
             port.complete_file_assessment(
-                str(self.repo), self.repo, "main", 1, source, evidence,
+                str(self.repo), self.repo, "main", 1, source, prepared,
             )
         self.assertEqual(self.ledger.reviews(str(self.repo))[0].source_revision, source)
         self.assertEqual(self.connection.execute(

@@ -661,7 +661,11 @@ barrier mode의 유지보수 Planner는 선행과 새 리팩터링 DAG를 판단
 
 다른 READY 파일 변경, 사용자 결정·draft 해제, snapshot 밖 파일과 실행 중·소유된 계획은 허용하지 않는다. 새 단계별 평가의 일반 계획은 별도 필요한 계획 주기에서 수행한다. 일반 계획 결합 여부와 종전 결과를 이미 보존한 cycle은 해당 mode·게시 검증을 유지해 복구한다.
 
-planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치를 확인한 뒤 정적·모듈 평가 근거와 해당 성공 기준을 SQLite transaction에서 확정한다. 미게시·검증 실패·원격 source 변경은 성공 기준을 전진시키지 않으며 잠정 근거·publication intent를 보존해 복구한다. 새 리팩터링 계획은 검증된 DAG와 Manager barrier 편집을 포함해 게시한다.
+planning batch의 평가 근거는 외부 관측과 DB 적용을 분리해 확정한다. 준비 단계는 공통 DB 접근을 해제한 뒤 파일/root의 revision·hash·mode·선정 범위·지침·실제 원본 인용, 게시 blob과 마지막 원격 revision을 확인한다. 파일별 legacy 복구는 저장된 publication intent와 게시 commit의 ancestry를 유지하며, tiered는 저장된 원문·receipt·루트 계획 연결을 같은 원본과 대조한다. 준비 값은 원본·게시 identity와 직렬화한 검토 근거 및 준비 시 DB 입력을 호출 안의 불변 값으로 보존한다.
+
+DB 적용은 준비 값과 현재 프로젝트 소유권·cycle revision·선정 ledger·성공 기준·publication intent를 대조하고, tiered의 assessment·unit·audit·루트 계획 연결도 비교한다. 변경된 입력은 낡은 성공 적용을 거부한다. 루트 계획의 현재 catalog 경로·비종료 상태와 batch의 기존 소유권·generation CAS도 유지한다. 적용 중 Git·원격·지침 파일 관측을 반복하지 않으며, 성공 행·코드맵·성공 기준은 기존 게시 transaction에 함께 참여해 실패 시 rollback한다. 게시 batch·게시 없는 빈 평가 완료·legacy 빈 평가 복구는 상위 transaction에 진입하기 전에 준비하며, 공개 ledger 호출도 같은 준비/적용 경계를 사용한다. 공통 접근이 조율하는 명시적 transaction에서 준비를 요청하면 거부하고 호출자가 준비를 외곽으로 옮기도록 한다.
+
+미게시·관측 실패·원격 source 변경·DB 경쟁은 성공 기준을 전진시키지 않으며 기존 성공 행·잠정 근거·publication intent를 보존해 복구한다. 외부 관측은 DB 적용 재시도에 포함하지 않는다. DB schema와 JSON·receipt 형식, cycle 주기와 legacy 복구 계약은 유지한다. 새 리팩터링 계획은 검증된 DAG와 Manager barrier 편집을 포함해 게시한다. 계획 등록과 나머지 게시 batch 외부 처리는 별도 경계이며 이 근거 적용의 DB 전용 보장에 포함하지 않는다.
 
 평가 성공과 cycle 종료는 별도 상태다. cycle 범위는 선행·리팩터링·발견을 연결한 기존 계획과 그 dependency closure를 포함한다. 범위의 모든 계획이 실제 MERGED이고 원격·catalog에 반영됐으며 미확정 게시·해당 범위의 catalog hold가 없을 때 종료하고 다음 자동 주기의 Merge 기준을 갱신한다. 작업이 없으면 검증·필요한 게시 뒤 종료할 수 있다. 마지막 Merge 뒤 새 평가나 사후 재검증을 종료 조건으로 추가하지 않으며, 유지보수 종료를 프로젝트 전체 완료로 기록하지 않는다.
 

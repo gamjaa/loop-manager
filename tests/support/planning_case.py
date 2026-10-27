@@ -116,6 +116,9 @@ def maintenance_cycle(**overrides):
 
 
 class FakeStatePort:
+    def prepare_file_assessment(self, repo, repository, base_branch, source_sha, evidence):
+        return evidence
+
     def prepare_legacy_release(self, expected, cycle):
         if self.snapshot != expected or self.cycle != cycle:
             raise RuntimeError("release input changed")

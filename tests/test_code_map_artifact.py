@@ -368,6 +368,40 @@ class CodeMapPublicationTest(PlanningCase):
         ports.state.record_maintenance_intent.assert_called_once()
         ports.state.publish_maintenance_batch.assert_called_once()
 
+    def test_empty_assessment_prepares_evidence_before_the_completion_transaction(self):
+        for direct in (False, True):
+            with self.subTest(direct=direct):
+                ports, run, service = self.prepared_run()
+                ports.state.prepare_file_assessment_artifact.return_value = None
+                evidence = SimpleNamespace(reviewed=())
+                prepared = object()
+                ports.state.file_assessment_evidence = mock.Mock(return_value=evidence)
+                ports.state.advance_success_baseline = mock.Mock()
+                events = []
+                transaction = ports.state.transaction
+                def prepare(*args):
+                    self.assertEqual(events, [])
+                    self.assertIs(args[-1], evidence)
+                    events.append('prepare')
+                    return prepared
+                def enter_transaction():
+                    events.append('transaction')
+                    return transaction()
+                def complete(*args):
+                    self.assertEqual(events, ['prepare', 'transaction'])
+                    self.assertIs(args[-1], prepared)
+                    events.append('apply')
+                ports.state.prepare_file_assessment = prepare
+                ports.state.transaction = enter_transaction
+                ports.state.complete_file_assessment = complete
+                ports.artifact_dirty = False
+                if direct:
+                    coordinator = PlanningLifecycleCoordinator(ports)
+                    coordinator._assessment._complete_empty_file_assessment(run, run.planning_worktree)
+                else:
+                    self.assertIsNone(service._publish_planner_result(run))
+                self.assertEqual(events, ['prepare', 'transaction', 'apply'])
+
     def test_identical_remote_context_clears_stale_index_without_commit(self):
         ports, run, service = self.prepared_run()
         ports.state.prepare_file_assessment_artifact.return_value = None
