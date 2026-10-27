@@ -7,7 +7,7 @@ import stat
 
 from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.catalog.execplan_catalog import parse_execplan_text
-from loop_manager_internal.git.command_adapter import revision_requirement_documents
+from loop_manager_internal.git.command_adapter import ExternalObservationError, revision_requirement_documents
 
 
 def blocked_plan_inputs(output: str, revision: str) -> dict[str, list[dict[str, str]]]:
@@ -60,26 +60,46 @@ def validate_blocked_plan_inputs(output: str, revision: str, rows, git, reposito
 
 
 def _blob(git, repository: Path, revision: str, path: str) -> str | None:
-    result = git(repository, "rev-parse", "--verify", f"{revision}:{path}", check=False)
-    return result.stdout.strip() if result.returncode == 0 else None
+    try:
+        result = git(repository, "ls-tree", "-z", "--full-tree", revision, "--", path)
+    except OSError as error:
+        raise ExternalObservationError(f"Git revision tree 조회에 실패했습니다: {path}") from error
+    if result.returncode:
+        raise ExternalObservationError(f"Git revision tree 조회에 실패했습니다: {path}")
+    records = [record for record in result.stdout.split("\0") if record]
+    if not records:
+        return None
+    if len(records) != 1:
+        raise ExternalObservationError(f"Git tree 경로 관측이 유효하지 않습니다: {path}")
+    metadata, separator, observed_path = records[0].partition("\t")
+    fields = metadata.split()
+    if (not separator or observed_path != path or len(fields) != 3
+            or fields[1] != "blob" or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", fields[2])):
+        raise ExternalObservationError(f"Git tree 객체 관측이 유효하지 않습니다: {path}")
+    return fields[2]
 
 
-def _content_changed(git, repository: Path, old: str, new: str, path: str) -> bool:
+
+def _content_changed(previous: str | None, current: str | None,
+                     archived: str | None = None) -> bool:
+    return previous != current and not (previous is not None and current is None and archived == previous)
+
+
+def _path_content_changed(git, repository: Path, old: str, new: str, path: str) -> bool:
     previous = _blob(git, repository, old, path)
     current = _blob(git, repository, new, path)
-    if previous == current:
-        return False
-    if previous and current is None:
+    archived = None
+    if previous is not None and current is None:
         # A completed Requirement/ExecPlan archive move preserves its bytes.
         if path.startswith("docs/requirements/"):
-            archived = "docs/requirements/archive/" + path.rsplit("/", 1)[-1]
+            archive_path = "docs/requirements/archive/" + path.rsplit("/", 1)[-1]
         elif path.startswith("docs/plans/"):
-            archived = "docs/plans/archive/" + path.rsplit("/", 1)[-1]
+            archive_path = "docs/plans/archive/" + path.rsplit("/", 1)[-1]
         else:
-            archived = ""
-        if archived and _blob(git, repository, new, archived) == previous:
-            return False
-    return True
+            archive_path = ""
+        if archive_path:
+            archived = _blob(git, repository, new, archive_path)
+    return _content_changed(previous, current, archived)
 
 
 _PLAN_PATH = re.compile(r"docs/plans/(?:archive/)?\[(G-\d{3,})\] [^/]+\.md")
@@ -249,7 +269,7 @@ def relevant_document_changes(
     # alone appears in a deletion-only diff.
     changed_inputs = {
         path for path in changed & relevant
-        if _content_changed(git, repository, old, new, path)
+        if _path_content_changed(git, repository, old, new, path)
     }
     if git_bytes is not None:
         by_source: dict[str, dict[str, str | None]] = {}
