@@ -1154,6 +1154,30 @@ class PlanningRecoveryTest(PlanningCase):
                 self.assertIsNone(coordinator._assessment._validate_planner_result(run))
                 self.assertEqual(run.validated_result.plans[0][1]["id"], "G-001")
                 self.assertTrue(plan.is_file())
+                from loop_manager_internal.storage.planning_publication_state import (
+                    GeneralPlanningPublication, record_general_planning_publication,
+                )
+                manifest = loop_manager._planning_result_manifest(run.validated_result)
+                record_general_planning_publication(connection, GeneralPlanningPublication(
+                    repo, "prepared", "base", "commit", snapshot.token, "spec", "fingerprint",
+                    manifest, hashlib.sha256(manifest.encode()).hexdigest(),
+                ))
+                declarations = {plan_path: ("G-001", loop_manager.file_hash(plan))}
+                with mock.patch.object(loop_manager, "git_bytes", return_value=plan.read_bytes()), \
+                     mock.patch.object(loop_manager, "plan_declarations", return_value=declarations):
+                    loop_manager._apply_general_planning_batch(
+                        connection, repo, worktree, run.validated_result, "commit", "spec", "fingerprint",
+                    )
+                saved = runtime.planning(repo)
+                self.assertEqual(saved.planning_retry_count, 0)
+                self.assertIsNone(saved.planner_session_id)
+                self.assertIsNone(saved.planning_validation_error)
+                self.assertIsNone(saved.planning_error)
+                self.assertFalse(saved.planning_result_pending_validation)
+                activated = loop_manager.activate_ready_execplan(connection, repo, root, "commit")
+                self.assertEqual(activated["plan_id"], "G-001")
+                self.assertEqual(runtime.planning(repo).phase, "WORKING")
+                self.assertTrue(plan.is_file())
 
     @mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess"))
     def test_planner_cli_failure_does_not_consume_validation_retry(self, _popen):
