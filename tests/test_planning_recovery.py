@@ -1172,7 +1172,6 @@ class PlanningRecoveryTest(PlanningCase):
             runtime.update_project(repo, {
                 "phase": "PLANNING", "active_sha": "base", "worktree": str(worktree),
                 "planning_attempt_fingerprint": "fingerprint", "planning_workspace_owned": 1,
-                "planner_session_id": "planner-session", "planning_validation_error": "invalid result",
             })
             ports = FakePorts(planning_snapshot())
             state = loop_manager._PlanningStatePorts(
@@ -1180,14 +1179,30 @@ class PlanningRecoveryTest(PlanningCase):
             )
             ports.state.planning = state.planning
             ports.state.update = state.update
+            real_validation = loop_manager._PlanningValidationPorts(connection)
+            ports.validation.validate_general_result = real_validation.validate_general_result
             context = replace(self.context, repo=repo, repo_path=Path(repo), state_dir=root)
             coordinator = PlanningLifecycleCoordinator(ports)
-            ports.agent.result = PlanningAgentResult(
-                1, "planner timeout", "planner-session", PlanningAgentResultKind.TRANSIENT_FAILURE,
-            )
             snapshot = MutableReadySnapshot(
                 repo=repo, active_sha="base", plans=(),
                 token=mutable_snapshot_token(repo, "base", ()),
+            )
+            run = coordinator._new_run(context)
+            run.planning_worktree = worktree
+            run.mutable_ready_snapshot = snapshot
+            run.current_fingerprint = "fingerprint"
+            self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+            run.dirty_files = ["unexpected.txt"]
+            with mock.patch.object(loop_manager, "changed_files", return_value=[]):
+                outcome = coordinator._assessment._validate_planner_result(run)
+            saved = runtime.planning(repo)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+            self.assertEqual(saved.planning_retry_count, 0)
+            self.assertIsNotNone(saved.planning_validation_error)
+            first_error = saved.planning_validation_error
+            self.assertEqual(saved.planner_session_id, "session-1")
+            ports.agent.result = PlanningAgentResult(
+                1, "planner timeout", "session-1", PlanningAgentResultKind.TRANSIENT_FAILURE,
             )
             for attempt in range(4):
                 run = coordinator._new_run(context)
@@ -1196,10 +1211,10 @@ class PlanningRecoveryTest(PlanningCase):
                 outcome = coordinator._assessment._run_planner_turn(run)
                 saved = runtime.planning(repo)
                 self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
-                self.assertEqual(ports.agent.run_count, attempt + 1)
-                self.assertEqual(ports.agent.resumed_session, "planner-session")
+                self.assertEqual(ports.agent.run_count, attempt + 2)
+                self.assertEqual(ports.agent.resumed_session, "session-1")
                 self.assertEqual(saved.planning_retry_count, 0)
-                self.assertEqual(saved.planning_validation_error, "invalid result")
+                self.assertEqual(saved.planning_validation_error, first_error)
                 self.assertIsNone(saved.planning_error)
                 self.assertFalse(saved.planning_result_pending_validation)
                 self.assertEqual(saved.last_error, "planner timeout")
