@@ -148,28 +148,14 @@ class ExternalBaseAdvanceUnitTests(unittest.TestCase):
                             reconcile_external_base(unavailable, Path('/source'), base,
                                 before, current, resources, registered_origin='owner/repo')
 
-    def test_remote_advance_race_is_accepted_by_scope_consumer(self):
+    def test_scope_consumer_does_not_reobserve_external_base(self):
         from types import SimpleNamespace
         from loop_manager_internal.agents import scope_validation
         from loop_manager_internal.agents.agent_scope_decision import used_git_resources
         ref, head = 'refs/remotes/origin/main', 'refs/remotes/origin/HEAD'
         before = snapshot(refs={ref: ('a', ''), head: ('a', ref)})
         current = replace(before, refs={ref: ('b', ''), head: ('b', ref)})
-        remote_reads = 0
-
-        def git(_repo, *args, **_kwargs):
-            nonlocal remote_reads
-            if args[0] == 'remote':
-                return SimpleNamespace(returncode=0, stdout='https://github.com/owner/repo.git\n')
-            if args[0] == 'ls-remote':
-                remote_reads += 1
-                oid = 'b' if remote_reads == 1 else 'c'
-                return SimpleNamespace(returncode=0, stdout=f'{oid}\trefs/heads/main\n')
-            if args[0] == 'rev-parse':
-                return SimpleNamespace(returncode=0, stdout='b\n')
-            if args[0] == 'merge-base':
-                return SimpleNamespace(returncode=0, stdout='')
-            return SimpleNamespace(returncode=0, stdout='')
+        git = mock.Mock(side_effect=AssertionError('scope validation must not re-observe the remote base'))
 
         validation_effects = scope_validation.ScopeValidationEffects(
             _agent_git_resources=lambda *_args, **_kwargs: None,
@@ -197,49 +183,7 @@ class ExternalBaseAdvanceUnitTests(unittest.TestCase):
                 base_branch='main', branch=before.branch, worktree_key='/managed'),
             effects=validation_effects,
         )
-        self.assertEqual(remote_reads, 0)
-
-    def test_external_base_observation_failure_is_transient(self):
-        from types import SimpleNamespace
-        from loop_manager_internal.agents import scope_validation
-        from loop_manager_internal.agents.agent_scope_decision import used_git_resources
-        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
-        ref, head = 'refs/remotes/origin/main', 'refs/remotes/origin/HEAD'
-        before = snapshot(refs={ref: ('a', ''), head: ('a', ref)})
-        current = replace(before, refs={ref: ('b', ''), head: ('b', ref)})
-        def unavailable(_repo, *args, **_kwargs):
-            if args[0] == 'remote':
-                return SimpleNamespace(returncode=0, stdout='https://github.com/owner/repo.git\n')
-            if args[0] == 'ls-remote':
-                return SimpleNamespace(returncode=1, stdout='')
-            return SimpleNamespace(returncode=0, stdout='b\n')
-        validation_effects = scope_validation.ScopeValidationEffects(
-            _agent_git_resources=lambda *_args, **_kwargs: None,
-            repository=lambda _connection: SimpleNamespace(
-                scope_owner=lambda *_args: {'origin': 'owner/repo'},
-            ),
-            _current_rebase_service=mock.Mock(),
-            _git_common_directory=lambda _path: Path('/common'),
-            _owned_rebase_state_dir=lambda *_args: None,
-            _plan_id_from_path=lambda _path: 'G-199',
-            _rebase_in_progress_for_branch=lambda *_args: False,
-            _scope_snapshot_with_start_ignore_rules=lambda _worktree, _before, after: after,
-            agent_snapshot_changes=lambda *_args: [],
-            capture_git_snapshot=lambda _worktree: current,
-            git=unavailable,
-            operation_log=mock.Mock(),
-            validate_managed_worktree=mock.Mock(),
-        )
-        with self.subTest():
-            scope_validation.validate_agent_scope(
-                'worker', Path('/managed'), before, current,
-                selected_plan_path='docs/plans/[G-199] Work.md',
-                external_worktree=Path('/source'), base_branch='main',
-                connection=object(),
-                resources=used_git_resources(role='worker', phase='WORKING',
-                    base_branch='main', branch=before.branch, worktree_key='/managed'),
-                effects=validation_effects,
-            )
+        git.assert_not_called()
 
     def test_checkpoint_accepts_only_proven_derived_head_and_preserves_other_refs(self):
         # Test the same pure normalization used before checkpoint ref checks.

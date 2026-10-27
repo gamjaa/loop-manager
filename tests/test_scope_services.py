@@ -1320,7 +1320,11 @@ class SandboxGitBoundaryTests(TestCase):
     def test_blocked_resume_reads_current_candidate_without_saved_scope_comparison(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)
-        connection.execute("UPDATE projects SET agent_role='reviewer', agent_snapshot='invalid old audit'")
+        original_audit = ('invalid old audit', 'saved result with unrelated refs')
+        connection.execute(
+            "UPDATE projects SET agent_role='reviewer', agent_snapshot=?, agent_result_snapshot=?",
+            original_audit,
+        )
         current = snapshot(head='user-commit', refs={'refs/heads/other': ('new', '')})
         capture = mock.Mock(return_value=current)
         effects = replace(manager._scope_recovery_effects(), capture_git_snapshot=capture,
@@ -1329,6 +1333,10 @@ class SandboxGitBoundaryTests(TestCase):
             connection, Path('/source'), 'repo', 'main', Path('/managed'),
             'docs/plans/[G-047] Runtime.md', require_safe_result=True, effects=effects), current)
         capture.assert_called_once_with(Path('/managed'))
+        row = connection.execute(
+            "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo='repo'"
+        ).fetchone()
+        self.assertEqual(tuple(row), original_audit)
 
     def test_manager_final_candidate_checks_preexisting_protected_changes(self):
         current = snapshot(dirty={'docs/requirements/archive/Protected.md': (('staged',), 'new')})

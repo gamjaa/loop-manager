@@ -26,11 +26,11 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 2·17은
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/documents/guidance_approval.py`와 `tests/test_guidance_approval.py`의 `GuidanceFormatTest`·`GuidanceInputContractTest`를 정리한다. 과거 행 생성에 필요한 값은 기존 `tests/support/guidance.py`의 fixture 계약 안에서 고정 입력으로 바꾸고, 런타임의 과거 대기 복구는 유지한다. `CommonPlansScopeTest`·`GuidanceGitAdapterTest`와 `tests/test_execution_guidance.py`의 stale 승인 보존·정상 Worker 진행·독립 차단 보호는 남긴다.
-- [ ] 확인한 `tests/test_execution_current_rebase_agent_scope.py`의 저장 결과 shared ref 변형과 `tests/test_published_checkpoint_resume.py`의 dirty snapshot 재개 사례는 현재 snapshot 수용·원래 감사 유지라는 이름과 assertion으로 고친다. 운영 scope·sandbox 거부 정책 자체는 수정하지 않는다.
-- [ ] 확인한 `tests/test_runtime_scope_diagnostics.py`의 호출되지 않는 외부 관측 실패 주입은 인접 소비자의 Git 조회 0회 검증으로 통합한다. 실제 관측 실패 처리는 `reconcile_external_base`를 검사하는 `test_live_forward_and_symbolic_head_accept_without_isolation_and_keep_original`의 실패 분기에 남긴다.
-- [ ] 확인한 `tests/test_scope_checkpoint_recovery.py`의 반환값 assertion 없이 과거 ref 위반 거부를 주장하는 사례는 `tests/test_scope_services.py:test_blocked_resume_reads_current_candidate_without_saved_scope_comparison`의 현재 snapshot/보존 검증에 통합한다. checkpoint cleanup·파일 보존·실제 차단 해제 회귀는 유지하며 참조가 없어진 전용 준비만 정리한다.
-- [ ] 확인한 `tests/test_self_merge_handoff.py:test_local_sync_status_never_gates_verified_self_merge_handoff`는 입력에 쓰이지 않는 `sync`/status 행렬을 제거하고 로컬 동기화 미호출·원격 ancestry 확인·handoff 발생 assertion을 한 사례에 보존한다. G-312의 handoff 구현은 변경하지 않는다.
+- [x] 확인한 `loop_manager_internal/documents/guidance_approval.py`와 `tests/test_guidance_approval.py`의 `GuidanceFormatTest`·`GuidanceInputContractTest`를 정리한다. 과거 행 생성에 필요한 값은 기존 `tests/support/guidance.py`의 fixture 계약 안에서 고정 입력으로 바꾸고, 런타임의 과거 대기 복구는 유지한다. `CommonPlansScopeTest`·`GuidanceGitAdapterTest`와 `tests/test_execution_guidance.py`의 stale 승인 보존·정상 Worker 진행·독립 차단 보호는 남긴다.
+- [x] 확인한 `tests/test_execution_current_rebase_agent_scope.py`의 저장 결과 shared ref 변형과 `tests/test_published_checkpoint_resume.py`의 dirty snapshot 재개 사례는 현재 snapshot 수용·원래 감사 유지라는 이름과 assertion으로 고친다. 운영 scope·sandbox 거부 정책 자체는 수정하지 않는다.
+- [x] 확인한 `tests/test_runtime_scope_diagnostics.py`의 호출되지 않는 외부 관측 실패 주입은 인접 소비자의 Git 조회 0회 검증으로 통합한다. 실제 관측 실패 처리는 `reconcile_external_base`를 검사하는 `test_live_forward_and_symbolic_head_accept_without_isolation_and_keep_original`의 실패 분기에 남긴다.
+- [x] 확인한 `tests/test_scope_checkpoint_recovery.py`의 반환값 assertion 없이 과거 ref 위반 거부를 주장하는 사례는 `tests/test_scope_services.py:test_blocked_resume_reads_current_candidate_without_saved_scope_comparison`의 현재 snapshot/보존 검증에 통합한다. checkpoint cleanup·파일 보존·실제 차단 해제 회귀는 유지하며 참조가 없어진 전용 준비만 정리한다.
+- [x] 확인한 `tests/test_self_merge_handoff.py:test_local_sync_status_never_gates_verified_self_merge_handoff`는 입력에 쓰이지 않는 `sync`/status 행렬을 제거하고 로컬 동기화 미호출·원격 ancestry 확인·handoff 발생 assertion을 한 사례에 보존한다. G-312의 handoff 구현은 변경하지 않는다.
 
 ## Validation
 
@@ -42,7 +42,11 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 2·17은
 ## Progress
 
 - [x] 저장된 발견 7건과 R-066/R-080·현재 snapshot 수용 계약으로 정리 범위를 확정했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 폐기·중복 검증 정리와 유지되는 assertion의 대응 확인
+- [x] 폐기한 parser 형식 검사는 현재 런타임에서 호출되지 않는 승인 parser/patch 적용기 전용 계약이었다. 알림의 과거 행은 고정 legacy 값으로 직접 준비하고 stale 승인 행 보존·과거 대기 재개·독립 차단 보존은 별도 회귀로 남겼다.
+- [x] shared ref·dirty snapshot의 과거 저장 결과는 재개 gate가 아니며, 소비자 테스트가 현재 snapshot 반환과 원래 `agent_snapshot`·저장 결과 보존을 assertion한다. 빈 stale ref 검사 테스트는 해당 candidate assertion과 기존 실제 checkpoint cleanup/파일 보존 사례로 대체했다.
+- [x] 외부 관측 실패 주입은 호출되지 않던 scope consumer 테스트에서 제거하고 0회 Git 조회를 assertion한다. 실제 `reconcile_external_base` 실패 분기는 기존 회귀로 남겼다. self-merge는 쓰이지 않던 sync/status 조합을 없애고 원격 ancestry·handoff·local sync 미호출을 한 사례에서 assertion한다.
+- [x] 독립 cause 보존을 확인하는 `test_project_rebase_release_preserves_each_independent_plan_cause`를 실행해 guidance 승인과 일반 user decision 차단이 재개 뒤에도 유지됨을 확인했다.
+- [x] targeted unit: guidance/scope/checkpoint/handoff 23개와 Worker 결과 계약 1개가 통과했다. 같은 19개 대상 명령의 첫 실행에서 saved-dirty snapshot과 mock `git_bytes` 기대 두 건이 실패했다. 두 번째 실행에서는 saved-dirty snapshot assertion이 두 current candidate 반환을 고려하지 않아 실패했고, 세 번째 동일 실행은 19개 모두 통과했다. 추가 legacy wait·fixture·cause 보존 4개와 corrected-result report contract 1개도 통과했다. 이전 최종 보고는 두 실패 결과를 `FAILED_COMMAND`와 `RERUN` 사이에 넣지 않아 판정에 실패했다. 첫 결과 2건, 중간 재실행 1건, 최종 동일 명령 PASS를 모두 적는 보고 형식을 기존 parser contract test와 `parse_worker_result`로 확인했다. 전체 verify는 Worker가 실행하지 않았다.
 
 ## Decision Log
 

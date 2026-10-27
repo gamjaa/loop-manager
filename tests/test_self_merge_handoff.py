@@ -23,27 +23,31 @@ class SelfMergeHandoffTest(PrRecoveryFixture, unittest.TestCase):
         connection.commit()
         return values
 
-    def test_local_sync_status_never_gates_verified_self_merge_handoff(self):
+    def test_verified_self_merge_handoff_uses_remote_ancestry_without_local_sync(self):
         project = RegisteredProject('/source', 'develop', 'codex', None, False, origin='owner/repo')
         old, remote = 'a' * 40, 'b' * 40
         runtime = loop_manager.RuntimeMutation(Path('/source'), Path('/runtime'), old, 'c' * 32)
         observation = WaitingPullRequestObservation((), True, ('https://example.test/pr/1',))
-        for status in ('updated', 'skipped', 'failed'):
-            with self.subTest(status=status):
-                sync = loop_manager.BaseWorktreeSyncResult(status, 'local checkout preserved', remote)
-                effects = self_runtime.FinishSelfMergeHandoffEffects(
-                    _registered_self_runtime_project=mock.Mock(return_value=True),
-                    _recorded_base_fetch=mock.Mock(return_value=remote),
-                    git=mock.Mock(return_value=SimpleNamespace(returncode=0)),
-                    git_bytes=mock.Mock(), operation_log=mock.Mock(),
-                )
-                with mock.patch('loop_manager.ensure_safe_base_worktree') as synchronize, mock.patch.object(
-                        self_runtime.runtime_inputs, 'changed', return_value=True):
-                    with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
-                        self_runtime._finish_self_merge_handoff(effects, None, project, Path('/state'), runtime, observation)
-                synchronize.assert_not_called()
-                effects.git.assert_called_with(Path('/source'), 'merge-base', '--is-ancestor', old, remote, check=False)
-                self.assertIn('code_changed=True', effects.operation_log.call_args.args[0])
+        recorded_base_fetch = mock.Mock(return_value=remote)
+        effects = self_runtime.FinishSelfMergeHandoffEffects(
+            _registered_self_runtime_project=mock.Mock(return_value=True),
+            _recorded_base_fetch=recorded_base_fetch,
+            git=mock.Mock(return_value=SimpleNamespace(returncode=0)),
+            git_bytes=mock.Mock(), operation_log=mock.Mock(),
+        )
+        with mock.patch('loop_manager.ensure_safe_base_worktree') as synchronize, mock.patch.object(
+                self_runtime.runtime_inputs, 'changed', return_value=True) as changed:
+            with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                self_runtime._finish_self_merge_handoff(
+                    effects, None, project, Path('/state'), runtime, observation)
+        synchronize.assert_not_called()
+        recorded_base_fetch.assert_called_once_with(
+            Path('/source'), Path('/state'), 'develop', owner='runtime-observation')
+        effects.git.assert_called_once_with(
+            Path('/source'), 'merge-base', '--is-ancestor', old, remote, check=False)
+        changed.assert_called_once_with(effects.git_bytes, Path('/source'), old, remote)
+        effects.operation_log.assert_called_once()
+        self.assertIn('code_changed=True', effects.operation_log.call_args.args[0])
 
     def test_code_handoff_precedes_pr_observation_and_preserves_parallel_state(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1717,20 +1717,17 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                 self.assertEqual(len(self.events(connection)), 1 if sent else 2)
 
     def test_guidance_action_survives_other_scope_recovery_and_project_release(self):
-        from loop_manager_internal.documents.guidance_approval import parse_guidance_document, guidance_patch_hash
-        from tests.support.guidance import guidance_plan
         for previously_sent in (False, True, None):
             with self.subTest(previously_sent=previously_sent):
                 connection = self.connection(enabled=previously_sent is not None)
-                proposal = parse_guidance_document(guidance_plan()).proposals[0]
+                proposal_id = 'legacy-rule'
                 with connection:
                     connection.execute('INSERT INTO guidance_approvals '
                         '(repo, plan_id, proposal_id, proposal_hash, target_path, scope, proposal_patch, '
                         'proposal_patch_hash, proposal_line, decision_line, batch_id, sequence, baseline_content, baseline_mode) '
                         "VALUES (?, 'G-018', ?, ?, ?, ?, ?, ?, ?, ?, 'batch', 0, ?, 33188)",
-                        (self.repo, proposal.proposal_id, proposal.identity, proposal.target, proposal.scope,
-                         proposal.patch, guidance_patch_hash(proposal.target, proposal.patch), proposal.line,
-                         proposal.decision.line, b'# Agents\n'))
+                        (self.repo, proposal_id, 'legacy-proposal-hash', 'AGENTS.md', 'project',
+                         'legacy proposal patch', 'legacy-patch-hash', 1, 2, b'# Agents\n'))
                     scoped_blocking.record_plan_block(connection, self.repo, 'G-018',
                         scoped_blocking.BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED, 'approval is pending', 'guidance-input')
                     checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)

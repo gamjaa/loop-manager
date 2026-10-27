@@ -347,19 +347,34 @@ class PublishedCheckpointResumeTests(ExecutionFixture, TestCase):
                 self.observe_git = observe
                 self.live = self.oid
 
-    def test_actual_saved_agent_violation_cannot_release_publication_block(self):
+    def test_saved_dirty_result_is_audit_only_when_current_snapshot_releases_publication_block(self):
         self.project_block()
         before = lm.GitSnapshot(self.oid, 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
+        saved_result = replace(before, dirty={'app.py': (('unstaged',), 'forbidden write')})
         self.connection.execute("UPDATE exec_plans SET agent_role='reviewer', agent_snapshot=?, "
-            "agent_result_snapshot=?, agent_recovery=NULL", (before.serialize(),
-            replace(before, dirty={'app.py': (('unstaged',), 'forbidden write')}).serialize()))
-        # 실물 범위 판정으로 Reviewer 쓰기를 거부하며 I/O snapshot만 제공한다.
+            "agent_result_snapshot=?, agent_recovery=NULL",
+            (before.serialize(), saved_result.serialize()))
+        original_audit = (before.serialize(), saved_result.serialize())
+        validate = lm.validate_blocked_agent_scope
+        validated_candidates = []
+        def validate_candidate(*args, **kwargs):
+            candidate = validate(*args, **kwargs)
+            validated_candidates.append(candidate)
+            return candidate
+        # 재개는 저장된 결과를 재판정하지 않고 현재 worktree snapshot을 사용한다.
         with (mock.patch.object(lm, 'capture_git_snapshot', return_value=before),
               mock.patch.object(lm, 'git', side_effect=self.observe_git),
               mock.patch.object(lm, 'validate_agent_scope', wraps=lm.validate_agent_scope) as scope,
               mock.patch.object(lm, 'validate_blocked_agent_scope',
-                                wraps=lm.validate_blocked_agent_scope) as validation):
+                                side_effect=validate_candidate) as validation):
             self.assertTrue(self.resume_project())
+        self.assertTrue(validated_candidates)
+        self.assertTrue(all(candidate == before for candidate in validated_candidates))
         validation.assert_called()
         scope.assert_not_called()
         self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        row = self.connection.execute(
+            "SELECT agent_snapshot, agent_result_snapshot FROM exec_plans "
+            "WHERE repo=? AND plan_id='G-047'", (self.repo,)
+        ).fetchone()
+        self.assertEqual(tuple(row), original_audit)
