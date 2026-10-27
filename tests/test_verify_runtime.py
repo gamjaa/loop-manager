@@ -1073,10 +1073,10 @@ class RunnerPoolTests(unittest.TestCase):
 
     def test_pool_failure_paths_stop_before_release_and_preserve_original_error(self):
         for failure in ('pipe', 'json', 'exit_before_report', 'exit_after_report', 'cancel'):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
                 root = Path(directory)
                 writer = EventWriter(root / 'events.jsonl')
-                self.addCleanup(writer.close)
+                cleanup.callback(writer.close)
                 operations = []
                 class Client:
                     def request(self, operation, **values):
