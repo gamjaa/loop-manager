@@ -48,12 +48,13 @@ def workspace_ownership_isolated(before, current, *, repo_path, worktree, branch
             == tuple(field for field in current.worktrees[target] if not field.startswith('HEAD=')))
 
 
-def _reservation_owners(connection, repo, plan_id):
+def _reservation_owners(connection, repo, plan_id, workspace=None):
     """Read only this reservation's writer and durable resource claims."""
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                               (repo, plan_id)).fetchone()
     if plan is None:
         raise runtime_state.RuntimeStateError('예약 workspace의 작업이 없습니다.')
+    branch, worktree = workspace or (plan['branch'], plan['worktree'])
     manual, owned = work_claims.manual_plan_ownership(connection, repo, plan_id, plan)
     ids, paths = work_claims.publication_claims(connection, repo)
     if owned or plan_id in ids or {plan['path'], *json.loads(plan['sources'])} & paths:
@@ -66,9 +67,9 @@ def _reservation_owners(connection, repo, plan_id):
                                          "AND state NOT IN ('PR_OPEN','CLOSED','MERGED')", (repo,)))
     pending_claims = []
     for other in claims:
-        if ((plan['branch'] and plan['branch'] == other['branch'])
-                or (plan['worktree'] and other['worktree']
-                    and Path(plan['worktree']).resolve() == Path(other['worktree']).resolve())):
+        if ((branch and branch == other['branch'])
+                or (worktree and other['worktree']
+                    and Path(worktree).resolve() == Path(other['worktree']).resolve())):
             dormant = other['status'] == 'READY' and not other['workspace_owned'] and other['plan_id'] not in ids
             for table, predicate in (('task_call_reservations', '1'), ('agent_invocations',
                     'finished_at IS NULL OR (execution_started_at IS NOT NULL AND execution_finish_evidence IS NULL)')):
@@ -113,6 +114,7 @@ class ReservationOwnership:
     repo: str
     plan_id: str
     observed: tuple
+    workspace: tuple | None = None
 
     @property
     def worker_sessions(self):
@@ -172,23 +174,26 @@ class ReservationOwnership:
 
     def check(self):
         """CAS-side check: no Git, process observation or waiting under the writer."""
-        if _reservation_owners(self.connection, self.repo, self.plan_id) != self.observed:
+        if _reservation_owners(self.connection, self.repo, self.plan_id, self.workspace) != self.observed:
             raise runtime_state.RuntimeStateError('예약 workspace 검증 중 writer 또는 소유권이 변경됐습니다.')
 
 
 @contextmanager
-def reserved_workspace_ownership(connection, state_dir, repo, plan_id):
+def reserved_workspace_ownership(connection, state_dir, repo, plan_id, *, workspace=None):
     """Hold the existing task/resource boundary before observing reserved Git."""
     from loop_manager_internal.agents.process_receipt import recover
-    observed = _reservation_owners(connection, repo, plan_id)
+    observed = _reservation_owners(connection, repo, plan_id, workspace)
     branch, worktree, _, _, calls, invocations, _adoption, _pending_claims = observed
     resources = ['plan:' + plan_id]
     resources += [prefix + value for prefix, value in (('branch:', branch), ('worktree:', worktree)) if value]
     if worktree:
         resources.append('git:' + str(Path(worktree).resolve()))
-    missing = [resource for resource in resources if not resource_owned(state_dir, repo, resource)]
+    if workspace is not None:
+        resources.extend(('branch:' + workspace[0], 'worktree:' + workspace[1],
+                          'git:' + str(Path(workspace[1]).resolve())))
+    missing = [resource for resource in dict.fromkeys(resources) if not resource_owned(state_dir, repo, resource)]
     with resource_locks(state_dir, repo, missing, owner='workspace-reservation-recovery'):
-        proof = ReservationOwnership(connection, repo, plan_id, observed)
+        proof = ReservationOwnership(connection, repo, plan_id, observed, workspace)
         proof.check()
         if connection.in_transaction:
             raise task_calls.CallDeferred('예약 writer 종료 관측 전에 DB 쓰기 처리를 종료해야 합니다.')

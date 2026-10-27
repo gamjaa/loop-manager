@@ -848,29 +848,10 @@ class RuntimeStateRepository:
             selected = execution_selection.get()
             if selected is not None and selected[0] == repo:
                 project = {"plan_path": self.get(*selected).path}
-            translated: dict[str, object] = {}
-            if not ("phase" in values and values["phase"] is None):
-                translated.update(
-                    (field, values[field])
-                    for field in MIRRORED_FIELDS
-                    if field in values
-                )
-                if "phase" in values:
-                    status = execplan_status_for_phase(values["phase"])
-                    if status is not None:
-                        translated["status"] = status
-            plan_id = None
-            if project is not None and project["plan_path"]:
-                match = re.fullmatch(
-                    r"docs/plans/\[(G-\d{3,})\] [^/]+\.md",
-                    str(project["plan_path"]),
-                )
-                plan_id = match.group(1) if match else None
-            if translated and plan_id is not None:
-                if self.connection.execute('SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?',
-                                           (repo, plan_id)).fetchone() is not None:
-                    self._update_plan_row(repo, plan_id, translated)
-                self._fault("after_execplan_update")
+            self.mirror_project_values(
+                repo, str(project["plan_path"]) if project is not None and project["plan_path"] else None,
+                values,
+            )
             self._update_project_row(repo, values)
             self._fault("after_project_update")
             if enqueue:
@@ -1199,8 +1180,16 @@ class RuntimeStateRepository:
 
         if not values or not set(values).issubset(PROJECT_UPDATE_FIELDS):
             raise ValueError("유효하지 않은 프로젝트 상태 필드입니다.")
-        if not plan_path or ("phase" in values and values["phase"] is None):
+        if (not plan_path or ("phase" in values and values["phase"] in (None, "PLANNING"))
+                or ("plan_path" in values and values["plan_path"] is None)):
             return
+        selected = execution_selection.get()
+        if "phase" not in values and (selected is None or selected[0] != repo):
+            project = self.connection.execute(
+                "SELECT phase FROM projects WHERE repo = ?", (repo,),
+            ).fetchone()
+            if project is not None and project["phase"] == "PLANNING":
+                return
         match = re.fullmatch(
             r"docs/plans/\[(G-\d{3,})\] [^/]+\.md", plan_path
         )

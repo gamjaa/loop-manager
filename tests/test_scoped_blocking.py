@@ -146,6 +146,102 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         return loop_manager.resume_project_block_if_safe(
             self.connection, Path(self.repo), Path('/state'), self.repo)
 
+    def corrupt_owned_workspace(self):
+        self.isolated_missing_creation()
+        self.snapshot = replace(self.snapshot, dirty={'app.py': (('unstaged',), 'saved-output')})
+        checkpoint = self.checkpoints.get(self.repo, 'G-001')
+        self.checkpoints.record(self.repo, 'G-001', expected_generation=checkpoint.generation,
+            operation=None, expected_head=self.head, target_base_oid='base', observed_remote_oid=self.head,
+            snapshot={'branch': self.branch, 'worktree': str(self.worktree), 'prior': 'audit'})
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET workspace_owned=1,status='VERIFYING', "
+                "branch=NULL,worktree='/state/planning/input',agent_snapshot=NULL, "
+                "worker_result='implemented',verify_token='saved-verify',last_error='prior failure' "
+                "WHERE plan_id='G-001'")
+            self.connection.execute("UPDATE projects SET phase='VERIFYING' WHERE repo=?", (self.repo,))
+        def validate(_state, _repo, _plan, branch, worktree):
+            if (branch, worktree) != (self.branch, self.worktree):
+                raise loop_manager.WorkspaceOwnershipError('wrong resource identity')
+        self.enterContext(mock.patch.object(loop_manager, 'validate_execplan_workspace_identity', side_effect=validate))
+        return dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+
+    def test_owned_workspace_restores_checkpoint_identity_without_restarting_work(self):
+        before = self.corrupt_owned_workspace()
+        self.assertTrue(self.resume())
+        after = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertEqual(after, {**before, 'branch': self.branch, 'worktree': str(self.worktree)})
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        saved = self.checkpoints.get(self.repo, 'G-001')
+        self.assertEqual(saved.snapshot['prior'], 'audit')
+        self.assertEqual(saved.snapshot['workspace_identity_recovery']['worktree'], '/state/planning/input')
+        self.assertFalse(self.resume())
+        self.assertEqual(self.checkpoints.get(self.repo, 'G-001'), saved)
+
+    def test_owned_workspace_repair_rejects_stale_head_and_competing_claim(self):
+        before = self.corrupt_owned_workspace()
+        self.snapshot = replace(self.snapshot, head='c' * 40)
+        self.assertFalse(self.resume())
+        self.snapshot = replace(self.snapshot, head=self.head)
+        self.plan('G-002', 'VERIFYING', branch=self.branch)
+        self.assertFalse(self.resume())
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()), before)
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertNotIn('workspace_identity_recovery', self.checkpoints.get(self.repo, 'G-001').snapshot)
+
+    def test_owned_workspace_repair_rolls_back_and_retries_after_interruption(self):
+        from loop_manager_internal.storage import runtime_state
+        before = self.corrupt_owned_workspace()
+        saved = self.checkpoints.get(self.repo, 'G-001')
+        update = runtime_state.RuntimeStateRepository.update_plan
+        def interrupted(repository, *args, **kwargs):
+            update(repository, *args, **kwargs)
+            raise runtime_state.RuntimeStateError('interrupted after resource repair')
+        with mock.patch.object(runtime_state.RuntimeStateRepository, 'update_plan', interrupted):
+            self.assertFalse(self.resume())
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()), before)
+        self.assertEqual(self.checkpoints.get(self.repo, 'G-001'), saved)
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertTrue(self.resume())
+
+    def test_owned_workspace_repair_requires_checkpoint_and_stopped_writer(self):
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        before = self.corrupt_owned_workspace()
+        saved = self.checkpoints.get(self.repo, 'G-001')
+        with self.connection:
+            self.checkpoints.record(self.repo, 'G-001', expected_generation=saved.generation,
+                operation=None, expected_head=None, target_base_oid=saved.target_base_oid,
+                observed_remote_oid=saved.observed_remote_oid, snapshot=saved.snapshot)
+        self.assertFalse(self.resume())
+        current = self.checkpoints.get(self.repo, 'G-001')
+        with self.connection:
+            self.checkpoints.record(self.repo, 'G-001', expected_generation=current.generation,
+                operation=None, expected_head=self.head, target_base_oid=saved.target_base_oid,
+                observed_remote_oid=saved.observed_remote_oid, snapshot=saved.snapshot)
+        with mock.patch('loop_manager_internal.recovery.scope_reconciliation.reserved_workspace_ownership',
+                        side_effect=CallDeferred('writer has not stopped')):
+            self.assertFalse(self.resume())
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()), before)
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+
+    def test_owned_workspace_repair_preserves_checkpoint_race(self):
+        before = self.corrupt_owned_workspace()
+        saved = self.checkpoints.get(self.repo, 'G-001')
+        observations = 0
+        def capture(_worktree):
+            nonlocal observations
+            observations += 1
+            if observations == 2:
+                with self.connection:
+                    self.checkpoints.record(self.repo, 'G-001', expected_generation=saved.generation,
+                        operation=None, expected_head=self.head, target_base_oid='new-target',
+                        observed_remote_oid=self.head, snapshot=saved.snapshot)
+            return self.snapshot
+        self.capture.side_effect = capture
+        self.assertFalse(self.resume())
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()), before)
+        self.assertEqual(self.checkpoints.get(self.repo, 'G-001').target_base_oid, 'new-target')
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+
     def isolated_missing_creation(self):
         self.snapshot = replace(self.snapshot,
             refs={'refs/heads/' + self.branch: (self.head, '')},

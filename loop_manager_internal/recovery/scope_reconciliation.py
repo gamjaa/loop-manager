@@ -106,6 +106,19 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             return False
     plan = (connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                                (repo, block['plan_id'])).fetchone() if block is not None and block['plan_id'] else None)
+    if (plan is not None and int(plan['workspace_owned']) == WORKSPACE_OWNED
+            and block['reason_code'] in {BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value,
+                                         BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL.value}):
+        try:
+            effects.validate_execplan_workspace_identity(
+                state_dir, repo, manual_workspace_owner(connection, repo, plan['plan_id']),
+                str(plan['branch'] or ''), Path(str(plan['worktree'] or '')))
+        except WorkspaceOwnershipError:
+            try:
+                if not _restore_checkpoint_workspace(effects, connection, repo_path, state_dir, repo, block, plan):
+                    return False
+            except (CallDeferred, ProcessLockBusyError, runtime_state.RuntimeStateError):
+                return False
     if plan is None or int(plan['workspace_owned']) != WORKSPACE_RESERVED:
         return _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo,
                                                    workspace_block=block if workspace_plan_id else None)
@@ -129,6 +142,59 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             return True
         return result
     except (CallDeferred, ProcessLockBusyError, runtime_state.RuntimeStateError):
+        return False
+
+
+def _restore_checkpoint_workspace(effects, connection, repo_path, state_dir, repo, block, plan):
+    """Repair only the resource identity of an already owned, stopped candidate."""
+    plan_id = str(plan['plan_id'])
+    repository = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    checkpoint = repository.get(repo, plan_id)
+    saved = checkpoint.snapshot or {}
+    branch, path = saved.get('branch'), saved.get('worktree')
+    project = connection.execute('SELECT * FROM projects WHERE repo=?', (repo,)).fetchone()
+    if (not isinstance(branch, str) or not branch or not isinstance(path, str) or not path
+            or not checkpoint.expected_head or checkpoint.operation is not None
+            or project is None or runtime_state.planning_owns_execution_slot(project)):
+        return False
+    worktree = Path(path)
+    try:
+        effects.validate_execplan_workspace_identity(
+            state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree)
+        with reserved_workspace_ownership(connection, state_dir, repo, plan_id,
+                                          workspace=(branch, path)) as owner:
+            effects.validate_managed_worktree(repo_path, worktree, branch)
+            checked = effects.capture_git_snapshot(worktree)
+            if (checked.head != checkpoint.expected_head or checked.branch != branch
+                    or checked.operations or any(agent_scope_decision.index_security_flags(entries)
+                                                 for entries in checked.index.values())):
+                return False
+            confirmed = effects.capture_git_snapshot(worktree)
+            if (not agent_scope_decision._same_local_snapshot(checked, confirmed)
+                    or not workspace_ownership_isolated(checked, confirmed, repo_path=repo_path,
+                        worktree=worktree, branch=branch, base=str(project['base_branch']))):
+                return False
+            with runtime_state._transaction(connection):
+                owner.check()
+                if (repository.get(repo, plan_id) != checkpoint
+                        or dict(connection.execute('SELECT * FROM projects WHERE repo=?', (repo,)).fetchone()) != dict(project)
+                        or dict(connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                                                   (repo, plan_id)).fetchone()) != dict(plan)
+                        or dict((scoped_blocking.project_block(connection, repo)
+                                 if block['scope'] == 'project' else
+                                 scoped_blocking.plan_block(connection, repo, plan_id)) or {}) != dict(block)):
+                    return False
+                repository.record(repo, plan_id, expected_generation=checkpoint.generation,
+                    operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                    target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
+                    snapshot={**saved, 'workspace_identity_recovery': {
+                        'branch': plan['branch'], 'worktree': plan['worktree'], 'block': dict(block)}})
+                runtime_state.RuntimeStateRepository(connection).update_plan(
+                    repo, plan_id, plan_values={'branch': branch, 'worktree': path}, enqueue=False)
+            return True
+    except RecoveryFailure:
+        raise
+    except (AgentScopeError, OSError, RuntimeError, ValueError):
         return False
 
 

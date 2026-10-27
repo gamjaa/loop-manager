@@ -942,6 +942,34 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         self.assertEqual(cleared["planning_fingerprint"], "project-only")
         self.assertEqual(repository.get("repo", "G-047").status, "REVIEWING")
 
+    def test_planning_updates_never_mirror_into_previous_execution(self):
+        for entry in ('update', 'legacy_mirror'):
+            with self.subTest(entry=entry):
+                connection = runtime_connection()
+                self.addCleanup(connection.close)
+                repository = runtime_state.RuntimeStateRepository(connection)
+                repository.activate('repo', 'G-047', activation_sha='base',
+                    branch='loop-manager/G-047', worktree='/state/G-047')
+                repository.update_project('repo', {'phase': 'VERIFYING',
+                    'worker_session_id': 'worker', 'worker_result': 'implemented',
+                    'verify_token': 'verified-input', 'last_error': 'prior failure'}, enqueue=False)
+                before = repository.get('repo', 'G-047')
+                values = {'phase': 'PLANNING', 'plan_path': None, 'branch': None,
+                    'worktree': '/state/planning/input', 'active_sha': 'new-base',
+                    'worker_session_id': None, 'worker_result': None, 'verify_token': None}
+                if entry == 'legacy_mirror':
+                    repository.mirror_project_values('repo', before.path, values)
+                else:
+                    repository.update_project('repo', values, enqueue=False)
+                    # Further planning writes with no phase must remain project-only.
+                    connection.execute("UPDATE projects SET plan_path=? WHERE repo='repo'", (before.path,))
+                    repository.update_project('repo', {'worktree': '/state/planning/retry'}, enqueue=False)
+                    restarted = runtime_state.RuntimeStateRepository(connection)
+                    self.assertEqual(restarted.planning('repo').phase, 'PLANNING')
+                    restarted.clear('repo')
+                    restarted.hydrate('repo', 'G-047')
+                self.assertEqual(repository.get('repo', 'G-047'), before)
+
     def test_compatibility_wrappers_preserve_public_update_and_hydrate_contract(self):
         connection = runtime_connection()
         loop_manager.activate_ready_execplan(

@@ -105,6 +105,20 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             Context().run(other_recovery)
         self.assertFalse(saved.run(resource_owned, self.directory, 'A', 'plan:G-001'))
 
+    def test_workspace_identity_repair_locks_checkpoint_resources(self):
+        from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
+        from loop_manager_internal.runtime.resource_lock import resource_owned
+        worktree = str((self.directory / 'restored').resolve())
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET workspace_owned=1,branch=NULL,worktree='planning' "
+                                    "WHERE repo='A' AND plan_id='G-001'")
+        with reserved_workspace_ownership(self.connection, self.directory, 'A', 'G-001',
+                                          workspace=('restored', worktree)) as proof:
+            proof.check()
+            for resource in ('plan:G-001', 'branch:restored', 'worktree:' + worktree, 'git:' + worktree):
+                self.assertTrue(resource_owned(self.directory, 'A', resource), resource)
+        self.assertFalse(resource_owned(self.directory, 'A', 'branch:restored'))
+
     def test_parallel_block_uses_selected_plan_and_preserves_representative(self):
         from loop_manager_internal.recovery import block_service
         from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason, decide

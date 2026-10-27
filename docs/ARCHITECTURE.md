@@ -600,6 +600,8 @@ rebase 관측의 안정성 지문에는 해당 branch·worktree의 등록과 공
 | 보존된 planning 상태 | worktree·session·미게시 결과·오류·실패 이력을 별도로 유지한다. 보존 기록이나 오류 자체가 실행 자리 점유를 뜻하지 않는다. |
 | 미확정 publication intent·공유 Git operation | 원격 게시·DB 적용과 소유 operation의 남은 처리를 복구한다. 미확정 게시나 종료 불명 writer의 실제 실행 자리·소유 예약을 다른 작업을 위해 해제하지 않으며, 관리 개수는 작업 상태별 조건을 따른다. |
 
+프로젝트 호환 갱신의 실행 필드 반영은 일반 갱신과 legacy mirror가 같은 경계를 사용한다. planning 진입·투영 해제는 이전 대표 ExecPlan에 반영하지 않고, 명시적 작업 선택이 없는 planning 중의 후속 갱신도 프로젝트에만 저장한다. 이미 소유권이 확정된 작업의 branch·worktree identity가 잘못 저장된 소유권 차단은 해당 작업의 진행 중인 operation이 없는 checkpoint에 저장된 자원 연결과 예상 HEAD로 복구한다. 현재 canonical 경로·branch의 Git 등록·HEAD·index 안전 조건과 두 관측의 작업물·대상 등록 안정성을 확인하고, 기존 호출 종료·작업 및 원래/복구 대상 자원 lease와 다른 소유자의 claim을 검사한다. 짧은 transaction에서 원인·프로젝트·작업·checkpoint를 재확인한 뒤 branch·worktree만 복원하고 이전 값과 차단을 checkpoint 감사에 남긴다. 복원과 감사는 함께 rollback하며 기존 차단 해제 경로가 현재 상태를 다시 검증한다. 근거 누락·현재 HEAD 불일치·진행 중 operation·writer 종료 불명·경쟁 변경에는 복원을 적용하지 않고, 단계·session·실패와 성공 근거를 초기화하거나 Git 작업을 수행하지 않는다.
+
 일반·유지보수 planning이 실행 자리나 미확정 게시·공유 Git operation을 소유하는 동안 다른 ExecPlan의 차단 복구는 프로젝트 투영을 교체·정리하지 않는다. 안전 gate가 허용한 PR Merge·Close 확인과 해당 계획의 상태·알림 기록은 계속할 수 있다.
 
 `planning/selection_service.py`는 worktree·writer 종료·소유권·역할 결과와 Git operation·게시·공유 안전 조건을 검증한 뒤 planning 상태를 보존하고 자리를 비운다. 관련성·검증 근거가 없는 계획과 전이적으로 의존하는 후속 작업은 보류하며, 독립 작업의 재개·선택은 기존 catalog·원격 revision·activation gate를 통과해야 한다. 소유 증거 부족이나 미해결 공유 안전 조건에서는 기존 상태를 보존한다.
