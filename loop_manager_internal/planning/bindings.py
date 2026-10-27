@@ -153,6 +153,14 @@ def register(assembly: Composition) -> None:
         ),
     )
 
+    assembly.bind('_observe_mutable_ready_prs', planner_validation._observe_mutable_ready_prs,
+        lambda: planner_validation.AssertMutableReadySnapshotCurrentEffects(
+            _execplan_metadata=assembly.callback('_execplan_metadata'),
+            _row_is_mutable_ready=assembly.callback('_row_is_mutable_ready'),
+            pr_for_branch=assembly.callback('pr_for_branch'),
+        ),
+    )
+
     assembly.bind('_assert_mutable_ready_snapshot_current', planner_validation._assert_mutable_ready_snapshot_current,
         lambda: planner_validation.AssertMutableReadySnapshotCurrentEffects(
             _execplan_metadata=assembly.callback('_execplan_metadata'),
@@ -206,6 +214,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('record_general_planning_publication_intent', planner_publication.record_general_planning_publication_intent,
         lambda: planner_publication.RecordGeneralPlanningPublicationIntentEffects(
+            _observe_mutable_ready_prs=assembly.callback('_observe_mutable_ready_prs'),
             _assert_mutable_ready_snapshot_current=assembly.callback('_assert_mutable_ready_snapshot_current'),
             _planning_result_manifest=assembly.callback('_planning_result_manifest'),
             _validate_general_planning_commit=assembly.callback('_validate_general_planning_commit'),
@@ -223,6 +232,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_apply_general_planning_batch', planner_publication._apply_general_planning_batch,
         lambda: planner_publication.ApplyGeneralPlanningBatchEffects(
+            _observe_mutable_ready_prs=assembly.callback('_observe_mutable_ready_prs'),
             _prepare_execplan_rows=assembly.callback('_prepare_execplan_rows'),
             _assert_mutable_ready_snapshot_current=assembly.callback('_assert_mutable_ready_snapshot_current'),
             _clear_active_in_current_transaction=assembly.callback('_clear_active_in_current_transaction'),

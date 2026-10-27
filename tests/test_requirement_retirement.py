@@ -729,9 +729,10 @@ class RetirementPublicationManifestTest(unittest.TestCase):
             planning_fingerprint="planning",
         )
         effects = ApplyGeneralPlanningBatchEffects(
-            _assert_mutable_ready_snapshot_current=lambda *_args: None,
+            _assert_mutable_ready_snapshot_current=lambda *_args, **_kwargs: None,
+            _observe_mutable_ready_prs=lambda *_args: None,
             _clear_active_in_current_transaction=lambda *_args, **_kwargs: None,
-            _general_planning_batch_already_applied=lambda *_args: False,
+            _general_planning_batch_already_applied=lambda *_args, **_kwargs: False,
             _register_execplan_rows=lambda *_args, **_kwargs: None,
             _prepare_execplan_rows=lambda *_args: None,
             file_hash=lambda *_args: "hash",

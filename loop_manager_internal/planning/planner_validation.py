@@ -1610,12 +1610,56 @@ class AssertMutableReadySnapshotCurrentEffects:
     pr_for_branch: Callable[..., object] | None = None
 
 
+@dataclass(frozen=True)
+class MutableReadyPRObservation:
+    repo: str
+    snapshot_token: str
+    branches: tuple[tuple[str, str | None, int], ...]
+
+
+def _observe_mutable_ready_prs(
+    effects: AssertMutableReadySnapshotCurrentEffects, connection: sqlite3.Connection,
+    snapshot: MutableReadySnapshot,
+) -> MutableReadyPRObservation:
+    """Read branch identities briefly, then check actual PRs without DB access."""
+    branches = []
+    for plan in snapshot.plans:
+        row = connection.execute(
+            "SELECT branch, catalog_generation FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (snapshot.repo, plan.plan_id),
+        ).fetchone()
+        if row is None:
+            raise PlannerValidationError(
+                f"mutable READY snapshot 이후 실행 상태가 변경됐습니다: {plan.plan_id}"
+            )
+        branches.append((plan.plan_id, str(row["branch"]) if row["branch"] else None,
+                         int(row["catalog_generation"])))
+    for plan_id, branch, _generation in branches:
+        if branch is None:
+            continue
+        if effects.pr_for_branch is None:
+            raise PlannerValidationError(f"계획 갱신 전에 PR이 등록됐거나 확인할 수 없습니다: {plan_id}")
+        if effects.pr_for_branch(Path(snapshot.repo), branch) is not None:
+            raise MutableReadyPRConflict(f"mutable READY snapshot 이후 PR이 등록됐습니다: {plan_id}")
+    return MutableReadyPRObservation(snapshot.repo, snapshot.token, tuple(branches))
+
+
 def _assert_mutable_ready_snapshot_current(
     effects: AssertMutableReadySnapshotCurrentEffects, connection: sqlite3.Connection,
     snapshot: MutableReadySnapshot,
+    *, pr_observation: MutableReadyPRObservation | None = None,
 ) -> None:
     """Compare-and-snapshot guard used immediately before publication."""
     from loop_manager_internal.catalog.remote_deletions import recovery_goals
+    if pr_observation is not None and (
+        pr_observation.repo != snapshot.repo or pr_observation.snapshot_token != snapshot.token
+        or tuple(plan_id for plan_id, _branch, _generation in pr_observation.branches)
+        != tuple(plan.plan_id for plan in snapshot.plans)
+    ):
+        raise PlannerValidationError("준비한 PR 관측이 mutable READY snapshot과 다릅니다.")
+    observed_branches = ({plan_id: (branch, generation)
+                          for plan_id, branch, generation in pr_observation.branches}
+                         if pr_observation is not None else {})
     if snapshot.recovery_goals != recovery_goals(connection, snapshot.repo):
         raise PlannerValidationError("삭제 목표 감사가 mutable READY snapshot 이후 변경됐습니다.")
 
@@ -1668,7 +1712,13 @@ def _assert_mutable_ready_snapshot_current(
             raise PlannerValidationError(
                 f'수동 소유권·membership이 mutable READY snapshot 이후 변경됐습니다: {plan.plan_id}'
             )
-        if row["branch"]:
+        if pr_observation is not None:
+            branch = str(row["branch"]) if row["branch"] else None
+            if (branch, int(row["catalog_generation"])) != observed_branches[plan.plan_id]:
+                raise PlannerValidationError(
+                    f"PR 관측 이후 계획 branch·generation이 변경됐습니다: {plan.plan_id}"
+                )
+        elif row["branch"]:
             if effects.pr_for_branch is None:
                 raise PlannerValidationError(f"계획 갱신 전에 PR이 등록됐거나 확인할 수 없습니다: {plan.plan_id}")
             if effects.pr_for_branch(Path(snapshot.repo), str(row["branch"])) is not None:

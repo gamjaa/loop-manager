@@ -437,6 +437,7 @@ class RecordGeneralPlanningPublicationIntentEffects:
     _planning_result_manifest: Callable[..., object]
     _validate_general_planning_commit: Callable[..., object]
     is_loop_manager_repository: Callable[..., object]
+    _observe_mutable_ready_prs: Callable[..., object]
 
 
 def record_general_planning_publication_intent(
@@ -448,40 +449,67 @@ def record_general_planning_publication_intent(
     specification_fingerprint: str,
     planning_fingerprint: str,
 ) -> GeneralPlanningPublication:
+    snapshot = result.mutable_snapshot
+    if snapshot is None or snapshot.repo != repo:
+        raise PlannerValidationError(
+            "SQLite-bound mutable READY snapshot이 publication 대상과 다릅니다."
+        )
+    project = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+    project_identity = tuple(project) if project is not None else None
+    affected_snapshot = work_claims.affected_snapshot(result)
+    pr_observation = effects._observe_mutable_ready_prs(connection, affected_snapshot)
+    effects._validate_general_planning_commit(worktree, result, plan_commit)
+    manager_repository = effects.is_loop_manager_repository(Path(repo))
+    approved_drafts = []
+    publication_error = None
+    catalog_identity = None
+    if manager_repository:
+        from loop_manager_internal.documents import document_drafts
+        if project is None:
+            raise PlannerValidationError("문서 계획의 등록 프로젝트가 없습니다.")
+        drafts = document_drafts.DocumentDraftRepository(connection)
+        catalog_identity = tuple(tuple(row) for row in connection.execute(
+            "SELECT plan_id, sources, status FROM exec_plans WHERE repo = ? ORDER BY plan_id", (repo,),
+        ).fetchall())
+        try:
+            for path, plan in result.plans:
+                plan_text = document_publication.read_plan_text(worktree / path)
+                claim = document_publication.plan_claim(plan_text)
+                if claim is not None:
+                    try:
+                        draft = drafts.get(claim)
+                        document_publication.validate_document_plan(plan_text, plan, draft)
+                        drafts.assert_current(draft, Path(repo), str(project["base_branch"]))
+                        approved_drafts.append(draft)
+                    except document_drafts.DocumentDraftError as error:
+                        publication_error = (claim, str(error))
+                        break
+        except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
+            raise PlannerValidationError(str(error)) from error
+    manifest = effects._planning_result_manifest(result)
+    manifest_hash = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
     with runtime_state._transaction(connection):
-        snapshot = result.mutable_snapshot
-        if snapshot is None or snapshot.repo != repo:
-            raise PlannerValidationError(
-                "SQLite-bound mutable READY snapshot이 publication 대상과 다릅니다."
-            )
-        effects._assert_mutable_ready_snapshot_current(connection, work_claims.affected_snapshot(result))
+        current_project = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+        if (tuple(current_project) if current_project is not None else None) != project_identity:
+            raise PlannerValidationError("publication 준비 이후 프로젝트 소유 상태가 변경됐습니다.")
+        effects._assert_mutable_ready_snapshot_current(
+            connection, affected_snapshot, pr_observation=pr_observation,
+        )
         work_claims.assert_manual_scopes_available(connection, repo, result)
         work_claims.assert_new_ids_available(connection, repo, (plan["id"] for _path, plan in result.plans))
-        effects._validate_general_planning_commit(worktree, result, plan_commit)
-        if effects.is_loop_manager_repository(Path(repo)):
-            from loop_manager_internal.documents import document_drafts
-            project = connection.execute(
-                "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
-            ).fetchone()
-            if project is None:
-                raise PlannerValidationError("문서 계획의 등록 프로젝트가 없습니다.")
-            drafts = document_drafts.DocumentDraftRepository(connection)
+        if manager_repository:
+            current_catalog = tuple(tuple(row) for row in connection.execute(
+                "SELECT plan_id, sources, status FROM exec_plans WHERE repo = ? ORDER BY plan_id", (repo,),
+            ).fetchall())
             try:
-                for path, plan in result.plans:
-                    plan_text = document_publication.read_plan_text(worktree / path)
-                    claim = document_publication.plan_claim(plan_text)
-                    if claim is not None:
-                        try:
-                            draft = drafts.get(claim)
-                            document_publication.validate_document_plan(plan_text, plan, draft)
-                            drafts.assert_current(draft, Path(repo), str(project["base_branch"]))
-                        except document_drafts.DocumentDraftError as error:
-                            drafts.record_publication_error(claim, str(error))
-                            raise
-            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
+                drafts_changed = any(drafts.get(draft.draft_id) != draft for draft in approved_drafts)
+            except document_drafts.DocumentDraftError as error:
                 raise PlannerValidationError(str(error)) from error
-        manifest = effects._planning_result_manifest(result)
-        manifest_hash = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+            if current_catalog != catalog_identity or drafts_changed:
+                raise PlannerValidationError("문서 계획의 승인·source 관계가 publication 준비 이후 변경됐습니다.")
+            if publication_error is not None:
+                drafts.record_publication_error(*publication_error)
+                raise PlannerValidationError(publication_error[1])
         return planning_publication_state.record_general_planning_publication(
             connection, GeneralPlanningPublication(
                 repo, "prepared", snapshot.active_sha, plan_commit, snapshot.token,
@@ -506,6 +534,8 @@ def _general_planning_batch_already_applied(
     plan_commit: str,
     specification_fingerprint: str,
     planning_fingerprint: str,
+    *, content_hashes: dict[str, str] | None = None,
+    declarations: dict | None = None,
 ) -> bool:
     project = connection.execute(
         "SELECT processed_sha, specification_fingerprint, planning_fingerprint "
@@ -524,7 +554,8 @@ def _general_planning_batch_already_applied(
     ):
         return False
     if not requirement_applied and not planning_input_state.matches(
-        connection, repo, effects.plan_declarations(worktree, plan_commit),
+        connection, repo, (declarations if declarations is not None
+                           else effects.plan_declarations(worktree, plan_commit)),
     ):
         return False
     for path, plan in result.plans:
@@ -547,7 +578,7 @@ def _general_planning_batch_already_applied(
             sources,
             dependencies,
             priority,
-            effects.file_hash(worktree / path),
+            content_hashes[path] if content_hashes is not None else effects.file_hash(worktree / path),
             plan_commit,
         ):
             return False
@@ -574,7 +605,8 @@ def _general_planning_batch_already_applied(
             sources,
             dependencies,
             priority,
-            effects.file_hash(worktree / revision.path),
+            (content_hashes[revision.path] if content_hashes is not None
+             else effects.file_hash(worktree / revision.path)),
             plan_commit,
             json.loads(revision.snapshot.execution_state)["status"] if revision.snapshot.execution_state else "READY",
             bool(json.loads(revision.snapshot.execution_state)["ever_started"]) if revision.snapshot.execution_state else False,
@@ -619,6 +651,7 @@ class ApplyGeneralPlanningBatchEffects:
     is_loop_manager_repository: Callable[..., object]
     plan_declarations: Callable[..., object]
     _prepare_execplan_rows: Callable[..., PreparedExecplanRows]
+    _observe_mutable_ready_prs: Callable[..., object]
 
 
 def _apply_general_planning_batch(
@@ -634,9 +667,29 @@ def _apply_general_planning_batch(
     snapshot = result.mutable_snapshot
     if snapshot is None or snapshot.repo != repo:
         raise PlannerValidationError("general planning snapshot 대상이 다릅니다.")
+    expected_intent = effects.general_planning_publication(connection, repo)
     prepared_rows = effects._prepare_execplan_rows(worktree, list(result.plans), plan_commit)
+    affected_snapshot = work_claims.affected_snapshot(result)
+    pr_observation = (effects._observe_mutable_ready_prs(connection, affected_snapshot)
+                      if expected_intent is not None else None)
+    content_hashes = {path: effects.file_hash(worktree / path)
+                      for path in [path for path, _plan in result.plans]
+                      + [revision.path for revision in result.revisions]}
+    revision_inputs = {str(revision.plan["id"]): execplan_drafts.input_digests(worktree, revision.plan)
+                       for revision in result.revisions}
+    declarations = effects.plan_declarations(worktree, plan_commit)
+    manager_repository = effects.is_loop_manager_repository(Path(repo))
+    plan_texts = {}
+    if manager_repository:
+        try:
+            plan_texts = {path: document_publication.read_plan_text(worktree / path)
+                          for path, _plan in result.plans}
+        except (OSError, UnicodeError) as error:
+            raise PlannerValidationError(str(error)) from error
     with runtime_state._transaction(connection):
         intent = effects.general_planning_publication(connection, repo)
+        if intent != expected_intent:
+            raise PlannerValidationError("게시 준비 이후 general planning publication intent가 변경됐습니다.")
         if intent is None:
             if effects._general_planning_batch_already_applied(
                 connection,
@@ -646,6 +699,7 @@ def _apply_general_planning_batch(
                 plan_commit,
                 specification_fingerprint,
                 planning_fingerprint,
+                content_hashes=content_hashes, declarations=declarations,
             ):
                 return
             raise PlannerValidationError(
@@ -669,12 +723,14 @@ def _apply_general_planning_batch(
             raise PlannerValidationError(
                 "보존된 general planning publication intent가 batch와 다릅니다."
             )
-        effects._assert_mutable_ready_snapshot_current(connection, work_claims.affected_snapshot(result))
+        effects._assert_mutable_ready_snapshot_current(
+            connection, affected_snapshot, pr_observation=pr_observation,
+        )
         planning_publication_state.apply_mutable_catalog_changes(
             connection, repo, deletions=result.deletions, revisions=result.revisions,
             snapshot_token=snapshot.token, plan_commit=plan_commit,
-            content_hash=lambda path: effects.file_hash(worktree / path),
-            draft_inputs=lambda plan: execplan_drafts.input_digests(worktree, plan),
+            content_hash=content_hashes.__getitem__,
+            draft_inputs=lambda plan: revision_inputs[str(plan["id"])],
         )
         if allow_legacy_priority:
             effects._register_execplan_rows(
@@ -692,12 +748,12 @@ def _apply_general_planning_batch(
         from loop_manager_internal.catalog.remote_deletions import resolve_recovery
         resolve_recovery(connection, snapshot, plan_commit,
                          {item.snapshot.plan_id for item in result.revisions} | {item.snapshot.plan_id for item in result.deletions})
-        if effects.is_loop_manager_repository(Path(repo)):
+        if manager_repository:
             from loop_manager_internal.documents import document_drafts
             drafts = document_drafts.DocumentDraftRepository(connection)
             try:
                 for path, plan in result.plans:
-                    plan_text = document_publication.read_plan_text(worktree / path)
+                    plan_text = plan_texts[path]
                     claim = document_publication.plan_claim(plan_text)
                     if claim is not None:
                         draft = drafts.get(claim)
@@ -713,7 +769,7 @@ def _apply_general_planning_batch(
                                       revised_plan_ids=tuple(item.snapshot.plan_id for item in result.revisions))
         if not requirement_only:
             planning_input_state.record_general(
-                connection, repo, plan_commit, effects.plan_declarations(worktree, plan_commit),
+                connection, repo, plan_commit, declarations,
             )
         effects._clear_active_in_current_transaction(
             connection,
