@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -178,8 +179,21 @@ class TieredPublicationTest(MaintenancePlanningCase):
         git(self.repo, "add", relative)
         git(self.repo, "commit", "-m", "Add root move maintenance plan")
         commit = git(self.repo, "rev-parse", "HEAD")
-        maintenance_file_publication.save_intent(self.connection, str(self.repo), context.cycle_revision,
+        prepared = maintenance_file_publication.prepare_intent(str(self.repo), context.cycle_revision,
             self.base_sha, commit, evidence, plan_repository=candidate_root)
+        with mock.patch.object(maintenance_file_publication, '_verify_root_plan_files',
+                               side_effect=AssertionError('root observation during intent apply')):
+            with self.assertRaisesRegex(RuntimeError, 'rollback'), maintenance_state._transaction(self.connection):
+                maintenance_file_publication.save_intent(self.connection, str(self.repo), context.cycle_revision,
+                    self.base_sha, commit, evidence, prepared=prepared)
+                raise RuntimeError('rollback')
+            self.assertIsNone(self.connection.execute(
+                'SELECT 1 FROM file_assessment_publications WHERE repo=?', (str(self.repo),)).fetchone())
+            with self.assertRaises(maintenance_file_publication.FileAssessmentPublicationError):
+                maintenance_file_publication.save_intent(self.connection, str(self.repo), context.cycle_revision,
+                    self.base_sha, commit, evidence, prepared=replace(prepared, publication_commit='other'))
+            maintenance_file_publication.save_intent(self.connection, str(self.repo), context.cycle_revision,
+                self.base_sha, commit, evidence, prepared=prepared)
         self.assertEqual(maintenance_file_publication.saved_intent(self.connection, str(self.repo),
             context.cycle_revision, self.base_sha, commit), evidence)
 

@@ -177,23 +177,10 @@ def _merged_count(connection: sqlite3.Connection, repo: str) -> int:
     return maintenance_state.MaintenanceRepository(connection).merged_count(repo)
 
 
-def save_intent(
-    connection: sqlite3.Connection, repo: str, cycle_revision: int,
-    source_revision: str, publication_commit: str, evidence: AssessmentEvidence, *,
-    plan_repository: Path | None = None,
-) -> None:
-    ensure_schema(connection)
+def _intent_payload(evidence: AssessmentEvidence) -> str:
     if evidence.root_reviews is None:
         raise FileAssessmentPublicationError("새 publication에 이전 형식 증거를 사용할 수 없습니다.")
-    if evidence.inventory.revision != source_revision:
-        raise FileAssessmentPublicationError("평가 증거의 source가 다릅니다.")
-    if evidence.tiered is not None:
-        _verify_root_plan_files(plan_repository or Path(repo), evidence.tiered)
-    from loop_manager_internal.storage import maintenance_state
-    maintenance_state.MaintenanceRepository(connection)._verified_merged_count(
-        repo, source_revision, evidence.merged_count,
-    )
-    payload = json.dumps({
+    return json.dumps({
         "inventory": asdict(evidence.inventory),
         "reviewed": [asdict(item) for item in evidence.reviewed],
         "code_maps": list(evidence.code_maps),
@@ -201,6 +188,49 @@ def save_intent(
         "root_reviews": list(evidence.root_reviews),
         **({"tiered": evidence.tiered} if evidence.tiered is not None else {}),
     }, ensure_ascii=False, sort_keys=True)
+
+
+@dataclass(frozen=True)
+class PreparedPublicationIntent:
+    repo: str
+    cycle_revision: int
+    source_revision: str
+    publication_commit: str
+    evidence_json: str
+
+
+def prepare_intent(
+    repo: str, cycle_revision: int, source_revision: str,
+    publication_commit: str, evidence: AssessmentEvidence, *,
+    plan_repository: Path | None = None,
+) -> PreparedPublicationIntent:
+    payload = _intent_payload(evidence)
+    if evidence.inventory.revision != source_revision:
+        raise FileAssessmentPublicationError("평가 증거의 source가 다릅니다.")
+    if evidence.tiered is not None:
+        _verify_root_plan_files(plan_repository or Path(repo), evidence.tiered)
+    return PreparedPublicationIntent(repo, cycle_revision, source_revision, publication_commit, payload)
+
+
+def save_intent(
+    connection: sqlite3.Connection, repo: str, cycle_revision: int,
+    source_revision: str, publication_commit: str, evidence: AssessmentEvidence, *,
+    plan_repository: Path | None = None,
+    prepared: PreparedPublicationIntent | None = None,
+) -> None:
+    if prepared is None:
+        prepared = prepare_intent(repo, cycle_revision, source_revision, publication_commit,
+                                  evidence, plan_repository=plan_repository)
+    if prepared != PreparedPublicationIntent(
+        repo, cycle_revision, source_revision, publication_commit, _intent_payload(evidence),
+    ) or evidence.inventory.revision != source_revision:
+        raise FileAssessmentPublicationError("준비한 평가 publication intent가 현재 입력과 다릅니다.")
+    ensure_schema(connection)
+    from loop_manager_internal.storage import maintenance_state
+    maintenance_state.MaintenanceRepository(connection)._verified_merged_count(
+        repo, source_revision, evidence.merged_count,
+    )
+    payload = prepared.evidence_json
     row = connection.execute(
         "SELECT cycle_revision, source_revision, publication_commit, evidence_json "
         "FROM file_assessment_publications WHERE repo = ?", (repo,),

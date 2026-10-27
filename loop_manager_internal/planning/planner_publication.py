@@ -678,6 +678,8 @@ def _apply_general_planning_batch(
     revision_inputs = {str(revision.plan["id"]): execplan_drafts.input_digests(worktree, revision.plan)
                        for revision in result.revisions}
     declarations = effects.plan_declarations(worktree, plan_commit)
+    from loop_manager_internal.agents import common_guidance
+    guidance_hash = common_guidance.planning_content_hash(connection, repo) or common_guidance.runtime_content_hash()
     manager_repository = effects.is_loop_manager_repository(Path(repo))
     plan_texts = {}
     if manager_repository:
@@ -726,6 +728,8 @@ def _apply_general_planning_batch(
         effects._assert_mutable_ready_snapshot_current(
             connection, affected_snapshot, pr_observation=pr_observation,
         )
+        work_claims.assert_manual_scopes_available(connection, repo, result)
+        work_claims.assert_new_ids_available(connection, repo, (plan["id"] for _path, plan in result.plans))
         planning_publication_state.apply_mutable_catalog_changes(
             connection, repo, deletions=result.deletions, revisions=result.revisions,
             snapshot_token=snapshot.token, plan_commit=plan_commit,
@@ -769,7 +773,7 @@ def _apply_general_planning_batch(
                                       revised_plan_ids=tuple(item.snapshot.plan_id for item in result.revisions))
         if not requirement_only:
             planning_input_state.record_general(
-                connection, repo, plan_commit, declarations,
+                connection, repo, plan_commit, declarations, guidance_hash=guidance_hash,
             )
         effects._clear_active_in_current_transaction(
             connection,

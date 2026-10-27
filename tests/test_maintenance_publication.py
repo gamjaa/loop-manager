@@ -1,4 +1,5 @@
 from tests.support.catalog import plan_text
+from contextlib import ExitStack
 import hashlib
 import json
 import sqlite3
@@ -31,6 +32,110 @@ from tests.support.git import isolated_git_test
 
 @isolated_git_test
 class MaintenancePublicationTest(MaintenancePlanningCase):
+    def test_batch_observes_git_files_and_success_fingerprints_before_transaction(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.catalog import execplan_drafts
+        context = self._begin_barrier()
+        with self.connection:
+            self.connection.execute('UPDATE maintenance_cycles SET include_general_planning=1')
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, 'add', 'docs/plans')
+        git(self.repo, 'commit', '-m', 'Prepare publication boundary fixture')
+        commit = git(self.repo, 'rev-parse', 'HEAD')
+        def outside_transaction(function):
+            def observe(*args, **kwargs):
+                self.assertFalse(self.connection.in_transaction)
+                return function(*args, **kwargs)
+            return observe
+        with ExitStack() as stack:
+            for name in ('git', 'git_bytes', 'file_hash', 'plan_declarations', 'is_loop_manager_repository',
+                         '_planning_input_fingerprint', '_specification_input_fingerprint'):
+                stack.enter_context(mock.patch.object(loop_manager, name,
+                    side_effect=outside_transaction(getattr(loop_manager, name))))
+            stack.enter_context(mock.patch.object(common_guidance, '_read',
+                side_effect=outside_transaction(common_guidance._read)))
+            stack.enter_context(mock.patch.object(execplan_drafts, 'input_digests',
+                side_effect=outside_transaction(execplan_drafts.input_digests)))
+            loop_manager.record_maintenance_publication_intent(
+                self.connection, str(self.repo), self.repo, 'main', result, commit)
+            git(self.repo, 'push', 'origin', 'HEAD:main')
+            git(self.repo, 'fetch', 'origin')
+            first = loop_manager.publish_maintenance_planning_batch(
+                self.connection, str(self.repo), self.repo, 'main', result, commit)
+            second = loop_manager.publish_maintenance_planning_batch(
+                self.connection, str(self.repo), self.repo, 'main', result, commit)
+        self.assertEqual(first, second)
+        self.assertEqual(first.publication_stage, 'remote_confirmed')
+        self.assertEqual(self.connection.execute('SELECT processed_sha FROM projects').fetchone()[0], commit)
+
+    def test_batch_rejects_cycle_owner_and_catalog_races_during_observation(self):
+        from loop_manager_internal.maintenance import maintenance_publication
+        from loop_manager_internal.storage import manual_work_state
+        manual_work_state.ensure_schema(self.connection)
+        self.connection.commit()
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, 'add', 'docs/plans')
+        git(self.repo, 'commit', '-m', 'Prepare publication CAS fixture')
+        commit = git(self.repo, 'rev-parse', 'HEAD')
+        saved = loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), self.repo, 'main', result, commit)
+        self.connection.commit()
+        declarations = loop_manager.plan_declarations
+        for mutation, restore in (
+            ('UPDATE maintenance_cycles SET revision=revision+1', 'UPDATE maintenance_cycles SET revision=revision-1'),
+            ("UPDATE projects SET planner_session_id='competitor'", 'UPDATE projects SET planner_session_id=NULL'),
+            ('UPDATE exec_plans SET catalog_generation=catalog_generation+1',
+             'UPDATE exec_plans SET catalog_generation=catalog_generation-1'),
+            ("INSERT INTO manual_work_members SELECT repo,'G-001','orphan' FROM projects",
+             "DELETE FROM manual_work_members WHERE group_id='orphan'"),
+        ):
+            def observe(*args):
+                self.assertFalse(self.connection.in_transaction)
+                value = declarations(*args)
+                if args[-1] == commit:
+                    with self.connection:
+                        self.connection.execute(mutation)
+                return value
+            with self.subTest(mutation=mutation), \
+                    mock.patch.object(loop_manager, 'plan_declarations', side_effect=observe), \
+                    self.assertRaisesRegex(loop_manager.MaintenancePlanningError, '게시 준비 이후|수동 소유권'):
+                loop_manager._apply_maintenance_planning_batch(
+                    self.connection, str(self.repo), self.repo, 'main', result, commit)
+            self.assertEqual([row[0] for row in self.connection.execute(
+                'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-000', 'G-001'])
+            current = maintenance_state.MaintenanceRepository(self.connection).get(str(self.repo))
+            self.assertEqual(current.publication_commit_sha, saved.publication_commit_sha)
+            self.assertEqual(current.publication_stage, 'prepared')
+            with self.connection:
+                self.connection.execute(restore)
+        self.assertEqual(maintenance_publication._maintenance_publication_db_identity(
+            self.connection, str(self.repo), result)[0], saved)
+
+    def test_intent_rejects_owner_changed_during_commit_observation(self):
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, 'add', 'docs/plans')
+        git(self.repo, 'commit', '-m', 'Prepare intent CAS fixture')
+        commit = git(self.repo, 'rev-parse', 'HEAD')
+        self.connection.commit()
+        validate = loop_manager._validate_maintenance_publication_commit
+        def observe(*args, **kwargs):
+            self.assertFalse(self.connection.in_transaction)
+            validate(*args, **kwargs)
+            with self.connection:
+                self.connection.execute("UPDATE projects SET planner_session_id='competitor'")
+        with mock.patch.object(loop_manager, '_validate_maintenance_publication_commit', side_effect=observe), \
+                self.assertRaisesRegex(loop_manager.MaintenancePlanningError, 'intent 준비 이후'):
+            loop_manager.record_maintenance_publication_intent(
+                self.connection, str(self.repo), self.repo, 'main', result, commit)
+        cycle = maintenance_state.MaintenanceRepository(self.connection).get(str(self.repo))
+        self.assertIsNone(cycle.publication_stage)
+        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'competitor')
+
     def test_legacy_manager_plan_recovers_from_published_maintenance_intent(self):
         from loop_manager_internal.catalog import manager_sources
         from loop_manager_internal.storage import verify_input_requests

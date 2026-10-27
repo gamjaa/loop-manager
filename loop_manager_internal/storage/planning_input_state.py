@@ -82,6 +82,7 @@ def has_baseline(connection: sqlite3.Connection, repo: str) -> bool:
 
 def record_general(
     connection: sqlite3.Connection, repo: str, revision: str, entries: PlanEntries,
+    *, guidance_hash: str | None = None,
 ) -> None:
     """Call in the same transaction as a successful full planning result."""
     ensure_schema(connection)
@@ -95,6 +96,7 @@ def record_general(
         "fingerprint_format = excluded.fingerprint_format, "
         "full_input_format = excluded.full_input_format, entries = excluded.entries, guidance_hash = excluded.guidance_hash",
         (repo, SCOPE, revision, revision, FORMAT, FULL_FORMAT, _encoded(entries),
+         guidance_hash if guidance_hash is not None else
          common_guidance.planning_content_hash(connection, repo) or common_guidance.runtime_content_hash()),
     )
     from . import execplan_draft_state

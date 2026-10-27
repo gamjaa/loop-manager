@@ -2,9 +2,10 @@
 from __future__ import annotations
 from loop_manager_internal.agents import common_guidance
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
 from loop_manager_internal.catalog import execplan_catalog, project_catalog_refresh
+from loop_manager_internal.catalog import execplan_drafts
 from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
 from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH
@@ -16,7 +17,7 @@ from loop_manager_internal.maintenance.maintenance_planning import MaintenancePl
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 from loop_manager_internal.storage import maintenance_file_ledger
 from loop_manager_internal.storage import maintenance_state
-from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage import runtime_state, work_claims
 from pathlib import Path
 import hashlib
 import json
@@ -287,6 +288,26 @@ def _assert_remote_preserves_maintenance_batch(
             f"{rendered}"
         )
 
+
+def _maintenance_publication_db_identity(
+    connection: sqlite3.Connection, repo: str, result: ValidatedPlanningResult,
+) -> tuple:
+    """Capture the cycle, owner, catalog and affected manual claims for CAS."""
+    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    project = connection.execute("SELECT * FROM projects WHERE repo=?", (repo,)).fetchone()
+    rows = connection.execute("SELECT * FROM exec_plans WHERE repo=? ORDER BY plan_id", (repo,)).fetchall()
+    by_id = {str(row["plan_id"]): row for row in rows}
+    affected = {str(plan["id"]) for _path, plan in result.plans}
+    affected.update(revision.snapshot.plan_id for revision in result.revisions)
+    manual = []
+    for plan_id in sorted(affected):
+        state, owned = work_claims.manual_plan_ownership(connection, repo, plan_id, by_id.get(plan_id))
+        if owned:
+            raise MaintenancePlanningError(f"게시 대상에 수동 소유권이 있습니다: {plan_id}")
+        manual.append((plan_id, state))
+    return cycle, tuple(project) if project is not None else None, tuple(tuple(row) for row in rows), tuple(manual)
+
+
 @dataclass(frozen=True)
 class RecordMaintenancePublicationIntentEffects:
     """Named effects for record_maintenance_publication_intent; no entry-point/module access."""
@@ -311,6 +332,8 @@ def record_maintenance_publication_intent(
             "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
         )
     effects._assert_maintenance_context_current(connection, context)
+    db_identity = _maintenance_publication_db_identity(connection, repo, result)
+    cycle = db_identity[0]
     effects._validate_maintenance_publication_commit(
         worktree,
         base_branch,
@@ -324,8 +347,8 @@ def record_maintenance_publication_intent(
         if context.mode is MaintenancePlanMode.BARRIER
         else maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION
     )
-    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
     evidence = None
+    prepared_intent = None
     if (expected_phase is maintenance_state.MaintenancePhase.ASSESSMENT
         and ((cycle.file_assessment_start_merged_count is not None
               and (not effects.is_loop_manager_repository(Path(repo)) or cycle.full_assessment_completed))
@@ -334,7 +357,18 @@ def record_maintenance_publication_intent(
             connection, repo, worktree, base_branch,
             context.cycle_revision, context.active_sha,
         )
+        prepared_intent = maintenance_file_publication.prepare_intent(
+            repo, context.cycle_revision, context.active_sha, plan_commit, evidence,
+            plan_repository=worktree,
+        )
     with runtime_state._transaction(connection):
+        if _maintenance_publication_db_identity(connection, repo, result) != db_identity:
+            raise MaintenancePlanningError("intent 준비 이후 cycle·프로젝트 소유권·catalog·수동 소유권이 변경됐습니다.")
+        effects._assert_maintenance_context_current(connection, context)
+        work_claims.assert_new_ids_available(connection, repo, (plan["id"] for _path, plan in result.plans))
+        # Revision membership is captured in db_identity, including inactive
+        # history. Check shared Requirement scopes without replacing that proof.
+        work_claims.assert_manual_scopes_available(connection, repo, replace(result, revisions=(), deletions=()))
         intent = maintenance_state.MaintenanceRepository(
             connection
         ).record_publication_intent(
@@ -353,7 +387,7 @@ def record_maintenance_publication_intent(
         if evidence is not None:
             maintenance_file_publication.save_intent(
                 connection, repo, context.cycle_revision, context.active_sha,
-                plan_commit, evidence, plan_repository=worktree,
+                plan_commit, evidence, plan_repository=worktree, prepared=prepared_intent,
             )
         return intent
 
@@ -371,6 +405,7 @@ def _maintenance_rows_match_published_batch(
     worktree: Path,
     result: ValidatedPlanningResult,
     plan_commit: str,
+    *, content_hashes: dict[str, str] | None = None,
 ) -> bool:
     for path, plan in result.plans:
         row = connection.execute(
@@ -393,7 +428,7 @@ def _maintenance_rows_match_published_batch(
             sources,
             dependencies,
             priority,
-            effects.file_hash(worktree / path),
+            content_hashes[path] if content_hashes is not None else effects.file_hash(worktree / path),
             plan_commit,
             "READY",
         ):
@@ -419,7 +454,8 @@ def _maintenance_rows_match_published_batch(
             sources,
             dependencies,
             priority,
-            effects.file_hash(worktree / revision.path),
+            (content_hashes[revision.path] if content_hashes is not None
+             else effects.file_hash(worktree / revision.path)),
             plan_commit,
             "READY",
         ):
@@ -480,6 +516,8 @@ def _maintenance_publication_already_applied(
     worktree: Path,
     result: ValidatedPlanningResult,
     plan_commit: str,
+    *, content_hashes: dict[str, str] | None = None,
+    manager_repository: bool | None = None,
 ) -> bool:
     context = result.maintenance_context
     assert context is not None
@@ -504,7 +542,8 @@ def _maintenance_publication_already_applied(
         )
     if (cycle_matches and context.mode is MaintenancePlanMode.BARRIER
         and ((cycle.file_assessment_start_merged_count is not None
-              and (not effects.is_loop_manager_repository(Path(repo)) or cycle.full_assessment_completed))
+              and (not (effects.is_loop_manager_repository(Path(repo)) if manager_repository is None
+                        else manager_repository) or cycle.full_assessment_completed))
              or tiered_review.has_assessment(connection, repo, context.cycle_revision, context.active_sha))):
         evidence = maintenance_file_publication.saved_intent(
             connection, repo, context.cycle_revision, context.active_sha,
@@ -519,8 +558,12 @@ def _maintenance_publication_already_applied(
             if (success is None or success.source_revision != evidence.inventory.revision
                 or cycle.last_success_file_assessment_merged_count is None):
                 return False
-    return cycle_matches and effects._maintenance_rows_match_published_batch(
-        connection, repo, worktree, result, plan_commit
+    if not cycle_matches:
+        return False
+    if content_hashes is None:
+        return effects._maintenance_rows_match_published_batch(connection, repo, worktree, result, plan_commit)
+    return effects._maintenance_rows_match_published_batch(
+        connection, repo, worktree, result, plan_commit, content_hashes=content_hashes,
     )
 
 
@@ -598,16 +641,31 @@ def _apply_maintenance_planning_batch(
         raise MaintenancePlanningError(
             "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
         )
-    repository = maintenance_state.MaintenanceRepository(connection)
+    db_identity = _maintenance_publication_db_identity(connection, repo, result)
+    cycle = db_identity[0]
+    manager_repository = effects.is_loop_manager_repository(Path(repo))
     prepared_rows = effects._prepare_execplan_rows(worktree, list(result.plans), plan_commit)
+    content_hashes = {path: effects.file_hash(worktree / path)
+                      for path in [path for path, _plan in result.plans]
+                      + [revision.path for revision in result.revisions]}
+    revision_inputs = {revision.path: execplan_drafts.input_digests(worktree, revision.plan)
+                       for revision in result.revisions}
+    after = effects.plan_declarations(worktree, plan_commit)
+    before = (effects.plan_declarations(worktree, context.active_sha)
+              if not cycle.include_general_planning else None)
+    guidance_hash = common_guidance.effective_planning_hash(connection, repo)
+    specification_fingerprint = (effects._specification_input_fingerprint(
+        worktree, plan_commit, guidance_hash=guidance_hash) if cycle.include_general_planning else None)
+    planning_fingerprint = (effects._planning_input_fingerprint(
+        worktree, plan_commit, guidance_hash=guidance_hash) if cycle.include_general_planning else None)
     already_applied = effects._maintenance_publication_already_applied(
         connection, repo, worktree, result, plan_commit,
+        content_hashes=content_hashes, manager_repository=manager_repository,
     )
-    cycle = repository.get(repo)
     prepared_assessment = None
     if (not already_applied and context.mode is MaintenancePlanMode.BARRIER
         and ((cycle.file_assessment_start_merged_count is not None
-              and (not effects.is_loop_manager_repository(Path(repo)) or cycle.full_assessment_completed))
+              and (not manager_repository or cycle.full_assessment_completed))
              or tiered_review.has_assessment(connection, repo, context.cycle_revision, context.active_sha))):
         evidence = maintenance_file_publication.saved_intent(
             connection, repo, context.cycle_revision, context.active_sha, plan_commit,
@@ -617,8 +675,11 @@ def _apply_maintenance_planning_batch(
         )
     with runtime_state._transaction(connection):
         repository = maintenance_state.MaintenanceRepository(connection)
+        if _maintenance_publication_db_identity(connection, repo, result) != db_identity:
+            raise MaintenancePlanningError("게시 준비 이후 cycle·프로젝트 소유권·catalog·수동 소유권이 변경됐습니다.")
         if effects._maintenance_publication_already_applied(
-            connection, repo, worktree, result, plan_commit
+            connection, repo, worktree, result, plan_commit,
+            content_hashes=content_hashes, manager_repository=manager_repository,
         ):
             return repository.get(repo)
         include_general_planning = repository.get(repo).include_general_planning
@@ -626,6 +687,8 @@ def _apply_maintenance_planning_batch(
             connection, repo, context, plan_commit, result
         )
         effects._assert_maintenance_context_current(connection, context)
+        work_claims.assert_new_ids_available(connection, repo, (plan["id"] for _path, plan in result.plans))
+        work_claims.assert_manual_scopes_available(connection, repo, replace(result, revisions=(), deletions=()))
         if allow_legacy_priority:
             effects._register_execplan_rows(
                 connection, repo, worktree, list(result.plans), plan_commit,
@@ -666,7 +729,7 @@ def _apply_maintenance_planning_batch(
                 """,
                 (
                     dependencies,
-                    effects.file_hash(worktree / revision.path),
+                    content_hashes[revision.path],
                     plan_commit,
                     plan_commit,
                     str(revision.plan["complexity"]),
@@ -696,16 +759,15 @@ def _apply_maintenance_planning_batch(
                     f"{snapshot.plan_id}"
                 )
             from loop_manager_internal.storage import execplan_draft_state
-            from loop_manager_internal.catalog import execplan_drafts
             execplan_draft_state.observe(connection, repo, revision.path, revision.plan,
-                effects.file_hash(worktree / revision.path), plan_commit,
+                content_hashes[revision.path], plan_commit,
                 agent=context.mode is MaintenancePlanMode.REVALIDATION,
-                inputs=execplan_drafts.input_digests(worktree, revision.plan))
+                inputs=revision_inputs[revision.path])
 
         cycle = repository.get(repo)
         if (context.mode is MaintenancePlanMode.BARRIER
             and ((cycle.file_assessment_start_merged_count is not None
-                  and (not effects.is_loop_manager_repository(Path(repo)) or cycle.full_assessment_completed))
+                  and (not manager_repository or cycle.full_assessment_completed))
                  or tiered_review.has_assessment(connection, repo, context.cycle_revision, context.active_sha))):
             evidence = maintenance_file_publication.saved_intent(
                 connection, repo, context.cycle_revision, context.active_sha,
@@ -752,28 +814,17 @@ def _apply_maintenance_planning_batch(
                 expected_revision=context.cycle_revision,
                 remote_commit=plan_commit,
             )
-        guidance_hash = common_guidance.effective_planning_hash(connection, repo)
         from loop_manager_internal.storage import planning_input_state
-        after = effects.plan_declarations(worktree, plan_commit)
         if include_general_planning:
-            planning_input_state.record_general(connection, repo, plan_commit, after)
+            planning_input_state.record_general(connection, repo, plan_commit, after, guidance_hash=guidance_hash)
         effects._clear_active_in_current_transaction(
             connection,
             repo,
             processed_sha=plan_commit if include_general_planning else None,
-            specification_fingerprint=(
-                effects._specification_input_fingerprint(worktree, plan_commit, guidance_hash=guidance_hash)
-                if include_general_planning
-                else None
-            ),
-            planning_fingerprint=(
-                effects._planning_input_fingerprint(worktree, plan_commit, guidance_hash=guidance_hash)
-                if include_general_planning
-                else None
-            ),
+            specification_fingerprint=specification_fingerprint,
+            planning_fingerprint=planning_fingerprint,
         )
         if not include_general_planning:
-            before = effects.plan_declarations(worktree, context.active_sha)
             planning_input_state.advance_verified_delta(
                 connection, repo, plan_commit,
                 planning_input_state.delta(before, after),

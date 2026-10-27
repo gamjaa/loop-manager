@@ -1503,6 +1503,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         return result, commit, specification, planning
 
     def test_general_batch_observes_git_and_files_before_its_transaction(self):
+        from loop_manager_internal.agents import common_guidance
         from loop_manager_internal.catalog import execplan_drafts
         result, commit, specification, planning = self.prepare_batch(record_intent=False)
         def outside_transaction(function):
@@ -1516,6 +1517,8 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                     side_effect=outside_transaction(getattr(loop_manager, name))))
             stack.enter_context(mock.patch.object(execplan_drafts, 'input_digests',
                 side_effect=outside_transaction(execplan_drafts.input_digests)))
+            stack.enter_context(mock.patch.object(common_guidance, '_read',
+                side_effect=outside_transaction(common_guidance._read)))
             loop_manager.record_general_planning_publication_intent(
                 self.connection, str(self.repo), self.repo, result, commit, specification, planning)
             loop_manager.publish_general_planning_batch(
