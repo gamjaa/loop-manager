@@ -13,8 +13,8 @@ import loop_manager
 from loop_manager_internal.catalog import archive_git, execplan_archive
 from loop_manager_internal.git import command_adapter, git_adapter, manager_git_journal, source_sync, workspace
 from loop_manager_internal.recovery import pull_request_recovery
-from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot, WorkspaceOwnershipError
-from loop_manager_internal.runtime.contracts import PublicationSafetyError
+from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot, PublicationSafetyError
+from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.storage.execplan_archive_state import MergedArchiveCandidate
 from tests.support.database import runtime_connection
 
@@ -251,17 +251,61 @@ class WorkspaceEffectBoundaryTests(unittest.TestCase):
 
 
 class PublicationObservationBoundaryTests(unittest.TestCase):
+    def test_registered_remote_checks_each_location_and_url_kind(self):
+        registered = 'owner/repo'
+        locations = (Path('/repo'), Path('/worktree'))
+        url_kinds = (('remote', 'get-url', '--all', 'origin'),
+                     ('remote', 'get-url', '--push', '--all', 'origin'))
+
+        git_calls = [mock.call(location, *url_kind) for location in locations for url_kind in url_kinds]
+        git = mock.Mock(return_value=SimpleNamespace(stdout='git@github.com:owner/repo.git\n'))
+        workspace.validate_registered_remote(
+            locations[0], locations[1], registered, git=git,
+            github_repository=lambda _: registered)
+        self.assertEqual(git.call_args_list, git_calls)
+
+        for location in locations:
+            for url_kind in url_kinds:
+                for stdout, reason in (('', 'missing'), ('url-a\nurl-b\n', 'multiple'),
+                                       ('git@github.com:other/repo.git\n', 'identity')):
+                    with self.subTest(location=location, url_kind=url_kind, reason=reason):
+                        def observe(path, *args):
+                            if path == location and args == url_kind:
+                                return SimpleNamespace(stdout=stdout)
+                            return SimpleNamespace(stdout='git@github.com:owner/repo.git\n')
+                        git = mock.Mock(side_effect=observe)
+                        with self.assertRaises(WorkspaceOwnershipError):
+                            workspace.validate_registered_remote(
+                            location, None, registered, git=git,
+                                github_repository=lambda url: 'other/repo' if 'other' in url else registered)
+                        self.assertIn(mock.call(location, *url_kind), git.call_args_list)
+
+                with self.subTest(location=location, url_kind=url_kind, reason='command failure'):
+                    def failed_git(path, *args):
+                        if path == location and args == url_kind:
+                            raise subprocess.CalledProcessError(1, ['git', *args])
+                        return SimpleNamespace(stdout='git@github.com:owner/repo.git\n')
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        workspace.validate_registered_remote(
+                            locations[0], locations[1], registered, git=failed_git,
+                            github_repository=lambda _: registered)
+
     def test_worker_checkpoint_origin_uses_shared_validator_and_maps_failure_before_push(self):
         from loop_manager_internal.git import publication_service
 
         connection = runtime_connection()
         self.addCleanup(connection.close)
         repo_path, worktree = Path('/repo'), Path('/worktree')
+        git = mock.Mock()
+        validate = mock.Mock(side_effect=lambda repo_path, selected_worktree, origin:
+            workspace.validate_registered_remote(repo_path, selected_worktree, origin,
+                git=lambda *_args: SimpleNamespace(stdout='git@github.com:other/repo.git\n'),
+                github_repository=lambda _: 'other/repo'))
         effects = publication_service.WorkerCheckpointPublicationEffects(
-            active_execplan=lambda *_: plan, git=mock.Mock(), remote_branch_oid=mock.Mock(),
+            active_execplan=lambda *_: plan, git=git, remote_branch_oid=mock.Mock(),
             pr_for_branch=mock.Mock(return_value=None), github_repository=mock.Mock(),
             validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
-            validate_registered_remote=mock.Mock(side_effect=WorkspaceOwnershipError('unsafe')),
+            validate_registered_remote=validate,
             update_project=mock.Mock())
         connection.execute("UPDATE projects SET origin='owner/repo', base_branch='main'")
         connection.commit()
@@ -273,8 +317,49 @@ class PublicationObservationBoundaryTests(unittest.TestCase):
             publication_service.push_worker_checkpoint_commits(
                 effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
                 'loop-manager/G-047', worktree, 'main', None, None)
-        effects.validate_registered_remote.assert_called_once_with(repo_path, worktree, 'owner/repo')
-        effects.git.assert_not_called()
+        validate.assert_called_once_with(repo_path, worktree, 'owner/repo')
+        git.assert_not_called()
+
+    def test_worker_checkpoint_rechecks_origin_before_push(self):
+        from loop_manager_internal.git import publication_service
+        from tests.test_worker_checkpoint_publication import WorkerCheckpointPublicationTests
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = WorkerCheckpointPublicationTests()
+            self.addCleanup(fixture.doCleanups)
+            repo, origin, branch, base, connection = fixture._repository(directory)
+            self.addCleanup(connection.close)
+            target = repo / 'src/app.py'
+            target.write_text('VALUE = 7\n', encoding='utf-8')
+            from tests.support.git import git_command
+            git_command(repo, 'add', 'src/app.py')
+            git_command(repo, 'commit', '-m', 'Worker change')
+            real = fixture._effects(repo, origin, connection)
+            original_git = real.git
+            observations = 0
+
+            def validate(repo_path, worktree, registered):
+                nonlocal observations
+                observations += 1
+                changed = observations > 1
+                workspace.validate_registered_remote(
+                    repo_path, worktree, registered,
+                    git=lambda path, *args: SimpleNamespace(stdout='registered-url\n'),
+                    github_repository=lambda _url: ('other/repo' if changed else registered))
+
+            pushes = []
+            def record_git(path, *args, **kwargs):
+                if args and args[0] == 'push':
+                    pushes.append(args)
+                return original_git(path, *args, **kwargs)
+            effects = publication_service.WorkerCheckpointPublicationEffects(
+                **{**real.__dict__, 'git': record_git, 'validate_registered_remote': validate})
+            with self.assertRaises(PublicationSafetyError) as raised:
+                publication_service.push_worker_checkpoint_commits(
+                    effects, connection, repo, Path(directory), str(repo), 'G-001',
+                    branch, repo, 'main', None, None)
+            self.assertEqual(observations, 2, str(raised.exception))
+            self.assertEqual(pushes, [])
 
     def test_archive_requires_the_current_regular_file_and_original_hash(self):
         effects = fake_effects(archive_git.ArchiveGitEffects)
