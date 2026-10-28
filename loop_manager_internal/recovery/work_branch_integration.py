@@ -238,8 +238,8 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
             raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '원격 branch와 PR head 관측 시점이 다릅니다.')
     current = ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
     acceptance = (current.snapshot or {}).get('current_rebase_acceptance') or {}
-    known = ((current.snapshot or {}).get('accepted_work_branch')
-             or plan['publication_remote_oid'] or published_branch(connection, repo, plan)
+    known = (plan['publication_remote_oid'] or published_branch(connection, repo, plan)
+             or (current.snapshot or {}).get('accepted_work_branch')
              or (acceptance.get('remote') or {}).get('oid'))
     adoption = (current.snapshot or {}).get('remote_adoption')
     if not known and adoption is not None:
