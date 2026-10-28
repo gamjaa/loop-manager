@@ -48,12 +48,18 @@ class RemoteIntegrationAnchorTests(unittest.TestCase):
             _blocked_execplan_revision_metadata_error=mock.Mock(return_value=None),
             capture_git_snapshot=mock.Mock(side_effect=lambda _: self.snapshot))
         self.ancestor = True
+        self.connected = True
+        self.patches = ''
         self.integration = self.enterContext(mock.patch.object(integration, 'integrate',
             side_effect=lambda *args: replace(self.snapshot, head='integrated')))
 
     def git(self, path, *args, **kwargs):
         if args[0] == 'remote':
             output = 'https://github.com/owner/repo'
+        elif args[0] in ('cat-file', 'rev-list'):
+            output = ''
+        elif args[0] == 'cherry':
+            output = self.patches
         elif args[0] == 'fetch':
             output = ''
         elif args[0] == 'rev-parse':
@@ -61,11 +67,14 @@ class RemoteIntegrationAnchorTests(unittest.TestCase):
         elif args[0] == 'ls-remote':
             output = f'{self.remote}\trefs/heads/{self.branch}\n'
         elif args[:2] == ('merge-base', '--is-ancestor'):
+            if args[2] == args[3]:
+                return subprocess.CompletedProcess([], 0, '')
             if args[2:] == (self.head, self.remote):
                 return subprocess.CompletedProcess([], 0 if self.ancestor else 1, '')
             return subprocess.CompletedProcess([], 1, '')
         elif args[0] == 'merge-base':
-            output = 'common-base'
+            return subprocess.CompletedProcess([], 0 if self.connected else 1,
+                                               'common-base' if self.connected else '')
         else:
             raise AssertionError(args)
         return subprocess.CompletedProcess([], 0, output)
@@ -94,13 +103,79 @@ class RemoteIntegrationAnchorTests(unittest.TestCase):
         self.assertEqual(saved.expected_head, 'integrated')
 
     def test_unconnected_history_waits_without_rewriting_or_retry_classification(self):
-        self.remote, self.ancestor = 'a' * 40, False
+        self.remote, self.ancestor, self.connected = 'a' * 40, False, False
         saved = self.store.get('repo', 'G-047')
         with self.assertRaises(RecoveryFailure) as failure:
             self.synchronize()
         self.assertEqual(failure.exception.reason, RecoveryReason.GIT_INPUT_UNCERTAIN)
         self.assertEqual(self.store.get('repo', 'G-047'), saved)
         self.integration.assert_not_called()
+
+    def test_related_rewrite_integrates_and_accepts_same_input_only_once(self):
+        self.remote, self.ancestor = 'a' * 40, False
+        self.assertTrue(self.synchronize())
+        self.assertFalse(self.synchronize())
+        self.integration.assert_called_once()
+        self.assertEqual(self.store.get('repo', 'G-047').snapshot['remote_adoption'], self.adoption)
+
+    def test_local_base_rebase_accepts_equivalent_old_remote_patches(self):
+        self.remote, self.ancestor = 'a' * 40, False
+        self.snapshot = replace(self.snapshot, head='rebased-local')
+        self.patches = '- ' + self.head + '\n'
+        self.assertTrue(self.synchronize())
+        self.integration.assert_called_once()
+
+    def test_old_remote_patch_missing_locally_is_not_discarded(self):
+        self.remote, self.ancestor = 'a' * 40, False
+        self.snapshot = replace(self.snapshot, head='different-local')
+        self.patches = '+ ' + self.head + '\n'
+        saved = self.store.get('repo', 'G-047')
+        with self.assertRaises(RecoveryFailure) as failure:
+            self.synchronize()
+        self.assertEqual(failure.exception.reason, RecoveryReason.GIT_INPUT_UNCERTAIN)
+        self.assertEqual(self.store.get('repo', 'G-047'), saved)
+        self.integration.assert_not_called()
+
+    def test_completed_integration_before_acceptance_still_invalidates_verification(self):
+        self.remote = 'a' * 40
+        original = self.snapshot
+        self.snapshot = replace(original, head='integrated')
+        current = self.store.get('repo', 'G-047')
+        self.store.record('repo', 'G-047', expected_generation=current.generation, operation=None,
+            expected_head='integrated', target_base_oid=self.remote, observed_remote_oid=self.remote,
+            snapshot={**current.snapshot, 'work_branch_integration': {
+                'phase': 'complete', 'remote': self.remote, 'head': 'integrated',
+                'before': original.serialize()}})
+        with mock.patch.object(integration.runtime_state.RuntimeStateRepository, 'update_project') as update:
+            self.assertTrue(self.synchronize())
+        values = update.call_args.args[1]
+        self.assertIsNone(values['verify_token'])
+        self.assertIsNone(values['review_token'])
+        self.assertFalse(self.synchronize())
+
+    def test_owned_base_rebase_can_preserve_anchor_in_its_current_partial_head(self):
+        self.remote, self.ancestor = 'a' * 40, False
+        current = self.store.get('repo', 'G-047')
+        self.store.record('repo', 'G-047', expected_generation=current.generation, operation='rebase',
+            expected_head='original-before-rebase', target_base_oid='base', observed_remote_oid=self.head,
+            snapshot=current.snapshot)
+        self.effects._current_rebase_service = mock.Mock(return_value=SimpleNamespace(
+            require_owned=mock.Mock(return_value=(None, SimpleNamespace(
+                status=SimpleNamespace(value='waiting_for_resolution'))))))
+        self.assertFalse(self.synchronize())
+        saved = self.store.get('repo', 'G-047')
+        self.assertEqual(saved.operation, 'rebase')
+        self.assertEqual(saved.snapshot['pending_work_branch_input'], self.remote)
+        self.integration.assert_not_called()
+
+    def test_acceptance_and_verification_invalidation_roll_back_together(self):
+        self.remote = 'a' * 40
+        saved = self.store.get('repo', 'G-047')
+        with mock.patch.object(integration.runtime_state.RuntimeStateRepository, 'update_project',
+                               side_effect=RuntimeError('DB application interrupted')):
+            with self.assertRaisesRegex(RuntimeError, 'DB application interrupted'):
+                self.synchronize()
+        self.assertEqual(self.store.get('repo', 'G-047'), saved)
 
     def test_adoption_for_another_target_is_not_accepted(self):
         self.adoption['branch'] = 'other'

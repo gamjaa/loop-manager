@@ -350,7 +350,8 @@ class BlockedPlanReconciler:
                 if head != branch.oid or relation not in {0, 1}:
                     raise AssessmentPending('작업 branch의 새 사용자 입력 관측이 변경됐습니다.')
                 if relation == 1:
-                    raise RuntimeError('진행 중인 작업 branch가 재작성됐습니다.')
+                    from loop_manager_internal.recovery.work_branch_integration import require_related_history
+                    require_related_history(self.ports.git, self.repo_path, context['branch_oid'], head)
                 context['branch_oid'] = branch.oid
             else:
                 raise RuntimeError('원격 작업 branch가 관측 이후 변경·삭제됐습니다.')

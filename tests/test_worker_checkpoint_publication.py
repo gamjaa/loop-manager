@@ -759,6 +759,51 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
             self.assertEqual(checkpoint.snapshot['accepted_work_branch'], head)
             self.assertNotIn('worker_checkpoint_pending', checkpoint.snapshot)
 
+    def test_rewritten_remote_retires_integrated_pending_push_without_claiming_success(self):
+        # Real Git binds the retired intent to the pre-rebase source and new remote lease.
+        import loop_manager
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin, branch, base, connection = self._repository(directory)
+            self.addCleanup(connection.close)
+            before = loop_manager.capture_git_snapshot(repo)
+            pending = {'branch': branch, 'from': base, 'target': before.head}
+            git_command(repo, 'switch', 'main')
+            (repo / 'remote.txt').write_text('new remote input\n')
+            git_command(repo, 'add', 'remote.txt')
+            git_command(repo, 'commit', '-m', 'New remote history')
+            remote = git_command(repo, 'rev-parse', 'HEAD')
+            git_command(repo, 'push', 'origin', f'{remote}:refs/heads/{branch}')
+            git_command(repo, 'switch', branch)
+            checkpoints = ExecutionCheckpointRepository(connection)
+            checkpoints.record(str(repo), 'G-001', expected_generation=0, operation=None,
+                expected_head=before.head, target_base_oid=base, observed_remote_oid=base,
+                snapshot={'accepted_work_branch': base, 'worker_checkpoint_pending': pending})
+            effects = self._effects(repo, origin, connection)
+            observed = mock.Mock(wraps=effects.git)
+            effects = publication_service.WorkerCheckpointPublicationEffects(**{**effects.__dict__, 'git': observed})
+            self.assertEqual(publication_service.push_worker_checkpoint_commits(
+                effects, connection, repo, Path(directory), str(repo), 'G-001', branch,
+                repo, 'main', remote, None), (before.head, 0))
+            self.assertIn('worker_checkpoint_pending', checkpoints.get(str(repo), 'G-001').snapshot)
+            git_command(repo, 'rebase', remote)
+            head = git_command(repo, 'rev-parse', 'HEAD')
+            current = checkpoints.get(str(repo), 'G-001')
+            checkpoints.record(str(repo), 'G-001', expected_generation=current.generation, operation=None,
+                expected_head=head, target_base_oid=remote, observed_remote_oid=remote,
+                snapshot={**current.snapshot, 'accepted_work_branch': remote,
+                    'work_branch_integration': {'phase': 'complete', 'remote': remote, 'head': head,
+                        'branch': branch, 'worktree': str(repo), 'before': before.serialize()}})
+            self.assertEqual(publication_service.push_worker_checkpoint_commits(
+                effects, connection, repo, Path(directory), str(repo), 'G-001', branch,
+                repo, 'main', remote, None), (head, 0))
+            saved = checkpoints.get(str(repo), 'G-001').snapshot
+            self.assertNotIn('worker_checkpoint_pending', saved)
+            self.assertEqual(saved['retired_worker_checkpoints'],
+                             [{'intent': pending, 'observed_remote': remote, 'confirmed': False}])
+            self.assertIsNone(connection.execute('SELECT publication_remote_oid FROM exec_plans').fetchone()[0])
+            self.assertFalse(any(call.args[1] == 'push' for call in observed.call_args_list))
+            self.assertEqual(git_command(repo.parent / 'remote.git', 'rev-parse', f'refs/heads/{branch}'), remote)
+
     def test_a_push_confirmed_before_sqlite_interruption_is_not_repeated(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, origin, branch, base, connection = self._repository(directory)

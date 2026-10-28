@@ -188,6 +188,38 @@ def require_remote_present(connection, repo, plan, remote, pull_request):
             f"명시적 재시작 요청이 필요합니다: {plan['branch']}")
 
 
+def require_related_history(git, repo_path, anchor, remote):
+    """Read connectivity only; callers still validate task identity and preservation."""
+    from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+    for oid in (anchor, remote):
+        if git(repo_path, 'cat-file', '-e', f'{oid}^{{commit}}', check=False).returncode:
+            raise RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN,
+                                  f'작업 branch commit을 확인할 수 없습니다: {oid}')
+    common = git(repo_path, 'merge-base', anchor, remote, check=False)
+    if common.returncode or not common.stdout.strip():
+        raise RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN,
+                              f'작업 branch의 공통 이력을 확인할 수 없습니다: {anchor} -> {remote}')
+    return common.stdout.strip()
+
+
+def _require_preserved_anchor(git, worktree, anchor, local, common, *, original=None):
+    """Old remote-only patches must survive locally before accepting a rewrite."""
+    from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+    for head in (local, original) if original else (local,):
+        contains = git(worktree, 'merge-base', '--is-ancestor', anchor, head, check=False)
+        if contains.returncode == 0:
+            return
+        if contains.returncode != 1:
+            raise RecoveryFailure(RecoveryReason.STATUS_FAILED, '기존 작업 commit의 로컬 보존을 확인할 수 없습니다.')
+    # shortcut: merge-only rewrites need stronger preservation evidence before automatic adoption.
+    merges = git(worktree, 'rev-list', '--min-parents=2', f'{common}..{anchor}', check=False)
+    patches = git(worktree, 'cherry', local, anchor, common, check=False)
+    if (merges.returncode or merges.stdout.strip() or patches.returncode
+            or any(not line.startswith('- ') for line in patches.stdout.splitlines())):
+        raise RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN,
+                              '재작성 전 원격 전용 변경의 로컬 보존을 확인할 수 없습니다.')
+
+
 def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, pull_request):
     """현재 작업의 원격 입력을 보존해 통합하고 게시 lease와 구분한다."""
     from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
@@ -206,8 +238,8 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
             raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '원격 branch와 PR head 관측 시점이 다릅니다.')
     current = ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
     acceptance = (current.snapshot or {}).get('current_rebase_acceptance') or {}
-    known = (plan['publication_remote_oid'] or published_branch(connection, repo, plan)
-             or (current.snapshot or {}).get('accepted_work_branch')
+    known = ((current.snapshot or {}).get('accepted_work_branch')
+             or plan['publication_remote_oid'] or published_branch(connection, repo, plan)
              or (acceptance.get('remote') or {}).get('oid'))
     adoption = (current.snapshot or {}).get('remote_adoption')
     if not known and adoption is not None:
@@ -241,10 +273,10 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
         raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
                               '전진한 원격 branch와 저장된 작업 이력을 연결할 수 없습니다.')
     relation = effects.git(repo_path, 'merge-base', '--is-ancestor', anchor, fetched, check=False)
-    if relation.returncode == 1:
-        raise RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN,
-                              f'원격 작업 branch의 이력 연결을 확인할 수 없습니다: {anchor} -> {fetched}')
-    if relation.returncode:
+    rewritten = relation.returncode == 1
+    if rewritten:
+        common = require_related_history(effects.git, repo_path, anchor, fetched)
+    elif relation.returncode:
         raise RecoveryFailure(RecoveryReason.STATUS_FAILED,
                               '원격 작업 branch의 fast-forward 관계를 확인할 수 없습니다.')
     if pull_request and pull_request.get('headRefOid') != fetched:
@@ -269,6 +301,15 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
     if metadata_error:
         raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, metadata_error)
     before = effects.capture_git_snapshot(worktree)
+    if rewritten:
+        local = before.head
+        if current.operation == 'rebase':
+            effects._current_rebase_service(connection, repo_path, state_dir, repo,
+                str(plan['plan_id']), worktree, branch, remote_oid=remote).require_owned(checkpoint=current)
+        if not (current.operation == 'rebase' and integration.get('remote') == anchor
+                and integration.get('phase') == 'rebasing'):
+            _require_preserved_anchor(effects.git, worktree, anchor, local, common,
+                original=current.expected_head if current.operation == 'rebase' else None)
     if current.operation == 'push' and remote != current.expected_head:
         contains = effects.git(worktree, 'merge-base', '--is-ancestor', current.expected_head, remote, check=False)
         if contains.returncode not in (0, 1):
@@ -323,18 +364,24 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
             raise
     checkpoints = ExecutionCheckpointRepository(connection)
     current = checkpoints.get(repo, str(plan['plan_id']))
-    checkpoints.record(repo, str(plan['plan_id']), expected_generation=current.generation,
-        operation=current.operation, expected_head=after.head,
-        target_base_oid=current.target_base_oid, observed_remote_oid=remote,
-        snapshot={**(current.snapshot or {}), 'accepted_work_branch': remote, 'pending_work_branch_input': None})
-    if pull_request and plan['pr_url']:
-        runtime_state.RuntimeStateRepository(connection).update_project(repo, {'pr_head_oid': remote})
-    changed = after.head != before.head or after.index != before.index or after.dirty != before.dirty
-    if changed and plan['status'] in runtime_state.ACTIVE_STATUSES:
-        values = managed_rebase_adoption.revalidation_values(plan['active_sha'])
-        values.pop('worker_result', None)
-        values['phase'] = 'VERIFYING' if plan['worker_result'] else 'WORKING'
-        runtime_state.RuntimeStateRepository(connection).update_project(repo, values)
+    completed = (current.snapshot or {}).get('work_branch_integration') or {}
+    comparison = before
+    if (completed.get('phase') == 'complete' and completed.get('remote') == remote
+            and (current.snapshot or {}).get('accepted_work_branch') != remote):
+        comparison = GitSnapshot.deserialize(completed['before'])
+    changed = (after.head, after.index, after.dirty) != (comparison.head, comparison.index, comparison.dirty)
+    with runtime_state._transaction(connection):
+        checkpoints.record(repo, str(plan['plan_id']), expected_generation=current.generation,
+            operation=current.operation, expected_head=after.head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=remote,
+            snapshot={**(current.snapshot or {}), 'accepted_work_branch': remote, 'pending_work_branch_input': None})
+        if pull_request and plan['pr_url']:
+            runtime_state.RuntimeStateRepository(connection).update_project(repo, {'pr_head_oid': remote})
+        if changed and plan['status'] in runtime_state.ACTIVE_STATUSES:
+            values = managed_rebase_adoption.revalidation_values(plan['active_sha'])
+            values.pop('worker_result', None)
+            values['phase'] = 'VERIFYING' if plan['worker_result'] else 'WORKING'
+            runtime_state.RuntimeStateRepository(connection).update_project(repo, values)
     return changed
 
 
@@ -434,7 +481,7 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
 
     if intent is None:
         # The caller validated saved Agent output, current ownership, origin,
-        # remote ancestry and ignored-path collisions before this boundary.
+        # related history and ignored-path collisions before this boundary.
         _require_ignored_safe(effects, worktree, remote)
         baseline = effects._capture_agent_baseline(repo, worktree, snapshot)
         preserved = json.loads(baseline) if baseline else None
