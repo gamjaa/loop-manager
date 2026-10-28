@@ -352,20 +352,39 @@ class PublicationObservationBoundaryTests(unittest.TestCase):
 
     def test_worker_checkpoint_rechecks_origin_before_push(self):
         from loop_manager_internal.git import publication_service
-        from tests.test_worker_checkpoint_publication import WorkerCheckpointPublicationTests
+        from tests.support.git import git_command, git_test_environment, local_github_origin, make_remote_repository
 
         with tempfile.TemporaryDirectory() as directory:
-            fixture = WorkerCheckpointPublicationTests()
-            self.addCleanup(fixture.doCleanups)
-            repo, origin, branch, base, connection = fixture._repository(directory)
+            repo = make_remote_repository(directory)
+            origin = local_github_origin(self, repo)
+            branch = 'loop-manager/G-047'
+            git_command(repo, 'switch', '-c', branch)
+            git_command(repo, 'config', 'user.email', 'worker@example.com')
+            git_command(repo, 'config', 'user.name', 'Worker')
+            base = git_command(repo, 'rev-parse', 'HEAD')
+            connection = runtime_connection()
             self.addCleanup(connection.close)
+            connection.execute("UPDATE projects SET origin=?, base_branch='main'", (origin,))
+            connection.execute(
+                "UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, branch=?, worktree=?",
+                (base, branch, str(repo)))
+            connection.commit()
             target = repo / 'src/app.py'
             target.write_text('VALUE = 7\n', encoding='utf-8')
-            from tests.support.git import git_command
             git_command(repo, 'add', 'src/app.py')
             git_command(repo, 'commit', '-m', 'Worker change')
-            real = fixture._effects(repo, origin, connection)
-            original_git = real.git
+            pushes = []
+
+            def git(path, *args, check=True):
+                if args and args[0] == 'push':
+                    pushes.append(args)
+                result = subprocess.run(
+                    ['git', '-C', str(path), *args], capture_output=True, text=True,
+                    encoding='utf-8', errors='replace', env=git_test_environment(), check=False)
+                if check and result.returncode:
+                    raise RuntimeError(result.stdout + result.stderr)
+                return result
+
             observations = 0
 
             def validate(repo_path, worktree, registered):
@@ -374,19 +393,21 @@ class PublicationObservationBoundaryTests(unittest.TestCase):
                 changed = observations > 1
                 workspace.validate_registered_remote(
                     repo_path, worktree, registered,
-                    git=lambda path, *args: SimpleNamespace(stdout='registered-url\n'),
+                    git=git,
                     github_repository=lambda _url: ('other/repo' if changed else registered))
 
-            pushes = []
-            def record_git(path, *args, **kwargs):
-                if args and args[0] == 'push':
-                    pushes.append(args)
-                return original_git(path, *args, **kwargs)
             effects = publication_service.WorkerCheckpointPublicationEffects(
-                **{**real.__dict__, 'git': record_git, 'validate_registered_remote': validate})
+                active_execplan=lambda conn, selected_repo: conn.execute(
+                    'SELECT * FROM exec_plans WHERE repo=?', (selected_repo,)).fetchone(),
+                git=git, remote_branch_oid=lambda *_: None, pr_for_branch=lambda *_: None,
+                github_repository=lambda _: origin,
+                validate_execplan_workspace_identity=lambda *_: None,
+                validate_managed_worktree=lambda *_: None,
+                validate_registered_remote=validate,
+                update_project=lambda *_args, **_kwargs: None)
             with self.assertRaises(PublicationSafetyError) as raised:
                 publication_service.push_worker_checkpoint_commits(
-                    effects, connection, repo, Path(directory), str(repo), 'G-001',
+                    effects, connection, repo, Path(directory), 'repo', 'G-047',
                     branch, repo, 'main', None, None)
             self.assertEqual(observations, 2, str(raised.exception))
             self.assertEqual(pushes, [])
