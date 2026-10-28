@@ -8,6 +8,7 @@ ownership from an OID or elapsed time alone.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -790,7 +791,20 @@ def _rebase_scope_owners(connection, repo, intent):
     return plans, dict(project), manual, calls, invocations, dict(checkpoint) if checkpoint else None
 
 
-def _stage_rebase_is_independent(state_dir, repo, intent, *, connection, git, worktrees, refs):
+def _rebase_scope_resources(intent):
+    return ['plan:' + intent['owner'].removeprefix('plan:'), 'branch:' + intent['expected']['branch'],
+            'worktree:' + intent['target'], 'git:' + intent['target'], 'git:config']
+
+
+def project_mutation_leases_owned(state_dir, repo, observation):
+    """CAS-side lease check: only this thread's still-open scope handles count."""
+    from loop_manager_internal.runtime.resource_lock import resource_owned
+    return all(resource_owned(state_dir, repo, resource, owner='pending-git-scope')
+               for intent, _saved, _owners in observation if intent['kind'] == 'managed_rebase'
+               for resource in _rebase_scope_resources(intent))
+
+
+def _stage_rebase_is_independent(state_dir, repo, intent, *, connection, git, worktrees, refs, lease_stack=None):
     from loop_manager_internal.recovery.plan_recovery import check_stopped_writers
     from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned, resource_is_held
     from loop_manager_internal.runtime.contracts import ProcessLockBusyError
@@ -804,12 +818,13 @@ def _stage_rebase_is_independent(state_dir, repo, intent, *, connection, git, wo
     try:
         owners = _rebase_scope_owners(connection, repo, intent)
         branch = intent['expected'].get('branch')
-        resources = ['plan:' + intent['owner'].removeprefix('plan:'), 'branch:' + branch,
-                     'worktree:' + intent['target'], 'git:' + intent['target'], 'git:config']
+        resources = _rebase_scope_resources(intent)
         missing = [resource for resource in resources if not resource_owned(state_dir, repo, resource, owner='pending-git-scope')]
         if any(resource_is_held(state_dir, repo, resource) for resource in missing):
             return False, 'resource_lease_busy'
-        with resource_locks(state_dir, repo, missing, owner='pending-git-scope'):
+        with ExitStack() as temporary:
+            (lease_stack if lease_stack is not None else temporary).enter_context(
+                resource_locks(state_dir, repo, missing, owner='pending-git-scope'))
             if owners != _rebase_scope_owners(connection, repo, intent):
                 return False, 'resource_owner_changed'
             check_stopped_writers(connection, state_dir, owners[3], owners[4])
@@ -852,13 +867,15 @@ def _stage_rebase_is_independent(state_dir, repo, intent, *, connection, git, wo
 
 
 def has_conflicting_project_mutation(
-    state_dir, repo, *, stage, connection, git, worktrees, refs=(), recoverable=None,
+    state_dir, repo, *, stage, connection, git, worktrees, refs=(), recoverable=None, lease_stack=None,
 ):
     """Classify every pending operation against this stage; never complete a journal.
 
     The decision is used immediately at the caller's existing safety boundary.
     It is not a reusable lease or a completion receipt. Exact own-operation
     recovery remains the caller's exception; unrelated records require proof.
+    A supplied lease_stack must remain open through state application. Without
+    it this is an observation only, insufficient for a later manual CAS.
     """
     from loop_manager_internal.runtime import operation_events
 
@@ -873,7 +890,7 @@ def has_conflicting_project_mutation(
         else:
             allowed, reason = _stage_rebase_is_independent(
                 state_dir, repo, intent, connection=connection, git=git,
-                worktrees=worktrees, refs=refs)
+                worktrees=worktrees, refs=refs, lease_stack=lease_stack)
         operation_events.emit('미확정 Git 작업의 단계별 자원 판단', project=repo, stage=stage,
             owner=intent['owner'], operation=intent['kind'], intent_id=intent['id'],
             resource=intent['target'],
@@ -895,7 +912,7 @@ def has_conflicting_project_mutation(
 
 
 def project_mutation_identity(state_dir, repo, connection):
-    """Capture journal and DB identities for a short CAS; perform no Git/process query."""
+    """Read journal/DB identities without Git/process queries; leases are checked separately."""
     identities = []
     def capture(intent):
         slot = _slot(state_dir, repo, intent['kind'], intent['target'])

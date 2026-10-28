@@ -50,6 +50,9 @@ priority: high
 - [x] 이번 호출 targeted: 관련 단위 13개가 통과했다(`PendingProjectMutationTest`, `ManualJournalScopeTests`, planning 최초 게시/복구 1개, 교정 후속 게시 1개, 기존 예약 lease 복구 2개, 외부 Git 무호출 수동 complete/submit 2개). 이후 직접 branch ref·config include 보호 변경의 영향 단위 5개도 통과했다(공통 행렬·수동 준비/slot/release·planning 최초 게시/복구·교정 게시·archive 진입). 기존 교정 writer 종료·pending rebase의 실행 복구 도달 회귀도 별도 통과했다. 실제 Git 효과·전체 suite/verify·Windows native는 실행하지 않았다.
 - 이번 호출의 실패와 수정: 공통 행렬의 다른 소유 lease 재사용 실패 1회는 helper 소유 lease만 허용하도록 고친 후 동일 명령으로 통과했다. 소비자 3개 명령의 첫 실행은 교정 fixture의 draft 테이블 누락과 수동 identity 비교의 소유권 변경 오류였고, fixture 및 미확인 identity 처리 수정 후 동일 명령을 재실행했다. 다음 실행의 수동 slot 실패는 fixture에 남은 planning 예약 때문이어서 예약을 명시적으로 비우고 해당 gate가 다시 켜지면 계속 거부함을 검증했다. 세 번째 동일 명령은 3개 모두 통과했다. 같은 테스트의 연속 3회 실패는 없고 미해결 targeted 실패는 없다.
 
+- [x] Review 교정 `project_mutation_identity::stale-resource-lease`: 관측 helper가 반환한 뒤 lease가 반환되는 간격을 없앴다. 수동 start/complete/submit·준비·생성/수락과 자리 반환의 외부 관측 lease를 호출자의 `ExitStack`에 연결해 상태 적용까지 유지하고, CAS에서 identity와 현재 process/thread의 열린 `pending-git-scope` handle을 함께 확인한다. 보호가 끝난 identity만으로 수락하지 않으며 정상·예외 뒤 lease를 반환하고 후속 자동 실행 전에 범위를 닫는다.
+- [x] 이번 Review 교정 targeted: 지정 runner로 수동 준비/slot/자리 반환 회귀와 기존 외부 Git 무호출 complete/submit audit 3개, 공통 자원 행렬과 정확한 수동 own-push 예외 2개를 실행해 모두 통과했다. 회귀는 helper 반환 후 별도 context의 plan/Git lease 취득 시도, journal·DB가 같은 stale identity의 CAS 거부, 자리 반환의 Git 조회 이후까지 보호 유지, 정상·예외 뒤 lease 반환과 기존 identity 변경 거부를 확인한다. 이번 호출에는 targeted 실패가 없다. 전달된 이전 후보의 targeted·전체 verify PASS는 재실행하지 않았으며 이 교정 뒤 전체 verify는 Manager 검증으로 남긴다.
+
 ## Decision Log
 
 - 원격의 직접 구현에 소급 작업을 만들지 않는다. R-055가 지정한 공통 원인과 호출자 전체의 같은 완료 조건을 한 작업으로 묶고, archive 실행 조율·게시 정리·복구 조율은 각 독립 작업에 남긴다. 단순 boolean false나 광범위 예외 무시는 교정이 아니다.

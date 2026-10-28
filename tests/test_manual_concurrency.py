@@ -911,6 +911,8 @@ class ManualJournalScopeTests(ManualWorkCase, AutomationCatalogFixture):
 
     def test_pending_rebase_scopes_preparation_slot_and_release_with_current_identity(self):
         from types import SimpleNamespace
+        from contextvars import Context
+        from loop_manager_internal.runtime.contracts import ProcessLockBusyError
         from loop_manager_internal.application.manual_concurrency import preparation_gate
         from loop_manager_internal.git import manager_git_journal as journal
         from loop_manager_internal.recovery.manual_work_recovery import release_wait
@@ -930,8 +932,20 @@ class ManualJournalScopeTests(ManualWorkCase, AutomationCatalogFixture):
                     before={'head': 'old', 'branch': 'loop-manager/G-099'}, expected={'branch': 'loop-manager/G-099'})
                 slot = journal._slot(service.state_dir, service.repo, 'managed_rebase', str(target))
                 preserved = {path.name: path.read_bytes() for path in slot.iterdir()}
+                resources = ['plan:G-099', 'git:' + str(target)]
+                attempts = []
+                def compete(resource):
+                    with resource_locks(service.state_dir, service.repo, [resource], owner='competing-execution'):
+                        return True
+                def blocked_competitors():
+                    for resource in resources:
+                        with self.assertRaises(ProcessLockBusyError):
+                            Context().run(compete, resource)
                 def git(repo, command, *args, **kwargs):
                     self.assertFalse(service.connection.in_transaction)
+                    if command == 'diff':
+                        blocked_competitors()
+                        attempts.append('release-after-observation')
                     if command == 'symbolic-ref':
                         return SimpleNamespace(stdout='', returncode=1)
                     if command == 'show-ref':
@@ -946,18 +960,37 @@ class ManualJournalScopeTests(ManualWorkCase, AutomationCatalogFixture):
                     with self.assertRaises(ManualWorkError):
                         preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False)
                 else:
-                    observation = preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False)
-                    # The DB CAS performs identity comparisons without Git/process observation.
-                    with service.connection:
-                        preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False,
-                            check_git_journal=False, git_observation=observation)
-                    service.connection.execute("UPDATE exec_plans SET branch='changed' WHERE plan_id='G-099'")
-                    service.connection.commit()
-                    with self.assertRaises(ManualWorkError), service.connection:
-                        preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False,
-                            check_git_journal=False, git_observation=observation)
-                    service.connection.execute("UPDATE exec_plans SET branch='loop-manager/G-099' WHERE plan_id='G-099'")
-                    service.connection.commit()
+                    with ExitStack() as git_leases:
+                        observation = preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False, lease_stack=git_leases)
+                        blocked_competitors()  # The helper returned; the caller still owns both leases.
+                        # The DB CAS performs identity comparisons without Git/process observation.
+                        with service.connection:
+                            preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False,
+                                check_git_journal=False, git_observation=observation)
+                        service.connection.execute("UPDATE exec_plans SET branch='changed' WHERE plan_id='G-099'")
+                        service.connection.commit()
+                        with self.assertRaises(ManualWorkError), service.connection:
+                            preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False,
+                                check_git_journal=False, git_observation=observation)
+                        service.connection.execute("UPDATE exec_plans SET branch='loop-manager/G-099' WHERE plan_id='G-099'")
+                        service.connection.commit()
+                if not conflict:
+                    # A detached identity is insufficient even when its journal/DB bytes have not changed.
+                    stale = preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False)
+                    for resource in resources:
+                        with resource_locks(service.state_dir, service.repo, [resource], owner='competing-execution'):
+                            self.assertEqual(journal.project_mutation_identity(
+                                service.state_dir, service.repo, service.connection), stale)
+                            with self.assertRaises(ManualWorkError), service.connection:
+                                preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False,
+                                    check_git_journal=False, git_observation=stale)
+                    with self.assertRaisesRegex(RuntimeError, 'abort'):
+                        with ExitStack() as git_leases:
+                            preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False,
+                                lease_stack=git_leases)
+                            raise RuntimeError('abort')
+                    for resource in resources:
+                        self.assertTrue(Context().run(compete, resource))
                 self.assertEqual(service.slot_available(recovering=group), not conflict)
                 service.connection.execute("UPDATE projects SET planning_attempt_fingerprint='reserved'")
                 service.connection.commit()
@@ -970,4 +1003,7 @@ class ManualJournalScopeTests(ManualWorkCase, AutomationCatalogFixture):
                 release_wait(service.connection, service.repo, outcome, service.state_dir, git)
                 self.assertEqual(service.runtime.get(service.repo, 'G-047').status,
                                  'VERIFYING' if conflict else 'MANUAL_PENDING')
+                self.assertEqual(attempts, [] if conflict else ['release-after-observation'])
+                for resource in resources:
+                    self.assertTrue(Context().run(compete, resource))
                 self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
