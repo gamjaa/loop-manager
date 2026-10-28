@@ -276,7 +276,7 @@ class PublicationObservationBoundaryTests(unittest.TestCase):
                         git = mock.Mock(side_effect=observe)
                         with self.assertRaises(WorkspaceOwnershipError):
                             workspace.validate_registered_remote(
-                                location, None, registered, git=git,
+                                locations[0], locations[1], registered, git=git,
                                 github_repository=lambda url: 'other/repo' if 'other' in url else registered)
                         self.assertIn(mock.call(location, *url_kind), git.call_args_list)
 
@@ -287,7 +287,7 @@ class PublicationObservationBoundaryTests(unittest.TestCase):
                         return SimpleNamespace(stdout='git@github.com:owner/repo.git\n')
                     with self.assertRaisesRegex(RuntimeError, 'git remote observation failed'):
                         workspace.validate_registered_remote(
-                            location, None, registered, git=failed_git,
+                            locations[0], locations[1], registered, git=failed_git,
                             github_repository=lambda _: registered)
 
     def test_worker_checkpoint_origin_uses_shared_validator_and_maps_failure_before_push(self):
@@ -352,65 +352,63 @@ class PublicationObservationBoundaryTests(unittest.TestCase):
 
     def test_worker_checkpoint_rechecks_origin_before_push(self):
         from loop_manager_internal.git import publication_service
-        from tests.support.git import git_command, git_test_environment, local_github_origin, make_remote_repository
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repo_path, worktree = Path('/repo'), Path('/worktree')
+        branch, root, head, registered = 'loop-manager/G-047', 'a' * 40, 'b' * 40, 'owner/repo'
+        connection.execute("UPDATE projects SET origin=?, base_branch='main'", (registered,))
+        connection.commit()
+        connection.execute(
+            "UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, branch=?, worktree=?",
+            (root, branch, str(worktree)))
+        connection.commit()
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        validation_count = 0
+        pushes = []
 
-        with tempfile.TemporaryDirectory() as directory:
-            repo = make_remote_repository(directory)
-            origin = local_github_origin(self, repo)
-            branch = 'loop-manager/G-047'
-            git_command(repo, 'switch', '-c', branch)
-            git_command(repo, 'config', 'user.email', 'worker@example.com')
-            git_command(repo, 'config', 'user.name', 'Worker')
-            base = git_command(repo, 'rev-parse', 'HEAD')
-            connection = runtime_connection()
-            self.addCleanup(connection.close)
-            connection.execute("UPDATE projects SET origin=?, base_branch='main'", (origin,))
-            connection.execute(
-                "UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, branch=?, worktree=?",
-                (base, branch, str(repo)))
-            connection.commit()
-            target = repo / 'src/app.py'
-            target.write_text('VALUE = 7\n', encoding='utf-8')
-            git_command(repo, 'add', 'src/app.py')
-            git_command(repo, 'commit', '-m', 'Worker change')
-            pushes = []
+        def git(path, *args, check=True):
+            if args[:2] == ('remote', 'get-url'):
+                url = 'changed-url' if validation_count == 2 and path == worktree else 'registered-url'
+                return SimpleNamespace(stdout=url + '\n', returncode=0)
+            if args[:3] == ('symbolic-ref', '--quiet', '--short'):
+                return SimpleNamespace(stdout=branch + '\n', returncode=0)
+            if args[:1] == ('rev-parse',):
+                return SimpleNamespace(stdout=head + '\n', returncode=0)
+            if args[:1] == ('ls-remote',):
+                return SimpleNamespace(stdout='', returncode=0)
+            if args[:1] == ('merge-base',):
+                return SimpleNamespace(stdout='', returncode=0)
+            if args[:2] == ('rev-list', '--reverse'):
+                return SimpleNamespace(stdout=f'{head} {root}\n', returncode=0)
+            if args[:2] == ('show', '-s'):
+                return SimpleNamespace(stdout=root + '\n', returncode=0)
+            if args[:1] == ('push',):
+                pushes.append(args)
+                return SimpleNamespace(stdout='', returncode=0)
+            raise AssertionError((path, args))
 
-            def git(path, *args, check=True):
-                if args and args[0] == 'push':
-                    pushes.append(args)
-                result = subprocess.run(
-                    ['git', '-C', str(path), *args], capture_output=True, text=True,
-                    encoding='utf-8', errors='replace', env=git_test_environment(), check=False)
-                if check and result.returncode:
-                    raise RuntimeError(result.stdout + result.stderr)
-                return result
+        def validate(repo, selected_worktree, origin):
+            nonlocal validation_count
+            validation_count += 1
+            return workspace.validate_registered_remote(
+                repo, selected_worktree, origin, git=git,
+                github_repository=lambda url: registered if url == 'registered-url' else 'other/repo')
 
-            observations = 0
-
-            def validate(repo_path, worktree, registered):
-                nonlocal observations
-                observations += 1
-                changed = observations > 1
-                workspace.validate_registered_remote(
-                    repo_path, worktree, registered,
-                    git=git,
-                    github_repository=lambda _url: ('other/repo' if changed else registered))
-
-            effects = publication_service.WorkerCheckpointPublicationEffects(
-                active_execplan=lambda conn, selected_repo: conn.execute(
-                    'SELECT * FROM exec_plans WHERE repo=?', (selected_repo,)).fetchone(),
-                git=git, remote_branch_oid=lambda *_: None, pr_for_branch=lambda *_: None,
-                github_repository=lambda _: origin,
-                validate_execplan_workspace_identity=lambda *_: None,
-                validate_managed_worktree=lambda *_: None,
-                validate_registered_remote=validate,
-                update_project=lambda *_args, **_kwargs: None)
+        effects = publication_service.WorkerCheckpointPublicationEffects(
+            active_execplan=lambda *_: plan, git=git, remote_branch_oid=lambda *_: None,
+            pr_for_branch=lambda *_: None, github_repository=lambda _: registered,
+            validate_execplan_workspace_identity=lambda *_: None,
+            validate_managed_worktree=lambda *_: None,
+            validate_registered_remote=validate,
+            update_project=lambda *_args, **_kwargs: None)
+        from loop_manager_internal.agents import scope_validation
+        with mock.patch.object(scope_validation, 'validate_worker_commit'):
             with self.assertRaises(PublicationSafetyError) as raised:
                 publication_service.push_worker_checkpoint_commits(
-                    effects, connection, repo, Path(directory), 'repo', 'G-047',
-                    branch, repo, 'main', None, None)
-            self.assertEqual(observations, 2, str(raised.exception))
-            self.assertEqual(pushes, [])
+                    effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
+                    branch, worktree, 'main', None, None)
+        self.assertEqual(validation_count, 2, str(raised.exception))
+        self.assertEqual(pushes, [])
 
     def test_worker_checkpoint_origin_failures_prevent_publication_effects(self):
         from loop_manager_internal.git import publication_service
