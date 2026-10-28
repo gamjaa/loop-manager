@@ -17,6 +17,7 @@ depends_on:
   - G-333
   - G-334
   - G-335
+  - G-336
 complexity: high
 risk: high
 priority: normal
@@ -31,7 +32,7 @@ priority: normal
 ## Acceptance Criteria
 
 - R-094 AC1–3: Worker·verify·Reviewer 실행, 독립 차단 계획·Planner 자리·유지보수 cycle만으로 archive를 미루지 않는다. 실제 충돌이 없으면 연속 작업 배정 중에도 기존 안전 경계에서 MERGED 후보를 처리한다. PR 동기화 직후 미처리·후보 기록 없이 진입 전 보류·Manager 재시작에도 DB MERGED와 최신 원격 catalog로 자동 재발견한다.
-- 같은 base 게시·미확정 Git 쓰기·대상 자원의 수동 소유·실행/종료 불명 writer와 실제 프로젝트 안전 차단은 보호한다. 충돌 자원과 재개 조건을 남겨 해당 archive만 보류하며 자원 반환 뒤 다음 안전 경계에서 재확인한다. 다른 작업의 worktree·index·후보·session·검증 근거를 변경하거나 호출을 선점하지 않는다.
+- 같은 base 게시·실제 충돌하는 미확정 Git 쓰기·대상 자원의 수동 소유·실행/종료 불명 writer와 실제 프로젝트 안전 차단은 보호한다. G-336의 공통 판단으로 독립성이 확인된 다른 작업의 미완료 rebase는 archive의 전제 조건으로 요구하지 않는다. 충돌 자원과 재개 조건을 남겨 해당 archive만 보류하며 자원 반환 뒤 문서 지문이 같아도 다음 안전 경계에서 재확인한다. 다른 작업의 worktree·index·후보·session·검증 근거를 변경하거나 호출을 선점하지 않는다.
 - Requirement 식별 정보 교정은 source·draft·planning 예약·writer 보호를 그대로 유지한다. 교정이 실행 불가하다는 이유만으로 안전한 archive를 막지 않으며 같은 base 등 실제 공유 충돌은 직렬화한다. 교정 실패를 삼켜 모델 평가로 진행시키는 기존 금지는 유지한다.
 - R-094 AC4–6: 실제 PR Merge와 SQLite MERGED가 확인된 후보만 최신 원격 detached worktree에서 최종 hash/revision·내용/mode를 보존한 rename-only commit으로 fast-forward 게시한다. 후보별 hash·경로·revision·일반 파일·목적지/동일 ID 충돌 검사를 유지해 문제 후보와 안전한 후보를 분리한다. 기본 checkout·활성 작업 공간을 편집하지 않는다.
 - commit 준비·게시 직전 원격/후보/소유권 경쟁은 재관측하며 force push·정리 commit 자동 rebase를 하지 않는다. push 실패·push 직후 중단·catalog/SQLite 확정 누락에서는 실제 원격 이동과 보존 operation을 대조한다. 유효한 같은 준비 commit을 재사용하고 이미 게시된 이동은 새 commit/push 없이 확정한다. 불확실한 결과·낡은 후보·타 문서 덮어쓰기로 성공을 만들지 않는다.
@@ -48,7 +49,7 @@ priority: normal
 
 ## Validation
 
-- Worker는 변경한 자원 판단·조율·저장 경계의 최소 unit case만 실행한다. Worker/verify/Reviewer·Planner 자리·활성 유지보수·독립 PLAN_BLOCKED가 있어도 실제 충돌 없음이면 dispatch하며, 같은 base 게시·미확정 journal·대상 소유/종료 불명 writer이면 보류해야 한다. 자원 반환 뒤 기존 안전 경계에서 재시도하고 활성 파일/index·session·다른 operation이 불변인지 검사한다.
+- Worker는 변경한 자원 판단·조율·저장 경계의 최소 unit case만 실행한다. Worker/verify/Reviewer·Planner 자리·활성 유지보수·독립 PLAN_BLOCKED가 있어도 실제 충돌 없음이면 dispatch하며, 같은 base 게시·실제 충돌하는 미확정 journal·대상 소유/종료 불명 writer이면 보류해야 한다. 독립성이 확인된 별도 rebase의 intent·차단은 보존한 채 archive dispatch에 도달해야 한다. 자원 반환 뒤 기존 안전 경계에서 재시도하고 활성 파일/index·session·다른 operation이 불변인지 검사한다.
 - `tests/test_task_scheduling.py`·`tests/test_project_services.py`에서 연속 신규 배정 사이의 이전 MERGED 처리, PR 후속 기회 누락, 후보 row 없는 진입 전 보류와 재시작을 모의 자원/실제 SQLite로 검사한다. 안전한 준비/결과 확정 중 경쟁과 DB 대기에도 독립 배정·기존 순서·runtime/planning drain이 유지돼야 한다. sleep이나 호스트 부하로 성공을 만들지 않는다.
 - Requirement 교정이 source/draft/planning/writer gate로 보류돼도 독립 archive가 실행되는 경우와 실제 base 경합으로 둘 다 보존되는 경우를 분리한다. 교정 오류의 기존 중단/복구 의미·보존 intent를 유지하고 교정 보호 조건 자체를 느슨하게 하는 테스트 변경은 금지한다.
 - `tests/test_execplan_archive.py`의 safe subset·base 재전진·준비 commit 재사용·이미 이동된 원격 무중복 확정과 state의 최종 blob/CAS 회귀를 유지한다. 실제 detached 이동·mode 보존·FF push·활성 worktree 불변은 `tests/test_pr_source_synchronization.py`의 기존 효과 경로를 최소 확장해 확인한다. push 직후 중단 및 DB 확정 누락 뒤 commit/push 호출 0도 실제 원격 관측과 연결한다. 정책 조합마다 저장소·게시 전체를 반복하지 않는다.
@@ -62,6 +63,8 @@ priority: normal
 - [ ] 기존 게시/복구 계약과 최소 회귀·문서 정합성
 
 ## Decision Log
+
+- R-055 B01/B02/B06/B08의 공통 journal 판단은 G-336을 선행 소비한다. 이 작업은 `_archive_housekeeping_safe()`·Requirement 교정과의 gate 분리·연속 배정 중 기회·진입 전 사유와 재발견을 계속 소유한다. 공통 helper의 허용만으로 archive dispatch 전체를 완료로 간주하지 않으며 실행 기회/자원 보류도 G-325의 정체 관측에서 빠지지 않도록 기존 구조화 결과를 제공한다.
 
 - R-094는 기존 archive의 검증/게시 알고리즘을 새로 만드는 목표가 아니다. 실행 기회와 자원 판단·보류 기록은 같은 dispatch 수명에서 검증돼야 하므로 한 작업으로 묶는다. G-297의 조율 경계를 먼저 소비하며 기존 catalog의 R-055 전체 감사는 이 작업의 실제 Merge 뒤 후속 소비만 확인한다.
 - complexity high: 진행 중 독립 작업과 실제 공유 쓰기·교정 게시를 구분하고 실행 기회·저장 이전 보류·게시 후 복구를 일관되게 연결해야 한다. risk high: 잘못된 자원 판정이 다른 writer의 index/operation이나 현재 catalog를 손상시키면 보존한 Git/DB 근거로 수동 복구가 필요할 수 있다. 대상별 소유권·기존 lease·FF-only·관측/CAS·활성 작업 불변 및 중단 회귀로 완화한다. priority normal은 완료 문서 정리의 필수 보완이며 구현·승인 자체를 막는 작업보다 우선하지 않는다. 최초 level은 5이며 Model·Effort는 Manager 설정을 따른다.

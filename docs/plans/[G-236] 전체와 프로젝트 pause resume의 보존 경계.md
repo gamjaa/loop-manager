@@ -23,7 +23,7 @@ priority: high
 ## Acceptance Criteria
 
 - pause [repo]는 먼저 요청을 저장하고 대상 Agent·verify·자식 종료를 유한 시간 안에 확인한다. 단계·session·작업물·진단·게시 intent를 보존하며 다른 프로젝트나 다른 기기의 수동 구현 종료를 주장하지 않는다.
-- Git·게시 중단 결과는 현재 소유권·실제 원격·기존 복구 증거로 확인한다. 게시 전, 게시 후 DB 미적용, DB 적용 후 worktree 정리·최종 해제 대기를 구분한다. 적용된 catalog·목적별 성공 기준은 pause나 정리 실패로 되돌리지 않고, planning 소유권·결과·session·intent와 `publication_remote_oid`를 보존한다. worktree 제거 뒤 DB 해제 전에 중단돼도 제거된 경로를 재생성하거나 batch를 다시 적용하지 않는다. 종료·저장·게시 결과 미확인에서는 pause와 미완료 대상을 보존하고 완료·새 자원 사용을 허용하지 않는다. 재시작도 같은 요청을 이어간다.
+- Git·게시 중단 결과는 현재 소유권·실제 원격·기존 복구 증거로 확인한다. 게시 전, 게시 후 DB 미적용, DB 적용 후 worktree 정리·최종 해제 대기를 구분한다. 적용된 catalog·목적별 성공 기준은 pause나 정리 실패로 되돌리지 않고, planning 소유권·결과·session·intent와 `publication_remote_oid`를 보존한다. worktree 제거 뒤 DB 해제 전에 중단돼도 제거된 경로를 재생성하거나 batch를 다시 적용하지 않는다. 별도 작업의 intent는 R-055의 실제 충돌 범위로 판단하고 pause가 그 intent·원인 차단을 정리하지 않는다. 종료·저장·게시 결과 미확인에서는 pause와 미완료 대상을 보존하고 완료·새 자원 사용을 허용하지 않는다. 재시작도 같은 요청을 이어간다.
 - 전체 pause의 run은 bootstrap/runtime·원격·Agent·verify·알림 전에 안내·코드 0으로 종료한다. 프로젝트 pause는 해당 대상을 제외하며 명시 repo로 우회하지 않는다. 수락된 수동 제출·복구·유지보수의 자동 후속 처리도 pause를 준수한다.
 - 전체/프로젝트 pause는 독립 저장하고 resume [repo]는 해당 범위만 해제한다. 기존 사용자 결정·차단·usage 제한·dependency·PR 대기는 유지하고 resume 자체는 작업을 시작하지 않는다.
 - pause 중 조회·설정·제어·기존 수동 준비와 요청 접수는 가능하다. 정상 무변경/완료 0, 안전 거부·종료 미확인 1, 인자 오류 2이며 요청 저장과 실제 중단을 구분한다.
@@ -48,6 +48,7 @@ priority: high
 
 ## Validation
 
+- 직접 구현된 별도 rebase 해제 fixture에 pause 접수를 연결해 원인 intent·차단·파일/index를 보존하고 pause 중 제거·해제·새 호출이 시작되지 않는지 확인한다. resume 자체의 외부 효과는 0회다. 현행 release 재진입을 확인하며 새 잔여 정리 수명·경로 배제의 통합 검증은 G-337에 남긴다.
 - 실제 저장·정책을 실행하는 targeted unit test로 중첩 범위·resume 격리·접수/선택 경합·종료 확인 실패·재시작과 수동/복구 후속 대기를 확인한다. 전체 pause 진입에서 외부 효과는 호출 시 실패 fixture로 차단한다.
 - 확인한 `tests/test_bootstrap_entry.py`, `tests/test_run_project_selection.py`, `tests/test_runtime_state.py`, `tests/test_planning_selection.py`의 fixture를 재사용해 전체 pause의 bootstrap 전 무효과, 선택 repo의 pause 제외, planning 전환 전/중/게시 후 DB 미적용의 pause·resume를 최소 unit으로 확인한다. 실제 SQLite의 원래 실행 row와 planning identity/오류·intent가 보존되고, 종료 미확인에서는 다음 실행이 시작되지 않아야 한다. 기존 다중 repo/등록 CLI를 다시 구현·검증하는 작업으로 확대하지 않는다.
 - 위 planning fixture와 `tests/test_task_scheduling.py`의 Git 자원 대기/배정 중단 회귀를 연결해, 보존한 rebase가 있는 별도 planning의 자원 대기·획득 직후·게시 후 DB 미적용에서 사용자 pause를 확인한다. 실제 요청 저장·보존 판단을 사용하고 Git/프로세스 관측만 double로 제공한다. 새 fetch/Planner/Worker가 시작되지 않고 원래 HEAD·index·target·checkpoint 및 planning intent가 남아야 한다. `tests/test_scope_block_revalidation.py:test_plan_input_rebase_block_resumes_from_owned_original_head`의 START 재개 근거를 재사용해 입력 차단 해제 뒤 pause도 intent·기존 해제 기록을 보존하는지 최소 연결만 확인한다. resume 명령의 외부 효과 호출 수는 0이며 이후 실행도 기존 planning·소유 rebase gate를 거쳐야 한다. 정상 배정 중단만 있을 때의 planning 허용·task 미호출·runtime handoff 거부는 기존 회귀를 재사용한다.
@@ -64,6 +65,7 @@ priority: high
 - [x] 현재 revision의 #294 Manager checkpoint·최소 prompt/전달 cursor를 정적으로 대조했다. 보존 후보 HEAD `bc5adea909fce7602607c811ee443aac115c1112`의 충돌 상태와 기존 기록을 읽기 전용으로 유지하며 새 조건의 pause 통합만 미충족으로 추가했다. 후보 파일/index/Git operation과 실행 기록은 변경하지 않았고 테스트·verify 성공을 확정하지 않았다.
 - [ ] Manager checkpoint·미확인 prompt 전달과 pause의 보존 연결/최소 회귀
 - [ ] planning DB 적용 후 정리·최종 해제 대기의 pause 보존과 자동 재개 연결
+- [ ] 별도 rebase의 실제 충돌 판단을 유지한 pause 연결; 후속 잔여 정리 분리와 pause 통합은 이 작업 Merge 뒤 G-337이 담당
 - [x] eb797d3a에는 pause/resume 명령과 저장 gate가 없다. 기존 잠금·자식 종료·checkpoint를 정적으로 확인했다. 실행 없음.
 - [ ] 요청·중단 확인·재개 구현과 targeted unit 검증
 - [x] 보존 후보 HEAD `26f1ec771c73393083f67d53a7fe08c69c5f579d`를 읽기 전용으로 확인했다. 후보에는 pause 구현·회귀와 기존 실행 기록이 있으며 tracked 변경은 없다. 후보 본문의 31개·개별 7개 PASS 기록과 앞선 실패/교정·metadata 인계 기록은 그대로 보존한다. 이 확인을 최신 base·새 targeted 수집 조건의 검증 성공으로 사용하지 않는다.
@@ -75,6 +77,8 @@ priority: high
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- `9dd75b5d`의 별도 rebase 해제 판정과 B01/B02 회귀를 현재 기준으로 소비한다. G-236은 현행 게시/해제 경계의 사용자 pause·자료 보존을 완성하고, G-337이 이 작업의 실제 Merge 뒤 새 잔여 정리 수명에 pause를 연결한다. 미Merge 기능을 현재 후보의 충족 조건으로 소급하지 않으며 무dependency·started ID/경로·기존 구현/검증 기록을 유지한다. 보존 후보 HEAD `bc5adea909fce7602607c811ee443aac115c1112`의 충돌 파일·index와 실행 기록은 읽기 전용으로 확인했고 변경하지 않았다.
 
 - `597e5b3c` → `993b7dfd` delta와 snapshot token `41f813fca623264d195b95b0250f8c8894b64ea87f4a119c8132db6125b6aa9e`에서 게시 적용·외부 정리·최종 DB 해제의 직접 구현과 회귀를 확인했다. R-076의 중단 결과 보존과 R-082/R-091의 재개·DB 접근 경계를 이 새 중단 위치에 연결하며 게시 엔진은 재구현하지 않는다. started ID·경로·metadata·무dependency와 기존 수행 기록을 유지한다. 보존 후보 HEAD `bc5adea909fce7602607c811ee443aac115c1112`의 충돌 상태·파일/index·실행 기록은 읽기 전용으로 보존했고 새 pause 연결은 미충족이다. 구현·테스트·verify·Review 성공이나 프로젝트 최종 전문 확인을 선언하지 않는다.
 
