@@ -2985,7 +2985,9 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
                 ), mock.patch.object(
                     planning_publication_state, "_mutable_ready_cas_where",
                     side_effect=change_cache_after_guard,
-                ), mock.patch.object(loop_manager, "file_hash", return_value="newhash"):
+                ), mock.patch.object(loop_manager, "file_hash", return_value="newhash"), \
+                        mock.patch.object(loop_manager, "plan_declarations", return_value={}), \
+                        mock.patch('loop_manager_internal.catalog.execplan_drafts.input_digests', return_value={}):
                     with self.assertRaisesRegex(
                         loop_manager.PlannerValidationError,
                         f"mutable READY {error_name}이 변경",

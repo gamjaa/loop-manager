@@ -1625,10 +1625,11 @@ def _observe_mutable_ready_prs(
     branches = []
     for plan in snapshot.plans:
         row = connection.execute(
-            "SELECT branch, catalog_generation FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (snapshot.repo, plan.plan_id),
         ).fetchone()
-        if row is None:
+        if (row is None or not effects._row_is_mutable_ready(row)
+                or (plan.execution_state is not None and planning_execution_state(row) != plan.execution_state)):
             raise PlannerValidationError(
                 f"mutable READY snapshot 이후 실행 상태가 변경됐습니다: {plan.plan_id}"
             )

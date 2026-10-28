@@ -704,9 +704,11 @@ class RetirementPublicationManifestTest(unittest.TestCase):
 
 
     def test_remote_confirmed_move_marks_receipt_and_preserves_old_audit(self):
+        from loop_manager_internal.storage.database import SCHEMA
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
+        connection.execute(SCHEMA)
         connection.executescript("""
             CREATE TABLE requirement_move_receipts(
                 repo TEXT, source_path TEXT, base_sha TEXT, stage TEXT, updated_at TEXT);

@@ -1994,9 +1994,11 @@ class SpecificationReviewSelectionTest(PlanningCase):
 
     def test_final_remote_race_and_cleanup_failure_do_not_confirm(self):
         for fault in ('remote', 'cleanup'):
-            with self.subTest(fault=fault):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 ports = self.review_ports(planning_snapshot(processed_sha='base',
                     planning_fingerprint='fingerprint', specification_fingerprint='fingerprint'))
+                context = replace(self.context, state_dir=Path(directory))
+                ports.git.make_planning_worktree = lambda _repo, worktree, *_args, **_kwargs: worktree.mkdir(parents=True, exist_ok=True)
                 original_agent = ports.agent.run_planner
                 def agent(*args, **kwargs):
                     result = original_agent(*args, **kwargs)
@@ -2006,10 +2008,19 @@ class SpecificationReviewSelectionTest(PlanningCase):
                         ports.git.remove_error = RuntimeError('cleanup failed')
                     return result
                 ports.agent.run_planner = agent
-                outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+                outcome = PlanningLifecycleCoordinator(ports).run(context)
                 self.assertTrue(outcome.error)
-                self.assertIsNone(ports.state.planning_review('/repo', 'final'))
-                self.assertIsNotNone(ports.state.planning_review('/repo', 'attempt'))
+                if fault == 'remote':
+                    self.assertIsNone(ports.state.planning_review('/repo', 'final'))
+                    self.assertIsNotNone(ports.state.planning_review('/repo', 'attempt'))
+                    self.assertIsNone(ports.state.pending_publication_release('/repo'))
+                else:
+                    self.assertEqual(ports.state.planning_review('/repo', 'final')['outcome'], 'fulfilled')
+                    self.assertIsNone(ports.state.planning_review('/repo', 'attempt'))
+                    self.assertIsNotNone(ports.state.pending_publication_release('/repo'))
+                self.assertEqual(ports.state.snapshot.phase, 'PLANNING')
+                self.assertTrue(Path(ports.state.snapshot.worktree).exists())
+                self.assertEqual(ports.agent.run_count, 1)
 
     def test_final_format_normalization_binds_only_verified_attempt_identity(self):
         from loop_manager_internal.planning.specification_review import validate_final, valid_final_receipt

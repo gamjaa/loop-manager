@@ -66,6 +66,14 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 4는 `pl
 - 재시도 fixture 2 case는 autocommit 연결에 transaction을 시작하지 않아 rollback 검사가 각각 1회 FAIL이었다. 명시적 transaction으로 고친 동일 명령 재실행은 PASS였다. 유지보수 초기 복구 case는 옵션의 잘못된 전달 위치와 중복 전달로 연속 2회 ERROR였고, 호출 분기를 교정한 동일 명령 재실행은 PASS였다. 실패·재실행 기록을 보존했다.
 - [x] ARCHITECTURE의 계획 게시·단계별 반영 절을 실제 준비/DB CAS/외부 정리/최종 해제와 중단 복구 책임에 맞게 통합했다. schema·intent/감사 JSON, ID/draft 경계와 일반/유지보수 성공 기준을 보존했다. 구현은 검증 후보이며 전체 verify와 Review는 Manager가 수행한다.
 
+- Manager verify `cc77c2cf0eba0f5973b06ab1cbc477c905f3a12f02aed37dee865b6c6962b3c2` occurrence 1 / revision 1의 실패를 교정했다. 공유 FakeState의 기본 `planning_review`가 기존 선택적 검토 기능을 의도치 않게 활성화한 것을 제거하고 게시 서비스의 조회를 기존 선택적 port 패턴에 맞췄다. 코드맵 게시 mock은 적용 후 해제 대기를 저장하며, CAS·legacy restart·Requirement 이동 fixture는 새 외부 입력 준비와 프로젝트 identity 조회 경계를 제공한다. 기존 commit 재사용·행별 CAS·transaction rollback·감사 보존 assertion은 유지했다.
+- PR 준비 helper는 현재 row의 mutable 실행 상태와 snapshot 실행 identity를 먼저 비교한다. 수동 시작이 먼저 확정된 row를 실제 PR 조회 전에 거부하고, 게시 확정의 PR 관측·generation·수동 ownership CAS는 유지한다. DB 확정 중 정지시키는 수동 시작 경합 fixture는 준비된 PR 관측 인자를 그대로 전달하도록 고쳤다.
+- 유지보수 검증이 직접 저장한 assessment/prerequisite 범위를 호출 내 cycle snapshot에도 동일하게 반영했다. 뒤의 no-change CAS는 방금 저장한 정상 범위를 오경합으로 거부하지 않으며, 현재 DB를 다시 읽어 경쟁 cycle을 기존 관측으로 대체하지 않는다. 실제 prerequisite Merge 뒤 외부 READY로 복귀하는 회귀를 유지했다.
+- 최종 검토 정리 실패 fixture는 임시 worktree를 실제로 만들어 제거 오류가 발생하게 했다. 원격 경합의 미확정 검토와 적용 뒤 정리 실패의 확인된 검토·planning 소유권·해제 대기를 구분하고, 둘 다 오류·worktree 보존·Planner 1회를 검사한다. 확인된 검토를 전체 planning 완료로 취급하지 않는다.
+- 이번 교정은 Manager 실패 60개 ID를 개별 targeted 명령으로 재실행해 모두 최종 PASS를 확인했다. 추가 PR 관측/CAS 2 case와 prerequisite 정리 실패 1 case도 PASS다. 첫 재현의 실패 6 case는 교정 후 동일 명령에서 PASS였으며, 추가 PR 회귀의 잘못된 class 경로 2건은 수집 오류로 구분해 실제 class에서 실행했다. 전체 verify는 Worker가 재실행하지 않았으며 Manager의 최종 verify와 Review가 남아 있다.
+
+- 결과 보고 교정: 이전 호출의 targeted JSONL에서 63개 ID의 최신 `test_end`가 모두 `success`이고, Manager verify 피드백의 60개 ID 전부가 포함됨을 다시 확인했다. Worker 결과 검증은 `TARGETED_TESTS`의 과거 이력 표현을 현재 실패 선언으로 해석했다. 구현·검증 규칙은 변경하지 않고 최종 결과 필드를 확인된 최신 상태로 명확히 보고한다. 이 호출은 기록 재확인과 보고 교정만 수행하므로 테스트를 중복 실행하지 않았다.
+
 ## Decision Log
 
 - complexity high: 일반/유지보수의 게시·정리·원격 관측과 원자 batch를 분리하면서 중단 위치별 재개를 보존해야 한다. risk high: 잘못된 확정은 미게시/변경된 계획을 등록하거나 작업을 조기 재개할 수 있다. intent·실제 원격 결과·generation을 보존하고 CAS/rollback으로 낡은 적용을 거부한다. 최초 level은 5다.

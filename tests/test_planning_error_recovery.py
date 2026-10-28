@@ -435,6 +435,7 @@ class PlanningErrorRecoveryTest(unittest.TestCase):
 
     def test_general_publication_restart_can_roll_back_with_cleanup_failure(self):
         connection = sqlite3.connect(":memory:")
+        connection.execute(loop_manager.SCHEMA)
         connection.execute(
             "CREATE TABLE general_planning_publications (repo TEXT PRIMARY KEY)"
         )

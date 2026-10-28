@@ -260,7 +260,8 @@ class PlanningPublicationService(PlanningService):
                     evidence = self._ports.state.prepare_file_assessment(
                         context.repo, context.repo_path, context.base_branch, str(row.active_sha), evidence,
                     )
-                review = self._ports.state.planning_review(context.repo, 'attempt') if not run.maintenance_planning else None
+                review = (getattr(self._ports.state, 'planning_review', lambda *_: None)(context.repo, 'attempt')
+                          if not run.maintenance_planning else None)
                 requirement_only = review is not None and review['purpose'] == 'requirement'
                 declarations = (self._ports.git.plan_declarations(context.repo_path, str(row.active_sha or ''))
                                 if run.maintenance_cycle.include_general_planning or not run.maintenance_planning and not requirement_only

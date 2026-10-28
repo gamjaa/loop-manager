@@ -146,7 +146,7 @@ class FakeStatePort:
         self.validation_cleared = False
         self.general_intent = None
         self.publication_revision = None
-        self.general_recovery_result = "restart"
+        self.general_recovery_result = "applied"
         self.general_intent_record_count = 0
         self.general_intent_error_call = None
         self.maintenance_due_self_repository = None
@@ -227,9 +227,6 @@ class FakeStatePort:
         self.check_record.update(values)
         self.check_record["stage"] = next_stage
         return True
-
-    def planning_review(self, _repo, _slot):
-        return None
 
     def publication_guidance_hash(self, _repo):
         return 'guidance'
