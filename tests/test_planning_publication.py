@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
 import json
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import sqlite3
@@ -46,6 +47,76 @@ from tests.support.planning_case import (
 )
 
 class PlanningPublicationTest(PlanningCase):
+    def test_publication_release_scopes_pending_rebase_on_first_publish_and_recovery(self):
+        from loop_manager_internal.git import manager_git_journal as journal
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+        for recovery in (False, True):
+            for scenario in ('independent', 'same-worktree', 'same-branch', 'unknown-kind',
+                             'missing-registration', 'changed-intent', 'damaged-intent', 'unknown-owner'):
+                with self.subTest(recovery=recovery, scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    worktree, other = root / 'planning', root / 'G-297'
+                    worktree.mkdir()
+                    other.mkdir()
+                    target = worktree if scenario == 'same-worktree' else other
+                    state = root / 'state'
+                    identity = journal.begin_rebase(state, repo='/repo', owner='plan:G-297',
+                        target=str(target), before={'head': 'old', 'branch': 'loop-manager/G-297'},
+                        expected={'branch': 'loop-manager/G-297'})
+                    slot = journal._slot(state, '/repo', 'managed_rebase', str(target))
+                    if scenario in ('unknown-kind', 'unknown-owner'):
+                        active = json.loads((slot / 'active.json').read_text())
+                        active['kind' if scenario == 'unknown-kind' else 'owner'] = 'unknown'
+                        (slot / 'active.json').write_text(json.dumps(active))
+                    if scenario == 'changed-intent':
+                        saved = json.loads((slot / f'{identity}.intent.json').read_text())
+                        saved['before']['head'] = 'changed'
+                        (slot / f'{identity}.intent.json').write_text(json.dumps(saved))
+                    if scenario == 'damaged-intent':
+                        (slot / f'{identity}.intent.json').write_text('{')
+                    preserved = {path.name: path.read_bytes() for path in slot.iterdir()}
+                    removed = []
+                    def git(repo, *args, **kwargs):
+                        output = ''
+                        if args[:2] == ('worktree', 'list'):
+                            if scenario != 'missing-registration':
+                                output = f'worktree {other}\0HEAD old\0detached\0\0'
+                            if worktree.exists():
+                                branch = 'branch refs/heads/loop-manager/G-297' if scenario == 'same-branch' else 'detached'
+                                output += f'worktree {worktree}\0HEAD commit\0{branch}\0\0'
+                        elif args[:2] == ('worktree', 'remove'):
+                            worktree.rmdir()
+                            removed.append(args[2])
+                        elif args[:1] == ('rev-parse',):
+                            output = 'commit'
+                        return SimpleNamespace(stdout=output, returncode=0)
+                    port = _PlanningGitPorts(SimpleNamespace(git=git, _git_operation_entries=lambda _: {},
+                                                            _nul_git_paths=mock.Mock()),
+                                             None, Path('/repo'), state)
+                    ports = FakePorts(planning_snapshot(phase='PLANNING', active_sha='base',
+                        worktree=str(worktree), planning_workspace_owned=1))
+                    ports.state.retain_planning_after_publication('/repo', 'commit')
+                    ports.git.run = git
+                    ports.git.validate_planning_release = port.validate_planning_release
+                    ports.git.validate_publication_release = port.validate_publication_release
+                    coordinator = PlanningLifecycleCoordinator(ports)
+                    run = coordinator._new_run(self.context)
+                    if recovery:
+                        outcome = coordinator._publication._recover_publication(run)
+                        self.assertEqual(outcome.kind, PlanningOutcomeKind.PUBLICATION_RECOVERY
+                            if scenario == 'independent' else PlanningOutcomeKind.OPERATIONAL_ERROR)
+                    elif scenario == 'independent':
+                        coordinator._publication._complete_publication_release(run)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            coordinator._publication._complete_publication_release(run)
+                    self.assertEqual(ports.state.pending_publication_release('/repo') is None,
+                                     scenario == 'independent')
+                    self.assertEqual(len(removed), int(scenario == 'independent'))
+                    self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
+                    self.assertTrue(other.exists())
+                    self.assertEqual(ports.agent.run_count, 0)
+
     def test_applied_publication_recovers_after_cleanup_before_db_release(self):
         from loop_manager_internal.storage import database, runtime_state
         from loop_manager_internal.storage.db_access import open_connection

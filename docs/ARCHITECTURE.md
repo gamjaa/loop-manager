@@ -445,7 +445,7 @@ Planner의 표준 결과는 `FINAL_SPECIFICATION_REVIEW: <JSON object>` 하나�
 4. 아직 게시하지 않은 동안 원격 base가 전진하면 변경·session을 보존해 반영하고 최신 catalog·대상 권한과 관련 문서를 재검증한다. 충돌·원격 재작성·소유권 불명확은 작업을 보존해 복구 경계로 보낸다.
 5. 기준과 mutable READY snapshot이 그대로면 복구 가능한 publication intent를 저장하고 base에 fast-forward push한다.
 6. 원격 commit을 확인한 뒤 생성 row 등록·개정 cache 갱신·삭제 row 제거와 ID 취소 감사·해당 모드의 성공 기준을 한 SQLite transaction으로 반영한다. 기존 프로젝트의 `publication_remote_oid`에 적용 revision을 저장하고 planning 소유권·결과·session을 유지한다. 일반 publication intent도 최종 해제까지 보존한다. FUTURE_IDEAS-only 변경은 실행 상태를 만들지 않는다.
-7. DB 밖에서 원격 이력과 게시 경로 보존, 소유 worktree의 HEAD·index·Git operation을 확인하고 worktree를 정리한다. 프로젝트·cycle·intent·catalog·수동 membership과 미종료 호출을 다시 확인한 별도 DB CAS가 planning 자리를 해제한다. 적용 뒤 정리 실패는 성공 기준을 되돌리지 않으며 작업 재개는 최종 해제 뒤에만 허용한다.
+7. DB 밖에서 원격 이력과 게시 경로 보존, 소유 worktree의 HEAD·index·Git operation을 확인하고 worktree를 정리한다. 프로젝트·cycle·intent·catalog·수동 membership과 미종료 호출을 다시 확인한 별도 DB CAS가 planning 자리를 해제한다. 미확정 Git journal 중 별도 관리 rebase는 활성·불변 intent 일치, 작업 소유 branch와 기존 branch의 일치, 실제 Git worktree 등록과 planning·원본 경로 및 branch의 독립성이 확인될 때만 해제 차단에서 제외한다. 해당 intent·충돌·작업 상태는 변경하지 않는다. 같은 자원·알 수 없는 쓰기·손상되거나 부족한 근거는 계속 거부하며 최초 게시와 중단 복구에 같은 검사를 적용한다. 적용 뒤 정리 실패는 성공 기준을 되돌리지 않으며 작업 재개는 최종 해제 뒤에만 허용한다.
 
 PR·Git blob·로컬 원문/hash·draft 입력·공식 선언·root 계획 연결과 승격 근거는 DB 적용 전에 호출 내 불변 입력으로 준비한다. DB 확정은 준비한 snapshot·branch/generation·소유권·cycle·intent와 현재 상태를 대조하고 등록·관계·감사를 원자 적용한다. 기존 DB 요청 runner의 재시도는 같은 준비 값을 사용하며 Git·Planner·worktree 제거를 실행하지 않는다. 지침 hash와 성공 지문도 준비 값으로 전달해 DB 적용 중 원본을 다시 읽지 않는다.
 
