@@ -232,6 +232,84 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
             self.publisher.dispatch('main')
         self.assertEqual((self.observations.commits, self.observations.pushes), (0, 0))
 
+    def test_independent_rebase_reaches_correction_publication_and_preserves_journal(self):
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.git import manager_git_journal as journal
+        connection = runtime_connection('repo')
+        self.addCleanup(connection.close)
+        connection.execute('CREATE TABLE document_drafts(repo TEXT,target_path TEXT,state TEXT)')
+        other = self.root / 'other'
+        connection.execute("UPDATE exec_plans SET branch='loop-manager/G-047',worktree=?", (str(other),))
+        connection.commit()
+        original = self.observations.git
+        def git(repo, command, *args, **kwargs):
+            if command == 'symbolic-ref':
+                return subprocess.CompletedProcess([], 1, '')
+            if command == 'show-ref':
+                return subprocess.CompletedProcess([], 0, 'a' * 40)
+            if command == 'config':
+                return subprocess.CompletedProcess([], 0, 'core.bare=false')
+            if command == 'rev-parse' and '--git-common-dir' in args:
+                return subprocess.CompletedProcess([], 0, '/shared')
+            if command == 'worktree' and args[0] == 'list':
+                return subprocess.CompletedProcess([], 0, f'worktree {other}\0HEAD old\0detached\0\0')
+            return original(repo, command, *args, **kwargs)
+        port = self.publisher.git
+        effects = port.effects
+        from dataclasses import replace
+        port._effects = lambda: replace(effects, git=git)
+        publisher = RequirementCorrectionPublisher(connection, port, refresh=lambda _: True, safe=self.safe)
+        journal.begin_rebase(port.state_dir, repo='repo', owner='plan:G-047', target=str(other),
+            before={'head': 'old', 'branch': 'loop-manager/G-047'}, expected={'branch': 'loop-manager/G-047'})
+        slot = journal._slot(port.state_dir, 'repo', 'managed_rebase', str(other))
+        preserved = {path.name: path.read_bytes() for path in slot.iterdir()}
+        self.assertTrue(publisher.dispatch('main'))
+        self.assertEqual((self.observations.commits, self.observations.pushes), (1, 1))
+        self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
+        # The same local worktree still conflicts when it owns the publication ref.
+        publisher.base_branch = 'loop-manager/G-047'
+        with self.assertRaises(CorrectionPending):
+            publisher.observe(self.observations.remote)
+        self.assertEqual((self.observations.commits, self.observations.pushes), (1, 1))
+
+    def test_housekeeping_dispatches_with_an_independent_rebase_and_keeps_safety_gate(self):
+        from types import SimpleNamespace
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.application.project_service import ProjectService
+        from loop_manager_internal.git import manager_git_journal as journal
+        connection = runtime_connection('repo')
+        self.addCleanup(connection.close)
+        target = self.root / 'other'
+        connection.execute("UPDATE exec_plans SET branch='loop-manager/G-047',worktree=?", (str(target),))
+        connection.commit()
+        journal.begin_rebase(self.root, repo='repo', owner='plan:G-047', target=str(target),
+            before={'head': 'old', 'branch': 'loop-manager/G-047'}, expected={'branch': 'loop-manager/G-047'})
+        slot = journal._slot(self.root, 'repo', 'managed_rebase', str(target))
+        preserved = {path.name: path.read_bytes() for path in slot.iterdir()}
+        def git(repo, command, *args, **kwargs):
+            if command == 'symbolic-ref':
+                return subprocess.CompletedProcess([], 1, '')
+            if command == 'show-ref':
+                return subprocess.CompletedProcess([], 0, 'a' * 40)
+            output = (f'worktree {target}\0HEAD old\0detached\0\0' if command == 'worktree' else
+                      '/shared' if command == 'rev-parse' else 'core.bare=false')
+            return subprocess.CompletedProcess([], 0, output)
+        service = ProjectService.__new__(ProjectService)
+        service.identity = SimpleNamespace(connection=connection, state_dir=self.root,
+            registered_only=False, refactoring_review_interval=5)
+        service.state = SimpleNamespace(repo='repo', repo_path=self.root, base='main',
+            validated_agent_scope=None, catalog_refresh=None)
+        gate = mock.Mock(return_value=True)
+        dispatch = mock.Mock()
+        service.effects = SimpleNamespace(_execplan_archive_housekeeping_safe=gate, git=git,
+            dispatch_execplan_archive_housekeeping=dispatch, operation_print=mock.Mock())
+        service._archive_housekeeping()
+        dispatch.assert_called_once()
+        gate.return_value = False
+        service._archive_housekeeping()
+        dispatch.assert_called_once()
+        self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
+
     def test_writer_gate_distinguishes_unstarted_failures_from_unconfirmed_writers(self):
         self.connection.execute(AGENT_INVOCATIONS_SCHEMA)
         cases = [

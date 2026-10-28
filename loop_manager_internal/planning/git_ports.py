@@ -205,13 +205,9 @@ class _PlanningGitPorts:
 
     def validate_planning_release(self, repo: str, worktree: Path | None, *, allow_missing: bool = False) -> None:
         from loop_manager_internal.git import manager_git_journal
-        def independent_rebase(intent):
-            return worktree is not None and manager_git_journal.rebase_uses_separate_workspace(
-                self._state_dir, repo, intent, worktrees=(worktree,), git=self._effects.git,
-            )
-
-        if manager_git_journal.has_pending_project_mutation(
-                self._state_dir, repo, recoverable=independent_rebase):
+        if manager_git_journal.has_conflicting_project_mutation(
+                self._state_dir, repo, stage='planning_release', connection=self._connection,
+                git=self._effects.git, worktrees=(worktree,) if worktree is not None else ()):
             raise PlanningWorkspaceOwnershipError("미확정 Manager Git 쓰기가 남아 있습니다.")
         if worktree is not None:
             if not worktree.exists() and allow_missing:

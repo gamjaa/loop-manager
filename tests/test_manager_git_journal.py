@@ -482,6 +482,83 @@ class PendingProjectMutationTest(unittest.TestCase):
                 self.assertEqual(result, scenario == 'independent')
                 self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
 
+    def test_stage_scope_preserves_intents_and_rejects_shared_writer_and_ownership_races(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.runtime.resource_lock import resource_locks
+        scenarios = ('independent', 'publication-ref', 'configuration-race', 'common-repository',
+                     'writer-unknown', 'writer-stopped', 'lease-busy', 'owner-race', 'intent-race',
+                     'registration-failed', 'shared-configuration-operation', 'checkpoint-race', 'symbolic-branch', 'missing-branch-ref')
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                repo, target, requested = str(state / 'repo'), state / 'owned', state / 'planning'
+                connection = runtime_connection(repo)
+                self.addCleanup(connection.close)
+                connection.execute("UPDATE exec_plans SET branch='loop-manager/G-047',worktree=?", (str(target),))
+                if scenario.startswith('writer-'):
+                    connection.execute("""INSERT INTO agent_invocations
+                        (invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at,
+                         finished_at,execution_started_at,execution_finish_evidence,execution_status)
+                        VALUES ('writer',?,'G-047','worker','codex','model','medium','new',1,'start',
+                                'finish','start',?,'executed')""",
+                        (repo, 'provider_process_finished' if scenario == 'writer-stopped' else None))
+                connection.commit()
+                identity = journal.begin_rebase(state, repo=repo, owner='plan:G-047', target=str(target),
+                    before={'head': OLD, 'branch': 'loop-manager/G-047'}, expected={'branch': 'loop-manager/G-047'})
+                slot = journal._slot(state, repo, 'managed_rebase', str(target))
+                if scenario == 'shared-configuration-operation':
+                    intent = journal._read(slot / 'active.json')
+                    intent['kind'] = 'shared_configuration'
+                    other = journal._slot(state, repo, intent['kind'], str(target))
+                    other.mkdir()
+                    (slot / 'active.json').unlink()
+                    journal._write_new(other / 'active.json', intent)
+                    journal._write_new(other / f'{identity}.intent.json', intent)
+                    slot = other
+                preserved = {path.name: path.read_bytes() for path in slot.iterdir()}
+                config_reads = 0
+                def git(context, *args, **kwargs):
+                    nonlocal config_reads
+                    self.assertFalse(connection.in_transaction)
+                    if args[0] == 'symbolic-ref':
+                        return SimpleNamespace(stdout='refs/heads/main', returncode=0 if scenario == 'symbolic-branch' else 1)
+                    if args[0] == 'show-ref':
+                        return SimpleNamespace(stdout=OLD, returncode=int(scenario == 'missing-branch-ref'))
+                    if args[0] == 'config':
+                        config_reads += 1
+                        value = 'changed' if scenario == 'configuration-race' and config_reads > 1 else 'core.bare=false'
+                    elif args[0] == 'rev-parse':
+                        value = '/other-repository' if scenario == 'common-repository' and context == target else '/shared'
+                    else:
+                        self.assertEqual(args, ('worktree', 'list', '--porcelain', '-z'))
+                        if scenario == 'owner-race':
+                            connection.execute("UPDATE exec_plans SET branch='changed'")
+                            connection.commit()
+                        if scenario == 'checkpoint-race':
+                            connection.execute('INSERT INTO execution_checkpoints(repo,plan_id,generation) VALUES (?, ?, 1)',
+                                               (repo, 'G-047'))
+                            connection.commit()
+                        if scenario == 'intent-race':
+                            replacement = journal._read(slot / 'active.json')
+                            replacement['id'] = 'd' * 32
+                            (slot / 'active.json').write_text(json.dumps(replacement))
+                            preserved['active.json'] = (slot / 'active.json').read_bytes()
+                        value = f'worktree {target}\0HEAD {OLD}\0detached\0\0'
+                    return SimpleNamespace(stdout=value, returncode=int(scenario == 'registration-failed' and args[0] == 'worktree'))
+                lease = (resource_locks(state, repo, ['plan:G-047'], owner='another-worker')
+                         if scenario == 'lease-busy' else nullcontext())
+                with lease, mock.patch('loop_manager_internal.runtime.operation_events.emit') as event:
+                    blocked = journal.has_conflicting_project_mutation(state, repo, stage='planning_release',
+                        connection=connection, git=git, worktrees=(requested,),
+                        refs=('refs/heads/loop-manager/G-047',) if scenario == 'publication-ref' else ())
+                self.assertEqual(blocked, scenario not in ('independent', 'writer-stopped'))
+                self.assertEqual(event.call_args.kwargs['decision'], 'hold' if blocked else 'allow')
+                for key in ('owner', 'operation', 'intent_id', 'stage', 'resource', 'next_condition'):
+                    self.assertTrue(event.call_args.kwargs[key])
+                self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
+
     def test_optional_source_intents_preserve_evidence_without_gating_remote_planning(self):
         for kind in ('source_fast_forward', 'source_rebase'):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:

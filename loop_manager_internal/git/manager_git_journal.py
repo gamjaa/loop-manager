@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sqlite3
 from typing import Any
 from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation, rebase_preserves_worktree_files
 from loop_manager_internal.git import managed_rebase_evidence as replay_evidence
@@ -754,11 +755,170 @@ def rebase_uses_separate_workspace(
     return found and unchanged()
 
 
+def _rebase_scope_owners(connection, repo, intent):
+    """Read the current resource claims and writer identities, without observing Git."""
+    if connection is None:
+        raise MutationEvidenceError('rebase scope: current ownership ledger unavailable')
+    plan_id = intent['owner'].removeprefix('plan:')
+    plans = tuple(dict(row) for row in connection.execute(
+        'SELECT plan_id,branch,worktree,workspace_owned FROM exec_plans WHERE repo=? ORDER BY plan_id', (repo,)))
+    plan = next((row for row in plans if row['plan_id'] == plan_id), None)
+    branch, target = intent['expected'].get('branch'), Path(intent['target']).resolve()
+    if (not isinstance(branch, str) or not branch.startswith('loop-manager/G-')
+            or intent['owner'] != 'plan:' + branch.removeprefix('loop-manager/')
+            or plan is None or plan['workspace_owned'] != 1 or plan['branch'] != branch
+            or not plan['worktree'] or Path(plan['worktree']).resolve() != target
+            or any(row['plan_id'] != plan_id and (row['branch'] == branch or
+                   row['worktree'] and Path(row['worktree']).resolve() == target) for row in plans)):
+        raise MutationEvidenceError('rebase scope: current resource owner differs')
+    project = connection.execute('SELECT origin,base_branch,worktree FROM projects WHERE repo=?', (repo,)).fetchone()
+    if (project is None or project['base_branch'] == branch
+            or project['worktree'] and Path(project['worktree']).resolve() == target):
+        raise MutationEvidenceError('rebase scope: project resource owner differs')
+    manual = tuple(dict(row) for row in connection.execute(
+        "SELECT group_id,branch,worktree,state FROM manual_work_groups WHERE repo=? "
+        "AND state NOT IN ('PR_OPEN','CLOSED','MERGED') ORDER BY group_id", (repo,)))
+    if any(row['branch'] == branch or row['worktree'] and Path(row['worktree']).resolve() == target for row in manual):
+        raise MutationEvidenceError('rebase scope: manual resource owner differs')
+    calls = tuple(dict(row) for row in connection.execute(
+        'SELECT * FROM task_call_reservations WHERE repo=? AND plan_id=? ORDER BY token', (repo, plan_id)))
+    invocations = tuple(dict(row) for row in connection.execute(
+        'SELECT * FROM agent_invocations WHERE repo=? AND (plan_id=? OR plan_id IS NULL) ORDER BY invocation_id',
+        (repo, plan_id)))
+    checkpoint = connection.execute(
+        'SELECT * FROM execution_checkpoints WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
+    return plans, dict(project), manual, calls, invocations, dict(checkpoint) if checkpoint else None
+
+
+def _stage_rebase_is_independent(state_dir, repo, intent, *, connection, git, worktrees, refs):
+    from loop_manager_internal.recovery.plan_recovery import check_stopped_writers
+    from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned, resource_is_held
+    from loop_manager_internal.runtime.contracts import ProcessLockBusyError
+    from loop_manager_internal.storage.task_calls import CallDeferred
+
+    if intent['kind'] != 'managed_rebase' or git is None:
+        return False, 'operation_resources_unknown'
+    # No observation or lock wait is allowed while holding a coordinated DB request.
+    if getattr(connection, '_held', False) or connection is not None and connection.in_transaction:
+        return False, 'database_boundary_busy'
+    try:
+        owners = _rebase_scope_owners(connection, repo, intent)
+        branch = intent['expected'].get('branch')
+        resources = ['plan:' + intent['owner'].removeprefix('plan:'), 'branch:' + branch,
+                     'worktree:' + intent['target'], 'git:' + intent['target'], 'git:config']
+        missing = [resource for resource in resources if not resource_owned(state_dir, repo, resource, owner='pending-git-scope')]
+        if any(resource_is_held(state_dir, repo, resource) for resource in missing):
+            return False, 'resource_lease_busy'
+        with resource_locks(state_dir, repo, missing, owner='pending-git-scope'):
+            if owners != _rebase_scope_owners(connection, repo, intent):
+                return False, 'resource_owner_changed'
+            check_stopped_writers(connection, state_dir, owners[3], owners[4])
+
+            def shared_identity():
+                identities = []
+                for context in (Path(repo), Path(intent['target'])):
+                    result = git(context, 'rev-parse', '--path-format=absolute', '--git-common-dir', check=False)
+                    if result.returncode or not result.stdout.strip():
+                        raise MutationEvidenceError('rebase scope: shared repository unavailable')
+                    common = Path(result.stdout.strip())
+                    identities.append((common if common.is_absolute() else context / common).resolve())
+                if identities[0] != identities[1]:
+                    raise MutationEvidenceError('rebase scope: shared repository differs')
+                config = git(Path(repo), 'config', '--null', '--local', '--includes', '--list', check=False)
+                if config.returncode or not config.stdout:
+                    raise MutationEvidenceError('rebase scope: shared configuration unavailable')
+                ref = f'refs/heads/{branch}'
+                symbolic = git(Path(repo), 'symbolic-ref', '--quiet', ref, check=False)
+                tip = git(Path(repo), 'show-ref', '--verify', '--hash', ref, check=False)
+                if (symbolic.returncode != 1 or tip.returncode
+                        or re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', tip.stdout.strip()) is None):
+                    raise MutationEvidenceError('rebase scope: local branch ref unavailable or indirect')
+                return identities[0], config.stdout, tip.stdout.strip()
+
+            shared = shared_identity()
+            separate = rebase_uses_separate_workspace(
+                state_dir, repo, intent, worktrees=worktrees, refs=refs, git=git)
+            check_stopped_writers(connection, state_dir, owners[3], owners[4])
+            if shared != shared_identity():
+                return False, 'shared_configuration_or_repository_changed'
+            slot = _slot(state_dir, repo, intent['kind'], intent['target'])
+            if (owners != _rebase_scope_owners(connection, repo, intent)
+                    or _read(slot / 'active.json') != intent
+                    or _read(slot / f"{intent['id']}.intent.json") != intent):
+                return False, 'resource_identity_changed'
+            return separate, 'separate_rebase' if separate else 'resource_conflict_or_incomplete_intent'
+    except (MutationEvidenceError, CallDeferred, ProcessLockBusyError, OSError, sqlite3.Error):
+        return False, 'ownership_writer_or_observation_unconfirmed'
+
+
+def has_conflicting_project_mutation(
+    state_dir, repo, *, stage, connection, git, worktrees, refs=(), recoverable=None,
+):
+    """Classify every pending operation against this stage; never complete a journal.
+
+    The decision is used immediately at the caller's existing safety boundary.
+    It is not a reusable lease or a completion receipt. Exact own-operation
+    recovery remains the caller's exception; unrelated records require proof.
+    """
+    from loop_manager_internal.runtime import operation_events
+
+    def independent(intent):
+        slot = _slot(state_dir, repo, intent['kind'], intent['target'])
+        if (re.fullmatch(r'[0-9a-f]{32}', intent['id']) is None
+                or _read(slot / f"{intent['id']}.intent.json") != intent
+                or _read(slot / 'active.json') != intent):
+            allowed, reason = False, 'active_intent_mismatch'
+        elif recoverable is not None and recoverable(intent):
+            allowed, reason = True, 'exact_own_operation_recovery'
+        else:
+            allowed, reason = _stage_rebase_is_independent(
+                state_dir, repo, intent, connection=connection, git=git,
+                worktrees=worktrees, refs=refs)
+        operation_events.emit('미확정 Git 작업의 단계별 자원 판단', project=repo, stage=stage,
+            owner=intent['owner'], operation=intent['kind'], intent_id=intent['id'],
+            resource=intent['target'],
+            resources=(intent['target'], intent['expected'].get('branch'), 'shared_git_config', 'writer'),
+            decision='allow' if allowed else 'hold', reason=reason,
+            next_condition='current_stage_gates' if allowed else 'confirm_owner_writer_and_resources')
+        return allowed
+
+    # targets filtering cannot prove that an operation outside the list does not
+    # touch a publication ref or shared configuration. Classify all records.
+    try:
+        return has_pending_project_mutation(state_dir, repo, recoverable=independent)
+    except MutationEvidenceError:
+        operation_events.emit('미확정 Git 기록을 확인할 수 없어 단계를 보류합니다.',
+            project=repo, stage=stage, owner='unknown', operation='unknown', intent_id='unknown',
+            resource='journal', decision='hold', reason='journal_unreadable',
+            next_condition='restore_active_and_immutable_intent_evidence')
+        return True
+
+
+def project_mutation_identity(state_dir, repo, connection):
+    """Capture journal and DB identities for a short CAS; perform no Git/process query."""
+    identities = []
+    def capture(intent):
+        slot = _slot(state_dir, repo, intent['kind'], intent['target'])
+        if re.fullmatch(r'[0-9a-f]{32}', intent['id']) is None:
+            raise MutationEvidenceError('Manager Git intent identity is invalid')
+        saved = _read(slot / f"{intent['id']}.intent.json")
+        try:
+            owners = (_rebase_scope_owners(connection, repo, intent)
+                      if intent['kind'] == 'managed_rebase' else None)
+        except (MutationEvidenceError, sqlite3.Error):
+            owners = ('unconfirmed',)
+        identities.append((intent, saved, owners))
+        return False
+    has_pending_project_mutation(state_dir, repo, recoverable=capture)
+    return tuple(sorted(identities, key=lambda item: item[0]['id']))
+
+
 def has_pending_project_mutation(state_dir: Path, repo: str, *, recoverable=None, targets=None) -> bool:
     """Unsealed managed-work intents block release; source sync is independent."""
     root = state_dir / "manager-git-journal"
     if not root.exists():
         return False
+    pending = False
     source_slots = {_slot(state_dir, repo, kind, repo)
                     for kind in ("source_fast_forward", "source_rebase")}
     for slot in root.iterdir():
@@ -786,10 +946,12 @@ def has_pending_project_mutation(state_dir: Path, repo: str, *, recoverable=None
                     continue
                 raise
             if (intent.get("repo") == repo and (targets is None or intent.get("target") in targets)
-                    and intent.get("kind") not in {"source_fast_forward", "source_rebase"}
-                    and not (recoverable and recoverable(intent))):
-                return True
-    return False
+                    and intent.get("kind") not in {"source_fast_forward", "source_rebase"}):
+                if slot != _slot(state_dir, repo, intent['kind'], intent['target']):
+                    raise MutationEvidenceError('Manager Git active resource slot differs')
+                if not (recoverable and recoverable(intent)):
+                    pending = True
+    return pending
 
 
 @journal_resource

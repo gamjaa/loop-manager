@@ -164,6 +164,15 @@ class ManualWorkService:
             return bool(recovering and intent['owner']==f"plan:{recovering['owner_id']}" and
                 ((intent['kind']=='managed_worktree_create' and intent['target']==recovering['worktree'])
                  or (intent['kind']=='manual_branch_push' and intent['target']==f"refs/heads/{recovering['branch']}")))
+        groups = (recovering,) if recovering is not None else self.store.pending(self.repo)
+        worktrees = tuple(Path(group['worktree']) for group in groups if group['worktree'])
+        refs = tuple(ref for group in groups if group['branch'] for ref in (
+            f"refs/heads/{group['branch']}", f"refs/remotes/origin/{group['branch']}"))
+        def journal_conflict():
+            return manager_git_journal.has_conflicting_project_mutation(
+                self.state_dir, self.repo, stage='manual_slot', connection=self.connection,
+                git=self.effects.git, worktrees=worktrees or (self.repo_path,), refs=refs,
+                recoverable=recoverable)
         own_block = bool(releasing_plan is not None and releasing_plan['status']=='PLAN_BLOCKED'
                          and row['plan_path']==releasing_plan['path'] and row['phase'] in {'BLOCKED','PLAN_BLOCKED'})
         from loop_manager_internal.application.task_scheduling import current_scheduler, managed_count
@@ -175,12 +184,12 @@ class ManualWorkService:
                 or runtime_state.planning_owns_execution_slot(row)
                 or scoped_blocking.project_block(self.connection, self.repo)
                 or cycle.phase is not maintenance_state.MaintenancePhase.IDLE
-                or manager_git_journal.has_pending_project_mutation(self.state_dir, self.repo, recoverable=recoverable))
+                or journal_conflict())
         return not (row['phase'] and not own_block or self.runtime.active_row(self.repo) or row['agent_snapshot']
             or runtime_state.planning_owns_execution_slot(row)
             or scoped_blocking.project_block(self.connection, self.repo)
             or cycle.phase is not maintenance_state.MaintenancePhase.IDLE
-            or manager_git_journal.has_pending_project_mutation(self.state_dir, self.repo,recoverable=recoverable))
+            or journal_conflict())
 
     def fetch(self, branch):
         if branch.startswith('-') or self.effects.git(self.repo_path, 'check-ref-format', f'refs/heads/{branch}', check=False).returncode:
@@ -260,7 +269,7 @@ class ManualWorkService:
                     or manager_git_journal.live_remote_branch_oid(self.effects.git,self.repo_path,branch) is not None:
                 raise ManualWorkError('동일 이름의 기존 branch/worktree에 SQLite 소유 근거가 없습니다.')
         start_base=(row['active_sha'] or base_head) if owned or group is not None else base_head
-        preparation_gate(self, plan_ids=[plan_id], group=group, inspect_workspace=False)
+        git_observation = preparation_gate(self, plan_ids=[plan_id], group=group, inspect_workspace=False)
 
         def reserve_start(db):
             with runtime_state._transaction(db):
@@ -276,7 +285,7 @@ class ManualWorkService:
                         f'{plan_id}: 준비 중 계획·요청·소유권이 변경됐습니다. 다시 실행하세요.'
                     )
                 preparation_gate(self, plan_ids=[plan_id], group=current_group,
-                                 inspect_workspace=False, check_git_journal=False)
+                                 inspect_workspace=False, check_git_journal=False, git_observation=git_observation)
                 collision = db.execute('SELECT plan_id FROM exec_plans WHERE repo=? AND plan_id!=? '
                     'AND (branch=? OR worktree=?)', (self.repo, plan_id, branch, str(worktree))).fetchone()
                 if collision:
@@ -450,7 +459,7 @@ class ManualWorkService:
             self.effects,self.repo_path,head,base_head,documents,connection=self.connection,
             config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
         from loop_manager_internal.execution.manual_candidate import candidate_token
-        preparation_gate(self, plan_ids=json.loads(group['members']), group=group, inspect_workspace=False)
+        git_observation = preparation_gate(self, plan_ids=json.loads(group['members']), group=group, inspect_workspace=False)
 
         def accept_complete(db):
             with runtime_state._transaction(db):
@@ -462,7 +471,7 @@ class ManualWorkService:
                         or candidate_token(db,self.repo_path,head,base_head,documents) != candidate):
                     raise ManualConflictError('수동 완료 관측 뒤 요청·구성 G·리비전·소유권 입력이 변경됐습니다.')
                 preparation_gate(self, plan_ids=json.loads(current_group['members']),
-                                 group=current_group, inspect_workspace=False, check_git_journal=False)
+                                 group=current_group, inspect_workspace=False, check_git_journal=False, git_observation=git_observation)
                 updated = self.store.update(
                     current_group, documents=json.dumps(documents,ensure_ascii=False),
                     definition_head=definition_head,
@@ -640,9 +649,11 @@ class ManualWorkService:
                 raise ManualWorkError('진행 중인 기존 G와 같은 R입니다. 목표 중복을 안전하게 배제할 수 없습니다: '+', '.join(overlap))
             if set(requirements) & live_requirement_paths(self.connection,self.repo):
                 raise ManualWorkError('같은 R의 미완료 수동 제출이 있습니다. 기존 source·R 범위로 다시 제출하세요.')
+        git_observation = preparation_gate(self, plan_ids=json.loads(group['members']) if group else [],
+                             group=group, requirements=requirements, inspect_workspace=False)
         with runtime_state._transaction(self.connection):
             preparation_gate(self, plan_ids=json.loads(group['members']) if group else [],
-                             group=group, requirements=requirements, inspect_workspace=False)
+                             group=group, requirements=requirements, inspect_workspace=False, check_git_journal=False, git_observation=git_observation)
             if group is None:
                 current_overlap = self.connection.execute("SELECT plan_id,sources FROM exec_plans WHERE repo=? AND status!='MERGED'", (self.repo,)).fetchall()
                 if any(set(json.loads(row['sources'])) & set(requirements) for row in current_overlap) or set(requirements) & live_requirement_paths(self.connection,self.repo):
@@ -701,7 +712,7 @@ class ManualWorkService:
             self.effects,self.repo_path,head,base,documents,connection=self.connection,
             config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
         from loop_manager_internal.execution.manual_candidate import candidate_token
-        preparation_gate(self, plan_ids=json.loads(group['members']), group=group,
+        git_observation = preparation_gate(self, plan_ids=json.loads(group['members']), group=group,
                          requirements=json.loads(group['requirements']), inspect_workspace=False)
 
         def accept_submit(db):
@@ -717,7 +728,7 @@ class ManualWorkService:
                     )
                 preparation_gate(self, plan_ids=json.loads(current_group['members']), group=current_group,
                                  requirements=json.loads(current_group['requirements']),
-                                 inspect_workspace=False, check_git_journal=False)
+                                 inspect_workspace=False, check_git_journal=False, git_observation=git_observation)
                 self.store.accept(current_group,head=head,base=base,input_token=candidate,
                     verify_input_token=verify_input,review_input_token=review_input,
                     skip_verify=args.skip_verify,skip_review=args.skip_review,
@@ -738,8 +749,9 @@ class ManualWorkService:
             raise ManualWorkError('완성된 G 목록과 확정 가능한 제출 범위가 필요합니다.')
         catalog=self.effects.git(self.repo_path,'ls-tree','-r','--name-only',group['base_sha'],'--','docs/plans').stdout
         source_catalog=self.effects.git(self.repo_path,'ls-tree','-r','--name-only',group['source_head'],'--','docs/plans').stdout
+        git_observation = preparation_gate(self, group=group, requirements=requirements, inspect_workspace=False)
         with runtime_state._transaction(self.connection):
-            preparation_gate(self, group=group, requirements=requirements, inspect_workspace=False)
+            preparation_gate(self, group=group, requirements=requirements, inspect_workspace=False, check_git_journal=False, git_observation=git_observation)
             records=self.connection.execute('SELECT plan_id FROM exec_plans WHERE repo=? UNION SELECT plan_id '
                 'FROM manual_work_members WHERE repo=? UNION SELECT plan_id FROM execplan_catalog_history WHERE repo=? '
                 'UNION SELECT plan_id FROM execplan_cancellations WHERE repo=?', (self.repo,)*4).fetchall()
@@ -790,8 +802,9 @@ class ManualWorkService:
                 f'refs/heads/{branch}',check=False).returncode==0 \
                 or manager_git_journal.live_remote_branch_oid(self.effects.git,self.repo_path,branch):
             raise ManualConflictError(f'생성 G 자원 충돌: {ids[0]}; branch={branch}; worktree={worktree}')
+        git_observation = preparation_gate(self, group=group, requirements=requirements, inspect_workspace=False)
         with runtime_state._transaction(self.connection):
-            preparation_gate(self, group=group, requirements=requirements, inspect_workspace=False)
+            preparation_gate(self, group=group, requirements=requirements, inspect_workspace=False, check_git_journal=False, git_observation=git_observation)
             current_records=self.connection.execute('SELECT plan_id FROM exec_plans WHERE repo=? UNION SELECT plan_id '
                 'FROM manual_work_members WHERE repo=? UNION SELECT plan_id FROM execplan_catalog_history WHERE repo=? '
                 'UNION SELECT plan_id FROM execplan_cancellations WHERE repo=?', (self.repo,)*4).fetchall()

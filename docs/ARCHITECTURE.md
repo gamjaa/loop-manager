@@ -177,7 +177,7 @@ Skill의 `scripts/read_requirements.py`는 현재 작업 폴더의 미커밋·�
 
 Requirement 교정 계산은 한 원격 tree의 활성·archive 문서, 게시·보관·draft ExecPlan과 저장된 작업 관계의 source 관측, 기본 branch 반영 순서를 입력으로 받는다. 기존 identity helper와 source resolver로 선택·편집 결과와 미확인 사유를 산출하며 Git·DB·Agent 효과는 수행하지 않는다. source 관측 실패는 참조 부재로 바꾸지 않고, 선택된 각 rename 뒤에도 원래 source가 같은 문서로 유일하게 해석되는지 확인한다.
 
-편집은 활성 Requirement의 식별 표현·확정 상대 링크와 비보관·비draft ExecPlan의 확정된 활성 source 경로만 대상으로 한다. ExecPlan 본문·다른 선언과 archive·`User Decision`은 보존한다. 코드 예제는 링크 편집에서 제외하며, 중첩 blockquote와 목록의 접두어·연속 들여쓰기·컨테이너 종료를 확인해 fenced·들여쓴 코드의 원문도 보존한다. 코드 내부의 목록 표식은 새 컨테이너로 해석하지 않으며 코드 종료 뒤 일반 링크 교정을 계속한다. 파일 적용·원격 재검사·게시와 중단 복구는 별도 Manager 경계가 소유한다.
+편집은 활성 Requirement의 식별 표현·확정 상대 링크와 비보관·비draft ExecPlan의 확정된 활성 source 경로만 대상으로 한다. ExecPlan 본문·다른 선언과 archive·`User Decision`은 보존한다. 코드 예제는 링크 편집에서 제외하며, 중첩 blockquote와 목록의 접두어·연속 들여쓰기·컨테이너 종료를 확인해 fenced·들여쓴 코드의 원문도 보존한다. 코드 내부의 목록 표식은 새 컨테이너로 해석하지 않으며 코드 종료 뒤 일반 링크 교정을 계속한다. 파일 적용·원격 재검사·게시와 중단 복구는 별도 Manager 경계가 소유한다. 교정 관측과 archive 진입의 journal gate는 [공통 자원 판단](#미확정-git-작업의-단계별-자원-판단)을 사용하며 기존 writer/source·draft·게시 예약과 개별 archive 후보 보호는 유지한다.
 
 Requirement 최종 판단은 source로 연결된 비종료 계획·draft와 수동 제출이 없는 시점에 일반 Planner가 담당한다. 관련 계획이 있으면 모두 실제 MERGED여야 하며 연결 계획 없는 직접 구현도 코드·검증·관련 제품·설계 문서로 판단한다. Manager는 유효한 기준별 충족 판단과 입력 지문·source 관계를 확인한 원문만 내용 보존 이동으로 게시한다. 미충족이면 후속 ExecPlan을 연결하며, 원격 확인 전 입력 변경에 따른 이동 철회와 원격 확인 후 archive를 구분한다.
 
@@ -326,6 +326,21 @@ Agent snapshot과 격리 ledger는 원문을 감사로 보존한다. 공유 ref�
 
 Agent preflight의 digest는 현재 역할·canonical worktree·repository·작업 identity에 결합한다. mutable Git snapshot을 digest에 넣거나 과거 OID와 일치시키지 않으며, provider가 실제 적용한 sandbox 정책과 설정 identity는 호출·재개·fallback마다 확인한다. 저장된 시작·결과 snapshot은 역할별 결과 유효성·성공 후보의 재사용과 실제 호출에 연결된 예약 workspace의 변경 귀속 증명에 사용한다. snapshot 일치만으로 접근 권한이나 성공을 만들지 않으며 현재 후보가 바뀌면 이전 verify·Review·게시 token을 무효화하고 필요한 단계부터 수행한다.
 
+### 미확정 Git 작업의 단계별 자원 판단
+
+`manager_git_journal.has_conflicting_project_mutation()`은 planning 해제·Requirement 교정·archive 진입·수동 준비/slot/release가 사용하는 공통 관측 경계다. 프로젝트의 모든 pending intent를 읽으며 targets 밖이라는 이유로 공유 자원 안전을 추정하지 않는다. 원본 source fast-forward/rebase 기록은 기존 source 동기화가 진단하며 별도 관리 작업의 gate로 승격하지 않는다. 정확한 수동 own-operation 복구는 owner·kind뿐 아니라 생성 worktree 또는 push ref까지 일치해야 한다.
+
+별도 `managed_rebase`의 격리는 다음 근거를 함께 확인할 때만 허용한다.
+
+- 실제 slot의 active와 불변 intent가 일치하고, 현재 소유 완료된 G row의 branch·worktree가 기록과 같다. 다른 작업·수동 묶음·planning의 같은 자원 claim과 기본 branch 충돌은 거부한다.
+- `rebase_uses_separate_workspace()`가 원본·이번 단계의 worktree 및 local/published ref와의 분리, intent의 작업 owner/원래 branch, 실제 worktree 등록과 중복 branch 등록 부재를 확인한다.
+- 기존 자원 lease를 plan·branch·worktree·Git target·공유 config에 적용하고 이 관측 경계가 직접 보유한 열린 lease만 재사용한다. `plan_recovery.check_stopped_writers()`로 원인 작업의 호출 예약·invocation과 프로젝트 범위 invocation의 실제 종료 또는 미시작 근거를 확인한다. 결과 관측만으로 종료를 합성하지 않는다.
+- Git common directory가 같은 저장소임과 include를 적용한 현재 공유 local config·직접 local branch ref의 tip을 관측 전후 비교하고, 소유권·호출 예약·writer 기록·checkpoint와 active/불변 intent도 다시 대조한다. 과거 repository snapshot 비교나 새 lock/journal 서비스는 만들지 않는다.
+
+Git·프로세스 관측과 잠금 대기는 DB 요청 밖에서 수행하며 DB transaction이 열려 있으면 외부 관측 대신 보류한다. 수동 준비는 외부 판단 전후의 `project_mutation_identity()`를 비교하고, 수락·등록의 짧은 DB CAS에서 같은 journal·DB identity를 다시 확인한다. 수동 자리 반환도 Git 충돌 조회 뒤 해당 identity와 선택 row·묶음을 재검사한다. 이 identity 조회는 Git·프로세스를 호출하지 않으며 지속 저장되는 성공 receipt나 재사용 승인 token이 아니다. 기존 source/draft·게시 예약·membership·dependency·프로젝트 안전·archive 유휴 조건은 소비자가 계속 소유한다.
+
+판정은 journal·충돌 파일·index·checkpoint·차단을 변경하지 않는다. 읽을 수 없는 기록과 알 수 없는 operation은 보류하며 완료 확정은 기존 operation별 완료 증명만 사용한다. 기존 operation log 경계에 owner·operation·intent ID·stage·resource/resources·allow/hold·reason·next_condition을 전달하고, 제어는 로그 문구를 파싱하지 않는다. 공통 config 원문과 인증값은 로그에 넣지 않는다.
+
 ### 예약 workspace의 소유권 복구
 
 일반 실행 준비와 프로젝트 소유권 차단 재평가는 `git/workspace.py`의 같은 변경 이력 판정을 사용한다. `workspace_owned=2`는 생성 예약이며 실행 기준 `active_sha`를 생성 HEAD로 사용하지 않는다. 봉인된 version 1 `managed_worktree_create`의 owner(`plan:{G-ID}`)·canonical repository/target·branch·생성 HEAD·index와 현재 자원을 대조하고, 현재 branch/lock identity를 유지한 승인된 전이만 연결한다. 다른 작업의 ref/worktree 변화는 이 자원의 비교 대상이 아니다.
@@ -445,7 +460,7 @@ Planner의 표준 결과는 `FINAL_SPECIFICATION_REVIEW: <JSON object>` 하나�
 4. 아직 게시하지 않은 동안 원격 base가 전진하면 변경·session을 보존해 반영하고 최신 catalog·대상 권한과 관련 문서를 재검증한다. 충돌·원격 재작성·소유권 불명확은 작업을 보존해 복구 경계로 보낸다.
 5. 기준과 mutable READY snapshot이 그대로면 복구 가능한 publication intent를 저장하고 base에 fast-forward push한다.
 6. 원격 commit을 확인한 뒤 생성 row 등록·개정 cache 갱신·삭제 row 제거와 ID 취소 감사·해당 모드의 성공 기준을 한 SQLite transaction으로 반영한다. 기존 프로젝트의 `publication_remote_oid`에 적용 revision을 저장하고 planning 소유권·결과·session을 유지한다. 일반 publication intent도 최종 해제까지 보존한다. FUTURE_IDEAS-only 변경은 실행 상태를 만들지 않는다.
-7. DB 밖에서 원격 이력과 게시 경로 보존, 소유 worktree의 HEAD·index·Git operation을 확인하고 worktree를 정리한다. 프로젝트·cycle·intent·catalog·수동 membership과 미종료 호출을 다시 확인한 별도 DB CAS가 planning 자리를 해제한다. 미확정 Git journal 중 별도 관리 rebase는 활성·불변 intent 일치, 작업 소유 branch와 기존 branch의 일치, 실제 Git worktree 등록과 planning·원본 경로 및 branch의 독립성이 확인될 때만 해제 차단에서 제외한다. 해당 intent·충돌·작업 상태는 변경하지 않는다. 같은 자원·알 수 없는 쓰기·손상되거나 부족한 근거는 계속 거부하며 최초 게시와 중단 복구에 같은 검사를 적용한다. 적용 뒤 정리 실패는 성공 기준을 되돌리지 않으며 작업 재개는 최종 해제 뒤에만 허용한다.
+7. DB 밖에서 원격 이력과 게시 경로 보존, 소유 worktree의 HEAD·index·Git operation을 확인하고 worktree를 정리한다. 프로젝트·cycle·intent·catalog·수동 membership과 미종료 호출을 다시 확인한 별도 DB CAS가 planning 자리를 해제한다. 미확정 Git journal은 [공통 자원 판단](#미확정-git-작업의-단계별-자원-판단)으로 별도 관리 rebase의 독립성을 확인하며 최초 게시와 중단 복구에 같은 검사를 적용한다. 원인 intent·충돌·작업 상태는 변경하지 않는다. 적용 뒤 정리 실패는 성공 기준을 되돌리지 않으며 작업 재개는 최종 해제 뒤에만 허용한다.
 
 PR·Git blob·로컬 원문/hash·draft 입력·공식 선언·root 계획 연결과 승격 근거는 DB 적용 전에 호출 내 불변 입력으로 준비한다. DB 확정은 준비한 snapshot·branch/generation·소유권·cycle·intent와 현재 상태를 대조하고 등록·관계·감사를 원자 적용한다. 기존 DB 요청 runner의 재시도는 같은 준비 값을 사용하며 Git·Planner·worktree 제거를 실행하지 않는다. 지침 hash와 성공 지문도 준비 값으로 전달해 DB 적용 중 원본을 다시 읽지 않는다.
 

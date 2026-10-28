@@ -76,6 +76,11 @@ class PlanningPublicationTest(PlanningCase):
                         (slot / f'{identity}.intent.json').write_text('{')
                     preserved = {path.name: path.read_bytes() for path in slot.iterdir()}
                     removed = []
+                    from tests.support.database import runtime_connection
+                    connection = runtime_connection('/repo')
+                    self.addCleanup(connection.close)
+                    connection.execute("UPDATE exec_plans SET plan_id='G-297',branch='loop-manager/G-297',worktree=?", (str(other),))
+                    connection.commit()
                     def git(repo, *args, **kwargs):
                         output = ''
                         if args[:2] == ('worktree', 'list'):
@@ -87,12 +92,18 @@ class PlanningPublicationTest(PlanningCase):
                         elif args[:2] == ('worktree', 'remove'):
                             worktree.rmdir()
                             removed.append(args[2])
+                        elif args[:1] == ('symbolic-ref',):
+                            return SimpleNamespace(stdout='', returncode=1)
+                        elif args[:1] == ('show-ref',):
+                            output = 'a' * 40
+                        elif args[:1] == ('config',):
+                            output = 'core.bare\0false\0'
                         elif args[:1] == ('rev-parse',):
-                            output = 'commit'
+                            output = '/shared' if '--git-common-dir' in args else 'commit'
                         return SimpleNamespace(stdout=output, returncode=0)
                     port = _PlanningGitPorts(SimpleNamespace(git=git, _git_operation_entries=lambda _: {},
                                                             _nul_git_paths=mock.Mock()),
-                                             None, Path('/repo'), state)
+                                             connection, Path('/repo'), state)
                     ports = FakePorts(planning_snapshot(phase='PLANNING', active_sha='base',
                         worktree=str(worktree), planning_workspace_owned=1))
                     ports.state.retain_planning_after_publication('/repo', 'commit')

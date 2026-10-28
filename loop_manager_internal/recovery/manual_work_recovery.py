@@ -193,12 +193,23 @@ def release_wait(connection, repo, outcome, state_dir, git):
     if not group or selected['agent_snapshot']:
         return
     from loop_manager_internal.git import manager_git_journal
-    if manager_git_journal.has_pending_project_mutation(state_dir,repo):
+    try:
+        git_observation = manager_git_journal.project_mutation_identity(state_dir, repo, connection)
+    except manager_git_journal.MutationEvidenceError:
+        return
+    if manager_git_journal.has_conflicting_project_mutation(
+            state_dir, repo, stage='manual_release', connection=connection, git=git,
+            worktrees=(Path(selected['worktree']),),
+            refs=(f"refs/heads/{selected['branch']}", f"refs/remotes/origin/{selected['branch']}")):
         return
     worktree=Path(selected['worktree'])
     if git(worktree,'diff','--name-only','--diff-filter=U').stdout.strip():
         return
     with connection:
+        if (manager_git_journal.project_mutation_identity(state_dir, repo, connection) != git_observation
+                or dict(runtime.active_row(repo) or {}) != dict(selected)
+                or dict(store.for_plan(repo, selected['plan_id']) or {}) != dict(group)):
+            return
         store.update(group,resume_phase=selected['status'],last_error=outcome.detail)
         runtime.transition_and_clear(repo,selected['plan_id'],expected_status=selected['status'],
                                      plan_values={'status':'MANUAL_PENDING'},enqueue=False)

@@ -26,6 +26,8 @@ from tests.support.git import git_command as git, commit_and_push, isolated_git_
 from tests.support.origin import remote_fixture, OriginScopeFixture
 from tests.support.workspace import WorkspaceFixture
 from tests.support.provider_execution import ProviderExecutionFixture
+from tests.support.manual_work_case import ManualWorkCase
+from tests.support.database import AutomationCatalogFixture
 
 
 @isolated_git_test
@@ -879,3 +881,93 @@ class ManualGenerationProviderGuidanceTests(ProviderExecutionFixture, unittest.T
         self.assertIn(common, delivered)
         self.assertIn(planner, delivered)
         self.assertIn('changed instruction:', delivered)
+
+
+
+
+class ManualJournalScopeTests(ManualWorkCase, AutomationCatalogFixture):
+    def test_exact_own_push_recovery_does_not_ignore_other_targets(self):
+        from loop_manager_internal.application.manual_concurrency import preparation_gate
+        from loop_manager_internal.git import manager_git_journal as journal
+        for own_target in (True, False):
+            with self.subTest(own_target=own_target), tempfile.TemporaryDirectory() as directory:
+                service = self.mocked_service(directory)
+                group, _, _, _ = self.seed_manual_group(service, directory, kind='start')
+                target = f"refs/heads/{group['branch']}" if own_target else 'refs/heads/other'
+                with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                    journal.execute(service.state_dir, repo=service.repo, owner='plan:G-047',
+                        kind='manual_branch_push', target=target, before={'oid': 'a' * 40},
+                        expected={'oid': 'b' * 40}, observe=lambda: {'oid': 'a' * 40},
+                        apply=mock.Mock(side_effect=RuntimeError('interrupted')), marker=lambda _: False)
+                slot = journal._slot(service.state_dir, service.repo, 'manual_branch_push', target)
+                preserved = {path.name: path.read_bytes() for path in slot.iterdir()}
+                if own_target:
+                    preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False)
+                else:
+                    with self.assertRaises(ManualWorkError):
+                        preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False)
+                service.effects.git.assert_not_called()
+                self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
+
+    def test_pending_rebase_scopes_preparation_slot_and_release_with_current_identity(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.application.manual_concurrency import preparation_gate
+        from loop_manager_internal.git import manager_git_journal as journal
+        from loop_manager_internal.recovery.manual_work_recovery import release_wait
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
+        for conflict in (False, True):
+            with self.subTest(conflict=conflict), tempfile.TemporaryDirectory() as directory:
+                service = self.mocked_service(directory)
+                service.connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+                service.connection.commit()
+                group, _, _, _ = self.seed_manual_group(service, directory, kind='start')
+                self._insert_plan(service.connection, 'G-099', 'PLAN_BLOCKED', repo=service.repo)
+                target = Path(directory) / 'other'
+                service.connection.execute("UPDATE exec_plans SET branch='loop-manager/G-099',worktree=?,workspace_owned=1 "
+                    "WHERE plan_id='G-099'", (str(target),))
+                service.connection.commit()
+                journal.begin_rebase(service.state_dir, repo=service.repo, owner='plan:G-099', target=str(target),
+                    before={'head': 'old', 'branch': 'loop-manager/G-099'}, expected={'branch': 'loop-manager/G-099'})
+                slot = journal._slot(service.state_dir, service.repo, 'managed_rebase', str(target))
+                preserved = {path.name: path.read_bytes() for path in slot.iterdir()}
+                def git(repo, command, *args, **kwargs):
+                    self.assertFalse(service.connection.in_transaction)
+                    if command == 'symbolic-ref':
+                        return SimpleNamespace(stdout='', returncode=1)
+                    if command == 'show-ref':
+                        return SimpleNamespace(stdout='a' * 40, returncode=0)
+                    output = (f'worktree {target}\0HEAD old\0detached\0\0' if command == 'worktree' else
+                              '/shared' if command == 'rev-parse' else 'core.bare=false' if command == 'config' else '')
+                    return SimpleNamespace(stdout=output, returncode=0)
+                service.effects = replace(service.effects, git=git)
+                if conflict:
+                    group = service.store.update(group, branch='loop-manager/G-099')
+                    service.connection.commit()
+                    with self.assertRaises(ManualWorkError):
+                        preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False)
+                else:
+                    observation = preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False)
+                    # The DB CAS performs identity comparisons without Git/process observation.
+                    with service.connection:
+                        preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False,
+                            check_git_journal=False, git_observation=observation)
+                    service.connection.execute("UPDATE exec_plans SET branch='changed' WHERE plan_id='G-099'")
+                    service.connection.commit()
+                    with self.assertRaises(ManualWorkError), service.connection:
+                        preparation_gate(service, plan_ids=['G-047'], group=group, inspect_workspace=False,
+                            check_git_journal=False, git_observation=observation)
+                    service.connection.execute("UPDATE exec_plans SET branch='loop-manager/G-099' WHERE plan_id='G-099'")
+                    service.connection.commit()
+                self.assertEqual(service.slot_available(recovering=group), not conflict)
+                service.connection.execute("UPDATE projects SET planning_attempt_fingerprint='reserved'")
+                service.connection.commit()
+                self.assertFalse(service.slot_available(recovering=group))
+                service.connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+                service.connection.commit()
+                service.runtime.update_plan(service.repo, 'G-047', plan_values={'status': 'VERIFYING'}, enqueue=False)
+                service.runtime.hydrate(service.repo, 'G-047')
+                outcome = ExecutionOutcome(ExecutionOutcomeKind.STABLE_WAIT, detail='wait')
+                release_wait(service.connection, service.repo, outcome, service.state_dir, git)
+                self.assertEqual(service.runtime.get(service.repo, 'G-047').status,
+                                 'VERIFYING' if conflict else 'MANUAL_PENDING')
+                self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)

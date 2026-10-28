@@ -29,10 +29,10 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/git/manager_git_journal.py:has_pending_project_mutation()`의 현재 source 예외·intent 읽기와 `planning/git_ports.py:validate_planning_release()`의 증거 판정을 재사용해 단계별 사용 자원과 미확정 작업의 관계를 판단한다. 기존 `runtime/resource_lock.py`·writer 종료/소유 근거를 연결하며 새 범용 lock/journal 서비스나 과거 repository snapshot 비교를 도입하지 않는다.
-- [ ] 확인한 모든 소비자 `catalog/requirement_correction_publication.py:observe()`, `application/project_service.py:_archive_housekeeping()`, `application/manual_concurrency.py:preparation_gate()`, `application/manual_work.py:slot_available()`, `recovery/manual_work_recovery.py:release_wait()`와 planning 해제를 대조해 공통 판정을 적용한다. targets 밖 기록을 무조건 무시하지 않고 실제 공유 자원을 확인한다. 교정의 writer/source 보호·수동 own-intent 복구·archive의 기존 개별 후보 보존을 유지한다.
-- [ ] `tests/test_manager_git_journal.py:PendingProjectMutationTest`, `tests/test_planning_publication.py:PlanningPublicationTest`와 소비자별 `tests/test_requirement_correction_publication.py`, `tests/test_manual_concurrency.py`, `tests/test_archive_housekeeping_adapter.py`의 기존 fixture를 사용한다. 판단 helper를 성공 mock으로 바꾸지 않고 journal 파일·SQLite 상태는 실제로, Git/프로세스/원격 관측만 double로 제공한다.
-- [ ] 실제 구현에 맞춰 PRODUCT의 복구·수동 준비와 ARCHITECTURE의 계획 해제·교정 게시·Git journal 책임을 통합한다. 사용 자원·불확실성의 의미를 소유 절에 두고 소비자마다 정책을 복제하지 않는다.
+- [x] 확인한 `loop_manager_internal/git/manager_git_journal.py:has_pending_project_mutation()`의 현재 source 예외·intent 읽기와 `planning/git_ports.py:validate_planning_release()`의 증거 판정을 재사용해 단계별 사용 자원과 미확정 작업의 관계를 판단한다. 기존 `runtime/resource_lock.py`·writer 종료/소유 근거를 연결하며 새 범용 lock/journal 서비스나 과거 repository snapshot 비교를 도입하지 않는다.
+- [x] 확인한 모든 소비자 `catalog/requirement_correction_publication.py:observe()`, `application/project_service.py:_archive_housekeeping()`, `application/manual_concurrency.py:preparation_gate()`, `application/manual_work.py:slot_available()`, `recovery/manual_work_recovery.py:release_wait()`와 planning 해제를 대조해 공통 판정을 적용한다. targets 밖 기록을 무조건 무시하지 않고 실제 공유 자원을 확인한다. 교정의 writer/source 보호·수동 own-intent 복구·archive의 기존 개별 후보 보존을 유지한다.
+- [x] `tests/test_manager_git_journal.py:PendingProjectMutationTest`, `tests/test_planning_publication.py:PlanningPublicationTest`와 소비자별 `tests/test_requirement_correction_publication.py`, `tests/test_manual_concurrency.py`, `tests/test_archive_housekeeping_adapter.py`의 기존 fixture를 사용한다. 판단 helper를 성공 mock으로 바꾸지 않고 journal 파일·SQLite 상태는 실제로, Git/프로세스/원격 관측만 double로 제공한다.
+- [x] 실제 구현에 맞춰 PRODUCT의 복구·수동 준비와 ARCHITECTURE의 계획 해제·교정 게시·Git journal 책임을 통합한다. 사용 자원·불확실성의 의미를 소유 절에 두고 소비자마다 정책을 복제하지 않는다.
 
 ## Validation
 
@@ -44,9 +44,11 @@ priority: high
 
 - [x] `993b7dfd` → `9dd75b5d` delta와 현재 helper의 모든 호출자·직접 planning 회귀를 정적으로 대조했다. planning의 국소 구현과 나머지 소비자/공유 안전의 미충족을 구분했으며 실행 검증은 하지 않았다.
 - [x] 보존점 1: planning의 별도 rebase 자원 증거 판정을 `manager_git_journal.rebase_uses_separate_workspace()`로 추출하고 planning 해제에서 재사용한다. 단계별 worktree·local/published ref 입력을 비교하며 active·불변 intent를 Git 등록 관측 전후에 재확인한다. 이는 자원 분리 근거만이며 writer 종료·lease·공유 설정 안전이나 다른 소비자의 진행 허가를 대신하지 않는다.
-- [ ] 공통 자원/증거 판정과 소비자 연결: writer 종료·현재 소유권·lease·공유 설정·단계별 사용 자원과 구조화된 원인/다음 조건을 연결하고, 교정·archive·수동 준비/slot/release의 기존 gate를 보존한 채 적용한다. 이 보존점에서는 이 다섯 소비자의 pending 정책을 변경하지 않았다.
+- [x] 공통 자원/증거 판정과 소비자 연결: `has_conflicting_project_mutation()`을 planning 해제·교정·archive 진입·수동 준비/slot/release에 연결했다. 현재 소유 완료 row·동일 자원 claim·checkpoint·호출 예약/실제 writer 종료 근거, 기존 lease, 실제 Git 등록·common directory·직접 branch ref와 include를 적용한 공유 local config를 대조한다. targets 밖 기록도 검사하고 정확한 수동 own-target 복구와 source 비권위 예외를 유지한다. 기존 writer 판정을 `check_stopped_writers()`로 추출해 예약 복구와 재사용한다. 수동 CAS/자리 반환은 외부 관측 뒤 `project_mutation_identity()`와 현재 대상·묶음을 재확인하며 Git·프로세스를 DB 안에서 호출하지 않는다.
 - [x] 보존점 1 targeted: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_manager_git_journal.PendingProjectMutationTest tests.test_planning_publication.PlanningPublicationTest.test_publication_release_scopes_pending_rebase_on_first_publish_and_recovery`를 실행했다. 첫 실행은 새 테스트의 active 교체 fixture가 손상 JSON을 사용해 오류 1건이었고, 유효한 다른 intent fixture로 수정 후 같은 명령의 5개 테스트가 통과했다. 독립/충돌 ref·worktree·등록 실패·intent 경쟁과 journal bytes 보존, 실제 최초 게시/복구 해제 및 Agent 무호출을 확인했다. 전체 verify는 실행하지 않았다.
-- [ ] 허용·거부·보존 및 후속 단계 도달의 최소 회귀·문서 정합성
+- [x] 허용·거부·보존 및 후속 단계 도달의 최소 회귀·문서 정합성: 실제 SQLite/journal과 Git 관측 double로 독립 rebase의 교정 commit/push·archive dispatch·수동 준비/slot/자리 반환 도달, 같은 게시 ref·미종료 writer·다른 소유 lease·공유 config/소유권/intent/checkpoint 경쟁·간접/누락 branch ref의 거부와 journal bytes 보존을 확인했다. archive 진입 회귀는 기존 ProjectService fixture가 있는 `test_requirement_correction_publication.py`에 두어 fixture를 복제하지 않았다. PRODUCT의 복구·수동 준비와 ARCHITECTURE의 공통 자원 계약·계획 해제·교정 게시 설명을 통합했다.
+- [x] 이번 호출 targeted: 관련 단위 13개가 통과했다(`PendingProjectMutationTest`, `ManualJournalScopeTests`, planning 최초 게시/복구 1개, 교정 후속 게시 1개, 기존 예약 lease 복구 2개, 외부 Git 무호출 수동 complete/submit 2개). 이후 직접 branch ref·config include 보호 변경의 영향 단위 5개도 통과했다(공통 행렬·수동 준비/slot/release·planning 최초 게시/복구·교정 게시·archive 진입). 기존 교정 writer 종료·pending rebase의 실행 복구 도달 회귀도 별도 통과했다. 실제 Git 효과·전체 suite/verify·Windows native는 실행하지 않았다.
+- 이번 호출의 실패와 수정: 공통 행렬의 다른 소유 lease 재사용 실패 1회는 helper 소유 lease만 허용하도록 고친 후 동일 명령으로 통과했다. 소비자 3개 명령의 첫 실행은 교정 fixture의 draft 테이블 누락과 수동 identity 비교의 소유권 변경 오류였고, fixture 및 미확인 identity 처리 수정 후 동일 명령을 재실행했다. 다음 실행의 수동 slot 실패는 fixture에 남은 planning 예약 때문이어서 예약을 명시적으로 비우고 해당 gate가 다시 켜지면 계속 거부함을 검증했다. 세 번째 동일 명령은 3개 모두 통과했다. 같은 테스트의 연속 3회 실패는 없고 미해결 targeted 실패는 없다.
 
 ## Decision Log
 
