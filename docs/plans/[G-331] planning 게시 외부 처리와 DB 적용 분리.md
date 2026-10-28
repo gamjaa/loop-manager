@@ -27,11 +27,11 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 4는 `pl
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/planning/publication_service.py`의 복구 요청 읽기, DB 밖 복구·정리, 결과 확정을 나눈다. `planning/state_ports.py`·`git_ports.py` 및 기존 effects/repository를 재사용하며, transaction만 외곽으로 옮기고 helper 내부에서 다시 잡는 우회가 없게 한다.
-- [ ] 확인한 `planning/planner_publication.py`·`storage/planning_publication_state.py`의 snapshot 검증·`_register_execplan_rows`에서 PR/Git blob 관측을 DB 밖의 준비 단계로 모은다. 검증한 경로·원문·hash/mode·공식 선언·게시 revision을 불변 입력으로 넘기고 실제 등록·mutable CAS·관계/감사 반영은 기존 원자 transaction 안에 둔다. 조회 실패·누락 입력·identity 충돌은 현재 거부를 유지한다.
-- [ ] 확인한 `loop_manager_internal/maintenance/maintenance_publication.py`의 같은 등록 경계를 재사용한다. G-330의 ledger prepare/apply와 tiered promote의 외부 원본 관측을 batch 밖에서 준비하고, 확정에는 검증한 근거와 현재 DB 입력만 전달한다. root plan link·barrier 최종 본문 hash·게시 blob 대조와 성공 기준 확정 순서를 보존한다.
-- [ ] 확인한 `tests/test_planning_publication.py`·`tests/test_maintenance_publication.py`·`tests/test_tiered_publication.py`의 rollback·재적용·push 후 중단 fixture를 재사용한다. 새 범용 transaction runner·publication 엔진·전역 공유 관측 cache는 추가하지 않는다.
-- [ ] 구현한 관측/적용·정리 복구 책임을 ARCHITECTURE의 계획 게시·단계별 반영 절에 통합한다. 실패 planning 자리/독립 선택은 G-278, 실패 원인 소비는 G-189에 남긴다.
+- [x] 확인한 `loop_manager_internal/planning/publication_service.py`의 복구 요청 읽기, DB 밖 복구·정리, 결과 확정을 나눈다. `planning/state_ports.py`·`git_ports.py` 및 기존 effects/repository를 재사용하며, transaction만 외곽으로 옮기고 helper 내부에서 다시 잡는 우회가 없게 한다.
+- [x] 확인한 `planning/planner_publication.py`·`storage/planning_publication_state.py`의 snapshot 검증·`_register_execplan_rows`에서 PR/Git blob 관측을 DB 밖의 준비 단계로 모은다. 검증한 경로·원문·hash/mode·공식 선언·게시 revision을 불변 입력으로 넘기고 실제 등록·mutable CAS·관계/감사 반영은 기존 원자 transaction 안에 둔다. 조회 실패·누락 입력·identity 충돌은 현재 거부를 유지한다.
+- [x] 확인한 `loop_manager_internal/maintenance/maintenance_publication.py`의 같은 등록 경계를 재사용한다. G-330의 ledger prepare/apply와 tiered promote의 외부 원본 관측을 batch 밖에서 준비하고, 확정에는 검증한 근거와 현재 DB 입력만 전달한다. root plan link·barrier 최종 본문 hash·게시 blob 대조와 성공 기준 확정 순서를 보존한다.
+- [x] 확인한 `tests/test_planning_publication.py`·`tests/test_maintenance_publication.py`·`tests/test_tiered_publication.py`의 rollback·재적용·push 후 중단 fixture를 재사용한다. 새 범용 transaction runner·publication 엔진·전역 공유 관측 cache는 추가하지 않는다.
+- [x] 구현한 관측/적용·정리 복구 책임을 ARCHITECTURE의 계획 게시·단계별 반영 절에 통합한다. 실패 planning 자리/독립 선택은 G-278, 실패 원인 소비는 G-189에 남긴다.
 
 ## Validation
 
@@ -42,8 +42,39 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 4는 `pl
 
 ## Progress
 
-- [x] 저장된 발견·관련 게시 계획과 R-082/R-091 계약을 대조해 ledger 선행과 나머지 batch 경계를 확정했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 외부 처리/DB 적용 분리와 중단·경쟁 회귀 검증
+- [x] 저장된 발견·관련 게시 계획과 R-082/R-091 계약을 대조해 ledger 선행과 나머지 batch 경계를 확정했다.
+- [x] 외부 처리/DB 적용 분리와 중단·경쟁 회귀 검증
+- [x] 공유 신규 row 등록의 호출 내 준비 값과 DB 적용 경계를 구현했다. `_prepare_execplan_rows`는 경로·선언·게시 commit, 로컬 내용 hash·게시 blob hash, draft 입력 지문과 원격 링크를 불변 값으로 준비한다. 일반·유지보수 batch와 `register_execplans`는 자체 transaction 전에 준비하고 `_register_execplan_rows`에 전달한다. 직접 catalog 호출의 기존 facade는 유지한다.
+- 등록 준비와 적용 사이 worktree·commit·선언 identity가 달라지면 쓰기 전에 거부한다. 혼합 draft/일반 등록의 두 번째 row에서 중단을 주입해 첫 row와 draft의 원자 rollback을 확인하고, 같은 준비 값을 재사용한 적용·재적용에서 파일·Git·draft 원문 관측을 금지했다. 개별 targeted runner로 이 두 case와 일반 게시 5 case, Requirement 이동 영수증 1 case, 유지보수 게시 2 case, tiered 원자 게시 1 case를 확인했다. 전체 verify는 실행하지 않았다.
+- 일반 legacy intent 복구 fixture에 transaction 경계 assertion을 추가한 실행은 fixture의 미종료 transaction 때문에 1회 FAIL이었다. intent 저장 뒤 fixture가 commit하도록 교정한 동일 개별 명령 재실행은 PASS였다. 이 결과는 상위 서비스 transaction의 해소를 뜻하지 않는다.
+- [x] 일반 게시의 내부 준비/확정 경계를 분리했다. PR 관측은 snapshot token·계획 ID·현재 branch·catalog generation에 결합하며 DB CAS는 관측을 반복하지 않고 실행 상태·수동 소유·현재 branch/generation을 비교한다. intent 예약의 commit·문서 원본 검증도 자체 transaction 전에 수행하고 현재 프로젝트 소유 상태·문서 승인·catalog source 관계를 확정 시 대조한다. batch 적용의 개정 hash·draft 입력·문서 본문·계획 선언과 멱등 판정 입력은 자체 transaction 전에 읽고, 적용 때 준비한 intent 전체 identity가 바뀌면 거부한다.
+- 일반 게시 경계 보존점에서 신규 접근 경계/경쟁 6 case와 관련 일반 게시·멱등/rollback·시작한 실행 보존·push 후 복구·문서 승인·Requirement 영수증 회귀를 합쳐 20개 개별 targeted case의 최종 PASS를 확인했다. PR 관측이 Event로 대기하는 동안 같은 파일 DB의 독립 연결이 갱신을 완료했고 활성 transaction과 공통 접근 소유가 없음을 확인했다. 일반 Git/blob/파일/draft 입력 관측도 자체 transaction 밖임을 검사했다. 전체 verify는 실행하지 않았다.
+- 혼합 batch 반복 게시 회귀는 적용 완료 후 삭제된 row를 PR 준비가 다시 찾는 ERROR 1회를 발견했다. intent가 없는 재적용에서는 기존 멱등 판정을 사용하고 PR 준비를 생략하도록 교정한 동일 개별 명령 재실행은 PASS였다. 원래 intent가 있거나 준비 중 identity가 변경된 경로의 검증은 유지했다.
+- [x] 유지보수 batch의 내부 준비/확정 경계를 분리했다. 개정 hash·draft 입력·계획 선언·지침 hash·두 성공 지문과 repository 구분을 자체 transaction 전에 준비하고, 멱등 판정에도 준비 값을 전달한다. intent 예약과 적용에서 cycle 전체·프로젝트 소유 상태·catalog 전체 및 대상 계획의 수동 membership 지문을 다시 비교한다. 확정 직전 신규 ID 예약과 공유 Requirement scope도 다시 검사한다. root 계획 검증은 불변 `PreparedPublicationIntent`로 전달하며 기존 JSON payload와 DB 저장 형식은 바꾸지 않았다.
+- 공유 `planning_input_state.record_general()`의 숨은 지침 원문 재독해도 제거했다. 일반·유지보수 batch는 준비한 지침 hash를 넘기며, 기존 호출의 기본 동작은 유지한다. root intent 준비 값을 적용 중 Git 재관측 없이 rollback 후 재사용하고 다른 게시 identity의 값을 거부하는 회귀를 추가했다.
+- 유지보수 보존점에서 개별 targeted 16 case의 최종 PASS를 확인했다. 내부 외부 관측/성공 지문 경계, cycle·owner·catalog generation·수동 membership 경쟁, intent 원본 관측 중 owner 경쟁, 일반/유지보수 원자 rollback·멱등 적용·legacy/CRLF 재시작 복구, 파일 근거 승격·tiered root 연결·원자 rollback, prerequisite scope와 일반 지침 baseline 보존을 확인했다. 전체 verify는 실행하지 않았다.
+- 신규 경계 test는 공유 baseline helper가 지침 원문을 transaction 안에서 다시 읽는 FAIL 1회와, 경쟁 fixture의 미종료 초기 transaction에 따른 FAIL 1회를 발견했다. 준비한 지침 hash 전달과 fixture intent commit을 반영한 동일 개별 명령 재실행은 각각 PASS였다. 실패를 성공 이력으로 덮거나 검사를 약화하지 않았다.
+- [x] 정상 게시와 변경 없음 완료의 상위 transaction에서 worktree 제거를 분리했다. catalog·성공 기준 적용과 함께 기존 `projects.publication_remote_oid`에 확인한 revision을 저장하고 planning 소유권·결과·session을 유지한다. 일반 intent도 슬롯 해제까지 유지한다. 다음 짧은 DB 읽기로 만든 release identity는 프로젝트·cycle·intent·catalog·수동 membership을 결합하며, 원격 이력/게시 경로·현재 HEAD·Git 등록을 DB 밖에서 확인하고 제거한 뒤 별도 CAS로 슬롯을 해제한다. DB schema와 intent JSON 형식은 바꾸지 않았다.
+- 적용 완료 release는 초기 prepared intent 복구보다 먼저 처리한다. 제거 뒤 DB 해제 중단에서도 이미 적용한 batch·push·Planner·제거를 반복하지 않고 남은 해제만 진행한다. 최종 해제는 기존 `run_database_request`를 사용하며 rollback 후 같은 준비 값을 재사용한다. 변경 없음 완료의 선언·지침도 상위 transaction 전에 준비한다. 일반 batch 확정에는 준비 중 프로젝트 소유 상태 변경을 거부하는 CAS를 추가했다.
+- 정리 실패 테스트는 원격에서 검증한 DB 적용을 rollback하는 기대 대신 적용 완료·planning 소유권 유지·해제 대기와 결과/session/진단 보존을 검사하도록 갱신했다. prerequisite scope도 게시 적용 뒤 유지한 채 정리 대기임을 검사한다. 실행 재개는 정리와 최종 CAS 뒤에만 허용하며 기존 원자 등록/개정 rollback 검사는 유지한다.
+- 슬롯 해제 보존점에서 개별 targeted 13 case의 최종 PASS를 확인했다. 실제 coordinated SQLite에서 제거 double이 대기하는 동안 독립 연결의 쓰기가 완료됐고, 효과 진입의 transaction·공통 접근 소유가 없음을 확인했다. 제거 뒤 DB 중단·재시작과 최종 해제 rollback/재시도에서도 제거 1회·게시/Planner 재호출 0회를 확인했다. 준비 후 owner·catalog generation·수동 membership 변경은 해제를 거부하고 경쟁 데이터를 보존했다. HEAD 변경·삭제 경로의 Git 등록 잔존 거부, 일반/유지보수 적용 후 슬롯 보존과 기존 서비스 실패/재개·조립 회귀도 확인했다. 전체 verify는 실행하지 않았다.
+- 새 제거/DB 해제 중단 fixture는 초기 INSERT의 미종료 transaction에 따른 FAIL 1회를 발견했다. intent 저장을 commit한 동일 개별 명령 재실행은 PASS였다. 이후 coordinated 연결과 독립 쓰기·DB-only 재시도 검사로 확장한 동일 test도 PASS였다.
+- [x] 초기 prepared intent 복구의 두 상위 transaction을 제거했다. 일반·유지보수 복구는 원격 게시된 결과를 DB에 적용한 뒤 같은 정리/해제 경계를 사용한다. 복구 관측 전 프로젝트·intent 또는 cycle·catalog·수동 소유 근거를 잡고 적용 시 다시 비교한다. 미게시 후보는 기존 소유 worktree 원격 반영 경계를 유지하며, 복구 관측 중 게시 사실이 달라지면 후보와 intent를 보존한다.
+- 게시 뒤 원본이 변경된 유지보수 재평가는 prepared cycle·기존 게시 OID·intent를 보존한 정리 대기로 처리한다. 최종 CAS가 재평가 cycle 재시작과 planning 해제를 함께 확정한다. 원본 관측 중 owner 변경은 정리 대기 저장 전에 거부하며, 최종 해제 중단은 cycle·intent·session을 rollback한다. 다음 해제에는 원본 관측·catalog 적용을 반복하지 않는다.
+- 공유 등록·일반/유지보수 intent 예약과 batch 적용·legacy restart 확정은 기존 `run_database_request`에 DB-only closure를 넘긴다. 외부 관측은 closure 전에 준비하며 첫 적용 rollback 뒤 같은 closure를 재실행해도 관측을 반복하지 않는다. 재시도 사이 owner·cycle이 바뀌면 기존 intent와 경쟁 데이터를 보존하고 적용을 거부한다. 변경 없음 완료도 선언·지침·승격 근거를 준비한 뒤 DB-only transaction으로 적용하고, 제거·해제는 분리한 경계를 사용한다.
+- 이번 호출은 개별 targeted 19 case의 최종 PASS를 확인했다. 일반/유지보수 intent·batch rollback/재시도와 owner·cycle 경쟁, 초기 복구의 상위 transaction 금지, 게시된 원본 변경 재평가와 해제 중단, 기존 coordinated DB 독립 쓰기·제거 후 재시작, 혼합 catalog·draft 등록·유지보수 원자 rollback, 변경 없음·prerequisite 범위 보존·Git 정리 검증을 포함한다. 전체 verify는 실행하지 않았으며 Manager 검증에 인계한다.
+- 재시도 fixture 2 case는 autocommit 연결에 transaction을 시작하지 않아 rollback 검사가 각각 1회 FAIL이었다. 명시적 transaction으로 고친 동일 명령 재실행은 PASS였다. 유지보수 초기 복구 case는 옵션의 잘못된 전달 위치와 중복 전달로 연속 2회 ERROR였고, 호출 분기를 교정한 동일 명령 재실행은 PASS였다. 실패·재실행 기록을 보존했다.
+- [x] ARCHITECTURE의 계획 게시·단계별 반영 절을 실제 준비/DB CAS/외부 정리/최종 해제와 중단 복구 책임에 맞게 통합했다. schema·intent/감사 JSON, ID/draft 경계와 일반/유지보수 성공 기준을 보존했다. 구현은 검증 후보이며 전체 verify와 Review는 Manager가 수행한다.
+
+- Manager verify `cc77c2cf0eba0f5973b06ab1cbc477c905f3a12f02aed37dee865b6c6962b3c2` occurrence 1 / revision 1의 실패를 교정했다. 공유 FakeState의 기본 `planning_review`가 기존 선택적 검토 기능을 의도치 않게 활성화한 것을 제거하고 게시 서비스의 조회를 기존 선택적 port 패턴에 맞췄다. 코드맵 게시 mock은 적용 후 해제 대기를 저장하며, CAS·legacy restart·Requirement 이동 fixture는 새 외부 입력 준비와 프로젝트 identity 조회 경계를 제공한다. 기존 commit 재사용·행별 CAS·transaction rollback·감사 보존 assertion은 유지했다.
+- PR 준비 helper는 현재 row의 mutable 실행 상태와 snapshot 실행 identity를 먼저 비교한다. 수동 시작이 먼저 확정된 row를 실제 PR 조회 전에 거부하고, 게시 확정의 PR 관측·generation·수동 ownership CAS는 유지한다. DB 확정 중 정지시키는 수동 시작 경합 fixture는 준비된 PR 관측 인자를 그대로 전달하도록 고쳤다.
+- 유지보수 검증이 직접 저장한 assessment/prerequisite 범위를 호출 내 cycle snapshot에도 동일하게 반영했다. 뒤의 no-change CAS는 방금 저장한 정상 범위를 오경합으로 거부하지 않으며, 현재 DB를 다시 읽어 경쟁 cycle을 기존 관측으로 대체하지 않는다. 실제 prerequisite Merge 뒤 외부 READY로 복귀하는 회귀를 유지했다.
+- 최종 검토 정리 실패 fixture는 임시 worktree를 실제로 만들어 제거 오류가 발생하게 했다. 원격 경합의 미확정 검토와 적용 뒤 정리 실패의 확인된 검토·planning 소유권·해제 대기를 구분하고, 둘 다 오류·worktree 보존·Planner 1회를 검사한다. 확인된 검토를 전체 planning 완료로 취급하지 않는다.
+- 이번 교정은 Manager 실패 60개 ID를 개별 targeted 명령으로 재실행해 모두 최종 PASS를 확인했다. 추가 PR 관측/CAS 2 case와 prerequisite 정리 실패 1 case도 PASS다. 첫 재현의 실패 6 case는 교정 후 동일 명령에서 PASS였으며, 추가 PR 회귀의 잘못된 class 경로 2건은 수집 오류로 구분해 실제 class에서 실행했다. 전체 verify는 Worker가 재실행하지 않았으며 Manager의 최종 verify와 Review가 남아 있다.
+
+- 결과 보고 교정: 이전 호출의 targeted JSONL에서 63개 ID의 최신 `test_end`가 모두 `success`이고, Manager verify 피드백의 60개 ID 전부가 포함됨을 다시 확인했다. Worker 결과 검증은 `TARGETED_TESTS`의 과거 이력 표현을 현재 실패 선언으로 해석했다. 구현·검증 규칙은 변경하지 않고 최종 결과 필드를 확인된 최신 상태로 명확히 보고한다. 이 호출은 기록 재확인과 보고 교정만 수행하므로 테스트를 중복 실행하지 않았다.
+
+- Manager verify `7f36d69de4c047c9bba6c134be333390990cb6a0c55ac35e4151d66d83938348` occurrence 1 / revision 1의 PR 관측 접근 해제 fixture에 `execution_state=None`을 명시했다. 실제 snapshot의 선택적 실행 identity 필드를 제공하며 준비 helper의 검사를 우회하지 않는다. 해당 개별 targeted test는 PASS였고 PR 대기 중 transaction·공통 접근 소유 부재와 독립 SQLite 연결의 쓰기 완료 assertion을 모두 유지했다. 전체 verify는 Manager에 맡긴다.
 
 ## Decision Log
 

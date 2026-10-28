@@ -114,6 +114,9 @@ class MaintenanceSnapshotResumeTest(unittest.TestCase):
 class MaintenancePublicationTransactionTest(unittest.TestCase):
     def test_stale_publication_restart_rolls_back_if_workspace_cleanup_fails(self):
         connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
         connection.execute("CREATE TABLE marker (value TEXT)")
         connection.execute("INSERT INTO marker (value) VALUES ('preserved')")
         connection.commit()
@@ -343,6 +346,30 @@ class ApprovedDocumentPlanTest(unittest.TestCase):
                 plans=((path, plan),), publication_paths=(path,),
                 mutable_snapshot=snapshot,
             )
+            from loop_manager_internal.storage.database import GENERAL_PLANNING_PUBLICATIONS_SCHEMA
+            connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+            connection.commit()
+            def observe_original(*_args):
+                self.assertFalse(connection.in_transaction)
+            with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
+                    mock.patch.object(loop_manager, "_validate_general_planning_commit"), \
+                    mock.patch.object(document_drafts.DocumentDraftRepository, "assert_current", side_effect=observe_original):
+                saved_intent = loop_manager.record_general_planning_publication_intent(
+                    connection, repo, worktree, result, "f" * 40, "spec", "plan")
+            def change_approval(*_args):
+                self.assertFalse(connection.in_transaction)
+                with connection:
+                    connection.execute("UPDATE document_drafts SET state='rejected' WHERE draft_id=?", (draft_id,))
+            with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
+                    mock.patch.object(loop_manager, "_validate_general_planning_commit"), \
+                    mock.patch.object(document_drafts.DocumentDraftRepository, "assert_current", side_effect=change_approval), \
+                    self.assertRaisesRegex(loop_manager.PlannerValidationError, '승인·source 관계'):
+                loop_manager.record_general_planning_publication_intent(
+                    connection, repo, worktree, result, "f" * 40, "spec", "plan")
+            self.assertEqual(loop_manager.general_planning_publication(connection, repo), saved_intent)
+            self.assertEqual(document_drafts.DocumentDraftRepository(connection).get(draft_id).state, 'rejected')
+            with connection:
+                connection.execute("UPDATE document_drafts SET state='approved' WHERE draft_id=?", (draft_id,))
             intent = SimpleNamespace(
                 stage="prepared", base_sha=snapshot.active_sha,
                 commit_sha="f" * 40, snapshot_token=snapshot.token,
@@ -353,6 +380,7 @@ class ApprovedDocumentPlanTest(unittest.TestCase):
                 mock.patch.object(loop_manager, "general_planning_publication", return_value=intent),
                 mock.patch.object(loop_manager, "_assert_mutable_ready_snapshot_current"),
                 mock.patch.object(loop_manager, "_register_execplan_rows"),
+                mock.patch.object(loop_manager, "_prepare_execplan_rows"),
                 mock.patch.object(loop_manager, "_clear_active_in_current_transaction"),
                 mock.patch.object(loop_manager, "plan_declarations", return_value={path: ("blob", "f" * 40)}),
             ):

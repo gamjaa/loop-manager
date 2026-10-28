@@ -25,6 +25,45 @@ class DatabaseAccessTests(unittest.TestCase):
             self.connection.execute('CREATE TABLE sample(id INTEGER PRIMARY KEY, value INTEGER)')
             self.connection.executemany('INSERT INTO sample VALUES (?,0)', [(1,), (2,), (3,)])
 
+    def test_planning_pr_observation_releases_access_before_waiting(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.planning import planner_validation as validation
+        from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
+        self.connection.row_factory = sqlite3.Row
+        with self.connection:
+            self.connection.execute('CREATE TABLE exec_plans(repo TEXT, plan_id TEXT, branch TEXT, catalog_generation INTEGER)')
+            self.connection.execute("INSERT INTO exec_plans VALUES ('repo', 'G-001', 'topic', 7)")
+        snapshot = MutableReadySnapshot('repo', 'base', (SimpleNamespace(plan_id='G-001', execution_state=None),), 'token')
+        entered, updated = threading.Event(), threading.Event()
+        errors = []
+        def other_request():
+            try:
+                self.assertTrue(entered.wait(5))
+                with closing(open_connection(self.path)) as other, other:
+                    other.execute('UPDATE sample SET value=9 WHERE id=1')
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                updated.set()
+        def observe(repo, branch):
+            self.assertEqual((repo, branch), (Path('repo'), 'topic'))
+            self.assertFalse(self.connection.in_transaction)
+            self.assertFalse(self.connection._held)
+            entered.set()
+            self.assertTrue(updated.wait(5))
+        effects = validation.AssertMutableReadySnapshotCurrentEffects(mock.Mock(), mock.Mock(), observe)
+        worker = threading.Thread(target=other_request)
+        worker.start()
+        try:
+            prepared = validation._observe_mutable_ready_prs(effects, self.connection, snapshot)
+            self.assertEqual(prepared.branches, (('G-001', 'topic', 7),))
+            self.assertEqual(self.connection.execute('SELECT value FROM sample WHERE id=1').fetchone()[0], 9)
+        finally:
+            entered.set()
+            worker.join(6)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
     def test_maintenance_observation_releases_access_before_waiting(self):
         from loop_manager_internal.storage import maintenance_file_ledger as ledger
         from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory

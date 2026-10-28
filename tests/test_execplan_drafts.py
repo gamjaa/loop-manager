@@ -1392,29 +1392,67 @@ class ExecPlanDraftPublicationTest(AutomationCatalogFixture, unittest.TestCase):
             (root / PATH).write_text(draft_text(), encoding="utf-8")
             (root / second).write_text(plan_text("G-002", "Independent"), encoding="utf-8")
             plans = [(path, loop_manager._parse_execplan(root, root / path)) for path in (PATH, second)]
-            hashes = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            def hashes(path):
+                self.assertFalse(connection.in_transaction)
+                return hashlib.sha256(path.read_bytes()).hexdigest()
             git = mock.Mock(return_value=SimpleNamespace(stdout="git@github.com:owner/project.git"))
             rows = planner_publication.RegisterExecplanRowsEffects(
                 _ensure_execplans_schema=loop_manager._ensure_execplans_schema, file_hash=hashes, git=git,
                 git_bytes=lambda _root, _show, spec: (root / spec.split(":", 1)[1]).read_bytes())
-            def interrupted_hash(path):
-                if path.name == Path(second).name:
+            prepared = planner_publication._prepare_execplan_rows(rows, root, plans, "a" * 40)
+            no_observation = replace(rows,
+                file_hash=mock.Mock(side_effect=AssertionError("file read during apply")),
+                git=mock.Mock(side_effect=AssertionError("Git during apply")),
+                git_bytes=mock.Mock(side_effect=AssertionError("blob read during apply")))
+            effects = planner_publication.RegisterExecplansEffects(
+                _prepare_execplan_rows=mock.Mock(return_value=prepared),
+                _register_execplan_rows=lambda *args, **kwargs:
+                    planner_publication._register_execplan_rows(no_observation, *args, **kwargs))
+            register = execplan_catalog_state.register_published_plan_row
+            def interrupt_second(db, repo, path, *args, **kwargs):
+                if path == second:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM execplan_drafts").fetchone()[0], 1)
                     raise KeyboardInterrupt("registration interrupted")
-                return hashes(path)
-            interrupted = replace(rows, file_hash=interrupted_hash)
-            effects = planner_publication.RegisterExecplansEffects(_register_execplan_rows=lambda *args:
-                planner_publication._register_execplan_rows(interrupted, *args))
-            with self.assertRaises(KeyboardInterrupt):
+                return register(db, repo, path, *args, **kwargs)
+            with mock.patch.object(execplan_catalog_state, "register_published_plan_row", side_effect=interrupt_second), \
+                    self.assertRaises(KeyboardInterrupt):
                 planner_publication.register_execplans(effects, connection, "repo", root, plans, "a" * 40, "fingerprint")
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM exec_plans").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM execplan_drafts").fetchone()[0], 0)
-            effects = replace(effects, _register_execplan_rows=lambda *args:
-                planner_publication._register_execplan_rows(rows, *args))
-            for _ in range(2):
-                planner_publication.register_execplans(effects, connection, "repo", root, plans, "a" * 40, "fingerprint")
+            with mock.patch.object(execplan_drafts, "input_digests",
+                                   side_effect=AssertionError("source read during apply")):
+                for _ in range(2):
+                    planner_publication.register_execplans(effects, connection, "repo", root, plans, "a" * 40, "fingerprint")
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM exec_plans").fetchone()[0], 2)
             self.assertEqual(execplan_draft_state.pending_ids(connection, "repo"), {"G-001"})
             saved = execplan_draft_state.evidence(connection, "repo", "G-001")
             self.assertIn("https://github.com/owner/project/blob/", saved["url"])
             self.assertEqual(loop_manager.select_ready_execplan(connection, "repo")["plan_id"], "G-002")
             self.assertTrue(all(call.args[1:] == ("remote", "get-url", "origin") for call in git.call_args_list))
+            git.assert_called_once()
+
+    def test_prepared_registration_rejects_changed_publication_identity(self):
+        connection = self._connection()
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            text = draft_text()
+            (root / PATH).write_text(text, encoding="utf-8")
+            plans = [(PATH, loop_manager._parse_execplan(root, root / PATH))]
+            rows = planner_publication.RegisterExecplanRowsEffects(
+                _ensure_execplans_schema=loop_manager._ensure_execplans_schema,
+                file_hash=lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
+                git=mock.Mock(return_value=SimpleNamespace(stdout="git@github.com:owner/project.git")),
+                git_bytes=mock.Mock(return_value=text.encode("utf-8")))
+            prepared = planner_publication._prepare_execplan_rows(rows, root, plans, "published")
+            changed = [(PATH, {**plans[0][1], "sources": ["docs/requirements/Changed.md"]})]
+            for worktree, candidate, commit in (
+                (root / "other", plans, "published"),
+                (root, plans, "other"),
+                (root, changed, "published"),
+            ):
+                with self.subTest(worktree=worktree, commit=commit, plans=candidate), \
+                        self.assertRaisesRegex(RuntimeError, "등록 입력"), connection:
+                    planner_publication._register_execplan_rows(
+                        rows, connection, "repo", worktree, candidate, commit, prepared=prepared)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM exec_plans").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM execplan_drafts").fetchone()[0], 0)

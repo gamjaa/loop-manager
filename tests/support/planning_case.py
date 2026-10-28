@@ -145,7 +145,8 @@ class FakeStatePort:
         self.recover_calls = []
         self.validation_cleared = False
         self.general_intent = None
-        self.general_recovery_result = "restart"
+        self.publication_revision = None
+        self.general_recovery_result = "applied"
         self.general_intent_record_count = 0
         self.general_intent_error_call = None
         self.maintenance_due_self_repository = None
@@ -227,7 +228,34 @@ class FakeStatePort:
         self.check_record["stage"] = next_stage
         return True
 
-    def record_general_plan_declarations(self, _repo, _revision, _entries):
+    def publication_guidance_hash(self, _repo):
+        return 'guidance'
+
+    def retain_planning_after_publication(self, _repo, revision, **values):
+        self.publication_revision = revision
+        self.snapshot = replace(self.snapshot, **{key: value for key, value in values.items() if value is not None})
+
+    def pending_publication_release(self, repo):
+        from loop_manager_internal.planning.planning_contracts import PlanningPublicationRelease
+        if self.publication_revision is None:
+            return None
+        return PlanningPublicationRelease(repo, Path(self.snapshot.worktree), self.snapshot.active_sha,
+            self.publication_revision, self.snapshot.planning_attempt_fingerprint or 'fingerprint',
+            (self.snapshot, self.cycle, self.general_intent))
+
+    def validate_publication_release(self, release):
+        if self.pending_publication_release(release.repo) != release:
+            raise RuntimeError('publication release input changed')
+
+    def complete_publication_release(self, release):
+        self.validate_publication_release(release)
+        self.clear_active(release.repo, processed_sha=self.snapshot.processed_sha,
+            specification_fingerprint=self.snapshot.specification_fingerprint,
+            planning_fingerprint=self.snapshot.planning_fingerprint)
+        self.publication_revision = None
+        self.general_intent = None
+
+    def record_general_plan_declarations(self, _repo, _revision, _entries, *, guidance_hash=None):
         self.plan_declarations_match_result = True
 
     def maintenance_cycle(self, _repo):
@@ -269,11 +297,11 @@ class FakeStatePort:
     def transaction(self):
         @contextmanager
         def restore_on_error():
-            before = (self.snapshot, self.cycle, self.general_intent)
+            before = (self.snapshot, self.cycle, self.general_intent, self.publication_revision)
             try:
                 yield
             except BaseException:
-                self.snapshot, self.cycle, self.general_intent = before
+                self.snapshot, self.cycle, self.general_intent, self.publication_revision = before
                 raise
 
         return restore_on_error()
@@ -363,6 +391,8 @@ class FakeStatePort:
 
     def recover_maintenance_batch(self, repo, worktree, base):
         self.recover_calls.append((repo, worktree, base))
+        self.cycle = self.recovered_cycle
+        self.retain_planning_after_publication(repo, self.recovered_cycle.publication_remote_oid or self.recovered_cycle.publication_commit_sha)
         return self.recovered_cycle
 
     def record_maintenance_intent(self, *_args, **_kwargs):
@@ -379,7 +409,7 @@ class FakeStatePort:
 
     def recover_general_batch(self, *_args):
         if self.general_recovery_result != "pending":
-            self.clear_active("/repo")
+            self.retain_planning_after_publication("/repo", self.general_intent.commit_sha)
         return self.general_recovery_result
 
     def supersede_unpublished_general_intent(self, _repo):
@@ -404,9 +434,8 @@ class FakeStatePort:
         specification_fingerprint,
         planning_fingerprint,
     ):
-        self.general_intent = None
-        self.clear_active(
-            "/repo",
+        self.retain_planning_after_publication(
+            "/repo", plan_commit,
             processed_sha=plan_commit,
             specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
@@ -495,7 +524,13 @@ class FakeGitPort:
         if self.ownership_error is not None:
             raise self.ownership_error
 
-    def validate_planning_release(self, _repo, _worktree):
+    def confirm_publication_release(self, _repository, _base, _base_revision, _revision):
+        return self.remote
+
+    def validate_publication_release(self, _repo, _worktree, _revision):
+        pass
+
+    def validate_planning_release(self, _repo, _worktree, *, allow_missing=False):
         pass
 
     def make_planning_worktree(self, *_args, **_kwargs):

@@ -311,7 +311,10 @@ class CodeMapPublicationTest(PlanningCase):
             maintenance_context=context, maintenance_code_map_hash="e" * 64)
         ports.state.prepare_file_assessment_artifact = mock.Mock(return_value=prepared)
         ports.state.record_maintenance_intent = mock.Mock(return_value=replace(cycle, publication_stage="prepared"))
-        ports.state.publish_maintenance_batch = mock.Mock(return_value=cycle)
+        def apply_batch(_repo, _worktree, _base, _result, commit):
+            ports.state.retain_planning_after_publication(_repo, commit)
+            return cycle
+        ports.state.publish_maintenance_batch = mock.Mock(side_effect=apply_batch)
         ports.git.advance_remote_on_push = True
         ports.artifact_dirty = True
         original_git = ports.git.run

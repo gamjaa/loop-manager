@@ -704,9 +704,11 @@ class RetirementPublicationManifestTest(unittest.TestCase):
 
 
     def test_remote_confirmed_move_marks_receipt_and_preserves_old_audit(self):
+        from loop_manager_internal.storage.database import SCHEMA
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
+        connection.execute(SCHEMA)
         connection.executescript("""
             CREATE TABLE requirement_move_receipts(
                 repo TEXT, source_path TEXT, base_sha TEXT, stage TEXT, updated_at TEXT);
@@ -729,10 +731,12 @@ class RetirementPublicationManifestTest(unittest.TestCase):
             planning_fingerprint="planning",
         )
         effects = ApplyGeneralPlanningBatchEffects(
-            _assert_mutable_ready_snapshot_current=lambda *_args: None,
+            _assert_mutable_ready_snapshot_current=lambda *_args, **_kwargs: None,
+            _observe_mutable_ready_prs=lambda *_args: None,
             _clear_active_in_current_transaction=lambda *_args, **_kwargs: None,
-            _general_planning_batch_already_applied=lambda *_args: False,
-            _register_execplan_rows=lambda *_args: None,
+            _general_planning_batch_already_applied=lambda *_args, **_kwargs: False,
+            _register_execplan_rows=lambda *_args, **_kwargs: None,
+            _prepare_execplan_rows=lambda *_args: None,
             file_hash=lambda *_args: "hash",
             general_planning_publication=lambda *_args: intent,
             is_loop_manager_repository=lambda *_args: False,

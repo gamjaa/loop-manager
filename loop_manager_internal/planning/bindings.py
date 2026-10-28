@@ -153,11 +153,28 @@ def register(assembly: Composition) -> None:
         ),
     )
 
+    assembly.bind('_observe_mutable_ready_prs', planner_validation._observe_mutable_ready_prs,
+        lambda: planner_validation.AssertMutableReadySnapshotCurrentEffects(
+            _execplan_metadata=assembly.callback('_execplan_metadata'),
+            _row_is_mutable_ready=assembly.callback('_row_is_mutable_ready'),
+            pr_for_branch=assembly.callback('pr_for_branch'),
+        ),
+    )
+
     assembly.bind('_assert_mutable_ready_snapshot_current', planner_validation._assert_mutable_ready_snapshot_current,
         lambda: planner_validation.AssertMutableReadySnapshotCurrentEffects(
             _execplan_metadata=assembly.callback('_execplan_metadata'),
             _row_is_mutable_ready=assembly.callback('_row_is_mutable_ready'),
             pr_for_branch=assembly.callback('pr_for_branch'),
+        ),
+    )
+
+    assembly.bind('_prepare_execplan_rows', planner_publication._prepare_execplan_rows,
+        lambda: planner_publication.RegisterExecplanRowsEffects(
+            _ensure_execplans_schema=assembly.callback('_ensure_execplans_schema'),
+            file_hash=assembly.callback('file_hash'),
+            git_bytes=assembly.callback('git_bytes'),
+            git=assembly.callback('git'),
         ),
     )
 
@@ -171,7 +188,9 @@ def register(assembly: Composition) -> None:
     )
 
     assembly.bind('register_execplans', planner_publication.register_execplans,
-        lambda: planner_publication.RegisterExecplansEffects(_register_execplan_rows=assembly.callback('_register_execplan_rows')),
+        lambda: planner_publication.RegisterExecplansEffects(
+            _register_execplan_rows=assembly.callback('_register_execplan_rows'),
+            _prepare_execplan_rows=assembly.callback('_prepare_execplan_rows')),
     )
 
     assembly.bind('_planning_result_manifest', planner_publication._planning_result_manifest,
@@ -195,6 +214,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('record_general_planning_publication_intent', planner_publication.record_general_planning_publication_intent,
         lambda: planner_publication.RecordGeneralPlanningPublicationIntentEffects(
+            _observe_mutable_ready_prs=assembly.callback('_observe_mutable_ready_prs'),
             _assert_mutable_ready_snapshot_current=assembly.callback('_assert_mutable_ready_snapshot_current'),
             _planning_result_manifest=assembly.callback('_planning_result_manifest'),
             _validate_general_planning_commit=assembly.callback('_validate_general_planning_commit'),
@@ -212,6 +232,8 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_apply_general_planning_batch', planner_publication._apply_general_planning_batch,
         lambda: planner_publication.ApplyGeneralPlanningBatchEffects(
+            _observe_mutable_ready_prs=assembly.callback('_observe_mutable_ready_prs'),
+            _prepare_execplan_rows=assembly.callback('_prepare_execplan_rows'),
             _assert_mutable_ready_snapshot_current=assembly.callback('_assert_mutable_ready_snapshot_current'),
             _clear_active_in_current_transaction=assembly.callback('_clear_active_in_current_transaction'),
             _general_planning_batch_already_applied=assembly.callback('_general_planning_batch_already_applied'),
@@ -290,6 +312,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_PlanningGitPorts', git_ports._PlanningGitPorts,
         lambda: git_ports.PlanningGitPortsEffects(
+            _assert_remote_preserves_maintenance_batch=assembly.callback('_assert_remote_preserves_maintenance_batch'),
             _capture_local_worktree_state=assembly.callback('_capture_local_worktree_state'),
             _git_operation_entries=assembly.callback('_git_operation_entries'),
             _ignored_worktree_paths=assembly.callback('_ignored_worktree_paths'),

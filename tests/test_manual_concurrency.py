@@ -264,8 +264,8 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                         raise
 
             real_check = manager._assert_mutable_ready_snapshot_current
-            def pause(connection, snapshot):
-                real_check(connection, snapshot)
+            def pause(connection, snapshot, **kwargs):
+                real_check(connection, snapshot, **kwargs)
                 checked.set()
                 if not release.wait(10):
                     raise RuntimeError('test synchronization timeout')

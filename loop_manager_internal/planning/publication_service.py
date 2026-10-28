@@ -10,6 +10,23 @@ from loop_manager_internal.planning.planning_contracts import _PlanningRun, Plan
 from loop_manager_internal.planning.planner_validation import MutableReadyPRConflict
 
 class PlanningPublicationService(PlanningService):
+    def _complete_publication_release(self, run: _PlanningRun) -> None:
+        release = self._ports.state.pending_publication_release(run.context.repo)
+        if release is None:
+            raise RuntimeError('게시 적용 후 planning 정리 근거가 없습니다.')
+        self._ports.git.validate_worktree_ownership(release.repo, release.fingerprint, release.worktree)
+        remote = self._ports.git.confirm_publication_release(
+            run.context.repo_path, run.context.base_branch, release.base_revision, release.revision,
+        )
+        self._ports.git.validate_publication_release(release.repo, release.worktree, release.revision)
+        self._ports.state.validate_publication_release(release)
+        if release.worktree.exists():
+            self._ports.git.run(run.context.repo_path, 'worktree', 'remove', str(release.worktree))
+        self._ports.git.validate_planning_release(release.repo, release.worktree, allow_missing=True)
+        self._ports.state.complete_publication_release(
+            release, **({'restart_revision': remote} if release.restart else {}),
+        )
+
     def _defer_mutable_pr_conflict(self, error: MutableReadyPRConflict) -> PlanningOutcome:
         self._ports.events.info(
             "PR 등록 경합으로 계획 후보와 실행 이력을 보존하고 현재 입력을 다시 확인합니다."
@@ -47,6 +64,12 @@ class PlanningPublicationService(PlanningService):
         context = run.context
         cycle = run.maintenance_cycle
         row = run.row
+        if self._ports.state.pending_publication_release(context.repo) is not None:
+            try:
+                self._complete_publication_release(run)
+            except RuntimeError as error:
+                return self._preserve_recovery_error(run, str(row.planning_attempt_fingerprint or ''), error)
+            return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
         general_intent = self._ports.state.general_publication(context.repo)
         if general_intent is not None and row.phase == "PLANNING":
             worktree = Path(str(row.worktree or ""))
@@ -65,14 +88,11 @@ class PlanningPublicationService(PlanningService):
                     # The intent has not reached origin. Keep its candidate
                     # and session for the owned-worktree rebase boundary.
                     return None
-                with self._ports.state.transaction():
-                    recovery = self._ports.state.recover_general_batch(
-                        context.repo, worktree, context.base_branch
-                    )
-                    if recovery != "pending" and worktree.exists():
-                        self._ports.git.run(
-                            context.repo_path, "worktree", "remove", str(worktree)
-                        )
+                recovery = self._ports.state.recover_general_batch(
+                    context.repo, worktree, context.base_branch
+                )
+                if recovery == "applied":
+                    self._complete_publication_release(run)
             except RuntimeError as error:
                 return self._preserve_recovery_error(run, fingerprint, error)
             if recovery == "pending":
@@ -110,14 +130,10 @@ class PlanningPublicationService(PlanningService):
                 ).returncode == 0
                 if not published:
                     return None
-                with self._ports.state.transaction():
-                    recovered_cycle = self._ports.state.recover_maintenance_batch(
-                        context.repo, worktree, context.base_branch
-                    )
-                    if worktree.exists():
-                        self._ports.git.run(
-                            context.repo_path, "worktree", "remove", str(worktree)
-                        )
+                recovered_cycle = self._ports.state.recover_maintenance_batch(
+                    context.repo, worktree, context.base_branch
+                )
+                self._complete_publication_release(run)
         except RuntimeError as error:
             return self._preserve_recovery_error(run, fingerprint, error)
         if recovered_cycle is None:
@@ -244,7 +260,18 @@ class PlanningPublicationService(PlanningService):
                     evidence = self._ports.state.prepare_file_assessment(
                         context.repo, context.repo_path, context.base_branch, str(row.active_sha), evidence,
                     )
+                review = (getattr(self._ports.state, 'planning_review', lambda *_: None)(context.repo, 'attempt')
+                          if not run.maintenance_planning else None)
+                requirement_only = review is not None and review['purpose'] == 'requirement'
+                declarations = (self._ports.git.plan_declarations(context.repo_path, str(row.active_sha or ''))
+                                if run.maintenance_cycle.include_general_planning or not run.maintenance_planning and not requirement_only
+                                else {})
+                guidance_hash = self._ports.state.publication_guidance_hash(context.repo)
                 with self._ports.state.transaction():
+                    if (self._ports.state.planning(context.repo) != row
+                            or self._ports.state.maintenance_cycle(context.repo) != run.maintenance_cycle
+                            or self._ports.state.planning_release_pending(context.repo)):
+                        raise RuntimeError('planning 완료 준비 이후 소유권·cycle·호출 상태가 변경됐습니다.')
                     if run.maintenance_planning:
                         if evidence is not None:
                             self._ports.state.complete_file_assessment(
@@ -270,12 +297,10 @@ class PlanningPublicationService(PlanningService):
                         if run.maintenance_cycle.include_general_planning:
                             self._ports.state.record_general_plan_declarations(
                                 context.repo, str(row.active_sha or ""),
-                                self._ports.git.plan_declarations(
-                                    context.repo_path, str(row.active_sha or ""),
-                                ),
+                                declarations, guidance_hash=guidance_hash,
                             )
-                        self._ports.state.clear_active_in_transaction(
-                            context.repo,
+                        self._ports.state.retain_planning_after_publication(
+                            context.repo, str(row.active_sha or ""),
                             processed_sha=(
                                 str(row.active_sha or "")
                                 if run.maintenance_cycle.include_general_planning
@@ -293,8 +318,6 @@ class PlanningPublicationService(PlanningService):
                             ),
                         )
                     else:
-                        review = getattr(self._ports.state, 'planning_review', lambda *_: None)(context.repo, 'attempt')
-                        requirement_only = review is not None and review['purpose'] == 'requirement'
                         if hasattr(self._ports.state, "confirm_planning_review"):
                             self._ports.state.confirm_planning_review(
                                 context.repo, str(row.active_sha), str(row.active_sha),
@@ -302,22 +325,17 @@ class PlanningPublicationService(PlanningService):
                         if not requirement_only:
                             self._ports.state.record_general_plan_declarations(
                                 context.repo, str(row.active_sha or ""),
-                                self._ports.git.plan_declarations(context.repo_path, str(row.active_sha or "")),
+                                declarations, guidance_hash=guidance_hash,
                             )
-                        self._ports.state.clear_active_in_transaction(
-                            context.repo,
+                        self._ports.state.retain_planning_after_publication(
+                            context.repo, str(row.active_sha or ""),
                             processed_sha=row.processed_sha if requirement_only else row.active_sha,
                             specification_fingerprint=(
                                 row.specification_fingerprint if requirement_only else completed_specification_fingerprint
                             ),
                             planning_fingerprint=row.planning_fingerprint if requirement_only else completed_fingerprint,
                         )
-                    self._ports.git.run(
-                        context.repo_path,
-                        "worktree",
-                        "remove",
-                        str(worktree),
-                    )
+                self._complete_publication_release(run)
             except RuntimeError as error:
                 message = str(error)
                 self._ports.state.update(
@@ -581,38 +599,32 @@ class PlanningPublicationService(PlanningService):
                 return self._operational_error()
 
         try:
-            with self._ports.state.transaction():
-                if run.maintenance_planning:
-                    self._ports.state.publish_maintenance_batch(
-                        context.repo,
-                        worktree,
-                        context.base_branch,
-                        validated_result,
-                        plan_commit,
-                    )
-                else:
-                    self._ports.git.validate_worktree_ownership(
-                        context.repo,
-                        str(row.planning_attempt_fingerprint or run.current_fingerprint or ""),
-                        worktree,
-                    )
-                    assert run.specification_fingerprint is not None
-                    assert run.general_fingerprint is not None
-                    self._ports.state.publish_general_batch(
-                        context.repo,
-                        worktree,
-                        context.base_branch,
-                        validated_result,
-                        plan_commit,
-                        run.specification_fingerprint,
-                        run.general_fingerprint,
-                    )
-                self._ports.git.run(
-                    context.repo_path,
-                    "worktree",
-                    "remove",
-                    str(worktree),
+            if run.maintenance_planning:
+                self._ports.state.publish_maintenance_batch(
+                    context.repo,
+                    worktree,
+                    context.base_branch,
+                    validated_result,
+                    plan_commit,
                 )
+            else:
+                self._ports.git.validate_worktree_ownership(
+                    context.repo,
+                    str(row.planning_attempt_fingerprint or run.current_fingerprint or ""),
+                    worktree,
+                )
+                assert run.specification_fingerprint is not None
+                assert run.general_fingerprint is not None
+                self._ports.state.publish_general_batch(
+                    context.repo,
+                    worktree,
+                    context.base_branch,
+                    validated_result,
+                    plan_commit,
+                    run.specification_fingerprint,
+                    run.general_fingerprint,
+                )
+            self._complete_publication_release(run)
         except RuntimeError as error:
             message = str(error)
             self._ports.state.update(

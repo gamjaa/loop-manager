@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -178,8 +179,21 @@ class TieredPublicationTest(MaintenancePlanningCase):
         git(self.repo, "add", relative)
         git(self.repo, "commit", "-m", "Add root move maintenance plan")
         commit = git(self.repo, "rev-parse", "HEAD")
-        maintenance_file_publication.save_intent(self.connection, str(self.repo), context.cycle_revision,
+        prepared = maintenance_file_publication.prepare_intent(str(self.repo), context.cycle_revision,
             self.base_sha, commit, evidence, plan_repository=candidate_root)
+        with mock.patch.object(maintenance_file_publication, '_verify_root_plan_files',
+                               side_effect=AssertionError('root observation during intent apply')):
+            with self.assertRaisesRegex(RuntimeError, 'rollback'), maintenance_state._transaction(self.connection):
+                maintenance_file_publication.save_intent(self.connection, str(self.repo), context.cycle_revision,
+                    self.base_sha, commit, evidence, prepared=prepared)
+                raise RuntimeError('rollback')
+            self.assertIsNone(self.connection.execute(
+                'SELECT 1 FROM file_assessment_publications WHERE repo=?', (str(self.repo),)).fetchone())
+            with self.assertRaises(maintenance_file_publication.FileAssessmentPublicationError):
+                maintenance_file_publication.save_intent(self.connection, str(self.repo), context.cycle_revision,
+                    self.base_sha, commit, evidence, prepared=replace(prepared, publication_commit='other'))
+            maintenance_file_publication.save_intent(self.connection, str(self.repo), context.cycle_revision,
+                self.base_sha, commit, evidence, prepared=prepared)
         self.assertEqual(maintenance_file_publication.saved_intent(self.connection, str(self.repo),
             context.cycle_revision, self.base_sha, commit), evidence)
 
@@ -208,6 +222,71 @@ class TieredPublicationTest(MaintenancePlanningCase):
         cycle = loop_manager.recover_maintenance_planning_batch(self.connection, str(self.repo), self.repo, "main")
         self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.IDLE)
         self.assertEqual(repository.success(str(self.repo))["digest"], evidence.tiered["digest"])
+
+    def test_published_source_drift_retains_intent_until_restart_cleanup_cas(self):
+        from loop_manager_internal.storage import runtime_state
+        from loop_manager_internal.storage.database import GENERAL_PLANNING_PUBLICATIONS_SCHEMA
+        context, repository, evidence, result = self.prepare()
+        with maintenance_state._transaction(self.connection):
+            self.connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+            self.connection.execute("UPDATE projects SET phase='PLANNING', active_sha=?, worktree=?, "
+                "planning_workspace_owned=1, planning_attempt_fingerprint='attempt', planner_session_id='saved-session'",
+                (self.base_sha, str(self.repo)))
+        git(self.repo, 'add', code_map_artifact.ARTIFACT_PATH)
+        git(self.repo, 'commit', '-m', 'Publish context before source drift')
+        commit = git(self.repo, 'rev-parse', 'HEAD')
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), self.repo, 'main', result, commit)
+        git(self.repo, 'push', 'origin', 'HEAD:main')
+        (self.repo / 'legacy/module.py').write_text('def changed():\n    return 1\n')
+        git(self.repo, 'add', 'legacy/module.py')
+        git(self.repo, 'commit', '-m', 'Advance source after context publication')
+        remote = git(self.repo, 'rev-parse', 'HEAD')
+        git(self.repo, 'push', 'origin', 'HEAD:main')
+        git(self.repo, 'fetch', 'origin')
+        git(self.repo, 'reset', '--hard', commit)
+        state = loop_manager._PlanningStatePorts(self.connection, runtime_state.RuntimeStateRepository(self.connection),
+            maintenance_state.MaintenanceRepository(self.connection), self.repo / 'state')
+        observe = maintenance_file_publication.sources_match_remote
+        def race(*args, **kwargs):
+            self.assertFalse(self.connection.in_transaction)
+            value = observe(*args, **kwargs)
+            with maintenance_state._transaction(self.connection):
+                self.connection.execute("UPDATE projects SET planner_session_id='competitor'")
+            return value
+        with mock.patch.object(maintenance_file_publication, 'sources_match_remote', side_effect=race), \
+                self.assertRaisesRegex(loop_manager.MaintenancePlanningError, '정리 준비 이후'):
+            state.recover_maintenance_batch(str(self.repo), self.repo, 'main')
+        self.assertIsNone(state.pending_publication_release(str(self.repo)))
+        self.assertEqual(state.maintenance_cycle(str(self.repo)), intent)
+        with maintenance_state._transaction(self.connection):
+            self.connection.execute("UPDATE projects SET planner_session_id='saved-session'")
+        def outside(*args, **kwargs):
+            self.assertFalse(self.connection.in_transaction)
+            return observe(*args, **kwargs)
+        with mock.patch.object(maintenance_file_publication, 'sources_match_remote', side_effect=outside):
+            self.assertEqual(state.recover_maintenance_batch(str(self.repo), self.repo, 'main'), intent)
+        release = state.pending_publication_release(str(self.repo))
+        self.assertTrue(release.restart)
+        self.assertEqual(release.revision, commit)
+        self.assertEqual(state.planning(str(self.repo)).planner_session_id, 'saved-session')
+        self.assertEqual(maintenance_file_publication.saved_intent(self.connection, str(self.repo),
+            context.cycle_revision, self.base_sha, commit), evidence)
+        with mock.patch.object(state, 'clear_active_in_transaction', side_effect=RuntimeError('release interrupted')), \
+                self.assertRaisesRegex(RuntimeError, 'release interrupted'):
+            state.complete_publication_release(release, restart_revision=remote)
+        self.assertEqual(state.maintenance_cycle(str(self.repo)), intent)
+        self.assertEqual(state.pending_publication_release(str(self.repo)), release)
+        with mock.patch.object(maintenance_file_publication, 'sources_match_remote', side_effect=AssertionError('repeat observation')):
+            state.complete_publication_release(release, restart_revision=remote)
+        restarted = state.maintenance_cycle(str(self.repo))
+        self.assertEqual(restarted.revision, intent.revision + 1)
+        self.assertEqual(restarted.phase, intent.phase)
+        self.assertEqual(restarted.cycle_base_sha, remote)
+        self.assertIsNone(restarted.publication_stage)
+        self.assertIsNone(state.planning(str(self.repo)).phase)
+        self.assertIsNone(state.pending_publication_release(str(self.repo)))
+        self.assertIsNone(repository.success(str(self.repo)))
 
     def test_source_change_before_promotion_never_advances_global_baseline(self):
         context, repository, evidence, result = self.prepare()
