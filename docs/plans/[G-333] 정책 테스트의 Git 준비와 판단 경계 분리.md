@@ -4,6 +4,7 @@ title: 정책 테스트의 Git 준비와 판단 경계 분리
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-080] Git Mock Defaults for Tests.md
+  - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
 depends_on: []
 complexity: medium
 risk: medium
@@ -14,7 +15,7 @@ priority: normal
 
 Git 자체의 효과를 assertion하지 않는 정책·저장 테스트에서 실제 repository 준비와 정책 판단의 책임 경계를 분리한다. 관측 경계에 입력을 공급하고 실제 판단·SQLite·파일 보존 검증을 유지하며, 필요한 Git 통합 회귀는 남긴다.
 
-revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 13·14·18·21·22·27은 공통 setUp이나 조건 행렬이 실제 init/commit/push를 요구하지만 assertion은 schema·상태·재시도·순수 분류에 있는 사례를 확인했다. 이 계획은 해당 사례만 전환하며 실제 Git 효과 검증이나 이미 완료한 R-080 전환을 다시 계획하지 않는다.
+revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 13·14·18·21·22·27은 공통 setUp이나 조건 행렬이 실제 init/commit/push를 요구하지만 assertion은 schema·상태·재시도·순수 분류에 있는 사례를 확인했다. 여기에 `993b7dfd`의 게시 분리 변경으로 추가된 CAS·DB retry 정책 사례 중 아래 명시한 일곱 case를 포함한다. 해당 사례의 공통 Git 준비를 분리하며 실제 Git 효과 검증이나 이미 완료한 R-080 전환을 다시 계획하지 않는다.
 
 ## Acceptance Criteria
 
@@ -22,6 +23,7 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 13·14·
 - 필요한 SQLite와 문서/파일 보존은 실제 fixture로 유지한다. Git 관측은 기존 port/adapter double을 재사용하고 새로운 범용 fixture·전역 cache를 만들지 않는다.
 - 사용자 동작과 공개 계약인 CLI/API·수집 범위·필수 Git 통합, DB/문서/receipt의 저장 형식을 보존한다. 테스트 skip·timeout 확대·필수 assertion 삭제로 전환을 대신하지 않는다.
 - 전환한 조건과 남긴 통합 회귀의 대응, 변경한 모듈의 실제 Git 호출 감소를 확인할 수 있다. 측정하지 않은 전체 verify 시간·절감률을 주장하지 않는다.
+- 게시 CAS·DB retry 사례는 R-091의 준비/적용 분리를 실제 SQLite·transaction rollback·현재 owner/cycle/intent/catalog/membership 비교로 계속 검증한다. 외부 관측 입력만 mock으로 제공하며 같은 준비 값 재사용·준비 호출 횟수·낡은 적용 거부와 경쟁 데이터/기존 intent 보존 assertion을 유지한다. 실제 공통 DB 접근 조율과 독립 연결 쓰기·worktree 제거의 연결 회귀도 유지한다.
 
 ## Implementation
 
@@ -31,20 +33,26 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 13·14·
 - [ ] 확인한 `tests/test_planner_validation_recovery.py`의 세 번째 저장 retry 무추가 호출·첫 validation retry·CLI 실패의 retry 비소비를 `tests/test_planning_recovery.py`·`tests/support/planning_case.py`의 기존 관측 경계와 실제 SQLite/임시 파일로 분리한다. 세션·호출 횟수·pending/error·파일 보존 assertion을 유지하고 실제 commit/게시·충돌/index 검증은 planning publication/rebase에 남긴다.
 - [ ] 확인한 `tests/test_requirement_archiving.py:test_missing_archived_source_does_not_block_unrelated_requirement_review`를 `tests/test_requirement_archive.py`의 순수 calculate 경계로 통합한다. catalog/states/문서 입력과 candidates assertion을 유지하고 공통 repository/DB setUp 의존만 없앤다. 실제 blob·worktree·이동 보존 사례는 남긴다.
 - [ ] 확인한 `tests/test_scope_project_recovery.py:test_active_execplan_uses_reconciled_identity_not_publication_equality`의 여섯 metadata/body 조건에 Git 관측/등록 입력을 주입한다. 실제 문서 파싱·reconciled SQLite 선언·필드별 수용과 보존을 유지한다. `tests/test_scope_rebase_recovery.py`·`tests/test_source_sync.py`의 실제 rebase/후보 보존을 대신 제거하지 않는다.
+- [ ] 확인한 `tests/test_incremental_planning.py:IncrementalPlanningCatalogTest`의 `test_applied_general_batch_retains_owner_and_rejects_stale_cleanup_release`, `test_general_db_retry_rejects_owner_change_without_repeating_preparation`, `test_general_batch_rejects_publication_intent_changed_during_observation`, `test_general_intent_rejects_project_owner_changed_during_observation`를 Git 없는 정책 fixture로 분리한다. 현재 `setUp()`의 init/commit/update-ref와 `prepare_batch()`의 commit·관측 준비를 이 네 case에서 요구하지 않게 하고, 실제 snapshot·manifest·임시 원문·SQLite row와 운영 intent/apply/release 함수는 유지한다. `tests/test_planning_publication.py`의 실제 SQLite·effects fixture와 `tests/test_incremental_planning.py:MutableReadyMetadataCasTest`의 관측 입력 패턴을 먼저 재사용한다. 공유 Git setUp을 단순 mock해 가짜 repository를 나머지 통합 case에 전파하지 않는다.
+- [ ] 확인한 `tests/test_maintenance_publication.py:MaintenancePublicationTest`의 `test_maintenance_db_retry_rejects_cycle_change_without_repeating_preparation`, `test_batch_rejects_cycle_owner_and_catalog_races_during_observation`, `test_intent_rejects_owner_changed_during_commit_observation`도 같은 원칙으로 분리한다. `tests/support/maintenance_planning_case.py`의 bare/seed init·push·`_validate_barrier()`가 이 정책 사례의 필수 준비가 되지 않도록 `tests/test_maintenance_planning.py`의 기존 SQLite/관측 fixture를 재사용한다. 실제 cycle·수동 membership·catalog·rollback·보존 결과와 정상/경쟁의 입력 순서는 유지하고 publication 함수 자체를 성공 mock으로 바꾸지 않는다. 운영 게시 구현·공개 port·저장 형식은 변경하지 않는다.
 
 ## Validation
 
-- Worker targeted unit은 위 여섯 전환 대상의 변경한 case와 통합한 순수 계산 case다. 실제 Git 명령 경계가 호출되면 실패하는 guard로 정책 사례의 Git 호출 0회를 확인하면서 실제 판단/SQLite assertion을 실행한다.
+- Worker targeted unit은 위 명시한 기존 여섯 전환 대상과 게시 정책 일곱 case의 변경분이다. 실제 Git 명령 경계가 호출되면 실패하는 guard를 fixture 준비 전부터 적용해 Git 호출 0회를 확인하면서 실제 판단/SQLite assertion을 실행한다. 공통 setUp의 실행을 guard 범위 밖으로 빼서 0회를 주장하지 않는다.
 - 이전 조건·호출 횟수·session·오류·pending·문서 보존·category/candidates assertion의 대응을 검토하고, 오류/경쟁 관측도 mock의 일괄 성공으로 사라지지 않는지 확인한다.
 - 전체 verify는 남긴 exact-SHA/worktree·원격 변화·blob/mode·게시/rebase/index·archive 보존 통합 회귀와 전환한 정책 사례를 함께 포함해야 한다. 같은 모듈 준비 비용 비교가 필요하면 동일 계측/수집 범위에서 비교하며 전체 실행을 반복하는 새 완료 조건을 만들지 않는다.
+- 게시 정책의 이전/이후 대응은 release의 session·catalog generation·수동 membership 경쟁, 준비 중 intent/owner 변화, rollback 뒤 owner/cycle 변화 거부와 준비 1회·row/intent 보존 assertion별로 확인한다. `tests/test_incremental_planning.py`의 `test_general_batch_observes_git_and_files_before_its_transaction`·`test_remote_confirmed_intent_recovers_after_push_before_sqlite_apply`·`test_mutable_snapshot_uses_git_blob_with_crlf_checkout`, `tests/test_maintenance_publication.py`의 `test_batch_observes_git_files_and_success_fingerprints_before_transaction`·`test_crlf_batch_recovers_from_durable_intent_after_restart`·`test_published_batch_recovers_after_remote_tip_advances`는 실제 게시 원문/adapter·원격 이력 연결의 회귀로 유지한다. `tests/test_db_access.py:test_planning_pr_observation_releases_access_before_waiting`와 `tests/test_planning_publication.py:test_applied_publication_recovers_after_cleanup_before_db_release`의 실제 조율된 SQLite·독립 쓰기·정리/재시작 검증을 mock으로 대체하지 않는다. 삭제·이동한 assertion과 남긴 검증의 대응을 결과에 기록한다.
 - 읽기 전용 Review에서 실제 Git 효과 assertion이 없는 사례만 전환했는지, 판단 함수를 mock하지 않았는지와 모든 이동/삭제 assertion의 대응을 확인한다.
 
 ## Progress
 
 - [x] 저장된 6건의 정책/실제 효과 구분과 남길 통합 회귀를 확인하고, 현재 관측 port에서 독립적으로 전환할 범위를 확정했다. 구현·테스트·verify는 실행하지 않았다.
 - [ ] 정책 fixture 전환과 기존 assertion·통합 검증 대응 확인
+- [ ] 새 게시 CAS·DB retry 일곱 case의 Git 준비 분리와 저장/경쟁 assertion 보존
 
 ## Decision Log
 
-- complexity medium: 여섯 테스트의 관측 경계는 명확하지만 실제 SQLite·연속 입력·상태 보존을 서로 맞춰야 한다. risk medium: 과도한 mock은 실제 정책 회귀를 가릴 수 있어 입력 관측만 대체하고 판단/저장과 필요한 통합을 유지한다. 최초 level은 3이다.
-- 현재 scheduler의 관측 입력만 분리하므로 G-297의 새 배정·대기 구현을 선행으로 요구하지 않는다. G-297은 해당 동작 변경을 계속 소유하며 이 계획은 현재 판단·저장 assertion을 보존한다. 이후 재평가 없이 지정 사례만 바꾸며 다른 느린 테스트로 범위를 확대하지 않는다.
+- `597e5b3c` → `993b7dfd`의 새 테스트는 운영 게시 분리의 구현 근거로 소비한다. 위 일곱 case는 실제 ref·index·worktree 효과가 아니라 DB 적용/보존·준비 횟수·경쟁 거부를 assertion하지만 공통 fixture가 실제 Git 준비를 요구하므로 R-080의 남은 전환 범위다. 같은 교정 목표의 이 started 계획을 개정하며 새 중복 계획은 만들지 않는다. R-091을 source로 연결해 외부 관측/DB 적용 경계와 경쟁·재시도 assertion을 보존하고, 실제 Git/blob·CRLF·게시 이력과 독립 DB 접근 연결은 남긴다. 기존 ID·경로·complexity/risk·priority·dependency와 수행 기록을 유지하며 차단 해제·구현·테스트·verify 성공을 선언하지 않는다.
+
+- complexity medium: 지정한 기존 정책 사례와 추가된 게시 사례의 관측 경계는 명확하지만 실제 SQLite·연속 입력·상태 보존을 서로 맞춰야 한다. risk medium: 과도한 mock은 실제 정책 회귀를 가릴 수 있어 입력 관측만 대체하고 판단/저장과 필요한 통합을 유지한다. 최초 level은 3이다.
+- 현재 scheduler와 이미 원격에 반영된 게시 구현의 관측 입력만 분리하므로 G-297의 새 배정·대기 구현을 선행으로 요구하지 않는다. G-297은 해당 동작 변경을 계속 소유하며 이 계획은 현재 판단·저장 assertion을 보존한다. 위 명시한 사례만 바꾸며 다른 느린 테스트로 범위를 확대하거나 게시 엔진을 재구현하지 않는다.
