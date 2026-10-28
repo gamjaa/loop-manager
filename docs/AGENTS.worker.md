@@ -97,11 +97,11 @@ WORKER_OUTCOME 앞에 `VERIFY_INPUT_EXCLUSIONS: <JSON>` 한 줄로 제출한다.
 - 테스트는 프로젝트 Python으로 환경변수 `LOOP_MANAGER_TARGETED_TEST_RUNNER`의 스크립트를 실행해
   개별 실행 결과를 남긴다. unittest는 `--unittest <test ID·class·module>`, JUnit을 지원하는 도구는
   `--junit -- <명령과 인자>`를 사용하고 도구의 XML 출력 인자에 `{junit}`을 넣는다.
-  기록 폴더는 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`다. 같은 테스트의 연속 3회 실패를 확인하면
+  기록 폴더는 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`다. 같은 테스트의 연속 5회 실패를 확인하면
   추가 수정을 멈추고 실패를 보고한다. 실행·수집 중단이나 기록 부재를 테스트 실패 횟수로 보고하지 않는다.
 - 실패 명령은 `FAILED_COMMAND:`, 수정 후 동일 명령은 `RERUN:` 줄로 보고하고
   재실행 결과를 그 뒤에 명시한다. 두 명령은 공백을 정규화한 뒤 정확히 같아야 한다. 성공·실패가 섞인 요약을 통과로 보고하지 않는다.
-- Loop Manager targeted 결과에서는 확인된 본문 실패·오류와 unittest `unexpected_success`를 실패로 보고한다. 성공·skip·expected failure만 실패 이력을 초기화하며, fixture-only·수집 오류와 구분 불명 결과는 누적하거나 초기화하지 않는다. JUnit 명령 종료 코드만으로 testcase 결과를 만들지 않는다.
+- Loop Manager targeted 결과에서는 확인된 본문 실패·오류와 unittest `unexpected_success`를 실패로 보고한다. 성공·skip·expected failure는 실패 횟수와 차단 도달 표식을 함께 초기화하며, fixture-only·수집 오류와 구분 불명 결과는 누적하거나 초기화하지 않는다. JUnit 명령 종료 코드만으로 testcase 결과를 만들지 않는다.
 - 전체 verify의 실제 입력을 `scripts/verify-inputs.json` version 1 상대 경로/glob 목록으로
   스크립트와 함께 유지한다. 코드·테스트·fixture·의존성 선언·저장소 검증 스크립트/선언과
   실제로 읽는 문서·`.agents/`를 반영한다. 재사용은 저장소 코드 입력 기준이며 실행 머신의 환경·

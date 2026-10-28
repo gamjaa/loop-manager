@@ -117,7 +117,7 @@ class WorkerHandler:
         repeated = repository.repeated(repo, plan_id)
         if not repeated:
             return None
-        detail = '동일 targeted unit test가 연속 3회 실패했습니다: ' + ', '.join(repeated)
+        detail = '동일 targeted unit test가 연속 5회 실패했습니다: ' + ', '.join(repeated)
         with runtime_state._transaction(self.ports.state.connection):
             self.ports.state.check_context(context)
             outcome = self.ports._recover(RecoveryReason.TARGETED_TEST_EXHAUSTED,
@@ -413,7 +413,7 @@ class WorkerHandler:
             targeted_tests.reconcile(state_dir=self.ports.identity.state_dir,
                                      repo=self.ports.identity.repo, plan_id=context.plan.plan_id)
             if targeted_tests.repeated(self.ports.identity.repo, context.plan.plan_id):
-                return AgentResult(1, '동일 targeted test 연속 3회 실패: 추가 CLI 재시도를 중단합니다.',
+                return AgentResult(1, '동일 targeted test 연속 5회 실패: 추가 CLI 재시도를 중단합니다.',
                                    current_session_id, AgentResultKind.PERMANENT_CONFIGURATION)
             if targeted_tests.pending(self.ports.identity.repo, context.plan.plan_id):
                 return AgentResult(1, 'targeted test 실행 근거의 종료 확인·재수집 대기',

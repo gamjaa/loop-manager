@@ -32,12 +32,12 @@ class TargetedHistoryTests(TestCase):
         ensure_schema(self.connection)
         self.repository = TargetedTestRepository(self.connection)
 
-    def test_only_three_distinct_runs_of_the_same_test_trigger_the_limit(self):
-        for number in range(1, 4):
+    def test_only_five_distinct_runs_of_the_same_test_trigger_the_limit(self):
+        for number in range(1, 6):
             self.repository.observe('repo', 'G-1', [event(str(number))])
             self.repository.observe('repo', 'G-1', [event(str(number))])
-            self.assertEqual(bool(self.repository.repeated('repo', 'G-1')), number == 3)
-        self.assertEqual(self.repository.sequence('repo', 'G-1'), 3)
+            self.assertEqual(bool(self.repository.repeated('repo', 'G-1')), number == 5)
+        self.assertEqual(self.repository.sequence('repo', 'G-1'), 5)
         self.assertFalse(self.repository.repeated('repo', 'G-2'))
 
     def test_explicit_success_skip_and_expected_failure_break_the_streak(self):
@@ -45,13 +45,13 @@ class TargetedHistoryTests(TestCase):
             with self.subTest(reset=reset):
                 self.repository.observe('repo', reset, [event('a')])
                 self.repository.observe('repo', reset, [event('b', result=reset)])
-                self.repository.observe('repo', reset, [event('c'), event('d')])
+                self.repository.observe('repo', reset, [event('c'), event('d'), event('c2'), event('d2')])
                 self.assertFalse(self.repository.repeated('repo', reset))
                 self.repository.observe('repo', reset, [event('e')])
                 self.assertEqual(self.repository.repeated('repo', reset), ('tests.Sample.test_one',))
 
     def test_unexpected_success_is_a_native_failure(self):
-        for run_id in ('a', 'b', 'c'):
+        for run_id in ('a', 'b', 'c', 'd', 'e'):
             self.repository.observe('repo', 'G-1', [event(run_id, result='unexpected_success')])
         self.assertEqual(self.repository.repeated('repo', 'G-1'), ('tests.Sample.test_one',))
 
@@ -61,7 +61,7 @@ class TargetedHistoryTests(TestCase):
         self.repository.observe('repo', 'G-1', [event('a', first)])
         self.repository.observe('repo', 'G-1', [event('b', first), event('other', second)])
         self.assertFalse(self.repository.repeated('repo', 'G-1'))
-        self.repository.observe('repo', 'G-1', [event('c', first)])
+        self.repository.observe('repo', 'G-1', [event('c', first), event('d', first), event('e', first)])
         self.assertEqual(self.repository.repeated('repo', 'G-1'), (first,))
 
     def test_fixture_and_indeterminate_results_preserve_the_existing_streak(self):
@@ -75,16 +75,17 @@ class TargetedHistoryTests(TestCase):
                     WHERE repo=? AND plan_id=? AND test_id=?''',
                     ('repo', plan_id, 'tests.Sample.test_one')).fetchone()[0]
                 self.assertEqual(failures, 2)
-                self.repository.observe('repo', plan_id, [event('d')])
+                self.repository.observe('repo', plan_id, [event('d'), event('e'), event('f')])
                 self.assertEqual(self.repository.repeated('repo', plan_id), ('tests.Sample.test_one',))
 
-    def test_reaching_three_is_preserved_until_block_even_if_the_turn_later_passes(self):
-        self.repository.observe('repo', 'G-1', [event('a'), event('b'), event('c'), event('d', result='success')])
+    def test_success_after_five_failures_clears_count_and_reach(self):
+        self.repository.observe('repo', 'G-1', [event(str(i)) for i in range(5)])
         self.assertTrue(self.repository.repeated('repo', 'G-1'))
-        with self.connection:
-            self.repository.acknowledge('repo', 'G-1')
+        self.repository.observe('repo', 'G-1', [event('pass', result='success')])
         self.assertFalse(self.repository.repeated('repo', 'G-1'))
-        self.repository.observe('repo', 'G-1', [event('e')])
+        self.assertEqual(tuple(self.connection.execute(
+            "SELECT failures, repeated FROM targeted_test_streaks").fetchone()), (0, 0))
+        self.repository.observe('repo', 'G-1', [event('next')])
         self.assertFalse(self.repository.repeated('repo', 'G-1'))
 
     def test_conflicting_duplicate_rolls_back_the_whole_observation(self):
@@ -101,7 +102,7 @@ class TargetedHistoryTests(TestCase):
                 TargetedTestRepository(first).observe('repo', 'G-1', [event('a'), event('b')])
             with closing(sqlite3.connect(path)) as second, second:
                 repository = TargetedTestRepository(second)
-                repository.observe('repo', 'G-1', [event('b'), event('c')])
+                repository.observe('repo', 'G-1', [event('b'), event('c'), event('d'), event('e')])
                 self.assertTrue(repository.repeated('repo', 'G-1'))
 
 
@@ -189,17 +190,17 @@ class TargetedRecoveryTests(TestCase):
 
     def test_restart_without_finally_replays_once_and_does_not_restore_consumed_reach(self):
         identity, directory = self.bind()
-        self.write(directory, ('a', 'b', 'c'), suffix='{"kind":')
+        self.write(directory, ('a', 'b', 'c', 'd', 'e'), suffix='{"kind":')
         self.connection.close()
         self.open()
         self.replay()
-        self.assertEqual(self.tests.sequence('repo', 'G-1'), 3)
+        self.assertEqual(self.tests.sequence('repo', 'G-1'), 5)
         self.assertTrue(self.tests.repeated('repo', 'G-1'))
         self.assertEqual(self.connection.execute('SELECT result_kind FROM agent_invocations').fetchone()[0], 'interrupted')
         self.tests.acknowledge('repo', 'G-1')
         self.connection.commit()
         self.replay()
-        self.assertEqual(self.tests.sequence('repo', 'G-1'), 3)
+        self.assertEqual(self.tests.sequence('repo', 'G-1'), 5)
         self.assertFalse(self.tests.repeated('repo', 'G-1'))
         self.assertTrue(directory.is_dir())
 
@@ -318,7 +319,7 @@ class TargetedRecoveryTests(TestCase):
             with self.subTest(error=error_type.__name__):
                 plan = error_type.__name__
                 identity, directory = self.bind(plan, plan=plan)
-                self.write(directory, (plan + '-a', plan + '-b', plan + '-c'))
+                self.write(directory, tuple(plan + str(i) for i in range(5)))
                 originals = {path: path.read_bytes() for path in directory.iterdir()}
                 with mock.patch.object(targeted.os, 'scandir', side_effect=error_type('scan unavailable')):
                     with self.assertRaises(error_type):
@@ -336,7 +337,7 @@ class TargetedRecoveryTests(TestCase):
                 self.replay()
                 self.assertFalse(self.tests.pending('repo', plan))
                 self.assertEqual(len(self.connection.execute('''SELECT * FROM targeted_test_results
-                    WHERE repo='repo' AND plan_id=?''', (plan,)).fetchall()), 3)
+                    WHERE repo='repo' AND plan_id=?''', (plan,)).fetchall()), 5)
                 self.assertEqual(self.tests.repeated('repo', plan), ('tests.Sample.test_one',))
                 sequence = self.tests.sequence('repo', plan)
                 self.replay()
@@ -479,7 +480,7 @@ class BrokenSetup(unittest.IsolatedAsyncioTestCase):
             failures = connection.execute('''SELECT failures FROM targeted_test_streaks
                 WHERE repo='repo' AND plan_id='G-290' AND test_id=?''', (identity,)).fetchone()[0]
             self.assertEqual(failures, 2)
-            repository.observe('repo', 'G-290', [event('after-fixture', identity)])
+            repository.observe('repo', 'G-290', [event(str(i), identity) for i in range(3)])
             self.assertEqual(repository.repeated('repo', 'G-290'), (identity,))
 
     def test_fixture_subtest_failures_do_not_replace_body_outcomes(self):
@@ -523,7 +524,7 @@ class AsyncTearDownSubTestBroken(unittest.IsolatedAsyncioTestCase):
                 'TearDownSubTestBroken')]
             repository.observe('repo', 'G-290', [
                 *(event(f'prior-{attempt}', identity) for identity in identities
-                  for attempt in ('a', 'b'))])
+                  for attempt in ('a', 'b', 'c', 'd'))])
 
             result = subprocess.run([sys.executable, str(Path(targeted.__file__).resolve()),
                 '--unittest', 'case_fixture_subtests'], cwd=project, env=environment,
@@ -543,8 +544,8 @@ class AsyncTearDownSubTestBroken(unittest.IsolatedAsyncioTestCase):
             streaks = dict(connection.execute('''SELECT test_id, failures FROM targeted_test_streaks
                 WHERE repo='repo' AND plan_id='G-290' '''))
             self.assertEqual({identity: streaks[identity] for identity in identities}, {
-                identities[0]: 2, identities[1]: 2, identities[2]: 3,
-                identities[3]: 2, identities[4]: 2,
+                identities[0]: 4, identities[1]: 4, identities[2]: 5,
+                identities[3]: 4, identities[4]: 4,
             })
             events = [json.loads(line) for path in records.glob('targeted-*.jsonl')
                       for line in path.read_text(encoding='utf-8').splitlines()]
@@ -662,7 +663,7 @@ class ZAffectedLast(unittest.TestCase):
             repository.observe('repo', 'mixed', targeted.collect(records))
             self.assertFalse(repository.repeated('repo', 'mixed'))
             repository.observe('repo', 'mixed',
-                               [event('after', identities[0]), event('after', identities[3])])
+                               [event(str(i), identity) for i in range(3) for identity in (identities[0], identities[3])])
             self.assertEqual(set(repository.repeated('repo', 'mixed')),
                              {identities[0], identities[3]})
 
@@ -770,7 +771,7 @@ class WorkerTargetedFailureTests(ExecutionFixture, TestCase):
         self.effects.validation.verify.assert_not_called()
         self.effects.blocking.block_active_execplan.assert_not_called()
 
-    def bound_records(self, runs=('a', 'b', 'c'), *, state_dir=None):
+    def bound_records(self, runs=('a', 'b', 'c', 'd', 'e'), *, state_dir=None):
         if state_dir is None:
             temporary = tempfile.TemporaryDirectory()
             self.addCleanup(temporary.cleanup)
@@ -787,7 +788,7 @@ class WorkerTargetedFailureTests(ExecutionFixture, TestCase):
             record = dict(event(run), kind='test_end', version=1, utc='2026-10-15T00:00:00')
             (directory / f'targeted-{run}.jsonl').write_text(json.dumps(record) + '\n', encoding='utf-8')
 
-    def test_recovered_third_failure_blocks_before_worker_and_verify(self):
+    def test_recovered_fifth_failure_blocks_before_worker_and_verify(self):
         self.bound_records()
         with mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value={'finished_at': 'proof'}):
             result = self.handler.run(self.context())
@@ -796,7 +797,7 @@ class WorkerTargetedFailureTests(ExecutionFixture, TestCase):
         self.effects.agent.run_agent.assert_not_called()
         self.effects.validation.verify.assert_not_called()
         repository = TargetedTestRepository(self.connection)
-        self.assertEqual(repository.sequence('repo', 'G-047'), 3)
+        self.assertEqual(repository.sequence('repo', 'G-047'), 5)
         self.assertFalse(repository.repeated('repo', 'G-047'))
         with mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value={'finished_at': 'proof'}):
             repository.reconcile(state_dir=self.handler.state_dir)
@@ -831,45 +832,57 @@ class WorkerTargetedFailureTests(ExecutionFixture, TestCase):
         self.assertFalse(TargetedTestRepository(self.connection).repeated('repo', 'G-047'))
         self.effects.agent.run_agent.assert_not_called()
 
-    def test_three_unexpected_successes_block_at_the_worker_boundary(self):
+    def test_five_unexpected_successes_block_at_the_worker_boundary(self):
         repository = TargetedTestRepository(self.connection)
         self.effects.validation.parse_worker_result.side_effect = TargetedTestFailure('unresolved test')
-        for number in range(3):
+        for number in range(5):
             def worker(*args, **kwargs):
                 repository.observe('repo', 'G-047',
                     [event(str(number), result='unexpected_success')])
                 return self.agent(*args, **kwargs)
             self.effects.agent.run_agent.side_effect = worker
             outcome = self.handler.run(self.context())
-            self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK if number == 2
+            self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK if number == 4
                              else ExecutionOutcomeKind.RETRY)
         self.assertEqual(outcome.recovery.observation.reason, RecoveryReason.TARGETED_TEST_EXHAUSTED)
         self.effects.validation.verify.assert_not_called()
 
-    def test_same_test_across_changed_candidates_blocks_on_the_third_execution(self):
+    def test_same_test_across_changed_candidates_blocks_on_the_fifth_execution(self):
         repository = TargetedTestRepository(self.connection)
         self.effects.validation.parse_worker_result.side_effect = TargetedTestFailure('unresolved test')
-        for number in range(3):
+        for number in range(5):
             self.effects.agent.capture_git_snapshot.return_value.dirty = {'app.py': f'candidate-{number}'}
             def worker(*args, **kwargs):
                 repository.observe('repo', 'G-047', [event(str(number))])
                 return self.agent(*args, **kwargs)
             self.effects.agent.run_agent.side_effect = worker
             outcome = self.handler.run(self.context())
-            self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK if number == 2
+            self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK if number == 4
                              else ExecutionOutcomeKind.RETRY)
 
-    def test_three_failures_inside_one_worker_turn_block_before_verify(self):
+    def test_five_failures_inside_one_worker_turn_block_before_verify(self):
         repository = TargetedTestRepository(self.connection)
         def worker(*args, **kwargs):
-            repository.observe('repo', 'G-047', [event('a'), event('b'), event('c')])
+            repository.observe('repo', 'G-047', [event('a'), event('b'), event('c'), event('d'), event('e')])
             return self.agent(*args, **kwargs)
         self.effects.agent.run_agent.side_effect = worker
         result = self.handler.run(self.context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
-        self.assertIn('연속 3회', result.detail)
+        self.assertIn('연속 5회', result.detail)
         self.assertEqual(result.recovery.observation.reason, RecoveryReason.TARGETED_TEST_EXHAUSTED)
         self.effects.validation.verify.assert_not_called()
+
+    def test_success_after_five_failures_in_one_turn_does_not_block(self):
+        repository = TargetedTestRepository(self.connection)
+        def worker(*args, **kwargs):
+            repository.observe('repo', 'G-047', [event(str(i)) for i in range(5)])
+            repository.observe('repo', 'G-047', [event('pass', result='success')])
+            return self.agent(*args, **kwargs)
+        self.effects.agent.run_agent.side_effect = worker
+        result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertFalse(repository.repeated('repo', 'G-047'))
 
     def test_distinct_failures_across_turns_do_not_use_the_completion_report_limit(self):
         repository = TargetedTestRepository(self.connection)
@@ -890,8 +903,8 @@ class WorkerTargetedFailureTests(ExecutionFixture, TestCase):
         self.assertIn('LOOP_MANAGER_TARGETED_TEST_RUNNER', self.state.row()['last_error'])
         self.effects.blocking.block_active_execplan.assert_not_called()
 
-    def test_restart_after_recording_third_failure_blocks_without_another_worker(self):
-        TargetedTestRepository(self.connection).observe('repo', 'G-047', [event('a'), event('b'), event('c')])
+    def test_restart_after_recording_fifth_failure_blocks_without_another_worker(self):
+        TargetedTestRepository(self.connection).observe('repo', 'G-047', [event('a'), event('b'), event('c'), event('d'), event('e')])
         outcome = self.handler.run(self.context())
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.effects.agent.run_agent.assert_not_called()

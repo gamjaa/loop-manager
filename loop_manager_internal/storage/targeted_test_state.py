@@ -134,11 +134,11 @@ class TargetedTestRepository:
                     (repo, plan_id, run_id, test_id, result))
                 if result in {'fixture_error', 'indeterminate'}:
                     continue
-                previous = self.connection.execute('''SELECT failures, repeated FROM targeted_test_streaks
+                previous = self.connection.execute('''SELECT failures FROM targeted_test_streaks
                     WHERE repo=? AND plan_id=? AND test_id=?''', (repo, plan_id, test_id)).fetchone()
                 failures = ((previous[0] if previous else 0) + 1
                             if result in {'failure', 'error', 'unexpected_success'} else 0)
-                repeated = bool(failures >= 3 or (previous and previous[1]))
+                repeated = failures >= 5
                 self.connection.execute('''INSERT INTO targeted_test_streaks VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(repo, plan_id, test_id) DO UPDATE SET
                     failures=excluded.failures, repeated=excluded.repeated''',

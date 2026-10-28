@@ -247,7 +247,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         self.effects.validation.verify.assert_not_called()
         self.assertNotIn('add', self.calls)
 
-    def test_reconciled_third_targeted_failure_blocks_before_saved_verify_reuse(self):
+    def test_reconciled_fifth_targeted_failure_blocks_before_saved_verify_reuse(self):
         import tempfile
         from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
 
@@ -255,7 +255,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         self.state.update_project('repo', phase='VERIFYING', worker_session_id='worker-session')
         context = self.handler._context()
         repository = TargetedTestRepository(self.connection)
-        for run in ('first', 'second'):
+        for run in ('first', 'second', 'third', 'fourth'):
             repository.observe('repo', 'G-047', [{
                 'run_id': run, 'id': 'tests.Sample.test_failure', 'result': 'failure',
             }])
@@ -264,7 +264,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         self.addCleanup(temporary.cleanup)
         self.handler.state_dir = Path(temporary.name)
         repository, _directory, _receipt = self._bound_targeted_record(
-            self.handler.state_dir, 'call-one', 'third', 'failure',
+            self.handler.state_dir, 'call-one', 'fifth', 'failure',
         )
         selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
         previous = verify_receipts.latest_decision(self.connection, selection)
@@ -276,7 +276,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
 
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.assertEqual(outcome.recovery.observation.reason, handlers.RecoveryReason.TARGETED_TEST_EXHAUSTED)
-        self.assertEqual(repository.sequence('repo', 'G-047'), 3)
+        self.assertEqual(repository.sequence('repo', 'G-047'), 5)
         self.assertFalse(repository.repeated('repo', 'G-047'))
         self.assertFalse(repository.pending('repo', 'G-047'))
         self.assertEqual(verify_receipts.latest_decision(

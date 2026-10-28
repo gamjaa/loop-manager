@@ -46,7 +46,7 @@ Claude 지원 경계가 준비된 뒤 Worker targeted 기록을 이미 구현된
 
 - Worker는 변경한 Claude 환경 전달·수집 callback의 최소 unittest case만 실행한다. provider 프로세스는 double로 두고 실제 임시 기록 파일→공통 collector→SQLite를 연결해 세 호출의 동일 테스트 실패와 서로 다른 테스트 실패를 비교한다. Git·실계정·유료 Agent를 실행하지 않는다.
 - 신규·동일 session 재개·transient retry·session fallback의 각 호출에 고유한 허용 기록 경로가 전달되고 동일 ExecPlan의 실패 이력은 이어져야 한다. 별도 작업·역할·공급자·상태 루트의 폴더나 결과는 섞이지 않아야 한다.
-- 준비/정책 거부와 기록 없는 중단은 실패 횟수를 만들지 않아야 한다. 완료 결과 뒤 interruption과 재시작 재관측은 한 번만 반영되고 세 번째 실패 뒤 새 CLI retry·verify는 없어야 한다. 읽기 전용 역할의 쓰기 정책·부모 환경·인증/개인 설정 원본은 유지돼야 한다.
+- 준비/정책 거부와 기록 없는 중단은 실패 횟수를 만들지 않아야 한다. 완료 결과 뒤 interruption과 재시작 재관측은 한 번만 반영되고 연속 다섯 번째 실패가 해소되지 않으면 새 CLI retry·verify는 없어야 한다. 후속 성공을 수집하면 실패 횟수와 도달 표식을 함께 초기화해야 한다. 읽기 전용 역할의 쓰기 정책·부모 환경·인증/개인 설정 원본은 유지돼야 한다.
 - facade→adapter→prepared callback→실제 임시 파일→공통 collector/SQLite 연결을 확인한다. callback의 경로/receipt와 invocation·호출 예약 identity가 일치하고 저장 실패에서는 모의 process launch도 호출되지 않아야 한다. live·종료 불명과 경로 교체에서는 미소비 원문을 유지하며 종료 확인/오류 해소 뒤 재수집돼야 한다. 기존 Codex `tests/test_agent_invocation.py`의 KeyboardInterrupt·retry/fallback·독립 provider 실패 회귀를 재사용하고 지원되지 않는 Claude OS/정책 거부와 실환경 미수행 구분을 유지한다.
 - 공통 DB 대기의 일반 정책 조합은 G-305의 회귀를 재사용하고, Claude 전달 경계에서 결합 대기 해소 뒤 최초 launch 한 번·한도 초과 시 launch 0과 targeted 실패 미증가만 추가 확인한다. 실제 정책/경로 오류의 기존 거부와 구분한다.
 
