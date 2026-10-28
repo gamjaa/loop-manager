@@ -53,7 +53,7 @@ class EvidenceFreeRebasePreparationTests(TestCase):
         self.pending()
         case = self.case
         connection = case.fixture.connection
-        connection.execute('CREATE TABLE manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        connection.execute('CREATE TABLE IF NOT EXISTS manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         connection.execute("INSERT INTO manager_metadata VALUES ('created_from_absence', '1')")
         connection.execute('DELETE FROM execution_checkpoints')
         case.state.update_project('repo', last_error='prior failure', publication_remote_oid='remote')

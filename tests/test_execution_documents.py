@@ -69,6 +69,7 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
         self.handler.run(self.context())
         self.assertIsNone(self.state.row()['verify_token'])
         self.assertIsNone(self.state.row()['review_token'])
+        patches.update({path: patch + '+changed after Worker\n' for path, patch in patches.items()})
         result = self.handler.verify(self.context(), self.handler)
         self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
         self.assertEqual(self.state.row()['phase'], 'WORKING')
@@ -769,8 +770,7 @@ class CommonGuidancePrReportTests(TestCase):
         from loop_manager_internal.documents.pr_description import common_guidance_report, DocumentReportError
         patches = {'docs/PRODUCT.md': '-old product\n+new product\n',
                    'docs/ARCHITECTURE.md': '-old design\n+new design\n'}
-        for summary in ('', '\n'.join(self.explanation(path, 'old patch') for path in patches),
-                        self.explanation('docs/PRODUCT.md', 'old patch') + '\nDOCUMENT_CHANGE: invalid'):
+        for summary in ('', 'DOCUMENT_CHANGE: invalid'):
             with self.subTest(summary=summary):
                 git = mock.Mock(side_effect=[SimpleNamespace(stdout='M\0docs/PRODUCT.md\0M\0docs/ARCHITECTURE.md\0'),
                     *[SimpleNamespace(stdout=patch) for patch in patches.values()]])
@@ -780,9 +780,45 @@ class CommonGuidancePrReportTests(TestCase):
                                            selected_execplan_path=self.selected_execplan_path)
                 for path, patch in patches.items():
                     self.assertIn(path, str(raised.exception))
-                    self.assertIn(hashlib.sha256(patch.encode()).hexdigest(), str(raised.exception))
+                    self.assertNotIn(hashlib.sha256(patch.encode()).hexdigest(), str(raised.exception))
                 self.assertIn('변경 문서 전체', str(raised.exception))
                 self.assertEqual(git.call_count, 3)
+
+    def test_manager_binds_reports_and_rejects_changed_patch_or_result(self):
+        import sqlite3
+        import json
+        from loop_manager_internal.documents.pr_description import common_guidance_report, DocumentReportError
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.execute('CREATE TABLE manager_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        summary = 'DOCUMENT_CHANGE: ' + json.dumps(dict(path='docs/New.md', summary='New behavior',
+            reason='Implement request', impact='Updates behavior'))
+        patch = 'new file patch'
+        def git(_path, *args):
+            return SimpleNamespace(stdout='A\0docs/New.md\0' if '--name-status' in args else patch)
+        for legacy_hash in (None, 'wrong-hash', 'a' * 61):
+            message = summary if legacy_hash is None else summary[:-1] + ', "patch_sha256": "' + legacy_hash + '"}'
+            evidence = (connection, 'repo', 'G-047', message)
+            with self.subTest(legacy_hash=legacy_hash):
+                with self.assertRaises(DocumentReportError):
+                    common_guidance_report(git, Path('/candidate'), 'base', 'head', '', message,
+                        selected_execplan_path=self.selected_execplan_path, evidence=evidence)
+                common_guidance_report(git, Path('/candidate'), 'base', '', '', message,
+                    selected_execplan_path=self.selected_execplan_path, evidence=evidence, bind=True)
+                report = common_guidance_report(git, Path('/candidate'), 'new-base', 'new-head', '', message,
+                    selected_execplan_path=self.selected_execplan_path, evidence=evidence)
+                self.assertIn('New behavior', report)
+                patch = 'changed patch'
+                with self.assertRaises(DocumentReportError):
+                    common_guidance_report(git, Path('/candidate'), 'base', 'head', '', message,
+                        selected_execplan_path=self.selected_execplan_path, evidence=evidence)
+                patch = 'new file patch'
+                with self.assertRaises(DocumentReportError):
+                    common_guidance_report(git, Path('/candidate'), 'base', 'head', '', message,
+                        selected_execplan_path=self.selected_execplan_path,
+                        evidence=(connection, 'repo', 'G-047', message + 'changed result'))
+                connection.execute('DELETE FROM manager_metadata')
+                connection.commit()
 
     @staticmethod
     def explanation(path, patch, reason='Align implementation contracts', impact='Document accepted behavior'):
@@ -796,7 +832,7 @@ class CommonGuidancePrReportTests(TestCase):
     def test_existing_pr_push_refreshes_report_for_confirmed_head_before_merge_wait(self):
         from loop_manager_internal.execution import execution_publication_handler as publication
         context = SimpleNamespace(branch='branch', worktree=Path('/candidate'),
-                                  plan=SimpleNamespace(path=self.selected_execplan_path))
+                                  plan=SimpleNamespace(path=self.selected_execplan_path, plan_id='G-047'))
         row = {'pr_url': 'https://github.com/o/r/pull/1', 'publication_remote_oid': 'previous',
                'validated_base_sha': 'latest-base', 'pr_conflict_recovery': 0, 'worker_result': 'result'}
         state = mock.Mock()
@@ -814,7 +850,8 @@ class CommonGuidancePrReportTests(TestCase):
         self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
         state.confirm_existing_pr_push.assert_called_once_with(None, 'confirmed-head')
         self.assertEqual(report.call_args.args[2:4], ('latest-base', 'confirmed-head'))
-        self.assertEqual(report.call_args.kwargs, {'selected_execplan_path': self.selected_execplan_path})
+        self.assertEqual(report.call_args.kwargs['selected_execplan_path'], self.selected_execplan_path)
+        self.assertEqual(report.call_args.kwargs['evidence'][1:], ('repo', 'G-047', 'result'))
         self.assertEqual(refresh.call_args.args[-2:],
                          ({'url': row['pr_url'], 'state': 'OPEN', 'headRefOid': 'confirmed-head'}, 'final report'))
         state.open_pull_request.assert_called_once()
@@ -960,7 +997,6 @@ class CommonGuidancePrReportTests(TestCase):
         for summary in (
             'docs/Old.md: stale reason and impact',
             self.explanation('docs/Old.md', patch),
-            self.explanation('docs/New.md', '+previous candidate\n'),
             'DOCUMENT_CHANGE: {"path": "docs/New.md"}',
         ):
             with self.subTest(summary=summary):
@@ -975,7 +1011,7 @@ class CommonGuidancePrReportTests(TestCase):
         from loop_manager_internal.execution import execution_publication_handler as publication
         from loop_manager_internal.application.contracts import WorkerResultError
         context = SimpleNamespace(worktree=Path('/candidate'),
-                                  plan=SimpleNamespace(path=self.selected_execplan_path))
+                                  plan=SimpleNamespace(path=self.selected_execplan_path, plan_id='G-047'))
         row = {'worker_result': 'result', 'validated_base_sha': 'base'}
         state = mock.Mock()
         ports = SimpleNamespace(
@@ -990,7 +1026,8 @@ class CommonGuidancePrReportTests(TestCase):
                                side_effect=publication.DocumentReportError('missing New.md')) as report:
             self.assertEqual(publication.PublicationHandler(ports)._publish_new_pull_request(
                 context, row), 'worker correction')
-        self.assertEqual(report.call_args.kwargs, {'selected_execplan_path': self.selected_execplan_path})
+        self.assertEqual(report.call_args.kwargs['selected_execplan_path'], self.selected_execplan_path)
+        self.assertEqual(report.call_args.kwargs['evidence'][1:], ('repo', 'G-047', 'result'))
         ports.build_pr_body.assert_not_called()
         state.update_project.assert_called_once_with('repo', phase='WORKING',
             validated_base_sha=None, last_error='missing New.md')

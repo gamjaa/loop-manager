@@ -215,7 +215,7 @@ class RemoteAdoptionPhaseTests(ExecutionFixture, TestCase):
         self.handler._identity = replace(self.handler._identity, state_dir=root)
         self.state.update_project('repo', worktree=str(root / 'G-047'))
         self.connection.executescript(
-            "CREATE TABLE manager_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS manager_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
             "INSERT INTO manager_metadata VALUES ('remote_adoption_bootstrap', 'null');"
             "UPDATE projects SET origin='owner/repo', planning_attempt_fingerprint=NULL;"
             "UPDATE exec_plans SET workspace_owned=0;")

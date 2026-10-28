@@ -341,7 +341,7 @@ class PullRequestHistoryTests(unittest.TestCase):
 
         fixture = execution_fixture(self)
         fixture.connection.executescript(
-            "CREATE TABLE manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS manager_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
             "INSERT INTO manager_metadata VALUES ('remote_adoption_bootstrap', 'null');"
             "UPDATE projects SET origin='owner/repo';"
             "UPDATE exec_plans SET workspace_owned=0;")

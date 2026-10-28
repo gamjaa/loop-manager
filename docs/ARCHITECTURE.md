@@ -821,7 +821,8 @@ catalog와 snapshot은 탐색·검증 입력이며 그 자체로 쓰기 권한�
   | `summary` | 해당 문서의 주요 변경 요약 |
   | `reason` | 수정 이유 |
   | `impact` | 제품·설계에 미치는 영향 |
-  | `patch_sha256` | 해당 문서의 최종 patch stdout을 UTF-8로 인코딩한 SHA-256의 소문자 64자리 16진수. 최종 base/head에서 `git diff --no-ext-diff --no-textconv --find-renames <base> <head> -- <해당 경로들>`로 계산하며 rename·copy는 양쪽 경로를 전달한다. |
+
+  Worker의 해시 제출은 요구하지 않으며 이전 응답의 `patch_sha256`도 무시한다. Manager는 Worker 결과 수신 뒤 범위가 확인된 후보를 staging하고 문서별 patch를 직접 해시한다. 결과 원문 지문과 문서별 patch 지문을 `manager_metadata`의 작업별 `document-report:` 항목에 저장한다. 검증·게시 직전에 해당 결과의 저장된 지문과 최종 문서별 diff를 코드로 비교한다. 결합 근거 부재·실제 patch 변경은 설명 교정으로 처리하며, 동일한 문서 patch는 base/head SHA 변경만으로 교정하지 않는다. Git 관측은 DB 쓰기 transaction 밖에서 수행하고 지문 저장만 짧게 처리한다.
 
   PR 문서 보고에는 파일명·변경 요약·이유·영향만 렌더링한다. 실제 patch·diff 링크·검증용 hash는 렌더링하지 않는다. 누락·중복·형식 오류·최종 diff에 없는 경로·patch 불일치는 일반 Summary로 대체하지 않고 기존 `WORKER_CORRECTION`으로 현재 후보의 설명을 보완하며 유효한 다른 문서의 설명도 함께 유지한다. 새로운 PR과 기존 PR 갱신 모두 불완전한 보고를 게시하거나 보고 반영 전에 게시 완료로 처리하지 않는다.
 

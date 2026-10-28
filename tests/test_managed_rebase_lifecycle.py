@@ -473,7 +473,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     connection, repo, state_dir, repo_key, 'G-047', worktree, branch, **options)))
 
             def parse_lifecycle_worker_result(_message, _plan):
-                active_base = effects.state.row()['active_sha']
+                pending = effects.checkpoint.get(repo_key, 'G-047')
+                active_base = (pending.target_base_oid if pending.operation == 'rebase'
+                               else effects.state.row()['active_sha'])
                 head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
                 paths = git(worktree, 'diff', '--name-only', active_base, head).stdout.splitlines()
                 changes = []

@@ -584,7 +584,7 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
     def test_existing_adoption_checks_grant_pr_and_keeps_original_head(self):
         from loop_manager_internal.storage import database
         with self.connection:
-            self.connection.execute('CREATE TABLE manager_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            self.connection.execute('CREATE TABLE IF NOT EXISTS manager_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
             self.connection.execute("INSERT INTO manager_metadata VALUES ('remote_adoption_bootstrap','null')")
             self.connection.execute("UPDATE projects SET origin='fixture/repository'")
         database.record_remote_work_adoption_catalog(self.connection, self.repo, self.head, ('G-001',))
@@ -659,7 +659,7 @@ class ReservedWorkspaceRecoveryTests(ScopedGateFixture, unittest.TestCase):
         else:
             (self.worktree / 'preserved.txt').write_text('local materials')
         with self.connection:
-            self.connection.execute('CREATE TABLE manager_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            self.connection.execute('CREATE TABLE IF NOT EXISTS manager_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
             self.connection.execute("INSERT INTO manager_metadata VALUES ('remote_adoption_bootstrap','null')")
             self.connection.execute("UPDATE projects SET origin='fixture/repository'")
             self.connection.execute('UPDATE exec_plans SET worktree=?', (str(self.worktree),))

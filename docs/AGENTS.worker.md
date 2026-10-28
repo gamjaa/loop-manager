@@ -115,13 +115,11 @@ WORKER_OUTCOME 앞에 `VERIFY_INPUT_EXCLUSIONS: <JSON>` 한 줄로 제출한다.
   같은 Worker 세션에 전달한다.
 
 최종 diff에서 선택된 ExecPlan을 제외한 모든 변경 문서(추가·삭제·rename 포함)에 대해 PR_SUMMARY 안에
-`DOCUMENT_CHANGE: {"path":"최종 경로","summary":"주요 변경","reason":"수정 이유","impact":"제품·설계 영향","patch_sha256":"문서 diff의 SHA-256"}`
+`DOCUMENT_CHANGE: {"path":"최종 경로","summary":"주요 변경","reason":"수정 이유","impact":"제품·설계 영향"}`
 한 줄씩 둔다. 선택된 ExecPlan은 PR 문서 보고와 DOCUMENT_CHANGE 제출 대상에서 제외하지만
 기존 diff 검토와 범위 검증은 유지한다. rebase 뒤 실제 변경에 맞게 갱신하며 rename은 새 경로,
 삭제는 원래 경로를 사용한다.
-hash는 Manager가 제시한 최종
-문서 patch 또는 `git diff --no-ext-diff --no-textconv --find-renames <base> <head> -- <해당 경로들>`의
-UTF-8 stdout에 결합한다. 누락·이전 후보의 설명은 현재 diff로 보완하며 모르는 의미를 추정해
+문서별 diff의 해시 계산·보존·비교는 Manager가 수행한다. 해시를 생성하거나 복사해 제출하지 않는다. 누락·이전 후보의 설명은 현재 diff로 보완하며 모르는 의미를 추정해
 채우지 않는다. 교정 후 최종 응답에도 보고 대상 문서 전체의 DOCUMENT_CHANGE를 함께 제출하며
 유효한 다른 문서의 설명을 빼지 않는다. 결과는 완료한 변경·미해결 문제·
 다음 필요한 작업을 구분한다. 실제 실행하지 않은 검증을 성공으로 보고하지 않는다.

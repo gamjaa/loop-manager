@@ -11,6 +11,7 @@ def runtime_connection(repo: str = "repo") -> sqlite3.Connection:
     try:
         connection.row_factory = sqlite3.Row
         connection.execute(database.SCHEMA)
+        connection.execute('CREATE TABLE IF NOT EXISTS manager_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         database._ensure_execplans_schema(connection)
         notifications.ensure_schema(connection)
         connection.execute(

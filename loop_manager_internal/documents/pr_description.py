@@ -17,10 +17,11 @@ COMMON_REPORT_END = '<!-- loop-manager:common-guidance:end -->'
 
 
 def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
-                           origin_url: str, summary: str, *, selected_execplan_path: str) -> str:
+                           origin_url: str, summary: str, *, selected_execplan_path: str,
+                           evidence=None, bind=False) -> str:
     """Report final document diffs except the selected ExecPlan."""
     fields = git(worktree, "diff", "--no-ext-diff", "--name-status", "-z", "--find-renames",
-                 base_sha, head_sha).stdout.split("\0")
+                 base_sha, *([head_sha] if head_sha else [])).stdout.split("\0")
     changes, index = [], 0
     while index < len(fields) and fields[index]:
         status = fields[index]
@@ -36,6 +37,15 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
         index += 1 + count
     if not changes:
         return ""
+    expected = None
+    if evidence is not None:
+        connection, repo, plan_id, message = evidence
+        key = 'document-report:' + json.dumps([repo, plan_id])
+        identity = hashlib.sha256(message.encode('utf-8')).hexdigest()
+        saved = connection.execute('SELECT value FROM manager_metadata WHERE key=?', (key,)).fetchone()
+        saved = json.loads(saved[0]) if saved else {}
+        expected = saved.get('patches', {}) if saved.get('result') == identity else {}
+    patches = {}
     explanations, errors = {}, []
     for line in summary.splitlines():
         if not line.startswith("DOCUMENT_CHANGE:"):
@@ -46,12 +56,12 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
                 continue
             if not isinstance(item, dict) or any(
                 not isinstance(item.get(key), str) or not item[key].strip()
-                for key in ("path", "summary", "reason", "impact", "patch_sha256")
+                for key in ("path", "summary", "reason", "impact")
             ) or item["path"] in explanations:
                 raise ValueError("missing/duplicate document fields")
             explanations[item["path"]] = item
         except (ValueError, TypeError):
-            errors.append("PR_SUMMARY의 DOCUMENT_CHANGE에 문서 경로·내용·이유·영향·patch_sha256을 보완하라.")
+            errors.append("PR_SUMMARY의 DOCUMENT_CHANGE에 문서 경로·내용·이유·영향을 보완하라.")
     final_paths = {paths[-1] for _, paths in changes}
     stale = explanations.keys() - final_paths
     if stale:
@@ -60,11 +70,12 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
     required = []
     for _, paths in changes:
         patch = git(worktree, "diff", "--no-ext-diff", "--no-textconv", "--find-renames",
-                    base_sha, head_sha, "--", *paths).stdout
+                    base_sha, *([head_sha] if head_sha else []), "--", *paths).stdout
         explanation = explanations.get(paths[-1])
         patch_hash = hashlib.sha256(patch.encode("utf-8")).hexdigest()
-        required.append(f"{paths[-1]}; patch_sha256={patch_hash}")
-        if explanation is None or explanation["patch_sha256"] != patch_hash:
+        patches[paths[-1]] = patch_hash
+        required.append(paths[-1])
+        if explanation is None or (not bind and expected is not None and expected.get(paths[-1]) != patch_hash):
             errors.append(f"최종 문서 설명 누락 또는 patch 변경: {paths[-1]}")
             continue
         report.extend([
@@ -80,6 +91,12 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
             "유효한 기존 설명도 유지하고 현재 diff의 주요 내용·수정 이유·제품/설계 영향을 포함하라.",
             *required,
         ]))
+    if bind and evidence is not None:
+        from loop_manager_internal.storage.runtime_state import _transaction
+        with _transaction(connection):
+            connection.execute('INSERT INTO manager_metadata(key,value) VALUES (?,?) '
+                           'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                           (key, json.dumps({'result': identity, 'patches': patches})))
     report.append(COMMON_REPORT_END)
     return "\n".join(report)
 

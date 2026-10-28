@@ -990,9 +990,27 @@ class WorkerHandler:
             self.ports.clear_agent_scope(self.ports.identity.repo)
         return self.ports._finish_worker(context, self.ports._row(), saved.worker_result)
 
+    def _bind_document_report(self, context, message, base):
+        from loop_manager_internal.documents.pr_description import common_guidance_report, DocumentReportError
+        worker = self.ports.parse_worker_result(message, self.ports.snapshot().plan)
+        try:
+            common_guidance_report(self.ports.git, context.worktree, base, '', '', worker.summary,
+                selected_execplan_path=context.plan.path,
+                evidence=(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id, message),
+                bind=True)
+        except DocumentReportError as error:
+            self.ports.state.update_project(self.ports.identity.repo, worker_result=message, last_error=str(error))
+            return self.ports._recover(RecoveryReason.WORKER_CORRECTION, str(error), context=context)
+
     def _finish_worker(self, context, row, message, *, staged=False):
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
         latest_sha = str(row['active_sha'] or '')
+        if not context.resolving_rebase:
+            from loop_manager_internal.execution.worker_checkpoint import stage_candidate
+            stage_candidate(self.ports, context)
+            report_outcome = self._bind_document_report(context, message, latest_sha)
+            if report_outcome is not None:
+                return report_outcome
         if context.resolving_rebase:
             definition = self.ports.snapshot()._definition_snapshot
             if definition is not None:
@@ -1003,6 +1021,10 @@ class WorkerHandler:
             if self.ports.current_rebase_service is not None:
                 _, decision = self.ports._current_rebase_service(context).require_owned()
                 if decision.status is RebaseStatus.COMPLETE:
+                    base = self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).target_base_oid or latest_sha
+                    report_outcome = self._bind_document_report(context, message, base)
+                    if report_outcome is not None:
+                        return report_outcome
                     self.ports._complete_rebase_intent(context, worker_definition=definition)
                     return self.ports._advanced()
             self.ports.state.update_project(self.ports.identity.repo, worker_result=message)
@@ -1104,6 +1126,9 @@ class WorkerHandler:
                     or row['active_sha'] or ''
                 )
             )
+            report_outcome = self._bind_document_report(context, message, latest_sha)
+            if report_outcome is not None:
+                return report_outcome
             self.ports._complete_rebase_intent(context, project_values={
                 'phase': 'WORKING', 'active_sha': latest_sha,
                 'validated_base_sha': None, 'last_error': None,

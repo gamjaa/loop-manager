@@ -617,7 +617,8 @@ class PublicationHandler:
             origin = self.ports.git(context.worktree, 'remote', 'get-url', 'origin').stdout.strip()
             report = common_guidance_report(self.ports.git, context.worktree,
                 str(row['validated_base_sha']), head_oid, origin, worker.summary,
-                selected_execplan_path=context.plan.path)
+                selected_execplan_path=context.plan.path,
+                evidence=(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id, str(row['worker_result'] or '')))
             refresh_common_guidance_pr(self.ports.command, context.worktree,
                 self.ports.identity.state_dir,
                 {'url': row['pr_url'], 'state': 'OPEN', 'headRefOid': head_oid}, report)
@@ -691,6 +692,7 @@ class PublicationHandler:
             common_change = common_guidance_report(
                 self.ports.git, context.worktree, str(row['validated_base_sha']), head_sha, origin_url,
                 worker_publication.summary, selected_execplan_path=context.plan.path,
+                evidence=(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id, str(row['worker_result'] or '')),
             )
         except DocumentReportError as error:
             self.ports.state.update_project(self.ports.identity.repo, phase='WORKING',
