@@ -202,8 +202,8 @@ def require_related_history(git, repo_path, anchor, remote):
     return common.stdout.strip()
 
 
-def _require_preserved_anchor(git, worktree, anchor, local, common, *, original=None):
-    """Old remote-only patches must survive locally before accepting a rewrite."""
+def _require_preserved_anchor(git, worktree, anchor, remote, local, common, *, original=None):
+    """Old remote-only patches must survive on either side of a rewrite."""
     from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
     for head in (local, original) if original else (local,):
         contains = git(worktree, 'merge-base', '--is-ancestor', anchor, head, check=False)
@@ -213,11 +213,20 @@ def _require_preserved_anchor(git, worktree, anchor, local, common, *, original=
             raise RecoveryFailure(RecoveryReason.STATUS_FAILED, '기존 작업 commit의 로컬 보존을 확인할 수 없습니다.')
     # shortcut: merge-only rewrites need stronger preservation evidence before automatic adoption.
     merges = git(worktree, 'rev-list', '--min-parents=2', f'{common}..{anchor}', check=False)
-    patches = git(worktree, 'cherry', local, anchor, common, check=False)
-    if (merges.returncode or merges.stdout.strip() or patches.returncode
-            or any(not line.startswith('- ') for line in patches.stdout.splitlines())):
-        raise RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN,
-                              '재작성 전 원격 전용 변경의 로컬 보존을 확인할 수 없습니다.')
+    missing = None
+    if not merges.returncode and not merges.stdout.strip():
+        for head in (local, remote):
+            patches = git(worktree, 'cherry', head, anchor, common, check=False)
+            lines = patches.stdout.splitlines()
+            if patches.returncode or any(not line.startswith(('+ ', '- ')) for line in lines):
+                break
+            absent = {line[2:] for line in lines if line.startswith('+ ')}
+            missing = absent if missing is None else missing & absent
+        else:
+            if not missing:
+                return
+    raise RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN,
+                          '재작성 전 원격 전용 변경의 보존을 확인할 수 없습니다.')
 
 
 def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, pull_request):
@@ -308,7 +317,7 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
                 str(plan['plan_id']), worktree, branch, remote_oid=remote).require_owned(checkpoint=current)
         if not (current.operation == 'rebase' and integration.get('remote') == anchor
                 and integration.get('phase') == 'rebasing'):
-            _require_preserved_anchor(effects.git, worktree, anchor, local, common,
+            _require_preserved_anchor(effects.git, worktree, anchor, remote, local, common,
                 original=current.expected_head if current.operation == 'rebase' else None)
     if current.operation == 'push' and remote != current.expected_head:
         contains = effects.git(worktree, 'merge-base', '--is-ancestor', current.expected_head, remote, check=False)

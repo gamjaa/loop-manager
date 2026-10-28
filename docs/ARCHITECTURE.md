@@ -1136,7 +1136,7 @@ push 전후 및 SQLite 반영 전 중단에서는 같은 intent와 실제 원격
 
 `work_branch_integration.synchronize`는 현재 등록 origin의 fetch/push URL, 작업·worktree·ref·연결 PR을 확인하고 정확한 원격 commit을 받아온다. 로컬·원격의 차이와 현재 Git operation을 분리하며, 필요한 통합은 기존 baseline tree와 보존 commit·현재 관리 rebase 경로를 사용한다. `accepted_work_branch`는 읽고 확인한 입력이며 게시 성공 receipt가 아니다.
 
-비조상 원격 입력은 두 commit과 공통 이력을 확인하고 같은 작업의 로컬 이력에 기존 anchor가 포함되거나 전용 patch가 동등하게 보존된 때 기존 통합기로 넘긴다. merge 해소의 patch 동등성만으로 보존을 증명하지 않는다. 진행 중인 소유 통합은 현재 rebase 소유권을 확인하고 기존 conflict baseline·restart intent로 보존한다. 차단 복구의 후속 원격 관측도 같은 연결성 검사를 사용하며 origin·branch·worktree·PR 검증을 유지한다. 완료한 통합의 원래 후보를 기준으로 재검증 필요 여부를 판단하고 원격 수용과 검증 무효화를 하나의 transaction에 반영한다.
+비조상 원격 입력은 두 commit과 공통 이력을 확인하고 같은 작업의 로컬 이력에 기존 anchor가 포함되거나 로컬·현재 원격에 전용 patch가 동등하게 보존된 때 기존 통합기로 넘긴다. merge 해소의 patch 동등성만으로 보존을 증명하지 않는다. 진행 중인 소유 통합은 현재 rebase 소유권을 확인하고 기존 conflict baseline·restart intent로 보존한다. 차단 복구의 후속 원격 관측도 같은 연결성 검사를 사용하며 origin·branch·worktree·PR 검증을 유지한다. 완료한 통합의 원래 후보를 기준으로 재검증 필요 여부를 판단하고 원격 수용과 검증 무효화를 하나의 transaction에 반영한다.
 
 같은 입력은 다시 통합하지 않고 실제 Git 쓰기 직전 대상·후보·원격 lease를 재확인한다. 원격 통합은 공통 ignored 충돌 helper로 최종 diff와 로컬 replay commit의 중간 경로를 대소문자·부모/자식 관계까지 비교한다. 보존 HEAD/index 적용과 rebase 시작 직전에 재관측하고, 후속 입력의 소유 rebase abort는 현재 operation의 원래 HEAD 복원 경로 helper로 검사한다. 관측 실패·충돌은 기존 checkpoint와 baseline·restart intent를 보존한 채 쓰기를 거부한다. 이미 완료된 소유 rebase는 이 쓰기 검사 없이 기존 소유권·lease 검증으로 결과만 수용한다.
 

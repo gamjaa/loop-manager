@@ -50,6 +50,7 @@ class RemoteIntegrationAnchorTests(unittest.TestCase):
         self.ancestor = True
         self.connected = True
         self.patches = ''
+        self.remote_patches = None
         self.integration = self.enterContext(mock.patch.object(integration, 'integrate',
             side_effect=lambda *args: replace(self.snapshot, head='integrated')))
 
@@ -59,7 +60,8 @@ class RemoteIntegrationAnchorTests(unittest.TestCase):
         elif args[0] in ('cat-file', 'rev-list'):
             output = ''
         elif args[0] == 'cherry':
-            output = self.patches
+            output = (self.remote_patches if args[1] == self.remote and self.remote_patches is not None
+                      else self.patches)
         elif args[0] == 'fetch':
             output = ''
         elif args[0] == 'rev-parse':
@@ -122,6 +124,14 @@ class RemoteIntegrationAnchorTests(unittest.TestCase):
         self.remote, self.ancestor = 'a' * 40, False
         self.snapshot = replace(self.snapshot, head='rebased-local')
         self.patches = '- ' + self.head + '\n'
+        self.assertTrue(self.synchronize())
+        self.integration.assert_called_once()
+
+    def test_old_remote_patch_preserved_by_rewritten_remote_can_be_integrated(self):
+        self.remote, self.ancestor = 'a' * 40, False
+        self.snapshot = replace(self.snapshot, head='different-local')
+        self.patches = '+ ' + self.head + '\n'
+        self.remote_patches = '- ' + self.head + '\n'
         self.assertTrue(self.synchronize())
         self.integration.assert_called_once()
 
