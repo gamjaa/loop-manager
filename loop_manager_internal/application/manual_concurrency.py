@@ -26,7 +26,7 @@ def group_resources(group):
 
 
 def preparation_gate(service, *, plan_ids=(), group=None, requirements=(), inspect_workspace=True,
-                     check_git_journal=True):
+                     check_git_journal=True, git_observation=None, lease_stack=None):
     connection, repo = service.connection, service.repo
     if scoped_blocking.project_block(connection, repo):
         raise ManualConflictError('프로젝트 승인·차단 gate가 활성 상태입니다. 수락되지 않았습니다.')
@@ -78,8 +78,36 @@ def preparation_gate(service, *, plan_ids=(), group=None, requirements=(), inspe
                 "OR result_code IS NULL AND result_kind IN ('interrupted','exception','timeout'))",
                 (repo,identity)).fetchone():
             raise ManualConflictError(f"수동 Planner 종료 상태 불명: 묶음 {group['group_id']}; 작업물을 보존합니다.")
+    requested_worktrees = [Path(group['worktree'])] if group and group['worktree'] else []
+    requested_refs = [f'refs/remotes/origin/{service.base}']
+    for key in plan_ids:
+        branch, path = workspace.expected_execplan_workspace(service.state_dir, repo, key)
+        requested_worktrees.append(path)
+        requested_refs.extend((f'refs/heads/{branch}', f'refs/remotes/origin/{branch}'))
+    if group and group['branch']:
+        requested_refs.extend((f"refs/heads/{group['branch']}", f"refs/remotes/origin/{group['branch']}"))
+    def recoverable(intent):
+        return bool(group and intent['owner'] == f"plan:{group['owner_id']}" and (
+            intent['kind'] == 'managed_worktree_create' and intent['target'] == group['worktree'] or
+            intent['kind'] == 'manual_branch_push' and intent['target'] == f"refs/heads/{group['branch']}"))
+    if git_observation is not None:
+        if (not manager_git_journal.project_mutation_leases_owned(service.state_dir, repo, git_observation)
+                or manager_git_journal.project_mutation_identity(service.state_dir, repo, connection) != git_observation):
+            raise ManualConflictError('미완료 Git 작업의 소유권·lease·writer·intent가 준비 중 변경됐습니다.')
+    elif check_git_journal:
+        try:
+            git_observation = manager_git_journal.project_mutation_identity(service.state_dir, repo, connection)
+            conflict = manager_git_journal.has_conflicting_project_mutation(
+                service.state_dir, repo, stage='manual_preparation', connection=connection,
+                git=service.effects.git, worktrees=tuple(requested_worktrees) or (service.repo_path,),
+                refs=tuple(requested_refs), recoverable=recoverable, lease_stack=lease_stack)
+            changed = manager_git_journal.project_mutation_identity(service.state_dir, repo, connection) != git_observation
+        except manager_git_journal.MutationEvidenceError as error:
+            raise ManualConflictError('미완료 Git 작업의 현재 소유권을 확인할 수 없습니다.') from error
+        if conflict or changed:
+            raise ManualConflictError('미완료 Git operation과 자원 또는 writer 소유권이 충돌합니다.')
     if group is None or not group['branch']:
-        return
+        return git_observation
     members = set(json.loads(group['members']))
     for row in connection.execute('SELECT plan_id,branch,worktree FROM exec_plans WHERE repo=? '
             'AND (branch=? OR worktree=?)', (repo, group['branch'], group['worktree'])):
@@ -88,19 +116,21 @@ def preparation_gate(service, *, plan_ids=(), group=None, requirements=(), inspe
     project = connection.execute('SELECT plan_path,worktree,phase FROM projects WHERE repo=?', (repo,)).fetchone()
     if project['worktree'] == group['worktree'] and project['phase'] == 'PLANNING':
         raise ManualConflictError(f"Planner worktree 소유권과 충돌: {group['worktree']}")
-    targets = {group['worktree'], f"refs/heads/{group['branch']}",
-               f"refs/remotes/origin/{group['branch']}", f'refs/remotes/origin/{service.base}'}
-    def recoverable(intent):
-        return intent['owner'] == f"plan:{group['owner_id']}" and intent['kind'] in {
-            'managed_worktree_create', 'manual_branch_push'}
-    if check_git_journal and manager_git_journal.has_pending_project_mutation(
-            service.state_dir, repo, targets=targets, recoverable=recoverable):
-        raise ManualConflictError('미완료 Git operation과 충돌: ' + ', '.join(sorted(targets)))
     path = Path(group['worktree'])
     if inspect_workspace and path.is_dir() and group['workspace_created']:
         service.effects.validate_workspace(service.repo_path, path, group['branch'])
     if inspect_workspace and path.is_dir() and service.effects.capture_snapshot(path).operations:
         raise ManualConflictError(f'미완료 Git operation을 보존합니다: {path}')
+    return git_observation
+
+
+def manual_git_protection(function):
+    """Keep pending-operation leases open through this manual state transition."""
+    @wraps(function)
+    def guarded(service, *args, **kwargs):
+        with ExitStack() as git_leases:
+            return function(service, *args, git_leases=git_leases, **kwargs)
+    return guarded
 
 
 def manual_preparation(function):
@@ -122,9 +152,10 @@ def manual_preparation(function):
         if group:
             resources.extend(group_resources(group))
         try:
-            with resource_locks(service.state_dir, service.repo, resources, owner='manual-' + function.__name__):
-                preparation_gate(service, plan_ids=plan_ids, group=group, requirements=requirements)
-                result = function(service, argument)
+            with ExitStack() as git_leases, resource_locks(
+                    service.state_dir, service.repo, resources, owner='manual-' + function.__name__):
+                preparation_gate(service, plan_ids=plan_ids, group=group, requirements=requirements, lease_stack=git_leases)
+                result = function(service, argument, git_leases=git_leases)
         except ProcessLockBusyError as error:
             raise ManualConflictError(str(error)) from error
         return service.drive(result) if isinstance(result, str) else result

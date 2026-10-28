@@ -181,7 +181,6 @@ class ReservationOwnership:
 @contextmanager
 def reserved_workspace_ownership(connection, state_dir, repo, plan_id, *, workspace=None):
     """Hold the existing task/resource boundary before observing reserved Git."""
-    from loop_manager_internal.agents.process_receipt import recover
     observed = _reservation_owners(connection, repo, plan_id, workspace)
     branch, worktree, _, _, calls, invocations, _adoption, _pending_claims = observed
     resources = ['plan:' + plan_id]
@@ -197,28 +196,34 @@ def reserved_workspace_ownership(connection, state_dir, repo, plan_id, *, worksp
         proof.check()
         if connection.in_transaction:
             raise task_calls.CallDeferred('예약 writer 종료 관측 전에 DB 쓰기 처리를 종료해야 합니다.')
-        for call in calls:
-            if not task_calls.execution_confirmed(connection, call, state_dir):
-                raise task_calls.CallDeferred('예약 workspace의 이전 호출 종료를 확인할 수 없습니다.')
-        for invocation in invocations:
-            if invocation['execution_finish_evidence']:
-                continue
-            if (invocation['execution_status'] == 'not_executed'
-                    and invocation['execution_started_at'] is None and invocation['finished_at']):
-                continue
-            call = next((item for item in calls if item['kind'] == 'agent'
-                         and item['invocation_id'] == invocation['invocation_id']), None)
-            if call is not None and (call['receipt_path'] is not None
-                                     or invocation['execution_started_at'] is None):
-                # The matching call was physically confirmed above. A call
-                # without a receipt proves non-launch only before start.
-                continue
-            stopped = recover(invocation['process_receipt_path'], state_dir) if invocation['process_receipt_path'] else None
-            if (stopped is None or stopped.get('evidence') == 'not_started'
-                    and invocation['execution_started_at'] is not None):
-                raise task_calls.CallDeferred('예약 workspace의 Agent 실제 종료를 확인할 수 없습니다.')
+        check_stopped_writers(connection, state_dir, calls, invocations)
         proof.check()
         yield proof
+
+
+def check_stopped_writers(connection, state_dir, calls, invocations):
+    """Require physical completion; observing a result alone does not stop a writer."""
+    from loop_manager_internal.agents.process_receipt import recover
+    for call in calls:
+        if not task_calls.execution_confirmed(connection, call, state_dir):
+            raise task_calls.CallDeferred('예약 workspace의 이전 호출 종료를 확인할 수 없습니다.')
+    for invocation in invocations:
+        if invocation['execution_finish_evidence']:
+            continue
+        if (invocation['execution_status'] == 'not_executed'
+                and invocation['execution_started_at'] is None and invocation['finished_at']):
+            continue
+        call = next((item for item in calls if item['kind'] == 'agent'
+                     and item['invocation_id'] == invocation['invocation_id']), None)
+        if call is not None and (call['receipt_path'] is not None
+                                 or invocation['execution_started_at'] is None):
+            # The matching call was physically confirmed above. A call
+            # without a receipt proves non-launch only before start.
+            continue
+        stopped = recover(invocation['process_receipt_path'], state_dir) if invocation['process_receipt_path'] else None
+        if (stopped is None or stopped.get('evidence') == 'not_started'
+                and invocation['execution_started_at'] is not None):
+            raise task_calls.CallDeferred('예약 workspace의 Agent 실제 종료를 확인할 수 없습니다.')
 
 
 def target_available(connection, repo, plan_id):

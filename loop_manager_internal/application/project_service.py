@@ -1107,7 +1107,11 @@ class ProjectService:
         if not self._archive_housekeeping_safe():
             return
         from loop_manager_internal.git import manager_git_journal
-        if manager_git_journal.has_pending_project_mutation(self.identity.state_dir, self.state.repo):
+        if manager_git_journal.has_conflicting_project_mutation(
+                self.identity.state_dir, self.state.repo, stage='archive_housekeeping',
+                connection=self.identity.connection, git=getattr(self.effects, 'git', None),
+                worktrees=(self.state.repo_path,),
+                refs=(f'refs/heads/{self.state.base}', f'refs/remotes/origin/{self.state.base}')):
             self.effects.operation_print('Requirement·archive 정리 보류: 기존 Manager Git 작업을 먼저 복구합니다.')
             return
         try:

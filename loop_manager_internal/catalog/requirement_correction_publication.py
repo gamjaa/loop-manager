@@ -59,7 +59,10 @@ class RequirementCorrectionPublisher:
         if not self.safe() or not self.refresh(base) or not self.safe():
             raise CorrectionPending('Requirement 교정의 안전한 처리 경계를 확인할 수 없습니다.')
         from loop_manager_internal.git import manager_git_journal
-        if manager_git_journal.has_pending_project_mutation(self.git.state_dir, self.git.repo):
+        if manager_git_journal.has_conflicting_project_mutation(
+                self.git.state_dir, self.git.repo, stage='requirement_correction', connection=self.connection,
+                git=self.git.effects.git, worktrees=(self.git.repo_path,),
+                refs=(f'refs/heads/{self.base_branch}', f'refs/remotes/origin/{self.base_branch}')):
             raise CorrectionPending('미확정 Manager Git 쓰기를 보존하고 Requirement 교정을 보류합니다.')
         if self.connection.execute("SELECT 1 FROM sqlite_master WHERE name='agent_invocations'").fetchone():
             from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
