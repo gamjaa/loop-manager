@@ -389,6 +389,7 @@ def push_worker_checkpoint_commits(
     accepted = (current.snapshot or {}).get('accepted_work_branch')
     pending = (current.snapshot or {}).get('worker_checkpoint_pending')
     pending_integrated = False
+    pending_retired = False
     if pending is not None:
         valid_oid = lambda value: isinstance(value, str) and re.fullmatch(
             r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', value) is not None
@@ -413,8 +414,21 @@ def push_worker_checkpoint_commits(
                     pending['target'], remote_oid, check=False).returncode == 0:
                 pending_integrated = True
             else:
-                raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
-                                      '미완료 Worker checkpoint와 현재 원격 branch의 관계가 불명확합니다.')
+                if remote_oid is not None and accepted != remote_oid:
+                    return head, 0  # Reconcile the new input before retrying this exact intent.
+                integration = (current.snapshot or {}).get('work_branch_integration') or {}
+                if (integration.get('phase') == 'complete'
+                        and integration.get('remote') == remote_oid
+                        and integration.get('head') == head
+                        and integration.get('branch') == branch
+                        and integration.get('worktree') == str(worktree)):
+                    from loop_manager_internal.agents.scope_contracts import GitSnapshot
+                    original = GitSnapshot.deserialize(integration['before'])
+                    pending_retired = effects.git(worktree, 'merge-base', '--is-ancestor',
+                        pending['target'], original.head, check=False).returncode == 0
+                if not pending_retired:
+                    raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
+                                          '미완료 Worker checkpoint와 현재 원격 branch의 관계가 불명확합니다.')
     recorded_remote = str(plan['publication_remote_oid'] or '') or None
     if remote_oid is None:
         if accepted or recorded_remote or plan['pr_url']:
@@ -440,6 +454,13 @@ def push_worker_checkpoint_commits(
 
 
     validate_pr(pull_request, remote_oid)
+    if pending_retired:
+        snapshot = deepcopy(current.snapshot or {})
+        snapshot.pop('worker_checkpoint_pending')
+        snapshot.setdefault('retired_worker_checkpoints', []).append(
+            {'intent': pending, 'observed_remote': remote_oid, 'confirmed': False})
+        persist(current, snapshot, head=head, remote=remote_oid, values={})
+        return head, 0
     if pending is not None and remote_oid in {pending.get('from'), pending['target']}:
         target_is_local = effects.git(
             worktree, 'merge-base', '--is-ancestor', pending['target'], head, check=False)

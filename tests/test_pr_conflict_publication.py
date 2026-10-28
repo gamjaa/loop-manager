@@ -12,14 +12,14 @@ from tests.support.worker import dummy_worker_sessions
 @isolated_git_test
 class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
-    def test_non_fast_forward_remote_head_pauses_before_worker_or_push(self):
+    def test_related_remote_rewrite_preserves_local_input_before_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
                 state_dir,
                 connection,
                 branch,
-                _worktree,
+                worktree,
                 pr_url,
                 head_oid,
             ) = self._pr_open_state(directory)
@@ -49,7 +49,8 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=pull_request
             ), mock.patch(
-                "loop_manager.run_codex", return_value=(1, loop_manager.USAGE_LIMIT_ERROR_PREFIX + " test pause")
+                "loop_manager.run_codex", return_value=loop_manager.CodexResult(
+                    1, "pause after input recovery", "worker-existing", loop_manager.AgentResultKind.USAGE_LIMIT)
             ) as agent, mock.patch(
                 "loop_manager.git", side_effect=recording_git
             ):
@@ -70,13 +71,13 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
             self.assertNotEqual(external_head, head_oid)
             self.assertEqual(result, 0)
             self.assertNotEqual(stored["phase"], "PROJECT_BLOCKED")
-            self.assertEqual(stored["pr_conflict_recovery"], 0)
+            self.assertEqual(stored["pr_conflict_recovery"], 1)
             self.assertEqual(pushes, [])
-            agent.assert_not_called()
-            recovery = connection.execute(
-                'SELECT disposition, pending_action FROM recovery_records WHERE repo=? AND subject=?',
-                (str(repo), 'G-026')).fetchone()
-            self.assertEqual(tuple(recovery), ('condition_wait', 'pause'))
+            agent.assert_called_once()
+            self.assertEqual((worktree / "src/app.py").read_text(), "VALUE = 2\n")
+            self.assertEqual(git_command(worktree, 'rev-parse', 'HEAD'), head_oid)
+            self.assertEqual(git_command(upstream, 'ls-remote', 'origin',
+                f'refs/heads/{branch}').split()[0], external_head)
 
     @dummy_worker_sessions(fixed_guidance=True)
     def test_lease_competition_reobserves_without_overwriting_remote_head(self):

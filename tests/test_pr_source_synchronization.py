@@ -495,7 +495,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
             synchronize.assert_not_called()
 
     @dummy_worker_sessions
-    def test_non_fast_forward_external_head_is_not_adopted_with_dirty_source(self):
+    def test_related_remote_rewrite_is_adopted_without_changing_dirty_source(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -589,7 +589,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
             self.assertEqual((first, second), (0, 0))
             self.assertEqual(stored["status"], "IMPLEMENTING")
             self.assertEqual(stored["pr_conflict_recovery"], 1)
-            self.assertEqual(stored["pr_conflict_head_oid"], observed_head)
+            self.assertEqual(stored["pr_conflict_head_oid"], external_head)
             project = connection.execute(
                 "SELECT phase FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
@@ -598,7 +598,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
             self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
             self.assertEqual(self._source_checkout_snapshot(repo), source_before)
             self.assertEqual(pushes, [])
-            agent.assert_not_called()
+            self.assertEqual(agent.call_count, 2)
 
 
 class MergedTerminalBoundaryTests(unittest.TestCase):

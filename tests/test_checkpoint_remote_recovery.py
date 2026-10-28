@@ -151,6 +151,42 @@ class ProjectCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.T
 
 @isolated_git_test
 class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.TestCase):
+    def test_synchronize_rewritten_remote_preserves_both_sides_and_dirty_index(self):
+        # Real Git verifies replay and pinned index blobs; policy combinations use mocks.
+        repo, published = self._remote_refresh_fixture()
+        remote = self.user_commit('remote.txt', 'remote input\n', rewrite=True)
+        self.run_git(self.repo, 'fetch', 'origin')
+        self.assertNotEqual(self.run_git(self.repo, 'merge-base', published, remote), published)
+        (self.worktree / 'local.txt').write_text('local commit\n')
+        self.run_git(self.worktree, 'add', 'local.txt')
+        self.run_git(self.worktree, 'commit', '-m', 'Local unique input')
+        (self.repo / 'base-only.txt').write_text('new base input\n')
+        self.run_git(self.repo, 'add', 'base-only.txt')
+        self.run_git(self.repo, 'commit', '-m', 'Advance local base')
+        self.run_git(self.worktree, 'rebase', 'main')
+        self.assertNotEqual(self.run_git(self.worktree, 'merge-base', published, 'HEAD'), published)
+        (self.worktree / 'dirty.txt').write_text('index bytes\n')
+        self.run_git(self.worktree, 'add', 'dirty.txt')
+        (self.worktree / 'dirty.txt').write_text('working bytes\n')
+        (self.worktree / 'binary').write_bytes(b'\0\xffuntracked')
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        effects = loop_manager._checkpoint_recovery_effects_reconcile_published_blocked_checkpoint()
+        self.assertTrue(work_branch_integration.synchronize(
+            effects, self.connection, self.repo, self.state_dir, repo, plan, remote, None))
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(repo, 'G-034')
+        baseline = json.loads(saved.snapshot['work_branch_integration']['baseline'])
+        self.assertEqual(self.run_git(self.worktree, 'show', baseline['index_tree'] + ':dirty.txt'), 'index bytes')
+        self.assertEqual((self.worktree / 'dirty.txt').read_text(), 'working bytes\n')
+        self.assertEqual((self.worktree / 'binary').read_bytes(), b'\0\xffuntracked')
+        self.assertEqual((self.worktree / 'local.txt').read_text(), 'local commit\n')
+        self.assertEqual((self.worktree / 'remote.txt').read_text(), 'remote input\n')
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'checkpoint\n')
+        self.run_git(self.worktree, 'merge-base', '--is-ancestor', remote, 'HEAD')
+        self.assertIsNone(saved.operation)
+        with mock.patch.object(loop_manager, '_journaled_direct_rebase', side_effect=AssertionError('duplicate rebase')):
+            self.assertFalse(work_branch_integration.synchronize(
+                effects, self.connection, self.repo, self.state_dir, repo, plan, remote, None))
+
     def test_dirty_attributes_preserve_raw_bytes_and_integrate_normalized_blobs(self):
         repo, _ = self._remote_refresh_fixture(branch_changed=True)
         raw = {'crlf.txt': b'working\r\n', 'encoded.txt': b'\xff\xfe' + 'working\n'.encode('utf-16-le')}
@@ -388,7 +424,13 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
         self.assertFalse(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir, repo, 'main'))
         self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
-        self.user_commit('code.py', 'local resolution\n')
+        user = Path(self.temporary.name) / 'user'
+        (user / 'code.py').write_text('local resolution\n')
+        self.run_git(user, 'add', 'code.py')
+        old_remote = self.run_git(user, 'rev-parse', 'HEAD')
+        self.run_git(user, 'commit', '--amend', '--no-edit')
+        self.run_git(user, 'push', f'--force-with-lease=refs/heads/loop-manager/G-034:{old_remote}',
+                     'origin', 'HEAD:refs/heads/loop-manager/G-034')
         loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo,
             self.connection.execute('SELECT * FROM projects').fetchone())
         with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
