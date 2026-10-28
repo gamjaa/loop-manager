@@ -206,35 +206,9 @@ class _PlanningGitPorts:
     def validate_planning_release(self, repo: str, worktree: Path | None, *, allow_missing: bool = False) -> None:
         from loop_manager_internal.git import manager_git_journal
         def independent_rebase(intent):
-            if worktree is None or intent['kind'] != 'managed_rebase':
-                return False
-            target = Path(intent['target']).resolve()
-            branch = intent['expected'].get('branch')
-            if (target in {Path(repo).resolve(), worktree.resolve()}
-                    or not branch or intent['owner'] != f"plan:{branch.removeprefix('loop-manager/')}"
-                    or not branch.startswith('loop-manager/G-')
-                    or intent['before'].get('branch') != branch):
-                return False
-            slot = manager_git_journal._slot(self._state_dir, repo, intent['kind'], intent['target'])
-            if (manager_git_journal._read(slot / f"{intent['id']}.intent.json") != intent
-                    or manager_git_journal._read(slot / 'active.json') != intent):
-                return False
-            registrations = self._effects.git(self._repo_path, 'worktree', 'list', '--porcelain', '-z').stdout
-            found = False
-            for record in registrations.split('\0\0'):
-                fields = dict(item.split(' ', 1) for item in record.split('\0') if ' ' in item)
-                path = fields.get('worktree')
-                if not path:
-                    continue
-                registered = Path(path).resolve()
-                ref = fields.get('branch')
-                if ref == f'refs/heads/{branch}' and registered != target:
-                    return False
-                if registered == target:
-                    if not fields.get('HEAD') or ref not in (None, f'refs/heads/{branch}'):
-                        return False
-                    found = True
-            return found
+            return worktree is not None and manager_git_journal.rebase_uses_separate_workspace(
+                self._state_dir, repo, intent, worktrees=(worktree,), git=self._effects.git,
+            )
 
         if manager_git_journal.has_pending_project_mutation(
                 self._state_dir, repo, recoverable=independent_rebase):

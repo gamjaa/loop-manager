@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -438,6 +439,49 @@ if __name__ == '__main__':
 
 
 class PendingProjectMutationTest(unittest.TestCase):
+    def test_rebase_workspace_separation_checks_refs_registration_and_observation_races(self):
+        from types import SimpleNamespace
+        scenarios = ('independent', 'same-worktree', 'same-local-ref', 'same-published-ref',
+                     'duplicate-branch', 'missing-registration', 'registration-failed',
+                     'changed-active', 'changed-immutable', 'replaced-during-observation')
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                repo, target, requested = state / 'repo', state / 'other', state / 'planning'
+                branch = 'loop-manager/G-165'
+                identity = journal.begin_rebase(state, owner='plan:G-165', repo=str(repo),
+                    target=str(target), before={'head': OLD, 'branch': branch},
+                    expected={'branch': branch})
+                slot = journal._slot(state, str(repo), 'managed_rebase', str(target))
+                intent = journal._read(slot / 'active.json')
+                if scenario == 'changed-active':
+                    (slot / 'active.json').write_text(json.dumps(dict(intent, id='d' * 32)))
+                if scenario == 'changed-immutable':
+                    saved = dict(intent, owner='plan:G-999')
+                    (slot / f'{identity}.intent.json').write_text(json.dumps(saved))
+                preserved = {path.name: path.read_bytes() for path in slot.iterdir()}
+
+                def git(repository, *arguments):
+                    self.assertEqual(repository, repo)
+                    self.assertEqual(arguments, ('worktree', 'list', '--porcelain', '-z'))
+                    if scenario == 'replaced-during-observation':
+                        replacement = dict(intent, id='c' * 32)
+                        (slot / 'active.json').write_text(json.dumps(replacement))
+                        preserved['active.json'] = (slot / 'active.json').read_bytes()
+                    output = f'worktree {target}\0HEAD {OLD}\0detached\0\0'
+                    if scenario == 'duplicate-branch':
+                        output += f'worktree {requested}\0HEAD {OLD}\0branch refs/heads/{branch}\0\0'
+                    return SimpleNamespace(returncode=int(scenario == 'registration-failed'),
+                        stdout='' if scenario == 'missing-registration' else output)
+
+                refs = ((f'refs/heads/{branch}',) if scenario == 'same-local-ref' else
+                        (f'refs/remotes/origin/{branch}',) if scenario == 'same-published-ref' else ())
+                result = journal.rebase_uses_separate_workspace(state, str(repo), intent,
+                    worktrees=(target if scenario == 'same-worktree' else requested,),
+                    refs=refs, git=git)
+                self.assertEqual(result, scenario == 'independent')
+                self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
+
     def test_optional_source_intents_preserve_evidence_without_gating_remote_planning(self):
         for kind in ('source_fast_forward', 'source_rebase'):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:

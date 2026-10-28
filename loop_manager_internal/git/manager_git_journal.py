@@ -702,6 +702,58 @@ def _slot(state_dir: Path, repo: str, kind: str, target: str) -> Path:
     return state_dir / "manager-git-journal" / digest
 
 
+def rebase_uses_separate_workspace(
+    state_dir: Path, repo: str, intent: Mapping[str, Any], *,
+    worktrees: Sequence[Path], git: Callable[..., Any], refs: Sequence[str] = (),
+) -> bool:
+    """Check the saved rebase's resource separation, without accepting its effects.
+
+    This is the planning release's resource proof, not writer termination or a
+    lease grant. Consumers must retain their own writer, ownership and safety
+    gates. In particular, paths alone cannot authorize another Git mutation.
+    """
+    if intent.get('repo') != repo or intent.get('kind') != 'managed_rebase' or not worktrees:
+        return False
+    target = Path(intent['target']).resolve()
+    branch = intent['expected'].get('branch')
+    if (target in {Path(repo).resolve(), *(path.resolve() for path in worktrees)}
+            or not branch or not branch.startswith('loop-manager/G-')
+            or intent['owner'] != f"plan:{branch.removeprefix('loop-manager/')}"
+            or intent['before'].get('branch') != branch
+            or f'refs/heads/{branch}' in refs
+            or f'refs/remotes/origin/{branch}' in refs
+            or re.fullmatch(r'[0-9a-f]{32}', intent['id']) is None):
+        return False
+    slot = _slot(state_dir, repo, intent['kind'], intent['target'])
+
+    def unchanged():
+        return (_read(slot / f"{intent['id']}.intent.json") == intent
+                and _read(slot / 'active.json') == intent)
+
+    if not unchanged():
+        return False
+    registration = git(Path(repo), 'worktree', 'list', '--porcelain', '-z')
+    if registration.returncode:
+        return False
+    found = False
+    for record in registration.stdout.split('\0\0'):
+        fields = dict(item.split(' ', 1) for item in record.split('\0') if ' ' in item)
+        path = fields.get('worktree')
+        if not path:
+            continue
+        registered = Path(path).resolve()
+        ref = fields.get('branch')
+        if ref == f'refs/heads/{branch}' and registered != target:
+            return False
+        if registered == target:
+            if not fields.get('HEAD') or ref not in (None, f'refs/heads/{branch}'):
+                return False
+            found = True
+    # Git observation may yield to another operation. Never reuse an intent
+    # which changed or was replaced while the registration was being read.
+    return found and unchanged()
+
+
 def has_pending_project_mutation(state_dir: Path, repo: str, *, recoverable=None, targets=None) -> bool:
     """Unsealed managed-work intents block release; source sync is independent."""
     root = state_dir / "manager-git-journal"

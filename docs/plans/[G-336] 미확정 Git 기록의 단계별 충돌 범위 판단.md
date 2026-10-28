@@ -43,7 +43,9 @@ priority: high
 ## Progress
 
 - [x] `993b7dfd` → `9dd75b5d` delta와 현재 helper의 모든 호출자·직접 planning 회귀를 정적으로 대조했다. planning의 국소 구현과 나머지 소비자/공유 안전의 미충족을 구분했으며 실행 검증은 하지 않았다.
-- [ ] 공통 자원/증거 판정과 소비자 연결
+- [x] 보존점 1: planning의 별도 rebase 자원 증거 판정을 `manager_git_journal.rebase_uses_separate_workspace()`로 추출하고 planning 해제에서 재사용한다. 단계별 worktree·local/published ref 입력을 비교하며 active·불변 intent를 Git 등록 관측 전후에 재확인한다. 이는 자원 분리 근거만이며 writer 종료·lease·공유 설정 안전이나 다른 소비자의 진행 허가를 대신하지 않는다.
+- [ ] 공통 자원/증거 판정과 소비자 연결: writer 종료·현재 소유권·lease·공유 설정·단계별 사용 자원과 구조화된 원인/다음 조건을 연결하고, 교정·archive·수동 준비/slot/release의 기존 gate를 보존한 채 적용한다. 이 보존점에서는 이 다섯 소비자의 pending 정책을 변경하지 않았다.
+- [x] 보존점 1 targeted: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_manager_git_journal.PendingProjectMutationTest tests.test_planning_publication.PlanningPublicationTest.test_publication_release_scopes_pending_rebase_on_first_publish_and_recovery`를 실행했다. 첫 실행은 새 테스트의 active 교체 fixture가 손상 JSON을 사용해 오류 1건이었고, 유효한 다른 intent fixture로 수정 후 같은 명령의 5개 테스트가 통과했다. 독립/충돌 ref·worktree·등록 실패·intent 경쟁과 journal bytes 보존, 실제 최초 게시/복구 해제 및 Agent 무호출을 확인했다. 전체 verify는 실행하지 않았다.
 - [ ] 허용·거부·보존 및 후속 단계 도달의 최소 회귀·문서 정합성
 
 ## Decision Log
