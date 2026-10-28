@@ -33,7 +33,7 @@ class DatabaseAccessTests(unittest.TestCase):
         with self.connection:
             self.connection.execute('CREATE TABLE exec_plans(repo TEXT, plan_id TEXT, branch TEXT, catalog_generation INTEGER)')
             self.connection.execute("INSERT INTO exec_plans VALUES ('repo', 'G-001', 'topic', 7)")
-        snapshot = MutableReadySnapshot('repo', 'base', (SimpleNamespace(plan_id='G-001'),), 'token')
+        snapshot = MutableReadySnapshot('repo', 'base', (SimpleNamespace(plan_id='G-001', execution_state=None),), 'token')
         entered, updated = threading.Event(), threading.Event()
         errors = []
         def other_request():

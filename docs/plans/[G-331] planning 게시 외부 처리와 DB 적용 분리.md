@@ -74,6 +74,8 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 4는 `pl
 
 - 결과 보고 교정: 이전 호출의 targeted JSONL에서 63개 ID의 최신 `test_end`가 모두 `success`이고, Manager verify 피드백의 60개 ID 전부가 포함됨을 다시 확인했다. Worker 결과 검증은 `TARGETED_TESTS`의 과거 이력 표현을 현재 실패 선언으로 해석했다. 구현·검증 규칙은 변경하지 않고 최종 결과 필드를 확인된 최신 상태로 명확히 보고한다. 이 호출은 기록 재확인과 보고 교정만 수행하므로 테스트를 중복 실행하지 않았다.
 
+- Manager verify `7f36d69de4c047c9bba6c134be333390990cb6a0c55ac35e4151d66d83938348` occurrence 1 / revision 1의 PR 관측 접근 해제 fixture에 `execution_state=None`을 명시했다. 실제 snapshot의 선택적 실행 identity 필드를 제공하며 준비 helper의 검사를 우회하지 않는다. 해당 개별 targeted test는 PASS였고 PR 대기 중 transaction·공통 접근 소유 부재와 독립 SQLite 연결의 쓰기 완료 assertion을 모두 유지했다. 전체 verify는 Manager에 맡긴다.
+
 ## Decision Log
 
 - complexity high: 일반/유지보수의 게시·정리·원격 관측과 원자 batch를 분리하면서 중단 위치별 재개를 보존해야 한다. risk high: 잘못된 확정은 미게시/변경된 계획을 등록하거나 작업을 조기 재개할 수 있다. intent·실제 원격 결과·generation을 보존하고 CAS/rollback으로 낡은 적용을 거부한다. 최초 level은 5다.
