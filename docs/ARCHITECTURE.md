@@ -427,7 +427,7 @@ Planner의 최초 계획 수립·명세 변경·draft 사용자 답변·추적 �
 
 PR 상태 동기화 뒤 마지막 연결 ExecPlan이 실제 MERGED가 된 활성 Requirement는 유효한 source 관계·관련 draft·현재 입력을 확인해 완료 재확인 대상으로 삼는다. 다른 Requirement의 READY·Open PR·완료나 프로젝트 전체 종료를 기다리지 않으며 독립된 새 작업·유지보수 cycle 선택 전에 처리한다.
 
-각 Acceptance Criterion을 최신 관련 명세·구현·테스트·실제 검증에 대조해 충족은 판단 기록·원문 archive, 미충족은 후속 ExecPlan, 필수 사용자 결정은 draft, 불확실은 보류로 반영한다. 같은 입력의 유효한 판단은 재사용하고 archive 게시·catalog·DB 적용은 기존 소유권·publication transaction·원격 재확인 경계를 유지한다.
+각 Acceptance Criterion을 최신 관련 명세·구현·테스트·실제 검증에 대조해 충족은 판단 기록·원문 archive, 미충족은 후속 ExecPlan, 필수 사용자 결정은 draft, 불확실은 보류로 반영한다. 같은 입력의 유효한 판단은 재사용하고 archive 게시·catalog·DB 적용은 기존 소유권·publication transaction·원격 재확인 경계를 유지한다. 대상 관측 중 판단 무효화와 불확실 기록은 각각 짧은 DB transaction에서 저장해 후속 Git 관측·관리 배정 대기까지 쓰기 잠금을 유지하지 않는다.
 
 ### 프로젝트 최종 확인과 완료 판정
 
