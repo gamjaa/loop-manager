@@ -1084,13 +1084,9 @@ class RuntimeStateRepository:
             raise RuntimeStateError('rebase recovery checkpoint changed before release')
         saved = current_checkpoint.snapshot or {}
         prior_release = saved.get('rebase_block_release') or {}
-        # Old metadata releases ran before catalog checks were deferred until after rebase.
-        legacy_metadata_release = (block['reason_code'] == 'plan_input_invalid'
-                                   and saved.get('rebase_block_release_policy') != 'deferred_metadata')
         if (decision.status is RebaseStatus.WAITING
                 and prior_release.get('reason_code') == block['reason_code']
-                and saved.get('rebase_block_release_state') == observed.fingerprint
-                and not legacy_metadata_release):
+                and saved.get('rebase_block_release_state') == observed.fingerprint):
             raise RuntimeStateError('unchanged pending rebase recovery was already resumed')
         def check_owner():
             project = project_row(self.connection, repo)
@@ -1149,7 +1145,6 @@ class RuntimeStateRepository:
                     snapshot={**(current_checkpoint.snapshot or {}),
                               'rebase_block_release': dict(block),
                               'rebase_block_release_state': observed.fingerprint,
-                              'rebase_block_release_policy': 'deferred_metadata',
                               'rebase_block_recovery_audit': [
                                   *(current_checkpoint.snapshot or {}).get('rebase_block_recovery_audit', ()),
                                   {'block': dict(block), 'prior_agent_recovery': expected_plan['agent_recovery'],

@@ -1116,7 +1116,7 @@ rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업�
 
 차단 계획의 원본 base 반영에서는 workspace identity·원격 lease·index·작업물 보존을 확인한 뒤 고정 target의 rebase와 중간 게시를 완료한다. 더 최신 base를 반영해야 하면 저장 target을 먼저 끝내고 후속 base까지 반영한 뒤 현재 계획 행으로 catalog metadata 전체 일치를 검사한다. 최종 불일치는 원래 차단 원인 평가·해제와 후속 자료 게시로 넘기지 않는다.
 
-execution checkpoint의 `rebase_block_release_policy=deferred_metadata`는 선언 전체 검사를 rebase 완료 뒤로 유예하는 정책에서 재개했음을 나타낸다. 이 정책으로 재개한 기록이 없는 과거 `plan_input_invalid` 차단은 현재 소유권·원격·실행 자리·dependency를 재검증한 뒤 같은 Git 상태에서도 한 번 재개할 수 있다. 재개 시 정책과 관측 fingerprint를 함께 저장하며, 이후 같은 원인·상태의 반복 재개는 거부한다. 다른 차단 원인의 중복 방지와 완료 후 선언·범위 검사는 유지한다.
+metadata 차단의 재평가 계기는 ExecPlan 등 원인 관련 입력 변경 또는 명시적인 차단 해제·재개 요청이다. 현재 소유권·원격·실행 자리·dependency와 checkpoint generation을 다시 확인하며, 자동 재평가에서 동일 원인과 `rebase_block_release_state`의 관측 fingerprint가 그대로면 반복 재개를 거부한다. 과거 `rebase_block_release_policy` 값은 기존 감사 자료로 보존하되 재개 판단에 사용하지 않고 새 기록에도 추가하지 않는다. 코드·검사 정책 변경이나 이 필드의 부재는 재개 계기가 아니다. 완료 후 선언·범위 검사는 유지하며 명시적 요청도 현재 안전 검사를 생략하지 않는다.
 
 rebase target은 바꾸지 않으며 원격 재전진은 기존 operation 완료 후 반영한다. 문서 전용 충돌은 Manager가 continue/skip하고 혼합 충돌의 나머지 파일과 autostash 충돌은 기존 Worker 교정 경계에 남긴다. 문서 Progress는 현재 후보의 실행·검증 성공 증거가 아니며 완료 후의 입력 재평가·verify·Review·게시 gate는 유지한다
 
