@@ -112,6 +112,10 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
             output = self.final_head
         elif args[:2] == ('rev-parse', '--git-path'):
             code = 1
+        elif args == ('merge-base', 'base', 'HEAD'):
+            output = 'base'
+        elif args == ('diff', '--no-ext-diff', '--name-status', '-z', '--find-renames', 'base'):
+            output = ''
         elif args[0] == 'rev-parse':
             output = 'base'
         elif args[0] == 'symbolic-ref':

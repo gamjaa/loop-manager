@@ -420,7 +420,7 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
                 return SimpleNamespace(stdout='', returncode=0)
             if args[:2] == ('diff', '--cached'):
                 return SimpleNamespace(stdout='', returncode=0)
-            if args[0] == 'merge-base':
+            if args[0] == 'merge-base' and '--is-ancestor' in args:
                 return SimpleNamespace(stdout='', returncode=0)
             if args == ('rev-parse', 'HEAD'):
                 return SimpleNamespace(stdout='owned-head\n', returncode=0)
