@@ -65,7 +65,7 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 
 ## 공식 호출 구성 조사와 중간 구현
 
-현재 구현은 설정 source 제외와 역할별 native 요청 정책 생성기까지 반영한 중간 후보이며, 관리 Claude 호출의 provider 단위 안전 거부는 유지한다. 역할별 전체 쓰기 경계·유효 정책 확인·호출 증거 연결을 완료했다고 선언하지 않는다.
+현재 구현은 설정 source 제외·역할별 native 요청 정책 생성기·독립 시작 확인 helper까지 반영한 중간 후보이며, 관리 Claude 호출의 provider 단위 안전 거부는 유지한다. 역할별 전체 쓰기 경계·유효 정책 확인·호출 증거 연결을 완료했다고 선언하지 않는다.
 
 2026-10-13 Worker의 공식 문서·changelog v2.1.296 조사에서는 managed 설정이 실행별 sandbox 설정을 대체할 수 있고 서버 갱신을 ConfigChange hook으로 사전 차단할 수 없다는 제약을 기록했다. 이는 문서 조사이며 실호출 관측이 아니다. 당시 별도 OS 경계 또는 구현 보류 판단이 필요하다고 기록했지만, 2026-10-16에 반영된 최신 R-023은 실행 중 managed 변경 대응을 현재 범위에서 제외했다. 따라서 그 조사 제약을 현재 구현의 판단 대기나 외부 격리 도입 조건으로 사용하지 않는다. 사용자 결정을 새로 작성하지 않으며 기존 Decision Log의 경위를 보존한다.
 
@@ -73,7 +73,7 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 
 | 공식 근거 | 현재 구현에 적용할 계약 |
 |---|---|
-| [Sandbox 설정](https://code.claude.com/docs/en/sandboxing#configure-sandboxing)·[CLI 옵션](https://code.claude.com/docs/en/cli-reference) | 빈 배열은 상속된 배열을 지우지 않는다. `--setting-sources`의 빈 문자열은 user/project/local source를 제외하며, 제외 source의 sandbox filesystem·Edit 권한을 sandbox 구성에서도 제외하는 계약은 v2.1.246 이상이다. 이 버전 조건의 시작 전 확인은 아직 구현하지 않았다. |
+| [Sandbox 설정](https://code.claude.com/docs/en/sandboxing#configure-sandboxing)·[CLI 옵션](https://code.claude.com/docs/en/cli-reference) | 빈 배열은 상속된 배열을 지우지 않는다. `--setting-sources`의 빈 문자열은 user/project/local source를 제외하며, 제외 source의 sandbox filesystem·Edit 권한을 sandbox 구성에서도 제외하는 계약은 v2.1.246 이상이다. 시작 확인 helper는 v2.1.307 이상을 검사한다. 이는 excluded-source 병합과 nonempty objects/refs 정리 보정을 포함하는 기준이며 관리 실행 연결은 아직 미완료다. |
 | [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit) | Edit·Write·NotebookEdit의 경로별 제한은 `Edit(path)`를 사용한다. 파일 권한의 `//절대경로`와 sandbox의 `/절대경로`를 구분하고 임의 subprocess에는 sandbox를 적용해야 한다. |
 | [CLI의 restricted 구성](https://code.claude.com/docs/en/cli-reference) | v2.1.248 이상의 `--restricted`는 파일 도구를 working directories에 한정하고 managed·실행별 설정만 로드한다. 명령 도구는 기본 제거되지만 `--tools`에 개별 이름을 명시해 사용할 수 있으므로 파일 도구의 workspace 밖 쓰기 거부를 구성할 native 후보로 남긴다. 요청 정책 생성기에 적용하고 단위 검증했지만 관리 호출에는 아직 연결하지 않았다. Bash sandbox·Git·임시 경로 보호를 대체하지 않는다. |
 | [설정 우선순위](https://code.claude.com/docs/en/settings#settings-precedence)·[permission mode](https://code.claude.com/docs/en/permission-modes) | 실행별 설정과 source 제외로 managed 설정까지 제거되지 않는다. 시작 정책 충돌은 별도 확인해야 하며 `auto`를 `acceptEdits`나 sandbox 명령 일괄 승인으로 대체하지 않는다. |
@@ -84,11 +84,22 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 
 2026-10-29 후속 호출은 Manager가 게시한 복구점 2f794f630c61991144dbc06056bef0bbb6ec9237에서 이어서 `agent_claude_policy.policy_arguments`를 구현했다. canonical source·다른 worktree·shared/worktree Git과 `.git` pointer를 `Edit`의 정확 경로·하위 경로 거부 및 sandbox `denyWrite`에 함께 넣는다. Reviewer는 모든 파일 편집 도구와 workspace의 명령 쓰기를 거부하면서 읽기·Bash 조사와 호출 소유 임시 쓰기 요청은 유지한다. restricted working directories는 workspace와 호출별 임시 경로로 한정하고, `auto`·`classifyAllShell=true`·strict sandbox·socket 및 namespace 확대 금지를 명시한다. 시스템 기본 per-user 임시 경로는 거부하며 Fast 요청도 보존한다.
 
-시작 시 해석한 managed 정책을 입력받는 생성기는 상속된 추가 디렉터리·범위 밖 allowWrite·명령 승인 규칙·자동 검토 비활성화·격리 밖 예외·환경·확장·hook 충돌과 잘못된 JSON 타입을 거부한다. 빈 배열로 상속 배열을 지웠다고 판단하지 않는다. 경로 중첩·symlink alias·플랫폼별 해석이 달라질 수 있는 glob 문자가 들어간 root는 모호한 권한 대신 오류를 반환한다. native Windows는 POSIX 전용 경로 처리 전에 거부한다. 아직 호출자가 managed 설정을 실제 수집하거나 이 생성기를 관리 실행에 연결하지 않았으므로 요청 설정과 유효 설정·실제 적용 성공을 구분한다.
+시작 시 해석한 managed 정책을 입력받는 생성기는 상속된 추가 디렉터리·범위 밖 allowWrite·명령 승인 규칙·자동 검토 비활성화·격리 밖 예외·환경·확장·hook 충돌과 잘못된 JSON 타입을 거부한다. 빈 배열로 상속 배열을 지웠다고 판단하지 않는다. 경로 중첩·symlink alias·플랫폼별 해석이 달라질 수 있는 glob 문자가 들어간 root는 모호한 권한 대신 오류를 반환한다. native Windows는 POSIX 전용 경로 처리 전에 거부한다. 시작 source 수집·확인 helper는 다음 단계에서 구현했으나 관리 실행에 연결하기 전이므로 요청 설정과 시작 입력 관측·실제 적용 성공을 구분한다.
 
 새 `tests/test_claude_policy.py`의 9개 unit case로 두 도구 경계의 보호 경로, Reviewer 읽기·쓰기 분리, 자동 검토·strict sandbox·기본 임시 경로 거부, 상속 충돌·타입·경로 중첩·symlink·Windows 거부를 검증했다. 테스트는 Agent·subprocess·보호 파일 쓰기 probe를 실행하지 않으며 설정 생성·거부 로직만 확인한다. Linux에서 실행했고 Windows case도 플랫폼 모의 결과이며 native Windows 실행 성공이 아니다. 기존 세 회귀의 앞선 복구점 성공과 현재 생성기의 단위 검증을 구분한다.
 
-다음 구현은 CLI·모델·계정 지원과 시작 managed source·우선순위·병합을 확인하는 preflight, 호출별 소유 임시 디렉터리 준비, 신규·재개·fallback의 정책·증거 영속화 및 실행 직전 재검사·실제 오류 보존 연결이다. 생성기 검증만으로 관리 호출을 허용하지 않는다. 기존 필수 검증과 미완료 Progress 항목은 유지하며 native 요청 정책 생성 단위의 중간 checkpoint를 요청한다.
+복구점 c99603ba78143ec20fea677c1ebd684793590355 이후에는 `agent_claude_preflight`에서 source 수집·CLI 시작 확인·재검사 단위를 구현했다. managed 파일과 이름순 JSON drop-in을 병합하고 remote·MDM·파일의 first-wins/merge 순위, 최고 source의 defaultMode, 하위 admin source의 env·filesystem 비활성화·sandbox 실행 파일 override를 구분한다. 개인·project·local 설정은 실행 입력에서 제외하며 끊어진 링크·잘못된 JSON·비일반 파일·읽기 실패를 부재로 처리하지 않는다. source 경로·resolved 경로·내용 지문과 비밀값 없는 환경 경로만 관측하고 원문·인증값은 결과에 넣지 않는다. macOS는 MDM domain 조회·해석 실패와 부재를 구분한다. WSL의 Windows 정책 상속은 아직 해석하지 않아 해당 환경의 시작 확인에서 구체적으로 거부한다.
+
+이 helper는 보호 경로와 겹치지 않는 비공개 runtime·호출별 임시 경로를 준비하고 CLI v2.1.307 이상·필수 native 옵션·인증 상태와 공통 홈·읽기 전용 doctor 진단을 확인한다. 인증·doctor 조회에도 restricted·source 제외·MCP 제한을 전달하며 doctor 뒤 새 remote source와 정책 충돌을 다시 확인한다. `assert_current`는 역할·workspace·repository·임시 경로·소유 권한·설정 지문·CLI를 재확인하고 삭제된 경로를 재생성하지 않는다. 다른 worktree 목록의 정상 변화나 Git snapshot 비교는 접근 위반으로 사용하지 않는다. 반환 자료에는 문서 기반 요청 정책과 `runtime_enforcement=not_observed`, 실제 호출에서 확인해야 할 auto mode 지원을 명시한다. 모델·계정의 auto 지원 확인·invocation 증거 저장·관리 프로세스 실행 연결은 아직 미완료이며 이 helper 결과만으로 호출을 허용하지 않는다.
+
+현재 최종 helper와 `tests/test_claude_preflight.py`의 18개 targeted unit case를 프로젝트 Python·Manager targeted runner로 실행해 통과했다. source 순위·배열 병합·숨겨진 cross-source 충돌·오류 보존·인증 홈·호출별 임시 격리·CLI/설정 재검사·비밀값 제외와 MDM/WSL의 모의 진단을 확인했다. 비일반 파일 회귀를 추가하는 과정에서 `fdopen`이 파일 종류 검사보다 먼저 실패하고 descriptor가 남을 수 있음을 확인해 검사 순서와 finally 닫기를 수정했다. 최초 실패 명령과 수정 뒤 동일 재실행은 다음과 같고, 동일 case 재실행 및 이후 최종 모듈 18개가 모두 통과했다.
+
+```sh
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_claude_preflight.ClaudePreflightTests.test_broken_links_bad_json_nonobjects_and_dropin_read_errors_are_not_absence
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_claude_preflight.ClaudePreflightTests.test_broken_links_bad_json_nonobjects_and_dropin_read_errors_are_not_absence
+```
+
+CLI·인증·doctor·MDM은 test double이며 실제 Claude·계정·OS 정책 적용·모델 호출과 전체 verify는 실행하지 않았다. 이 검증을 실제 격리 성공으로 기록하지 않는다. 다음 구현은 모델·계정 auto 지원의 실제 시작 메시지 확인, 신규·재개·fallback의 prepared 증거 영속화·실행 직전 재검사·실제 오류 보존·프로세스 receipt/targeted 전달 연결이다. 기존 provider 거부·필수 검증·미완료 Progress를 유지하고 시작 확인 helper 단위의 중간 checkpoint를 요청한다.
 
 ## Decision Log
 
