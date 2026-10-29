@@ -64,6 +64,13 @@ class CatalogSchedulingObservationTest(unittest.TestCase):
                 port.head = port.remote = revisions[repo_path]
                 port.fingerprint = "changed-input" if repo_path == blocked else "fingerprint"
                 port.specification_fingerprints[port.remote] = "changed-spec" if repo_path == blocked else "specification"
+                def run_bytes(_repo, *args):
+                    if args[:4] == ("ls-tree", "-rz", "--full-tree", port.remote):
+                        return b"100644 blob product\tdocs/PRODUCT.md\0"
+                    if args == ("cat-file", "blob", "product"):
+                        return (repo_path / "docs/PRODUCT.md").read_bytes()
+                    raise AssertionError(f"unexpected planning Git observation: {args}")
+                port.run_bytes = run_bytes
                 return port
             def agent_port(*_args):
                 agent = FakeAgentPort()
@@ -80,11 +87,28 @@ class CatalogSchedulingObservationTest(unittest.TestCase):
                 return SimpleNamespace(repo=repo, repo_path=repo_path, state_dir=state_dir,
                     fetch_remote_base=lambda _base: revisions[repo_path],
                     _manifest=lambda _revision: {path: ("100644", "blob", path) for path in documents},
-                    effects=SimpleNamespace(git_bytes=lambda _repo, _command, _kind, oid: documents[oid]))
+                    effects=SimpleNamespace(
+                        git_bytes=lambda _repo, _command, _kind, oid: documents[oid],
+                        git=lambda _repo, *args: (
+                            SimpleNamespace(stdout=revisions[repo_path] + "\n", returncode=0)
+                            if args == ("rev-list", "--first-parent", "--reverse", revisions[repo_path])
+                            else (_ for _ in ()).throw(AssertionError(f"unexpected archive Git observation: {args}"))
+                        ),
+                    ))
             def agent(_worktree, _state, _config, role_name, _prompt, **_kwargs):
                 roles.append(role_name)
                 return loop_manager.CodexResult(1, "stop", "worker-session")
             config = loop_manager.ManagedConfig(path=root / "unused.ini", max_workers=2, telegram_token="", telegram_chat_id="")
+            def observed_git(repo, *args, **kwargs):
+                if args[:3] == ("show-ref", "--verify", "--quiet"):
+                    return SimpleNamespace(stdout="", returncode=1)
+                return SimpleNamespace(stdout=revisions[Path(repo)], returncode=0)
+            def unexpected_process(*_args, **_kwargs):
+                import traceback
+                raise AssertionError("unexpected subprocess: " + " > ".join(
+                    f"{frame.name}:{frame.lineno}" for frame in traceback.extract_stack()[-9:-1]
+                ))
+            _popen.side_effect = unexpected_process
             with ExitStack() as stack:
                 stack.enter_context(mock.patch.object(loop_manager, "validate_repository", side_effect=lambda path, **kw: Path(path).resolve()))
                 stack.enter_context(mock.patch.object(loop_manager, "remote_base", return_value="main"))
@@ -92,7 +116,7 @@ class CatalogSchedulingObservationTest(unittest.TestCase):
                 stack.enter_context(mock.patch.object(loop_manager, "_ExecPlanArchiveGitPort", side_effect=archive_port))
                 stack.enter_context(mock.patch.object(loop_manager, "_recorded_base_fetch"))
                 stack.enter_context(mock.patch.object(loop_manager, "ensure_safe_base_worktree"))
-                stack.enter_context(mock.patch.object(loop_manager, "git", side_effect=lambda repo, *args, **kw: SimpleNamespace(stdout=revisions[Path(repo)], returncode=0)))
+                stack.enter_context(mock.patch.object(loop_manager, "git", side_effect=observed_git))
                 stack.enter_context(mock.patch.object(loop_manager, "_GitCatalogDefinitionPort", side_effect=definition))
                 stack.enter_context(mock.patch.object(loop_manager, "_PlanningGitPorts", side_effect=git_port))
                 stack.enter_context(mock.patch.object(loop_manager, "_PlanningAgentPorts", side_effect=agent_port))
