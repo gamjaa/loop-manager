@@ -8,6 +8,7 @@ sources:
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
   - docs/requirements/[R-066] Agent CLI 지침의 독립성.md
   - docs/requirements/[R-085] Codex·Claude 인증 전용 자동 실행 환경.md
+  - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
 depends_on:
   - G-182
   - G-147
@@ -57,6 +58,7 @@ priority: high
 - 다른 계획/작업의 PASS·교정 이력·승인을 복제하지 않는다. 생략 이유와 원래 근거를 남기며 실제 Reviewer가 실행되면 기존 읽기 전용·검증 결과 전달·issue 교정 계약을 유지한다.
 - G-241의 일반 verify 재사용은 최신 R-072의 목록·저장소 코드/테스트/fixture·의존성 선언·검증 스크립트/선언과 선택 진입점의 bytes·경로·kind·mode 및 누락 확인으로 판단한다. 설치 도구·환경변수·사용자/시스템 설정·외부 동적 입력·Git revision 값의 동일성이나 `runtime_identity` 증명을 verify의 선행 조건으로 요구하지 않는다. 이 제외를 실제 Reviewer의 환경·정책 비교로 확대하지 않는다. R-082의 선행 Review PASS·VERIFY_REQUIRED와 과거 verify 참고 출력은 최종 승인 receipt가 아니며, 검증 보완 이후에도 문서 선행 결과 자체를 재사용·게시 근거로 승격하지 않는다. R-086의 일반 선행 결과는 별도 증거이며 해당 전체 검증·최종 승인 gate를 통과한 기록만 마지막 최종 승인으로 읽을 수 있다.
 - R-085의 실제 Reviewer 실행 환경과 소비하는 설정·정책 입력이 같다는 근거를 확인한다. 인증 원본의 사용하지 않는 개인 config 변경은 재사용 입력이 아니며, 관리 home/source 선택·유효 정책 변경 또는 과거 환경의 입력 부재는 새 Review로 연결한다. 인증값을 지문·receipt·로그에 넣거나 현재 환경을 과거 승인 당시의 환경으로 소급 채택하지 않는다.
+- R-023의 Claude `prepared`는 문서 기반 시작 구성이고 실제 OS 격리 성공이나 Review 입력 동일성의 `verified` 증거가 아니다. 현재 `provider_execution.observe()`가 Claude에 반환하는 `None`은 비교 불가로 소비해 필요한 실제 Review를 수행한다. `prepared`를 `verified`로 승격하거나 이 재사용 작업에서 Claude native proof·실계정 probe를 새로 만들지 않는다. 이는 지원 호출의 정상 실행이나 개발 완료를 거부하는 조건이 아니며 기존 Codex 증거 비교와 verify 코드 입력 재사용을 유지한다.
 
 ## Implementation
 
@@ -65,6 +67,7 @@ priority: high
 - [ ] 직접 구현된 `agents/common_guidance.py:runtime_content_hash()`·`plan_content_hash()`와 invocation ledger의 실제 전달 해시를 재사용한다. 현재 전체 원본 해시와 승인 당시 실제 Reviewer instruction을 별도로 보존·비교하며 common 본문만으로 역할·Ponytail 변경을 누락하지 않는다. 과거 JSON·Markdown snapshot과 `common_guidance_versions`는 감사로만 보존하고 그 누락·손상을 현재 호출의 거부 조건으로 되살리지 않는다. 승인 당시 입력 근거가 부족하거나 실제 외부 검토 기준을 확인할 수 없으면 새 Review를 선택하며 과거 증거를 현재 값으로 합성하지 않는다. 문서 source fallback/예약어 규칙 버전과 G-171의 최종 문서 diff 보고는 유지한다.
 - [ ] 실제 Reviewer 호출에는 G-197의 최종 후보 검증 근거 전달 경계를 재사용한다. verify 성공을 재사용했으면 원래 성공 근거와 현재 입력의 동일성 확인을 전달하고, 새 verify를 실행한 것으로 보고하지 않는다.
 - [ ] G-262의 준비된 실행 환경·실제 설정 관측과 G-263/G-264의 provider별 공통 홈/소비 source, G-317의 native 지침 해석·최종 설정 동일성 근거를 사용한다. 역할별 임시 경로와 공통 홈을 구분하고 실제 현재 설정 생성·교체 및 최종 검사 뒤 변경을 같은 비밀값 없는 환경/정책 identity에 반영한다. 지침 해석 완료 뒤 증거 갱신 전 설정 변경으로 현재 관측이 거부되면 과거 승인과 동일하다고 대용하지 않는다. provider 경계의 검사 자체는 선행 구현을 소비하며 사용하지 않는 과거 runtime config·개인 config를 조회·복원하거나 인증 cache를 추가하지 않는다. 과거 환경의 증거 부재나 확인 불가를 동일성으로 대용하지 않는다.
+- [ ] 확인한 `agents/provider_execution.py:observe()`·`execution_identity()`와 `tests/test_claude_managed_runtime.py:ClaudePreparedEvidenceTests`의 준비/검증 구분을 Review·publication 소비자에 유지한다. G-264가 R-085에 맞춘 실제 소비 source를 재사용하되, Claude에 재사용 증거가 없는 현재 분기는 새 Review로 처리하고 실패·부분 결과를 승인으로 만들지 않는다. provider 지원·시작 source·정책 생성기를 재구현하지 않는다.
 - [ ] 자동 역할·권한·검증은 매 호출 현재 선택 runtime의 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md instruction을 사용하고, 설계·계획 작성은 docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 프로젝트 지침 해석은 Agent CLI에 맡기며 Manager가 루트 지침을 읽거나 과거 승인·patch를 Review receipt에 추가하지 않는다. 기존 helper·관련 테스트와 R-064의 예약 경로를 유지한다.
 
 ## Validation
@@ -78,7 +81,8 @@ priority: high
 - 실제 Review가 필요한 경우 실행한 verify 또는 재사용한 verify의 유효한 근거가 같은 후보에 결합돼 전달되는지 확인한다. Review 생략은 새 Reviewer 호출·새 테스트 실행 근거를 만들지 않는다.
 - 단계별 문서 변경 뒤 선행 PASS·VERIFY_REQUIRED·최종 PASS를 구분하고, 일반 verify 재사용 및 새 완료 조건의 증거 부재에서 최종 Review를 잘못 생략하지 않는 최소 unit case를 확인한다.
 - R-085 fixture에서 실제 미소비 개인 설정만 변경한 경우와 관리 home/source·소비 설정/정책 변경·과거 환경 identity 부재를 분리한다. 실제 no-call/필수 Reviewer call·기존 receipt 보존·비밀값 비노출을 확인하며 모의 인증 성공을 실계정 실행 근거로 사용하지 않는다.
-- 공통 홈의 정상 설정 생성/교체 뒤에는 새 현재 설정 관측을 사용하고 낡은 설정의 Review를 재사용하지 않는다. G-317의 지침 해석 완료→증거 갱신 사이 변경 거부를 소비해 동일성 미확인에서 Review를 생략하지 않는지 확인하며 provider의 원자 교체 회귀를 다시 구현하지 않는다. 호출별 소유 임시 경로 정규화가 다른 worktree/role/정책 변경을 숨기지 않는지 기존 provider execution fixture로 확인한다. R-085 Non-Goals의 session/CLI·실계정/OS 호환성 미수행을 별도 선행 gate로 추가하지 않으며 현재 호출의 실제 격리/완료 증거는 계속 요구한다.
+- 공통 홈의 정상 설정 생성/교체 뒤에는 실제 소비 source의 현재 관측을 사용하고 낡은 설정의 Review를 재사용하지 않는다. G-317의 지침 해석 완료→증거 갱신 사이 변경 거부를 소비해 동일성 미확인에서 Review를 생략하지 않는지 확인하며 provider의 원자 교체 회귀를 다시 구현하지 않는다. 호출별 소유 임시 경로 정규화가 다른 worktree/role/정책 변경을 숨기지 않는지 기존 provider execution fixture로 확인한다. R-085 Non-Goals의 session/CLI·실계정/OS 호환성 미수행을 별도 선행 gate로 추가하지 않으며 provider별 지원 계약과 실제 호출 완료 증거를 유지한다.
+- 기존 Review handler/SQLite fixture에 Claude `prepared`·과거 호출 성공과 현재 `observe() is None`을 연결한 최소 case를 둔다. verify 코드 입력이 같아도 Review 호출은 필요하고 `prepared`를 최종 승인/정책 동일성으로 채택하지 않아야 한다. 기존 Codex 동일 입력의 no-call과 독립 verify 재사용은 유지하며 provider preflight 행렬·실계정 호출을 추가하지 않는다.
 
 ## Progress
 
@@ -90,6 +94,8 @@ priority: high
 - [x] 2026-10-11 delta 검토: PR 전 snapshot token `4e4794ea5a72e4acbf130a00b86c65166feb4676b19e417a33a4af84e631cb28`, revision `6fc245469a6bd3cced81dbf64fc049130982bbc8`와 원본 hash `94dc14021dce370d8033c0c91bf1ab0dcea013699e1240603e397a78571a4314`를 대조했다. R-085의 미구현 실행 환경 전환을 기존 최종 Review 동일성 목표에 연결했다. 기존 기록을 보존하며 구현·테스트·전체 verify는 실행하지 않았다.
 
 ## Decision Log
+
+- 현재 원격의 Claude 지원은 G-191의 문서 기반 `prepared` 구성과 실제 호출 관측을 구분한다. 새 지원 구현을 소비하되 이 작업은 기존 비교 불가 fallback만 연결한다. R-085의 실제 소비 source 교정은 G-264에 유지하며 native proof 수집·OS probe를 지원 완료 조건이나 새 구현 목표로 추가하지 않는다. ID·경로·기존 dependency·최종 승인 재사용 목표와 과거 기록을 보존한다.
 
 - revision `7f77ebb8d40d10b23d168e422ba135e38621b6d0`의 G-320 구현·관련 회귀를 정적으로 확인해 새 `stage_results`/rebase 감사 자료의 실제 경로와 소비 계약을 연결했다. 원래 Review 보존과 Worker/verify 재연결은 재구현하지 않으며 마지막 최종 승인 비교·현재 후보 승인만 이 작업에 남긴다. ID·경로·metadata·dependency·기존 기록을 보존하고 이번 호출의 검증 성공이나 최종 승인을 만들지 않는다.
 
