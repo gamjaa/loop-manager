@@ -1114,7 +1114,9 @@ rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업�
 
 충돌 해결 Worker의 종료 검사도 소유된 중간 상태에서는 최종 변경 범위·선언 판정을 유예하고 구조·operation·원격 소유권을 확인한다. 응답·실제 호출 전에 고정한 입력 snapshot·session·종료 코드·결과 종류는 후속 검사 전에 같은 교정 turn에 함께 보존한다. 검사 오류 뒤 재개에도 당시 입력을 최신 definition으로 대체하지 않는다. Git rebase가 끝나면 Manager가 고정 target base의 선택된 ExecPlan frontmatter를 복원하며 구현·검증 본문과 mode는 보존한다. 복원 전후 bytes·다른 파일의 상태·commit tree를 execution checkpoint에 기록해 쓰기·stage·commit 중단을 같은 결과로 재개한다. 선택 ExecPlan의 본문은 기존 Worker turn receipt가 없는 저장 rebase에서도 사용자 결정·draft 보호와 현재 소유권·다른 문서의 채택 원문을 검증한 뒤 선언 복원 전후 bytes로 보존할 수 있다. 복원된 정확한 출력만 후속 문서 범위 검사에서 수용하며, 복원 기록을 Worker 완료·targeted test·verify·Review 성공 근거로 사용하지 않는다. 복원 후 전체 최종 범위·선언 검사와 기존 verify·Review를 수행한다. 선언 불일치는 Worker 반복 교정으로 보내지 않으며 plan_input_invalid의 소유 rebase도 일반 branch 검사 전에 같은 복구 경계로 재평가한다.
 
-execution checkpoint의 `rebase_block_release_policy=deferred_metadata`는 선언 전체 검사를 rebase 완료 뒤로 유예하는 정책에서 재개했음을 나타낸다. 이 값이 없는 과거 `plan_input_invalid` 차단은 현재 소유권·원격·실행 자리·dependency를 재검증한 뒤 같은 Git 상태에서도 한 번 재개할 수 있다. 재개 시 정책과 관측 fingerprint를 함께 저장하며, 이후 같은 원인·상태의 반복 재개는 거부한다. 다른 차단 원인의 중복 방지와 완료 후 선언·범위 검사는 유지한다.
+차단 계획의 원본 base 반영에서는 workspace identity·원격 lease·index·작업물 보존을 확인한 뒤 고정 target의 rebase와 중간 게시를 완료한다. 더 최신 base를 반영해야 하면 저장 target을 먼저 끝내고 후속 base까지 반영한 뒤 현재 계획 행으로 catalog metadata 전체 일치를 검사한다. 최종 불일치는 원래 차단 원인 평가·해제와 후속 자료 게시로 넘기지 않는다.
+
+execution checkpoint의 `rebase_block_release_policy=deferred_metadata`는 선언 전체 검사를 rebase 완료 뒤로 유예하는 정책에서 재개했음을 나타낸다. 이 정책으로 재개한 기록이 없는 과거 `plan_input_invalid` 차단은 현재 소유권·원격·실행 자리·dependency를 재검증한 뒤 같은 Git 상태에서도 한 번 재개할 수 있다. 재개 시 정책과 관측 fingerprint를 함께 저장하며, 이후 같은 원인·상태의 반복 재개는 거부한다. 다른 차단 원인의 중복 방지와 완료 후 선언·범위 검사는 유지한다.
 
 rebase target은 바꾸지 않으며 원격 재전진은 기존 operation 완료 후 반영한다. 문서 전용 충돌은 Manager가 continue/skip하고 혼합 충돌의 나머지 파일과 autostash 충돌은 기존 Worker 교정 경계에 남긴다. 문서 Progress는 현재 후보의 실행·검증 성공 증거가 아니며 완료 후의 입력 재평가·verify·Review·게시 gate는 유지한다
 
