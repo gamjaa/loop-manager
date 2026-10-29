@@ -50,7 +50,7 @@ def observe(connection, *, repo: str, plan_id: str | None, worktree: Path,
             resolve_profile, snapshot_digest, validate_runtime=None, invocation_id: str | None = None):
     """Read actual completed evidence or prove the current prepared inputs."""
     if provider != 'codex':
-        return None  # Existing Claude isolation refusal remains authoritative.
+        return None  # Claude prepared configuration is not native verified-policy reuse proof.
     launch = None
     try:
         ledger = InvocationRepository(connection)

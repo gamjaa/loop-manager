@@ -19,6 +19,7 @@ from loop_manager_internal.agents.agent_profiles import agent_environment, prepa
 from loop_manager_internal.agents.provider_home import prepare_authentication, authentication_links, assert_authentication_links
 from loop_manager_internal.agents.agent_provider_usage import claude_usage, codex_log_usage
 from loop_manager_internal.agents import agent_write_isolation
+from loop_manager_internal.agents import agent_claude_preflight
 from loop_manager_internal.agents import provider_guidance
 from loop_manager_internal.agents.common_guidance import CommonGuidance
 from loop_manager_internal.agents.agent_activity import AgentActivity, received_lines
@@ -605,11 +606,29 @@ def run_claude(
     on_process_finished: Callable[[], None] | None = None,
     stream_output: bool = False,
     common_guidance: CommonGuidance | None = None,
+    prepared_launch: agent_claude_preflight.ClaudeLaunch | None = None,
+    on_launch_prepared=None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | AgentResult:
     launch_environment = agent_environment("claude", role_name, state_dir=state_dir)
-    prepare_authentication('claude', launch_environment)
+    if on_isolation_checked is None:
+        prepare_authentication('claude', launch_environment)
     auth_links = authentication_links('claude', launch_environment)
+    native_launch = None
+    checked = []
+    if on_isolation_checked is not None:
+        def observe(evidence):
+            on_isolation_checked(evidence)
+            checked.append(evidence)
+        native_launch = agent_write_isolation.prepare_isolation(
+            'claude', role_name, worktree, state_dir, read_only,
+            observe, isolation_snapshot_digest, config_path=config_path,
+            expected_repository=expected_repository, session_id=session_id,
+            environment_variables=launch_environment, prepared_launch=prepared_launch)
+        if (not isinstance(native_launch, agent_claude_preflight.ClaudeLaunch)
+                or len(checked) != 1 or checked[0].status != 'prepared'):
+            raise agent_write_isolation.IsolationError('Claude 호출의 prepared 설정 증거가 없습니다.')
+        launch_environment = native_launch.environment
     with prepared_environment('claude', launch_environment):
         profile = resolved_profile or effects._agent_profile(
             config_path, "claude", role_name, level, worktree
@@ -619,23 +638,20 @@ def run_claude(
     fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
     additional = provider_guidance.claude_arguments(common_guidance, environment=launch_environment) if common_guidance else []
     assert_authentication_links('claude', launch_environment, auth_links)
-    if on_isolation_checked is not None:
-        agent_write_isolation.prepare_isolation(
-            "claude", role_name, worktree, state_dir, read_only,
-            on_isolation_checked, isolation_snapshot_digest,
-            config_path=config_path, expected_repository=expected_repository,
-            session_id=session_id, environment_variables=launch_environment,
-        )
     project_dir = _provider_log_directory(worktree, state_dir)
-    attempt = Path(tempfile.mkdtemp(prefix=f'claude-{role_name}-', dir=project_dir))
-    launch_environment['TMPDIR'] = str(attempt)
+    attempt = (native_launch.attempt if native_launch else
+               Path(tempfile.mkdtemp(prefix=f'claude-{role_name}-', dir=project_dir)))
+    if native_launch is None:
+        launch_environment['TMPDIR'] = str(attempt)
     if os.name == 'nt':
         launch_environment['TMP'] = launch_environment['TEMP'] = str(attempt)
-    log = _provider_log_path(worktree, state_dir, "claude", role_name)
+    log = (attempt / 'provider.log' if native_launch else
+           _provider_log_path(worktree, state_dir, 'claude', role_name))
     last_message = project_dir / f"claude-{role_name}-last.txt"
-    last_message.unlink(missing_ok=True)
+    if native_launch is None:
+        last_message.unlink(missing_ok=True)
 
-    streaming = role_name == "reviewer" or (persist_session and session_id is None) or stream_output
+    streaming = native_launch is not None or role_name == "reviewer" or (persist_session and session_id is None) or stream_output
     arguments = [
         "claude",
         "--print",
@@ -646,7 +662,7 @@ def run_claude(
         model,
         "--effort",
         effort,
-        *claude_permission_arguments(read_only, fast_mode=fast_mode),
+        *(native_launch.arguments if native_launch else claude_permission_arguments(read_only, fast_mode=fast_mode)),
         *additional,
         *(["--resume", session_id] if session_id else []),
     ]
@@ -656,15 +672,41 @@ def run_claude(
     timeout_triggered = threading.Event()
     usage = Usage()
     collection_status = "unknown"
+    if native_launch is not None:
+        try:
+            boundary = agent_write_isolation.inspect_worktree(worktree, state_dir, read_only=read_only)
+            agent_claude_preflight.assert_current(native_launch, boundary, role_name, read_only, config_path)
+        except agent_write_isolation.IsolationError as error:
+            on_isolation_checked(replace(checked[0], status='rejected', reason=str(error)))
+            raise
+        if on_launch_prepared is not None:
+            on_launch_prepared(native_launch)
 
     if streaming:
         final_event: Mapping[str, object] = {}
         stream_error_seen = False
         stream_error_message = ""
         diagnostic_tail = ""
+        if native_launch is not None:
+            from . import process_receipt
+        def checked_handoff(command, **context):
+            if native_launch is not None:
+                try:
+                    boundary = agent_write_isolation.inspect_worktree(worktree, state_dir, read_only=read_only)
+                    agent_claude_preflight.assert_current(native_launch, boundary, role_name, read_only,
+                                                          config_path, check_cli=False)
+                except agent_write_isolation.IsolationError as error:
+                    process_receipt.not_started(process_receipt.receipt_path(native_launch))
+                    on_isolation_checked(replace(checked[0], status='rejected', reason=str(error)))
+                    raise
+            return effects._handoff_popen(command, **context)
         with log.open("w", encoding="utf-8") as output:
             output.write(fast_mode_log)
-            process = effects._handoff_popen(
+            process = (agent_write_isolation.CodexLaunch.start(
+                arguments, launch_process=checked_handoff,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                encoding='utf-8', errors='replace', env=launch_environment, cwd=worktree,
+            ) if native_launch else effects._handoff_popen(
                 arguments,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -674,13 +716,17 @@ def run_claude(
                 errors="replace",
                 env=launch_environment,
                 cwd=worktree,
-            )
+            ))
             assert process.stdin is not None
             assert process.stdout is not None
-            timeout = _start_timeout(process, timeout_triggered)
+            stop = agent_write_isolation.CodexLaunch.stop if native_launch else None
+            timeout = _start_timeout(process, timeout_triggered, stop)
+            initialized = False
             try:
                 if on_process_started is not None:
                     on_process_started()
+                if native_launch is not None:
+                    process_receipt.started(native_launch, process)
                 process.stdin.write(prompt)
                 process.stdin.close()
                 lines = (_bounded_reviewer_lines(process.stdout) if role_name == "reviewer"
@@ -728,23 +774,39 @@ def run_claude(
                         resolved_session_id = event_session
                         if on_session_started:
                             on_session_started(resolved_session_id)
+                    if native_launch is not None:
+                        initialized = agent_claude_preflight.check_event(
+                            event, native_launch, model, initialized, session_id=session_id)
                     if event.get("type") == "result":
                         final_event = event
                         parsed_usage = claude_usage(event)
                         if parsed_usage.status != "unknown" or usage.status != "invalid":
                             usage = parsed_usage
+                    if native_launch is not None and (event.get('is_error') or event.get('type') == 'error'):
+                        _stop_process(process, stop)
+                        break
                 returncode = process.wait()
-                if on_process_finished is not None:
+                if native_launch is not None and returncode == 0 and not initialized and not stream_error_seen:
+                    raise agent_write_isolation.IsolationError('Claude auto mode 시작 관측이 없습니다.')
+                if native_launch is None and on_process_finished is not None:
                     on_process_finished()
             except BaseException:
-                _stop_process(process)
+                _stop_process(process, stop)
                 process.wait()
-                if on_process_finished is not None:
+                if native_launch is None and on_process_finished is not None:
                     on_process_finished()
                 raise
             finally:
                 timeout.cancel()
-                process.stdout.close()
+                try:
+                    if native_launch is not None:
+                        agent_write_isolation.CodexLaunch.stop(process)
+                        process.wait(timeout=10)
+                        process_receipt.finished(native_launch, process)
+                        if on_process_finished is not None:
+                            on_process_finished()
+                finally:
+                    process.stdout.close()
         message = stream_error_message or _claude_result_message(final_event)
         if stream_error_seen and returncode == 0:
             returncode = 1
@@ -958,6 +1020,19 @@ class ClaudeAgentAdapter:
     def __init__(self, run: Callable[..., tuple[int, str] | AgentResult]):
         self._run = run
 
+    def prepare_environment(self, request: AgentRequest):
+        boundary = agent_write_isolation.inspect_worktree(request.worktree, request.state_dir,
+                                                         read_only=request.read_only)
+        if request.expected_repository is None or Path(request.expected_repository).resolve() != boundary.source:
+            raise agent_write_isolation.IsolationError('Claude 선택 repository identity가 다릅니다.')
+        environment = agent_environment('claude', request.role_name, state_dir=request.state_dir)
+        try:
+            return agent_claude_preflight.prepare(boundary, request.state_dir, request.role_name,
+                request.read_only, environment, request.config_path,
+                fast_mode=provider_fast_mode(request.config_path, 'claude'))
+        except RuntimeError as error:
+            raise agent_write_isolation.IsolationError(redact_secrets(str(error))) from error
+
     def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
         return self._run(
             request.worktree,
@@ -978,4 +1053,6 @@ class ClaudeAgentAdapter:
             on_process_started=request.on_process_started,
             on_process_finished=request.on_process_finished,
             stream_output=request.stream_output,
+            prepared_launch=request.prepared_launch,
+            on_launch_prepared=request.on_launch_prepared,
         )

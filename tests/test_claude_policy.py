@@ -98,6 +98,8 @@ class ClaudePolicyTests(unittest.TestCase):
             {'env': {'CLAUDE_CODE_TMPDIR': str(self.root)}},
             {'hooks': {'PreToolUse': []}},
             {'policyHelper': '/external/helper'},
+            {'apiKeyHelper': 'external-command'},
+            {'awsAuthRefresh': 'external-command'},
             {'managedMcpServers': {'writer': {'command': 'writer'}}},
         ]
         for inherited in conflicts:

@@ -252,7 +252,8 @@ class InvocationRepository:
                     WHERE call.invocation_id=excluded.invocation_id
                       AND call.provider=excluded.provider AND call.role=excluded.role
                       AND call.execution_started_at IS NULL AND call.finished_at IS NULL)
-                  AND agent_isolation_evidence.status='verified'
+                  AND (agent_isolation_evidence.status='verified' OR
+                       (agent_isolation_evidence.provider='claude' AND agent_isolation_evidence.status='prepared'))
                   AND agent_isolation_evidence.provider=excluded.provider
                   AND agent_isolation_evidence.cli_version=excluded.cli_version
                   AND agent_isolation_evidence.environment=excluded.environment
@@ -348,7 +349,8 @@ class InvocationRepository:
                  usage.reasoning_output_tokens, identity))
             if cursor.rowcount and kind != "success":
                 self.connection.execute("""UPDATE agent_isolation_evidence
-                    SET status = 'invalidated', reason = 'agent_attempt_not_successful'
+                    SET status = 'invalidated', reason = CASE WHEN provider='claude'
+                        THEN reason ELSE 'agent_attempt_not_successful' END
                     WHERE invocation_id = ? AND status IN ('verified', 'prepared')""", (identity,))
 
     def apply_observation(self, identity: str, value: dict) -> None:
@@ -405,7 +407,8 @@ class InvocationRepository:
                 if task in protected or identity in observations_pending:
                     continue
                 self.connection.execute("""UPDATE agent_isolation_evidence
-                    SET status = 'invalidated', reason = 'agent_attempt_interrupted'
+                    SET status = 'invalidated', reason = CASE WHEN provider='claude'
+                        THEN reason ELSE 'agent_attempt_interrupted' END
                     WHERE status IN ('verified', 'prepared') AND invocation_id = ?""", (identity,))
                 count += self.connection.execute("""UPDATE agent_invocations SET
                     finished_at = ?, result_kind = 'interrupted', collection_status = 'unknown',

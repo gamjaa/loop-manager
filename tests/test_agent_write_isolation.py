@@ -603,7 +603,7 @@ class WriteIsolationTests(TestCase):
             launch.probe.assert_called_once()
             self.assertEqual(records[0].status, 'rejected')
 
-    def test_unsupported_provider_records_rejection_without_launch(self):
+    def test_claude_missing_environment_records_rejection_without_launch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
@@ -611,13 +611,13 @@ class WriteIsolationTests(TestCase):
             with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                  mock.patch.object(isolation.subprocess, 'run') as run:
-                for role in ('planner', 'worker', 'maintenance', 'reviewer'):
+                for role in ('planner', 'planner_check', 'worker', 'maintenance_planner', 'reviewer'):
                     for session in (None, 'saved-session'):
                         with self.subTest(role=role, session=session):
                             records = []
                             with self.assertRaisesRegex(isolation.IsolationError, 'claude'):
                                 isolation.prepare_isolation(
-                                    'claude', role, root, root, role == 'reviewer',
+                                    'claude', role, root, root, role in {'reviewer', 'planner_check'},
                                     records.append, lambda: 'snapshot',
                                     expected_repository=str(root / 'source'), session_id=session)
                             self.assertEqual(records[0].status, 'rejected')

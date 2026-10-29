@@ -1,7 +1,7 @@
-"""Preflight evidence for an Agent write boundary.
+"""Invocation-bound write policies and evidence.
 
-The provider runs directly with its native tool policy, checked by a separate
-standalone sandbox preflight. Unproven calls stop before provider execution.
+Codex uses a standalone native sandbox probe. Claude records documented native
+configuration as prepared, separately from actual invocation observations.
 """
 
 from __future__ import annotations
@@ -15,7 +15,10 @@ import platform
 import re
 import subprocess
 import tomllib
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .agent_claude_preflight import ClaudeLaunch
 
 from loop_manager_internal.agents.agent_codex_sandbox import CODEX_EXTENSION_ARGUMENTS, CodexLaunch, prepare_launch
 from loop_manager_internal.config import execution_path
@@ -258,14 +261,14 @@ def _checked_codex_configuration(worktree: Path, state_dir: Path,
 
 def _policy_digest(provider: str, version: str, environment: str, role: str,
                    worktree: str, repository: str, configuration: str,
-                   arguments: tuple[str, ...], launch: CodexLaunch | None,
+                   arguments: tuple[str, ...], launch: CodexLaunch | ClaudeLaunch | None,
                    session_id: str | None) -> str:
     policy = json.dumps({"provider": provider, "version": version,
                          "environment": environment, "role": role,
                          "worktree": worktree, "repository": repository,
                          "configuration": configuration,
                          "arguments": arguments,
-                         "boundary": "native-tools-v2",
+                         "boundary": "claude-native-request-v1" if provider == 'claude' else "native-tools-v2",
                          "probe": launch.probe_arguments if launch else (),
                          "session": session_id}, sort_keys=True)
     return sha256(policy.encode()).hexdigest()
@@ -316,9 +319,14 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
                       expected_repository: str | None = None,
                       session_id: str | None = None,
                       environment_variables: dict[str, str] | None = None,
-                      prepared_launch: CodexLaunch | None = None,
-                      ) -> CodexLaunch:
-    """Prove one physical call; emit a fresh record even on rejection."""
+                      prepared_launch: CodexLaunch | ClaudeLaunch | None = None,
+                      ) -> CodexLaunch | ClaudeLaunch:
+    """Prepare one physical call; emit a fresh record even on rejection."""
+    if provider == 'claude':
+        from .agent_claude_preflight import isolate
+        return isolate(role, worktree, state_dir, read_only, observe, snapshot_digest,
+            config_path=config_path, expected_repository=expected_repository, session_id=session_id,
+            environment_variables=environment_variables, prepared_launch=prepared_launch)
     environment = f"{platform.system()}:{platform.release()}:{platform.machine()}"
     boundary: WorktreeBoundary | None = None
     version = "unknown"

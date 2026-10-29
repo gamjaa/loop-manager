@@ -44,6 +44,7 @@ class ManagedSourceResolutionTests(unittest.TestCase):
 
     def test_malformed_nested_sources_raise_policy_errors(self):
         for source in ([], {'permissions': []}, {'sandbox': []},
+                       {'autoMode': []}, {'env': []}, {'unknownSetting': True},
                        {'sandbox': {'network': []}}, {'sandbox': {'filesystem': []}},
                        {'managedSourcesBehavior': 'unknown', 'model': 'model'}):
             with self.subTest(source=source), self.assertRaises(IsolationError):
@@ -61,7 +62,7 @@ class ClaudePreflightTests(unittest.TestCase):
         self.system = self.root / 'system'
         self.system.mkdir()
         self.home = self.root / 'claude-home'
-        self.home.mkdir()
+        self.home.mkdir(mode=0o700)
         self.workspace = self.root / 'worktrees/G-191'
         self.workspace.mkdir(parents=True)
         self.boundary = WorktreeBoundary(self.workspace, self.root / 'source',
@@ -158,6 +159,7 @@ class ClaudePreflightTests(unittest.TestCase):
             self.assertEqual(json.loads(launch.reason)['authentication_home'], str(self.home))
             self.assertEqual(json.loads(launch.reason)['auto_mode_support'], 'requires_invocation_init')
             self.assertNotIn('not-a-real-key', launch.specification + launch.reason)
+            self.assertNotIn('not-a-real-key', repr(launch))
             self.assertIn('--permission-prompts', launch.arguments)
         self.assertEqual(native.call_count, 8)
 
@@ -246,19 +248,24 @@ class ClaudePreflightTests(unittest.TestCase):
         with mock.patch.object(preflight.subprocess, 'run', side_effect=native), self.assertRaisesRegex(IsolationError, '인증 상태'):
             self.prepare()
 
-    def test_mdm_domain_precedence_and_query_failures_are_distinguished_from_absence(self):
+    def test_mdm_managed_plist_precedence_and_conflicts_are_distinguished_from_absence(self):
         (self.system / 'managed-settings.json').write_text('{"model":"file"}')
-        with mock.patch.object(preflight.platform, 'system', return_value='Darwin'):
-            with mock.patch.object(preflight.subprocess, 'run', return_value=
-                    subprocess.CompletedProcess([], 0, plistlib.dumps({'model': 'mdm'}), b'')):
-                effective, _, observations = preflight.configuration(self.environment, None)
-                self.assertEqual(effective['model'], 'mdm')
-                self.assertTrue(any(row.get('source') == 'com.anthropic.claudecode' for row in observations))
-            with mock.patch.object(preflight.subprocess, 'run', return_value=
-                    subprocess.CompletedProcess([], 1, b'', b'Domain does not exist')):
-                effective, _, _ = preflight.configuration(self.environment, None)
-                self.assertEqual(effective['model'], 'file')
-            with mock.patch.object(preflight.subprocess, 'run', side_effect=PermissionError), self.assertRaisesRegex(IsolationError, 'MDM'):
+        machine, user = self.root / 'machine.plist', self.root / 'user.plist'
+        with mock.patch.object(preflight.platform, 'system', return_value='Darwin'), \
+                mock.patch.object(preflight, '_mdm_paths', return_value=(machine, user)):
+            effective, _, _ = preflight.configuration(self.environment, None)
+            self.assertEqual(effective['model'], 'file')
+            machine.write_bytes(plistlib.dumps({'model': 'mdm'}))
+            effective, _, observations = preflight.configuration(self.environment, None)
+            self.assertEqual(effective['model'], 'mdm')
+            self.assertTrue(any(row.get('path') == str(machine) for row in observations))
+            user.write_bytes(plistlib.dumps({'model': 'other-mdm'}))
+            with self.assertRaisesRegex(IsolationError, 'MDM'):
+                preflight.configuration(self.environment, None)
+            user.write_bytes(plistlib.dumps({'model': 'mdm'}))
+            self.assertEqual(preflight.configuration(self.environment, None)[0]['model'], 'mdm')
+            user.write_text('not plist')
+            with self.assertRaisesRegex(IsolationError, 'source 형식'):
                 preflight.configuration(self.environment, None)
 
     def test_unknown_wsl_host_policy_inheritance_is_diagnosed_before_cli_lookup(self):
@@ -267,3 +274,9 @@ class ClaudePreflightTests(unittest.TestCase):
                 self.assertRaisesRegex(IsolationError, 'Windows managed'):
             self.prepare()
         native.assert_not_called()
+
+    def test_success_exit_does_not_hide_a_stderr_policy_warning(self):
+        with mock.patch.object(preflight.subprocess, 'run', return_value=
+                subprocess.CompletedProcess([], 0, 'ok', 'Settings Warning: ignored sandbox.enabled')), \
+                self.assertRaisesRegex(IsolationError, 'stderr'):
+            preflight._command(['claude', 'doctor'], self.environment, self.workspace)

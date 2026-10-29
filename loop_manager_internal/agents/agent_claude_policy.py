@@ -69,7 +69,9 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
         raise IsolationError('Claude managed 권한 정책이 자동 승인 검토·쓰기 경계와 충돌합니다.')
     if any(inherited.get(key) for key in (
             'env', 'hooks', 'statusLine', 'subagentStatusLine', 'fileSuggestion',
-            'enabledPlugins', 'managedMcpServers', 'mcpServers', 'policyHelper')):
+            'enabledPlugins', 'managedMcpServers', 'mcpServers', 'policyHelper',
+            'apiKeyHelper', 'otelHeadersHelper', 'awsAuthRefresh', 'awsCredentialExport',
+            'gcpAuthRefresh')):
         raise IsolationError('Claude managed 확장·환경 정책의 쓰기 경계를 확인할 수 없습니다.')
     if set(permissions) - {'defaultMode', 'allow', 'deny', 'ask', 'additionalDirectories',
                            'disableAutoMode', 'disableBypassPermissionsMode',
