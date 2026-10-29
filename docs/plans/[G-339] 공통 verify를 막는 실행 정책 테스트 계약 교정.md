@@ -31,6 +31,7 @@ priority: high
 - [x] 세 물리 재시도 테스트가 SQLite의 실패 누계 3·비도달 표식·세 test 결과·각기 다른 run 및 invocation 귀속을 확인하도록 교정했다. 실행 수와 운영 임계값은 바꾸지 않았다.
 - [x] 문서 결합·재시도 실패·session 및 Review 경계 테스트와 기존 다섯 번째 고유 실패 도달 테스트를 targeted 실행했다.
 - [x] verify 피드백의 복구·publication 테스트 Git double에도 정확한 작업 base merge-base와 head 없는 문서 경로 diff 관측을 추가했다. checkpoint recovery double에서는 ancestry 검사 외 merge-base를 원래 fixture에 위임해 복구된 VERIFYING context 검증을 유지했다. 제품 코드·상태 assertion은 변경하지 않았다.
+- [x] `ExistingPrPlanRecoveryTests`의 실제 worker·publication double에도 정확한 `merge-base <base> HEAD`와 head 없는 문서 경로 diff 응답을 추가해 interruption·restart 회귀가 worker 검증과 publication 경계에 도달하게 했다.
 
 ## Validation
 
@@ -54,6 +55,7 @@ priority: high
 - 최초 실행은 fixture가 `merge-base base HEAD` 관측을 빠뜨려 4개 정책 테스트를 실패시켰다. exact 인수 허용을 추가한 뒤 동일 targeted 명령으로 모두 통과했다.
 - 추가 verify 피드백의 6개 publication/recovery 실패와 1개 checkpoint recovery 오류도 Git double이 문서 보고의 작업 base 조회를 제공하지 않은 같은 원인이었다. 정확한 관측을 보완해 전달된 7개 케이스가 통과했다.
 - 반복 전달된 동일 verify 피드백에 대해 지목된 7개 케이스와 G-339 정책 targeted 6개를 다시 실행해 모두 통과했다. Worker 범위에서 전체 verify를 실행하지 않았다.
+- 후속 verify가 보고한 `ExistingPrPlanRecoveryTests` 실패 7개와 진단의 추가 동종 case 1개는 이 fixture가 ancestry merge-base만 구현하고 작업 base 조회에는 빈 출력을 돌려주는 문제였다. 정확한 base 조회와 문서 경로 diff를 추가한 뒤 8개를 targeted 실행해 통과했다.
 - 전체 verify는 Worker 범위 밖이므로 실행하지 않았다.
 
 ## Decision Log

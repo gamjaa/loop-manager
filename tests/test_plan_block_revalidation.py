@@ -435,6 +435,10 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                 output = self.pull_request['headRefOid']
                 if args[0] == 'ls-remote':
                     output += '\t' + f"refs/heads/{self.plan()['branch']}\n"
+            elif args == ('merge-base', self.base, 'HEAD'):
+                output = self.base
+            elif args == ('diff', '--no-ext-diff', '--name-status', '-z', '--find-renames', self.base):
+                output = ''
             elif args[0] == 'merge-base':
                 code = 0 if self.ancestry or args[2] == self.base else 1
             elif args[0] == 'status' and self.candidate_dirty:
