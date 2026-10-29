@@ -148,7 +148,18 @@ class RunnerTests(TestCase):
         self.assertEqual(calls, ['old-session', 'old-session', None])
         self.assertEqual(self.connection.execute('SELECT count(DISTINCT invocation_id) FROM targeted_test_run_owners').fetchone()[0], 3)
         self.assertEqual(TargetedTestRepository(self.connection).sequence('repo', 'G-1'), 3)
-        self.assertTrue(TargetedTestRepository(self.connection).repeated('repo', 'G-1'))
+        repository = TargetedTestRepository(self.connection)
+        self.assertEqual(repository.repeated('repo', 'G-1'), ())
+        streak = self.connection.execute('''SELECT failures, repeated FROM targeted_test_streaks
+            WHERE repo='repo' AND plan_id='G-1' AND test_id='suite.test_one' ''').fetchone()
+        self.assertEqual(tuple(streak), (3, 0))
+        results = self.connection.execute('''SELECT r.run_id, r.test_id, r.result, o.invocation_id
+            FROM targeted_test_results r JOIN targeted_test_run_owners o USING (run_id)
+            WHERE r.repo='repo' AND r.plan_id='G-1' ORDER BY r.sequence''').fetchall()
+        self.assertEqual([(row['test_id'], row['result']) for row in results],
+                         [('suite.test_one', 'failure')] * 3)
+        self.assertEqual(len({row['run_id'] for row in results}), 3)
+        self.assertEqual(len({row['invocation_id'] for row in results}), 3)
 
     def test_collection_pending_preserves_independent_provider_failure(self):
         class Provider:
