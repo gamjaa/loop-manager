@@ -497,9 +497,6 @@ class BlockedPlanReconciler:
                     self.repo, plan_id, expected_generation=checkpoint.generation,
                     operation=None, expected_head=request.local_oid, target_base_oid=checkpoint.target_base_oid,
                     observed_remote_oid=request.remote_oid, snapshot=checkpoint.snapshot)
-            metadata = self.ports._blocked_execplan_metadata_error(self.repo_path, worktree, plan)
-            if metadata:
-                raise RuntimeError(metadata)
             ancestor = self.ports.git(worktree, 'merge-base', '--is-ancestor', context['base_oid'], 'HEAD', check=False).returncode
             if ancestor not in {0, 1}:
                 raise RuntimeError('차단 계획 target base ancestry를 확인할 수 없습니다.')
@@ -557,6 +554,9 @@ class BlockedPlanReconciler:
             # The saved result is now published. Only now may a newer target
             # start, and the original cause still has not been inspected.
             return self._incorporate(self._plan(plan_id), context)
+        metadata = self.ports._blocked_execplan_metadata_error(self.repo_path, worktree, self._plan(plan_id))
+        if metadata:
+            raise RuntimeError(metadata)
         context['candidate'] = self.ports._worktree_state_signature(worktree)
 
     def _evaluate(self, plan, context):

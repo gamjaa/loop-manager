@@ -1732,14 +1732,19 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
             SimpleNamespace(returncode=1, stdout='') if args[:1] == ('merge-base',)
             else self.git(path, *args, **kwargs))
         store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        completed = False
+        self.ports._blocked_execplan_metadata_error.side_effect = (
+            lambda *_: None if completed else 'old sources differ from catalog')
         def rebase(*args, **kwargs):
             store.record(self.repo, 'G-106', expected_generation=0, operation='rebase',
                          expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None, snapshot={})
             return SimpleNamespace(returncode=0, stdout='rebased')
         def complete(*args, **kwargs):
+            nonlocal completed
             current = store.get(self.repo, 'G-106')
             store.record(self.repo, 'G-106', expected_generation=current.generation, operation=None,
                          expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None, snapshot={})
+            completed = True
         self.ports._journaled_direct_rebase.side_effect = rebase
         self.ports._complete_direct_rebase_checkpoint.side_effect = complete
         with mock.patch.object(self.coordinator, '_publish'):
@@ -1750,6 +1755,15 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.ports._recorded_base_fetch.assert_called_once_with(
             Path('/repo'), Path('/state'), 'main', owner='plan:G-106')
         self.assertEqual(self.plan()['blocked_fingerprint'], 'input')
+
+    def test_final_catalog_mismatch_still_blocks_cause_evaluation(self):
+        self.ports._blocked_execplan_metadata_error.return_value = 'final sources differ from catalog'
+        with mock.patch.object(self.coordinator, '_publish') as publish:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+        self.ports._current_rebase_service.return_value.require_owned.assert_called()
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        publish.assert_not_called()
 
 
     def test_interrupted_evaluated_stage_does_not_repeat_rebase_or_cause_check(self):
