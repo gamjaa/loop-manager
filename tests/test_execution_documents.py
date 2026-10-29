@@ -1052,3 +1052,56 @@ class CommonGuidancePrReportTests(TestCase):
         self.assertIn('## ExecPlan', body)
         self.assertIn('docs/plans/%5BG-147%5D%20Plan.md', body)
         self.assertIn('Purpose: Keep instructions.', body)
+
+
+class WorkerDocumentReportBaseTests(TestCase):
+    def test_report_uses_candidate_ancestor_before_and_after_rebase(self):
+        from contextlib import closing
+        import sqlite3
+        from loop_manager_internal.execution.execution_worker_handler import WorkerHandler
+        selected = 'docs/plans/Selected.md'
+        for ancestor in ('work-base', 'integrated-base'):
+            for changed_document in (False, True):
+                with self.subTest(ancestor=ancestor, changed_document=changed_document):
+                    with closing(sqlite3.connect(':memory:')) as connection:
+                        connection.execute('CREATE TABLE manager_metadata(key TEXT PRIMARY KEY, value TEXT)')
+                        diff_bases = []
+                        def git(_path, *args, **kwargs):
+                            if args[0] == 'merge-base':
+                                self.assertEqual(args, ('merge-base', 'latest-base', 'HEAD'))
+                                return SimpleNamespace(returncode=0, stdout=ancestor)
+                            diff_bases.append(args[args.index('--find-renames') + 1])
+                            if '--name-status' in args:
+                                names = 'M\0' + selected + '\0'
+                                if changed_document or diff_bases[-1] == 'latest-base':
+                                    names += 'M\0docs/PRODUCT.md\0'
+                                return SimpleNamespace(stdout=names)
+                            return SimpleNamespace(stdout='-old\n+new\n')
+                        ports = SimpleNamespace(git=git, snapshot=lambda: SimpleNamespace(plan=None),
+                            parse_worker_result=lambda *_: SimpleNamespace(summary=''),
+                            state=SimpleNamespace(connection=connection, update_project=mock.Mock()),
+                            identity=SimpleNamespace(repo='repo'), _recover=mock.Mock(return_value='correction'))
+                        context = SimpleNamespace(worktree=Path('/candidate'),
+                            plan=SimpleNamespace(path=selected, plan_id='G-047'))
+                        result = WorkerHandler(ports)._bind_document_report(context, 'worker result', 'latest-base')
+                        self.assertEqual(set(diff_bases), {ancestor})
+                        if changed_document:
+                            self.assertEqual(result, 'correction')
+                            self.assertIn('docs/PRODUCT.md', ports._recover.call_args.args[1])
+                        else:
+                            self.assertIsNone(result)
+                            ports._recover.assert_not_called()
+
+    def test_missing_ancestor_preserves_result_without_worker_correction(self):
+        from loop_manager_internal.execution.execution_worker_handler import WorkerHandler
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
+        for code, output in ((1, ''), (0, '')):
+            with self.subTest(code=code):
+                ports = SimpleNamespace(git=mock.Mock(return_value=SimpleNamespace(returncode=code, stdout=output)),
+                    snapshot=lambda: SimpleNamespace(plan=None),
+                    parse_worker_result=lambda *_: SimpleNamespace(summary=''),
+                    _recover=mock.Mock(return_value='recovery'))
+                context = SimpleNamespace(worktree=Path('/candidate'))
+                self.assertEqual(WorkerHandler(ports)._bind_document_report(context, 'saved result', 'base'), 'recovery')
+                self.assertEqual(ports._recover.call_args.args[0], RecoveryReason.STATUS_FAILED)
+                ports.git.assert_called_once()

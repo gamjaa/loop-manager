@@ -544,6 +544,8 @@ rebase로 원본 브랜치에서 유입된 다른 문서는 Worker의 범위 밖
 
 PR 본문의 문서 보고는 최종 diff에서 선택된 ExecPlan을 제외한 모든 변경 문서의 파일명·변경 요약·이유·영향을 제공한다. 선택된 ExecPlan은 `DOCUMENT_CHANGE` 제출 대상에서도 제외하지만 기존 diff 검토·범위 검증과 PR의 ExecPlan 링크·Purpose는 유지한다. 추가·삭제·rename을 포함하며 실제 변경 내용·patch·diff 링크·검증용 hash는 본문에 넣지 않는다.
 
+문서 보고의 비교 기준은 해당 후보의 작업 base와 후보 HEAD다. rebase 전에는 작업이 기준으로 삼은 base를 유지하고, rebase 완료 뒤에는 통합을 완료한 대상 base와 새 후보 HEAD를 사용한다. 최신 원격 base에만 있는 변경을 Worker의 수정·삭제나 설명 누락으로 판정하지 않는다. 최신 base 반영 필요성과 문서 보고 검증은 별도로 판단한다.
+
 Manager는 Worker Summary와 실제 최종 diff/hash를 대조하고 rebase·PR head 변경 뒤 보고도 갱신한다. 설명 누락·중복·형식 오류·최종 diff 불일치는 해당 Worker의 교정으로 보완한다. 오래된 일반 Summary나 patch로 대신하지 않으며 불완전한 보고를 게시하거나 보고 반영 전에 게시 완료로 처리하지 않는다.
 
 열린 PR의 보고는 확인된 head를 기준으로 Manager 소유 영역만 교체·제거한다. 사용자가 쓴 본문과 기존 ExecPlan·source의 고정 참조, Purpose는 보존한다. 보고 필드와 최종 diff 결합 방식은 [Worker의 구현과 문서 경계](ARCHITECTURE.md#worker의-구현과-문서-경계)를 따른다.

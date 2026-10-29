@@ -993,6 +993,12 @@ class WorkerHandler:
     def _bind_document_report(self, context, message, base):
         from loop_manager_internal.documents.pr_description import common_guidance_report, DocumentReportError
         worker = self.ports.parse_worker_result(message, self.ports.snapshot().plan)
+        # active_sha may advance before this candidate has integrated that base.
+        observed = self.ports.git(context.worktree, 'merge-base', base, 'HEAD', check=False)
+        if observed.returncode or not observed.stdout.strip():
+            return self.ports._recover(RecoveryReason.STATUS_FAILED,
+                f'문서 보고의 작업 base를 확인할 수 없습니다: base={base}, candidate=HEAD', context=context)
+        base = observed.stdout.strip()
         try:
             common_guidance_report(self.ports.git, context.worktree, base, '', '', worker.summary,
                 selected_execplan_path=context.plan.path,

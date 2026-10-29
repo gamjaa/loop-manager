@@ -813,6 +813,10 @@ catalog와 snapshot은 탐색·검증 입력이며 그 자체로 쓰기 권한�
 
 - `documents/pr_description.py`는 기존 실행 지침 보고 경계와 publication 호출을 재사용해 최종 base/head의 name-status와 문서별 patch를 검증한다. `docs/` 아래 파일과 저장소의 Markdown·RST·TXT 문서를 대상으로 추가·삭제·rename·copy를 식별하며 rename·copy는 양쪽 경로를 포함한다. 검증 전과 새 PR·기존 PR 게시 경계에서 현재 선택된 ExecPlan 경로를 전달하고, 최종 경로가 일치하는 파일만 문서 보고·`DOCUMENT_CHANGE` 제출 대상에서 제외한다. 이전 Worker 결과에 남은 해당 경로의 보고도 무시한다. 다른 문서의 보고 검사와 선택된 ExecPlan의 diff 검토·범위 검증, PR의 고정 링크·Purpose는 유지한다.
 
+  보고 대상 경로 수집·문서별 patch 계산·저장 근거 재검증은 같은 작업 base와 후보를 사용한다. 작업 base는 해당 후보가 실제 기준으로 삼은 commit이며 최신 원격 OID·프로젝트 대표 투영으로 대체하지 않는다. Worker 결과 결합 시 기록된 실행 base와 현재 HEAD의 공통 조상으로 후보의 작업 기준을 확인한다. 이는 기존 범위 검사의 원본·후보 조상 관계와 같은 기준이며, 조회 실패·빈 결과는 복구 대상으로 남긴다. rebase 전에는 기존 작업 base, rebase 완료 후에는 통합이 확인된 대상 base와 새 후보 HEAD를 결합한다. Worker 결과를 commit하기 전에는 같은 작업 base와 범위 확인·staging된 후보를 비교하고, 검증·새 PR·기존 PR 갱신에서는 해당 후보 HEAD를 비교한다. Worker에 전달하는 보고·교정 문맥에도 실제 비교 base와 후보를 명시해 서로 다른 diff를 보지 않게 한다.
+
+  최신 원격 base 반영은 별도 rebase·복구 경계에서 판단한다. 진행 중 rebase의 중간 상태를 최종 보고로 확정하거나 base 값만 최신으로 바꿔 검증하지 않는다. 작업 base를 확인할 근거가 없으면 원인·후보·작업물을 보존해 기존 복구 경계에서 확인하며 최신 원격이나 임의의 공통 조상으로 조용히 대체하지 않는다. 올바른 비교에서 실제 문서 patch가 변경된 경우의 설명 교정과 게시 전 재검증은 유지한다.
+
   Worker는 `PR_SUMMARY`의 각 줄 맨 앞에 `DOCUMENT_CHANGE:`를 두고 뒤에 JSON 객체 하나를 기록한다. 변경 문서별로 한 건이며 아래 필드는 모두 비어 있지 않은 문자열이어야 한다.
 
   | 필수 필드 | 계약 |

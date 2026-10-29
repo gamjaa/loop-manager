@@ -266,6 +266,8 @@ class ExecutionFixture:
         if args[0] == 'commit':
             self.dirty = False
         output = self.remote if args[0] == 'rev-parse' else ''
+        if args[0] == 'merge-base' and '--is-ancestor' not in args:
+            output = args[1]
         if args[:2] == ('ls-files', '--cached'):
             output = 'app.py\0'
         if args[0] == 'status' and self.dirty:
@@ -340,7 +342,7 @@ class ExecutionFixture:
         if args[:2] == ('diff', '--cached'):
             return SimpleNamespace(stdout='', returncode=0)
         if args[0] == 'merge-base':
-            return SimpleNamespace(stdout='', returncode=0)
+            return SimpleNamespace(stdout='' if '--is-ancestor' in args else args[1], returncode=0)
         if args == ('rev-parse', 'HEAD'):
             return SimpleNamespace(stdout='owned-head\n', returncode=0)
         return self.git(path, *args, **kwargs)
