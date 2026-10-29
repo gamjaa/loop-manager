@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from loop_manager_internal.git import github_observation, publication_service
+from loop_manager_internal.git import github_observation, publication_service, workspace
 from loop_manager_internal.storage import database
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from tests.support.git import git_command, git_test_environment, isolated_git_test, local_github_origin, make_remote_repository
@@ -538,6 +538,9 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
                 publication_service.RemoteBranchOidEffects(git=self._git), path, branch),
             pr_for_branch=lambda *_: None, github_repository=lambda _: origin,
             validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+            validate_registered_remote=lambda repo_path, worktree, registered: workspace.validate_registered_remote(
+                repo_path, worktree, registered, git=git or self._git,
+                github_repository=lambda _: origin),
             update_project=update or (lambda _connection, selected_repo, **values: connection.execute(
                 'UPDATE exec_plans SET ' + ', '.join(f'{key}=?' for key in values) + ' WHERE repo=?',
                 (*values.values(), selected_repo))),
@@ -725,6 +728,8 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
                 github_repository=lambda _url: origin,
                 validate_execplan_workspace_identity=mock.Mock(),
                 validate_managed_worktree=mock.Mock(),
+                validate_registered_remote=lambda repo_path, worktree, registered: workspace.validate_registered_remote(
+                    repo_path, worktree, registered, git=self._git, github_repository=lambda _: origin),
                 update_project=lambda _connection, selected_repo, **values: connection.execute(
                     'UPDATE exec_plans SET ' + ', '.join(f'{key}=?' for key in values) + ' WHERE repo=?',
                     (*values.values(), selected_repo),
@@ -829,6 +834,8 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
                 github_repository=lambda _url: origin,
                 validate_execplan_workspace_identity=mock.Mock(),
                 validate_managed_worktree=mock.Mock(),
+                validate_registered_remote=lambda repo_path, worktree, registered: workspace.validate_registered_remote(
+                    repo_path, worktree, registered, git=self._git, github_repository=lambda _: origin),
                 update_project=lambda _connection, selected_repo, **values: connection.execute(
                     'UPDATE exec_plans SET ' + ', '.join(f'{key}=?' for key in values) + ' WHERE repo=?',
                     (*values.values(), selected_repo),
@@ -871,6 +878,8 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
                 github_repository=lambda _url: origin,
                 validate_execplan_workspace_identity=mock.Mock(),
                 validate_managed_worktree=mock.Mock(),
+                validate_registered_remote=lambda repo_path, worktree, registered: workspace.validate_registered_remote(
+                    repo_path, worktree, registered, git=self._git, github_repository=lambda _: origin),
                 update_project=mock.Mock(),
             )
             with self.assertRaisesRegex(RuntimeError, '게시 전 원격 branch가 전진'):
@@ -949,6 +958,8 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                         github_repository=lambda _: 'owner/repo',
                         validate_execplan_workspace_identity=lambda *_: None,
                         validate_managed_worktree=lambda *_: None,
+                        validate_registered_remote=lambda repo_path, worktree, registered: workspace.validate_registered_remote(
+                            repo_path, worktree, registered, git=git, github_repository=lambda _: 'owner/repo'),
                         update_project=lambda c, r, **values: state.update_project(r, preserve_transaction=True, **values),
                         run_request=state.run_checkpoint_publication_request)
                     record = ExecutionCheckpointRepository.record
@@ -1158,6 +1169,8 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                             github_repository=lambda _: 'owner/repo',
                             validate_execplan_workspace_identity=lambda *_: None,
                             validate_managed_worktree=lambda *_: None,
+                            validate_registered_remote=lambda repo_path, worktree, registered: workspace.validate_registered_remote(
+                                repo_path, worktree, registered, git=git, github_repository=lambda _: 'owner/repo'),
                             update_project=lambda c, r, **values: c.execute(
                                 'UPDATE exec_plans SET publication_remote_oid=?', (values['publication_remote_oid'],)))
                         publication_service.push_worker_checkpoint_commits(effects, connection,

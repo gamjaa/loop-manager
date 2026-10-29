@@ -13,7 +13,8 @@ import loop_manager
 from loop_manager_internal.catalog import archive_git, execplan_archive
 from loop_manager_internal.git import command_adapter, git_adapter, manager_git_journal, source_sync, workspace
 from loop_manager_internal.recovery import pull_request_recovery
-from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot, WorkspaceOwnershipError
+from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot, PublicationSafetyError
+from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.storage.execplan_archive_state import MergedArchiveCandidate
 from tests.support.database import runtime_connection
 
@@ -250,6 +251,351 @@ class WorkspaceEffectBoundaryTests(unittest.TestCase):
 
 
 class PublicationObservationBoundaryTests(unittest.TestCase):
+    def test_registered_remote_checks_each_location_and_url_kind(self):
+        registered = 'owner/repo'
+        locations = (Path('/repo'), Path('/worktree'))
+        url_kinds = (('remote', 'get-url', '--all', 'origin'),
+                     ('remote', 'get-url', '--push', '--all', 'origin'))
+
+        git_calls = [mock.call(location, *url_kind) for location in locations for url_kind in url_kinds]
+        git = mock.Mock(return_value=SimpleNamespace(stdout='git@github.com:owner/repo.git\n'))
+        workspace.validate_registered_remote(
+            locations[0], locations[1], registered, git=git,
+            github_repository=lambda _: registered)
+        self.assertEqual(git.call_args_list, git_calls)
+
+        for location in locations:
+            for url_kind in url_kinds:
+                for stdout, reason in (('', 'missing'), ('url-a\nurl-b\n', 'multiple'),
+                                       ('git@github.com:other/repo.git\n', 'identity')):
+                    with self.subTest(location=location, url_kind=url_kind, reason=reason):
+                        def observe(path, *args):
+                            if path == location and args == url_kind:
+                                return SimpleNamespace(stdout=stdout)
+                            return SimpleNamespace(stdout='git@github.com:owner/repo.git\n')
+                        git = mock.Mock(side_effect=observe)
+                        with self.assertRaises(WorkspaceOwnershipError):
+                            workspace.validate_registered_remote(
+                                locations[0], locations[1], registered, git=git,
+                                github_repository=lambda url: 'other/repo' if 'other' in url else registered)
+                        self.assertIn(mock.call(location, *url_kind), git.call_args_list)
+
+                with self.subTest(location=location, url_kind=url_kind, reason='command failure'):
+                    def failed_git(path, *args):
+                        if path == location and args == url_kind:
+                            raise RuntimeError('git remote observation failed')
+                        return SimpleNamespace(stdout='git@github.com:owner/repo.git\n')
+                    with self.assertRaisesRegex(RuntimeError, 'git remote observation failed'):
+                        workspace.validate_registered_remote(
+                            locations[0], locations[1], registered, git=failed_git,
+                            github_repository=lambda _: registered)
+
+    def test_worker_checkpoint_origin_uses_shared_validator_and_maps_failure_before_push(self):
+        from loop_manager_internal.git import publication_service
+
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repo_path, worktree = Path('/repo'), Path('/worktree')
+        git = mock.Mock()
+        def reject_identity(repo_path, selected_worktree, origin):
+            return workspace.validate_registered_remote(repo_path, selected_worktree, origin,
+                git=lambda *_args: SimpleNamespace(stdout='git@github.com:other/repo.git\n'),
+                github_repository=lambda _: 'other/repo')
+        validate = mock.Mock(side_effect=reject_identity)
+        effects = publication_service.WorkerCheckpointPublicationEffects(
+            active_execplan=lambda *_: plan, git=git, remote_branch_oid=mock.Mock(),
+            pr_for_branch=mock.Mock(return_value=None), github_repository=mock.Mock(),
+            validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+            validate_registered_remote=validate,
+            update_project=mock.Mock())
+        connection.execute("UPDATE projects SET origin='owner/repo', base_branch='main'")
+        connection.commit()
+        connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch=?, worktree=?",
+                           ('loop-manager/G-047', str(worktree)))
+        connection.commit()
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        with self.assertRaises(PublicationSafetyError):
+            publication_service.push_worker_checkpoint_commits(
+                effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
+                'loop-manager/G-047', worktree, 'main', None, None)
+        validate.assert_called_once_with(repo_path, worktree, 'owner/repo')
+        git.assert_not_called()
+
+    def test_worker_checkpoint_preserves_origin_observation_command_failure(self):
+        from loop_manager_internal.git import publication_service
+
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repo_path, worktree = Path('/repo'), Path('/worktree')
+        connection.execute("UPDATE projects SET origin='owner/repo', base_branch='main'")
+        connection.commit()
+        connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch=?, worktree=?",
+                           ('loop-manager/G-047', str(worktree)))
+        connection.commit()
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        git = mock.Mock()
+        effects = publication_service.WorkerCheckpointPublicationEffects(
+            active_execplan=lambda *_: plan, git=git, remote_branch_oid=mock.Mock(),
+            pr_for_branch=mock.Mock(return_value=None), github_repository=mock.Mock(),
+            validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+            validate_registered_remote=lambda repo, selected_worktree, origin:
+                workspace.validate_registered_remote(
+                    repo, selected_worktree, origin,
+                    git=lambda *_: (_ for _ in ()).throw(RuntimeError('git command failed')),
+                    github_repository=lambda _: origin),
+            update_project=mock.Mock())
+        with self.assertRaisesRegex(RuntimeError, 'git command failed'):
+            publication_service.push_worker_checkpoint_commits(
+                effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
+                'loop-manager/G-047', worktree, 'main', None, None)
+        git.assert_not_called()
+
+    def test_worker_checkpoint_rechecks_origin_before_push(self):
+        from loop_manager_internal.git import publication_service
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repo_path, worktree = Path('/repo'), Path('/worktree')
+        branch, root, head, registered = 'loop-manager/G-047', 'a' * 40, 'b' * 40, 'owner/repo'
+        connection.execute("UPDATE projects SET origin=?, base_branch='main'", (registered,))
+        connection.commit()
+        connection.execute(
+            "UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, branch=?, worktree=?",
+            (root, branch, str(worktree)))
+        connection.commit()
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        validation_count = 0
+        pushes = []
+
+        def git(path, *args, check=True):
+            if args[:2] == ('remote', 'get-url'):
+                url = 'changed-url' if validation_count == 2 and path == worktree else 'registered-url'
+                return SimpleNamespace(stdout=url + '\n', returncode=0)
+            if args[:3] == ('symbolic-ref', '--quiet', '--short'):
+                return SimpleNamespace(stdout=branch + '\n', returncode=0)
+            if args[:1] == ('rev-parse',):
+                return SimpleNamespace(stdout=head + '\n', returncode=0)
+            if args[:1] == ('ls-remote',):
+                return SimpleNamespace(stdout='', returncode=0)
+            if args[:1] == ('merge-base',):
+                return SimpleNamespace(stdout='', returncode=0)
+            if args[:2] == ('rev-list', '--reverse'):
+                return SimpleNamespace(stdout=f'{head} {root}\n', returncode=0)
+            if args[:2] == ('show', '-s'):
+                return SimpleNamespace(stdout=root + '\n', returncode=0)
+            if args[:1] == ('push',):
+                pushes.append(args)
+                return SimpleNamespace(stdout='', returncode=0)
+            raise AssertionError((path, args))
+
+        def validate(repo, selected_worktree, origin):
+            nonlocal validation_count
+            validation_count += 1
+            return workspace.validate_registered_remote(
+                repo, selected_worktree, origin, git=git,
+                github_repository=lambda url: registered if url == 'registered-url' else 'other/repo')
+
+        effects = publication_service.WorkerCheckpointPublicationEffects(
+            active_execplan=lambda *_: plan, git=git, remote_branch_oid=lambda *_: None,
+            pr_for_branch=lambda *_: None, github_repository=lambda _: registered,
+            validate_execplan_workspace_identity=lambda *_: None,
+            validate_managed_worktree=lambda *_: None,
+            validate_registered_remote=validate,
+            update_project=lambda *_args, **_kwargs: None)
+        from loop_manager_internal.agents import scope_validation
+        with mock.patch.object(scope_validation, 'validate_worker_commit'):
+            with self.assertRaises(PublicationSafetyError) as raised:
+                publication_service.push_worker_checkpoint_commits(
+                    effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
+                    branch, worktree, 'main', None, None)
+        self.assertEqual(validation_count, 2, str(raised.exception))
+        self.assertEqual(pushes, [])
+
+    def test_worker_checkpoint_origin_failures_prevent_publication_effects(self):
+        from loop_manager_internal.git import publication_service
+
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE projects SET origin='owner/repo', base_branch='main'")
+        connection.commit()
+        connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch=?, worktree=?",
+                           ('loop-manager/G-047', '/worktree'))
+        connection.commit()
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        for stdout, identity in (('', 'owner/repo'), ('first\nsecond\n', 'owner/repo'),
+                                 ('git@github.com:other/repo.git\n', 'other/repo')):
+            with self.subTest(stdout=stdout, identity=identity):
+                git = mock.Mock(return_value=SimpleNamespace(stdout=stdout))
+                effects = publication_service.WorkerCheckpointPublicationEffects(
+                    active_execplan=lambda *_: plan, git=git, remote_branch_oid=mock.Mock(),
+                    pr_for_branch=mock.Mock(return_value=None), github_repository=mock.Mock(),
+                    validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+                    validate_registered_remote=lambda repo, worktree, origin: workspace.validate_registered_remote(
+                        repo, worktree, origin, git=git, github_repository=lambda _: identity),
+                    update_project=mock.Mock())
+                with self.assertRaises(PublicationSafetyError):
+                    publication_service.push_worker_checkpoint_commits(
+                        effects, connection, Path('/repo'), Path('/state'), 'repo', 'G-047',
+                        'loop-manager/G-047', Path('/worktree'), 'main', None, None)
+                self.assertFalse(any(call.args[1] == 'push' for call in git.call_args_list))
+                effects.remote_branch_oid.assert_not_called()
+
+    def test_new_remote_input_wait_requires_registered_origins_before_deferring_intent(self):
+        from loop_manager_internal.git import publication_service
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+
+        repo_path, worktree = Path('/repo'), Path('/worktree')
+        branch, base, target, remote, head = (
+            'loop-manager/G-047', 'a' * 40, 'b' * 40, 'c' * 40, 'd' * 40)
+        for bad_location in (repo_path, worktree, None):
+            with self.subTest(bad_location=bad_location):
+                connection = runtime_connection()
+                self.addCleanup(connection.close)
+                connection.execute("UPDATE projects SET origin='owner/repo', base_branch='main'")
+                connection.execute(
+                    "UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, branch=?, worktree=?",
+                    (base, branch, str(worktree)))
+                connection.commit()
+                checkpoints = ExecutionCheckpointRepository(connection)
+                pending = {'branch': branch, 'from': base, 'target': target}
+                checkpoints.record('repo', 'G-047', expected_generation=0, operation=None,
+                    expected_head=head, target_base_oid=base, observed_remote_oid=remote,
+                    snapshot={'accepted_work_branch': base, 'worker_checkpoint_pending': pending})
+                plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+                validation_count = 0
+                git_calls = []
+
+                def git(path, *args, check=True):
+                    git_calls.append((path, args))
+                    if args[:2] == ('remote', 'get-url'):
+                        bad = bad_location == path
+                        url = 'git@github.com:other/repo.git' if bad else 'git@github.com:owner/repo.git'
+                        return SimpleNamespace(stdout=url + '\n', returncode=0)
+                    if args[:3] == ('symbolic-ref', '--quiet', '--short'):
+                        return SimpleNamespace(stdout=branch + '\n', returncode=0)
+                    if args[:1] == ('rev-parse',):
+                        return SimpleNamespace(stdout=head + '\n', returncode=0)
+                    if args[:1] == ('ls-remote',):
+                        return SimpleNamespace(stdout=f'{remote}\trefs/heads/{branch}\n', returncode=0)
+                    if args[:2] == ('show', '-s'):
+                        return SimpleNamespace(stdout=base + '\n', returncode=0)
+                    if args[:3] == ('merge-base', '--is-ancestor', target):
+                        return SimpleNamespace(stdout='', returncode=1)
+                    raise AssertionError((path, args))
+
+                def validate(repo, selected_worktree, origin):
+                    nonlocal validation_count
+                    validation_count += 1
+                    return workspace.validate_registered_remote(
+                        repo, selected_worktree, origin, git=git,
+                        github_repository=lambda url: 'other/repo' if 'other' in url else 'owner/repo')
+
+                effects = publication_service.WorkerCheckpointPublicationEffects(
+                    active_execplan=lambda *_: plan, git=git, remote_branch_oid=lambda *_: remote,
+                    pr_for_branch=mock.Mock(return_value=None), github_repository=mock.Mock(),
+                    validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+                    validate_registered_remote=validate, update_project=mock.Mock())
+                from loop_manager_internal.agents import scope_validation
+                with mock.patch.object(scope_validation, 'validate_worker_commit'):
+                    if bad_location is None:
+                        self.assertEqual(publication_service.push_worker_checkpoint_commits(
+                            effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
+                            branch, worktree, 'main', remote, None), (head, 0))
+                    else:
+                        with self.assertRaises(PublicationSafetyError):
+                            publication_service.push_worker_checkpoint_commits(
+                                effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
+                                branch, worktree, 'main', remote, None)
+                if bad_location is None:
+                    self.assertEqual(validation_count, 1)
+                    self.assertEqual(checkpoints.get('repo', 'G-047').snapshot['worker_checkpoint_pending'], pending)
+                else:
+                    self.assertEqual(validation_count, 1)
+                    self.assertEqual(checkpoints.get('repo', 'G-047').generation, 1)
+                self.assertFalse(any(args[:1] == ('push',) for _, args in git_calls))
+
+    def test_retiring_integrated_checkpoint_intent_requires_registered_origins(self):
+        from loop_manager_internal.agents.scope_contracts import GitSnapshot
+        from loop_manager_internal.git import publication_service
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+
+        repo_path, worktree = Path('/repo'), Path('/worktree')
+        branch, base, target, remote, head = (
+            'loop-manager/G-047', 'a' * 40, 'b' * 40, 'c' * 40, 'd' * 40)
+        original_head = target
+        original = GitSnapshot(target, branch, {}, {}, {}, {}, {}, {}).serialize()
+        integration = {'phase': 'complete', 'remote': remote, 'head': head,
+            'branch': branch, 'worktree': str(worktree), 'before': original}
+        pending = {'branch': branch, 'from': base, 'target': target}
+        for bad_location in (repo_path, worktree, None):
+            with self.subTest(bad_location=bad_location):
+                connection = runtime_connection()
+                self.addCleanup(connection.close)
+                connection.execute("UPDATE projects SET origin='owner/repo', base_branch='main'")
+                connection.execute(
+                    "UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, branch=?, worktree=?",
+                    (base, branch, str(worktree)))
+                connection.commit()
+                checkpoints = ExecutionCheckpointRepository(connection)
+                checkpoints.record('repo', 'G-047', expected_generation=0, operation=None,
+                    expected_head=head, target_base_oid=remote, observed_remote_oid=remote,
+                    snapshot={'accepted_work_branch': remote, 'worker_checkpoint_pending': pending,
+                              'work_branch_integration': integration})
+                plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+                git_calls = []
+
+                def git(path, *args, check=True):
+                    git_calls.append((path, args))
+                    if args[:2] == ('remote', 'get-url'):
+                        bad = bad_location == path
+                        url = 'git@github.com:other/repo.git' if bad else 'git@github.com:owner/repo.git'
+                        return SimpleNamespace(stdout=url + '\n', returncode=0)
+                    if args[:3] == ('symbolic-ref', '--quiet', '--short'):
+                        return SimpleNamespace(stdout=branch + '\n', returncode=0)
+                    if args[:1] == ('rev-parse',):
+                        return SimpleNamespace(stdout=head + '\n', returncode=0)
+                    if args[:1] == ('ls-remote',):
+                        return SimpleNamespace(stdout=f'{remote}\trefs/heads/{branch}\n', returncode=0)
+                    if args[:2] == ('show', '-s'):
+                        return SimpleNamespace(stdout=base + '\n', returncode=0)
+                    if args[:3] == ('merge-base', '--is-ancestor', target):
+                        return SimpleNamespace(stdout='', returncode=0 if args[3] == original_head else 1)
+                    raise AssertionError((path, args))
+
+                def validate(repo, selected_worktree, origin):
+                    return workspace.validate_registered_remote(
+                        repo, selected_worktree, origin, git=git,
+                        github_repository=lambda url: 'other/repo' if 'other' in url else 'owner/repo')
+
+                effects = publication_service.WorkerCheckpointPublicationEffects(
+                    active_execplan=lambda *_: plan, git=git, remote_branch_oid=lambda *_: remote,
+                    pr_for_branch=mock.Mock(return_value=None), github_repository=mock.Mock(),
+                    validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+                    validate_registered_remote=validate, update_project=mock.Mock())
+                from loop_manager_internal.agents import scope_validation
+                with mock.patch.object(scope_validation, 'validate_worker_commit'):
+                    if bad_location is None:
+                        self.assertEqual(publication_service.push_worker_checkpoint_commits(
+                            effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
+                            branch, worktree, 'main', remote, None), (head, 0))
+                    else:
+                        with self.assertRaises(PublicationSafetyError):
+                            publication_service.push_worker_checkpoint_commits(
+                                effects, connection, repo_path, Path('/state'), 'repo', 'G-047',
+                                branch, worktree, 'main', remote, None)
+                if bad_location is None:
+                    saved = checkpoints.get('repo', 'G-047').snapshot
+                    self.assertNotIn('worker_checkpoint_pending', saved)
+                    self.assertEqual(saved['retired_worker_checkpoints'], [
+                        {'intent': pending, 'observed_remote': remote, 'confirmed': False}])
+                    self.assertEqual(checkpoints.get('repo', 'G-047').expected_head, head)
+                    self.assertIsNone(connection.execute(
+                        'SELECT publication_remote_oid FROM exec_plans').fetchone()[0])
+                else:
+                    current = checkpoints.get('repo', 'G-047')
+                    self.assertEqual(current.generation, 1)
+                    self.assertEqual(current.snapshot['worker_checkpoint_pending'], pending)
+                self.assertFalse(any(args[:1] == ('push',) for _, args in git_calls))
+
     def test_archive_requires_the_current_regular_file_and_original_hash(self):
         effects = fake_effects(archive_git.ArchiveGitEffects)
         adapter = archive_git.ExecPlanArchiveGitPort(Path('/repo'), Path('/state'), 'repo', effects=lambda: effects)

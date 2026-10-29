@@ -23,8 +23,8 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 3은 `gi
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/git/publication_service.py`의 URL/identity 판단을 `git/workspace.py:validate_registered_remote()` 재사용으로 바꾼다. 기존 effects 조립을 통해 같은 관측 경계를 사용하고 helper 예외를 게시 소비자의 기존 예외로 변환한다. 새로운 validator·전역 설정·캐시를 추가하지 않는다.
-- [ ] 확인한 `tests/test_workspace_publication_adapters.py`에서 실제 helper와 게시 호출을 연결하는 mock 관측 unit을 보강한다. 현재 `push_worker_checkpoint_commits()`의 새 원격 입력 대기·완료 통합 뒤 낡은 intent 폐기에서도 최초 origin 검증이 적용되고 실제 push 경로의 직전 재검사가 유지돼야 한다. `tests/test_worker_checkpoint_publication.py`의 실제 commit/push·중단 재개·`confirmed: false` 폐기 감사 회귀는 그대로 남기고 같은 Git 준비를 새 정책 행렬마다 반복하지 않는다. 관계 판단·통합·게시 요청 확정은 이 공통화의 구현 범위로 확대하지 않는다.
+- [x] 확인한 `loop_manager_internal/git/publication_service.py`의 URL/identity 판단을 `git/workspace.py:validate_registered_remote()` 재사용으로 바꾼다. 기존 effects 조립을 통해 같은 관측 경계를 사용하고 helper 예외를 게시 소비자의 기존 예외로 변환한다. 새로운 validator·전역 설정·캐시를 추가하지 않는다.
+- [x] 확인한 `tests/test_workspace_publication_adapters.py`에서 실제 helper와 게시 호출을 연결하는 mock 관측 unit을 보강한다. 현재 `push_worker_checkpoint_commits()`의 새 원격 입력 대기·완료 통합 뒤 낡은 intent 폐기에서도 최초 origin 검증이 적용되고 실제 push 경로의 직전 재검사가 유지돼야 한다. `tests/test_worker_checkpoint_publication.py`의 실제 commit/push·중단 재개·`confirmed: false` 폐기 감사 회귀는 그대로 남기고 같은 Git 준비를 새 정책 행렬마다 반복하지 않는다. 관계 판단·통합·게시 요청 확정은 이 공통화의 구현 범위로 확대하지 않는다.
 
 ## Validation
 
@@ -36,7 +36,12 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 3은 `gi
 ## Progress
 
 - [x] 저장된 중복 판정의 인용·공통 helper·게시 회귀 책임을 확인했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] helper 연결·예외 보존과 targeted unit 검증
+- [x] helper 연결·예외 보존과 targeted unit 검증
+
+## Validation Record
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_workspace_publication_adapters.PublicationObservationBoundaryTests` — 13 tests passed. 실제 `validate_registered_remote()`와 mock Git observation을 연결해 repository/worktree × fetch/push 정상·누락·복수·identity 불일치·명령 실패, publisher 예외·무쓰기, push 직전 재검사, 새 원격 입력 대기와 통합 완료 뒤 intent 폐기 경로를 확인했다.
+- 전체 verify는 Worker 범위 밖이므로 실행하지 않았다.
 
 ## Decision Log
 
