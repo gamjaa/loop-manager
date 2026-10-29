@@ -491,6 +491,39 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
 
 
 class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase):
+    def test_legacy_metadata_release_retries_once_under_deferred_metadata_policy(self):
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        original = self.case.observed
+        block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'rebase_block_release': block,
+                      'rebase_block_release_state': original.fingerprint})
+        self.connection.commit()
+
+        self.assertTrue(self.resume())
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((row['status'], row['last_error'], row['worker_session_id']),
+                         ('IMPLEMENTING', loop_manager.REBASE_IN_PROGRESS_ERROR, 'saved-worker'))
+        released = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(released.operation, 'rebase')
+        self.assertIsNone(released.current_rebase_acceptance())
+        self.assertEqual(self.case.observed, original)
+        project = self.connection.execute('SELECT * FROM projects').fetchone()
+        self.case.fixture.effects.workspace.is_directory.return_value = True
+        self.assertTrue(self.case.handler._resolving_rebase(project))
+
+        # The same failure under the new policy must not create a retry loop.
+        self.connection.execute("DELETE FROM notified_block_incidents")
+        self.block(reason='plan_input_invalid')
+        before = self.snapshot()
+        self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+        self.git_write.assert_not_called()
+
     def test_plan_input_block_uses_owned_rebase_before_ordinary_branch_recovery(self):
         from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
         from loop_manager_internal.storage.recovery_state import RecoveryRepository
