@@ -5,7 +5,8 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-067] 프로젝트 공통 verify 실행 규약.md
   - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
-depends_on: []
+depends_on:
+  - G-339
 complexity: medium
 risk: high
 priority: normal
@@ -41,9 +42,13 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 12는 `l
 ## Progress
 
 - [x] 저장된 전송 결합/직렬 중복과 G-309의 실행 경계를 대조해 현재 인터페이스로 독립 검증할 공통화 범위를 확정했다. 구현·테스트·verify는 실행하지 않았다.
+- [ ] 보고 369의 범위 밖 공통 결함 교정 G-339 반영 뒤 보존된 후보·실패 근거로 남은 검증 재개
 - [ ] 공통 전송·직렬 제한 분리와 양쪽 adapter 회귀 검증
 
 ## Decision Log
+
+- 공통 결함 snapshot `48f1af6159481ff29edbdcc6abd90b12fcc5246e1f069c1a7e424751d43e785b`의 보고 369는 이 작업의 전체 verify에서 정책 fixture와 targeted 기록 테스트가 실패했다고 관측한다. 현재 원격에서 원인을 각각 Git 관측 누락·3회 실패의 잘못된 도달 기대임을 정적으로 확인해 G-339에서 원인별로 구분한다. 어느 하나만 고치면 같은 필수 전체 verify가 나머지 실패로 막혀 하나의 Merge 단위로 두며, dependency는 남은 필수 검증의 확인된 실패를 선행 교정하는 관계다. 이 관계로 전송 구현 범위를 넓히지 않는다. started ID·경로·기존 기록·분류와 후보/실패를 보존하고 계획 게시만으로 교정·전체 verify 성공이나 차단 해제를 확정하지 않는다.
+- 직접 sources 밖 R-061의 해시 호환·작업 base 기준은 이 작업에서 관측된 문서 보고 오류를 재평가하는 입력이다. 현재 결합 구현과 G-189의 후속 감사를 소비하며 adapter 리팩터링 안에서 보고 엔진을 재구현하거나 전수 감사를 역방향 선행으로 추가하지 않는다.
 
 - complexity medium: 공통화할 책임과 adapter callback이 이미 구분돼 있다. risk high: 프로세스/예약 수명을 잘못 옮기면 종료 불명 실행의 자리 회수·가드 누락이 생길 수 있다. 기존 receipt·PID identity·환경 정제·다른 run 보존을 유지하며 시작/종료 실패 회귀로 확인한다. 최초 level은 3이다.
 - G-309는 통합 실행 위치·시간 예산, 이 계획은 adapter 간 전송 의존만 소유한다. child 환경·clock·core callback 계약을 보존하므로 G-309의 구현은 공통 전송 분리의 필수 선행이 아니다. 파일 수정 충돌 방지만으로 선행을 추가하지 않으며, 현재 인터페이스에서 독립 검증·Merge하고 추가 유지보수 평가를 요구하지 않는다.

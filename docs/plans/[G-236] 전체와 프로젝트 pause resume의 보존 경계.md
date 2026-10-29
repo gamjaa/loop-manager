@@ -23,7 +23,7 @@ priority: high
 
 ## Acceptance Criteria
 
-- R-061의 문서 보고 결합도 pause에서 보존한다. Worker 결과 원문과 작업별 `manager_metadata`의 `document-report:` 근거를 유지하며 저장 전·후의 pause를 결합 완료나 설명 승인으로 간주하지 않는다. resume 명령은 보고를 재결합·소비하거나 과거 해시 오류 차단을 해제하지 않는다. 다음 자동 실행만 기존 검증/게시 경계에서 현재 문서별 patch와 결합 근거를 비교하며, 근거 부재·실제 patch 변경은 현재 설명 교정으로 처리한다.
+- R-061의 문서 보고 결합도 pause에서 보존한다. Worker 결과 원문·작업 base/후보와 작업별 `manager_metadata`의 `document-report:` 근거를 유지하며 저장 전·후의 pause를 결합 완료나 설명 승인으로 간주하지 않는다. resume 명령은 base 조회·보고 재결합/소비나 잘못된 base·과거 해시 오류 차단 해제를 수행하지 않는다. 다음 자동 실행만 기존 검증/게시 경계에서 같은 작업 base와 현재 후보의 문서별 patch를 대조한다. 원격 base 전진만으로 작업 base를 바꾸지 않고 rebase 완료 근거 뒤에만 통합된 target으로 전환한다. 작업 base 조회 실패·근거 부재는 후보·원문·진단을 보존해 기존 복구로 이어가며 실제 patch 변경·설명 결합 부재의 교정과 구별한다.
 
 - pause [repo]는 먼저 요청을 저장하고 대상 Agent·verify·자식 종료를 유한 시간 안에 확인한다. 단계·session·작업물·진단·게시 intent를 보존하며 다른 프로젝트나 다른 기기의 수동 구현 종료를 주장하지 않는다.
 - Git·게시 중단 결과는 현재 소유권·실제 원격·기존 복구 증거로 확인한다. 게시 전, 게시 후 DB 미적용, DB 적용 후 worktree 정리·최종 해제 대기를 구분한다. 적용된 catalog·목적별 성공 기준은 pause나 정리 실패로 되돌리지 않고, planning 소유권·결과·session·intent와 `publication_remote_oid`를 보존한다. worktree 제거 뒤 DB 해제 전에 중단돼도 제거된 경로를 재생성하거나 batch를 다시 적용하지 않는다. 별도 작업의 intent는 R-055의 실제 충돌 범위로 판단하고 pause가 그 intent·원인 차단을 정리하지 않는다. 종료·저장·게시 결과 미확인에서는 pause와 미완료 대상을 보존하고 완료·새 자원 사용을 허용하지 않는다. 재시작도 같은 요청을 이어간다.
@@ -39,7 +39,7 @@ priority: high
 
 ## Implementation
 
-- [ ] 최신 `execution/execution_worker_handler.py:_bind_document_report()`·`documents/pr_description.py:common_guidance_report()`의 staging 뒤 Git 관측과 짧은 지문 저장을 기존 pause 보존 경계에 연결한다. 중단 시 Worker 결과·현재 후보·이미 저장한 결합 근거를 유지하고, 다음 자동 진입은 기존 보고 검사를 소비한다. Manager 결합 알고리즘·파서·해시 계산이나 resume 전용 보고 복구를 새로 만들지 않는다.
+- [ ] 최신 `execution/execution_worker_handler.py:_bind_document_report()`·`documents/pr_description.py:common_guidance_report()`의 staging 뒤 작업 base 조회·Git diff·지문 저장을 기존 pause 경계에 연결한다. 조회/저장 전후 중단 시 Worker 원문·후보·확인한 base·기존 근거를 보존하고, 다음 자동 진입만 현재 보고 검사를 소비한다. 진행 중 rebase를 최종 보고로 확정하거나 resume에서 최신 원격으로 base를 교체하지 않는다. Manager 결합 알고리즘·파서·해시 계산이나 resume 전용 복구를 새로 만들지 않으며 G-189의 후속 감사를 이 pause 작업의 선행으로 만들지 않는다.
 
 기존 process/resource lock·subprocess 종료/verify 자식 조율·실행 checkpoint·수동 요청 저장을 재사용한다. bootstrap 이전의 pause 조회와 실행 중 요청 접수는 실행 잠금 소유자의 작업을 탈취하지 않는다. 필요한 호환 저장·요청/확인 전이는 기존 runtime/storage 경계에 두고 PRODUCT·ARCHITECTURE와 운영 안내에 반영한다. 새 daemon·실행 엔진·자동 병렬 Worker를 만들지 않는다.
 
@@ -53,7 +53,7 @@ priority: high
 
 ## Validation
 
-- 후보의 `tests/test_pause.py`에 있는 실제 SQLite·단계/session 보존 fixture와 `tests/test_execution_documents.py`의 Manager 결합 회귀를 재사용한다. 결합 저장 전/후 pause에서 원문·후보·저장된 근거가 보존되고 resume의 staging·Git·결합 저장·Worker 호출이 0회인지 최소 unit으로 확인한다. 다음 자동 실행은 일치한 근거만 재사용하고 근거 부재/실제 patch 변경은 기존 설명 교정으로 이어져야 한다. 기존 해시 호환성·rebase 동일 patch 검사를 복제하지 않는다.
+- 후보의 `tests/test_pause.py`에 있는 실제 SQLite·단계/session 보존 fixture와 `tests/test_execution_documents.py`의 Manager 결합 회귀를 재사용한다. 작업 base 조회·결합 저장 전/후 pause에서 원문·후보·확인한 base·기존 근거가 보존되고 resume의 staging·Git/base 조회·결합 저장·Worker 호출이 0회인지 최소 unit으로 확인한다. 원격 base만 전진했거나 rebase가 중단된 상태도 pause로 최종 설명이 확정되지 않아야 한다. 다음 자동 실행에서만 올바른 base와 같은 patch의 근거를 재사용하고 base 확인 실패는 보존 복구, 설명 결합 부재/실제 patch 변경은 현재 설명 교정으로 구분한다. 기존 해시 호환성·rebase 동일 patch 행렬은 복제하지 않는다.
 
 - `tests/test_planning_publication.py:test_publication_release_scopes_pending_rebase_on_first_publish_and_recovery`와 `tests/test_manual_concurrency.py:ManualJournalScopeTests.test_pending_rebase_scopes_preparation_slot_and_release_with_current_identity`의 실제 journal·SQLite·관측 double을 재사용한다. 별도 rebase 관측의 lease 취득 전/후와 자동 release의 상태 확정 전에 pause를 접수해, 추가 제거·해제·새 호출 없이 원인 intent·차단·파일/index와 planning/수동 요청이 보존되는지 최소 연결로 확인한다. 정상·pause·예외 반환 뒤 관측 lease가 남지 않고, 반환된 lease의 과거 identity는 상태 확정에 재사용되지 않아야 한다. 후보 `tests/test_pause.py:test_separate_manual_preparation_keeps_existing_resource_boundary`의 수동 준비 허용과 자동 후속 처리 중단을 함께 유지한다. 공통 안전 판단 자체를 성공 mock으로 바꾸거나 기존 충돌/종료 불명 행렬을 복제하지 않는다. resume 자체의 외부 효과는 0회이고 다음 자동 실행만 현재 소유권·writer·lease를 다시 확인한다. 새 잔여 정리 수명·경로 배제의 통합 검증은 G-337에 남긴다.
 - 실제 저장·정책을 실행하는 targeted unit test로 중첩 범위·resume 격리·접수/선택 경합·종료 확인 실패·재시작과 수동/복구 후속 대기를 확인한다. 전체 pause 진입에서 외부 효과는 호출 시 실패 fixture로 차단한다.
@@ -69,7 +69,7 @@ priority: high
 
 ## Progress
 
-- [ ] R-061의 Manager 문서 보고 결합과 pause 전후 보존 연결·최소 회귀
+- [ ] R-061의 작업 base 조회·Manager 문서 결합과 pause 전후 보존 연결·최소 회귀
 
 - [x] 현재 revision의 #294 Manager checkpoint·최소 prompt/전달 cursor를 정적으로 대조했다. 보존 후보 HEAD `bc5adea909fce7602607c811ee443aac115c1112`의 충돌 상태와 기존 기록을 읽기 전용으로 유지하며 새 조건의 pause 통합만 미충족으로 추가했다. 후보 파일/index/Git operation과 실행 기록은 변경하지 않았고 테스트·verify 성공을 확정하지 않았다.
 - [ ] Manager checkpoint·원격 통합/낡은 intent 폐기 감사·미확인 prompt 전달과 pause의 보존 연결/최소 회귀
@@ -87,7 +87,7 @@ priority: high
 
 ## Decision Log
 
-- R-061의 직접 구현은 재사용하고, 새로 저장하는 문서 보고 결합 근거의 pause 수명만 기존 작업에 연결한다. 시작한 ID·경로·후보·실행/검증 기록과 무dependency를 유지하며 과거 해시 오류 재평가 자체는 pause/resume의 효과로 추가하지 않는다.
+- R-061의 작업 base 교정은 직접 구현으로 소비하고 조회/결합 중단의 pause 보존만 같은 작업에 연결한다. snapshot token `b81ad32aabbf4dd1b5d9bb5588bd34073f3fe905e63b4598b99cf4dfe27e7704`와 원문 hash를 대조했으며 started ID·경로·기존 수행 기록·무dependency를 유지한다. 보존 후보의 현재 HEAD `b546c3c5b07e1ae79c342e06afc92accadcb5e1c`와 선택 ExecPlan의 미해결 충돌, 기존 pause 구현/테스트를 읽기 전용으로 확인했다. 파일/index·Git operation·실행 이력을 변경하거나 중간 후보를 최신 조건의 검증 성공으로 판단하지 않았다. 잘못된 base/해시 오류 재평가는 pause/resume의 효과로 추가하지 않는다.
 
 - 비교 기준 `1cca71cf` → revision `7b1a2e22`, snapshot token `52eb05094dd88c347febe6a00f6aaccac53cefd38d15a456e3a5d24cfe98d4c5`와 개정 전 hash `06b1316254029b8a3d0ea23d9e65247d0c1ece18125fc736efcd4463097235bc`를 확인했다. 기존 공통 Git 자원 판단·writer/열린 lease 보호에 더해 이번 비조상 통합·원자 수용/무효화와 낡은 checkpoint intent 폐기도 직접 구현으로 소비한다. 미충족 부분은 각 전이의 사용자 pause·자료 보존 연결이며 관계 판단·CAS·일반 게시 재개를 재구현하지 않는다. G-313의 일반 요청/게시 연결과 G-337의 후속 정리 수명은 기존 순서로 남긴다. 무dependency·started ID/경로·분류·기존 구현/검증 기록을 유지하며 보존 후보 HEAD `bc5adea909fce7602607c811ee443aac115c1112`의 충돌 파일·index·실행 기록은 읽기 전용으로 확인했다. 구현·테스트·verify·후보 변경과 차단 해제·프로젝트 최종 전문 확인을 수행하지 않았다.
 
