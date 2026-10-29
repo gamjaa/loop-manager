@@ -62,6 +62,7 @@ class Task:
     connection: object
     resumed: bool = True
     retry_order: int | None = None
+    recovery: bool = False
 
     def rank(self, priority_reader=None):
         from loop_manager_internal.catalog.effective_priority import effective_priorities
@@ -234,8 +235,9 @@ class TaskScheduler:
         from loop_manager_internal.recovery import scoped_blocking
         from loop_manager_internal.storage import execplan_draft_state
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
-        if (scoped_blocking.project_block(connection, task.repo) is not None
-                or scoped_blocking.plan_block(connection, task.repo, task.plan_id) is not None
+        project_block = scoped_blocking.project_block(connection, task.repo)
+        if ((project_block is not None and not (task.recovery and project_block['plan_id'] == task.plan_id))
+                or (not task.recovery and scoped_blocking.plan_block(connection, task.repo, task.plan_id) is not None)
                 or task.plan_id in scoped_blocking.catalog_held_plan_ids(connection, task.repo)
                 or task.plan_id in execplan_draft_state.pending_ids(connection, task.repo)):
             return False
@@ -244,7 +246,8 @@ class TaskScheduler:
             return False
         row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?",
                                  (task.repo, task.plan_id)).fetchone()
-        if row is None or row['status'] in {'PLAN_BLOCKED', 'PR_OPEN', 'MERGED', 'MANUAL_WORKING'}:
+        if (row is None or row['status'] in {'PR_OPEN', 'MERGED', 'MANUAL_WORKING'}
+                or row['status'] == 'PLAN_BLOCKED' and not task.recovery):
             return False
         group = ManualWorkRepository(connection).for_plan(task.repo, task.plan_id)
         if group is not None and (not group['request_id']
@@ -265,7 +268,7 @@ class TaskScheduler:
             rows = connection.execute('SELECT * FROM exec_plans WHERE repo=?', (task.repo,)).fetchall()
             if task.plan_id not in cycle_scope_plan_ids(rows, cycle):
                 return False
-        if check_priority and self.priority_reader is not None:
+        if check_priority and self.priority_reader is not None and not task.recovery:
             decision = self.priority_reader(connection, task.repo)
             if task.plan_id not in dict(decision.priority_ranks):
                 return False
@@ -340,7 +343,7 @@ class TaskScheduler:
                 task = item[0]
                 count = managed_count(connection, task.repo) if kind == 'management' else None
                 rank = Task(task.repo, task.plan_id, connection, task.resumed,
-                            task.retry_order).rank(self.priority_reader)
+                            task.retry_order, task.recovery).rank(self.priority_reader)
                 refreshed.append((item, rank, count))
         with self.condition:
             if self.waiters[kind] != registered:

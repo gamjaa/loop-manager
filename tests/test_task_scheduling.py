@@ -892,6 +892,97 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             scheduling.current_task.reset(task)
             scheduling.current_scheduler.reset(token)
 
+    def test_project_recovery_admission_preserves_exact_active_owner_and_planning_gate(self):
+        from loop_manager_internal.recovery.plan_recovery import recovery_admission
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        with self.connection:
+            self.connection.execute("INSERT INTO project_blocks(repo,plan_id,scope,reason_code,evidence) "
+                                    "VALUES ('A','G-001','project','repository_state_unsafe','original cause')")
+        before = dict(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone())
+        scheduler = self.scheduler()
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with self.assertRaises(scheduling.SchedulingDeferred), scheduler.admission(
+                    scheduling.Task('A', 'G-001', self.connection)):
+                self.fail('일반 배정이 프로젝트 차단을 우회했습니다.')
+            with self.assertRaises(scheduling.SchedulingDeferred), recovery_admission(self.connection, 'A', 'G-002'):
+                self.fail('다른 계획이 프로젝트 차단의 복구 자리를 얻었습니다.')
+            with recovery_admission(self.connection, 'A', 'G-001'), runtime_state._transaction(self.connection):
+                self.assertEqual(runtime.get('A', 'G-001').status, 'IMPLEMENTING')
+                self.assertEqual(scheduling.managed_count(self.connection, 'A'), 1)
+            with self.connection:
+                self.connection.execute("UPDATE projects SET planning_resume_plan_id='G-001' WHERE repo='A'")
+            with self.assertRaises(scheduling.SchedulingDeferred), recovery_admission(self.connection, 'A', 'G-001'):
+                self.fail('복구가 planning 소유권을 우회했습니다.')
+            with self.connection:
+                self.connection.execute("UPDATE projects SET planning_resume_plan_id=NULL WHERE repo='A'")
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()), before)
+        block = self.connection.execute("SELECT plan_id,evidence FROM project_blocks WHERE repo='A'").fetchone()
+        self.assertEqual(tuple(block), ('G-001', 'original cause'))
+        self.assertFalse(scheduler.admitting)
+
+    def test_blocked_recovery_uses_scheduler_for_review_verify_and_reactivation(self):
+        from loop_manager_internal.recovery import plan_recovery, scoped_blocking
+        from loop_manager_internal.recovery.blocked_plan_service import (
+            RequeueBlockedExecplanEffects, _requeue_blocked_execplan,
+        )
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED',pr_conflict_recovery=1 "
+                                    "WHERE repo='A' AND plan_id='G-001'")
+            self.connection.execute("INSERT INTO execplan_blocks(repo,plan_id,scope,reason_code,evidence) "
+                                    "VALUES ('A','G-001','plan','user_decision_required','preserved question')")
+        scheduler = self.scheduler(max_workers=1)
+        scheduler.priority_reader = lambda connection, repo: SimpleNamespace(priority_ranks=())
+        token = scheduling.current_scheduler.set(scheduler)
+        calls = []
+        @scheduling.scheduled_call('agent')
+        def reviewer(**_options):
+            calls.append('reviewer')
+        @scheduling.scheduled_call('verify')
+        def verify():
+            calls.append('verify')
+        try:
+            normal = scheduling.Task('A', 'G-001', self.connection)
+            with self.assertRaises(scheduling.SchedulingDeferred), scheduler.slot('agent', normal):
+                self.fail('일반 호출이 차단을 우회했습니다.')
+            with plan_recovery.recovering_plan(self.connection, self.directory, 'A', 'G-001') as owned:
+                self.assertTrue(owned)
+                for change, restore in (
+                    ("INSERT INTO project_blocks(repo,scope,reason_code,evidence) VALUES ('A','project','repository_state_unsafe','unsafe')",
+                     "DELETE FROM project_blocks WHERE repo='A'"),
+                    ("UPDATE projects SET phase='PLANNING' WHERE repo='A'",
+                     "UPDATE projects SET phase=NULL WHERE repo='A'"),
+                    ("UPDATE exec_plans SET depends_on='[\"G-002\"]' WHERE repo='A' AND plan_id='G-001'",
+                     "UPDATE exec_plans SET depends_on='[]' WHERE repo='A' AND plan_id='G-001'"),
+                ):
+                    with self.subTest(gate=change):
+                        with self.connection:
+                            self.connection.execute(change)
+                        with self.assertRaises(scheduling.SchedulingDeferred):
+                            verify()
+                        self.assertEqual(calls, [])
+                        with self.connection:
+                            self.connection.execute(restore)
+                reviewer(role_name='reviewer')
+                verify()
+                self.assertIsNotNone(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
+                _requeue_blocked_execplan(RequeueBlockedExecplanEffects(loop_manager._clear_active_values),
+                    self.connection, 'A', 'G-001')
+            self.assertIsNone(scheduling.current_task.get())
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(calls, ['reviewer', 'verify'])
+        self.assertEqual(runtime_state.RuntimeStateRepository(self.connection).get('A', 'G-001').status,
+                         'IMPLEMENTING')
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'A', 'G-001'))
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+        self.assertEqual(sum(scheduler.running['verify'].values()), 0)
+        self.assertFalse(scheduler.admitting)
+
     def test_waiting_calls_recheck_current_gates_and_candidate_before_start(self):
         from loop_manager_internal.storage import execplan_draft_state
         for change in ('project', 'catalog', 'draft', 'dependency', 'manual', 'maintenance', 'phase', 'candidate', 'ownership'):
