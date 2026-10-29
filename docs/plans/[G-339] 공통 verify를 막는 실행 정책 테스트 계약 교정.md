@@ -27,10 +27,9 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `tests/support/execution.py:execution_policy_fixture()`의 지역 `git()`을 수정한다. 상위 `ExecutionFixture.git()`·`phase_git()`의 현재 merge-base 지원과 지역 override의 차이를 대조하고 기존 후보/commit 상태에서 필요한 관측만 추가한다. 새 fixture·범용 fallback을 만들지 않는다.
-- [ ] 확인한 `tests/test_execution_retry_policy.py`·`tests/test_recovery_history.py`·`tests/test_review_profile_escalation.py`의 fixture 소비자가 문서 결합을 통과해 원래 정책 assertion에 도달하도록 한다. 현재 `test_git_observation_failure_pauses_without_discarding_saved_worker`의 예상 밖 Git 거부 assertion을 유지하고 필요하면 같은 unit에 commit 전/후 관측만 보완한다.
-- [ ] 확인한 `tests/test_agent_invocation.py:RunnerTests.test_targeted_records_follow_each_physical_retry_and_session_fallback`의 마지막 `repeated()` 기대를 세 번 실패의 비도달·실패 누계 및 귀속 assertion으로 교정한다. 기존 Provider double·임시 JSONL·SQLite·종료 receipt 관측을 재사용한다. 현재 `storage/targeted_test_state.py:TargetedTestRepository.observe()`의 `failures >= 5`와 실제 `agents/invocation_service.py` 수집 경로는 변경하지 않는다.
-- [ ] 확인한 `tests/test_execution_documents.py:WorkerDocumentReportBaseTests`·`CommonGuidancePrReportTests`와 `tests/test_targeted_test_streak.py:TargetedHistoryTests.test_only_five_distinct_runs_of_the_same_test_trigger_the_limit` 등 기존 회귀의 assertion 대응을 남긴다. 이미 있는 base/해시·1–5회 행렬은 다시 복제하지 않는다.
+- [x] `execution_policy_fixture()`가 `merge-base base HEAD`와 후보 SHA 변형, head 인자 없는 정확한 base name-status diff에만 응답하도록 했다. 기존 후보 diff·base/candidate binary diff와 예상 밖 Git 거부 assertion을 유지했다.
+- [x] 세 물리 재시도 테스트가 SQLite의 실패 누계 3·비도달 표식·세 test 결과·각기 다른 run 및 invocation 귀속을 확인하도록 교정했다. 실행 수와 운영 임계값은 바꾸지 않았다.
+- [x] 문서 결합·재시도 실패·session 및 Review 경계 테스트와 기존 다섯 번째 고유 실패 도달 테스트를 targeted 실행했다.
 
 ## Validation
 
@@ -41,8 +40,14 @@ priority: high
 ## Progress
 
 - [x] revision `7b2979597ed1af97b19409c375057747ee3b0704`에서 보고 369의 두 관측을 현재 명세·코드와 정적으로 대조했다. 지역 Git override에는 commit 전 diff·현재 merge-base 응답이 없고 재시도 테스트는 세 결과 뒤 5회 표식을 기대한다. 테스트는 실행하지 않았다.
-- [ ] 정확한 Git 관측 추가와 기존 정책 assertion 확인
-- [ ] 세 실패의 누계·비도달·귀속 assertion 교정과 기존 5회 회귀 확인
+- [x] 정확한 Git 관측 추가와 기존 정책 assertion 확인
+- [x] 세 실패의 누계·비도달·귀속 assertion 교정과 기존 5회 회귀 확인
+
+## Validation Record
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_execution_retry_policy.ExecutionRetryPolicyTest.test_distinct_verify_failures_recover_in_one_run_with_persistent_sessions tests.test_execution_retry_policy.ExecutionRetryPolicyTest.test_git_observation_failure_pauses_without_discarding_saved_worker tests.test_recovery_history.RecoveryHistoryTest.test_review_protocol_errors_do_not_retry_worker_or_consume_history tests.test_review_profile_escalation.ReviewDrivenWorkerProfileEscalationTest.test_reviewer_cli_failure_does_not_escalate_worker tests.test_agent_invocation.RunnerTests.test_targeted_records_follow_each_physical_retry_and_session_fallback tests.test_targeted_test_streak.TargetedHistoryTests.test_only_five_distinct_runs_of_the_same_test_trigger_the_limit` — 6 tests passed.
+- 최초 실행은 fixture가 `merge-base base HEAD` 관측을 빠뜨려 4개 정책 테스트를 실패시켰다. exact 인수 허용을 추가한 뒤 동일 targeted 명령으로 모두 통과했다.
+- 전체 verify는 Worker 범위 밖이므로 실행하지 않았다.
 
 ## Decision Log
 

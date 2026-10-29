@@ -386,6 +386,8 @@ def execution_policy_fixture(test, *, pr_conflict=False):
             output = fixture.candidate
         elif args == ('rev-parse', 'origin/main'):
             output = 'base'
+        elif args in {('merge-base', 'base', fixture.candidate), ('merge-base', 'base', 'HEAD')}:
+            output = 'base'
         elif args == ('status', '--porcelain'):
             output = ' M app.py' if fixture.dirty else ''
         elif pr_conflict and args == ('ls-files', '-u', '-z'):
@@ -403,6 +405,8 @@ def execution_policy_fixture(test, *, pr_conflict=False):
             output = 'https://example.test/owner/repo.git'
         elif args == ('diff', '--no-ext-diff', '--name-status', '-z', '--find-renames',
                       'base', fixture.candidate):
+            output = ''
+        elif args == ('diff', '--no-ext-diff', '--name-status', '-z', '--find-renames', 'base'):
             output = ''
         elif args == ('diff', '--binary', '--unified=0', '--no-ext-diff', '--no-textconv',
                       'base', fixture.candidate):
