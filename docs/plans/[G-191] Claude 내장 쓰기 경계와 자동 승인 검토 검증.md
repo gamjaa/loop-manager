@@ -63,25 +63,26 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 
 실제 CLI 정책 조합은 아직 실행 검증하지 않았다. 실환경 점검과 실행 중 managed 정책 변경 대응은 FUTURE_IDEAS의 후속 확인으로 보존하며 현재 구현 완료 조건에 추가하지 않는다. 이용 가능한 환경의 실호출 검증은 추가 근거이며 CLI 설치·계정 확보·유료 호출도 완료 조건이 아니다. 이 문서 정합화는 최신 R-023의 범위 결정을 반영하며 구현·테스트·실제 정책 적용 성공을 뜻하지 않는다.
 
-## Native 정책 갱신 조사와 남은 판단
+## 공식 호출 구성 조사와 중간 구현
 
-2026-10-13 Worker는 공식 문서와 [공식 changelog](https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md)의 최신 표기 v2.1.296을 대조했다. 아래는 문서 조사 결과이며 설치 CLI에서 관측한 결과가 아니다. 개발 환경은 Linux/Python 3.12.3이고 Claude executable이 없다. CLI 부재는 아래 제약의 근거나 사용자 판단 요청의 이유가 아니다. 선택 adapter는 `scripts/verify.json` version 1의 unittest이고 `docs/VERIFY.md`의 Python 3.11–3.14 계약을 확인했다.
+현재 구현은 설정 source 제외까지 반영한 중간 후보이며, 관리 Claude 호출의 provider 단위 안전 거부는 유지한다. 역할별 전체 쓰기 경계·유효 정책 확인·호출 증거 연결을 완료했다고 선언하지 않는다.
 
-| 조사한 native 경로 | 확인된 기능·버전 및 제약 |
+2026-10-13 Worker의 공식 문서·changelog v2.1.296 조사에서는 managed 설정이 실행별 sandbox 설정을 대체할 수 있고 서버 갱신을 ConfigChange hook으로 사전 차단할 수 없다는 제약을 기록했다. 이는 문서 조사이며 실호출 관측이 아니다. 당시 별도 OS 경계 또는 구현 보류 판단이 필요하다고 기록했지만, 2026-10-16에 반영된 최신 R-023은 실행 중 managed 변경 대응을 현재 범위에서 제외했다. 따라서 그 조사 제약을 현재 구현의 판단 대기나 외부 격리 도입 조건으로 사용하지 않는다. 사용자 결정을 새로 작성하지 않으며 기존 Decision Log의 경위를 보존한다.
+
+2026-10-29 관리 rebase 뒤 a30388e1 기준 전체 diff와 현재 sources·PRODUCT·ARCHITECTURE를 다시 확인하고 공식 문서를 새로 조회했다.
+
+| 공식 근거 | 현재 구현에 적용할 계약 |
 |---|---|
-| 실행별 파일·명령 정책 | [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit)은 `Edit(path)`로 편집 도구를 제한하지만 임의 subprocess에는 적용되지 않는다. `--disallowedTools`는 managed 정책에 추가 제한을 줄 수 있다. [Sandbox](https://code.claude.com/docs/en/sandboxing#configure-sandboxing)의 filesystem 배열은 병합되며, 제외한 설정 source를 sandbox 구성에서도 제외하는 동작은 v2.1.246부터다. 추가 허용이나 빈 배열로 상속 허용을 지웠다고 판단할 수 없다. |
-| managed보다 강한 실행별 제한 | [설정 우선순위 예외](https://code.claude.com/docs/en/settings#exceptions-to-managed-settings-precedence)에는 `autoMode.classifyAllShell=true`가 있으나 sandbox `enabled`, `failIfUnavailable`, `allowUnsandboxedCommands`, `autoAllowBashIfSandboxed`는 없다. [Sandbox의 managed 우선순위](https://code.claude.com/docs/en/sandboxing#keep-developers-from-widening-the-policy)는 managed Boolean 값이 로컬 값을 대체함을 명시한다. 명령 classifier의 검토를 OS 쓰기 제한으로 대신할 수 없다. |
-| 정책 변경 hook | [ConfigChange 계약](https://code.claude.com/docs/en/hooks#configchange)은 로컬 managed 파일 변경을 통지하지만 해당 변경의 blocking 결정을 무시한다. 서버 managed 갱신에는 hook 자체가 실행되지 않는다. 변경을 막는 hook이나 변경 통지 후 종료만으로 모든 managed 갱신에 대한 사전 중단을 보장할 수 없다. |
-| 시작·실행 중 관측 | [서버 managed 설정](https://code.claude.com/docs/en/server-managed-settings#fetch-and-caching-behavior)은 시작 시 fetch와 실행 중 매시간 갱신을 수행한다. `claude doctor`의 remote delivery 진단은 v2.1.248부터이며 현재 fetch 결과이지 다음 갱신을 고정하는 계약이 아니다. `-p`에서 승인 dialog가 필요한 정책도 해당 실행에 적용된다. 시작 검사나 외부 polling 사이에 다음 명령이 실행될 수 있다. |
-| 설정 source 제외·bare mode | [CLI](https://code.claude.com/docs/en/cli-reference)는 `--setting-sources`에 user/project/local만 제공한다. [Bare mode](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode)는 subscription OAuth/keychain을 읽지 않고 API 인증을 요구한다. 이를 기존 계정·지침 계약을 보존하면서 managed 갱신만 고정하는 기능으로 채택할 근거가 없다. `--safe-mode`도 managed 정책을 유지한다. |
+| [Sandbox 설정](https://code.claude.com/docs/en/sandboxing#configure-sandboxing)·[CLI 옵션](https://code.claude.com/docs/en/cli-reference) | 빈 배열은 상속된 배열을 지우지 않는다. `--setting-sources`의 빈 문자열은 user/project/local source를 제외하며, 제외 source의 sandbox filesystem·Edit 권한을 sandbox 구성에서도 제외하는 계약은 v2.1.246 이상이다. 이 버전 조건의 시작 전 확인은 아직 구현하지 않았다. |
+| [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit) | Edit·Write·NotebookEdit의 경로별 제한은 `Edit(path)`를 사용한다. 파일 권한의 `//절대경로`와 sandbox의 `/절대경로`를 구분하고 임의 subprocess에는 sandbox를 적용해야 한다. |
+| [CLI의 restricted 구성](https://code.claude.com/docs/en/cli-reference) | v2.1.248 이상의 `--restricted`는 파일 도구를 working directories에 한정하고 managed·실행별 설정만 로드한다. 명령 도구는 기본 제거되지만 `--tools`에 개별 이름을 명시해 사용할 수 있으므로 파일 도구의 workspace 밖 쓰기 거부를 구성할 native 후보로 남긴다. 아직 채택·연결·모의 검증하지 않았으며 Bash sandbox·Git·임시 경로 보호를 대체하지 않는다. |
+| [설정 우선순위](https://code.claude.com/docs/en/settings#settings-precedence)·[permission mode](https://code.claude.com/docs/en/permission-modes) | 실행별 설정과 source 제외로 managed 설정까지 제거되지 않는다. 시작 정책 충돌은 별도 확인해야 하며 `auto`를 `acceptEdits`나 sandbox 명령 일괄 승인으로 대체하지 않는다. |
 
-구체적 반례는 시작 시 안전한 유효 정책을 확인한 `--print --permission-mode auto` 호출에 서버가 `sandbox.enabled=false` 또는 `sandbox.allowUnsandboxedCommands=true`를 갱신하는 경우다. 전자는 명령 sandbox를 해제하고 후자는 실행별 sandbox 밖 retry 금지를 대체한다. managed 우선순위와 ConfigChange 미통지 때문에 현재 직접 CLI 경로의 시작 검사·설정 지문·hook으로는 갱신 적용과 다음 도구 실행 사이의 중단을 보장할 수 없다. 별도 polling이나 종료 후 diff 검사는 이미 발생한 쓰기를 예방하지 못한다. native Windows 미지원, 상속 충돌의 시작 전 거부와 달리 실행 중 정책을 원자적으로 확인·거부하는 계약이 필요한 반례다.
+이번 중간 구현은 공통 `claude_permission_arguments`에서 `--setting-sources`와 빈 문자열을 별도 인자로 전달한다. 신규·재개가 같은 helper를 사용하고 기존 `auto`·Fast 요청·Reviewer 파일 도구 금지·strict sandbox 요청을 유지한다. 이 source 선택만으로 managed 충돌·전체 쓰기 경계나 실제 정책 적용을 확인했다고 판단하지 않는다.
 
-이는 조사한 직접 CLI 기능에서 R-023과 이 작업의 실행 중 제한 유지·충돌 중단 Acceptance Criteria를 함께 충족할 수 없는 조건이다. 모든 Claude 환경의 기능 부재나 실제 범위 위반 발생을 선언하지 않는다. 해당 조건을 지원으로 표시하거나 mock으로 실제 정책 적용 성공을 합성하지 않으며, 현재 provider 단위 안전 거부는 변경하지 않았다. 독립 Codex 호출·기존 session·snapshot·과거 거부 기록도 변경하지 않았다.
+현재 후보에서 프로젝트 Python과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 다음 세 unit case를 새로 실행해 모두 통과했다. `tests.test_provider_runtime.ProviderNeutralAgentRuntimeTest.test_claude_starts_resumes_and_applies_role_permissions`는 모의 신규 Worker·재개 Reviewer 호출의 빈 source 선택 인자와 자동 검토·sandbox 요청을 확인했다. `tests.test_agent_write_isolation.WriteIsolationTests.test_unsupported_provider_records_rejection_without_launch`와 `test_claude_preflight_rejection_precedes_log_and_process`는 기존 관리 호출 거부와 프로세스 미시작을 확인했다. 이전 후보의 성공을 재사용하지 않았다. 실제 Claude CLI·계정 호출과 전체 verify는 실행하지 않았으며 이 결과는 모의 호출·안전 거부 회귀만의 근거다.
 
-필요한 사용자 판단: 이 조건까지 지원하기 위해 현재 Implementation에서 제외한 별도 OS 쓰기 경계를 허용할지, 또는 native CLI가 갱신 전 확인·중단 계약을 제공할 때까지 해당 조건의 지원 구현을 보류할지 결정이 필요하다. 전자는 Claude 직접 호출의 실행 경계와 설계 변경을 요구하며 자동 승인 검토는 그대로 유지해야 한다. 조직 관리 환경만으로 지원 범위를 축소하거나 유료 호출·새 계정을 요구하는 제안은 아니다. 사용자 결정은 아직 없으며 Requirement·PRODUCT·ARCHITECTURE의 보장과 이 작업의 필수 검증은 수정하지 않았다.
-
-이번 diff는 조사·제약·필요 판단 기록만 포함한다. 실행 가능한 코드·설정·test 변경이 없어 targeted unit test를 실행하지 않았다. 전체 verify·실제 Claude 호출·managed 갱신의 실제 실행 검증도 수행하지 않았다. 구현·검증 완료와 실행 상태 판정은 기록하지 않는다.
+다음 구현은 역할별 canonical source·다른 worktree·shared/worktree Git·Reviewer workspace·소유 임시 경로의 이중 보호, CLI·모델·계정 지원 및 시작 유효 정책·충돌 확인, 신규·재개·fallback의 호출별 증거·실제 오류 보존 연결이다. 기존 필수 검증과 미완료 Progress 항목은 유지하며 중간 checkpoint를 요청한다.
 
 ## Decision Log
 

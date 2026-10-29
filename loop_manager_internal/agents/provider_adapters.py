@@ -863,7 +863,10 @@ def codex_sandbox_arguments(read_only: bool) -> list[str]:
 
 
 def claude_permission_arguments(read_only: bool, *, fast_mode: bool = False) -> list[str]:
-    arguments = ["--permission-mode", "auto"]
+    # Empty arrays in --settings do not remove inherited permission/sandbox
+    # arrays. Exclude personal and repository sources explicitly; managed
+    # settings still apply and need their own preflight conflict check.
+    arguments = ["--permission-mode", "auto", "--setting-sources", ""]
     if read_only:
         arguments.extend([
             "--disallowedTools",
