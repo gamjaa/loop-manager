@@ -65,7 +65,7 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 
 ## 공식 호출 구성 조사와 중간 구현
 
-현재 구현은 설정 source 제외까지 반영한 중간 후보이며, 관리 Claude 호출의 provider 단위 안전 거부는 유지한다. 역할별 전체 쓰기 경계·유효 정책 확인·호출 증거 연결을 완료했다고 선언하지 않는다.
+현재 구현은 설정 source 제외와 역할별 native 요청 정책 생성기까지 반영한 중간 후보이며, 관리 Claude 호출의 provider 단위 안전 거부는 유지한다. 역할별 전체 쓰기 경계·유효 정책 확인·호출 증거 연결을 완료했다고 선언하지 않는다.
 
 2026-10-13 Worker의 공식 문서·changelog v2.1.296 조사에서는 managed 설정이 실행별 sandbox 설정을 대체할 수 있고 서버 갱신을 ConfigChange hook으로 사전 차단할 수 없다는 제약을 기록했다. 이는 문서 조사이며 실호출 관측이 아니다. 당시 별도 OS 경계 또는 구현 보류 판단이 필요하다고 기록했지만, 2026-10-16에 반영된 최신 R-023은 실행 중 managed 변경 대응을 현재 범위에서 제외했다. 따라서 그 조사 제약을 현재 구현의 판단 대기나 외부 격리 도입 조건으로 사용하지 않는다. 사용자 결정을 새로 작성하지 않으며 기존 Decision Log의 경위를 보존한다.
 
@@ -75,14 +75,20 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 |---|---|
 | [Sandbox 설정](https://code.claude.com/docs/en/sandboxing#configure-sandboxing)·[CLI 옵션](https://code.claude.com/docs/en/cli-reference) | 빈 배열은 상속된 배열을 지우지 않는다. `--setting-sources`의 빈 문자열은 user/project/local source를 제외하며, 제외 source의 sandbox filesystem·Edit 권한을 sandbox 구성에서도 제외하는 계약은 v2.1.246 이상이다. 이 버전 조건의 시작 전 확인은 아직 구현하지 않았다. |
 | [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit) | Edit·Write·NotebookEdit의 경로별 제한은 `Edit(path)`를 사용한다. 파일 권한의 `//절대경로`와 sandbox의 `/절대경로`를 구분하고 임의 subprocess에는 sandbox를 적용해야 한다. |
-| [CLI의 restricted 구성](https://code.claude.com/docs/en/cli-reference) | v2.1.248 이상의 `--restricted`는 파일 도구를 working directories에 한정하고 managed·실행별 설정만 로드한다. 명령 도구는 기본 제거되지만 `--tools`에 개별 이름을 명시해 사용할 수 있으므로 파일 도구의 workspace 밖 쓰기 거부를 구성할 native 후보로 남긴다. 아직 채택·연결·모의 검증하지 않았으며 Bash sandbox·Git·임시 경로 보호를 대체하지 않는다. |
+| [CLI의 restricted 구성](https://code.claude.com/docs/en/cli-reference) | v2.1.248 이상의 `--restricted`는 파일 도구를 working directories에 한정하고 managed·실행별 설정만 로드한다. 명령 도구는 기본 제거되지만 `--tools`에 개별 이름을 명시해 사용할 수 있으므로 파일 도구의 workspace 밖 쓰기 거부를 구성할 native 후보로 남긴다. 요청 정책 생성기에 적용하고 단위 검증했지만 관리 호출에는 아직 연결하지 않았다. Bash sandbox·Git·임시 경로 보호를 대체하지 않는다. |
 | [설정 우선순위](https://code.claude.com/docs/en/settings#settings-precedence)·[permission mode](https://code.claude.com/docs/en/permission-modes) | 실행별 설정과 source 제외로 managed 설정까지 제거되지 않는다. 시작 정책 충돌은 별도 확인해야 하며 `auto`를 `acceptEdits`나 sandbox 명령 일괄 승인으로 대체하지 않는다. |
 
-이번 중간 구현은 공통 `claude_permission_arguments`에서 `--setting-sources`와 빈 문자열을 별도 인자로 전달한다. 신규·재개가 같은 helper를 사용하고 기존 `auto`·Fast 요청·Reviewer 파일 도구 금지·strict sandbox 요청을 유지한다. 이 source 선택만으로 managed 충돌·전체 쓰기 경계나 실제 정책 적용을 확인했다고 판단하지 않는다.
+앞선 복구점은 공통 `claude_permission_arguments`에서 `--setting-sources`와 빈 문자열을 별도 인자로 전달한다. 신규·재개가 같은 helper를 사용하고 기존 `auto`·Fast 요청·Reviewer 파일 도구 금지·strict sandbox 요청을 유지한다. 이 source 선택만으로 managed 충돌·전체 쓰기 경계나 실제 정책 적용을 확인했다고 판단하지 않는다.
 
-현재 후보에서 프로젝트 Python과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 다음 세 unit case를 새로 실행해 모두 통과했다. `tests.test_provider_runtime.ProviderNeutralAgentRuntimeTest.test_claude_starts_resumes_and_applies_role_permissions`는 모의 신규 Worker·재개 Reviewer 호출의 빈 source 선택 인자와 자동 검토·sandbox 요청을 확인했다. `tests.test_agent_write_isolation.WriteIsolationTests.test_unsupported_provider_records_rejection_without_launch`와 `test_claude_preflight_rejection_precedes_log_and_process`는 기존 관리 호출 거부와 프로세스 미시작을 확인했다. 이전 후보의 성공을 재사용하지 않았다. 실제 Claude CLI·계정 호출과 전체 verify는 실행하지 않았으며 이 결과는 모의 호출·안전 거부 회귀만의 근거다.
+앞선 복구점 호출에서는 프로젝트 Python과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 다음 세 unit case를 새로 실행해 모두 통과했다. `tests.test_provider_runtime.ProviderNeutralAgentRuntimeTest.test_claude_starts_resumes_and_applies_role_permissions`는 모의 신규 Worker·재개 Reviewer 호출의 빈 source 선택 인자와 자동 검토·sandbox 요청을 확인했다. `tests.test_agent_write_isolation.WriteIsolationTests.test_unsupported_provider_records_rejection_without_launch`와 `test_claude_preflight_rejection_precedes_log_and_process`는 기존 관리 호출 거부와 프로세스 미시작을 확인했다. 이전 후보의 성공을 재사용하지 않았다. 실제 Claude CLI·계정 호출과 전체 verify는 실행하지 않았으며 이 결과는 모의 호출·안전 거부 회귀만의 근거다.
 
-다음 구현은 역할별 canonical source·다른 worktree·shared/worktree Git·Reviewer workspace·소유 임시 경로의 이중 보호, CLI·모델·계정 지원 및 시작 유효 정책·충돌 확인, 신규·재개·fallback의 호출별 증거·실제 오류 보존 연결이다. 기존 필수 검증과 미완료 Progress 항목은 유지하며 중간 checkpoint를 요청한다.
+2026-10-29 후속 호출은 Manager가 게시한 복구점 2f794f630c61991144dbc06056bef0bbb6ec9237에서 이어서 `agent_claude_policy.policy_arguments`를 구현했다. canonical source·다른 worktree·shared/worktree Git과 `.git` pointer를 `Edit`의 정확 경로·하위 경로 거부 및 sandbox `denyWrite`에 함께 넣는다. Reviewer는 모든 파일 편집 도구와 workspace의 명령 쓰기를 거부하면서 읽기·Bash 조사와 호출 소유 임시 쓰기 요청은 유지한다. restricted working directories는 workspace와 호출별 임시 경로로 한정하고, `auto`·`classifyAllShell=true`·strict sandbox·socket 및 namespace 확대 금지를 명시한다. 시스템 기본 per-user 임시 경로는 거부하며 Fast 요청도 보존한다.
+
+시작 시 해석한 managed 정책을 입력받는 생성기는 상속된 추가 디렉터리·범위 밖 allowWrite·명령 승인 규칙·자동 검토 비활성화·격리 밖 예외·환경·확장·hook 충돌과 잘못된 JSON 타입을 거부한다. 빈 배열로 상속 배열을 지웠다고 판단하지 않는다. 경로 중첩·symlink alias·플랫폼별 해석이 달라질 수 있는 glob 문자가 들어간 root는 모호한 권한 대신 오류를 반환한다. native Windows는 POSIX 전용 경로 처리 전에 거부한다. 아직 호출자가 managed 설정을 실제 수집하거나 이 생성기를 관리 실행에 연결하지 않았으므로 요청 설정과 유효 설정·실제 적용 성공을 구분한다.
+
+새 `tests/test_claude_policy.py`의 9개 unit case로 두 도구 경계의 보호 경로, Reviewer 읽기·쓰기 분리, 자동 검토·strict sandbox·기본 임시 경로 거부, 상속 충돌·타입·경로 중첩·symlink·Windows 거부를 검증했다. 테스트는 Agent·subprocess·보호 파일 쓰기 probe를 실행하지 않으며 설정 생성·거부 로직만 확인한다. Linux에서 실행했고 Windows case도 플랫폼 모의 결과이며 native Windows 실행 성공이 아니다. 기존 세 회귀의 앞선 복구점 성공과 현재 생성기의 단위 검증을 구분한다.
+
+다음 구현은 CLI·모델·계정 지원과 시작 managed source·우선순위·병합을 확인하는 preflight, 호출별 소유 임시 디렉터리 준비, 신규·재개·fallback의 정책·증거 영속화 및 실행 직전 재검사·실제 오류 보존 연결이다. 생성기 검증만으로 관리 호출을 허용하지 않는다. 기존 필수 검증과 미완료 Progress 항목은 유지하며 native 요청 정책 생성 단위의 중간 checkpoint를 요청한다.
 
 ## Decision Log
 
