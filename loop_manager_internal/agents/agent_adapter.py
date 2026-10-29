@@ -482,6 +482,8 @@ def run_claude(
     on_process_finished: Callable[[], None] | None = None,
     stream_output: bool = False,
     common_guidance: object | None = None,
+    prepared_launch=None,
+    on_launch_prepared=None,
 ) -> tuple[int, str] | AgentResult:
     return provider_adapters.run_claude(
         worktree,
@@ -502,6 +504,8 @@ def run_claude(
         on_process_started=on_process_started,
         on_process_finished=on_process_finished,
         stream_output=stream_output,
+        prepared_launch=prepared_launch,
+        on_launch_prepared=on_launch_prepared,
         effects=effects._provider_adapters_effects(),
     )
 

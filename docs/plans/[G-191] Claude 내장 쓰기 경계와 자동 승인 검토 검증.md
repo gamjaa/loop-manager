@@ -13,7 +13,7 @@ priority: high
 
 ## Purpose
 
-Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 경계를, 기존 내장 기능과 유효 정책에 따라 역할별 쓰기 제한·자동 승인 검토를 확인하는 경계로 완성한다. 최신 R-023에 따라 공식 웹 문서에 근거한 일반 호출 구성과 모의 테스트로 구현·완료를 판단한다. 실행 중 managed 정책 변경의 감시·적용 전 차단·지속 제한 보장과 실환경 점검은 FUTURE_IDEAS의 후속 확인이며 현재 구현·검증·사용자 판단의 선행 조건이 아니다. 이를 위한 별도 hook·polling·외부 격리나 조직 관리 환경 도입을 요구하지 않는다. 실제 선택 호출의 미지원·정책 충돌·제한 적용 실패는 근거를 보존하고 안전 중단한다. R-023의 provider 검증 범위만 다루며 원격 bootstrap과 공통 지침 주입은 기존 담당 계획에 남긴다.
+Claude의 관리 호출을 provider 이름만으로 일괄 거부하던 경계를, 기존 내장 기능과 유효 정책에 따라 역할별 쓰기 제한·자동 승인 검토를 확인하는 경계로 완성한다. 최신 R-023에 따라 공식 웹 문서에 근거한 일반 호출 구성과 모의 테스트로 구현·완료를 판단한다. 실행 중 managed 정책 변경의 감시·적용 전 차단·지속 제한 보장과 실환경 점검은 FUTURE_IDEAS의 후속 확인이며 현재 구현·검증·사용자 판단의 선행 조건이 아니다. 이를 위한 별도 hook·polling·외부 격리나 조직 관리 환경 도입을 요구하지 않는다. 실제 선택 호출의 미지원·정책 충돌·제한 적용 실패는 근거를 보존하고 안전 중단한다. R-023의 provider 검증 범위만 다루며 원격 bootstrap과 공통 지침 주입은 기존 담당 계획에 남긴다.
 
 ## Acceptance Criteria
 
@@ -29,7 +29,7 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 
 ## Implementation
 
-- docs/ARCHITECTURE.md의 `R-023: workspace 쓰기 제한과 자동 승인 검토 (구현 예정)` 설계를 적용한다. 기존 provider adapter의 Claude permission·sandbox 설정, isolation evidence와 invocation 저장 경계를 재사용하며 필요 부분만 provider 책임으로 분리한다. Codex 전용 launch 값을 Claude 검증 성공으로 대용하거나 범용 격리 framework를 추가하지 않는다.
+- docs/ARCHITECTURE.md의 `R-023: workspace 쓰기 제한과 자동 승인 검토` 설계를 적용한다. 기존 provider adapter의 Claude permission·sandbox 설정, isolation evidence와 invocation 저장 경계를 재사용하며 필요 부분만 provider 책임으로 분리한다. Codex 전용 launch 값을 Claude 검증 성공으로 대용하거나 범용 격리 framework를 추가하지 않는다.
 - 공식 웹 문서에서 조사한 기능·적용 버전·지원 조건과 남은 제약을 기록하고, 실행별 `--settings`·파일 권한·sandbox 정책을 기존 adapter의 역할별 호출에 연결한다. 파일 도구 경로 규칙은 `Edit(경로)`를 사용하며 경로 기준·절대경로 표기·canonical 경로를 확인한다. Bash·하위 프로세스에는 sandbox를 적용한다. `--add-dir`·`permissions.additionalDirectories`·`allowWrite`는 추가 허용으로 해석하고 기본 허용·명시적 거부·설정 source·배열 병합·임시 경로를 함께 검토한다. 빈 배열이나 실행별 설정이 상속된 허용을 모두 제거한다고 가정하지 않는다.
 - 정책 작성, 호출별 적용 확인, 증거 영속화와 호출 직전 재검증을 기존 adapter에 연결한다. 요청 설정과 병합 후 유효 정책·적용 source, 공식 조사·모의 테스트·실제 호출 관측을 구분해 저장한다. 이용 가능한 환경의 실제 호출 검증은 추가 근거로 기록한다. 단순 설정 문자열이나 mock 성공만으로 실제 정책 적용 성공을 기록하지 않으며, 실제 호출의 정책 확인 실패는 원인별로 보존한다.
 - 신규·재개·fallback의 시작 설정·권한·지원 조건을 확인하고, 시작 시 정책 충돌·초기화 실패와 실행 중 실제 권한·인증·도구 오류를 기존 호출별 중단·근거 보존 경로에 연결한다. 실행 중 managed 변경의 감시·적용 전 차단·지속 제한 보장은 현재 구현·검증에서 제외하며 docs/FUTURE_IDEAS.md의 Claude 실환경 후속 점검으로 남긴다. 후속 점검의 미완료만으로 기존 질문이나 추가 infrastructure 선택을 다시 요구하지 않는다.
@@ -56,12 +56,65 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 ## Progress
 
 - [x] 2026-10-05 planning 기준 32e496c에서 prepare_isolation의 non-Codex 일괄 거부와 run_claude의 관리 호출 경계를 대조했다. 기존 테스트는 Linux의 모든 역할·신규·재개에서 Claude 거부만 확인하며 supported 호출의 실제 경계 확인은 없다. 비종료 G-147은 공통 지침 전달·버전 보존으로 이 범위를 포함하지 않는다. 기존 파일 최대 ID는 G-190이다. 구현·테스트 실행은 하지 않았다.
-- [ ] 공식 기능·버전별 실행별 설정과 파일 권한·sandbox 조합, 상속·배열 병합·임시 경로의 유효 경계 조사 및 지원·거부 조건 구현
-- [ ] 시작 설정의 충돌·초기화 실패와 실제 관측한 호출 오류의 중단·근거 보존 검증
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 공식 기능·버전별 실행별 설정과 파일 권한·sandbox 조합, 상속·배열 병합·임시 경로의 유효 경계 조사 및 지원·거부 조건 구현
+- [x] 시작 설정의 충돌·초기화 실패와 실제 관측한 호출 오류의 중단·근거 보존 검증
+- [x] 구현 및 관련 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
-실제 CLI 정책 조합은 아직 실행 검증하지 않았다. 실환경 점검과 실행 중 managed 정책 변경 대응은 FUTURE_IDEAS의 후속 확인으로 보존하며 현재 구현 완료 조건에 추가하지 않는다. 이용 가능한 환경의 실호출 검증은 추가 근거이며 CLI 설치·계정 확보·유료 호출도 완료 조건이 아니다. 이 문서 정합화는 최신 R-023의 범위 결정을 반영하며 구현·테스트·실제 정책 적용 성공을 뜻하지 않는다.
+현재 후보는 구현·targeted unit 검증을 마쳤으며 Manager의 전체 verify·Review를 기다린다. 실제 Claude CLI·계정·OS 정책 적용은 실행 검증하지 않았다. 실환경 점검과 실행 중 managed 정책 변경 대응은 FUTURE_IDEAS의 후속 확인으로 보존하며 현재 완료 조건에 추가하지 않는다.
+
+## 구현 결과와 검증 근거
+
+관리 Claude 호출의 provider 단위 일괄 거부를 역할별 native 정책 준비·실행 확인으로 교체했다. `agent_claude_policy`는 restricted 파일 도구·Edit 거부·strict Bash sandbox·auto 검토를 구성하고, `agent_claude_preflight`는 시작 source·CLI·인증 홈·소유 임시 경로를 확인한다. `provider_adapters`는 신규·재개·session-unavailable fallback에 같은 경계를 연결한다. source·다른 worktree·shared/worktree Git과 `.git` pointer를 파일 도구와 sandbox 양쪽에서 보호하고 Reviewer·planner_check는 workspace 쓰기도 거부한다. 기존 Codex 직접 exec·native probe 경로는 유지한다.
+
+| 공식 근거 | 적용한 계약과 제약 |
+|---|---|
+| [CLI 옵션](https://code.claude.com/docs/en/cli-reference)·[Sandbox 설정](https://code.claude.com/docs/en/sandboxing#configure-sandboxing) | v2.1.307 이상을 검사한다. restricted의 v2.1.248·excluded-source sandbox 병합의 v2.1.246 계약과 nonempty objects/refs 정리 보정을 포함한다. 빈 setting-sources로 개인·project·local 설정을 제외하고 native tool 목록과 MCP 제한을 명시한다. |
+| [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit) | Edit·Write·NotebookEdit에 `Edit(//절대경로)`를 적용하고 Bash·하위 프로세스에는 sandbox `/절대경로` denyWrite를 적용한다. 추가 allowWrite만으로 완전한 allowlist를 증명하지 않는다. |
+| [설정 우선순위](https://code.claude.com/docs/en/settings#settings-precedence)·[managed source](https://code.claude.com/docs/en/managed-settings) | remote cache·MDM·system JSON/drop-in의 first-wins/merge·배열 병합과 최고 source의 defaultMode를 해석한다. 하위 admin source의 env·filesystem 비활성화·binary override도 확인한다. 빈 배열로 상속 배열을 지우지 않는다. |
+| [Apple Managed Preferences](https://www.apple.com/education/docs/Apple-ClientManagementWhitePaper.pdf) | macOS의 protected machine/user plist만 MDM source로 읽는다. 개인 defaults 조회로 대체하지 않으며 서로 다른 두 유효 정책은 모호한 우선순위로 거부한다. |
+| [permission mode](https://code.claude.com/docs/en/permission-modes)·[시작 mode 관측](https://code.claude.com/docs/en/agent-sdk/permissions#auto-mode) | auto·classifyAllShell을 요청하고 실제 init의 mode·모델·CLI·cwd·도구·확장·재개 session을 확인한다. acceptEdits·일괄 명령 승인·sandbox 밖 재실행으로 대체하지 않는다. |
+
+source는 제한된 일반 파일·JSON object/plist dictionary·유효 타입을 확인한다. 끊어진 링크·비일반 파일·읽기 실패·미지원 root key를 부재나 빈 정책으로 바꾸지 않는다. 권한을 넓히는 상속·hook/plugin/credential helper 충돌과 보호 경로 중첩·symlink alias·모호한 glob root를 거부한다. native Windows와 아직 host 정책 상속을 확인하지 못하는 WSL도 해당 호출만 진단·중단한다. source 경로·내용 지문과 비밀값 없는 환경 경로를 보존하며 원문·인증값은 저장하지 않는다.
+
+준비 자료는 invocation·역할·workspace·repository·CLI·설정·session에 결합해 `prepared`로 저장한다. `basis=documented-native-configuration`, `runtime_enforcement=not_observed`를 명시하고 OS probe나 Codex verified 근거로 대용하지 않는다. 지침/profile 준비 뒤와 receipt 결합 후 spawn 직전에 설정·경로를 재확인하며 저장·재검사 실패는 프로세스를 시작하지 않는다. 실제 init 불일치·권한/인증/보안 오류를 관측하면 기존 process group 중단·오류/session 보존을 사용한다. 정상 unit 명령 실패는 교정할 수 있게 유지한다. 종료 확인 전 finished receipt를 만들지 않으며 Worker의 targeted runner·기록 경로를 같은 invocation에 결합한다. 실패·중단으로 근거가 invalidated돼도 원래 구성 사유는 보존한다. Git 상태의 전후 비교나 정상적인 다른 작업 ref/worktree 변화를 Agent 위반으로 판정하지 않는다.
+
+### 실행 이력과 targeted unit 결과
+
+2026-10-13 v2.1.296 공식 조사에서 기록한 실행 중 managed 갱신의 사전 차단 제약은 2026-10-16 최신 R-023에서 범위 밖 후속 확인으로 정리됐다. 이를 현재 판단 대기나 외부 격리 도입 조건으로 사용하지 않으며 기존 Decision Log를 보존한다. 2026-10-29 관리 rebase 뒤 a30388e1 기준 전체 diff와 현재 sources를 대조했다. Manager 복구점 2f794f630c61991144dbc06056bef0bbb6ec9237은 source 선택, c99603ba78143ec20fea677c1ebd684793590355는 native 정책 생성기, 1139c5b73de975cd60e62eb75c1b903ebe8eadbe는 source 수집·시작 확인 helper를 보존했다. 이번 호출은 마지막 복구점에서 관리 실행·세션·receipt·targeted 수집을 연결했다.
+
+앞선 완료 후보에서 프로젝트 Python과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 관련 unit 60개를 실행해 모두 통과했다(Ran 60 tests in 0.942s, OK). 정책 모듈 9개, 시작 확인 모듈 19개, 관리 runtime 모듈 16개와 기존 isolation/provider/guidance/process-start의 관련 case 16개다. 모든 역할의 신규·재개와 session fallback, readonly·상속 충돌·경로·설정 재검사·초기화 거부·보안 오류·중단 불명·저장 실패·session/사용량/timeout 보존을 확인했다. 관리 service fixture는 실제 in-memory invocation ledger와 receipt/targeted 수집을 연결하고 subprocess만 모의해 빈 targeted 기록에서 성공을 합성하지 않는지 확인한다. 기존 provider 일괄 거부 회귀는 현재 계약에 맞게 missing-environment 거부 회귀로 이름을 바꾸고 신규 runtime 회귀로 지원 호출을 확인한다. 무관한 테스트를 제거하지 않았다.
+
+앞선 helper 검증에서는 비일반 파일을 `fdopen` 전에 검사하지 않아 descriptor가 남을 수 있는 실패를 수정했고 동일 단일 case와 최종 모듈 재실행이 통과했다.
+
+```sh
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_claude_preflight.ClaudePreflightTests.test_broken_links_bad_json_nonobjects_and_dropin_read_errors_are_not_absence
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_claude_preflight.ClaudePreflightTests.test_broken_links_bad_json_nonobjects_and_dropin_read_errors_are_not_absence
+```
+
+이번 호출의 기존 isolation 회귀는 고정 import가 공유 inspect_worktree mock을 우회해 실패했다. helper가 기존 모듈의 현재 함수를 참조하도록 교정한 뒤 아래 동일 명령 3개가 통과했다. 첫 test ID는 이후 현재 계약을 설명하는 `test_claude_missing_environment_records_rejection_without_launch`로 변경했고 최종 60개 실행에서도 통과했다.
+
+```sh
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_write_isolation.WriteIsolationTests.test_unsupported_provider_records_rejection_without_launch tests.test_agent_write_isolation.WriteIsolationTests.test_claude_preflight_rejection_precedes_log_and_process tests.test_provider_runtime.ProviderNeutralAgentRuntimeTest.test_claude_starts_resumes_and_applies_role_permissions
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_write_isolation.WriteIsolationTests.test_unsupported_provider_records_rejection_without_launch tests.test_agent_write_isolation.WriteIsolationTests.test_claude_preflight_rejection_precedes_log_and_process tests.test_provider_runtime.ProviderNeutralAgentRuntimeTest.test_claude_starts_resumes_and_applies_role_permissions
+```
+
+CLI·인증·doctor·모델·MDM/OS 분기는 test double이며 보호 파일 쓰기 probe·실계정·실제 Claude·OS 정책 적용과 전체 verify는 실행하지 않았다. 문서/mock 결과를 실제 격리 성공으로 기록하지 않는다. 다음 단계는 Manager 전체 verify·읽기 전용 Review이며 실제 Merge 완료를 선언하지 않는다.
+
+### Review 피드백 교정
+
+시작 HEAD c17adbc9b997b6306c3e76136468bc0bb39b3686에서 세 미해결 피드백을 교정했다. control-only remote의 managedSourcesBehavior도 병합 방식 결정에 사용하며 remote merge·MDM model·file sandbox.enabled=false 조합은 policy 생성에서 거부한다. Bash에는 canonical `/tmp` 아래 짧은 호출별 비공개 root를 전달하고 이 root와 기존 attempt만 추가 허용한다. 긴 상태 경로에서 native가 시스템 fallback으로 바꾸는 변환을 모의해 소유 root 안의 claude-UID와 공유 기본 deny가 양립하는지 확인했다. 실제 시스템 디렉터리 생성은 테스트 fixture로 대체한다. CLI 임시 root의 존재·소유권·권한은 spawn 전 재검사하며 targeted·receipt·결과 기록은 기존 state runtime에 남긴다.
+
+Claude 결과는 기존 원자적 helper로 호출별 last-message.txt에 저장한다. DB 결과 확정을 DatabaseWaitTimeout으로 중단한 모의 관리 호출에서 다음 진입이 동일 invocation·session·원문을 복구하고 새 subprocess를 실행하지 않는지 검증했다. 공용 최신 결과 파일을 다른 내용으로 바꿔도 복구 결과는 유지된다.
+
+최초 실행은 테스트에서 실제 `/tmp` 생성을 시도해 현재 sandbox의 쓰기 범위에 막혔다. 생성은 fixture 안으로 옮기고 production의 짧은 경로 요청과 native 변환을 mock으로 확인하도록 교정한 뒤 동일 명령이 47개 모두 통과했다(Ran 47 tests in 0.810s, OK). 기존 60개 성공을 현재 후보 검증으로 재사용하지 않았다.
+
+```sh
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_claude_policy tests.test_claude_preflight tests.test_claude_managed_runtime
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_claude_policy tests.test_claude_preflight tests.test_claude_managed_runtime
+```
+
+실제 Claude·계정·native OS 적용과 전체 verify는 이번 교정에서도 미실행이다. Manager의 전체 verify·Review가 남아 있다.
 
 ## Decision Log
 

@@ -538,8 +538,10 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         self.assertIn("--disallowedTools", resume_arguments)
         self.assertEqual(resume_options["cwd"], worktree)
         for arguments in (start_arguments, resume_arguments):
+            self.assertEqual(arguments.count("--setting-sources"), 1)
+            self.assertEqual(arguments[arguments.index("--setting-sources") + 1], "")
             settings = json.loads(arguments[arguments.index("--settings") + 1])
-            self.assertEqual(settings["permissions"]["defaultMode"], "auto")
+            self.assertEqual(settings["permissions"], {"defaultMode": "auto"})
             self.assertEqual(settings["sandbox"], {
                 "enabled": True, "failIfUnavailable": True,
                 "allowUnsandboxedCommands": False, "autoAllowBashIfSandboxed": False,

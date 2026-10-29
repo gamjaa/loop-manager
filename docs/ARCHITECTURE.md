@@ -875,7 +875,7 @@ Worker에 추가하는 [AGENTS.ponytail.md](AGENTS.ponytail.md)는 [Ponytail](ht
 | provider | 현재 관리 호출 |
 |---|---|
 | Codex | 지원 CLI·OS와 소유 workspace에서 사전 검증을 통과한 경우 직접 실행한다. 쓰기 역할은 `workspace-write`, Reviewer·읽기 전용 역할은 `read-only`다. |
-| Claude | 공통 홈·일부 호출 옵션은 구현돼 있으나 역할·OS와 관계없이 현재 격리 사전 검사에서 거부한다. 사용자 설정 source 전체 제외·내장 쓰기 제한·자동 승인 검토의 남은 목표는 아래 R-023 절을 따른다. |
+| Claude | Linux·macOS의 native 호출을 시작 설정 확인 뒤 실행한다. `prepared` 구성 근거와 실제 시작·오류 관측을 구분하며, 세부 지원·거부 조건은 아래 R-023 절을 따른다. |
 
 provider adapter는 실제 호출 직전에 canonical worktree·Git 등록·repository identity를 확인하고 신규 session·재개·retry·fallback마다 역할의 쓰기 정책을 확인한다. 허용 쓰기는 선택 workspace와 소유권을 확인한 최소 임시 경로에 한정한다. 설정 병합으로 source checkout·다른 worktree·shared Git metadata·넓은 임시 경로가 추가되면 격리 확인으로 수락하지 않는다. 역할별 허용 파일·문서·결과 검증은 sandbox와 별도로 유지한다.
 
@@ -926,7 +926,7 @@ CLI·OS별 실행 전제는 [인증과 실행 조건](OPERATIONS.md#인증과-�
 
 `provider_home`은 비공개 경로 검증을 적용하고 전용 인증 위치가 비어 있을 때 기본 파일만 링크한다. 기존 파일·링크를 덮어쓰거나 링크 실패를 복사·개인 홈 fallback으로 우회하지 않는다. 호출 전후 링크 경로를 확인하되 인증 내용은 지문·기록에 넣지 않는다. Manager가 로그인·로그아웃이나 인증 원본 덮어쓰기를 수행하지 않으며 링크를 통한 CLI 인증 갱신은 원본에도 반영될 수 있다. 설정 방법·오류와 OS 인증 저장소의 차이는 [전용 공급자 홈과 인증](OPERATIONS.md#전용-공급자-홈과-인증)을 따른다.
 
-설정 지문·직전 재검사는 실제 사용하는 공통 홈·프로젝트·관리 설정을 대상으로 한다. 읽기 실패·소유권 불명·검사 뒤 변경·권한·확장 충돌과 기본 사용자 저장소 사이의 재사용을 확인하지 못한 인증 방식은 거부한다. Claude의 설정 디렉터리 밖 개인 source 전체 제외는 아직 남은 목표이며 현재 호출 거부를 유지한다.
+설정 지문·직전 재검사는 실제 소비하는 설정 source를 대상으로 한다. Codex의 공통 홈·프로젝트·관리 설정 확인은 유지하고 Claude는 아래 R-023 계약에 따라 개인·project·local 설정 source를 제외한다. 읽기 실패·소유권 불명·검사 뒤 변경·권한·확장 충돌과 확인하지 못한 인증 방식은 해당 호출에서 거부한다.
 
 Model·Effort·Fast·instruction·sandbox·승인 정책은 명시적 호출 입력으로 제공한다. Agent 도구의 쓰기 허용은 역할별 선택 worktree·해당 호출의 최소 소유 임시 경로에 한정하고 공통 홈·개인 홈·다른 호출의 임시 경로를 추가하지 않는다. Reviewer의 읽기 전용과 기존 ACL·Job Object·sandbox·자동 승인 검토를 유지하며 CLI 자체의 상태 저장과 도구 쓰기 권한을 구분한다.
 
@@ -940,30 +940,29 @@ session은 Manager에 저장된 ID와 repository·worktree·role·작업 결합�
 
 호출별 임시 경로·출력·실행값·권한 분리는 기존 fixture·모의 호출의 확인 범위다. 실제 session 재개·동시 모델 실행·Claude CLI 호환성·실계정 인증과 갱신·credential store·다른 OS 실환경의 완료 근거로 확대하지 않는다. 이 미수행 범위는 R-085의 Non-Goals에 남긴 후속 확인이며 공통 홈 전환의 선행·완료 조건으로 추가하거나 기존 미지원 호출을 허용하는 근거로 사용하지 않는다.
 
-### R-023: workspace 쓰기 제한과 자동 승인 검토 (구현 예정)
+### R-023: workspace 쓰기 제한과 자동 승인 검토
 
-현재 관리 Claude 호출은 역할·OS와 관계없이 격리 사전 검사에서 거부한다. 아래는 [R-023의 남은 provider 지원 목표](requirements/%5BR-023%5D%20Self-Hosted%20Runtime%20Refresh%20Handoff.md#requirement)에 필요한 설계이며 G-191의 구현 완료나 실제 실행 성공을 선언하지 않는다. Codex는 [현재 provider 계약](#provider의-현재-지원과-쓰기-정책)을 따르고 Manager의 Git 쓰기 책임은 양쪽에 유지한다.
+Claude adapter는 [R-023](requirements/%5BR-023%5D%20Self-Hosted%20Runtime%20Refresh%20Handoff.md#requirement)의 일반 native 호출을 문서 기반 구성으로 실행하며 OS 쓰기 probe 성공을 합성하지 않는다. `agent_claude_policy`가 역할별 요청 정책을 만들고 `agent_claude_preflight`가 시작 source·지원 조건·소유 경로를 확인한다. `provider_adapters`는 준비·실행·중단을 기존 invocation·session·receipt·targeted 수집에 연결한다. Codex의 직접 exec·native probe·검증 계약과 Manager의 Git 쓰기 책임은 유지한다.
 
-Claude의 채택 범위는 공식 문서에 대응하는 일반적인 호출 구성과 모의 검증이다. provider 내장 파일 권한·명령 sandbox·자동 승인 검토를 조합하되 Codex와 동등한 실환경 검증이나 모든 조합의 완전 지원을 요구하지 않는다. 시작 시 적용하는 설정의 우선순위·병합은 확인하며 추가 허용 경로만으로 범위 밖 쓰기 차단을 인정하지 않는다.
-
-| 미구현 정책 경계 | 구현·확인할 계약 |
+| 책임 경계 | 현재 계약 |
 |---|---|
-| 파일 도구 | 실행별 `--settings`의 `Edit(경로)` 허용·거부를 Edit·Write·NotebookEdit에 적용한다. `Write(경로)`·`NotebookEdit(경로)`를 독립 보호 규칙으로 오인하지 않는다. 파일 권한의 `//절대경로`와 sandbox의 `/절대경로`를 canonical 경로·기준 디렉터리와 대조한다. Reviewer는 선택 workspace 쓰기도 거부한다. |
-| 자동 승인 검토 | 쓰기 역할의 `--permission-mode auto`와 해당 모델·계정·CLI의 지원 조건을 확인한다. `acceptEdits`로 대체하지 않는다. Reviewer도 읽기 전용·편집 금지를 유지하는 지원 경로를 확인하며 미지원이면 권한을 완화하지 않는다. 모든 동작이 검토된다고 보장하지 않으며 격리 밖 재실행·쓰기 권한 확대는 검토의 승인으로 허용하지 않는다. |
-| Bash·하위 프로세스 | OS 내장 sandbox에 `enabled=true`·`failIfUnavailable=true`·`allowUnsandboxedCommands=false`·빈 `excludedCommands`를 적용하고 병합 후에도 격리 밖 예외가 없는지 확인한다. `autoAllowBashIfSandboxed=false`로 permission mode의 검토 흐름을 유지한다. 파일 도구 규칙만으로 명령 쓰기를 제한했다고 판단하지 않는다. |
-| 유효 설정 | `--add-dir`·`permissions.additionalDirectories`·`sandbox.filesystem.allowWrite`는 추가 허용이다. 기본 cwd·임시 경로·파일 권한에서 파생한 허용, 전체 설정 source·우선순위·배열 병합을 확인한다. `--settings`가 전체 교체나 managed 정책 우선이라고 가정하지 않고 빈 배열로 상속 배열이 제거됐다고 판단하지 않는다. |
-| Git·임시 경로 | source checkout·다른 worktree·`.git` pointer와 resolved shared/worktree Git directory를 파일 도구의 `Edit` 거부와 `sandbox.filesystem.denyWrite`로 함께 보호한다. linked worktree의 기본 shared Git 허용도 확인한다. 임시 쓰기는 호출별 최소 소유 경로로 제한하며 상속·기본 임시 경로로 넓히지 않는다. |
-| 환경·지원 한계 | 내장 sandbox가 없는 Claude native Windows 등 확인된 미지원과 시작 정책 충돌·초기화 실패는 해당 호출에서 처리한다. 실행 중 조직 managed 정책 변경의 감시·적용 전 차단·지속 제한 보장은 현재 범위 밖이다. 이를 위한 hook·polling·WSL·컨테이너·외부 격리를 추가하지 않는다. |
-| 호출 증거 | provider·CLI 버전·환경·역할·canonical worktree·repository identity·요청 정책·적용 source·병합 후 유효 정책 지문·session/호출 identity·확인/거부 결과를 기존 invocation·snapshot과 호환 가능한 추가 저장으로 결합한다. 저장·확인 실패는 성공으로 인정하지 않는다. 재개·fallback·provider/설정 변경과 중단 뒤에는 새 호출에 다시 결합한다. |
-| 증거 보호·실패 | 문서 조사·모의 검증·실제 호출 관측을 구분하고 비밀값·인증 자료·source 로컬 파일 내용은 저장하지 않는다. 실제 호출에서 관측한 오류의 근거를 보존하며 실시간 managed 변경 감시를 증거 수집 조건으로 요구하지 않는다. 기존 작업물·session·재시도·과거 감사는 보존하며 Git snapshot 접근 검사를 되살리지 않는다. |
+| 파일 도구 | `--restricted`로 working directories를 선택 workspace와 호출별 소유 임시 경로에 한정한다. source·다른 worktree·shared/worktree Git directory·workspace의 `.git` pointer에 정확 경로와 하위 경로 `Edit(//절대경로)` 거부를 함께 둔다. `Edit` 규칙은 Write·NotebookEdit에도 적용한다. 읽기 전용 역할은 `Edit` 전체를 거부하고 편집 도구를 노출하지 않으며 Bash 조사는 유지한다. |
+| Bash·하위 프로세스 | native sandbox의 enabled·failIfUnavailable을 켜고 unsandboxed retry·명령 제외·자동 일괄 승인·약한 namespace·Unix socket 확대를 끈다. 같은 보호 경로와 Reviewer workspace를 `/절대경로` denyWrite로 명시한다. 기본 shared Git 허용을 신뢰하지 않으며, 기본 per-user 임시 경로도 거부하고 호출 기록용 attempt와 별도의 짧은 Bash 소유 임시 경로만 추가한다. |
+| 자동 승인 검토·확장 | `--permission-mode auto`, `autoMode.classifyAllShell=true`, `--permission-prompts none`을 사용한다. 승인 mode를 acceptEdits·dontAsk·bypass로 대체하지 않는다. native tool 목록을 명시하고 MCP를 strict 빈 구성·tool deny로 제한한다. source에 있는 hook·plugin·credential helper 등 sandbox 밖 명령 경계를 확인하지 못하는 확장과 쓰기·자동 검토 충돌은 시작 전에 거부한다. |
+| 시작 source | restricted와 빈 setting-sources로 user/project/local 설정을 제외한다. remote cache·macOS Managed Preferences plist·system managed JSON 및 이름순 drop-in의 우선순위·배열 병합을 해석한다. 정책 key가 없는 상위 control-only source도 병합 방식 결정에 사용한다. first-wins에서 가려진 scalar와 모든 admin source에서 읽는 env·filesystem 비활성화·native binary override를 구분한다. 빈 배열로 상속 배열을 지웠다고 판단하지 않는다. |
+| 실행·중단 | CLI·인증·doctor를 읽기 전용으로 조회하고 지침·profile 준비 뒤 CLI·설정·canonical repository를 재검사한다. spawn 직전에는 DB/receipt 결합 사이에 바뀐 설정도 재확인한다. native JSONL의 시작 mode·모델·CLI 버전·cwd·도구·확장·재개 session을 대조하고 실제 mode 이탈·권한/인증/보안 오류를 관측하면 프로세스 그룹을 중단한다. 정상적인 unit 명령 실패는 Worker가 교정할 수 있게 둔다. |
 
-설정·CLI 조사는 [Claude CLI 옵션](https://code.claude.com/docs/en/cli-reference), [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit), [sandbox](https://code.claude.com/docs/en/sandboxing#configure-sandboxing), [설정 우선순위](https://code.claude.com/docs/en/settings#settings-precedence), [permission mode](https://code.claude.com/docs/en/permission-modes)의 기능·버전을 실제 호출 환경과 대조한다. 지원하지 않는 key를 무시한 실행을 격리 확인으로 기록하지 않는다.
+지원 기준은 Linux·macOS와 CLI v2.1.307 이상이다. restricted의 v2.1.248·excluded-source sandbox 병합의 v2.1.246 계약과 nonempty objects/refs 정리 보정을 함께 포함한다. native Windows는 sandbox 미지원으로 거부하고 WSL은 현재 Windows host 정책 상속을 확인하지 못해 해당 시작 확인에서 거부한다. source 조회·형식·초기화·CLI/모델/계정 지원 오류, 유효 경계가 넓어지는 설정과 해석하지 못한 보안 설정도 해당 호출에서 진단한다. 이 조건을 새 OS·외부 격리·계정 도입이나 독립 Codex 작업 차단으로 우회하지 않는다.
 
-개발·완료 기준과 회귀 범위는 [R-023 Acceptance Criteria](requirements/%5BR-023%5D%20Self-Hosted%20Runtime%20Refresh%20Handoff.md#acceptance-criteria)를 따른다. 공식 문서 조사와 신규·재개·fallback 모의 테스트로 지원 구현을 완료할 수 있다. 실제 CLI·계정·유료 모델 호출·금지 쓰기 시연과 실환경 완전성은 필수 조건이 아니다. 문서/mock 확인·실호출 확인·미수행을 구분하고 실제 인증·지원·권한·초기화 오류는 해당 호출에서 보존·처리한다. 미검증만으로 개발 완료·독립 Codex 실행을 막거나 선택 provider를 바꾸지 않는다.
+source는 최대 2 MiB의 일반 파일 JSON object와 macOS plist dictionary로 읽는다. macOS는 `/Library/Managed Preferences/com.anthropic.claudecode.plist`와 그 OS 사용자별 하위 경로만 읽고 개인 defaults domain을 MDM으로 대체하지 않는다. 두 protected source가 서로 다른 비어 있지 않은 정책을 제공하면 우선순위를 추정하지 않고 거부한다. 해석하지 못하는 managed root key도 native schema에서 무시되는지에 따라 source 순위가 달라질 수 있어 거부한다. permissions·sandbox 및 그 filesystem/network는 object, 권한·경로 목록은 문자열 배열이어야 하며 필수 Boolean은 숫자로 대체할 수 없다. managed JSON drop-in은 숨김·비JSON 파일을 제외하고 이름순으로 병합한다. remote cache의 미지원 wrapper·끊어진 링크·비일반 파일·읽기 실패를 부재나 빈 정책으로 바꾸지 않는다. 경로는 canonical 절대경로로 확인하고 보호 경로 중첩·symlink alias·플랫폼별 의미가 달라질 수 있는 glob root는 거부한다. Claude 인증 조회가 보고한 configDirectory는 선택된 공통 홈과 같아야 한다. 개인 source 원문·인증값은 증거에 저장하지 않는다.
 
-유효 정책과 실제 허용·거부를 확인하되 Codex 프로세스 전체의 mount·내부 쓰기나 중첩 sandbox 성공을 추가 증명 조건으로 요구하지 않는다. exec JSONL의 전용 필드 부재만으로 transport나 바깥 wrapper를 추가하지 않는다. 정상 인증·session·로그와 허용된 임시 ref는 Agent의 범위 밖 쓰기 권한과 구분한다. Reviewer의 읽기·명령·테스트 경계는 [테스트와 Reviewer의 책임](#테스트와-reviewer의-책임)을 따른다.
+호출별 자료는 기존 `agent_isolation_evidence`에 `prepared`로 결합한다. provider·CLI·환경·role·canonical workspace·repository와 시작 source/configuration digest·요청 정책 digest·요청 session·invocation ID를 연결한다. 기존 snapshot_digest 칸에는 호출 문맥의 지문을 담으며 Git 상태 전후 비교나 접근 권한 증명으로 사용하지 않는다. reason의 JSON은 `basis=documented-native-configuration`, `runtime_enforcement=not_observed`, 요청·managed 정책 지문과 source 경로/내용 지문·인증 method/home을 보존한다. 실제 init·오류는 호출별 JSONL과 invocation 결과/session에 남기고, 실패·중단 시 prepared를 invalidated로 바꾸면서 원래 구성 근거를 유지한다. 저장 실패는 모델 실행을 시작하지 않으며 이전 receipt가 있는 launch를 다음 호출의 준비 근거로 재사용하지 않는다. Claude의 prepared 자료를 Codex verified scope나 선행 Review의 native 정책 검증 재사용 근거로 채택하지 않는다.
 
-실제 CLI 정책 조합·인증·session·OS/버전별 동작과 managed 변경 대응의 후속 확인은 [FUTURE_IDEAS](FUTURE_IDEAS.md#claude-실환경-후속-점검)에 둔다. 이 목록을 현재 지원 구현의 선행·완료 조건이나 조직 관리 환경·외부 infrastructure의 필수 선택으로 사용하지 않는다.
+Bash 임시 경로는 canonical `/tmp` 아래 `mkdtemp`로 만든 호출별 비공개 `lm-*` 디렉터리다. `CLAUDE_CODE_TMPDIR`·TMPDIR·TMP·TEMP에 이 짧은 root를 전달해 긴 state/hash/attempt 경로에서 발생하는 native 시스템 fallback을 피한다. CLI가 추가하는 `claude-{uid}`도 이 소유 root 안에 남으며 공유 기본 경로의 deny는 유지한다. 이 root는 준비 자료에 결합하고 실행 전 소유권·권한·존재를 다시 확인한다. 호출 기록·targeted 결과·receipt는 기존 state runtime에 유지한다. [공식 임시 경로 계약](https://code.claude.com/docs/en/env-vars)의 변환은 모의 검증하며 native OS 실측으로 표시하지 않는다.
+
+Agent 프로세스는 호출별 새 process group으로 직접 실행하며 종료 확인 뒤 attempt 밖 receipt를 기록한다. 종료를 확인하지 못하면 finished receipt를 만들지 않는다. Worker의 owned attempt에 전달한 targeted runner·기록 경로는 기존 `on_launch_prepared`로 호출에 결합하고, 실제 종료 근거 뒤 같은 수집 경로로 처리한다. 빈 기록에서 성공·실패를 합성하지 않는다. Claude 결과 원문은 기존 원자적 저장 helper로 `<attempt>/last-message.txt`에 보존하며 빈 결과도 파일로 남긴다. 공용 최신 결과 파일은 보조 출력이며 DB 저장 대기 후 복구는 receipt와 호출별 원문의 지문을 대조한다. 신규·재개·session-unavailable fallback은 매번 같은 역할 정책과 새 소유 임시 경로를 준비하며 기존 session·작업물·실패 감사와 사용량/timeout 처리를 보존한다.
+
+공식 근거는 [CLI 옵션](https://code.claude.com/docs/en/cli-reference), [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit), [sandbox](https://code.claude.com/docs/en/sandboxing), [managed source](https://code.claude.com/docs/en/managed-settings)·[Apple Managed Preferences 경로](https://www.apple.com/education/docs/Apple-ClientManagementWhitePaper.pdf), [permission mode](https://code.claude.com/docs/en/permission-modes)와 [실행 중 mode 관측](https://code.claude.com/docs/en/agent-sdk/permissions#auto-mode)이다. 역할별 정책·신규/재개/fallback·충돌/실패·저장·중단 경계는 모의 단위 검증 범위이며 실제 Claude CLI·계정·OS 정책 적용을 검증했다고 확대하지 않는다. 실환경·managed 갱신 대응은 [후속 확인](FUTURE_IDEAS.md#claude-실환경-후속-점검)에 두며 현재 완료 조건으로 올리지 않는다. Reviewer의 읽기 전용 조사와 프롬프트의 테스트 재실행 금지는 별도로 유지한다.
 
 ## Model과 Effort
 
@@ -1420,7 +1419,7 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
   실행 가능한 관련 unit test가 없는 변경은 사유를 남기며 전체 검증을 생략하는 근거로 사용하지 않는다
 
 - 실행 전 `targeted_test_collections`에 물리 invocation과 기록 디렉터리·파일시스템 identity·process receipt 경로를 결합한다. invocation ledger가 repository·ExecPlan·Worker 역할·guidance 작업·scope와 실제 provider/model을 소유한다. 기록 경로는 기존 `state/agent-runtime/<runtime>/<call>`이고 receipt는 쓰기 허용 call 바깥의 `<call>.process.json`이다. 정규 경로·기존 디렉터리·Worker 소유권과 호출별 경로의 유일성을 확인하며 파일시스템 device/inode는 Windows의 큰 식별자도 보존하도록 십진 문자열로 저장한다. 이 additive 테이블이 없는 과거 호출의 기록 위치를 디렉터리 탐색으로 추측하지 않는다.
-- invocation 종료의 finally, Manager의 `reconcile_interrupted()`와 Worker 호출 전·CLI retry 전·호출 후 경계가 같은 미소비 기록을 재관측한다. 기존 process receipt 복구로 writer 종료가 확인되고 디렉터리 identity가 일치할 때만 읽는다. 살아 있는 수동 작업은 기존 소유권 보호를 적용한다. receipt 부재·종료 불명·경로 교체·symlink·읽기/해석/저장 오류에서는 원문·결합을 보존하고 해당 작업을 대기한다. 같은 작업의 앞선 호출이 대기하면 후속 호출도 순서를 보존하며 다른 repository·ExecPlan의 수집은 이어간다. runtime·모델 교체는 저장된 호출 귀속을 바꾸지 않는다. `AgentRequest.on_targeted_prepared`는 launch 객체 없이 같은 디렉터리·receipt를 결합하는 port이며 Claude의 실제 전달 연결은 별도 작업이다.
+- invocation 종료의 finally, Manager의 `reconcile_interrupted()`와 Worker 호출 전·CLI retry 전·호출 후 경계가 같은 미소비 기록을 재관측한다. 기존 process receipt 복구로 writer 종료가 확인되고 디렉터리 identity가 일치할 때만 읽는다. 살아 있는 수동 작업은 기존 소유권 보호를 적용한다. receipt 부재·종료 불명·경로 교체·symlink·읽기/해석/저장 오류에서는 원문·결합을 보존하고 해당 작업을 대기한다. 같은 작업의 앞선 호출이 대기하면 후속 호출도 순서를 보존하며 다른 repository·ExecPlan의 수집은 이어간다. runtime·모델 교체는 저장된 호출 귀속을 바꾸지 않는다. `AgentRequest.on_targeted_prepared`는 launch 객체 없이 같은 디렉터리·receipt를 결합하는 port다. 관리 Claude는 native launch의 owned attempt와 receipt를 `on_launch_prepared`로 결합해 같은 수집 경계를 사용한다.
 - Manager는 완료된 개별 결과를 SQLite `targeted_test_results`·`targeted_test_streaks`에 반영하고, 실행 ID의 invocation 귀속(`targeted_test_run_owners`)과 collection의 `collected` 전이를 같은 transaction에서 확정한다. 미소비 상태는 `pending` 또는 오류 종류를 가진 `error`이며 저장 실패·transaction 중단 뒤에도 재시도한다. repository·ExecPlan·실행 ID·테스트 ID로 중복과 상충 결과를 검사하고 다른 호출의 실행 ID 재사용은 거부한다. `failure`·`error`·`unexpected_success`는 누적하고 `success`·`skip`·`expected_failure`는 초기화한다. `fixture_error`·`indeterminate`는 감사 결과로 기록하되 기존 streak를 늘리거나 초기화하지 않는다. JSONL의 불완전한 마지막 줄과 기록 부재에서 성공·실패를 합성하지 않으며 수집·fixture 오류도 개별 테스트 실패로 세지 않는다. JUnit `<failure>`는 native 실패로, `<skipped>`는 skip으로 기록한다. fixture 여부를 구별할 원본 근거가 없는 `<error>`는 `indeterminate`이며, suite 오류와 명령 종료 코드는 별도 실행 오류로 남겨 개별 테스트 실패를 합성하지 않는다. 기존 저장 결과는 이 분류로 소급 변경하지 않는다. 연속 다섯 번째 실패에 도달하면 새 Worker·CLI retry·verify 전에 `targeted_test_exhausted`로 차단한다. 이후 같은 테스트의 `success`·`skip`·`expected_failure`를 관측하면 실패 횟수와 도달 표식을 함께 초기화한다.
 
   차단 확정과 도달 표식 소비는 같은 transaction이며 실행·실패 감사는 보존한다. Worker 최종 실패 보고는 `targeted_test_correction`, 수집 대기는 `targeted_collection_pending`으로 구별해 일반·rebase 보고 오류 한도를 소비하지 않는다. 근거 없는 실패 보고는 작업별 재시도 대기 뒤 재검증하고 수집 대기는 기존 자료를 먼저 재수집한다. 수집 대기는 별도 반환 표식으로 전달하며 물리 provider 결과·사용량·종료 감사를 덮지 않는다. 실제 provider 거부·완료 보고 오류·명시적 사용자 결정과 독립 안전 차단은 각 기존 경계에서 처리한다.

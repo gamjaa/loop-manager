@@ -15,6 +15,7 @@ from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
 from loop_manager_internal.config import execution_path
 
 if TYPE_CHECKING:
+    from .agent_claude_preflight import ClaudeLaunch
     from loop_manager_internal.agents.common_guidance import CommonGuidance
 
 
@@ -143,9 +144,9 @@ class AgentRequest:
     on_process_started: Callable[[], None] | None = None
     on_process_finished: Callable[[], None] | None = None
     stream_output: bool = False
-    prepared_launch: CodexLaunch | None = field(default=None, repr=False)
+    prepared_launch: CodexLaunch | ClaudeLaunch | None = field(default=None, repr=False)
     on_execution_identity: Callable[[dict[str, str]], None] | None = None
-    on_launch_prepared: Callable[[CodexLaunch], None] | None = None
+    on_launch_prepared: Callable[[CodexLaunch | ClaudeLaunch], None] | None = None
     on_targeted_prepared: Callable[[Path, Path], None] | None = None
 
 
