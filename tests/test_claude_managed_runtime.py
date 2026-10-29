@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -26,6 +27,17 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
+        self.short_temp_requests = []
+        make_directory = tempfile.mkdtemp
+        def owned_temp(*args, **kwargs):
+            if kwargs.get('prefix') == 'lm-':
+                self.short_temp_requests.append(dict(kwargs))
+                kwargs = dict(kwargs, dir=self.root)
+            directory = make_directory(*args, **kwargs)
+            if kwargs.get('prefix') == 'lm-':
+                self.addCleanup(shutil.rmtree, directory)
+            return directory
+        self.enterContext(mock.patch.object(tempfile, 'mkdtemp', side_effect=owned_temp))
         self.workspace, self.state, self.system = (self.root / name for name in ('workspace', 'state', 'system'))
         for path in (self.workspace, self.state, self.system):
             path.mkdir()
@@ -110,7 +122,7 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
                     arguments, context = self.calls[-1]
                     self.assertTrue(context['start_new_session'])
                     self.assertIn('--restricted', arguments)
-                    self.assertEqual(context['env']['TMPDIR'], str(self.launches[-1].attempt))
+                    self.assertEqual(context['env']['TMPDIR'], str(self.launches[-1].bash_temporary))
                     settings = json.loads(arguments[arguments.index('--settings') + 1])
                     self.assertEqual(str(self.workspace) in settings['sandbox']['filesystem']['denyWrite'],
                                      role in {'reviewer', 'planner_check'})
@@ -189,7 +201,7 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
         launch = adapter.prepare_environment(request)
         def profile(*args):
             from loop_manager_internal.agents.agent_profiles import agent_environment
-            self.assertEqual(agent_environment('claude')['TMPDIR'], str(launch.attempt))
+            self.assertEqual(agent_environment('claude')['TMPDIR'], str(launch.bash_temporary))
             return self.profile
         self.effects._agent_profile.side_effect = profile
         self.assertEqual(self.run_claude(prepared_launch=launch, resolved_profile=None).code, 0)
@@ -255,8 +267,42 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
             FROM agent_invocations a JOIN agent_isolation_evidence p USING(invocation_id)
             JOIN targeted_test_collections t USING(invocation_id) WHERE invocation_id=?''',
             (result.isolation_invocation_id,)).fetchone()
-        self.assertEqual(row, ('new-session', 'prepared', 'executed', self.calls[-1][1]['env']['TMPDIR'], 'collected'))
+        self.assertEqual(row, ('new-session', 'prepared', 'executed', self.calls[-1][1]['env']['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'], 'collected'))
         self.assertEqual(connection.execute('SELECT count(*) FROM targeted_test_results').fetchone()[0], 0)
+
+    def test_database_wait_recovers_the_original_attempt_message_without_another_process(self):
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        state.ensure_schema(connection)
+        context = InvocationContext(str(self.boundary.source), 'G-191')
+        pin_common_guidance(connection, context, self.workspace, self.state, provider='claude')
+        original_apply = state.InvocationRepository.apply_observation
+        def unavailable(repository, identity, value):
+            if 'outcome' in value:
+                raise DatabaseWaitTimeout('result database unavailable')
+            return original_apply(repository, identity, value)
+        def invoke():
+            return manager.run_agent('claude', self.workspace, self.state, self.config, 'worker',
+                'prompt', read_only=False, connection=connection, invocation=context,
+                resolved_profile=self.profile, persist_session=True)
+        with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+                mock.patch.object(provider_guidance, '_probe', return_value='--append-system-prompt-file --system-prompt-snapshot'), \
+                mock.patch.object(manager, '_handoff_popen', side_effect=self.spawn), \
+                mock.patch.object(process_receipt, 'started', side_effect=self.real_receipt_started), \
+                mock.patch.object(process_receipt, 'finished', side_effect=self.real_receipt_finished):
+            with mock.patch.object(state.InvocationRepository, 'apply_observation', unavailable):
+                first = invoke()
+            row = connection.execute('SELECT invocation_id,process_receipt_path FROM agent_invocations').fetchone()
+            self.assertTrue(process_receipt.observation(row[1], self.state, row[0])['database_pending'])
+            # The shared latest message is auxiliary and cannot be recovery input.
+            project = provider_adapters._provider_log_directory(self.workspace, self.state)
+            (project / 'claude-worker-last.txt').write_text('another invocation result')
+            recovered = invoke()
+        self.assertEqual((recovered.code, recovered.message, recovered.session_id), (0, 'done', 'new-session'))
+        self.assertEqual(first.isolation_invocation_id, recovered.isolation_invocation_id)
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(process_receipt.observation(row[1], self.state, row[0])['database_pending'])
 
 
 class ClaudePreparedEvidenceTests(unittest.TestCase):

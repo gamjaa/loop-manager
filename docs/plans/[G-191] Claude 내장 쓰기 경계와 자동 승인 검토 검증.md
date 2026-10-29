@@ -83,7 +83,7 @@ source는 제한된 일반 파일·JSON object/plist dictionary·유효 타입�
 
 2026-10-13 v2.1.296 공식 조사에서 기록한 실행 중 managed 갱신의 사전 차단 제약은 2026-10-16 최신 R-023에서 범위 밖 후속 확인으로 정리됐다. 이를 현재 판단 대기나 외부 격리 도입 조건으로 사용하지 않으며 기존 Decision Log를 보존한다. 2026-10-29 관리 rebase 뒤 a30388e1 기준 전체 diff와 현재 sources를 대조했다. Manager 복구점 2f794f630c61991144dbc06056bef0bbb6ec9237은 source 선택, c99603ba78143ec20fea677c1ebd684793590355는 native 정책 생성기, 1139c5b73de975cd60e62eb75c1b903ebe8eadbe는 source 수집·시작 확인 helper를 보존했다. 이번 호출은 마지막 복구점에서 관리 실행·세션·receipt·targeted 수집을 연결했다.
 
-현재 코드에 대해 프로젝트 Python과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 관련 unit 60개를 이번 호출에서 새로 실행해 모두 통과했다(Ran 60 tests in 0.942s, OK). 정책 모듈 9개, 시작 확인 모듈 19개, 관리 runtime 모듈 16개와 기존 isolation/provider/guidance/process-start의 관련 case 16개다. 모든 역할의 신규·재개와 session fallback, readonly·상속 충돌·경로·설정 재검사·초기화 거부·보안 오류·중단 불명·저장 실패·session/사용량/timeout 보존을 확인했다. 관리 service fixture는 실제 in-memory invocation ledger와 receipt/targeted 수집을 연결하고 subprocess만 모의해 빈 targeted 기록에서 성공을 합성하지 않는지 확인한다. 기존 provider 일괄 거부 회귀는 현재 계약에 맞게 missing-environment 거부 회귀로 이름을 바꾸고 신규 runtime 회귀로 지원 호출을 확인한다. 무관한 테스트를 제거하지 않았다.
+앞선 완료 후보에서 프로젝트 Python과 `LOOP_MANAGER_TARGETED_TEST_RUNNER`로 관련 unit 60개를 실행해 모두 통과했다(Ran 60 tests in 0.942s, OK). 정책 모듈 9개, 시작 확인 모듈 19개, 관리 runtime 모듈 16개와 기존 isolation/provider/guidance/process-start의 관련 case 16개다. 모든 역할의 신규·재개와 session fallback, readonly·상속 충돌·경로·설정 재검사·초기화 거부·보안 오류·중단 불명·저장 실패·session/사용량/timeout 보존을 확인했다. 관리 service fixture는 실제 in-memory invocation ledger와 receipt/targeted 수집을 연결하고 subprocess만 모의해 빈 targeted 기록에서 성공을 합성하지 않는지 확인한다. 기존 provider 일괄 거부 회귀는 현재 계약에 맞게 missing-environment 거부 회귀로 이름을 바꾸고 신규 runtime 회귀로 지원 호출을 확인한다. 무관한 테스트를 제거하지 않았다.
 
 앞선 helper 검증에서는 비일반 파일을 `fdopen` 전에 검사하지 않아 descriptor가 남을 수 있는 실패를 수정했고 동일 단일 case와 최종 모듈 재실행이 통과했다.
 
@@ -100,6 +100,21 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_agent_
 ```
 
 CLI·인증·doctor·모델·MDM/OS 분기는 test double이며 보호 파일 쓰기 probe·실계정·실제 Claude·OS 정책 적용과 전체 verify는 실행하지 않았다. 문서/mock 결과를 실제 격리 성공으로 기록하지 않는다. 다음 단계는 Manager 전체 verify·읽기 전용 Review이며 실제 Merge 완료를 선언하지 않는다.
+
+### Review 피드백 교정
+
+시작 HEAD c17adbc9b997b6306c3e76136468bc0bb39b3686에서 세 미해결 피드백을 교정했다. control-only remote의 managedSourcesBehavior도 병합 방식 결정에 사용하며 remote merge·MDM model·file sandbox.enabled=false 조합은 policy 생성에서 거부한다. Bash에는 canonical `/tmp` 아래 짧은 호출별 비공개 root를 전달하고 이 root와 기존 attempt만 추가 허용한다. 긴 상태 경로에서 native가 시스템 fallback으로 바꾸는 변환을 모의해 소유 root 안의 claude-UID와 공유 기본 deny가 양립하는지 확인했다. 실제 시스템 디렉터리 생성은 테스트 fixture로 대체한다. CLI 임시 root의 존재·소유권·권한은 spawn 전 재검사하며 targeted·receipt·결과 기록은 기존 state runtime에 남긴다.
+
+Claude 결과는 기존 원자적 helper로 호출별 last-message.txt에 저장한다. DB 결과 확정을 DatabaseWaitTimeout으로 중단한 모의 관리 호출에서 다음 진입이 동일 invocation·session·원문을 복구하고 새 subprocess를 실행하지 않는지 검증했다. 공용 최신 결과 파일을 다른 내용으로 바꿔도 복구 결과는 유지된다.
+
+최초 실행은 테스트에서 실제 `/tmp` 생성을 시도해 현재 sandbox의 쓰기 범위에 막혔다. 생성은 fixture 안으로 옮기고 production의 짧은 경로 요청과 native 변환을 mock으로 확인하도록 교정한 뒤 동일 명령이 47개 모두 통과했다(Ran 47 tests in 0.810s, OK). 기존 60개 성공을 현재 후보 검증으로 재사용하지 않았다.
+
+```sh
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_claude_policy tests.test_claude_preflight tests.test_claude_managed_runtime
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_claude_policy tests.test_claude_preflight tests.test_claude_managed_runtime
+```
+
+실제 Claude·계정·native OS 적용과 전체 verify는 이번 교정에서도 미실행이다. Manager의 전체 verify·Review가 남아 있다.
 
 ## Decision Log
 

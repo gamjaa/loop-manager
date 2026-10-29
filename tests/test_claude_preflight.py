@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import plistlib
 import subprocess
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -42,6 +43,18 @@ class ManagedSourceResolutionTests(unittest.TestCase):
         self.assertEqual(preflight.resolve_managed({'managedSourcesBehavior': 'merge'},
             {'model': 'mdm'}, {'model': 'file'}), {'model': 'mdm'})
 
+    def test_control_only_merge_includes_lower_unsafe_sandbox_policy(self):
+        remote = {'managedSourcesBehavior': 'merge'}
+        mdm = {'model': 'mdm'}
+        files = {'sandbox': {'enabled': False}}
+        effective = preflight.resolve_managed(remote, mdm, files)
+        self.assertIs(effective['sandbox']['enabled'], False)
+        from loop_manager_internal.agents.agent_claude_policy import policy_arguments
+        with mock.patch.object(preflight.platform, 'system', return_value='Linux'), self.assertRaises(IsolationError):
+            policy_arguments(mock.Mock(), Path('/owned'), False, managed_settings=effective)
+        # A higher policy document with no control retains first-wins.
+        self.assertEqual(preflight.resolve_managed({'model': 'remote'}, remote, files), {'model': 'remote'})
+
     def test_malformed_nested_sources_raise_policy_errors(self):
         for source in ([], {'permissions': []}, {'sandbox': []},
                        {'autoMode': []}, {'env': []}, {'unknownSetting': True},
@@ -57,6 +70,17 @@ class ClaudePreflightTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
+        self.short_temp_requests = []
+        make_directory = tempfile.mkdtemp
+        def owned_temp(*args, **kwargs):
+            if kwargs.get('prefix') == 'lm-':
+                self.short_temp_requests.append(dict(kwargs))
+                kwargs = dict(kwargs, dir=self.root)
+            directory = make_directory(*args, **kwargs)
+            if kwargs.get('prefix') == 'lm-':
+                self.addCleanup(shutil.rmtree, directory)
+            return directory
+        self.enterContext(mock.patch.object(tempfile, 'mkdtemp', side_effect=owned_temp))
         self.state = self.root / 'state'
         self.state.mkdir()
         self.system = self.root / 'system'
@@ -151,8 +175,8 @@ class ClaudePreflightTests(unittest.TestCase):
             second = self.prepare()
         self.assertNotEqual(first.attempt, second.attempt)
         for launch in (first, second):
-            self.assertEqual(launch.environment['TMPDIR'], str(launch.attempt))
-            self.assertEqual(launch.environment['CLAUDE_CODE_TMPDIR'], str(launch.attempt))
+            self.assertEqual(launch.environment['TMPDIR'], str(launch.bash_temporary))
+            self.assertEqual(launch.environment['CLAUDE_CODE_TMPDIR'], str(launch.bash_temporary))
             self.assertEqual(launch.environment['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'], str(launch.attempt))
             self.assertEqual(launch.attempt.stat().st_mode & 0o777, 0o700)
             self.assertEqual(json.loads(launch.reason)['runtime_enforcement'], 'not_observed')
@@ -162,6 +186,41 @@ class ClaudePreflightTests(unittest.TestCase):
             self.assertNotIn('not-a-real-key', repr(launch))
             self.assertIn('--permission-prompts', launch.arguments)
         self.assertEqual(native.call_count, 8)
+
+    def test_long_state_path_uses_short_owned_native_bash_temp_without_shared_fallback(self):
+        self.state = self.root / ('long-state-' + 'x' * 100)
+        self.state.mkdir()
+        with mock.patch.object(preflight.subprocess, 'run', side_effect=self.native):
+            launch = self.prepare()
+        self.assertGreater(len(str(launch.attempt)), 150)
+        override = Path(launch.environment['CLAUDE_CODE_TMPDIR'])
+        # Native Unix transformation appends claude-UID; a long override would
+        # instead choose the shared system fallback denied by our policy.
+        def native_bash_tmp(root):
+            return ((Path('/tmp').resolve() if len(str(root).encode()) > 50 else root)
+                    / f'claude-{os.getuid()}')
+        # Filesystem allocation stays in the fixture; native CLI and the short
+        # system allocation are mocked. Check the requested production path.
+        short = self.short_temp_requests[-1]['dir'] / override.name
+        actual = native_bash_tmp(short)
+        shared = Path('/tmp').resolve() / f'claude-{os.getuid()}'
+        self.assertEqual(actual.parent, short)
+        self.assertEqual(native_bash_tmp(launch.attempt), shared)
+        settings = json.loads(launch.arguments[launch.arguments.index('--settings') + 1])
+        filesystem = settings['sandbox']['filesystem']
+        self.assertIn(str(override), filesystem['allowWrite'])
+        from loop_manager_internal.agents.agent_claude_policy import policy_arguments
+        args = policy_arguments(self.boundary, launch.attempt, False, bash_temporary=short)
+        filesystem = json.loads(args[args.index('--settings') + 1])['sandbox']['filesystem']
+        self.assertIn(str(actual.parent), filesystem['allowWrite'])
+        self.assertIn(str(shared), filesystem['denyWrite'])
+        self.assertFalse(any(actual == Path(root) or actual.is_relative_to(Path(root))
+                             for root in filesystem['denyWrite']))
+        self.assertEqual(override.stat().st_mode & 0o777, 0o700)
+        override.rmdir()
+        with self.assertRaisesRegex(IsolationError, '다시 확인'):
+            preflight.assert_current(launch, self.boundary, 'worker', False, None)
+        override.mkdir(mode=0o700)  # cleanup owns this exact test directory
 
     def test_nonregular_source_closes_its_open_descriptor(self):
         descriptor = os.open(self.system, os.O_RDONLY)

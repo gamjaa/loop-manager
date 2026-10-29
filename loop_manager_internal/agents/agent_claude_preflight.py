@@ -43,6 +43,7 @@ class ClaudeLaunch:
     configuration_digest: str
     reason: str
     probe_arguments: tuple[str, ...] = ()
+    bash_temporary: Path | None = None
 
 
 def _merge(lower: dict, higher: dict) -> dict:
@@ -86,7 +87,10 @@ def resolve_managed(remote: dict, mdm: dict, files: dict) -> dict:
     if not sources:
         return {}
     selected = sources[0]
-    behavior = selected.get('managedSourcesBehavior', 'first-wins')
+    # Control-only documents select composition even though they supply no policy.
+    controls = next(source for source in (remote, mdm, files)
+                    if 'managedSourcesBehavior' in source or source in sources)
+    behavior = controls.get('managedSourcesBehavior', 'first-wins')
     if behavior not in {'first-wins', 'merge'}:
         raise IsolationError('Claude managedSourcesBehavior를 해석할 수 없습니다.')
     effective = dict(selected)
@@ -248,13 +252,22 @@ def prepare(boundary: WorktreeBoundary, state_dir: Path, role: str, read_only: b
                             + str(boundary.worktree) + '\0' + role).encode()).hexdigest()
     _owned_directory(runtime)
     attempt = Path(tempfile.mkdtemp(prefix='call-', dir=runtime))
-    child = dict(environment, TMPDIR=str(attempt), TMP=str(attempt), TEMP=str(attempt),
-                 CLAUDE_CODE_TMPDIR=str(attempt), CLAUDE_CODE_AUTO_CONNECT_IDE='0')
+    # Keep Bash below native temp/socket path limits without granting the shared
+    # claude-UID fallback. Receipts and targeted records stay in the state runtime.
+    short_base = Path('/tmp').resolve()
+    if any(short_base == path or short_base.is_relative_to(path)
+           for path in (boundary.source, boundary.worktree, *boundary.other_worktrees,
+                        boundary.common_dir, boundary.git_dir, home)):
+        raise IsolationError('Claude 짧은 임시 경로와 보호 경로가 겹칩니다.')
+    bash_temporary = Path(tempfile.mkdtemp(prefix='lm-', dir=short_base))
+    child = dict(environment, TMPDIR=str(bash_temporary), TMP=str(bash_temporary), TEMP=str(bash_temporary),
+                 CLAUDE_CODE_TMPDIR=str(bash_temporary), CLAUDE_CODE_AUTO_CONNECT_IDE='0')
     if role == 'worker' and not read_only:
         child['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'] = str(attempt)
         child['LOOP_MANAGER_TARGETED_TEST_RUNNER'] = str(Path(__file__).resolve().parents[1] / 'verification/targeted.py')
     effective, _, _ = configuration(child, config_path)
-    arguments = policy_arguments(boundary, attempt, read_only, fast_mode=fast_mode, managed_settings=effective) + CLI_GUARDS
+    arguments = policy_arguments(boundary, attempt, read_only, fast_mode=fast_mode, managed_settings=effective,
+                                 bash_temporary=bash_temporary) + CLI_GUARDS
     version = _command(['claude', '--version'], child, boundary.worktree)
     match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?: \(Claude Code\))?', version)
     # Includes restricted, excluded-source filesystem merging and the native
@@ -280,18 +293,19 @@ def prepare(boundary: WorktreeBoundary, state_dir: Path, role: str, read_only: b
     if POLICY_DIAGNOSTIC.search(doctor):
         raise IsolationError('Claude 시작 설정 진단에서 정책 오류·무시를 관측했습니다.')
     effective, digest, observations = configuration(child, config_path)
-    arguments = policy_arguments(boundary, attempt, read_only, fast_mode=fast_mode, managed_settings=effective) + CLI_GUARDS
+    arguments = policy_arguments(boundary, attempt, read_only, fast_mode=fast_mode, managed_settings=effective,
+                                 bash_temporary=bash_temporary) + CLI_GUARDS
     specification = json.dumps({'worktree': str(boundary.worktree), 'source': str(boundary.source),
         'repository': boundary.repository_identity, 'read_only': read_only, 'role': role,
         'git_directory': str(boundary.git_dir), 'common_directory': str(boundary.common_dir),
-        'temporary': str(attempt), 'settings_sources': observations}, sort_keys=True)
+        'temporary': str(attempt), 'bash_temporary': str(bash_temporary), 'settings_sources': observations}, sort_keys=True)
     reason = json.dumps({'basis': 'documented-native-configuration', 'runtime_enforcement': 'not_observed',
         'authentication_method': authentication['authMethod'], 'authentication_home': str(home),
         'auto_mode_support': 'requires_invocation_init',
         'requested_policy_digest': sha256(json.dumps(arguments).encode()).hexdigest(),
         'settings_sources': observations,
         'effective_managed_digest': sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()}, sort_keys=True)
-    return ClaudeLaunch(arguments, child, runtime, attempt, specification, version, digest, reason)
+    return ClaudeLaunch(arguments, child, runtime, attempt, specification, version, digest, reason, bash_temporary=bash_temporary)
 
 
 def assert_current(launch: ClaudeLaunch, boundary: WorktreeBoundary, role: str,
@@ -302,9 +316,12 @@ def assert_current(launch: ClaudeLaunch, boundary: WorktreeBoundary, role: str,
             'worktree': str(boundary.worktree), 'source': str(boundary.source),
             'repository': boundary.repository_identity, 'role': role,
             'git_directory': str(boundary.git_dir), 'common_directory': str(boundary.common_dir),
-            'read_only': read_only, 'temporary': str(launch.attempt)}.items()):
+            'read_only': read_only, 'temporary': str(launch.attempt),
+            'bash_temporary': str(launch.bash_temporary)}.items()):
         raise IsolationError('Claude 시작 확인과 현재 호출 identity가 다릅니다.')
-    for path in (launch.runtime, launch.attempt):
+    if launch.bash_temporary is None:
+        raise IsolationError('Claude Bash 소유 임시 경로가 없습니다.')
+    for path in (launch.runtime, launch.attempt, launch.bash_temporary):
         try:
             info = path.lstat()
         except OSError as error:

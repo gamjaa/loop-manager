@@ -32,7 +32,8 @@ def _object(settings: dict, key: str) -> dict:
 
 
 def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: bool,
-                     *, fast_mode: bool = False, managed_settings: dict | None = None
+                     *, fast_mode: bool = False, managed_settings: dict | None = None,
+                     bash_temporary: Path | None = None
                      ) -> tuple[str, ...]:
     """Compose explicit deny rules with restricted file tools and strict Bash.
 
@@ -93,17 +94,20 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
             raise IsolationError('Claude managed filesystem 목록 형식이 올바르지 않습니다.')
 
     workspace, temporary = _canonical(boundary.worktree), _canonical(temporary)
+    temporaries = tuple(dict.fromkeys((temporary, *(() if bash_temporary is None else
+                                                       (_canonical(bash_temporary),)))))
     protected = tuple(dict.fromkeys(_canonical(path) for path in (
         boundary.source, *boundary.other_worktrees, boundary.common_dir,
         boundary.git_dir, workspace / '.git')))
     for denied in protected:
         if (workspace == denied or workspace.is_relative_to(denied)
-                or temporary == denied or temporary.is_relative_to(denied)
-                or denied.is_relative_to(temporary)):
+                or any(root == denied or root.is_relative_to(denied)
+                       or denied.is_relative_to(root) for root in temporaries)):
             raise IsolationError('Claude 허용 경로와 보호 경로가 겹칩니다.')
-    if temporary == workspace or temporary.is_relative_to(workspace) or workspace.is_relative_to(temporary):
+    if any(root == workspace or root.is_relative_to(workspace) or workspace.is_relative_to(root)
+           for root in temporaries):
         raise IsolationError('Claude 임시 경로와 workspace가 겹칩니다.')
-    writable = (temporary,) if read_only else (workspace, temporary)
+    writable = temporaries if read_only else (workspace, *temporaries)
     for raw in filesystem.get('allowWrite', []):
         path = _canonical(Path(raw))
         if not any(path == root or path.is_relative_to(root) for root in writable):
@@ -115,19 +119,19 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
         base.resolve() / f'claude-{os.getuid()}'
         for base in (Path('/tmp'), Path(tempfile.gettempdir()))))
     denied_paths = (*protected, *default_temporary, *((workspace,) if read_only else ()))
-    if any(temporary == denied or temporary.is_relative_to(denied)
-           or denied.is_relative_to(temporary) for denied in default_temporary):
+    if any(root == denied or root.is_relative_to(denied) or denied.is_relative_to(root)
+           for root in temporaries for denied in default_temporary):
         raise IsolationError('Claude 호출 임시 경로와 기본 공유 임시 경로가 겹칩니다.')
     deny = [rule for path in protected
             for rule in (f'Edit(/{path})', f'Edit(/{path}/**)')]
     if read_only:
         deny.append('Edit')  # Covers Edit, Write and NotebookEdit together.
     settings = {'permissions': {'defaultMode': 'auto', 'deny': deny,
-                                'additionalDirectories': [str(temporary)]},
+                                'additionalDirectories': [str(root) for root in temporaries]},
                 'autoMode': {'classifyAllShell': True}, 'disableAllHooks': True,
                 'fastMode': fast_mode,
                 'sandbox': dict(required, network=network_limits, filesystem={
-                    'disabled': False, 'allowWrite': [str(temporary)],
+                    'disabled': False, 'allowWrite': [str(root) for root in temporaries],
                     'denyWrite': [str(path) for path in denied_paths]})}
     tools = ['Bash', 'Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch']
     if not read_only:

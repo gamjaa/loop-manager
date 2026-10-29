@@ -892,6 +892,11 @@ def run_claude(
         message = f"Claude {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if role_name == "reviewer":
         message = _redact_reviewer_log(message)
+    if native_launch is not None:
+        try:
+            _write_attempt_message(attempt / "last-message.txt", message)
+        except (OSError, UnicodeError):
+            collection_status = "error"
     if message:
         try:
             last_message.write_text(message, encoding="utf-8")
