@@ -718,10 +718,20 @@ def rebase_uses_separate_workspace(
         return False
     target = Path(intent['target']).resolve()
     branch = intent['expected'].get('branch')
+    before, expected = intent['before'], intent['expected']
+    metadata = before.get('metadata')
+    # A continued rebase starts detached; its saved metadata identifies the branch.
+    continued = (before.get('branch') is None and expected.get('action') == 'continue'
+                 and isinstance(metadata, dict)
+                 and metadata.get('head-name') == f'refs/heads/{branch}'
+                 and bool(expected.get('before_head'))
+                 and metadata.get('orig-head') == expected['before_head']
+                 and bool(expected.get('target_base_oid'))
+                 and metadata.get('onto') == expected['target_base_oid'])
     if (target in {Path(repo).resolve(), *(path.resolve() for path in worktrees)}
             or not branch or not branch.startswith('loop-manager/G-')
             or intent['owner'] != f"plan:{branch.removeprefix('loop-manager/')}"
-            or intent['before'].get('branch') != branch
+            or (before.get('branch') != branch and not continued)
             or f'refs/heads/{branch}' in refs
             or f'refs/remotes/origin/{branch}' in refs
             or re.fullmatch(r'[0-9a-f]{32}', intent['id']) is None):

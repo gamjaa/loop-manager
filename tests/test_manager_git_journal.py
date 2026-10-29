@@ -441,7 +441,10 @@ if __name__ == '__main__':
 class PendingProjectMutationTest(unittest.TestCase):
     def test_rebase_workspace_separation_checks_refs_registration_and_observation_races(self):
         from types import SimpleNamespace
-        scenarios = ('independent', 'same-worktree', 'same-local-ref', 'same-published-ref',
+        scenarios = ('independent', 'continued', 'continued-wrong-branch', 'continued-wrong-head',
+                     'continued-wrong-base', 'continued-missing-head', 'continued-missing-base',
+                     'detached-without-metadata', 'detached-without-action',
+                     'same-worktree', 'same-local-ref', 'same-published-ref',
                      'duplicate-branch', 'missing-registration', 'registration-failed',
                      'changed-active', 'changed-immutable', 'replaced-during-observation')
         for scenario in scenarios:
@@ -449,9 +452,28 @@ class PendingProjectMutationTest(unittest.TestCase):
                 state = Path(directory)
                 repo, target, requested = state / 'repo', state / 'other', state / 'planning'
                 branch = 'loop-manager/G-165'
+                before = {'head': OLD, 'branch': branch}
+                expected = {'branch': branch}
+                if scenario.startswith(('continued', 'detached')):
+                    before.update(branch=None, metadata={
+                        'head-name': f'refs/heads/{branch}', 'orig-head': OLD, 'onto': NEW})
+                    expected.update(action='continue', before_head=OLD, target_base_oid=NEW)
+                    if scenario == 'continued-wrong-branch':
+                        before['metadata']['head-name'] = 'refs/heads/loop-manager/G-999'
+                    if scenario == 'continued-wrong-head':
+                        before['metadata']['orig-head'] = NEW
+                    if scenario == 'continued-wrong-base':
+                        before['metadata']['onto'] = OLD
+                    if scenario == 'continued-missing-head':
+                        del expected['before_head']
+                    if scenario == 'continued-missing-base':
+                        del expected['target_base_oid']
+                    if scenario == 'detached-without-metadata':
+                        del before['metadata']
+                    if scenario == 'detached-without-action':
+                        del expected['action']
                 identity = journal.begin_rebase(state, owner='plan:G-165', repo=str(repo),
-                    target=str(target), before={'head': OLD, 'branch': branch},
-                    expected={'branch': branch})
+                    target=str(target), before=before, expected=expected)
                 slot = journal._slot(state, str(repo), 'managed_rebase', str(target))
                 intent = journal._read(slot / 'active.json')
                 if scenario == 'changed-active':
@@ -479,7 +501,7 @@ class PendingProjectMutationTest(unittest.TestCase):
                 result = journal.rebase_uses_separate_workspace(state, str(repo), intent,
                     worktrees=(target if scenario == 'same-worktree' else requested,),
                     refs=refs, git=git)
-                self.assertEqual(result, scenario == 'independent')
+                self.assertEqual(result, scenario in ('independent', 'continued'))
                 self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
 
     def test_stage_scope_preserves_intents_and_rejects_shared_writer_and_ownership_races(self):
