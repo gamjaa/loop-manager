@@ -57,6 +57,56 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         return scheduling.TaskScheduler(replace(self.config, **values), database.connect_database,
                                          self.directory, self.connection)
 
+    def test_scheduled_call_waits_past_runtime_ttl_without_probe_and_honors_handoff(self):
+        from loop_manager_internal.runtime import handoff_gate
+        for stopped in (False, True):
+            with self.subTest(handoff=stopped):
+                self._reset_catalog()
+                scheduler = self.scheduler(verify_concurrency=1)
+                scheduler.running['verify']['B'] = 1
+                observer = mock.Mock()
+                gate = handoff_gate.RuntimeHandoffGate(threading.Event(), threading.Lock(), observer,
+                                                      observed_at=0)
+                clock, waits, calls, preflights = [31.0], [], [], []
+                def waiting(_timeout):
+                    observer.assert_not_called()
+                    clock[0] += 31
+                    waits.append(True)
+                    if len(waits) == 2:
+                        scheduler.running['verify']['B'] = 0
+                        if stopped:
+                            gate.stop()
+                def preflight():
+                    observer.assert_not_called()
+                    preflights.append(True)
+                @scheduling.scheduled_call('verify')
+                def verify():
+                    observer.assert_called_once()
+                    calls.append(True)
+                token = scheduling.current_scheduler.set(scheduler)
+                selected = scheduling.current_task.set(scheduling.Task('A', 'G-001', self.connection))
+                handoff = handoff_gate._runtime_handoff_signal.set(gate)
+                try:
+                    with mock.patch.object(handoff_gate.time, 'monotonic', side_effect=lambda: clock[0]), \
+                         mock.patch.object(scheduler.condition, 'wait', side_effect=waiting), \
+                         scheduling.verify_preflight(preflight):
+                        if stopped:
+                            with self.assertRaises(handoff_gate.SelfMergeRuntimeHandoff):
+                                verify()
+                        else:
+                            verify()
+                finally:
+                    handoff_gate._runtime_handoff_signal.reset(handoff)
+                    scheduling.current_task.reset(selected)
+                    scheduling.current_scheduler.reset(token)
+                self.assertEqual(len(waits), 2)
+                self.assertEqual(calls, [] if stopped else [True])
+                self.assertEqual(preflights, [] if stopped else [True])
+                self.assertEqual(observer.call_count, 0 if stopped else 1)
+                self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+                self.assertEqual(sum(scheduler.running['verify'].values()), 0)
+                self.assertEqual(scheduler.retained, {})
+
     def test_full_call_slots_skip_priority_refresh_until_capacity_returns(self):
         self.connection.commit()
         scheduler = self.scheduler(verify_concurrency=1)
@@ -1151,14 +1201,24 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         from loop_manager_internal.agents.scope_contracts import GitSnapshot
         runtime = runtime_state.RuntimeStateRepository(self.connection)
         runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree=str(self.directory / 'one'))
-        for change in ('candidate', 'remote', 'sibling'):
+        for change in ('candidate', 'remote', 'sibling', 'contention'):
             with self.subTest(change=change):
                 scheduler = self.scheduler(verify_concurrency=1)
                 snapshot = [GitSnapshot('head', 'one', {}, {}, {}, {}, {}, {})]
                 base = ['base']
                 calls, errors, commands = [], [], []
+                git_waiting = threading.Event()
+                emit = scheduling.events.emit
+                def observe(message, **values):
+                    if message == '공유 Git 자원 배정 대기':
+                        git_waiting.set()
+                    emit(message, **values)
                 def git(_path, *args, **_options):
                     self.assertFalse(self.connection.in_transaction)
+                    if args == ('fetch', 'origin'):
+                        self.assertEqual(sum(scheduler.running['verify'].values()), 0)
+                        self.assertEqual(scheduling.current_task.get().connection.execute(
+                            "SELECT COUNT(*) FROM task_call_reservations WHERE repo='A'").fetchone()[0], 0)
                     commands.append(args)
                     return SimpleNamespace(returncode=0, stdout=base[0])
                 @scheduling.scheduled_call('verify')
@@ -1178,24 +1238,50 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                         errors.append(error)
                     finally:
                         scheduling.current_scheduler.reset(token)
+                from contextlib import ExitStack
+                from loop_manager_internal.runtime.resource_lock import resource_locks
                 with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda _path:snapshot[0]), \
-                     mock.patch.object(loop_manager, 'git', side_effect=git):
-                    with scheduler.slot('verify', scheduling.Task('B', 'G-003', self.connection)):
-                        thread = threading.Thread(target=queued)
-                        thread.start()
-                        with scheduler.condition:
-                            self.assertTrue(scheduler.condition.wait_for(lambda:bool(scheduler.waiters['verify']), 3))
-                            if change == 'candidate':
-                                snapshot[0] = replace(snapshot[0], head='new-head')
-                            elif change == 'remote':
-                                base[0] = 'new-base'
-                            else:
-                                snapshot[0] = replace(snapshot[0], refs={'refs/heads/sibling':('oid', 'commit')},
-                                                      worktrees={'sibling':('new-head',)})
+                     mock.patch.object(loop_manager, 'git', side_effect=git), \
+                     mock.patch.object(scheduling.events, 'emit', side_effect=observe):
+                    with ExitStack() as leases:
+                        if change == 'contention':
+                            leases.enter_context(resource_locks(self.directory, str(Path('A').resolve()),
+                                ['git:fetch'], owner='existing-fetch'))
+                        with scheduler.slot('verify', scheduling.Task('B', 'G-003', self.connection)):
+                            thread = threading.Thread(target=queued)
+                            thread.start()
+                            with scheduler.condition:
+                                self.assertTrue(scheduler.condition.wait_for(lambda:bool(scheduler.waiters['verify']), 3))
+                                if change == 'candidate':
+                                    snapshot[0] = replace(snapshot[0], head='new-head')
+                                elif change == 'remote':
+                                    base[0] = 'new-base'
+                                elif change == 'sibling':
+                                    snapshot[0] = replace(snapshot[0], refs={'refs/heads/sibling':('oid', 'commit')},
+                                                          worktrees={'sibling':('new-head',)})
+                        if change == 'contention':
+                            self.assertTrue(git_waiting.wait(3))
+                            self.assertEqual(calls, [])
+                            self.assertEqual(self.connection.execute(
+                                "SELECT COUNT(*) FROM task_call_reservations WHERE repo='A'").fetchone()[0], 0)
+                            independent_done = threading.Event()
+                            def independent():
+                                try:
+                                    with closing(database.connect_database(self.directory, run_migrations=False)) as other:
+                                        with scheduler.slot('verify', scheduling.Task('B', 'G-003', other)):
+                                            self.assertFalse(calls)
+                                except BaseException as error:
+                                    errors.append(error)
+                                finally:
+                                    independent_done.set()
+                            independent_thread = threading.Thread(target=independent)
+                            independent_thread.start()
+                            self.assertTrue(independent_done.wait(3))
+                            independent_thread.join(3)
                     thread.join(4)
                 self.assertFalse(thread.is_alive())
                 self.assertIn(('fetch', 'origin'), commands)
-                if change == 'sibling':
+                if change in {'sibling', 'contention'}:
                     self.assertEqual(errors, [])
                     self.assertEqual(calls, ['verify'])
                 else:
@@ -1889,6 +1975,84 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         finally:
             scheduling.current_scheduler.reset(token)
 
+    def test_observed_specification_change_drains_before_followup_dispatch(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcome
+        from loop_manager_internal.planning.planning_runtime import PlanningContext
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            for plan in ('G-001', 'G-002'):
+                runtime.activate('A', plan, activation_sha='base', branch=plan, worktree=plan)
+        runtime.update_plan('A', 'G-001', plan_values={'worker_session_id':'saved-session'}, enqueue=False)
+        with self.connection:
+            self.connection.execute("UPDATE projects SET processed_sha='base', specification_fingerprint='stable', "
+                                    "planning_fingerprint='full-base' WHERE repo='A'")
+        scheduler = self.scheduler(max_tasks_per_project=2, verify_concurrency=1)
+        agent_running, drained = threading.Event(), threading.Event()
+        calls, observed = [], []
+        def git(_path, *_args, **_kwargs):
+            with scheduler.condition:
+                ready = agent_running.is_set() and bool(scheduler.waiters['verify'])
+            return SimpleNamespace(stdout='new-specification' if ready or drained.is_set() else 'base')
+        def planning_ports(connection, repository, _maintenance, _context, _mutex):
+            def specification(_path, revision):
+                observed.append(revision)
+                return 'changed' if revision == 'new-specification' else 'stable'
+            return SimpleNamespace(state=SimpleNamespace(planning=repository.planning),
+                git=SimpleNamespace(input_fingerprint=lambda _path, revision:'full-' + revision,
+                    specification_fingerprint=specification, requirement_archive_only=lambda *_args, **_kwargs:False))
+        def dispatch(context):
+            task = scheduling.current_task.get()
+            calls.append(task.plan_id)
+            if task.plan_id == 'G-002':
+                @scheduling.scheduled_call('verify')
+                def verify():
+                    self.fail('명세 변경 뒤 대기 중 verify가 시작됐습니다.')
+                verify()
+            else:
+                with scheduler.slot('agent', task):
+                    agent_running.set()
+                    self.assertTrue(drained.wait(4))
+                    self.assertEqual(scheduler.running['agent']['A'], 1)
+                    with scheduler.slot('agent', scheduling.Task('B', 'G-003', task.connection)):
+                        calls.append('independent-B')
+                return ExecutionOutcome.advanced(context)
+        def coordinator(_ports):
+            context = SimpleNamespace(repo='A')
+            return SimpleNamespace(prepare=lambda:context, dispatch=dispatch)
+        emit = scheduling.events.emit
+        def observe(message, **values):
+            if message == '프로젝트 배정 중단':
+                drained.set()
+            emit(message, **values)
+        effects = SimpleNamespace(git=git, _PlanningLifecyclePorts=planning_ports,
+            _ExecutionLifecyclePorts=mock.Mock(), ExecutionPhaseCoordinator=coordinator,
+            _check_runtime_handoff=mock.Mock(), activate_ready_execplan=mock.Mock(), resume_manual_work=None)
+        service = ProjectService(effects, ProjectIdentity(self.connection, self.directory, 'A', self.config_path,
+            None, False, None, True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base', provider='codex')
+        context = PlanningContext(repo='A', repo_path=Path('A'), state_dir=self.directory, base_branch='main',
+            base_sha='base', provider='codex', config_path=self.config_path, registered_only=True,
+            refactoring_review_interval=20, self_repository=False, refresh_catalog=service._refresh_catalog)
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with scheduler.slot('verify', scheduling.Task('B', 'G-003', self.connection)), \
+                 mock.patch.object(scheduling.events, 'emit', side_effect=observe):
+                self.assertEqual(service._dispatch_execution(runtime, newly_activated=False,
+                    planning_context=context), loop_manager.PROJECT_STEP_RETRY)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(calls.count('G-001'), 1)
+        self.assertEqual(calls.count('G-002'), 1)
+        self.assertIn('independent-B', calls)
+        self.assertIn('new-specification', observed)
+        self.assertIn('A', scheduler.draining_projects)
+        self.assertNotIn('B', scheduler.draining_projects)
+        effects.activate_ready_execplan.assert_not_called()
+        self.assertEqual(runtime.get('A', 'G-001').worker_session_id, 'saved-session')
+        self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+
     def test_merge_planning_pending_drains_project_and_returns_to_coordinator(self):
         from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
         scheduler = self.scheduler(max_tasks_per_project=1)
@@ -2242,7 +2406,9 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
 
 
     def test_unexpected_task_exception_retries_before_sibling_verify_finishes(self):
-        self._assert_exception_isolation('retry')
+        with mock.patch.object(scheduling, 'observe_runtime') as observe:
+            self._assert_exception_isolation('retry')
+        observe.assert_not_called()
 
     def test_repeated_task_exceptions_pause_only_that_task_and_keep_admitting(self):
         self._assert_exception_isolation('pause')

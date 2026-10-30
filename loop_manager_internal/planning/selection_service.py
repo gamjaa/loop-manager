@@ -565,6 +565,14 @@ class PlanningSelectionService(PlanningService):
         run.maintenance_cycle = cycle
         return None
 
+    def execution_planning_required(self, context: PlanningContext) -> bool:
+        """Reuse the project's successful specification baseline during execution."""
+        row = self._ports.state.planning(context.repo)
+        return self._user_decision_pending(context, context.base_sha) or self._general_planning_required(
+            row, context, context.base_sha,
+            self._ports.git.input_fingerprint(context.repo_path, context.base_sha),
+        )
+
     def _general_planning_required(
         self,
         row: runtime_state.PlanningSnapshot,

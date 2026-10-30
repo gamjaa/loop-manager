@@ -989,8 +989,12 @@ class ProjectService:
         from loop_manager_internal.application.task_scheduling import current_scheduler, current_task, run_project_tasks
         if (current_scheduler.get() is not None and current_task.get() is None
                 and self.identity.recovery_request_id is None):
-            return run_project_tasks(self, newly_activated=newly_activated)
+            return run_project_tasks(self, newly_activated=newly_activated, planning_context=planning_context)
         if current_scheduler.get() is not None:
+            from loop_manager_internal.application.task_scheduling import project_recheck
+            recheck = project_recheck.get()
+            if recheck is not None:
+                recheck(self.state.repo)
             current_scheduler.get().check_project(self.state.repo)
         execution_ports = self.effects._ExecutionLifecyclePorts(
             self.identity.connection,
@@ -1017,6 +1021,8 @@ class ProjectService:
         while True:
             self.effects._check_runtime_handoff()
             if current_scheduler.get() is not None:
+                if recheck is not None:
+                    recheck(self.state.repo)
                 current_scheduler.get().check_project(self.state.repo)
             from loop_manager_internal.storage.task_calls import CallDeferred
             from loop_manager_internal.application.task_scheduling import TaskRecheckRequired
@@ -1036,7 +1042,7 @@ class ProjectService:
                 and execution_outcome.context is not None
             ):
                 execution_context = execution_outcome.context
-                if planning_context is not None:
+                if planning_context is not None and current_scheduler.get() is None:
                     before_planning = runtime_repository.active(self.state.repo)
                     self.effects._recorded_base_fetch(self.state.repo_path, self.identity.state_dir,
                                                       self.state.base, owner='project')

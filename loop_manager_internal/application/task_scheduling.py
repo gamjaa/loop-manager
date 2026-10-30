@@ -37,6 +37,7 @@ def verify_preflight(callback: Callable[[], None]):
 
 
 call_revalidation = ContextVar("scheduled_call_revalidation", default=None)
+project_recheck = ContextVar("scheduled_project_recheck", default=None)
 
 
 class SchedulingDeferred(task_calls.CallDeferred):
@@ -371,6 +372,9 @@ class TaskScheduler:
     def slot(self, kind, task):
         if task.connection.in_transaction or getattr(task.connection, '_depth', 0):
             raise runtime_state.RuntimeStateError("DB 쓰기 transaction을 유지한 채 호출 배정을 기다릴 수 없습니다.")
+        recheck = project_recheck.get()
+        if recheck is not None:
+            recheck(task.repo)
         entry = [task, task.rank(self.priority_reader)]
         observed = self._observation(task)
         waited = False
@@ -391,6 +395,21 @@ class TaskScheduler:
                 if capacity:
                     rank = task.rank(self.priority_reader)
                     next_entry = self._next(kind, task.connection)
+                    # Refresh Git inputs before claiming a call slot: a fetch
+                    # lease may wait while independent calls use the capacity.
+                    revalidate = call_revalidation.get()
+                    if next_entry is entry and waited and revalidate is not None:
+                        with self.condition:
+                            self.waiters[kind].remove(entry)
+                            self.condition.notify_all()
+                        try:
+                            revalidate(waited=True)
+                        finally:
+                            with self.condition:
+                                self.waiters[kind].append(entry)
+                                self.condition.notify_all()
+                        waited = False
+                        continue
                 with self.condition:
                     if capacity:
                         entry[1] = rank
@@ -429,7 +448,7 @@ class TaskScheduler:
                 raise SchedulingDeferred("실행 직전 작업의 호출 자격이 변경됐습니다.")
             revalidate = call_revalidation.get()
             if revalidate is not None:
-                revalidate(waited=waited)
+                revalidate(waited=False)
             self.check_project(task.repo)
             if not self._eligible(task, task.connection):
                 raise SchedulingDeferred("입력 재관측 중 작업의 호출 자격이 변경됐습니다.")
@@ -500,16 +519,14 @@ class TaskScheduler:
 
 def scheduled_call(kind):
     def decorate(function):
-        def call_once(args, kwargs, returned, raised, bound_task, request_state, retried):
-            if not retried:
-                observe_runtime()
+        def call_once(args, kwargs, returned, raised, bound_task, request_state):
             scheduler, task = current_scheduler.get(), bound_task or current_task.get()
             role = kwargs.get("role_name", args[4] if len(args) > 4 else None)
             preflight = current_verify_preflight.get() if kind == "verify" else None
             if scheduler is None:
                 if preflight is not None:
                     preflight()
-                if not retried:
+                if kind == 'verify':
                     observe_runtime()
                 return function(*args, **kwargs)
             if kind == "agent" and role not in {"worker", "reviewer"}:
@@ -548,7 +565,7 @@ def scheduled_call(kind):
                         raise task_calls.CallDeferred('호출 대기 중 차단·catalog/draft 보류가 확인됐습니다.')
                 if preflight is not None:
                     preflight()
-                if not retried:
+                if kind == 'verify':
                     observe_runtime()
                 try:
                     result = function(*args, **kwargs)
@@ -568,10 +585,9 @@ def scheduled_call(kind):
                 task = Task(invocation.repo, invocation.plan_id, kwargs['connection'])
             role = kwargs.get('role_name', args[4] if len(args) > 4 else None)
             returned, raised, request_state = [], [], []
-            retried = False
             while True:
                 try:
-                    result = returned[-1] if returned else call_once(args, kwargs, returned, raised, task, request_state, retried)
+                    result = returned[-1] if returned else call_once(args, kwargs, returned, raised, task, request_state)
                     if scheduler is not None and task is not None and kind == 'agent':
                         identity = getattr(result, 'isolation_invocation_id', None)
                         if identity:
@@ -597,7 +613,6 @@ def scheduled_call(kind):
                     if kind != 'agent' or scheduler is None or (task is None and invocation is None):
                         raise
                     request_scope = task or invocation
-                    retried = True
                     scheduler.check_project(request_scope.repo)
                     events.emit('Agent 요청 DB 재시도 대기', level='WARN', project=request_scope.repo, plan=request_scope.plan_id)
                     with scheduler.condition:
@@ -620,7 +635,7 @@ def scheduled_call(kind):
     return decorate
 
 
-def run_project_tasks(service, *, newly_activated):
+def run_project_tasks(service, *, newly_activated, planning_context=None):
     """프로젝트 준비·planning 이후 독립 실행을 각자의 DB 연결에서 진행한다."""
     from concurrent.futures import Future, wait, FIRST_COMPLETED
     from contextlib import closing
@@ -642,6 +657,56 @@ def run_project_tasks(service, *, newly_activated):
     recovery_keys = {}
     setup_database_attempts = Counter()
     initial = runtime_state.RuntimeStateRepository(connection).active(repo)
+
+    requested_checks = []
+    observed_base = service.state.base_sha
+    if planning_context is not None:
+        from loop_manager_internal.planning.selection_service import PlanningSelectionService
+        from loop_manager_internal.storage import maintenance_state
+        planning_ports = service.effects._PlanningLifecyclePorts(
+            connection, runtime_state.RuntimeStateRepository(connection),
+            maintenance_state.MaintenanceRepository(connection), planning_context, service.identity.planner_mutex)
+        selection = PlanningSelectionService(planning_ports)
+
+    def request_check(target_repo):
+        if planning_context is None or target_repo != repo:
+            return
+        checked = Future()
+        with scheduler.condition:
+            scheduler.check_project(repo)
+            requested_checks.append(checked)
+            scheduler.condition.notify_all()
+            while not checked.done():
+                scheduler.check_project(repo)
+                scheduler.condition.wait(.2)
+            checked.result()
+
+    def check_inputs():
+        nonlocal observed_base
+        if planning_context is None:
+            return
+        with scheduler.condition:
+            checks = list(requested_checks)
+            requested_checks.clear()
+        try:
+            latest = service.effects.git(service.state.repo_path, 'rev-parse', '--verify',
+                f'refs/remotes/origin/{service.state.base}^{{commit}}').stdout.strip()
+            if latest != observed_base:
+                context = replace(planning_context, base_sha=latest)
+                if selection.execution_planning_required(context):
+                    scheduler.pause_project(repo)
+                    results.append(PROJECT_STEP_RETRY)
+                else:
+                    service.state.base_sha = service._refresh_catalog()
+                observed_base = latest
+        except BaseException:
+            scheduler.pause_project(repo)
+            raise
+        finally:
+            with scheduler.condition:
+                for checked in checks:
+                    checked.set_result(None)
+                scheduler.condition.notify_all()
 
     def execute(plan_id, resumed, result):
         try:
@@ -677,7 +742,9 @@ def run_project_tasks(service, *, newly_activated):
                                 "SELECT subject,generation FROM recovery_records WHERE repo=?", (repo,))}
                             child.state.row = runtime_state.project_row(owned, repo)
                             code = child._dispatch_execution(
-                                runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed)
+                                runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed,
+                                planning_context=replace(planning_context, refresh_catalog=child._refresh_catalog)
+                                if planning_context is not None else None)
                             notifications.flush_project_events(owned, repo)
                             if code == PROJECT_STEP_RETRY and retry_pause_detail(
                                     owned, repo, before, attempts, plan_id=plan_id) is not None:
@@ -734,7 +801,6 @@ def run_project_tasks(service, *, newly_activated):
                         if code != PROJECT_STEP_RETRY:
                             break
                         scheduler.check_project(repo)
-                        observe_runtime()
                         scheduler.requeue(current_task.get())
                         resumed = True
             result.set_result(code)
@@ -771,6 +837,8 @@ def run_project_tasks(service, *, newly_activated):
         plan_id = str(row["plan_id"])
         result = Future()
         context = copy_context()
+        if planning_context is not None:
+            context.run(project_recheck.set, request_check)
         target = execute_recovery if recovery_key is not None else execute
         thread = threading.Thread(target=context.run, args=(target, plan_id, resumed, result),
                                   name=f"loop-task-{plan_id}")
@@ -785,6 +853,7 @@ def run_project_tasks(service, *, newly_activated):
         while True:
             from loop_manager_internal.runtime.handoff_gate import _check_runtime_handoff
             _check_runtime_handoff()
+            check_inputs()
             for plan_id, result in tuple(running.items()):
                 if result.done():
                     try:
@@ -862,6 +931,9 @@ def run_project_tasks(service, *, newly_activated):
             wait(tuple(running.values()), timeout=0.2, return_when=FIRST_COMPLETED)
     except PlanningDrain:
         results.append(PROJECT_STEP_RETRY)
+    except BaseException:
+        scheduler.pause_project(repo)
+        raise
     finally:
         for thread in threads:
             thread.join()
