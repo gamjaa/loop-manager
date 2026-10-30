@@ -810,9 +810,9 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             continue
         if current_reason == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
             continue
-        if not blocked_plan_reconciliation.slot_available(connection, repo, str(blocked['plan_id'])):
-            continue
         if current_reason == BlockReasonCode.USER_DECISION_REQUIRED.value:
+            if not blocked_plan_reconciliation.slot_available(connection, repo, str(blocked['plan_id'])):
+                continue
             resolved, _detail, _stage = effects.plan_recovery_effects()._evaluate_remote_checkpoint_cause(
                 connection, repo_path, state_dir, repo, blocked, config_path, verify_timeout_seconds)
             if not resolved:
