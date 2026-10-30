@@ -11,6 +11,7 @@ from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage import task_calls, work_claims, database
+from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 
 
@@ -226,7 +227,7 @@ def check_stopped_writers(connection, state_dir, calls, invocations):
             raise task_calls.CallDeferred('예약 workspace의 Agent 실제 종료를 확인할 수 없습니다.')
 
 
-def target_available(connection, repo, plan_id):
+def target_available(connection, repo, plan_id, *, project_recovery=False):
     from loop_manager_internal.storage.planning_review_state import general_pending
     if general_pending(connection, repo):
         return False
@@ -235,7 +236,13 @@ def target_available(connection, repo, plan_id):
         return False
     project = connection.execute("SELECT * FROM projects WHERE repo=?", (repo,)).fetchone()
     plan = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, plan_id)).fetchone()
-    if plan is None or plan['status'] != 'PLAN_BLOCKED':
+    allowed = {'PLAN_BLOCKED'}
+    if project_recovery:
+        block = scoped_blocking.project_block(connection, repo)
+        if block is None or block['plan_id'] != plan_id:
+            return False
+        allowed.update({'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'})
+    if plan is None or plan['status'] not in allowed:
         return False
     if project['pr_conflict_recovery'] and not project['plan_path'] and not plan['pr_conflict_recovery']:
         return False

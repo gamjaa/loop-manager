@@ -60,10 +60,11 @@ class AssessmentPending(RuntimeError):
     """An external cause probe did not produce a definitive assessment."""
 
 
-def slot_available(connection, repo, plan_id) -> bool:
+def slot_available(connection, repo, plan_id, *, project_recovery=False) -> bool:
     from loop_manager_internal.recovery.plan_recovery import target_available
     from loop_manager_internal.storage.task_calls import management_available
-    if not management_available(connection,repo,plan_id) or not target_available(connection, repo, plan_id):
+    if not management_available(connection,repo,plan_id) or not target_available(
+            connection, repo, plan_id, project_recovery=project_recovery):
         return False
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
     publication = (connection.execute(

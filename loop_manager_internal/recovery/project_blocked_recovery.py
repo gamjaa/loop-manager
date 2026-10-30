@@ -51,7 +51,7 @@ def project_slot_available(connection, repo, plan_id):
     runtime = runtime_state.RuntimeStateRepository(connection)
     projected = runtime.projected_row(repo)
     return bool(block is not None and block['plan_id'] == plan_id
-                and slot_available(connection, repo, plan_id)
+                and slot_available(connection, repo, plan_id, project_recovery=True)
                 and (projected is None or projected['plan_id'] == plan_id))
 
 
@@ -484,12 +484,12 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             return False
 
     def reconcile(self, plan_id):
-        if not project_slot_available(self.connection, self.repo, plan_id):
-            return 'deferred'
         if self._plan(plan_id) is None:
             # Legacy project projections may name a plan absent from the
             # catalog. Preserve that safety block without attempting recovery.
             return 'blocked'
+        if not project_slot_available(self.connection, self.repo, plan_id):
+            return 'deferred'
         if self.ports.unmet_execplan_dependencies(self.connection, self.repo, plan_id):
             return 'deferred'
         row = self.connection.execute('SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',

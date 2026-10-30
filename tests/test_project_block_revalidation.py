@@ -57,8 +57,13 @@ class ProjectRecoveryGateTests(ProjectRemoteRecoveryFixture, unittest.TestCase):
 
 
     def test_active_blocked_owner_can_keep_its_slot_without_hydration_or_agent(self):
-        self.connection.execute("UPDATE exec_plans SET status = 'IMPLEMENTING' WHERE plan_id = 'G-106'")
         self.connection.execute("UPDATE projects SET plan_path = 'docs/plans/[G-106] Work.md'")
+        from loop_manager_internal.recovery.plan_recovery import target_available
+        for status in ('VERIFYING', 'REVIEWING', 'PUBLISHING', 'IMPLEMENTING'):
+            with self.subTest(status=status):
+                self.connection.execute("UPDATE exec_plans SET status=? WHERE plan_id='G-106'", (status,))
+                self.assertTrue(self.recovery.project_slot_available(self.connection, self.repo, 'G-106'))
+                self.assertFalse(target_available(self.connection, self.repo, 'G-106'))
         self.connection.commit()
         self.assertTrue(self.recovery.project_slot_available(self.connection, self.repo, 'G-106'))
         project = dict(self.connection.execute('SELECT * FROM projects').fetchone())

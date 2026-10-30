@@ -983,6 +983,23 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                 ports._current_rebase_service = mock.Mock(return_value=SimpleNamespace(
                     require_owned=mock.Mock(return_value=(None, SimpleNamespace(
                         status=RebaseStatus.COMPLETE, acceptance=acceptance)))))
+                from dataclasses import fields
+                from loop_manager_internal.execution.execution_ports import (
+                    ExecutionLifecyclePortsEffects, _ExecutionLifecyclePorts)
+                dependencies = ExecutionLifecyclePortsEffects(**{
+                    field.name: mock.Mock() for field in fields(ExecutionLifecyclePortsEffects)})
+                dependencies.git.return_value = SimpleNamespace(stdout=head, returncode=1)
+                dependencies.remote_branch_oid.return_value = remote
+                def publish_worker(ctx, **options):
+                    with mock.patch('loop_manager_internal.execution.execution_ports._ExecutionStatePort',
+                                    return_value=state):
+                        lifecycle = _ExecutionLifecyclePorts(dependencies, connection, runtime,
+                            repo='repo', repo_path=Path('/source'), state_dir=Path('/state'),
+                            base='main', base_sha=start, provider='codex', config_path=Path('/config'),
+                            newly_activated=False)
+                    lifecycle._publish_rebased_checkpoint = ports._publish_rebased_checkpoint
+                    return lifecycle.effects.publication.publish_worker_checkpoints(ctx, **options)
+                ports.publish_worker_checkpoints.side_effect = publish_worker
                 with mock.patch.object(worker_checkpoint, 'committed_tree_matches_intent',
                                        side_effect=lambda _w, _s, h, *_: not rebased or h == original):
                     if rebased:
@@ -994,8 +1011,19 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                         ports.publish_worker_checkpoints.assert_not_called()
                         ports._publish_rebased_checkpoint.assert_not_called()
                         service.require_owned.side_effect = None
+                    from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
+                    ports._publish_rebased_checkpoint.side_effect = None
+                    waiting = worker_checkpoint.resume_request(ports, context)
+                    self.assertEqual(waiting.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+                    self.assertEqual(store.get('repo', 'G-047').snapshot['worker_checkpoint_request'], request)
+                    self.assertEqual(state.row()['publication_remote_oid'], remote)
+                    ports._publish_rebased_checkpoint.reset_mock()
+                    ports._publish_rebased_checkpoint.side_effect = publish_rebase
                     worker_checkpoint.resume_request(ports, context)
                 ports._publish_rebased_checkpoint.assert_called_once_with(context, candidate_head=head)
+                ports._publish_rebased_checkpoint.reset_mock()
+                self.assertEqual(publish_worker(context), {'candidate_changed': False, 'pushed': 0})
+                ports._publish_rebased_checkpoint.assert_not_called()
                 ports._commit_owned.assert_not_called()
                 saved = store.get('repo', 'G-047')
                 self.assertNotIn('worker_checkpoint_request', saved.snapshot)

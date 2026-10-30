@@ -277,6 +277,18 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
                 detail=f'Worker checkpoint DB 확정을 기다립니다: {error}')
 
+    def publish_rebase_candidate(context, head, remote):
+        handlers._publish_rebased_checkpoint(context, candidate_head=head)
+        current = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+            identity['repo'], context.plan.plan_id)
+        if current.operation is not None or state.row()['publication_remote_oid'] != head:
+            return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
+                detail='현재 rebase 후보의 게시·원격 입력 재확인을 기다립니다.')
+        if current.observed_remote_oid != head:
+            raise recovery_runtime.RecoveryFailure(recovery_runtime.RecoveryReason.PUBLICATION_RETRY,
+                '현재 rebase 후보의 원격 게시 DB 확정이 다릅니다.')
+        return {'candidate_changed': False, 'pushed': int(remote != head)}
+
     def _publish_worker_checkpoints(context, *, allowed_requirement_archives=(), worker_start_head=None):
         from loop_manager_internal.git import publication_service
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
@@ -298,6 +310,16 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         current = checkpoints.get(identity['repo'], context.plan.plan_id)
         remote = dependencies.remote_branch_oid(identity['repo_path'], context.branch)
         head = dependencies.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
+        if (not (current.snapshot or {}).get('pending_work_branch_input')
+                and not (current.snapshot or {}).get('worker_checkpoint_pending')
+                and (current.operation == 'rebase_publish'
+                     or current.operation is None and valid_acceptance(
+                         (current.snapshot or {}).get('current_rebase_acceptance'))
+                     and row['publication_remote_oid'] != head)):
+            # Every caller publishes the current accepted candidate before
+            # interpreting a pre-rebase Worker start HEAD as linear history.
+            return publish_rebase_candidate(context, head, remote)
         pending = (current.snapshot or {}).get('worker_checkpoint_pending')
         if current.operation is not None:
             raise recovery_runtime.RecoveryFailure(recovery_runtime.RecoveryReason.PUBLICATION_RETRY,
@@ -346,7 +368,9 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                 context.worktree, 'merge-base', '--is-ancestor', start_head, head,
                 check=False,
             )
-            if follows_scope.returncode != 0:
+            if (follows_scope.returncode != 0
+                    and not (follows_scope.returncode == 1 and valid_acceptance(
+                        (current.snapshot or {}).get('current_rebase_acceptance')))):
                 raise recovery_runtime.RecoveryFailure(
                     recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE,
                     'Worker checkpoint HEAD가 실행 시작점의 후손이 아닙니다.',
@@ -424,6 +448,14 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             identity['base'], remote, pull_request,
             allow_common_plans=dependencies._published_plan_allows_common_plans(identity['repo_path'], plan),
         )
+        current = checkpoints.get(identity['repo'], context.plan.plan_id)
+        head = dependencies.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        if (state.row()['publication_remote_oid'] != head
+                and valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))):
+            result = publish_rebase_candidate(context, head, remote)
+            if isinstance(result, ExecutionOutcome):
+                return result
+            newly_pushed += result['pushed']
         return {'candidate_changed': candidate_changed, 'pushed': pushed + newly_pushed}
     effects = execution_handlers.ExecutionEffects(
         state=state,
@@ -550,4 +582,5 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                 context, previous, definition, changed),
         ),
     )
-    return execution_handlers.ExecutionHandlers(effects, **identity)
+    handlers = execution_handlers.ExecutionHandlers(effects, **identity)
+    return handlers

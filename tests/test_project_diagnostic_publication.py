@@ -200,6 +200,10 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
         connection.execute(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(connection)
         connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')")
+        connection.execute("INSERT INTO exec_plans "
+            "(repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,branch,worktree) "
+            "VALUES ('repo','G-107','docs/plans/[G-107] Work.md','Work','[]','[]','normal','hash',"
+            "'IMPLEMENTING','loop-manager/G-107','/state/G-107')")
         connection.execute("INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence) "
                            "VALUES ('repo', 'project', 'publication_ownership_uncertain', 'G-107', 'cause')")
         connection.commit()
