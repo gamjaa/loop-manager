@@ -736,6 +736,9 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
     recovery_request_id: str | None = None,
 ) -> bool:
     from loop_manager_internal.recovery.plan_recovery import recovering_plan
+    from loop_manager_internal.application.task_scheduling import current_scheduler
+    workspace_only = (current_scheduler.get() is not None and plan_id is None
+                      and recovery_request_id is None and not force_timeout_recheck)
     for blocked in effects.plan_blocked_execplans(connection, repo):
         selected = str(blocked['plan_id'])
         if plan_id is not None and selected != plan_id:
@@ -743,7 +746,8 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
         try:
             with recovering_plan(connection, state_dir, repo, selected) as available:
                 if available and _resume_plan_blocks(effects, connection, repo_path, state_dir, repo, base,
-                        config_path, verify_timeout_seconds, selected, force_timeout_recheck, recovery_request_id):
+                        config_path, verify_timeout_seconds, selected, force_timeout_recheck, recovery_request_id,
+                        workspace_only=workspace_only):
                     return True
         except RecoveryFailure:
             raise
@@ -763,6 +767,7 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
     plan_id: str | None = None,
     force_timeout_recheck: bool = False,
     recovery_request_id: str | None = None,
+    *, workspace_only: bool = False,
 ) -> bool:
     """Reevaluate each plan block without letting one overwrite another."""
 
@@ -794,6 +799,8 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             if resume_project_block_if_safe(effects.workspace_recovery_effects(), connection,
                     repo_path, state_dir, repo, workspace_plan_id=str(blocked['plan_id'])):
                 return True
+            continue
+        if workspace_only:
             continue
         local_verify_recheck = force_timeout_recheck and current_reason in {
             BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value,

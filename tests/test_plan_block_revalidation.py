@@ -23,6 +23,27 @@ from tests.support.git import git_command
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_scheduler_preparation_defers_question_assessment_to_selected_task(self):
+        from loop_manager_internal.application.task_scheduling import current_scheduler, current_task, Task
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan(self.repo, 'G-106', reason_code='user_decision_required',
+                           evidence='Original question', release_fingerprint='question', clear_projection=False)
+        self.connection.execute("UPDATE exec_plans SET status='READY' WHERE plan_id='G-107'")
+        self.connection.commit()
+        scheduler_token = current_scheduler.set(SimpleNamespace())
+        task_token = current_task.set(None)
+        try:
+            with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause', return_value=(False, 'keep', None)) as assess:
+                self.assertFalse(loop_manager.resume_plan_blocks(self.connection, Path('/repo'), Path('/state'), self.repo, 'main'))
+                assess.assert_not_called()
+                current_task.set(Task(self.repo, 'G-106', self.connection))
+                self.assertFalse(loop_manager.resume_plan_blocks(self.connection, Path('/repo'), Path('/state'),
+                    self.repo, 'main', plan_id='G-106'))
+                assess.assert_called_once()
+        finally:
+            current_task.reset(task_token)
+            current_scheduler.reset(scheduler_token)
+
     def test_cycle_gate_precedes_user_question_agent_assessment(self):
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenancePhase
         runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
