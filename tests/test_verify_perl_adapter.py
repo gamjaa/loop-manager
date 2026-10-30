@@ -174,7 +174,7 @@ class PerlAdapterTests(unittest.TestCase):
         self.addCleanup(writer.close)
         with \
                 mock.patch.object(perl_adapter, 'execute_manifest', side_effect=execute), \
-                mock.patch.object(perl_adapter.unittest_adapter, 'start_worker') as spawn:
+                mock.patch.object(perl_adapter, 'start_worker') as spawn:
             stage = {**self.stage, 'execution': 'serial'}
             self.assertTrue(perl_adapter.execute(connection, stage, [self.unit], self.root, writer, parent, 'run', Path('entrypoint')))
             self.assertEqual(spawn.call_args.kwargs['command'], [sys.executable, '-u', 'entrypoint', '--perl-worker'])

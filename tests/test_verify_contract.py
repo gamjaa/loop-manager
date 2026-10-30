@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from loop_manager_internal.verification import contract, core, manifest, runner, unittest_adapter
+from loop_manager_internal.verification import contract, core, manifest, runner, unittest_adapter, worker_transport
 from loop_manager_internal.verification.timing import EventWriter, summarize, comparison
 from loop_manager_internal.execution import result_validation, verify_process
 
@@ -210,6 +210,42 @@ class VerifyContractTests(unittest.TestCase):
         with mock.patch.object(core, 'execute_manifest', side_effect=execute):
             self.assertTrue(unittest_adapter.execute(connection, stage, [], self.root, self.writer(), parent, 'run', Path('runtime')))
         self.assertEqual(parent.request.call_count, 2)
+
+    def test_shared_transport_sanitizes_environment_and_preserves_assignment_identity(self):
+        process = mock.Mock(stdin=io.StringIO())
+        output = io.StringIO('previous log')
+        output.seek(0, 2)
+        environment = {'LOOP_MANAGER_VERIFY_SESSION': 'secret', 'CUSTOM': 'value'}
+        identity = {'version': 1, 'run_id': 'run', 'stage_id': 'stage'}
+        with mock.patch.object(core, 'start_process', return_value=(process, output, None)) as start:
+            worker = worker_transport.start_worker('token', 2, self.root, command=['python', 'worker'],
+                cwd=self.root, environment=environment, identity=identity)
+        self.assertEqual(start.call_args.args, (['python', 'worker'], 2, self.root))
+        self.assertEqual(start.call_args.kwargs['cwd'], self.root)
+        self.assertNotIn('LOOP_MANAGER_VERIFY_SESSION', start.call_args.kwargs['environment'])
+        self.assertEqual(environment['LOOP_MANAGER_VERIFY_SESSION'], 'secret')
+        for name in ('first', 'second'):
+            unit = manifest.Module(name, (name + '.test',))
+            worker.assign(unit, self.root / (name + '.json'), self.root)
+        requests = [json.loads(line) for line in process.stdin.getvalue().splitlines()]
+        self.assertEqual([request['unit_id'] for request in requests], ['first', 'second'])
+        self.assertTrue(all(request['run_id'] == 'run' and request['worker_id'] == 2 for request in requests))
+        self.assertEqual(worker.log_offset, len('previous log'))
+        self.assertEqual(worker.report, self.root / 'second.json')
+
+    def test_serial_client_allows_retry_after_denial_and_forwards_lifecycle(self):
+        parent = mock.Mock()
+        parent.request.side_effect = [{'granted': False}, {'granted': True}, {}, {}, {'granted': True}, {}]
+        client = worker_transport.SerialClient(parent)
+        self.assertFalse(client.request('acquire')['granted'])
+        self.assertTrue(client.request('acquire')['granted'])
+        self.assertFalse(client.request('acquire')['granted'])
+        client.request('bind', token='owned', pid=42)
+        client.request('idle', token='owned')
+        self.assertTrue(client.request('acquire', token='owned')['granted'])
+        client.request('release', token='owned')
+        self.assertEqual([call.args[0] for call in parent.request.call_args_list],
+                         ['acquire', 'acquire', 'bind', 'idle', 'acquire', 'release'])
 
     def test_command_reserves_binds_and_releases_after_confirmed_stop_without_test_results(self):
         client = mock.Mock()

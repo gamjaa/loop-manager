@@ -45,7 +45,7 @@ command의 독립 인수 `{python}`과 `{runner}`는 각각 프로젝트 interpr
 
 adapter version 1의 범위는 Python 3.11–3.14 stdlib unittest이다. [공식 unittest 계약](https://docs.python.org/3.12/library/unittest.html)의 discovery·`load_tests`, module/class fixture, skip·expected failure·unexpected success·subtest를 유지한다. 모듈별 독립 프로세스를 배정하고 도구 내부 병렬은 사용하지 않는다. module 사이에 공유 fixture·DB·파일·포트·순서 의존이 있으면 tests 단계를 `serial`로 선언한다. 수집 시 결정한 테스트 ID·fixture 소유자를 실행 시 다시 대조한다. fixture skip은 원래 소유자 근거로 기록하고 실행하지 않은 테스트의 완료를 만들지 않는다.
 
-공통 core는 자원 배정·예약·프로세스 종료 확인을 담당하고, unittest adapter는 프로젝트 interpreter에서의 수집·재수집·reporter·fixture 의미를 담당한다. 테스트 import와 자식의 Python 경로는 후보 worktree를 선택하며 Manager runtime 소스가 후보 구현을 대신하지 않는다. 실제 Agent CLI/API 호출은 기존 guard로 차단하고 테스트에서는 mock/stub을 사용한다. Python 가드는 runpy·일반 import가 프로세스 설치 근거를 공유하며 확인된 audit hook과 Popen wrapper를 한 번 설치한다. 부분 실패는 재시도하고 자식 sitecustomize 설치 실패는 고정 진단 후 종료한다. wrapper가 준비한 동일 환경은 해당 호출의 audit에서 재사용하되 변경된 환경과 명령/API는 매 실행 경계에서 다시 검사한다. 명시/상속 환경의 조율 인증값 제외·부모/호출자 환경 보존·중첩 Python 보호·후보 package 선택·bytecode 정책과 Windows 대소문자/POSIX bytes 별칭을 유지한다. 이 Python guard가 임의 언어의 모든 subprocess를 차단한다고 보장하지 않는다.
+공통 core는 자원 배정·예약·프로세스 종료 확인을, 공통 worker 전송 계층은 프로세스 생성·IPC와 직렬 예약 제한을 담당하고, unittest adapter는 프로젝트 interpreter에서의 수집·재수집·reporter·fixture 의미를 담당한다. 테스트 import와 자식의 Python 경로는 후보 worktree를 선택하며 Manager runtime 소스가 후보 구현을 대신하지 않는다. 실제 Agent CLI/API 호출은 기존 guard로 차단하고 테스트에서는 mock/stub을 사용한다. Python 가드는 runpy·일반 import가 프로세스 설치 근거를 공유하며 확인된 audit hook과 Popen wrapper를 한 번 설치한다. 부분 실패는 재시도하고 자식 sitecustomize 설치 실패는 고정 진단 후 종료한다. wrapper가 준비한 동일 환경은 해당 호출의 audit에서 재사용하되 변경된 환경과 명령/API는 매 실행 경계에서 다시 검사한다. 명시/상속 환경의 조율 인증값 제외·부모/호출자 환경 보존·중첩 Python 보호·후보 package 선택·bytecode 정책과 Windows 대소문자/POSIX bytes 별칭을 유지한다. 이 Python guard가 임의 언어의 모든 subprocess를 차단한다고 보장하지 않는다.
 
 완료 모듈 수집 뒤 coordinator가 허용하는 모듈은 매번 acquire·예약·PID bind를 거쳐 연속 배정한다. 즉시 완료 report는 배정 중 다른 모듈의 결과가 준비되거나 배정이 거절된 뒤에도 대기 없이 수집한다. 진행이 없거나 배정이 거절되고 즉시 수집할 report도 없으면 50ms 대기한다. report가 있어도 살아 있는 자식의 종료 확인을 생략하거나 worker를 조기에 재사용하지 않는다.
 
@@ -72,7 +72,7 @@ plan을 대조한다. `파일 ID#번호` 결과는 해당 suite에 속하고, �
 Test::More의 TODO 성공/실패 의미와 nested subtest의 부모 결과를 유지한다. nested assertion은
 원본 spool에 보존하고 별도의 최상위 수집 ID로 합성하지 않는다.
 
-Python worker IPC와 공통 core의 acquire·PID bind·idle·종료 후 release를 재사용한다. Perl
+공통 worker 전송과 core의 acquire·PID bind·idle·종료 후 release를 재사용한다. Perl
 reporter가 테스트 subprocess를 기다린 뒤에만 단위 report를 만든다. serial 선언은 worker 하나를
 재사용하고 independent는 파일별 프로세스를 배정한다. native JSON Lines는 `module-N.native.ndjson`에, 공통 EventWriter 이벤트는 `*.jsonl`에
 저장한다. 진단 집계는 공통 이벤트만 읽으며 native 원본을 공통 이벤트로 해석하지 않는다.

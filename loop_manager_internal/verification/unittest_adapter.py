@@ -1,6 +1,6 @@
 """unittest 수집, fixture, reporter와 프로젝트 interpreter 경계."""
 from __future__ import annotations
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 import importlib
 import json
 import os
@@ -10,11 +10,12 @@ import sys
 import traceback
 import unittest
 
-from loop_manager_internal.verification.guard import MARKER, install_guard, worker_environment
+from loop_manager_internal.verification.guard import MARKER, install_guard
 from loop_manager_internal.verification.git_timing import git_command_timing
 from loop_manager_internal.verification.manifest import Module, discover, load_module, test_cases, validate_report
 from loop_manager_internal.verification.resources import process_memory
 from loop_manager_internal.verification.core import stop_worker, failure_output
+from loop_manager_internal.verification.worker_transport import Worker, start_worker, SerialClient
 from loop_manager_internal.verification import timing as instrumentation
 from loop_manager_internal.verification.timing import EventWriter, TimedResult, atomic_json, fixture_timing, phase
 
@@ -100,44 +101,6 @@ def worker_main():
     return 0
 
 
-@dataclass
-class Worker:
-    process: object
-    token: str
-    number: int
-    output: object
-    job: object = None
-    module: Module | None = None
-    report: Path | None = None
-    log_offset: int = 0
-    identity: dict | None = None
-    result_observed_at: float | None = None
-    result_ready_at: float | None = None
-    child_wait_started_at: float | None = None
-    child_wait_last_active: int | None = None
-    child_wait_seconds: float | None = None
-    previous_unit_id: str | None = None
-    previous_result_observed_at: float | None = None
-    previous_module_result_at: float | None = None
-
-    def assign(self, module, report, directory):
-        self.output.flush()
-        self.log_offset = self.output.tell()
-        self.module, self.report = module, report
-        self.process.stdin.write(json.dumps({"module": module.name, "ids": module.ids, "owners": module.owners, "pattern": module.pattern,
-                                 "result": str(report), "directory": str(directory), "worker": self.number,
-                                 "worker_id": self.number, **(self.identity or {}),
-                                 **({"unit_id": module.name} if self.identity else {})}) + "\n")
-        self.process.stdin.flush()
-
-
-def start_worker(token, number, directory, *, command=None, cwd=None, environment=None, identity=None):
-    from loop_manager_internal.verification.core import start_process
-    command = command or [sys.executable, "-u", "-m", "loop_manager_internal.verification.runner", "--worker"]
-    process, output, job = start_process(command, number, directory, cwd=cwd,
-        environment=worker_environment(os.environ if environment is None else environment))
-    return Worker(process, token, number, output, job, identity=identity)
-
 
 def compile_project(root):
     for path in [root / "loop_manager.py", *sorted((root / "loop_manager_internal").rglob("*.py"))]:
@@ -196,18 +159,7 @@ def execute(connection, stage, modules, directory, writer, client, run_id, entry
             command=[str(connection.python), "-u", str(entrypoint), "--worker"],
             cwd=connection.root / stage["cwd"], environment=environment, identity=event_identity)
     if stage["execution"] == "serial":
-        # Keep one reusable process, so module fixtures and dependency order remain intact.
-        parent = client
-        class SerialClient:
-            def request(self, operation, **data):
-                if operation == "acquire" and "token" not in data and active[0]:
-                    return {"granted": False, "reason": "serial stage"}
-                reply = parent.request(operation, **data)
-                if operation == "acquire" and reply["granted"]:
-                    active[0] = True
-                return reply
-        active = [False]
-        client = SerialClient()
+        client = SerialClient(client)
     return execute_manifest(modules, directory, writer, client, spawn=spawn, validate_report=validate,
         stop_worker=stop_worker, failure_output=failure_output,
         coverage=lambda unit, report: report["completed"] + report.get("fixture_skipped", []))

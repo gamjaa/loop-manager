@@ -27,10 +27,10 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 12는 `l
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/verification/unittest_adapter.py`·`loop_manager_internal/verification/perl_adapter.py`의 `Worker`·`start_worker`와 직렬 client 제한을 기존 `verification/core.py`의 공통 실행 경계에 모은다. core 책임과 순환 import를 피하려면 예정 파일 `verification/worker_transport.py`에 전송만 두고 기존 adapter의 필요한 내부 호환 진입점은 얇게 유지한다. 새로운 범용 작업 프레임워크는 만들지 않는다.
-- [ ] 각 adapter의 spawn이 기존 callback을 통해 언어별 명령·환경·진단 identity를 넘기게 한다. 공통 helper는 테스트 discovery·reporter·TAP 판정을 알지 않으며 reservation client의 acquire/bind/release와 종료 확인을 그대로 전달한다.
-- [ ] 현재 child 환경·clock·core callback 경계를 그대로 사용한다. `guard.py`·프로세스 종료/예약 보존·예산 흐름을 재설계하거나 일반 테스트 자식에 조율 인증값을 돌려주지 않는다. G-309의 상위 통합 단계·상하위 예산 구현과 테스트 이전은 이 작업에 포함하지 않는다.
-- [ ] 확인한 `tests/test_verify_perl_adapter.py`·`tests/test_verify_contract.py`·`tests/test_verify_runtime.py`의 transport/serial fixture를 재사용해 공통 전송을 검증한다. 각 adapter 연결·serial budget 테스트는 서로 다른 연결 계약이므로 중복으로 제거하지 않는다. 실제 구조 설명만 ARCHITECTURE/VERIFY의 실행 책임 절에 반영한다.
+- [x] 확인한 `loop_manager_internal/verification/unittest_adapter.py`·`loop_manager_internal/verification/perl_adapter.py`의 `Worker`·`start_worker`와 직렬 client 제한을 기존 `verification/core.py`의 공통 실행 경계에 모은다. core 책임과 순환 import를 피하려면 예정 파일 `verification/worker_transport.py`에 전송만 두고 기존 adapter의 필요한 내부 호환 진입점은 얇게 유지한다. 새로운 범용 작업 프레임워크는 만들지 않는다.
+- [x] 각 adapter의 spawn이 기존 callback을 통해 언어별 명령·환경·진단 identity를 넘기게 한다. 공통 helper는 테스트 discovery·reporter·TAP 판정을 알지 않으며 reservation client의 acquire/bind/release와 종료 확인을 그대로 전달한다.
+- [x] 현재 child 환경·clock·core callback 경계를 그대로 사용한다. `guard.py`·프로세스 종료/예약 보존·예산 흐름을 재설계하거나 일반 테스트 자식에 조율 인증값을 돌려주지 않는다. G-309의 상위 통합 단계·상하위 예산 구현과 테스트 이전은 이 작업에 포함하지 않는다.
+- [x] 확인한 `tests/test_verify_perl_adapter.py`·`tests/test_verify_contract.py`·`tests/test_verify_runtime.py`의 transport/serial fixture를 재사용해 공통 전송을 검증한다. 각 adapter 연결·serial budget 테스트는 서로 다른 연결 계약이므로 중복으로 제거하지 않는다. 실제 구조 설명만 ARCHITECTURE/VERIFY의 실행 책임 절에 반영한다.
 
 ## Validation
 
@@ -42,8 +42,8 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 12는 `l
 ## Progress
 
 - [x] 저장된 전송 결합/직렬 중복과 G-309의 실행 경계를 대조해 현재 인터페이스로 독립 검증할 공통화 범위를 확정했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 보고 369의 범위 밖 공통 결함 교정 G-339 반영 뒤 보존된 후보·실패 근거로 남은 검증 재개
-- [ ] 공통 전송·직렬 제한 분리와 양쪽 adapter 회귀 검증
+- [x] 공통 전송·직렬 제한을 분리했다. 보고 369의 공통 결함 교정 G-339가 base에 반영된 뒤 양쪽 adapter 연결과 공통 pool의 targeted unit을 다시 검증했다.
+- [ ] 보존된 전체 verify 실패 근거를 바탕으로 Manager가 전체 verify·실제 OS 격리와 남은 Review를 검증한다.
 
 ## Decision Log
 

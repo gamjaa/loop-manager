@@ -1071,6 +1071,41 @@ class RunnerPoolTests(unittest.TestCase):
             self.assertNotIn("previous successful", value)
             self.assertNotIn("private-value", value)
 
+    def test_pool_failure_paths_stop_before_release_and_preserve_original_error(self):
+        for failure in ('pipe', 'json', 'exit_before_report', 'exit_after_report', 'cancel'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+                root = Path(directory)
+                writer = EventWriter(root / 'events.jsonl')
+                cleanup.callback(writer.close)
+                operations = []
+                class Client:
+                    def request(self, operation, **values):
+                        operations.append(operation)
+                        return {'granted': True, 'token': 'owned', 'reason': 'fake'}
+                process = mock.Mock(pid=100, stdin=io.StringIO())
+                process.poll.return_value = 1 if failure.startswith('exit_') else None
+                worker = SimpleNamespace(process=process, token='owned', number=0,
+                    module=None, report=None, job=None)
+                def assign(unit, report, _directory):
+                    worker.module, worker.report = unit, report
+                    if failure == 'pipe':
+                        raise BrokenPipeError('pipe')
+                    if failure == 'cancel':
+                        raise KeyboardInterrupt()
+                    if failure in ('json', 'exit_after_report'):
+                        report.write_text('invalid json')
+                worker.assign = assign
+                def stop(_worker):
+                    operations.append('stop')
+                expected = {'pipe': BrokenPipeError, 'json': json.JSONDecodeError,
+                    'exit_before_report': RuntimeError, 'exit_after_report': RuntimeError,
+                    'cancel': KeyboardInterrupt}[failure]
+                with mock.patch.object(runner, 'stop_worker', side_effect=stop):
+                    with self.assertRaises(expected):
+                        runner.execute_manifest([manifest.Module('unit', ('test',))], root, writer,
+                            Client(), spawn=lambda *_args: worker, sleep=lambda _: None)
+                self.assertEqual(operations, ['acquire', 'bind', 'stop', 'release'])
+
     def test_serial_pool_reuses_worker_and_releases_only_after_stop(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root = Path(directory)
