@@ -732,6 +732,11 @@ class BlockedPlanReconciler:
             context.update(plan_id=plan_id, identity={field: plan[field] for field in IDENTITY_FIELDS},
                            block=dict(block), artifacts={field: plan[field] for field in ARTIFACT_FIELDS},
                            planning_input=planning_input, common_defect_input=correction)
+            if (previous_context.get('block') == dict(block)
+                    and previous_context.get('identity', {}).get('path') == plan['path']):
+                for field in ARTIFACT_FIELDS:
+                    if context['artifacts'][field] is None:
+                        context['artifacts'][field] = previous_context.get('artifacts', {}).get(field)
             same_cause = all(previous_context.get('block', {}).get(field) == block[field]
                              for field in ('reason_code', 'release_fingerprint', 'evidence'))
             context['comparison_revision'] = (

@@ -23,6 +23,32 @@ from tests.support.git import git_command
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_new_remote_input_keeps_original_failure_after_candidate_results_are_invalidated(self):
+        self.connection.execute("UPDATE exec_plans SET worker_result='Original failure' WHERE plan_id='G-106'")
+        self.connection.commit()
+        def incorporate(_plan, context):
+            context['candidate'] = self.signature
+            with self.connection:
+                self.connection.execute("UPDATE exec_plans SET worker_result=NULL WHERE plan_id='G-106'")
+        with (mock.patch.object(self.coordinator, '_incorporate', side_effect=incorporate),
+              mock.patch.object(self.coordinator, '_publish')):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+            for revision, change_cause, expected in (
+                    ('c' * 40, False, 'Original failure'), ('d' * 40, True, None)):
+                with self.subTest(revision=revision):
+                    if change_cause:
+                        self.connection.execute("UPDATE execplan_blocks SET evidence='Different failure' WHERE plan_id='G-106'")
+                        self.connection.commit()
+                    self.base = revision
+                    self.record_observation()
+                    blocked_remote_observation.observe_refs.return_value = (
+                        blocked_remote_observation.RefObservation('present', self.base),
+                        blocked_remote_observation.RefObservation('absent'))
+                    self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+                    saved = self.connection.execute(
+                        "SELECT context FROM blocked_plan_reconciliations WHERE plan_id='G-106'").fetchone()[0]
+                    self.assertEqual(json.loads(saved)['artifacts']['worker_result'], expected)
+
     def test_cycle_targets_can_recover_without_releasing_unrelated_plans(self):
         from loop_manager_internal.application.commands import local_recovery_request_ready
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenancePhase
