@@ -22,6 +22,7 @@ class PublicationBaseValidationTest(PublicationFixture, unittest.TestCase):
                 _branch,
                 _worktree,
             ) = self._publication_state(directory)
+            self.assertEqual(git_command(repo, "ls-remote", "origin", f"refs/heads/{_branch}"), "")
             (repo / "docs/notes.md").write_text(
                 "# Base two\n", encoding="utf-8"
             )
@@ -96,6 +97,7 @@ class PublicationBaseValidationTest(PublicationFixture, unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             latest_base = git_command(repo, "rev-parse", "origin/main")
+            published_head = git_command(repo, "ls-remote", "origin", f"refs/heads/{_branch}").split()[0]
 
         self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.WAITING)
         self.assertIsNone(project["phase"])
@@ -103,6 +105,7 @@ class PublicationBaseValidationTest(PublicationFixture, unittest.TestCase):
         self.assertEqual(plan["active_sha"], latest_base)
         self.assertEqual(plan["validated_base_sha"], latest_base)
         self.assertIsNotNone(plan["pr_head_oid"])
+        self.assertEqual(published_head, plan["pr_head_oid"])
         self.assertEqual(verify.call_count, 2)
         self.assertEqual(reviews, ["reviewer", "reviewer"])
         self.assertEqual(len(created), 1)

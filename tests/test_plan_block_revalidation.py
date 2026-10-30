@@ -23,6 +23,37 @@ from tests.support.git import git_command
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_cycle_targets_can_recover_without_releasing_unrelated_plans(self):
+        from loop_manager_internal.application.commands import local_recovery_request_ready
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenancePhase
+        store = MaintenanceRepository(self.connection)
+        cycle = store.get(self.repo)
+        request = SimpleNamespace(repo=self.repo, plan_id='G-106')
+        for phase, publication, roots, allowed in (
+                (MaintenancePhase.IDLE, None, (), True),
+                (MaintenancePhase.REFACTORING, 'remote_confirmed', ('G-106',), True),
+                (MaintenancePhase.PREREQUISITE_WAIT, None, ('G-106',), True),
+                (MaintenancePhase.POST_REFACTOR_REVALIDATION, None, ('G-106',), True),
+                (MaintenancePhase.REFACTORING, 'remote_confirmed', ('G-107',), False),
+                (MaintenancePhase.REFACTORING, 'remote_confirmed', ('G-999',), False),
+                (MaintenancePhase.REFACTORING, 'prepared', ('G-106',), False),
+                (MaintenancePhase.ASSESSMENT, None, ('G-106',), False)):
+            with self.subTest(phase=phase, publication=publication, roots=roots), mock.patch.object(
+                    MaintenanceRepository, 'get', return_value=replace(cycle, phase=phase,
+                        publication_stage=publication, refactoring_plan_ids=roots)):
+                self.assertEqual(blocked_plan_reconciliation.slot_available(
+                    self.connection, self.repo, 'G-106'), allowed)
+                self.assertEqual(local_recovery_request_ready(self.connection, request), allowed)
+        self.connection.execute("UPDATE exec_plans SET depends_on='[\"G-106\"]' WHERE plan_id='G-107'")
+        with mock.patch.object(MaintenanceRepository, 'get', return_value=replace(cycle,
+                phase=MaintenancePhase.REFACTORING, publication_stage='remote_confirmed',
+                refactoring_plan_ids=('G-107',))):
+            self.assertTrue(blocked_plan_reconciliation.slot_available(self.connection, self.repo, 'G-106'))
+            self.assertTrue(local_recovery_request_ready(self.connection, request))
+            self.connection.execute("UPDATE exec_plans SET depends_on='[\"G-107\"]' WHERE plan_id='G-106'")
+            self.assertFalse(blocked_plan_reconciliation.slot_available(self.connection, self.repo, 'G-106'))
+            self.assertFalse(local_recovery_request_ready(self.connection, request))
+
     def test_recovery_slot_checks_target_resources_instead_of_sibling_projection(self):
         runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
         runtime.update_plan(self.repo, 'G-107', plan_values={'status': 'VERIFYING'})

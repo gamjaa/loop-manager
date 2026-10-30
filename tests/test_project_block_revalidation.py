@@ -17,6 +17,16 @@ from tests.support.blocked_remote import ProjectRemoteRecoveryFixture
 
 
 class ProjectRecoveryGateTests(ProjectRemoteRecoveryFixture, unittest.TestCase):
+    def test_cycle_project_owner_can_recover_without_waiting_for_cycle_completion(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenancePhase
+        cycle = MaintenanceRepository(self.connection).get(self.repo)
+        self.connection.execute("UPDATE projects SET plan_path='docs/plans/[G-106] Work.md'")
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE plan_id='G-106'")
+        with mock.patch.object(MaintenanceRepository, 'get', return_value=replace(cycle,
+                phase=MaintenancePhase.REFACTORING, publication_stage='remote_confirmed',
+                refactoring_plan_ids=('G-106',))):
+            self.assertTrue(self.recovery.project_slot_available(self.connection, self.repo, 'G-106'))
+
     def test_fetch_lease_contention_keeps_same_remote_observation_retryable(self):
         with mock.patch.object(self.coordinator, '_incorporate',
                 side_effect=loop_manager.ProcessLockBusyError('git:fetch is occupied')) as incorporate:

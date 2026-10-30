@@ -311,11 +311,14 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         remote = dependencies.remote_branch_oid(identity['repo_path'], context.branch)
         head = dependencies.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
         from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
+        # A branch with no remote OID uses the initial publication's absence
+        # lease; the rebase publisher only replaces an existing owned ref.
         if (not (current.snapshot or {}).get('pending_work_branch_input')
                 and not (current.snapshot or {}).get('worker_checkpoint_pending')
                 and (current.operation == 'rebase_publish'
                      or current.operation is None and valid_acceptance(
                          (current.snapshot or {}).get('current_rebase_acceptance'))
+                     and (current.snapshot or {})['current_rebase_acceptance']['remote']['oid'] is not None
                      and row['publication_remote_oid'] != head)):
             # Every caller publishes the current accepted candidate before
             # interpreting a pre-rebase Worker start HEAD as linear history.
@@ -451,7 +454,8 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         current = checkpoints.get(identity['repo'], context.plan.plan_id)
         head = dependencies.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
         if (state.row()['publication_remote_oid'] != head
-                and valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))):
+                and valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))
+                and (current.snapshot or {})['current_rebase_acceptance']['remote']['oid'] is not None):
             result = publish_rebase_candidate(context, head, remote)
             if isinstance(result, ExecutionOutcome):
                 return result

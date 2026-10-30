@@ -411,8 +411,12 @@ def local_recovery_request_ready(
     if active is not None and str(active["plan_id"]) != request.plan_id:
         return False
     project = connection.execute("SELECT phase FROM projects WHERE repo = ?", (request.repo,)).fetchone()
-    cycle = connection.execute("SELECT phase FROM maintenance_cycles WHERE repo = ?", (request.repo,)).fetchone()
-    return project["phase"] != "PLANNING" and (cycle is None or cycle["phase"] == "idle")
+    from loop_manager_internal.maintenance.maintenance_orchestration import cycle_allows_recovery
+    from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+    maintenance = MaintenanceRepository(connection)
+    cycle = maintenance.get(request.repo)
+    rows = maintenance.plan_rows(request.repo)
+    return project["phase"] != "PLANNING" and cycle_allows_recovery(rows, cycle, request.plan_id)
 
 
 def next_local_recovery_request(

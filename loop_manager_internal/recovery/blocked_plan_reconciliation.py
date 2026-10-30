@@ -66,12 +66,14 @@ def slot_available(connection, repo, plan_id, *, project_recovery=False) -> bool
     if not management_available(connection,repo,plan_id) or not target_available(
             connection, repo, plan_id, project_recovery=project_recovery):
         return False
-    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    maintenance = maintenance_state.MaintenanceRepository(connection)
+    cycle = maintenance.get(repo)
     publication = (connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'general_planning_publications'").fetchone()
         and connection.execute('SELECT 1 FROM general_planning_publications WHERE repo = ?', (repo,)).fetchone())
-    return bool(cycle.phase is maintenance_state.MaintenancePhase.IDLE
-                and cycle.publication_stage is None and not publication)
+    from loop_manager_internal.maintenance.maintenance_orchestration import cycle_allows_recovery
+    rows = maintenance.plan_rows(repo)
+    return not publication and cycle_allows_recovery(rows, cycle, plan_id)
 
 
 def remote_adoption_is_current(checkpoint) -> bool:
