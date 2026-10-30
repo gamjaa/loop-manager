@@ -99,10 +99,42 @@ class CatalogSchedulingObservationTest(unittest.TestCase):
                 roles.append(role_name)
                 return loop_manager.CodexResult(1, "stop", "worker-session")
             config = loop_manager.ManagedConfig(path=root / "unused.ini", max_workers=2, telegram_token="", telegram_chat_id="")
+            registrations = {}
             def observed_git(repo, *args, **kwargs):
+                repo = Path(repo)
                 if args[:3] == ("show-ref", "--verify", "--quiet"):
                     return SimpleNamespace(stdout="", returncode=1)
-                return SimpleNamespace(stdout=revisions[Path(repo)], returncode=0)
+                if args[:3] == ("worktree", "add", "--lock"):
+                    import shutil
+                    reason = args[3].split("=", 1)[1]
+                    branch, worktree = args[5], Path(args[6])
+                    shutil.copytree(repo, worktree)
+                    registrations[repo] = [{"worktree": str(worktree), "HEAD": revisions[repo],
+                                             "branch": f"refs/heads/{branch}", "locked": reason}]
+                    return SimpleNamespace(stdout="", returncode=0)
+                owner = next((source for source, entries in registrations.items()
+                              if entries and repo == Path(entries[0]["worktree"])), repo)
+                if owner not in revisions and "planning" in owner.parts:
+                    owner = blocked
+                if args[:3] == ("ls-files", "-u", "-z"):
+                    return SimpleNamespace(stdout="", returncode=0)
+                return SimpleNamespace(stdout=revisions[owner], returncode=0)
+            def observed_bytes(repo, *args):
+                if args[:4] == ("ls-tree", "-r", "-z", "--full-tree") and args[-1] == "docs/requirements":
+                    return b""
+                if args[0] == "show" and len(args) == 2 and ":" in args[1]:
+                    revision, path = args[1].split(":", 1)
+                    for source, sha in revisions.items():
+                        if sha == revision and (source / path).is_file():
+                            return (source / path).read_bytes()
+                raise AssertionError(f"unexpected Git bytes observation: {repo}, {args}")
+            def observed_snapshot(worktree, **_kwargs):
+                path = str(Path(worktree).resolve())
+                return loop_manager.GitSnapshot(
+                    head=ready_sha, branch="loop-manager/G-001", index={}, dirty={},
+                    refs={}, worktrees={path: ("HEAD=" + ready_sha, "branch=refs/heads/loop-manager/G-001")},
+                    config={}, operations={},
+                )
             def unexpected_process(*_args, **_kwargs):
                 import traceback
                 raise AssertionError("unexpected subprocess: " + " > ".join(
@@ -117,6 +149,10 @@ class CatalogSchedulingObservationTest(unittest.TestCase):
                 stack.enter_context(mock.patch.object(loop_manager, "_recorded_base_fetch"))
                 stack.enter_context(mock.patch.object(loop_manager, "ensure_safe_base_worktree"))
                 stack.enter_context(mock.patch.object(loop_manager, "git", side_effect=observed_git))
+                stack.enter_context(mock.patch.object(loop_manager, "git_bytes", side_effect=observed_bytes))
+                stack.enter_context(mock.patch.object(loop_manager, "pr_for_branch", return_value=None))
+                stack.enter_context(mock.patch.object(loop_manager, "capture_git_snapshot", side_effect=observed_snapshot))
+                stack.enter_context(mock.patch.object(loop_manager, "_worktree_catalog", side_effect=lambda repo: registrations.get(Path(repo), [])))
                 stack.enter_context(mock.patch.object(loop_manager, "_GitCatalogDefinitionPort", side_effect=definition))
                 stack.enter_context(mock.patch.object(loop_manager, "_PlanningGitPorts", side_effect=git_port))
                 stack.enter_context(mock.patch.object(loop_manager, "_PlanningAgentPorts", side_effect=agent_port))
