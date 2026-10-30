@@ -42,9 +42,8 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 12는 `l
 ## Progress
 
 - [x] 저장된 전송 결합/직렬 중복과 G-309의 실행 경계를 대조해 현재 인터페이스로 독립 검증할 공통화 범위를 확정했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 보고 369의 범위 밖 공통 결함 교정 G-339 반영 뒤 보존된 후보·실패 근거로 남은 검증 재개
-- [ ] 공통 전송·직렬 제한 분리와 양쪽 adapter 회귀 검증
-- [x] 공통 전송·직렬 제한을 분리하고 양쪽 adapter 연결과 공통 pool의 targeted unit을 검증했다. 전체 verify·실제 OS 격리는 Manager 검증으로 남긴다.
+- [x] 공통 전송·직렬 제한을 분리했다. 보고 369의 공통 결함 교정 G-339가 base에 반영된 뒤 양쪽 adapter 연결과 공통 pool의 targeted unit을 다시 검증했다.
+- [ ] 보존된 전체 verify 실패 근거를 바탕으로 Manager가 전체 verify·실제 OS 격리와 남은 Review를 검증한다.
 
 ## Decision Log
 
