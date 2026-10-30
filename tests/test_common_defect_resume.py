@@ -82,6 +82,33 @@ class CommonDefectResumeTests(unittest.TestCase):
         plan = self.connection.execute('SELECT * FROM exec_plans WHERE plan_id=?', (plan_id,)).fetchone()
         return _assess_user_decision_cause(self.effects, self.connection, Path('/repo'), Path('/state'), 'repo', plan, Path('/config'))
 
+    def test_rebase_result_invalidation_keeps_same_block_correction_evidence(self):
+        from loop_manager_internal.recovery.blocked_plan_reconciliation import SCHEMA
+        from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
+        self.observe_merge()
+        expected = common_defect_state.reassessment(self.connection, 'repo', 'G-048')
+        self.assertTrue(expected['ready'])
+        plan = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-048'").fetchone()
+        block = dict(self.connection.execute("SELECT * FROM execplan_blocks WHERE plan_id='G-048'").fetchone())
+        context = dict(block=block, identity=dict(path=plan['path']), artifacts=dict(worker_result=self.raw))
+        with self.connection:
+            self.connection.execute(SCHEMA)
+            self.connection.execute('INSERT INTO blocked_plan_reconciliations VALUES (?,?,?,?,?)',
+                ('repo', 'G-048', 'original-input', 'adopted', json.dumps(context)))
+            runtime_state.RuntimeStateRepository(self.connection).update_plan('repo', 'G-048',
+                plan_values={'worker_result': revalidation_values(self.remote)['worker_result']}, enqueue=False)
+        self.assertEqual(common_defect_state.reassessment(self.connection, 'repo', 'G-048'), expected)
+        for changed in ({**context, 'block': {**block, 'evidence': 'Different failure'}},
+                        {**context, 'identity': {'path': 'different.md'}}, []):
+            with self.subTest(context=changed):
+                self.connection.execute("UPDATE blocked_plan_reconciliations SET context=? WHERE plan_id='G-048'",
+                                        (json.dumps(changed),))
+                self.assertIsNone(common_defect_state.reassessment(self.connection, 'repo', 'G-048'))
+        self.connection.execute("UPDATE blocked_plan_reconciliations SET context=? WHERE plan_id='G-048'",
+                                (json.dumps(context),))
+        self.connection.execute("UPDATE exec_plans SET worker_result='A newer unrelated result' WHERE plan_id='G-048'")
+        self.assertIsNone(common_defect_state.reassessment(self.connection, 'repo', 'G-048'))
+
     def test_plan_publication_and_merge_status_alone_cannot_resume(self):
         self.assertFalse(common_defect_state.reassessment(self.connection, 'repo', 'G-048')['ready'])
         with self.connection:

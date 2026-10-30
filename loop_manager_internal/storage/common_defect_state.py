@@ -150,11 +150,27 @@ def reassessment(connection, repo, plan_id):
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
     if plan is None or 'worker_result' not in plan.keys():
         return None
+    worker_result = plan['worker_result']
+    if (not worker_result and plan['blocked_reason'] == 'common_defect_pending'
+            and {'blocked_plan_reconciliations', 'execplan_blocks'} <= tables):
+        saved = connection.execute('SELECT context FROM blocked_plan_reconciliations '
+                                   'WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
+        block = connection.execute('SELECT * FROM execplan_blocks WHERE repo=? AND plan_id=?',
+                                   (repo, plan_id)).fetchone()
+        try:
+            context = json.loads(saved['context']) if saved else {}
+            # Rebase invalidates candidate results, not the original failure.
+            # Only the same still-blocked cause may borrow its frozen report.
+            if (block is not None and context.get('block') == dict(block)
+                    and context.get('identity', {}).get('path') == plan['path']):
+                worker_result = context.get('artifacts', {}).get('worker_result')
+        except (TypeError, ValueError, AttributeError):
+            pass
     reports = set()
-    if plan['worker_result']:
+    if isinstance(worker_result, str) and worker_result:
         row = connection.execute("SELECT r.id FROM validation_results r JOIN common_defect_reports c ON c.result_id=r.id "
             "WHERE r.repo=? AND r.plan_id=? AND r.stage='worker' AND r.raw_output=? AND c.report IS NOT NULL "
-            "ORDER BY r.id DESC LIMIT 1", (repo, plan_id, redact_secrets(plan['worker_result']))).fetchone()
+            "ORDER BY r.id DESC LIMIT 1", (repo, plan_id, redact_secrets(worker_result))).fetchone()
         if row is not None:
             reports.add(row[0])
     reports.update(row[0] for row in connection.execute(
