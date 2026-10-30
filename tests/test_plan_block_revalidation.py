@@ -23,6 +23,20 @@ from tests.support.git import git_command
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_cycle_gate_precedes_user_question_agent_assessment(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenancePhase
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan(self.repo, 'G-106', reason_code='user_decision_required',
+                           evidence='Original question', release_fingerprint='question', clear_projection=False)
+        cycle = MaintenanceRepository(self.connection).get(self.repo)
+        with (mock.patch.object(MaintenanceRepository, 'get', return_value=replace(cycle,
+                phase=MaintenancePhase.REFACTORING, publication_stage='remote_confirmed',
+                refactoring_plan_ids=('G-107',))),
+              mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause', return_value=(False, 'keep', None)) as assess):
+            self.assertFalse(loop_manager.resume_plan_blocks(self.connection, Path('/repo'), Path('/state'),
+                self.repo, 'main', plan_id='G-106'))
+        assess.assert_not_called()
+
     def test_new_remote_input_keeps_original_failure_after_candidate_results_are_invalidated(self):
         self.connection.execute("UPDATE exec_plans SET worker_result='Original failure' WHERE plan_id='G-106'")
         self.connection.commit()
