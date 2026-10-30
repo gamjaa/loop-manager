@@ -23,7 +23,7 @@ class RebaseObservationRetry(RecoveryFailure):
 
 
 def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree,
-                       branch, service, owns_remote, git, lookup_pr):
+                       branch, service, owns_remote, git, lookup_pr, candidate_head=None):
     try:
         current = checkpoints.get(repo, plan_id)
         saved = current.snapshot or {}
@@ -33,15 +33,42 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
         pending = current.operation == 'rebase_publish'
         if pending and current.rebase_publication_intent() is None:
             raise RebasePublicationRejected('intermediate checkpoint intent identity differs')
+        if pending and candidate_head is not None and intent['head'] != candidate_head:
+            raise RebasePublicationRejected('Worker checkpoint differs from the pending rebase publication')
         acceptance = saved.get('current_rebase_acceptance')
         if not pending and (current.operation is not None or not valid_acceptance(acceptance)):
             return
+        if candidate_head is not None and not pending:
+            if (current.expected_head != candidate_head
+                    or git(worktree, 'merge-base', '--is-ancestor', acceptance['head'],
+                           candidate_head, check=False).returncode != 0):
+                raise RebasePublicationRejected('Worker checkpoint no longer follows the accepted rebase')
+            try:
+                _, decision = service().observe(checkpoint=current)
+            except (RecoveryFailure, manager_git_journal.MutationEvidenceError):
+                raise
+            except (RuntimeError, OSError) as error:
+                raise RebaseObservationRetry('Worker checkpoint rebase observation failed') from error
+            if decision.status is RebaseStatus.UNAVAILABLE:
+                raise RebaseObservationRetry('Worker checkpoint rebase observation unavailable: ' + decision.reason)
+            fresh = decision.acceptance
+            if (decision.status is not RebaseStatus.COMPLETE or not valid_acceptance(fresh)
+                    or fresh['head'] != candidate_head
+                    or any(fresh[key] != acceptance[key] for key in (
+                        'repo', 'plan_id', 'repository_identity', 'worktree', 'branch', 'target_base_oid'))
+                    or any(fresh['remote'][key] != acceptance['remote'][key]
+                           for key in ('repository', 'branch'))
+                    or (fresh['remote']['pull_request'] or {}).get('identity')
+                       != (acceptance['remote']['pull_request'] or {}).get('identity')):
+                raise RebasePublicationRejected('Worker checkpoint current rebase ownership or scope differs')
+            acceptance = fresh
         row = state.row()
         if not pending and not acceptance['remote']['oid']:
             return
-        if not pending and saved.get('rebase_publication_result', {}).get('acceptance_id') == acceptance['id']:
+        if (not pending and candidate_head is None
+                and saved.get('rebase_publication_result', {}).get('acceptance_id') == acceptance['id']):
             return
-        if not pending and saved.get('rebase_publication_deferred') == acceptance['id']:
+        if not pending and candidate_head is None and saved.get('rebase_publication_deferred') == acceptance['id']:
             return
         owner = checkpoints.connection.execute(
             "SELECT accepted_remote_oid FROM blocked_checkpoints WHERE repo = ? AND plan_id = ? "

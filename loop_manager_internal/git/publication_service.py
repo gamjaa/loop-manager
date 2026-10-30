@@ -483,6 +483,21 @@ def push_worker_checkpoint_commits(
     root = remote_oid or str(plan['active_sha'] or '')
     if not root:
         raise PublicationSafetyError('Worker checkpoint의 시작 commit을 확인할 수 없습니다.')
+
+    def linear_commits(start):
+        commits, parent = [], start
+        if start != head:
+            history = effects.git(worktree, 'rev-list', '--reverse', '--parents', f'{start}..{head}')
+            for line in history.stdout.splitlines():
+                values = line.split()
+                if (len(values) != 2 or values[1] != parent
+                        or re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', values[0]) is None):
+                    raise PublicationSafetyError('Worker checkpoint 이력이 단일 부모 선형 commit이 아닙니다.')
+                commits.append(values[0])
+                parent = values[0]
+        if parent != head:
+            raise PublicationSafetyError('Worker checkpoint commit 이력이 HEAD까지 이어지지 않습니다.')
+        return commits
     ancestry = effects.git(worktree, 'merge-base', '--is-ancestor', root, head, check=False)
     if ancestry.returncode not in (0, 1):
         raise RuntimeError('Worker checkpoint commit ancestry를 확인할 수 없습니다.')
@@ -498,23 +513,15 @@ def push_worker_checkpoint_commits(
                 and acceptance['remote']['oid'] == remote_oid
                 and effects.git(worktree, 'merge-base', '--is-ancestor',
                                 acceptance['head'], head, check=False).returncode == 0):
-            # Rewritten history belongs to the validated rebase/final publication path.
+            parent = acceptance['head']
+            for commit in linear_commits(parent):
+                validate_commit(parent, commit)
+                parent = commit
+            # The caller publishes the checked successor through the rebase lease.
             return head, 0
         raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                               '원격 또는 base commit이 Worker checkpoint의 조상이 아닙니다.')
-    commits = []
-    if root != head:
-        history = effects.git(worktree, 'rev-list', '--reverse', '--parents', f'{root}..{head}')
-        parent = root
-        for line in history.stdout.splitlines():
-            values = line.split()
-            if (len(values) != 2 or values[1] != parent
-                    or re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', values[0]) is None):
-                raise PublicationSafetyError('Worker checkpoint 이력이 단일 부모 선형 commit이 아닙니다.')
-            commits.append(values[0])
-            parent = values[0]
-        if parent != head:
-            raise PublicationSafetyError('Worker checkpoint commit 이력이 HEAD까지 이어지지 않습니다.')
+    commits = linear_commits(root)
 
     expected = remote_oid
     for commit in commits:

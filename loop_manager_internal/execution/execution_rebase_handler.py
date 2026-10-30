@@ -816,7 +816,7 @@ class RebaseHandler:
         if worker_definition is not None:
             self.ports.state.retain_clean_rebase_worker(prior, worker_definition, checkpoint)
 
-    def _publish_rebased_checkpoint(self, context):
+    def _publish_rebased_checkpoint(self, context, *, candidate_head=None):
         if self.ports.checkpoint is None:
             return
         managed_rebase_publication.publish_checkpoint(
@@ -827,4 +827,4 @@ class RebaseHandler:
             owns_remote=lambda oid, selected, **evidence: self.ports._owned_checkpoint_remote(
                 context, self.ports._row(), oid, selected, **evidence),
             git=self.ports.git,
-            lookup_pr=self.ports.pr_for_branch)
+            lookup_pr=self.ports.pr_for_branch, candidate_head=candidate_head)

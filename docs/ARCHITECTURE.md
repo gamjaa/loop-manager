@@ -603,6 +603,8 @@ planning 게시의 외부 관측·복구·worktree 정리는 공통 DB 접근 �
 
 작업별 일반 RETRY는 프로젝트 조율로 반환하지 않고 실행 대기열의 재시도 순서로 재등록한다. RETRY마다 DB 상태를 다시 준비하고 기존 일시 복구의 같은 실행 3회 한도를 공통으로 적용한다. 단계 처리의 일반 예외는 작업별 상세 오류·traceback을 기록하고 미확정 transaction을 rollback한 뒤 같은 배정 경로로 제한 재시도한다. 예외 3회 실패는 해당 작업만 보류하며 Future의 일반 예외도 작업별 오류로 수집해 조율기의 추가 배정을 계속한다. Planner 배정 중단·runtime handoff·사용자 중단은 별도 제어 신호로 전파한다. 재시도 우선순위는 수동 제출보다 낮고 다른 일반 작업보다 높으며 재등록 순서를 유지한다. 프로젝트 조율기가 명세 변경으로 planning이 필요하다고 판단하면 프로젝트 배정 중단 신호로 관리 편입·실행 대기 호출·후속 단계를 반환시키고 실행 중 처리를 join한 뒤 프로젝트 조율로 돌아간다. 진행 중 rebase의 작업물·index·checkpoint·원래 target은 보존하고 별도 planning worktree에서 Planner 게시·catalog·DB 반영을 먼저 완료한 뒤 작업 배정을 다시 연다. 재개한 실행은 갱신된 베이스와 명세를 기존 revision gate로 확인하며, 보존된 rebase를 완료로 간주하거나 강제로 중단하지 않는다. 다른 진행 중 Git operation과 미종료 호출의 안전 gate는 유지한다. runtime handoff는 기존 전체 launch gate로 새 호출을 막고 진행 중 처리의 반환을 기다린다.
 
+같은 원인·입력 지문·진전 marker의 관측이 세 번 이상인 일시 복구는 재시도 묶음의 상한 뒤 타이머만으로 다시 배정하지 않는다. 기존 `recovery_records.occurrence`와 `pending_action=pause`로 해당 작업을 보존하고 독립 작업을 계속한다. 입력이나 진전이 달라진 관측은 별도의 묶음으로 판단한다. 이 보류는 최종 차단·사용자 결정·성공을 만들지 않으며 다음 외부 실행의 현재 상태 재검사를 막지 않는다. 준비·단계 처리·결과 수집의 DB 대기 만료는 실패/교정 횟수에 합산하지 않고 같은 작업을 최대 세 번 재시도한 뒤 보존한다. 실제 결과가 이미 확보된 Agent 호출은 기존 결과 저장 재개 경계를 사용해 provider를 반복하지 않는다.
+
 `projects.max_tasks_per_project`는 정수 0 이상이고 migration 기본 0이다. 0이면 해당 Manager가 읽은 config 기본값을 상속하며 양수는 보존한다. 배정 경계에서 DB를 재조회한다. `task_call_reservations`는 호출 token·repo·plan·종류·실행 receipt를 보존하고, 재시작 시 미시작 또는 실제 프로세스 종료 증거가 있는 호출만 회수한다. `PLAN_BLOCKED`는 호출 예약이나 `execution_checkpoints.operation`이 남아 있어도 관리 개수에서 제외한다. 실제 호출의 실행 자리·자원 소유권·checkpoint는 삭제하지 않으며 차단 해제 후에는 관리 한도를 다시 확인한다. 차단되지 않은 작업은 미확정 호출·operation의 기존 관리 자리 보존 조건을 유지한다. Agent는 기존 group/Job 종료 receipt, verify는 소유 프로세스·WSL lifecycle receipt를 사용한다. 불확실한 종류의 호출이 상한에 도달하면 해당 단계는 보존하고 다른 종류의 적격 호출을 계속한다.
 
 rebase 관측의 안정성 지문에는 해당 branch·worktree의 등록과 공유 config만 포함하고 무관한 작업의 ref·worktree 변화는 제외한다. 해당 branch의 중복 등록·현재 후보·index·입력·원격 PR의 검증은 유지한다. rebase 완료·차단 해제의 Git·원격 재관측은 쓰기 transaction 전에 마치고, 짧은 DB transaction 안에서 대상 실행 snapshot·현재 투영·checkpoint generation을 다시 비교해 acceptance와 상태·outbox를 함께 적용한다. 대표 투영이 비어 있거나 다른 plan을 가리켜도 명시 대상의 원본과 일치하면 해당 plan만 갱신하고, 대상 자체의 identity·generation·원격 OID 불일치는 계속 거부한다. 게시된 rebase의 원격 lease는 현재 대상·branch·checkpoint 관측이 `WAITING` 또는 `COMPLETE`로 확인될 때만 유지하며, base가 조상에 포함되지 않는 `START` 판단은 완료 증거나 게시 소유권으로 승격하지 않는다. Worker 결과 scope 검사도 대상 checkpoint의 현재 rebase를 다시 관측하며, 관측 실패는 원래 영역·진단을 보존해 거부하고 최종 파일 판정에 전달하지 않는다. 중간 Git 작업이 확인된 `WAITING`만 최종 파일 검사를 미루며, 최종 결과는 `COMPLETE` 또는 현재 파일 정책에 따른 구체적 scope 거부로 판정한다. 반복 충돌 차단은 아직 rebase가 시작되지 않은 `START` 상태만으로 해제하지 않지만, 기존 plan-input correction의 재개 의미는 유지한다. 상위 execution 포트도 외부 재관측 전에 writer를 예약하지 않는다.
@@ -1035,6 +1037,8 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 
 일반적인 PLAN_BLOCKED는 계획·원래 활성 sources의 내용 해시를 기준으로 재평가한다. 닫힌 PR은 같은 PR reopen을 요구한다. 과거 파일 승인 대기는 일반 작업·소유권 검사를 통과하면 기록을 보존한 채 재개한다. 독립 차단·planning 오류·실패 감사는 함께 지우지 않는다. planning_error는 실제 교정·재검증·게시 복구로 원인이 해소된 뒤에만 지운다. cleanup_pending과 ExecPlan archive pending은 상태 전이를 만들지 않는다.
 
+차단 재평가의 자리는 대상 계획의 호출 종료·branch/worktree 경합·관리 상한과 planning·유지보수 소유권으로 판단한다. 다른 계획의 실행 단계나 대표 투영만으로 독립 복구를 보류하지 않는다. 사용자 질문의 재평가 중 원격·계획·checkpoint가 달라지면 `remote_snapshot_race`로 남겨 같은 원인의 재검사 입력을 보존하며, 최종 거부나 처리 완료로 소비하지 않는다.
+
 **수동 준비·게시 복구.**
 
 수동 명령의 준비·수락은 `application/manual_work.py`와 `manual_concurrency.py`가 소유하며 [PRODUCT의 명령별 역할·결과](PRODUCT.md#수동-명령의-준비와-수락)를 따른다. `start`의 진입 상태는 `READY`·`PLAN_BLOCKED`·기존 `MANUAL_WORKING`이고, 차단 인계는 `verify_retry_exhausted`·`review_retry_exhausted`·`review_protocol_exhausted`·`worker_output_invalid`로 한정한다. draft·catalog hold·프로젝트 차단·활성 유지보수와 계획·자원 소유권을 별도로 검사하며 기존 수동 준비 재호출은 저장된 작업을 재사용한다.
@@ -1135,6 +1139,8 @@ rebase 채택의 한 검사 구간에서는 `ManagedRebaseService.adopt`가 안�
 신규 원격 branch·다른 계획의 branch는 기존 게시 intent로 갱신하지 않는다.
 
 중간 게시 intent는 정확한 기대 원격 OID와 후보 HEAD, 현재 상태 수용 identity·지문을 SQLite에 보존한다. 게시 직전 실제 ref와 연결 PR의 identity·head를 다시 확인하고 정확한 OID를 명시한 `--force-with-lease`로 같은 ref만 갱신한다. 새로운 원격 입력은 재관측·통합·재검증 대상으로 처리하고, 삭제·다른 대상·실제 권한 또는 보호 정책 거부는 해당 작업이나 쓰기를 보류한다. 원격 변화를 이전 intent의 새 lease로 끼워 넣지 않는다.
+
+Worker의 저장된 checkpoint 요청이 수용된 rebase의 후속 commit이면 현재 후보의 소유권·최종 범위를 새로 확인해 같은 중간 게시 경계로 연결한다. 과거 rebase 게시 보류나 최종 PR 게시 예정만으로 요청 완료를 기다리게 하지 않는다. 요청 commit과 정확한 lease를 intent에 고정하고 중단 뒤 같은 게시를 재개하며, 원격 확인과 DB 확정 전에는 요청을 소비하지 않는다. 게시만으로 Worker 완료·verify·Review 성공을 만들지 않는다.
 
 Worker checkpoint의 미완료 push도 새 원격 입력을 먼저 통합한다. 완료된 같은 branch·worktree 통합의 원래 HEAD에 게시 대상 commit이 포함된 경우만 낡은 intent를 `retired_worker_checkpoints` 감사 배열의 `intent`·`observed_remote`·`confirmed: false`로 보존하고 폐기한다. 이는 push 성공이나 최종 검증 근거가 아니다.
 

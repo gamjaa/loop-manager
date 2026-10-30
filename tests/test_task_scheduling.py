@@ -1562,6 +1562,27 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         wait.assert_not_called()
         self.assertEqual(dict(repository.row('A', 'G-001')), before)
 
+    def test_unchanged_publication_failure_does_not_restart_from_a_timer(self):
+        from loop_manager_internal.storage import recovery_state
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        scheduler = self.scheduler()
+        repository = recovery_state.RecoveryRepository(self.connection)
+        failure = RecoveryObservation(RecoveryReason.PUBLICATION_RETRY, 'A', 'G-001',
+            'WORKING', 'revision', 'base', 'same-input', 'same-head', 'unpublished checkpoint')
+        for _ in range(3):
+            repository.observe(failure, attempts=3)
+        self.connection.commit()
+        before = dict(repository.row('A', 'G-001'))
+        with mock.patch.object(scheduler.condition, 'wait') as wait:
+            self.assertFalse(scheduler.wait_retry(self.connection, 'A', 'G-001'))
+        wait.assert_not_called()
+        self.assertEqual(dict(repository.row('A', 'G-001')), before)
+        repository.observe(replace(failure, fingerprint='new-input'), attempts=3)
+        self.connection.commit()
+        with mock.patch.object(recovery_state.time, 'time', return_value=100) as clock, \
+             mock.patch.object(scheduler.condition, 'wait', side_effect=lambda _: setattr(clock, 'return_value', 131)):
+            self.assertTrue(scheduler.wait_retry(self.connection, 'A', 'G-001'))
+
     def test_unproven_pr_history_releases_projection_and_continues_other_work(self):
         from loop_manager_internal.application.project_service import ProjectService
         from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
@@ -1738,6 +1759,12 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
     def test_db_wait_preserves_task_and_keeps_independent_admission(self):
         self._assert_exception_isolation('db_wait')
 
+    def test_db_wait_retries_the_same_task_after_the_queue_recovers(self):
+        self._assert_exception_isolation('db_retry')
+
+    def test_no_progress_retry_stops_only_that_task_and_keeps_admitting(self):
+        self._assert_exception_isolation('no_progress')
+
     def test_pause_record_db_wait_is_inside_the_task_error_boundary(self):
         self._assert_exception_isolation('pause_record')
 
@@ -1783,11 +1810,21 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                             self.assertIsNotNone(task.retry_order)
                             self.assertFalse(options['newly_activated'])
                         calls.append(task.plan_id)
-                        if failure in {'db_wait', 'pause_record'}:
+                        if failure == 'no_progress':
+                            from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+                            from loop_manager_internal.storage.recovery_state import RecoveryRepository
+                            RecoveryRepository(task.connection).observe(RecoveryObservation(
+                                RecoveryReason.PUBLICATION_RETRY, 'A', 'G-001', 'WORKING',
+                                'revision', 'base', 'same-input', 'same-head', 'unpublished checkpoint'))
+                            task.connection.commit()
                             failed.set()
-                            if failure == 'db_wait':
-                                raise DatabaseWaitTimeout('DB queue deadline')
                             return project_runner.PROJECT_STEP_RETRY
+                        if failure in {'db_wait', 'db_retry', 'pause_record'}:
+                            failed.set()
+                            if failure == 'db_wait' or failure == 'db_retry' and len(calls) == 1:
+                                raise DatabaseWaitTimeout('DB queue deadline')
+                            if failure == 'pause_record':
+                                return project_runner.PROJECT_STEP_RETRY
                         if failure == 'pause':
                             if len(calls) == 3:
                                 failed.set()
@@ -1816,8 +1853,12 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 result = scheduling.run_project_tasks(service, newly_activated=True)
         finally:
             scheduling.current_scheduler.reset(token)
-        self.assertEqual(len(calls), {'retry': 2, 'pause': 3, 'setup': 0, 'db_wait': 1, 'pause_record': 1, 'db_setup': 0}[failure])
-        self.assertEqual(result, {'retry': 0, 'pause': PROJECT_STEP_TRANSIENT_PAUSE, 'setup': 1, 'db_wait': PROJECT_STEP_TRANSIENT_PAUSE, 'pause_record': PROJECT_STEP_TRANSIENT_PAUSE, 'db_setup': PROJECT_STEP_TRANSIENT_PAUSE}[failure])
+        self.assertEqual(len(calls), {'retry': 2, 'pause': 3, 'setup': 0, 'db_wait': 3, 'db_retry': 2,
+                                    'no_progress': 3, 'pause_record': 3, 'db_setup': 0}[failure])
+        self.assertEqual(result, {'retry': 0, 'pause': PROJECT_STEP_TRANSIENT_PAUSE, 'setup': 1,
+                                 'db_wait': PROJECT_STEP_TRANSIENT_PAUSE, 'db_retry': 0,
+                                 'no_progress': PROJECT_STEP_TRANSIENT_PAUSE,
+                                 'pause_record': PROJECT_STEP_TRANSIENT_PAUSE, 'db_setup': PROJECT_STEP_TRANSIENT_PAUSE}[failure])
         self.assertEqual(runtime.get('A', 'G-004').status, 'PR_OPEN')
         self.assertEqual(runtime.get('A', 'G-002').status, 'PR_OPEN')
         if failure == 'pause':

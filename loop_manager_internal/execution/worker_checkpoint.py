@@ -188,6 +188,10 @@ def resume_request(ports, context):
             snapshot={**current.snapshot, 'after_head': head})
     if ports.publish_worker_checkpoints is None:
         raise PublicationSafetyError('checkpoint 게시 경로가 없습니다.')
+    if current.operation == 'rebase_publish':
+        if getattr(ports, '_publish_rebased_checkpoint', None) is None:
+            raise PublicationSafetyError('checkpoint rebase 게시 경로가 없습니다.')
+        ports._publish_rebased_checkpoint(context, candidate_head=head)
     ports._fetch_latest_base()
     published = ports.publish_worker_checkpoints(context, worker_start_head=request['start_head'],
         allowed_requirement_archives=ports.snapshot().archive_scope_sources)
@@ -198,7 +202,15 @@ def resume_request(ports, context):
     if (current.snapshot or {}).get('worker_checkpoint_pending') or current.operation is not None:
         raise PublicationSafetyError('checkpoint 게시 완료 확인을 기다립니다.')
     if ports._row()['publication_remote_oid'] != head and not (published or {}).get('candidate_changed'):
-        raise PublicationSafetyError('checkpoint 원격 게시 완료가 확인되지 않았습니다.')
+        from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
+        if (not valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))
+                or getattr(ports, '_publish_rebased_checkpoint', None) is None):
+            raise PublicationSafetyError('checkpoint 원격 게시 완료가 확인되지 않았습니다.')
+        ports._publish_rebased_checkpoint(context, candidate_head=head)
+        current = ports.checkpoint.get(repo, plan_id)
+        if (current.operation is not None or ports._row()['publication_remote_oid'] != head
+                or current.observed_remote_oid != head):
+            raise PublicationSafetyError('checkpoint 원격 게시 완료가 확인되지 않았습니다.')
     with runtime_state._transaction(ports.state.connection):
         ports.state.check()
         saved = dict(current.snapshot or {})

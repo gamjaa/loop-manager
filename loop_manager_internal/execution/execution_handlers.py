@@ -402,8 +402,8 @@ class ExecutionHandlers:
         return self._rebase_handler()._complete_rebase_intent(
             context, project_values=project_values, worker_definition=worker_definition)
 
-    def _publish_rebased_checkpoint(self, context):
-        return self._rebase_handler()._publish_rebased_checkpoint(context)
+    def _publish_rebased_checkpoint(self, context, *, candidate_head=None):
+        return self._rebase_handler()._publish_rebased_checkpoint(context, candidate_head=candidate_head)
 
     def _workspace_handler(self):
         return execution_assembly.workspace(
@@ -529,6 +529,7 @@ class ExecutionHandlers:
             self._snapshot, self._update_snapshot,
             {
                 "_commit_owned": lambda *a, **kw: self._commit_owned(*a, **kw),
+                "_publish_rebased_checkpoint": lambda *a, **kw: self._publish_rebased_checkpoint(*a, **kw),
                 "guard": lambda *a, **kw: self.guard(*a, **kw),
                 "_advanced": lambda *a, **kw: self._advanced(*a, **kw),
                 "_archive_candidates_at": lambda *a, **kw: self._archive_candidates_at(*a, **kw),

@@ -102,6 +102,7 @@ class WorkerHandlerPorts:
     _stage_rebase_correction: Callable[..., Any]
     _unmerged_stages: Callable[..., Any]
     publish_worker_checkpoints: Callable[..., Any] | None = None
+    _publish_rebased_checkpoint: Callable[..., Any] | None = None
 
 
 class WorkerHandler:

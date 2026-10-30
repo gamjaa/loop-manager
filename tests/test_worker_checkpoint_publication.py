@@ -497,6 +497,19 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
                     self.assertEqual(git_command(repo.parent / 'remote.git', 'rev-parse',
                                                 f'refs/heads/{branch}'), remote)
                     self.assertEqual(checkpoint.get(str(repo), 'G-001').expected_head, rebased)
+            product = repo / 'docs/requirements/Active.md'
+            original = product.read_bytes()
+            product.write_bytes(original + b'\nForbidden intermediate edit\n')
+            git_command(repo, 'add', 'docs/requirements/Active.md')
+            git_command(repo, 'commit', '-m', 'Protected intermediate change')
+            product.write_bytes(original)
+            git_command(repo, 'add', 'docs/requirements/Active.md')
+            git_command(repo, 'commit', '-m', 'Restore protected document')
+            from loop_manager_internal.runtime.contracts import PublicationSafetyError
+            with self.assertRaisesRegex(PublicationSafetyError, '금지 문서 변경'):
+                publication_service.push_worker_checkpoint_commits(effects, connection,
+                    repo, Path(directory), str(repo), 'G-001', branch, repo, 'main', remote, None)
+            self.assertEqual(git_command(repo.parent / 'remote.git', 'rev-parse', f'refs/heads/{branch}'), remote)
             connection.execute('UPDATE exec_plans SET active_sha=?', (base,))
             connection.commit()
             with self.assertRaises(RecoveryFailure):
@@ -892,6 +905,84 @@ class WorkerCheckpointPublicationTests(unittest.TestCase):
 
 
 class WorkerCheckpointPolicyTests(unittest.TestCase):
+    def test_saved_worker_request_finishes_through_the_rebase_publication_boundary(self):
+        from loop_manager_internal.execution import worker_checkpoint
+        from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionPhase, ExecutionPlanMetadata
+        from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
+        from loop_manager_internal.execution.execution_state import ExecutionStatePort
+        from loop_manager_internal.storage import runtime_state
+        from tests.support.database import runtime_connection
+        from tests.support.rebase_observations import decision_for, expectation, observation
+        from loop_manager_internal.git.managed_rebase_validation import Remote
+
+        for operation in (None, 'rebase_publish'):
+            with self.subTest(operation=operation):
+                connection = runtime_connection()
+                self.addCleanup(connection.close)
+                start, head, tree, remote = 'a' * 40, 'b' * 40, 'c' * 40, 'd' * 40
+                branch, worktree = 'loop-manager/G-047', Path('/managed')
+                connection.execute("UPDATE exec_plans SET status='IMPLEMENTING',active_sha=?,branch=?,worktree=?, "
+                                   "publication_remote_oid=?,worker_session_id='same-session'",
+                                   (start, branch, str(worktree), remote))
+                connection.commit()
+                runtime = runtime_state.RuntimeStateRepository(connection)
+                runtime.hydrate('repo', 'G-047')
+                state = ExecutionStatePort(connection, runtime, 'repo')
+                store = ExecutionCheckpointRepository(connection)
+                accepted = expectation(repo='repo', plan_id='G-047', branch=branch, worktree=str(worktree),
+                    plan_path='docs/plans/[G-047] Runtime.md', target_base_oid=start, remote=Remote('repo', branch, remote))
+                acceptance = decision_for(accepted, observation(accepted)).acceptance
+                request = dict(repo='repo', plan_id='G-047', branch=branch, worktree=str(worktree),
+                    start_head=start, message='checkpoint', title='Checkpoint', files={'app.py': [420, 'digest']},
+                    session='same-session', delivery=None, invocation_id=None, code=0, tree=tree)
+                current = store.record('repo', 'G-047', expected_generation=0, operation=None,
+                    expected_head=head, target_base_oid=start, observed_remote_oid=remote,
+                    snapshot={'worker_checkpoint_request': request, 'current_rebase_acceptance': acceptance,
+                              'commit_tree_oid': tree, 'commit_message': 'Checkpoint'})
+                if operation:
+                    candidate = decision_for(accepted, observation(accepted, head=head,
+                        branch_ref=(head, ''), registration=(f'HEAD={head}', f'branch=refs/heads/{branch}'))).acceptance
+                    store.begin_rebase_publication('repo', 'G-047', expected_generation=current.generation,
+                        acceptance=candidate, remote_before=remote)
+                context = ExecutionContext('repo', Path('/source'), Path('/state'), 'main', start, 'codex',
+                    Path('/config'), ExecutionPlanMetadata('G-047', 'Runtime', 'docs/plans/[G-047] Runtime.md', start),
+                    ExecutionPhase.IMPLEMENTING, branch, worktree, start, None, worker_session_id='same-session')
+                def publish_rebase(_context, *, candidate_head):
+                    self.assertEqual(candidate_head, head)
+                    current = store.get('repo', 'G-047')
+                    with connection:
+                        if current.operation == 'rebase_publish':
+                            intent = current.snapshot['rebase_publication_intent']
+                            confirmed = expectation(repo='repo', plan_id='G-047', branch=branch,
+                                worktree=str(worktree), plan_path='docs/plans/[G-047] Runtime.md',
+                                target_base_oid=start, remote=Remote('repo', branch, head))
+                            store.finish_rebase_publication('repo', 'G-047', intent=intent,
+                                acceptance=decision_for(confirmed, observation(confirmed, head=head,
+                                    branch_ref=(head, ''), registration=(f'HEAD={head}', f'branch=refs/heads/{branch}'))).acceptance)
+                        else:
+                            store.record('repo', 'G-047', expected_generation=current.generation, operation=None,
+                                expected_head=head, target_base_oid=start, observed_remote_oid=head, snapshot=current.snapshot)
+                        state.update_project('repo', preserve_transaction=True, publication_remote_oid=head)
+                ports = SimpleNamespace(identity=ExecutionIdentity(repo='repo', repo_path=Path('/source'),
+                    state_dir=Path('/state'), base='main'), checkpoint=store, state=state,
+                    _row=state.row, git=mock.Mock(return_value=SimpleNamespace(stdout=head)),
+                    validate_execplan_workspace_identity=mock.Mock(), validate_managed_worktree=mock.Mock(),
+                    _commit_owned=mock.Mock(), _fetch_latest_base=mock.Mock(), snapshot=lambda: PreparationSnapshot(),
+                    publish_worker_checkpoints=mock.Mock(return_value={'pushed': 0, 'candidate_changed': False}),
+                    _publish_rebased_checkpoint=mock.Mock(side_effect=publish_rebase), feedback=None,
+                    _retry=lambda detail: detail)
+                with mock.patch.object(worker_checkpoint, 'committed_tree_matches_intent', return_value=True):
+                    worker_checkpoint.resume_request(ports, context)
+                ports._publish_rebased_checkpoint.assert_called_once_with(context, candidate_head=head)
+                ports._commit_owned.assert_not_called()
+                saved = store.get('repo', 'G-047')
+                self.assertNotIn('worker_checkpoint_request', saved.snapshot)
+                self.assertEqual(saved.snapshot['worker_checkpoint_requests'], [{**request, 'head': head}])
+                self.assertEqual(saved.snapshot['worker_checkpoint_result']['head'], head)
+                self.assertEqual(state.row()['publication_remote_oid'], head)
+                self.assertIsNone(state.row()['worker_result'])
+                self.assertIsNone(state.row()['verify_token'])
+
     def test_database_requests_retry_or_preserve_the_same_publication(self):
         from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
         from loop_manager_internal.storage import db_access, runtime_state

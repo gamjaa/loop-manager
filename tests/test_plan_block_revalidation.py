@@ -23,6 +23,19 @@ from tests.support.git import git_command
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_recovery_slot_checks_target_resources_instead_of_sibling_projection(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.update_plan(self.repo, 'G-107', plan_values={'status': 'VERIFYING'})
+        runtime.hydrate(self.repo, 'G-107')
+        before = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        from loop_manager_internal.config.managed_config import ManagedConfig, fast_mode_scope
+        with fast_mode_scope(ManagedConfig(path=Path('/unused'), max_workers=2,
+                                          telegram_token='', telegram_chat_id='', max_tasks_per_project=3)):
+            self.assertTrue(blocked_plan_reconciliation.slot_available(self.connection, self.repo, 'G-106'))
+            runtime.update_plan(self.repo, 'G-106', plan_values={'worktree': self.plan('G-107')['worktree']})
+            self.assertFalse(blocked_plan_reconciliation.slot_available(self.connection, self.repo, 'G-106'))
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), before)
+
     def test_fetch_lease_contention_keeps_same_remote_observation_retryable(self):
         with mock.patch.object(self.coordinator, '_incorporate',
                 side_effect=loop_manager.ProcessLockBusyError('git:fetch is occupied')) as incorporate:
@@ -1388,6 +1401,42 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
 
 
 class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_question_assessment_checkpoint_race_keeps_the_input_retryable(self):
+        from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan(self.repo, 'G-106', reason_code='user_decision_required', evidence='original question',
+            release_fingerprint='input', clear_projection=False, plan_values={'active_sha': 'before-docs'})
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        from loop_manager_internal.storage import planning_review_state as reviews
+        with self.connection:
+            reviews.begin(self.connection, self.repo, purpose='delta', revision=self.base,
+                input_fingerprint='new', specification_fingerprint='spec', work_cycle='cycle', comparison_revision=None)
+            reviews.validate(self.connection, self.repo, self.base, 'BLOCKED_PLAN_INPUTS: ' + json.dumps(dict(
+                revision=self.base, plans=[dict(plan_id='G-106', requirements=[dict(
+                    source='docs/requirements/[R-002] Policy.md', reason='recheck question', quote='unchanged source')])])), 'reviewed')
+            reviews.confirm(self.connection, self.repo, self.base, self.base)
+        def assess(*_args, **_kwargs):
+            current = store.get(self.repo, 'G-106')
+            with self.connection:
+                store.record(self.repo, 'G-106', expected_generation=current.generation,
+                    operation=current.operation, expected_head=current.expected_head,
+                    target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**(current.snapshot or {}), 'concurrent_audit': 'preserved'})
+            return 0, 'USER_DECISION_ASSESSMENT: ' + json.dumps(dict(resolved=False, detail='still needed', evidence=[]))
+        effects = SimpleNamespace(git=lambda _root, *args, **_kw: SimpleNamespace(
+                returncode=0, stdout=self.base if args[0] == 'rev-parse' else
+                'prior source' if args[0] == 'show' and args[1].startswith('before-docs:') else 'unchanged source'),
+            run_agent=mock.Mock(side_effect=assess), capture_git_snapshot=mock.Mock(), validate_agent_scope=mock.Mock())
+        with self.assertRaises(recovery_runtime.RecoveryFailure) as caught:
+            _assess_user_decision_cause(effects, self.connection, self.coordinator.repo_path, self.coordinator.state_dir,
+                                        self.repo, self.plan('G-106'), None)
+        self.assertIs(caught.exception.reason, recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE)
+        self.assertEqual(effects.run_agent.call_count, 1, self.plan()['last_error'])
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        self.assertEqual(store.get(self.repo, 'G-106').snapshot['concurrent_audit'], 'preserved')
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')['evidence'], 'original question')
+
     def test_revised_correction_owner_resumes_worker_without_its_own_merge(self):
         from loop_manager_internal.storage import common_defect_state, runtime_state
         runtime_state.RuntimeStateRepository(self.connection).block_plan(self.repo, 'G-106',

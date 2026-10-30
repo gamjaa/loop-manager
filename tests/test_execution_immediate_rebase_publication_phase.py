@@ -55,7 +55,7 @@ class ImmediateRebasePublicationTests(TestCase):
                 self.before_push()
             if self.push_failure:
                 return SimpleNamespace(returncode=1, stdout='permission denied')
-            self.remote = 'owned-head'
+            self.remote = args[-1].split(':', 1)[0]
             pr = self.seed.expected.remote.pull_request
             self.seed.observed = replace(self.seed.observed,
                 remote=replace(self.seed.expected.remote, oid=self.remote,
@@ -65,6 +65,49 @@ class ImmediateRebasePublicationTests(TestCase):
 
     def complete(self):
         self.handler._complete_rebase_intent(self.handler._context())
+
+    def test_worker_checkpoint_publishes_a_successor_of_a_deferred_rebase(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+        with mock.patch.object(self.handler, '_publish_rebased_checkpoint'):
+            self.complete()
+        current = self.checkpoints.get('repo', 'G-047')
+        accepted = current.snapshot['current_rebase_acceptance']
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=None, expected_head='worker-head', target_base_oid=current.target_base_oid,
+            observed_remote_oid=self.remote,
+            snapshot={**current.snapshot, 'rebase_publication_deferred': accepted['id']})
+        self.seed.observed = replace(self.seed.observed, head='worker-head',
+            branch_ref=('worker-head', ''),
+            registration=('HEAD=worker-head', 'branch=refs/heads/loop-manager/G-047'))
+        self.push_failure = True
+        with self.assertRaises(RecoveryFailure):
+            self.handler._worker_handler().ports._publish_rebased_checkpoint(
+                self.handler._context(), candidate_head='worker-head')
+        pending = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(pending.operation, 'rebase_publish')
+        self.assertEqual(pending.snapshot['rebase_publication_intent']['head'], 'worker-head')
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'remote')
+        self.push_failure = False
+        self.restart()
+        self.handler._publish_rebased_checkpoint(self.handler._context(), candidate_head='worker-head')
+        self.assertEqual(self.pushes, [('push', '--force-with-lease=refs/heads/loop-manager/G-047:remote',
+                                       'origin', 'worker-head:refs/heads/loop-manager/G-047')] * 2)
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'worker-head')
+        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertIsNone(self.checkpoints.get('repo', 'G-047').operation)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['current_rebase_acceptance'], accepted)
+
+    def test_worker_checkpoint_rejects_a_candidate_outside_the_accepted_rebase(self):
+        from loop_manager_internal.git.managed_rebase_publication import RebasePublicationRejected
+        with mock.patch.object(self.handler, '_publish_rebased_checkpoint'):
+            self.complete()
+        before = self.checkpoints.get('repo', 'G-047')
+        with self.assertRaises(RebasePublicationRejected):
+            self.handler._publish_rebased_checkpoint(self.handler._context(), candidate_head='unowned-head')
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), before)
+        self.assertEqual(self.pushes, [])
 
     def restart(self):
         self.state = ExecutionStatePort(self.fixture.connection,

@@ -61,26 +61,15 @@ class AssessmentPending(RuntimeError):
 
 
 def slot_available(connection, repo, plan_id) -> bool:
+    from loop_manager_internal.recovery.plan_recovery import target_available
     from loop_manager_internal.storage.task_calls import management_available
-    if not management_available(connection,repo,plan_id):
+    if not management_available(connection,repo,plan_id) or not target_available(connection, repo, plan_id):
         return False
-    runtime = runtime_state.RuntimeStateRepository(connection)
-    project = runtime_state.project_row(connection, repo)
-    active = runtime.active_row(repo)
-    projected = runtime.projected_row(repo)
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
     publication = (connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'general_planning_publications'").fetchone()
         and connection.execute('SELECT 1 FROM general_planning_publications WHERE repo = ?', (repo,)).fetchone())
-    return bool(project is not None and runtime.recovery_slot_available(repo)
-                and not planning_review_state.general_pending(connection, repo)
-                and (not project['pr_conflict_recovery']
-                     or projected is not None and projected['plan_id'] == plan_id)
-                and (active is None or active['plan_id'] == plan_id)
-                and (project['phase'] not in {'WORKING', 'IMPLEMENTING', 'VERIFYING',
-                                             'REVIEWING', 'PUBLISHING'}
-                     or projected is not None and projected['plan_id'] == plan_id)
-                and cycle.phase is maintenance_state.MaintenancePhase.IDLE
+    return bool(cycle.phase is maintenance_state.MaintenancePhase.IDLE
                 and cycle.publication_stage is None and not publication)
 
 

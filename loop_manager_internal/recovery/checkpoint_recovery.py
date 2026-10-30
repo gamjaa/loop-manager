@@ -1,5 +1,6 @@
 """Checkpoint successor adoption and cause-specific candidate revalidation."""
 from __future__ import annotations
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
@@ -809,7 +810,8 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
                 and not any(item['source'] in code_paths for item in result['evidence'])):
         raise RuntimeError('사용자 질문 해소의 현재 명세 근거를 확인할 수 없습니다.')
     if effects.git(repo_path, 'rev-parse', f"refs/remotes/origin/{project['base_branch']}").stdout.strip() != revision:
-        raise RuntimeError('사용자 질문 재평가 중 원격 입력이 변경됐습니다.')
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                              '사용자 질문 재평가 중 원격 입력이 변경됐습니다.')
     with runtime_state._transaction(connection):
         latest_plan = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?",
                                          (repo, blocked['plan_id'])).fetchone()
@@ -823,7 +825,8 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
                 or any(runtime_state.project_row(connection, repo)[key] != project[key]
                        for key in ('base_branch', 'origin'))
                 or dict(scoped_blocking.plan_block(connection, repo, str(blocked['plan_id'])) or {}) != dict(block or {})):
-            raise RuntimeError('사용자 질문 재평가 중 차단 원인 또는 checkpoint가 변경됐습니다.')
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                  '사용자 질문 재평가 중 차단 원인 또는 checkpoint가 변경됐습니다.')
         if saved.get('identity') == identity:
             return result['resolved'], result['detail'], None
         assessment = dict(identity=identity, meaning_identity=meaning_identity,

@@ -266,6 +266,7 @@ def worker(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> WorkerHandler:
     return WorkerHandler(WorkerHandlerPorts(
+        _publish_rebased_checkpoint=callbacks["_publish_rebased_checkpoint"],
         identity=identity,
         snapshot=snapshot,
         update_snapshot=update_snapshot,

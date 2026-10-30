@@ -154,6 +154,11 @@ class TaskScheduler:
         if (saved['reason_code'] == RecoveryReason.REMOTE_SNAPSHOT_RACE.value
                 and saved['pending_action'] == 'pause' and saved['attempts'] >= 3):
             return False
+        if saved['pending_action'] == 'pause' and saved['occurrence'] >= 3:
+            events.emit('동일 입력의 무진전 재시도 보류', level='WARN', project=repo, plan=plan_id,
+                        reason_code=saved['reason_code'], occurrence=saved['occurrence'],
+                        next_action='작업 보존·입력 또는 복구 조건 변경 후 재검사')
+            return False
         saved = repository.defer_retry(repo, plan_id)
         events.emit('작업 재시도 대기', project=repo, plan=plan_id, reason_code=saved['reason_code'],
                     retry_after=saved['retry_after'])
@@ -507,6 +512,7 @@ def run_project_tasks(service, *, newly_activated):
     running, threads, visited, results = {}, [], set(), []
     rechecked_blocks = set()
     recovery_keys = {}
+    setup_database_attempts = Counter()
     initial = runtime_state.RuntimeStateRepository(connection).active(repo)
 
     def execute(plan_id, resumed, result):
@@ -532,6 +538,7 @@ def run_project_tasks(service, *, newly_activated):
                         owned, scheduler.config.telegram_token, scheduler.config.telegram_chat_id, repo):
                     attempts = {}
                     exception_attempts = 0
+                    database_attempts = 0
                     while True:
                         scheduler.check_project(repo)
                         scheduler.wait_usage(owned, repo, plan_id)
@@ -556,10 +563,17 @@ def run_project_tasks(service, *, newly_activated):
                             owned.rollback()
                             from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
                             if isinstance(error, DatabaseWaitTimeout):
+                                database_attempts += 1
                                 events.emit("DB 접근 대기 종료; 작업 상태 보존", level="WARN", project=repo,
                                             plan=plan_id, reason=str(error))
-                                code = PROJECT_STEP_TRANSIENT_PAUSE
-                                break
+                                if database_attempts >= 3:
+                                    code = PROJECT_STEP_TRANSIENT_PAUSE
+                                    break
+                                with scheduler.condition:
+                                    scheduler.condition.wait(.2)
+                                scheduler.requeue(current_task.get())
+                                resumed = True
+                                continue
                             exception_attempts += 1
                             detail = redact_secrets(traceback.format_exc())
                             events.emit("작업 처리 예외", level="ERROR", project=repo, plan=plan_id,
@@ -652,7 +666,16 @@ def run_project_tasks(service, *, newly_activated):
                             reason=f"{type(error).__name__}: {error}", traceback=traceback.format_exc(),
                             next_action="해당 작업 보존·독립 작업 계속")
                         from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
-                        results.append(PROJECT_STEP_TRANSIENT_PAUSE if isinstance(error, DatabaseWaitTimeout) else 1)
+                        if isinstance(error, DatabaseWaitTimeout):
+                            setup_database_attempts[plan_id] += 1
+                            if setup_database_attempts[plan_id] < 3:
+                                visited.discard(plan_id)
+                                with scheduler.condition:
+                                    scheduler.condition.wait(.2)
+                            else:
+                                results.append(PROJECT_STEP_TRANSIENT_PAUSE)
+                        else:
+                            results.append(1)
                     key = recovery_keys.pop(plan_id, None)
                     if key is not None:
                         visited.discard(plan_id)
