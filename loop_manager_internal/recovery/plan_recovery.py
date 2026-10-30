@@ -279,9 +279,20 @@ def recovering_plan(connection, state_dir, repo, plan_id):
                 return
             token = _selected_recovery.set(_selected_recovery.get() | {key})
             try:
-                with runtime_state.selected_execution(repo, plan_id, include_blocked=True):
-                    entered = True
-                    yield True
+                from loop_manager_internal.application.task_scheduling import current_scheduler, current_task, Task
+                task_token = None
+                if current_scheduler.get() is not None:
+                    task = current_task.get()
+                    task = (replace(task, recovery=True) if task is not None and (task.repo, task.plan_id) == key
+                            else Task(repo, plan_id, connection, recovery=True))
+                    task_token = current_task.set(task)
+                try:
+                    with runtime_state.selected_execution(repo, plan_id, include_blocked=True):
+                        entered = True
+                        yield True
+                finally:
+                    if task_token is not None:
+                        current_task.reset(task_token)
             finally:
                 _selected_recovery.reset(token)
                 runtime = runtime_state.RuntimeStateRepository(connection)
@@ -305,5 +316,5 @@ def recovery_admission(connection, repo, plan_id):
     if scheduler is None:
         yield
     else:
-        with scheduler.admission(Task(repo, plan_id, connection, resumed=True)):
+        with scheduler.admission(Task(repo, plan_id, connection, resumed=True, recovery=True)):
             yield

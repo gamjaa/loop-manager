@@ -173,6 +173,18 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     """Bind named effects to legacy helpers, preserving their patch points."""
     verify_timeout_seconds = identity.pop("verify_timeout_seconds", 600)
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
+    def call_inputs():
+        current = runtime_repository.projected(identity['repo'])
+        if current is None:
+            return None
+        worktree = Path(current.worktree)
+        candidate = dependencies.capture_git_snapshot(worktree)
+        return (current, candidate.head, candidate.branch, candidate.index, candidate.dirty,
+                candidate.config, candidate.operations,
+                candidate.worktrees.get(str(worktree.resolve())),
+                dependencies.git(identity['repo_path'], 'rev-parse', '--verify',
+                                 f"refs/remotes/origin/{identity['base']}^{{commit}}").stdout)
+    state.call_inputs = call_inputs
     lookup_pr = dependencies.pr_for_branch
     def execution_pr(repo_path, branch, url=None, *, history=False):
         from loop_manager_internal.recovery.deleted_branch_restart import current_pr
@@ -587,4 +599,5 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         ),
     )
     handlers = execution_handlers.ExecutionHandlers(effects, **identity)
+    state.refresh_call_inputs = handlers._fetch_latest_base
     return handlers

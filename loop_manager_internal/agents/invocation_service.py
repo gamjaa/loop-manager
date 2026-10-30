@@ -270,7 +270,7 @@ def run_agent(
             scheduler, task, owner = current_scheduler.get(), current_task.get(), current_call.get()
             if scheduler is None or invocation is None or (owner is not None and owner.connection is not connection):
                 raise
-            scheduler.finish_agent_storage(task or invocation, operation, stopped='finished_at' in observations)
+            scheduler.finish_storage(task or invocation, operation, stopped='finished_at' in observations)
 
     def observe_session(started_session_id: str) -> None:
         nonlocal collection_status

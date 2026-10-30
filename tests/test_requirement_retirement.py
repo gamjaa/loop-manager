@@ -262,6 +262,34 @@ class RequirementRetirementTest(unittest.TestCase):
         self.assertEqual(len(self.port.pending("repo", self.root, "base")), 1)
         self.assertIsNotNone(self.port.judgments.get("repo", SOURCE).invalidation_reason)
 
+    def test_pending_judgment_writes_release_transaction_before_git_and_admission(self):
+        for change in ('uncertain', 'invalidated'):
+            with self.subTest(change=change):
+                self.connection.execute('DELETE FROM requirement_judgments')
+                self.git.files[SOURCE] = CONTENTS
+                if change == 'invalidated':
+                    (item,) = self.port.pending('repo', self.root, 'base')
+                    self.port.record('repo', self.port.validate_result(
+                        'repo', self.root, 'base', self.judgment_line(item, 'unfulfilled')))
+                    self.git.files['feature.py'] = b'changed implementation'
+                else:
+                    self.git.files[SOURCE] = b'# Requirement without acceptance criteria\n'
+                self.connection.commit()
+                read = self.git.run_bytes
+                def observe(*args):
+                    self.assertFalse(self.connection.in_transaction)
+                    return read(*args)
+                with mock.patch.object(self.git, 'run_bytes', side_effect=observe):
+                    pending = self.port.pending('repo', self.root, 'base')
+                self.assertFalse(self.connection.in_transaction)
+                saved = self.port.judgments.get('repo', SOURCE)
+                if change == 'uncertain':
+                    self.assertEqual(pending, ())
+                    self.assertEqual(saved.outcome, 'uncertain')
+                else:
+                    self.assertEqual(len(pending), 1)
+                    self.assertIsNotNone(saved.invalidation_reason)
+
     def test_requirement_and_related_specification_change_invalidate_cached_result(self):
         for changed_path, contents in (
             (SOURCE, CONTENTS + b"\nMore detail\n"),

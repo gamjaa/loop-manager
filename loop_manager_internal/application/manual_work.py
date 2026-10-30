@@ -510,6 +510,7 @@ class ManualWorkService:
 
     def resume(self):
         from loop_manager_internal.recovery.manual_work_recovery import rotate_correction
+        from loop_manager_internal.application.task_scheduling import SchedulingDeferred
         rotate_correction(self.connection,self.repo)
         pending=self.store.pending(self.repo)
         recovering=next((group for group in pending if group['state']=='REGISTERING'
@@ -528,7 +529,7 @@ class ManualWorkService:
                     self._resume_group(group)
                     if self.runtime.active_row(self.repo) is not None:
                         return
-            except (ProcessLockBusyError, runtime_state.TaskLimitReached):
+            except (ProcessLockBusyError, runtime_state.TaskLimitReached, SchedulingDeferred):
                 continue
             except (RuntimeError, OSError, ValueError, TypeError, KeyError) as error:
                 with self.connection:
@@ -568,7 +569,8 @@ class ManualWorkService:
         scheduler = current_scheduler.get()
         with (scheduler.admission(Task(self.repo,owner,self.connection))
               if scheduler is not None else nullcontext()):
-            if not self.slot_available(recovering=group):
+            latest = self.store.get(self.repo, group['group_id'])
+            if dict(latest) != dict(group) or not self.slot_available(recovering=latest):
                 return
             with self.connection:
                 self.runtime.update_plan(self.repo,owner,plan_values={'status':group['resume_phase']},enqueue=False)

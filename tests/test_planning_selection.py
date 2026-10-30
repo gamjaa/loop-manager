@@ -917,6 +917,22 @@ class PlanningSelectionTest(PlanningCase):
         self.assertEqual(ports.agent.run_count, 1)
         self.assertEqual(ports.state.clear_calls, [])
 
+    def test_execution_observation_reuses_specification_baseline_and_archive_policy(self):
+        from loop_manager_internal.planning.selection_service import PlanningSelectionService
+        for change in ('specification', 'code-or-plan', 'archive', 'already-applied'):
+            with self.subTest(change=change):
+                ports = self._code_check_ports()
+                if change != 'code-or-plan':
+                    ports.git.specification_fingerprints[self.context.base_sha] = 'changed'
+                    ports.git.specification_fingerprints['old-base'] = 'specification'
+                if change == 'archive':
+                    ports.git.requirement_archive_only = mock.Mock(return_value=True)
+                if change == 'already-applied':
+                    ports.state.snapshot = replace(ports.state.snapshot, specification_fingerprint='changed')
+                self.assertEqual(PlanningSelectionService(ports).execution_planning_required(self.context),
+                                 change == 'specification')
+                self.assertEqual(ports.agent.run_count, 0)
+
     def test_specification_change_plans_once_before_runnable_ready(self):
         ports = FakePorts(
             planning_snapshot(

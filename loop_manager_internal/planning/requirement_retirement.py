@@ -13,6 +13,7 @@ import json
 from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.git.command_adapter import revision_requirement_documents
 from loop_manager_internal.storage.manual_work_state import live_requirement_paths
+from loop_manager_internal.storage.runtime_state import _transaction
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -422,14 +423,16 @@ class RequirementRetirementPort:
             if prior is not None and prior.input_token == token and prior.invalidation_reason is None:
                 continue
             if prior is not None and prior.input_token != token:
-                self.judgments.invalidate(repo, path, "related specification, plan, implementation or validation changed")
+                with _transaction(self.connection):
+                    self.judgments.invalidate(repo, path, "related specification, plan, implementation or validation changed")
             contents = self.git.run_bytes(repository, "cat-file", "blob", oid)
             try:
                 criteria = _criteria(contents)
             except RetirementError as error:
-                self.judgments.put(repo, Judgment(
-                    path, token, "uncertain", (str(error),), relevant_paths, revision,
-                ))
+                with _transaction(self.connection):
+                    self.judgments.put(repo, Judgment(
+                        path, token, "uncertain", (str(error),), relevant_paths, revision,
+                    ))
                 continue
             reuse_from = None
             if prior is not None and prior.outcome == "fulfilled" and prior.input_token != token:

@@ -70,51 +70,64 @@ def activate_ready_execplan(
     state_dir: Path,
     base_sha: str,
 ) -> sqlite3.Row | None:
-    selected = effects.select_ready_execplan(connection, repo)
-    if selected is None:
-        return None
-    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
-    branch = str(selected["branch"] or f"loop-manager/{selected['plan_id']}")
-    worktree = (
-        Path(str(selected["worktree"]))
-        if selected["worktree"]
-        else state_dir / "worktrees" / project_id / str(selected["plan_id"])
-    )
-    activation_sha = (
-        effects.git(worktree, "rev-parse", "HEAD").stdout.strip()
-        if worktree.is_dir()
-        else base_sha
-    )
-    try:
-        from loop_manager_internal.application.task_scheduling import current_scheduler, Task
-        scheduler = current_scheduler.get()
-        with (scheduler.admission(Task(repo,str(selected['plan_id']),connection,
-                                       resumed=not effects.is_unowned_ready(selected)))
-              if scheduler is not None else nullcontext()):
-            runtime_state.RuntimeStateRepository(connection).activate(
-                repo,
-                str(selected["plan_id"]),
-                activation_sha=activation_sha,
-                branch=branch,
-                worktree=str(worktree),
-                preserve_worker_session=(
-                    effects.assessment_can_yield(
-                        maintenance_state.MaintenanceRepository(connection).get(repo)
-                    )
-                    and not effects.is_unowned_ready(selected)
-                ),
-            )
-    except (runtime_state.TaskLimitReached, CallDeferred):
-        return None
-    except runtime_state.RuntimeStateError as error:
-        raise RuntimeError(
-            "READY ExecPlan 선택 상태가 변경되었습니다."
-        ) from error
-    connection.commit()
-    return connection.execute(
-        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
-        (repo, selected["plan_id"]),
-    ).fetchone()
+    while True:
+        selected = effects.select_ready_execplan(connection, repo)
+        if selected is None:
+            return None
+        project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+        branch = str(selected["branch"] or f"loop-manager/{selected['plan_id']}")
+        worktree = (
+            Path(str(selected["worktree"]))
+            if selected["worktree"]
+            else state_dir / "worktrees" / project_id / str(selected["plan_id"])
+        )
+        try:
+            from loop_manager_internal.application.task_scheduling import current_scheduler, Task, SchedulingChanged, SchedulingDeferred
+            scheduler = current_scheduler.get()
+            with (scheduler.admission(Task(repo,str(selected['plan_id']),connection,
+                                           resumed=not effects.is_unowned_ready(selected)))
+                  if scheduler is not None else nullcontext()):
+                latest = effects.select_ready_execplan(connection, repo)
+                if latest is None:
+                    return None
+                if dict(latest) != dict(selected):
+                    raise SchedulingChanged("READY 선택·소유권이 변경되어 다시 선택합니다.")
+                activation_sha = (
+                    effects.git(worktree, "rev-parse", "HEAD").stdout.strip()
+                    if worktree.is_dir()
+                    else base_sha
+                )
+                runtime_state.RuntimeStateRepository(connection).activate(
+                    repo,
+                    str(selected["plan_id"]),
+                    activation_sha=activation_sha,
+                    branch=branch,
+                    worktree=str(worktree),
+                    preserve_worker_session=(
+                        effects.assessment_can_yield(
+                            maintenance_state.MaintenanceRepository(connection).get(repo)
+                        )
+                        and not effects.is_unowned_ready(selected)
+                    ),
+                )
+        except SchedulingChanged:
+            continue
+        except SchedulingDeferred:
+            latest = effects.select_ready_execplan(connection, repo)
+            if latest is not None and dict(latest) != dict(selected):
+                continue
+            return None
+        except (runtime_state.TaskLimitReached, CallDeferred):
+            return None
+        except runtime_state.RuntimeStateError as error:
+            raise RuntimeError(
+                "READY ExecPlan 선택 상태가 변경되었습니다."
+            ) from error
+        connection.commit()
+        return connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, selected["plan_id"]),
+        ).fetchone()
 
 
 @dataclass(frozen=True)
