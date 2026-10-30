@@ -84,7 +84,8 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                     observer.assert_called_once()
                     calls.append(True)
                 token = scheduling.current_scheduler.set(scheduler)
-                selected = scheduling.current_task.set(scheduling.Task('A', 'G-001', self.connection))
+                task = scheduling.Task('A', 'G-001', self.connection, retry_order=9)
+                selected = scheduling.current_task.set(task)
                 handoff = handoff_gate._runtime_handoff_signal.set(gate)
                 try:
                     with mock.patch.object(handoff_gate.time, 'monotonic', side_effect=lambda: clock[0]), \
@@ -106,6 +107,10 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
                 self.assertEqual(sum(scheduler.running['verify'].values()), 0)
                 self.assertEqual(scheduler.retained, {})
+                self.assertEqual(scheduler.cursor.get('verify'), None if stopped else 'A')
+                cursor = self.connection.execute("SELECT repo FROM task_scheduling_cursor WHERE kind='verify'").fetchone()
+                self.assertEqual(cursor[0] if cursor else None, None if stopped else 'A')
+                self.assertEqual(task.retry_order, 9 if stopped else None)
 
     def test_full_call_slots_skip_priority_refresh_until_capacity_returns(self):
         self.connection.commit()

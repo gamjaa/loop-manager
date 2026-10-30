@@ -376,21 +376,30 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
             state_dir,
             self.connection,
         )
+        scheduler.cursor['verify'] = 'previous-project'
+        with self.connection:
+            self.connection.execute("INSERT INTO task_scheduling_cursor VALUES ('verify','previous-project')")
+        previous_cursor = dict(scheduler.cursor)
+        previous_db_cursor = list(self.connection.execute('SELECT kind,repo FROM task_scheduling_cursor'))
         original_slot = scheduler.slot
         inserted = []
 
         @contextmanager
-        def slot_with_new_targeted_writer(kind, task):
-            with original_slot(kind, task):
+        def slot_with_new_targeted_writer(kind, task, *, before_start=None):
+            def prepare_start():
                 if kind == 'verify' and task.plan_id == 'G-047':
                     inserted.append(self._bound_targeted_record(
                         state_dir, 'arrived-during-slot', 'arrived', 'success',
                     )[0])
+                if before_start is not None:
+                    before_start()
+            with original_slot(kind, task, before_start=prepare_start):
                 yield
 
         scheduler.slot = slot_with_new_targeted_writer
         scheduler_token = task_scheduling.current_scheduler.set(scheduler)
-        task_token = task_scheduling.current_task.set(Task('repo', 'G-047', self.connection))
+        task = Task('repo', 'G-047', self.connection, retry_order=7)
+        task_token = task_scheduling.current_task.set(task)
         try:
             with mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value=None), \
                  mock.patch.object(self.handler, '_fetch_latest_base', return_value='base'), \
@@ -413,6 +422,10 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
             ('repo', 'G-047', 'verify'),
         ).fetchone()[0], 0)
         self.assertEqual(scheduler.running['verify']['repo'], 0)
+        self.assertEqual(scheduler.cursor, previous_cursor)
+        self.assertEqual(list(self.connection.execute('SELECT kind,repo FROM task_scheduling_cursor')), previous_db_cursor)
+        self.assertEqual(task.retry_order, 7)
+        self.assertTrue(task.resumed)
 
 
     def test_preparation_recovery_corrects_owned_stale_markers_before_verify(self):

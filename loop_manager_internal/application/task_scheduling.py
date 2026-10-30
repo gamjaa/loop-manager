@@ -408,7 +408,7 @@ class TaskScheduler:
             return min(candidates, key=lambda item: (item[1][2], item[0].repo, item[0].plan_id))
 
     @contextmanager
-    def slot(self, kind, task):
+    def slot(self, kind, task, *, before_start=None):
         if task.connection.in_transaction or getattr(task.connection, '_depth', 0):
             raise runtime_state.RuntimeStateError("DB 쓰기 transaction을 유지한 채 호출 배정을 기다릴 수 없습니다.")
         recheck = project_recheck.get()
@@ -493,6 +493,8 @@ class TaskScheduler:
                 raise SchedulingDeferred("입력 재관측 중 작업의 호출 자격이 변경됐습니다.")
             if self._observation(task) != observed:
                 raise SchedulingChanged("호출 입력 재관측 중 작업 상태가 변경됐습니다.")
+            if before_start is not None:
+                before_start()
             with runtime_state._transaction(task.connection):
                 task.connection.execute(
                     "INSERT INTO task_scheduling_cursor VALUES (?,?) "
@@ -593,15 +595,21 @@ def scheduled_call(kind):
                         raise TaskRecheckRequired('DB 재시도 대기 중 작업 입력이 변경됐습니다.')
                     if not request_state:
                         request_state.append(expected)
-                    stack.enter_context(scheduler.slot(kind, task))
-                    if runtime.get(task.repo, task.plan_id) != expected:
-                        raise TaskRecheckRequired('호출 대기 중 작업 입력이 변경됐습니다.')
-                    if not scheduler._eligible(task, task.connection):
-                        raise SchedulingDeferred('호출 대기 중 현재 실행 자격이 변경됐습니다.')
-                if preflight is not None:
-                    preflight()
-                if kind == 'verify':
-                    observe_runtime()
+                    def before_start():
+                        if runtime.get(task.repo, task.plan_id) != expected:
+                            raise TaskRecheckRequired('호출 대기 중 작업 입력이 변경됐습니다.')
+                        if not scheduler._eligible(task, task.connection):
+                            raise SchedulingDeferred('호출 대기 중 현재 실행 자격이 변경됐습니다.')
+                        if preflight is not None:
+                            preflight()
+                        if kind == 'verify':
+                            observe_runtime()
+                    stack.enter_context(scheduler.slot(kind, task, before_start=before_start))
+                else:
+                    if preflight is not None:
+                        preflight()
+                    if kind == 'verify':
+                        observe_runtime()
                 try:
                     result = function(*args, **kwargs)
                     returned.append(result)
