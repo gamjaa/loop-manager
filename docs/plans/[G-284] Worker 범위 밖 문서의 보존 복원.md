@@ -29,12 +29,12 @@ R-082의 후속 복원 목표와 확인된 사용자 결정에 따라, 종료한
 - [ ] 확인한 `loop_manager_internal/agents/scope_adapter.py:validate_worker_workspace_scope()`·`scope_lifecycle.py:begin_agent_scope()`와 `scope_validation.py:validate_agent_scope()`에서 현재 호출 전후 근거·원본 유입 제외·범위 오류 경로를 재사용한다. 순수 경로/원문 판정과 Manager의 파일·index 효과를 분리하고 실제 변경 주체를 증명할 수 있는 대상만 준비한다. 모든 Requirement 거부나 source 조회·정확한 선언 검사를 완화하지 않는다.
 - [ ] 확인한 `git/rebase_file_evidence.py:capture_originals()`의 literal path·원문/mode·index·부재·symlink 부모 검사와 `git/rebase_documents.py`의 경로별 보존·현재 형상 재확인·index 적용/결과 확인 패턴을 재사용한다. rebase 전용 `resolve()`나 폐기된 `agents/scope_baseline.py`의 전체 baseline 복원 경로를 정상 Worker 결과 복원으로 호출하지 않는다. Worker 시작 원문·현재 채택 원본과 실제 기준을 먼저 확정하고 후보 전체를 과거 tree로 되돌리지 않는다.
 - [ ] 확인한 `storage/execution_checkpoint_state.py:ExecutionCheckpointRepository`에 이 작업의 보존·미완료 적용·확정 결과를 현재 snapshot/CAS 경계로 연결한다. 새 DB 원본·비호환 schema·범용 journal을 추가하지 않는다. 원문은 소유 checkpoint의 기존 저장 방식으로 보존하고 prompt·운영 요약·invocation ledger에 문서 전문을 추가하지 않는다.
-- [ ] 확인한 `execution/execution_worker_handler.py:WorkerHandler.run()`의 frontmatter 복원 피드백·기존 `_retry()`와 session/feedback 저장을 재사용해 경로별 복원 결과를 전달한다. 현재 `_bind_document_report()`와 `documents/pr_description.py:common_guidance_report()`의 작업 base 비교를 소비해 복원 뒤 보고/교정에도 같은 기준을 전달한다. 원문 보존과 적용 완료 확인이 끝나기 전에 정상 진행을 확정하지 않는다. 선택 frontmatter 부분 복원·문서 결합 알고리즘은 재구현하지 않고 후속 교체에서도 기존 `worker_frontmatter_restores`·문서 반영 기록과 독립 감사를 유지한다.
+- [ ] 확인한 `execution/execution_worker_handler.py:WorkerHandler.run()`의 frontmatter 복원 피드백·기존 `_retry()`와 session/feedback 저장을 재사용해 경로별 복원 결과를 전달한다. 현재 `_bind_document_report()`와 `documents/pr_description.py:common_guidance_report()`의 작업 base 비교를 소비해 복원 뒤 보고/교정에도 같은 기준을 전달한다. `execution/plan_validation.py:restore_worker_frontmatter()`가 catalog identity를 확인한 공식 선언과 현재 선언의 일치에 쓰기 없이 반환하는 직접 구현도 소비한다. 시작 전 선언 차이만으로 이 결과를 복원 실패·재시도로 바꾸거나 실제 복원 감사·피드백을 합성하지 않는다. 원문 보존과 필요한 적용 완료 확인이 끝나기 전에 정상 진행을 확정하지 않는다. 선택 frontmatter 부분 복원·문서 결합 알고리즘은 재구현하지 않고 후속 교체에서도 기존 `worker_frontmatter_restores`·문서 반영 기록과 독립 감사를 유지한다.
 - [ ] 필요한 effect를 `agents/bindings.py`·`execution/execution_ports.py`의 명시적 계약에만 연결한다. PRODUCT·ARCHITECTURE의 현재 결과 검증·문서 보존 절에 승인된 경계와 실제 구현만 반영한다. Worker는 이 작업에서도 모든 Requirement를 수정하지 않으며 R-082 자체를 교정하거나 archive하지 않는다.
 
 ## Validation
 
-- Worker는 `tests/test_scope_services.py:ScopeValidationTests`, `tests/test_execution_worker_phase.py:ExecutionWorkerPhaseTests`와 `tests/test_requirement_sources.py:WorkerFrontmatterRestoreTests`에서 변경한 최소 unit case만 실행한다. 실제 SQLite/checkpoint·파일 bytes·순수 판정과 handler를 검사하고 Git·provider 효과만 double로 제공한다. 기존 선택 frontmatter 복원·범위 거부 회귀와 fixture를 재사용한다.
+- Worker는 `tests/test_scope_services.py:ScopeValidationTests`, `tests/test_execution_worker_phase.py:ExecutionWorkerPhaseTests`와 `tests/test_requirement_sources.py:WorkerFrontmatterRestoreTests`에서 변경한 최소 unit case만 실행한다. 실제 SQLite/checkpoint·파일 bytes·순수 판정과 handler를 검사하고 Git·provider 효과만 double로 제공한다. 기존 선택 frontmatter 복원·범위 거부 회귀와 fixture를 재사용한다. `test_worker_correction_to_official_header_needs_no_restore`의 공식 선언 일치·교체 0회·본문 보존은 직접 회귀로 유지하며 같은 helper case를 복제하지 않는다. 후속 파일/index 복원·피드백을 연결할 때 이 무변경 결과가 불필요한 교정이나 독립 범위 검사 생략으로 바뀌는 누락만 확인한다.
 - 호출 전 clean 보호 문서에 대한 Worker 수정·삭제·추가·rename/이동, 원본 rebase 유입과 혼합 변경을 구성한다. 경로별 원문/mode/index 복원과 보존 감사, 선택 본문·구현·테스트·다른 staged/unstaged/untracked 파일·HEAD/branch·session/실패 불변을 확인한다. 원본 유입 문서에는 복원 효과가 호출되지 않아야 한다.
 - 사전 수정·동시 편집·writer 생존/종료 불명·작업 소유권 변경·rebase 진행·원본 조회 실패·부모 symlink·경로 별칭·보존 실패·CAS 경쟁에서는 대상 파일을 쓰지 않는다. 파일 적용 전/후·index 적용 전/후·완료 기록 전 중단을 각각 현재 형상에서 재개해 남은 적용만 수행하며 복원 후 생긴 사용자 편집을 보존한다. 성공 결과를 미리 둔 fixture만으로 중단 복구를 통과시키지 않는다.
 - mock만으로 확인할 수 없는 실제 파일/index 선택 효과는 `tests/test_scope_services.py`의 기존 격리 Git fixture를 사용한 최소 통합 사례 하나로 검사한다. Worker는 이 통합을 실행하지 않고 Manager의 기존 전체 verify에서 실행한다. 특정 두 보호 경로만 복원한 뒤 다른 staged/unstaged 파일과 index entry·HEAD가 유지되는 assertion에 실제 Git의 목적을 한정하며 정책 조합마다 전체 Git lifecycle을 반복하지 않는다.
@@ -48,6 +48,8 @@ R-082의 후속 복원 목표와 확인된 사용자 결정에 따라, 종료한
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 이번 delta의 공식 frontmatter 일치 시 무변경 반환은 기존 helper의 직접 교정이다. 다른 보호 문서의 원문 보존·선택 파일/index 복원·동일 Worker 문맥 갱신이라는 남은 목표와 사용자 결정은 유지하고 해당 helper를 재구현하지 않는다. snapshot token `4a5912aa2b0768f4afe120f9f6c10856d16b732ca30d00f65aa092e6cf12a9cf`의 started ID·경로·metadata·dependency·기존 수행 기록을 보존한다. 문서 개정은 사용자 승인·차단 해제·검증 성공을 만들지 않는다.
 
 - R-061의 현재 delta는 기존 복원 승인 범위를 바꾸지 않고 복원 후 보고의 비교 기준을 구체화한다. source와 해당 피드백·회귀에만 연결하며 started ID·경로·기존 사용자 결정과 수행 기록·무dependency·분류를 보존한다. 직접 구현된 결합 경계는 재사용하고 G-189의 전수 감사를 이 작업의 선행으로 만들지 않는다. 현재 명세 반영을 사용자 승인·질문 해소·차단 해제로 기록하지 않는다.
 
