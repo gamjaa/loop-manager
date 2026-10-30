@@ -952,6 +952,13 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         before = dict(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone())
         scheduler = self.scheduler()
         token = scheduling.current_scheduler.set(scheduler)
+        calls = []
+        @scheduling.scheduled_call('agent')
+        def reviewer(**_options):
+            calls.append('reviewer')
+        @scheduling.scheduled_call('verify')
+        def verify():
+            calls.append('verify')
         try:
             with self.assertRaises(scheduling.SchedulingDeferred), scheduler.admission(
                     scheduling.Task('A', 'G-001', self.connection)):
@@ -961,6 +968,14 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             with recovery_admission(self.connection, 'A', 'G-001'), runtime_state._transaction(self.connection):
                 self.assertEqual(runtime.get('A', 'G-001').status, 'IMPLEMENTING')
                 self.assertEqual(scheduling.managed_count(self.connection, 'A'), 1)
+            with recovery_admission(self.connection, 'A', 'G-001'):
+                selected = scheduling.current_task.set(scheduling.Task('A', 'G-001', self.connection, recovery=True))
+                try:
+                    reviewer(role_name='reviewer')
+                    verify()
+                finally:
+                    scheduling.current_task.reset(selected)
+            self.assertEqual(calls, ['reviewer', 'verify'])
             with self.connection:
                 self.connection.execute("UPDATE projects SET planning_resume_plan_id='G-001' WHERE repo='A'")
             with self.assertRaises(scheduling.SchedulingDeferred), recovery_admission(self.connection, 'A', 'G-001'):
@@ -2297,6 +2312,13 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 repository.observe(RecoveryObservation(RecoveryReason.STATUS_FAILED, 'A', plan_id, 'WORKING',
                     'revision', 'base', str(index), 'progress', 'temporary'))
             self.connection.commit()
+            if index == 2:
+                from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+                with mock.patch.object(RecoveryRepository, 'mark_paused',
+                        side_effect=DatabaseWaitTimeout('pause write queue deadline')), \
+                     self.assertRaises(DatabaseWaitTimeout):
+                    retry_pause_detail(self.connection, 'A', before, attempts, plan_id='G-001')
+                self.assertEqual(attempts, {'G-001|transient_retry': 2})
             detail = retry_pause_detail(self.connection, 'A', before, attempts, plan_id='G-001')
             self.assertEqual(detail, 'temporary' if index == 2 else None)
             before = {str(row['subject']): int(row['generation']) for row in self.connection.execute(
@@ -2416,6 +2438,101 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
     def test_task_setup_exception_does_not_abort_project_result_collection(self):
         self._assert_exception_isolation('setup')
 
+    def test_database_retry_wait_reacquires_real_sqlite_writer_without_call_capacity(self):
+        from contextlib import contextmanager
+        from loop_manager_internal.storage import db_access
+        scheduler = self.scheduler()
+        waiting, completed = threading.Event(), threading.Event()
+        errors = []
+        original_waiting = db_access._waiting
+        @contextmanager
+        def observe_wait():
+            waiting.set()
+            with original_waiting():
+                yield
+        def retry():
+            try:
+                with closing(database.connect_database(self.directory, run_migrations=False)) as other:
+                    scheduler.wait_database(scheduling.Task('A', 'G-001', other))
+                    self.assertFalse(other.in_transaction)
+                    completed.set()
+            except BaseException as error:
+                errors.append(error)
+        thread = threading.Thread(target=retry)
+        with closing(sqlite3.connect(self.directory / 'loop-manager.db', timeout=0)) as writer:
+            writer.execute('BEGIN IMMEDIATE')
+            try:
+                with mock.patch.object(db_access, '_waiting', observe_wait):
+                    thread.start()
+                    self.assertTrue(waiting.wait(3))
+                    self.assertFalse(completed.is_set())
+                    self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+                    self.assertEqual(sum(scheduler.running['verify'].values()), 0)
+                    writer.rollback()
+                    self.assertTrue(completed.wait(3))
+            finally:
+                writer.rollback()
+                thread.join(4)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+
+    def test_paused_task_reenters_only_after_recovery_inputs_change(self):
+        self._assert_exception_isolation('changed_recovery')
+
+    def test_retry_condition_wait_ignores_timers_and_diagnostics_and_honors_drain(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        repository = RecoveryRepository(self.connection)
+        repository.observe(RecoveryObservation(RecoveryReason.STATUS_FAILED, 'A', 'G-001', 'WORKING',
+            'revision', 'base', 'same-input', 'same-head', 'temporary'), attempts=3)
+        self.connection.commit()
+        for stop in (False, True):
+            with self.subTest(drain=stop):
+                scheduler = self.scheduler()
+                task = scheduling.Task('A', 'G-001', self.connection)
+                observed = scheduler.retry_inputs(task)
+                waits = []
+                def waiting(_timeout):
+                    waits.append(True)
+                    with self.connection:
+                        self.connection.execute("UPDATE exec_plans SET last_error=?,worker_session_id=?, "
+                            "catalog_generation=catalog_generation+1 WHERE repo='A' AND plan_id='G-001'",
+                            (str(len(waits)), str(len(waits))))
+                        self.connection.execute("UPDATE recovery_records SET generation=generation+1,attempts=attempts+1, "
+                            "retry_after=COALESCE(retry_after,0)+30 WHERE repo='A' AND subject='G-001'")
+                    self.assertEqual(scheduler.retry_inputs(task), observed)
+                    if len(waits) == 3:
+                        if stop:
+                            scheduler.pause_project('A')
+                        else:
+                            runtime.update_plan('A', 'G-001', plan_values={'active_sha':'new-input'}, enqueue=False)
+                with mock.patch.object(scheduler.condition, 'wait', side_effect=waiting), \
+                     mock.patch.object(scheduling, 'observe_runtime') as observe:
+                    if stop:
+                        with self.assertRaises(scheduling.PlanningDrain):
+                            scheduler.wait_recheck(task, observed)
+                    else:
+                        self.assertTrue(scheduler.wait_recheck(task, observed))
+                self.assertEqual(len(waits), 3)
+                observe.assert_not_called()
+                self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
+                self.assertEqual(sum(scheduler.running['agent'].values()), 0)
+
+    def test_task_setup_exception_retries_in_the_same_execution(self):
+        self._assert_exception_isolation('setup_retry')
+
+    def test_completed_dispatch_collection_wait_does_not_repeat_the_effect(self):
+        self._assert_exception_isolation('collection')
+
+    def test_completed_dispatch_collection_error_retries_only_collection(self):
+        self._assert_exception_isolation('collection_error')
+
+    def test_error_record_db_wait_preserves_original_error_and_independent_work(self):
+        self._assert_exception_isolation('error_record')
+
     def test_setup_db_wait_is_a_transient_pause(self):
         self._assert_exception_isolation('db_setup')
 
@@ -2450,17 +2567,27 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                             True, threading.Lock(), 20, 600, None))
         service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base', provider='codex')
         verifying, failed, replacement = threading.Event(), threading.Event(), threading.Event()
-        calls = []
+        calls, storage_attempts, setup_attempts, dispatches = [], [], [], []
+        resumed_after_condition, paused_input = threading.Event(), threading.Event()
         configure_session = notifications.configure_session
         def configure(connection, **options):
+            if failure == 'setup_retry' and threading.current_thread().name == 'loop-task-G-001':
+                setup_attempts.append(True)
+                if len(setup_attempts) == 1:
+                    failed.set()
+                    raise RuntimeError('task setup failed once')
             if failure in {'setup', 'db_setup'} and threading.current_thread().name == 'loop-task-G-001':
-                failed.set()
-                if failure == 'db_setup':
-                    raise DatabaseWaitTimeout('setup DB queue deadline')
-                raise RuntimeError('task setup failed')
+                setup_attempts.append(True)
+                if len(setup_attempts) <= 3:
+                    if len(setup_attempts) == 3:
+                        failed.set()
+                    if failure == 'db_setup':
+                        raise DatabaseWaitTimeout('setup DB queue deadline')
+                    raise RuntimeError('task setup failed')
             return configure_session(connection, **options)
         def execute(child, repository, **options):
             task = scheduling.current_task.get()
+            dispatches.append(task.plan_id)
             if task.plan_id == 'G-002':
                 with scheduler.slot('verify', task):
                     verifying.set()
@@ -2473,59 +2600,120 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                             self.assertIsNotNone(task.retry_order)
                             self.assertFalse(options['newly_activated'])
                         calls.append(task.plan_id)
-                        if failure == 'no_progress':
+                        if ((failure in {'pause', 'db_wait', 'changed_recovery'} and len(calls) == 4)
+                                or failure in {'setup', 'db_setup'} and len(calls) == 1):
+                            self.assertTrue(verifying.is_set())
+                            resumed_after_condition.set()
+                        if failure == 'no_progress' or failure == 'changed_recovery' and len(calls) <= 3:
                             from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
                             from loop_manager_internal.storage.recovery_state import RecoveryRepository
                             RecoveryRepository(task.connection).observe(RecoveryObservation(
                                 RecoveryReason.PUBLICATION_RETRY, 'A', 'G-001', 'WORKING',
                                 'revision', 'base', 'same-input', 'same-head', 'unpublished checkpoint'))
                             task.connection.commit()
-                            failed.set()
+                            if failure != 'changed_recovery' or len(calls) == 3:
+                                failed.set()
                             return project_runner.PROJECT_STEP_RETRY
                         if failure in {'db_wait', 'db_retry', 'pause_record'}:
-                            failed.set()
-                            if failure == 'db_wait' or failure == 'db_retry' and len(calls) == 1:
+                            if failure != 'db_wait' or len(calls) == 3:
+                                failed.set()
+                            if (failure == 'db_wait' and len(calls) <= 3
+                                    or failure == 'db_retry' and len(calls) == 1):
                                 raise DatabaseWaitTimeout('DB queue deadline')
-                            if failure == 'pause_record':
+                            if failure == 'pause_record' and len(calls) == 1:
                                 return project_runner.PROJECT_STEP_RETRY
-                        if failure == 'pause':
+                        if failure == 'pause' and len(calls) <= 3:
                             if len(calls) == 3:
                                 failed.set()
                             raise sqlite3.OperationalError('database is locked')
                         if len(calls) == 1:
                             failed.set()
-                            raise MutationEvidenceError('stored rebase result differs')
+                            if failure not in {'collection', 'collection_error'}:
+                                raise MutationEvidenceError('stored rebase result differs')
                     else:
                         self.assertTrue(failed.wait(3))
                         self.assertTrue(verifying.wait(3))
                         self.assertEqual(sum(scheduler.running['verify'].values()), 1)
+                        if failure == 'changed_recovery':
+                            self.assertTrue(paused_input.wait(4))
+                            from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+                            from loop_manager_internal.storage.recovery_state import RecoveryRepository
+                            RecoveryRepository(task.connection).observe(RecoveryObservation(
+                                RecoveryReason.PUBLICATION_RETRY, 'A', 'G-001', 'WORKING',
+                                'revision', 'base', 'new-input', 'new-head', 'corrected checkpoint'))
+                            task.connection.commit()
+                        if failure in {'pause', 'setup'}:
+                            repository.update_plan('A', 'G-001',
+                                plan_values={'active_sha':'condition-resolved'}, enqueue=False)
+                        if failure in {'pause', 'setup', 'db_wait', 'db_setup', 'changed_recovery'}:
+                            self.assertTrue(resumed_after_condition.wait(4))
                         replacement.set()
             repository.transition_from_snapshot(repository.projected('A'), plan_values={'status': 'PR_OPEN'},
                                                  project_values=runtime_state.clear_project_values())
             return 0
         pause_detail = project_runner.retry_pause_detail
+        flush_events = notifications.flush_project_events
+        update_plan = runtime_state.RuntimeStateRepository.update_plan
+        def storage_wait():
+            storage_attempts.append(True)
+            if len(storage_attempts) <= 3:
+                self.assertEqual(len(calls), 1)
+                from loop_manager_internal.storage import task_calls
+                self.assertIsNone(task_calls.current_call.get())
+                if failure == 'collection_error':
+                    if len(storage_attempts) <= 2:
+                        raise RuntimeError('result collection transient error')
+                else:
+                    raise DatabaseWaitTimeout('result storage queue deadline')
         def pause(*args, **kwargs):
             if failure == 'pause_record' and kwargs.get('plan_id') == 'G-001':
-                raise DatabaseWaitTimeout('pause record queue deadline')
+                storage_wait()
             return pause_detail(*args, **kwargs)
+        def flush(*args, **kwargs):
+            task = scheduling.current_task.get()
+            if failure in {'collection', 'collection_error'} and task is not None and task.plan_id == 'G-001':
+                storage_wait()
+            return flush_events(*args, **kwargs)
+        def save(repository, repo, plan_id, **kwargs):
+            if failure == 'error_record' and plan_id == 'G-001' and kwargs.get('plan_values', {}).get('last_error'):
+                storage_wait()
+            return update_plan(repository, repo, plan_id, **kwargs)
+        retry_inputs = scheduler.retry_inputs
+        def inputs(task):
+            key = retry_inputs(task)
+            if (failure == 'changed_recovery' and task.plan_id == 'G-001' and key[1] is not None
+                    and key[1][-1] == 'pause' and threading.current_thread().name == 'loop-task-G-001'):
+                paused_input.set()
+            return key
         token = scheduling.current_scheduler.set(scheduler)
         try:
-            with fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute), \
+            with mock.patch.object(scheduler, 'retry_inputs', side_effect=inputs), \
+                 fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute), \
                  mock.patch.object(notifications, 'configure_session', configure), \
-                 mock.patch.object(project_runner, 'retry_pause_detail', pause):
+                 mock.patch.object(project_runner, 'retry_pause_detail', pause), \
+                 mock.patch.object(notifications, 'flush_project_events', flush), \
+                 mock.patch.object(runtime_state.RuntimeStateRepository, 'update_plan', save):
                 result = scheduling.run_project_tasks(service, newly_activated=True)
         finally:
             scheduling.current_scheduler.reset(token)
-        self.assertEqual(len(calls), {'retry': 2, 'pause': 3, 'setup': 0, 'db_wait': 3, 'db_retry': 2,
-                                    'no_progress': 3, 'pause_record': 3, 'db_setup': 0}[failure])
-        self.assertEqual(result, {'retry': 0, 'pause': PROJECT_STEP_TRANSIENT_PAUSE, 'setup': 1,
-                                 'db_wait': PROJECT_STEP_TRANSIENT_PAUSE, 'db_retry': 0,
-                                 'no_progress': PROJECT_STEP_TRANSIENT_PAUSE,
-                                 'pause_record': PROJECT_STEP_TRANSIENT_PAUSE, 'db_setup': PROJECT_STEP_TRANSIENT_PAUSE}[failure])
+        self.assertEqual(len(calls), {'retry': 2, 'pause': 4, 'setup': 2, 'db_wait': 4, 'db_retry': 2,
+                                    'no_progress': 3, 'changed_recovery': 4, 'pause_record': 2, 'db_setup': 2,
+                                    'setup_retry': 2, 'collection': 1, 'collection_error': 1, 'error_record': 2}[failure])
+        self.assertEqual(dispatches.count('G-001'), len(calls))
+        self.assertEqual(result, {'retry': 0, 'pause': 0, 'setup': 0,
+                                 'db_wait': 0, 'db_retry': 0,
+                                 'no_progress': PROJECT_STEP_TRANSIENT_PAUSE, 'changed_recovery': 0,
+                                 'pause_record': 0, 'db_setup': 0,
+                                 'setup_retry': 0, 'collection': 0, 'collection_error': 0, 'error_record': 0}[failure])
         self.assertEqual(runtime.get('A', 'G-004').status, 'PR_OPEN')
         self.assertEqual(runtime.get('A', 'G-002').status, 'PR_OPEN')
+        if failure in {'pause_record', 'collection', 'collection_error', 'error_record'}:
+            self.assertEqual(len(storage_attempts), 3 if failure == 'collection_error' else 4)
+            self.assertEqual(runtime.get('A', 'G-001').status, 'PR_OPEN')
+        if failure == 'setup_retry':
+            self.assertEqual(len(setup_attempts), 2)
         if failure == 'pause':
-            self.assertEqual(runtime.get('A', 'G-001').status, 'IMPLEMENTING')
+            self.assertEqual(runtime.get('A', 'G-001').status, 'PR_OPEN')
             self.assertIn('OperationalError: database is locked', runtime.get('A', 'G-001').last_error)
             self.assertIn('Traceback (most recent call last)', runtime.get('A', 'G-001').last_error)
 

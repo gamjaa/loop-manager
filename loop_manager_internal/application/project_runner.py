@@ -473,12 +473,14 @@ def retry_pause_detail(connection, repo, recovery_before, recovery_attempts, *, 
             continue
         identity = str(record["identity"])
         run_key = f"{record['subject']}|{record['disposition']}"
-        recovery_attempts[run_key] = recovery_attempts.get(run_key, 0) + 1
-        if recovery_attempts[run_key] >= 3:
+        next_attempt = recovery_attempts.get(run_key, 0) + 1
+        if next_attempt >= 3:
             with connection:
                 recovery_state.RecoveryRepository(connection).mark_paused(
                     repo, str(record["subject"]), identity,
-                    int(record["generation"]), recovery_attempts[run_key],
+                    int(record["generation"]), next_attempt,
                 )
+            recovery_attempts[run_key] = next_attempt
             return str(record["detail"])
+        recovery_attempts[run_key] = next_attempt
     return None

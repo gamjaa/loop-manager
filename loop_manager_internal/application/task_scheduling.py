@@ -133,8 +133,8 @@ class TaskScheduler:
             self.condition.notify_all()
         events.emit("작업 RETRY 우선 재배정", project=task.repo, plan=task.plan_id)
 
-    def finish_agent_storage(self, task, operation, *, stopped):
-        """Keep the role result on its stack while retrying only its DB confirmation."""
+    def finish_storage(self, task, operation, *, stopped=False):
+        """Keep a completed effect on its stack while retrying only its DB confirmation."""
         from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
         owner = task_calls.current_call.get()
         if stopped and owner is not None and owner.kind == 'agent':
@@ -148,9 +148,48 @@ class TaskScheduler:
             try:
                 return operation()
             except DatabaseWaitTimeout:
-                events.emit('Agent 결과 DB 확정 재시도 대기', level='WARN', project=task.repo, plan=task.plan_id)
+                events.emit('작업 결과 DB 확정 재시도 대기', level='WARN', project=task.repo, plan=task.plan_id,
+                            traceback=redact_secrets(traceback.format_exc()))
                 with self.condition:
                     self.condition.wait(.2)
+
+    def retry_inputs(self, task):
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        execution = runtime_state.RuntimeStateRepository(task.connection).get(task.repo, task.plan_id)
+        saved = RecoveryRepository(task.connection).row(task.repo, task.plan_id)
+        recovery = tuple(saved[field] for field in ('identity', 'fingerprint', 'progress_marker', 'pending_action')) if saved else None
+        inputs = tuple(getattr(execution, field) for field in (
+            'status', 'current_revision_sha', 'plan_sha', 'active_sha', 'validated_base_sha',
+            'publication_remote_oid', 'pr_conflict_recovery', 'pr_conflict_head_oid', 'pr_conflict_base_oid',
+            'branch', 'worktree', 'pr_url', 'pr_head_oid', 'definition_snapshot', 'worker_input_token',
+            'archive_token', 'verify_token', 'review_token', 'publication_token', 'revision_resume_status', 'workspace_owned',
+        ))
+        return inputs, recovery
+
+    def wait_recheck(self, task, observed):
+        """A timer cannot authorize another effect on the same failed inputs."""
+        events.emit('작업 조건 재관측 대기', project=task.repo, plan=task.plan_id,
+                    next_action='입력·복구 상태 변경 후 현재 자격 재검사')
+        while True:
+            self.check_project(task.repo)
+            current = self.retry_inputs(task)
+            if (current[0][0] not in runtime_state.ACTIVE_STATUSES
+                    or current[1] is not None and current[1][-1] == 'final_block'):
+                return False
+            if current != observed and self._eligible(task, task.connection):
+                return True
+            with self.condition:
+                self.condition.wait(.2)
+
+    def wait_database(self, task):
+        events.emit('DB 접근 조건 재확인 대기', project=task.repo, plan=task.plan_id,
+                    next_action='쓰기 요청 자리 재확보 후 작업 재준비')
+        def available():
+            # Acquire the same short write boundary as the failed request,
+            # without changing product state or claiming execution progress.
+            with runtime_state._transaction(task.connection):
+                pass
+        self.finish_storage(task, available)
 
     def wait_retry(self, connection, repo, plan_id=None, *, resume=False):
         from loop_manager_internal.storage import recovery_state
@@ -555,14 +594,10 @@ def scheduled_call(kind):
                     if not request_state:
                         request_state.append(expected)
                     stack.enter_context(scheduler.slot(kind, task))
-                    from loop_manager_internal.recovery import scoped_blocking
-                    from loop_manager_internal.storage import execplan_draft_state
                     if runtime.get(task.repo, task.plan_id) != expected:
                         raise TaskRecheckRequired('호출 대기 중 작업 입력이 변경됐습니다.')
-                    if (scoped_blocking.project_block(task.connection, task.repo) is not None
-                            or task.plan_id in scoped_blocking.catalog_held_plan_ids(task.connection, task.repo)
-                            or task.plan_id in execplan_draft_state.pending_ids(task.connection, task.repo)):
-                        raise task_calls.CallDeferred('호출 대기 중 차단·catalog/draft 보류가 확인됐습니다.')
+                    if not scheduler._eligible(task, task.connection):
+                        raise SchedulingDeferred('호출 대기 중 현재 실행 자격이 변경됐습니다.')
                 if preflight is not None:
                     preflight()
                 if kind == 'verify':
@@ -653,9 +688,13 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
     with scheduler.condition:
         scheduler.draining_projects.discard(repo)
     running, threads, visited, results = {}, [], set(), []
+    task_results = {}
     rechecked_blocks = set()
     recovery_keys = {}
     setup_database_attempts = Counter()
+    setup_exception_attempts = Counter()
+    setup_waits, setup_inputs, deferred_inputs = {}, {}, {}
+    readmitted = set()
     initial = runtime_state.RuntimeStateRepository(connection).active(repo)
 
     requested_checks = []
@@ -711,6 +750,15 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
     def execute(plan_id, resumed, result):
         try:
             with closing(scheduler.connect_database(service.identity.state_dir, run_migrations=False)) as owned:
+                if plan_id in setup_waits:
+                    task = Task(repo, plan_id, owned)
+                    if setup_waits[plan_id] == 'database':
+                        scheduler.wait_database(task)
+                    elif not scheduler.wait_recheck(task, setup_inputs[plan_id]):
+                        result.set_result(PROJECT_STEP_TRANSIENT_PAUSE)
+                        return
+                    del setup_waits[plan_id]
+                setup_inputs[plan_id] = scheduler.retry_inputs(Task(repo, plan_id, owned))
                 from loop_manager_internal.notifications import notifications
                 from loop_manager_internal.storage import recovery_state
                 notifications.configure_session(owned, enabled=scheduler.config.telegram_enabled,
@@ -729,7 +777,12 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                 )
                 with scheduler.task(repo, plan_id, owned, resumed=resumed), notifications.immediate_delivery(
                         owned, scheduler.config.telegram_token, scheduler.config.telegram_chat_id, repo):
+                    if setup_database_attempts[plan_id] or setup_exception_attempts[plan_id] or plan_id in readmitted:
+                        readmitted.discard(plan_id)
+                        scheduler.requeue(current_task.get())
+                        resumed = True
                     attempts = {}
+                    pending_result = []
                     exception_attempts = 0
                     database_attempts = 0
                     while True:
@@ -738,17 +791,23 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                         scheduler.wait_existing_call(owned, repo, plan_id)
                         scheduler.wait_retry(owned, repo, plan_id, resume=True)
                         try:
-                            before = {str(row['subject']): int(row['generation']) for row in owned.execute(
-                                "SELECT subject,generation FROM recovery_records WHERE repo=?", (repo,))}
-                            child.state.row = runtime_state.project_row(owned, repo)
-                            code = child._dispatch_execution(
-                                runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed,
-                                planning_context=replace(planning_context, refresh_catalog=child._refresh_catalog)
-                                if planning_context is not None else None)
-                            notifications.flush_project_events(owned, repo)
-                            if code == PROJECT_STEP_RETRY and retry_pause_detail(
-                                    owned, repo, before, attempts, plan_id=plan_id) is not None:
+                            if not pending_result:
+                                condition_before = scheduler.retry_inputs(current_task.get())
+                                before = {str(row['subject']): int(row['generation']) for row in owned.execute(
+                                    "SELECT subject,generation FROM recovery_records WHERE repo=?", (repo,))}
+                                child.state.row = runtime_state.project_row(owned, repo)
+                                code = child._dispatch_execution(
+                                    runtime_state.RuntimeStateRepository(owned), newly_activated=not resumed,
+                                    planning_context=replace(planning_context, refresh_catalog=child._refresh_catalog)
+                                    if planning_context is not None else None)
+                                pending_result.append((code, before))
+                            code, before = pending_result[0]
+                            scheduler.finish_storage(current_task.get(),
+                                lambda: notifications.flush_project_events(owned, repo))
+                            if code == PROJECT_STEP_RETRY and scheduler.finish_storage(current_task.get(),
+                                    lambda: retry_pause_detail(owned, repo, before, attempts, plan_id=plan_id)) is not None:
                                 code = PROJECT_STEP_TRANSIENT_PAUSE
+                            pending_result.clear()
                         except PlanningDrain:
                             raise
                         except TaskRecheckRequired:
@@ -762,8 +821,7 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                                 events.emit("DB 접근 대기 종료; 작업 상태 보존", level="WARN", project=repo,
                                             plan=plan_id, reason=str(error))
                                 if database_attempts >= 3:
-                                    code = PROJECT_STEP_TRANSIENT_PAUSE
-                                    break
+                                    scheduler.wait_database(current_task.get())
                                 with scheduler.condition:
                                     scheduler.condition.wait(.2)
                                 scheduler.requeue(current_task.get())
@@ -775,15 +833,22 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                                 reason=f"{type(error).__name__}: {error}", traceback=detail, attempts=exception_attempts,
                                 next_action="작업 상태 재확인 후 재시도" if exception_attempts < 3 else "해당 작업 보류")
                             runtime = runtime_state.RuntimeStateRepository(owned)
-                            if runtime.get(repo, plan_id).status not in runtime_state.ACTIVE_STATUSES:
+                            if runtime.get(repo, plan_id).status not in runtime_state.ACTIVE_STATUSES and not pending_result:
                                 code = 1
                                 break
-                            runtime.update_plan(repo, plan_id, plan_values={"last_error": detail}, enqueue=False)
+                            scheduler.finish_storage(current_task.get(), lambda: runtime.update_plan(
+                                repo, plan_id, plan_values={"last_error": detail}, enqueue=False))
                             if isinstance(error, task_calls.CallDeferred) and scheduler.wait_existing_call(owned, repo, plan_id):
                                 code = PROJECT_STEP_RETRY
-                            elif isinstance(error, task_calls.CallDeferred) or exception_attempts >= 3:
+                            elif isinstance(error, task_calls.CallDeferred):
                                 code = PROJECT_STEP_TRANSIENT_PAUSE
                                 break
+                            elif exception_attempts >= 3:
+                                observed = (condition_before[0], scheduler.retry_inputs(current_task.get())[1])
+                                if not scheduler.wait_recheck(current_task.get(), observed):
+                                    code = PROJECT_STEP_TRANSIENT_PAUSE
+                                    break
+                                code = PROJECT_STEP_RETRY
                             else:
                                 before, code = None, PROJECT_STEP_RETRY
                         if code == PROJECT_STEP_PLANNING_PENDING:
@@ -803,6 +868,8 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                         scheduler.check_project(repo)
                         scheduler.requeue(current_task.get())
                         resumed = True
+                if code == PROJECT_STEP_TRANSIENT_PAUSE:
+                    deferred_inputs[plan_id] = scheduler.retry_inputs(Task(repo, plan_id, owned))
             result.set_result(code)
         except PlanningDrain:
             result.set_result(PROJECT_STEP_RETRY)
@@ -836,6 +903,9 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
     def launch(row, resumed, *, recovery_key=None):
         plan_id = str(row["plan_id"])
         result = Future()
+        task_results.pop(plan_id, None)
+        if plan_id not in setup_inputs:
+            setup_inputs[plan_id] = scheduler.retry_inputs(Task(repo, plan_id, connection))
         context = copy_context()
         if planning_context is not None:
             context.run(project_recheck.set, request_check)
@@ -857,7 +927,7 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
             for plan_id, result in tuple(running.items()):
                 if result.done():
                     try:
-                        results.append(result.result())
+                        task_results[plan_id] = result.result()
                     except Exception as error:
                         events.emit("작업 처리 예외", level="ERROR", project=repo, plan=plan_id,
                             reason=f"{type(error).__name__}: {error}", traceback=traceback.format_exc(),
@@ -865,18 +935,31 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                         from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
                         if isinstance(error, DatabaseWaitTimeout):
                             setup_database_attempts[plan_id] += 1
-                            if setup_database_attempts[plan_id] < 3:
-                                visited.discard(plan_id)
-                                with scheduler.condition:
-                                    scheduler.condition.wait(.2)
-                            else:
-                                results.append(PROJECT_STEP_TRANSIENT_PAUSE)
+                            if setup_database_attempts[plan_id] >= 3:
+                                setup_waits[plan_id] = 'database'
+                            visited.discard(plan_id)
+                            with scheduler.condition:
+                                scheduler.condition.wait(.2)
                         else:
-                            results.append(1)
+                            setup_exception_attempts[plan_id] += 1
+                            if setup_exception_attempts[plan_id] >= 3:
+                                setup_waits[plan_id] = 'input'
+                            visited.discard(plan_id)
+                            with scheduler.condition:
+                                scheduler.condition.wait(.2)
                     key = recovery_keys.pop(plan_id, None)
                     if key is not None:
                         visited.discard(plan_id)
                     del running[plan_id]
+            for plan_id, observed in tuple(deferred_inputs.items()):
+                task = Task(repo, plan_id, connection)
+                current = scheduler.retry_inputs(task)
+                if (plan_id not in running and current != observed
+                        and (current[1] is None or current[1][-1] != 'final_block')
+                        and scheduler._eligible(task, connection)):
+                    visited.discard(plan_id)
+                    readmitted.add(plan_id)
+                    del deferred_inputs[plan_id]
             existing = connection.execute("SELECT * FROM exec_plans WHERE repo=? "
                 "AND status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') ORDER BY plan_id", (repo,)).fetchall()
             for row in existing:
@@ -946,5 +1029,6 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                 (repo, repo)).fetchone() is None:
             runtime_state.RuntimeStateRepository(connection).update_project(
                 repo, runtime_state.EXECUTION_CLEAR_VALUES)
-    return next((code for code in results if code in {PROJECT_STEP_PLANNING_PENDING, PROJECT_STEP_RETRY}),
-                next((code for code in results if code), 0))
+    final_results = [*results, *task_results.values()]
+    return next((code for code in final_results if code in {PROJECT_STEP_PLANNING_PENDING, PROJECT_STEP_RETRY}),
+                next((code for code in final_results if code), 0))
