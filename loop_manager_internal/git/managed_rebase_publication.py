@@ -76,11 +76,13 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
             (repo, plan_id, branch, str(worktree))).fetchone()
     except sqlite3.OperationalError as error:
         raise RebaseObservationRetry('intermediate checkpoint database observation failed') from error
-    expected_oid = (intent['remote_before'] if pending else saved.get('accepted_work_branch') or
-                    row['publication_remote_oid'] or (row['pr_head_oid'] if row['pr_url'] else None)
-                    or (owner[0] if owner else None))
-    if not pending and expected_oid is None:
-        raise RebasePublicationRejected('existing remote branch has no durable publication identity')
+    known_remote_oids = {value for value in (
+        saved.get('accepted_work_branch'), row['publication_remote_oid'],
+        row['pr_head_oid'] if row['pr_url'] else None, owner[0] if owner else None,
+    ) if value}
+    expected_oid = intent['remote_before'] if pending else acceptance['remote']['oid']
+    if not pending and expected_oid not in known_remote_oids:
+        raise RebasePublicationRejected('current rebase remote has no durable publication identity')
     if not expected_oid:
         raise RebasePublicationRejected('intermediate checkpoint has no adopted remote OID')
     try:

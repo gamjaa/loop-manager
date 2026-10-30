@@ -282,6 +282,7 @@ class ExecutionCheckpointRepository:
             'current_acceptance': dict(acceptance)}
         saved['pushed_checkpoint_head'] = intent['head']
         saved['last_adopted_remote_oid'] = intent['head']
+        saved['accepted_work_branch'] = intent['head']
         return self.record(repo, plan_id, expected_generation=current.generation,
                            operation=None, expected_head=intent['head'],
                            target_base_oid=intent['target_base_oid'],

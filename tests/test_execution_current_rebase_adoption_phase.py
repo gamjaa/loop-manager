@@ -109,8 +109,12 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
             else observed_git(root, *args, **kwargs))
         self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), 'owned-head', current))
         git.side_effect = observed_git
+        other_input = replace(current, snapshot={**current.snapshot, 'accepted_work_branch': 'foreign'})
+        self.assertTrue(self.handler._owned_checkpoint_remote(
+            context, self.state.row(), 'owned-head', other_input))
+        self.assertFalse(self.handler._owned_checkpoint_remote(
+            context, {**dict(self.state.row()), 'publication_remote_oid': 'foreign'}, 'owned-head', other_input))
         for changed in (replace(current, operation=None),
-                        replace(current, snapshot={**current.snapshot, 'accepted_work_branch': 'foreign'}),
                         replace(current, snapshot={**current.snapshot, 'rebase_publication_intent': None})):
             with self.subTest(changed=changed.operation):
                 self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), 'owned-head', changed))

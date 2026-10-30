@@ -270,7 +270,9 @@ class ExecutionStatePort:
                     or expected.branch != intent['branch'] or expected.worktree != intent['worktree']
                     or expected.workspace_owned != 1
                     or (expected.pr_url or None) != (intent['acceptance']['remote']['pull_request'] or {}).get('identity')
-                    or expected.publication_remote_oid not in (None, intent['remote_before'], intent['head'])):
+                    or expected.publication_remote_oid not in (None, intent['remote_before'], intent['head'])
+                    and not ((before.snapshot or {}).get('accepted_work_branch') == intent['remote_before']
+                             and before.observed_remote_oid == intent['remote_before'])):
                 raise runtime_state.RuntimeStateError('intermediate publication owner changed')
             if oid != intent['head'] or checked != acceptance:
                 raise runtime_state.RuntimeStateError('intermediate publication observation changed')

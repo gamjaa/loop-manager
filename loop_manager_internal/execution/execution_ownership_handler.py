@@ -67,8 +67,8 @@ class OwnershipHandler:
         # its exact intent retains ownership across older BLOCKED receipts.
         publication = current.rebase_publication_intent() if current and current.operation == 'rebase_publish' else None
         pending_checkpoint = bool(publication and remote_oid == publication['head']
-            and publication['remote_before'] == row['publication_remote_oid']
-            and publication['remote_before'] == (current.snapshot or {}).get('accepted_work_branch')
+            and publication['remote_before'] in {
+                row['publication_remote_oid'], (current.snapshot or {}).get('accepted_work_branch')}
             and publication['repo'] == self.ports.identity.repo
             and publication['plan_id'] == context.plan.plan_id
             and publication['branch'] == context.branch and publication['worktree'] == str(context.worktree))

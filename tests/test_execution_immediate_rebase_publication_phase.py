@@ -78,6 +78,45 @@ class ImmediateRebasePublicationTests(TestCase):
         self.remote = 'foreign'
         self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), recorded, current))
 
+    def test_old_adopted_input_does_not_override_the_confirmed_publication_lease(self):
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'accepted_work_branch': 'older-adopted-input'})
+        self.complete()
+        self.assertEqual(self.remote, 'owned-head')
+        self.assertEqual(self.state.row()['publication_remote_oid'], self.remote)
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(saved.observed_remote_oid, self.remote)
+        self.assertEqual(saved.snapshot['accepted_work_branch'], self.remote)
+        self.assertEqual(self.pushes[0][1], '--force-with-lease=refs/heads/loop-manager/G-047:remote')
+
+    def test_current_adopted_input_can_supply_a_lease_newer_than_the_last_push(self):
+        with mock.patch.object(self.handler, '_publish_rebased_checkpoint'):
+            self.complete()
+        self.state.update_project('repo', publication_remote_oid='older-published-head')
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=None, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'accepted_work_branch': self.remote})
+        self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.assertEqual(self.remote, 'owned-head')
+        self.assertEqual(self.pushes[0][1], '--force-with-lease=refs/heads/loop-manager/G-047:remote')
+
+    def test_current_remote_without_durable_owner_is_never_used_as_a_lease(self):
+        from loop_manager_internal.git.managed_rebase_publication import RebasePublicationRejected
+        with mock.patch.object(self.handler, '_publish_rebased_checkpoint'):
+            self.complete()
+        self.state.update_project('repo', publication_remote_oid='unrelated-published-head')
+        self.fixture.connection.execute('DELETE FROM blocked_checkpoints')
+        self.fixture.connection.commit()
+        with self.assertRaises(RebasePublicationRejected):
+            self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.remote, 'remote')
+
     def test_retired_intent_keeps_confirmed_remote_owned_during_the_next_rebase(self):
         self.complete()
         current = self.checkpoints.get('repo', 'G-047')
@@ -94,7 +133,8 @@ class ImmediateRebasePublicationTests(TestCase):
         self.fixture.connection.commit()
         context = self.handler._context()
         self.assertTrue(self.handler._owned_checkpoint_remote(context, self.state.row(), self.remote, current))
-        unrelated = replace(current, snapshot={**current.snapshot, 'retired_rebase_publications': []})
+        unrelated = replace(current, snapshot={**current.snapshot, 'retired_rebase_publications': [],
+                                              'accepted_work_branch': 'unrelated-input'})
         self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), self.remote, unrelated))
         self.remote = 'foreign'
         self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), intent['head'], current))
@@ -112,6 +152,10 @@ class ImmediateRebasePublicationTests(TestCase):
         self.seed.observed = replace(self.seed.observed, head='worker-head',
             branch_ref=('worker-head', ''),
             registration=('HEAD=worker-head', 'branch=refs/heads/loop-manager/G-047'))
+        observed_git = self.fixture.observed_git
+        self.fixture.observed_git = lambda root, *args, **options: (
+            SimpleNamespace(stdout='worker-head', returncode=0) if args == ('rev-parse', 'HEAD')
+            else observed_git(root, *args, **options))
         self.push_failure = True
         with self.assertRaises(RecoveryFailure):
             self.handler._worker_handler().ports._publish_rebased_checkpoint(
