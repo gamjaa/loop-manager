@@ -66,6 +66,18 @@ class ImmediateRebasePublicationTests(TestCase):
     def complete(self):
         self.handler._complete_rebase_intent(self.handler._context())
 
+    def test_confirmed_rebase_publication_owns_remote_after_block_receipt_is_retired(self):
+        self.complete()
+        self.fixture.connection.execute("UPDATE blocked_checkpoints SET phase='unpublished', "
+                                        "accepted_remote_oid=NULL,published_oid=NULL")
+        self.fixture.connection.commit()
+        current = self.checkpoints.get('repo', 'G-047')
+        context = self.handler._context()
+        self.assertTrue(self.handler._owned_checkpoint_remote(context, self.state.row(), self.remote, current))
+        recorded = self.remote
+        self.remote = 'foreign'
+        self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), recorded, current))
+
     def test_worker_checkpoint_publishes_a_successor_of_a_deferred_rebase(self):
         from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
         with mock.patch.object(self.handler, '_publish_rebased_checkpoint'):

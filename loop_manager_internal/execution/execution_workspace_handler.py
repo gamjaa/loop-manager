@@ -173,7 +173,7 @@ class WorkspaceHandler:
                     self.ports._finish_rebase_journal(context)
                     self.ports._complete_rebase_intent(context)
                     return self.ports._context()
-            if (current.snapshot or {}).get('worker_checkpoint_request'):
+            if current.operation != 'rebase' and (current.snapshot or {}).get('worker_checkpoint_request'):
                 # Its stopped result and exact local effect must resume before
                 # normal fetch/rebase recovery can change the candidate.
                 return context

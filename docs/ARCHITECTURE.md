@@ -1134,6 +1134,8 @@ rebase 채택의 한 검사 구간에서는 `ManagedRebaseService.adopt`가 안�
 
 #### 중간 checkpoint 게시와 원격 입력
 
+진행 중 rebase에서는 저장된 일반 Worker checkpoint 요청을 소비하지 않고 rebase 충돌 처리·완료를 먼저 수행한다. 완료된 중간 게시의 intent·결과 identity와 현재 수용 기록은 과거 차단 checkpoint가 unpublished로 바뀌어도 원격 소유권 근거로 유지한다. 같은 계획·branch·worktree·게시 HEAD와 현재 원격 OID를 대조하고 현재 rebase 소유권·범위도 다시 검사하며, 과거 차단 기록의 상태만으로 새 게시 증거를 거부하지 않는다.
+
 동일 계획의 기존 원격 작업 branch를 관리 rebase한 경우, 현재 repository·계획·worktree·branch·HEAD·등록·target base·index·operation·입력과 연결 PR을 확인한 뒤 완료 HEAD의 중간 checkpoint 게시 또는 현재 lease에 따른 보류를 확정한다. 기존 PR도 같은 URL·head/base branch를 유지하며 이 경로를 사용할 수 있다. 원격 입력이 바뀌면 이전 intent를 성공 없이 감사로 보존하고 통합·재검증으로 돌아간다.
 
 신규 원격 branch·다른 계획의 branch는 기존 게시 intent로 갱신하지 않는다.

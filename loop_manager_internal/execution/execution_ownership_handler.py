@@ -41,6 +41,24 @@ class OwnershipHandler:
         *, rebase_observation=None,
     ):
         """검증한 현재 작업 입력과 과거 게시 영수증을 분리한다."""
+        saved = (current.snapshot or {}) if current else {}
+        intent = saved.get('rebase_publication_intent') or {}
+        result = saved.get('rebase_publication_result') or {}
+        from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
+        published = result.get('current_acceptance')
+        if (remote_oid and remote_oid == row['publication_remote_oid']
+                and result.get('head') == remote_oid and result.get('intent_id') == intent.get('id')
+                and valid_acceptance(published)
+                and all(published[key] == value for key, value in {
+                    'repo': self.ports.identity.repo, 'plan_id': context.plan.plan_id,
+                    'branch': context.branch, 'worktree': str(context.worktree), 'head': remote_oid}.items())
+                and published['remote']['oid'] == remote_oid):
+            service = self.ports._current_rebase_service(context, remote_oid=remote_oid)
+            _, decision = service.require_owned(checkpoint=current)
+            if decision.status not in {RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
+                return False
+            return manager_git_journal.live_remote_branch_oid(
+                self.ports.git, self.ports.identity.repo_path, context.branch) == remote_oid
         pending_push = current is not None and current.operation == 'push' and current.expected_head == remote_oid
         # A confirmed intermediate push can precede the SQLite lease update;
         # its exact intent retains ownership across older BLOCKED receipts.

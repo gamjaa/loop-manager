@@ -44,6 +44,23 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
                 case.fixture.effects.agent.run_agent.assert_not_called()
                 case.fixture.effects.validation.verify.assert_not_called()
 
+    def test_pending_worker_request_does_not_short_circuit_an_unfinished_rebase(self):
+        case = current_rebase_case(self)
+        case._prepare_current_checkpoint_recovery()
+        current = case.checkpoint.get('repo', 'G-047')
+        case.checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'worker_checkpoint_request': {'saved': 'worker'}})
+        from loop_manager_internal.execution import worker_checkpoint
+        context = replace(case.fixture.context(), resolving_rebase=True)
+        with mock.patch.object(worker_checkpoint, 'resume_request') as resume, \
+             mock.patch.object(case.handler._worker_handler().__class__, '_targeted_test_block',
+                               side_effect=RuntimeError('rebase path reached')):
+            with self.assertRaisesRegex(RuntimeError, 'rebase path reached'):
+                case.handler._worker_handler().run(context)
+        resume.assert_not_called()
+
     def test_worker_request_does_not_override_rebase_ownership_or_index(self):
         from loop_manager_internal.git.managed_rebase_validation import FileChange
         for invalid in ('remote','index'):

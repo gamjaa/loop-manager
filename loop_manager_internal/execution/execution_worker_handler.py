@@ -198,7 +198,7 @@ class WorkerHandler:
 
     def run(self, context: ExecutionContext) -> ExecutionOutcome:
         self.ports.state.check_context(context)
-        if self.ports.checkpoint is not None:
+        if self.ports.checkpoint is not None and not context.resolving_rebase:
             from loop_manager_internal.execution import worker_checkpoint
             try:
                 resumed = worker_checkpoint.resume_request(self.ports, context)
