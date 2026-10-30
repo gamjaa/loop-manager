@@ -809,7 +809,7 @@ catalog와 snapshot은 탐색·검증 입력이며 그 자체로 쓰기 권한�
 
   scope의 경로 허용은 목표 관련성이나 사용자 판단을 승인하지 않는다. 후보 전체의 변경 범위는 관측한 등록 원본 브랜치 OID와 후보 HEAD의 공통 조상부터 비교해 rebase로 유입된 변경을 Worker 수정으로 오인하지 않는다. 이 원본 증거가 없으면 기존 catalog 기준을 유지하며, 공통 조상 조회 실패는 변경 없음으로 처리하지 않는다. 범위 오류에는 비교 원본·후보 revision과 경로·변경 종류를 남긴다.
 
-  기존 ExecPlan은 파일이 삭제돼도 시작 index와 Git 원본으로 확인하며 결정·실행 기록을 파일째 제거하는 변경을 거부한다. 원본과 수정본을 대조해 draft 해제와 User Decision 변경·삭제를 거부한다. Worker 종료 후의 정상 경계에서는 저장된 시작 ExecPlan과 고정 공식 revision의 frontmatter가 같은지 확인한 뒤 선택된 frontmatter만 원자 교체한다. 본문 bytes·mode를 유지하고 파일이 다시 바뀌면 교체하지 않는다.
+  기존 ExecPlan은 파일이 삭제돼도 시작 index와 Git 원본으로 확인하며 결정·실행 기록을 파일째 제거하는 변경을 거부한다. 원본과 수정본을 대조해 draft 해제와 User Decision 변경·삭제를 거부한다. Worker 종료 후의 정상 경계에서는 저장된 시작 ExecPlan과 고정 공식 revision의 frontmatter가 같은지 확인한 뒤 선택된 frontmatter만 원자 교체한다. 현재 frontmatter가 catalog identity를 검증한 공식 선언과 이미 같으면 복원 쓰기 없이 후속 검증을 이어간다. 시작 전 차이가 있더라도 Worker가 공식 선언으로 바로잡은 결과를 복원 실패로 재시도하지 않는다. 본문 bytes·mode를 유지하고 파일이 다시 바뀌면 교체하지 않는다.
 
   변경 전후 선언·본문 hash는 기존 execution checkpoint에 보존하며 후속 checkpoint에서도 유지한다. index·HEAD·branch와 다른 문서는 복원하지 않고 Worker에 현재 diff·문서 보고 갱신을 전달한다. 진행 중 rebase나 경계·원본이 불명확하면 복원하지 않는다.
 
@@ -1136,6 +1136,8 @@ rebase 채택의 한 검사 구간에서는 `ManagedRebaseService.adopt`가 안�
 
 #### 중간 checkpoint 게시와 원격 입력
 
+현재 rebase 소유권 관측은 대상 worktree의 HEAD·index·파일·Git operation과 전체 ref·worktree 등록 관계·필요 config를 새로 읽는다. 다른 worktree의 파일·index 상세 상태는 이 판정에 사용하지 않으므로 관측하지 않는다. 같은 branch의 중복 등록과 실제 대상 소유권 검사는 유지하며, Agent 실행 전후 격리 snapshot은 기본 전체 관측을 계속 사용해 다른 worktree의 변경을 검사한다.
+
 진행 중 rebase에서는 저장된 일반 Worker checkpoint 요청을 소비하지 않고 rebase 충돌 처리·완료를 먼저 수행한다. 완료된 중간 게시의 intent·결과 identity와 현재 수용 기록은 과거 차단 checkpoint가 unpublished로 바뀌거나 다음 rebase가 intent를 `retired_rebase_publications`로 옮겨도 원격 소유권 근거로 유지한다. 현재 결과와 같은 ID의 활성 또는 보존 intent를 찾아 같은 계획·branch·worktree·게시 HEAD와 현재 원격 OID를 대조하고 현재 rebase 소유권·범위도 다시 검사한다. 보존 intent 자체의 `confirmed: false`는 해당 폐기 동작이 게시 성공을 새로 확인하지 않았다는 뜻이며, 별도로 확정된 같은 intent의 게시 결과를 취소하지 않는다. 과거 차단 기록의 상태나 활성 intent 포인터 교체만으로 확인된 게시 증거를 거부하지 않는다.
 
 동일 계획의 기존 원격 작업 branch를 관리 rebase한 경우, 현재 repository·계획·worktree·branch·HEAD·등록·target base·index·operation·입력과 연결 PR을 확인한 뒤 완료 HEAD의 중간 checkpoint 게시 또는 현재 lease에 따른 보류를 확정한다. 기존 PR도 같은 URL·head/base branch를 유지하며 이 경로를 사용할 수 있다. 원격 입력이 바뀌면 이전 intent를 성공 없이 감사로 보존하고 통합·재검증으로 돌아간다.
@@ -1144,7 +1146,7 @@ rebase 채택의 한 검사 구간에서는 `ManagedRebaseService.adopt`가 안�
 
 중간 게시 intent를 만들 때 기대 원격 OID는 현재 검증된 rebase 수용 기록의 원격 OID를 사용하되, 저장된 수용 입력·마지막 게시·연결 PR head·게시된 차단 checkpoint 중 적어도 하나의 소유 근거와 일치해야 한다. 마지막 수용 입력과 마지막 게시 OID는 서로 다른 시점의 근거이므로 고정 우선순위로 하나를 선택하거나 둘의 일치를 요구하지 않는다. 현재 관측만으로 알려지지 않은 원격을 새 lease로 승인하지 않는다. 이 동일한 소유 근거 기준을 lease 선택·push 직후 소유권 검사·DB 확정에 적용한다. 중간 게시 intent는 선택된 정확한 기대 원격 OID와 후보 HEAD, 현재 상태 수용 identity·지문을 SQLite에 보존한다. 게시 직전 실제 ref와 연결 PR의 identity·head를 다시 확인하고 정확한 OID를 명시한 `--force-with-lease`로 같은 ref만 갱신한다. 새로운 원격 입력은 재관측·통합·재검증 대상으로 처리하고, 삭제·다른 대상·실제 권한 또는 보호 정책 거부는 해당 작업이나 쓰기를 보류한다. 원격 변화를 이전 intent의 새 lease로 끼워 넣지 않는다.
 
-Worker checkpoint 요청·workspace 준비·최종 PR 게시가 호출하는 `publish_worker_checkpoints`는 현재 후보에 맞는 게시 경로를 공통으로 선택한다. 수용된 rebase 후보와 미완료 rebase 게시 intent는 원래 Worker 시작 HEAD의 선형 ancestry 검사보다 먼저 현재 소유권·범위를 재검증하고 정확한 lease로 게시한다. 이전 선형 push intent나 원격 통합이 남으면 그것을 먼저 확정·폐기한 뒤 현재 후보로 경로를 다시 선택한다. 이 판단은 호출자가 별도 fallback을 수행하는 데 의존하지 않는다. 현재 HEAD의 원격 반영과 DB lease·checkpoint 확정이 함께 확인돼야 반환을 완료로 소비하며, 게시가 보류됐으면 명시적인 일시 대기로 반환해 요청·단계·이력을 유지한다.
+Worker checkpoint 요청·workspace 준비·최종 PR 게시가 호출하는 `publish_worker_checkpoints`는 현재 후보에 맞는 게시 경로를 공통으로 선택한다. 원격 작업 branch가 없는 후보는 부재 lease를 사용하는 최초 게시 경로로 보낸다. 기존 원격 OID를 필요로 하는 중간 rebase 게시의 무효과 반환을 미완료 게시로 반복 소비하지 않는다. 최초 게시 직전 원격이 생기거나 소유 근거와 달라지면 기존 재관측·소유권 경계로 처리한다. 수용된 rebase 후보와 미완료 rebase 게시 intent는 원래 Worker 시작 HEAD의 선형 ancestry 검사보다 먼저 현재 소유권·범위를 재검증하고 정확한 lease로 게시한다. 이전 선형 push intent나 원격 통합이 남으면 그것을 먼저 확정·폐기한 뒤 현재 후보로 경로를 다시 선택한다. 이 판단은 호출자가 별도 fallback을 수행하는 데 의존하지 않는다. 현재 HEAD의 원격 반영과 DB lease·checkpoint 확정이 함께 확인돼야 반환을 완료로 소비하며, 게시가 보류됐으면 명시적인 일시 대기로 반환해 요청·단계·이력을 유지한다.
 
 Worker의 저장된 checkpoint 요청이 수용된 rebase의 후속 commit이면 현재 후보의 소유권·최종 범위를 새로 확인해 같은 중간 게시 경계로 연결한다. 요청 commit 자체가 이후 Manager rebase로 재작성됐으면 `rebase_operation_history`의 동일 요청·원래 commit intent와 실제 원래 parent/tree/message를 대조하고 현재 HEAD의 rebase 수용·소유권·최종 범위를 다시 확인한다. 현재 tree를 과거 tree와 같다고 가정하지 않으며 원래 commit 증거나 현재 수용 근거가 없으면 요청을 보존한다. 과거 rebase 게시 보류나 최종 PR 게시 예정만으로 요청 완료를 기다리게 하지 않는다. 현재 후보와 정확한 lease를 게시 intent에 고정하고 중단 뒤 같은 게시를 재개하며, 원격 확인과 DB 확정 전에는 요청을 소비하지 않는다. 완료 감사의 `worker_checkpoint_requests`에는 현재 `head`와 재작성 전 `original_head`를 함께 남기고 요청 원문·session·전달 identity를 유지한다. 게시만으로 Worker 완료·verify·Review 성공을 만들지 않는다. 게시 확정 transaction은 실행 행의 게시 OID와 checkpoint의 관측 OID·게시 영수증·`accepted_work_branch`를 같은 intent HEAD로 갱신한다. 원래 게시 lease와 수용 근거는 intent와 게시 감사에 보존하며, 과거 DB의 낡은 수용 포인터는 현재 검증된 다른 소유 근거를 무효화하지 않는다.
 
@@ -1185,6 +1187,8 @@ rebase나 사용자 입력으로 후보 HEAD가 바뀌면 후보에 결합된 ve
 5. `planning_error`, 등록·branch 생성 전 실패, 기존 PR 또는 현재 대상 작업의 소유권·범위를 증명할 수 없는 차단에는 원격 쓰기를 수행하지 않고 미게시 이유를 저장한다. `PROJECT_BLOCKED`에서는 검증 가능한 대상 계획의 복구·보존만 [프로젝트 차단과 진단 게시](#프로젝트-차단과-진단-게시)의 경계에서 허용한다. 차단 알림은 checkpoint 결과 확정 뒤 성공 시 commit OID와 immutable branch link를, 미게시 시 local-only 이유를 포함한다
 
 #### 계획별 해제와 원격 입력 수용
+
+유지보수 cycle의 차단 복구와 명시적 로컬 재검사 요청은 READY 선택과 같은 확정 대상·필수 dependency 범위를 사용한다. `prerequisite_wait`·`refactoring`·호환 `post_revalidation`에서 이번 범위의 작업은 cycle 종료를 기다리지 않고 기존 대상 lease·writer 종료·관리 배정 한도·planning 및 원인별 재검사 조건을 거쳐 복구한다. cycle이 차단 작업의 완료를 기다리는 동안 해당 작업의 복구를 `idle`로 제한하지 않는다. 확정 게시 영수증인 `remote_confirmed`는 복구를 막지 않으며, 미확정 게시·평가 중 상태·범위 밖 계획·불명확하거나 순환한 dependency는 기존 대기로 유지한다. archive된 dependency는 검증된 Merge 이력만 사용한다. 이 gate는 사용자 질문·공통 원인의 Agent 평가를 시작하기 전에도 적용해, 범위 밖 또는 자리 없는 작업의 Agent 검사가 허용된 작업보다 먼저 실행되지 않게 한다. 이 배정 허용은 공통 교정 Merge·사용자 판단·실패 원인의 해소나 검증 성공을 대신하지 않는다.
 
 계획별 입력 변경, 사용자 결정 또는 닫힌 PR reopen 조건은 해당 `PLAN_BLOCKED`만 재평가한다. 작업 branch의 저장 OID나 receipt가 현재 원격과 달라도 현재 계획·branch·worktree·등록 origin·PR과 Git operation, 작업물·ignored 경로의 보존 조건을 확인해 새 입력을 수용한다. 로컬·원격의 추가 작업과 확인 가능한 관련 재작성은 양쪽 작업을 보존·통합하고 최신 base를 반영한다.
 
@@ -1421,7 +1425,11 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 
 `common_defect_merges`는 실제 PR Merge를 관측한 Manager의 완료 transaction에서 PR URL·후보 HEAD·`mergeCommit` OID와 검증 근거를 불변으로 기록한다. 일반 PR 조회도 mergeCommit을 요청하며 squash Merge의 원래 PR HEAD와 실제 Merge OID를 구분한다. 검증 근거는 같은 프로젝트·계획·실행 주기의 전체 run receipt 또는 확인된 재사용과 원래 실제 run, 후보/출력 verify token·PASS review token·정의 digest를 대조한다. `verification`은 이 receipt/origin ID·run/reuse 구분·token·정의 SHA-256·검증 base를 담은 JSON이며 불명이면 JSON null이다. manual 묶음은 `manual_work_publications`의 같은 request·PR·HEAD·base와 전체 구성원별 PASS를 원래 `manual_work_results`에 대조한다. 각 G의 명시적인 개별 Review PASS와 공유 후보를 실제로 실행한 구성원의 native 전체 run/reuse·Review token을 함께 확인하며, 구성원별 자동 token의 부재를 실패로 간주하지 않는다. 묶음 proof는 group/member/execution-plan ID와 게시 영수증 digest를 추가로 보존한다. 사용자 생략이나 구성원 누락·영수증 불일치는 근거로 인정하지 않는다. archive 문서에 근거한 MERGED 상태·면제·부분/미완료/실패·다른 작업의 receipt·후보 불일치·Merge OID 불명은 검증된 교정 반영을 만들지 않는다. 외부 Git·파일·모델 관측을 DB 쓰기 잠금 안에서 하지 않으며 근거 수집이 새 전체 verify 실행을 만들지 않는다.
 
-재평가 입력은 해당 작업의 현재 Worker 원문에 일치하는 최신 보고와 활성 validation feedback의 원본 result에 연결된 목표만 선택한다. 피드백 event가 없는 verify/Review 거부도 해당 차단 단계의 최신 원본 결과에 보고가 있을 때만 연결하며, 뒤의 다른 실패에 과거 보고를 붙이지 않는다. 보고·목표별 최신 채택 연결과 실제 Merge/검증 근거를 기존 차단 reconciliation의 input identity에 포함해 반영 뒤 영향 작업만 다시 검사한다. 같은 근거의 무진전 재호출은 기존 완료 관측과 assessment cache로 억제한다. 연결·Merge·검증이 미충족이면 보류하며 평가/적용 직전 같은 원인·후보·checkpoint generation·소유권·공통 교정 입력을 다시 확인한다. 다른 프로젝트·계획은 기존 lease·배정 경계를 유지한다.
+재평가 입력은 해당 작업의 현재 Worker 원문에 일치하는 최신 보고와 활성 validation feedback의 원본 result에 연결된 목표만 선택한다. 차단 복구의 rebase가 후보 결과를 초기화한 경우에는 현재 `common_defect_pending` 차단 행 전체와 계획 경로가 일치하는 저장된 reconciliation의 원래 Worker 원문을 사용해 같은 불변 result를 조회한다. 후보의 verify·Review 무효화와 원래 실패의 교정 연결을 구분한다. 이후 원격·planning 입력으로 같은 차단의 reconciliation을 다시 만들 때에도, 현재 비어 있는 결과는 동일 차단 행·계획 경로에 고정된 원래 결과로 보존한다. 현재의 새 결과를 과거 결과로 덮지 않으며 다른 차단 원인·계획이나 불명확한 저장 문맥에는 과거 보고를 붙이지 않는다. 피드백 event가 없는 verify/Review 거부도 해당 차단 단계의 최신 원본 결과에 보고가 있을 때만 연결하며, 뒤의 다른 실패에 과거 보고를 붙이지 않는다. 보고·목표별 최신 채택 연결과 실제 Merge/검증 근거를 기존 차단 reconciliation의 input identity에 포함해 반영 뒤 영향 작업만 다시 검사한다. 같은 근거의 무진전 재호출은 기존 완료 관측과 assessment cache로 억제한다.
+
+Scheduler 실행의 프로젝트 준비 단계는 workspace 소유권 hold 복구를 유지하고, 일반 차단의 원인 평가·입력 통합·재개는 대상별 작업 coordinator에 맡긴다. 준비 단계의 직렬 재평가가 기존 활성 작업을 다시 가로막거나 같은 복구를 중복 실행하지 않는다. Scheduler 없는 기존 실행과 명시적 로컬 복구는 해당 경로를 유지한다. 작업 coordinator는 같은 원인·개정·확정 planning 입력의 차단 재검사를 실행당 한 번으로 유지한다. 다른 작업이 관리 한도를 채웠다는 이유로 완료한 재검사 표시를 지우지 않으며, 원인이 남으면 입력 변경이나 다음 정상 실행에서 다시 확인한다.
+
+연결·Merge·검증이 미충족이면 보류하며 평가/적용 직전 같은 원인·후보·checkpoint generation·소유권·공통 교정 입력을 다시 확인한다. 다른 프로젝트·계획은 기존 lease·배정 경계를 유지한다.
 
 확정 연결이 차단 작업 자신을 교정 소유자로 지정하면, 현재 경로·source·개정이 채택된 대상과 일치하고 보고 당시 정의에서 전진했는지 확인한다. 모든 현재 보고가 연결되고 다른 미반영 교정이 없을 때만 `owner_execution`으로 기존 reconciliation의 원격·소유권·후보·generation/CAS와 Worker 재검증 전환을 사용한다. 이 경로는 구현/verify/Review 교정 차단만 실행으로 전환하며 사용자 질문·독립 차단과 완료 판정을 유지한다. `ready`와 Merge 근거는 생성하지 않는다.
 
