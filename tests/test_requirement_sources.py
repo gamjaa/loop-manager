@@ -397,6 +397,15 @@ class WorkerFrontmatterRestoreTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), self.candidate)
         self.assertEqual(checkpoints.get('repo', 'G-236').snapshot, {'existing': 'keep'})
 
+    def test_worker_correction_to_official_header_needs_no_restore(self):
+        self.connection.execute('UPDATE exec_plans SET agent_input_plan = ?', (self.candidate.decode(),))
+        corrected = self.original.split(b'## Progress', 1)[0] + self.body
+        self.target.write_bytes(corrected)
+        with unittest.mock.patch.object(self.validation.os, 'replace') as replace:
+            self.assertFalse(self.restore())
+        replace.assert_not_called()
+        self.assertEqual(self.target.read_bytes(), corrected)
+
     def test_edit_during_atomic_write_is_preserved_and_temporary_is_removed(self):
         from unittest import mock
         original_chmod = self.validation.os.chmod

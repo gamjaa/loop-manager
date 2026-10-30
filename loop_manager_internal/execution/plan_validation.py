@@ -365,6 +365,8 @@ def restore_worker_frontmatter(worktree, relative_path, plan, *, repo, revision,
     if error is not None or official.get('draft'):
         raise ExecPlanMetadataError(error or 'draft 선언은 자동 복원하지 않습니다.')
     desired, _ = split(original)
+    if current.replace(b'\r\n', b'\n') == desired.replace(b'\r\n', b'\n'):
+        return False
     if started.replace(b'\r\n', b'\n') != desired.replace(b'\r\n', b'\n'):
         raise RuntimeError('Worker 시작 이전의 frontmatter 변경은 자동 복원하지 않습니다.')
     from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
