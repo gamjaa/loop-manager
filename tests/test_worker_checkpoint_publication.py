@@ -915,8 +915,9 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
         from tests.support.rebase_observations import decision_for, expectation, observation
         from loop_manager_internal.git.managed_rebase_validation import Remote
 
-        for operation in (None, 'rebase_publish'):
-            with self.subTest(operation=operation):
+        for operation, rebased in ((None, False), ('rebase_publish', False),
+                                   (None, True), ('rebase_publish', True)):
+            with self.subTest(operation=operation, rebased=rebased):
                 connection = runtime_connection()
                 self.addCleanup(connection.close)
                 start, head, tree, remote = 'a' * 40, 'b' * 40, 'c' * 40, 'd' * 40
@@ -935,10 +936,17 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                 request = dict(repo='repo', plan_id='G-047', branch=branch, worktree=str(worktree),
                     start_head=start, message='checkpoint', title='Checkpoint', files={'app.py': [420, 'digest']},
                     session='same-session', delivery=None, invocation_id=None, code=0, tree=tree)
+                original = 'e' * 40
+                if rebased:
+                    acceptance = decision_for(accepted, observation(accepted, head=head,
+                        branch_ref=(head, ''), registration=(f'HEAD={head}', f'branch=refs/heads/{branch}'))).acceptance
+                history = [{'worker_checkpoint_request': request, 'after_head': original,
+                            'before_head': start, 'commit_tree_oid': tree, 'commit_message': 'Checkpoint'}]
                 current = store.record('repo', 'G-047', expected_generation=0, operation=None,
                     expected_head=head, target_base_oid=start, observed_remote_oid=remote,
                     snapshot={'worker_checkpoint_request': request, 'current_rebase_acceptance': acceptance,
-                              'commit_tree_oid': tree, 'commit_message': 'Checkpoint'})
+                              'commit_tree_oid': tree, 'commit_message': 'Checkpoint',
+                              **({'rebase_operation_history': history} if rebased else {})})
                 if operation:
                     candidate = decision_for(accepted, observation(accepted, head=head,
                         branch_ref=(head, ''), registration=(f'HEAD={head}', f'branch=refs/heads/{branch}'))).acceptance
@@ -971,13 +979,28 @@ class WorkerCheckpointPolicyTests(unittest.TestCase):
                     publish_worker_checkpoints=mock.Mock(return_value={'pushed': 0, 'candidate_changed': False}),
                     _publish_rebased_checkpoint=mock.Mock(side_effect=publish_rebase), feedback=None,
                     _retry=lambda detail: detail)
-                with mock.patch.object(worker_checkpoint, 'committed_tree_matches_intent', return_value=True):
+                from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+                ports._current_rebase_service = mock.Mock(return_value=SimpleNamespace(
+                    require_owned=mock.Mock(return_value=(None, SimpleNamespace(
+                        status=RebaseStatus.COMPLETE, acceptance=acceptance)))))
+                with mock.patch.object(worker_checkpoint, 'committed_tree_matches_intent',
+                                       side_effect=lambda _w, _s, h, *_: not rebased or h == original):
+                    if rebased:
+                        service = ports._current_rebase_service.return_value
+                        service.require_owned.side_effect = RuntimeError('current ownership changed')
+                        with self.assertRaisesRegex(RuntimeError, 'current ownership changed'):
+                            worker_checkpoint.resume_request(ports, context)
+                        self.assertEqual(store.get('repo', 'G-047').snapshot['worker_checkpoint_request'], request)
+                        ports.publish_worker_checkpoints.assert_not_called()
+                        ports._publish_rebased_checkpoint.assert_not_called()
+                        service.require_owned.side_effect = None
                     worker_checkpoint.resume_request(ports, context)
                 ports._publish_rebased_checkpoint.assert_called_once_with(context, candidate_head=head)
                 ports._commit_owned.assert_not_called()
                 saved = store.get('repo', 'G-047')
                 self.assertNotIn('worker_checkpoint_request', saved.snapshot)
-                self.assertEqual(saved.snapshot['worker_checkpoint_requests'], [{**request, 'head': head}])
+                self.assertEqual(saved.snapshot['worker_checkpoint_requests'], [{**request, 'head': head,
+                    **({'original_head': original} if rebased else {})}])
                 self.assertEqual(saved.snapshot['worker_checkpoint_result']['head'], head)
                 self.assertEqual(state.row()['publication_remote_oid'], head)
                 self.assertIsNone(state.row()['worker_result'])

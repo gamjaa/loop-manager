@@ -107,6 +107,30 @@ def save_request(ports, context, outcome, message, before, *, delivery=None, ses
     return resume_request(ports, context)
 
 
+def _rebased_request_commit(ports, context, current, request, head):
+    from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
+    saved = current.snapshot or {}
+    acceptance = saved.get('current_rebase_acceptance')
+    if (current.operation not in {None, 'rebase_publish'} or not valid_acceptance(acceptance)
+            or acceptance['head'] != head or current.expected_head != head):
+        return None
+    for prior in reversed(saved.get('rebase_operation_history', ())):
+        original = prior.get('after_head')
+        if (prior.get('worker_checkpoint_request') == request and original
+                and prior.get('commit_tree_oid') == request['tree']
+                and prior.get('commit_message') == request['title']
+                and committed_tree_matches_intent(context.worktree, request['start_head'],
+                                                  original, prior, ports.git)):
+            # The original commit is immutable evidence; the current rebase owns
+            # the rewritten candidate, including Manager-validated resolutions.
+            _, decision = ports._current_rebase_service(context).require_owned(checkpoint=current)
+            if (decision.status is RebaseStatus.COMPLETE and valid_acceptance(decision.acceptance)
+                    and all(decision.acceptance[key] == acceptance[key] for key in
+                            ('repo', 'plan_id', 'branch', 'worktree', 'head', 'target_base_oid'))):
+                return original
+    return None
+
+
 def resume_request(ports, context):
     """Finish exactly this request before another model call, including restart."""
     repo, plan_id = ports.identity.repo, context.plan.plan_id
@@ -173,12 +197,14 @@ def resume_request(ports, context):
         ports._commit_owned(context, request['title'], expected_tree=request['tree'])
         current = ports.checkpoint.get(repo, plan_id)
         head = ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+    original_head = head
     if (request['tree'] != (current.snapshot or {}).get('commit_tree_oid')
-            or request['title'] != (current.snapshot or {}).get('commit_message')):
-        raise PublicationSafetyError('checkpoint 요청과 Manager commit 후보가 다릅니다.')
-    if not committed_tree_matches_intent(context.worktree, request['start_head'], head,
-                                          current.snapshot or {}, ports.git):
-        raise PublicationSafetyError('checkpoint 실제 parent/tree/message가 Manager intent와 다릅니다.')
+            or request['title'] != (current.snapshot or {}).get('commit_message')
+            or not committed_tree_matches_intent(context.worktree, request['start_head'], head,
+                                                 current.snapshot or {}, ports.git)):
+        original_head = _rebased_request_commit(ports, context, current, request, head)
+        if original_head is None:
+            raise PublicationSafetyError('checkpoint 실제 parent/tree/message가 Manager intent와 다릅니다.')
     # _commit_owned's durable intent is also sufficient when commit succeeded but
     # its completion write was interrupted. It never creates a second commit.
     if current.operation == 'commit':
@@ -217,7 +243,8 @@ def resume_request(ports, context):
         saved.pop('worker_checkpoint_request', None)
         saved['worker_checkpoint_result'] = {'head': head, 'title': request['title']}
         saved['worker_checkpoint_requests'] = [*saved.get('worker_checkpoint_requests', []),
-                                               {**request, 'head': head}]
+                                               {**request, 'head': head,
+                                                **({'original_head': original_head} if original_head != head else {})}]
         ports.checkpoint.record(repo, plan_id, expected_generation=current.generation,
             operation=current.operation, expected_head=current.expected_head,
             target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,

@@ -78,6 +78,27 @@ class ImmediateRebasePublicationTests(TestCase):
         self.remote = 'foreign'
         self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), recorded, current))
 
+    def test_retired_intent_keeps_confirmed_remote_owned_during_the_next_rebase(self):
+        self.complete()
+        current = self.checkpoints.get('repo', 'G-047')
+        intent = current.snapshot['rebase_publication_intent']
+        self.fixture.connection.execute("UPDATE blocked_checkpoints SET phase='unpublished', "
+                                        "accepted_remote_oid=NULL,published_oid=NULL,remote_observed=1")
+        current = self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head=self.remote, target_base_oid=current.target_base_oid,
+            observed_remote_oid=self.remote,
+            snapshot={**current.snapshot, 'rebase_publication_intent': None,
+                      'current_rebase_acceptance': None,
+                      'retired_rebase_publications': [{'intent': intent, 'confirmed': False,
+                                                       'observed_remote': self.remote}]})
+        self.fixture.connection.commit()
+        context = self.handler._context()
+        self.assertTrue(self.handler._owned_checkpoint_remote(context, self.state.row(), self.remote, current))
+        unrelated = replace(current, snapshot={**current.snapshot, 'retired_rebase_publications': []})
+        self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), self.remote, unrelated))
+        self.remote = 'foreign'
+        self.assertFalse(self.handler._owned_checkpoint_remote(context, self.state.row(), intent['head'], current))
+
     def test_worker_checkpoint_publishes_a_successor_of_a_deferred_rebase(self):
         from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
         with mock.patch.object(self.handler, '_publish_rebased_checkpoint'):

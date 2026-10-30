@@ -1134,7 +1134,7 @@ rebase 채택의 한 검사 구간에서는 `ManagedRebaseService.adopt`가 안�
 
 #### 중간 checkpoint 게시와 원격 입력
 
-진행 중 rebase에서는 저장된 일반 Worker checkpoint 요청을 소비하지 않고 rebase 충돌 처리·완료를 먼저 수행한다. 완료된 중간 게시의 intent·결과 identity와 현재 수용 기록은 과거 차단 checkpoint가 unpublished로 바뀌어도 원격 소유권 근거로 유지한다. 같은 계획·branch·worktree·게시 HEAD와 현재 원격 OID를 대조하고 현재 rebase 소유권·범위도 다시 검사하며, 과거 차단 기록의 상태만으로 새 게시 증거를 거부하지 않는다.
+진행 중 rebase에서는 저장된 일반 Worker checkpoint 요청을 소비하지 않고 rebase 충돌 처리·완료를 먼저 수행한다. 완료된 중간 게시의 intent·결과 identity와 현재 수용 기록은 과거 차단 checkpoint가 unpublished로 바뀌거나 다음 rebase가 intent를 `retired_rebase_publications`로 옮겨도 원격 소유권 근거로 유지한다. 현재 결과와 같은 ID의 활성 또는 보존 intent를 찾아 같은 계획·branch·worktree·게시 HEAD와 현재 원격 OID를 대조하고 현재 rebase 소유권·범위도 다시 검사한다. 보존 intent 자체의 `confirmed: false`는 해당 폐기 동작이 게시 성공을 새로 확인하지 않았다는 뜻이며, 별도로 확정된 같은 intent의 게시 결과를 취소하지 않는다. 과거 차단 기록의 상태나 활성 intent 포인터 교체만으로 확인된 게시 증거를 거부하지 않는다.
 
 동일 계획의 기존 원격 작업 branch를 관리 rebase한 경우, 현재 repository·계획·worktree·branch·HEAD·등록·target base·index·operation·입력과 연결 PR을 확인한 뒤 완료 HEAD의 중간 checkpoint 게시 또는 현재 lease에 따른 보류를 확정한다. 기존 PR도 같은 URL·head/base branch를 유지하며 이 경로를 사용할 수 있다. 원격 입력이 바뀌면 이전 intent를 성공 없이 감사로 보존하고 통합·재검증으로 돌아간다.
 
@@ -1142,7 +1142,7 @@ rebase 채택의 한 검사 구간에서는 `ManagedRebaseService.adopt`가 안�
 
 중간 게시 intent는 정확한 기대 원격 OID와 후보 HEAD, 현재 상태 수용 identity·지문을 SQLite에 보존한다. 게시 직전 실제 ref와 연결 PR의 identity·head를 다시 확인하고 정확한 OID를 명시한 `--force-with-lease`로 같은 ref만 갱신한다. 새로운 원격 입력은 재관측·통합·재검증 대상으로 처리하고, 삭제·다른 대상·실제 권한 또는 보호 정책 거부는 해당 작업이나 쓰기를 보류한다. 원격 변화를 이전 intent의 새 lease로 끼워 넣지 않는다.
 
-Worker의 저장된 checkpoint 요청이 수용된 rebase의 후속 commit이면 현재 후보의 소유권·최종 범위를 새로 확인해 같은 중간 게시 경계로 연결한다. 과거 rebase 게시 보류나 최종 PR 게시 예정만으로 요청 완료를 기다리게 하지 않는다. 요청 commit과 정확한 lease를 intent에 고정하고 중단 뒤 같은 게시를 재개하며, 원격 확인과 DB 확정 전에는 요청을 소비하지 않는다. 게시만으로 Worker 완료·verify·Review 성공을 만들지 않는다.
+Worker의 저장된 checkpoint 요청이 수용된 rebase의 후속 commit이면 현재 후보의 소유권·최종 범위를 새로 확인해 같은 중간 게시 경계로 연결한다. 요청 commit 자체가 이후 Manager rebase로 재작성됐으면 `rebase_operation_history`의 동일 요청·원래 commit intent와 실제 원래 parent/tree/message를 대조하고 현재 HEAD의 rebase 수용·소유권·최종 범위를 다시 확인한다. 현재 tree를 과거 tree와 같다고 가정하지 않으며 원래 commit 증거나 현재 수용 근거가 없으면 요청을 보존한다. 과거 rebase 게시 보류나 최종 PR 게시 예정만으로 요청 완료를 기다리게 하지 않는다. 현재 후보와 정확한 lease를 게시 intent에 고정하고 중단 뒤 같은 게시를 재개하며, 원격 확인과 DB 확정 전에는 요청을 소비하지 않는다. 완료 감사의 `worker_checkpoint_requests`에는 현재 `head`와 재작성 전 `original_head`를 함께 남기고 요청 원문·session·전달 identity를 유지한다. 게시만으로 Worker 완료·verify·Review 성공을 만들지 않는다.
 
 Worker checkpoint의 미완료 push도 새 원격 입력을 먼저 통합한다. 완료된 같은 branch·worktree 통합의 원래 HEAD에 게시 대상 commit이 포함된 경우만 낡은 intent를 `retired_worker_checkpoints` 감사 배열의 `intent`·`observed_remote`·`confirmed: false`로 보존하고 폐기한다. 이는 push 성공이나 최종 검증 근거가 아니다.
 
