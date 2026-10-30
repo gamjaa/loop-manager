@@ -363,14 +363,18 @@ class DirectRebasePublicationStatePort(ExecutionStatePort):
         self.plan_id = plan_id
         self.expected = repository.get(repo, plan_id)
         projection = repository.projected(repo)
+        self.project_recovery = projection is None and self.expected.status != 'PLAN_BLOCKED'
+        from loop_manager_internal.recovery.project_blocked_recovery import project_slot_available
         if (projection is not None and projection != self.expected
-                or projection is None and self.expected.status != 'PLAN_BLOCKED'):
+                or self.project_recovery and not project_slot_available(connection, repo, plan_id)):
             raise runtime_state.RuntimeStateError('direct publication execution is not selected')
         self.projected = projection is not None
 
     def check(self):
+        from loop_manager_internal.recovery.project_blocked_recovery import project_slot_available
         if (self.repository.get(self.repo, self.plan_id) != self.expected
-                or self.repository.projected(self.repo) != (self.expected if self.projected else None)):
+                or self.repository.projected(self.repo) != (self.expected if self.projected else None)
+                or self.project_recovery and not project_slot_available(self.connection, self.repo, self.plan_id)):
             raise runtime_state.RuntimeStateError('direct publication execution changed')
         return self.expected
 

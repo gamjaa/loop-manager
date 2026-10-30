@@ -207,11 +207,12 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
         connection.execute("INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence) "
                            "VALUES ('repo', 'project', 'publication_ownership_uncertain', 'G-107', 'cause')")
         connection.commit()
-        with (mock.patch('loop_manager_internal.execution.execution_state.DirectRebasePublicationStatePort'),
-              mock.patch.object(loop_manager.managed_rebase_publication, 'publish_checkpoint') as publish,
+        with (mock.patch.object(loop_manager.managed_rebase_publication, 'publish_checkpoint') as publish,
               mock.patch.object(loop_manager, 'git') as git):
             loop_manager._publish_direct_rebase_checkpoint(connection, Path('/repo'), Path('/state'),
                                                           'repo', 'G-107', Path('/state/G-107'), 'loop-manager/G-107')
+            state = publish.call_args.kwargs['state']
+            state.check()
             publish.call_args.kwargs['git'](Path('/state/G-107'), 'push', 'origin', 'head:ref', check=False)
             self.assertEqual(git.call_args.args[1:3], ('-c', f'core.hooksPath={os.devnull}'))
             publish.reset_mock()
@@ -219,3 +220,7 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
                 loop_manager._publish_direct_rebase_checkpoint(connection, Path('/repo'), Path('/state'),
                                                               'repo', 'G-108', Path('/state/G-108'), 'loop-manager/G-108')
             publish.assert_not_called()
+            connection.execute('DELETE FROM project_blocks')
+            from loop_manager_internal.storage.runtime_state import RuntimeStateError
+            with self.assertRaises(RuntimeStateError):
+                state.check()
