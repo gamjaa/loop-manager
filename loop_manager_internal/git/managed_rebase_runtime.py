@@ -421,7 +421,8 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                    or path in approved for path in paths) and checked_contracts(observed)
 
     service = ManagedRebaseService(expected, ObservationAdapters(
-        git=ports.git, capture_snapshot=ports.capture_git_snapshot,
+        git=ports.git, capture_snapshot=lambda path, **kwargs: ports.capture_git_snapshot(
+            path, include_other_worktree_state=False, **kwargs),
         validate_identity=validate_identity, read_rebase_metadata=ports._owned_rebase_metadata,
         read_remote=read_remote, read_inputs=lambda _: current_contract()[-2:],
         read_file=read_file,

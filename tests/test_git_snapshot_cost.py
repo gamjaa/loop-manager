@@ -23,6 +23,27 @@ from tests.support.rebase_observations import expectation
 
 @isolated_git_test
 class GitSnapshotCostTests(unittest.TestCase):
+    def test_rebase_snapshot_keeps_registrations_without_reading_other_worktree_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            other = Path(directory) / 'other'
+            git_command(repo, 'worktree', 'add', '--detach', str(other))
+            before = manager.capture_git_snapshot(repo)
+            (other / 'untracked.txt').write_text('Other Agent work', encoding='utf-8')
+            full = manager.capture_git_snapshot(repo)
+            self.assertNotEqual(before.worktrees, full.worktrees)
+            with mock.patch.object(scope_observation, '_worktree_state_signature',
+                    side_effect=AssertionError('Rebase must not inspect sibling files')):
+                selected = manager.capture_git_snapshot(repo, include_other_worktree_state=False)
+            self.assertEqual(selected.head, full.head)
+            self.assertEqual(selected.index, full.index)
+            self.assertEqual(selected.dirty, full.dirty)
+            self.assertEqual(selected.refs, full.refs)
+            self.assertEqual(selected.config, full.config)
+            self.assertEqual(selected.operations, full.operations)
+            self.assertEqual(selected.worktrees, {path: tuple(field for field in fields
+                if not field.startswith('state=')) for path, fields in full.worktrees.items()})
+
     def test_adoption_shares_owner_inspection_but_reobserves_confirmation(self):
         from loop_manager_internal.execution.execution_ownership_handler import OwnershipHandler
         from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService

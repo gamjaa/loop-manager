@@ -155,9 +155,11 @@ class CaptureGitSnapshotEffects:
 
 
 def capture_git_snapshot(effects: CaptureGitSnapshotEffects, worktree: Path,
-                         *, details: dict | None = None) -> GitSnapshot:
+                         *, details: dict | None = None,
+                         include_other_worktree_state: bool = True) -> GitSnapshot:
     return scope_observation.capture_git_snapshot(
-        worktree, effects=effects._scope_observation_effects(), details=details)
+        worktree, effects=effects._scope_observation_effects(), details=details,
+        include_other_worktree_state=include_other_worktree_state)
 
 
 @dataclass(frozen=True)

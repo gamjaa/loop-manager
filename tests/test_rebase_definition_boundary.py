@@ -131,6 +131,12 @@ class RebaseDefinitionBoundaryTests(TestCase):
         return lm._current_rebase_service(self.connection, self.repo, self.state_dir,
             self.repo_key, 'G-047', self.worktree, self.branch, **options)
 
+    def test_current_rebase_service_only_reads_target_worktree_contents(self):
+        from loop_manager_internal.agents import scope_observation
+        with mock.patch.object(scope_observation, '_worktree_state_signature',
+                side_effect=AssertionError('Current rebase must not inspect sibling files')):
+            self.service().require_owned(checkpoint=self.checkpoints.get(self.repo_key, 'G-047'))
+
     def test_missing_definition_starts_rebase_and_revalidates_completed_result(self):
         # Real Git must adopt the target header without losing committed Worker code.
         from loop_manager_internal.git.managed_rebase_validation import RebaseStatus

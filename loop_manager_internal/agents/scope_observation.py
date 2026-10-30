@@ -131,7 +131,8 @@ def _shared_ref_entries(worktree: Path, *, effects: ObservationEffects) -> dict[
     return refs
 
 
-def _registered_worktree_entries(worktree: Path, *, effects: ObservationEffects) -> dict[str, tuple[str, ...]]:
+def _registered_worktree_entries(worktree: Path, *, effects: ObservationEffects,
+                                include_other_worktree_state: bool = True) -> dict[str, tuple[str, ...]]:
     entries: dict[str, tuple[str, ...]] = {}
     active_path = _canonical_path(worktree)
     for record in effects._worktree_catalog(worktree):
@@ -146,7 +147,7 @@ def _registered_worktree_entries(worktree: Path, *, effects: ObservationEffects)
         state = [
             f"{key}={value}" for key, value in record.items() if key != "worktree"
         ]
-        if _canonical_path(Path(raw_path)) != active_path:
+        if include_other_worktree_state and _canonical_path(Path(raw_path)) != active_path:
             state.append(f"state={_worktree_state_signature(Path(raw_path), effects=effects)}")
         entries[path] = tuple(sorted(state))
     return entries
@@ -535,7 +536,8 @@ def _normalize_legacy_ignored_snapshot(
 
 
 def capture_git_snapshot(worktree: Path, *, effects: ObservationEffects,
-                         details: dict | None = None) -> GitSnapshot:
+                         details: dict | None = None,
+                         include_other_worktree_state: bool = True) -> GitSnapshot:
     """Capture local and repository-wide Git state without staging content."""
 
     with snapshot_timing(effects) as observed:
@@ -554,7 +556,8 @@ def capture_git_snapshot(worktree: Path, *, effects: ObservationEffects,
             index=index,
             dirty=dirty,
             refs=_shared_ref_entries(worktree, effects=observed),
-            worktrees=_registered_worktree_entries(worktree, effects=observed),
+            worktrees=_registered_worktree_entries(worktree, effects=observed,
+                include_other_worktree_state=include_other_worktree_state),
             config=_config_entries(worktree, effects=observed),
             operations=operations,
         )
