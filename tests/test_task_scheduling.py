@@ -1868,6 +1868,36 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
 
 
 
+    def test_completed_block_recheck_is_not_repeated_when_other_work_fills_capacity(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('A', 'G-001', reason_code='user_decision_required', evidence='Keep question',
+                           release_fingerprint='same-input', clear_projection=False)
+        calls, full_observations = [], []
+        def recheck(*_args, plan_id, **_kwargs):
+            calls.append(plan_id)
+            return False
+        def count(*_args, **_kwargs):
+            # Other work can fill the management slots after this check ends.
+            if calls and not full_observations:
+                full_observations.append(True)
+                return self.config.max_tasks_per_project
+            return 0
+        service = ProjectService(SimpleNamespace(activate_ready_execplan=mock.Mock(return_value=None),
+            resume_manual_work=None, resume_plan_blocks=recheck),
+            ProjectIdentity(self.connection, self.directory, 'A', self.config_path, None, False, None,
+                            True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base')
+        token = scheduling.current_scheduler.set(self.scheduler())
+        try:
+            with fast_mode_scope(self.config), mock.patch.object(scheduling, 'managed_count', side_effect=count):
+                self.assertEqual(scheduling.run_project_tasks(service, newly_activated=False), 0)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(calls, ['G-001'])
+        self.assertEqual(full_observations, [True])
+        self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+
     def test_independent_block_rechecks_use_target_ownership_and_one_recovery_lease(self):
         from loop_manager_internal.recovery.plan_recovery import recovering_plan
         from loop_manager_internal.storage import task_calls

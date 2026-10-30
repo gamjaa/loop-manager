@@ -679,10 +679,6 @@ def run_project_tasks(service, *, newly_activated):
                     key = recovery_keys.pop(plan_id, None)
                     if key is not None:
                         visited.discard(plan_id)
-                        _, limit, _ = project_registry.task_limit(connection, repo, scheduler.config.max_tasks_per_project)
-                        if (managed_count(connection, repo) >= limit
-                                and runtime_state.RuntimeStateRepository(connection).get(repo, plan_id).status == 'PLAN_BLOCKED'):
-                            rechecked_blocks.discard(key)
                     del running[plan_id]
             existing = connection.execute("SELECT * FROM exec_plans WHERE repo=? "
                 "AND status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') ORDER BY plan_id", (repo,)).fetchall()
