@@ -100,7 +100,7 @@ def resource_locks(state_dir: Path, repo: str, resources, *, owner: str):
 def journal_resource(function):
     @wraps(function)
     def guarded(state_dir, *, repo, target, **kwargs):
-        if (kwargs.get('kind') == 'managed_worktree_create'
+        if (kwargs.get('kind') in {'managed_worktree_create', 'managed_worktree_remove'}
                 and resource_owned(state_dir, repo, 'git:' + target, owner='workspace-reservation-recovery')
                 and (kwargs.get('owner') is None or resource_owned(state_dir, repo, kwargs['owner']))):
             return function(state_dir, repo=repo, target=target, **kwargs)

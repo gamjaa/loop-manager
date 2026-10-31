@@ -139,3 +139,23 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             git=mock.Mock(side_effect=AssertionError('closed PR must not query or recreate a branch')))
         observe_waiting_pull_requests(effects, self.connection, Path('/repo'), Path('/tmp'), '/repo')
         block.assert_called_once()
+
+    def test_cleanup_journal_reuses_only_held_task_and_workspace_leases(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from unittest import mock
+        from loop_manager_internal.runtime import resource_lock
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            target = str(state / 'G-001')
+            called = mock.Mock(return_value='removed')
+            guarded = resource_lock.journal_resource(called)
+            with resource_lock.resource_locks(state, '/repo', ['plan:G-001', 'git:' + target],
+                                              owner='workspace-reservation-recovery'):
+                with mock.patch.object(resource_lock, 'resource_locks', side_effect=AssertionError('double acquisition')):
+                    self.assertEqual(guarded(state, repo='/repo', target=target,
+                        kind='managed_worktree_remove', owner='plan:G-001'), 'removed')
+            with resource_lock.resource_locks(state, '/repo', ['git:' + target], owner='workspace-reservation-recovery'):
+                with mock.patch.object(resource_lock, 'resource_locks', side_effect=ValueError('plan lease required')):
+                    with self.assertRaisesRegex(ValueError, 'plan lease required'):
+                        guarded(state, repo='/repo', target=target, kind='managed_worktree_remove', owner='plan:G-001')
