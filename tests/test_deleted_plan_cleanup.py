@@ -181,3 +181,19 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.connection.execute("DELETE FROM validation_results WHERE plan_id='G-002'")
         self.connection.rollback()
+
+    def test_release_ignores_global_causes_outside_dependents_but_keeps_own_cause(self):
+        from loop_manager_internal.catalog.deleted_plan_cleanup import release_reference_holds
+        path = 'docs/plans/[G-999] Deleted.md'
+        causes = [{'plan_id':'G-002', 'code':'missing-plan-reference', 'source':path},
+                  {'plan_id':'G-888', 'code':'missing-plan-reference', 'source':'unrelated'}]
+        self.connection.execute('INSERT INTO execplan_catalog_holds(repo,plan_id,revision_sha,evidence) VALUES (?,?,?,?)',
+                                ('/repo','G-002','sha',json.dumps({'causes':causes})))
+        release_reference_holds(self.connection, '/repo', 'G-999', path, {'G-002':[]})
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM execplan_catalog_holds WHERE plan_id='G-002'").fetchone())
+        causes.append({'plan_id':'G-002', 'code':'missing-source', 'source':'required.md'})
+        self.connection.execute('INSERT INTO execplan_catalog_holds(repo,plan_id,revision_sha,evidence) VALUES (?,?,?,?)',
+                                ('/repo','G-002','sha',json.dumps({'causes':causes})))
+        release_reference_holds(self.connection, '/repo', 'G-999', path, {'G-002':[]})
+        saved=json.loads(self.connection.execute("SELECT evidence FROM execplan_catalog_holds WHERE plan_id='G-002'").fetchone()[0])
+        self.assertEqual(saved['causes'], [causes[-1]])

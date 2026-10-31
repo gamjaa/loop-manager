@@ -92,6 +92,33 @@ def artifact_paths(connection, repo, row, state_dir):
     return tuple(dict.fromkeys(paths))
 
 
+def release_reference_holds(connection, repo, key, path, resolved):
+    dependencies = {row['plan_id']: json.loads(row['depends_on']) for row in connection.execute(
+        'SELECT plan_id,depends_on FROM exec_plans WHERE repo=?', (repo,))}
+    for held in connection.execute('SELECT plan_id,evidence FROM execplan_catalog_holds WHERE repo=?', (repo,)).fetchall():
+        evidence = json.loads(held['evidence'])
+        causes = evidence.get('causes', ())
+        removed = lambda cause: (cause.get('plan_id') == key or cause.get('source') == path
+            or cause.get('code') == 'deleted-goal' and cause.get('message', '').endswith(' -> ' + key))
+        if held['plan_id'] not in resolved and not any(removed(cause) for cause in causes):
+            continue
+        closure, pending = set(), [held['plan_id']]
+        while pending:
+            target = pending.pop()
+            if target not in closure:
+                closure.add(target)
+                pending.extend(dependencies.get(target, ()))
+        # Old holds stored the whole catalog's causes, including unrelated tasks.
+        remaining = [cause for cause in causes if not removed(cause)
+                     and (not cause.get('plan_id') or cause['plan_id'] in closure)]
+        if remaining:
+            evidence['causes'] = remaining
+            connection.execute('UPDATE execplan_catalog_holds SET evidence=? WHERE repo=? AND plan_id=?',
+                               (json.dumps(evidence, ensure_ascii=False), repo, held['plan_id']))
+        else:
+            connection.execute('DELETE FROM execplan_catalog_holds WHERE repo=? AND plan_id=?', (repo, held['plan_id']))
+
+
 def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, pr_for_branch, state_dir, revision_is_current,
             assess_cleanup=None, remove_cleanup_worktree=None):
     """Observe outside the DB writer; recheck under task resource leases before erasure."""
@@ -188,18 +215,7 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                                            (json.dumps(dependencies, ensure_ascii=False, separators=(',', ':')), repo, other))
                     deleted_plan_state.forget(connection, repo, key,
                         artifacts=artifact_paths(connection, repo, row, state_dir))
-                    for held in connection.execute('SELECT plan_id,evidence FROM execplan_catalog_holds WHERE repo=?', (repo,)).fetchall():
-                        evidence = json.loads(held['evidence'])
-                        causes = [cause for cause in evidence.get('causes', ())
-                                  if cause.get('plan_id') != key and cause.get('source') != path
-                                  and not (cause.get('code') == 'deleted-goal'
-                                           and cause.get('message', '').endswith(' -> ' + key))]
-                        if causes:
-                            evidence['causes'] = causes
-                            connection.execute('UPDATE execplan_catalog_holds SET evidence=? WHERE repo=? AND plan_id=?',
-                                               (json.dumps(evidence, ensure_ascii=False), repo, held['plan_id']))
-                        else:
-                            connection.execute('DELETE FROM execplan_catalog_holds WHERE repo=? AND plan_id=?', (repo, held['plan_id']))
+                    release_reference_holds(connection, repo, key, path, resolved)
                 remove_pending_files(connection, repo, state_dir)
                 deleted.append(key)
         except CallDeferred:
