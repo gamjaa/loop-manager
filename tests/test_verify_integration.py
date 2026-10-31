@@ -191,6 +191,62 @@ class ChildCoordinatorTests(CoordinatorFixture, unittest.TestCase):
 
 
 class TrustedRunnerPortTests(CoordinatorFixture, unittest.TestCase):
+    def test_language_copy_cleanup_requires_final_coordinator_stop_receipt(self):
+        repository = Path(__file__).resolve().parents[1]
+        for final_state in ('runner-live', 'worker-live', 'reply-lost', 'invalid-reply', 'confirmed'):
+            with self.subTest(final_state=final_state):
+                self.identities.update({101: 1, 201: 3})
+                self.busy = False
+                lease = {}
+                directory = self.root / final_state
+                budget = ExecutionClock({BUDGET_DIRECTORY: str(self.root)}, clock=lambda: self.now)
+                def request(operation, **data):
+                    reply = self.parent_request(operation, **data)
+                    if operation == 'open_child':
+                        lease.update(reply)
+                    if operation == 'finish_child' and final_state == 'reply-lost':
+                        raise RuntimeError('final stop reply lost')
+                    if operation == 'finish_child' and final_state == 'invalid-reply':
+                        return {}
+                    return reply
+                def run(*_arguments, **options):
+                    options['on_started'](SimpleNamespace(pid=101), None)
+                    if final_state == 'worker-live':
+                        reservation = self.child_request(lease, 'acquire', run_id=lease['session'], unit_id='example')
+                        self.child_request(lease, 'bind', token=reservation['token'], pid=201)
+                    if final_state != 'runner-live':
+                        self.identities.pop(101)
+                    options['on_stopped']()
+                    return True, False, verify_process.VerifyProcessOutput('original output', exit_code=0)
+                try:
+                    with mock.patch.object(integration, '_state', SimpleNamespace(audit=None)), \
+                            mock.patch.object(integration, 'run_verify_process', side_effect=run), \
+                            mock.patch('loop_manager_internal.verification.coordination.descendant', return_value=True), \
+                            mock.patch.object(integration, 'validate_example', return_value={'run_id': 'example'}) as validate:
+                        port = integration.TrustedRunnerPort(SimpleNamespace(request=request), budget, 10)
+                        if final_state == 'confirmed':
+                            integration.language_case(repository, directory, port, 'python', True, False, 'head')
+                            validate.assert_called_once()
+                        else:
+                            with self.assertRaises(verify_process.VerifyTerminationUncertain):
+                                integration.language_case(repository, directory, port, 'python', True, False, 'head')
+                            validate.assert_not_called()
+                    proof = integration._json(directory / 'logs/coordination.json')
+                    self.assertIs(proof['stopped'], final_state == 'confirmed')
+                    self.assertEqual((directory / 'project/tests/test_example.py').is_file(), final_state != 'confirmed')
+                    self.assertEqual((directory / 'logs/console.log').read_text(), 'original output')
+                    self.assertTrue(integration._json(directory / 'logs/process.json')['passed'])
+                    self.assertEqual(integration._json(directory / 'logs/runner-start.json')['state'], 'bound')
+                    if final_state in ('runner-live', 'worker-live'):
+                        self.assertTrue(self.coordinator.sessions[lease['session']]['uncertain'])
+                        if final_state == 'worker-live':
+                            self.assertTrue(proof['reservations'])
+                finally:
+                    self.identities.pop(101, None)
+                    self.identities.pop(201, None)
+                    if lease.get('session') in self.coordinator.sessions:
+                        self.parent_request('finish_child', child=lease['session'], stopped=True)
+
     def test_uncertain_process_preserves_redacted_console_before_output_closes(self):
         budget = ExecutionClock({BUDGET_DIRECTORY: str(self.root)}, clock=lambda: self.now)
         process = mock.Mock(pid=101, returncode=None)

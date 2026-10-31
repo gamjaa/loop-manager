@@ -64,6 +64,15 @@ Final result: PASS (1 test).
 
 - [x] 수정 뒤 같은 runner로 `tests.test_verify_resources.ReservationTests` 9개 통과. 추가로 `tests.test_verify_integration.ChildCoordinatorTests.test_ancestor_exit_cannot_reclaim_live_descendant_runner_or_worker`와 `test_active_and_uncertain_sibling_block_wait_and_other_run_is_preserved`를 개별 ID로 실행해 2개 통과했다. 실제 생존한 하위 runner/worker 회수 거부와 독립 예약 보존을 현재 후보에서 확인했다. 이전 후보의 성공은 이번 호출의 실행 결과로 사용하지 않았다. 기존 tests/** 입력 glob이 fixture 수정을 포함한다. 전체 verify·실제 통합/native·Review는 실행하지 않았으며 외부 검증은 별도로 남는다. 호환 코드·self-runtime 정책과 사용자 판단 기록은 변경하지 않았다.
 
+- [x] review feedback `review:loop_manager_internal/verification/integration.py::trustedrunnerport.run::premature-stop-receipt` occurrence 1/revision 1을 port → language_case 정리 경로로 재현하고 수정했다. 기존 코드는 finish_child 검사 전에 stopped=true를 저장해, 실제 runner/worker 생존으로 최종 확인이 거부돼도 예제 복사본을 삭제했다. 조율 snapshot은 stopped=false로 먼저 보존하고 최종 성공 응답 뒤에만 true로 갱신한다. 응답 거부·유실·형식 불일치는 VerifyTerminationUncertain으로 전달해 복사본·진단과 소유 예산을 보존한다. 원래 process 결과와 시작/예약 근거는 변경하지 않는다. ARCHITECTURE의 v1 종료 기록 계약을 같은 기준으로 갱신했다.
+
+FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_verify_integration.TrustedRunnerPortTests.test_language_copy_cleanup_requires_final_coordinator_stop_receipt`
+Initial result: FAIL 2 / ERROR 1 (하나의 test 내 subcase). 생존 runner/worker의 조기 종료 기록과 최종 응답 유실 처리를 재현했다.
+RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_verify_integration.TrustedRunnerPortTests.test_language_copy_cleanup_requires_final_coordinator_stop_receipt`
+Final result: PASS (1 test).
+
+- [x] 최종 응답 형식 불일치 subcase까지 보완한 뒤 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_verify_integration` 실행에서 29개 통과했다. 실제 coordinator·port·language_case와 fake 프로세스 경계를 연결해 생존 runner/worker·응답 유실/불일치의 false receipt/복사본/원래 출력·process 결과·시작 identity 보존과, 정상 확인 뒤 true receipt 및 복사본 정리를 확인했다. 현재 코드의 개별 재실행과 module 결과이며 이전 전체 verify PASS를 새 후보의 성공으로 재사용하지 않는다. 실제 통합/native·전체 verify·Review는 실행하지 않았다. 기존 loop_manager_internal/**·tests/** 입력이 변경을 포함하며 호환 코드·self-runtime 정책·사용자 판단 기록은 변경하지 않았다.
+
 ## Decision Log
 
 - revision `5395d93192ede14c777bb26aebca4b2f4a98b769`의 공통 worker 전송 분리는 현재 코드와 두 adapter·pool 회귀로 소비한다. 남은 신뢰된 통합 단계·상하위 대기 예산·실제 예제 이전은 그대로이며 전송 추출의 재구현이나 새 선행 작업을 만들지 않는다. snapshot token `4a5912aa2b0768f4afe120f9f6c10856d16b732ca30d00f65aa092e6cf12a9cf`의 ID·경로·metadata·dependency와 기존 기록을 보존한다. 이번 정적 대조는 테스트·verify·Review 성공이나 차단 해제가 아니다.

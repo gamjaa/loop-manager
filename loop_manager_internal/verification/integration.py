@@ -288,9 +288,17 @@ class TrustedRunnerPort:
             try:
                 try:
                     status = self.client.request('child_status', child=lease['session'])
-                    atomic_json(directory / 'coordination.json', {'version': 1, **status, 'stopped': stopped})
+                    proof = {'version': 1, **status, 'stopped': False}
+                    atomic_json(directory / 'coordination.json', proof)
                 finally:
-                    self.client.request('finish_child', child=lease['session'], stopped=stopped)
+                    try:
+                        finished = self.client.request('finish_child', child=lease['session'], stopped=stopped)
+                        if finished.get('ok') is not True:
+                            raise RuntimeError('하위 runner 종료 확인 응답이 유효하지 않습니다.')
+                    except Exception as error:
+                        raise VerifyTerminationUncertain(f'하위 runner 최종 종료 확인 실패: {error}') from error
+                if stopped:
+                    atomic_json(directory / 'coordination.json', {**proof, 'stopped': True})
             except Exception as error:
                 if isinstance(primary, VerifyTerminationUncertain):
                     raise VerifyTerminationUncertain(f"{primary}; 하위 runner 진단/조율 정리 실패: {error}") from primary
