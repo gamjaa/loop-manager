@@ -511,7 +511,7 @@ Manager는 유효한 남은 source·dependency와 현재 snapshot을 검증한 �
 | Progress·Decision Log 변경 | 원격 계보·이전 원문 조회가 확인되고 scope·source 입력·User Decision이 같으면 검증된 답변의 원래 diff를 유지한다. 새 진행 기록을 답변으로 승격하지 않으며 현재 인용·source hash는 계속 검사한다. 목표·답변·판단 입력 변경과 계보 불확실성에는 적용하지 않는다. |
 | 질문 일부 해소 | 질문별로 정확히 분리되는 답변 줄만 소비하고 공유 답변·남은 User Decision·사용자 출처·유효한 판단을 보존한다. |
 
-Planner의 `DRAFT_DECISION_RESULT`는 질문별 답변·새 사용자 원문 인용·근거 경로·남은 질문을 반환한다. 공통 strict JSON 파서가 중복 marker/key·비유한 값·잘못된 identity·필드를 거부하고 Manager가 인용을 현재 ExecPlan 원문 또는 source 입력 hash와 대조한다. Agent는 draft·입력 양식을 직접 해제하지 않는다.
+Planner의 `DRAFT_DECISION_RESULT`는 질문별 답변·새 사용자 원문 인용·근거 경로·남은 질문을 반환한다. 공통 strict JSON 파서가 중복 marker/key·비유한 값·잘못된 identity·필드를 거부하고 Manager가 인용을 현재 ExecPlan 원문 또는 source 입력 hash와 대조한다. Agent는 draft·입력 양식을 직접 해제하지 않는다. 같은 revision의 draft 질문에 대해 `outcome` 없이 `resolved: []`와 기존 질문 그대로의 `remaining`을 반환하면 미응답 유지로 처리한다. draft·승인 상태·대기 근거를 보존하고 독립 planning의 게시를 계속한다. 이를 새 사용자 결정이나 질문 해소로 기록하지 않으며, 변경된 질문이나 잘못된 결과는 계속 거부한다.
 
 정리 전 `execplan_drafts`에 준비 영수증을 저장하고 cleanup hash·현재 입력·revision·원격 게시를 같은 publication transaction에서 대조해 질문별 감사와 대기를 확정한다. 부분 해소·중단 재개에도 결정 감사·source·dependency·실행 이력을 유지한다.
 
@@ -779,6 +779,8 @@ Manager 전용 process receipt는 기존 PID·호스트/boot·종료 근거와 �
 
 관리 실행의 준비 대기 만료는 현재 작업 입력을 재확인한 RETRY 배정으로 이어간다. 결과를 확보한 호출은 원래 스택의 응답/예외를 유지하며 DB 확정만 다시 요청하고, 예약 정리가 대기해도 반환된 응답을 보존한다. 작업 조율기도 완료한 dispatch의 반환값을 보존해 결과 수집·보류 기록만 다시 처리하며 외부 효과를 재실행하지 않는다. 오류 기록의 DB 대기에는 원래 traceback과 저장 traceback을 함께 남기고 해당 저장 요청만 재시도한다. 보류 기록이 확정되기 전에는 일반 retry 묶음의 메모리 횟수도 확정하지 않는다. setup의 일반 예외와 DB 대기는 각각 별도 제한 묶음으로 재준비하고 RETRY 순서를 유지한다. 묶음 소진 뒤 일반 예외는 단계·후보·작업 입력·소유권 또는 기존 recovery identity·진전·다음 동작의 변경을 기다린 뒤 현재 자격을 재검사한다. 로그·session 생성·catalog generation·retry 타이머와 진단 횟수는 재편입 근거가 아니다. DB 묶음은 상태를 변경하지 않는 짧은 쓰기 transaction의 실제 재확보 뒤 같은 요청 준비로 돌아가며 누적 횟수를 초기화하지 않는다. 완료 Future로 수집한 보류도 조율 중 입력이 바뀌면 RETRY로 다시 편입하고, 최종 결과는 작업별 마지막 반환을 사용해 과거 보류가 후속 성공을 덮지 않게 한다. `TaskScheduler`는 확인된 실제 종료와 저장 대기를 구분해 실행 개수만 먼저 반환할 수 있다. 이 구분은 재시작 때 같은 프로세스 종료 근거로 복원하고 저장 대기 예약·관리 작업은 유지한다. 종료 불명은 실행 개수도 유지한다. 대기 중에는 local pause/handoff만 확인하고 runtime 원격 관측은 DB 준비 후 실제 단계 진입에서 수행한다.
 
+활성 작업과 실제 호출 예약이 없으면 대표 실행 투영이 가리키는 작업의 미완료 Git operation을 확인해 오래된 실행 표시를 정리한다. 다른 차단 작업의 미완료 operation은 각 checkpoint에 보존하되 해당 투영의 정리를 막지 않는다. 투영의 소유 작업을 식별할 수 없으면 전체 미완료 operation을 확인하는 보수적 처리를 유지한다.
+
 재시작의 응답 전달은 대기 표식이 있는 기존 호출에 한정한다. 요청 지문에는 원래 요청 session을 포함하고 그 값을 `request_session_id`로 보존한다. 재진입 session은 원래 요청 값 또는 같은 invocation의 callback·결과에서 관측한 session만 허용한다. 따라서 신규 요청 뒤 callback이 저장한 Worker/Planner session으로 재시작해도 원래 요청 session을 사용해 나머지 입력 지문을 검증하며 다른 session 요청은 보류한다. 일반 Planner의 session별 조회 안내 구성은 prompt를 만들기 전에 같은 미전달 receipt의 원래 요청 session으로 판단한다. 실제 재진입 session은 유지하고 복원한 전체 prompt도 기존 지문 검사에 통과해야 하므로, 정상 callback 전이만으로 안내가 빠지는 문제를 막으면서 다른 prompt 변경의 거부는 유지한다. 전달 확정 뒤의 새 Planner 요청은 현재 session으로 안내 구성을 판단한다. `request_session_id`가 없는 구형 관측은 현재 입력으로 원래 지문이 그대로 일치할 때만 전달하며 원래 session을 추정하지 않는다. session 입력 자체가 빠진 구형 요청 지문도 일치로 추정하지 않는다.
 
 Codex adapter는 반환할 역할 응답을 해당 호출 attempt의 UTF-8 `last-message.txt`에 남긴다. Reviewer는 기존 응답 정제 뒤 파일을 원자 교체하며, 다른 역할은 CLI가 같은 attempt 경로에 출력한다. 기존 provider·role별 공유 최신 응답 파일은 최신 응답 소비를 위한 호환 파일로 유지하고 재시작 근거로 읽지 않는다. 요청 지문, ledger의 원래 결과·session·사용량과 session 귀속을 확인하고, 같은 invocation receipt가 결합한 attempt의 `last-message.txt` 원문 또는 그 양끝 공백을 제거한 값이 메시지 지문과 일치할 때만 `AgentResult`를 전달한다. attempt 파일 부재·symlink/경로 치환·지문 불일치·입력 변경·예외 원문 부족은 `CallDeferred`로 후속 처리를 보류하며 provider나 공유 최신 파일을 대체 증거로 사용하지 않는다.
@@ -904,7 +906,7 @@ CLI·OS별 실행 전제는 [인증과 실행 조건](OPERATIONS.md#인증과-�
 | 실행 환경 준비 | `AgentRequest.prepared_launch`가 worktree·repository·role의 공통 홈과 호출별 임시 저장을 provider 조회 전에 선택한다. legacy profile callback도 `prepared_environment`의 같은 필터된 mapping을 사용하며 부모 `os.environ`·호출자 mapping은 바꾸지 않는다. |
 | 모델 호출 없는 사전 검사 | 현재 CLI·설정·확장·역할 정책과 별도 `codex sandbox` 안의 파일 도구 경계를 검사한다. version 조회 뒤와 feature 조회 뒤 sandbox probe 전에 설정 정책을 다시 확인하고, sandbox probe 뒤에도 안정된 최종 설정 지문을 계산한다. 조회 사이 설정이 충돌 상태로 바뀌면 다음 Codex 조회 전에 중단한다. 실제 Agent 실행을 감싸는 wrapper나 모델 호출·중첩 도구 시연과 구분한다. |
 | 실행 직전 | 같은 환경의 인증·Model/Effort·Fast·native 지침을 확인하고 workspace·설정·CLI와 인증 링크를 재검사한다. native developer의 `additional_tools`는 전송 ID를 제외한 정의를 전후 비교하며 지침 메시지로 해석하지 않는다. 준비 조회가 안전한 설정을 바꿨으면 새 내용을 다시 검사해 최종 격리·실행 지문에 결합한다. 최종 증거를 invocation에 저장한 뒤 process handoff에서도 설정·workspace snapshot을 확인하고 실제 `codex exec`를 시작한다. |
-| 종료 | 프로세스 그룹 또는 Windows Job의 정리·wait 성공 뒤에만 종료 콜백을 호출한다. 시작·writer 종료·결과 성공·검증 성공은 별도 사실로 기록한다. |
+| 종료 | Linux Codex 호출은 subreaper supervisor가 별도 session으로 이탈한 자손도 종료·회수할 때까지 소유한다. process receipt는 supervisor PID에 결합하며, supervisor의 정상 종료 또는 전체 자손의 중단 확인 뒤에만 종료 콜백을 호출한다. 동시 중단 요청은 한 번의 종료 확인을 공유하고, 확인 실패는 supervisor 종료만으로 성공으로 바꾸지 않는다. 다른 플랫폼은 기존 프로세스 그룹 또는 Windows Job의 정리·wait 경계를 유지한다. 시작·writer 종료·결과 성공·검증 성공은 별도 사실로 기록한다. |
 
 `provider_execution.observe`는 모델 실행 없이 현재 Codex Reviewer의 입력을 확인하거나 지정한 실제 invocation의 완료 기록을 읽는다. `execution_identity`의 문자열 필드는 `provider`·`model`·`effort`·`instruction`·`environment`·`policy`이며, `instruction` 지문은 native developer 메시지와 전송 ID를 제외한 `additional_tools` 정의를 함께 포함한다. 도구 정의는 developer instruction에 합성하지 않는다. 지침·환경·정책은 지문으로 저장한다. 실제 호출 identity는 process 시작 전에 한 번 결합하고 현재 설정을 과거 행에 소급하지 않는다. credential 값·그 값의 해시·prompt 원문은 저장하지 않는다.
 
