@@ -569,6 +569,29 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
             self.assertEqual((root / source).read_text(), after)
             self.assertTrue(self.waiting()['pending'])
 
+    def test_no_answers_with_unchanged_question_preserves_draft_without_blocking_batch(self):
+        saved = self.waiting()
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
+        original = loop_manager._ready_plan_snapshot_from_contents(row, self.text.encode(), allow_started=True)
+        snapshot = MutableReadySnapshot('repo', row['current_revision_sha'], (original,), 'fixture')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / PATH
+            target.parent.mkdir(parents=True)
+            target.write_text(self.text)
+            for remaining in (saved['question'], 'Question: A different decision'):
+                output = [{'id': 'G-001', 'revision': saved['revision'], 'resolved': [], 'remaining': remaining}]
+                self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'",
+                                        (draft_decisions.PREFIX + json.dumps(output),))
+                self.connection.commit()
+                if remaining == saved['question']:
+                    self.assertEqual(draft_decisions.prepare(self.connection, 'repo', root, snapshot), {})
+                else:
+                    with self.assertRaises(loop_manager.PlannerValidationError):
+                        draft_decisions.prepare(self.connection, 'repo', root, snapshot)
+                self.assertEqual(target.read_text(), self.text)
+                self.assertEqual(self.waiting(), saved)
+
     def test_malformed_resolution_never_changes_document_or_hold(self):
         documents = {PATH: accepted_text(self.text, self.waiting()["revision"])}
         self.reconcile(documents)

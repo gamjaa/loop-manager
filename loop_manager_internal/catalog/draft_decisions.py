@@ -163,6 +163,11 @@ def prepare(connection, repo, worktree, snapshot):
         decision = saved.get("decision", {})
         if assessment is None or assessment.get("outcome") == "uncertain":
             continue
+        if (assessment.get("outcome") is None and assessment.get("resolved") == []
+                and assessment.get("revision") == saved["revision"] and plan.get("draft")
+                and isinstance(assessment.get("remaining"), str)
+                and assessment["remaining"].strip() == saved["question"].strip()):
+            continue
         if decision.get("Decision") in {"reject", "defer"}:
             raise PlannerValidationError("거절·보류한 사용자 결정을 해소할 수 없습니다.")
         if decision and not saved.get("decision_ready"):
