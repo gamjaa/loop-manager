@@ -51,11 +51,14 @@ def check_boundary(spec: dict) -> None:
     # Linux는 read-only mount, Windows/macOS는 파일 접근 정책을 검사한다.
     for value in spec['protected']:
         root = Path(value)
-        if not root.exists():
-            raise BoundaryError('protected path is not read-only')
+        # An absent path cannot be created when its nearest existing parent is read-only.
+        while not root.exists():
+            if root == root.parent:
+                raise BoundaryError('protected path ancestry was inconclusive')
+            root = root.parent
         if sys.platform.startswith('linux'):
             if not os.statvfs(root).f_flag & os.ST_RDONLY:
-                raise BoundaryError('protected path is not read-only')
+                raise BoundaryError(f'protected path is not read-only: {root}')
         elif sys.platform == 'darwin':
             _darwin_readonly_path(root)
         elif sys.platform == 'win32' and root.is_dir():
@@ -87,8 +90,8 @@ def main() -> int:
         if len(sys.argv) != 2:
             raise BoundaryError('probe cannot launch a command')
         check_boundary(json.loads(sys.argv[1]))
-    except (BoundaryError, OSError, ValueError, KeyError, TypeError):
-        print('agent tool boundary verification failed', file=sys.stderr)
+    except (BoundaryError, OSError, ValueError, KeyError, TypeError) as error:
+        print(f'agent tool boundary verification failed: {type(error).__name__}: {error}', file=sys.stderr)
         return 125
     print('agent-tool-boundary-v2')
     return 0

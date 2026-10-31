@@ -125,7 +125,9 @@ class CodexLaunch:
                                 env=self.environment,
                                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=False)
         if result.returncode or result.stdout.strip() != 'agent-tool-boundary-v2':
-            raise RuntimeError('Codex 내장 도구 sandbox의 파일 쓰기 경계를 확인할 수 없습니다.')
+            from loop_manager_internal.execution.validation_feedback import redact_secrets
+            detail = redact_secrets((result.stderr or result.stdout).strip())[-2000:]
+            raise RuntimeError(f'Codex 내장 도구 sandbox의 파일 쓰기 경계를 확인할 수 없습니다. exit={result.returncode}; {detail}')
 
 
 def _owned_directory(path: Path) -> None:

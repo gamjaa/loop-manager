@@ -223,15 +223,35 @@ class NativeWriteIsolationTests(TestCase):
                      mock.patch.object(gate.sys, 'argv', ['probe', json.dumps(specification)]), \
                      mock.patch.object(gate.sys, 'stdout', stdout), \
                      mock.patch.object(gate.sys, 'stderr', stderr), \
-                     mock.patch.object(gate.os, 'statvfs', side_effect=failure) as checked, \
+                     mock.patch.object(gate.os, 'statvfs', side_effect=failure, return_value=mock.Mock(f_flag=0)) as checked, \
                      mock.patch.object(gate.os, 'open') as opened, \
                      mock.patch.object(gate.tempfile, 'TemporaryDirectory') as scratch:
                     self.assertEqual(gate.main(), 125)
                 self.assertEqual(stdout.getvalue(), '')
                 self.assertIn('boundary verification failed', stderr.getvalue())
-                self.assertEqual(checked.call_count, int(failure is not None))
+                self.assertEqual(checked.call_count, 1)
                 opened.assert_not_called()
                 scratch.assert_not_called()
+
+    def test_missing_protected_sibling_requires_readonly_existing_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / 'removed' / 'worktree'
+            spec = {'protected':[str(missing)],'files':[],'writable':[]}
+            for readonly in (True,False):
+                with self.subTest(readonly=readonly), \
+                     mock.patch.object(gate.os,'statvfs',return_value=mock.Mock(f_flag=gate.os.ST_RDONLY if readonly else 0)) as checked, \
+                     mock.patch.object(gate.os,'open') as opened, \
+                     mock.patch.object(gate.tempfile,'TemporaryDirectory') as scratch:
+                    if readonly:
+                        gate.check_boundary(spec)
+                    else:
+                        with self.assertRaisesRegex(gate.BoundaryError,'not read-only'):
+                            gate.check_boundary(spec)
+                    checked.assert_called_once_with(root)
+                    opened.assert_not_called()
+                    scratch.assert_not_called()
+            self.assertFalse(missing.parent.exists())
 
     def test_writable_probe_creates_updates_renames_and_removes_only_scratch(self):
         with tempfile.TemporaryDirectory() as directory:
