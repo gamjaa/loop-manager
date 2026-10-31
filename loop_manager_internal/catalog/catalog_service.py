@@ -409,6 +409,8 @@ class ReconcileExecplanCatalogEffects:
     git: Callable[..., object]
     migrate_legacy_execplans: Callable[..., object]
     pr_for_branch: Callable[..., object] | None = None
+    assess_cleanup: Callable[..., object] | None = None
+    remove_cleanup_worktree: Callable[..., object] | None = None
 
 
 def reconcile_execplan_catalog(
@@ -459,6 +461,18 @@ def reconcile_execplan_catalog(
             references = remote_deletions.reference_issues(
                 connection, repo, repo_path, pinned, git_bytes=port._effects.git_bytes,
             )
+            from loop_manager_internal.catalog import deleted_plan_cleanup
+            state_file = connection.execute('PRAGMA database_list').fetchone()[2]
+            if state_file and deleted_plan_cleanup.cleanup(
+                    connection, repo_path, repo, pinned, references, git=effects.git,
+                    git_bytes=port._effects.git_bytes, pr_for_branch=effects.pr_for_branch,
+                    state_dir=Path(state_file).parent, assess_cleanup=effects.assess_cleanup,
+                    remove_cleanup_worktree=effects.remove_cleanup_worktree,
+                    revision_is_current=lambda: port.current_revision() == pinned.revision_sha):
+                port.loaded = None
+                pinned = port.load()
+                references = remote_deletions.reference_issues(
+                    connection, repo, repo_path, pinned, git_bytes=port._effects.git_bytes)
             pinned = replace(pinned, rowless_hold_deletions=remote_deletions.rowless_hold_deletion_evidence(
                 connection, repo, repo_path, pinned, references, git_bytes=port._effects.git_bytes,
             ))

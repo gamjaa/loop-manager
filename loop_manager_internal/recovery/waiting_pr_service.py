@@ -190,6 +190,10 @@ def observe_waiting_pull_requests(
             continue
         if group and group['state']=='AUTOMATIC' and state == 'OPEN':
             continue
+        if state == "CLOSED":
+            if stored["blocked_reason"] != PR_CLOSED_BLOCK_REASON:
+                effects._block_closed_pull_request(connection, repo, stored, url, head_oid)
+            continue
         if stored['blocked_reason'] == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
             continue
         from loop_manager_internal.recovery.work_branch_integration import published_branch
@@ -208,10 +212,6 @@ def observe_waiting_pull_requests(
                     scoped_blocking.record_plan_block(connection, repo, str(stored['plan_id']),
                         BlockReasonCode.REMOTE_BRANCH_DELETED, str(error), None)
                 continue
-        if state == "CLOSED":
-            if stored["status"] != "PLAN_BLOCKED":
-                effects._block_closed_pull_request(connection, repo, stored, url, head_oid)
-            continue
         if state != "OPEN":
             raise RuntimeError(f"지원하지 않는 GitHub PR 상태입니다: {state}")
         if group and effects.base_head and stored['status']=='PR_OPEN':

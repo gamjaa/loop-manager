@@ -273,6 +273,10 @@ draft 판단 대기와 검증 피드백 이행 표식은 실행·소유 이력�
 | 실행 row 없이 남은 hold의 원격 삭제 | hold의 원문·revision·최초 관측 revision·미확인 사유를 보존하고 후속 참조가 생기면 그 영향과 함께 Planner 복구 목표로 전달한다. 영향 계획의 복구 판단·게시 전까지 hold를 유지하고 snapshot/SQLite CAS가 바뀌면 감사 갱신을 적용하지 않는다. |
 | 과거 ID의 active 재등장 | archive·취소 ID의 예약을 유지해 새 계획 등록을 거부한다. |
 
+`deleted_plan_cleanup.py`는 원격 ExecPlan 부재와 마지막 채택 bytes·ancestor revision, 미Merge CLOSED PR 및 후속 선언의 `DEPENDENCY_RECOVERY` 판단을 확인한다. 기존 작업별 자원 lease와 물리적 writer 종료 검증을 사용하고 수동 소유·미확정 Git 전이는 정리하지 않는다. 현재 경로는 원격 작업 ref가 이미 없을 때 관리 worktree·정확한 로컬 ref를 정리한다. 살아 있는 원격 ref의 lease 기반 삭제와 row 없이 남은 과거 취소 감사의 정리는 아직 일반 삭제 복구 목표에 남아 있다.
+
+`deleted_plan_state.forget()`은 같은 transaction에서 대상의 `(repo, plan_id)` 소유 상태·감사·호출·사용량과 invocation 하위 기록, 정확한 대상의 복구·알림을 제거하고 `deleted_plan_ids(repo, plan_id)`만 예약한다. 이 표식은 catalog·Planner·수동 번호 배정에서 재등록을 막으며 source·dependency 충족 근거로 사용하지 않는다. 파일 정리는 `deleted_plan_files(repo, plan_id, path)`에 한시적으로 저장해 DB 확정 뒤 관리 `agent-runtime`·`logs` 아래 대상 산출물을 제거하고 완료 항목을 삭제한다. 중단 뒤 다음 catalog 관측에서 남은 파일 정리부터 이어간다. 다른 작업의 Git 관측 snapshot·공유 이력, GitHub PR·Git 과거 commit과 운영자가 별도로 보관한 DB 백업은 재작성하지 않는다.
+
 현재 `remote_deletions.py`는 고정 원격 revision과 마지막 채택 원문·선언·실행/게시 이력을 대조해 실제 Requirement·ExecPlan 삭제를 관측한다. archive·rename·조회 실패를 실제 삭제와 구별하고, 확인된 ExecPlan 삭제의 취소 감사와 Requirement 삭제에 따른 목표 복구 입력을 만든다. 일반 Planner의 철회·유지·대체 판단은 허용된 계획 개정·삭제 게시와 연결하며 Manager가 참조·소유권·현재 PR을 재검증한다. 확인되지 않은 범위는 보류하고 검증된 독립 작업은 계속한다.
 
 삭제 관측·취소 경로가 있다는 사실만으로 후속 정리가 모두 완료된 것은 아니다. 취소 감사는 원문·실행 이력·예약과 소유 자원의 `cleanup_pending`을 보존한다. 유지하는 관리 브랜치의 문서 동기화, 취소·완료 작업의 소유 로컬·원격 branch 및 worktree 정리와 각 확정 지점의 중단 복구는 [R-055의 삭제 반영·복구 목표](requirements/%5BR-055%5D%20%EC%B0%A8%EB%8B%A8%20%EA%B2%BD%EB%A1%9C%20%EC%A0%84%EC%88%98%20%EC%A1%B0%EC%82%AC%EC%99%80%20%EB%B6%88%ED%95%84%EC%9A%94%ED%95%9C%20%EC%9E%91%EC%97%85%20%EC%A4%91%EB%8B%A8%20%EC%B6%95%EC%86%8C.md#삭제의-db브랜치-반영과-중단-복구)에 남은 범위다. 현재 Merge 정리와 삭제 처리의 권한을 이 목표로 확대하지 않는다.

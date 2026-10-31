@@ -710,6 +710,7 @@ class DefinitionStateRepository:
         # Some durable audit tables can outlive their execution row after an
         # interrupted migration. An ID linked to any such history stays owned.
         for table, path_column in (
+            ("deleted_plan_ids", None),
             ("execplan_archive_items", "active_path"),
             ("manual_work_members", None),
             ("execution_checkpoints", None),

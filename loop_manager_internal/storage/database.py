@@ -481,6 +481,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
             connection.execute("RELEASE ever_started_backfill")
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     connection.execute(EXECPLAN_CANCELLATIONS_SCHEMA)
+    from . import deleted_plan_state
+    deleted_plan_state.ensure_schema(connection)
     if "recovery_evidence" not in {row[1] for row in connection.execute("PRAGMA table_info(execplan_cancellations)")}:
         connection.execute("ALTER TABLE execplan_cancellations ADD COLUMN recovery_evidence TEXT")
     connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)

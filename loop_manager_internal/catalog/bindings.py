@@ -59,6 +59,8 @@ def register(assembly: Composition) -> None:
             git=assembly.callback('git'),
             migrate_legacy_execplans=assembly.callback('migrate_legacy_execplans'),
             pr_for_branch=assembly.callback('pr_for_branch'),
+            assess_cleanup=assembly.callback('assess_cleanup'),
+            remove_cleanup_worktree=assembly.callback('remove_cleanup_worktree'),
         ),
     )
 

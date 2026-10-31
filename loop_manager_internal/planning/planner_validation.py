@@ -223,7 +223,7 @@ def _planning_id_inventory(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        for table in ("exec_plans", "execplan_cancellations", "manual_work_members"):
+        for table in ("exec_plans", "execplan_cancellations", "deleted_plan_ids", "manual_work_members"):
             if table not in tables:
                 continue
             for row in connection.execute(
