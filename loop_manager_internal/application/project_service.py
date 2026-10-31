@@ -1028,6 +1028,10 @@ class ProjectService:
                 if recheck is not None:
                     recheck(self.state.repo)
                 current_scheduler.get().check_project(self.state.repo)
+                from loop_manager_internal.storage.management_admission import parked
+                if current_task.get() is not None and parked(self.identity.connection,self.state.repo,current_task.get().plan_id):
+                    return self.effects._execution_outcome_step_result(
+                        ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE, detail='명시적 명령의 관리 자리 인계 대기'))
             from loop_manager_internal.storage.task_calls import CallDeferred
             from loop_manager_internal.application.task_scheduling import TaskRecheckRequired
             try:

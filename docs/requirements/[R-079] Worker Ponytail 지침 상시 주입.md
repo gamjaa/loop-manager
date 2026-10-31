@@ -2,7 +2,7 @@
 
 ## Summary
 
-Worker에 현재 선택 runtime의 Ponytail AGENTS 원문을 기존 common+Worker instruction과 정확히 한 번 합쳐 항상 전달한다. Plugin 설치 목록 조회·설치 판정·원격 갱신을 제거하고 다른 역할·사용자 prompt에는 추가하지 않는다. 사용자 Plugin 설정·기존 확장 차단·쓰기 제한·자동 승인 검토와 과거 지침 snapshot을 보존하며 스타일 지침으로 필수 요구·검증을 생략하지 않는다.
+Worker에 현재 선택 runtime의 저장된 Ponytail AGENTS 지침을 기존 common+Worker instruction과 정확히 한 번 합쳐 항상 전달한다. Plugin 설치 목록 조회·설치 판정·원격 갱신을 제거하고 다른 역할·사용자 prompt에는 추가하지 않는다. 사용자 Plugin 설정·기존 확장 차단·쓰기 제한·자동 승인 검토와 과거 지침 snapshot을 보존하며 스타일 지침으로 필수 요구·검증을 생략하지 않는다.
 
 ## Context
 
@@ -14,23 +14,21 @@ Worker가 불필요한 코드·추상화·의존성을 추가하지 않고 기�
 
 ## Requirement
 
-- Ponytail 플러그인 저장소의 루트 `AGENTS.md` 원문을 `docs/AGENTS.ponytail.md`로 저장한다. 출처·기준 revision·라이선스를 확인할 수 있어야 한다. 실행 시에는 선택 runtime에 저장된 원문을 사용한다.
+- Ponytail 플러그인 저장소의 루트 `AGENTS.md`에 기반한 지침을 `docs/AGENTS.ponytail.md`로 저장한다. 목록·문단의 빈 줄 배치를 upstream과 동일하게 맞추는 별도 정리는 요구하지 않는다. 출처·기준 revision·라이선스를 확인할 수 있어야 한다. 실행 시에는 선택 runtime에 저장된 원문을 사용한다.
 - Worker 지침은 기존 공통·Worker 지침에 Ponytail 원문을 정확히 한 번 합친다. provider·설치 여부·활성 상태와 관계없이 기존 instruction 전달 경로를 사용하며 사용자 prompt에 반복하지 않는다. Planner·Reviewer 등 다른 역할에는 추가하지 않는다.
 - Ponytail 적용을 위해 CLI Plugin 목록을 조회하거나 설치 여부를 캐시·판정하지 않는다. Skill·Hook·설정 디렉터리 탐색과 실행 중 원격 원문 다운로드도 하지 않는다.
 - Codex 호출의 기존 Plugin·App 비활성화와 내장 쓰기 제한·자동 승인 검토를 유지한다. 사용자 Plugin 설정이나 설치 상태는 변경하지 않는다. 다른 provider의 기존 실행 경계도 유지한다.
 - 원본과 전달 내용은 R-064의 현재 runtime 선택·호출 기록·결과 재사용 규칙을 따른다. 같은 작업의 재시도·재개·provider 변경도 현재 runtime의 Ponytail 원문을 사용한다. 과거 snapshot은 감사에만 보존하며 현재 원본·실행용 파일 오류는 모델 실행 전에 거부한다.
 - Ponytail은 코딩 스타일 지침이다. 명시된 요구사항·필수 기능·보안·입력 검증·데이터 무결성·필수 테스트 및 Manager의 역할·권한·검증·게시 규칙을 생략하거나 변경하는 근거로 사용하지 않는다.
-- README 하단에 Ponytail 사용 안내와 `docs/AGENTS.ponytail.md` 상대 링크를 제공하고 실제 적용 정책을 설명한다.
 
 ## Acceptance Criteria
 
-- 저장된 Ponytail 원문·라이선스가 upstream과 일치하고 출처·기준 revision을 확인할 수 있다.
+- 저장된 Ponytail 지침의 내용과 라이선스를 보존하고 출처·기준 revision을 확인할 수 있다. upstream과의 줄 배치 일치나 별도 README 안내 보완은 완료 조건으로 요구하지 않는다.
 - Codex·Claude Worker는 현재 runtime의 Ponytail 원문을 정확히 한 번 전달받고, 기존 공통·역할·기본·추가 지침과 프로젝트 규칙을 보존한다. Plugin 설치·활성 상태에 따른 생략은 없다.
 - Worker 호출·재시도·재개·동시 실행 및 Worker가 없는 실행에서 이번 기능에 의한 Plugin 목록 조회가 없다. 설치 목록 조회 실패·timeout·미발견 진단도 발생하지 않는다.
 - 다른 역할과 작업별 사용자 prompt에는 Ponytail 원문을 추가하지 않는다.
 - provider 변경과 같은 세션 재개에도 현재 runtime 원문을 전달하고 실제 전달 내용·해시는 호출 기록과 일치한다. 다른 지침으로 얻은 성공 결과를 동일 지침의 결과로 재사용하지 않는다. 과거 snapshot의 내용 보존과 현재 원본·실행용 파일 오류의 호출 거부를 유지한다.
 - Codex 직접 실행·재개·fallback의 기존 Plugin·App 비활성화와 파일 쓰기 경계·자동 승인 검토를 유지하고 사용자 설정을 변경하지 않는다.
-- README의 사용 안내와 상대 링크가 유효하고 요구사항·안전·검증·역할·게시 조건을 유지한다.
 
 ## Product Impact
 

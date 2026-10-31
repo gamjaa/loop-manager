@@ -173,20 +173,7 @@ class ManualWorkService:
                 self.state_dir, self.repo, stage='manual_slot', connection=self.connection,
                 git=self.effects.git, worktrees=worktrees or (self.repo_path,), refs=refs,
                 recoverable=recoverable)
-        own_block = bool(releasing_plan is not None and releasing_plan['status']=='PLAN_BLOCKED'
-                         and row['plan_path']==releasing_plan['path'] and row['phase'] in {'BLOCKED','PLAN_BLOCKED'})
-        from loop_manager_internal.application.task_scheduling import current_scheduler, managed_count
-        scheduler = current_scheduler.get()
-        if scheduler is not None:
-            from loop_manager_internal.runtime.project_registry import task_limit
-            _, limit, _ = task_limit(self.connection, self.repo, scheduler.config.max_tasks_per_project)
-            return not (managed_count(self.connection, self.repo) >= limit
-                or runtime_state.planning_owns_execution_slot(row)
-                or scoped_blocking.project_block(self.connection, self.repo)
-                or cycle.phase is not maintenance_state.MaintenancePhase.IDLE
-                or journal_conflict())
-        return not (row['phase'] and not own_block or self.runtime.active_row(self.repo) or row['agent_snapshot']
-            or runtime_state.planning_owns_execution_slot(row)
+        return not (runtime_state.planning_owns_execution_slot(row)
             or scoped_blocking.project_block(self.connection, self.repo)
             or cycle.phase is not maintenance_state.MaintenancePhase.IDLE
             or journal_conflict())

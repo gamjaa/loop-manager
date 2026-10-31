@@ -25,6 +25,8 @@ class CallDeferred(RuntimeError):
 
 
 def ensure_schema(connection):
+    from .management_admission import ensure_schema as ensure_admission
+    ensure_admission(connection)
     from loop_manager_internal.storage.execution_checkpoint_state import SCHEMA as checkpoints_schema
     connection.execute(checkpoints_schema)
     connection.execute("""CREATE TABLE IF NOT EXISTS task_call_reservations (
@@ -63,10 +65,12 @@ def bind_agent_receipt(path):
 
 
 def managed_count(connection, repo, plan_id=None):
-    return connection.execute("""SELECT COUNT(DISTINCT CASE WHEN m.group_id IS NULL
+    admission = ("AND NOT EXISTS (SELECT 1 FROM task_management_admissions a WHERE a.repo=p.repo AND a.plan_id=p.plan_id AND a.parked=1)"
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE name='task_management_admissions'").fetchone() else "")
+    return connection.execute(f"""SELECT COUNT(DISTINCT CASE WHEN m.group_id IS NULL
         THEN 'plan:'||p.plan_id ELSE 'manual:'||m.group_id END)
         FROM exec_plans p LEFT JOIN manual_work_members m ON m.repo=p.repo AND m.plan_id=p.plan_id
-        WHERE p.repo=? AND p.status <> 'PLAN_BLOCKED' AND (p.status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING')
+        WHERE p.repo=? {admission} AND p.status <> 'PLAN_BLOCKED' AND (p.status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING')
             OR EXISTS (SELECT 1 FROM task_call_reservations c WHERE c.repo=p.repo AND c.plan_id=p.plan_id)
             OR EXISTS (SELECT 1 FROM execution_checkpoints x WHERE x.repo=p.repo
                        AND x.plan_id=p.plan_id AND x.operation IS NOT NULL))
@@ -78,6 +82,9 @@ def managed_count(connection, repo, plan_id=None):
 def management_available(connection, repo, plan_id):
     from loop_manager_internal.config.managed_config import fast_mode_settings
     from loop_manager_internal.runtime.project_registry import task_limit
+    from .management_admission import parked
+    if parked(connection, repo, plan_id):
+        return False
     config=fast_mode_settings.get()
     _,limit,_=task_limit(connection,repo,config.max_tasks_per_project if config else 1)
     return bool(managed_count(connection,repo,plan_id)) or managed_count(connection,repo)<limit

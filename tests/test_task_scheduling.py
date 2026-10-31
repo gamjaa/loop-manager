@@ -57,6 +57,97 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         return scheduling.TaskScheduler(replace(self.config, **values), database.connect_database,
                                          self.directory, self.connection)
 
+    def test_explicit_release_queues_at_capacity_and_preserves_rebase_then_yields_last(self):
+        from loop_manager_internal.storage import management_admission as admission
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE repo='A'")
+        self._insert_plan(self.connection,'G-004','PLAN_BLOCKED',repo='A')
+        self.connection.execute("INSERT INTO execplan_blocks(repo,plan_id,scope,reason_code,evidence) "
+            "VALUES ('A','G-004','plan','user_decision_required','original question')")
+        self.connection.execute("INSERT INTO execution_checkpoints(repo,plan_id,generation,operation,snapshot) "
+            "VALUES ('A','G-004',7,'rebase','{}')")
+        self.connection.commit()
+        project_registry.set_task_limit(self.connection,'A',2,3)
+        checkpoint = tuple(self.connection.execute("SELECT * FROM execution_checkpoints WHERE plan_id='G-004'").fetchone())
+        admission.release_blocks(self.connection,'A',['G-004','G-004'])
+        self.assertTrue(admission.parked(self.connection,'A','G-004'))
+        self.assertEqual(scheduling.managed_count(self.connection,'A'),2)
+        admission.reconcile(self.connection,'A',2,busy={'G-002'})
+        self.assertTrue(admission.parked(self.connection,'A','G-004'))
+        self.assertTrue(admission.parked(self.connection,'A','G-002'))
+        admission.reconcile(self.connection,'A',2)
+        self.assertFalse(admission.parked(self.connection,'A','G-004'))
+        self.assertFalse(admission.parked(self.connection,'A','G-001'))
+        self.assertTrue(admission.parked(self.connection,'A','G-002'))
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM execution_checkpoints WHERE plan_id='G-004'").fetchone()),checkpoint)
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM execplan_blocks WHERE plan_id='G-004'").fetchone())
+        self.assertEqual(self.connection.execute("SELECT status FROM exec_plans WHERE plan_id='G-002'").fetchone()[0],'IMPLEMENTING')
+        sequence = self.connection.execute("SELECT sequence FROM task_management_admissions WHERE plan_id='G-004'").fetchone()[0]
+        admission.release_blocks(self.connection,'A',['G-004'])
+        self.assertEqual(self.connection.execute("SELECT sequence FROM task_management_admissions WHERE plan_id='G-004'").fetchone()[0],sequence)
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE plan_id='G-004'")
+        self.connection.execute("UPDATE execution_checkpoints SET operation=NULL WHERE plan_id='G-004'")
+        admission.reconcile(self.connection,'A',2)
+        self.assertFalse(admission.parked(self.connection,'A','G-002'))
+        self.assertEqual(scheduling.managed_count(self.connection,'A'),2)
+
+    def test_explicit_release_is_atomic_and_does_not_override_safety_blocks(self):
+        from loop_manager_internal.storage import management_admission as admission
+        for pid,reason in [('G-001','user_decision_required'),('G-002','managed_worktree_conflict')]:
+            self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo='A' AND plan_id=?",(pid,))
+            self.connection.execute("INSERT INTO execplan_blocks(repo,plan_id,scope,reason_code,evidence) VALUES ('A',?,'plan',?,'original')",(pid,reason))
+        self.connection.commit()
+        with self.assertRaises(ValueError):
+            admission.release_blocks(self.connection,'A',['G-001','G-002'])
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0],2)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_management_admissions').fetchone()[0],0)
+
+    def test_unblock_cli_dispatch_and_live_reservation_drain(self):
+        from loop_manager_internal.application.commands import execute_runtime_command
+        from loop_manager_internal.storage import management_admission as admission, task_calls
+        repo = str(self.directory.resolve())
+        self.connection.execute("UPDATE projects SET repo=?,registered=1 WHERE repo='A'",(repo,))
+        self.connection.execute("UPDATE exec_plans SET repo=?,status='IMPLEMENTING' WHERE repo='A'",(repo,))
+        self._insert_plan(self.connection,'G-004','PLAN_BLOCKED',repo=repo)
+        self.connection.execute("INSERT INTO execplan_blocks(repo,plan_id,scope,reason_code,evidence) VALUES (?, 'G-004','plan','common_defect_pending','cause')",(repo,))
+        self.connection.commit()
+        args = loop_manager.build_parser().parse_args(['unblock',repo,'G-004'])
+        messages=[]
+        effects=SimpleNamespace(connect_database=database.connect_database,operation_print=messages.append)
+        self.assertEqual(execute_runtime_command(effects,args,self.directory,self.config_path),0)
+        owner = task_calls.reserve(self.connection,self.directory,repo,'G-002','verify','run')
+        self.connection.commit()
+        admission.reconcile(self.connection,repo,1)
+        self.assertTrue(admission.parked(self.connection,repo,'G-004'))
+        self.assertIsNotNone(self.connection.execute('SELECT 1 FROM task_call_reservations WHERE token=?',(owner.token,)).fetchone())
+        scheduler=self.scheduler()
+        self.assertFalse(scheduler._eligible(scheduling.Task(repo,'G-002',self.connection),self.connection))
+        task_calls.release(owner)
+        admission.reconcile(self.connection,repo,1)
+        self.assertFalse(admission.parked(self.connection,repo,'G-004'))
+        self.assertEqual(scheduling.managed_count(self.connection,repo),1)
+        self.assertIn('G-004', messages[0])
+
+    def test_manual_management_admission_queues_without_replacing_projection(self):
+        from loop_manager_internal.storage import management_admission as admission
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE repo='A'")
+        self._insert_plan(self.connection,'G-004','MANUAL_PENDING',repo='A')
+        store=ManualWorkRepository(self.connection)
+        group=store.create('A','submit','manual',[],'head','base',members=('G-004',))
+        store.update(group,state='AUTOMATIC',request_id='accepted',owner_id='G-004')
+        project_registry.set_task_limit(self.connection,'A',2,3)
+        before=tuple(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone())
+        runtime_state.RuntimeStateRepository(self.connection).update_plan('A','G-004',plan_values={'status':'VERIFYING'},enqueue=False)
+        self.assertTrue(admission.parked(self.connection,'A','G-004'))
+        self.assertEqual(scheduling.managed_count(self.connection,'A'),2)
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()),before)
+        admission.reconcile(self.connection,'A',2,eligible=lambda _pid:False)
+        self.assertTrue(admission.parked(self.connection,'A','G-004'))
+        self.assertFalse(admission.parked(self.connection,'A','G-002'))
+        admission.reconcile(self.connection,'A',2)
+        self.assertFalse(admission.parked(self.connection,'A','G-004'))
+        self.assertTrue(admission.parked(self.connection,'A','G-002'))
+
     def test_scheduled_call_waits_past_runtime_ttl_without_probe_and_honors_handoff(self):
         from loop_manager_internal.runtime import handoff_gate
         for stopped in (False, True):

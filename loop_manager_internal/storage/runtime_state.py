@@ -723,7 +723,8 @@ class RuntimeStateRepository:
             f"AND status IN ({placeholders}) ORDER BY plan_id",
             (repo, *sorted(ACTIVE_STATUSES)),
         ).fetchall()
-        return rows[0] if rows else None
+        from .management_admission import parked
+        return next((row for row in rows if not parked(self.connection, repo, row["plan_id"])), None)
 
     def active(self, repo: str) -> ExecutionSnapshot | None:
         row = self.active_row(repo)
@@ -805,7 +806,13 @@ class RuntimeStateRepository:
         self._validate_fields(values, EXECPLAN_RUNTIME_FIELDS)
         if values.get("status") in ACTIVE_STATUSES:
             from .task_calls import management_available
-            if not management_available(self.connection,repo,plan_id):
+            from .management_admission import parked, request
+            manual = self.connection.execute('SELECT 1 FROM manual_work_members m JOIN manual_work_groups g '
+                'ON g.repo=m.repo AND g.group_id=m.group_id WHERE m.repo=? AND m.plan_id=? AND g.request_id IS NOT NULL',
+                (repo,plan_id)).fetchone()
+            if manual and not management_available(self.connection,repo,plan_id) and not parked(self.connection,repo,plan_id):
+                request(self.connection,repo,plan_id)
+            if not parked(self.connection,repo,plan_id) and not management_available(self.connection,repo,plan_id):
                 raise TaskLimitReached("프로젝트 관리 대상 한도 때문에 작업을 재개할 수 없습니다.")
         if values.get("status") in ACTIVE_STATUSES or any(values.get(field) for field in (
                 "branch", "worktree", "worker_session_id", "reviewer_session_id", "pr_url", "workspace_owned")):

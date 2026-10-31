@@ -74,6 +74,10 @@ class Task:
             "WHERE m.repo=? AND m.plan_id=? AND g.request_id IS NOT NULL",
             (self.repo, self.plan_id),
         ).fetchone()[0]
+        admission = self.connection.execute('SELECT priority FROM task_management_admissions '
+            'WHERE repo=? AND plan_id=? AND priority>0', (self.repo,self.plan_id)).fetchone()
+        if manual is None and admission is not None:
+            return (.5, admission[0], ())
         if manual is None and self.retry_order is not None:
             return (1, self.retry_order, ())
         if priority_reader is not None:
@@ -97,6 +101,7 @@ class TaskScheduler:
         self.admitting = False
         self.draining_projects = set()
         self.retry_sequence = 0
+        self.tasks = {}
         self.limits = {"agent": config.max_workers, "verify": config.verify_concurrency}
         self.uncertain=Counter()
         self.retained={}
@@ -271,10 +276,13 @@ class TaskScheduler:
                 self.condition.notify_all()
         return True
 
-    def _eligible(self, task, connection, *, check_priority=True):
+    def _eligible(self, task, connection, *, check_priority=True, check_management=True):
         from loop_manager_internal.recovery import scoped_blocking
         from loop_manager_internal.storage import execplan_draft_state
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        from loop_manager_internal.storage.management_admission import parked
+        if check_management and parked(connection,task.repo,task.plan_id):
+            return False
         project_block = scoped_blocking.project_block(connection, task.repo)
         if ((project_block is not None and not (task.recovery and project_block['plan_id'] == task.plan_id))
                 or (not task.recovery and scoped_blocking.plan_block(connection, task.repo, task.plan_id) is not None)
@@ -457,7 +465,7 @@ class TaskScheduler:
                             or self.uncertain[kind]>=self.limits[kind]):
                         raise task_calls.CallDeferred("기존 호출의 종료가 확인되지 않아 실제 실행 자리를 보존합니다.")
                     if capacity and sum(self.running[kind].values()) < self.limits[kind] and next_entry is entry:
-                        allocation = ("retry" if entry[1][0] == 1 else "manual" if entry[1][0] == 0 else "resume" if entry[1][0] == 2
+                        allocation = ("unblock" if entry[1][0] == .5 else "retry" if entry[1][0] == 1 else "manual" if entry[1][0] == 0 else "resume" if entry[1][0] == 2
                                       else "basic" if not self.running[kind][task.repo] else "priority")
                         self.running[kind][task.repo] += 1
                         break
@@ -548,13 +556,18 @@ class TaskScheduler:
 
     @contextmanager
     def task(self, repo, plan_id, connection, *, resumed=True):
-        token = current_task.set(Task(repo, plan_id, connection, resumed))
+        task = Task(repo, plan_id, connection, resumed)
+        token = current_task.set(task)
+        with self.condition:
+            self.tasks[(repo,plan_id)] = task
         try:
             from loop_manager_internal.runtime.resource_lock import resource_locks
             with resource_locks(self.state_dir, repo, ['plan:' + plan_id], owner='task-execution'), \
                  runtime_state.selected_execution(repo, plan_id):
                 yield
         finally:
+            with self.condition:
+                self.tasks.pop((repo,plan_id), None)
             current_task.reset(token)
 
 
@@ -795,6 +808,10 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                     database_attempts = 0
                     while True:
                         scheduler.check_project(repo)
+                        from loop_manager_internal.storage.management_admission import parked
+                        if parked(owned,repo,plan_id):
+                            code = PROJECT_STEP_TRANSIENT_PAUSE
+                            break
                         scheduler.wait_usage(owned, repo, plan_id)
                         scheduler.wait_existing_call(owned, repo, plan_id)
                         scheduler.wait_retry(owned, repo, plan_id, resume=True)
@@ -823,6 +840,9 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                             code = PROJECT_STEP_RETRY
                         except Exception as error:
                             owned.rollback()
+                            if isinstance(error, SchedulingDeferred) and parked(owned,repo,plan_id):
+                                code = PROJECT_STEP_TRANSIENT_PAUSE
+                                break
                             from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
                             if isinstance(error, DatabaseWaitTimeout):
                                 database_attempts += 1
@@ -968,10 +988,21 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                     visited.discard(plan_id)
                     readmitted.add(plan_id)
                     del deferred_inputs[plan_id]
+            from loop_manager_internal.storage import management_admission
+            _, management_limit, _ = project_registry.task_limit(connection,repo,scheduler.config.max_tasks_per_project)
+            was_parked = {r[0] for r in connection.execute('SELECT plan_id FROM task_management_admissions WHERE repo=? AND parked=1',(repo,))}
+            with scheduler.condition:
+                retry_orders = {pid: task.retry_order for (task_repo,pid), task in scheduler.tasks.items() if task_repo==repo}
+            management_admission.reconcile(connection,repo,management_limit,busy=running,retry_orders=retry_orders,
+                eligible=lambda pid: scheduler._eligible(Task(repo,pid,connection),connection,check_management=False))
+            for pid in was_parked:
+                if pid not in running and not management_admission.parked(connection,repo,pid):
+                    visited.discard(pid)
             existing = connection.execute("SELECT * FROM exec_plans WHERE repo=? "
                 "AND status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') ORDER BY plan_id", (repo,)).fetchall()
             for row in existing:
-                if repo not in scheduler.draining_projects and str(row["plan_id"]) not in visited:
+                if (repo not in scheduler.draining_projects and str(row["plan_id"]) not in visited
+                        and not management_admission.parked(connection,repo,str(row["plan_id"]))):
                     launch(row, not (newly_activated and initial and initial.plan_id == row["plan_id"]))
             stop_admission = repo in scheduler.draining_projects or PROJECT_STEP_PLANNING_PENDING in results
             if not stop_admission:

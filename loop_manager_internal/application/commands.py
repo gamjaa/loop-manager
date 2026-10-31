@@ -60,6 +60,11 @@ def _project_limits_status(effects, args, state_dir, config_path):
                 "source": source, "config": str(config.path), "managed_tasks": managed_count(connection, repo),
                 "max_workers": config.max_workers, "verify_concurrency": config.verify_concurrency,
                 "execution_config": None, "actual_calls": None}
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE name='task_management_admissions'").fetchone():
+                result["data"]["management_waiting"] = [r[0] for r in connection.execute(
+                    "SELECT a.plan_id FROM task_management_admissions a JOIN exec_plans p USING(repo,plan_id) "
+                    "WHERE a.repo=? AND a.parked=1 AND p.status IN ('IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') "
+                    "ORDER BY a.sequence", (repo,))]
             result["warnings"] = ["실행 중 Manager의 config·실제 호출 수·설정 반영 여부는 미확인입니다."]
     except (ManagedConfigError, project_registry.ProjectRegistryError, RuntimeError, OSError, sqlite3.DatabaseError) as error:
         if isinstance(error, sqlite3.DatabaseError):
@@ -601,6 +606,13 @@ def execute_runtime_command(
     config_path: Path,
     runtime_mutation: RuntimeMutation | None = None,
 ) -> int:
+    if args.command == 'unblock':
+        from loop_manager_internal.storage.management_admission import release_blocks
+        repo = str(Path(args.repository).expanduser().resolve())
+        with closing(effects.connect_database(state_dir)) as connection:
+            released = release_blocks(connection,repo,args.plan_ids)
+        effects.operation_print(f"차단 해제·우선 재개 대기: {', '.join(released)}; 실제 검증·실행은 다음 안전한 배정에서 수행합니다.")
+        return 0
     if args.command == 'reset':
         if effects.reset_command is None:
             raise RuntimeError('삭제 작업 재시작 composition이 없습니다.')

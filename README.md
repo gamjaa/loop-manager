@@ -97,6 +97,7 @@ Windows:
 | 등록 목록 | `python loop_manager.py config list` |
 | 등록 해제 | `python loop_manager.py remove <project-path>` |
 | 다음 안전한 경계에서 유지보수 요청 | `python loop_manager.py maintenance-review <project-path>` |
+| 사용자 판단·공통 교정 차단 해제 | `python loop_manager.py unblock <project-path> G-001 [G-002 ...]` |
 | 로컬 환경 수정 후 재검사 | `python loop_manager.py recover <project-path> [--plan G-001]` |
 | 기존 계획을 수동 구현 | `python loop_manager.py manual start <project-path> G-012` |
 | 수동 구현 제출 | [complete·submit 안내](docs/OPERATIONS.md#수동-구현과-제출) |

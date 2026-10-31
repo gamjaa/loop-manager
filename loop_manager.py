@@ -110,6 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("repository", help="재검사할 등록 저장소 루트")
     recover.add_argument("--plan", help="이 프로젝트 안의 특정 ExecPlan만 재검사")
 
+    unblock = subcommands.add_parser('unblock', help='명시적 사용자 결정에 따라 계획 차단 해제·우선 재개 대기')
+    unblock.add_argument('repository')
+    unblock.add_argument('plan_ids', nargs='+')
+
     reset = subcommands.add_parser('reset', help='원격 branch 삭제로 중단된 자동 작업의 명시적 재시작')
     reset.add_argument('repository', help='등록된 Git 저장소 루트')
     reset.add_argument('plan_id', help='삭제로 중단된 ExecPlan ID')
@@ -192,7 +196,7 @@ def main() -> int:
                 if not args.runtime_source or not args.runtime_sha:
                     raise RuntimeError("runtime 자식 소유권 정보가 없습니다.")
                 source = Path(args.runtime_source).expanduser().resolve()
-                concurrent = args.command in {"manual", "recover"}
+                concurrent = args.command in {"manual", "recover", "unblock"}
                 runtime_options = {"concurrent": True} if concurrent else {}
                 child_options = {"command_id": args.runtime_mutation_id} if concurrent else {}
                 validate_runtime_child(source, state_dir, str(args.runtime_sha), **child_options)
@@ -211,7 +215,7 @@ def main() -> int:
 
             source = ROOT
             mutation_id = secrets.token_hex(16)
-            concurrent = args.command in {"manual", "recover"}
+            concurrent = args.command in {"manual", "recover", "unblock"}
             lock_options = {"name": f"manual-{mutation_id}.lock"} if concurrent else {}
             runtime_options = {"concurrent": True} if concurrent else {}
             with process_lock(state_dir, identity=f"bootstrap:{mutation_id}", **lock_options) as lock_handle:
