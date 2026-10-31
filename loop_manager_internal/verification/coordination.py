@@ -80,33 +80,58 @@ class VerifyCoordinator:
         self.clock, self.identity = clock, identity
         self.lock = threading.Lock()
         self.sessions, self.reservations, self.waiters, self.last_request = {}, {}, deque(), {}
+        self.wait_groups = {}
+        self.wait_identity = secrets.token_hex(16)
         self.server = self.thread = None
 
     def open(self, cap, *, require_guard=False):
-        session, secret = secrets.token_hex(16), secrets.token_hex(32)
         with self.lock:
-            self.sessions[session] = {"secret": secret, "cap": cap, "guard": None, "require_guard": require_guard,
-                "waiting": False, "waiting_seconds": 0.0, "waiting_at": self.clock(),
-                "budget_directory": os.environ.get("LOOP_MANAGER_VERIFY_BUDGET_DIR")}
+            return self._open(cap, require_guard=require_guard)
+
+    def _open(self, cap, *, require_guard=False, parent=None, observer_only=False):
+        session, secret = secrets.token_hex(16), secrets.token_hex(32)
+        self.sessions[session] = {"secret": secret, "cap": cap, "guard": None, "require_guard": require_guard,
+            "waiting": False, "waiting_at": self.clock(), "parent": parent,
+            "observer_only": observer_only, "pid": None, "identity": None, "events": [], "uncertain": False,
+            "budget_directory": (self.sessions[parent]["budget_directory"] if parent else
+                str(Path(os.environ["LOOP_MANAGER_VERIFY_BUDGET_DIR"]).resolve())
+                if os.environ.get("LOOP_MANAGER_VERIFY_BUDGET_DIR") else None)}
         return session, secret
 
     def track_waiting(self, session, directory):
         with self.lock:
-            self.sessions[session]["budget_directory"] = str(directory)
+            self.sessions[session].update(budget_directory=str(Path(directory).resolve()),
+                                          waiting=False, waiting_at=self.clock())
 
     def _record_wait(self, session, waiting):
         owner = self.sessions[session]
         now = self.clock()
-        interval = now-owner["waiting_at"]
-        # 배정 요청의 heartbeat가 끊긴 구간을 대기로 추정하지 않는다.
-        if owner["waiting"] and 0 <= interval <= 1:
-            owner["waiting_seconds"] += interval
+        directory = owner["budget_directory"]
+        if directory:
+            group = self.wait_groups.setdefault(directory,
+                {"at": now, "waiting": False, "waiting_seconds": 0.0})
+            members = {key: value for key, value in self.sessions.items()
+                       if value["budget_directory"] == directory}
+            def confirmed_wait():
+                return (all(value["waiting"] and not value["uncertain"] and 0 <= now-value["waiting_at"] <= 1
+                            and (value["parent"] is None or value["pid"] is not None
+                                 and self.identity(value["pid"]) == value["identity"])
+                            for value in members.values())
+                        and not any(value["active"] or value["uncertain"]
+                                    for value in self.reservations.values()
+                                    if value["session"] in members))
+            interval = now-group["at"]
+            # 같은 예산의 모든 session이 기다린 겹친 구간은 한 번만 기록한다.
+            # heartbeat 단절이나 실행/종료 불명 예약이 있으면 공제하지 않는다.
+            if waiting and group["waiting"] and confirmed_wait() and 0 <= interval <= 1:
+                group["waiting_seconds"] += interval
         owner.update(waiting=waiting, waiting_at=now)
-        if owner["budget_directory"]:
+        if directory:
+            group.update(at=now, waiting=confirmed_wait())
             from loop_manager_internal.verification.timing import atomic_json
-            directory = Path(owner["budget_directory"])
-            directory.mkdir(parents=True, exist_ok=True)
-            atomic_json(directory / (session+".json"), {"waiting_seconds": owner["waiting_seconds"]})
+            path = Path(directory)
+            path.mkdir(parents=True, exist_ok=True)
+            atomic_json(path / (self.wait_identity+".json"), {"waiting_seconds": group["waiting_seconds"]})
 
     def _allocation(self, session, reply):
         active = any(value["active"] or value["uncertain"] for value in self.reservations.values()
@@ -120,25 +145,123 @@ class VerifyCoordinator:
 
     def finish(self, session, *, stopped):
         with self.lock:
-            if session in self.sessions:
-                self._record_wait(session, False)
-            if stopped:
-                self.reservations = {key: value for key, value in self.reservations.items() if value["session"] != session}
-                self.sessions.pop(session, None)
-            else:
-                for value in self.reservations.values():
-                    if value["session"] == session:
-                        value["uncertain"] = True
-            if session in self.waiters:
-                self.waiters.remove(session)
-            self.last_request.pop(session, None)
+            self._checked_finish(session, stopped=stopped)
+
+    def _owned(self, session):
+        owned, pending = {session}, [session]
+        while pending:
+            parent = pending.pop()
+            children = {key for key, value in self.sessions.items() if value["parent"] == parent} - owned
+            owned.update(children)
+            pending.extend(children)
+        return owned
+
+    def retained(self, session):
+        """Snapshot this run's reservation subtree, excluding independent runs."""
+        with self.lock:
+            owned = self._owned(session)
+            return {key: dict(value) for key, value in self.reservations.items() if value["session"] in owned}
+
+    def _checked_finish(self, session, *, stopped):
+        if stopped:
+            try:
+                owned = self._owned(session)
+                tracked = [value for key, value in self.sessions.items() if key in owned]
+                tracked += [value for value in self.reservations.values() if value["session"] in owned]
+                if any(value["pid"] is not None and self.identity(value["pid"]) == value["identity"] for value in tracked):
+                    from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
+                    raise VerifyTerminationUncertain("하위 runner/worker의 종료 근거가 시작 identity와 불일치합니다.")
+            except BaseException:
+                self._finish(session, stopped=False)
+                raise
+        self._finish(session, stopped=stopped)
+
+    def _finish(self, session, *, stopped):
+        if not stopped:
+            owned = self._owned(session)
+            for key, value in self.sessions.items():
+                if key in owned:
+                    value["uncertain"] = True
+            for value in self.reservations.values():
+                if value["session"] in owned:
+                    value["uncertain"] = True
+        for child in [key for key, owner in self.sessions.items() if owner["parent"] == session]:
+            self._finish(child, stopped=stopped)
+        if session in self.sessions:
+            self._record_wait(session, False)
+        if stopped:
+            self.reservations = {key: value for key, value in self.reservations.items() if value["session"] != session}
+            self.sessions.pop(session, None)
+        if session in self.waiters:
+            self.waiters.remove(session)
+        self.last_request.pop(session, None)
 
     def request(self, session, secret, operation, **data):
         with self.lock:
             owner = self.sessions.get(session)
             if owner is None or not secrets.compare_digest(owner["secret"], secret):
                 raise RuntimeError("verify 통신 인증 실패")
+            if owner["observer_only"] and operation != "observer_state":
+                raise RuntimeError("배정 관측 전용 session의 허용 범위를 벗어났습니다.")
+            if operation == "open_child":
+                if owner["uncertain"] or self.server is None or type(data.get("observer_only")) is not bool:
+                    raise RuntimeError("하위 runner 관측 모드 형식 오류")
+                child, child_secret = self._open(1, require_guard=True, parent=session,
+                                                observer_only=data["observer_only"])
+                self._record_wait(session, False)
+                return {"session": child, "secret": child_secret, "endpoint": self.endpoint}
+            if operation in {"bind_child", "child_status", "finish_child"}:
+                child = data.get("child")
+                target = self.sessions.get(child) if isinstance(child, str) else None
+                if target is None or target["parent"] != session:
+                    raise RuntimeError("다른 verify 또는 알 수 없는 하위 runner입니다.")
+                self._record_wait(session, False)
+                if operation == "bind_child":
+                    pid = data.get("pid")
+                    if (owner["uncertain"] or target["uncertain"] or type(pid) is not int
+                            or pid <= 0 or target["pid"] is not None):
+                        raise RuntimeError("하위 runner PID 형식 오류")
+                    if owner["require_guard"] and owner["guard"] is None:
+                        raise RuntimeError("상위 runner 소유권을 확인하지 못했습니다.")
+                    if owner["guard"] is not None and not owner["guard"](pid):
+                        raise RuntimeError("선택된 verify의 하위 runner가 아닙니다.")
+                    identity = self.identity(pid)
+                    if identity is None:
+                        raise RuntimeError("하위 runner 시작 identity를 확인하지 못했습니다.")
+                    target.update(pid=pid, identity=identity)
+                    target["guard"] = lambda candidate: (self.identity(pid) == identity and descendant(candidate, pid))
+                    return {"ok": True, "pid": pid, "identity": identity}
+                elif operation == "finish_child":
+                    stopped = data.get("stopped")
+                    if type(stopped) is not bool:
+                        raise RuntimeError("하위 runner 종료 근거 형식 오류")
+                    self._checked_finish(child, stopped=stopped)
+                else:
+                    # ponytail: fixed integration fixtures fit the 8 KiB IPC;
+                    # stream the trace before supporting arbitrary child suites.
+                    return {"session": child, "pid": target["pid"], "identity": target["identity"],
+                            "observer_only": target["observer_only"], "events": list(target["events"]),
+                            "reservations": {key: dict(value) for key, value in self.reservations.items()
+                                             if value["session"] == child}}
+                return {"ok": True}
+            if operation == "children_wait":
+                children = [value for value in self.sessions.values() if value["parent"] == session]
+                waiting = not owner["uncertain"] and bool(children) and all(not value["uncertain"] and value["pid"] is not None and
+                    self.identity(value["pid"]) == value["identity"] for value in children)
+                self._record_wait(session, waiting)
+                return {"ok": True}
+            if operation == "observer_state":
+                if owner["uncertain"] or not owner["observer_only"] or type(data.get("waiting")) is not bool:
+                    raise RuntimeError("하위 runner 배정 관측의 소유권/형식 오류")
+                if owner["pid"] is None:
+                    return {"ready": False}
+                if self.identity(owner["pid"]) != owner["identity"]:
+                    raise RuntimeError("하위 runner 시작 identity가 변경됐습니다.")
+                self._record_wait(session, data["waiting"])
+                return {"ready": True}
             if operation == "acquire":
+                if owner["uncertain"]:
+                    raise RuntimeError("종료 불명 session은 새 자원을 예약할 수 없습니다.")
                 for key in ("run_id", "unit_id"):
                     value = data.get(key)
                     if value is not None and (not isinstance(value, str) or not value):
@@ -195,6 +318,9 @@ class VerifyCoordinator:
                         if value is not None:
                             self.reservations[token][key] = value
                     reply["token"] = token
+                    if owner["parent"] is not None:
+                        owner["events"].append({"operation": "acquire", "token": token,
+                                                "run_id": data.get("run_id"), "unit_id": data.get("unit_id")})
                 return self._allocation(session, reply)
             token = data.get("token")
             self._record_wait(session, False)
@@ -203,7 +329,7 @@ class VerifyCoordinator:
                 raise RuntimeError("다른 verify 또는 알 수 없는 예약입니다.")
             if operation == "bind":
                 pid = data.get("pid")
-                if not isinstance(pid, int) or pid <= 0 or reservation["pid"] is not None:
+                if owner["uncertain"] or type(pid) is not int or pid <= 0 or reservation["pid"] is not None:
                     raise RuntimeError("verify 자식 bind 형식 오류")
                 guard = owner["guard"]
                 if guard is not None and not guard(pid):
@@ -225,6 +351,9 @@ class VerifyCoordinator:
                 self.reservations.pop(token)
             else:
                 raise RuntimeError("허용되지 않은 verify 통신 요청입니다.")
+            if owner["parent"] is not None:
+                owner["events"].append({"operation": operation, "token": token,
+                    "pid": reservation["pid"], "identity": reservation["identity"]})
             return {"ok": True}
 
     def start(self):

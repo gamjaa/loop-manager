@@ -717,6 +717,31 @@ class GuardAndConfigurationTests(unittest.TestCase):
 
 
 class VerifyProcessBoundaryTests(unittest.TestCase):
+    def test_exit_zero_still_checks_final_execution_budget_and_wait_records(self):
+        from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
+        for elapsed, corrupt in ((32, False), (42, False), (32, True)):
+            with self.subTest(elapsed=elapsed, corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                now = [0.0]
+                budget = ExecutionClock({BUDGET_DIRECTORY: str(root / 'budget')}, clock=lambda: now[0])
+                process = mock.Mock(pid=123, returncode=0)
+                def wait(**_options):
+                    now[0] = elapsed
+                    (budget.directory / 'session.json').write_text('{' if corrupt else '{"waiting_seconds": 30}')
+                    return 0
+                process.wait.side_effect = wait
+                with mock.patch.object(verify_process, 'terminate_verify_process') as terminate:
+                    if corrupt:
+                        with self.assertRaises(VerifyBudgetError):
+                            verify_process.run_verify_process(['verify'], root, None,
+                                execution_clock=budget, launch_process=mock.Mock(return_value=process))
+                    else:
+                        passed, timed_out, _output = verify_process.run_verify_process(['verify'], root, 10,
+                            execution_clock=budget, launch_process=mock.Mock(return_value=process))
+                        self.assertEqual((passed, timed_out), (elapsed == 32, elapsed == 42))
+                        terminate.assert_not_called()
+                self.assertEqual(budget.active_processes, 0)
+
     def test_linux_freeze_failure_still_kills_every_observed_child(self):
         def signal(pid, _birth, action):
             if pid == 101 and action == 9:
@@ -1294,6 +1319,23 @@ class ExecutionQueueTests(unittest.TestCase):
 
 
 class ManagerAdapterTests(unittest.TestCase):
+    def test_stop_observation_mismatch_still_preserves_child_reservation_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            coordinator = mock.Mock(endpoint=('127.0.0.1', 123))
+            coordinator.open.return_value = ('session', 'private')
+            coordinator.finish.side_effect = verify_process.VerifyTerminationUncertain('live child')
+            coordinator.retained.return_value = {'child': {'session': 'child-session', 'uncertain': True}}
+            effects = mock.Mock()
+            effects.run_verify_process.return_value = (True, False, 'parent exited')
+            with execution_settings(coordinator, 1, root), \
+                    self.assertRaisesRegex(verify_process.VerifyTerminationUncertain, 'live child'):
+                manager_adapter.run(effects, ['fake'], root, 20)
+            journal = json.loads((root / 'logs/verify/session/uncertain-reservations.json').read_text())
+            self.assertEqual(journal, coordinator.retained.return_value)
+            coordinator.finish.assert_called_once_with('session', stopped=True)
+            coordinator.retained.assert_called_once_with('session')
+
     def test_progress_reads_stage_worker_events_once_and_tracks_interruption(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root = Path(directory)
@@ -1358,13 +1400,16 @@ class ManagerAdapterTests(unittest.TestCase):
             root = Path(directory)
             coordinator = mock.Mock(endpoint=("127.0.0.1", 123))
             coordinator.open.return_value = ("session", "private")
-            coordinator.lock = __import__("threading").Lock()
             coordinator.reservations = {"owned": {"session": "session", "uncertain": True},
+                                        "child": {"session": "child-session", "uncertain": True},
                                         "other": {"session": "other"}}
+            coordinator.retained.return_value = {key: coordinator.reservations[key] for key in ('owned', 'child')}
             effects = mock.Mock()
             effects.run_verify_process.side_effect = verify_process.VerifyTerminationUncertain("fake uncertainty")
             with execution_settings(coordinator, "auto", root), self.assertRaises(verify_process.VerifyTerminationUncertain):
                 manager_adapter.run(effects, ["fake"], root, 20)
             coordinator.finish.assert_called_once_with("session", stopped=False)
             journal = json.loads((root / "logs/verify/session/uncertain-reservations.json").read_text())
-            self.assertEqual(set(journal), {"owned"})
+            self.assertEqual(set(journal), {"owned", "child"})
+            coordinator.retained.assert_called_once_with('session')
+            self.assertEqual(coordinator.reservations['other'], {'session': 'other'})

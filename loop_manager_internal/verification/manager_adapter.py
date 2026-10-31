@@ -367,12 +367,15 @@ def run(effects, arguments, worktree, timeout, *, launch=None, partial_base=None
         return passed, timed_out, output
     finally:
         try:
-            coordinator.finish(session, stopped=stopped)
-            if not stopped and directory.is_dir():
-                with coordinator.lock:
-                    retained = {key: value for key, value in coordinator.reservations.items() if value["session"] == session}
-                atomic_json(directory / "uncertain-reservations.json", retained)
-                diagnostic(directory)
+            finish_failed = True
+            try:
+                coordinator.finish(session, stopped=stopped)
+                finish_failed = False
+            finally:
+                if (not stopped or finish_failed) and directory.is_dir():
+                    retained = coordinator.retained(session)
+                    atomic_json(directory / "uncertain-reservations.json", retained)
+                    diagnostic(directory)
         finally:
             try:
                 if writer:

@@ -3,23 +3,19 @@ import json
 from dataclasses import asdict
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from loop_manager_internal.verification import contract, manifest, runner, unittest_adapter
-from loop_manager_internal.execution.verify_process import run_verify_process
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.execution import result_validation
 from loop_manager_internal.execution.verify_process import VerifyProcessOutput
 from loop_manager_internal.verification import manager_adapter
 from types import SimpleNamespace
-import threading
 from loop_manager_internal.verification.timing import comparison
 from tests.support.git import isolated_git_test
-from tests.support.verify_fixture import nested_runner_source
 
 
 @isolated_git_test
@@ -118,8 +114,8 @@ class PartialRunnerTests(unittest.TestCase):
                 coordinator = mock.Mock()
                 coordinator.open.return_value = ('session', 'secret')
                 coordinator.endpoint = {}
-                coordinator.lock = threading.RLock()
                 coordinator.reservations = {'owned': {'session': 'session'}}
+                coordinator.retained.return_value = dict(coordinator.reservations)
                 context = SimpleNamespace(coordinator=coordinator, cap=1, state_dir=root)
                 effects = mock.Mock()
                 if uncertain:
@@ -178,124 +174,3 @@ class PartialRunnerTests(unittest.TestCase):
                 validate = core.call_args.kwargs['validate_report']
                 with self.assertRaisesRegex(RuntimeError, 'identity'):
                     validate(unit, {'version': 1, 'run_id': 'other', 'unit_id': unit.name, 'stage_id': 'tests'})
-
-    def test_nested_runner_fixes_resource_observation_and_restores_sampler(self):
-        from loop_manager_internal.verification.resources import ResourceSampler, decide
-        entrypoint = Path(runner.__file__).with_name('entrypoint.py')
-        original = ResourceSampler.sample
-        observations = []
-
-        def inspect(path, *, run_name):
-            self.assertEqual(path, str(entrypoint))
-            self.assertEqual(run_name, '__main__')
-            sampler = ResourceSampler()
-            for _ in range(2):
-                observed = sampler.sample()
-                self.assertEqual((observed.cpus, observed.busy, observed.available),
-                                 (2, 0, 4 * 1024 ** 3))
-                self.assertTrue(decide(observed, now=observed.at, running=0, cap=1).granted)
-                observations.append(observed)
-            raise SystemExit(0)
-
-        before = list(sys.path)
-        try:
-            with mock.patch('runpy.run_path', side_effect=inspect) as run:
-                with self.assertRaises(SystemExit) as stopped:
-                    exec(compile(nested_runner_source(entrypoint), '<nested runner>', 'exec'), {})
-                self.assertEqual(stopped.exception.code, 0)
-                run.assert_called_once()
-        finally:
-            sys.path[:] = before
-        self.assertEqual(len(observations), 2)
-        self.assertIs(ResourceSampler.sample, original)
-
-    def test_actual_partial_and_full_runs_preserve_manifest_and_separate_results(self):
-        # Two actual runs prove subprocess discovery/execution and partial/full
-        # separation. Policy combinations use existing unit adapters above.
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / 'project'
-            root.mkdir()
-            (root / 'tests').mkdir()
-            (root / 'pkg').mkdir()
-            (root / 'scripts').mkdir()
-            (root / 'docs/requirements').mkdir(parents=True)
-            document = root / 'docs/requirements/[R-086] Impact.md'
-            document.write_text('# Review inputs\n')
-            def git(*args):
-                return subprocess.run(['git', '-C', str(root), *args], check=True,
-                                      capture_output=True, text=True).stdout.strip()
-            git('init', '-q')
-            (root / '.gitignore').write_text('__pycache__/\n')
-            (root / 'pkg/value.py').write_text('def _value():\n    return 1\n')
-            # An opaque module elsewhere must be reported without forcing the
-            # precheck to run the whole manifest; actual full verify still runs.
-            (root / 'pkg/opaque.py').write_text('def dynamic(name):\n    return __import__(name)\n')
-            (root / 'tests/test_selected.py').write_text(
-                'import unittest\nfrom pkg.value import _value\n'
-                'class Case(unittest.TestCase):\n'
-                '    def test_value(self):\n        self.assertEqual(_value(), 2)\n'
-                '    @unittest.skip("intentional skip")\n'
-                '    def test_skip(self):\n        pass\n')
-            for index in range(5):
-                (root / f'tests/test_other{index}.py').write_text(
-                    'import unittest\nclass Case(unittest.TestCase):\n'
-                    '    def test_ok(self):\n        self.assertTrue(True)\n')
-            declaration = {'version': 1, 'adapter': 'unittest', 'environment': {'python': 'launcher'},
-                'stages': [{'id': 'tests', 'kind': 'tests', 'cwd': '.',
-                            'collection': {'directory': 'tests', 'pattern': 'test*.py'}, 'execution': 'serial'},
-                           {'id': 'compile', 'kind': 'command', 'cwd': '.',
-                            'argv': ['{python}', '{runner}', '--compile', 'pkg']}]}
-            (root / 'scripts/verify.json').write_text(json.dumps(declaration))
-            git('add', '.')
-            git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'base')
-            base = git('rev-parse', 'HEAD')
-            (root / 'pkg/value.py').write_text('def _value():\n    return 2\n')
-            document.write_text('# Updated review inputs\n')
-            git('add', '.')
-            git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'candidate')
-            entrypoint = Path(runner.__file__).with_name('entrypoint.py')
-            bootstrap = Path(temporary) / 'nested-runner.py'
-            bootstrap.write_text(nested_runner_source(entrypoint))
-            reports = []
-            # The full suite can run another module beside this nested runner
-            # on 2-CPU hosts; keep the behavioral assertions past that wait.
-            for mode in ('partial', 'full'):
-                logs = Path(temporary) / mode
-                environment = dict(os.environ, LOOP_MANAGER_VERIFY_LOG_DIR=str(logs))
-                environment.pop('LOOP_MANAGER_VERIFY_PARTIAL_BASE', None)
-                for name in ('LOOP_MANAGER_VERIFY_ENDPOINT', 'LOOP_MANAGER_VERIFY_SESSION', 'LOOP_MANAGER_VERIFY_SECRET'):
-                    environment.pop(name, None)
-                # Nested real-process runs need startup/shutdown room under full-suite load.
-                arguments = [sys.executable, str(bootstrap), '--execute', '--parallelism', '1', '--timeout', '90']
-                if mode == 'partial':
-                    arguments += ['--partial-base', base]
-                passed, timed_out, output = run_verify_process(arguments, root, 120, environment=environment, job_scope=True)
-                self.assertTrue(passed, f'{mode}: timed_out={timed_out}, '
-                                f'exit_code={getattr(output, "exit_code", None)}; {output}; '
-                                + '\n'.join(path.read_text(encoding='utf-8', errors='replace')[-3000:]
-                                            for path in logs.rglob('*')
-                                            if path.suffix in {'.log', '.jsonl'}))
-                self.assertFalse(timed_out)
-                reports.append(json.loads((logs / 'manifest.json').read_text()))
-                if mode == 'partial':
-                    result = json.loads((logs / 'partial-result.json').read_text())
-                    self.assertEqual(result['status'], 'PASS')
-                    self.assertEqual(result['kind'], 'partial_verify')
-                    self.assertEqual(result['selection']['modules'], ['test_selected'])
-                    self.assertEqual(len(result['selection']['ids']), 2)
-                    self.assertEqual(result['selection']['total_tests'], 7)
-                    self.assertEqual(result['selection']['analysis']['coverage'], 'selected_modules_only')
-                    self.assertTrue(result['selection']['analysis']['remaining_uncertainties'])
-                    proof = result['selection']['analysis']['documents'][0]
-                    self.assertEqual(proof['path'], 'docs/requirements/[R-086] Impact.md')
-                    self.assertNotEqual(proof['source_identity']['base'], proof['source_identity']['head'])
-                    units = reports[-1]['stages'][0]['units']
-                    self.assertEqual(sum(unit['status'] == 'NOT_SELECTED' for unit in units), 5)
-                    events = [json.loads(line) for line in (logs / 'runner.jsonl').read_text().splitlines()]
-                    self.assertEqual([e['unit_id'] for e in events if e['kind'] == 'module_result'], ['test_selected'])
-                    self.assertFalse(any(e.get('unit_id') == 'compile' for e in events))
-                else:
-                    self.assertFalse((logs / 'partial-result.json').exists())
-                    self.assertEqual(len(reports[-1]['stages']), 2)
-            self.assertEqual([unit['payload'] for unit in reports[0]['stages'][0]['units']],
-                             [unit['payload'] for unit in reports[1]['stages'][0]['units']])

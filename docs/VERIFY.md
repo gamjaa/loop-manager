@@ -19,7 +19,11 @@ Windows에서도 Python과 `entrypoint.py`의 절대 경로로 같은 인수를 
 
 ## 순번 대기와 시간 예산
 
-Manager의 verify 호출 대기는 `verify_concurrency` 자리 배정 뒤 시간 측정을 시작한다. runner의 내부 자원 대기는 coordinator가 해당 session에 실행 중이거나 종료 불명인 자식이 없고 정상 heartbeat가 이어지는 구간만 확인해 누계로 남긴다. 다른 자식이 실행 중이거나 runner가 멈춘 구간은 제외하지 않는다. 부모의 경과 시간에서 확인된 대기만 빼며 병렬 자식 시간을 더하지 않는다.
+Manager의 verify 호출 대기는 `verify_concurrency` 자리 배정 뒤 시간 측정을 시작한다. runner의 내부 자원 대기는 같은 coordinator와 예산 디렉터리에 연결된 모든 session이 배정을 기다리고, 각 session의 heartbeat 간격이 1초 이내이며 실행 중·종료 불명 예약이 없는 구간만 공통 누계로 남긴다. 겹친 session 대기는 한 번만 공제한다. 한 session이 준비·처리 중이거나 heartbeat가 끊기면 공제하지 않으며 다른 예산 디렉터리의 session은 이 판정에 포함하지 않는다. session 종료·다음 session 시작에도 같은 coordinator의 누계를 유지한다. 부모의 경과 시간에서 확인된 대기만 빼며 병렬 자식 시간을 더하지 않는다. 자체 필수 runner 통합 단계와 그 하위 실행도 이 예산을 공유한다. 상위 처리와 단계 전환에서 이미 소비한 시간은 후속 호출에 남는다.
+
+내부 port는 신뢰된 상위의 고정 runtime 실행에 한정하며 일반 guard 자식은 사용할 수 없다. standalone 하위의 관측 전용 session은 예약 권한 없이 실제 배정 상태만 전달하고 로컬 누계는 상위 합계에서 분리한다. 상위의 대기 보고와 하위의 PID·시작 identity·heartbeat가 모두 유효한 동안만 공제한다. 조율 인증값은 일반 자식에게 전달하지 않는다. 시작·조율·종료 진단과 예약 트리 보존 계약은 [공통 verify 실행 경계](ARCHITECTURE.md#공통-verify-실행-경계)에 둔다. 자체 Windows 전체 검증은 기존 `verify.ps1`의 WSL 전체 단계에서 통합 suite를 실행하고 Windows 핵심 회귀를 이어 실행한다. 직접 native 전체 runner 호출로 이 경계를 우회할 수 없다. Linux unit을 Windows native 실행 근거로 삼지 않는다.
+
+대기 JSON의 `waiting_seconds`는 0 이상의 유한한 숫자이며 같은 기록에서 감소하거나 사라질 수 없다. 잘못된 JSON·필드/타입·음수·비유한 값·합계 범위 초과·관측한 기록의 역행/소실·누계 디렉터리 읽기 실패는 상한이 없는 호출에서도 `VerifyBudgetError`로 실패한다. 실패 시점의 파일과 직전 관측값을 누계 디렉터리의 `error-*/`에 즉시 보존하며 이후 정상 기록이 써져도 같은 clock의 오류를 해제하지 않는다. WSL의 `wsl-lifecycle.json`은 대기 합산 대신 기존 종료 확인 경계가 검증한다. runner는 session 정리 전에 실패한 누계 원본을 진단 디렉터리의 `budget-error/`에 복사하고, 예산 오류가 발생한 clock의 소유 임시 누계 디렉터리를 보존한다. 마지막 단계·결과 처리와 프로세스 종료 확인 뒤에도 예산을 다시 검사하므로 종료 코드 0만으로 timeout을 성공 처리하지 않는다. 최종 검사 실패 뒤 부분 결과는 ERROR이며 PASS를 남기지 않는다.
 
 `LOOP_MANAGER_VERIFY_BUDGET_DIR`는 같은 검증의 Manager·launcher·runner가 누계를 공유하는 내부 환경값이다. 단계 사이에서 예산을 초기화하지 않고, 테스트 worker에는 이 조율 환경을 제거해 검증 대상이 부모 시간을 조작하지 않도록 한다. Windows·WSL 두 단계도 같은 실제 시간 예산을 사용하며 Windows Job 종료와 Linux 자식 종료·복사본 정리 근거를 함께 확인한다. WSL 종료가 불명이면 lifecycle receipt와 소유 예약을 보존하고 실행 자리를 임의로 회수하지 않는다.
 
@@ -36,8 +40,11 @@ Manager의 verify 호출 대기는 `verify_concurrency` 자리 배정 뒤 시간
 | `stages` | 중복 없는 `id`, `kind`, worktree 안의 `cwd`를 가진 순서 있는 필수 단계 |
 | tests 단계 | `collection.directory`, `collection.pattern`, `execution` (`independent` 또는 `serial`) |
 | command 단계 | 비어 있지 않은 `argv` 배열; shell 문자열 해석 없음 |
+| runner-integration 단계 | unittest 선언의 마지막 단계 하나만 허용; `cwd`는 `.`, `suite`는 `loop-manager-v1`; 임의 argv·plugin 없음 |
 
 command의 독립 인수 `{python}`과 `{runner}`는 각각 프로젝트 interpreter와 Manager runtime 진입점으로 치환한다. perl-tap command의 첫 인수 `{perl}`는 선언한 Perl과 검증 guard preload 인수로 치환한다. Perl compile은 이 형식을 사용해 BEGIN 단계에도 guard를 적용한다. 일반 문자열의 보간이나 범용 DAG·resource lock 설정은 제공하지 않는다. command 단계는 직렬이며 테스트별 결과를 만들지 않는다. 자체 compile은 명시된 `loop_manager.py`와 `loop_manager_internal/**/*.py` 전체를 프로젝트 Python으로 검사한다.
+
+자체 저장소의 `runner-integration`은 tests·compile 뒤의 필수 단계다. 같은 계약을 구현한 runtime으로 Manager와 단독 실행을 검증하며 구형 runtime의 미지원 오류를 우회하지 않는다. 명시하지 않은 등록 프로젝트에는 자동 추가하지 않는다. 전체 manifest에 고정 case 목록과 결과 경로를 기록하고 `integration-result.json` version 1의 run·stage·revision·platform과 순서 있는 완료 case를 대조한다. 누락·중복·미완료·실패·timeout·부분 결과는 전체 PASS가 아니다. 부분 verify는 tests에서 종료하며 이 단계를 성공 처리하지 않는다.
 
 수집한 manifest는 version·run·adapter identity, 프로젝트 도구 버전과 각 단계의 단위 ID·argv·cwd·실행 조건·테스트 ID를 포함한다. Perl 단계는 Manager Python worker argv와 별도로 native 도구 버전을 `tool`에 기록한다. 정적 선언에 테스트 ID를 쓰지 않는다. 단계 실패 뒤의 단계는 시작하지 않는다. `auto`와 `1`은 같은 필수 범위를 사용한다.
 
@@ -112,19 +119,12 @@ Linux에서는 위 설치 도구의 부재·버전 불일치를 성공/skip으�
 Perl native case만 명시적으로 skip하고 Python 예제와 플랫폼 독립 계약·IPC 검사를 유지한다.
 순수 계약/IPC 검사는 임시 도구 파일과 mock을 사용하며 native 지원 근거로 취급하지 않는다.
 이 테스트 수집 구분은 명시적으로 연결한 프로젝트의 도구 부재 실패 계약을 바꾸지 않는다.
-예제 Manager 호출의 shell 선택은 기존 verify_arguments의 pwsh/powershell 경로를 따른다.
 
 [test_verify_perl_adapter.py](../tests/test_verify_perl_adapter.py)는 native assertion·plan·skip·TODO·
 subtest·오류, 수집/결과 identity·범위·부분 결과·통신 실패·guard·serial 예산을 검사한다.
-[test_verify_language_examples.py](../tests/test_verify_language_examples.py)는 실제 두 예제의
-단독/Manager 성공·실패와 실제 조율 모드·session/run identity·공통 manifest·예약 회수를 확인한다.
-단독/Manager 호출 fixture는 guard가 자식 환경에서 제거한 테스트 예산 경로를 임시 파일로
-runner 진입점에 전달하며 Manager 호출에는 해당 fixture의 session도 전달한다.
-같은 wrapper에서 중첩 runner의 자원 관측도 고정해 호스트 부하와 분리한다.
-프로젝트 test worker의 인증값 제거와 Agent guard는 유지한다.
-이 전달 계약은 subprocess를 mock한 unit test로 확인하며 native 통합 회귀는 Worker가 실행하지 않는다.
-로컬 native targeted 근거는 Linux/Perl 5.38.2이며 실제 강제 종료,
-Windows/Linux 격리와 동시 실행 실측은 전체 verify·후속 Manager 검증으로 남는다.
+[integration.py](../loop_manager_internal/verification/integration.py)의 필수 suite는 두 언어 × standalone/coordinated × 정상/native 실패의 8개 case와 실제 partial/full roundtrip을 실행한다. 지원 Linux의 Perl 부재는 실패이며 미지원 플랫폼만 명시적으로 구별한다. 각 예제는 compile → tests의 실제 성공·수집 범위·native report·skip/expected failure/TODO 의미·revision/run identity와 종료를 대조한다. 기대한 테스트 본문 실패 대신 fixture 오류·통신 실패·timeout이 발생하면 실패다. coordinated 예제는 실제 예약의 acquire/bind/release와 PID/시작 identity까지 확인하며 standalone은 관측 전용 session으로 실제 로컬 배정을 유지한다. 실제 suite에는 고정 CPU/메모리 sampler나 중첩 runner bootstrap fixture를 사용하지 않는다.
+
+partial/full case는 실제 Git 후보의 문서 identity·선정 테스트·불확실성·NOT_SELECTED 5개 모듈·부분 compile 미호출과 후속 전체 manifest를 확인한다. 일반 unittest의 중복 실제 실행과 소비자가 사라진 고정 sampler helper·용량/복원 unit은 제거했다. [test_verify_integration.py](../tests/test_verify_integration.py)는 선언·결과 validator·공유 예산·신뢰 경계·종료 보존을 mock/fake 기반으로 검사한다. 일반/예제 worker와 command의 조율 인증값 제거 및 Agent/API guard는 유지한다. 실제 suite·전체 verify·Windows native 실행은 Manager 검증이며 unit 통과로 대신하지 않는다. Windows/Linux 격리와 동시 실행 실측은 후속 검증 범위다.
 
 ## 영향 기반 부분 실행
 

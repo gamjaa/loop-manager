@@ -913,10 +913,11 @@ Worker는 현재 작업의 테스트를 명세·구현과 대조해 폐기된 �
 
 - Worker는 현재 환경의 전체 검증 스크립트를 생성·유지하고, 프로그램이 Agent 밖에서 실행한다. 최종 후보의 게시 판단은 위 조건표를 따르며, Reviewer는 검증 근거와 실제 변경을 읽기 전용으로 검토한다.
 - 자체 verify는 직렬·프로세스 병렬 모드에서 동일한 unittest manifest·fixture 계약과 전체 compile을 유지한다. 실제 Agent 실행을 테스트 경계에서 차단하며 테스트·준비·대기·정리 시간과 중단 진단은 성공 stdout과 분리해 보존한다.
-- 명시적 공통 verify 연결은 unittest와 Perl TAP adapter를 제공한다. 도구·연결 오류와 부분 결과를 성공으로 처리하지 않으며 두 언어는 같은 자원 예약·종료·진단과 필수 compile 순서를 따른다. Perl의 Agent 호출 차단·지원 버전·한계는 [VERIFY.md](VERIFY.md#perl-tap-지원과-두-언어-예제)를 따른다.
+- 명시적 공통 verify 연결은 unittest와 Perl TAP adapter를 제공한다. 도구·연결 오류와 부분 결과를 성공으로 처리하지 않으며 두 언어는 같은 자원 예약·종료·진단과 필수 compile 순서를 따른다. 대기 기록의 손상·역행·소실은 실패로 진단하고 원본 근거를 보존한다. 마지막 결과 처리와 종료 확인 뒤 실제 시간 예산을 넘었으면 종료 코드가 0이어도 성공하지 않으며 부분 PASS도 남기지 않는다. Perl의 Agent 호출 차단·지원 버전·한계는 [VERIFY.md](VERIFY.md#perl-tap-지원과-두-언어-예제)를 따른다.
 - 자체 verify 입력에는 실행 코드·테스트·고정 샘플·의존성·실제 verify/copy/실행 스크립트가 포함된다. 저장소의 공통·역할·Ponytail 원문 `docs/AGENTS.common.md`, `docs/AGENTS.planner.md`, `docs/AGENTS.planner_check.md`, `docs/AGENTS.worker.md`, `docs/AGENTS.reviewer.md`, `docs/AGENTS.ponytail.md`를 비롯한 문서·Skill·README·예제 설정의 정책·안내 문구 일관성은 검사하지 않으며 문서 원본을 고정 샘플로 자동 동기화하지 않는다. 현재 runtime의 실제 지침 선택·planning 입력 해시·Agent 전달과 호출 해시는 계속 적용하고, 지침 변경의 의미는 Reviewer가 실제 diff와 명세에서 검토한다. 파서·등록·profile·파일 복사 검증과 필수 unittest·전체 compile은 유지하며 verify가 문서 품질을 보증하지는 않는다.
 
   prose 제외만으로 재사용을 허용하지 않고 아래 코드 입력 목록·누락 확인·실제 전체 성공 근거를 확인한다. 환경·runtime의 완전성 증명은 요구하지 않는다. 일반 코드 관측은 환경 증명 없이 재사용을 판단한다. 자동 문서 제외 확인과 Worker 소비 검토의 적용 범위는 [운영 입력 관측 adapter](ARCHITECTURE.md#운영-입력-관측-adapter)에 명시하며, 환경 증명 부재를 새 정책의 완료 조건으로 유지하지 않는다.
+- 자체 전체 verify는 테스트·compile과 신뢰된 runner 통합 단계를 모두 완료해야 한다. 두 언어의 지원 범위 안에서 단독·조율 정상/실패와 실제 부분/전체 결과 분리를 검사하며, 필수 항목 누락·중복·미완료·시간 초과를 성공으로 처리하지 않는다. 상하위가 모두 배정만 기다린 확인된 시간은 한 번만 제외하고 처리·heartbeat 단절·종료 불명 구간은 소비 예산에 남긴다. 부분 verify의 PASS는 통합 단계나 후속 전체 verify를 대신하지 않는다. Windows 자체 전체 검증은 WSL 전체와 native 핵심 회귀를 결합한다.
 - `verify_parallelism`은 생략 시 `auto`, 양의 정수는 상한, `1`은 직렬이다. 프로그램이 CPU 제한·실제 부하·메모리 여유·미반영 예약으로 실행량을 정하며 등록 프로젝트 수로 고정 분할하지 않는다. 관측 실패는 직렬로 축소한다. 확인된 순번·자원 배정 대기는 timeout에서 제외하고 준비·수집·복사·호출·결과 처리·정리의 실제 경과 시간만 계산한다.
 - Manager 인스턴스가 동시 verify의 확인·예약을 조율한다. 자식 종료·미시작을 확인한 뒤 예약을 해제하고 종료 불명은 보존한다. 종료 불명 호출과 미확정 Git operation·게시의 실제 실행 자리·자원 예약은 보존한다. 관리 자리 계산은 위의 작업 상태별 조건을 따르며 과거 시간 자료는 현재 검증을 대신하지 않는다.
 
