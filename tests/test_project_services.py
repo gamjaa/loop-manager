@@ -16,6 +16,45 @@ from tests.support.database import runtime_connection
 
 
 class ProjectServiceCompositionTests(unittest.TestCase):
+    def test_scheduled_planning_wait_still_dispatches_task_recovery(self):
+        from loop_manager_internal.application.task_scheduling import current_scheduler, current_task
+        for scheduled, nested, kind in (
+            (True, False, project_service.PlanningOutcomeKind.WAITING),
+            (False, False, project_service.PlanningOutcomeKind.WAITING),
+            (True, True, project_service.PlanningOutcomeKind.WAITING),
+            (True, False, project_service.PlanningOutcomeKind.TRANSIENT_PAUSE),
+        ):
+            with self.subTest(scheduled=scheduled, nested=nested, kind=kind):
+                connection = runtime_connection()
+                self.addCleanup(connection.close)
+                effects = SimpleNamespace(_recorded_base_fetch=mock.Mock(),
+                    _check_runtime_handoff=mock.Mock(), _PlanningLifecyclePorts=mock.Mock(),
+                    _record_project_recovery=mock.Mock(),
+                    is_loop_manager_repository=mock.Mock(return_value=False),
+                    _planning_outcome_step_result=loop_manager._planning_outcome_step_result)
+                identity = project_service.ProjectIdentity(connection, Path('/state'), 'repo',
+                    Path('/config.ini'), None, False, None, True, None, 20, 600, None)
+                service = project_service.ProjectService(effects, identity)
+                service.state.repo = 'repo'
+                service.state.base = 'main'
+                service.state.row = connection.execute('SELECT * FROM projects').fetchone()
+                scheduler_token = current_scheduler.set(SimpleNamespace(draining_projects=set()) if scheduled else None)
+                task_token = current_task.set(object() if nested else None)
+                try:
+                    with mock.patch.object(service, '_refresh_catalog', return_value='base'), \
+                         mock.patch.object(service, '_dispatch_execution', return_value=73) as dispatch, \
+                         mock.patch.object(project_service, 'PlanningLifecycleCoordinator') as planning:
+                        planning.return_value.run.return_value = project_service.PlanningOutcome(kind)
+                        result = service._run_coordinators()
+                    if scheduled and not nested and kind is project_service.PlanningOutcomeKind.WAITING:
+                        self.assertEqual(result, 73)
+                        dispatch.assert_called_once_with(mock.ANY, newly_activated=False, planning_context=mock.ANY)
+                    else:
+                        dispatch.assert_not_called()
+                finally:
+                    current_task.reset(task_token)
+                    current_scheduler.reset(scheduler_token)
+
     def test_manual_revalidation_defers_only_open_pr_reconciliation(self):
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
         for state in ('OPEN','CLOSED','MERGED'):

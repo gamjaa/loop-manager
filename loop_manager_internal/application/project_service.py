@@ -874,7 +874,7 @@ class ProjectService:
 
     def _run_coordinators(self) -> int | None:
         assert self.state.row is not None
-        from loop_manager_internal.application.task_scheduling import current_scheduler
+        from loop_manager_internal.application.task_scheduling import current_scheduler, current_task
         scheduler = current_scheduler.get()
         if scheduler is not None and self.state.repo in scheduler.draining_projects and any(
                 scheduler.running[kind][self.state.repo] for kind in ('agent', 'verify')):
@@ -975,7 +975,11 @@ class ProjectService:
                 ),
             )
         planning_step_result = self.effects._planning_outcome_step_result(planning_outcome)
-        if planning_step_result is not None:
+        if planning_step_result is not None and not (
+            planning_outcome.kind is PlanningOutcomeKind.WAITING
+            and scheduler is not None and current_task.get() is None
+            and self.identity.recovery_request_id is None
+        ):
             return planning_step_result
         self.state.base_sha = planning_outcome.base_sha or self.state.base_sha
         if self.identity.recovery_request_id:
