@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 
 CODEX_EXTENSION_ARGUMENTS = ('-c', 'features.plugins=false', '-c', 'features.apps=false')
 
@@ -31,10 +32,32 @@ class CodexLaunch:
             from .windows_runtime import stop
             stop(process)
             return
+        lock = vars(process).get('_agent_stop_lock')
+        if lock is not None:
+            with lock:
+                if vars(process).get('_agent_stop_error') is not None:
+                    raise process._agent_stop_error
+                if vars(process).get('_agent_stop_confirmed'):
+                    return
+                try:
+                    CodexLaunch._stop_posix(process)
+                except BaseException as error:
+                    process._agent_stop_error = error
+                    raise
+                process._agent_stop_confirmed = True
+            return
+        CodexLaunch._stop_posix(process)
+
+    @staticmethod
+    def _stop_posix(process) -> None:
         if sys.platform.startswith('linux') and process.poll() is None:
             from loop_manager_internal.execution.verify_process import terminate_verify_process
             terminate_verify_process(process)
             return
+        if (sys.platform.startswith('linux') and isinstance(process.returncode, int)
+                and process.returncode < 0):
+            from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
+            raise VerifyTerminationUncertain('Agent supervisor 종료 후 자식 종료 근거가 없습니다.')
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -51,7 +74,10 @@ class CodexLaunch:
             from loop_manager_internal.execution.verify_process import _LINUX_SUBREAPER
             arguments = [sys.executable, '-c',
                          _LINUX_SUBREAPER.replace('stdin=subprocess.DEVNULL', 'stdin=None'), *arguments]
-        return launch_process(arguments, stdin=subprocess.PIPE, start_new_session=True, **kwargs)
+        process = launch_process(arguments, stdin=subprocess.PIPE, start_new_session=True, **kwargs)
+        if sys.platform.startswith('linux'):
+            process._agent_stop_lock = threading.Lock()
+        return process
 
     def run(self, arguments: list[str], *,
             launch_process: Callable[..., subprocess.Popen],
