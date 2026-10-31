@@ -55,6 +55,15 @@ Python·Perl 실제 runner 예제를 일반 unittest 자식에서 신뢰된 전�
 - [ ] 신뢰된 필수 통합 단계·두 언어 및 partial/full 실제 회귀 이전과 상하위 실행 예산 연결
 - [ ] 최소 unit·실제 필수 단계의 결과/종료 근거 및 문서 정합성 확인
 
+- [x] 관리 rebase 완료 뒤 HEAD `56364d86ee1739d7e89dc242f7fb44ded56adff1`의 현재 계획·sources·base 대비 전체 변경을 다시 대조했다. verify feedback `verify:171739809e3963eccd204dde3617e29d64b49847762e42a76cdfa8337dc54b05` occurrence 1/revision 1의 실패를 개별 targeted unit으로 재현했다. 공정 배정 fixture는 PID 100의 시작 identity를 살아 있는 상태로 둔 채 stopped=True를 선언해, 새 종료 확인 계약과 모순됐다. 같은 파일의 release 회귀처럼 identity 제거로 종료 관측을 먼저 반영한 뒤 finish를 호출하도록 fixture만 수정했다. 배정 순서·pending CPU/메모리·다른 session 예약 보존 assertion과 실제 종료 확인 구현은 유지했다.
+
+FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_verify_resources.ReservationTests.test_waiting_verify_gets_turn_and_other_reservations_survive_finish`
+Initial result: ERROR (1 test), VerifyTerminationUncertain으로 전달된 전체 verify 오류를 재현했다.
+RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_verify_resources.ReservationTests.test_waiting_verify_gets_turn_and_other_reservations_survive_finish`
+Final result: PASS (1 test).
+
+- [x] 수정 뒤 같은 runner로 `tests.test_verify_resources.ReservationTests` 9개 통과. 추가로 `tests.test_verify_integration.ChildCoordinatorTests.test_ancestor_exit_cannot_reclaim_live_descendant_runner_or_worker`와 `test_active_and_uncertain_sibling_block_wait_and_other_run_is_preserved`를 개별 ID로 실행해 2개 통과했다. 실제 생존한 하위 runner/worker 회수 거부와 독립 예약 보존을 현재 후보에서 확인했다. 이전 후보의 성공은 이번 호출의 실행 결과로 사용하지 않았다. 기존 tests/** 입력 glob이 fixture 수정을 포함한다. 전체 verify·실제 통합/native·Review는 실행하지 않았으며 외부 검증은 별도로 남는다. 호환 코드·self-runtime 정책과 사용자 판단 기록은 변경하지 않았다.
+
 ## Decision Log
 
 - revision `5395d93192ede14c777bb26aebca4b2f4a98b769`의 공통 worker 전송 분리는 현재 코드와 두 adapter·pool 회귀로 소비한다. 남은 신뢰된 통합 단계·상하위 대기 예산·실제 예제 이전은 그대로이며 전송 추출의 재구현이나 새 선행 작업을 만들지 않는다. snapshot token `4a5912aa2b0768f4afe120f9f6c10856d16b732ca30d00f65aa092e6cf12a9cf`의 ID·경로·metadata·dependency와 기존 기록을 보존한다. 이번 정적 대조는 테스트·verify·Review 성공이나 차단 해제가 아니다.

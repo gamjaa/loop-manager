@@ -241,6 +241,8 @@ class ReservationTests(unittest.TestCase):
         self.assertTrue(resumed["granted"])
         self.assertEqual(resumed["pending_cpu"], 2)
         self.assertEqual(resumed["pending_memory"], 2 * resources.DEFAULT_WORKER_BYTES)
+        # The bound worker must have exited before its session can be reclaimed.
+        self.identities.pop(100)
         self.coordinator.finish(self.a, stopped=True)
         self.assertIn(other, self.coordinator.reservations)
         self.assertNotIn(token, self.coordinator.reservations)
