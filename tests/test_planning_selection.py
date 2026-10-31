@@ -403,6 +403,19 @@ class PlanningSelectionTest(PlanningCase):
                 self.assertEqual(ports.state.cycle.phase, maintenance_state.MaintenancePhase.IDLE)
                 ports.state.activate_ready.assert_not_called()
 
+    def test_maintenance_wait_reports_its_actual_blocked_target(self):
+        ports = FakePorts(planning_snapshot(), maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.REFACTORING,refactoring_plan_ids=('G-001',)))
+        ports.state.execplan_rows = lambda _repo: [
+            {'plan_id':'G-001','status':'PLAN_BLOCKED','depends_on':'[]'},
+            {'plan_id':'G-002','status':'READY','depends_on':'[]'}]
+        coordinator=PlanningLifecycleCoordinator(ports)
+        outcome=coordinator._selection._select_planning_work(coordinator._new_run(self.context))
+        self.assertEqual(outcome.kind,PlanningOutcomeKind.WAITING)
+        self.assertIn('G-001(PLAN_BLOCKED)',outcome.detail)
+        self.assertNotIn('G-002',outcome.detail)
+        self.assertEqual(ports.agent.run_count,0)
+
     def test_project_safety_block_prevents_maintenance_completion_transition(self):
         ports = FakePorts(planning_snapshot(), maintenance_cycle(
             phase=maintenance_state.MaintenancePhase.REFACTORING, refactoring_plan_ids=("G-001",)))

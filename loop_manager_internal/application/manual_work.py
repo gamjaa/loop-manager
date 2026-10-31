@@ -173,9 +173,15 @@ class ManualWorkService:
                 self.state_dir, self.repo, stage='manual_slot', connection=self.connection,
                 git=self.effects.git, worktrees=worktrees or (self.repo_path,), refs=refs,
                 recoverable=recoverable)
+        cycle_blocked = cycle.phase is not maintenance_state.MaintenancePhase.IDLE
+        if cycle_blocked and recovering is not None and recovering['request_id']:
+            from loop_manager_internal.maintenance.maintenance_orchestration import cycle_allows_recovery
+            owner = recovering['active_id'] or recovering['owner_id']
+            rows = self.connection.execute('SELECT * FROM exec_plans WHERE repo=?',(self.repo,)).fetchall()
+            cycle_blocked = not (owner and cycle_allows_recovery(rows,cycle,owner,explicit_request=True))
         return not (runtime_state.planning_owns_execution_slot(row)
             or scoped_blocking.project_block(self.connection, self.repo)
-            or cycle.phase is not maintenance_state.MaintenancePhase.IDLE
+            or cycle_blocked
             or journal_conflict())
 
     def fetch(self, branch):
@@ -500,14 +506,11 @@ class ManualWorkService:
         from loop_manager_internal.application.task_scheduling import SchedulingDeferred
         rotate_correction(self.connection,self.repo)
         pending=self.store.pending(self.repo)
-        recovering=next((group for group in pending if group['state']=='REGISTERING'
-                         or group['source_update_candidate']),None)
-        if not self.slot_available(recovering=recovering):
-            return
         for group in pending:
-            from loop_manager_internal.application.task_scheduling import current_scheduler
+            if not self.slot_available(recovering=group):
+                continue
             owner = group['active_id'] or group['owner_id']
-            if current_scheduler.get() is not None and owner:
+            if owner:
                 current = self.runtime.get(self.repo, owner)
                 if current.status in runtime_state.ACTIVE_STATUSES:
                     continue
@@ -542,6 +545,8 @@ class ManualWorkService:
         confirm_dependencies(self.connection,self.effects,self.repo_path,json.loads(group['documents']),self.base)
         owner = group['active_id'] or group['owner_id']
         row = self.runtime.get(self.repo,owner)
+        if row.status in runtime_state.ACTIVE_STATUSES:
+            return
         if row.status=='PLAN_BLOCKED':
             return  # Existing scoped recovery owns final blocks.
         if row.status in {'PR_OPEN','MERGED'}:
@@ -557,11 +562,15 @@ class ManualWorkService:
         with (scheduler.admission(Task(self.repo,owner,self.connection))
               if scheduler is not None else nullcontext()):
             latest = self.store.get(self.repo, group['group_id'])
-            if dict(latest) != dict(group) or not self.slot_available(recovering=latest):
+            if (dict(latest) != dict(group) or not self.slot_available(recovering=latest)
+                    or self.runtime.get(self.repo,owner).status in runtime_state.ACTIVE_STATUSES):
                 return
             with self.connection:
-                self.runtime.update_plan(self.repo,owner,plan_values={'status':group['resume_phase']},enqueue=False)
-                self.runtime.hydrate(self.repo,owner)
+                self.runtime.update_plan(self.repo,owner,expected_status=row.status,
+                    plan_values={'status':group['resume_phase']},enqueue=False)
+                from loop_manager_internal.storage.management_admission import parked
+                if not parked(self.connection,self.repo,owner):
+                    self.runtime.hydrate(self.repo,owner)
                 self.store.update(group,active_id=owner)
         return
 

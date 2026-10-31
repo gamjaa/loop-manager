@@ -306,7 +306,7 @@ class TaskScheduler:
         if unmet_execplan_dependencies(connection, task.repo, task.plan_id):
             return False
         from loop_manager_internal.storage import maintenance_state
-        from loop_manager_internal.maintenance.maintenance_orchestration import assessment_can_yield, cycle_scope_plan_ids, is_unowned_ready
+        from loop_manager_internal.maintenance.maintenance_orchestration import assessment_can_yield, cycle_allows_recovery, is_unowned_ready
         cycle = maintenance_state.MaintenanceRepository(connection).get(task.repo)
         if assessment_can_yield(cycle) and is_unowned_ready(row):
             return False
@@ -314,7 +314,9 @@ class TaskScheduler:
                            maintenance_state.MaintenancePhase.REFACTORING,
                            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION}:
             rows = connection.execute('SELECT * FROM exec_plans WHERE repo=?', (task.repo,)).fetchall()
-            if task.plan_id not in cycle_scope_plan_ids(rows, cycle):
+            from loop_manager_internal.storage.management_admission import explicit_request
+            requested = bool(group is not None and group['request_id']) or explicit_request(connection,task.repo,task.plan_id)
+            if not cycle_allows_recovery(rows,cycle,task.plan_id,explicit_request=requested):
                 return False
         if check_priority and self.priority_reader is not None and not task.recovery:
             decision = self.priority_reader(connection, task.repo)

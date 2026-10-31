@@ -148,6 +148,84 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertFalse(admission.parked(self.connection,'A','G-004'))
         self.assertTrue(admission.parked(self.connection,'A','G-002'))
 
+    def test_explicit_release_runs_outside_blocked_maintenance_without_releasing_other_gates(self):
+        from loop_manager_internal.storage import management_admission as admission, maintenance_state
+        self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo='A'")
+        for pid in ('G-001','G-002'):
+            self.connection.execute("INSERT INTO execplan_blocks(repo,plan_id,scope,reason_code,evidence) "
+                "VALUES ('A',?,'plan','common_defect_pending','original cause')",(pid,))
+        self._insert_plan(self.connection,'G-004','READY',repo='A')
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,refactoring_plan_ids,publication_stage) "
+            "VALUES ('A','refactoring','[\"G-001\"]','remote_confirmed')")
+        self.connection.commit()
+        original_cycle = maintenance_state.MaintenanceRepository(self.connection).get('A')
+        admission.release_blocks(self.connection,'A',['G-002'])
+        scheduler=self.scheduler(max_workers=1,max_tasks_per_project=1)
+        scheduler.priority_reader=loop_manager.catalog_schedule_decision
+        task=scheduling.Task('A','G-002',self.connection)
+        self.assertTrue(scheduler._eligible(task,self.connection,check_management=False))
+        admission.reconcile(self.connection,'A',1,eligible=lambda pid:
+            scheduler._eligible(scheduling.Task('A',pid,self.connection),self.connection,check_management=False))
+        with scheduler.slot('agent',task):
+            self.assertEqual(scheduling.managed_count(self.connection,'A'),1)
+        self.assertFalse(scheduler._eligible(scheduling.Task('A','G-004',self.connection),self.connection))
+        self.assertIsNotNone(self.connection.execute("SELECT 1 FROM execplan_blocks WHERE plan_id='G-001'").fetchone())
+        self.assertEqual(maintenance_state.MaintenanceRepository(self.connection).get('A'),original_cycle)
+        for stage in ('intent','remote_confirmed'):
+            self.connection.execute("UPDATE maintenance_cycles SET publication_stage=? WHERE repo='A'",(stage,))
+            self.assertEqual(scheduler._eligible(task,self.connection),stage=='remote_confirmed')
+        self.connection.execute("UPDATE exec_plans SET depends_on='[\"G-004\"]' WHERE repo='A' AND plan_id='G-002'")
+        self.assertFalse(scheduler._eligible(task,self.connection))
+
+    def test_accepted_manual_reentry_respects_maintenance_publication_and_git_safety(self):
+        from loop_manager_internal.application.manual_work import ManualWorkService
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        self.connection.execute("UPDATE exec_plans SET status='MANUAL_PENDING' WHERE repo='A'")
+        store=ManualWorkRepository(self.connection)
+        group=store.create('A','submit','manual',[],'head','base',members=('G-002',))
+        store.update(group,state='AUTOMATIC',request_id='accepted',owner_id='G-002')
+        group=store.get('A',group['group_id'])
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,refactoring_plan_ids,publication_stage) "
+            "VALUES ('A','refactoring','[\"G-001\"]','remote_confirmed')")
+        service=object.__new__(ManualWorkService)
+        service.connection,service.repo,service.store=self.connection,'A',store
+        service.state_dir,service.repo_path=self.directory,Path('A')
+        service.effects=SimpleNamespace(git=mock.Mock())
+        with mock.patch('loop_manager_internal.git.manager_git_journal.has_conflicting_project_mutation',return_value=False) as conflict:
+            self.assertTrue(service.slot_available(recovering=group))
+            self.assertFalse(service.slot_available())
+            self.connection.execute("UPDATE maintenance_cycles SET publication_stage='intent' WHERE repo='A'")
+            self.assertFalse(service.slot_available(recovering=group))
+            self.connection.execute("UPDATE maintenance_cycles SET publication_stage='remote_confirmed' WHERE repo='A'")
+            conflict.return_value=True
+            self.assertFalse(service.slot_available(recovering=group))
+
+    def test_queued_manual_resume_preserves_the_other_project_projection(self):
+        from loop_manager_internal.application.manual_work import ManualWorkService
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        from loop_manager_internal.storage.management_admission import parked
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE repo='A'")
+        self._insert_plan(self.connection,'G-004','MANUAL_PENDING',repo='A')
+        store=ManualWorkRepository(self.connection)
+        group=store.create('A','submit','manual',[],'head','base',members=('G-004',))
+        store.update(group,state='AUTOMATIC',request_id='accepted',owner_id='G-004',worktree=str(self.directory))
+        group=store.get('A',group['group_id'])
+        project_registry.set_task_limit(self.connection,'A',2,3)
+        before=tuple(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone())
+        service=object.__new__(ManualWorkService)
+        service.connection,service.repo,service.store=self.connection,'A',store
+        service.state_dir,service.repo_path,service.base=self.directory,Path('A'),'main'
+        service.runtime=runtime_state.RuntimeStateRepository(self.connection)
+        service.effects=SimpleNamespace(git=mock.Mock(),git_bytes=mock.Mock(),resolve_profile=mock.Mock())
+        service.config_path,service.project=self.config_path,{'provider':'codex'}
+        with mock.patch('loop_manager_internal.execution.manual_candidate.ManualCandidate.note_pending'), \
+             mock.patch('loop_manager_internal.application.manual_work.confirm_dependencies'), \
+             mock.patch.object(service,'slot_available',return_value=True):
+            service._resume_group(group)
+        self.assertTrue(parked(self.connection,'A','G-004'))
+        self.assertEqual(service.runtime.get('A','G-004').status,'VERIFYING')
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()),before)
+
     def test_scheduled_call_waits_past_runtime_ttl_without_probe_and_honors_handoff(self):
         from loop_manager_internal.runtime import handoff_gate
         for stopped in (False, True):

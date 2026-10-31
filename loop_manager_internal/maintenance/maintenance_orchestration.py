@@ -328,8 +328,8 @@ def select_cycle_ready_execplan(
     return min(candidates, key=order) if candidates else None
 
 
-def cycle_allows_recovery(rows, cycle, plan_id) -> bool:
-    """A cycle must be able to recover its own fixed targets and dependencies."""
+def cycle_allows_recovery(rows, cycle, plan_id, *, explicit_request=False) -> bool:
+    """Keep fixed targets while admitting explicit requests at safe published boundaries."""
     if cycle.phase is maintenance_state.MaintenancePhase.IDLE:
         return cycle.publication_stage is None
     if (cycle.phase not in {maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
@@ -338,7 +338,8 @@ def cycle_allows_recovery(rows, cycle, plan_id) -> bool:
             or cycle.publication_stage not in {None, 'remote_confirmed'}):
         return False
     try:
-        return plan_id in cycle_scope_plan_ids(rows, cycle)
+        scope = cycle_scope_plan_ids(rows, cycle)
+        return explicit_request or plan_id in scope
     except MaintenanceOrchestrationError:
         return False
 

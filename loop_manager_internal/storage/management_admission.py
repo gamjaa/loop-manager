@@ -19,6 +19,11 @@ def parked(connection, repo, plan_id):
         'WHERE repo=? AND plan_id=? AND parked=1', (repo, plan_id)).fetchone() is not None
 
 
+def explicit_request(connection, repo, plan_id):
+    return connection.execute('SELECT 1 FROM task_management_admissions '
+        'WHERE repo=? AND plan_id=? AND priority>0',(repo,plan_id)).fetchone() is not None
+
+
 def request(connection, repo, plan_id):
     sequence = connection.execute('SELECT COALESCE(MAX(priority),0)+1 FROM task_management_admissions').fetchone()[0]
     connection.execute('INSERT INTO task_management_admissions(repo,plan_id,priority) VALUES (?,?,?) '

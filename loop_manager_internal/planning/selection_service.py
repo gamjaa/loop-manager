@@ -2,7 +2,9 @@
 from __future__ import annotations
 from pathlib import Path
 import subprocess
-from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
+from loop_manager_internal.maintenance.maintenance_orchestration import (
+    maintenance_planning_fingerprint, cycle_scope_plan_ids, MaintenanceOrchestrationError,
+)
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
 from loop_manager_internal.storage import maintenance_state, runtime_state
@@ -494,10 +496,17 @@ class PlanningSelectionService(PlanningService):
         }:
             decision = self._ports.state.schedule(context.repo)
             if decision.runnable_ready is None:
-                self._ports.events.info(
-                    "활성 유지보수 주기의 dependency 충족을 기다립니다."
-                )
-                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                rows = self._ports.state.execplan_rows(context.repo)
+                try:
+                    scope = cycle_scope_plan_ids(rows,cycle)
+                except MaintenanceOrchestrationError as error:
+                    remaining = str(error)
+                else:
+                    remaining = ', '.join(f"{item['plan_id']}({item['status']})" for item in rows
+                        if item['plan_id'] in scope and item['status'] != 'MERGED')
+                detail = f"활성 유지보수 주기의 dependency 충족을 기다립니다. 남은 범위: {remaining}"
+                self._ports.events.info(detail)
+                return PlanningOutcome(PlanningOutcomeKind.WAITING,detail=detail)
             run.base_sha = self._fetch_remote_head(context)
             self._ports.state.activate_ready(context.repo, run.base_sha)
             row = self._ports.state.planning(context.repo)
