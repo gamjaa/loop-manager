@@ -53,6 +53,7 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 13·14·
 
 - [x] 저장된 6건의 정책/실제 효과 구분과 남길 통합 회귀를 확인하고, 현재 관측 port에서 독립적으로 전환할 범위를 확정했다. 구현·테스트·verify는 실행하지 않았다.
 - [x] 보존된 G-333 후보의 catalog fixture와 미커밋 관측 보완을 읽기 전용으로 확인했다. 후보의 구현·기록·작업 공간은 수정하지 않았으며 이 확인을 테스트·verify·Review 성공으로 사용하지 않았다.
+- 보존된 원격 문서 관측 보완을 포함한 현재 후보에서 `CatalogSchedulingObservationTest.test_dependency_blocked_ready_is_not_an_empty_catalog`가 targeted runner로 통과했다. 실패 Planner와 독립 Worker의 역할·SQLite 상태를 확인했으며, 최신 조건의 planning WAITING 뒤 dependency 대기와 일곱 게시 정책 사례는 아직 확인하지 않았다.
 - [ ] 정책 fixture 전환과 기존 assertion·통합 검증 대응 확인
 - [ ] 새 게시 CAS·DB retry 일곱 case의 Git 준비 분리와 저장/경쟁 assertion 보존
 
