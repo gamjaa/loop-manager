@@ -6,6 +6,7 @@ sources:
   - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
   - docs/requirements/[R-077] G 계획 수동 구현과 R·코드 일괄 제출.md
   - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
+  - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
 depends_on:
   - G-236
   - G-237
@@ -32,6 +33,8 @@ priority: high
 
 ## Acceptance Criteria
 
+- 명령 수락은 관리 한도와 독립적으로 처리하되 실제 종료·백업·PR/소유권 거부 조건은 유지한다. parked 상태를 종료/무소유나 READY로 간주하지 않는다. 성공한 초기화/수동 해제의 현재 admission만 요청/단계와 함께 정리하고 과거 감사와 다른 작업의 순서·실제 예약을 보존한다. R-055의 목표 철회/삭제 확정은 reset·백업 복원의 대상이 아니다.
+
 - 등록된 비종료 작업·전체 제출 묶음·정확한 Manager 소유 branch/worktree만 대상으로 한다. 일반 reset/manual cancel/stop은 실행 종료와 자원 해제를 확인하며 PR 생성/연결·MERGED/archive·사용자 결정·독립 안전 차단·사용자 Git operation·소유권 불명을 거부한다. R-055의 실제 원격 삭제로 중단된 자동 작업에 대한 명시적 reset만 PR 미Merge의 예외를 유지한다. 실제 Merge 확인은 완료를 우선하고 기존 PR·작업물·실패·게시 감사는 보존한다.
 - 미커밋·미게시 파일/commit과 현재 상태를 복구 가능하게 백업하고 위치를 출력한다. 백업 실패에서는 초기화하지 않는다. 아직 base에 없는 수동 R/G 정의·사용자 결정·원본 snapshot·감사·묶음 관계도 보존한다.
 - 관리 rebase만 안전하게 취소하고 사용자 source checkout/branch는 변경하지 않는다. 현재 소유 작업 branch를 확인한 원격 base로 초기화하며 원격에는 정확한 관측 OID lease를 사용한다. 예상 밖 후속 commit·PR·소유자 변화는 덮어쓰지 않는다.
@@ -41,11 +44,15 @@ priority: high
 
 ## Implementation
 
+- [ ] 현재 `storage/management_admission.py`의 우선 요청·보존 대기와 `task_calls.py`의 물리 예약을 종료/백업·원자 READY 확정에 연결한다. 명령 포화 거부를 추가하지 않으며 초기화 실패에는 기존 요청/대기·순서·intent를 보존한다. 기록 제거 예외는 G-260/G-261의 확인된 목표 철회에 한정해 소비하고 reset이 삭제 ID/문서를 되살리지 않게 한다.
+
 - [ ] 기존 수동 자원 예약·Manager Git journal·현재 rebase 판정·게시 lease와 checkpoint generation을 재사용해 일반 reset/manual stop의 백업·묶음 초기화를 구현한다. 필요한 백업·호환 intent는 기존 관리 경계 안에 두고 실제 보완한 보존/복구 계약만 PRODUCT·ARCHITECTURE에 반영한다.
 - [ ] 확인한 `loop_manager.py`의 reset parser, `application/commands.py`의 `reset_deleted_branch()`·`execute_runtime_command()`, `recovery/deleted_branch_restart.py`의 기존 분기를 조사해 일반 reset과 삭제 재시작을 현재 요청 종류로 구분한다. 삭제 재시작의 archive·새 작업 주기·성공 무효화·원격 부재 lease 경로를 중복 구현하거나 일반 PR 거부로 가리지 않는다.
 - [ ] `tests/test_task_remote_inputs.py`의 실제 삭제·로컬 staged/unstaged/untracked 보존·worktree 이동/새 공간 준비 중단·실제 Merge 우선 회귀를 재사용하고 일반 reset/manual stop의 조건 조합은 기존 수동 fixture·관측 mock으로 검사한다. 명시적 재시작 없이 run·pause 해제·ref 재생성으로 과거 실행이 이어지지 않게 한다.
 
 ## Validation
+
+- 보존 대기 단위·포화 상태에서 명령 수락/실제 종료·백업을 구분하고 미종료 예약·PR/lease 경쟁에는 무초기화를 확인한다. 초기화 전후 중단에서 admission과 묶음 상태가 함께 확정/보존되고 타 작업 순서 불변·삭제 확정 ID의 재등록/백업 자동 복원 0회를 검사한다.
 
 - targeted unit test로 미종료·백업 실패·PR 출현·lease/소유자 경쟁·미게시 R/G·묶음 일부 거부·각 저장 경계 중단을 실제 정책/SQLite/파일 보존으로 확인한다. 판정 함수를 성공값으로 대체하지 않는다.
 - reset command 분기 unit에서 일반 PR 연결 작업의 거부, 확인된 삭제 자동 작업의 명시적 재시작, 실제 Merge 우선, 미확인 삭제·독립 gate 거부를 확인한다. 새 작업 주기에 이전 success token·게시 intent를 적용하지 않으며 원래 PR 감사는 유지한다. 기존 실제 이동/lease 회귀를 정책 조합마다 반복하지 않는다.

@@ -28,6 +28,7 @@ depends_on:
   - G-333
   - G-334
   - G-335
+  - G-345
 complexity: medium
 risk: medium
 priority: normal
@@ -38,6 +39,8 @@ priority: normal
 확정된 운영 CLI를 안내하는 Loop Manager 전용 Skill과 manual start 성공에서 복사할 수 있는 짧은 구현 프롬프트를 제공한다. 프로젝트 구현·재검증·push까지의 지시는 복사용 프롬프트에, Manager에서 실행할 완료 명령과 선택적 생략 사유 안내는 별도 사용자 출력에 둔다. 명령·대상·검증·후속 조치를 실제 준비 결과에 맞춘다.
 
 ## Acceptance Criteria
+
+- 현재 `unblock <repo> <G-ID> [<G-ID> ...]`을 안내한다. 명시적 사용자 판단/공통 교정 차단만 원자 해제·우선 대기하며 안전/소유권·종료 불명은 우회하지 않는다. 수동 제출 → 명시 해제 관리 재진입 → RETRY → 기존 자동 → 신규 순서, 포화 중 수락과 마지막 관리 단위의 보존 대기·안전 반환 뒤 인계를 설명한다. 반복 요청의 최초 순서 보존·실제 호출 상한·pause/dependency와 수락/실제 시작의 차이를 유지한다.
 
 - Skill·도움말·사용 예시는 새 list/status/usage/logs·add/remove·run 범위·pause/resume·reset·manual cancel/stop 및 유지 명령의 의미·거부·결과 확인을 일치하게 안내한다. explain·제거된 config list/add/remove 호환 명령은 안내하지 않는다.
 - R-076/R-091: 이미 구현된 `config set <repo> --max-tasks-per-project <N>`과 `status <repo>`를 안내한다. DB의 0은 config 상속이고 양수는 개별값이며 config 자체의 0은 거부됨을 구분한다. 기본값은 Agent 3·관리 1·verify 1이고 세 종류의 한도·verify 내부 병렬도는 별개다. 실행/pause 중 저장·다음 안전한 배정 반영·상한 축소 시 기존 작업 보존과 조회 config/실행 config 미확인을 같은 의미로 설명한다. 수동 제출 우선은 실행 중 호출의 선점이나 즉시 실행 보장이 아니며 공유 묶음 내부만 직렬이다.
@@ -50,6 +53,8 @@ priority: normal
 
 ## Implementation
 
+- [ ] 확인한 `loop_manager.py`의 unblock parser·`application/commands.py`의 수락 출력과 README의 새 명령 행을 소비한다. G-345의 실제 순서/재시작 보완 뒤 Skill·운영 안내를 해당 계약과 대조하며 새 CLI나 admission 엔진을 재구현하지 않는다. metadata/로컬 환경의 recover와 사용자 판단/공통 교정 unblock, pause resume를 구별한다.
+
 기존 CLI 출력·manual start 결과와 Skill 구조를 재사용한다. 프롬프트 텍스트 생성은 준비 결과에 결합한 결정적 formatter로 두고 모델/설치 탐색을 추가하지 않는다. 복사 범위를 수정하며 G-230 배포 명령도 유지한다. PRODUCT·ARCHITECTURE의 Skill 소유/배포 책임을 반영한다.
 
 - [ ] 확인한 `loop_manager.py`의 명령 도움말, `application/commands.py`의 요청 접수·config set/status 출력과 `README.md`·`docs/OPERATIONS.md`를 새 명령 Skill의 안내와 대조한다. 직접 반영된 유지보수 0·요청 예시와 프로젝트 한도 설정/조회 설명을 재사용하고 도움말·Skill의 남은 설명만 맞춘다. `config/managed_config.py`·`runtime/project_registry.py`의 한도 저장/상속과 `storage/maintenance_state.py`·`maintenance/tiered_review.py`의 유지보수 0·기존 요청 저장/소비는 다시 만들지 않는다.
@@ -57,6 +62,8 @@ priority: normal
 - [ ] 확인한 `application/manual_work.py`의 start 성공 결과·출력과 기존 `validate_options()`·`execution/manual_candidate.py`의 생략 표시를 대조한다. 복사용 formatter는 프로젝트에서의 구현·검증·push까지만 생성하고 별도 사용자 출력이 Manager의 complete 명령을 담당하게 한다. G-254 뒤의 선택적 사유 계약을 Skill·완료 안내에 연결하되 옵션 수락·정규화·감사·Reviewer/PR 표시 구현은 재작성하지 않는다. complete/submit의 생략 안내는 실제 수행 사실을 사용자가 제공하는 절차이며 프롬프트 생성기가 사유나 성공을 합성하지 않는다.
 
 ## Validation
+
+- 변경한 도움말/명령 출력의 최소 fixture에서 수락과 실행 미시작·다중 ID·안전 거부가 사실대로 표현되는지 확인한다. Skill prose는 실제 명령과 읽기 전용으로 대조하고 문구 고정 테스트·운영 명령 실제 실행을 추가하지 않는다.
 
 - targeted unit test로 준비 성공/실패·공백 경로·작업 문서·verify 환경별 명령·전체 내용과 모델 호출 부재를 확인한다. 고정 샘플로 실제 복사 스크립트의 전용 Skill 제외·Specification 파일 보존·충돌 거부를 검사한다. Manager가 없는 복사 대상에서 ID 조회와 활성/archive 존재 여부·활성 제목/경로/기존 Summary 조회를 실행해 독립 배포를 확인한다.
 - `tests/test_manual_work.py`·`tests/support/manual_work.py`의 start 준비·출력 fixture와 분리된 공통 `tests/support/manual_work_case.py`를 재사용해 복사용 프롬프트에는 프로젝트 재검증·push 지시가 있고 PR 생성·Manager 명령 실행 지시는 없으며, 별도 출력에 정확한 repository·G ID의 complete 명령이 있는지 최소 unit case로 검사한다. 준비 실패·미완료에는 준비 완료용 프롬프트가 없어야 한다. 생략 안내 출력을 바꾸면 사용자가 선택한 옵션·필수 전체 expected SHA·선택적 사유를 구분하는 case를 추가하고, 실제 옵션의 사유 생략/빈 값/공백 수락·reason 단독 거부는 G-254의 회귀를 재사용한다. 새 Skill prose 검사나 실제 Manager 실행은 추가하지 않는다.

@@ -24,6 +24,8 @@ priority: high
 
 ## Acceptance Criteria
 
+- R-091의 명시적 수동 제출/unblock 수락·관리 보존 대기/인계 기록도 pause에서 보존한다. pause 중 유효 요청 접수·명시 해제 상태 반영은 가능하지만 자동 후속 배정은 시작하지 않는다. pause resume 자체는 독립 차단을 해제하거나 admission을 재정렬/소비하지 않고 다음 자동 실행만 현재 자격·자리·종료를 확인한다. 사용자 pause의 종료 요청과 관리 인계의 안전 반환 대기는 구별한다.
+
 - R-061의 문서 보고 결합도 pause에서 보존한다. Worker 결과 원문·작업 base/후보와 작업별 `manager_metadata`의 `document-report:` 근거를 유지하며 저장 전·후의 pause를 결합 완료나 설명 승인으로 간주하지 않는다. resume 명령은 base 조회·보고 재결합/소비나 잘못된 base·과거 해시 오류 차단 해제를 수행하지 않는다. 다음 자동 실행만 기존 검증/게시 경계에서 같은 작업 base와 현재 후보의 문서별 patch를 대조한다. 원격 base 전진만으로 작업 base를 바꾸지 않고 rebase 완료 근거 뒤에만 통합된 target으로 전환한다. 작업 base 조회 실패·근거 부재는 후보·원문·진단을 보존해 기존 복구로 이어가며 실제 patch 변경·설명 결합 부재의 교정과 구별한다.
 
 - pause [repo]는 먼저 요청을 저장하고 대상 Agent·verify·자식 종료를 유한 시간 안에 확인한다. 단계·session·작업물·진단·게시 intent를 보존하며 다른 프로젝트나 다른 기기의 수동 구현 종료를 주장하지 않는다.
@@ -41,6 +43,8 @@ priority: high
 - R-093의 Manager checkpoint 요청·commit·push·결과 저장 사이 pause에서도 요청/intent·이미 생성한 commit·실제 게시/종료 근거·session과 미확인 prompt 전달 cursor를 보존한다. 새 원격 통합 중에는 원래 `before`·현재 후보·`accepted_work_branch`·검증 무효화 상태와 미완료 request를 함께 보존하고, 낡은 push intent가 이미 폐기됐으면 `retired_worker_checkpoints`의 원래 intent·관측 원격·`confirmed: false` 감사도 유지한다. 수용된 rebase의 후속 checkpoint도 같은 계약을 따른다. 진행 중 rebase와 일반 checkpoint 요청이 함께 남으면 원래 target·충돌 처리·요청을 보존하고 rebase 해결·완료가 일반 요청 소비보다 먼저 이어지게 한다. 완료 게시의 intent/result·현재 acceptance는 과거 차단 checkpoint가 unpublished로 바뀌거나 intent가 `retired_rebase_publications`로 이동해도 같은 ID의 게시 결과와 함께 보존하며, 다음 자동 실행에서 현재 소유권·범위·실제 원격을 다시 확인한다. 폐기 감사의 `confirmed: false`는 별도로 확인된 같은 intent의 게시 성공을 취소하지 않는다. 요청 commit이 재작성됐으면 `rebase_operation_history`의 동일 요청·원래 commit intent와 실제 parent/tree/message, 현재 후보의 acceptance를 함께 보존한다. 현재 tree와 과거 tree의 동일성을 요구하지 않으며 완료 감사의 `head`·`original_head`와 요청/session/전달 identity를 유지한다. 현재 후보·정확한 lease를 고정한 `rebase_publication_intent`·원래 acceptance와 게시 확인/DB 확정을 보존한다. 게시 확정 transaction이 갱신한 실행 행의 게시 OID·checkpoint 관측 OID·게시 영수증·`accepted_work_branch`도 같은 intent HEAD로 보존하며, 원래 lease/수용 근거와 현재 포인터의 시점을 구분한다. pause나 resume가 낡은 수용 포인터를 되살려 다른 유효한 소유 근거를 무효화하거나 intent의 lease를 바꾸지 않는다. pause 뒤에도 과거 deferred 표시나 최종 PR 대기를 이유로 요청을 버리지 않는다. pause/재시작·입력 수용·intent 폐기 자체로 push 성공·요청 완료·문맥 전달 확인을 만들지 않으며, 미확정 게시가 해결되기 전 새 Worker는 시작하지 않는다. Worker의 직접 Git 쓰기 금지와 완료 후보/복구점 구분을 유지한다.
 
 ## Implementation
+
+- [ ] 현재 `storage/management_admission.py`·`storage/task_calls.py`·`application/task_scheduling.py`·`project_service.py`의 수락/parked·단계 진입 gate를 기존 pause 구현에 연결한다. 수락 또는 관리 대기 전/후의 원래 단계·순서·해제 감사·미완료 rebase/호출 예약을 보존하며 관리 인계가 사용자 pause의 기존 종료/확인 절차를 생략하지 않게 한다. 직접 구현된 unblock·포화 수락과 G-345의 순서 교정은 재구현하지 않는다.
 
 - [ ] 확인한 `execution/execution_state.py:complete_rebase_publication()`·`storage/execution_checkpoint_state.py:finish_rebase_publication()`의 원자 확정 전후에 기존 pause 경계를 연결한다. intent 저장 후·push 확인 후 DB 미확정에는 원래 lease/acceptance·현재 소유 근거와 요청을 남기고, 확정 뒤에는 게시 OID·관측 OID·receipt·`accepted_work_branch`를 함께 유지한다. 이미 구현된 포인터 갱신은 반복 구현하지 않는다. 네 근거의 공통 소유권 정합화는 G-313이 맡고, 이 작업은 현재 유효한 근거와 미확정 효과를 pause/resume에서 보존한다. 기존 pause fixture로 확정 직전/직후의 보존과 resume의 무효과만 확인하며 소유 근거별 전체 게시 행렬은 복제하지 않는다.
 
@@ -62,6 +66,8 @@ priority: high
 
 ## Validation
 
+- 보존 후보의 기존 pause SQLite/종료 fixture에 관리 인계 대기 중 pause, pause 중 유효 다중 해제/수동 제출 수락, resume 후 다음 자동 실행만의 인계를 최소 연결한다. 수락 순서·parked/단계/checkpoint·해제 감사·종료 불명 예약 보존, pause 범위 밖 독립 작업 불변과 resume의 배정/게시 effect 0회를 확인한다.
+
 - 후보의 `tests/test_pause.py`에 있는 실제 SQLite·단계/session 보존 fixture와 `tests/test_execution_documents.py`의 Manager 결합 회귀를 재사용한다. 작업 base 조회·결합 저장 전/후 pause에서 원문·후보·확인한 base·기존 근거가 보존되고 resume의 staging·Git/base 조회·결합 저장·Worker 호출이 0회인지 최소 unit으로 확인한다. 원격 base만 전진했거나 rebase가 중단된 상태도 pause로 최종 설명이 확정되지 않아야 한다. 다음 자동 실행에서만 올바른 base와 같은 patch의 근거를 재사용하고 base 확인 실패는 보존 복구, 설명 결합 부재/실제 patch 변경은 현재 설명 교정으로 구분한다. 기존 해시 호환성·rebase 동일 patch 행렬은 복제하지 않는다.
 
 - `tests/test_planning_publication.py:test_publication_release_scopes_pending_rebase_on_first_publish_and_recovery`와 `tests/test_manual_concurrency.py:ManualJournalScopeTests.test_pending_rebase_scopes_preparation_slot_and_release_with_current_identity`의 실제 journal·SQLite·관측 double을 재사용한다. 별도 rebase 관측의 lease 취득 전/후와 자동 release의 상태 확정 전에 pause를 접수해, 추가 제거·해제·새 호출 없이 원인 intent·차단·파일/index와 planning/수동 요청이 보존되는지 최소 연결로 확인한다. 정상·pause·예외 반환 뒤 관측 lease가 남지 않고, 반환된 lease의 과거 identity는 상태 확정에 재사용되지 않아야 한다. 후보 `tests/test_pause.py:test_separate_manual_preparation_keeps_existing_resource_boundary`의 수동 준비 허용과 자동 후속 처리 중단을 함께 유지한다. 공통 안전 판단 자체를 성공 mock으로 바꾸거나 기존 충돌/종료 불명 행렬을 복제하지 않는다. resume 자체의 외부 효과는 0회이고 다음 자동 실행만 현재 소유권·writer·lease를 다시 확인한다. 새 잔여 정리 수명·경로 배제의 통합 검증은 G-337에 남긴다.
@@ -80,6 +86,8 @@ priority: high
 - `tests/test_pause.py`의 실제 pause DB/종료 fixture와 `test_worker_checkpoint_publication.py:test_manager_request_survives_commit_completion_interruption_without_new_commit`, `test_execution_worker_phase.py:test_pending_checkpoint_request_prevents_a_new_worker_turn`, `test_validation_feedback_state.py:test_context_delivery_write_failure_keeps_both_channels_pending`을 재사용한다. 요청 저장 후·commit 후·push 확인 후 DB 미확정·전달 확인 전 pause에서 실제 효과/미확인 cursor·session/intent가 보존되고 resume 자체의 commit/push/Worker 호출은 0회인지 최소 연결만 확인한다. 새 원격 수용/검증 무효화의 원자 적용 전후와 낡은 intent 폐기의 CAS 전후에도 같은 pause fixture로 실제 SQLite·현재 request/원형/후보·`confirmed: false` 감사 보존을 확인한다. `tests/test_work_branch_integration.py:RemoteIntegrationAnchorTests`의 원자 수용/rollback과 `tests/test_worker_checkpoint_publication.py:test_rewritten_remote_retires_integrated_pending_push_without_claiming_success`는 직접 근거로 재사용한다. `test_saved_worker_request_finishes_through_the_rebase_publication_boundary`와 `test_execution_immediate_rebase_publication_phase.py`의 후속 후보·deferred 게시 실패/재시작 회귀도 재사용한다. 실제 요청/게시 handler와 SQLite·pause 판단을 최소 연결해 rebase intent 저장 전후 및 게시 확인 뒤 DB/요청 확정 전 pause의 request/commit/lease/acceptance·현재 소유 근거 보존, 확정 후 게시 OID·관측 OID·receipt·`accepted_work_branch`의 동일 HEAD 유지, resume 자체의 push/소비/새 Worker 0회와 다음 자동 실행의 누락 확정만 검사한다. `tests/test_execution_current_rebase_adoption_phase.py:test_pending_worker_request_does_not_short_circuit_an_unfinished_rebase`와 `tests/test_execution_immediate_rebase_publication_phase.py:test_confirmed_rebase_publication_owns_remote_after_block_receipt_is_retired`를 직접 근거로 재사용한다. `test_retired_intent_keeps_confirmed_remote_owned_during_the_next_rebase`와 위 `test_saved_worker_request_finishes_through_the_rebase_publication_boundary`의 재작성/소유권 변경 case도 직접 근거로 재사용한다. 같은 pause fixture에서 미완료 rebase와 요청이 함께 남은 중단, intent 폐기/교체 뒤 완료 결과가 보존된 중단, 공통 게시 포트의 일시 대기 반환과 현재 게시 확인 뒤 요청 DB 확정 전 중단을 최소 연결한다. 같은 intent ID의 보존 근거·원래 commit history·현재 acceptance와 완료 감사의 두 HEAD가 유지돼야 하며 소유권 재검사 실패에서는 요청·미확인 전달을 남긴다. resume 명령은 요청 소비·rebase continue·push를 하지 않고, 다음 자동 실행은 원래 rebase를 먼저 처리하거나 보존한 완료 게시 근거를 현재 소유권/원격과 대조해 누락 확정만 이어가야 한다. 요청 없는 일반 rebase나 기존 소유권 거부 행렬은 복제하지 않는다. pause/resume로 통합·폐기·게시 효과를 반복하거나 폐기를 push 성공으로 승격하지 않아야 한다. Worker는 변경한 관측 double unit만 실행하며 기존 실제 Git 통합은 유지한다.
 
 ## Progress
+
+- [ ] 최신 명시 요청 수락·관리 보존 대기/안전 인계의 pause 보존 연결·최소 회귀
 
 - [ ] 현재 관리 Claude의 준비·spawn·process group/receipt와 pause의 보존 연결·최소 회귀
 
@@ -100,6 +108,8 @@ priority: high
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 최신 R-076/R-077/R-091의 포화 수락/관리 인계는 원격의 직접 구현을 소비하고 남은 pause 연결만 추가한다. started ID·경로·무dependency·기존 구현/검증 기록을 보존하며 G-345를 이 작업의 선행으로 만들지 않는다. 사용자 pause·runtime drain·관리 인계의 각 권한/종료 조건과 기존 임계값 판단 대기를 구별한다.
 
 - 현재 통합 runner의 하위 종료 응답·예약 트리·예산 오류 보존과 Linux Codex supervisor는 원격의 직접 구현으로 소비한다. R-067은 이 작업의 verify 중단·종료 자료 보존에 실질적으로 적용돼 source로 연결하며 새 검증 엔진이나 stop 구현은 만들지 않는다. 남은 작업은 기존 pause 요청/완료 전이에 현재 종료 근거를 소비시키는 것이다. snapshot token `45bca81e68a942e7da99615278950c6c529c9c22a7eb905d863db25ae77fedca`의 원문 hash를 확인했고 started ID·경로·기존 수행 기록·분류·무dependency를 보존한다. 보존 후보나 실행 이력을 변경하거나 새 검증 성공·차단 해제를 확정하지 않는다.
 

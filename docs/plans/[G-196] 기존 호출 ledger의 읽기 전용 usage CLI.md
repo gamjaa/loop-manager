@@ -4,6 +4,8 @@ title: 기존 호출 ledger의 읽기 전용 usage CLI
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
+  - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
+  - docs/requirements/[R-073] 호출 목적과 사용량 범위 기록 및 조회.md
 depends_on:
   - G-194
   - G-208
@@ -37,6 +39,8 @@ priority: normal
 
 ## Acceptance Criteria
 
+- R-055/R-073의 삭제 확정 뒤 현재 ledger에 없는 호출·사용량은 조회·부분 합계·분모에서 제외하고 취소 감사/전용 사본으로 복원하지 않는다. ID 표식만 남은 대상을 보존된 종료 계획으로 꾸미거나 호출 없는 실측 0을 만들지 않는다. 공유 기록의 다른 작업·미연결 호출과 실제 MERGED의 조회는 유지한다.
+
 - 프로젝트 조회는 계획 연결 없는 Planner·유지보수 호출도 포함한다. plan 조회는 해당 프로젝트의 지정 계획에 연결된 호출만 포함하며 미연결 호출을 배분하지 않는다. 명시한 종료 계획도 조회하며 정상적인 빈 범위와 알 수 없는 프로젝트/계획을 구분한다.
 - 기존 `storage/agent_invocation_state.py`의 집계 경계를 재사용해 provider·Model·역할·Effort·session 전이별 값을 제공한다. R-076의 CLI `calls`는 ledger 행 수, `retries`는 `attempt > 1`인 행 수로 유지하고 기록된 시도 수임을 명시한다. 현재 `summary()`의 동명 필드는 실행이 확인된 행만 세므로, CLI 시도 수와 실제 실행·실행 retry·실행 전 거부·미확인을 각각 구분해 표시한다. 목적·실행 여부·범위가 없는 과거 기록은 미확인으로 보존하고 실제 실행·청구 호출 수로 추정하지 않는다.
 - 기록된 input·cached input·cache write input·output·reasoning output token과 소요시간은 provider의 포함 관계를 보존한다. cache·reasoning을 input·output에 다시 더하지 않으며 비교 가능한 값만 기존 cache 비중에 사용한다.
@@ -48,12 +52,16 @@ priority: normal
 
 ## Implementation
 
+- [ ] 확인한 `storage/deleted_plan_state.py`의 현재 제거 결과와 `storage/agent_invocation_state.py`의 ledger 집계만 읽는다. ID 표식·선택 필드 없는 legacy schema를 G-194의 오류/미확인 계약으로 처리하고 조회에서 삭제·정리·migration을 수행하지 않는다. G-260의 최종 제거 엔진과 G-185의 새 수집/범위 계산은 이 작업에서 구현하지 않는다.
+
 - 현재 summary와 provider fixture를 재사용해 같은 집계 경계에 optional plan 필터와 시도/실행별 계수·지표별 알려진/미수집 분모를 추가한다. summary의 실행 수 의미를 유지하고 CLI 호환 필드에는 명시적으로 시도 행 수를 연결한다. 현재 summary의 목적·plan/task·target별 결과는 이 CLI의 기본 집계 차원으로 통합하되 미연결 호출을 계획에 배분하지 않는다. 별도의 중복 SQL·provider 집계 규칙을 만들지 않는다.
 - G-194의 조회 연결과 결과·출력 경계에 usage를 연결한다. schema 변경이나 새로운 수집 서비스 없이 읽기 가능한 기존 기록의 한계를 표시하며 R-073의 기간·목적·실행 여부 확장은 G-185에서 같은 경계를 확장한다.
 - G-184의 저장 필드가 있는 경우에는 이미 기록된 실행 여부·실행 시간을 읽고, 지원되는 legacy schema에 해당 선택 필드가 없으면 미확인으로 처리한다. schema 초기화·migration을 수행하는 Repository 생성자를 조회에서 호출하지 않는다. G-185에는 새로운 범위 수집과 기간·목적·실행 여부 필터를 남기며 이 작업은 저장된 자료만 조회한다.
 - 상위 명세는 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를, 자동 역할·검증 책임은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를 따른다.
 
 ## Validation
+
+- 실제 SQLite 조회 fixture에 삭제 확정 전/후·공유 session의 다른 작업·실제 MERGED를 두고 대상 호출/분모 제외와 타 작업 집계 보존을 확인한다. 삭제 표식만 남은 ID는 `unknown_plan`으로 처리하고 자동 복원·정리 쓰기·가짜 0/익명 합계는 없어야 한다.
 
 - Worker는 tests/test_agent_invocation_state.py의 summary fixture를 재사용한 targeted unit test로 두 provider, 역할·Model·Effort·session 전이, retry 행 수, plan 필터·미연결 호출·다른 프로젝트 격리, 빈 결과와 지표마다 다른 부분 수집·전부 미수집·실측 0을 검증한다.
 - 미종료·중단·실패 호출과 schema 선택 정보 누락에서 token·시간 분모와 경고를 검증하고 기존 summary 소비자의 값·cache 포함 관계가 유지되는지 확인한다.

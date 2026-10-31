@@ -5,6 +5,7 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md
   - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
+  - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
 depends_on:
   - G-194
   - G-208
@@ -38,6 +39,8 @@ priority: normal
 
 ## Acceptance Criteria
 
+- 명시적 차단 해제의 이전 원인/오류와 수락 순서·관리 인계 근거를 현재 실행 단계/실제 시작과 구별한다. 보존 대기에서도 후보·checkpoint·원래 단계는 같고 요청 수락만으로 검증 성공·재개 완료를 표시하지 않는다. 최종 삭제된 작업의 감사/후보를 ID 표식으로 재구성하지 않는다.
+
 - repository와 위치 인자 plan ID로 종료 작업을 포함한 특정 작업 하나를 조회하며 G-194의 상태·범위·기본 출력/JSON·오류 계약을 따른다. list 요약과 status 상세의 공통 사실·사유·재개 조건이 일치하며 상세를 요약에 반복하지 않는다.
 - 저장된 마지막 단계 전환의 이전·이후 단계·시각·사유를 근거가 있는 범위에서 보여준다. 이력이 없으면 현재 상태로 전환 이력을 만들지 않고 미확인과 이유를 표시한다. 실제 진전·관측 시각·신선도도 G-194의 근거 규칙을 따른다.
 - 복구 disposition·pending action·원인 code·scope, retry와 반복 횟수, 최종 차단 근거·남은 불확실성·확인된 사용자 대상 및 대기 조건을 보여준다. 저장된 판단과 다음 실행의 재판정을 구분하며 사용자 행동이나 자동 재개 가능성을 추측하지 않는다.
@@ -47,12 +50,16 @@ priority: normal
 
 ## Implementation
 
+- [ ] G-194가 읽는 `task_management_admissions`의 현재 대기/해제 근거와 G-345의 순서/인계 정보만 상세에 연결한다. 저장 감사의 존재와 실제 실행·현재 후보 성공을 구별하며 `release_blocks()`·배정·삭제 복구는 호출하지 않는다.
+
 - 저장된 실행 checkpoint·검증 피드백·복구 상태의 책임 경계에서 설명에 필요한 사실만 읽고 G-194의 공통 상태 투영을 확장한다. 전환 이력이나 증명 체계를 새로 저장하지 않는다.
 - 기존 후보/입력 identity와 순수 복구 판단을 재사용해 결과 연결을 검증하고, 읽기만으로 확정할 수 없는 원격·소유권 조건은 재검사 필요로 남긴다. 정상 실행의 정책이나 상태 전이를 바꾸지 않는다.
 - [ ] 확인한 `storage/recovery_state.py`·`storage/execution_checkpoint_state.py`와 G-194가 읽는 구조화 원인 근거를 작업/operation identity로 연결한다. 현재 로그 text를 새 진단으로 파싱하거나 journal·Git을 새로 읽어 복구를 판정하지 않는다. `tests/test_recovery_state.py`·`tests/test_scope_block_revalidation.py`의 보존 근거를 조회 fixture에 사용해 복수 원인·legacy 부재·독립 해소의 출력/JSON을 검사한다.
 - CLI parser와 문서·출력 계약을 연결한다. 상위 문서는 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를, 자동 역할·검증 책임은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를 따른다.
 
 ## Validation
+
+- 명시 해제 뒤 인계 전/후·밀려난 단계 보존·해제 감사만 있고 실행 없는 경우와 실제 독립 실패를 같은 fixture로 확인한다. 기본 출력/JSON이 수락·인계·실제 시작을 구분하고 삭제 확정 뒤 `unknown_plan`이 과거 감사/로그를 출력하지 않아야 한다.
 
 - 원인 작업 A와 영향 작업 B, 별도 프로젝트 publication 사건을 같은 읽기 snapshot에 두고 operation/intent·자원·상호 대기와 남은 조건을 실제 저장값대로 보여주는지 확인한다. 독립 사건 해소를 B의 후보 성공/전역 해소로 표시하지 않고 legacy 관계 부재는 미확인이다. Git/복구/정리 효과 0회와 DB·outbox·이력 불변을 G-194의 조회 fixture에서 검사한다.
 - Worker는 기존 execution checkpoint·validation feedback·복구 fixture의 targeted unit test로 전환 기록 유무, 복수 원인·scope·retry, 사용자 대상 확인/부재, 후보·plan revision·base 일치/불일치와 누락된 성공 근거를 검증한다. 저장 시각을 진전으로 오인하는 사례와 진단 비밀값 제거도 확인한다.

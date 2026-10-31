@@ -5,6 +5,7 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-073] 호출 목적과 사용량 범위 기록 및 조회.md
   - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
+  - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
 depends_on:
   - G-184
   - G-196
@@ -40,6 +41,8 @@ priority: normal
 
 ## Acceptance Criteria
 
+- R-073/R-055의 삭제 확정 작업은 호출·사용량·전용 로그 제거 뒤 기간/목적/프로젝트 집계에서도 제외한다. 공유 session의 다른 작업 값은 유지하고 익명 합계·새 삭제 감사로 대신 남기지 않는다. 일반 취소·실제 MERGED와 근거 없는 legacy 데이터는 기존 보존 조건을 따른다.
+
 - Codex/Claude의 turn·call·session 누적, 하위 Agent 포함과 모델별 원본을 식별한다. 중간/최종/모델별 중복을 합산하지 않고 input의 cache read·output의 reasoning 포함 관계를 보존한다.
 - 누적 증가분은 비교 가능한 이전 범위·reset 증거가 있을 때만 계산한다. 누락/부분 필드/형식 오류/중단은 0·완전 합계로 표시하지 않고 누적 원본과 미확인 증가분을 구분한다.
 - 정상 종료뿐 아니라 실패·timeout·중단 직후에도 해당 호출에서 이미 관측한 구조화 사용량과 수집 상태를 invocation identity·원래 로그에 연결한다. 예외 경로가 관측한 값을 빈 `Usage()`로 대체하지 않으며, 회수하지 못한 출력·종료·범위는 미확인으로 남긴다. 선택적 수집 실패는 원래 Agent 결과·예외와 필수 격리 증거를 바꾸지 않는다.
@@ -50,6 +53,8 @@ priority: normal
 
 ## Implementation
 
+- [ ] 확인한 `storage/deleted_plan_state.py:forget()`의 대상 invocation 제거와 `storage/agent_invocation_state.py`의 실제 ledger 집계를 소비한다. G-260의 최종 제거/공유 부분 정리를 재구현하지 않고, 새 범위·누적 증가분·목적 조회가 삭제 전 저장값이나 전용 로그로 호출을 재생하지 않게 한다. 삭제된 이전 누적 관측 때문에 비교 근거가 부족하면 증가분 미확인으로 남긴다.
+
 - agents/agent_provider_usage.py와 기존 provider 구조화 출력 fixture·ledger summary를 확장한다. provider별 범위/포함 관계를 보존하고 raw source identity로 dedup한다.
 - G-184가 구현한 목적·target·process 시작/종료·실행 여부와 additive ledger를 재사용한다. `provider_adapters.py`에서 관측한 사용량이 `invocation_service.py`의 정상·예외 종료 저장까지 전달되는 경계를 보완하고, 누적 범위·중복 제거·부분 수집을 기존 invocation에 결합한다. 시작·종료 관측이나 목적 전달을 다시 구현하지 않고 구조화 자료가 없는 과거 로그를 추측으로 채우지 않는다.
 - [ ] 확인한 `agents/provider_adapters.py:run_codex()`·`_provider_log_path()`와 `agents/invocation_service.py:run_agent()`의 호출별 로그 복사를 실제 launch 소유 경계에 연결한다. Codex가 내부 `prepare_isolation()`에서 선택한 attempt도 예외 전 확보 원문을 기존 보존 위치에 연결하고, 이미 저장된 정상 호출은 재실행하지 않는다. 기존 `on_process_started`·`on_process_finished`와 ledger 종료 관측으로 운영 로그의 준비/실행 시간·미확인 종료를 설명한다. raw 출력·prompt·인증 자료를 운영 요약이나 ledger에 추가하지 않으며 기존 provider 상세 로그 보호를 유지한다.
@@ -57,6 +62,8 @@ priority: normal
 - 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
+
+- 기존 provider/ledger fixture에서 같은 session의 대상 호출과 다른 작업 호출을 섞고 확인된 삭제 뒤 기간·목적 합계·알려진 분모·원본 링크를 대조한다. 대상 기록 재수집·익명 합산은 없고 다른 작업 값과 실행 전/미확인 의미는 유지돼야 한다. 누적 비교의 이전 관측이 제거된 경우 추측한 증가분/0을 만들지 않는다.
 
 - tests/test_agent_provider_usage.py, test_agent_invocation_state.py와 조회 parser 테스트에서 두 provider·중복·부분·누적/reset·legacy·필터/분모의 최소 unit case를 실행한다. 실제 실행·실행 전 거부·미확인·retry 행을 섞어 CLI 시도 수와 ledger의 실제 실행 수를 각각 대조한다.
 - `tests/test_provider_runtime.py`·`tests/test_agent_invocation.py`의 최소 fixture에서 구조화 사용량 관측 뒤 실패·timeout·중단, 출력 회수 실패와 수집 저장 실패를 확인한다. provider process는 double로 대체하되 실제 파서·종료 저장을 실행하고, 관측한 부분값·원래 결과/예외·미확인 종료·필수 안전 gate가 보존되는지 검사한다.
@@ -73,6 +80,8 @@ priority: normal
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 최신 삭제 예외는 R-073이 명시적으로 정한 관측 수명 변경이다. 원격의 좁은 forget 구현은 소비하고 이 계획에는 새 수집/범위·조회 소비만 남긴다. 최종 제거는 G-260, 운영 조회는 G-196과 공유하며 서로의 전체 구현을 선행으로 요구하는 순환을 만들지 않는다.
 
 - 이번 delta의 R-091 공통 DB 경합 처리는 G-305의 호출 저장 경계로 분리해 선행 연결한다. 이 작업의 사용량 범위·부분값·예외 원문 회수와 조회 목표는 유지하며 같은 DB 대기/결과 보존을 재구현하지 않는다. 기존 ID·목표·dependency·수행 기록을 보존하고 새로운 실제 호출·검증 성공을 만들지 않는다.
 
