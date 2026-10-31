@@ -30,7 +30,7 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 13·14·
 ## Implementation
 
 - [ ] 확인한 `tests/test_blocked_remote_observation.py`의 schema migration과 `test_remote_failure_cause_changes_are_persisted_as_new_input`를 독립 SQLite/관측 mock fixture로 옮긴다. 실제 원격 변화·재시작·작업 경로를 검증하는 나머지 통합 사례는 유지한다.
-- [ ] 확인한 `tests/test_catalog_scheduling.py:test_dependency_blocked_ready_is_not_an_empty_catalog`는 Git 관측을 주입하고 현재 scheduler·SQLite·반환 종류·호출 역할·planning baseline·계획 상태를 실제로 검사한다. 기존 관측 port만 바꾸며 G-297의 배정 직전 재검사/대기 정책은 구현하지 않는다. `test_planning_and_ready_selection_pin_fingerprint_to_resolved_sha`의 실제 선택 SHA/worktree HEAD 연결은 남긴다.
+- [ ] 확인한 `tests/test_catalog_scheduling.py:test_dependency_blocked_ready_is_not_an_empty_catalog`는 Git 관측을 주입하고 현재 scheduler·SQLite·반환 종류·호출 역할·planning baseline·계획 상태를 실제로 검사한다. 기존 관측 port만 바꾸며 G-297의 배정 직전 재검사/대기 정책은 구현하지 않는다. 현재 최상위 planning WAITING 뒤 작업 coordinator가 실행돼도 dependency 대기를 만족하지 못한 G는 Worker를 호출하지 않아야 한다. 코드/ExecPlan만의 전진·archive 예외·기존 성공 기준 재사용과 실제 명세 변경의 선행 planning을 구분하고, 새 원격 source 조회에는 정확한 revision/path 관측만 제공한다. coordinator·selector를 일괄 성공 mock해 dependency/대기 판단을 제거하지 않는다. `test_planning_and_ready_selection_pin_fingerprint_to_resolved_sha`의 실제 선택 SHA/worktree HEAD 연결은 남긴다.
 - [ ] 확인한 `tests/test_maintenance_file_inventory.py:test_root_placement_inventory_keeps_fixed_paths_and_marks_root_source_for_review`는 명시적 `SourceInventory`로 category·reason을 검사하게 한다. 같은 파일의 multilanguage 원격 blob/mode·로컬 dirty 분리와 unsafe mode/revision 검증은 통합 회귀로 유지한다.
 - [ ] 확인한 `tests/test_planner_validation_recovery.py`의 세 번째 저장 retry 무추가 호출·첫 validation retry·CLI 실패의 retry 비소비를 `tests/test_planning_recovery.py`·`tests/support/planning_case.py`의 기존 관측 경계와 실제 SQLite/임시 파일로 분리한다. 세션·호출 횟수·pending/error·파일 보존 assertion을 유지하고 실제 commit/게시·충돌/index 검증은 planning publication/rebase에 남긴다.
 - [ ] 확인한 `tests/test_requirement_archiving.py:test_missing_archived_source_does_not_block_unrelated_requirement_review`를 `tests/test_requirement_archive.py`의 순수 calculate 경계로 통합한다. catalog/states/문서 입력과 candidates assertion을 유지하고 공통 repository/DB setUp 의존만 없앤다. 실제 blob·worktree·이동 보존 사례는 남긴다.
@@ -45,16 +45,20 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 13·14·
 - 이전 조건·호출 횟수·session·오류·pending·문서 보존·category/candidates assertion의 대응을 검토하고, 오류/경쟁 관측도 mock의 일괄 성공으로 사라지지 않는지 확인한다.
 - 전체 verify는 남긴 exact-SHA/worktree·원격 변화·blob/mode·게시/rebase/index·archive 보존 통합 회귀와 전환한 정책 사례를 함께 포함해야 한다. 같은 모듈 준비 비용 비교가 필요하면 동일 계측/수집 범위에서 비교하며 전체 실행을 반복하는 새 완료 조건을 만들지 않는다.
 - 게시 정책의 이전/이후 대응은 release의 session·catalog generation·수동 membership 경쟁, 준비 중 intent/owner 변화, rollback 뒤 owner/cycle 변화 거부와 준비 1회·row/intent 보존 assertion별로 확인한다. `tests/test_incremental_planning.py`의 `test_general_batch_observes_git_and_files_before_its_transaction`·`test_remote_confirmed_intent_recovers_after_push_before_sqlite_apply`·`test_mutable_snapshot_uses_git_blob_with_crlf_checkout`, `tests/test_maintenance_publication.py`의 `test_batch_observes_git_files_and_success_fingerprints_before_transaction`·`test_crlf_batch_recovers_from_durable_intent_after_restart`·`test_published_batch_recovers_after_remote_tip_advances`는 실제 게시 원문/adapter·원격 이력 연결의 회귀로 유지한다. `tests/test_db_access.py:test_planning_pr_observation_releases_access_before_waiting`와 `tests/test_planning_publication.py:test_applied_publication_recovers_after_cleanup_before_db_release`의 실제 조율된 SQLite·독립 쓰기·정리/재시작 검증을 mock으로 대체하지 않는다. 삭제·이동한 assertion과 남긴 검증의 대응을 결과에 기록한다.
+- catalog 정책 fixture는 위 WAITING에서도 Worker 무호출·실제 planning baseline/계획 상태를 유지한다. `tests/test_project_services.py:test_scheduled_planning_wait_still_dispatches_task_recovery`·`tests/test_planning_selection.py:test_execution_observation_reuses_specification_baseline_and_archive_policy`는 이미 있는 운영 연결/선택 회귀로 소비하며 이 테스트 준비 분리에서 복제하지 않는다.
 - 읽기 전용 Review에서 실제 Git 효과 assertion이 없는 사례만 전환했는지, 판단 함수를 mock하지 않았는지와 모든 이동/삭제 assertion의 대응을 확인한다.
 - 원격의 위 rebase 해제 회귀가 최초 게시/복구의 실제 해제·worktree 제거 여부, active intent bytes 불변·원인 작업 보존과 Agent 무호출을 계속 검사하는지 정적으로 대조한다. 전환 대상의 판단을 성공 mock으로 대체해 이 검증을 우회하거나 보호된 실패 조건을 제거하면 실패다. 해당 회귀를 다시 작성하지 않고 기존 assertion의 소비 위치를 남긴다.
 
 ## Progress
 
 - [x] 저장된 6건의 정책/실제 효과 구분과 남길 통합 회귀를 확인하고, 현재 관측 port에서 독립적으로 전환할 범위를 확정했다. 구현·테스트·verify는 실행하지 않았다.
+- [x] 보존된 G-333 후보의 catalog fixture와 미커밋 관측 보완을 읽기 전용으로 확인했다. 후보의 구현·기록·작업 공간은 수정하지 않았으며 이 확인을 테스트·verify·Review 성공으로 사용하지 않았다.
 - [ ] 정책 fixture 전환과 기존 assertion·통합 검증 대응 확인
 - [ ] 새 게시 CAS·DB retry 일곱 case의 Git 준비 분리와 저장/경쟁 assertion 보존
 
 ## Decision Log
+
+- 이번 delta의 planning WAITING 전달·프로젝트 단위 명세 재관측에 맞춰 catalog 정책 fixture의 입력과 assertion을 보존한다. 기존 시작한 ID·경로·무dependency·분류와 후보의 구현/실패 기록은 유지하며 운영 배정 교정이나 새 fixture 체계로 범위를 넓히지 않는다.
 
 - R-055 B08은 직접 sources 밖에서도 이 작업의 게시/DB 정책 전환에 실질적으로 적용되므로 source와 assertion 대응에 연결한다. 새 직접 구현의 pending rebase 회귀는 기존 검증으로 보존하며 운영 공통화는 G-336에 맡긴다. started ID·경로·기존 수행 기록·무dependency·분류를 유지하고 차단 해제나 검증 성공은 선언하지 않는다.
 
