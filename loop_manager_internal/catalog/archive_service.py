@@ -68,8 +68,13 @@ def dispatch_execplan_archive_housekeeping(
         except Exception as error:
             raise CorrectionPending(str(error)) from error
 
-    def apply_catalog(base_sha, commit_oid, candidates):
+    def prepare_catalog(base_sha, commit_oid, candidates):
         assert catalog_refresh is not None
+        if connection.in_transaction or getattr(connection, "_held", False):
+            return None
+        from loop_manager_internal.runtime.resource_lock import resource_owned
+        if not resource_owned(state_dir, repo, "git:fetch", owner="execplan-archive"):
+            return None
         expected = catalog_refresh.repository.capture(repo)
         moves = tuple(execplan_archive.ArchiveMove(
             item.plan_id, item.active_path, item.archive_path, item.content_hash, item.revision_sha,
@@ -77,18 +82,27 @@ def dispatch_execplan_archive_housekeeping(
         operation_id = execplan_archive.archive_operation_id(base_sha, moves)
         stored = archive_repository.prepared_operation(repo, operation_id)
         if stored is None or stored.commit_oid != commit_oid:
-            return False
+            return None
         prepared = execplan_archive.PreparedArchive(
             operation_id, base_sha, stored.final_hash, commit_oid,
         )
         if not git_port.commit_matches(prepared, moves):
-            return False
-        return catalog_refresh.apply_archive(
-            base_sha, commit_oid, candidates, expected=expected,
-        )
+            return None
+        if catalog_refresh.current_revision() != commit_oid:
+            return None
+        def apply_catalog():
+            # ProjectService retains the fetch lease through this short CAS.
+            # Git proof and ref observation above must not hold DB access.
+            return catalog_refresh.apply_archive(
+                base_sha, commit_oid, candidates, expected=expected,
+                revision_is_current=lambda: resource_owned(
+                    state_dir, repo, "git:fetch", owner="execplan-archive",
+                ),
+            )
+        return apply_catalog
 
     archive_repository = execplan_archive_state.ExecPlanArchiveRepository(
-        connection, apply_catalog=apply_catalog if catalog_refresh else None,
+        connection, prepare_catalog=prepare_catalog if catalog_refresh else None,
     )
     outcome = execplan_archive.ExecPlanArchiveDispatcher(
         archive_repository,
@@ -159,6 +173,15 @@ class ArchiveExecutionResources:
                 self.state_dir, self.repo, missing, owner="execplan-archive", wait=False,
             ))
 
+    def _report_journal(self, message, **fields):
+        from loop_manager_internal.runtime import operation_events
+        if execplan_archive_state.ExecPlanArchiveRepository(self.connection).observe(
+            self.repo, "git:" + fields["intent_id"], category="shared_resource",
+            resource=fields["resource"], reason=fields["decision"] + ":" + fields["reason"],
+            resume_condition=fields["next_condition"],
+        ):
+            operation_events.emit(message, **fields)
+
     def safe(self, *, correction_pending=True):
         from loop_manager_internal.git import manager_git_journal
         from loop_manager_internal.runtime.handoff_gate import _check_runtime_handoff
@@ -196,6 +219,7 @@ class ArchiveExecutionResources:
                 git=self.git, worktrees=(self.repo_path,),
                 refs=(f"refs/heads/{self.base}", f"refs/remotes/origin/{self.base}"),
                 lease_stack=self.leases,
+                report=self._report_journal,
             ):
                 return self._hold("manager_git_journal", "conflicting_project_mutation",
                                   "confirm_writer_termination_and_independent_resources")

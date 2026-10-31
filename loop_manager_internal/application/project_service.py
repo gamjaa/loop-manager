@@ -1110,12 +1110,20 @@ class ProjectService:
         return 1
 
     def _archive_housekeeping_safe(self) -> bool:
-        return self.effects._execplan_archive_housekeeping_safe(
+        """Admit Requirement corrections; archive checks concrete resources separately."""
+        if not self.effects._execplan_archive_housekeeping_safe(
             self.identity.connection,
             self.state.repo,
             self.state.validated_agent_scope,
             maintenance_assessment_enabled=self.identity.registered_only,
             refactoring_review_interval=self.identity.refactoring_review_interval,
+        ):
+            return False
+        from loop_manager_internal.catalog.requirement_correction_publication import correction_admission_available
+        pinned = self.state.catalog_refresh.pinned if self.state.catalog_refresh is not None else None
+        return correction_admission_available(
+            self.identity.connection, self.identity.state_dir, self.state.repo,
+            available_paths=pinned.regular_paths if pinned is not None else None,
         )
 
     def _archive_housekeeping(self, *, archive_only=False) -> None:
@@ -1172,6 +1180,70 @@ class ProjectService:
         if not candidates:
             return
         self._archive_housekeeping(archive_only=True)
+
+    def _archive_retry_token(self):
+        """Observe releases in the existing wait loop without Git or remote I/O.
+
+        This token schedules a fresh safety check; it never authorizes a write.
+        """
+        if self.state.catalog_refresh is None:
+            return None
+        from loop_manager_internal.git import manager_git_journal
+        from loop_manager_internal.runtime.resource_lock import resource_is_held
+        from loop_manager_internal.storage import work_claims
+        from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        connection, repo = self.identity.connection, self.state.repo
+        try:
+            # ponytail: scan pending candidates at existing loop boundaries;
+            # use storage change notifications if large catalogs dominate this wait.
+            candidates = ExecPlanArchiveRepository(connection).merged_candidates(repo)
+            if not candidates:
+                return ()
+            resources = {f"archive:{self.state.base}", f"branch:{self.state.base}",
+                         f"git:refs/heads/{self.state.base}", "git:fetch", "git:config"}
+            owners, writers, receipts = [], [], []
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for item in candidates:
+                row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?",
+                                         (repo, item.plan_id)).fetchone()
+                if row is None:
+                    return None
+                resources.add("plan:" + item.plan_id)
+                resources.update(key + ":" + row[key] for key in ("branch", "worktree") if row[key])
+                owners.append(work_claims.manual_plan_ownership(connection, repo, item.plan_id, row))
+                for table, columns in (("agent_invocations", "invocation_id,execution_status,execution_finish_evidence,process_receipt_path"),
+                                       ("task_call_reservations", "token,receipt_path")):
+                    if table in tables:
+                        pending = (" AND execution_finish_evidence IS NULL AND "
+                                   "(finished_at IS NULL OR execution_status<>'not_executed')") if table == "agent_invocations" else ""
+                        for writer in connection.execute(f"SELECT {columns} FROM {table} WHERE repo=? AND plan_id=?{pending} ORDER BY 1",
+                                                         (repo, item.plan_id)):
+                            writers.append(tuple(writer))
+                            receipt = writer[-1]
+                            if receipt:
+                                try:
+                                    observed = Path(receipt).lstat()
+                                    receipts.append((receipt, observed.st_mtime_ns, observed.st_size))
+                                except OSError:
+                                    receipts.append((receipt, None, None))
+            publications = []
+            for table, condition in (("general_planning_publications", "1"),
+                                     ("maintenance_cycles", "publication_stage IS NOT NULL"),
+                                     ("requirement_correction_publications", "stage='prepared'")):
+                if table in tables:
+                    publications.append((table, tuple(tuple(row) for row in connection.execute(
+                        f"SELECT * FROM {table} WHERE repo=? AND ({condition}) ORDER BY rowid", (repo,)))))
+            try:
+                journal = manager_git_journal.project_mutation_identity(self.identity.state_dir, repo, connection)
+            except manager_git_journal.MutationEvidenceError as error:
+                journal = str(error)
+            block = scoped_blocking.project_block(connection, repo)
+            base = connection.execute("SELECT base_branch FROM projects WHERE repo=?", (repo,)).fetchone()
+            return (candidates, owners, writers, receipts, publications, journal,
+                    tuple(block) if block is not None else None, tuple(base) if base is not None else None,
+                    tuple((name, resource_is_held(self.identity.state_dir, repo, name)) for name in sorted(resources)))
+        except (sqlite3.Error, OSError, runtime_state.RuntimeStateError):
+            return None
 
     def _archive_deferred(self, category, resource, reason, resume_condition, *, attempted=False) -> None:
         from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository

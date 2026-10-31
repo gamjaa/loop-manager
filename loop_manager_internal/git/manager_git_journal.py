@@ -878,6 +878,7 @@ def _stage_rebase_is_independent(state_dir, repo, intent, *, connection, git, wo
 
 def has_conflicting_project_mutation(
     state_dir, repo, *, stage, connection, git, worktrees, refs=(), recoverable=None, lease_stack=None,
+    report=None,
 ):
     """Classify every pending operation against this stage; never complete a journal.
 
@@ -888,6 +889,7 @@ def has_conflicting_project_mutation(
     it this is an observation only, insufficient for a later manual CAS.
     """
     from loop_manager_internal.runtime import operation_events
+    report = report or operation_events.emit
 
     def independent(intent):
         slot = _slot(state_dir, repo, intent['kind'], intent['target'])
@@ -901,7 +903,7 @@ def has_conflicting_project_mutation(
             allowed, reason = _stage_rebase_is_independent(
                 state_dir, repo, intent, connection=connection, git=git,
                 worktrees=worktrees, refs=refs, lease_stack=lease_stack)
-        operation_events.emit('미확정 Git 작업의 단계별 자원 판단', project=repo, stage=stage,
+        report('미확정 Git 작업의 단계별 자원 판단', project=repo, stage=stage,
             owner=intent['owner'], operation=intent['kind'], intent_id=intent['id'],
             resource=intent['target'],
             resources=(intent['target'], intent['expected'].get('branch'), 'shared_git_config', 'writer'),
@@ -914,7 +916,7 @@ def has_conflicting_project_mutation(
     try:
         return has_pending_project_mutation(state_dir, repo, recoverable=independent)
     except MutationEvidenceError:
-        operation_events.emit('미확정 Git 기록을 확인할 수 없어 단계를 보류합니다.',
+        report('미확정 Git 기록을 확인할 수 없어 단계를 보류합니다.',
             project=repo, stage=stage, owner='unknown', operation='unknown', intent_id='unknown',
             resource='journal', decision='hold', reason='journal_unreadable',
             next_condition='restore_active_and_immutable_intent_evidence')

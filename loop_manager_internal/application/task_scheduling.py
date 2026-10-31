@@ -719,6 +719,7 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
     setup_waits, setup_inputs, deferred_inputs = {}, {}, {}
     readmitted = set()
     archive_boundary = True
+    archive_retry_token = None
     initial = runtime_state.RuntimeStateRepository(connection).active(repo)
 
     requested_checks = []
@@ -1010,13 +1011,19 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                     launch(row, not (newly_activated and initial and initial.plan_id == row["plan_id"]))
             stop_admission = repo in scheduler.draining_projects or PROJECT_STEP_PLANNING_PENDING in results
             if not stop_admission:
-                if archive_boundary:
+                retry_token = service._archive_retry_token()
+                if archive_boundary or retry_token != archive_retry_token:
                     archive_boundary = False
+                    archive_retry_token = retry_token
                     service._archive_scheduling_boundary()
                     # Archive may advance origin by a proven rename. Recheck
                     # planning inputs before launching another execution.
                     check_inputs()
                     if repo in scheduler.draining_projects:
+                        continue
+                    if service._archive_retry_token() != retry_token:
+                        # A MERGED transition during archive must be observed
+                        # before admission, not acknowledged as already tried.
                         continue
                 _, limit, source = project_registry.task_limit(connection, repo, scheduler.config.max_tasks_per_project)
                 if managed_count(connection, repo) < limit:

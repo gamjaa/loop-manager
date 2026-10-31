@@ -214,16 +214,20 @@ class ProjectCatalogRefresh:
         self, base_sha: str, commit_oid: str,
         candidates: Sequence[MergedArchiveCandidate], *,
         expected: state.CatalogStateSnapshot | None = None,
+        revision_is_current: Callable[[], bool] | None = None,
     ) -> bool:
         """Called inside the archive success transaction after Git proof.
 
         The publisher proves the commit is exactly these byte-preserving moves.
         Revalidate the resulting graph from the pinned documents; no Git catalog
-        reread is necessary. Repository CAS and remote checks still apply.
+        reread is necessary. The archive publisher supplies a local lease check
+        after observing the ref outside DB access; other consumers retain their
+        current-revision callback. Repository CAS still applies to both paths.
         """
+        revision_is_current = revision_is_current or (lambda: self.current_revision() == commit_oid)
         pinned = self.pinned
         if (pinned is None or pinned.snapshot.issues or pinned.revision_sha != base_sha
-                or self.current_revision() != commit_oid
+                or not revision_is_current()
                 or pinned.regular_paths is None):
             return False
         expected = expected or self.repository.capture(self.repo)
@@ -260,7 +264,7 @@ class ProjectCatalogRefresh:
                          regular_paths=frozenset(paths))
         if self.repository.apply(
             self.repo, result, expected,
-            revision_is_current=lambda: self.current_revision() == commit_oid,
+            revision_is_current=revision_is_current,
         ) is None:
             return False
         # A rolled-back owning transaction changes the declaration signature,

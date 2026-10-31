@@ -171,6 +171,28 @@ class ExecPlanArchiveStateTest(unittest.TestCase):
             self.connection, "/repo", {"docs/plans/[G-002] User.md": ("blob", "changed")},
         ))
 
+    def test_catalog_preparation_runs_outside_transaction_and_stale_apply_rolls_back_success(self):
+        self._insert("G-001", "Merged")
+        self.connection.commit()
+        item = self.repository.merged_candidates("/repo")[0]
+        calls = []
+        def prepare(*_args):
+            self.assertFalse(self.connection.in_transaction)
+            calls.append("observe")
+            def apply():
+                self.assertTrue(self.connection.in_transaction)
+                calls.append("cas")
+                return False
+            return apply
+        repository = execplan_archive_state.ExecPlanArchiveRepository(self.connection, prepare_catalog=prepare)
+        result = repository.record_success(
+            "/repo", (item,), base_sha="base", operation_id=None,
+            commit_oid="commit", push_result="pushed:commit",
+        )
+        self.assertEqual(result, execplan_archive_state.ArchiveWriteResult.SUPERSEDED)
+        self.assertEqual(calls, ["observe", "cas"])
+        self.assertIsNone(repository.item("/repo", item.plan_id))
+
     def test_revision_change_supersedes_old_candidate_and_preserves_audit(self):
         self._insert("G-001", "Original")
         old = self.repository.merged_candidates("/repo")[0]

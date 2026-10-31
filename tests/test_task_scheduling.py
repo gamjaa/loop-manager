@@ -2070,13 +2070,19 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(scheduling.managed_count(self.connection,'A'),0)
 
     def test_archive_runs_between_continuous_admissions_without_candidate_records(self):
+        from contextlib import ExitStack
+        from concurrent.futures import wait as wait_for_tasks
         from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.runtime.resource_lock import resource_locks
         from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        self._insert_plan(self.connection, 'G-004', 'MERGED', repo='A')
         scheduler = self.scheduler(max_tasks_per_project=1)
         runtime = runtime_state.RuntimeStateRepository(self.connection)
         with fast_mode_scope(self.config):
             runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
         seen = []
+        archived_while_running = threading.Event()
+        first_future = []
         def archive(connection, _repo_path, _state_dir, repo, _base, **options):
             self.assertTrue(options['archive_safety']())
             self.assertFalse(options['correction_safety']())
@@ -2088,6 +2094,9 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 with connection:
                     connection.execute('UPDATE exec_plans SET path=? WHERE repo=? AND plan_id=?',
                                        (item.archive_path, repo, item.plan_id))
+                if item.plan_id == 'G-004':
+                    archived_while_running.set()
+                    first_future[0].result(timeout=3)
         effects = SimpleNamespace(activate_ready_execplan=loop_manager.activate_ready_execplan,
             resume_manual_work=None, dispatch_execplan_archive_housekeeping=archive, operation_print=mock.Mock())
         service = ProjectService(effects, ProjectIdentity(self.connection, self.directory, 'A', self.config_path,
@@ -2096,6 +2105,8 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         def execute(child, repository, **_options):
             task = scheduling.current_task.get()
             seen.append('execute:' + task.plan_id)
+            if task.plan_id == 'G-001':
+                self.assertTrue(archived_while_running.wait(3), 'lease 반환 뒤에도 archive가 Worker 종료를 기다렸습니다.')
             if task.plan_id == 'G-002':
                 self.assertIn('archive:G-001', seen)
             repository.transition_from_snapshot(repository.projected('A'),
@@ -2103,11 +2114,22 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             return 0
         token = scheduling.current_scheduler.set(scheduler)
         try:
-            with fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute):
-                self.assertEqual(scheduling.run_project_tasks(service, newly_activated=True), 0)
+            with ExitStack() as held:
+                held.enter_context(resource_locks(self.directory, 'A', ['git:refs/heads/main'], owner='other-publication'))
+                def wait(*args, **kwargs):
+                    if not first_future:
+                        first_future.append(args[0][0])
+                    held.close()
+                    return wait_for_tasks(*args, **kwargs)
+                with fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute), \
+                     mock.patch('concurrent.futures.wait', side_effect=wait), \
+                     mock.patch.object(scheduler, 'wait_recheck', return_value=False):
+                    self.assertEqual(scheduling.run_project_tasks(service, newly_activated=True), 0)
         finally:
             scheduling.current_scheduler.reset(token)
-        self.assertEqual(seen, ['execute:G-001', 'archive:G-001', 'execute:G-002', 'archive:G-002'])
+        self.assertEqual([item for item in seen if item != 'execute:G-001'],
+                         ['archive:G-004', 'archive:G-001', 'execute:G-002', 'archive:G-002'])
+        self.assertEqual(service.effects.operation_print.call_count, 1)
 
     def test_archive_discovery_db_wait_does_not_prevent_independent_admission(self):
         from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService

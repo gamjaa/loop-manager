@@ -136,9 +136,11 @@ class ExecPlanArchiveRepository:
     """SQLite boundary that never changes ExecPlan execution status or path."""
 
     def __init__(self, connection: sqlite3.Connection, *, ensure: bool = True,
-                 apply_catalog: Callable[..., bool] | None = None):
+                 apply_catalog: Callable[..., bool] | None = None,
+                 prepare_catalog: Callable[..., Callable[[], bool] | None] | None = None):
         self.connection = connection
         self.apply_catalog = apply_catalog
+        self.prepare_catalog = prepare_catalog
         if ensure:
             ensure_schema(connection)
 
@@ -427,6 +429,14 @@ class ExecPlanArchiveRepository:
         commit_oid: str | None,
         push_result: str,
     ) -> ArchiveWriteResult:
+        apply_catalog = None
+        if commit_oid is not None:
+            if self.prepare_catalog is not None:
+                apply_catalog = self.prepare_catalog(base_sha, commit_oid, candidates)
+                if apply_catalog is None:
+                    return ArchiveWriteResult.SUPERSEDED
+            elif self.apply_catalog is not None:
+                apply_catalog = lambda: self.apply_catalog(base_sha, commit_oid, candidates)
         try:
             with _transaction(self.connection):
                 if not self.candidates_current(repo, candidates):
@@ -453,10 +463,9 @@ class ExecPlanArchiveRepository:
                         pending_reason=None,
                         archived=True,
                     )
-                if (commit_oid is not None and self.apply_catalog is not None
-                        and not self.apply_catalog(base_sha, commit_oid, candidates)):
+                if apply_catalog is not None and not apply_catalog():
                     raise _ArchiveCatalogSuperseded
-                if commit_oid is not None and self.apply_catalog is not None:
+                if apply_catalog is not None:
                     planning_input_state.advance_verified_delta(
                         self.connection, repo, commit_oid,
                         {

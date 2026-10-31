@@ -303,12 +303,15 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         dispatch = mock.Mock()
         service.effects = SimpleNamespace(_execplan_archive_housekeeping_safe=gate, git=git,
             dispatch_execplan_archive_housekeeping=dispatch, operation_print=mock.Mock())
-        service._archive_housekeeping()
-        dispatch.assert_called_once()
-        gate.return_value = False
-        service._archive_housekeeping()
-        self.assertEqual(dispatch.call_count, 2)
-        self.assertFalse(dispatch.call_args.kwargs['correction_safety']())
+        with mock.patch('loop_manager_internal.runtime.operation_events.emit') as report:
+            service._archive_housekeeping()
+            dispatch.assert_called_once()
+            gate.return_value = False
+            service._archive_housekeeping()
+            self.assertEqual(dispatch.call_count, 2)
+            self.assertFalse(dispatch.call_args.kwargs['correction_safety']())
+        decisions = [call for call in report.call_args_list if call.args[0] == '미확정 Git 작업의 단계별 자원 판단']
+        self.assertEqual(len(decisions), 1)
         self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
 
     def test_writer_gate_distinguishes_unstarted_failures_from_unconfirmed_writers(self):
@@ -497,6 +500,63 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         self.assertIs(actual, outcome)
         self.assertEqual(self.observations.commits, 0)
         self.assertEqual(self.observations.pushes, 0)
+
+    def test_known_correction_draft_or_writer_claim_does_not_block_archive_entry(self):
+        from types import SimpleNamespace
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.application.project_service import ProjectService
+        from loop_manager_internal.catalog import archive_service, execplan_archive
+        import loop_manager
+        for claim in ('draft', 'writer'):
+            with self.subTest(claim=claim):
+                connection = runtime_connection('repo')
+                self.addCleanup(connection.close)
+                connection.execute("CREATE TABLE document_drafts(repo TEXT,target_path TEXT,state TEXT)")
+                connection.execute("UPDATE projects SET planning_attempt_fingerprint=NULL")
+                connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED'")
+                connection.execute("INSERT INTO exec_plans "
+                    "(repo,plan_id,path,title,sources,depends_on,priority,content_hash,current_revision_sha,status) "
+                    "VALUES ('repo','G-048','docs/plans/[G-048] Done.md','Done','[\"docs/PRODUCT.md\"]','[]','normal','hash','base','MERGED')")
+                if claim == 'draft':
+                    connection.execute("INSERT INTO document_drafts VALUES ('repo',?,'pending')", (A,))
+                else:
+                    connection.execute("INSERT INTO agent_invocations "
+                        "(invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at) "
+                        "VALUES ('writer','repo','G-047','worker','codex','mock','low','new',1,'started')")
+                connection.commit()
+                self.assertTrue(loop_manager._execplan_archive_housekeeping_safe(
+                    connection, 'repo', None, maintenance_assessment_enabled=False, refactoring_review_interval=5))
+                effects = archive_service.DispatchExecplanArchiveHousekeepingEffects(
+                    lambda *_args: self.publisher.git, self.observations.git, mock.Mock(), mock.Mock())
+                service = ProjectService.__new__(ProjectService)
+                service.identity = SimpleNamespace(connection=connection, state_dir=self.root,
+                    registered_only=False, refactoring_review_interval=5)
+                service.state = SimpleNamespace(repo='repo', repo_path=self.root, base='main',
+                    validated_agent_scope=None, catalog_refresh=SimpleNamespace(
+                        pinned=SimpleNamespace(regular_paths=frozenset({A, B}))))
+                service.effects = SimpleNamespace(git=self.observations.git, operation_print=mock.Mock(),
+                    _execplan_archive_housekeeping_safe=loop_manager._execplan_archive_housekeeping_safe,
+                    dispatch_execplan_archive_housekeeping=lambda *args, **kwargs:
+                        archive_service.dispatch_execplan_archive_housekeeping(effects, *args, **kwargs))
+                def archive(dispatcher, repo, base):
+                    self.assertTrue(dispatcher.execution_safety())
+                    item = dispatcher.repository.merged_candidates(repo)[0]
+                    self.assertEqual(item.plan_id, 'G-048')
+                    self.assertIsNone(dispatcher.candidate_safety(item))
+                    return execplan_archive.ArchiveDispatchOutcome(
+                        execplan_archive.ArchiveDispatchKind.PENDING, pending=(('G-048', 'source_missing'),))
+                with mock.patch.object(execplan_archive.ExecPlanArchiveDispatcher, 'dispatch', autospec=True,
+                                       side_effect=archive) as dispatch:
+                    service._archive_housekeeping()
+                dispatch.assert_called_once()
+                self.assertEqual((self.observations.fetches, self.observations.commits, self.observations.pushes), (0, 0, 0))
+                from loop_manager_internal.storage.requirement_correction_state import RequirementCorrectionRepository
+                self.assertIsNone(RequirementCorrectionRepository(connection).pending('repo'))
+                if claim == 'draft':
+                    self.assertEqual(connection.execute('SELECT state FROM document_drafts').fetchone()[0], 'pending')
+                else:
+                    self.assertEqual(tuple(connection.execute(
+                        'SELECT execution_status,execution_finished_at FROM agent_invocations').fetchone()), ('unknown', None))
 
     def test_archive_safety_does_not_replace_correction_refresh_gate(self):
         from loop_manager_internal.catalog import archive_service, execplan_archive
