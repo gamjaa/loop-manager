@@ -31,6 +31,10 @@ class CodexLaunch:
             from .windows_runtime import stop
             stop(process)
             return
+        if sys.platform.startswith('linux') and process.poll() is None:
+            from loop_manager_internal.execution.verify_process import terminate_verify_process
+            terminate_verify_process(process)
+            return
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -43,6 +47,10 @@ class CodexLaunch:
         if os.name == 'nt':
             from .windows_runtime import start
             return start(arguments, launch_process, **kwargs)
+        if sys.platform.startswith('linux'):
+            from loop_manager_internal.execution.verify_process import _LINUX_SUBREAPER
+            arguments = [sys.executable, '-c',
+                         _LINUX_SUBREAPER.replace('stdin=subprocess.DEVNULL', 'stdin=None'), *arguments]
         return launch_process(arguments, stdin=subprocess.PIPE, start_new_session=True, **kwargs)
 
     def run(self, arguments: list[str], *,

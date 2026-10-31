@@ -497,6 +497,9 @@ class NativeWriteIsolationTests(TestCase):
 
                 def start(command, **kwargs):
                     self.assertTrue(handoff.launch_lock.locked())
+                    if envelope.sys.platform.startswith('linux'):
+                        self.assertEqual(command[:2], [envelope.sys.executable, '-c'])
+                        command = command[3:]
                     self.assertEqual(command[:2], ['codex', 'exec'])
                     self.assertTrue(kwargs['start_new_session'])
                     if session:
@@ -661,7 +664,8 @@ class NativeWriteIsolationTests(TestCase):
                     read_only=False, persist_session=True, connection=connection,
                     resolved_profile=invocation.ResolvedProfile('model', 'high'),
                     invocation=invocation.InvocationContext(str(boundary.source), 'G-088'))
-            self.assertEqual(commands[0][:2], ['codex', 'exec'])
+            command = commands[0][3:] if envelope.sys.platform.startswith('linux') else commands[0]
+            self.assertEqual(command[:2], ['codex', 'exec'])
             self.assertEqual((result.code, result.session_id), (0, 'new-session'))
             self.assertEqual(connection.execute('SELECT session_id FROM agent_invocations').fetchone()[0],
                              'new-session')
