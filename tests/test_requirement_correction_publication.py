@@ -477,6 +477,41 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
                 'repo', 'main', catalog_refresh=refresh, archive_safety=self.safe)
         self.assertEqual(self.observations.commits, 1)
 
+    def test_correction_deferral_does_not_close_independent_archive_safety(self):
+        from loop_manager_internal.catalog import archive_service, execplan_archive
+        refresh = mock.Mock()
+        refresh.refresh.side_effect = lambda base: base
+        effects = archive_service.DispatchExecplanArchiveHousekeepingEffects(
+            lambda *_args: self.publisher.git, self.observations.git, mock.Mock(), mock.Mock())
+        correction_safety = mock.Mock(return_value=False)
+        archive_safety = mock.Mock(return_value=True)
+        outcome = execplan_archive.ArchiveDispatchOutcome(execplan_archive.ArchiveDispatchKind.NO_CANDIDATES)
+        with mock.patch.object(execplan_archive.ExecPlanArchiveDispatcher, 'dispatch', return_value=outcome) as archive:
+            actual = archive_service.dispatch_execplan_archive_housekeeping(
+                effects, self.connection, self.publisher.git.repo_path, self.publisher.git.state_dir,
+                'repo', 'main', catalog_refresh=refresh, archive_safety=archive_safety,
+                correction_safety=correction_safety)
+        correction_safety.assert_called_once_with()
+        archive.assert_called_once_with('repo', 'main')
+        self.assertIs(actual, outcome)
+        self.assertEqual(self.observations.commits, 0)
+        self.assertEqual(self.observations.pushes, 0)
+
+    def test_archive_safety_does_not_replace_correction_refresh_gate(self):
+        from loop_manager_internal.catalog import archive_service, execplan_archive
+        refresh = mock.Mock()
+        refresh.refresh.side_effect = lambda base: base
+        effects = archive_service.DispatchExecplanArchiveHousekeepingEffects(
+            lambda *_args: self.publisher.git, self.observations.git, mock.Mock(), mock.Mock())
+        outcome = execplan_archive.ArchiveDispatchOutcome(execplan_archive.ArchiveDispatchKind.NO_CANDIDATES)
+        with mock.patch.object(execplan_archive.ExecPlanArchiveDispatcher, 'dispatch', return_value=outcome):
+            archive_service.dispatch_execplan_archive_housekeeping(
+                effects, self.connection, self.publisher.git.repo_path, self.publisher.git.state_dir,
+                'repo', 'main', catalog_refresh=refresh, archive_safety=lambda: False,
+                correction_safety=self.safe)
+        self.assertEqual(self.observations.commits, 1)
+        self.assertEqual(self.observations.pushes, 1)
+
     def test_project_boundary_does_not_swallow_correction_failure(self):
         from types import SimpleNamespace
         from loop_manager_internal.application.project_service import ProjectService

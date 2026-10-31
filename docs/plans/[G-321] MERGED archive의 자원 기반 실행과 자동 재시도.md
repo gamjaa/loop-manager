@@ -162,6 +162,20 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_archiv
 - [ ] 최신 관리 인계/삭제 예외와 보존 후보 통합·관련 최소 회귀
 - [ ] 최신 후보의 필요한 Manager verify·Review·사용자 Merge
 
+### 안전 판단 분리의 준비 보존점
+
+`archive_service`는 선택적인 `correction_safety`를 받아 Requirement 교정의 안전 판단과 archive의 판단을 따로 전달할 수 있다. 기존 호출은 같은 gate를 유지한다. 교정의 catalog refresh는 교정 자신의 source/draft/writer 판단을 사용하며, archive gate로 교정의 실행 가능 여부를 대신 판단하지 않는다. 교정 실패의 `CorrectionPending` 전파는 유지한다.
+
+archive dispatcher는 catalog refresh 이후뿐 아니라 실제 commit 준비 직전과 push 직전에도 `execution_safety`를 확인한다. 닫힌 경계는 기존 operation 저장소에 `execution_deferred`와 단계별 사유를 기록한다. push 전 보류는 준비 commit·tree를 보존하고 gate가 다시 열리면 같은 commit을 재사용한다. 아직 프로젝트 유휴 gate를 해제하거나 새로운 병렬 게시를 허용하지 않았다.
+
+프로젝트 Python `python3`와 `LOOP_MANAGER_TARGETED_TEST_RUNNER --unittest`로 아래 개별 case만 실행했다. 첫 실행 4개, 두 번째 실행 5개가 모두 통과했으며 전체 verify·통합 suite는 실행하지 않았다. 실행 기록은 Manager가 제공한 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`에 남겼다.
+
+- `tests.test_execplan_archive.ExecPlanArchiveTest`: `test_execution_safety_is_rechecked_before_commit`, `test_execution_safety_deferral_retains_prepared_commit_for_retry`, `test_prepared_commit_is_reused_after_push_failure`, `test_remote_archive_after_interruption_converges_without_new_commit`.
+- `tests.test_requirement_correction_publication.RequirementCorrectionPublicationTest`: `test_correction_deferral_does_not_close_independent_archive_safety`, `test_connection_dispatches_correction_before_archive_without_model`, `test_archive_safety_does_not_replace_correction_refresh_gate`, `test_project_boundary_does_not_swallow_correction_failure`.
+- `tests.test_project_catalog_refresh.CatalogArchiveConsumerTests.test_archive_refresh_rechecks_safety_before_preparing_or_publishing`.
+
+다음 작업은 ProjectService의 실제 자원 판단·lease와 진입 전 보류 관측, 연속 배정 중 archive 기회, 반복 로그 억제 및 PRODUCT·ARCHITECTURE 갱신이다. 이 보존점은 R-094나 G-321의 구현 완료 후보가 아니다.
+
 ## Decision Log
 
 - 이번 delta는 G-321을 초기화하거나 완료한 구현을 중복 계획하지 않는다. 앞의 후보에 보존된 구현/검증 원문과 과거 준비점은 유지하고 현재 원격의 관리 인계·삭제 정책과 만나는 경계만 미충족 통합으로 구분한다. started ID·경로·기존 dependency·metadata를 보존한다. 후보 확인·기존 targeted 기록은 최신 전체 verify/Review 성공·Merge가 아니다.

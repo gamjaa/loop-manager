@@ -171,6 +171,50 @@ class DefinitionValidatingFakeGit(FakeGit):
 
 
 class ExecPlanArchiveTest(unittest.TestCase):
+    def test_execution_safety_is_rechecked_before_commit(self):
+        item = candidate("G-001")
+        repository = FakeRepository((item,))
+        git = FakeGit({"base": {item.plan_id: (entry(item.plan_id), None)}})
+        safety = mock.Mock(return_value=False)
+        dispatcher = execplan_archive.ExecPlanArchiveDispatcher(
+            repository, git, execution_safety=safety,
+        )
+
+        outcome = dispatcher.dispatch("repo", "main")
+
+        self.assertEqual(outcome.pending, ((item.plan_id, "execution_safety_changed_before_commit"),))
+        self.assertEqual(git.prepared, [])
+        self.assertEqual(git.pushed, [])
+        self.assertEqual(repository.operation_pending[-1][2]["push_result"], "execution_deferred")
+        safety.return_value = True
+        resumed = dispatcher.dispatch("repo", "main")
+        self.assertEqual(resumed.archived_plan_ids, (item.plan_id,))
+        self.assertEqual(len(git.prepared), 1)
+        self.assertEqual(git.pushed, ["commit-base"])
+
+    def test_execution_safety_deferral_retains_prepared_commit_for_retry(self):
+        item = candidate("G-001")
+        repository = FakeRepository((item,))
+        git = FakeGit({"base": {item.plan_id: (entry(item.plan_id), None)}})
+        safety = mock.Mock(side_effect=[True, False])
+        dispatcher = execplan_archive.ExecPlanArchiveDispatcher(
+            repository, git, execution_safety=safety,
+        )
+
+        outcome = dispatcher.dispatch("repo", "main")
+
+        self.assertEqual(outcome.pending, ((item.plan_id, "execution_safety_changed_before_push"),))
+        self.assertEqual(git.pushed, [])
+        saved = repository.operation_pending[-1][2]
+        self.assertEqual(saved["commit_oid"], "commit-base")
+        self.assertEqual(saved["final_hash"], "tree-base")
+        safety.side_effect = None
+        safety.return_value = True
+        resumed = dispatcher.dispatch("repo", "main")
+        self.assertEqual(resumed.archived_plan_ids, (item.plan_id,))
+        self.assertEqual(len(git.prepared), 1)
+        self.assertEqual(git.pushed, ["commit-base"])
+
     def test_stored_commit_mismatch_is_reprepared_before_push(self):
         item = candidate("G-001")
         repository = FakeRepository((item,))

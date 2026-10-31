@@ -32,13 +32,13 @@ def dispatch_execplan_archive_housekeeping(
     *,
     catalog_refresh: project_catalog_refresh.ProjectCatalogRefresh | None = None,
     archive_safety: Callable[[], bool] | None = None,
+    correction_safety: Callable[[], bool] | None = None,
 ) -> execplan_archive.ArchiveDispatchOutcome:
     """Assemble the archive service and map its result to operator logging."""
 
     def refresh_candidates(base_sha: str) -> bool:
         if catalog_refresh is not None:
-            return (catalog_refresh.refresh(base_sha) == base_sha
-                    and (archive_safety is None or archive_safety()))
+            return catalog_refresh.refresh(base_sha) == base_sha
         result = effects.reconcile_execplan_catalog(
             connection, repo_path, repo, base_branch
         )
@@ -52,13 +52,14 @@ def dispatch_execplan_archive_housekeeping(
 
     git_port = effects._ExecPlanArchiveGitPort(repo_path, state_dir, repo)
 
-    # Deterministic corrections share the existing between-lifecycles gate,
-    # but a failed publication must not fall through to a model assessment.
-    if catalog_refresh is not None and archive_safety is not None:
+    # Keep the correction's source/draft/writer protections independent of
+    # archive execution. Existing callers retain their shared safety gate.
+    correction_safety = correction_safety or archive_safety
+    if catalog_refresh is not None and correction_safety is not None:
         from loop_manager_internal.catalog.requirement_correction_publication import CorrectionPending, RequirementCorrectionPublisher
         try:
             RequirementCorrectionPublisher(
-                connection, git_port, refresh=refresh_candidates, safe=archive_safety,
+                connection, git_port, refresh=refresh_candidates, safe=correction_safety,
             ).dispatch(base_branch)
         except project_catalog_refresh.CatalogRefreshStopped:
             raise
@@ -90,7 +91,11 @@ def dispatch_execplan_archive_housekeeping(
     outcome = execplan_archive.ExecPlanArchiveDispatcher(
         archive_repository,
         git_port,
-        refresh_candidates=refresh_candidates,
+        refresh_candidates=lambda base_sha: (
+            refresh_candidates(base_sha)
+            and (archive_safety is None or archive_safety())
+        ),
+        execution_safety=archive_safety,
     ).dispatch(repo, base_branch)
     if outcome.commit_oid:
         effects.operation_print(
