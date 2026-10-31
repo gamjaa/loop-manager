@@ -56,7 +56,8 @@ revision `f5a9d4ea510c62cea769eacd32c604f32bf25425`의 저장된 발견 13·14·
 - 보존된 원격 문서 관측 보완을 포함한 현재 후보에서 `CatalogSchedulingObservationTest.test_dependency_blocked_ready_is_not_an_empty_catalog`가 targeted runner로 통과했다. 실패 Planner와 독립 Worker의 역할·SQLite 상태를 확인했으며, 최신 조건의 planning WAITING 뒤 dependency 대기와 일곱 게시 정책 사례는 아직 확인하지 않았다.
 - 의존성 차단·실행 가능·안정 입력 대기의 세 프로젝트를 실제 scheduler/SQLite와 Git 관측 double로 검사했다. WAITING 뒤 차단된 G의 Worker 무호출·baseline·상태, 명세 변경의 Planner와 독립 프로젝트 Worker 역할을 확인했으며 targeted unit은 통과했다. 동일 조건의 기존 Git 준비 사례를 제거하고 선택 SHA/worktree HEAD 통합 회귀 및 별도 코드/명세·archive 선택 회귀는 유지했다.
 - [x] rebase된 후보에서 기존 여섯 전환 대상의 9개 단위 사례를 targeted runner로 다시 실행해 통과했다. Git 통합 회귀와 R-055 B08 소비자 회귀는 유지한다.
-- [ ] 새 게시 CAS·DB retry 일곱 case의 Git 준비 분리와 저장/경쟁 assertion 보존
+- 일반 planning DB retry 한 사례를 Git 없는 SQLite fixture로 이동했다. 실제 임시 문서와 snapshot, 혼합 생성·개정·삭제 batch 및 운영 intent/apply를 사용하며 rollback·준비 1회·경쟁 owner/intent/catalog 보존 assertion을 유지한다. 이 fixture의 batch는 기존 validation 결과에 대응하는 입력으로 직접 구성하며, 실제 commit·게시 원문과 pending rebase 안전 판정은 기존 publication/rebase 회귀가 담당한다. 해당 targeted unit과 이번 후보의 기존 전환 대상 9개 단위 사례는 통과했다.
+- [ ] 나머지 여섯 게시 CAS·DB retry case의 Git 준비 분리와 저장/경쟁 assertion 보존
 
 ## Decision Log
 
