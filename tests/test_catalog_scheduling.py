@@ -102,8 +102,14 @@ class CatalogSchedulingObservationTest(unittest.TestCase):
             registrations = {}
             def observed_git(repo, *args, **kwargs):
                 repo = Path(repo)
+                if args[:2] == ("show-ref", "--hash"):
+                    return SimpleNamespace(stdout="", returncode=1)
                 if args[:3] == ("show-ref", "--verify", "--quiet"):
                     return SimpleNamespace(stdout="", returncode=1)
+                if args[:2] == ("remote", "get-url"):
+                    return SimpleNamespace(stdout="https://github.com/example/project.git", returncode=0)
+                if args[:2] == ("ls-remote", "--heads"):
+                    return SimpleNamespace(stdout="", returncode=0)
                 if args[:3] == ("worktree", "add", "--lock"):
                     import shutil
                     reason = args[3].split("=", 1)[1]
@@ -116,12 +122,23 @@ class CatalogSchedulingObservationTest(unittest.TestCase):
                               if entries and repo == Path(entries[0]["worktree"])), repo)
                 if owner not in revisions and "planning" in owner.parts:
                     owner = blocked
-                if args[:3] == ("ls-files", "-u", "-z"):
+                if args[:3] == ("ls-files", "-u", "-z") or args[:3] == ("diff", "--cached", "--name-only"):
                     return SimpleNamespace(stdout="", returncode=0)
+                if args == ("symbolic-ref", "--quiet", "--short", "HEAD"):
+                    return SimpleNamespace(stdout="loop-manager/G-001", returncode=0)
                 return SimpleNamespace(stdout=revisions[owner], returncode=0)
+            import hashlib
+            blobs = {hashlib.sha1(path.read_bytes()).hexdigest(): path.read_bytes()
+                     for source in plans for path in [source / "docs/PRODUCT.md", *plans[source]]}
             def observed_bytes(repo, *args):
                 if args[:4] == ("ls-tree", "-r", "-z", "--full-tree") and args[-1] == "docs/requirements":
                     return b""
+                if args[:4] == ("ls-tree", "-r", "-z", "--full-tree") and len(args) == 5:
+                    source = next(source for source, sha in revisions.items() if sha == args[4])
+                    files = [source / "docs/PRODUCT.md", *plans[source]]
+                    return b"".join(b"100644 blob " + hashlib.sha1(path.read_bytes()).hexdigest().encode() + b"\t" + path.relative_to(source).as_posix().encode() + b"\0" for path in files)
+                if args[:2] == ("cat-file", "blob"):
+                    return blobs[args[2]]
                 if args[0] == "show" and len(args) == 2 and ":" in args[1]:
                     revision, path = args[1].split(":", 1)
                     for source, sha in revisions.items():
@@ -152,6 +169,8 @@ class CatalogSchedulingObservationTest(unittest.TestCase):
                 stack.enter_context(mock.patch.object(loop_manager, "git_bytes", side_effect=observed_bytes))
                 stack.enter_context(mock.patch.object(loop_manager, "pr_for_branch", return_value=None))
                 stack.enter_context(mock.patch.object(loop_manager, "capture_git_snapshot", side_effect=observed_snapshot))
+                stack.enter_context(mock.patch.object(loop_manager, "_git_operation_entries", return_value={}))
+                stack.enter_context(mock.patch.object(loop_manager, "_rebase_in_progress_for_branch", return_value=False))
                 stack.enter_context(mock.patch.object(loop_manager, "_worktree_catalog", side_effect=lambda repo: registrations.get(Path(repo), [])))
                 stack.enter_context(mock.patch.object(loop_manager, "_GitCatalogDefinitionPort", side_effect=definition))
                 stack.enter_context(mock.patch.object(loop_manager, "_PlanningGitPorts", side_effect=git_port))
@@ -162,7 +181,8 @@ class CatalogSchedulingObservationTest(unittest.TestCase):
                 stack.enter_context(mock.patch("loop_manager_internal.application.scheduler.VerifyCoordinator"))
                 outcomes = loop_manager.schedule_registered_projects(connection, state_dir, config)
             results = {item.repo: item.result.kind for item in outcomes}
-            self.assertEqual(results, {str(blocked): loop_manager.ProjectRunKind.OPERATIONAL_ERROR, str(runnable): loop_manager.ProjectRunKind.OPERATIONAL_ERROR})
+            details = [tuple(row) for row in connection.execute("SELECT repo, reason_code, detail FROM recovery_records")]
+            self.assertEqual(results, {str(blocked): loop_manager.ProjectRunKind.OPERATIONAL_ERROR, str(runnable): loop_manager.ProjectRunKind.OPERATIONAL_ERROR}, details)
             self.assertCountEqual(roles, ["planner", "worker"], msg=[(item.repo, item.result.detail) for item in outcomes])
             self.assertEqual(tuple(connection.execute("SELECT phase, planning_fingerprint FROM projects WHERE repo=?", (str(blocked),)).fetchone()), ("PLANNING", "old-input"))
             self.assertEqual([tuple(row) for row in connection.execute("SELECT plan_id,status FROM exec_plans WHERE repo=? ORDER BY plan_id", (str(blocked),))], [("G-009", "PLAN_BLOCKED"), ("G-010", "READY")])
