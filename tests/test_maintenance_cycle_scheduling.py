@@ -198,6 +198,11 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                 completed = maintenance_state.MaintenanceRepository(connection).get(
                     repo
                 )
+                archived_latest = git_command(repo_path, "rev-parse", "origin/main")
+                self.assertTrue(loop_manager._is_requirement_archive_only_change(
+                    repo_path, latest, archived_latest,
+                    verified_plan_declarations=True, allow_execplan_only=True,
+                ))
             finally:
                 connection.close()
 
@@ -208,7 +213,8 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         )
         self.assertEqual(selected, ["G-001", "G-002"])
         self.assertEqual(completed.phase, maintenance_state.MaintenancePhase.IDLE)
-        self.assertEqual(completed.last_cycle_commit, latest)
+        self.assertEqual(completed.last_cycle_commit, archived_latest)
+        self.assertEqual(completed.last_cycle_merged_count, 1)
 
 
     @dummy_worker_sessions

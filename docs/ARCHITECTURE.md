@@ -705,7 +705,9 @@ DB 적용은 준비 값과 현재 프로젝트 소유권·cycle revision·선정
 
 미게시·관측 실패·원격 source 변경·DB 경쟁은 성공 기준을 전진시키지 않으며 기존 성공 행·잠정 근거·publication intent를 보존해 복구한다. 외부 관측은 DB 적용 재시도에 포함하지 않는다. DB schema와 JSON·receipt 형식, cycle 주기와 legacy 복구 계약은 유지한다. 새 리팩터링 계획은 검증된 DAG와 Manager barrier 편집을 포함해 게시한다. 계획 등록과 나머지 게시 batch 외부 처리는 별도 경계이며 이 근거 적용의 DB 전용 보장에 포함하지 않는다.
 
-평가 성공과 cycle 종료는 별도 상태다. cycle 범위는 선행·리팩터링·발견을 연결한 기존 계획과 그 dependency closure를 포함한다. 범위의 모든 계획이 실제 MERGED이고 원격·catalog에 반영됐으며 미확정 게시·해당 범위의 catalog hold가 없을 때 종료하고 다음 자동 주기의 Merge 기준을 갱신한다. 작업이 없으면 검증·필요한 게시 뒤 종료할 수 있다. 마지막 Merge 뒤 새 평가나 사후 재검증을 종료 조건으로 추가하지 않으며, 유지보수 종료를 프로젝트 전체 완료로 기록하지 않는다.
+archive가 최초 평가 workspace 생성 전에 base를 전진시키면, 게시 intent·평가 결과·완료 근거·보존 workspace가 없는 assessment만 기존 context 재시작으로 최신 base에 맞춘다. 같은 cycle·단계를 유지하고 revision을 올려 낡은 context를 무효화한다. 저장된 결과·workspace·게시 intent는 각자의 기존 복구 경계를 따른다.
+
+평가 성공과 cycle 종료는 별도 상태다. cycle 범위는 선행·리팩터링·발견을 연결한 기존 계획과 그 dependency closure를 포함한다. 범위의 모든 계획이 실제 MERGED이고 원격·catalog에 반영됐으며 미확정 게시·해당 범위의 catalog hold가 없을 때 종료하고 다음 자동 주기의 Merge 기준을 갱신한다. 작업이 없으면 검증·필요한 게시 뒤 종료할 수 있다. 종료 기준 commit은 내용 보존 archive까지 반영한 현재 catalog revision이며, archive 자체를 실제 Merge 수에 더하지 않는다. 마지막 Merge 뒤 새 평가나 사후 재검증을 종료 조건으로 추가하지 않으며, 유지보수 종료를 프로젝트 전체 완료로 기록하지 않는다.
 
 #### 결과 해석과 공백 원본
 
@@ -1628,6 +1630,8 @@ PR 없는 원격 branch의 rebase 복구도 SQLite에 저장된 동일 Manager �
 ExecPlan은 GitHub Merge 확인과 SQLite MERGED 전이 뒤에만 별도 정리 대상으로 삼는다. 최신 원격 base의 detached 임시 worktree에서 `docs/plans/`의 문서를 같은 파일명의 `docs/plans/archive/`로 내용 보존 rename-only commit해 직접 fast-forward 게시한다.
 
 `ProjectService`는 Requirement 교정의 lifecycle gate와 archive 실행 자원 판단을 분리한다. `ArchiveExecutionResources`는 base 게시·fetch·공유 설정과 후보별 plan/branch/worktree의 기존 lease를 dispatch 동안 유지한다. archive의 lease 요청은 경합 시 기다리지 않으므로 실행 중 호출이나 다음 배정을 선점하지 않는다. 일반·유지보수·교정의 실제 base 게시 예약과 프로젝트 안전 차단을 재확인하고, 단순 phase·유지보수 cycle·다른 작업의 존재는 쓰기 권한이나 거부 근거로 사용하지 않는다. 미확정 Git 기록은 [공통 자원 판단](#미확정-git-작업의-단계별-자원-판단)에 같은 lease stack을 전달하며 원인 rebase의 intent·차단을 보존한다.
+
+archive는 관리 배정 자리를 소비하지 않는다. 관리 배정의 parked·인계·반환은 물리 writer 종료의 근거가 아니다. 후보 자원 검사는 기존 task-call 예약과 종료 영수증을 사용하고, 명시 요청의 우선순위·관리 한도·drain·pause는 조율 경계에 남긴다. 미Merge CLOSED와 삭제 ID·정리 pending은 MERGED 후보에 포함하지 않는다. 독립 삭제 보존 기록은 전역 gate가 아니며 같은 base·journal·후보 자원의 실제 충돌만 보류한다. 삭제 기록·정리 파일의 제거와 복구는 [삭제 재시작과 파일별 복구](#삭제-재시작과-파일별-복구)의 책임으로 유지한다.
 
 보관 근거는 최초 게시본이 아닌 catalog의 현재 최종 문서 hash와 `current_revision_sha`다. operation identity는 base·계획 ID·이전/보관 경로·최종 hash·revision에 결합하며 준비 commit의 실제 rename-only diff와 후보 정의를 게시 전에 다시 확인한다.
 

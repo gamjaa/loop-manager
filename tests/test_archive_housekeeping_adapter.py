@@ -441,3 +441,66 @@ class ArchiveExecutionResourcesTest(unittest.TestCase):
         self.connection.commit()
         with ExitStack() as leases:
             self.assertIsNone(self.guard(leases).candidate_reason(item))
+
+    def test_parked_target_keeps_physical_reservation_while_other_merged_candidate_is_safe(self):
+        import json
+        import sys
+        from loop_manager_internal.storage import management_admission, task_calls
+        from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        self.connection.execute("UPDATE exec_plans SET status='MERGED',current_revision_sha='base'")
+        self.connection.execute("INSERT INTO exec_plans "
+            "(repo,plan_id,path,title,sources,depends_on,priority,content_hash,current_revision_sha,status) "
+            "VALUES (?,'G-048','docs/plans/[G-048] Other.md','Other','[]','[]','normal','other','base','MERGED')", (self.repo,))
+        management_admission.request(self.connection, self.repo, 'G-047')
+        self.connection.commit()
+        owner = task_calls.reserve(self.connection, self.root, self.repo, 'G-047', 'verify', 'test')
+        receipt = self.root / 'logs/task-calls' / (owner.token + '.json')
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({'token': owner.token, 'platform': sys.platform, 'state': 'running'}))
+        self.connection.execute('UPDATE task_call_reservations SET receipt_path=?,uncertain=1 WHERE token=?',
+                                (str(receipt), owner.token))
+        self.connection.commit()
+        before = tuple(self.connection.execute('SELECT * FROM task_call_reservations').fetchone())
+        admission = tuple(self.connection.execute('SELECT * FROM task_management_admissions').fetchone())
+        items = ExecPlanArchiveRepository(self.connection).merged_candidates(self.repo)
+        with ExitStack() as leases:
+            guard = self.guard(leases)
+            self.assertTrue(guard.safe())
+            self.assertEqual(guard.candidate_reason(items[0]), 'candidate_resource_writer_or_lease_busy')
+            self.assertIsNone(guard.candidate_reason(items[1]))
+        self.assertTrue(management_admission.parked(self.connection, self.repo, 'G-047'))
+        self.assertEqual(task_calls.managed_count(self.connection, self.repo), 0)
+        self.assertEqual(tuple(self.connection.execute('SELECT * FROM task_call_reservations').fetchone()), before)
+        task_calls.verify_stopped(receipt)
+        with ExitStack() as leases:
+            self.assertIsNone(self.guard(leases).candidate_reason(items[0]))
+        self.assertEqual(tuple(self.connection.execute('SELECT * FROM task_management_admissions').fetchone()), admission)
+
+    def test_closed_and_deleted_tasks_are_not_archive_candidates_or_global_holds(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED',blocked_reason='pull_request_closed',pr_url='closed-pr'")
+        self.connection.execute("INSERT INTO exec_plans "
+            "(repo,plan_id,path,title,sources,depends_on,priority,content_hash,current_revision_sha,status) "
+            "VALUES (?,'G-048','docs/plans/[G-048] Merged.md','Merged','[]','[]','normal','hash','base','MERGED')", (self.repo,))
+        deleted_plan_state.ensure_schema(self.connection)
+        artifact = self.root / 'logs' / 'deleted-owner.txt'
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text('preserve cleanup evidence')
+        self.connection.execute('INSERT INTO deleted_plan_ids VALUES (?,?)', (self.repo, 'G-049'))
+        self.connection.execute('INSERT INTO deleted_plan_files VALUES (?,?,?)', (self.repo, 'G-049', str(artifact)))
+        self.connection.commit()
+        closed = tuple(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-047'").fetchone())
+        candidates = ExecPlanArchiveRepository(self.connection).merged_candidates(self.repo)
+        self.assertEqual([item.plan_id for item in candidates], ['G-048'])
+        with ExitStack() as leases:
+            guard = self.guard(leases)
+            self.assertTrue(guard.safe())
+            self.assertIsNone(guard.candidate_reason(candidates[0]))
+        with resource_locks(self.root, self.repo, ['git:refs/heads/main'], owner='deleted-plan-publication'):
+            with ExitStack() as leases:
+                self.assertFalse(self.guard(leases).safe())
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-047'").fetchone()), closed)
+        self.assertEqual(self.connection.execute('SELECT plan_id FROM deleted_plan_ids').fetchone()[0], 'G-049')
+        self.assertEqual(self.connection.execute('SELECT path FROM deleted_plan_files').fetchone()[0], str(artifact))
+        self.assertEqual(artifact.read_text(), 'preserve cleanup evidence')

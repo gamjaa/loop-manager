@@ -102,6 +102,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_management_admissions').fetchone()[0],0)
 
     def test_unblock_cli_dispatch_and_live_reservation_drain(self):
+        from loop_manager_internal.application.project_service import ProjectService
         from loop_manager_internal.application.commands import execute_runtime_command
         from loop_manager_internal.storage import management_admission as admission, task_calls
         repo = str(self.directory.resolve())
@@ -114,16 +115,34 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         messages=[]
         effects=SimpleNamespace(connect_database=database.connect_database,operation_print=messages.append)
         self.assertEqual(execute_runtime_command(effects,args,self.directory,self.config_path),0)
+        self._insert_plan(self.connection,'G-005','MERGED',repo=repo)
+        self.connection.commit()
+        archive_opportunities = []
+        def archive(_connection, _path, _state, _repo, _base, **options):
+            self.assertTrue(options['archive_safety']())
+            from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+            item = ExecPlanArchiveRepository(self.connection).merged_candidates(repo)[0]
+            self.assertEqual(item.plan_id, 'G-005')
+            self.assertIsNone(options['candidate_safety'](item))
+            archive_opportunities.append(admission.parked(self.connection, repo, 'G-004'))
+        service = ProjectService.__new__(ProjectService)
+        service.identity = SimpleNamespace(connection=self.connection, state_dir=self.directory)
+        service.state = SimpleNamespace(repo=repo, repo_path=Path(repo), base='main', catalog_refresh=mock.Mock())
+        service.effects = SimpleNamespace(git=mock.Mock(), operation_print=mock.Mock(),
+                                         dispatch_execplan_archive_housekeeping=archive)
         owner = task_calls.reserve(self.connection,self.directory,repo,'G-002','verify','run')
         self.connection.commit()
         admission.reconcile(self.connection,repo,1)
         self.assertTrue(admission.parked(self.connection,repo,'G-004'))
+        service._archive_scheduling_boundary()
         self.assertIsNotNone(self.connection.execute('SELECT 1 FROM task_call_reservations WHERE token=?',(owner.token,)).fetchone())
         scheduler=self.scheduler()
         self.assertFalse(scheduler._eligible(scheduling.Task(repo,'G-002',self.connection),self.connection))
         task_calls.release(owner)
         admission.reconcile(self.connection,repo,1)
         self.assertFalse(admission.parked(self.connection,repo,'G-004'))
+        service._archive_scheduling_boundary()
+        self.assertEqual(archive_opportunities, [True, False])
         self.assertEqual(scheduling.managed_count(self.connection,repo),1)
         self.assertIn('G-004', messages[0])
 
