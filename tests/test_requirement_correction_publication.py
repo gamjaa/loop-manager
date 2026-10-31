@@ -307,7 +307,8 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         dispatch.assert_called_once()
         gate.return_value = False
         service._archive_housekeeping()
-        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_count, 2)
+        self.assertFalse(dispatch.call_args.kwargs['correction_safety']())
         self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, preserved)
 
     def test_writer_gate_distinguishes_unstarted_failures_from_unconfirmed_writers(self):
@@ -515,8 +516,11 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
     def test_project_boundary_does_not_swallow_correction_failure(self):
         from types import SimpleNamespace
         from loop_manager_internal.application.project_service import ProjectService
+        from tests.support.database import runtime_connection
+        connection = runtime_connection('repo')
+        self.addCleanup(connection.close)
         service = ProjectService.__new__(ProjectService)
-        service.identity = SimpleNamespace(connection=self.connection, state_dir=self.root,
+        service.identity = SimpleNamespace(connection=connection, state_dir=self.root,
             registered_only=False, refactoring_review_interval=5)
         service.state = SimpleNamespace(repo='repo', repo_path=self.root, base='main',
             validated_agent_scope=None, catalog_refresh=None)
@@ -529,8 +533,11 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         from types import SimpleNamespace
         from loop_manager_internal.application.project_service import ProjectService
         from loop_manager_internal.git import manager_git_journal
+        from tests.support.database import runtime_connection
+        connection = runtime_connection('repo')
+        self.addCleanup(connection.close)
         service = ProjectService.__new__(ProjectService)
-        service.identity = SimpleNamespace(connection=self.connection, state_dir=self.root,
+        service.identity = SimpleNamespace(connection=connection, state_dir=self.root,
             registered_only=False, refactoring_review_interval=5, recovery_request_id=None)
         service.state = SimpleNamespace(repo='repo', repo_path=self.root, base='main', validated_agent_scope=None)
         service.effects = SimpleNamespace(_execplan_archive_housekeeping_safe=lambda *_a, **_k: True,

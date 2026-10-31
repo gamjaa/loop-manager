@@ -196,6 +196,7 @@ class ExecPlanArchiveDispatcher:
         max_base_restarts: int = 3,
         refresh_candidates: Callable[[str], bool] | None = None,
         execution_safety: Callable[[], bool] | None = None,
+        candidate_safety: Callable[[MergedArchiveCandidate], str | None] | None = None,
     ):
         if max_base_restarts < 1:
             raise ValueError("max_base_restarts must be positive")
@@ -204,6 +205,7 @@ class ExecPlanArchiveDispatcher:
         self.max_base_restarts = max_base_restarts
         self.refresh_candidates = refresh_candidates
         self.execution_safety = execution_safety
+        self.candidate_safety = candidate_safety
 
     def dispatch(self, repo: str, base_branch: str) -> ArchiveDispatchOutcome:
         last_pending: dict[str, str] = {}
@@ -220,6 +222,10 @@ class ExecPlanArchiveDispatcher:
                         if archived_ids or last_pending
                         else ArchiveDispatchOutcome(ArchiveDispatchKind.NO_CANDIDATES)
                     )
+                if self.execution_safety is not None and not self.execution_safety():
+                    reason = "execution_safety_changed_before_observation"
+                    last_pending.update((item.plan_id, reason) for item in candidates)
+                    return self._outcome(archived_ids, last_pending, transient=True)
                 observations = self.git.observe(base_sha, candidates)
             except Exception as error:
                 reason = f"remote_observation_failed:{error}"
@@ -245,6 +251,8 @@ class ExecPlanArchiveDispatcher:
             last_pending = {}
             for candidate in candidates:
                 status, move = validate_candidate(by_id[candidate.plan_id])
+                if status in {"safe", "archived"} and self.candidate_safety is not None:
+                    status = self.candidate_safety(candidate) or status
                 if status == "archived":
                     succeeded = self.repository.record_success(
                         repo,

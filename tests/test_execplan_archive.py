@@ -171,11 +171,25 @@ class DefinitionValidatingFakeGit(FakeGit):
 
 
 class ExecPlanArchiveTest(unittest.TestCase):
+    def test_candidate_resource_hold_does_not_prevent_independent_safe_subset(self):
+        items = (candidate("G-001"), candidate("G-002"))
+        repository = FakeRepository(items)
+        git = FakeGit({"base": {item.plan_id: (entry(item.plan_id), None) for item in items}})
+        dispatcher = execplan_archive.ExecPlanArchiveDispatcher(
+            repository, git, candidate_safety=lambda item: (
+                "candidate_resource_manual_owner" if item.plan_id == "G-001" else None
+            ),
+        )
+        outcome = dispatcher.dispatch("repo", "main")
+        self.assertEqual(outcome.archived_plan_ids, ("G-002",))
+        self.assertEqual(outcome.pending, (("G-001", "candidate_resource_manual_owner"),))
+        self.assertEqual(git.prepared, [("base", ("G-002",))])
+
     def test_execution_safety_is_rechecked_before_commit(self):
         item = candidate("G-001")
         repository = FakeRepository((item,))
         git = FakeGit({"base": {item.plan_id: (entry(item.plan_id), None)}})
-        safety = mock.Mock(return_value=False)
+        safety = mock.Mock(side_effect=[True, False])
         dispatcher = execplan_archive.ExecPlanArchiveDispatcher(
             repository, git, execution_safety=safety,
         )
@@ -186,6 +200,7 @@ class ExecPlanArchiveTest(unittest.TestCase):
         self.assertEqual(git.prepared, [])
         self.assertEqual(git.pushed, [])
         self.assertEqual(repository.operation_pending[-1][2]["push_result"], "execution_deferred")
+        safety.side_effect = None
         safety.return_value = True
         resumed = dispatcher.dispatch("repo", "main")
         self.assertEqual(resumed.archived_plan_ids, (item.plan_id,))
@@ -196,7 +211,7 @@ class ExecPlanArchiveTest(unittest.TestCase):
         item = candidate("G-001")
         repository = FakeRepository((item,))
         git = FakeGit({"base": {item.plan_id: (entry(item.plan_id), None)}})
-        safety = mock.Mock(side_effect=[True, False])
+        safety = mock.Mock(side_effect=[True, True, False])
         dispatcher = execplan_archive.ExecPlanArchiveDispatcher(
             repository, git, execution_safety=safety,
         )

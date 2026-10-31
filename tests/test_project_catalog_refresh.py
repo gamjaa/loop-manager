@@ -133,7 +133,8 @@ class _CatalogRefreshCase(unittest.TestCase):
             stack.enter_context(mock.patch.object(manager, 'remote_base', side_effect=lambda *a, **k: self.events.append('fetch') or 'main'))
             stack.enter_context(mock.patch.object(manager, 'git', side_effect=lambda *a, **k: SimpleNamespace(stdout=self.sha)))
             stack.enter_context(mock.patch.object(manager, 'recheck_cleanup_pending', return_value=[]))
-            stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe', side_effect=safe))
+            stack.enter_context(mock.patch(
+                'loop_manager_internal.catalog.archive_service.ArchiveExecutionResources.safe', side_effect=safe))
             stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests', side_effect=pull_requests))
             stack.enter_context(mock.patch.object(manager.project_catalog_refresh, 'ProjectCatalogRefresh', return_value=self.boundary))
             stack.enter_context(mock.patch.object(manager.PlanningLifecycleCoordinator, 'run', side_effect=planning))
@@ -703,7 +704,8 @@ class ProjectCatalogConsumerTests(_CatalogRefreshCase):
             stack.enter_context(mock.patch.object(manager.project_catalog_refresh, 'ProjectCatalogRefresh', return_value=self.boundary))
             stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests', side_effect=observe_pr))
             stack.enter_context(mock.patch.object(manager, 'recheck_cleanup_pending', return_value=[]))
-            stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe', return_value=False))
+            stack.enter_context(mock.patch(
+                'loop_manager_internal.catalog.archive_service.ArchiveExecutionResources.safe', return_value=False))
             pr = stack.enter_context(mock.patch.object(manager, 'pr_for_branch', side_effect=AssertionError('new Worker PR lookup')))
             execution = stack.enter_context(mock.patch.object(manager, 'ExecutionPhaseCoordinator'))
             execution.return_value.prepare.side_effect = prepare
