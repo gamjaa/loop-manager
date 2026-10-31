@@ -159,3 +159,25 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 with mock.patch.object(resource_lock, 'resource_locks', side_effect=ValueError('plan lease required')):
                     with self.assertRaisesRegex(ValueError, 'plan lease required'):
                         guarded(state, repo='/repo', target=target, kind='managed_worktree_remove', owner='plan:G-001')
+
+    def test_immutable_validation_audits_allow_only_explicit_task_erasure(self):
+        import sqlite3
+        from loop_manager_internal.storage import validation_feedback_state
+        validation_feedback_state.ensure_schema(self.connection)
+        for key in ('G-001', 'G-002'):
+            self.connection.execute('''INSERT INTO validation_results
+                (repo,plan_id,stage,classification,raw_output,identities,created_at)
+                VALUES ('/repo',?,'verify','failed','output','[]','now')''', (key,))
+        self.connection.execute("INSERT INTO common_defect_reports VALUES (1,'{}',NULL)")
+        self.connection.execute("INSERT INTO common_defect_links(repo,result_id,goal_key,correction_plan_id,reviewed_revision,confirmed_revision,evidence) VALUES ('/repo',1,'goal','G-002','old','new','{}')")
+        self.connection.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute("DELETE FROM validation_results WHERE plan_id='G-001'")
+        self.connection.rollback()
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual([r[0] for r in self.connection.execute('SELECT plan_id FROM validation_results')], ['G-002'])
+        self.assertEqual(self.connection.execute('SELECT count(*) FROM common_defect_reports').fetchone()[0], 0)
+        self.assertEqual(self.connection.execute('SELECT count(*) FROM common_defect_links').fetchone()[0], 0)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute("DELETE FROM validation_results WHERE plan_id='G-002'")
+        self.connection.rollback()

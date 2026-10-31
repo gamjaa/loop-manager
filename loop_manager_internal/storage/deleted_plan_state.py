@@ -29,6 +29,24 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         if connection.execute('SELECT 1 FROM manual_work_members WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone():
             raise ValueError('수동 소유 작업은 자동 제거할 수 없습니다.')
         calls = [row[0] for row in connection.execute('SELECT invocation_id FROM agent_invocations WHERE repo=? AND plan_id=?', (repo, plan_id))]
+        # Audit immutability remains in force outside this explicit erasure transaction.
+        triggers = connection.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+            "AND name IN ('validation_results_delete_immutable','validation_feedback_events_delete_immutable',"
+            "'common_defect_reports_delete_immutable','common_defect_links_delete_immutable',"
+            "'common_defect_merges_delete_immutable')").fetchall()
+        for trigger in triggers:
+            connection.execute(f'DROP TRIGGER "{trigger[0]}"')
+        if 'validation_delivery_items' in tables:
+            connection.execute('''DELETE FROM validation_delivery_items WHERE attempt_id IN
+                (SELECT id FROM validation_delivery_attempts WHERE repo=? AND plan_id=?)
+                OR sequence IN (SELECT sequence FROM validation_feedback_events WHERE repo=? AND plan_id=?)''',
+                (repo, plan_id, repo, plan_id))
+        for table in ('common_defect_reports', 'common_defect_links'):
+            if table in tables:
+                connection.execute(f'DELETE FROM "{table}" WHERE result_id IN '
+                    '(SELECT id FROM validation_results WHERE repo=? AND plan_id=?)', (repo, plan_id))
+        if 'common_defect_links' in tables:
+            connection.execute('DELETE FROM common_defect_links WHERE repo=? AND correction_plan_id=?', (repo, plan_id))
         # Invocation children lack repo/plan columns; delete before their parent.
         for table in ('targeted_test_run_owners', 'targeted_test_collections', 'agent_isolation_evidence'):
             if table in tables:
@@ -55,10 +73,12 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         # All task stores use this exact ownership pair, including usage and audits.
         owned = [table for table, columns in tables.items()
                  if {'repo', 'plan_id'} <= columns and table not in {'exec_plans', 'deleted_plan_ids', 'deleted_plan_files'}]
-        for table in owned:
+        for table in sorted(owned, key=lambda name: name == 'validation_results'):
             connection.execute(f'DELETE FROM "{table}" WHERE repo=? AND plan_id=?', (repo, plan_id))
         connection.execute('DELETE FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id))
         connection.execute('INSERT OR IGNORE INTO deleted_plan_ids VALUES (?,?)', (repo, plan_id))
         connection.executemany('INSERT OR IGNORE INTO deleted_plan_files VALUES (?,?,?)',
                                ((repo, plan_id, str(path)) for path in artifacts))
+        for trigger in triggers:
+            connection.execute(trigger[1])
 
