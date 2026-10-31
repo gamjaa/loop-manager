@@ -1642,6 +1642,35 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(tuple(self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()), before)
         self.assertEqual(runtime.get('A', 'G-001').worktree, 'one')
 
+    def test_other_blocked_operation_does_not_keep_stale_project_execution(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        runtime.block_plan('A', 'G-001', reason_code='worker_output_invalid', evidence='failed test',
+                           release_fingerprint='blocked', project_values={'phase': 'WORKING'})
+        runtime.hydrate_snapshot('A', runtime.get('A', 'G-001'))
+        self.connection.execute("UPDATE projects SET phase='WORKING' WHERE repo='A'")
+        self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo='A' AND plan_id='G-002'")
+        self.connection.execute("INSERT INTO execution_checkpoints(repo,plan_id,operation) VALUES ('A','G-002','rebase')")
+        self.connection.commit()
+        scheduler = self.scheduler()
+        effects = SimpleNamespace(activate_ready_execplan=mock.Mock(return_value=None), resume_manual_work=None)
+        service = ProjectService(effects, ProjectIdentity(self.connection, self.directory, 'A', self.config_path,
+                                 None, False, None, True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base')
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            self.assertEqual(scheduling.run_project_tasks(service, newly_activated=False), 0)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        project = self.connection.execute("SELECT * FROM projects WHERE repo='A'").fetchone()
+        self.assertIsNone(project['phase'])
+        self.assertIsNone(project['branch'])
+        self.assertEqual(runtime.get('A', 'G-001').status, 'PLAN_BLOCKED')
+        self.assertEqual(runtime.get('A', 'G-001').worktree, 'one')
+        self.assertEqual(self.connection.execute("SELECT operation FROM execution_checkpoints WHERE plan_id='G-002'").fetchone()[0], 'rebase')
+
     def test_limit_reduction_during_activation_preserves_ready_without_failure(self):
         from loop_manager_internal.storage.task_calls import CallDeferred
         for error in (runtime_state.TaskLimitReached('limit reduced'), CallDeferred('call pending')):

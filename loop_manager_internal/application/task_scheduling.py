@@ -1028,13 +1028,17 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
     finally:
         for thread in threads:
             thread.join()
-        active = runtime_state.RuntimeStateRepository(connection).active(repo)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        active = repository.active(repo)
+        projected = repository.projected_row(repo)
+        projected_id = str(projected['plan_id']) if projected is not None else None
         if active is not None:
             runtime_state.RuntimeStateRepository(connection).hydrate_snapshot(repo, active)
         elif not managed_count(connection, repo) and connection.execute(
                 "SELECT 1 FROM task_call_reservations WHERE repo=? UNION ALL "
-                "SELECT 1 FROM execution_checkpoints WHERE repo=? AND operation IS NOT NULL LIMIT 1",
-                (repo, repo)).fetchone() is None:
+                "SELECT 1 FROM execution_checkpoints WHERE repo=? AND operation IS NOT NULL "
+                "AND (? IS NULL OR plan_id=?) LIMIT 1",
+                (repo, repo, projected_id, projected_id)).fetchone() is None:
             runtime_state.RuntimeStateRepository(connection).update_project(
                 repo, runtime_state.EXECUTION_CLEAR_VALUES)
     final_results = [*results, *task_results.values()]
