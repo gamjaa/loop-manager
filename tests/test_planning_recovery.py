@@ -1090,7 +1090,8 @@ class PlanningRecoveryTest(PlanningCase):
             self.assertEqual(saved.planner_session_id, "planner-session")
             self.assertEqual(invalid.read_text(encoding="utf-8"), "invalid\n")
 
-    def test_first_planner_validation_retry_resumes_session_and_clears_state(self):
+    @mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess"))
+    def test_first_planner_validation_retry_resumes_session_and_clears_state(self, _popen):
         from loop_manager_internal.storage import runtime_state
         from tests.support.catalog import make_catalog_root, planner_git_observations, write_execplan
         with tempfile.TemporaryDirectory() as directory:
