@@ -1120,6 +1120,10 @@ class ProjectService:
 
     def _archive_housekeeping(self) -> None:
         if not self._archive_housekeeping_safe():
+            self._archive_deferred(
+                "execution_opportunity", "project_lifecycle", "lifecycle_gate_closed",
+                "next_safe_project_boundary",
+            )
             return
         from loop_manager_internal.git import manager_git_journal
         if manager_git_journal.has_conflicting_project_mutation(
@@ -1127,7 +1131,10 @@ class ProjectService:
                 connection=self.identity.connection, git=getattr(self.effects, 'git', None),
                 worktrees=(self.state.repo_path,),
                 refs=(f'refs/heads/{self.state.base}', f'refs/remotes/origin/{self.state.base}')):
-            self.effects.operation_print('Requirement·archive 정리 보류: 기존 Manager Git 작업을 먼저 복구합니다.')
+            self._archive_deferred(
+                "shared_resource", "manager_git_journal", "conflicting_project_mutation",
+                "confirm_writer_termination_and_independent_resources",
+            )
             return
         try:
             self.effects.dispatch_execplan_archive_housekeeping(
@@ -1147,8 +1154,28 @@ class ProjectService:
                 raise
             # Archive maintenance is deliberately non-gating: MERGED state,
             # READY selection, planning, and completion continue unchanged.
+            self._archive_deferred(
+                "publication_confirmation", f"refs/heads/{self.state.base}",
+                f"housekeeping_failed:{error}", "next_safe_boundary_reobserve_remote_and_saved_operation",
+                attempted=True,
+            )
+
+    def _archive_deferred(self, category, resource, reason, resume_condition, *, attempted=False) -> None:
+        from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        try:
+            changed = ExecPlanArchiveRepository(self.identity.connection).observe(
+                self.state.repo, "dispatch", category=category, resource=resource,
+                reason=reason, resume_condition=resume_condition, attempted=attempted,
+            )
+        except sqlite3.Error as error:
             self.effects.operation_print(
-                f"ExecPlan archive housekeeping 실패 (다음 실행에서 재시도): {error}",
+                f"ExecPlan archive 보류 기록 미확정: {error}; {resource}: {reason}; 재개 조건={resume_condition}",
+                file=sys.stderr,
+            )
+            return
+        if changed:
+            self.effects.operation_print(
+                f"ExecPlan archive 보류 [{category}] {resource}: {reason}; 재개 조건={resume_condition}",
                 file=sys.stderr,
             )
 

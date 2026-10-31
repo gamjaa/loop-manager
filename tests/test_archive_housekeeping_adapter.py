@@ -8,6 +8,71 @@ import loop_manager
 
 
 class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
+    def test_entry_deferral_is_durable_and_logs_only_reason_changes(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.application.project_service import ProjectService
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        service = ProjectService.__new__(ProjectService)
+        service.identity = SimpleNamespace(connection=connection)
+        service.state = SimpleNamespace(repo="/repo")
+        service.effects = SimpleNamespace(operation_print=mock.Mock())
+        service._archive_housekeeping_safe = mock.Mock(return_value=False)
+
+        service._archive_housekeeping()
+        service._archive_housekeeping()
+
+        row = connection.execute("SELECT * FROM execplan_archive_observations").fetchone()
+        self.assertEqual(row["category"], "execution_opportunity")
+        self.assertEqual(row["reason"], "lifecycle_gate_closed")
+        self.assertEqual(row["attempts"], 0)
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM execplan_archive_items").fetchone()[0], 0)
+        service.effects.operation_print.assert_called_once()
+        service._archive_deferred("shared_resource", "refs/heads/main", "writer_unknown", "confirm_writer_stopped")
+        self.assertEqual(service.effects.operation_print.call_count, 2)
+
+    def test_candidate_log_suppression_keeps_attempt_count_and_completion_transition(self):
+        from loop_manager_internal.catalog import archive_service, execplan_archive
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        effects = archive_service.DispatchExecplanArchiveHousekeepingEffects(
+            mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock())
+        pending = execplan_archive.ArchiveDispatchOutcome(
+            execplan_archive.ArchiveDispatchKind.PENDING,
+            pending=(("G-001", "source_hash_mismatch"),),
+        )
+        completed = execplan_archive.ArchiveDispatchOutcome(
+            execplan_archive.ArchiveDispatchKind.CONVERGED, archived_plan_ids=("G-001",),
+        )
+        outcomes = (pending, pending, completed, pending)
+        with mock.patch.object(execplan_archive.ExecPlanArchiveDispatcher, "dispatch", side_effect=outcomes):
+            for _ in outcomes:
+                archive_service.dispatch_execplan_archive_housekeeping(
+                    effects, connection, Path("/repo"), Path("/state"), "/repo", "main")
+        self.assertEqual(effects.operation_print.call_count, 3)
+        row = connection.execute("SELECT * FROM execplan_archive_observations WHERE scope='G-001'").fetchone()
+        self.assertEqual(row["attempts"], 4)
+        self.assertEqual(row["category"], "candidate")
+        self.assertEqual(row["reason"], "source_hash_mismatch")
+
+    def test_deferral_storage_failure_keeps_archive_non_gating(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.application.project_service import ProjectService
+        from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        service = ProjectService.__new__(ProjectService)
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        service.identity = SimpleNamespace(connection=connection)
+        service.state = SimpleNamespace(repo="/repo")
+        service.effects = SimpleNamespace(operation_print=mock.Mock())
+        service._archive_housekeeping_safe = mock.Mock(return_value=False)
+        with mock.patch.object(ExecPlanArchiveRepository, "observe", side_effect=sqlite3.OperationalError("database busy")):
+            service._archive_housekeeping()
+        self.assertIn("기록 미확정", service.effects.operation_print.call_args.args[0])
+
     def test_archive_housekeeping_waits_for_preserved_planning_attempt(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)

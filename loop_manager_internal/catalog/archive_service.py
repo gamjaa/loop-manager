@@ -97,17 +97,41 @@ def dispatch_execplan_archive_housekeeping(
         ),
         execution_safety=archive_safety,
     ).dispatch(repo, base_branch)
-    if outcome.commit_oid:
+    archive_repository.observe(
+        repo, "dispatch", category="execution_result", resource=f"refs/heads/{base_branch}",
+        reason=outcome.kind.value, resume_condition="next_safe_boundary", attempted=True,
+    )
+    if outcome.archived_plan_ids:
         effects.operation_print(
-            "MERGED ExecPlan archive 게시 완료: "
+            "MERGED ExecPlan archive 완료 확인: "
             + ", ".join(outcome.archived_plan_ids)
         )
     for plan_id, reason in outcome.pending:
-        effects.operation_print(
-            f"ExecPlan archive 대기 ({plan_id}): {reason}",
-            file=sys.stderr,
+        if archive_repository.observe(
+            repo, plan_id, category=_pending_category(reason), resource=plan_id,
+            reason=reason, resume_condition="reobserve_candidate_and_resources_at_next_safe_boundary",
+            attempted=True,
+        ):
+            effects.operation_print(
+                f"ExecPlan archive 대기 ({plan_id}): {reason}; 다음 안전 경계에서 후보·자원 재확인",
+                file=sys.stderr,
+            )
+    for plan_id in outcome.archived_plan_ids:
+        archive_repository.observe(
+            repo, plan_id, category="complete", resource=plan_id,
+            reason="archived", resume_condition="none", attempted=True,
         )
     return outcome
+
+
+def _pending_category(reason: str) -> str:
+    if reason.startswith("execution_safety_"):
+        return "shared_resource"
+    if reason.startswith(("remote_", "pre_commit_base_", "pre_push_base_", "incomplete_candidate_observation")):
+        return "remote_observation"
+    if reason.startswith(("commit_preparation_", "workspace_cleanup_", "push_", "catalog_")):
+        return "publication_confirmation"
+    return "candidate"
 
 
 @dataclass(frozen=True)

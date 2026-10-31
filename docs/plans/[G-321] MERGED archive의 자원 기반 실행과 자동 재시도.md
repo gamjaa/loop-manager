@@ -176,6 +176,20 @@ archive dispatcher는 catalog refresh 이후뿐 아니라 실제 commit 준비 �
 
 다음 작업은 ProjectService의 실제 자원 판단·lease와 진입 전 보류 관측, 연속 배정 중 archive 기회, 반복 로그 억제 및 PRODUCT·ARCHITECTURE 갱신이다. 이 보존점은 R-094나 G-321의 구현 완료 후보가 아니다.
 
+### 보류 관측의 준비 보존점
+
+`execplan_archive_observations`는 `(repo, scope)`별 현재 범주·대상 자원·사유·재개 조건과 실제 dispatch 시도 누계를 보존한다. `scope=dispatch`는 후보 row가 없는 진입 전 보류도 기록하며, 후보 ID scope는 개별 보류와 완료 전이를 기록한다. 같은 관측을 반복하면 로그를 생략하지만 실제 시도 누계는 갱신한다. 사유 변경·완료 이후 같은 사유의 재발은 다시 출력한다. 이 관측은 준비 operation·후보 row·MERGED나 알림 상태를 변경하지 않는다.
+
+ProjectService의 기존 lifecycle/journal 진입 전 반환과 archive 예외를 저장 경계에 연결했다. 관측 DB 처리가 실패하면 사유·자원·재개 조건과 기록 미확정 사실을 운영 로그에 남기고 독립 처리를 계속한다. Requirement 교정 실패의 기존 전파는 유지한다. dispatcher의 반복 pending 출력은 관측 비교로 억제하고 원격에서 이미 완료된 이동도 완료 확인을 출력한다. 자원 gate 전환·연속 배정 기회와 최종 설계 문서 갱신은 아직 남아 있다.
+
+최소 unit 실행은 재시작/후보 row 부재, 준비 operation 불변, 진입 전 사유 전이, 후보 로그 억제·시도 누계·완료 전이의 4개 case가 통과했다. 이어서 로그 변경과 DB 오류 처리, 교정 실패 전파, 충돌 rebase 보류와 독립 rebase 허용의 5개 case를 실행했다. DB 오류 테스트의 Mock 연결이 schema 조회를 지원하지 않아 1개 오류가 발생했고, 실제 격리 SQLite 연결에서 오류를 주입하도록 수정했다. 같은 명령 재실행은 5개 모두 통과했다. 전체 verify·suite는 실행하지 않았다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_archive_housekeeping_adapter.ExecPlanArchiveHousekeepingAdapterTest.test_candidate_log_suppression_keeps_attempt_count_and_completion_transition tests.test_archive_housekeeping_adapter.ExecPlanArchiveHousekeepingAdapterTest.test_deferral_storage_failure_keeps_archive_non_gating tests.test_requirement_correction_publication.RequirementCorrectionPublicationTest.test_project_boundary_does_not_swallow_correction_failure tests.test_requirement_correction_publication.RequirementCorrectionPublicationTest.test_pending_rebase_defers_housekeeping_and_reaches_execution_recovery tests.test_requirement_correction_publication.RequirementCorrectionPublicationTest.test_housekeeping_dispatches_with_an_independent_rebase_and_keeps_safety_gate
+
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_archive_housekeeping_adapter.ExecPlanArchiveHousekeepingAdapterTest.test_candidate_log_suppression_keeps_attempt_count_and_completion_transition tests.test_archive_housekeeping_adapter.ExecPlanArchiveHousekeepingAdapterTest.test_deferral_storage_failure_keeps_archive_non_gating tests.test_requirement_correction_publication.RequirementCorrectionPublicationTest.test_project_boundary_does_not_swallow_correction_failure tests.test_requirement_correction_publication.RequirementCorrectionPublicationTest.test_pending_rebase_defers_housekeeping_and_reaches_execution_recovery tests.test_requirement_correction_publication.RequirementCorrectionPublicationTest.test_housekeeping_dispatches_with_an_independent_rebase_and_keeps_safety_gate
+
+재실행 결과: 5 tests, OK. 기록 경로는 이번 호출의 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`이며 기존 실패 기록을 성공으로 대체하지 않았다.
+
 ## Decision Log
 
 - 이번 delta는 G-321을 초기화하거나 완료한 구현을 중복 계획하지 않는다. 앞의 후보에 보존된 구현/검증 원문과 과거 준비점은 유지하고 현재 원격의 관리 인계·삭제 정책과 만나는 경계만 미충족 통합으로 구분한다. started ID·경로·기존 dependency·metadata를 보존한다. 후보 확인·기존 targeted 기록은 최신 전체 verify/Review 성공·Merge가 아니다.

@@ -48,6 +48,20 @@ CREATE TABLE IF NOT EXISTS execplan_archive_operations (
 )
 """
 
+ARCHIVE_OBSERVATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS execplan_archive_observations (
+    repo TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    category TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    resume_condition TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (repo, scope)
+)
+"""
+
 _ACTIVE_PLAN_PATH = re.compile(r"docs/plans/\[(G-\d{3,})\] [^/]+\.md")
 
 
@@ -90,6 +104,7 @@ def _revision_token(candidates: Sequence[MergedArchiveCandidate]) -> str:
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(ARCHIVE_ITEMS_SCHEMA)
     connection.execute(ARCHIVE_OPERATIONS_SCHEMA)
+    connection.execute(ARCHIVE_OBSERVATIONS_SCHEMA)
     for table, column, definition in (
         ("execplan_archive_items", "current_revision_sha", "TEXT"),
         ("execplan_archive_operations", "current_revisions", "TEXT"),
@@ -126,6 +141,35 @@ class ExecPlanArchiveRepository:
         self.apply_catalog = apply_catalog
         if ensure:
             ensure_schema(connection)
+
+    def observe(
+        self, repo: str, scope: str, *, category: str, resource: str,
+        reason: str, resume_condition: str, attempted: bool = False,
+    ) -> bool:
+        """Persist the current reason without replacing a prepared operation.
+
+        Return whether operator-visible state changed. Actual dispatch attempts
+        are counted even when their outcome repeats; they do not reopen a log
+        episode with the same reason. No execution or notification state changes.
+        """
+        state = (category, resource, reason, resume_condition)
+        with _transaction(self.connection):
+            previous = self.connection.execute(
+                "SELECT category,resource,reason,resume_condition FROM execplan_archive_observations "
+                "WHERE repo=? AND scope=?", (repo, scope),
+            ).fetchone()
+            changed = previous is None or tuple(previous) != state
+            if changed or attempted:
+                self.connection.execute(
+                    "INSERT INTO execplan_archive_observations "
+                    "(repo,scope,category,resource,reason,resume_condition,attempts) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(repo,scope) DO UPDATE SET category=excluded.category,resource=excluded.resource,"
+                    "reason=excluded.reason,resume_condition=excluded.resume_condition,"
+                    "attempts=execplan_archive_observations.attempts+excluded.attempts,"
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (repo, scope, *state, int(attempted)),
+                )
+        return changed
 
     def merged_candidates(self, repo: str) -> tuple[MergedArchiveCandidate, ...]:
         candidates: list[MergedArchiveCandidate] = []
