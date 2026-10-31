@@ -249,7 +249,38 @@ class BlockedRemoteObservationTest(unittest.TestCase):
         self.assertTrue(observation.pending_input(after))
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
 
-    def test_remote_failure_cause_changes_are_persisted_as_new_input(self):
+    def test_plan_and_project_block_inputs_remain_distinct(self):
+        self.connection.execute(
+            "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence, release_fingerprint) "
+            "VALUES (?, 'G-001', 'plan', 'user_decision_required', 'decision', 'plan-input')",
+            (str(self.repo),),
+        )
+        self.connection.execute(
+            "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence, release_fingerprint) "
+            "VALUES (?, 'project', 'repository_state_unsafe', 'G-001', 'unsafe', 'project-input')",
+            (str(self.repo),),
+        )
+        row = self.observe()
+        self.assertEqual(row["blocked_reason"], "user_decision_required")
+        self.assertEqual(row["blocked_fingerprint"], "plan-input")
+        self.assertEqual(row["project_blocked_reason"], "repository_state_unsafe")
+        self.assertEqual(row["project_blocked_fingerprint"], "project-input")
+
+
+
+class BlockedRemoteObservationUnitTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name) / "repo"
+        self.remote = Path(temporary.name) / "remote.git"
+        self.connection = sqlite3.connect(":memory:")
+        self.addCleanup(self.connection.close)
+        self.connection.row_factory = sqlite3.Row
+
+    @mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess"))
+    def test_remote_failure_cause_changes_are_persisted_as_new_input(self, _popen):
+        observation.ensure_schema(self.connection)
         for diagnostic, cause in (
             ("fatal: Authentication failed", "authentication"),
             ("fatal: Could not resolve host", "network"),
@@ -257,11 +288,12 @@ class BlockedRemoteObservationTest(unittest.TestCase):
             with self.subTest(cause=cause), mock.patch.object(
                 observation.subprocess, "run",
                 return_value=subprocess.CompletedProcess([], 128, "", diagnostic),
-            ):
+            ) as remote_call:
                 base, branch = observation.observe_refs(
                     self.repo, str(self.remote),
                     ("refs/heads/main", "refs/heads/work/one"),
                 )
+                remote_call.assert_called_once()
             observation.record(
                 self.connection, repo=str(self.repo), plan_id="G-001",
                 registered_origin=str(self.remote), origin_url=str(self.remote),
@@ -281,25 +313,8 @@ class BlockedRemoteObservationTest(unittest.TestCase):
                 self.connection, str(self.repo), "G-001", observation.input_identity(row),
             ))
 
-    def test_plan_and_project_block_inputs_remain_distinct(self):
-        self.connection.execute(
-            "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence, release_fingerprint) "
-            "VALUES (?, 'G-001', 'plan', 'user_decision_required', 'decision', 'plan-input')",
-            (str(self.repo),),
-        )
-        self.connection.execute(
-            "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence, release_fingerprint) "
-            "VALUES (?, 'project', 'repository_state_unsafe', 'G-001', 'unsafe', 'project-input')",
-            (str(self.repo),),
-        )
-        row = self.observe()
-        self.assertEqual(row["blocked_reason"], "user_decision_required")
-        self.assertEqual(row["blocked_fingerprint"], "plan-input")
-        self.assertEqual(row["project_blocked_reason"], "repository_state_unsafe")
-        self.assertEqual(row["project_blocked_fingerprint"], "project-input")
-
-    def test_existing_observation_table_adds_failure_and_project_columns(self):
-        self.connection.execute("DROP TABLE blocked_remote_observations")
+    @mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess"))
+    def test_existing_observation_table_adds_failure_and_project_columns(self, _popen):
         self.connection.execute(
             "CREATE TABLE blocked_remote_observations "
             "(repo TEXT, plan_id TEXT, base_result TEXT, branch_result TEXT)"

@@ -13,7 +13,7 @@ from unittest import mock
 from types import SimpleNamespace
 import json
 import loop_manager
-from tests.support.catalog import write_execplan
+from tests.support.catalog import make_catalog_root, write_execplan
 from tests.support.git import git_command, commit_and_push
 
 
@@ -142,7 +142,11 @@ class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
             self.assertEqual(tuple(plan), ("IMPLEMENTING", session_id))
             self.assertEqual(source_note.read_text(encoding="utf-8"), "preserve me\n")
 
-    def test_active_execplan_uses_reconciled_identity_not_publication_equality(self):
+
+
+class ActiveExecplanIdentityUnitTest(unittest.TestCase):
+    @mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess"))
+    def test_active_execplan_uses_reconciled_identity_not_publication_equality(self, _popen):
         replacements = (
             (
                 "sources",
@@ -162,10 +166,10 @@ class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
         for name, original, replacement in replacements:
             with self.subTest(field=name):
                 with tempfile.TemporaryDirectory() as directory:
-                    repo, plan_path = self._repository_with_plan(directory)
+                    repo = make_catalog_root(directory)
+                    plan_path = write_execplan(repo, "G-001", "Scope Safety").relative_to(repo).as_posix()
                     write_execplan(repo, "G-002", "Dependency")
-                    commit_and_push(repo, "Add dependency plan")
-                    plan_sha = git_command(repo, "rev-parse", "origin/main")
+                    plan_sha = "a" * 40
                     connection = sqlite3.connect(":memory:")
                     self.addCleanup(connection.close)
                     connection.row_factory = sqlite3.Row
@@ -178,14 +182,11 @@ class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
                         repo,
                         repo / plan_path,
                     )
-                    loop_manager.register_execplans(
-                        connection,
-                        str(repo),
-                        repo,
-                        [(plan_path, parsed)],
-                        plan_sha,
-                        loop_manager.planning_input_fingerprint(repo, "main"),
-                    )
+                    with mock.patch.object(loop_manager, "git_bytes", return_value=(repo / plan_path).read_bytes()):
+                        loop_manager.register_execplans(
+                            connection, str(repo), repo, [(plan_path, parsed)],
+                            plan_sha, "planning-fingerprint",
+                        )
                     connection.execute(
                         "UPDATE exec_plans SET status = 'IMPLEMENTING' "
                         "WHERE repo = ? AND plan_id = 'G-001'",

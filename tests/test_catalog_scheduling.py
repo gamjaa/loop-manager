@@ -2,6 +2,8 @@ from tests.support.fixed_samples import use_fixed_guidance
 from tests.support.database import AutomationCatalogFixture
 import json
 import tempfile
+from contextlib import ExitStack
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11,6 +13,194 @@ from tests.support.catalog import write_execplan
 from tests.support.maintenance import request_maintenance
 from tests.support.git import git_command, make_remote_repository, commit_and_push, isolated_git_test
 from tests.support.worker import dummy_worker_context, dummy_worker_sessions, legacy_planning_ports
+
+
+class CatalogSchedulingObservationTest(unittest.TestCase):
+    @dummy_worker_sessions
+    @mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess"))
+    def test_dependency_blocked_ready_is_not_an_empty_catalog(self, _popen):
+        from loop_manager_internal.catalog import execplan_catalog
+        from loop_manager_internal.storage.execplan_catalog_state import PinnedCatalog
+        from tests.support.catalog import make_catalog_root
+        from tests.support.planning_case import FakeGitPort, FakeAgentPort
+        from loop_manager_internal.planning.planning_runtime import PlanningAgentResult, PlanningAgentResultKind
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blocked = make_catalog_root(str(root / "blocked"))
+            runnable = make_catalog_root(str(root / "runnable"))
+            waiting = make_catalog_root(str(root / "waiting"))
+            plans = {
+                blocked: [write_execplan(blocked, "G-009", "Unverified Historical"),
+                          write_execplan(blocked, "G-010", "Dependency Blocked", depends_on=("G-009",), priority="critical")],
+                runnable: [write_execplan(runnable, "G-001", "Runnable", priority="high")],
+                waiting: [write_execplan(waiting, "G-009", "Unverified Historical"),
+                          write_execplan(waiting, "G-010", "Dependency Blocked", depends_on=("G-009",), priority="critical")],
+            }
+            old_sha, new_sha, ready_sha = "a" * 40, "b" * 40, "c" * 40
+            revisions = {blocked: new_sha, runnable: ready_sha, waiting: "d" * 40}
+            pinned = {}
+            for repo, paths in plans.items():
+                documents = {p.relative_to(repo).as_posix(): p.read_text(encoding="utf-8") for p in paths}
+                snapshot = execplan_catalog.snapshot_from_documents(documents, revision_sha=revisions[repo])
+                pinned[repo] = PinnedCatalog(revisions[repo], snapshot, frozenset({"docs/PRODUCT.md", *documents}))
+            state_dir = root / "state"
+            state_dir.mkdir()
+            connection = loop_manager.connect_database(state_dir, create=True)
+            self.addCleanup(connection.close)
+            for repo in (blocked, runnable, waiting):
+                connection.execute("INSERT INTO projects (repo, base_branch, specification_fingerprint, planning_fingerprint) VALUES (?, 'main', ?, ?)",
+                                   (str(repo), "old-spec" if repo == blocked else "specification", "old-input" if repo == blocked else "fingerprint"))
+                planning_input_state.record_general(connection, str(repo), old_sha if repo == blocked else revisions[repo],
+                    {p.relative_to(repo).as_posix(): (loop_manager._parse_execplan(repo, p)["id"], loop_manager.file_hash(p)) for p in plans[repo]})
+                for path in plans[repo]:
+                    parsed = loop_manager._parse_execplan(repo, path)
+                    connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (str(repo), parsed["id"], path.relative_to(repo).as_posix(), parsed["title"], json.dumps(parsed["sources"]), json.dumps(parsed["depends_on"]), parsed["priority"], loop_manager.file_hash(path), "PLAN_BLOCKED" if parsed["id"] == "G-009" else "READY", old_sha if repo == blocked else revisions[repo]))
+                maintenance = loop_manager.maintenance_state.MaintenanceRepository(connection)
+                request_maintenance(connection, str(repo))
+                cycle, _ = maintenance.begin_assessment_if_due(str(repo), 5, revisions[repo], self_repository=True)
+                maintenance.advance_success_baseline(str(repo), expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit=revisions[repo])
+            connection.commit()
+            roles = []
+            def git_port(_connection, repo_path, _state_dir):
+                port = FakeGitPort()
+                port.head = port.remote = revisions[repo_path]
+                port.fingerprint = "changed-input" if repo_path == blocked else "fingerprint"
+                port.specification_fingerprints[port.remote] = "changed-spec" if repo_path == blocked else "specification"
+                def run_bytes(_repo, *args):
+                    if args[:4] == ("ls-tree", "-rz", "--full-tree", port.remote):
+                        return b"100644 blob product\tdocs/PRODUCT.md\0"
+                    if args == ("cat-file", "blob", "product"):
+                        return (repo_path / "docs/PRODUCT.md").read_bytes()
+                    raise AssertionError(f"unexpected planning Git observation: {args}")
+                port.run_bytes = run_bytes
+                return port
+            def agent_port(*_args):
+                agent = FakeAgentPort()
+                def fail(worktree, prompt, session, callback, **kwargs):
+                    roles.append("planner")
+                    return PlanningAgentResult(1, "stop", "planner-session", PlanningAgentResultKind.PERMANENT_CONFIGURATION)
+                agent.run_planner = fail
+                return agent
+            def definition(repo_path, *_args, **_kwargs):
+                item = pinned[repo_path]
+                return SimpleNamespace(load=lambda: item, loaded=item, current_revision=lambda: item.revision_sha)
+            def archive_port(repo_path, state_dir, repo):
+                documents = {p.relative_to(repo_path).as_posix(): p.read_bytes() for p in plans[repo_path]}
+                return SimpleNamespace(repo=repo, repo_path=repo_path, state_dir=state_dir,
+                    fetch_remote_base=lambda _base: revisions[repo_path],
+                    _manifest=lambda _revision: {path: ("100644", "blob", path) for path in documents},
+                    effects=SimpleNamespace(
+                        git_bytes=lambda _repo, _command, _kind, oid: documents[oid],
+                        git=lambda _repo, *args: (
+                            SimpleNamespace(stdout=revisions[repo_path] + "\n", returncode=0)
+                            if args == ("rev-list", "--first-parent", "--reverse", revisions[repo_path])
+                            else (_ for _ in ()).throw(AssertionError(f"unexpected archive Git observation: {args}"))
+                        ),
+                    ))
+            def agent(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                roles.append(role_name)
+                return loop_manager.CodexResult(1, "stop", "worker-session")
+            config = loop_manager.ManagedConfig(path=root / "unused.ini", max_workers=2, telegram_token="", telegram_chat_id="")
+            registrations = {}
+            def observed_git(repo, *args, **kwargs):
+                repo = Path(repo)
+                if args[0] == "show" and len(args) == 2 and ":" in args[1]:
+                    revision, path = args[1].split(":", 1)
+                    source = next(source for source, sha in revisions.items() if sha == revision)
+                    if path not in pinned[source].regular_paths:
+                        raise AssertionError(f"unexpected Git document observation: {revision}:{path}")
+                    return SimpleNamespace(stdout=(source / path).read_text(encoding="utf-8"), returncode=0)
+                if args[:2] == ("show-ref", "--hash"):
+                    return SimpleNamespace(stdout="", returncode=1)
+                if args[:3] == ("show-ref", "--verify", "--quiet"):
+                    return SimpleNamespace(stdout="", returncode=1)
+                if args[:2] == ("remote", "get-url"):
+                    return SimpleNamespace(stdout="https://github.com/example/project.git", returncode=0)
+                if args[:2] == ("ls-remote", "--heads"):
+                    return SimpleNamespace(stdout="", returncode=0)
+                if args[:3] == ("worktree", "add", "--lock"):
+                    import shutil
+                    reason = args[3].split("=", 1)[1]
+                    branch, worktree = args[5], Path(args[6])
+                    shutil.copytree(repo, worktree)
+                    registrations[repo] = [{"worktree": str(worktree), "HEAD": revisions[repo],
+                                             "branch": f"refs/heads/{branch}", "locked": reason}]
+                    return SimpleNamespace(stdout="", returncode=0)
+                owner = next((source for source, entries in registrations.items()
+                              if entries and repo == Path(entries[0]["worktree"])), repo)
+                if owner not in revisions and "planning" in owner.parts:
+                    owner = blocked
+                if args[:3] == ("ls-files", "-u", "-z") or args[:3] == ("diff", "--cached", "--name-only"):
+                    return SimpleNamespace(stdout="", returncode=0)
+                if args == ("symbolic-ref", "--quiet", "--short", "HEAD"):
+                    return SimpleNamespace(stdout="loop-manager/G-001", returncode=0)
+                return SimpleNamespace(stdout=revisions[owner], returncode=0)
+            import hashlib
+            blobs = {hashlib.sha1(path.read_bytes()).hexdigest(): path.read_bytes()
+                     for source in plans for path in [source / "docs/PRODUCT.md", *plans[source]]}
+            def observed_bytes(repo, *args):
+                if args[:4] == ("ls-tree", "-r", "-z", "--full-tree") and args[-1] == "docs/requirements":
+                    return b""
+                if args[:4] == ("ls-tree", "-r", "-z", "--full-tree") and len(args) == 5:
+                    source = next(source for source, sha in revisions.items() if sha == args[4])
+                    files = [source / "docs/PRODUCT.md", *plans[source]]
+                    return b"".join(b"100644 blob " + hashlib.sha1(path.read_bytes()).hexdigest().encode() + b"\t" + path.relative_to(source).as_posix().encode() + b"\0" for path in files)
+                if args[:2] == ("cat-file", "blob"):
+                    return blobs[args[2]]
+                if args[0] == "show" and len(args) == 2 and ":" in args[1]:
+                    revision, path = args[1].split(":", 1)
+                    for source, sha in revisions.items():
+                        if sha == revision and (source / path).is_file():
+                            return (source / path).read_bytes()
+                raise AssertionError(f"unexpected Git bytes observation: {repo}, {args}")
+            def observed_snapshot(worktree, **_kwargs):
+                path = str(Path(worktree).resolve())
+                return loop_manager.GitSnapshot(
+                    head=ready_sha, branch="loop-manager/G-001", index={}, dirty={},
+                    refs={}, worktrees={path: ("HEAD=" + ready_sha, "branch=refs/heads/loop-manager/G-001")},
+                    config={}, operations={},
+                )
+            def unexpected_process(*_args, **_kwargs):
+                import traceback
+                raise AssertionError("unexpected subprocess: " + " > ".join(
+                    f"{frame.name}:{frame.lineno}" for frame in traceback.extract_stack()[-9:-1]
+                ))
+            _popen.side_effect = unexpected_process
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(loop_manager, "validate_repository", side_effect=lambda path, **kw: Path(path).resolve()))
+                stack.enter_context(mock.patch.object(loop_manager, "remote_base", return_value="main"))
+                stack.enter_context(mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=False))
+                stack.enter_context(mock.patch.object(loop_manager, "_ExecPlanArchiveGitPort", side_effect=archive_port))
+                stack.enter_context(mock.patch.object(loop_manager, "_recorded_base_fetch"))
+                stack.enter_context(mock.patch.object(loop_manager, "ensure_safe_base_worktree"))
+                stack.enter_context(mock.patch.object(loop_manager, "git", side_effect=observed_git))
+                stack.enter_context(mock.patch.object(loop_manager, "git_bytes", side_effect=observed_bytes))
+                stack.enter_context(mock.patch.object(loop_manager, "pr_for_branch", return_value=None))
+                stack.enter_context(mock.patch.object(loop_manager, "capture_git_snapshot", side_effect=observed_snapshot))
+                stack.enter_context(mock.patch.object(loop_manager, "_git_operation_entries", return_value={}))
+                stack.enter_context(mock.patch.object(loop_manager, "_rebase_in_progress_for_branch", return_value=False))
+                stack.enter_context(mock.patch.object(loop_manager, "_worktree_catalog", side_effect=lambda repo: registrations.get(Path(repo), [])))
+                stack.enter_context(mock.patch.object(loop_manager, "_GitCatalogDefinitionPort", side_effect=definition))
+                stack.enter_context(mock.patch.object(loop_manager, "_PlanningGitPorts", side_effect=git_port))
+                stack.enter_context(mock.patch.object(loop_manager, "_PlanningAgentPorts", side_effect=agent_port))
+                stack.enter_context(mock.patch.object(loop_manager, "run_codex", side_effect=agent))
+                stack.enter_context(legacy_planning_ports())
+                stack.enter_context(dummy_worker_context(roles=("worker", "planner", "maintenance_planner")))
+                stack.enter_context(mock.patch("loop_manager_internal.maintenance.code_index.git", side_effect=OSError("no source facts in this catalog fixture")))
+                stack.enter_context(mock.patch("loop_manager_internal.application.scheduler.VerifyCoordinator"))
+                outcomes = loop_manager.schedule_registered_projects(connection, state_dir, config)
+            results = {item.repo: item.result.kind for item in outcomes}
+            details = [tuple(row) for row in connection.execute("SELECT repo, reason_code, detail FROM recovery_records")]
+            self.assertEqual(results, {str(blocked): loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
+                                       str(runnable): loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
+                                       str(waiting): loop_manager.ProjectRunKind.WAITING}, details)
+            self.assertCountEqual(roles, ["planner", "worker"], msg=[(item.repo, item.result.detail) for item in outcomes])
+            self.assertEqual(tuple(connection.execute("SELECT phase, planning_fingerprint FROM projects WHERE repo=?", (str(blocked),)).fetchone()), ("PLANNING", "old-input"))
+            self.assertEqual([tuple(row) for row in connection.execute("SELECT plan_id,status FROM exec_plans WHERE repo=? ORDER BY plan_id", (str(blocked),))], [("G-009", "PLAN_BLOCKED"), ("G-010", "READY")])
+            self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE repo=? AND plan_id='G-001'", (str(runnable),)).fetchone()[0], "IMPLEMENTING")
+            self.assertEqual(tuple(connection.execute("SELECT phase, planning_fingerprint FROM projects WHERE repo=?", (str(waiting),)).fetchone()), (None, "fingerprint"))
+            self.assertEqual([tuple(row) for row in connection.execute("SELECT plan_id,status FROM exec_plans WHERE repo=? ORDER BY plan_id", (str(waiting),))], [("G-009", "PLAN_BLOCKED"), ("G-010", "READY")])
 
 
 @isolated_git_test
@@ -47,225 +237,6 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(decision.active["plan_id"], "G-005")
         self.assertTrue(decision.has_ready)
         self.assertIsNone(decision.runnable_ready)
-
-    @dummy_worker_sessions
-    def test_dependency_blocked_ready_is_not_an_empty_catalog(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            blocked_parent = root / "blocked"
-            runnable_parent = root / "runnable"
-            blocked_parent.mkdir()
-            runnable_parent.mkdir()
-            blocked_repo = make_remote_repository(str(blocked_parent))
-            runnable_repo = make_remote_repository(str(runnable_parent))
-            (blocked_repo / "docs/plans").mkdir()
-            (runnable_repo / "docs/plans").mkdir()
-
-            historical = write_execplan(
-                blocked_repo, "G-009", "Unverified Historical"
-            )
-
-            blocked_plan = write_execplan(
-                blocked_repo,
-                "G-010",
-                "Dependency Blocked",
-                depends_on=("G-009",),
-                priority="critical",
-            )
-            runnable_plan = write_execplan(
-                runnable_repo,
-                "G-001",
-                "Runnable",
-                priority="high",
-            )
-            commit_and_push(blocked_repo, "Add dependency-blocked plan")
-            commit_and_push(runnable_repo, "Add runnable plan")
-            blocked_plan_sha = git_command(blocked_repo, "rev-parse", "origin/main")
-            runnable_plan_sha = git_command(runnable_repo, "rev-parse", "origin/main")
-            preserved_fingerprint = loop_manager.planning_input_fingerprint(
-                blocked_repo, "main"
-            )
-            preserved_specification = (
-                loop_manager.specification_input_fingerprint(
-                    blocked_repo, "main"
-                )
-            )
-
-            (blocked_repo / "docs/PRODUCT.md").write_text(
-                "# Changed product input\n",
-                encoding="utf-8",
-            )
-            commit_and_push(blocked_repo, "Change blocked project input")
-
-            state_dir = root / "state"
-            state_dir.mkdir()
-            connection = loop_manager.connect_database(state_dir, create=True)
-            connection.executemany(
-                "INSERT INTO projects (repo, base_branch, "
-                "specification_fingerprint, planning_fingerprint) "
-                "VALUES (?, 'main', ?, ?)",
-                (
-                    (
-                        str(blocked_repo),
-                        preserved_specification,
-                        preserved_fingerprint,
-                    ),
-                    (
-                        str(runnable_repo),
-                        loop_manager.specification_input_fingerprint(
-                            runnable_repo, "main"
-                        ),
-                        loop_manager.planning_input_fingerprint(
-                            runnable_repo, "main"
-                        ),
-                    ),
-                ),
-            )
-            planning_input_state.record_general(
-                connection, str(blocked_repo), blocked_plan_sha,
-                loop_manager.plan_declarations(blocked_repo, blocked_plan_sha),
-            )
-            planning_input_state.record_general(
-                connection, str(runnable_repo), runnable_plan_sha,
-                loop_manager.plan_declarations(runnable_repo, runnable_plan_sha),
-            )
-            for repo, plan_id, plan_path, title, dependencies, priority, plan_sha, status in (
-                (
-                    blocked_repo,
-                    "G-009",
-                    historical,
-                    "Unverified Historical",
-                    (),
-                    "normal",
-                    blocked_plan_sha,
-                    "PLAN_BLOCKED",
-                ),
-                (
-                    blocked_repo,
-                    "G-010",
-                    blocked_plan,
-                    "Dependency Blocked",
-                    ("G-009",),
-                    "critical",
-                    blocked_plan_sha,
-                    "READY",
-                ),
-                (
-                    runnable_repo,
-                    "G-001",
-                    runnable_plan,
-                    "Runnable",
-                    (),
-                    "high",
-                    runnable_plan_sha,
-                    "READY",
-                ),
-            ):
-                connection.execute(
-                    """
-                    INSERT INTO exec_plans (
-                        repo, plan_id, path, title, sources, depends_on, priority,
-                        content_hash, status, plan_sha
-                    ) VALUES (?, ?, ?, ?, '["docs/PRODUCT.md"]', ?, ?,
-                              ?, ?, ?)
-                    """,
-                    (
-                        str(repo),
-                        plan_id,
-                        plan_path.relative_to(repo).as_posix(),
-                        title,
-                        json.dumps(dependencies),
-                        priority,
-                        loop_manager.file_hash(plan_path),
-                        status,
-                        plan_sha,
-                    ),
-                )
-            maintenance_repository = (
-                loop_manager.maintenance_state.MaintenanceRepository(connection)
-            )
-            for current_repo in (blocked_repo, runnable_repo):
-                current_sha = git_command(
-                    current_repo, "rev-parse", "origin/main"
-                )
-                request_maintenance(connection, str(current_repo))
-                cycle, _ = maintenance_repository.begin_assessment_if_due(
-                    str(current_repo), 5, current_sha, self_repository=True,
-                )
-                maintenance_repository.advance_success_baseline(
-                    str(current_repo),
-                    expected_phase=cycle.phase,
-                    expected_revision=cycle.revision,
-                    remote_commit=current_sha,
-                )
-            connection.commit()
-            config = loop_manager.ManagedConfig(
-                path=root / "unused.ini",
-                max_workers=2,
-                telegram_token="",
-                telegram_chat_id="",
-            )
-            roles: list[str] = []
-
-            def agent(_worktree, _state, _config, role_name, _prompt, **_kwargs):
-                roles.append(role_name)
-                return loop_manager.CodexResult(
-                    1, "stop runnable worker", "worker-session"
-                )
-
-            try:
-                with mock.patch(
-                    "loop_manager.validate_repository",
-                    side_effect=lambda path, **_kwargs: Path(path).resolve(),
-                ), mock.patch(
-                    "loop_manager.run_codex",
-                    side_effect=agent,
-                ), legacy_planning_ports(), dummy_worker_context(
-                    roles=("worker", "planner", "maintenance_planner")
-                ), mock.patch(
-                    "loop_manager_internal.application.scheduler.VerifyCoordinator"
-                ):
-                    outcomes = loop_manager.schedule_registered_projects(
-                        connection,
-                        state_dir,
-                        config,
-                    )
-                blocked_project = connection.execute(
-                    "SELECT phase, planning_fingerprint FROM projects WHERE repo = ?",
-                    (str(blocked_repo),),
-                ).fetchone()
-                blocked_catalog = connection.execute(
-                    "SELECT plan_id, status FROM exec_plans WHERE repo = ?",
-                    (str(blocked_repo),),
-                ).fetchall()
-                runnable_status = connection.execute(
-                    "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
-                    (str(runnable_repo),),
-                ).fetchone()["status"]
-            finally:
-                connection.close()
-
-        results = {item.repo: item.result.kind for item in outcomes}
-        self.assertEqual(
-            results[str(blocked_repo)],
-            loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
-        )
-        self.assertEqual(
-            results[str(runnable_repo)],
-            loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
-        )
-        self.assertCountEqual(
-            roles, ["planner", "worker"],
-            msg=[(item.repo, item.result.detail) for item in outcomes],
-        )
-        self.assertEqual(
-            tuple(blocked_project), ("PLANNING", preserved_fingerprint)
-        )
-        self.assertEqual(
-            [tuple(row) for row in blocked_catalog],
-            [("G-009", "PLAN_BLOCKED"), ("G-010", "READY")],
-        )
-        self.assertEqual(runnable_status, "IMPLEMENTING")
 
     def test_merge_marks_only_current_plan_and_unlocks_next_dependency(self):
         with tempfile.TemporaryDirectory() as directory:

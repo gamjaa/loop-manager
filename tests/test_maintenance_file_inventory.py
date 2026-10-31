@@ -136,36 +136,6 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(source_inventory.SourceInventoryError, "src/link"):
             source_inventory.tracked_source_inventory(self.repo, "main", revision, include_uncertain=True)
 
-    def test_root_placement_inventory_keeps_fixed_paths_and_marks_root_source_for_review(self):
-        files = {
-            ".agents/guide.txt": b"agent guidance\n",
-            "AGENTS.md": b"# guidance\n",
-            "README.md": b"# project\n",
-            "config/settings.ini": b"[app]\n",
-            "docs/PRODUCT.md": b"# Product\n",
-            "tests/check.py": b"assert True\n",
-            "engine.py": b"def run(): pass\n",
-            "scratch.png": b"\x89PNG\x00asset",
-        }
-        for path, content in files.items():
-            self.write(path, content)
-        revision = self.publish()
-
-        inventory = source_inventory.tracked_source_inventory(self.repo, "main", revision)
-        placements = {
-            item.path: item for item in source_inventory.root_placement_inventory(inventory)
-        }
-
-        self.assertEqual(placements[".agents"].category, "tool_required")
-        self.assertEqual(placements["AGENTS.md"].category, "user_entry")
-        self.assertEqual(placements["docs"].category, "tool_required")
-        self.assertEqual(placements["README.md"].category, "user_entry")
-        self.assertEqual(placements["config"].category, "execution_build_deploy")
-        self.assertEqual(placements["tests"].category, "execution_build_deploy")
-        self.assertEqual(placements["scratch.png"].category, "uncertain")
-        self.assertEqual(placements["engine.py"].category, "internal_implementation")
-        self.assertIn("entry path, references, owner", placements["engine.py"].reason)
-
     def test_optional_reserved_paths_protect_only_present_exact_paths(self):
         reserved_paths = (
             ".gitignore", ".codex/config.toml", ".codex/rules/team.md",
@@ -230,6 +200,40 @@ class TrackedSourceInventoryTest(unittest.TestCase):
             with self.assertRaisesRegex(source_inventory.SourceInventoryError, "path|경로"):
                 source_inventory.tracked_source_inventory(self.repo, "main", revision)
 
+
+class RootPlacementUnitTest(unittest.TestCase):
+    @mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess"))
+    def test_root_placement_inventory_keeps_fixed_paths_and_marks_root_source_for_review(self, _popen):
+        revision = "a" * 40
+        classifications = (
+            (".agents/guide.txt", "excluded", "fixture"),
+            ("AGENTS.md", "excluded", "documentation file"),
+            ("README.md", "excluded", "documentation file"),
+            ("config/settings.ini", "excluded", "fixture"),
+            ("docs/PRODUCT.md", "excluded", "fixture"),
+            ("tests/check.py", "source", "fixture"),
+            ("engine.py", "source", "fixture"),
+            ("scratch.png", "excluded", "fixture"),
+        )
+        inventory = source_inventory.SourceInventory(
+            revision,
+            tuple(source_inventory.TrackedSource(path, "hash", "100644", revision, reason)
+                  for path, disposition, reason in classifications if disposition == "source"),
+            tuple(source_inventory.ClassifiedPath(*item) for item in classifications),
+        )
+        placements = {
+            item.path: item for item in source_inventory.root_placement_inventory(inventory)
+        }
+
+        self.assertEqual(placements[".agents"].category, "tool_required")
+        self.assertEqual(placements["AGENTS.md"].category, "user_entry")
+        self.assertEqual(placements["docs"].category, "tool_required")
+        self.assertEqual(placements["README.md"].category, "user_entry")
+        self.assertEqual(placements["config"].category, "execution_build_deploy")
+        self.assertEqual(placements["tests"].category, "execution_build_deploy")
+        self.assertEqual(placements["scratch.png"].category, "uncertain")
+        self.assertEqual(placements["engine.py"].category, "internal_implementation")
+        self.assertIn("entry path, references, owner", placements["engine.py"].reason)
 
 class InventoryCacheUnitTest(unittest.TestCase):
     def test_cached_inventory_checks_remote_but_does_not_reload_blobs(self):

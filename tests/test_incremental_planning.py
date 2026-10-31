@@ -1502,46 +1502,6 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             )
         return result, commit, specification, planning
 
-    def test_applied_general_batch_retains_owner_and_rejects_stale_cleanup_release(self):
-        from loop_manager_internal.storage import runtime_state, manual_work_state
-        manual_work_state.ensure_schema(self.connection)
-        self.connection.commit()
-        result, commit, specification, planning = self.prepare_batch()
-        with self.connection:
-            self.connection.execute("UPDATE projects SET worktree=?, planner_session_id='saved-session', "
-                                    "planning_result='saved result'", (str(self.repo),))
-        state = loop_manager._PlanningStatePorts(self.connection, runtime_state.RuntimeStateRepository(self.connection),
-            maintenance_state.MaintenanceRepository(self.connection), self.repo / 'state')
-        self.assertEqual(state.recover_general_batch(str(self.repo), self.repo, 'main'), 'applied')
-        release = state.pending_publication_release(str(self.repo))
-        self.assertIsNotNone(release)
-        self.assertEqual(release.revision, commit)
-        self.assertEqual(state.planning(str(self.repo)).phase, 'PLANNING')
-        self.assertEqual(state.planning(str(self.repo)).planner_session_id, 'saved-session')
-        self.assertEqual([row[0] for row in self.connection.execute(
-            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-003'])
-        for mutation, restore in (
-            ("UPDATE projects SET planner_session_id='competitor'", "UPDATE projects SET planner_session_id='saved-session'"),
-            ('UPDATE exec_plans SET catalog_generation=catalog_generation+1',
-             'UPDATE exec_plans SET catalog_generation=catalog_generation-1'),
-            ("INSERT INTO manual_work_members SELECT repo,'G-001','competitor' FROM projects",
-             "DELETE FROM manual_work_members WHERE group_id='competitor'"),
-        ):
-            with self.subTest(mutation=mutation):
-                with self.connection:
-                    self.connection.execute(mutation)
-                changed = state.pending_publication_release(str(self.repo))
-                with self.assertRaisesRegex(RuntimeError, '소유권·catalog'):
-                    state.complete_publication_release(release)
-                self.assertEqual(state.pending_publication_release(str(self.repo)), changed)
-                self.assertIsNotNone(state.general_publication(str(self.repo)))
-                with self.connection:
-                    self.connection.execute(restore)
-        state.complete_publication_release(release)
-        self.assertIsNone(state.pending_publication_release(str(self.repo)))
-        self.assertIsNone(state.general_publication(str(self.repo)))
-        self.assertEqual(state.planning(str(self.repo)).processed_sha, commit)
-
     def test_general_batch_observes_git_and_files_before_its_transaction(self):
         from loop_manager_internal.planning import planner_publication as publication
         from loop_manager_internal.storage.db_access import run_database_request
@@ -1588,96 +1548,6 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertEqual(self.connection.execute(
             "SELECT processed_sha FROM projects WHERE repo=?", (str(self.repo),)).fetchone()[0], commit)
         self.assertEqual(len(requests), 3)
-
-    def test_general_db_retry_rejects_owner_change_without_repeating_preparation(self):
-        from loop_manager_internal.planning import planner_publication
-        from loop_manager_internal.storage.runtime_state import _transaction
-        result, commit, specification, planning = self.prepare_batch()
-        intent = loop_manager.general_planning_publication(self.connection, str(self.repo))
-        before = tuple(self.connection.iterdump())
-        def replay_with_owner_race(connection, operation):
-            with self.assertRaisesRegex(RuntimeError, 'DB retry'), _transaction(connection):
-                operation(connection)
-                raise RuntimeError('DB retry')
-            self.assertEqual(tuple(connection.iterdump()), before)
-            with _transaction(connection):
-                connection.execute("UPDATE projects SET planner_session_id='retry-competitor'")
-            with _transaction(connection):
-                return operation(connection)
-        with mock.patch.object(planner_publication, 'run_database_request', side_effect=replay_with_owner_race), \
-                mock.patch.object(loop_manager, '_prepare_execplan_rows', wraps=loop_manager._prepare_execplan_rows) as prepare, \
-                self.assertRaisesRegex(loop_manager.PlannerValidationError, '프로젝트 소유 상태'):
-            loop_manager._apply_general_planning_batch(
-                self.connection, str(self.repo), self.repo, result, commit, specification, planning)
-        prepare.assert_called_once()
-        self.assertEqual(loop_manager.general_planning_publication(self.connection, str(self.repo)), intent)
-        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'retry-competitor')
-        self.assertEqual([row[0] for row in self.connection.execute(
-            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-002'])
-
-    def test_general_batch_rejects_publication_intent_changed_during_observation(self):
-        result, commit, specification, planning = self.prepare_batch()
-        original = loop_manager.general_planning_publication(self.connection, str(self.repo))
-        declarations = loop_manager.plan_declarations
-        def observe(*args):
-            self.assertFalse(self.connection.in_transaction)
-            value = declarations(*args)
-            manifest = original.manifest + ' '
-            with self.connection:
-                self.connection.execute(
-                    'UPDATE general_planning_publications SET manifest=?, manifest_hash=? WHERE repo=?',
-                    (manifest, hashlib.sha256(manifest.encode()).hexdigest(), str(self.repo)))
-            return value
-        with mock.patch.object(loop_manager, 'plan_declarations', side_effect=observe), \
-                self.assertRaisesRegex(loop_manager.PlannerValidationError, 'intent가 변경'):
-            loop_manager._apply_general_planning_batch(
-                self.connection, str(self.repo), self.repo, result, commit, specification, planning)
-        self.assertEqual(loop_manager.general_planning_publication(
-            self.connection, str(self.repo)).manifest, original.manifest + ' ')
-        self.assertEqual([row[0] for row in self.connection.execute(
-            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-002'])
-
-    def test_general_intent_rejects_project_owner_changed_during_observation(self):
-        result, commit, specification, planning = self.prepare_batch(record_intent=False)
-        validate = loop_manager._validate_general_planning_commit
-        def observe(*args):
-            self.assertFalse(self.connection.in_transaction)
-            validate(*args)
-            with self.connection:
-                self.connection.execute("UPDATE projects SET planner_session_id='competitor' WHERE repo=?",
-                                        (str(self.repo),))
-        with mock.patch.object(loop_manager, '_validate_general_planning_commit', side_effect=observe), \
-                self.assertRaisesRegex(loop_manager.PlannerValidationError, '프로젝트 소유 상태'):
-            loop_manager.record_general_planning_publication_intent(
-                self.connection, str(self.repo), self.repo, result, commit, specification, planning)
-        self.assertIsNone(loop_manager.general_planning_publication(self.connection, str(self.repo)))
-        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'competitor')
-        with self.connection:
-            self.connection.execute('UPDATE projects SET planner_session_id=NULL')
-        intent = loop_manager.record_general_planning_publication_intent(
-            self.connection, str(self.repo), self.repo, result, commit, specification, planning)
-        declarations = loop_manager.plan_declarations
-        def observe_before_apply(*args):
-            value = declarations(*args)
-            with self.connection:
-                self.connection.execute("UPDATE projects SET planner_session_id='apply-competitor'")
-            return value
-        with mock.patch.object(loop_manager, 'plan_declarations', side_effect=observe_before_apply), \
-                self.assertRaisesRegex(loop_manager.PlannerValidationError, '프로젝트 소유 상태'):
-            loop_manager._apply_general_planning_batch(
-                self.connection, str(self.repo), self.repo, result, commit, specification, planning)
-        self.assertEqual(loop_manager.general_planning_publication(self.connection, str(self.repo)), intent)
-        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'apply-competitor')
-        self.assertEqual([row[0] for row in self.connection.execute(
-            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-002'])
-        with self.connection:
-            self.connection.execute('UPDATE projects SET planner_session_id=NULL')
-        with mock.patch.object(loop_manager, '_validate_general_planning_commit', side_effect=observe), \
-                self.assertRaisesRegex(loop_manager.PlannerValidationError, '복구 관측 이후'):
-            loop_manager.recover_general_planning_batch(
-                self.connection, str(self.repo), self.repo, 'main', retain_planning=True)
-        self.assertEqual(loop_manager.general_planning_publication(self.connection, str(self.repo)), intent)
-        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'competitor')
 
     def test_mixed_batch_updates_catalog_and_cancellation_audit_atomically(self):
         result, commit, specification, planning = self.prepare_batch()
@@ -2739,6 +2609,216 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
         effects = mock.Mock()
         self.assertIsNone(documents.refresh(effects, state, ExecutionCheckpointRepository(self.connection),
             identity, context, current, current, [current.path]))
+
+
+class GeneralPublicationPolicyTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected subprocess")))
+        use_fixed_guidance(self)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name)
+        (self.repo / "docs/plans").mkdir(parents=True)
+        (self.repo / "docs/PRODUCT.md").write_text("# Product\n", encoding="utf-8")
+        self.base, self.commit = "a" * 40, "b" * 40
+        self.paths = {"G-001": "docs/plans/[G-001] First.md",
+                      "G-002": "docs/plans/[G-002] Second.md"}
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        self.connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(self.connection)
+        maintenance_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO projects (repo, base_branch, provider, phase, active_sha, planning_attempt_fingerprint, planning_workspace_owned) VALUES (?, 'main', 'codex', 'PLANNING', ?, 'attempt', 1)", (str(self.repo), self.base))
+        self.documents = {}
+        for plan_id, path in self.paths.items():
+            title = "First" if plan_id == "G-001" else "Second"
+            content = plan_text(plan_id, title).encode()
+            (self.repo / path).write_bytes(content)
+            self.documents[(self.base, path)] = content
+            self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha, initial_worker_level, effective_worker_level) VALUES (?, ?, ?, ?, '[\"docs/PRODUCT.md\"]', '[]', 'normal', ?, 'READY', ?, 1, 1)",
+                (str(self.repo), plan_id, path, title, hashlib.sha256(content).hexdigest(), self.base))
+        self.connection.commit()
+        rows = self.connection.execute("SELECT * FROM exec_plans ORDER BY plan_id").fetchall()
+        original = tuple(loop_manager._ready_plan_snapshot_from_contents(row, self.documents[(self.base, row["path"])]) for row in rows)
+        snapshot = MutableReadySnapshot(str(self.repo), self.base, original, mutable_snapshot_token(str(self.repo), self.base, original))
+        for path in self.paths.values():
+            (self.repo / path).unlink()
+        revised_path = "docs/plans/[G-001] Urgent First.md"
+        new_path = "docs/plans/[G-003] Third.md"
+        for path, text in ((revised_path, plan_text("G-001", "Urgent First", priority="critical")),
+                           (new_path, plan_text("G-003", "Third"))):
+            (self.repo / path).write_text(text, encoding="utf-8")
+            self.documents[(self.commit, path)] = text.encode()
+        revised = loop_manager._parse_execplan(self.repo, self.repo / revised_path)
+        created = loop_manager._parse_execplan(self.repo, self.repo / new_path)
+        paths = tuple(sorted((*self.paths.values(), revised_path, new_path)))
+        hashes = tuple((path, hashlib.sha256(self.documents[(self.commit, path)]).hexdigest()) for path in (revised_path, new_path))
+        self.result = loop_manager.ValidatedPlanningResult(
+            plans=((new_path, created),), publication_paths=paths, publication_hashes=hashes,
+            revisions=(PlanRevision(revised_path, revised, original[0]),),
+            deletions=(PlanDeletion(original[1]),), mutable_snapshot=snapshot,
+        )
+        def git_observation(_repo, *args, **kwargs):
+            if args in (("rev-parse", "HEAD"),
+                        ("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")):
+                return SimpleNamespace(stdout=self.commit, returncode=0)
+            if args == ("merge-base", "--is-ancestor", self.commit, self.commit):
+                return SimpleNamespace(stdout="", returncode=0)
+            if args == ("rev-list", "--parents", "-n", "1", self.commit):
+                return SimpleNamespace(stdout=f"{self.commit} {self.base}", returncode=0)
+            if args[:2] == ("cat-file", "-e"):
+                rev, path = args[2].split(":", 1)
+                return SimpleNamespace(stdout="", returncode=0 if (rev, path) in self.documents else 1)
+            raise AssertionError(f"unexpected Git observation: {args}")
+        def bytes_observation(_repo, *args):
+            if args[0] == "show":
+                rev, path = args[1].split(":", 1)
+                return self.documents[(rev, path)]
+            raise AssertionError(f"unexpected Git bytes: {args}")
+        self.enterContext(mock.patch.object(loop_manager, "git", side_effect=git_observation))
+        self.enterContext(mock.patch.object(loop_manager, "git_bytes", side_effect=bytes_observation))
+        self.enterContext(mock.patch.object(loop_manager, "_nul_git_paths", return_value=paths))
+        self.enterContext(mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=False))
+        declarations = {path: (plan_id, hashlib.sha256(self.documents[(self.commit, path)]).hexdigest())
+                        for path, plan_id in ((revised_path, "G-001"), (new_path, "G-003"))}
+        self.enterContext(mock.patch.object(loop_manager, "plan_declarations", return_value=declarations))
+
+    def prepare_batch(self, *, record_intent=True):
+        if record_intent:
+            loop_manager.record_general_planning_publication_intent(
+                self.connection, str(self.repo), self.repo, self.result, self.commit, "specification", "planning")
+        return self.result, self.commit, "specification", "planning"
+
+    def test_general_db_retry_rejects_owner_change_without_repeating_preparation(self):
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.storage.runtime_state import _transaction
+        result, commit, specification, planning = self.prepare_batch()
+        intent = loop_manager.general_planning_publication(self.connection, str(self.repo))
+        before = tuple(self.connection.iterdump())
+        def replay_with_owner_race(connection, operation):
+            with self.assertRaisesRegex(RuntimeError, 'DB retry'), _transaction(connection):
+                operation(connection)
+                raise RuntimeError('DB retry')
+            self.assertEqual(tuple(connection.iterdump()), before)
+            with _transaction(connection):
+                connection.execute("UPDATE projects SET planner_session_id='retry-competitor'")
+            with _transaction(connection):
+                return operation(connection)
+        with mock.patch.object(planner_publication, 'run_database_request', side_effect=replay_with_owner_race), \
+                mock.patch.object(loop_manager, '_prepare_execplan_rows', wraps=loop_manager._prepare_execplan_rows) as prepare, \
+                self.assertRaisesRegex(loop_manager.PlannerValidationError, '프로젝트 소유 상태'):
+            loop_manager._apply_general_planning_batch(
+                self.connection, str(self.repo), self.repo, result, commit, specification, planning)
+        prepare.assert_called_once()
+        self.assertEqual(loop_manager.general_planning_publication(self.connection, str(self.repo)), intent)
+        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'retry-competitor')
+        self.assertEqual([row[0] for row in self.connection.execute(
+            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-002'])
+
+    def test_general_batch_rejects_publication_intent_changed_during_observation(self):
+        result, commit, specification, planning = self.prepare_batch()
+        original = loop_manager.general_planning_publication(self.connection, str(self.repo))
+        declarations = loop_manager.plan_declarations.return_value
+        def observe(*args):
+            self.assertFalse(self.connection.in_transaction)
+            value = declarations
+            manifest = original.manifest + ' '
+            with self.connection:
+                self.connection.execute(
+                    'UPDATE general_planning_publications SET manifest=?, manifest_hash=? WHERE repo=?',
+                    (manifest, hashlib.sha256(manifest.encode()).hexdigest(), str(self.repo)))
+            return value
+        with mock.patch.object(loop_manager, 'plan_declarations', side_effect=observe), \
+                self.assertRaisesRegex(loop_manager.PlannerValidationError, 'intent가 변경'):
+            loop_manager._apply_general_planning_batch(
+                self.connection, str(self.repo), self.repo, result, commit, specification, planning)
+        self.assertEqual(loop_manager.general_planning_publication(
+            self.connection, str(self.repo)).manifest, original.manifest + ' ')
+        self.assertEqual([row[0] for row in self.connection.execute(
+            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-002'])
+
+    def test_general_intent_rejects_project_owner_changed_during_observation(self):
+        result, commit, specification, planning = self.prepare_batch(record_intent=False)
+        validate = loop_manager._validate_general_planning_commit
+        def observe(*args):
+            self.assertFalse(self.connection.in_transaction)
+            validate(*args)
+            with self.connection:
+                self.connection.execute("UPDATE projects SET planner_session_id='competitor' WHERE repo=?",
+                                        (str(self.repo),))
+        with mock.patch.object(loop_manager, '_validate_general_planning_commit', side_effect=observe), \
+                self.assertRaisesRegex(loop_manager.PlannerValidationError, '프로젝트 소유 상태'):
+            loop_manager.record_general_planning_publication_intent(
+                self.connection, str(self.repo), self.repo, result, commit, specification, planning)
+        self.assertIsNone(loop_manager.general_planning_publication(self.connection, str(self.repo)))
+        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'competitor')
+        with self.connection:
+            self.connection.execute('UPDATE projects SET planner_session_id=NULL')
+        intent = loop_manager.record_general_planning_publication_intent(
+            self.connection, str(self.repo), self.repo, result, commit, specification, planning)
+        declarations = loop_manager.plan_declarations.return_value
+        def observe_before_apply(*args):
+            value = declarations
+            with self.connection:
+                self.connection.execute("UPDATE projects SET planner_session_id='apply-competitor'")
+            return value
+        with mock.patch.object(loop_manager, 'plan_declarations', side_effect=observe_before_apply), \
+                self.assertRaisesRegex(loop_manager.PlannerValidationError, '프로젝트 소유 상태'):
+            loop_manager._apply_general_planning_batch(
+                self.connection, str(self.repo), self.repo, result, commit, specification, planning)
+        self.assertEqual(loop_manager.general_planning_publication(self.connection, str(self.repo)), intent)
+        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'apply-competitor')
+        self.assertEqual([row[0] for row in self.connection.execute(
+            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-002'])
+        with self.connection:
+            self.connection.execute('UPDATE projects SET planner_session_id=NULL')
+        with mock.patch.object(loop_manager, '_validate_general_planning_commit', side_effect=observe), \
+                self.assertRaisesRegex(loop_manager.PlannerValidationError, '복구 관측 이후'):
+            loop_manager.recover_general_planning_batch(
+                self.connection, str(self.repo), self.repo, 'main', retain_planning=True)
+        self.assertEqual(loop_manager.general_planning_publication(self.connection, str(self.repo)), intent)
+        self.assertEqual(self.connection.execute('SELECT planner_session_id FROM projects').fetchone()[0], 'competitor')
+
+    def test_applied_general_batch_retains_owner_and_rejects_stale_cleanup_release(self):
+        from loop_manager_internal.storage import runtime_state, manual_work_state
+        manual_work_state.ensure_schema(self.connection)
+        self.connection.commit()
+        result, commit, specification, planning = self.prepare_batch()
+        with self.connection:
+            self.connection.execute("UPDATE projects SET worktree=?, planner_session_id='saved-session', "
+                                    "planning_result='saved result'", (str(self.repo),))
+        state = loop_manager._PlanningStatePorts(self.connection, runtime_state.RuntimeStateRepository(self.connection),
+            maintenance_state.MaintenanceRepository(self.connection), self.repo / 'state')
+        self.assertEqual(state.recover_general_batch(str(self.repo), self.repo, 'main'), 'applied')
+        release = state.pending_publication_release(str(self.repo))
+        self.assertIsNotNone(release)
+        self.assertEqual(release.revision, commit)
+        self.assertEqual(state.planning(str(self.repo)).phase, 'PLANNING')
+        self.assertEqual(state.planning(str(self.repo)).planner_session_id, 'saved-session')
+        self.assertEqual([row[0] for row in self.connection.execute(
+            'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-001', 'G-003'])
+        for mutation, restore in (
+            ("UPDATE projects SET planner_session_id='competitor'", "UPDATE projects SET planner_session_id='saved-session'"),
+            ('UPDATE exec_plans SET catalog_generation=catalog_generation+1',
+             'UPDATE exec_plans SET catalog_generation=catalog_generation-1'),
+            ("INSERT INTO manual_work_members SELECT repo,'G-001','competitor' FROM projects",
+             "DELETE FROM manual_work_members WHERE group_id='competitor'"),
+        ):
+            with self.subTest(mutation=mutation):
+                with self.connection:
+                    self.connection.execute(mutation)
+                changed = state.pending_publication_release(str(self.repo))
+                with self.assertRaisesRegex(RuntimeError, '소유권·catalog'):
+                    state.complete_publication_release(release)
+                self.assertEqual(state.pending_publication_release(str(self.repo)), changed)
+                self.assertIsNotNone(state.general_publication(str(self.repo)))
+                with self.connection:
+                    self.connection.execute(restore)
+        state.complete_publication_release(release)
+        self.assertIsNone(state.pending_publication_release(str(self.repo)))
+        self.assertIsNone(state.general_publication(str(self.repo)))
+        self.assertEqual(state.planning(str(self.repo)).processed_sha, commit)
 
 
 class MutableReadyMetadataCasTest(unittest.TestCase):
