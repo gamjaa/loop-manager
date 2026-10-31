@@ -82,13 +82,14 @@ def inspect_worktree(worktree: Path, state_dir: Path,
         git_dir = Path(_git(selected, "rev-parse", "--path-format=absolute",
                             "--absolute-git-dir")).resolve(strict=True)
         listed = _git(selected, "worktree", "list", "--porcelain")
+        # Missing sibling roots remain protected without blocking this worktree.
         registered = tuple(
-            Path(line[9:]).resolve(strict=True)
+            Path(line[9:]).resolve()
             for line in listed.splitlines() if line.startswith("worktree ")
         )
         if not registered or selected not in registered or selected == registered[0]:
             raise IsolationError("Agent worktree가 선택된 관리 linked worktree로 등록되지 않았습니다.")
-        source = registered[0]
+        source = registered[0].resolve(strict=True)
         source_common = Path(_git(source, "rev-parse", "--path-format=absolute",
                                   "--git-common-dir")).resolve(strict=True)
         if common != source_common or git_dir == common:
@@ -101,7 +102,7 @@ def inspect_worktree(worktree: Path, state_dir: Path,
                                 tuple(path for path in registered[1:] if path != selected),
                                 git_dir, common, identity)
     except (OSError, ValueError) as error:
-        raise IsolationError("Agent worktree 등록·canonical 경로 확인 실패") from error
+        raise IsolationError(f"Agent worktree 등록·canonical 경로 확인 실패: {type(error).__name__}: {redact_secrets(str(error))}") from error
 
 
 def _inspect_read_only_runtime(selected: Path, state_root: Path, source: Path) -> None:

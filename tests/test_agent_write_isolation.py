@@ -66,6 +66,26 @@ class WriteIsolationTests(TestCase):
                 symlink_or_skip(alias, selected, target_is_directory=True)
                 with self.assertRaises(isolation.IsolationError):
                     isolation.inspect_worktree(alias, state_root)
+                missing = root / 'removed' / 'sibling'
+                stale_list = listed + f'\nworktree {missing}\nHEAD old\nprunable gitdir file points to non-existent location\n'
+                with mock.patch.object(isolation, '_git', side_effect=lambda path, *args:
+                                       stale_list if args[-1] == '--porcelain' else git(path, *args)):
+                    stale = isolation.inspect_worktree(selected, state_root)
+                    self.assertEqual(stale.worktree, boundary.worktree)
+                    self.assertEqual(stale.repository_identity, boundary.repository_identity)
+                    self.assertIn(missing, stale.other_worktrees)
+                    self.assertFalse(missing.exists())
+                for missing_role in ('source', 'selected'):
+                    with self.subTest(missing=missing_role):
+                        def missing_git(path, *args):
+                            if missing_role == 'source' and args[-1] == '--porcelain':
+                                return listed.replace(f'worktree {source}', f'worktree {missing}')
+                            if missing_role == 'selected' and args[-1] == '--show-toplevel':
+                                return str(missing)
+                            return git(path, *args)
+                        with mock.patch.object(isolation, '_git', side_effect=missing_git):
+                            with self.assertRaisesRegex(isolation.IsolationError, 'FileNotFoundError'):
+                                isolation.inspect_worktree(selected, state_root)
                 unrelated = root / 'unrelated'
                 unrelated.mkdir()
                 with mock.patch.object(isolation, '_git', side_effect=lambda path, *args:
