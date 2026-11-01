@@ -198,6 +198,24 @@ FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.te
 
 수동 재개 엔진의 공통 교정이 필요한 관측으로 Manager에 COMMON_DEFECT_REPORT를 제출한다. G-321의 기존 변경과 검증 기록을 보존하고 전체 verify 완료 판정은 보류한다. 해당 범위 밖 구현·Requirement·다른 ExecPlan은 변경하지 않았다.
 
+
+### 공통 교정 반영 후 rebase 후보 재검증
+
+호출 시작 HEAD `650f1c11913d5ac0fe30eceffb2e9cdf092b0220`, 현재 base `decf15beb7367244b70d3c42acd8edeafee6f4e3`를 기준으로 최신 ExecPlan·sources·dependency와 base 대비 최종 diff 전체를 대조했다. 수동 재개 원인의 Manager 재평가는 정적 근거로만 사용하고, 이전 후보의 성공을 현재 성공으로 승계하지 않았다. 현재 `resume()`은 회전 뒤 활성 구성원을 건너뛰고 `_resume_group()`도 활성 상태를 반환하며, 전환 직전 활성 여부 재확인과 expected_status 갱신을 사용한다. 기존 두 테스트의 IMPLEMENTING assertion은 유지돼 있다. 관련 공통 구현은 이번 Worker가 수정하지 않았다.
+
+위 `call-zvxnxzmi`의 FAILED_COMMAND와 2 failures는 당시 감사로 보존한다. 동일 명령을 현재 후보에서 새로 실행했다.
+
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_manual_work.ManualWorkTest.test_shared_review_failure_rotates_only_one_active_member tests.test_manual_work.ManualWorkTest.test_verify_failure_resumes_worker_automatically
+결과: 2 tests, OK, exit 0 (4.351s). Worker 교정 단계와 공유 묶음의 다른 구성원 상태가 보존됐다. 과거 로그를 새 실패로 재보고하지 않는다.
+
+현재 archive 연결은 다음 최소 명령으로 별도 확인했다.
+
+`python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_task_scheduling.TaskSchedulingTests.test_unblock_cli_dispatch_and_live_reservation_drain tests.test_task_scheduling.TaskSchedulingTests.test_archive_runs_between_continuous_admissions_without_candidate_records tests.test_pr_source_synchronization.PrSourceSynchronizationTest.test_archive_push_then_db_interruption_recovers_without_recommit_or_push`
+
+결과: 3 tests, OK, exit 0 (2.354s). 명시 요청의 parked/인계 전후 독립 archive, 물리 호출 종료 전 lease 반환과 연속 배정 사이 처리, 실제 Git push 후 DB 확정 누락 복구에서 prepare/push 0·mode·기존 HEAD/index/작업물 보존을 확인했다. 이번 호출에서 총 5개 case를 새로 실행했고 모두 통과했다. 기록은 `call-foa1kryj`의 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`에 남겼다.
+
+추가 구현 교정은 필요하지 않았으며 이번 변경은 선택 ExecPlan 본문의 재검증 기록이다. 기존 PRODUCT·ARCHITECTURE 변경은 현재 공통 교정의 활성 단계 보존 규칙과 양립한다. 전체 verify·Review·사용자 Merge는 Manager의 후속 절차로 남긴다. 검증 입력 제외 identity는 선언하지 않는다.
+
 ## Decision Log
 
 - 이번 delta는 G-321을 초기화하거나 완료한 구현을 중복 계획하지 않는다. 앞의 후보에 보존된 구현/검증 원문과 과거 준비점은 유지하고 현재 원격의 관리 인계·삭제 정책과 만나는 경계만 미충족 통합으로 구분한다. started ID·경로·기존 dependency·metadata를 보존한다. 후보 확인·기존 targeted 기록은 최신 전체 verify/Review 성공·Merge가 아니다.
