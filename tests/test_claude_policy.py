@@ -33,8 +33,9 @@ class ClaudePolicyTests(unittest.TestCase):
 
     def test_file_and_command_policies_protect_git_source_and_other_worktrees(self):
         arguments, settings = self.settings()
-        self.assertIn('--restricted', arguments)
-        self.assertEqual(arguments[arguments.index('--setting-sources') + 1], '')
+        self.assertNotIn('--restricted', arguments)
+        self.assertEqual(arguments[arguments.index('--setting-sources') + 1], 'user,project,local')
+        self.assertTrue(settings['permissions']['blockReadsOutsideWorkingDirectories'])
         self.assertEqual(settings['permissions']['additionalDirectories'], [str(self.temporary)])
         for path in (self.boundary.source, *self.boundary.other_worktrees,
                      self.boundary.common_dir, self.boundary.git_dir, self.workspace / '.git'):

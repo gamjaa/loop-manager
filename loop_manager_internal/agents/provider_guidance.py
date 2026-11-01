@@ -162,9 +162,13 @@ def codex_arguments(guidance: CommonGuidance, worktree: Path, *,
     raise GuidanceError("Codex 설정이 지침 조회 중 계속 변경됐습니다.")
 
 
-def claude_arguments(guidance: CommonGuidance, *, environment: dict[str, str] | None = None) -> list[str]:
+def claude_arguments(guidance: CommonGuidance, *, environment: dict[str, str] | None = None,
+                     worktree: Path | None = None) -> list[str]:
     _validate(guidance)
-    help_text = _probe(["claude", "--help"], env=environment)
+    from .agent_claude_preflight import discovery
+    selected = agent_environment('claude') if environment is None else environment
+    with discovery(selected, worktree) as arguments:
+        help_text = _probe(["claude", *arguments, "--help"], env=selected, cwd=worktree)
     if any(flag not in help_text for flag in (
         "--append-system-prompt-file", "--system-prompt-snapshot",
     )):

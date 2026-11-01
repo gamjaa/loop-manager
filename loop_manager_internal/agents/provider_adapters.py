@@ -636,7 +636,7 @@ def run_claude(
     model, effort = profile.model, profile.effort
     fast_mode = provider_fast_mode(config_path, "claude")
     fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
-    additional = provider_guidance.claude_arguments(common_guidance, environment=launch_environment) if common_guidance else []
+    additional = provider_guidance.claude_arguments(common_guidance, environment=launch_environment, worktree=worktree) if common_guidance else []
     assert_authentication_links('claude', launch_environment, auth_links)
     project_dir = _provider_log_directory(worktree, state_dir)
     attempt = (native_launch.attempt if native_launch else

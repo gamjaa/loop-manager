@@ -2,7 +2,7 @@
 
 The caller must discover the effective managed settings, check CLI/account/model
 support, own the temporary directory, and bind/recheck the result per invocation.
-User/project/local settings are excluded, not merged with empty arrays.
+All consumed sources are validated before native settings merging.
 """
 from __future__ import annotations
 
@@ -31,17 +31,17 @@ def _object(settings: dict, key: str) -> dict:
     return value
 
 
-def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: bool,
-                     *, fast_mode: bool = False, managed_settings: dict | None = None,
-                     bash_temporary: Path | None = None
-                     ) -> tuple[str, ...]:
-    """Compose explicit deny rules with restricted file tools and strict Bash.
+SOURCE_ARGUMENTS = ('--setting-sources', 'user,project,local')
+SANDBOX_REQUIRED = {'enabled': True, 'failIfUnavailable': True,
+                    'allowUnsandboxedCommands': False, 'autoAllowBashIfSandboxed': False,
+                    'excludedCommands': [], 'allowNestedUserNamespaces': False,
+                    'enableWeakerNestedSandbox': False}
+NETWORK_LIMITS = {'allowAllUnixSockets': False, 'allowUnixSockets': [],
+                  'allowLocalBinding': False}
 
-    managed_settings is the caller's resolved starting policy, never the user's
-    settings.json. Unknown or incompatible security settings require diagnosis;
-    emitting an empty list cannot remove an inherited list.
-    """
-    inherited = {} if managed_settings is None else managed_settings
+
+def validate_settings(inherited: dict) -> None:
+    """Reject inherited capability/extension conflicts before even discovery."""
     if platform.system() not in {'Linux', 'Darwin'}:
         raise IsolationError('Claude native sandbox가 없는 환경에서는 관리 호출을 지원하지 않습니다.')
     if not isinstance(inherited, dict):
@@ -51,10 +51,7 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
     filesystem = _object(sandbox, 'filesystem')
     network = _object(sandbox, 'network')
     auto = _object(inherited, 'autoMode')
-    required = {'enabled': True, 'failIfUnavailable': True,
-                'allowUnsandboxedCommands': False, 'autoAllowBashIfSandboxed': False,
-                'excludedCommands': [], 'allowNestedUserNamespaces': False,
-                'enableWeakerNestedSandbox': False}
+    required = SANDBOX_REQUIRED
     # Validate without coercion: JSON 0 is not a Boolean false.
     if (any(key in sandbox and (type(sandbox[key]) is not type(value) or sandbox[key] != value)
             for key, value in required.items())
@@ -62,7 +59,9 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
             or set(filesystem) - {'allowWrite', 'denyWrite', 'allowRead', 'denyRead', 'disabled'}
             or ('disabled' in filesystem and filesystem['disabled'] is not False)):
         raise IsolationError('Claude managed sandbox 정책이 역할별 쓰기 제한과 충돌합니다.')
-    if (inherited.get('disableAutoMode') or permissions.get('disableAutoMode')
+    if (('blockReadsOutsideWorkingDirectories' in permissions
+             and permissions['blockReadsOutsideWorkingDirectories'] is not True)
+            or inherited.get('disableAutoMode') or permissions.get('disableAutoMode')
             or permissions.get('defaultMode', 'auto') != 'auto'
             or permissions.get('allow') or permissions.get('additionalDirectories')
             or set(auto) - {'classifyAllShell'}
@@ -78,8 +77,7 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
                            'disableAutoMode', 'disableBypassPermissionsMode',
                            'blockReadsOutsideWorkingDirectories'}:
         raise IsolationError('Claude managed 파일 권한 정책을 해석할 수 없습니다.')
-    network_limits = {'allowAllUnixSockets': False, 'allowUnixSockets': [],
-                      'allowLocalBinding': False}
+    network_limits = NETWORK_LIMITS
     if (any(key in network and (type(network[key]) is not type(value) or network[key] != value)
             for key, value in network_limits.items())
             or set(network) - {*network_limits, 'allowedDomains', 'deniedDomains', 'strictAllowlist'}):
@@ -92,6 +90,23 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
         if key in filesystem and (not isinstance(filesystem[key], list)
                 or any(not isinstance(value, str) for value in filesystem[key])):
             raise IsolationError('Claude managed filesystem 목록 형식이 올바르지 않습니다.')
+
+
+def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: bool,
+                     *, fast_mode: bool = False, managed_settings: dict | None = None,
+                     bash_temporary: Path | None = None
+                     ) -> tuple[str, ...]:
+    """Compose explicit deny rules with working-directory checks and strict Bash.
+
+    managed_settings is the caller's resolved policy from all consumed sources.
+    Unknown or incompatible security settings require diagnosis;
+    emitting an empty list cannot remove an inherited list.
+    """
+    inherited = {} if managed_settings is None else managed_settings
+    validate_settings(inherited)
+    filesystem = inherited.get("sandbox", {}).get("filesystem", {})
+    required = SANDBOX_REQUIRED
+    network_limits = NETWORK_LIMITS
 
     workspace, temporary = _canonical(boundary.worktree), _canonical(temporary)
     temporaries = tuple(dict.fromkeys((temporary, *(() if bash_temporary is None else
@@ -127,6 +142,7 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
     if read_only:
         deny.append('Edit')  # Covers Edit, Write and NotebookEdit together.
     settings = {'permissions': {'defaultMode': 'auto', 'deny': deny,
+                                'blockReadsOutsideWorkingDirectories': True,
                                 'additionalDirectories': [str(root) for root in temporaries]},
                 'autoMode': {'classifyAllShell': True}, 'disableAllHooks': True,
                 'fastMode': fast_mode,
@@ -136,6 +152,6 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
     tools = ['Bash', 'Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch']
     if not read_only:
         tools.extend(('Edit', 'Write', 'NotebookEdit'))
-    return ('--restricted', '--setting-sources', '', '--permission-mode', 'auto',
+    return (*SOURCE_ARGUMENTS, '--permission-mode', 'auto',
             '--tools', ','.join(tools), '--disallowedTools', 'mcp__*',
             '--settings', json.dumps(settings, sort_keys=True))

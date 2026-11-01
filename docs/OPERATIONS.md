@@ -11,9 +11,9 @@ Git·`gh`와 선택한 Agent CLI를 설치·인증하고 대상 GitHub 저장소
 | Windows | PowerShell, Codex 사용 시 Python 3.13 이상과 초기 설정을 마친 elevated sandbox |
 | Linux·macOS | Bash, 공급자별 공통 홈과 호출별 임시 폴더 사용 |
 | Codex | CLI 0.159.3 이상, 세 OS의 내장 sandbox 사전 검사 통과 |
-| Claude Code | 설정 예시의 모델을 사용하려면 CLI 2.1.284 이상, 검증된 격리 경계 필요 |
+| Claude Code | Linux·macOS CLI 2.1.307 이상, 시작 설정 확인 필요 |
 
-Codex는 세 OS에서 상태 루트의 공통 홈을 인증·설정·session 저장소로 직접 사용한다. Windows ACL·Job Object, macOS Seatbelt, Linux 읽기 전용 mount·프로세스 그룹의 경계를 확인할 수 없으면 권한을 완화하지 않고 중단한다. 검증되지 않은 Claude 격리 호출도 거부한다. [Codex 권한 정책](https://developers.openai.com/codex/permissions) · [격리 설계](ARCHITECTURE.md#repository-safety-and-security)
+Codex는 세 OS에서 상태 루트의 공통 홈을 인증·설정·session 저장소로 직접 사용한다. Windows ACL·Job Object, macOS Seatbelt, Linux 읽기 전용 mount·프로세스 그룹의 경계를 확인할 수 없으면 권한을 완화하지 않고 중단한다. Claude는 공식 native 호출 구성과 모의 회귀를 기준으로 시작 설정을 확인하며, 이를 실제 OS 격리 검증 성공으로 표시하지 않는다. [Codex 권한 정책](https://developers.openai.com/codex/permissions) · [격리 설계](ARCHITECTURE.md#repository-safety-and-security)
 
 ### 전용 공급자 홈과 인증
 
@@ -37,7 +37,7 @@ env CLAUDE_CONFIG_DIR=/path/to/state/automation-claude claude auth status
 
 링크를 사용하는 인증 갱신은 기본 인증 파일에도 영향을 줄 수 있다. 로그인·로그아웃은 Manager가 자동 실행하지 않는다. CLI 호출 전후에 링크 공유를 확인하며 링크를 사본으로 교체한 결과는 정상 실행으로 사용하지 않는다. 원본 파일의 같은 경로에서 내용 갱신·원자적 교체는 다음 호출에도 반영한다. [Codex 파일·credential store](https://learn.chatgpt.com/docs/auth#credential-storage)와 [Claude 파일·Keychain](https://code.claude.com/docs/en/authentication#credential-management)은 별개다. 파일이 없는 저장소의 비밀을 추출하지 않으며 Linux·macOS Codex의 기본 사용자 저장소와 자동 실행 홈 사이에서 재사용을 확인하지 못한 `keyring`·`auto`·`ephemeral` 설정은 계속 거부한다. 필요한 파일 인증은 CLI의 지원 방식으로 준비하고 조직의 저장 정책을 완화하지 않는다.
 
-기존 Codex 역할·worktree별 runtime 홈의 config·auth·session은 삭제·이동·복제하지 않으며 새 호출 입력으로 연결하지 않는다. 이전 session은 저장된 ID로 재개를 시도하고 사용할 수 없으면 기존 작업·실패 문맥을 보존하는 새 session fallback을 따른다. Codex의 호출별 임시 폴더는 기존 runtime 아래에, Claude의 임시 폴더는 기존 worktree별 로그 경로 아래에 따로 생성한다. 공통 홈을 Agent 도구의 쓰기 허용 범위에 추가하지 않으며 역할별 권한과 명시적 실행값을 유지한다. 공통 홈 선택만으로 프로젝트·관리 설정이 무효화되거나 Claude의 사용자 설정 source 전체 제외·격리 지원이 완료됐다고 간주하지 않는다.
+기존 역할·worktree별 runtime 홈의 config·auth·session은 삭제·이동·복제하지 않으며 새 호출 입력으로 연결하지 않는다. 이전 session은 저장된 ID로 재개를 시도하고 사용할 수 없으면 기존 작업·실패 문맥을 보존하는 새 session fallback을 따른다. 호출 기록용 임시 폴더는 runtime 아래에 분리하며 Claude Bash의 짧은 임시 폴더는 `/tmp` 아래 호출별 비공개 경로를 사용한다. 공통 홈을 Agent 도구의 쓰기 허용 범위에 추가하지 않으며 역할별 권한과 명시적 실행값을 유지한다. Claude는 선택 공통 홈의 `settings.json`과 프로젝트·local·managed 설정을 현재 호출에서 검사한다. 개인 홈의 settings·Hook은 연결하지 않는다. 공통 홈 설정의 정상 생성·원자 교체·삭제는 다음 호출에 반영되며, 소비 설정의 확장·권한 충돌·읽기 실패·소유권 불명·조회 뒤 변경은 원본을 보존해 거부한다. 오류가 나면 진단된 소비 경로를 확인하고 충돌을 해소한 뒤 재시도한다. 과거 runtime의 설정이나 개인 설정을 다시 연결해 우회하지 않는다. 실제 CLI·계정·OS·session 호환성 후속 확인은 [개발·지원 범위](PRODUCT.md#claude-개발지원-범위)를 따른다.
 
 기존 상태 루트가 `/home/ubuntu/.local/state/loop-manager`인 cron은 기존 `automation-codex`를 재사용하므로 `env CODEX_HOME=...`을 제거하고 `bash /home/ubuntu/loop-manager/run.sh --skip-if-running`으로 전환할 수 있다. DB의 상태 루트를 고정하는 `LOOP_MANAGER_STATE_DIR` 등 다른 옵션은 유지한다. 실제 crontab은 자동 수정하지 않는다.
 

@@ -67,7 +67,7 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
     def probe(self, arguments, environment, worktree):
         if arguments[1:] == ['--version']:
             return '2.1.307 (Claude Code)'
-        if arguments[1:] == ['--help']:
+        if arguments[-1:] == ['--help']:
             return '--restricted --setting-sources --settings --permission-mode --permission-prompts --tools --disallowedTools --strict-mcp-config'
         if arguments[-2:] == ['auth', 'status']:
             return json.dumps({'authMethod': 'api_key', 'configDirectory': environment['CLAUDE_CONFIG_DIR']})
@@ -121,7 +121,7 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
                     self.assertEqual(self.run_claude(role, session).code, 0)
                     arguments, context = self.calls[-1]
                     self.assertTrue(context['start_new_session'])
-                    self.assertIn('--restricted', arguments)
+                    self.assertNotIn('--restricted', arguments)
                     self.assertEqual(context['env']['TMPDIR'], str(self.launches[-1].bash_temporary))
                     settings = json.loads(arguments[arguments.index('--settings') + 1])
                     self.assertEqual(str(self.workspace) in settings['sandbox']['filesystem']['denyWrite'],
@@ -136,12 +136,25 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
 
     def test_missing_saved_session_fallback_reprepares_the_same_boundary(self):
         self.missing_session = True
+        def spawn(arguments, **context):
+            process = self.spawn(arguments, **context)
+            if '--resume' in arguments:
+                # A failed CLI call may leave new settings for the next call.
+                home = Path(context['env']['CLAUDE_CONFIG_DIR'])
+                (home / 'settings.json').write_text('{"model":"next-call"}')
+            return process
+        self.effects._handoff_popen.side_effect = spawn
         result = manager.run_agent_with_retries(lambda session, recovery: self.run_claude(session=session),
                                                 session_id='saved-session')
         self.assertEqual((result.code, result.session_id), (0, 'new-session'))
         self.assertEqual(len(self.calls), 2)
         self.assertNotEqual(self.launches[0].attempt, self.launches[1].attempt)
-        self.assertTrue(all('--restricted' in arguments for arguments, _ in self.calls))
+        self.assertNotEqual(json.loads(self.launches[0].reason)['effective_settings_digest'],
+                            json.loads(self.launches[1].reason)['effective_settings_digest'])
+        home = Path(self.calls[-1][1]['env']['CLAUDE_CONFIG_DIR'])
+        self.assertEqual((home / 'settings.json').read_text(), '{"model":"next-call"}')
+        self.assertTrue(all(arguments[arguments.index('--setting-sources') + 1] == 'user,project,local'
+                            for arguments, _ in self.calls))
 
     def test_invalid_native_init_is_stopped_and_observed_session_is_preserved(self):
         for mutation in ({'permissionMode': 'acceptEdits'}, {'model': 'other-model'},
