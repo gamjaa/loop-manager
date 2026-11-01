@@ -171,6 +171,25 @@ class CommonDefectResumeTests(unittest.TestCase):
         self.assertFalse(self.evaluate()[0])
         self.effects.run_agent.assert_not_called()
 
+    def test_current_common_cause_does_not_wait_for_followup_spec_planning(self):
+        from loop_manager_internal.storage import planning_review_state
+        self.observe_merge()
+        def changed_spec(root, *args, **kwargs):
+            if args[:2] == ('diff', '--quiet'):
+                return SimpleNamespace(returncode=1, stdout='')
+            return self.git(root, *args, **kwargs)
+        with (mock.patch.object(planning_review_state, 'get', return_value={'confirmed_revision': self.base}),
+              mock.patch.object(self.effects, 'git', side_effect=changed_spec)):
+            self.assertTrue(self.evaluate()[0])
+            calls = self.effects.run_agent.call_count
+            with mock.patch.object(planning_review_state, 'general_pending', return_value=True):
+                self.assertFalse(self.evaluate()[0])
+            self.connection.execute("UPDATE exec_plans SET blocked_reason='user_decision_required' WHERE plan_id='G-048'")
+            self.connection.execute("UPDATE execplan_blocks SET reason_code='user_decision_required' WHERE plan_id='G-048'")
+            self.connection.commit()
+            self.assertFalse(self.evaluate()[0])
+            self.assertEqual(self.effects.run_agent.call_count, calls)
+
     def test_confirmed_self_revision_allows_owner_execution_without_claiming_merge(self):
         self.feedback.record_result('repo', 'G-048', 'original-definition', 'worker', 'returned', self.raw)
         with self.connection:

@@ -1,4 +1,5 @@
 """Reobserve and retire resolved diagnostic refs without releasing work gates."""
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from dataclasses import dataclass
 import hashlib
 import json
@@ -128,7 +129,7 @@ def _observe(effects, connection, state_dir, state):
             manual_workspace_owner(connection, repo, owner), branch, path)
         effects.validate_managed_worktree(Path(repo), path, branch)
         current = effects.capture_git_snapshot(path)
-        if current.branch != branch or current.operations or any(entry.split()[-1] != '0'
+        if current.branch != branch or controlling_git_operation(current.operations) or any(entry.split()[-1] != '0'
                 for entries in current.index.values() for entry in entries):
             raise RuntimeError('진단 원인의 Git operation 또는 index 충돌이 남아 있습니다.')
         adapter = effects.adapter_factory(connection, Path(repo), state_dir, repo)

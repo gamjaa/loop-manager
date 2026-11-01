@@ -1,4 +1,5 @@
 """명시적인 삭제 작업 재시작: 이전 worktree 전체를 보존하고 새 실행을 만든다."""
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from pathlib import Path
 from loop_manager_internal.runtime.resource_lock import resource_locks
 from uuid import uuid4
@@ -61,7 +62,7 @@ def restart(effects, connection, repo_path, state_dir, repo, plan_id, *, complet
     if intent is None or intent.get('state') == 'complete':
         effects.validate_managed_worktree(repo_path, worktree, branch)
         before = effects.capture_git_snapshot(worktree)
-        if before.operations:
+        if controlling_git_operation(before.operations):
             raise RuntimeError('진행 중인 Git 작업이 끝나야 재시작할 수 있습니다.')
         with resource_locks(state_dir, str(repo_path.resolve()), ['git:fetch'], owner='restart-fetch'):
             effects.git(repo_path, 'fetch', '--no-tags', 'origin',
@@ -107,7 +108,7 @@ def restart(effects, connection, repo_path, state_dir, repo, plan_id, *, complet
         effects.git(repo_path, 'worktree', 'add', '-b', branch, str(worktree), intent['base'])
     effects.validate_managed_worktree(repo_path, worktree, branch)
     fresh = effects.capture_git_snapshot(worktree)
-    if fresh.head != intent['base'] or fresh.dirty or fresh.operations:
+    if fresh.head != intent['base'] or fresh.dirty or controlling_git_operation(fresh.operations):
         raise RuntimeError('새 실행의 원본 상태가 변경됐습니다.')
     with runtime_state._transaction(connection):
         latest_block = scoped_blocking.plan_block(connection, repo, plan_id)

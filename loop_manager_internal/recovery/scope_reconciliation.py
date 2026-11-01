@@ -1,5 +1,7 @@
 """Independent plan and project safety gate reconciliation."""
 from __future__ import annotations
+
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
 from collections.abc import Callable
@@ -1195,7 +1197,7 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
         effects.validate_execplan_workspace_identity(state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree)
         effects.validate_managed_worktree(repo_path, worktree, branch)
         current = effects.capture_git_snapshot(worktree)
-        if (current.operations or current.dirty or current.branch != branch
+        if (controlling_git_operation(current.operations) or current.dirty or current.branch != branch
                 or (not marker and any(_non_default_index_flags(entries)
                                        for entries in current.index.values()))
                 or not current.head):
@@ -1449,7 +1451,7 @@ def _resume_legacy_review_count_block(effects: ResumeLegacyReviewCountBlockEffec
         if effects._rebase_in_progress_for_branch(worktree, branch):
             return False
         snapshot = effects.capture_git_snapshot(worktree)
-        if snapshot.branch != branch or snapshot.operations or not snapshot.head:
+        if snapshot.branch != branch or controlling_git_operation(snapshot.operations) or not snapshot.head:
             return False
         blocked_snapshot = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
         if plan['agent_snapshot']:
@@ -1666,7 +1668,7 @@ def _resume_interrupted_blocked_rebase(effects: ResumeInterruptedBlockedRebaseEf
             and marker.get('target_base_oid') == target_base
             and checkpoint.observed_remote_oid == (adopted_oid if confirmed else owned_oid)
             and snapshot.head == current_head and snapshot.branch == branch
-            and not snapshot.operations
+            and not controlling_git_operation(snapshot.operations)
             and (not after_head or after_head == current_head)
             and effects._blocked_execplan_metadata_error(repo_path, worktree, plan) is None
         )
@@ -1687,7 +1689,7 @@ def _resume_interrupted_blocked_rebase(effects: ResumeInterruptedBlockedRebaseEf
                         worktree, branch, target=target_base,
                     ).observe(checkpoint=checkpoint)
                     restored_stage = (decision.reason == 'adopted_checkpoint_work_pending'
-                                      and observed.metadata is None and not observed.operations
+                                      and observed.metadata is None and not controlling_git_operation(dict(observed.operations))
                                       and observed.index_clean is False and bool(observed.staged)
                                       and not any(entry.stage for entry in observed.index))
                     safe = (accepted['head'] == current_head == checkpoint.expected_head

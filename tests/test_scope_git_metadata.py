@@ -9,6 +9,26 @@ from tests.support.git import git_command
 @isolated_git_test
 class ScopeGitMetadataTest(AgentScopeFixture, unittest.TestCase):
 
+    def test_retained_rebase_head_remains_evidence_without_blocking_checkpoint(self):
+        from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+        from loop_manager_internal.recovery import blocked_checkpoint
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            head = git_command(repo, 'rev-parse', 'HEAD')
+            git_command(repo, 'update-ref', 'REBASE_HEAD', head)
+            (repo / plan_path).write_text((repo / plan_path).read_text() + '\nWorker progress\n')
+            observed = loop_manager.capture_git_snapshot(repo)
+            self.assertIn('REBASE_HEAD', observed.operations)
+            self.assertIsNone(controlling_git_operation(observed.operations))
+            self.assertIn(plan_path, observed.dirty)
+            verdict = blocked_checkpoint.assess_safety(blocked_checkpoint.SafetyObservation(
+                workspace_identity_matches=True, workspace_owned=True, head_oid=observed.head,
+                actual_branch=observed.branch, expected_branch=observed.branch,
+                operations=tuple(observed.operations), dirty_paths=(blocked_checkpoint.DirtyPath(
+                    plan_path, ('unstaged',), True),)))
+            self.assertTrue(verdict.safe)
+            self.assertEqual(verdict.included_paths, (plan_path,))
+
 
 
 

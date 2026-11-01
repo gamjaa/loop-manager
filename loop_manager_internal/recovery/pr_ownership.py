@@ -1,5 +1,7 @@
 """recovery pr ownership boundaries and named composition effects."""
 from __future__ import annotations
+
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from loop_manager_internal.storage import runtime_state
 from collections.abc import Callable
@@ -167,7 +169,7 @@ def _validate_pr_conflict_recovery_ownership(
             )
         if flagged_paths:
             details.append("index flags " + ", ".join(flagged_paths[:8]))
-        if snapshot.operations:
+        if controlling_git_operation(snapshot.operations):
             details.append(
                 "Git operation " + ", ".join(sorted(snapshot.operations))
             )
@@ -231,7 +233,7 @@ def _validate_blocked_pr_without_conflict(
         path for path, entries in snapshot.index.items()
         if effects._non_default_index_flags(entries)
     )
-    if snapshot.branch != branch or snapshot.head != head_oid or dirty or flags or snapshot.operations:
+    if snapshot.branch != branch or snapshot.head != head_oid or dirty or flags or controlling_git_operation(snapshot.operations):
         raise ManagedWorktreeConflictError(
             "PR 충돌 복구 차단 해제 전 관리 worktree 상태 불일치: "
             + "; ".join(filter(None, (

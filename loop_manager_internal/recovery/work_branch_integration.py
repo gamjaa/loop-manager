@@ -78,7 +78,7 @@ def _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, pla
         if result.returncode:
             raise RuntimeError('소유 rebase 재시작을 재시도합니다: ' + result.stdout[-2000:])
         now = effects.capture_git_snapshot(worktree)
-    if now.head != restart['original_head'] or now.branch != branch or now.operations:
+    if now.head != restart['original_head'] or now.branch != branch or controlling_git_operation(now.operations):
         raise RuntimeError('소유 rebase 복원 결과가 원래 로컬 HEAD와 다릅니다.')
     return now
 
@@ -368,7 +368,7 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
         try:
             after = integrate(effects, connection, repo_path, state_dir, repo, plan, remote, before)
         except RuntimeError as error:
-            if effects.capture_git_snapshot(worktree).operations:
+            if controlling_git_operation(effects.capture_git_snapshot(worktree).operations):
                 raise RecoveryFailure(RecoveryReason.REBASE_CONFLICT, str(error)) from error
             raise
     checkpoints = ExecutionCheckpointRepository(connection)

@@ -1501,6 +1501,7 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         runtime=loop_manager.runtime_state.RuntimeStateRepository(self.connection)
         runtime.block_plan(self.repo,'G-106',reason_code='common_defect_pending',evidence='shared cause',
             release_fingerprint='input',clear_projection=False,plan_values={'worker_result':raw})
+        self.ports.capture_git_snapshot.return_value.operations = {'REBASE_HEAD': 'retained commit'}
         self.ports._evaluate_remote_checkpoint_cause.return_value=(True,'current code removes cause',None)
         self.assertEqual(self.coordinator.reconcile('G-106'),'resumed')
         self.ports._evaluate_remote_checkpoint_cause.assert_called_once()

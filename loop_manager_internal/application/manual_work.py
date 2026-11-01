@@ -1,6 +1,8 @@
 """Manual command policy and restartable handoff to the ordinary execution loop."""
 from __future__ import annotations
 
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
 from dataclasses import dataclass
 from collections.abc import Callable
 from pathlib import Path
@@ -249,7 +251,7 @@ class ManualWorkService:
         owned = int(row['workspace_owned']) == 1
         if owned and worktree.is_dir():
             self.effects.validate_workspace(self.repo_path,worktree,branch)
-            if self.effects.capture_snapshot(worktree).operations:
+            if controlling_git_operation(self.effects.capture_snapshot(worktree).operations):
                 raise ManualWorkError('소유 worktree의 미완료 Git operation을 보존합니다. 수동 인계하지 않습니다.')
         if row['pr_url']:
             pr=self.effects.pr_for_branch(self.repo_path,branch,row['pr_url'])

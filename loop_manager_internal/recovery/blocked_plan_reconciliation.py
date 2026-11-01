@@ -4,6 +4,8 @@ The additive recovery state preserves original causes and publication audit.
 Current rebase acceptance never requires historical execution evidence.
 """
 from __future__ import annotations
+
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
 import json
@@ -473,7 +475,8 @@ class BlockedPlanReconciler:
                 self._adopt(plan, {**context, 'branch_oid': remote})
                 context['branch_oid'] = remote
             snapshot = self.ports.capture_git_snapshot(worktree)
-            if (snapshot.operations
+            if (controlling_git_operation(snapshot.operations)
+                    or any(entry.split()[-1:] != ['0'] for entries in snapshot.index.values() for entry in entries)
                     or any(self.ports._non_default_index_flags(entries) for entries in snapshot.index.values())):
                 raise RuntimeError('미해결 Git 작업 또는 예상 밖 로컬/index 변경을 보존합니다.')
             if snapshot.dirty:

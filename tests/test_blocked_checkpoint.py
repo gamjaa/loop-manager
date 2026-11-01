@@ -82,6 +82,17 @@ class BlockedCheckpointPolicyTest(unittest.TestCase):
         values.update(changes)
         return blocked_checkpoint.SafetyObservation(**values)
 
+    def test_retained_operation_evidence_does_not_block_owned_dirty_checkpoint(self):
+        auxiliary = ('REBASE_HEAD', 'MERGE_MSG', 'MERGE_MODE', 'AUTO_MERGE')
+        self.assertTrue(blocked_checkpoint.assess_safety(self.observation(operations=auxiliary)).safe)
+        self.assertFalse(blocked_checkpoint.assess_safety(self.observation(
+            operations=auxiliary, unmerged_index=True)).safe)
+        for marker in ('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'sequencer', 'unknown-operation'):
+            with self.subTest(marker=marker):
+                verdict = blocked_checkpoint.assess_safety(self.observation(operations=(*auxiliary, marker)))
+                self.assertFalse(verdict.safe)
+                self.assertEqual(verdict.reason_code, 'git_operation_in_progress')
+
     def test_assessor_accepts_only_owned_worker_paths_and_clean_git_state(self):
         verdict = blocked_checkpoint.assess_safety(self.observation())
         self.assertTrue(verdict.safe)

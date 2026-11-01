@@ -1,6 +1,8 @@
 """recovery blocked agent service boundaries and named composition effects."""
 from __future__ import annotations
 
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
 from loop_manager_internal.agents import agent_scope_decision
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
@@ -447,11 +449,11 @@ def _complete_blocked_agent_recovery_selected(
         raise AgentScopeError(
             "BLOCKED Agent 복구 worktree branch가 저장된 branch와 다릅니다."
         )
-    if current.operations:
+    if controlling_git_operation(current.operations):
         raise AgentScopeError(
             "BLOCKED Agent 복구 worktree에 Git operation이 남아 있습니다."
         )
-    if before.operations:
+    if controlling_git_operation(before.operations):
         raise AgentScopeError(
             "Agent 실행 전 Git operation이 있는 worktree는 자동 복구할 수 없습니다."
         )

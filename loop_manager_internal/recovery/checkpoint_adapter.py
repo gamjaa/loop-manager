@@ -377,6 +377,8 @@ class CheckpointSafetyAdapter:
             actual_branch=actual_branch,
             expected_branch=branch,
             operations=operations,
+            unmerged_index=bool(snapshot and any(entry.split()[-1:] != ['0']
+                for entries in snapshot.index.values() for entry in entries)),
             dirty_paths=tuple(dirty_paths),
             shared_metadata_owned=shared_metadata_owned,
             project_blocked=project_blocked,

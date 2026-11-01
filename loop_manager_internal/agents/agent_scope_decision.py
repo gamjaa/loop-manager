@@ -6,6 +6,8 @@ This module only compares already captured snapshots and describes checks to run
 
 from __future__ import annotations
 
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
 from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
@@ -301,7 +303,7 @@ def blocked_agent_local_baseline(
     if flagged_paths:
         raise ScopeDecisionError('BLOCKED index flags 변경: ' + ', '.join(flagged_paths[:8]))
     if accept_current_input:
-        if before.operations or current.operations:
+        if controlling_git_operation(before.operations) or controlling_git_operation(current.operations):
             raise ScopeDecisionError("BLOCKED 인계에 미해결 Git operation이 있습니다.")
         if before.branch != current.branch:
             raise ScopeDecisionError("BLOCKED 인계의 소유 branch가 변경됐습니다.")

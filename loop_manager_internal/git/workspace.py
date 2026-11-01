@@ -135,7 +135,7 @@ def validate_reserved_worktree(effects: ValidateReservedWorktreeEffects,
     if snapshot.dirty:
         paths = ", ".join(sorted(snapshot.dirty)[:8])
         violations.append(f"변경 파일 {paths}")
-    if snapshot.operations:
+    if controlling_git_operation(snapshot.operations):
         operations = ", ".join(sorted(snapshot.operations))
         violations.append(f"Git operation {operations}")
     if violations:

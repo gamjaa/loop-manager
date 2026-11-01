@@ -1,6 +1,8 @@
 """Agent local tree capture/restoration through the existing Git adapter."""
 from __future__ import annotations
 
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
@@ -167,7 +169,7 @@ def _capture_agent_baseline(
 ) -> str | None:
     if not snapshot.dirty:
         return None
-    if snapshot.operations and not preserve_conflicts:
+    if controlling_git_operation(snapshot.operations) and not preserve_conflicts:
         # Rebase-conflict resolution intentionally starts inside a Git
         # operation. Its scope is still validated, but it cannot use the
         # ordinary HEAD/index tree recovery representation.

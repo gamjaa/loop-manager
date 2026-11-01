@@ -375,7 +375,7 @@ def assess_current_rebase(
         return reject('target_base_not_ancestor')
     if expected.autostash_oid and (
             any(entry.stage for entry in observed.index) or observed.staged):
-        if set(operations) - {'MERGE_MSG', 'MERGE_MODE', 'REBASE_HEAD'}:
+        if controlling_git_operation(operations):
             return reject('unresolved_operation_or_index')
         return RebaseDecision(RebaseStatus.WAITING, 'owned_autostash_restore_pending')
     if (adopted_head == observed.head and observed.staged

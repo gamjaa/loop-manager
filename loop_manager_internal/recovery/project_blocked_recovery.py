@@ -3,6 +3,7 @@
 Current-state scope is independent of publication lineage. Diagnostic refs
 preserve artifacts but never update the original branch's ownership records.
 """
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from dataclasses import dataclass, replace
 from collections.abc import Callable
@@ -72,7 +73,7 @@ def independent_scope(ports, connection, repo_path, state_dir, repo, plan,
         detail = observed.detail if isinstance(observed, ObservationFailure) else '현재 작업 범위 또는 원격 기대값 불일치'
         raise RuntimeError('project 복구 작업물을 검증할 수 없습니다: ' + detail)
     checkpoint = ExecutionCheckpointRepository(connection).get(repo, plan['plan_id'])
-    if observed.operations or observed.metadata is not None:
+    if controlling_git_operation(dict(observed.operations)) or observed.metadata is not None:
         # An owned pending rebase is preserved for manual resolution. It is
         # never a committable/publishable checkpoint.
         service.require_owned(checkpoint=checkpoint)

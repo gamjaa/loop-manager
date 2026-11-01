@@ -4,6 +4,8 @@ Git mutation and journal policy remain in the existing Git adapters. This
 service owns runtime selection, ownership validation and child handoff only.
 """
 from __future__ import annotations
+
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.runtime import operation_events as events
 from contextlib import closing
 
@@ -236,7 +238,7 @@ class BootstrapService:
                 f"기존 runtime worktree가 clean 상태가 아닙니다: {runtime}"
             )
         operations = self.effects._git_operation_entries(runtime)
-        if operations:
+        if controlling_git_operation(operations):
             raise WorkspaceOwnershipError(
                 "기존 runtime worktree에 Git operation이 진행 중입니다: "
                 + ", ".join(sorted(operations))

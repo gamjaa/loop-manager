@@ -1,5 +1,7 @@
 """Checkpoint successor adoption and cause-specific candidate revalidation."""
 from __future__ import annotations
+
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
@@ -222,7 +224,7 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     if safety_error:
         return refuse(safety_error)
     assert snapshot is not None
-    if snapshot.operations and not integrating:
+    if controlling_git_operation(snapshot.operations) and not integrating:
         return refuse("미해결 Git operation: " + ", ".join(sorted(snapshot.operations)))
     if (snapshot.branch != branch and not integrating) or not snapshot.head:
         return refuse("관리 worktree의 branch 또는 HEAD가 저장된 ExecPlan과 다릅니다.")
@@ -668,7 +670,7 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
                                  'docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'docs/requirements', check=False)
         if difference.returncode not in (0, 1):
             raise RuntimeError('확정 planning 이후의 원격 명세 변경을 조회할 수 없습니다.')
-        if difference.returncode == 1:
+        if difference.returncode == 1 and not common:
             return False, '후속 원격 명세 변경의 planning 확정을 기다립니다.', None
     prior_revision = (blocked['comparison_revision'] if 'comparison_revision' in blocked.keys() else None
                       ) or blocked['active_sha'] or blocked['plan_sha']

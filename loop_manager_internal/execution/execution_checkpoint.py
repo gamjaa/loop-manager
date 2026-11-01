@@ -6,7 +6,7 @@ from loop_manager_internal.git import rebase_file_evidence
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Iterable
 
 
 class CheckpointAction(str, Enum):
@@ -21,16 +21,12 @@ class CheckpointAction(str, Enum):
 # Git may retain message and current-commit files after an operation has
 # completed. They are useful evidence in the durable snapshot, but only the
 # operation's controlling state proves that another Git command is unsafe.
-_CONTROLLING_GIT_OPERATIONS = frozenset({
-    'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge',
-    'rebase-apply', 'sequencer', 'BISECT_HEAD', 'BISECT_LOG',
-    'BISECT_START', 'BISECT_TERMS',
-})
+_AUXILIARY_GIT_MARKERS = frozenset({'MERGE_MODE', 'MERGE_MSG', 'REBASE_HEAD', 'AUTO_MERGE'})
 
 
-def controlling_git_operation(markers: Mapping[str, object] | None) -> str | None:
-    """Return a marker that still controls a Git operation, if any."""
-    return next(iter(sorted(_CONTROLLING_GIT_OPERATIONS.intersection(markers or {}))), None)
+def controlling_git_operation(markers: Iterable[str] | None) -> str | None:
+    """Ignore retained evidence files; unknown markers still block mutation."""
+    return next(iter(sorted(set(markers or ()) - _AUXILIARY_GIT_MARKERS)), None)
 
 
 @dataclass(frozen=True)

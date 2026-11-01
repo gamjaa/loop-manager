@@ -1,6 +1,8 @@
 """Preserving source checkout synchronization effects."""
 from __future__ import annotations
 
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from collections.abc import Mapping
@@ -97,7 +99,7 @@ def _base_worktree_snapshot(effects: BaseWorktreeSnapshotEffects,
         operations=operations,
         config=tuple(sorted(effects._config_entries(repo).items())),
     )
-    if operations or effects._base_worktree_index_error(preliminary):
+    if controlling_git_operation(dict(operations)) or effects._base_worktree_index_error(preliminary):
         return preliminary
     changes = []
     for kind, paths in (
@@ -332,7 +334,7 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                     "skipped", f"다른 branch checkout: {branch}", selected_remote
                 )
             operations = effects._git_operation_entries(repo)
-            if operations:
+            if controlling_git_operation(operations):
                 return BaseWorktreeSyncResult(
                     "skipped",
                     "진행 중 Git operation: " + ", ".join(sorted(operations)),
@@ -348,7 +350,7 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                 f"다른 branch checkout: {before.branch}",
                 selected_remote,
             )
-        if before.operations:
+        if controlling_git_operation(dict(before.operations)):
             return BaseWorktreeSyncResult(
                 "skipped",
                 "진행 중 Git operation: " + ", ".join(name for name, _ in before.operations),

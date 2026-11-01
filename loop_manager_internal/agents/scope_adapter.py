@@ -1,5 +1,7 @@
 """agents scope adapter boundaries and named composition effects."""
 from __future__ import annotations
+
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from loop_manager_internal.agents import agent_scope_decision
@@ -508,7 +510,7 @@ def validate_worker_workspace_scope(
     if allow_rebase and connection is not None:
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
         checkpoint = ExecutionCheckpointRepository(connection).get(str(repo_path), str(catalog_plan['plan_id']))
-    if allow_rebase and (getattr(after, 'operations', {}) or checkpoint and checkpoint.operation == 'rebase'):
+    if allow_rebase and (controlling_git_operation(getattr(after, 'operations', {})) or checkpoint and checkpoint.operation == 'rebase'):
         from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
         plan_id = str(catalog_plan['plan_id'])
         state_dir = state_dir or effects._owned_rebase_state_dir(str(repo_path), plan_id, worktree)

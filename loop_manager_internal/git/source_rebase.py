@@ -6,6 +6,8 @@ an owned abort; an interruption without that receipt preserves the operation.
 """
 from __future__ import annotations
 
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
 import os
 from pathlib import Path
 import secrets
@@ -49,7 +51,7 @@ def _completed(effects, repo: Path, intent: dict, current: dict) -> bool:
     before_view = _view(effects, repo, before, before, current)
     current_view = _view(effects, repo, before, current, current)
     return (
-        current["branch"] == expected["base"] and not current["operations"]
+        current["branch"] == expected["base"] and not controlling_git_operation(dict(current["operations"]))
         and current["head"] == current["ref"]
         and current["origin"] == before["origin"]
         and current_view["changes"] == before_view["changes"]

@@ -1,6 +1,8 @@
 """Resource-scoped manual preparation, separate from the automatic execution slot."""
 from __future__ import annotations
 
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 import json
@@ -119,7 +121,7 @@ def preparation_gate(service, *, plan_ids=(), group=None, requirements=(), inspe
     path = Path(group['worktree'])
     if inspect_workspace and path.is_dir() and group['workspace_created']:
         service.effects.validate_workspace(service.repo_path, path, group['branch'])
-    if inspect_workspace and path.is_dir() and service.effects.capture_snapshot(path).operations:
+    if inspect_workspace and path.is_dir() and controlling_git_operation(service.effects.capture_snapshot(path).operations):
         raise ManualConflictError(f'미완료 Git operation을 보존합니다: {path}')
     return git_observation
 

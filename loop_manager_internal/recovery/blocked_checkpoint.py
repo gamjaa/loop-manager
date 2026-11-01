@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
 from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
@@ -70,6 +72,7 @@ class SafetyObservation:
     actual_branch: str | None
     expected_branch: str | None
     operations: tuple[str, ...] = ()
+    unmerged_index: bool = False
     dirty_paths: tuple[DirtyPath, ...] = ()
     shared_metadata_owned: bool = True
     project_blocked: bool = False
@@ -177,12 +180,12 @@ def assess_safety(observation: SafetyObservation) -> SafetyVerdict:
             observation.head_oid,
             (),
         )
-    if observation.operations:
+    if controlling_git_operation(observation.operations) or observation.unmerged_index:
         return SafetyVerdict(
             False,
             SafetyScope.PLAN,
             "git_operation_in_progress",
-            "미해결 Git operation: " + ", ".join(observation.operations),
+            "미해결 Git operation/index: " + ", ".join(observation.operations),
             observation.head_oid,
             (),
         )

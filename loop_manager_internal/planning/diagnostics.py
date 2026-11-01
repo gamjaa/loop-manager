@@ -1,5 +1,7 @@
 """planning diagnostics boundaries and named composition effects."""
 from __future__ import annotations
+
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -153,8 +155,8 @@ def preserve_remote_planning_diagnostics(effects: RemotePlanningDiagnosticsEffec
             if current.branch is not None or not current.shared_metadata_complete:
                 raise RuntimeError('planning 진단 worktree의 detached 소유권이 유효하지 않습니다.')
             unmerged = any(entry.split()[-1] != '0' for entries in current.index.values() for entry in entries)
-            if current.operations or unmerged:
-                if set(current.operations) - {'rebase-merge', 'rebase-apply', 'REBASE_HEAD', 'MERGE_MSG', 'MERGE_MODE'}:
+            if controlling_git_operation(current.operations) or unmerged:
+                if set(current.operations) - {'rebase-merge', 'rebase-apply', 'REBASE_HEAD', 'MERGE_MSG', 'MERGE_MODE', 'AUTO_MERGE'}:
                     raise RuntimeError('planning의 다른 Git operation이 진행 중입니다.')
                 journal = planning_rebase._read(planning_rebase._journal_path(state_dir, repo, worktree), repo, worktree)
                 if journal is None or journal['old'] != row.active_sha:
