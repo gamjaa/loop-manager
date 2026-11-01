@@ -186,6 +186,18 @@ RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_maint
 
 최신 ExecPlan·R-094와 근거 입력, HEAD/base의 전체 변경 범위를 다시 대조했다. 현재 호출에서 위 동일 targeted 명령을 새로 실행해 2 tests, OK (9.771s, exit 0)를 확인했다. 기록은 `call-fljf77gh`의 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`에 남겼다. 이전 호출의 10개 성공 기록을 이번 실행으로 합성하지 않는다. 전체 verify는 Manager 재실행이 필요하다.
 
+
+### 후속 verify의 수동 교정 재개 공통 결함
+
+호출 시작 HEAD `56d38172ddd434df0ffb3fd2328463675c042577`에서 Manager verify `verify:29ce766287c5b40d6f7989b863206c1221b6203e835efab087d665e9f0f76526` occurrence=1 revision=1의 두 실패를 targeted runner로 재현했다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_manual_work.ManualWorkTest.test_shared_review_failure_rotates_only_one_active_member tests.test_manual_work.ManualWorkTest.test_verify_failure_resumes_worker_automatically
+결과: 2 tests, 2 failures, exit 1 (4.400s). 두 case 모두 `service.resume()` 뒤 실제 상태 VERIFYING과 기대 IMPLEMENTING의 차이로 실패했다. 기록은 이번 호출 `call-zvxnxzmi`의 targeted 결과 폴더에 남겼다. 수정·재실행 성공이나 전체 verify 성공으로 처리하지 않는다.
+
+`ManualWorkService.resume()`은 `rotate_correction()` 뒤 `_resume_group()`을 호출한다. 회전 helper는 실패한 구성 G를 IMPLEMENTING으로 옮기지만 `_resume_group()`은 현재 IMPLEMENTING 상태를 제외하지 않고 묶음의 저장 `resume_phase`를 실행 상태에 다시 적용한다. 두 실패의 assertion은 archive 결과가 아닌 수동 verify/Review 교정 재개 상태를 검증한다. 관련 수동 service·candidate·recovery·테스트는 현재 base 대비 변경이 없음을 확인했다. G-321의 실제 archive 자원 충돌·기회·보류 계약으로 이 수동 교정 상태 전이를 바꾸지 않으며, 기존 assertion을 완화하지 않는다.
+
+수동 재개 엔진의 공통 교정이 필요한 관측으로 Manager에 COMMON_DEFECT_REPORT를 제출한다. G-321의 기존 변경과 검증 기록을 보존하고 전체 verify 완료 판정은 보류한다. 해당 범위 밖 구현·Requirement·다른 ExecPlan은 변경하지 않았다.
+
 ## Decision Log
 
 - 이번 delta는 G-321을 초기화하거나 완료한 구현을 중복 계획하지 않는다. 앞의 후보에 보존된 구현/검증 원문과 과거 준비점은 유지하고 현재 원격의 관리 인계·삭제 정책과 만나는 경계만 미충족 통합으로 구분한다. started ID·경로·기존 dependency·metadata를 보존한다. 후보 확인·기존 targeted 기록은 최신 전체 verify/Review 성공·Merge가 아니다.
