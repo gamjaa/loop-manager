@@ -456,7 +456,7 @@ def execute_local_recovery_request(
     if plan_id is None:
         targets.extend(str(row[0]) for row in connection.execute(
             "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
-            "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted') "
+            "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted', 'plan_input_invalid') "
             "ORDER BY plan_id", (repository,)))
         # Once bounded verify checks have released the execution slot,
         # revisit the project coordinator for its independent planning cause.
@@ -473,9 +473,13 @@ def execute_local_recovery_request(
                 for item in outcomes
             )):
                 continue
-        if plan_id is None and target is not None and local_recovery_state.recheck_consumed(
-                connection, request.request_id, target, "verify"):
-            continue
+        if plan_id is None and target is not None:
+            reason = connection.execute(
+                "SELECT blocked_reason FROM exec_plans WHERE repo=? AND plan_id=?", (repository, target),
+            ).fetchone()
+            cause = "metadata" if reason and reason[0] == "plan_input_invalid" else "verify"
+            if local_recovery_state.recheck_consumed(connection, request.request_id, target, cause):
+                continue
         with events.log_context(project=repository, plan=target, stage="RECOVERY"):
             with events.activity(
                 "로컬 환경 재검사 처리", heartbeat=True, error_level="ERROR",

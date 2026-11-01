@@ -1069,7 +1069,7 @@ class RuntimeStateRepository:
 
     def resume_rebase_block(self, expected_plan, expected_project, block, checkpoint_repository,
                             observation, *, expected_checkpoint, is_plan_block, reobserve, dependencies_ready,
-                            pending_error):
+                            pending_error, recovery_request_id=None):
         """Adopt current Git state and release one rebase cause atomically.
 
         No Git writes occur here. Other plan causes, sessions, failure history and
@@ -1091,7 +1091,7 @@ class RuntimeStateRepository:
             raise RuntimeStateError('rebase recovery checkpoint changed before release')
         saved = current_checkpoint.snapshot or {}
         prior_release = saved.get('rebase_block_release') or {}
-        if (decision.status is RebaseStatus.WAITING
+        if (recovery_request_id is None and decision.status is RebaseStatus.WAITING
                 and prior_release.get('reason_code') == block['reason_code']
                 and saved.get('rebase_block_release_state') == observed.fingerprint):
             raise RuntimeStateError('unchanged pending rebase recovery was already resumed')
@@ -1115,6 +1115,12 @@ class RuntimeStateRepository:
             raise RuntimeStateError('current rebase state changed during block release')
         with _transaction(self.connection):
             check_owner()
+            if recovery_request_id is not None:
+                from loop_manager_internal.storage import local_recovery_state
+                if (block['reason_code'] != scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value
+                        or not local_recovery_state.consume_recheck(
+                            self.connection, recovery_request_id, str(plan_id), 'metadata', repo=repo)):
+                    raise RuntimeStateError('metadata recheck request already consumed or cause changed')
             separate_block = not is_plan_block and expected_plan['status'] == 'PLAN_BLOCKED'
             values = revalidation_values(current_checkpoint.target_base_oid)
             retired_scope = scoped_blocking.is_scope_baseline_block(block)

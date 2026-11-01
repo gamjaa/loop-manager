@@ -491,6 +491,39 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
 
 
 class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase):
+    def test_explicit_metadata_recheck_consumes_request_with_release(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        request = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+            plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id))
+        self.assertTrue(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').operation, 'rebase')
+
+    def test_explicit_metadata_recheck_rolls_back_consumption_on_interruption(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        request = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        before = self.snapshot()
+        def fault(_runtime, stage):
+            if stage == 'after_rebase_block_release':
+                raise RuntimeError('interrupted metadata release')
+        def resume():
+            return loop_manager.resume_plan_blocks(
+                self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+                plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id)
+        with mock.patch.object(loop_manager.runtime_state.RuntimeStateRepository, '_fault', fault):
+            self.assertFalse(resume())
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+        self.assertTrue(resume())
+
     def test_metadata_release_policy_does_not_resume_unchanged_block(self):
         self.block(reason='plan_input_invalid')
         self.pending()

@@ -125,7 +125,7 @@ class ReconcileRebaseEvidenceBlockEffects:
 
 def _reconcile_rebase_evidence_block(
     effects: ReconcileRebaseEvidenceBlockEffects, connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
-    repo: str, block: sqlite3.Row, *, plan_block: bool,
+    repo: str, block: sqlite3.Row, *, plan_block: bool, recovery_request_id: str | None = None,
 ) -> bool:
     """Recheck the owned current rebase and release only its saved cause."""
     plan_id = str(block["plan_id"] or "")
@@ -193,7 +193,7 @@ def _reconcile_rebase_evidence_block(
                 is_plan_block=plan_block,
                 reobserve=lambda: confirmed,
                 dependencies_ready=lambda: not effects.unmet_execplan_dependencies(connection, repo, plan_id),
-                pending_error=REBASE_IN_PROGRESS_ERROR)
+                pending_error=REBASE_IN_PROGRESS_ERROR, recovery_request_id=recovery_request_id)
         return True
     except (RuntimeError, OSError, ValueError, sqlite3.Error) as error:
         effects.operation_log(f"관리 rebase 차단 재평가 보류 ({plan_id}): {error}", error=True)

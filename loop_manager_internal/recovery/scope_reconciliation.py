@@ -808,7 +808,10 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value,
             BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
         }
-        if force_timeout_recheck and not local_verify_recheck:
+        local_metadata_recheck = bool(force_timeout_recheck and recovery_request_id
+            and current_reason == BlockReasonCode.PLAN_INPUT_INVALID.value
+            and workspace_checkpoint.operation == 'rebase')
+        if force_timeout_recheck and not (local_verify_recheck or local_metadata_recheck):
             continue
         if current_reason == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
             continue
@@ -824,6 +827,12 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
                 repo, str(blocked['plan_id']))
             if checkpoint.operation == 'rebase':
+                if local_metadata_recheck:
+                    if effects._reconcile_rebase_evidence_block(
+                            connection, repo_path, state_dir, repo, current_block,
+                            plan_block=True, recovery_request_id=recovery_request_id):
+                        return True
+                    continue
                 if effects.resume_blocked_execplan_if_inputs_changed(
                         connection, repo_path, repo, base, state_dir, plan_id=str(blocked['plan_id'])):
                     return True

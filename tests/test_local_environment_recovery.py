@@ -548,6 +548,20 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             self.assertEqual([row[0] for row in connection.execute("SELECT status FROM exec_plans ORDER BY plan_id")], ['PLAN_BLOCKED', 'READY'])
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM local_environment_recheck_consumption").fetchone()[0], 2)
 
+    def test_project_command_enumerates_metadata_recheck_target(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha, blocked_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (repo, 'G-001', 'docs/plans/G-001.md', 'one', '[]', '[]', 'normal', 'hash', 'PLAN_BLOCKED', 'base', 'plan_input_invalid'))
+        targets = []
+        def run(connection, *_args, **kwargs):
+            targets.append(kwargs['recovery_plan_id'])
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        self.assertEqual(recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
+        self.assertEqual(targets, [None, 'G-001'])
+
     def test_project_reentry_does_not_dispatch_retained_paused_execution(self):
         from loop_manager_internal.storage import local_recovery_state
         self.config_path.write_text("[loop]\n", encoding="utf-8")
