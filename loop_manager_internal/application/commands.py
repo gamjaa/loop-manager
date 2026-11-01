@@ -383,19 +383,27 @@ def recover_local_environment(
                     events.emit("로컬 복구 실행 대기", request_id=request.request_id,
                                 next_action="다음 run에서 재개")
                     return _local_recovery_waiting(effects, request)
+                from loop_manager_internal.runtime import refresh
+                if refresh.paused(state_dir, repository):
+                    events.emit('로컬 복구 실행 대기', request_id=request.request_id,
+                                next_action='일시 중지 해제 뒤 재확인')
+                    return _local_recovery_waiting(effects, request)
                 next_request = next_local_recovery_request(connection, repository)
                 if next_request is None or next_request.request_id != request.request_id:
                     events.emit("로컬 복구 실행 대기", request_id=request.request_id,
                                 next_action="앞선 실행 또는 소유 scope 종료 뒤 재확인")
                     return _local_recovery_waiting(effects, request)
-                return execute_local_recovery_request(
-                    LocalRecoveryExecutionEffects(effects.operation_print, effects.run_project_result),
-                    connection, state_dir, request, config.path,
-                    planner_mutex=threading.Lock(),
-                    refactoring_review_interval=config.refactoring_review_interval,
-                    verify_timeout_seconds=config.verify_timeout_seconds,
-                    runtime_mutation=runtime_mutation,
-                ).exit_code
+                try:
+                    return execute_local_recovery_request(
+                        LocalRecoveryExecutionEffects(effects.operation_print, effects.run_project_result),
+                        connection, state_dir, request, config.path,
+                        planner_mutex=threading.Lock(),
+                        refactoring_review_interval=config.refactoring_review_interval,
+                        verify_timeout_seconds=config.verify_timeout_seconds,
+                        runtime_mutation=runtime_mutation,
+                    ).exit_code
+                except refresh.RuntimePaused:
+                    return _local_recovery_waiting(effects, request)
 
 
 def _local_recovery_waiting(effects, request: local_recovery_state.LocalRecoveryRequest) -> int:

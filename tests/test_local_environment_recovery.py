@@ -256,6 +256,33 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             self.assertIn(request.request_id, call.args[0])
             self.assertIn('다음 run', call.args[0])
 
+    def test_paused_project_keeps_recovery_request_pending(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        run = mock.Mock()
+        repo = str(self.repository.resolve())
+        with mock.patch('loop_manager_internal.runtime.refresh.paused', return_value=True):
+            self.assertEqual(recover_local_environment(self.effects(run), self.arguments,
+                self.state_dir, self.config_path), 1)
+        run.assert_not_called()
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            request = local_recovery_state.pending_request(connection, repo)
+            self.assertIsNotNone(request)
+            self.assertFalse(connection.execute(
+                'SELECT 1 FROM local_environment_recheck_consumption WHERE request_id=?',
+                (request.request_id,)).fetchone())
+
+    def test_pause_during_recovery_keeps_same_request_pending(self):
+        from loop_manager_internal.runtime.refresh import RuntimePaused
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        repo = str(self.repository.resolve())
+        run = mock.Mock(side_effect=RuntimePaused)
+        self.assertEqual(recover_local_environment(self.effects(run), self.arguments,
+            self.state_dir, self.config_path), 1)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            request = local_recovery_state.pending_request(connection, repo)
+            self.assertIsNotNone(request)
+            self.assertEqual(request.request_id, run.call_args.kwargs['recovery_request_id'])
+
     def test_next_run_consumes_saved_plan_request_once(self):
         self.config_path.write_text('[loop]\nverify_timeout_seconds = 937\n', encoding='utf-8')
         args = self.add_recovery_plans('G-001')

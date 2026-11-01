@@ -132,6 +132,9 @@ def _reconcile_rebase_evidence_block(
     """Recheck the owned current rebase and release only its saved cause."""
     plan_id = str(block["plan_id"] or "")
     if recovery_request_id is not None:
+        from loop_manager_internal.runtime import refresh
+        if refresh.paused(state_dir, repo):
+            raise refresh.RuntimePaused()
         from loop_manager_internal.storage import local_recovery_state
         request = connection.execute(
             "SELECT repo, plan_id, status, before_state FROM local_environment_recovery_requests WHERE request_id=?",
@@ -254,6 +257,8 @@ def _reconcile_rebase_evidence_block(
         confirmed = observe()
         from loop_manager_internal.recovery.plan_recovery import recovery_admission
         with recovery_admission(connection, repo, plan_id):
+            if recovery_request_id is not None and refresh.paused(state_dir, repo):
+                raise refresh.RuntimePaused()
             runtime_state.RuntimeStateRepository(connection).resume_rebase_block(
                 plan, project, block, checkpoints, observation, expected_checkpoint=checkpoint,
                 is_plan_block=plan_block,

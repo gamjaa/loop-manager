@@ -1343,6 +1343,8 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 | 실행 결과 | 실행 전에는 결과가 없을 수 있다. `in_progress`는 pending, `resolved`·`unresolved`는 completed로 저장하며 전후 snapshot·소비·과거 결과를 감사로 보존한다. |
 | 제한 재검사 소비 | `local_environment_recheck_consumption`의 `(request_id, subject, cause)`별로 기록한다. 같은 pending 요청의 해당 대상·원인 재검사는 반복 소비하지 않는다. |
 
+요청 전 snapshot의 계획 항목은 정수 `checkpoint_generation`을 포함한다. metadata 재검사는 이 값과 해당 scope의 원인 코드·진단 및 해제 지문을 현재 block과 비교한다. generation이 없는 과거 요청이나 비교 불가한 근거는 기존 요청·진단을 보존하며 같은 원인의 재검사 허용으로 추정하지 않는다. metadata 차단의 선택적 checkpoint 관측은 block 사본·generation·Git snapshot과 원격 문서 입력 지문을 결합하며, 지문 부재는 원격 입력 변화의 증거가 아니다.
+
 요청 commit 뒤 managed config를 읽고 전역 process lock을 비차단 방식으로 얻는다. 선택한 계획의 실행 자리와 queue 순서가 허용할 때만 기존 복구 executor를 호출한다.
 
 | 접수·실행 결과 | 상태·재개와 명령 결과 |
