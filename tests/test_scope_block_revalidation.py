@@ -499,6 +499,7 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         effects = SimpleNamespace(
             _plan_id_from_path=lambda _: 'G-047', project_execplan=lambda *_: None,
             _worktree_execplan_input_fingerprint=lambda *_: 'a' * 64,
+            _revision_execplan_input_fingerprint=lambda *_: 'c' * 64,
             capture_git_snapshot=lambda *_: fresh,
             _final_block_recovery_decision=lambda *_: None,
         )
@@ -507,13 +508,14 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         checkpoint = self.checkpoints.get('repo', 'G-047')
         block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
         self.assertEqual(checkpoint.snapshot['metadata_block_git'], {
-            'generation': checkpoint.generation, 'block': block, 'snapshot': fresh.serialize()})
+            'generation': checkpoint.generation, 'block': block, 'snapshot': fresh.serialize(), 'remote_input': 'c' * 64})
         self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0], stale)
         self.case.observed = replace(self.case.observed, head='owned-head', branch='loop-manager/G-047',
             branch_ref=('owned-head', ''), registration=('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'),
             branch_worktrees=(str(Path('/state/G-047').resolve()),), operations=(), metadata=None,
             index=(), staged=(), index_clean=True, base_is_ancestor=False)
-        self.assertTrue(self.resume())
+        with mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='c' * 64):
+            self.assertTrue(self.resume())
 
     def test_project_metadata_recheck_consumes_only_matching_request(self):
         from loop_manager_internal.storage import local_recovery_state
@@ -647,9 +649,12 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
     def test_metadata_block_without_baseline_keeps_original_cause(self):
         self.block(reason='plan_input_invalid')
         self.pending()
+        normalize = mock.Mock(side_effect=AssertionError('unchanged block must not restore declarations'))
+        self.factory.side_effect = lambda *_args, **_kwargs: replace(self.case.factory(None), normalizer=normalize)
         before = self.snapshot()
         self.assertFalse(self.resume())
         self.assertEqual(self.snapshot(), before)
+        normalize.assert_not_called()
 
     def test_metadata_block_rejects_unrelated_head_and_incomparable_input(self):
         self.block(reason='plan_input_invalid')
@@ -662,6 +667,28 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
              mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='unavailable'):
             self.assertFalse(self.resume())
         self.assertEqual(self.snapshot(), before)
+
+    def test_metadata_rechecks_only_changed_remote_document_inputs(self):
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        before = loop_manager.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
+        block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'metadata_block_git': {
+                'generation': current.generation + 1, 'block': block,
+                'snapshot': before.serialize(), 'remote_input': 'a' * 64}})
+        self.connection.commit()
+        with mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='a' * 64) as inputs:
+            saved = self.snapshot()
+            self.assertFalse(self.resume())
+            self.assertEqual(self.snapshot(), saved)
+            inputs.return_value = 'b' * 64
+            self.case.expected = replace(self.case.expected, input_fingerprint='new-remote-input')
+            self.case.observed = replace(self.case.observed, input_fingerprint='new-remote-input')
+            self.assertTrue(self.resume())
 
     def test_metadata_start_without_saved_git_transition_remains_blocked(self):
         self.block(reason='plan_input_invalid')

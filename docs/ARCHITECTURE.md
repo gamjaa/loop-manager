@@ -1154,7 +1154,9 @@ rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업�
 
 차단 계획의 원본 base 반영에서는 workspace identity·원격 lease·index·작업물 보존을 확인한 뒤 고정 target의 rebase와 중간 게시를 완료한다. 더 최신 base를 반영해야 하면 저장 target을 먼저 끝내고 후속 base까지 반영한 뒤 현재 계획 행으로 catalog metadata 전체 일치를 검사한다. 최종 불일치는 원래 차단 원인 평가·해제와 후속 자료 게시로 넘기지 않는다.
 
-metadata 차단의 재평가 계기는 ExecPlan 등 원인 관련 입력 변경 또는 명시적인 차단 해제·재개 요청이다. 현재 소유권·원격·실행 자리·dependency와 checkpoint generation을 다시 확인하며, 자동 재평가에서 동일 원인과 `rebase_block_release_state`의 관측 fingerprint가 그대로면 반복 재개를 거부한다. 과거 `rebase_block_release_policy` 값은 기존 감사 자료로 보존하되 재개 판단에 사용하지 않고 새 기록에도 추가하지 않는다. 코드·검사 정책 변경이나 이 필드의 부재는 재개 계기가 아니다. 완료 후 선언·범위 검사는 유지하며 명시적 요청도 현재 안전 검사를 생략하지 않는다.
+metadata 차단의 자동 재평가는 차단 당시와 현재의 선택 worktree 또는 원격 base의 ExecPlan·source 입력 지문을 비교한다. 차단 당시의 별도 Git 관측이 같은 block과 checkpoint generation에 결합되어 있고 rebase 진행 상태가 현재 소유 원래 HEAD의 START로 돌아온 경우도 계기가 된다. 증거가 없거나 비교할 수 없으면 보존하며, 무관한 SHA·코드·검사 정책 변경과 과거 해제 기록이나 `rebase_block_release_policy`의 유무는 계기가 아니다. 입력 판단을 통과한 뒤 선언 복원과 현재 소유권·원격·실행 자리·dependency를 검사한다. 이전 release의 같은 WAITING 상태는 자동으로 반복하지 않는다.
+
+명시적 `recover`는 접수 snapshot의 대상·원인·checkpoint generation이 유지되는 metadata 차단을 현재 상태에서 다시 검사한다. 같은 요청의 대상·원인 소비와 차단 해제·checkpoint 전이를 한 transaction에서 확정하므로 중단 시 함께 보존된다. 새 요청은 재검사의 계기이며 소유권·writer 종료·원격·PR·dependency·pause·관리 자리나 독립 차단을 우회하지 않는다. 원래 target·작업물·세션·실패 이력과 이전 정책 감사는 보존하고 START/WAITING 해제를 완료나 검증 성공으로 기록하지 않는다. Git 완료 후 선언·범위 검사와 검증·게시 gate는 유지한다.
 
 rebase target은 바꾸지 않으며 원격 재전진은 기존 operation 완료 후 반영한다. 문서 전용 충돌은 Manager가 continue/skip하고 혼합 충돌의 나머지 파일과 autostash 충돌은 기존 Worker 교정 경계에 남긴다. 문서 Progress는 현재 후보의 실행·검증 성공 증거가 아니며 완료 후의 입력 재평가·verify·Review·게시 gate는 유지한다
 

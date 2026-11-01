@@ -137,6 +137,7 @@ def block_active_execplan(
     expected_plan = dict(plan)
     checkpoints = blocked_checkpoint = None
     blocked_git_snapshot = None
+    blocked_remote_input = None
     if reason is BlockReasonCode.PLAN_INPUT_INVALID:
         from loop_manager_internal.storage import execution_checkpoint_state
         checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
@@ -148,9 +149,22 @@ def block_active_execplan(
                 blocked_git_snapshot = observed.serialize()
         except (OSError, RuntimeError, ValueError):
             pass
+        if blocked_git_snapshot is not None and project['base_branch']:
+            try:
+                revision = f"refs/remotes/origin/{project['base_branch']}"
+                observed_input = effects._revision_execplan_input_fingerprint(Path(repo), revision, plan)
+                if (re.fullmatch(r'[0-9a-f]{64}', observed_input or '')
+                        and effects._revision_execplan_input_fingerprint(Path(repo), revision, plan) == observed_input):
+                    blocked_remote_input = observed_input
+            except (OSError, RuntimeError, ValueError, TypeError):
+                pass
     blocked_worktree_fingerprint = effects._worktree_execplan_input_fingerprint(
         worktree, plan
     )
+    if (blocked_git_snapshot is not None and effects._worktree_execplan_input_fingerprint(
+            worktree, plan) != blocked_worktree_fingerprint):
+        from loop_manager_internal.application.task_scheduling import TaskRecheckRequired
+        raise TaskRecheckRequired('차단 입력 관측 중 작업 문서가 변경됐습니다.')
     fingerprint = str(
         project["agent_input_fingerprint"] or blocked_worktree_fingerprint
     )
@@ -226,7 +240,8 @@ def block_active_execplan(
                     observed_remote_oid=current_checkpoint.observed_remote_oid,
                     snapshot={**(current_checkpoint.snapshot or {}), 'metadata_block_git': {
                         'generation': current_checkpoint.generation + 1,
-                        'block': dict(block), 'snapshot': blocked_git_snapshot}},
+                        'block': dict(block), 'snapshot': blocked_git_snapshot,
+                        'remote_input': blocked_remote_input}},
                 )
         else:
             runtime_state.RuntimeStateRepository(connection).transition(

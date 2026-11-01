@@ -453,11 +453,15 @@ def execute_local_recovery_request(
     # Freeze this request's candidates before execution changes the active
     # projection. A failed first check must not starve independent plans.
     targets = [plan_id]
+    target_causes = {}
     if plan_id is None:
-        targets.extend(str(row[0]) for row in connection.execute(
-            "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
+        candidates = connection.execute(
+            "SELECT plan_id, blocked_reason FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
             "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted', 'plan_input_invalid') "
-            "ORDER BY plan_id", (repository,)))
+            "ORDER BY plan_id", (repository,)).fetchall()
+        targets.extend(str(row[0]) for row in candidates)
+        target_causes = {str(row[0]): ('metadata' if row[1] == 'plan_input_invalid' else 'verify')
+                         for row in candidates}
         # Once bounded verify checks have released the execution slot,
         # revisit the project coordinator for its independent planning cause.
         if len(targets) > 1 and project["planning_error"]:
@@ -474,11 +478,7 @@ def execute_local_recovery_request(
             )):
                 continue
         if plan_id is None and target is not None:
-            reason = connection.execute(
-                "SELECT blocked_reason FROM exec_plans WHERE repo=? AND plan_id=?", (repository, target),
-            ).fetchone()
-            cause = "metadata" if reason and reason[0] == "plan_input_invalid" else "verify"
-            if local_recovery_state.recheck_consumed(connection, request.request_id, target, cause):
+            if local_recovery_state.recheck_consumed(connection, request.request_id, target, target_causes[target]):
                 continue
         with events.log_context(project=repository, plan=target, stage="RECOVERY"):
             with events.activity(

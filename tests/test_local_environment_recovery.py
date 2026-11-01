@@ -562,6 +562,23 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         self.assertEqual(recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
         self.assertEqual(targets, [None, 'G-001'])
 
+    def test_project_request_does_not_dispatch_consumed_metadata_again(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha, blocked_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (repo, 'G-001', 'docs/plans/G-001.md', 'one', '[]', '[]', 'normal', 'hash', 'PLAN_BLOCKED', 'base', 'plan_input_invalid'))
+        targets = []
+        def run(connection, *_args, **kwargs):
+            targets.append(kwargs['recovery_plan_id'])
+            with connection:
+                local_recovery_state.consume_recheck(connection, kwargs['recovery_request_id'], 'G-001', 'metadata', repo=repo)
+                connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', blocked_reason=NULL WHERE repo=? AND plan_id='G-001'", (repo,))
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        self.assertEqual(recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
+        self.assertEqual(targets, [None])
+
     def test_project_reentry_does_not_dispatch_retained_paused_execution(self):
         from loop_manager_internal.storage import local_recovery_state
         self.config_path.write_text("[loop]\n", encoding="utf-8")
@@ -730,6 +747,30 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         pr_sync.assert_not_called()
         self.assertEqual(effects.resume_plan_blocks.call_args.kwargs,
                          {"plan_id": "G-047", "force_timeout_recheck": True, "recovery_request_id": "request"})
+
+    def test_project_metadata_block_passes_explicit_request_to_owned_recheck(self):
+        from contextlib import contextmanager
+        repo = str(self.repository.resolve())
+        connection = runtime_connection(repo)
+        self.addCleanup(connection.close)
+        with connection:
+            connection.execute("UPDATE projects SET phase='PROJECT_BLOCKED' WHERE repo=?", (repo,))
+            connection.execute("INSERT INTO project_blocks(repo,scope,reason_code,plan_id,evidence,previous_phase) "
+                "VALUES (?,'project','plan_input_invalid','G-047','original','WORKING')", (repo,))
+        identity = ProjectIdentity(connection=connection, state_dir=self.state_dir, repo_arg=repo,
+            config_path=self.config_path, requested_base=None, allow_agents_mismatch=False,
+            requested_provider='codex', registered_only=True, planner_mutex=None,
+            refactoring_review_interval=20, verify_timeout_seconds=600, runtime_mutation=None,
+            recovery_request_id='request', recovery_plan_id='G-047')
+        effects = SimpleNamespace(_check_runtime_handoff=mock.Mock(), _self_runtime_project=mock.Mock(return_value=None),
+            observe_blocked_plan_remotes=mock.Mock(), _ensure_cleanup_pending_schema=mock.Mock(),
+            resume_project_block_if_safe=mock.Mock(return_value=True), operation_print=mock.Mock())
+        @contextmanager
+        def admission(*_args, **_kwargs):
+            yield True
+        with mock.patch('loop_manager_internal.recovery.plan_recovery.recovering_plan', admission):
+            self.assertEqual(ProjectService(effects, identity)._prepare_repository(), 0)
+        self.assertEqual(effects.resume_project_block_if_safe.call_args.kwargs, {'recovery_request_id': 'request'})
 
     def test_recovery_does_not_loop_for_independent_ready_work(self):
         connection = runtime_connection()

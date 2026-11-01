@@ -184,34 +184,50 @@ def _reconcile_rebase_evidence_block(
     try:
         service = effects._current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch)
+        def metadata_trigger(observation=None):
+            saved_input = plan['blocked_worktree_fingerprint']
+            current_input = (effects._worktree_execplan_input_fingerprint(worktree, plan)
+                             if isinstance(saved_input, str)
+                             and re.fullmatch(r'[0-9a-f]{64}', saved_input)
+                             and worktree.is_dir() else None)
+            if (isinstance(current_input, str) and re.fullmatch(r'[0-9a-f]{64}', current_input)
+                    and current_input != saved_input):
+                return True
+            saved_git = (checkpoint.snapshot or {}).get('metadata_block_git')
+            if (not isinstance(saved_git, dict) or saved_git.get('generation') != checkpoint.generation
+                    or saved_git.get('block') != dict(block) or not saved_git.get('snapshot')):
+                return False
+            saved_remote = saved_git.get('remote_input')
+            if isinstance(saved_remote, str) and re.fullmatch(r'[0-9a-f]{64}', saved_remote):
+                try:
+                    remote_input = effects._revision_execplan_input_fingerprint(
+                        repo_path, f"refs/remotes/origin/{project['base_branch']}", plan)
+                except (OSError, RuntimeError, ValueError):
+                    remote_input = None
+                if (isinstance(remote_input, str) and re.fullmatch(r'[0-9a-f]{64}', remote_input)
+                        and remote_input != saved_remote):
+                    return True
+            try:
+                before = GitSnapshot.deserialize(str(saved_git['snapshot']))
+                if not ({'rebase-merge', 'rebase-apply'} & set(before.operations)):
+                    return False
+            except (KeyError, TypeError, ValueError, RuntimeError):
+                return False
+            if observation is None:
+                observation = service.require_owned(checkpoint=checkpoints.get(repo, plan_id))
+            return observation[1].status is managed_rebase_validation.RebaseStatus.START
+        automatic_metadata = (block['reason_code'] == scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value
+                              and recovery_request_id is None)
+        if automatic_metadata and not metadata_trigger():
+            return False
         if service.normalize_frontmatter():
             checkpoint = checkpoints.get(repo, plan_id)
             service = effects._current_rebase_service(
                 connection, repo_path, state_dir, repo, plan_id, worktree, branch)
         def observe():
             observation = service.require_owned(checkpoint=checkpoints.get(repo, plan_id))
-            if (block['reason_code'] == scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value
-                    and recovery_request_id is None):
-                saved_input = plan['blocked_worktree_fingerprint']
-                current_input = (effects._worktree_execplan_input_fingerprint(worktree, plan)
-                                 if isinstance(saved_input, str)
-                                 and re.fullmatch(r'[0-9a-f]{64}', saved_input)
-                                 and worktree.is_dir() else None)
-                changed_input = bool(isinstance(current_input, str)
-                    and re.fullmatch(r'[0-9a-f]{64}', current_input)
-                    and current_input != saved_input)
-                changed_to_start = False
-                saved_git = (checkpoint.snapshot or {}).get('metadata_block_git')
-                if (not changed_input and observation[1].status is managed_rebase_validation.RebaseStatus.START
-                        and isinstance(saved_git, dict) and saved_git.get('generation') == checkpoint.generation
-                        and saved_git.get('block') == dict(block) and saved_git.get('snapshot')):
-                    try:
-                        before = GitSnapshot.deserialize(str(saved_git['snapshot']))
-                        changed_to_start = bool({'rebase-merge', 'rebase-apply'} & set(before.operations))
-                    except (KeyError, TypeError, ValueError, RuntimeError):
-                        pass
-                if not (changed_input or changed_to_start):
-                    raise RuntimeError('metadata block has no comparable changed input or Git transition')
+            if automatic_metadata and not metadata_trigger(observation):
+                raise RuntimeError('metadata block has no comparable changed input or Git transition')
             if (block['reason_code'] == scoped_blocking.BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
                     and observation[1].status is managed_rebase_validation.RebaseStatus.START):
                 raise RuntimeError('managed worktree conflict has not reached a rebase-owned state')
