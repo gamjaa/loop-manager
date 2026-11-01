@@ -12,6 +12,7 @@ sources:
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
   - docs/requirements/[R-093] 원격 작업 브랜치로 새 환경에서 이어하기.md
   - docs/requirements/[R-061] Agent 역할·문서 권한과 draft ExecPlan 사용자 판단.md
+  - docs/requirements/[R-094] MERGED ExecPlan archive의 독립 실행과 자동 재시도.md
 depends_on: []
 complexity: high
 risk: high
@@ -34,6 +35,7 @@ priority: high
 - 전체 pause의 run은 bootstrap/runtime·원격·Agent·verify·알림 전에 안내·코드 0으로 종료한다. 프로젝트 pause는 해당 대상을 제외하며 명시 repo로 우회하지 않는다. 수락된 수동 제출·복구·유지보수의 자동 후속 처리도 pause를 준수한다.
 - 전체/프로젝트 pause는 독립 저장하고 resume [repo]는 해당 범위만 해제한다. 기존 사용자 결정·차단·usage 제한·dependency·PR 대기는 유지하고 resume 자체는 작업을 시작하지 않는다. 프로젝트 차단의 정확한 활성 소유자가 기존 관리 자리에서 복구·중간 게시할 수 있어도 자동 후속 처리에는 같은 pause를 적용한다. pause는 소유자의 단계·원인·예약을 바꾸거나 계획 차단 해제의 대상 상태를 확대하지 않는다.
 - pause 중 조회·설정·제어·기존 수동 준비와 요청 접수는 가능하다. 정상 무변경/완료 0, 안전 거부·종료 미확인 1, 인자 오류 2이며 요청 저장과 실제 중단을 구분한다.
+- R-094의 PR 후속·연속 배정 중 archive도 자동 효과이므로 같은 사용자 pause를 적용한다. archive가 관리 자리를 소비하지 않는다는 이유로 pause를 우회하지 않는다. 준비 commit·정확한 게시 intent·실제 원격 결과·catalog/DB 확정과 관측을 보존하며, archive 대기만으로 MERGED·dependency·유지보수 종료·독립 작업의 상태를 바꾸지 않는다. resume 명령은 archive나 Requirement 교정을 실행하지 않고 다음 자동 경계만 현재 자원·게시 결과를 다시 확인한다.
 - R-082의 일반 planning 전환 중에도 pause는 실제 Planner·verify·Agent와 자식만 대상으로 종료를 확인한다. `planning_resume_plan_id`로 보존한 원래 작업, 별도 planning worktree·결과·게시 intent·오류와 실행/실패 이력을 유지한다. 보존한 rebase의 HEAD·index·작업물·원래 target·checkpoint도 유지하며 Git 표식만으로 실행 중 자식이 있다고 판단하거나 임의 continue/abort하지 않는다. `plan_input_invalid`가 안전한 START 관측으로 이미 해제됐어도 미시작 rebase intent와 기존 단계만 보존하며, START를 완료·게시 소유 근거로 바꾸지 않는다. 사용자 resume는 pause만 해제하고 planning 성공·영향 확정·rebase 완료·원래 작업 재개를 합성하지 않는다. 다음 실행의 planning 게시·DB 적용과 같은 작업 재개는 기존 R-082 gate를 따른다.
 - R-091의 프로젝트 planning 배정 중단과 R-076의 사용자 pause를 구별한다. 프로젝트 준비·planning이 작업 배정 중단 중 Git 자원을 사용할 수 있어도 사용자 pause·runtime handoff·실제 자원 잠금은 계속 적용한다. Git 자원 대기·관측 중 또는 자동 해제의 상태 확정 전에 pause를 접수하면 추가 효과 없이 보존 경계로 반환한다. 이번 관측 lease는 반환하되 원인 작업의 intent·checkpoint·차단과 다른 프로젝트의 자원·작업은 유지한다. pause 중 허용된 수동 준비·요청 접수와 자동 후속 처리의 중단을 구분한다.
 - R-055/PRODUCT의 targeted 기록 수명도 pause·resume에서 보존한다. 호출별 JSONL·디렉터리 identity·process receipt·미소비 결합은 종료/수집·저장이 불확실해도 남긴다. 저장된 VERIFYING의 초기 gate와 verify slot 배정 뒤 재확인 사이에서도 사용자 pause는 새 검증을 막고 Worker 결과·session·후보·미소비 자료를 보존한다. 배정 후 preflight에서 시작을 보류한 검증은 기존 미시작 호출 자리만 반환하고 새 검증 실행·실패·성공 receipt를 만들지 않는다. 이미 시작했거나 종료 불명인 검증에는 기존 종료 확인을 적용한다. resume 자체는 기록을 소비하거나 도달 표식·실패 이력을 초기화하지 않는다. 다음 자동 실행은 기존 호출 재수집을 거치며 후속 성공은 실패 횟수·도달 표식을 초기화하며, 해소되지 않은 연속 다섯 번째 실패와 수집 대기는 해당 작업의 기존 차단/대기 경계로 이어진다. 다른 작업의 자료와 살아 있는 수동 writer는 변경하지 않는다.
@@ -55,6 +57,7 @@ priority: high
 - [ ] 확인한 `verification/integration.py:TrustedRunnerPort.run()`의 `on_stopped`·최종 하위 종료 응답, `coordination.py:retained()`·`_checked_finish()`와 `manager_adapter.py`의 소유 하위 예약 보존을 pause의 기존 종료/저장 소비에 연결한다. `execution/verify_process.py`의 출력 보존·확인된 종료 기억과 `ExecutionClock`의 예산 오류 보존은 그대로 사용한다. 현재 `agents/agent_codex_sandbox.py:CodexLaunch.start()/stop()`의 Linux subreaper·동시 stop 직렬화·종료 실패 보존을 사용하고 supervisor/PID를 provider 종료로 대용하지 않는다. 프로세스 엔진·가드/인증 예외를 새로 만들지 않으며 필요한 설계 설명만 현재 pause 보존 경계에 맞춘다.
 
 - [ ] 확인한 `loop_manager.py`의 bootstrap 전 진입·`loop_manager_internal/application/commands.py`·`scheduler.py`의 등록된 선택 범위와 `application/project_service.py`의 실행 dispatch 경계에 pause 확인을 연결한다. 이미 반영된 `add/remove`와 다중 repo 정규화·미등록 사전 거부는 재사용하고 전체 pause가 이 준비보다 먼저 종료되는 조건을 유지한다.
+- [ ] 현재 `project_service.py:_archive_scheduling_boundary()`·`_archive_housekeeping()`과 `task_scheduling.py:run_project_tasks()`의 archive 기회에 기존 pause scope를 연결한다. `catalog/archive_service.py:ArchiveExecutionResources.safe()`의 `_check_runtime_handoff()`·열린 lease·후보 writer 검사와 `execplan_archive.py`의 준비/게시 직전 재검사는 직접 구현으로 소비한다. 사용자 pause 제어 신호를 일반 archive 실패로 삼키거나 pause 이후 새 교정·원격 효과를 시작하지 않게 하며, 이미 게시한 결과의 미확정 DB 반영·정리만 기존 복구로 이어간다. 관리 인계의 parked 표식이나 archive 재시도 token을 물리 종료·pause 해제로 해석하지 않는다.
 - [ ] `loop_manager_internal/storage/runtime_state.py`의 planning 전환/재개와 `planning/selection_service.py`의 오류 보존을 읽는 제어 경계에서 실제 실행 대상과 보존 작업을 구별한다. pause/resume를 프로젝트 planning의 투영 비우기/재투영과 혼동하거나 같은 작업의 재개 identity를 초기화하지 않는다. 최신 base의 `planning/git_ports.py:execution_blocks_planning()`은 보존한 rebase와 다른 Git operation을 이미 구별한다. 이 정상 전환과 `execution/execution_state.py:recover_rebase_checkpoint()`의 소유권 복구를 재구현하지 않고 사용자 pause 전후에 원래 target·index·checkpoint가 보존되도록 연결한다. `planning/publication_service.py:_complete_publication_release()`·`planning/state_ports.py`의 `pending_publication_release()`/`complete_publication_release()`와 `storage/planning_publication_state.py:retain_planning_after_publication()`의 적용·정리·해제를 그대로 소비한다. 외부 관측/제거를 DB 요청 안으로 옮기지 않고 pause를 각 효과 진입에 연결하며, resume 명령은 정리·CAS·원래 작업 재개를 실행하지 않는다. 다음 자동 실행만 실제 게시/제거 근거와 현재 release identity를 재확인해 남은 단계를 이어간다. R-082의 실패 planning suspend·독립 선택은 G-278에 남긴다.
 - [ ] 확인한 `runtime/resource_lock.py:resource_locks()`의 대기/획득 뒤 `_check_runtime_handoff()`와 보존 후보의 `runtime/handoff_gate.py`·`runtime/pause.py`를 통합한다. 최신 `git/manager_git_journal.py:has_conflicting_project_mutation()`의 `pending-git-scope` lease 취득·관측에도 같은 자동 실행 scope를 적용한다. `current_task`가 없는 프로젝트 준비·planning의 Git 접근 허용과 사용자 pause 검사를 함께 유지한다. `application/manual_concurrency.py:manual_preparation()`·`manual_git_protection()`과 `recovery/manual_work_recovery.py:release_wait()`의 호출자 `ExitStack`·상태 확정 전 identity/열린 lease 검사는 그대로 소비한다. pause 반환·예외에서 이번 관측이 취득한 lease를 반환하고 원인 rebase의 intent·checkpoint·차단은 보존한다. 공통 helper에 무조건적인 pause 거부를 넣어 기존 수동 준비·요청 접수까지 막지 않으며, 자동 후속 처리에만 대상 pause를 적용한다. task의 `PlanningDrain`과 runtime 전체 handoff도 보존하며 같은 scope·프로세스 종료 근거를 재사용한다.
 - [ ] 확인한 `recovery/project_blocked_recovery.py:project_slot_available()`·`plan_recovery.py:target_available()`·`blocked_plan_reconciliation.py:slot_available()`의 프로젝트 복구와 일반 계획 차단 해제 구분을 그대로 소비해 자동 복구/중간 게시의 효과 진입·반환에 사용자 pause를 연결한다. 활성 소유자의 기존 관리 자리를 새로 만들거나 해당 상태를 `PLAN_BLOCKED`로 바꾸지 않는다. 다른 투영·자원·미종료 호출과 대상 행 부재의 기존 거부를 유지하고, resume 명령 자체에서는 복구·게시·차단 해제를 실행하지 않는다. `execution/execution_state.py:DirectRebasePublicationStatePort`의 투영 없는 활성 소유자 선택·게시 중 자격 재확인도 직접 구현으로 소비한다. pause 전후 차단 해제·소유자 변경·다른 투영이 생기면 기존 선택을 계속 사용하거나 투영을 덮어쓰지 않고 현재 gate로 돌아간다. 공통 admission·StatePort 교정은 현재 원격 구현이며 이 작업이 재구현할 범위가 아니다.
@@ -66,6 +69,7 @@ priority: high
 
 ## Validation
 
+- 후보의 pause/실제 SQLite fixture에 `tests/test_archive_housekeeping_adapter.py`·`tests/test_task_scheduling.py`의 archive 자원/연속 배정 관측 double을 연결한다. 진입 전·lease 획득 뒤·준비 commit 보존 뒤의 pause에는 새 fetch/commit/push가 없고 이번 lease만 반환돼야 한다. 게시 후 DB 미확정 pause는 저장 intent·준비 commit·원격 결과를 보존하고, resume 자체의 효과는 0회이며 다음 자동 실행만 이미 게시된 이동을 중복 commit/push 없이 확정해야 한다. 실제 게시 후 복구 효과는 기존 `tests/test_pr_source_synchronization.py:test_archive_push_then_db_interruption_recovers_without_recommit_or_push`를 재사용하며 전체 Git 시나리오를 pause 조합마다 반복하지 않는다. Requirement 교정의 별도 gate·실제 오류 전파와 다른 작업/후보·MERGED·완료 기준은 유지한다.
 - 보존 후보의 기존 pause SQLite/종료 fixture에 관리 인계 대기 중 pause, pause 중 유효 다중 해제/수동 제출 수락, resume 후 다음 자동 실행만의 인계를 최소 연결한다. 수락 순서·parked/단계/checkpoint·해제 감사·종료 불명 예약 보존, pause 범위 밖 독립 작업 불변과 resume의 배정/게시 effect 0회를 확인한다.
 
 - 후보의 `tests/test_pause.py`에 있는 실제 SQLite·단계/session 보존 fixture와 `tests/test_execution_documents.py`의 Manager 결합 회귀를 재사용한다. 작업 base 조회·결합 저장 전/후 pause에서 원문·후보·확인한 base·기존 근거가 보존되고 resume의 staging·Git/base 조회·결합 저장·Worker 호출이 0회인지 최소 unit으로 확인한다. 원격 base만 전진했거나 rebase가 중단된 상태도 pause로 최종 설명이 확정되지 않아야 한다. 다음 자동 실행에서만 올바른 base와 같은 patch의 근거를 재사용하고 base 확인 실패는 보존 복구, 설명 결합 부재/실제 patch 변경은 현재 설명 교정으로 구분한다. 기존 해시 호환성·rebase 동일 patch 행렬은 복제하지 않는다.
@@ -87,6 +91,7 @@ priority: high
 
 ## Progress
 
+- [ ] 연속 배정 archive의 pause 진입·게시/확정 중단 보존과 최소 연결 회귀
 - [ ] 최신 명시 요청 수락·관리 보존 대기/안전 인계의 pause 보존 연결·최소 회귀
 
 - [ ] 현재 관리 Claude의 준비·spawn·process group/receipt와 pause의 보존 연결·최소 회귀
@@ -109,6 +114,7 @@ priority: high
 
 ## Decision Log
 
+- revision `bc70b7392453c95fc13b39c498c7866ed6733074`의 archive 실행 기회·비대기 lease·게시/DB 분리는 직접 구현으로 소비한다. R-094는 새 자동 효과에 기존 사용자 pause를 적용하고 MERGED·독립 진행을 보존하는 조건으로만 추가한다. archive 엔진이나 별도 정지 정책을 구현하지 않는다. snapshot token `6fd1ab5481b11cccc0c2bb5b704bcc39df85e22a34c6a334652c339a25e20626`의 원문 hash를 대조했고 started ID·경로·기존 분류·무dependency·구현/검증 기록을 보존한다. 새 연결은 미충족이며 후보 수정·차단 해제·실행 검증 성공을 뜻하지 않는다.
 - 최신 R-076/R-077/R-091의 포화 수락/관리 인계는 원격의 직접 구현을 소비하고 남은 pause 연결만 추가한다. started ID·경로·무dependency·기존 구현/검증 기록을 보존하며 G-345를 이 작업의 선행으로 만들지 않는다. 사용자 pause·runtime drain·관리 인계의 각 권한/종료 조건과 기존 임계값 판단 대기를 구별한다.
 
 - 현재 통합 runner의 하위 종료 응답·예약 트리·예산 오류 보존과 Linux Codex supervisor는 원격의 직접 구현으로 소비한다. R-067은 이 작업의 verify 중단·종료 자료 보존에 실질적으로 적용돼 source로 연결하며 새 검증 엔진이나 stop 구현은 만들지 않는다. 남은 작업은 기존 pause 요청/완료 전이에 현재 종료 근거를 소비시키는 것이다. snapshot token `45bca81e68a942e7da99615278950c6c529c9c22a7eb905d863db25ae77fedca`의 원문 hash를 확인했고 started ID·경로·기존 수행 기록·분류·무dependency를 보존한다. 보존 후보나 실행 이력을 변경하거나 새 검증 성공·차단 해제를 확정하지 않는다.
