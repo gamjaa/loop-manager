@@ -1,6 +1,8 @@
 """Persisted and blocked scope evidence reconciliation before Git recovery."""
 from __future__ import annotations
 
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 import hashlib
@@ -268,7 +270,7 @@ def _remote_adoption_agent_baseline(
             registration = current.worktrees.get(str(_canonical_path(worktree)), ())
             if (current.branch != pending['branch'] or current.refs.get(own_ref) != (current.head, '')
                     or f'branch={own_ref}' not in registration
-                    or current.operations or current.dirty
+                    or controlling_git_operation(current.operations) or current.dirty
                     or any(_non_default_index_flags(entries) for entries in current.index.values())
                     or effects.git(worktree, 'diff', '--cached', '--quiet', check=False).returncode != 0):
                 raise AgentScopeError('미완료 원격 채택의 HEAD·index·작업 범위가 다릅니다.')

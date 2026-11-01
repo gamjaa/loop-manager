@@ -69,6 +69,20 @@ class CheckpointScopeTests(TestCase):
     def plan(self):
         return self.connection.execute('SELECT * FROM exec_plans').fetchone()
 
+    def test_adapter_accepts_auxiliary_markers_but_keeps_operations_and_unmerged_index_blocked(self):
+        auxiliary = {'REBASE_HEAD': 'retained', 'MERGE_MSG': 'retained'}
+        self.current = replace(self.before, operations=auxiliary)
+        self.effects = replace(self.effects, validate_execplan_workspace_identity=lambda *a, **kw: None,
+            validate_managed_worktree=lambda *a, **kw: None, capture_git_snapshot=lambda *a: self.current,
+            _rebase_in_progress_for_branch=lambda *a: False)
+        with mock.patch.object(self.adapter, '_shared_safety_error', return_value=None):
+            self.assertTrue(self.adapter.assess(self.request).safe)
+            for marker in ('rebase-merge', 'MERGE_HEAD', 'unknown-operation'):
+                self.current = replace(self.before, operations={**auxiliary, marker: 'active'})
+                self.assertFalse(self.adapter.assess(self.request).safe)
+            self.current = replace(self.before, operations=auxiliary, index={'app.py': ('M 100644 blob 1',)})
+            self.assertFalse(self.adapter.assess(self.request).safe)
+
     def test_stale_checkpoint_cause_refresh_cancel_and_competing_request(self):
         original = self.request
         self.connection.execute("UPDATE execplan_blocks SET reason_code='worker_failed', evidence='new cause'")

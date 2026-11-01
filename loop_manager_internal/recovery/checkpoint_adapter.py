@@ -1,5 +1,7 @@
 """Checkpoint safety, Git publication and durable result adapters."""
 from __future__ import annotations
+
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
 from collections.abc import Callable
@@ -276,7 +278,7 @@ class CheckpointSafetyAdapter:
             snapshot is not None
             and identity_matches
             and not project_blocked
-            and snapshot.operations
+            and controlling_git_operation(snapshot.operations)
         ):
             operations = tuple(sorted(snapshot.operations))
             return blocked_checkpoint.SafetyVerdict(

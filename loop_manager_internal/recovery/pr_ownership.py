@@ -156,7 +156,7 @@ def _validate_pr_conflict_recovery_ownership(
     )
     if (
         snapshot.branch != branch or effects.git(worktree, 'merge-base', '--is-ancestor', head_oid, snapshot.head, check=False).returncode != 0
-        or publishable_dirty or flagged_paths or snapshot.operations
+        or publishable_dirty or flagged_paths or controlling_git_operation(snapshot.operations)
     ):
         details = []
         if snapshot.branch != branch:
@@ -241,7 +241,7 @@ def _validate_blocked_pr_without_conflict(
                 f"HEAD {snapshot.head} (expected {head_oid})" if snapshot.head != head_oid else "",
                 "게시 가능 변경 " + ", ".join(dirty[:8]) if dirty else "",
                 "index flags " + ", ".join(flags[:8]) if flags else "",
-                "Git operation " + ", ".join(sorted(snapshot.operations)) if snapshot.operations else "",
+                "Git operation " + ", ".join(sorted(snapshot.operations)) if controlling_git_operation(snapshot.operations) else "",
             )))
         )
     remote = effects.git(

@@ -173,7 +173,7 @@ def _restore_checkpoint_workspace(effects, connection, repo_path, state_dir, rep
             effects.validate_managed_worktree(repo_path, worktree, branch)
             checked = effects.capture_git_snapshot(worktree)
             if (checked.head != checkpoint.expected_head or checked.branch != branch
-                    or checked.operations or any(agent_scope_decision.index_security_flags(entries)
+                    or controlling_git_operation(checked.operations) or any(agent_scope_decision.index_security_flags(entries)
                                                  for entries in checked.index.values())):
                 return False
             confirmed = effects.capture_git_snapshot(worktree)
