@@ -78,8 +78,12 @@ class Task:
             'WHERE repo=? AND plan_id=? AND priority>0', (self.repo,self.plan_id)).fetchone()
         if manual is None and admission is not None:
             return (.5, admission[0], ())
-        if manual is None and self.retry_order is not None:
-            return (1, self.retry_order, ())
+        saved = self.connection.execute('SELECT retry_order,resumed FROM task_management_admissions '
+            'WHERE repo=? AND plan_id=?', (self.repo,self.plan_id)).fetchone()
+        retry_order = saved['retry_order'] if saved is not None else self.retry_order
+        resumed = saved['resumed'] if saved is not None and saved['resumed'] is not None else self.resumed
+        if manual is None and retry_order is not None:
+            return (1, retry_order, ())
         if priority_reader is not None:
             ranks=dict(priority_reader(self.connection,self.repo).priority_ranks)
             priority=ranks.get(self.plan_id,(4,int(self.plan_id[2:])))
@@ -87,7 +91,7 @@ class Task:
             rows = self.connection.execute("SELECT * FROM exec_plans WHERE repo=?", (self.repo,)).fetchall()
             value = effective_priorities(rows).get(self.plan_id)
             priority=value.sort_key(self.plan_id) if value else (4,int(self.plan_id[2:]))
-        return (0 if manual is not None else 2 if self.resumed else 3, manual or "",priority)
+        return (0 if manual is not None else 2 if resumed else 3, manual or "",priority)
 
 
 class TaskScheduler:
@@ -100,8 +104,6 @@ class TaskScheduler:
         self.running = {"agent": Counter(), "verify": Counter(), "management": Counter()}
         self.admitting = False
         self.draining_projects = set()
-        self.retry_sequence = 0
-        self.tasks = {}
         self.limits = {"agent": config.max_workers, "verify": config.verify_concurrency}
         self.uncertain=Counter()
         self.retained={}
@@ -131,9 +133,14 @@ class TaskScheduler:
                 raise PlanningDrain()
 
     def requeue(self, task):
+        with runtime_state._transaction(task.connection):
+            sequence = task.connection.execute(
+                'SELECT COALESCE(MAX(retry_order),0)+1 FROM task_management_admissions').fetchone()[0]
+            task.connection.execute('INSERT INTO task_management_admissions(repo,plan_id,parked,retry_order,resumed) '
+                'VALUES (?,?,0,?,1) ON CONFLICT(repo,plan_id) DO UPDATE SET retry_order=excluded.retry_order,resumed=1',
+                (task.repo,task.plan_id,sequence))
         with self.condition:
-            self.retry_sequence += 1
-            task.retry_order = self.retry_sequence
+            task.retry_order = sequence
             task.resumed = True
             self.condition.notify_all()
         events.emit("작업 RETRY 우선 재배정", project=task.repo, plan=task.plan_id)
@@ -509,6 +516,8 @@ class TaskScheduler:
                 task.connection.execute(
                     "INSERT INTO task_scheduling_cursor VALUES (?,?) "
                     "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (kind, task.repo))
+                task.connection.execute('UPDATE task_management_admissions SET retry_order=NULL,resumed=1 '
+                    'WHERE repo=? AND plan_id=?', (task.repo,task.plan_id))
             with self.condition:
                 self.cursor[kind] = task.repo
             events.emit("작업 호출 배정", kind=kind, project=task.repo, plan=task.plan_id,
@@ -558,18 +567,20 @@ class TaskScheduler:
 
     @contextmanager
     def task(self, repo, plan_id, connection, *, resumed=True):
-        task = Task(repo, plan_id, connection, resumed)
+        with runtime_state._transaction(connection):
+            connection.execute('INSERT INTO task_management_admissions(repo,plan_id,parked,resumed) VALUES (?,?,0,?) '
+                'ON CONFLICT(repo,plan_id) DO UPDATE SET resumed=COALESCE(resumed,excluded.resumed)',
+                (repo,plan_id,int(resumed)))
+        saved = connection.execute('SELECT retry_order,resumed FROM task_management_admissions WHERE repo=? AND plan_id=?',
+            (repo,plan_id)).fetchone()
+        task = Task(repo, plan_id, connection, bool(saved['resumed']), saved['retry_order'])
         token = current_task.set(task)
-        with self.condition:
-            self.tasks[(repo,plan_id)] = task
         try:
             from loop_manager_internal.runtime.resource_lock import resource_locks
             with resource_locks(self.state_dir, repo, ['plan:' + plan_id], owner='task-execution'), \
                  runtime_state.selected_execution(repo, plan_id):
                 yield
         finally:
-            with self.condition:
-                self.tasks.pop((repo,plan_id), None)
             current_task.reset(token)
 
 
@@ -804,7 +815,8 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                         owned, scheduler.config.telegram_token, scheduler.config.telegram_chat_id, repo):
                     if setup_database_attempts[plan_id] or setup_exception_attempts[plan_id] or plan_id in readmitted:
                         readmitted.discard(plan_id)
-                        scheduler.requeue(current_task.get())
+                        if current_task.get().retry_order is None:
+                            scheduler.requeue(current_task.get())
                         resumed = True
                     attempts = {}
                     pending_result = []
@@ -996,9 +1008,7 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
             from loop_manager_internal.storage import management_admission
             _, management_limit, _ = project_registry.task_limit(connection,repo,scheduler.config.max_tasks_per_project)
             was_parked = {r[0] for r in connection.execute('SELECT plan_id FROM task_management_admissions WHERE repo=? AND parked=1',(repo,))}
-            with scheduler.condition:
-                retry_orders = {pid: task.retry_order for (task_repo,pid), task in scheduler.tasks.items() if task_repo==repo}
-            management_admission.reconcile(connection,repo,management_limit,busy=running,retry_orders=retry_orders,
+            management_admission.reconcile(connection,repo,management_limit,busy=running,
                 eligible=lambda pid: scheduler._eligible(Task(repo,pid,connection),connection,check_management=False))
             for pid in was_parked:
                 if pid not in running and not management_admission.parked(connection,repo,pid):

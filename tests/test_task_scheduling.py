@@ -90,6 +90,182 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertFalse(admission.parked(self.connection,'A','G-002'))
         self.assertEqual(scheduling.managed_count(self.connection,'A'),2)
 
+    def test_handoff_restores_retry_order_after_task_return_and_database_reconnect(self):
+        from loop_manager_internal.storage import management_admission as admission, task_calls
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE repo='A'")
+        for pid in ('G-004', 'G-005', 'G-006', 'G-007'):
+            self._insert_plan(self.connection, pid, 'REVIEWING', repo='A')
+        # A shared manual candidate is one management unit and keeps its current correction phase.
+        store = ManualWorkRepository(self.connection)
+        group = store.create('A', 'submit', 'manual', [], 'head', 'base', members=('G-004','G-005'))
+        store.accept(group,head='head',base='base',input_token='input')
+        store.update(group, state='AUTOMATIC', owner_id='G-004')
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,refactoring_plan_ids,publication_stage) "
+            "VALUES ('A','refactoring','[\"G-001\",\"G-002\",\"G-006\"]','remote_confirmed')")
+        self.connection.execute("UPDATE exec_plans SET worker_session_id='preserved' WHERE repo='A'")
+        self.connection.execute("INSERT INTO execution_checkpoints(repo,plan_id,generation,operation,snapshot) "
+            "VALUES ('A','G-002',7,'rebase','{}')")
+        scheduler = self.scheduler()
+        with scheduler.task('A','G-001',self.connection):
+            scheduler.requeue(scheduling.current_task.get())
+        with scheduler.task('A','G-002',self.connection):
+            scheduler.requeue(scheduling.current_task.get())
+        admission.request(self.connection,'A','G-004')
+        admission.request(self.connection,'A','G-005')
+        admission.request(self.connection,'A','G-007')
+        original = [tuple(row) for row in self.connection.execute("SELECT * FROM exec_plans ORDER BY repo,plan_id")]
+        checkpoint = tuple(self.connection.execute("SELECT * FROM execution_checkpoints").fetchone())
+        owner = task_calls.reserve(self.connection,self.directory,'A','G-002','verify','run')
+        task_calls.mark_uncertain(owner)
+        admission.reconcile(self.connection,'A',3,busy={'G-002'},eligible=lambda pid:
+            scheduler._eligible(scheduling.Task('A',pid,self.connection),self.connection,check_management=False))
+        self.assertTrue(admission.parked(self.connection,'A','G-006'))
+        self.assertTrue(admission.parked(self.connection,'A','G-002'))
+        self.assertTrue(admission.parked(self.connection,'A','G-007'))
+        # Repeating requests on a separate connection does not change acceptance or selection.
+        accepted = tuple(self.connection.execute("SELECT priority,sequence FROM task_management_admissions WHERE plan_id='G-007'").fetchone())
+        with closing(database.connect_database(self.directory,run_migrations=False)) as other:
+            admission.request(other,'A','G-007')
+            other.commit()
+            replacement = scheduling.TaskScheduler(self.config,database.connect_database,self.directory,other)
+            self.assertEqual(replacement.uncertain['verify'],1)
+            admission.reconcile(other,'A',3,eligible=lambda pid:
+                replacement._eligible(scheduling.Task('A',pid,other),other,check_management=False))
+            self.assertTrue(admission.parked(other,'A','G-007'))
+            task_calls.release(owner)
+            admission.reconcile(other,'A',3,eligible=lambda pid:
+                replacement._eligible(scheduling.Task('A',pid,other),other,check_management=False))
+            self.assertFalse(admission.parked(other,'A','G-007'))
+            self.assertEqual(scheduling.managed_count(other,'A'),3)
+            other.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE repo='A' AND plan_id IN ('G-004','G-005','G-007')")
+            other.commit()
+            admission.reconcile(other,'A',2)
+            self.assertFalse(admission.parked(other,'A','G-002'))
+            self.assertTrue(admission.parked(other,'A','G-006'))
+            with replacement.task('A','G-002',other):
+                restored = scheduling.current_task.get()
+                self.assertEqual(restored.retry_order,2)
+                self.assertEqual(restored.rank(),(1,2,()))
+                replacement.requeue(restored)
+                self.assertEqual(restored.retry_order,3)
+            self.assertEqual(scheduling.Task('A','G-001',other).rank(),(1,1,()))
+            self.assertEqual(tuple(other.execute("SELECT priority,sequence FROM task_management_admissions WHERE plan_id='G-007'").fetchone()),accepted)
+        # Only the explicit completion above changed execution rows.
+        self.connection.execute("UPDATE exec_plans SET status='REVIEWING' WHERE repo='A' AND plan_id IN ('G-004','G-005','G-007')")
+        self.assertEqual([tuple(row) for row in self.connection.execute("SELECT * FROM exec_plans ORDER BY repo,plan_id")],original)
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM execution_checkpoints").fetchone()),checkpoint)
+        self.assertEqual(self.connection.execute("SELECT publication_stage FROM maintenance_cycles WHERE repo='A'").fetchone()[0],'remote_confirmed')
+
+    def test_old_admission_does_not_evict_on_limit_reduction_but_new_request_does(self):
+        from loop_manager_internal.storage import management_admission as admission
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE repo='A'")
+        admission.request(self.connection,'A','G-001')
+        admission.reconcile(self.connection,'A',2)
+        admission.reconcile(self.connection,'A',1)
+        self.assertEqual(scheduling.managed_count(self.connection,'A'),2)
+        self.assertFalse(admission.parked(self.connection,'A','G-002'))
+        self._insert_plan(self.connection,'G-004','IMPLEMENTING',repo='A')
+        admission.request(self.connection,'A','G-004')
+        admission.reconcile(self.connection,'A',1,eligible=lambda pid:pid!='G-004')
+        self.assertEqual(scheduling.managed_count(self.connection,'A'),2)
+        admission.reconcile(self.connection,'A',1)
+        self.assertEqual(scheduling.managed_count(self.connection,'A'),2)
+        self.assertTrue(admission.parked(self.connection,'A','G-004'))
+        # Once the earlier request completes, a new eligible request gets its ordered handoff.
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE repo='A' AND plan_id='G-001'")
+        admission.reconcile(self.connection,'A',1)
+        self.assertFalse(admission.parked(self.connection,'A','G-004'))
+        self.assertTrue(admission.parked(self.connection,'A','G-002'))
+        self.assertFalse(admission.parked(self.connection,'B','G-003'))
+
+    def test_displaced_request_keeps_its_place_ahead_of_a_new_request(self):
+        from loop_manager_internal.storage import management_admission as admission
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE repo='A'")
+        admission.request(self.connection,'A','G-002')
+        admission.reconcile(self.connection,'A',1)
+        self._insert_plan(self.connection,'G-004','VERIFYING',repo='A')
+        store = ManualWorkRepository(self.connection)
+        group = store.create('A','submit','manual',[],'head','base',members=('G-004',))
+        store.accept(group,head='head',base='base',input_token='input')
+        store.update(group,state='AUTOMATIC',owner_id='G-004')
+        admission.request(self.connection,'A','G-004')
+        admission.reconcile(self.connection,'A',1)
+        self.assertTrue(admission.parked(self.connection,'A','G-002'))
+        self.assertEqual(self.connection.execute("SELECT pending FROM task_management_admissions WHERE plan_id='G-002'").fetchone()[0],0)
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE plan_id='G-004'")
+        self._insert_plan(self.connection,'G-005','IMPLEMENTING',repo='A')
+        admission.request(self.connection,'A','G-005')
+        admission.reconcile(self.connection,'A',1)
+        self.assertFalse(admission.parked(self.connection,'A','G-002'))
+        self.assertTrue(admission.parked(self.connection,'A','G-005'))
+        self.assertEqual(scheduling.managed_count(self.connection,'A'),1)
+
+    def test_concurrent_requests_and_retry_registration_keep_unique_durable_order(self):
+        from loop_manager_internal.storage import management_admission as admission
+        scheduler = self.scheduler()
+        ready = threading.Barrier(2)
+        errors = []
+        def register(pid):
+            try:
+                with closing(database.connect_database(self.directory,run_migrations=False)) as connection:
+                    ready.wait(timeout=3)
+                    admission.request(connection,'A',pid)
+                    admission.request(connection,'A',pid)
+                    scheduler.requeue(scheduling.Task('A',pid,connection))
+            except BaseException as error:
+                errors.append(error)
+        threads = [threading.Thread(target=register,args=(pid,)) for pid in ('G-001','G-002')]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors,[])
+        rows = self.connection.execute('SELECT priority,retry_order,pending,parked FROM task_management_admissions').fetchall()
+        self.assertEqual(sorted(row['priority'] for row in rows),[1,2])
+        self.assertEqual(sorted(row['retry_order'] for row in rows),[1,2])
+        self.assertTrue(all(row['pending']==1 and row['parked']==1 for row in rows))
+
+    def test_legacy_admission_upgrade_keeps_only_proven_order_and_is_idempotent(self):
+        from loop_manager_internal.storage import management_admission as admission
+        with closing(sqlite3.connect(':memory:')) as legacy:
+            legacy.row_factory = sqlite3.Row
+            legacy.execute('CREATE TABLE task_management_admissions(sequence INTEGER PRIMARY KEY AUTOINCREMENT, '
+                'repo TEXT NOT NULL,plan_id TEXT NOT NULL,priority INTEGER NOT NULL DEFAULT 0,'
+                'parked INTEGER NOT NULL DEFAULT 1,release_evidence TEXT,UNIQUE(repo,plan_id))')
+            legacy.execute("INSERT INTO task_management_admissions(repo,plan_id,priority) VALUES ('A','G-001',7)")
+            legacy.execute("INSERT INTO task_management_admissions(repo,plan_id,priority,parked) VALUES ('A','G-002',0,0)")
+            admission.ensure_schema(legacy)
+            admission.ensure_schema(legacy)
+            rows = legacy.execute('SELECT * FROM task_management_admissions ORDER BY sequence').fetchall()
+            self.assertEqual([(row['sequence'],row['priority'],row['pending']) for row in rows],[(1,7,1),(2,0,0)])
+            self.assertTrue(all(row['retry_order'] is None and row['resumed'] is None for row in rows))
+            admission.request(legacy,'A','G-002')
+            self.assertTrue(admission.parked(legacy,'A','G-002'))
+            self.assertEqual(legacy.execute("SELECT pending FROM task_management_admissions WHERE plan_id='G-002'").fetchone()[0],1)
+
+    def test_handoff_transaction_rollback_and_changed_eligibility_preserve_waiting_request(self):
+        from loop_manager_internal.storage import management_admission as admission
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE repo='A'")
+        self._insert_plan(self.connection,'G-004','VERIFYING',repo='A')
+        admission.request(self.connection,'A','G-004')
+        self.connection.commit()
+        self.connection.execute("CREATE TEMP TRIGGER interrupt_handoff BEFORE UPDATE ON task_management_admissions "
+            "WHEN NEW.plan_id='G-004' BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        before = [tuple(row) for row in self.connection.execute('SELECT * FROM task_management_admissions')]
+        with self.assertRaisesRegex(sqlite3.IntegrityError,'interrupted'):
+            admission.reconcile(self.connection,'A',1,busy={'G-002'})
+        self.assertEqual([tuple(row) for row in self.connection.execute('SELECT * FROM task_management_admissions')],before)
+        self.connection.execute('DROP TRIGGER interrupt_handoff')
+        admission.reconcile(self.connection,'A',1,busy={'G-002'})
+        admission.reconcile(self.connection,'A',1,eligible=lambda pid:pid!='G-004')
+        self.assertFalse(admission.parked(self.connection,'A','G-001'))
+        self.assertTrue(admission.parked(self.connection,'A','G-004'))
+        admission.reconcile(self.connection,'A',1)
+        self.assertFalse(admission.parked(self.connection,'A','G-004'))
+
     def test_explicit_release_is_atomic_and_does_not_override_safety_blocks(self):
         from loop_manager_internal.storage import management_admission as admission
         for pid,reason in [('G-001','user_decision_required'),('G-002','managed_worktree_conflict')]:
@@ -272,7 +448,8 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                     observer.assert_called_once()
                     calls.append(True)
                 token = scheduling.current_scheduler.set(scheduler)
-                task = scheduling.Task('A', 'G-001', self.connection, retry_order=9)
+                task = scheduling.Task('A', 'G-001', self.connection)
+                scheduler.requeue(task)
                 selected = scheduling.current_task.set(task)
                 handoff = handoff_gate._runtime_handoff_signal.set(gate)
                 try:
@@ -298,7 +475,10 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(scheduler.cursor.get('verify'), None if stopped else 'A')
                 cursor = self.connection.execute("SELECT repo FROM task_scheduling_cursor WHERE kind='verify'").fetchone()
                 self.assertEqual(cursor[0] if cursor else None, None if stopped else 'A')
-                self.assertEqual(task.retry_order, 9 if stopped else None)
+                self.assertEqual(task.retry_order, 1 if stopped else None)
+                saved = self.connection.execute("SELECT retry_order,resumed FROM task_management_admissions "
+                    "WHERE repo='A' AND plan_id='G-001'").fetchone()
+                self.assertEqual(tuple(saved), (1 if stopped else None, 1))
 
     def test_full_call_slots_skip_priority_refresh_until_capacity_returns(self):
         self.connection.commit()
@@ -607,8 +787,11 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                     except BaseException as error:
                         errors.append(error)
                 def progress():
-                    scheduler.requeue(scheduling.Task('B', 'G-003', None))
-                    progressed.set()
+                    # RETRY registration now needs the DB writer too. Observe
+                    # the independent scheduler condition directly during that wait.
+                    with scheduler.condition:
+                        scheduler.condition.notify_all()
+                        progressed.set()
                 target = task_calls if boundary == 'reserve' else scheduler
                 attribute = 'reserve' if boundary == 'reserve' else '_eligible'
                 with mock.patch.object(target, attribute, side_effect=waiting):
@@ -1074,7 +1257,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                     thread.start()
                     self.assertTrue(waiting.wait(2))
                     self.assertFalse(fetched.is_set())
-                    scheduler.requeue(scheduling.Task('B', 'G-003', None))
+                    scheduler.requeue(scheduling.Task('B', 'G-003', self.connection))
                 self.assertTrue(fetched.wait(2))
         finally:
             if thread.ident is not None:
