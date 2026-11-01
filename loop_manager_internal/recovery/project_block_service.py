@@ -23,6 +23,7 @@ from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
 import sqlite3
+import re
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,26 @@ def _reconcile_rebase_evidence_block(
                 connection, repo_path, state_dir, repo, plan_id, worktree, branch)
         def observe():
             observation = service.require_owned(checkpoint=checkpoints.get(repo, plan_id))
+            if (block['reason_code'] == scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value
+                    and recovery_request_id is None):
+                saved_input = plan['blocked_worktree_fingerprint']
+                current_input = (effects._worktree_execplan_input_fingerprint(worktree, plan)
+                                 if isinstance(saved_input, str)
+                                 and re.fullmatch(r'[0-9a-f]{64}', saved_input)
+                                 and worktree.is_dir() else None)
+                changed_input = bool(isinstance(current_input, str)
+                    and re.fullmatch(r'[0-9a-f]{64}', current_input)
+                    and current_input != saved_input)
+                changed_to_start = False
+                if (not changed_input and observation[1].status is managed_rebase_validation.RebaseStatus.START
+                        and plan['agent_result_snapshot']):
+                    try:
+                        before = GitSnapshot.deserialize(str(plan['agent_result_snapshot']))
+                        changed_to_start = bool({'rebase-merge', 'rebase-apply'} & set(before.operations))
+                    except (KeyError, TypeError, ValueError, RuntimeError):
+                        pass
+                if not (changed_input or changed_to_start):
+                    raise RuntimeError('metadata block has no comparable changed input or Git transition')
             if (block['reason_code'] == scoped_blocking.BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
                     and observation[1].status is managed_rebase_validation.RebaseStatus.START):
                 raise RuntimeError('managed worktree conflict has not reached a rebase-owned state')

@@ -527,13 +527,19 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
     def test_metadata_release_policy_does_not_resume_unchanged_block(self):
         self.block(reason='plan_input_invalid')
         self.pending()
+        self.connection.execute("UPDATE exec_plans SET blocked_worktree_fingerprint=?", ('a' * 64,))
+        self.connection.commit()
+        self.enterContext(mock.patch.object(Path, 'is_dir', return_value=True))
+        inputs = self.enterContext(mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='a' * 64))
         original = self.case.observed
         block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
-        for policy in (None, 'deferred_metadata'):
-            with self.subTest(policy=policy):
+        for released, policy in ((False, None), (False, 'deferred_metadata'), (True, None), (True, 'deferred_metadata')):
+            with self.subTest(released=released, policy=policy):
                 current = self.checkpoints.get('repo', 'G-047')
-                snapshot = {**current.snapshot, 'rebase_block_release': block,
-                            'rebase_block_release_state': original.fingerprint}
+                snapshot = {key: value for key, value in current.snapshot.items()
+                            if key not in {'rebase_block_release', 'rebase_block_release_state', 'rebase_block_release_policy'}}
+                if released:
+                    snapshot.update(rebase_block_release=block, rebase_block_release_state=original.fingerprint)
                 if policy is not None:
                     snapshot['rebase_block_release_policy'] = policy
                 self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
@@ -547,12 +553,39 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
 
         self.case.expected = replace(self.case.expected, input_fingerprint='updated-plan-input')
         self.case.observed = replace(original, input_fingerprint='updated-plan-input')
+        inputs.return_value = 'b' * 64
         self.assertTrue(self.resume())
         row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual((row['status'], row['last_error'], row['worker_session_id']),
                          ('IMPLEMENTING', loop_manager.REBASE_IN_PROGRESS_ERROR, 'saved-worker'))
         self.assertEqual(self.checkpoints.get('repo', 'G-047').operation, 'rebase')
         self.git_write.assert_not_called()
+
+    def test_metadata_block_without_baseline_keeps_original_cause(self):
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        before = self.snapshot()
+        self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_metadata_block_rejects_unrelated_head_and_incomparable_input(self):
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        self.connection.execute("UPDATE exec_plans SET blocked_worktree_fingerprint=?", ('a' * 64,))
+        self.connection.commit()
+        self.case.observed = replace(self.case.observed, head='unrelated-head')
+        before = self.snapshot()
+        with mock.patch.object(Path, 'is_dir', return_value=True), \
+             mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='unavailable'):
+            self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_metadata_start_without_saved_git_transition_remains_blocked(self):
+        self.block(reason='plan_input_invalid')
+        self.case.observed = replace(self.case.observed, base_is_ancestor=False)
+        before = self.snapshot()
+        self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
 
     def test_plan_input_block_uses_owned_rebase_before_ordinary_branch_recovery(self):
         from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
@@ -566,9 +599,13 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.connection.execute("UPDATE recovery_records SET final_evidence=? WHERE repo='repo' AND subject='G-047'",
             ('{"block_reason_code":"plan_input_invalid"}',))
         self.connection.commit()
+        self.connection.execute("UPDATE exec_plans SET blocked_worktree_fingerprint=?", ('a' * 64,))
+        self.connection.commit()
         original = self.case.observed
         with mock.patch.object(loop_manager, 'make_worktree',
-                               side_effect=AssertionError('detached rebase is not an ordinary worktree')):
+                               side_effect=AssertionError('detached rebase is not an ordinary worktree')), \
+             mock.patch.object(Path, 'is_dir', return_value=True), \
+             mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='b' * 64):
             self.assertTrue(self.resume())
         self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
         self.assertEqual(self.case.observed, original)
@@ -581,6 +618,9 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
     def test_plan_input_rebase_block_resumes_from_owned_original_head(self):
         from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
         self.block(reason='plan_input_invalid')
+        before = loop_manager.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (before.serialize(),))
+        self.connection.commit()
         self.case.observed = replace(self.case.observed, base_is_ancestor=False)
         block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
         checkpoint_before = self.checkpoints.get('repo', 'G-047')
