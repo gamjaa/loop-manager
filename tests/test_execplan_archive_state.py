@@ -67,6 +67,40 @@ class ExecPlanArchiveStateTest(unittest.TestCase):
             "docs/plans/archive/[G-001] Merged.md",
         )
 
+    def test_execution_observation_survives_reopen_without_candidate_records(self):
+        import tempfile
+        from pathlib import Path
+        state = dict(category="shared_resource", resource="refs/heads/main",
+                     reason="busy", resume_condition="release_base_writer")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.row_factory = sqlite3.Row
+                repository = execplan_archive_state.ExecPlanArchiveRepository(connection)
+                self.assertTrue(repository.observe("/repo", "dispatch", **state))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM execplan_archive_items").fetchone()[0], 0)
+            with sqlite3.connect(path) as connection:
+                connection.row_factory = sqlite3.Row
+                repository = execplan_archive_state.ExecPlanArchiveRepository(connection)
+                self.assertFalse(repository.observe("/repo", "dispatch", **state))
+                self.assertFalse(repository.observe("/repo", "dispatch", **state, attempted=True))
+                row = connection.execute("SELECT * FROM execplan_archive_observations").fetchone()
+                self.assertEqual(row["attempts"], 1)
+                self.assertEqual(row["resume_condition"], "release_base_writer")
+                self.assertTrue(repository.observe("/repo", "dispatch", **{**state, "reason": "writer_unknown"}))
+
+    def test_observation_does_not_change_prepared_operation_or_candidate(self):
+        self._insert("G-001", "Merged")
+        item = self.repository.merged_candidates("/repo")[0]
+        self.repository.record_prepared("/repo", "operation", "base", "tree", "commit", (item,))
+        before = tuple(self.repository.item("/repo", item.plan_id))
+        saved = self.repository.prepared_operation("/repo", "operation")
+        state = dict(resource=item.plan_id, reason="busy", resume_condition="release_owner")
+        self.assertTrue(self.repository.observe("/repo", item.plan_id, category="shared_resource", **state))
+        self.assertFalse(self.repository.observe("/repo", item.plan_id, category="shared_resource", **state))
+        self.assertEqual(tuple(self.repository.item("/repo", item.plan_id)), before)
+        self.assertEqual(self.repository.prepared_operation("/repo", "operation"), saved)
+
     def test_operation_and_item_state_survive_prepare_pending_and_success(self):
         self._insert("G-001", "Merged")
         candidate = self.repository.merged_candidates("/repo")[0]
@@ -136,6 +170,28 @@ class ExecPlanArchiveStateTest(unittest.TestCase):
         self.assertFalse(planning_input_state.matches(
             self.connection, "/repo", {"docs/plans/[G-002] User.md": ("blob", "changed")},
         ))
+
+    def test_catalog_preparation_runs_outside_transaction_and_stale_apply_rolls_back_success(self):
+        self._insert("G-001", "Merged")
+        self.connection.commit()
+        item = self.repository.merged_candidates("/repo")[0]
+        calls = []
+        def prepare(*_args):
+            self.assertFalse(self.connection.in_transaction)
+            calls.append("observe")
+            def apply():
+                self.assertTrue(self.connection.in_transaction)
+                calls.append("cas")
+                return False
+            return apply
+        repository = execplan_archive_state.ExecPlanArchiveRepository(self.connection, prepare_catalog=prepare)
+        result = repository.record_success(
+            "/repo", (item,), base_sha="base", operation_id=None,
+            commit_oid="commit", push_result="pushed:commit",
+        )
+        self.assertEqual(result, execplan_archive_state.ArchiveWriteResult.SUPERSEDED)
+        self.assertEqual(calls, ["observe", "cas"])
+        self.assertIsNone(repository.item("/repo", item.plan_id))
 
     def test_revision_change_supersedes_old_candidate_and_preserves_audit(self):
         self._insert("G-001", "Original")

@@ -15,6 +15,65 @@ from tests.support.worker import dummy_worker_sessions
 
 @isolated_git_test
 class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
+    def test_archive_push_then_db_interruption_recovers_without_recommit_or_push(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.application.project_service import ProjectService
+        from loop_manager_internal.catalog.archive_git import ExecPlanArchiveGitPort
+        from loop_manager_internal.catalog.project_catalog_refresh import ProjectCatalogRefresh
+        from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, _branch, worktree, _url, _head = self._pr_open_state(directory)
+            row = connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-026'").fetchone()
+            source = row['path']
+            destination = source.replace('docs/plans/', 'docs/plans/archive/', 1)
+            git_command(worktree, 'update-index', '--chmod=+x', '--', source)
+            git_command(worktree, 'commit', '-m', 'Preserve executable plan mode')
+            git_command(worktree, 'push', 'origin', 'HEAD:main')
+            (worktree / 'src/app.py').write_text('VALUE = 3\n', encoding='utf-8')
+            git_command(worktree, 'add', 'src/app.py')
+            (worktree / 'keep.txt').write_text('preserve\n', encoding='utf-8')
+            before = (git_command(repo, 'rev-parse', 'HEAD'), git_command(worktree, 'rev-parse', 'HEAD'),
+                      git_command(worktree, 'write-tree'), git_command(worktree, 'status', '--porcelain=v1'))
+            with connection:
+                connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-026'")
+                connection.execute("UPDATE projects SET phase='VERIFYING'")
+            boundary = ProjectCatalogRefresh(
+                connection, str(repo), lambda: git_command(repo, 'rev-parse', 'origin/main'),
+                lambda revision, remember: loop_manager.reconcile_execplan_catalog(
+                    connection, repo, str(repo), 'main', remote_sha=revision, on_reconciled=remember),
+            )
+            service = ProjectService.__new__(ProjectService)
+            service.identity = SimpleNamespace(connection=connection, state_dir=state_dir)
+            service.state = SimpleNamespace(repo=str(repo), repo_path=repo, base='main', catalog_refresh=boundary)
+            service.effects = SimpleNamespace(git=loop_manager.git, operation_print=mock.Mock(),
+                dispatch_execplan_archive_housekeeping=loop_manager.dispatch_execplan_archive_housekeeping)
+            original = ExecPlanArchiveRepository.record_success
+            interrupted = False
+            def confirm(repository, *args, **kwargs):
+                nonlocal interrupted
+                if kwargs['commit_oid'] and not interrupted:
+                    interrupted = True
+                    raise DatabaseWaitTimeout('confirmation interrupted after push')
+                return original(repository, *args, **kwargs)
+            with mock.patch.object(ExecPlanArchiveRepository, 'record_success', confirm):
+                service._archive_housekeeping(archive_only=True)
+            self.assertTrue(interrupted)
+            published = git_command(repo, 'rev-parse', 'origin/main')
+            self.assertEqual(git_command(repo, 'ls-tree', published, '--', destination).split()[0], '100755')
+            self.assertEqual(ExecPlanArchiveRepository(connection).item(str(repo), 'G-026')['archived'], 0)
+            with mock.patch.object(ExecPlanArchiveGitPort, 'prepare_commit') as prepare, \
+                 mock.patch.object(ExecPlanArchiveGitPort, 'push_fast_forward') as push:
+                service._archive_housekeeping(archive_only=True)
+            prepare.assert_not_called()
+            push.assert_not_called()
+            self.assertEqual(ExecPlanArchiveRepository(connection).item(str(repo), 'G-026')['archived'], 1)
+            self.assertEqual(git_command(repo, 'rev-parse', 'origin/main'), published)
+            self.assertEqual((git_command(repo, 'rev-parse', 'HEAD'), git_command(worktree, 'rev-parse', 'HEAD'),
+                              git_command(worktree, 'write-tree'), git_command(worktree, 'status', '--porcelain=v1')), before)
+            self.assertEqual((worktree / 'src/app.py').read_text(), 'VALUE = 3\n')
+            self.assertEqual((worktree / 'keep.txt').read_text(), 'preserve\n')
+
     def final_review_result(self, connection, repo):
         from loop_manager_internal.storage import planning_review_state
         attempt = planning_review_state.get(connection, str(repo), 'attempt')

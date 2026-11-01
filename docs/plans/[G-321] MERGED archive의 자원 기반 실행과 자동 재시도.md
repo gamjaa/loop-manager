@@ -45,8 +45,8 @@ priority: normal
 
 보존 후보 HEAD `5336b1dfd14bc2fd27b8f576c10e1f70b4019b8b`에는 아래 기존 항목의 구현과 targeted 기록이 있다. 기존 base 상태 설명/체크리스트는 원래 범위이며 재구현 지시가 아니다. 후보의 구현·실패/교정/검증 원문은 그 작업 공간의 같은 ExecPlan `Progress`에 보존하며 최신 base 조건과의 통합/잔여 검증만 이어간다.
 
-- [ ] 확인한 최신 `storage/management_admission.py`·`task_calls.py`·`application/task_scheduling.py`의 parked/인계·반환 경계에 후보의 archive 실행 기회를 통합한다. 관리 자리 반납을 물리 writer 종료로 간주하지 않고, 명시 요청의 우선 순서와 단위/실행 한도·planning/runtime drain·pause를 유지한다. archive는 관리 자리나 별도 실행용 G를 요구하지 않는다.
-- [ ] 확인한 `catalog/deleted_plan_cleanup.py`·`storage/deleted_plan_state.py`·`recovery/waiting_pr_service.py`의 CLOSED/삭제 예외와 archive 후보의 실제 MERGED 근거를 대조한다. 삭제 정리의 공유 자원 충돌만 보류하고, G-260/G-261의 기록/자원 제거를 archive 구현 안에서 수행하지 않는다. 최신 ARCHITECTURE의 관련 소유 절에는 후보의 기존 archive 변경과 실제 새 통합만 반영한다.
+- [x] 확인한 최신 `storage/management_admission.py`·`task_calls.py`·`application/task_scheduling.py`의 parked/인계·반환 경계에 후보의 archive 실행 기회를 통합한다. 관리 자리 반납을 물리 writer 종료로 간주하지 않고, 명시 요청의 우선 순서와 단위/실행 한도·planning/runtime drain·pause를 유지한다. archive는 관리 자리나 별도 실행용 G를 요구하지 않는다.
+- [x] 확인한 `catalog/deleted_plan_cleanup.py`·`storage/deleted_plan_state.py`·`recovery/waiting_pr_service.py`의 CLOSED/삭제 예외와 archive 후보의 실제 MERGED 근거를 대조한다. 삭제 정리의 공유 자원 충돌만 보류하고, G-260/G-261의 기록/자원 제거를 archive 구현 안에서 수행하지 않는다. 최신 ARCHITECTURE의 관련 소유 절에는 후보의 기존 archive 변경과 실제 새 통합만 반영한다.
 
 - [x] 확인한 `loop_manager_internal/catalog/archive_service.py`·`application/project_service.py`의 공통 gate를 archive 실행 자원 판단과 Requirement 교정의 기존 안전 판단으로 분리한다. `runtime/resource_lock.py`·`git/manager_git_journal.py`와 현재 게시 소유권을 재사용해 실제 충돌 자원만 검사·예약하고 준비/게시 직전에 다시 확인한다. 무관한 작업의 전체 Git snapshot이나 단순 phase를 쓰기 권한 근거로 삼지 않는다.
 - [x] 확인한 `application/task_scheduling.py:run_project_tasks()`의 완료 수집·다음 배정 경계와 `ProjectService`의 기존 조율/PR 후속 경계에 archive 기회를 연결한다. G-297의 배정 중단·현재 자격 재확인 구조를 소비하고 별도 polling/상주 thread 없이 계속 배정되는 경우의 기아를 없앤다. runtime 종료 결정·사용자 pause·실제 프로젝트 차단을 우회하지 않으며 외부 조회/Git 대기 중 DB 접근을 유지하지 않는다.
@@ -159,8 +159,92 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_archiv
 
 보존 후보 HEAD `5336b1dfd14bc2fd27b8f576c10e1f70b4019b8b`의 clean 상태와 위 Progress 원문·archive/scheduler 연결을 읽기 전용으로 확인했다. 위 기존 수행/실패/검증 기록과 Implementation의 완료 표시는 후보에서 그대로 보존한 기록이다. 후보 파일·Git·실행 이력은 수정하지 않았으며 최신 조건의 성공으로 승계하지 않는다.
 
-- [ ] 최신 관리 인계/삭제 예외와 보존 후보 통합·관련 최소 회귀
+- [x] 최신 관리 인계/삭제 예외와 보존 후보 통합·관련 최소 회귀
 - [ ] 최신 후보의 필요한 Manager verify·Review·사용자 Merge
+
+
+### 관리 rebase 뒤 최신 조건 통합과 verify 실패 교정
+
+호출 시작 HEAD `78531e5cac73f48d4c646f9a5f10e980bb28c09b`와 base `1829086bc5a8caa02ce073061af87cf7e584f3d0` 사이의 최종 diff 전체, 최신 ExecPlan·sources와 현재 구현을 다시 대조했다. 이전 후보의 성공을 현재 후보 성공으로 승계하지 않았다. Manager verify 피드백 `verify:e69ffb3b612c0d5b26911a223b1e3362fd564ba63aa86a51b8d085eb367d530e` occurrence=1 revision=1의 두 실패를 현재 코드에서 재현했다.
+
+첫 실패는 active assessment가 최초 workspace를 만들기 전에 독립 archive가 base를 전진시켜 cycle 기준 SHA가 남은 것이었다. 게시 intent·평가 결과·완료·보존 workspace가 없는 초기 assessment만 기존 intent-free context 재시작을 사용해 같은 cycle/단계에서 최신 base로 준비한다. 저장된 평가·workspace·게시 복구를 우회하지 않는다. 두 번째는 archive 이전 SHA를 종료 기준으로 고정한 assertion이었다. 실제 Git의 내용 보존 archive-only 이동을 검증한 뒤 종료 기준을 현재 원격 SHA와 비교하고 실제 Merge 수가 1인 assertion을 추가했다. 기존 역할 호출·선택 순서·idle 종료 검증은 유지했다.
+
+FAILED_COMMAND: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_maintenance_cycle_publication.MaintenanceCycleTest.test_published_combined_batch_recovers_before_changed_fingerprint_cleanup tests.test_maintenance_cycle_scheduling.MaintenanceCycleTest.test_prerequisite_merge_returns_to_outside_ready_without_reassessment`
+결과: 2개 실행, 2개 failure. 게시 intent 저장 전에 평가 기준 불일치와 archive 이전 종료 SHA assertion을 확인했다.
+
+RERUN: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_maintenance_cycle_publication.MaintenanceCycleTest.test_published_combined_batch_recovers_before_changed_fingerprint_cleanup tests.test_maintenance_cycle_scheduling.MaintenanceCycleTest.test_prerequisite_merge_returns_to_outside_ready_without_reassessment`
+결과: 수정 후 동일 2개 모두 통과. 첫 case는 의도한 push 후 SQLite 중단까지 도달하고 보존된 prepared batch를 입력 지문 정리 전에 복구한다.
+
+관리 admission의 명시 요청 수락·live reservation 반환 테스트에 기존 archive 경계를 연결했다. 요청이 parked인 동안과 앞선 물리 호출 반환 후 모두 독립 MERGED 후보를 처리하며 기존 배정 우선순위·한도를 보존한다. 별도 guard case는 parked 대상의 running/불확실 영수증에는 해당 후보만 보류하고 stopped 영수증 확인 뒤 같은 예약·admission을 보존한 채 재개함을 확인했다. CLOSED 미Merge와 삭제 ID·정리 파일 pending은 후보에 들어가지 않고 독립 MERGED는 허용하되 실제 공유 base lease에는 보류한다. 삭제·admission 엔진은 변경하지 않았고 기존 lifecycle을 복제하지 않았다.
+
+현재 후보에서 targeted runner로 새로 확인한 최소 case는 위 실패 교정 2개, parked/삭제 자원 guard 2개, 명시 요청 반환/연속 배정 archive 기회 2개, 실제 Git push 후 DB 확정 중단 복구·mode/작업 공간 보존 1개, transaction 밖 catalog 준비와 stale CAS rollback 1개, 교정 draft/writer 점유 중 독립 archive 1개, 기존 유지보수 push 실패 뒤 저장 결과로 재계획 없이 재개하는 1개로 총 10개다. 모두 통과했으며 기록은 이번 호출의 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`에 남겼다. 전체 verify는 Worker가 실행하지 않았으며 Manager의 재검증이 남아 있다. 테스트 삭제·skip은 없고 폐기된 archive 이전 SHA assertion만 현재 native 효과와 Merge 수 검증으로 교체했다.
+
+
+### 결과 보고 보완과 현재 후보 재확인
+
+결과 검증 거부는 이전 최종 응답의 TARGETED_TESTS에서 최초 실패 설명이 FAILED_COMMAND 앞에 위치하고, FAILED_COMMAND와 RERUN 사이에는 최초 결과가 없어서 발생했다. `execution/result_validation.py`의 기존 계약과 `tests/test_verify_receipts.py`의 보고 예제를 대조했다. 결과 검증기는 변경하지 않는다. 이전 호출의 실제 두 실패와 동일 명령 재실행 성공은 위 원문에 보존하고, 최종 보고에서도 명령 → 최초 결과 → 동일 명령 재실행 → 현재 결과 순서로 제출한다.
+
+최신 ExecPlan·R-094와 근거 입력, HEAD/base의 전체 변경 범위를 다시 대조했다. 현재 호출에서 위 동일 targeted 명령을 새로 실행해 2 tests, OK (9.771s, exit 0)를 확인했다. 기록은 `call-fljf77gh`의 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`에 남겼다. 이전 호출의 10개 성공 기록을 이번 실행으로 합성하지 않는다. 전체 verify는 Manager 재실행이 필요하다.
+
+
+### 후속 verify의 수동 교정 재개 공통 결함
+
+호출 시작 HEAD `56d38172ddd434df0ffb3fd2328463675c042577`에서 Manager verify `verify:29ce766287c5b40d6f7989b863206c1221b6203e835efab087d665e9f0f76526` occurrence=1 revision=1의 두 실패를 targeted runner로 재현했다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_manual_work.ManualWorkTest.test_shared_review_failure_rotates_only_one_active_member tests.test_manual_work.ManualWorkTest.test_verify_failure_resumes_worker_automatically
+결과: 2 tests, 2 failures, exit 1 (4.400s). 두 case 모두 `service.resume()` 뒤 실제 상태 VERIFYING과 기대 IMPLEMENTING의 차이로 실패했다. 기록은 이번 호출 `call-zvxnxzmi`의 targeted 결과 폴더에 남겼다. 수정·재실행 성공이나 전체 verify 성공으로 처리하지 않는다.
+
+`ManualWorkService.resume()`은 `rotate_correction()` 뒤 `_resume_group()`을 호출한다. 회전 helper는 실패한 구성 G를 IMPLEMENTING으로 옮기지만 `_resume_group()`은 현재 IMPLEMENTING 상태를 제외하지 않고 묶음의 저장 `resume_phase`를 실행 상태에 다시 적용한다. 두 실패의 assertion은 archive 결과가 아닌 수동 verify/Review 교정 재개 상태를 검증한다. 관련 수동 service·candidate·recovery·테스트는 현재 base 대비 변경이 없음을 확인했다. G-321의 실제 archive 자원 충돌·기회·보류 계약으로 이 수동 교정 상태 전이를 바꾸지 않으며, 기존 assertion을 완화하지 않는다.
+
+수동 재개 엔진의 공통 교정이 필요한 관측으로 Manager에 COMMON_DEFECT_REPORT를 제출한다. G-321의 기존 변경과 검증 기록을 보존하고 전체 verify 완료 판정은 보류한다. 해당 범위 밖 구현·Requirement·다른 ExecPlan은 변경하지 않았다.
+
+
+### 공통 교정 반영 후 rebase 후보 재검증
+
+호출 시작 HEAD `650f1c11913d5ac0fe30eceffb2e9cdf092b0220`, 현재 base `decf15beb7367244b70d3c42acd8edeafee6f4e3`를 기준으로 최신 ExecPlan·sources·dependency와 base 대비 최종 diff 전체를 대조했다. 수동 재개 원인의 Manager 재평가는 정적 근거로만 사용하고, 이전 후보의 성공을 현재 성공으로 승계하지 않았다. 현재 `resume()`은 회전 뒤 활성 구성원을 건너뛰고 `_resume_group()`도 활성 상태를 반환하며, 전환 직전 활성 여부 재확인과 expected_status 갱신을 사용한다. 기존 두 테스트의 IMPLEMENTING assertion은 유지돼 있다. 관련 공통 구현은 이번 Worker가 수정하지 않았다.
+
+위 `call-zvxnxzmi`의 FAILED_COMMAND와 2 failures는 당시 감사로 보존한다. 동일 명령을 현재 후보에서 새로 실행했다.
+
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_manual_work.ManualWorkTest.test_shared_review_failure_rotates_only_one_active_member tests.test_manual_work.ManualWorkTest.test_verify_failure_resumes_worker_automatically
+결과: 2 tests, OK, exit 0 (4.351s). Worker 교정 단계와 공유 묶음의 다른 구성원 상태가 보존됐다. 과거 로그를 새 실패로 재보고하지 않는다.
+
+현재 archive 연결은 다음 최소 명령으로 별도 확인했다.
+
+`python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_task_scheduling.TaskSchedulingTests.test_unblock_cli_dispatch_and_live_reservation_drain tests.test_task_scheduling.TaskSchedulingTests.test_archive_runs_between_continuous_admissions_without_candidate_records tests.test_pr_source_synchronization.PrSourceSynchronizationTest.test_archive_push_then_db_interruption_recovers_without_recommit_or_push`
+
+결과: 3 tests, OK, exit 0 (2.354s). 명시 요청의 parked/인계 전후 독립 archive, 물리 호출 종료 전 lease 반환과 연속 배정 사이 처리, 실제 Git push 후 DB 확정 누락 복구에서 prepare/push 0·mode·기존 HEAD/index/작업물 보존을 확인했다. 이번 호출에서 총 5개 case를 새로 실행했고 모두 통과했다. 기록은 `call-foa1kryj`의 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`에 남겼다.
+
+추가 구현 교정은 필요하지 않았으며 이번 변경은 선택 ExecPlan 본문의 재검증 기록이다. 기존 PRODUCT·ARCHITECTURE 변경은 현재 공통 교정의 활성 단계 보존 규칙과 양립한다. 전체 verify·Review·사용자 Merge는 Manager의 후속 절차로 남긴다. 검증 입력 제외 identity는 선언하지 않는다.
+
+
+### 프로젝트 차단 재평가 fixture의 관측 계약 불일치
+
+호출 시작 HEAD `1e705f51dcf9ea5d416a5ba4379af68ce5d1fa20`에서 Manager verify `verify:fffd43028c4bdceb43034e699e6756b9b948fd7bdf1c2230c268a96805cf8119` occurrence=1 revision=1의 오류를 현재 후보에서 재현했다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_project_block_revalidation.ProjectCauseRevalidationTests.test_current_scope_rejects_pending_conflict_and_scope_mismatch
+결과: 1 test, 1 error, exit 1 (0.050s). `independent_scope()`의 `dict(observed.operations)`에서 ValueError가 발생해 의도한 RuntimeError 차단 검증에 도달하지 않는다. 이번 호출 `call-k42_ys7t`의 targeted 기록을 보존하며 재실행 성공·전체 verify 성공을 기록하지 않는다.
+
+실제 `RebaseObservation.operations` 계약은 `tuple[tuple[str, str], ...]`이고 `observe_current_rebase()`는 `tuple(sorted(snapshot.operations.items()))`로 생성한다. 실패 case의 fixture는 `('rebase-merge',)`를 전달하므로 현재 실제 관측 형식과 다르다. 프로젝트 차단 재평가 구현·관측기·관측 타입·해당 테스트는 origin/main 대비 diff가 없다. 이 관측은 실제 Git operation 보호를 완화할 근거가 아니며 G-321의 archive 실행 자원·재시도 경로를 바꾸지 않는다.
+
+선택 범위 밖 프로젝트 차단 재평가 테스트의 관측 계약 불일치를 COMMON_DEFECT_REPORT로 인계한다. 해당 코드·테스트·다른 ExecPlan·Requirement는 수정하지 않았고 기존 G-321 결과를 보존한다. 현재 전체 verify 완료는 이 공통 검증 교정과 Manager의 재검증을 기다린다.
+
+
+### 관측 계약 공통 교정 반영 뒤 현재 후보 확인
+
+호출 시작 HEAD `24cf402ae4b5bd52127d49cbf5070c10fb8f9958`, base `9d4aaf1b327af67dfaadb41cafa1be1b5bc64427`의 최신 ExecPlan·근거 입력과 base 대비 최종 diff 전체를 대조했다. 앞서 검토한 `1e705f51dcf9ea5d416a5ba4379af68ce5d1fa20`과도 구현·테스트·PRODUCT·ARCHITECTURE를 직접 비교했다. G-321 구현과 테스트는 동일하며 ARCHITECTURE의 관측 mock 계약은 공통 교정에서 추가된 base 내용이다. 이 비교는 이전 테스트 성공을 승계하는 근거가 아니다.
+
+현재 프로젝트 차단 재평가 fixture는 공통 `observation()` 생성 도구와 marker·관측값 쌍을 사용하고, scope mismatch의 원인 문자열·LocalWorkPending의 종류와 사유·require_owned 호출을 검증한다. 위 `call-k42_ys7t`의 1 error는 과거 감사로 보존하며 현재 코드에서 같은 명령을 새로 실행했다.
+
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_project_block_revalidation.ProjectCauseRevalidationTests.test_current_scope_rejects_pending_conflict_and_scope_mismatch
+결과: 1 test, OK, exit 0 (0.071s). dict 변환 오류 없이 의도한 미해결 operation 보호와 scope 거부를 확인했다.
+
+현재 archive 후보의 관련 최소 연결도 다음 명령으로 확인했다.
+
+`python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_requirement_correction_publication.RequirementCorrectionPublicationTest.test_housekeeping_dispatches_with_an_independent_rebase_and_keeps_safety_gate tests.test_task_scheduling.TaskSchedulingTests.test_archive_runs_between_continuous_admissions_without_candidate_records tests.test_pr_source_synchronization.PrSourceSynchronizationTest.test_archive_push_then_db_interruption_recovers_without_recommit_or_push`
+
+결과: 3 tests, OK, exit 0 (2.397s). 독립 rebase journal 보존과 교정 gate 분리, lease 반환 후 연속 배정 사이 archive, 실제 게시 후 DB 확정 중단의 prepare/push 무중복·mode/HEAD/index/작업물 보존을 확인했다. 이번 호출의 4개 case 모두 통과했으며 결과는 `call-cxyjuxj3`의 targeted 기록에 남겼다. 이전 후보의 성공이나 Manager의 정적 원인 재평가를 이번 검증 결과로 합성하지 않았다.
+
+추가 코드·테스트 교정은 필요하지 않았다. 이번 변경은 선택 ExecPlan 본문의 재검증 기록이며 frontmatter·Requirement·다른 ExecPlan은 변경하지 않는다. 전체 verify·Review·사용자 Merge는 Manager의 후속 검증·완료 절차로 남긴다. 검증 입력 제외 identity는 선언하지 않는다.
 
 ## Decision Log
 

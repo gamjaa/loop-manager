@@ -526,7 +526,7 @@ R-077의 수동 소유 계획과 start/submit 준비 intent 대상은 snapshot·
 - Planner와 Worker의 실행 후보는 `docs/plans/` 바로 아래의 active ExecPlan으로 제한하고, `docs/plans/archive/`는 ID 고유성, 다음 번호, dependency, 복구와 감사 검증에만 포함한다
 - 정상적으로 열린 로컬 DB에 필요한 개별 작업 행이 없으면 활성·archive 문서로 보완한다. 활성 문서는 기본 READY 등록과 기존 실행 복구 규칙을 따르고, archive 문서는 추가 PR 조회나 과거 게시 본문 검증 없이 문서에 근거해 MERGED로 수락한다. 이 수락 근거와 실제 PR Merge 관측은 구분하며 유실된 최초 게시·세션·실패 이력을 만들어 내지 않는다. 활성 선언의 형식·ID·source·dependency 검증과 기존 행의 실행·소유권·실패 이력은 보존한다. 양쪽 문서가 없는 활성 작업은 누락으로 보고하되 완전한 Merge proof가 있는 archive 이력은 활성 선언으로 재등록하지 않고 dependency·완료 근거로 유지한다. 미확인 이력을 MERGED로 계산하지 않는다. DB 전체 손실·손상은 백업 복원이나 초기화가 필요하다
 - 일반 원격 catalog 동기화에서 오류 작업을 유일하게 식별하고 영향 범위를 확정할 수 있으면 해당 작업과 그 작업에 의존하는 후속 작업을 보류하고, 검증된 독립 작업의 선택·PR 관측은 계속한다. 원격 파일 누락만으로 취소·완료를 확정하지 않는다. 식별 모호성·입력 조회 실패·공유 소유권 등 안전 범위를 확정할 수 없는 오류는 전체 동기화를 보류하며, 상세 경계는 [원격 catalog와 실행 이력의 분리](ARCHITECTURE.md#원격-catalog와-실행-이력의-분리)를 따른다
-- ExecPlan archive-only 이동은 계획 입력 지문, 유지보수 Merge count, 프로젝트 완료 cycle을 바꾸지 않는다
+- ExecPlan archive-only 이동은 계획 입력 지문, 유지보수 Merge count, 프로젝트 완료 cycle을 바꾸지 않는다. 실행 기회·보류·복구는 [MERGED ExecPlan archive](#merged-execplan-archive)를 따른다
 
 #### Worker 문서 수정 범위
 
@@ -974,9 +974,19 @@ GitHub의 Merge 확인으로 작업을 MERGED로 기록하고, worktree 정리�
 | 사용자 변경·미게시 로컬 commit·Git operation·소유권 또는 안전성 불확실 | 경로·원인을 `cleanup_pending`에 기록하고 보존한다. 소유권·안전 조건이 충족되면 재평가하며 소유권이 불명확한 경로를 자동 삭제하지 않는다. |
 | 보존 경로가 사라짐 | 부재를 확인해 해당 정리 대기를 해제한다. |
 
-현행 Merge 정리는 worktree 제거까지 수행한다. 로컬 관리 branch의 비강제 삭제 기준은 현재 정리 코드에 반영되지 않은 차이로 남기며, 원격 branch 자동 삭제를 수행한 것으로 기록하지 않는다. MERGED ExecPlan은 [별도 archive 게시](ARCHITECTURE.md#merged-execplan-archive)로 처리하고 실패 시 archive pending으로 보존한다.
+현행 Merge 정리는 worktree 제거까지 수행한다. 로컬 관리 branch의 비강제 삭제 기준은 현재 정리 코드에 반영되지 않은 차이로 남기며, 원격 branch 자동 삭제를 수행한 것으로 기록하지 않는다.
 
 게시 lease·중단 복구·후보 검증 토큰의 적용은 [관리 rebase와 후보 검증](ARCHITECTURE.md#관리-rebase와-후보-검증)을 따른다.
+
+#### MERGED ExecPlan archive
+
+실제 PR Merge와 SQLite MERGED가 확인된 활성 ExecPlan은 PR 동기화 후속과 작업 관리 진입·완료 수집·연속 배정의 안전한 경계에서 자동 보관한다. 다른 Worker·verify·Reviewer의 진행, Planner 자리·유지보수 cycle이나 독립 계획의 차단만으로 전체 종료를 기다리지 않는다. Manager 재시작이나 앞선 진입 전 보류로 후보 기록이 없어도 MERGED 상태와 최신 원격 catalog에서 다시 찾는다.
+
+같은 base의 게시 예약·실제 공유 Git 충돌·프로젝트 안전 차단은 실행을 보류하고, 대상의 수동 소유·종료 불명 writer는 해당 후보를 보존한다. 기본 checkout과 기존 작업 공간·index·session·검증 근거를 편집하거나 호출을 선점하지 않는다. Requirement 식별 교정의 기존 source·draft·planning·writer 보호와 교정 실패 처리는 유지하며, 교정의 실행 불가만으로 독립 archive를 금지하지 않는다.
+
+최종 hash·revision과 내용·mode가 일치하는 안전한 후보만 detached 공간에서 rename-only commit해 fast-forward 게시한다. 원격 경쟁·게시 실패·DB 확정 중단에는 보존 근거와 실제 원격 결과를 대조하고, 유효한 준비 commit은 재사용하며 이미 게시된 이동은 새 commit·push 없이 확정한다. 파일·목적지·동일 ID 충돌이 있는 후보는 덮어쓰지 않고 안전한 다른 후보와 분리한다.
+
+진입 전을 포함한 보류 범주·대상 자원·사유·재개 조건과 시도 결과는 DB·운영 로그에 남긴다. 동일 사유의 반복 출력은 억제하고 변경·완료는 기록한다. 자원이 반환되면 문서 지문이 같아도 다음 안전 경계에서 재확인한다. archive 대기·실패는 MERGED·dependency·독립 배정·Planner·유지보수 종료·프로젝트 완료를 바꾸지 않으며, 이동만으로 새 planning·작업 주기·Merge 수·완료 알림·사용자 조치 없는 Telegram을 만들지 않는다. 별도 Agent·작업·PR·상주 스케줄러 없이 [기존 Manager 게시 경계](ARCHITECTURE.md#merged-execplan-archive)를 사용한다.
 
 ### 프로젝트 완료 조건
 

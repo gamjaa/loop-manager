@@ -28,6 +28,30 @@ def _requirement(path):
             and (len(parts) == 3 or parts[2] == 'archive') and path.endswith('.md'))
 
 
+def correction_writer_pending(connection, state_dir, repo):
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='agent_invocations'").fetchone():
+        return False
+    from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+    InvocationRepository(connection).reconcile_execution(state_dir=state_dir, repo=repo)
+    return connection.execute(
+        "SELECT 1 FROM agent_invocations WHERE repo=? AND execution_finished_at IS NULL "
+        "AND (finished_at IS NULL OR execution_status != 'not_executed') LIMIT 1", (repo,),
+    ).fetchone() is not None
+
+
+def correction_admission_available(connection, state_dir, repo, *, available_paths=None):
+    """Known correction-only claims close admission; publisher rechecks races."""
+    if live_requirement_paths(connection, repo) or work_claims.publication_claims(connection, repo)[1]:
+        return False
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='document_drafts'").fetchone():
+        for row in connection.execute(
+            "SELECT target_path FROM document_drafts WHERE repo=? AND state IN ('pending','approved')", (repo,),
+        ):
+            if _requirement(row[0]) and (available_paths is None or row[0] in available_paths):
+                return False
+    return not correction_writer_pending(connection, state_dir, repo)
+
+
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
@@ -64,15 +88,8 @@ class RequirementCorrectionPublisher:
                 git=self.git.effects.git, worktrees=(self.git.repo_path,),
                 refs=(f'refs/heads/{self.base_branch}', f'refs/remotes/origin/{self.base_branch}')):
             raise CorrectionPending('미확정 Manager Git 쓰기를 보존하고 Requirement 교정을 보류합니다.')
-        if self.connection.execute("SELECT 1 FROM sqlite_master WHERE name='agent_invocations'").fetchone():
-            from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
-            InvocationRepository(self.connection).reconcile_execution(state_dir=self.git.state_dir, repo=self.git.repo)
-            if self.connection.execute(
-                "SELECT 1 FROM agent_invocations WHERE repo=? AND execution_finished_at IS NULL "
-                "AND (finished_at IS NULL OR execution_status != 'not_executed') LIMIT 1",
-                (self.git.repo,),
-            ).fetchone():
-                raise CorrectionPending('종료가 확인되지 않은 Agent writer가 있어 교정을 보류합니다.')
+        if correction_writer_pending(self.connection, self.git.state_dir, self.git.repo):
+            raise CorrectionPending('종료가 확인되지 않은 Agent writer가 있어 교정을 보류합니다.')
         tree = self.git._manifest(base)
         documents = {path: self._read(base, tree, path) for path in tree if _requirement(path)}
         references = set()

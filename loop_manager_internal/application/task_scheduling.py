@@ -718,6 +718,8 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
     setup_exception_attempts = Counter()
     setup_waits, setup_inputs, deferred_inputs = {}, {}, {}
     readmitted = set()
+    archive_boundary = True
+    archive_retry_token = None
     initial = runtime_state.RuntimeStateRepository(connection).active(repo)
 
     requested_checks = []
@@ -956,6 +958,7 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
             check_inputs()
             for plan_id, result in tuple(running.items()):
                 if result.done():
+                    archive_boundary = True
                     try:
                         task_results[plan_id] = result.result()
                     except Exception as error:
@@ -1008,6 +1011,20 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                     launch(row, not (newly_activated and initial and initial.plan_id == row["plan_id"]))
             stop_admission = repo in scheduler.draining_projects or PROJECT_STEP_PLANNING_PENDING in results
             if not stop_admission:
+                retry_token = service._archive_retry_token()
+                if archive_boundary or retry_token != archive_retry_token:
+                    archive_boundary = False
+                    archive_retry_token = retry_token
+                    service._archive_scheduling_boundary()
+                    # Archive may advance origin by a proven rename. Recheck
+                    # planning inputs before launching another execution.
+                    check_inputs()
+                    if repo in scheduler.draining_projects:
+                        continue
+                    if service._archive_retry_token() != retry_token:
+                        # A MERGED transition during archive must be observed
+                        # before admission, not acknowledged as already tried.
+                        continue
                 _, limit, source = project_registry.task_limit(connection, repo, scheduler.config.max_tasks_per_project)
                 if managed_count(connection, repo) < limit:
                     if service.effects.resume_manual_work is not None:
@@ -1049,6 +1066,7 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                         events.emit("작업 관리 배정", project=repo, plan=activation['plan_id'],
                             managed=managed_count(connection, repo), limit=limit, source=source)
                         launch(activation, False)
+                        archive_boundary = True
                         continue
             if not running:
                 break

@@ -419,6 +419,8 @@ runtime 자식은 등록된 canonical source·repository/origin·base·실제 ru
 
 dependency와 일반 작업 간 순서는 [PRODUCT의 작업 선택 정책](PRODUCT.md#작업-선택과-동시-실행)을, Worker·검증·Review·PR 생성은 [제품 처리 흐름](PRODUCT.md#execplan-생성과-자동-처리)을 따른다.
 
+실행 조율의 `run_project_tasks`는 진입·완료 수집·새 배정 뒤 다음 선택 전에 [MERGED archive](#merged-execplan-archive) 기회를 제공한다. 후보 조회 DB 대기는 별도 보류로 기록하고 독립 배정을 계속한다. 기존 대기 loop에서는 후보·소유 예약·미확정 journal·종료 영수증 metadata·lease 반환만 관측한다. 관련 상태 변화는 새 안전 검사 기회이며 쓰기 권한이나 완료 증거가 아니다. 시도 전 관측만 기억하고 처리 도중 후보나 자원이 바뀌면 다음 배정 전에 다시 검사해 새 MERGED 전이를 놓치지 않는다. 같은 대기 상태에서 원격 조회를 반복하지 않으며, archive가 ref를 전진시켰으면 기존 planning 입력을 재확인한 뒤 다음 작업을 배정한다. planning drain·runtime handoff·사용자 pause는 이 경계에도 적용한다.
+
 ### Planner 실행과 Requirement 완료 확인
 
 일반 Planner의 최초 수립·명세 변경 판단은 최신 원격 PRODUCT·활성 Requirement·ARCHITECTURE와 적용된 일반 planning 성공 기준을 비교하며, 지침 변경은 [계획 변경 감지](#계획-변경-감지)의 별도 조건을 따른다.
@@ -703,7 +705,9 @@ DB 적용은 준비 값과 현재 프로젝트 소유권·cycle revision·선정
 
 미게시·관측 실패·원격 source 변경·DB 경쟁은 성공 기준을 전진시키지 않으며 기존 성공 행·잠정 근거·publication intent를 보존해 복구한다. 외부 관측은 DB 적용 재시도에 포함하지 않는다. DB schema와 JSON·receipt 형식, cycle 주기와 legacy 복구 계약은 유지한다. 새 리팩터링 계획은 검증된 DAG와 Manager barrier 편집을 포함해 게시한다. 계획 등록과 나머지 게시 batch 외부 처리는 별도 경계이며 이 근거 적용의 DB 전용 보장에 포함하지 않는다.
 
-평가 성공과 cycle 종료는 별도 상태다. cycle 범위는 선행·리팩터링·발견을 연결한 기존 계획과 그 dependency closure를 포함한다. 범위의 모든 계획이 실제 MERGED이고 원격·catalog에 반영됐으며 미확정 게시·해당 범위의 catalog hold가 없을 때 종료하고 다음 자동 주기의 Merge 기준을 갱신한다. 작업이 없으면 검증·필요한 게시 뒤 종료할 수 있다. 마지막 Merge 뒤 새 평가나 사후 재검증을 종료 조건으로 추가하지 않으며, 유지보수 종료를 프로젝트 전체 완료로 기록하지 않는다.
+archive가 최초 평가 workspace 생성 전에 base를 전진시키면, 게시 intent·평가 결과·완료 근거·보존 workspace가 없는 assessment만 기존 context 재시작으로 최신 base에 맞춘다. 같은 cycle·단계를 유지하고 revision을 올려 낡은 context를 무효화한다. 저장된 결과·workspace·게시 intent는 각자의 기존 복구 경계를 따른다.
+
+평가 성공과 cycle 종료는 별도 상태다. cycle 범위는 선행·리팩터링·발견을 연결한 기존 계획과 그 dependency closure를 포함한다. 범위의 모든 계획이 실제 MERGED이고 원격·catalog에 반영됐으며 미확정 게시·해당 범위의 catalog hold가 없을 때 종료하고 다음 자동 주기의 Merge 기준을 갱신한다. 작업이 없으면 검증·필요한 게시 뒤 종료할 수 있다. 종료 기준 commit은 내용 보존 archive까지 반영한 현재 catalog revision이며, archive 자체를 실제 Merge 수에 더하지 않는다. 마지막 Merge 뒤 새 평가나 사후 재검증을 종료 조건으로 추가하지 않으며, 유지보수 종료를 프로젝트 전체 완료로 기록하지 않는다.
 
 #### 결과 해석과 공백 원본
 
@@ -1625,6 +1629,10 @@ PR 없는 원격 branch의 rebase 복구도 SQLite에 저장된 동일 Manager �
 
 ExecPlan은 GitHub Merge 확인과 SQLite MERGED 전이 뒤에만 별도 정리 대상으로 삼는다. 최신 원격 base의 detached 임시 worktree에서 `docs/plans/`의 문서를 같은 파일명의 `docs/plans/archive/`로 내용 보존 rename-only commit해 직접 fast-forward 게시한다.
 
+`ProjectService`는 Requirement 교정의 lifecycle gate와 archive 실행 자원 판단을 분리한다. `ArchiveExecutionResources`는 base 게시·fetch·공유 설정과 후보별 plan/branch/worktree의 기존 lease를 dispatch 동안 유지한다. archive의 lease 요청은 경합 시 기다리지 않으므로 실행 중 호출이나 다음 배정을 선점하지 않는다. 일반·유지보수·교정의 실제 base 게시 예약과 프로젝트 안전 차단을 재확인하고, 단순 phase·유지보수 cycle·다른 작업의 존재는 쓰기 권한이나 거부 근거로 사용하지 않는다. 미확정 Git 기록은 [공통 자원 판단](#미확정-git-작업의-단계별-자원-판단)에 같은 lease stack을 전달하며 원인 rebase의 intent·차단을 보존한다.
+
+archive는 관리 배정 자리를 소비하지 않는다. 관리 배정의 parked·인계·반환은 물리 writer 종료의 근거가 아니다. 후보 자원 검사는 기존 task-call 예약과 종료 영수증을 사용하고, 명시 요청의 우선순위·관리 한도·drain·pause는 조율 경계에 남긴다. 미Merge CLOSED와 삭제 ID·정리 pending은 MERGED 후보에 포함하지 않는다. 독립 삭제 보존 기록은 전역 gate가 아니며 같은 base·journal·후보 자원의 실제 충돌만 보류한다. 삭제 기록·정리 파일의 제거와 복구는 [삭제 재시작과 파일별 복구](#삭제-재시작과-파일별-복구)의 책임으로 유지한다.
+
 보관 근거는 최초 게시본이 아닌 catalog의 현재 최종 문서 hash와 `current_revision_sha`다. operation identity는 base·계획 ID·이전/보관 경로·최종 hash·revision에 결합하며 준비 commit의 실제 rename-only diff와 후보 정의를 게시 전에 다시 확인한다.
 
 | 관측·중단 조건 | 보관·재개 결과 |
@@ -1632,21 +1640,28 @@ ExecPlan은 GitHub Merge 확인과 SQLite MERGED 전이 뒤에만 별도 정리 
 | 현재 revision이 있고 일반 파일 source의 최종 hash가 일치하며 destination·다른 동일 ID 보관 문서가 없음 | 안전한 후보만 묶어 게시한다. 충돌한 다른 후보는 pending으로 분리한다. |
 | source가 없고 같은 destination에 최종 hash가 일치하는 일반 파일이 이미 있음 | 원격 보관 완료를 관측해 확정하며 새 commit·push를 만들지 않는다. |
 | source/destination 충돌·양쪽 부재·다른 동일 ID 보관 문서·비일반 파일·hash 불일치·현재 revision 부재 | 해당 후보의 실제 이유를 archive pending에 보존하고 덮어쓰지 않는다. |
+| 대상의 수동 소유·호출 종료 미확인·lease 경합 | 해당 후보를 보존하고 다른 안전한 후보를 계속 처리한다. 후보 writer는 기존 물리적 종료/미실행 증거로 확인한다. |
 | push 실패 뒤 같은 base·후보의 준비 commit이 유효함 | 저장한 commit을 검증해 재사용한다. base·후보가 달라졌으면 최신 관측으로 다시 계산하며 낡은 후보를 그대로 게시하지 않는다. |
 
-원격 base·후보 정의는 commit 준비와 게시 직전에 재확인한다. 경쟁·게시·정리 실패는 보존한 operation·OID·이유로 재시도하며 MERGED 상태·독립 후속 작업·프로젝트 완료를 막지 않는다.
+원격 base·후보 정의·실행 자원은 초기 관측과 commit 준비·게시 직전에 재확인한다. 준비 뒤 자원 보류는 commit·tree를 보존한다. 결과 확정의 Git rename 검증·ref 관측은 DB 요청 밖에서 수행하고, 짧은 transaction은 열린 fetch lease와 catalog snapshot/generation을 재확인해 archive 성공·catalog 이동·증명된 planning delta를 함께 적용한다. snapshot 경쟁이나 lease 반환에는 확정하지 않는다. 원격 게시 뒤 DB 확정이 끊겨도 MERGED 행·현재 원격 catalog와 미완료 item에서 이동을 재발견해 commit/push를 반복하지 않는다.
+
+`execplan_archive_observations`는 `(repo, scope)`를 문자열 key로 사용한다. scope는 실행 전체의 `dispatch`, 후보 G ID 또는 미확정 Git 판단의 `git:<intent_id>`다. Git 판단의 reason에는 allow/hold와 실제 원인을 함께 기록하며 같은 판단의 반복 출력만 억제하고 판단 자체는 매번 수행한다. `category`는 `execution_opportunity`·`shared_resource`·`remote_observation`·`candidate`·`publication_confirmation`·`execution_result`·`complete`를 구분하고, 문자열 `resource`·`reason`·`resume_condition`과 음이 아닌 정수 `attempts`, 마지막 갱신 시각을 보존한다. `attempts`는 해당 scope의 실제 dispatch 결과 관측 누계이며 commit/push 횟수가 아니다. 같은 보류는 로그를 생략해도 실제 시도 누계는 유지하고, 사유 변경·완료와 완료 뒤 재발은 다시 기록한다. 후보 row 없는 진입 전 보류도 실행 scope에 남고, 관측 저장 실패는 기록 미확정 사실과 원인·재개 조건을 로그에 남긴다. 이 관측은 실행 상태·Telegram outbox를 변경하지 않는다.
+
+후보는 보류 지문에 고정하지 않고 다음 PR 후속·조율 경계와 재시작에서 DB MERGED 및 최신 catalog로 다시 찾는다. 경쟁·게시·정리 실패는 operation·OID·이유를 보존하며 독립 후속 작업·완료를 막지 않는다. archive-only 이동의 planning·작업 주기·Merge 집계 보존은 기존 검증된 delta 적용을 재사용한다.
 
 ### Requirement 교정 게시와 복구
 
 Requirement 교정은 모델 없이 식별 정보·확정 상대 링크를 보정해 같은 commit으로 게시한다. 편집 의미와 source 보존은 [Requirement 교정과 완료 보관](#requirement-교정과-완료-보관)을 따르며, 이 절은 파일 적용·원격 게시와 중단 복구를 소유한다.
 
-PR 관계 동기화 뒤 기존 housekeeping 안전 gate 안에서 ExecPlan archive보다 먼저 실행한다. `requirement_correction_publication`은 기존 detached-worktree Git adapter·기록된 fetch·자원 lock·fast-forward push를 재사용하고 기본 checkout·Agent/verify worktree를 편집하지 않는다.
+PR 관계 동기화 뒤 교정 전용의 기존 lifecycle·source/draft/planning/writer gate 안에서 ExecPlan archive보다 먼저 실행한다. 이 gate가 닫혀도 실제 자원 조건이 허용하면 archive는 별도로 진행한다. 연속 실행 조율의 archive 기회는 새 교정을 시도하지 않으며 준비된 교정 게시가 같은 base를 예약하면 archive를 보류한다. `requirement_correction_publication`은 기존 detached-worktree Git adapter·기록된 fetch·자원 lock·fast-forward push를 재사용하고 기본 checkout·Agent/verify worktree를 편집하지 않는다.
 
 | 진입·실행 조건 | 처리 |
 |---|---|
-| 진입 전 안전 gate가 닫혔거나 수동 작업이 Requirement source를 소유함 | 원격 관측·편집 없이 교정만 보류한다. 기존 후보·작업물·실패 원인을 보존하고 기존 수동 verify·Review·PR 복구와 독립 실행을 계속한다. |
+| 진입 전 lifecycle gate가 닫혔거나 DB에 수동 source·planning 예약·원격 catalog의 Requirement 문서 draft·종료 미확인 writer가 이미 확인됨 | 원격 관측·편집 없이 교정만 보류한다. 기존 후보·작업물·실패 원인을 보존하고 기존 수동 verify·Review·PR 복구와 독립 archive를 계속한다. 실제 base 게시 예약은 archive의 별도 자원 gate도 닫는다. |
 | 진입 뒤 안전 gate·미확정 Git 쓰기·종료 불명 writer·수동 source 소유·Requirement draft·planning publication의 경쟁 또는 실패 | 후보와 이유를 보존하고 이번 단계를 중단한다. 교정 실패를 비차단 archive 진단으로 삼켜 Planner로 넘기지 않는다. |
 | 보류 원인·소유권이 해소됨 | 저장 후보와 현재 원격·관계를 다시 확인해 아래 상태별로 재개한다. |
+
+교정의 사전 진입 판단과 실행 중 관측은 같은 물리적 writer 종료 조회를 사용한다. 진입 판단은 이미 알려진 교정 전용 점유를 실행 실패와 구분할 뿐이며, 진입 뒤 source/draft/예약/writer의 변화와 실제 교정 오류를 삼키지 않는다. catalog·관계·소유권 조회 실패도 빈 입력이나 안전한 보류로 추정하지 않고 기존 `CorrectionPending` 경계로 전파한다.
 
 동일 base의 일반 blob·mode, 활성·archive Requirement, 게시·draft·archive ExecPlan의 sources, SQLite 실행·취소·draft 관계와 planning intake를 모아 G-232의 `plan_requirement_corrections`를 호출한다. 기본 branch의 first-parent 반영 이력으로 순서를 관측하고 구분 불가 순서는 계산 함수의 파일명 정렬에 맡긴다. 조회 실패를 빈 관계로 대체하지 않는다.
 

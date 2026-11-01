@@ -102,6 +102,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_management_admissions').fetchone()[0],0)
 
     def test_unblock_cli_dispatch_and_live_reservation_drain(self):
+        from loop_manager_internal.application.project_service import ProjectService
         from loop_manager_internal.application.commands import execute_runtime_command
         from loop_manager_internal.storage import management_admission as admission, task_calls
         repo = str(self.directory.resolve())
@@ -114,16 +115,34 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         messages=[]
         effects=SimpleNamespace(connect_database=database.connect_database,operation_print=messages.append)
         self.assertEqual(execute_runtime_command(effects,args,self.directory,self.config_path),0)
+        self._insert_plan(self.connection,'G-005','MERGED',repo=repo)
+        self.connection.commit()
+        archive_opportunities = []
+        def archive(_connection, _path, _state, _repo, _base, **options):
+            self.assertTrue(options['archive_safety']())
+            from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+            item = ExecPlanArchiveRepository(self.connection).merged_candidates(repo)[0]
+            self.assertEqual(item.plan_id, 'G-005')
+            self.assertIsNone(options['candidate_safety'](item))
+            archive_opportunities.append(admission.parked(self.connection, repo, 'G-004'))
+        service = ProjectService.__new__(ProjectService)
+        service.identity = SimpleNamespace(connection=self.connection, state_dir=self.directory)
+        service.state = SimpleNamespace(repo=repo, repo_path=Path(repo), base='main', catalog_refresh=mock.Mock())
+        service.effects = SimpleNamespace(git=mock.Mock(), operation_print=mock.Mock(),
+                                         dispatch_execplan_archive_housekeeping=archive)
         owner = task_calls.reserve(self.connection,self.directory,repo,'G-002','verify','run')
         self.connection.commit()
         admission.reconcile(self.connection,repo,1)
         self.assertTrue(admission.parked(self.connection,repo,'G-004'))
+        service._archive_scheduling_boundary()
         self.assertIsNotNone(self.connection.execute('SELECT 1 FROM task_call_reservations WHERE token=?',(owner.token,)).fetchone())
         scheduler=self.scheduler()
         self.assertFalse(scheduler._eligible(scheduling.Task(repo,'G-002',self.connection),self.connection))
         task_calls.release(owner)
         admission.reconcile(self.connection,repo,1)
         self.assertFalse(admission.parked(self.connection,repo,'G-004'))
+        service._archive_scheduling_boundary()
+        self.assertEqual(archive_opportunities, [True, False])
         self.assertEqual(scheduling.managed_count(self.connection,repo),1)
         self.assertIn('G-004', messages[0])
 
@@ -2068,6 +2087,87 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual({item[0] for item in observations},{'G-001','G-002','G-004'})
         self.assertTrue(all(item[1]==1 and item[2]<=3 for item in observations))
         self.assertEqual(scheduling.managed_count(self.connection,'A'),0)
+
+    def test_archive_runs_between_continuous_admissions_without_candidate_records(self):
+        from contextlib import ExitStack
+        from concurrent.futures import wait as wait_for_tasks
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.runtime.resource_lock import resource_locks
+        from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        self._insert_plan(self.connection, 'G-004', 'MERGED', repo='A')
+        scheduler = self.scheduler(max_tasks_per_project=1)
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with fast_mode_scope(self.config):
+            runtime.activate('A', 'G-001', activation_sha='base', branch='one', worktree='one')
+        seen = []
+        archived_while_running = threading.Event()
+        first_future = []
+        def archive(connection, _repo_path, _state_dir, repo, _base, **options):
+            self.assertTrue(options['archive_safety']())
+            self.assertFalse(options['correction_safety']())
+            repository = ExecPlanArchiveRepository(connection)
+            for item in repository.merged_candidates(repo):
+                self.assertIsNone(repository.item(repo, item.plan_id))
+                self.assertIsNone(options['candidate_safety'](item))
+                seen.append('archive:' + item.plan_id)
+                with connection:
+                    connection.execute('UPDATE exec_plans SET path=? WHERE repo=? AND plan_id=?',
+                                       (item.archive_path, repo, item.plan_id))
+                if item.plan_id == 'G-004':
+                    archived_while_running.set()
+                    first_future[0].result(timeout=3)
+        effects = SimpleNamespace(activate_ready_execplan=loop_manager.activate_ready_execplan,
+            resume_manual_work=None, dispatch_execplan_archive_housekeeping=archive, operation_print=mock.Mock())
+        service = ProjectService(effects, ProjectIdentity(self.connection, self.directory, 'A', self.config_path,
+            None, False, None, True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', base_sha='base', catalog_refresh=mock.Mock())
+        def execute(child, repository, **_options):
+            task = scheduling.current_task.get()
+            seen.append('execute:' + task.plan_id)
+            if task.plan_id == 'G-001':
+                self.assertTrue(archived_while_running.wait(3), 'lease 반환 뒤에도 archive가 Worker 종료를 기다렸습니다.')
+            if task.plan_id == 'G-002':
+                self.assertIn('archive:G-001', seen)
+            repository.transition_from_snapshot(repository.projected('A'),
+                plan_values={'status': 'MERGED'}, project_values=runtime_state.clear_project_values())
+            return 0
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with ExitStack() as held:
+                held.enter_context(resource_locks(self.directory, 'A', ['git:refs/heads/main'], owner='other-publication'))
+                def wait(*args, **kwargs):
+                    if not first_future:
+                        first_future.append(args[0][0])
+                    held.close()
+                    return wait_for_tasks(*args, **kwargs)
+                with fast_mode_scope(self.config), mock.patch.object(ProjectService, '_dispatch_execution', execute), \
+                     mock.patch('concurrent.futures.wait', side_effect=wait), \
+                     mock.patch.object(scheduler, 'wait_recheck', return_value=False):
+                    self.assertEqual(scheduling.run_project_tasks(service, newly_activated=True), 0)
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual([item for item in seen if item != 'execute:G-001'],
+                         ['archive:G-004', 'archive:G-001', 'execute:G-002', 'archive:G-002'])
+        self.assertEqual(service.effects.operation_print.call_count, 1)
+
+    def test_archive_discovery_db_wait_does_not_prevent_independent_admission(self):
+        from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE repo='A' AND plan_id='G-001'")
+        self.connection.commit()
+        effects = SimpleNamespace(operation_print=mock.Mock(), dispatch_execplan_archive_housekeeping=mock.Mock())
+        service = ProjectService(effects, ProjectIdentity(self.connection, self.directory, 'A', self.config_path,
+            None, False, None, True, threading.Lock(), 20, 600, None))
+        service.state = ProjectObservations(Path('A'), repo='A', base='main', catalog_refresh=mock.Mock())
+        with mock.patch.object(ExecPlanArchiveRepository, 'merged_candidates', side_effect=DatabaseWaitTimeout('busy')):
+            service._archive_scheduling_boundary()
+        effects.dispatch_execplan_archive_housekeeping.assert_not_called()
+        row = self.connection.execute("SELECT * FROM execplan_archive_observations WHERE repo='A'").fetchone()
+        self.assertEqual(row['reason'], 'candidate_discovery_failed:busy')
+        with fast_mode_scope(self.config):
+            activation = loop_manager.activate_ready_execplan(self.connection, 'A', self.directory, 'base')
+        self.assertEqual(activation['plan_id'], 'G-002')
 
 
     def test_manual_precedes_retry_then_resumed_and_new_calls_without_preemption(self):

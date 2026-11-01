@@ -382,6 +382,16 @@ class PlanningSelectionService(PlanningService):
             return PlanningOutcome(PlanningOutcomeKind.WAITING)
         previous_phase = cycle.phase
         try:
+            # An archive may advance base before an untouched assessment gets
+            # its first workspace. Use the existing intent-free context restart;
+            # saved results/workspaces still follow their own recovery path.
+            if (cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+                    and cycle.cycle_base_sha != run.base_sha
+                    and cycle.publication_stage is None
+                    and cycle.full_assessment_result is None
+                    and not cycle.full_assessment_completed
+                    and not row.planning_preserved_state):
+                cycle = self._ports.state.restart_stale_maintenance(context.repo, cycle, run.base_sha)
             cycle = self._ports.state.advance_maintenance_cycle(
                 context.repo, run.base_sha
             )

@@ -2,6 +2,7 @@
 import contextlib
 import json
 import stat
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -133,7 +134,8 @@ class _CatalogRefreshCase(unittest.TestCase):
             stack.enter_context(mock.patch.object(manager, 'remote_base', side_effect=lambda *a, **k: self.events.append('fetch') or 'main'))
             stack.enter_context(mock.patch.object(manager, 'git', side_effect=lambda *a, **k: SimpleNamespace(stdout=self.sha)))
             stack.enter_context(mock.patch.object(manager, 'recheck_cleanup_pending', return_value=[]))
-            stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe', side_effect=safe))
+            stack.enter_context(mock.patch(
+                'loop_manager_internal.catalog.archive_service.ArchiveExecutionResources.safe', side_effect=safe))
             stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests', side_effect=pull_requests))
             stack.enter_context(mock.patch.object(manager.project_catalog_refresh, 'ProjectCatalogRefresh', return_value=self.boundary))
             stack.enter_context(mock.patch.object(manager.PlanningLifecycleCoordinator, 'run', side_effect=planning))
@@ -410,7 +412,13 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
 
     def test_archive_adapter_validates_publication_then_adopts_delta_and_audit(self):
         from loop_manager_internal.catalog import execplan_archive as archive
+        from loop_manager_internal.runtime.resource_lock import resource_locks
         self.boundary.refresh()
+        current_revision = self.boundary.current_revision
+        def observe_revision():
+            self.assertFalse(self.connection.in_transaction)
+            return current_revision()
+        self.boundary.current_revision = observe_revision
         port = mock.Mock()
         port.fetch_remote_base.side_effect = lambda base: self.sha
         entry = archive.ArchiveTreeEntry('100644', 'blob', 'object', self.row('G-002')['content_hash'])
@@ -418,15 +426,21 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
             archive.ArchiveCandidateObservation(item, entry, None) for item in candidates)
         port.prepare_commit.side_effect = lambda sha, base, operation, moves: archive.PreparedArchive(
             operation, sha, 'tree-hash', 'c'*40)
-        port.commit_matches.return_value = True
+        def commit_matches(*_args):
+            self.assertFalse(self.connection.in_transaction)
+            return True
+        port.commit_matches.side_effect = commit_matches
         def push(prepared, base):
             self.sha = prepared.commit_oid
             return archive.ArchivePushResult(True, self.sha)
         port.push_fast_forward.side_effect = push
-        with mock.patch.object(manager, '_ExecPlanArchiveGitPort', return_value=port):
-            result = manager.dispatch_execplan_archive_housekeeping(
-                self.connection, Path(self.repo), Path('/state'), self.repo, 'main',
-                catalog_refresh=self.boundary)
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            with resource_locks(state_dir, self.repo, ['git:fetch'], owner='execplan-archive'), \
+                 mock.patch.object(manager, '_ExecPlanArchiveGitPort', return_value=port):
+                result = manager.dispatch_execplan_archive_housekeeping(
+                    self.connection, Path(self.repo), state_dir, self.repo, 'main',
+                    catalog_refresh=self.boundary)
         self.assertEqual(result.commit_oid, self.sha)
         self.assertEqual(result.archived_plan_ids, ('G-002',))
         self.assertEqual(self.row('G-002')['path'], 'docs/plans/archive/[G-002] Dependency.md')
@@ -703,7 +717,8 @@ class ProjectCatalogConsumerTests(_CatalogRefreshCase):
             stack.enter_context(mock.patch.object(manager.project_catalog_refresh, 'ProjectCatalogRefresh', return_value=self.boundary))
             stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests', side_effect=observe_pr))
             stack.enter_context(mock.patch.object(manager, 'recheck_cleanup_pending', return_value=[]))
-            stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe', return_value=False))
+            stack.enter_context(mock.patch(
+                'loop_manager_internal.catalog.archive_service.ArchiveExecutionResources.safe', return_value=False))
             pr = stack.enter_context(mock.patch.object(manager, 'pr_for_branch', side_effect=AssertionError('new Worker PR lookup')))
             execution = stack.enter_context(mock.patch.object(manager, 'ExecutionPhaseCoordinator'))
             execution.return_value.prepare.side_effect = prepare
