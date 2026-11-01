@@ -135,6 +135,19 @@ def block_active_execplan(
     if recovery_decision is not None and recovery_decision.observation.plan_id != str(plan['plan_id']):
         raise ValueError('recovery decision and block target disagree')
     expected_plan = dict(plan)
+    checkpoints = blocked_checkpoint = None
+    blocked_git_snapshot = None
+    if reason is BlockReasonCode.PLAN_INPUT_INVALID:
+        from loop_manager_internal.storage import execution_checkpoint_state
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+        blocked_checkpoint = checkpoints.get(repo, str(plan['plan_id']))
+    if blocked_checkpoint is not None and blocked_checkpoint.operation == 'rebase':
+        try:
+            observed = effects.capture_git_snapshot(worktree)
+            if effects.capture_git_snapshot(worktree) == observed:
+                blocked_git_snapshot = observed.serialize()
+        except (OSError, RuntimeError, ValueError):
+            pass
     blocked_worktree_fingerprint = effects._worktree_execplan_input_fingerprint(
         worktree, plan
     )
@@ -186,6 +199,9 @@ def block_active_execplan(
         if current is None or dict(current) != expected_plan:
             from loop_manager_internal.application.task_scheduling import TaskRecheckRequired
             raise TaskRecheckRequired('차단 관측 중 작업 상태가 변경됐습니다.')
+        if blocked_git_snapshot is not None and checkpoints.get(repo, plan_id) != blocked_checkpoint:
+            from loop_manager_internal.application.task_scheduling import TaskRecheckRequired
+            raise TaskRecheckRequired('차단 Git 관측 중 checkpoint가 변경됐습니다.')
         decision = effects._final_block_recovery_decision(
             connection, repo, plan, str(project["phase"] or "") if project else "",
             reason, error, fingerprint, recovery_decision,
@@ -200,6 +216,18 @@ def block_active_execplan(
                 plan_values=plan_values,
                 clear_projection=True,
             )
+            if blocked_git_snapshot is not None:
+                current_checkpoint = checkpoints.get(repo, plan_id)
+                block = scoped_blocking.plan_block(connection, repo, plan_id)
+                checkpoints.record(
+                    repo, plan_id, expected_generation=current_checkpoint.generation,
+                    operation=current_checkpoint.operation, expected_head=current_checkpoint.expected_head,
+                    target_base_oid=current_checkpoint.target_base_oid,
+                    observed_remote_oid=current_checkpoint.observed_remote_oid,
+                    snapshot={**(current_checkpoint.snapshot or {}), 'metadata_block_git': {
+                        'generation': current_checkpoint.generation + 1,
+                        'block': dict(block), 'snapshot': blocked_git_snapshot}},
+                )
         else:
             runtime_state.RuntimeStateRepository(connection).transition(
                 repo,

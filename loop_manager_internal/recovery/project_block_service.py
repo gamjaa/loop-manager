@@ -24,6 +24,7 @@ from loop_manager_internal.storage import runtime_state
 from pathlib import Path
 import sqlite3
 import re
+import json
 
 
 @dataclass(frozen=True)
@@ -133,7 +134,7 @@ def _reconcile_rebase_evidence_block(
     if recovery_request_id is not None:
         from loop_manager_internal.storage import local_recovery_state
         request = connection.execute(
-            "SELECT repo, plan_id, status FROM local_environment_recovery_requests WHERE request_id=?",
+            "SELECT repo, plan_id, status, before_state FROM local_environment_recovery_requests WHERE request_id=?",
             (recovery_request_id,),
         ).fetchone()
         if (request is None or request['repo'] != repo or request['status'] != 'pending'
@@ -150,6 +151,20 @@ def _reconcile_rebase_evidence_block(
         return False
     checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     checkpoint = checkpoints.get(repo, plan_id)
+    if recovery_request_id is not None:
+        try:
+            original = json.loads(request['before_state'])
+            selected = next(item for item in original['plans'] if item['plan_id'] == plan_id)
+            cause = next(item for item in original['blocks']
+                         if item['plan_id'] == plan_id and item['scope'] == ('plan' if plan_block else 'project'))
+            if (selected['checkpoint_generation'] != checkpoint.generation
+                    or cause['reason_code'] != block['reason_code']
+                    or cause['evidence_sha256'] != local_recovery_state._digest(block['evidence'])
+                    or cause['release_fingerprint_sha256'] != (
+                        local_recovery_state._digest(block['release_fingerprint']) if block['release_fingerprint'] else None)):
+                return False
+        except (KeyError, TypeError, ValueError, StopIteration):
+            return False
     recovery = recovery_state.RecoveryRepository(connection).row(repo, plan_id)
     if (not rebase_block_reconciliation.block_matches(block, recovery, checkpoint)
             and not (scoped_blocking.is_scope_baseline_block(block) and checkpoint.operation == 'rebase')):
@@ -186,10 +201,12 @@ def _reconcile_rebase_evidence_block(
                     and re.fullmatch(r'[0-9a-f]{64}', current_input)
                     and current_input != saved_input)
                 changed_to_start = False
+                saved_git = (checkpoint.snapshot or {}).get('metadata_block_git')
                 if (not changed_input and observation[1].status is managed_rebase_validation.RebaseStatus.START
-                        and plan['agent_result_snapshot']):
+                        and isinstance(saved_git, dict) and saved_git.get('generation') == checkpoint.generation
+                        and saved_git.get('block') == dict(block) and saved_git.get('snapshot')):
                     try:
-                        before = GitSnapshot.deserialize(str(plan['agent_result_snapshot']))
+                        before = GitSnapshot.deserialize(str(saved_git['snapshot']))
                         changed_to_start = bool({'rebase-merge', 'rebase-apply'} & set(before.operations))
                     except (KeyError, TypeError, ValueError, RuntimeError):
                         pass

@@ -491,6 +491,30 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
 
 
 class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase):
+    def test_metadata_block_records_fresh_git_evidence_for_start(self):
+        from loop_manager_internal.recovery import block_service
+        self.pending()
+        fresh = loop_manager.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
+        stale = replace(fresh, operations={}).serialize()
+        effects = SimpleNamespace(
+            _plan_id_from_path=lambda _: 'G-047', project_execplan=lambda *_: None,
+            _worktree_execplan_input_fingerprint=lambda *_: 'a' * 64,
+            capture_git_snapshot=lambda *_: fresh,
+            _final_block_recovery_decision=lambda *_: None,
+        )
+        block_service.block_active_execplan(effects, self.connection, 'repo', Path('/state/G-047'),
+            'metadata failure', '', preserved_agent_result_snapshot=stale)
+        checkpoint = self.checkpoints.get('repo', 'G-047')
+        block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        self.assertEqual(checkpoint.snapshot['metadata_block_git'], {
+            'generation': checkpoint.generation, 'block': block, 'snapshot': fresh.serialize()})
+        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0], stale)
+        self.case.observed = replace(self.case.observed, head='owned-head', branch='loop-manager/G-047',
+            branch_ref=('owned-head', ''), registration=('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'),
+            branch_worktrees=(str(Path('/state/G-047').resolve()),), operations=(), metadata=None,
+            index=(), staged=(), index_clean=True, base_is_ancestor=False)
+        self.assertTrue(self.resume())
+
     def test_project_metadata_recheck_consumes_only_matching_request(self):
         from loop_manager_internal.storage import local_recovery_state
         self.block(project=True, reason='plan_input_invalid')
@@ -551,6 +575,38 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
             self.connection, request.request_id, 'G-047', 'metadata'))
         self.assertTrue(resume())
 
+    def test_explicit_metadata_recheck_rejects_changed_cause_and_generation(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        request = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        def resume():
+            return loop_manager.resume_plan_blocks(
+                self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+                plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id)
+        original = scoped_blocking.plan_block(self.connection, 'repo', 'G-047')['evidence']
+        self.connection.execute("UPDATE execplan_blocks SET evidence='different failure'")
+        self.connection.commit()
+        self.assertFalse(resume())
+        self.connection.execute('UPDATE execplan_blocks SET evidence=?', (original,))
+        self.connection.commit()
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot=current.snapshot)
+        self.connection.commit()
+        self.assertFalse(resume())
+        self.factory.assert_not_called()
+        self.assertFalse(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+        after = local_recovery_state.snapshot(self.connection, 'repo', 'G-047')
+        local_recovery_state.complete_request(self.connection, request, 'unresolved', after)
+        renewed = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+            plan_id='G-047', force_timeout_recheck=True, recovery_request_id=renewed.request_id))
+
     def test_metadata_release_policy_does_not_resume_unchanged_block(self):
         self.block(reason='plan_input_invalid')
         self.pending()
@@ -609,6 +665,9 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
 
     def test_metadata_start_without_saved_git_transition_remains_blocked(self):
         self.block(reason='plan_input_invalid')
+        stale = loop_manager.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (stale.serialize(),))
+        self.connection.commit()
         self.case.observed = replace(self.case.observed, base_is_ancestor=False)
         before = self.snapshot()
         self.assertFalse(self.resume())
@@ -646,10 +705,15 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
         self.block(reason='plan_input_invalid')
         before = loop_manager.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
-        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (before.serialize(),))
-        self.connection.commit()
         self.case.observed = replace(self.case.observed, base_is_ancestor=False)
         block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'metadata_block_git': {
+                'generation': current.generation + 1, 'block': block, 'snapshot': before.serialize()}})
+        self.connection.commit()
         checkpoint_before = self.checkpoints.get('repo', 'G-047')
         decision = self.case.factory(None).require_owned(checkpoint=checkpoint_before)
         self.assertIs(decision[1].status, RebaseStatus.START)
