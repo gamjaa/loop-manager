@@ -45,6 +45,7 @@ priority: normal
 
 - R-067/R-091: 현재 필수 `runner-integration`의 고정 9개 case(두 언어 × standalone/coordinated × 정상/native 실패와 partial/full)를 Manager·단독 전체 실행 자료에서 확인한다. 지원 플랫폼의 case 완료·run/stage/revision·고유 child run과 실제 session·예약·PID/시작 identity·최종 종료 응답을 대조한다. 일반 unittest 자식의 중첩 runner를 복원하지 않고 Agent/API 거부·인증값/예산 제어값 격리를 유지한다. 단계 누락·중복·timeout·인프라/fixture 실패를 전체 성공이나 의도된 native 실패로 처리하지 않는다.
 - Windows·Linux의 실제 공통 프로세스/예약 경계와 지원되는 두 언어 예제에서 auto와 1이 같은 수집·테스트/compile 범위를 수행한다. Python은 선언한 프로젝트 interpreter를 사용하고 Perl native 실행은 현재 VERIFY의 Linux/Perl 5.38.2·Test::More 1.302194·TAP::Parser 3.44 범위에서 확인한다. Windows에는 Python 실제 실행과 플랫폼 독립 Perl 계약/IPC 회귀를 유지하며 이 결과를 Windows native Perl 지원으로 표시하지 않는다. 고부하 대기·동시 두 프로젝트·새 작업 진입에서 실제 관측과 미반영 예약을 함께 계산한다.
+- R-065의 CPU 조건은 최초 시작과 추가 실행 모두 현재 `resources.decide()`의 `min(1.0, 허용 CPU 수 × 0.25)`를 소비한다. 실제 배정 자료에서 순간·평균 부하 중 큰 값과 미반영 예약, 메모리·cap·관측 실패 보호를 함께 확인한다. 2코어의 0.5코어 경계는 이미 구현된 unit 회귀를 재사용하고 시작에만 더 높은 여유를 요구하는 별도 gate를 만들지 않는다.
 - R-086이 지원하는 자체 unittest 부분 실행에서도 기존 자식/예약 격리·timeout·취소·종료 불명 보호를 확인한다. 현재 Windows launcher의 부분 요청은 `self_windows_requires_full` FALLBACK이며 두 단계를 실행하지 않는다. 이를 Linux 부분 실행의 성공이나 Windows 부분 지원으로 표시하지 않고 이후 실제 전체 경로와 연결한다. 부분 실행의 미선택 상태와 실행 없는 fallback을 전체 필수 검증 완료와 구분하며 Python/비Python의 기존 전체 적합성 범위는 유지한다.
 - timeout·취소·시작/통신/결과 오류·강제 종료에서 해당 자식 종료와 예약 해제를 확인한다. 종료 미확인 예약은 함부로 풀지 않고 다른 프로젝트의 자식/예약/작업을 변경하지 않는다.
 - R-091: Manager의 기본 `verify_concurrency=1`과 명시적 2에서 실제 호출 수·대기·Agent 병행을 구분한다. 동시 두 프로젝트의 부하/예약 비교는 2로 명시하고 단독 runner의 기존 조율 범위와 구별한다. 순번·자원 대기를 제외한 실제 실행 예산과 wall 경과·대기 누계를 별도로 기록한다. 종료 불명은 관련 호출/관리 자리를 보존하며 자체 Windows 두 단계와 정리는 같은 verify 자리 하나를 유지한다.
@@ -80,6 +81,8 @@ priority: normal
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- revision `97df4cae88d54e9fcb469f5366d7ee360e5469e5`의 R-065·PRODUCT·ARCHITECTURE와 `resources.py`·`test_verify_resources.py`를 대조했다. 최초/추가 실행의 같은 CPU 여유 기준과 평균·예약 경계는 직접 구현돼 별도 교정 작업을 만들지 않는다. 남은 실제 OS·동시 부하·동일 범위 비교는 이 기준으로 수행하며 알고리즘 unit을 복제하지 않는다. snapshot token `dba8d3c522069d8b703fbccbec09143be1fe2ec6e82673402ef36c7181a489ac`의 원문 hash를 확인했고 기존 ID·경로·metadata·dependency·수행 기록을 보존했다. archive-only 이동은 목표 철회가 아니며 실제 검증 성공·프로젝트 최종 전문 확인은 수행하지 않았다.
 
 - revision `c233021f56362b22f6fb10257eb2734c2664e23e`의 고정 통합 suite·관측 전용 session·공통 대기 누계·최종 종료 응답과 예산 오류 보존은 원격 구현으로 소비한다. 삭제된 중첩 예제/고정 관측 helper의 정상·native 실패·partial/full 검증은 `integration.py`와 새 unit으로 이전됐으며 이 계획은 남은 실제 OS 격리·동시 부하·동일 범위 비교 자료만 담당한다. snapshot token `45bca81e68a942e7da99615278950c6c529c9c22a7eb905d863db25ae77fedca`의 원문 hash를 확인했고 기존 ID·경로·metadata·dependency·수행 기록을 보존한다. 실제 통합·Windows 실행·성능이나 프로젝트 최종 전문 확인의 성공을 새로 기록하지 않는다.
 - 2026-10-16 delta: R-091의 직접 구현된 기본 verify 직렬·설정 가능한 동시 호출과 대기 제외 시간 기준을 실측 조건에 연결한다. G-297의 조율 보완 뒤 실제 연결을 확인하고 기존 OS/언어/부하 목표·수행 이력은 보존한다. 부분 unit/mock 근거를 실측이나 최종 전문 확인으로 확대하지 않는다.
