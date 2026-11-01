@@ -1096,7 +1096,8 @@ class RuntimeStateRepository:
                 and saved.get('rebase_block_release_state') == observed.fingerprint):
             raise RuntimeStateError('unchanged pending rebase recovery was already resumed')
         def check_owner():
-            project = project_row(self.connection, repo)
+            project = (project_row(self.connection, repo) if is_plan_block else
+                       self.connection.execute('SELECT * FROM projects WHERE repo=?', (repo,)).fetchone())
             current_block = (scoped_blocking.plan_block(self.connection, repo, plan_id)
                              if is_plan_block else scoped_blocking.project_block(self.connection, repo))
             active = self.active_row(repo)

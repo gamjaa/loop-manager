@@ -491,6 +491,33 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
 
 
 class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase):
+    def test_project_metadata_recheck_consumes_only_matching_request(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.block(project=True, reason='plan_input_invalid')
+        self.pending()
+        wrong = local_recovery_state.begin_request(self.connection, 'repo', 'G-999')
+        request = local_recovery_state.begin_request(self.connection, 'repo', None)
+        from contextlib import nullcontext
+        from loop_manager_internal.recovery.plan_recovery import recovering_plan
+        before = self.snapshot()
+        with mock.patch('loop_manager_internal.recovery.plan_recovery.resource_locks', return_value=nullcontext()):
+            with recovering_plan(self.connection, Path('/state'), 'repo', 'G-047', project_recovery=True) as available:
+                self.assertTrue(available)
+                self.assertFalse(loop_manager.resume_project_block_if_safe(
+                    self.connection, Path('/repo'), Path('/state'), 'repo', recovery_request_id=wrong.request_id))
+        self.assertEqual(self.snapshot(), before)
+        self.factory.assert_not_called()
+        with mock.patch('loop_manager_internal.recovery.plan_recovery.resource_locks', return_value=nullcontext()):
+            with recovering_plan(self.connection, Path('/state'), 'repo', 'G-047', project_recovery=True) as available:
+                self.assertTrue(available)
+                self.assertTrue(loop_manager.resume_project_block_if_safe(
+                    self.connection, Path('/repo'), Path('/state'), 'repo', recovery_request_id=request.request_id),
+                    loop_manager.operation_log.call_args_list)
+        self.assertTrue(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').operation, 'rebase')
+
     def test_explicit_metadata_recheck_consumes_request_with_release(self):
         from loop_manager_internal.storage import local_recovery_state
         self.block(reason='plan_input_invalid')

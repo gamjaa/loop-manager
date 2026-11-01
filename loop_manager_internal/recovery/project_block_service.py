@@ -130,10 +130,22 @@ def _reconcile_rebase_evidence_block(
 ) -> bool:
     """Recheck the owned current rebase and release only its saved cause."""
     plan_id = str(block["plan_id"] or "")
+    if recovery_request_id is not None:
+        from loop_manager_internal.storage import local_recovery_state
+        request = connection.execute(
+            "SELECT repo, plan_id, status FROM local_environment_recovery_requests WHERE request_id=?",
+            (recovery_request_id,),
+        ).fetchone()
+        if (request is None or request['repo'] != repo or request['status'] != 'pending'
+                or request['plan_id'] not in (None, plan_id)
+                or block['reason_code'] != scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value
+                or local_recovery_state.recheck_consumed(connection, recovery_request_id, plan_id, 'metadata')):
+            return False
     plan = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?", (repo, plan_id),
     ).fetchone()
-    project = runtime_state.project_row(connection, repo)
+    project = (runtime_state.project_row(connection, repo) if plan_block else
+               connection.execute('SELECT * FROM projects WHERE repo=?', (repo,)).fetchone())
     if plan is None or project is None or block['repo'] != repo:
         return False
     checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
@@ -346,9 +358,9 @@ def resume_project_block_if_safe(
     effects: ResumeProjectBlockIfSafeEffects, connection: sqlite3.Connection,
     repo_path: Path,
     state_dir: Path,
-    repo: str,
+    repo: str, *, recovery_request_id: str | None = None,
 ) -> bool:
-    return scope_reconciliation.resume_project_block_if_safe(effects._scope_reconciliation_effects_resume_project_block_if_safe(), connection, repo_path, state_dir, repo)
+    return scope_reconciliation.resume_project_block_if_safe(effects._scope_reconciliation_effects_resume_project_block_if_safe(), connection, repo_path, state_dir, repo, recovery_request_id=recovery_request_id)
 
 
 @dataclass(frozen=True)

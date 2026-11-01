@@ -278,6 +278,16 @@ class ProjectService:
             != BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
         ):
             if self.identity.recovery_request_id:
+                if (initial_project_block['reason_code'] == BlockReasonCode.PLAN_INPUT_INVALID.value
+                        and initial_project_block['plan_id']
+                        and self.identity.recovery_plan_id in (None, str(initial_project_block['plan_id']))):
+                    from loop_manager_internal.recovery.plan_recovery import recovering_plan
+                    with recovering_plan(self.identity.connection, self.identity.state_dir, self.state.repo,
+                                         str(initial_project_block['plan_id']), project_recovery=True) as available:
+                        if available and self.effects.resume_project_block_if_safe(
+                                self.identity.connection, self.state.repo_path, self.identity.state_dir,
+                                self.state.repo, recovery_request_id=self.identity.recovery_request_id):
+                            return 0
                 self.effects.operation_print(
                     "프로젝트 안전 차단은 로컬 재검사 명령으로 해제하지 않습니다: "
                     + str(initial_project_block["reason_code"]), file=sys.stderr,
