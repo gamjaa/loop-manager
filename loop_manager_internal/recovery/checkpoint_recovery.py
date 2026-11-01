@@ -760,7 +760,9 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         "링크·표현 변화나 무관한 변경은 해소 근거가 아니다. 선택 문서의 삭제·부재 사실만으로 해소하지 마라. "
         "필요하면 Git의 지정 revision에서 source 원문을 읽어라. 파일을 수정하지 마라. "
         "한 줄 USER_DECISION_ASSESSMENT: JSON 객체를 반환하라. 필드는 resolved(bool), detail(이유), "
-        "evidence(근거별 source·quote 배열)다. "
+        "evidence(근거별 source·quote 배열)다. source는 아래 sources 목록의 저장소 상대 경로와 정확히 "
+        "같아야 하며 :행번호·범위·링크를 붙이지 마라. 목록 밖 파일의 근거는 evidence에 넣지 말고 "
+        "필요하면 detail에 설명하라. quote는 해당 경로의 현재 원문에 그대로 포함된 문자열이어야 한다. "
         + ("true에는 현재 상위 명세의 구체적 선택 인용과 현재 원인 코드 인용이 필요하다. "
            "원인 코드가 전부 삭제됐다면 실제 부재와 상위 명세를 대조하라.\n" if correction or unlinked else
            "true에는 변경된 source의 현재 원문 인용과 ExecPlan 이외의 상위 명세가 "
