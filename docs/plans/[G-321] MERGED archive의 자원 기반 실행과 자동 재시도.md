@@ -228,6 +228,24 @@ FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.te
 
 선택 범위 밖 프로젝트 차단 재평가 테스트의 관측 계약 불일치를 COMMON_DEFECT_REPORT로 인계한다. 해당 코드·테스트·다른 ExecPlan·Requirement는 수정하지 않았고 기존 G-321 결과를 보존한다. 현재 전체 verify 완료는 이 공통 검증 교정과 Manager의 재검증을 기다린다.
 
+
+### 관측 계약 공통 교정 반영 뒤 현재 후보 확인
+
+호출 시작 HEAD `24cf402ae4b5bd52127d49cbf5070c10fb8f9958`, base `9d4aaf1b327af67dfaadb41cafa1be1b5bc64427`의 최신 ExecPlan·근거 입력과 base 대비 최종 diff 전체를 대조했다. 앞서 검토한 `1e705f51dcf9ea5d416a5ba4379af68ce5d1fa20`과도 구현·테스트·PRODUCT·ARCHITECTURE를 직접 비교했다. G-321 구현과 테스트는 동일하며 ARCHITECTURE의 관측 mock 계약은 공통 교정에서 추가된 base 내용이다. 이 비교는 이전 테스트 성공을 승계하는 근거가 아니다.
+
+현재 프로젝트 차단 재평가 fixture는 공통 `observation()` 생성 도구와 marker·관측값 쌍을 사용하고, scope mismatch의 원인 문자열·LocalWorkPending의 종류와 사유·require_owned 호출을 검증한다. 위 `call-k42_ys7t`의 1 error는 과거 감사로 보존하며 현재 코드에서 같은 명령을 새로 실행했다.
+
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_project_block_revalidation.ProjectCauseRevalidationTests.test_current_scope_rejects_pending_conflict_and_scope_mismatch
+결과: 1 test, OK, exit 0 (0.071s). dict 변환 오류 없이 의도한 미해결 operation 보호와 scope 거부를 확인했다.
+
+현재 archive 후보의 관련 최소 연결도 다음 명령으로 확인했다.
+
+`python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_requirement_correction_publication.RequirementCorrectionPublicationTest.test_housekeeping_dispatches_with_an_independent_rebase_and_keeps_safety_gate tests.test_task_scheduling.TaskSchedulingTests.test_archive_runs_between_continuous_admissions_without_candidate_records tests.test_pr_source_synchronization.PrSourceSynchronizationTest.test_archive_push_then_db_interruption_recovers_without_recommit_or_push`
+
+결과: 3 tests, OK, exit 0 (2.397s). 독립 rebase journal 보존과 교정 gate 분리, lease 반환 후 연속 배정 사이 archive, 실제 게시 후 DB 확정 중단의 prepare/push 무중복·mode/HEAD/index/작업물 보존을 확인했다. 이번 호출의 4개 case 모두 통과했으며 결과는 `call-cxyjuxj3`의 targeted 기록에 남겼다. 이전 후보의 성공이나 Manager의 정적 원인 재평가를 이번 검증 결과로 합성하지 않았다.
+
+추가 코드·테스트 교정은 필요하지 않았다. 이번 변경은 선택 ExecPlan 본문의 재검증 기록이며 frontmatter·Requirement·다른 ExecPlan은 변경하지 않는다. 전체 verify·Review·사용자 Merge는 Manager의 후속 검증·완료 절차로 남긴다. 검증 입력 제외 identity는 선언하지 않는다.
+
 ## Decision Log
 
 - 이번 delta는 G-321을 초기화하거나 완료한 구현을 중복 계획하지 않는다. 앞의 후보에 보존된 구현/검증 원문과 과거 준비점은 유지하고 현재 원격의 관리 인계·삭제 정책과 만나는 경계만 미충족 통합으로 구분한다. started ID·경로·기존 dependency·metadata를 보존한다. 후보 확인·기존 targeted 기록은 최신 전체 verify/Review 성공·Merge가 아니다.
