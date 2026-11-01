@@ -51,6 +51,19 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             run_project_result=run_project_result,
         )
 
+    def test_recheck_consumption_rejects_other_repo_and_plan(self):
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            request = local_recovery_state.begin_request(connection, repo, 'G-001')
+            for other_repo, subject in (('other', 'G-001'), (repo, 'G-002'), (repo, 'planning')):
+                with self.subTest(repo=other_repo, subject=subject):
+                    with self.assertRaises(local_recovery_state.LocalRecoveryRequestError):
+                        local_recovery_state.consume_recheck(connection, request.request_id, subject, 'verify', repo=other_repo)
+                    self.assertFalse(local_recovery_state.recheck_consumed(connection, request.request_id, subject, 'verify'))
+            with connection:
+                self.assertTrue(local_recovery_state.consume_recheck(connection, request.request_id, 'G-001', 'verify', repo=repo))
+                self.assertFalse(local_recovery_state.consume_recheck(connection, request.request_id, 'G-001', 'verify', repo=repo))
+
     def test_recover_releases_database_access_during_external_execution(self):
         from loop_manager_internal.storage.db_access import open_connection
         self.config_path.write_text('[loop]\n', encoding='utf-8')

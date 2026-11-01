@@ -1010,7 +1010,7 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             with connection:
                 if recovery_request_id is not None:
                     from loop_manager_internal.storage import local_recovery_state
-                    if not local_recovery_state.consume_recheck(connection, recovery_request_id, str(blocked["plan_id"]), "verify"):
+                    if not local_recovery_state.consume_recheck(connection, recovery_request_id, str(blocked["plan_id"]), "verify", repo=repo):
                         effects._clear_active_in_current_transaction(connection, repo)
                         continue
                 runtime_state.RuntimeStateRepository(connection).transition(

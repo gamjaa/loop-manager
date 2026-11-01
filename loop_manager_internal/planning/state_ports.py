@@ -285,7 +285,7 @@ class _PlanningStatePorts:
         from loop_manager_internal.storage import local_recovery_state
         with self.transaction():
             self.update(repo, **values)
-            local_recovery_state.consume_recheck(self._connection, request_id, "planning", "planner")
+            local_recovery_state.consume_recheck(self._connection, request_id, "planning", "planner", repo=repo)
 
     def release_planning_correction(
         self, repo: str, *, error: str, active_sha: str, context: str,
