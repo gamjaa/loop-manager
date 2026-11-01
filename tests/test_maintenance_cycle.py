@@ -366,7 +366,9 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
                             self.addCleanup(connection.close)
                             self.connection.backup(connection)
                         repository = maintenance_state.MaintenanceRepository(connection)
-                        ports = FakePorts(planning_snapshot(repo="/one"), repository.get("/one"))
+                        ports = FakePorts(planning_snapshot(repo="/one", processed_sha=self.latest,
+                            planning_fingerprint="fingerprint", specification_fingerprint="specification"),
+                            repository.get("/one"))
                         ports.state.maintenance_cycle = repository.get
                         ports.state.advance_maintenance_cycle = lambda repo, sha: loop_manager._advance_maintenance_cycle_after_merges(connection, repo, sha)
                         ports.state.schedule = lambda repo: loop_manager.catalog_schedule_decision(connection, repo)
