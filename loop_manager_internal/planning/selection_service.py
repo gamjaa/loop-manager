@@ -486,7 +486,7 @@ class PlanningSelectionService(PlanningService):
             )
             return PlanningOutcome(PlanningOutcomeKind.WAITING)
         maintenance_specification_changed = False
-        if decision.runnable_ready is not None and cycle.phase in {
+        if cycle.phase in {
             maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
             maintenance_state.MaintenancePhase.REFACTORING,
         }:
