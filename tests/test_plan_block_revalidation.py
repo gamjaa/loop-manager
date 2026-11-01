@@ -1493,6 +1493,22 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
 
 
 class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_unlinked_common_report_reaches_cause_review_and_resumes_without_fake_validation(self):
+        from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
+        raw='COMMON_DEFECT_REPORT: '+json.dumps(dict(problem='shared cause',scope='outside plan',
+            evidence='original failure',locations=[dict(path='shared.py',line=1)]))
+        ValidationFeedbackRepository(self.connection).record_result(self.repo,'G-106','old','worker','returned',raw)
+        runtime=loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan(self.repo,'G-106',reason_code='common_defect_pending',evidence='shared cause',
+            release_fingerprint='input',clear_projection=False,plan_values={'worker_result':raw})
+        self.ports._evaluate_remote_checkpoint_cause.return_value=(True,'current code removes cause',None)
+        self.assertEqual(self.coordinator.reconcile('G-106'),'resumed')
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+        self.assertEqual(self.plan()['status'],'IMPLEMENTING')
+        self.assertIsNone(self.plan()['verify_token'])
+        self.assertIsNone(scoped_blocking.plan_block(self.connection,self.repo,'G-106'))
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM common_defect_merges').fetchone()[0],0)
+
     def test_question_assessment_checkpoint_race_keeps_the_input_retryable(self):
         from loop_manager_internal.recovery.checkpoint_recovery import _assess_user_decision_cause
         runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)

@@ -642,9 +642,11 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
     project = runtime_state.project_row(connection, repo)
     revision = effects.git(repo_path, 'rev-parse', f"refs/remotes/origin/{project['base_branch']}").stdout.strip()
     correction = common_defect_state.reassessment(connection, repo, str(blocked['plan_id']))
-    if (common and correction is None) or correction and not correction['ready']:
+    unlinked = common_defect_state.unlinked_reports(connection, repo, str(blocked['plan_id'])) if common and correction is None else []
+    if (common and correction is None and not unlinked) or correction and not correction['ready']:
         return False, '공통 교정의 실제 Merge·필수 검증 근거를 기다립니다.', None
-    code_paths = set()
+    code_revisions = {location['path']: item['revision'] for item in unlinked for location in item['report']['locations']}
+    code_paths = set(code_revisions)
     if correction:
         for item in correction['corrections']:
             if effects.git(repo_path, 'merge-base', '--is-ancestor', item['merge']['merge_oid'], revision, check=False).returncode != 0:
@@ -711,7 +713,7 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         from loop_manager_internal.catalog.requirement_sources import source_requirement_id
         # A newly introduced Requirement has no historical text. The current
         # required source must still resolve before historical absence is used.
-        old = source(prior_revision, path, optional=(
+        old = source(code_revisions.get(path) or prior_revision, path, optional=(
             is_optional_product or path in code_paths or source_requirement_id(path) is not None))
         prior_presence[path] = old is not None
         previous[path] = old
@@ -726,13 +728,15 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
             fromfile=f'a/{path}' if old is not None else '/dev/null',
             tofile=f'b/{path}' if latest is not None else '/dev/null',
         ))
-    if not changes and not correction:
+    if unlinked and not any(path in changes or current[path] is None for path in code_paths):
+        return False, '공통 결함 보고의 관련 코드 변경·부재가 없어 현재 원인을 보존합니다.', None
+    if not changes and not correction and not unlinked:
         return False, '기존 사용자 질문을 다시 판단할 명세·계획 본문 변경이 없습니다.', None
     question = str(block['evidence'])
     candidate = [blocked[key] for key in ('path', 'sources', 'content_hash', 'current_revision_sha')]
     candidate.append(checkpoint.expected_head)
     meaning_identity = hashlib.sha256(json.dumps([
-        question, candidate,
+        question, candidate, unlinked,
         {path: (value if path in code_paths else meaning(value)) if value is not None else None for path, value in current.items()},
         {path: (value if path in code_paths else meaning(value)) if value is not None else None for path, value in previous.items()},
         [{key: item[key] for key in ('source', 'reason')} for item in related],
@@ -756,11 +760,11 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         "한 줄 USER_DECISION_ASSESSMENT: JSON 객체를 반환하라. 필드는 resolved(bool), detail(이유), "
         "evidence(근거별 source·quote 배열)다. "
         + ("true에는 현재 상위 명세의 구체적 선택 인용과 현재 원인 코드 인용이 필요하다. "
-           "원인 코드가 전부 삭제됐다면 실제 부재와 상위 명세를 대조하라.\n" if correction else
+           "원인 코드가 전부 삭제됐다면 실제 부재와 상위 명세를 대조하라.\n" if correction or unlinked else
            "true에는 변경된 source의 현재 원문 인용과 ExecPlan 이외의 상위 명세가 "
            "질문 해소를 뒷받침하는 인용이 모두 필요하다.\n")
         + json.dumps(dict(question=question, revision=revision, sources=paths,
-                         common_defect_input=correction, common_defect_wait=common,
+                         common_defect_input=correction, unlinked_common_defect_reports=unlinked, common_defect_wait=common,
                          code_presence={path: current[path] is not None for path in sorted(code_paths)},
                          source_presence={path: value is not None for path, value in current.items()},
                          prior_source_presence=prior_presence,
@@ -769,7 +773,7 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
                          prior_revision=prior_revision,
                          execplan=current[blocked['path']], changes=changes,
                          manager_inputs={path: current[path] for path in paths if path.startswith('manager:')}), ensure_ascii=False))
-    if correction:
+    if correction or unlinked:
         prompt += ('\n공통 교정의 실제 Merge·검증 근거는 질문 해소나 원인 해결을 뜻하지 않는다. '
                    '현재 코드·명세에서 원래 원인이 실제 해소됐는지 확인하라. '
                    'common_defect_wait=true는 사용자 승인을 요구하지 않는 구현 교정 대기다. '
@@ -803,7 +807,7 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
             or not isinstance(item.get('quote'), str) or not item['quote'].strip()
             or not isinstance(current[item['source']], str)
             or item['quote'] not in current[item['source']] for item in result['evidence'])
-            or not correction and not any(item['source'] in changes and isinstance(current[item['source']], str)
+            or not (correction or unlinked) and not any(item['source'] in changes and isinstance(current[item['source']], str)
                                           for item in result['evidence'])
             or not any(item['source'] in upper_sources for item in result['evidence'])
             or common and any(isinstance(current[path], str) and current[path].strip() for path in code_paths)
@@ -821,6 +825,7 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
                 or checkpoints.get(repo, str(blocked['plan_id'])) != checkpoint
                 or planning_review_state.general_pending(connection, repo)
                 or common_defect_state.reassessment(connection, repo, str(blocked['plan_id'])) != correction
+                or (unlinked and common_defect_state.unlinked_reports(connection, repo, str(blocked['plan_id'])) != unlinked)
                 or dict(planning_review_state.get(connection, repo, 'general') or {}) != (general or {})
                 or any(runtime_state.project_row(connection, repo)[key] != project[key]
                        for key in ('base_branch', 'origin'))
@@ -830,7 +835,7 @@ def _assess_user_decision_cause(effects, connection, repo_path, state_dir, repo,
         if saved.get('identity') == identity:
             return result['resolved'], result['detail'], None
         assessment = dict(identity=identity, meaning_identity=meaning_identity,
-                          common_defect_input=correction,
+                          common_defect_input=correction, unlinked_common_defect_reports=unlinked,
                           planning_confirmation=planning_input, revision=revision, question=question,
                           prior_revision=prior_revision, prior_source_presence=prior_presence,
                           source_presence={path: value is not None for path, value in current.items()},

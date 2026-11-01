@@ -276,6 +276,10 @@ class BlockedPlanReconciler:
             raise InputChanged('차단 계획의 확정 planning 입력이 변경됐습니다.')
         if context.get('common_defect_input') != common_defect_state.reassessment(self.connection, self.repo, plan_id):
             raise InputChanged('공통 교정의 연결·Merge·검증 근거가 변경됐습니다.')
+        if context.get('unlinked_common_defect_reports', []) != (
+                common_defect_state.unlinked_reports(self.connection, self.repo, plan_id)
+                if context.get('common_defect_input') is None else []):
+            raise InputChanged('공통 결함의 원래 실패 보고가 변경됐습니다.')
         return plan
 
     def _confirmed_planning_identity(self, plan, context, planning_input):
@@ -562,7 +566,8 @@ class BlockedPlanReconciler:
                     context['base_oid'], check=False).returncode != 0 for item in correction['corrections']):
                 return dict(resolved=False, detail='현재 원격에 확정된 교정 개정·다른 교정 Merge가 없습니다.', stage=None)
             return dict(resolved=True, detail='확정된 개정의 공통 교정 소유 작업을 Worker부터 실행합니다.', stage='worker')
-        if ((reason == BlockReasonCode.COMMON_DEFECT_PENDING.value and not correction)
+        if ((reason == BlockReasonCode.COMMON_DEFECT_PENDING.value and not correction
+                and not common_defect_state.unlinked_reports(self.connection, self.repo, plan['plan_id']))
                 or correction and not correction['ready']):
             return dict(resolved=False, detail='공통 교정의 실제 Merge·검증 반영을 기다립니다.', stage=None)
         assessment_plan = {**dict(plan), **context['artifacts'], 'blocked_reason': reason}
@@ -712,11 +717,13 @@ class BlockedPlanReconciler:
                                         (self.repo, plan_id)).fetchone()
         planning_input = planning_review_state.reassessment(self.connection, self.repo, plan_id)
         correction = common_defect_state.reassessment(self.connection, self.repo, plan_id)
+        unlinked = common_defect_state.unlinked_reports(self.connection, self.repo, plan_id) if correction is None else []
         previous_context = json.loads(saved['context']) if saved else {}
         previous_input = previous_context.get('planning_input', {})
         if saved is None or saved['stage'] in TERMINAL:
             if (not observations.pending_input(row) and planning_input == previous_input
-                    and correction == previous_context.get('common_defect_input')):
+                    and correction == previous_context.get('common_defect_input')
+                    and unlinked == previous_context.get('unlinked_common_defect_reports', [])):
                 if (self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value
                         or local_verify_recheck and self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value):
                     return 'unhandled'
@@ -731,7 +738,7 @@ class BlockedPlanReconciler:
                        'branch_ref', 'base_oid', 'branch_oid')}
             context.update(plan_id=plan_id, identity={field: plan[field] for field in IDENTITY_FIELDS},
                            block=dict(block), artifacts={field: plan[field] for field in ARTIFACT_FIELDS},
-                           planning_input=planning_input, common_defect_input=correction)
+                           planning_input=planning_input, common_defect_input=correction, unlinked_common_defect_reports=unlinked)
             if (previous_context.get('block') == dict(block)
                     and previous_context.get('identity', {}).get('path') == plan['path']):
                 for field in ARTIFACT_FIELDS:
@@ -744,8 +751,8 @@ class BlockedPlanReconciler:
             ) or (plan['plan_sha'] if same_cause else None) or plan['active_sha'] or plan['plan_sha']
             remote_key = observations.input_identity(row)
             context['remote_input_identity'] = remote_key
-            key, stage = (json.dumps([remote_key, planning_input, correction], sort_keys=True)
-                          if planning_input or correction else remote_key), 'observed'
+            key, stage = (json.dumps([remote_key, planning_input, correction, *([unlinked] if unlinked else [])], sort_keys=True)
+                          if planning_input or correction or unlinked else remote_key), 'observed'
             context['input_identity'] = key
             self._save(plan_id, key, stage, context)
         else:
@@ -754,7 +761,8 @@ class BlockedPlanReconciler:
             context.setdefault('comparison_revision', self._plan(plan_id)['plan_sha'] or self._plan(plan_id)['active_sha'])
         try:
             if (saved is not None and saved['stage'] not in TERMINAL
-                    and (planning_input != previous_input or correction != previous_context.get('common_defect_input'))):
+                    and (planning_input != previous_input or correction != previous_context.get('common_defect_input')
+                         or unlinked != previous_context.get('unlinked_common_defect_reports', []))):
                 # Keep the owned Git operation and its original target. Only
                 # refresh assessment inputs and the next desired base; pending
                 # rebase completion remains _incorporate's responsibility.
@@ -768,16 +776,18 @@ class BlockedPlanReconciler:
                     if (dict(current_saved or {}) != dict(saved)
                             or planning_review_state.reassessment(self.connection, self.repo, plan_id) != planning_input
                             or common_defect_state.reassessment(self.connection, self.repo, plan_id) != correction
+                            or (common_defect_state.unlinked_reports(self.connection, self.repo, plan_id) if correction is None else []) != unlinked
                             or dict(self._plan(plan_id)) != dict(observed_plan)
                             or ExecutionCheckpointRepository(self.connection).get(self.repo, plan_id) != checkpoint):
                         return 'deferred'
                     context['planning_input'] = planning_input
                     context['common_defect_input'] = correction
+                    context['unlinked_common_defect_reports'] = unlinked
                     context['identity'] = identity
                     self._check_owner(plan_id, context)
                     context['base_oid'] = row['base_oid']
                     context['remote_input_identity'] = observations.input_identity(row)
-                    key = json.dumps([context['remote_input_identity'], planning_input, correction], sort_keys=True)
+                    key = json.dumps([context['remote_input_identity'], planning_input, correction, *([unlinked] if unlinked else [])], sort_keys=True)
                     context['input_identity'] = key
                     context.pop('evaluation', None)
                     if stage in {'incorporated', 'evaluated'}:

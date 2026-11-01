@@ -140,16 +140,16 @@ def record_merge(connection, repo, plan_id, pr_url, head, merge_oid):
         (repo, plan_id, pr_url, head or '', merge_oid or '', json.dumps(verification, sort_keys=True)))
 
 
-def reassessment(connection, repo, plan_id):
-    """Return current failure links and native Merge/validation evidence, never success for the affected task."""
+def _current_reports(connection, repo, plan_id):
+    """Select immutable failures bound to the current result or the same frozen block."""
     from loop_manager_internal.execution.validation_feedback import redact_secrets
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if not {'common_defect_links', 'common_defect_merges', 'validation_results',
             'common_defect_reports', 'validation_feedback_current', 'validation_feedback_events'} <= tables:
-        return None
+        return set()
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
     if plan is None or 'worker_result' not in plan.keys():
-        return None
+        return set()
     worker_result = plan['worker_result']
     if (not worker_result and plan['blocked_reason'] == 'common_defect_pending'
             and {'blocked_plan_reconciliations', 'execplan_blocks'} <= tables):
@@ -187,6 +187,12 @@ def reassessment(connection, repo, plan_id):
             'ORDER BY r.id DESC LIMIT 1', (repo, plan_id, stage)).fetchone()
         if latest is not None and latest['classification'] != 'success' and latest['report'] is not None:
             reports.add(latest['id'])
+    return reports
+
+
+def reassessment(connection, repo, plan_id):
+    """Return current failure links and native Merge/validation evidence, never success for the affected task."""
+    reports = _current_reports(connection, repo, plan_id)
     if not reports:
         return None
     current = {}
@@ -226,6 +232,18 @@ def reassessment(connection, repo, plan_id):
     covered = reports <= {item['result_id'] for item in corrections}
     return dict(ready=all(item['merge'] is not None for item in corrections) and covered,
                 owner_execution=owner_execution and owns_correction and covered, corrections=corrections)
+
+
+def unlinked_reports(connection, repo, plan_id):
+    """Current immutable reports are assessment input, never correction/validation proof."""
+    reports = _current_reports(connection, repo, plan_id)
+    rows = connection.execute("SELECT r.id,r.definition_revision,c.report FROM validation_results r "
+        "JOIN common_defect_reports c ON c.result_id=r.id WHERE r.repo=? AND r.plan_id=? "
+        "AND c.report IS NOT NULL AND NOT EXISTS "
+        "(SELECT 1 FROM common_defect_links l WHERE l.repo=r.repo AND l.result_id=r.id) ORDER BY r.id",
+        (repo, plan_id)).fetchall() if reports else []
+    return [dict(id=row['id'], revision=row['definition_revision'], report=json.loads(row['report']))
+            for row in rows if row['id'] in reports]
 
 
 def goal_key(link: dict) -> str:

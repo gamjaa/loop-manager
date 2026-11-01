@@ -163,6 +163,27 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertIn('R-002', delta)
         self.assertIn('second error', delta)
 
+    def test_resolved_common_cause_reaches_resumed_worker_once_without_validation_success(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.effects, checkpoint=checkpoint)
+        checkpoint.record('repo', 'G-047', expected_generation=0, operation=None,
+            expected_head='head', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'common_defect_assessment': {'resolved': True, 'detail': 'shared cause removed'}})
+        self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
+        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(0, VALID_WORKER_RESULT, 'same-session')
+        self.state.update_project('repo', worker_session_id='same-session')
+        with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
+            self.handler.run(self.context())
+            first = self.effects.agent.run_agent.call_args.args[5]
+            self.handler.run(self.context())
+            second = self.effects.agent.run_agent.call_args.args[5]
+        self.assertIn('shared cause removed', first)
+        self.assertIn('검증 성공 아님', first)
+        self.assertNotIn('shared cause removed', second)
+        self.assertIsNone(self.state.row()['verify_token'])
+
     def test_invalid_return_does_not_acknowledge_archive_or_error_context(self):
         feedback = ValidationFeedbackRepository(self.connection)
         self._with_feedback(feedback)

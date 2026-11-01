@@ -109,6 +109,60 @@ class CommonDefectResumeTests(unittest.TestCase):
         self.connection.execute("UPDATE exec_plans SET worker_result='A newer unrelated result' WHERE plan_id='G-048'")
         self.assertIsNone(common_defect_state.reassessment(self.connection, 'repo', 'G-048'))
 
+    def test_unlinked_direct_fix_is_assessed_against_current_code_without_fabricating_merge(self):
+        self.connection.execute("INSERT INTO exec_plans "
+            "(repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,plan_sha,active_sha,branch,worktree,workspace_owned,worker_result) "
+            "SELECT repo,'G-050','docs/plans/[G-050] Direct.md',title,sources,depends_on,priority,content_hash,'READY',plan_sha,active_sha,branch,'/state/G-050',workspace_owned,worker_result FROM exec_plans WHERE plan_id='G-048'")
+        self.feedback.record_result('repo','G-050','definition','worker','returned',self.raw)
+        runtime_state.RuntimeStateRepository(self.connection).block_plan('repo','G-050',
+            reason_code='common_defect_pending',evidence='Original direct cause',release_fingerprint='input',clear_projection=False)
+        self.connection.execute("UPDATE exec_plans SET active_sha=? WHERE plan_id='G-050'",(self.remote,))
+        self.connection.commit()
+        self.assertIsNone(common_defect_state.reassessment(self.connection,'repo','G-050'))
+        def unchanged(root,*args,**kwargs):
+            if args[0]=='show' and args[1].endswith(':shared.py'):
+                return SimpleNamespace(returncode=0,stdout='return unchanged')
+            return self.git(root,*args,**kwargs)
+        with mock.patch.object(self.effects,'git',side_effect=unchanged):
+            self.assertFalse(self.evaluate('G-050')[0])
+            self.effects.run_agent.assert_not_called()
+        quotes=self.quotes
+        self.quotes=[dict(source='docs/PRODUCT.md',quote='Required contract.')]
+        with self.assertRaisesRegex(RuntimeError,'근거'):
+            self.evaluate('G-050')
+        self.quotes=quotes
+        self.assertTrue(self.evaluate('G-050')[0])
+        self.assertEqual(self.effects.run_agent.call_count,2)
+        plan=self.connection.execute("SELECT status,verify_token,review_token FROM exec_plans WHERE plan_id='G-050'").fetchone()
+        self.assertEqual(tuple(plan),('PLAN_BLOCKED',None,None))
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM common_defect_merges").fetchone()[0],0)
+        snapshot=execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo','G-050').snapshot
+        self.assertTrue(snapshot['common_defect_assessment']['unlinked_common_defect_reports'])
+        store=execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        current=store.get('repo','G-050')
+        store.record('repo','G-050',expected_generation=current.generation,operation=None,
+            expected_head=current.expected_head,target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,snapshot={})
+        self.assertEqual(store.get('repo','G-050').snapshot['common_defect_assessment'],snapshot['common_defect_assessment'])
+        from loop_manager_internal.recovery.blocked_plan_reconciliation import BlockedPlanReconciler
+        plan=self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-050'").fetchone()
+        ports=SimpleNamespace(_evaluate_remote_checkpoint_cause=lambda *a:(True,'current assessment',None))
+        coordinator=BlockedPlanReconciler(ports,self.connection,Path('/repo'),Path('/state'),'repo','main')
+        self.assertTrue(coordinator._evaluate(plan,dict(block=dict(reason_code='common_defect_pending'),
+            common_defect_input=None,artifacts={}))['resolved'])
+        self.assertTrue(self.evaluate('G-050')[0])
+        self.assertEqual(self.effects.run_agent.call_count,2)
+
+        self.quotes = [dict(source='docs/PRODUCT.md', quote='Required contract.')]
+        def deleted(root, *args, **kwargs):
+            if args[0] == 'show' and args[1].endswith(':shared.py'):
+                return SimpleNamespace(returncode=128, stdout='')
+            if args[0] == 'ls-tree' and args[-1] == 'shared.py':
+                return SimpleNamespace(returncode=0, stdout='')
+            return self.git(root, *args, **kwargs)
+        with mock.patch.object(self.effects, 'git', side_effect=deleted):
+            self.assertTrue(self.evaluate('G-050')[0])
+
     def test_plan_publication_and_merge_status_alone_cannot_resume(self):
         self.assertFalse(common_defect_state.reassessment(self.connection, 'repo', 'G-048')['ready'])
         with self.connection:

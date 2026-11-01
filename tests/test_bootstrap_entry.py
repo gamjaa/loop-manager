@@ -583,7 +583,7 @@ os._exit(0)
 
     def test_owned_child_dispatch_uses_validated_selection_when_tracking_base_advances(self):
         identity = loop_manager.RuntimeMutation(loop_manager.ROOT, Path('/state/runtime'), 'a' * 40, 'b' * 32)
-        with mock.patch.object(loop_manager.sys, 'argv', ['loop_manager.py', '--runtime-child',
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(loop_manager.sys, 'argv', ['loop_manager.py', '--state-dir', directory, '--runtime-child',
                 '--runtime-source', str(loop_manager.ROOT), '--runtime-sha', 'a' * 40, 'run']), \
                 mock.patch.object(loop_manager, 'validate_runtime_child'), \
                 mock.patch.object(loop_manager, 'validate_runtime_mutation', return_value=identity), \
@@ -593,11 +593,12 @@ os._exit(0)
         self.assertEqual(execute.call_args.args[3], identity)
 
     def test_runtime_child_does_not_reacquire_process_lock(self):
-        with mock.patch.object(
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             loop_manager.sys,
             "argv",
             [
                 "loop_manager.py",
+                "--state-dir", directory,
                 "--runtime-child",
                 "--runtime-source",
                 str(loop_manager.ROOT),

@@ -466,6 +466,9 @@ class WorkerHandler:
                     for item in saved.get('worker_frontmatter_restores', [])[-1:]], ensure_ascii=False),
                 'rebase': json.dumps(accepted, ensure_ascii=False, sort_keys=True),
             }
+            cause_assessment = saved.get('common_defect_assessment') or {}
+            if cause_assessment.get('resolved'):
+                context_values['cause_assessment'] = json.dumps(cause_assessment, ensure_ascii=False, sort_keys=True)
             from loop_manager_internal.execution.manual_candidate import get_manual
             manual = get_manual(self.ports.state)
             if manual and manual.enabled():
@@ -484,6 +487,9 @@ class WorkerHandler:
                 changed = context_values
                 initial = not current_session_id or recovering
             extras = []
+            if 'cause_assessment' in changed:
+                extras.append('Manager의 현재 원인 재평가(검증 성공 아님): ' + context_values['cause_assessment']
+                              + '\n과거 실패는 감사로 보존한다. 현재 코드·후보에서 다시 확인하고 과거 로그만으로 같은 결함을 새 실패로 보고하지 마라.')
             if 'task' in changed:
                 extras.append('작업 공간: ' + str(context.worktree))
             if 'archives' in changed and not self.ports.snapshot().archive_candidates:
