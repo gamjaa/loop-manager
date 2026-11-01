@@ -1528,6 +1528,8 @@ Agent CLI 실행 실패·timeout·일시적 서비스 오류는 한 호출 요�
 
 mock은 기존 Git adapter·관측 경계에 적용하고 `ExecutionFixture`·`CurrentRebaseFixture`·관측값 생성 도구를 재사용한다. 정상·오류·중단과 연속 관측 사이의 HEAD·원격 OID 변화를 재현한다.
 
+관측 mock은 실제 관측 타입과 collection 형식을 유지한다. rebase 관측은 `tests/support/rebase_observations.py`의 `RebaseObservation` 생성 도구를 사용하며 `operations`는 marker 이름·관측값 쌍의 tuple이다. checkpoint 정책에 전달하는 marker 이름 목록과 혼용하지 않는다. 거부 시나리오는 의도한 판단의 오류 종류·근거를 확인해 fixture 변환 오류가 거부 검증을 대신하지 않게 한다.
+
 실제 Git fixture의 `tests/support/git.py`는 최초 bare/seed init과 후속 명령에 global/system 설정 및 template을 격리한 환경을 전달한다. `XDG_CONFIG_HOME`도 통제 template 경로로 지정해 기본 전역 ignore·attributes를 제외하고 `GIT_ATTR_NOSYSTEM=1`로 system attributes를 차단한다.
 
 실제 adapter·Python 자식까지 실행하는 테스트는 `isolated_git_test`로 setUp부터 cleanup까지 같은 환경을 상속하며 예외 후 호출자 환경을 복원한다. 저장소별 local 설정은 보존하고 상속 검사는 `git_command`의 명시적 `env`에 통제된 설정 파일을 제공한다. 기본 template은 테스트용 `info/exclude`와 실행 hook이 없는 hooks 디렉터리를 제공한다.

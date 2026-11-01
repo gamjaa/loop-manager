@@ -14,6 +14,8 @@ from loop_manager_internal.recovery import blocked_remote_observation
 
 
 from tests.support.blocked_remote import ProjectRemoteRecoveryFixture
+from tests.support.rebase_observations import observation
+from loop_manager_internal.git.managed_rebase_validation import Remote
 
 
 class ProjectRecoveryGateTests(ProjectRemoteRecoveryFixture, unittest.TestCase):
@@ -251,7 +253,7 @@ class ProjectCauseRevalidationTests(ProjectRemoteRecoveryFixture, unittest.TestC
         cause = dict(scoped_blocking.project_block(self.connection, self.repo))
         project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
         with (mock.patch.object(self.recovery, 'observe_current_rebase', return_value=(
-                  SimpleNamespace(remote=None), SimpleNamespace(allowed=False))),
+                  observation(remote=None), SimpleNamespace(allowed=False))),
               mock.patch.object(self.coordinator, '_incorporate') as incorporate,
               mock.patch.object(self.coordinator, '_publish') as publish):
             self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
@@ -302,31 +304,35 @@ class ProjectCauseRevalidationTests(ProjectRemoteRecoveryFixture, unittest.TestC
 
 
     def test_current_scope_accepts_missing_historical_rebase_evidence(self):
-        remote = object()
-        observed = SimpleNamespace(
-            remote=remote, operations=(), metadata=None, branch=self.plan()['branch'],
+        remote = Remote(self.repo, self.plan()['branch'], None)
+        observed = observation(
+            remote=remote, branch=self.plan()['branch'],
             branch_ref=(self.head, ''), head=self.head, branch_worktrees=(str(Path('/state/G-106').resolve()),),
             registration=(f'HEAD={self.head}', 'branch=refs/heads/loop-manager/G-106'), index=())
-        observed.remote = SimpleNamespace(pull_request=None)
         self.ports._current_rebase_service.return_value.expected.remote = observed.remote
-        with mock.patch.object(self.recovery, 'observe_current_rebase', return_value=(observed, SimpleNamespace(allowed=True))):
-            _, current = self.recovery.independent_scope(
-                self.ports, self.connection, Path('/repo'), Path('/state'), self.repo,
-                self.plan(), target=self.base, remote_oid=None)
-        self.assertEqual(current.head, self.head)
+        for markers in ((), (('REBASE_HEAD', 'retained'), ('MERGE_MSG', 'retained'))):
+            with self.subTest(markers=markers), mock.patch.object(self.recovery, 'observe_current_rebase',
+                    return_value=(replace(observed, operations=markers), SimpleNamespace(allowed=True))):
+                _, current = self.recovery.independent_scope(
+                    self.ports, self.connection, Path('/repo'), Path('/state'), self.repo,
+                    self.plan(), target=self.base, remote_oid=None)
+                self.assertEqual(current.head, self.head)
         self.assertIsNone(loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(
             self.connection).get(self.repo, 'G-106').snapshot)
 
 
     def test_current_scope_rejects_pending_conflict_and_scope_mismatch(self):
-        remote = SimpleNamespace(pull_request=None)
+        remote = Remote(self.repo, self.plan()['branch'], None)
         self.ports._current_rebase_service.return_value.expected.remote = remote
-        for allowed, operations in ((False, ()), (True, ('rebase-merge',))):
-            observed = SimpleNamespace(remote=remote, operations=operations, metadata=None)
+        for allowed, operations, error, detail in (
+                (False, (), RuntimeError, '현재 작업 범위 또는 원격 기대값 불일치'),
+                (True, (('rebase-merge', 'metadata'),), self.recovery.LocalWorkPending, '미해결 Git operation')):
+            observed = observation(remote=remote, operations=operations)
             with mock.patch.object(self.recovery, 'observe_current_rebase', return_value=(observed, SimpleNamespace(allowed=allowed))):
-                with self.assertRaises(RuntimeError):
+                with self.assertRaisesRegex(error, detail):
                     self.recovery.independent_scope(self.ports, self.connection, Path('/repo'), Path('/state'),
                                                     self.repo, self.plan(), target=self.base, remote_oid=None)
+        self.ports._current_rebase_service.return_value.require_owned.assert_called_once()
 
 
 class ProjectCheckpointPublicationTests(ProjectRemoteRecoveryFixture, unittest.TestCase):
