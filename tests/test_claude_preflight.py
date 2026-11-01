@@ -159,6 +159,13 @@ class ClaudePreflightTests(unittest.TestCase):
         project.mkdir()
         self.boundary.source.mkdir()
         (self.boundary.source / '.claude').mkdir()
+        # A home/ancestor repository must not replace the linked-worktree root.
+        (self.root / '.git').mkdir()
+        # Anchor repository discovery inside the fixture, independent of any
+        # .git entry and ownership on the machine's temporary ancestors.
+        self.boundary.git_dir.mkdir(parents=True)
+        (self.boundary.git_dir / 'commondir').write_text('../..')
+        (self.workspace / '.git').write_text('gitdir: ' + str(self.boundary.git_dir))
         for path in (self.home / 'settings.json', project / 'settings.json',
                      project / 'settings.local.json',
                      self.boundary.source / '.claude/settings.local.json'):

@@ -418,10 +418,12 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             "loop_manager.command", return_value=authenticated
         ) as auth_command:
             loop_manager.validate_provider_runtime(config, "claude")
-        self.assertEqual(
-            auth_command.call_args_list[0].args[0],
-            ["claude", "auth", "status"],
-        )
+        arguments = auth_command.call_args_list[0].args[0]
+        self.assertEqual(arguments[0], 'claude')
+        self.assertEqual(arguments[-2:], ['auth', 'status'])
+        self.assertEqual(arguments[arguments.index('--setting-sources') + 1], 'user,project,local')
+        self.assertEqual(json.loads(arguments[arguments.index('--settings') + 1]),
+                         {'disableAllHooks': True})
         self.assertTrue(
             any(
                 "--init-only" in call.args[0]
