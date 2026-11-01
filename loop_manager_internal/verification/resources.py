@@ -70,9 +70,9 @@ def decide(snapshot: Snapshot, *, now: float, running: int, cap: str | int,
         return Decision(allowed, "관측 실패/낡은 관측: 직렬 축소", 1, True)
     load = max(snapshot.busy, snapshot.busy_average) if snapshot.busy_average is not None else snapshot.busy
     free = snapshot.cpus - load - pending_cpu
-    # CPU 상한 안에서만 확대한다. 2코어에서는 0.5코어의 보호 여유를 두며,
+    # 최초 시작과 추가 실행 모두 2코어에서는 0.5코어의 보호 여유를 두며,
     # 낮은 순간 부하는 평균보다 먼저 확대하지 않고 순간 과부하는 즉시 제한한다.
-    threshold = min(1.0, snapshot.cpus * (0.8 if running == 0 else 0.25))
+    threshold = min(1.0, snapshot.cpus * 0.25)
     allowed = free >= threshold and snapshot.busy < snapshot.cpus * 0.95
     return Decision(allowed, "CPU 여유 활용" if allowed else "CPU 부하/미반영 예약 대기", limit,
                     free_cpu=free, required_cpu=threshold)

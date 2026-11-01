@@ -56,6 +56,23 @@ class ResourceDecisionTests(unittest.TestCase):
         self.assertFalse(decide(self.snapshot(cpus=2, busy=0), now=10, running=2, cap="auto").granted)
         self.assertTrue(decide(self.snapshot(cpus=2, busy=1.3, busy_average=1.4), now=10, running=1, cap="auto").granted)
 
+    def test_start_and_expansion_use_same_cpu_margin(self):
+        for cpus, threshold in ((1.5, 0.375), (2, 0.5), (4, 1.0), (8, 1.0)):
+            for running in (0, 1):
+                for shortage in (0, 0.01):
+                    with self.subTest(cpus=cpus, running=running, shortage=shortage):
+                        decision = decide(self.snapshot(cpus=cpus, busy=cpus-threshold+shortage),
+                                          now=10, running=running, cap="auto")
+                        self.assertEqual(decision.required_cpu, threshold)
+                        self.assertEqual(decision.granted, shortage == 0)
+
+    def test_start_preserves_average_load_and_pending_cpu_guards(self):
+        for values, pending in (({"busy": 1.4, "busy_average": 1.6}, 0),
+                                ({"busy": 0.6}, 1)):
+            with self.subTest(values=values, pending=pending):
+                self.assertFalse(decide(self.snapshot(cpus=2, **values), now=10, running=0,
+                                        cap="auto", pending_cpu=pending).granted)
+
     def test_sampler_distinguishes_system_cgroup_and_smooths_recovery(self):
         clock = [0.0]
         samples = iter([(2, 100, 20, 1024 * MIB, 0, 4),
