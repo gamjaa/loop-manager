@@ -216,6 +216,18 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_manual
 
 추가 구현 교정은 필요하지 않았으며 이번 변경은 선택 ExecPlan 본문의 재검증 기록이다. 기존 PRODUCT·ARCHITECTURE 변경은 현재 공통 교정의 활성 단계 보존 규칙과 양립한다. 전체 verify·Review·사용자 Merge는 Manager의 후속 절차로 남긴다. 검증 입력 제외 identity는 선언하지 않는다.
 
+
+### 프로젝트 차단 재평가 fixture의 관측 계약 불일치
+
+호출 시작 HEAD `1e705f51dcf9ea5d416a5ba4379af68ce5d1fa20`에서 Manager verify `verify:fffd43028c4bdceb43034e699e6756b9b948fd7bdf1c2230c268a96805cf8119` occurrence=1 revision=1의 오류를 현재 후보에서 재현했다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_project_block_revalidation.ProjectCauseRevalidationTests.test_current_scope_rejects_pending_conflict_and_scope_mismatch
+결과: 1 test, 1 error, exit 1 (0.050s). `independent_scope()`의 `dict(observed.operations)`에서 ValueError가 발생해 의도한 RuntimeError 차단 검증에 도달하지 않는다. 이번 호출 `call-k42_ys7t`의 targeted 기록을 보존하며 재실행 성공·전체 verify 성공을 기록하지 않는다.
+
+실제 `RebaseObservation.operations` 계약은 `tuple[tuple[str, str], ...]`이고 `observe_current_rebase()`는 `tuple(sorted(snapshot.operations.items()))`로 생성한다. 실패 case의 fixture는 `('rebase-merge',)`를 전달하므로 현재 실제 관측 형식과 다르다. 프로젝트 차단 재평가 구현·관측기·관측 타입·해당 테스트는 origin/main 대비 diff가 없다. 이 관측은 실제 Git operation 보호를 완화할 근거가 아니며 G-321의 archive 실행 자원·재시도 경로를 바꾸지 않는다.
+
+선택 범위 밖 프로젝트 차단 재평가 테스트의 관측 계약 불일치를 COMMON_DEFECT_REPORT로 인계한다. 해당 코드·테스트·다른 ExecPlan·Requirement는 수정하지 않았고 기존 G-321 결과를 보존한다. 현재 전체 verify 완료는 이 공통 검증 교정과 Manager의 재검증을 기다린다.
+
 ## Decision Log
 
 - 이번 delta는 G-321을 초기화하거나 완료한 구현을 중복 계획하지 않는다. 앞의 후보에 보존된 구현/검증 원문과 과거 준비점은 유지하고 현재 원격의 관리 인계·삭제 정책과 만나는 경계만 미충족 통합으로 구분한다. started ID·경로·기존 dependency·metadata를 보존한다. 후보 확인·기존 targeted 기록은 최신 전체 verify/Review 성공·Merge가 아니다.
