@@ -308,7 +308,21 @@ def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, p
             raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, '현재 등록 origin과 Git 대상이 다릅니다.')
     metadata_error = effects._blocked_execplan_revision_metadata_error(repo_path, remote, plan)
     if metadata_error:
-        raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, metadata_error)
+        # A historical work branch may predate the official base declaration.
+        # Validate its identity now; compare declarations after the base rebase.
+        from loop_manager_internal.catalog.execplan_catalog import parse_execplan_text
+        revision = plan['current_revision_sha'] or plan['plan_sha']
+        includes_base = effects.git(repo_path, 'merge-base', '--is-ancestor',
+                                    revision, remote, check=False) if revision else None
+        if includes_base is None or includes_base.returncode != 1:
+            raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, metadata_error)
+        official_error = effects._blocked_execplan_revision_metadata_error(repo_path, revision, plan)
+        if official_error:
+            raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, official_error)
+        shown = effects.git(repo_path, 'show', f"{remote}:{plan['path']}")
+        historical = parse_execplan_text(plan['path'], shown.stdout, validate_sources=False)
+        if historical['id'] != plan['plan_id'] or historical.get('draft'):
+            raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, metadata_error)
     before = effects.capture_git_snapshot(worktree)
     if rewritten:
         local = before.head

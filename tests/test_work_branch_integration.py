@@ -95,6 +95,26 @@ class RemoteIntegrationAnchorTests(unittest.TestCase):
         self.integration.assert_not_called()
         self.assertFalse(any('newer-base' in call.args for call in self.effects.git.call_args_list))
 
+    def test_historical_declaration_uses_official_base_without_editing_remote(self):
+        self.plan.update(current_revision_sha='official-base', plan_sha='old-base',
+                         path='docs/plans/[G-047] Runtime.md')
+        self.effects._blocked_execplan_revision_metadata_error.side_effect = ['old depends_on', None]
+        original = self.effects.git.side_effect
+        def git(path, *args, **kwargs):
+            if args == ('merge-base', '--is-ancestor', 'official-base', self.remote):
+                return SimpleNamespace(returncode=1, stdout='')
+            if args[0] == 'show':
+                return SimpleNamespace(returncode=0, stdout='historical declaration')
+            return original(path, *args, **kwargs)
+        self.effects.git.side_effect = git
+        with mock.patch('loop_manager_internal.catalog.execplan_catalog.parse_execplan_text',
+                        return_value={'id': 'G-047', 'draft': False}):
+            self.assertFalse(self.synchronize())
+        self.effects._blocked_execplan_revision_metadata_error.assert_any_call(
+            Path('/repo'), 'official-base', self.plan)
+        self.integration.assert_not_called()
+        self.assertEqual(self.store.get('repo', 'G-047').snapshot['accepted_work_branch'], self.remote)
+
     def test_user_successor_is_integrated_and_checkpoint_keeps_old_evidence(self):
         self.remote = 'a' * 40
         self.assertTrue(self.synchronize())
