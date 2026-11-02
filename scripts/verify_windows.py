@@ -384,10 +384,10 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
         print(output, flush=True)
         passed = passed and not timed_out
     except BaseException as error:
-        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
-        if isinstance(error, VerifyBudgetError) and error.diagnostic_directory is not None:
+        evidence = getattr(error, 'diagnostic_directory', None)
+        if evidence is not None:
             try:
-                shutil.copytree(error.diagnostic_directory, bundle / 'logs' / 'budget-error', symlinks=True)
+                shutil.copytree(evidence, bundle / 'logs' / 'budget-error', symlinks=True)
             except OSError as copy_error:
                 error.add_note(f'WSL 예산 오류 진단 복사 실패: {copy_error}')
         raise
@@ -562,6 +562,7 @@ def windows_main(root):
             with phase('windows-core'):
                 # 자체 실행기는 표준 라이브러리만 사용하며 venv redirector를 worker로 남기지 않는다.
                 native_environment = dict(os.environ, LOOP_MANAGER_VERIFY_PARENT_RUN_ID=session)
+                check_budget(budget, timeout)
                 passed, timed_out, output = run_verify_process(
                     [runtime_python, '-u', str(Path(__file__).resolve()), '--native', str(root),
                      str(entrypoint), str(native_logs), str(getattr(sys, '_base_executable', sys.executable))],
@@ -628,6 +629,11 @@ def windows_main(root):
                 try:
                     writer.close()
                 except OSError as error:
+                    report['passed'] = False
+                    try:
+                        atomic_json(directory / 'result.json', report)
+                    except OSError as write_error:
+                        error.add_note(f'실패 결과 기록 실패: {write_error}')
                     if primary is None:
                         primary = error
                         raise
@@ -637,8 +643,18 @@ def windows_main(root):
                     os.environ.pop(BUDGET_DIRECTORY, None)
                 else:
                     os.environ[BUDGET_DIRECTORY] = previous_budget
-                budget.__exit__(type(primary) if primary is not None else None, primary,
-                                primary.__traceback__ if primary is not None else None)
+                try:
+                    budget.__exit__(type(primary) if primary is not None else None, primary,
+                                    primary.__traceback__ if primary is not None else None)
+                except BaseException as error:
+                    report['passed'] = False
+                    try:
+                        atomic_json(directory / 'result.json', report)
+                    except OSError as write_error:
+                        error.add_note(f'실패 결과 기록 실패: {write_error}')
+                    if primary is None:
+                        raise
+                    primary.add_note(f'실행 시간 기록 정리 실패: {error}')
 
 
 if __name__ == '__main__':

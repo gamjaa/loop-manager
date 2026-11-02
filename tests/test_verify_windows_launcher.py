@@ -534,6 +534,18 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertFalse(self.report()['passed'])
         self.native.assert_not_called()
 
+    def test_event_log_close_failure_revokes_whole_success(self):
+        from loop_manager_internal.verification import timing
+        original_close = timing.EventWriter.close
+        def close(writer):
+            original_close(writer)
+            raise OSError('event close failed')
+        with mock.patch.object(timing.EventWriter, 'close', new=close):
+            with self.assertRaisesRegex(OSError, 'event close failed'):
+                launcher.windows_main(self.root)
+        self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
+        self.assertFalse(self.report()['passed'])
+
     def test_partial_request_falls_back_without_executing_either_phase(self):
         os.environ.update(LOOP_MANAGER_VERIFY_PARTIAL_BASE='base', LOOP_MANAGER_VERIFY_SESSION='session')
         self.assertEqual(launcher.windows_main(self.root), 0)
