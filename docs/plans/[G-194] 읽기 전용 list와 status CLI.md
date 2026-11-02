@@ -62,7 +62,7 @@ priority: normal
 
 ## Implementation
 
-- [ ] 직접 구현된 `_project_limits_status()`의 `management_waiting`과 `storage/management_admission.py`·G-345가 보완하는 순서/인계 근거를 읽기 전용 투영에 통합한다. 현재 status의 parked ID 나열을 소급 구현하지 않으며 추가 상세 필드·legacy 부재·수락/시작 구별만 완성한다. 순서 결정·reconcile·release_blocks를 조회에서 호출하지 않는다.
+- [ ] 직접 구현된 `_project_limits_status()`의 `management_waiting`과 `storage/management_admission.py`에 반영된 G-345의 순서/인계 근거를 읽기 전용 투영에 통합한다. `pending`은 미반영 명시 요청, `parked`는 후속 배정 보류, `handoff`는 선택됐으나 기존 단위의 반환을 기다리는 상태로 읽는다. 수동 최초 수락·명시 요청의 양수 `priority`·미소비 `retry_order`·nullable `resumed`와 현재 유효 priority를 구분하고 admission의 `sequence`를 실제 실행 순서로 표시하지 않는다. 과거 수락 행만으로 현재 요청·인계·시작을 추정하지 않는다. 선택 column 부재와 NULL은 미확인으로 남기며 조회에서 schema를 보완하지 않는다. 현재 status의 parked ID 나열을 소급 구현하지 않으며 추가 상세 필드·legacy 부재·수락/시작 구별만 완성한다. 순서 결정·reconcile·release_blocks를 조회에서 호출하지 않는다.
 
 - 구현 시작 시 최신 원격 코드에서 같은 조회 기능을 확인한다. 확인한 `loop_manager.py`의 조기 status dispatch와 `application/commands.py:_project_limits_status()`의 읽기 전용 연결·JSON envelope·등록/schema 오류, `runtime/project_registry.py:task_limit()`과 `storage/task_calls.py:managed_count()`를 재사용한다. parser와 초기화 이전 dispatch, 조회 연결·투영·출력의 책임을 기존 경계 안에서 나누며 새 루트 항목·별도 엔진·관측 체계·설정은 추가하지 않는다.
 - 기존 schema·프로젝트 registry·작업 상태와 `recovery/recovery_runtime.py`, 선택·알림 사유의 순수 판단을 확인해 재사용한다. schema ensure나 기록 갱신을 숨긴 Repository·복구 helper를 조회에 연결하지 않는다. 쓰기 실행과 설명이 공유할 최소 순수 경계만 분리하며 정책을 복제하지 않는다.
@@ -71,7 +71,7 @@ priority: normal
 
 ## Validation
 
-- 같은 snapshot의 수락 요청·밀려난 작업·반환 전 실제 reservation·반환 뒤 인계, 공유 묶음·legacy admission 부재를 출력/JSON으로 비교한다. parked를 READY/차단/실행 종료로 표시하거나 관리 수와 실제 호출 수를 혼합하지 않는다. 삭제 표식만 남은 ID는 `unknown_plan`이며 조회로 복구하지 않는다.
+- 같은 snapshot의 새 수락 요청(`pending`)·밀려난 작업(`parked`)·안전 반환 대기(`handoff`)·반환 전 실제 reservation·반환 뒤 인계, 공유 묶음·legacy admission 부재를 출력/JSON으로 비교한다. 재연결 뒤 저장된 RETRY 순번·재개 구분, 과거 수락 뒤 한도만 축소한 상태와 새 요청에 의한 교체를 기존 `tests/test_task_scheduling.py`의 SQLite 자료로 구성한다. 순서/인계 판단 행렬은 기존 scheduler 회귀에 맡기고 조회의 값·미확인 표시와 무변경성만 확인한다. parked를 READY/차단/실행 종료로 표시하거나 관리 수와 실제 호출 수를 혼합하지 않는다. 삭제 표식만 남은 ID는 `unknown_plan`이며 조회로 복구하지 않는다.
 
 - Worker는 기존 CLI·project 서비스·SQLite fixture를 재사용한 targeted unit test로 범위 선택, 종료 작업, 다중 대기·차단 사유, 근거 없는 진전·생존·재개 시각, 오래된 관측과 JSON/기본 출력 동등성을 확인한다.
 - 실제 Git·모델을 호출하지 않는 unit case로 list 정렬·--all·직접 source 필터와 선행 없음/충족/미충족/미확인·잘못된 graph·archive/rename 대응을 검사한다. 조회 결과를 manual start 예약으로 사용하지 않는다.
@@ -90,7 +90,7 @@ priority: normal
 
 ## Decision Log
 
-- 이번 원격의 unblock/포화 수락·대기 ID status는 직접 구현으로 소비한다. G-345의 순서/인계 근거를 선행으로 연결하고 조회만 확장한다. R-055 삭제 확정은 보존된 종료 작업 조회의 예외이며 일반 취소·MERGED의 기존 데이터 보존은 유지한다.
+- 이번 원격의 unblock/포화 수락·대기 ID status는 직접 구현으로 소비한다. G-345는 같은 ID·sources·dependency를 유지한 archive이며 순서/인계 구현은 현재 base에서 소비한다. 기존 G-345 선행 관계는 유지하고 조회에 남은 투영만 확장한다. runtime schema의 `pending`·`parked`·`handoff`·`retry_order`·`resumed`를 표시하기 위해 배정기·migration을 호출하지 않는다. R-055 삭제 확정은 보존된 종료 작업 조회의 예외이며 일반 취소·MERGED의 기존 데이터 보존은 유지한다.
 
 - R-055 B06의 기존 status 요구는 이 계획의 프로젝트 상세 범위로 통합하고 G-325의 저장 근거를 선행 소비한다. G-195는 작업별 후보/복구 상세를 계속 담당한다. 새 조회 명령·진단 수집 체계나 조회 중 외부 관측을 만들지 않으며 기존 R-076의 읽기 전용·JSON/오류 계약과 기록을 유지한다.
 

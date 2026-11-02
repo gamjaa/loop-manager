@@ -40,7 +40,7 @@ priority: normal
 
 ## Acceptance Criteria
 
-- 현재 `unblock <repo> <G-ID> [<G-ID> ...]`을 안내한다. 명시적 사용자 판단/공통 교정 차단만 원자 해제·우선 대기하며 안전/소유권·종료 불명은 우회하지 않는다. 수동 제출 → 명시 해제 관리 재진입 → RETRY → 기존 자동 → 신규 순서, 포화 중 수락과 마지막 관리 단위의 보존 대기·안전 반환 뒤 인계를 설명한다. 반복 요청의 최초 순서 보존·실제 호출 상한·pause/dependency와 수락/실제 시작의 차이를 유지한다.
+- 현재 `unblock <repo> <G-ID> [<G-ID> ...]`을 안내한다. 명시적 사용자 판단/공통 교정 차단만 원자 해제·우선 대기하며 안전/소유권·종료 불명은 우회하지 않는다. 수동 제출 → 명시 해제 관리 재진입 → RETRY → 기존 자동 → 신규 순서, 포화 중 수락과 마지막 관리 단위의 보존 대기·안전 반환 뒤 인계를 설명한다. 반복 요청의 최초 순서 보존·실제 호출 상한·pause/dependency와 수락/실제 시작의 차이를 유지한다. 새 적격 요청 없는 한도 축소에서는 기존 관리 단위가 후속 단계를 계속하며, 과거 수락 기록이나 반복 명령만으로 교체하지 않는다고 안내한다. 밀려난 RETRY의 자격·순번은 task 반환·DB 재연결·Manager 재시작 뒤에도 보존되며 자리 인계 자체를 실제 시작·검증 성공으로 안내하지 않는다.
 
 - Skill·도움말·사용 예시는 새 list/status/usage/logs·add/remove·run 범위·pause/resume·reset·manual cancel/stop 및 유지 명령의 의미·거부·결과 확인을 일치하게 안내한다. explain·제거된 config list/add/remove 호환 명령은 안내하지 않는다.
 - R-076/R-091: 이미 구현된 `config set <repo> --max-tasks-per-project <N>`과 `status <repo>`를 안내한다. DB의 0은 config 상속이고 양수는 개별값이며 config 자체의 0은 거부됨을 구분한다. 기본값은 Agent 3·관리 1·verify 1이고 세 종류의 한도·verify 내부 병렬도는 별개다. 실행/pause 중 저장·다음 안전한 배정 반영·상한 축소 시 기존 작업 보존과 조회 config/실행 config 미확인을 같은 의미로 설명한다. 수동 제출 우선은 실행 중 호출의 선점이나 즉시 실행 보장이 아니며 공유 묶음 내부만 직렬이다.
@@ -53,7 +53,7 @@ priority: normal
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager.py`의 unblock parser·`application/commands.py`의 수락 출력과 README의 새 명령 행을 소비한다. G-345의 실제 순서/재시작 보완 뒤 Skill·운영 안내를 해당 계약과 대조하며 새 CLI나 admission 엔진을 재구현하지 않는다. metadata/로컬 환경의 recover와 사용자 판단/공통 교정 unblock, pause resume를 구별한다.
+- [ ] 확인한 `loop_manager.py`의 unblock parser·`application/commands.py`의 수락 출력과 README의 새 명령 행을 소비한다. 현재 base에 반영된 G-345의 실제 순서/재시작 계약과 Skill·운영 안내를 대조한다. 수락·보존 대기·선택 후 안전 반환 대기·실제 시작의 구별은 기존 조회 결과를 사용하며 새 CLI나 admission 엔진을 재구현하지 않는다. metadata/로컬 환경의 recover와 사용자 판단/공통 교정 unblock, pause resume를 구별한다.
 
 기존 CLI 출력·manual start 결과와 Skill 구조를 재사용한다. 프롬프트 텍스트 생성은 준비 결과에 결합한 결정적 formatter로 두고 모델/설치 탐색을 추가하지 않는다. 복사 범위를 수정하며 G-230 배포 명령도 유지한다. PRODUCT·ARCHITECTURE의 Skill 소유/배포 책임을 반영한다.
 
@@ -63,7 +63,7 @@ priority: normal
 
 ## Validation
 
-- 변경한 도움말/명령 출력의 최소 fixture에서 수락과 실행 미시작·다중 ID·안전 거부가 사실대로 표현되는지 확인한다. Skill prose는 실제 명령과 읽기 전용으로 대조하고 문구 고정 테스트·운영 명령 실제 실행을 추가하지 않는다.
+- 변경한 도움말/명령 출력의 최소 fixture에서 수락과 실행 미시작·다중 ID·안전 거부가 사실대로 표현되는지 확인한다. 새 적격 요청 유무에 따른 한도 축소/인계 차이와 재시작 뒤 순서 보존은 현재 CLI·설계와 정적으로 대조하고, 관련 출력 변경이 있을 때만 기존 SQLite fixture의 기대 결과를 확인한다. scheduler 순서·migration 회귀를 복제하지 않는다. Skill prose는 실제 명령과 읽기 전용으로 대조하고 문구 고정 테스트·운영 명령 실제 실행을 추가하지 않는다.
 
 - targeted unit test로 준비 성공/실패·공백 경로·작업 문서·verify 환경별 명령·전체 내용과 모델 호출 부재를 확인한다. 고정 샘플로 실제 복사 스크립트의 전용 Skill 제외·Specification 파일 보존·충돌 거부를 검사한다. Manager가 없는 복사 대상에서 ID 조회와 활성/archive 존재 여부·활성 제목/경로/기존 Summary 조회를 실행해 독립 배포를 확인한다.
 - `tests/test_manual_work.py`·`tests/support/manual_work.py`의 start 준비·출력 fixture와 분리된 공통 `tests/support/manual_work_case.py`를 재사용해 복사용 프롬프트에는 프로젝트 재검증·push 지시가 있고 PR 생성·Manager 명령 실행 지시는 없으며, 별도 출력에 정확한 repository·G ID의 complete 명령이 있는지 최소 unit case로 검사한다. 준비 실패·미완료에는 준비 완료용 프롬프트가 없어야 한다. 생략 안내 출력을 바꾸면 사용자가 선택한 옵션·필수 전체 expected SHA·선택적 사유를 구분하는 case를 추가하고, 실제 옵션의 사유 생략/빈 값/공백 수락·reason 단독 거부는 G-254의 회귀를 재사용한다. 새 Skill prose 검사나 실제 Manager 실행은 추가하지 않는다.
@@ -77,6 +77,8 @@ priority: normal
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- G-345의 archive는 동일 작업의 보관이며 선행 ID는 유지한다. 순서·인계·재시작 구현을 새로 계획하지 않고 현재 계약의 사용자 안내만 이 작업에 통합한다. 기존 분류·목표·진행 기록을 유지하며 새 운영 정책·명령·테스트 성공을 만들지 않는다.
 
 - 2026-10-16 delta: R-091의 설정·수동 우선·병렬 한도는 직접 구현과 운영 문서를 소비한다. 남은 관리 Skill 안내를 같은 ID에 통합하며 CLI·DB·scheduler를 소급 구현하지 않는다. 기존 dependency·분류·진행 기록을 보존한다. Skill 내용은 실제 명령과 읽기 전용으로 대조하고 prose 고정 테스트를 추가하지 않는다.
 
