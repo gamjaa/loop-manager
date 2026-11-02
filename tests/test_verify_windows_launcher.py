@@ -439,6 +439,36 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertEqual(self.report()['windows'], 'PASS')
         self.assertFalse(self.report()['passed'])
 
+    def test_diagnostic_time_is_included_before_pass(self):
+        from loop_manager_internal.verification import execution_clock, timing
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        def diagnostic(_directory):
+            now[0] = 60.0
+            return 'diagnostic'
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])), \
+             mock.patch.object(timing, 'diagnostic', side_effect=diagnostic):
+            with self.assertRaises(TimeoutError):
+                launcher.windows_main(self.root)
+        self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
+        self.assertFalse(self.report()['passed'])
+
+    def test_diagnostic_failure_does_not_replace_budget_error(self):
+        from loop_manager_internal.verification import execution_clock, timing
+        def wsl(*_args):
+            budget = execution_clock.current_execution_clock.get()
+            (budget.directory / 'wait.json').write_text('invalid')
+            budget.remaining(60)
+        self.wsl.side_effect = wsl
+        with mock.patch.object(timing, 'diagnostic', side_effect=OSError('diagnostic failed')):
+            with self.assertRaises(execution_clock.VerifyBudgetError) as raised:
+                launcher.windows_main(self.root)
+        self.assertEqual((self.logs / 'budget-error' / 'wait.json').read_text(), 'invalid')
+        self.assertTrue(raised.exception.diagnostic_directory.exists())
+        self.assertFalse(self.report()['passed'])
+        self.native.assert_not_called()
+
     def test_partial_request_falls_back_without_executing_either_phase(self):
         os.environ.update(LOOP_MANAGER_VERIFY_PARTIAL_BASE='base', LOOP_MANAGER_VERIFY_SESSION='session')
         self.assertEqual(launcher.windows_main(self.root), 0)

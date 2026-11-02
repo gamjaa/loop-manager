@@ -464,7 +464,7 @@ def windows_main(root):
     from loop_manager_internal.execution.verify_process import run_verify_process
     from loop_manager_internal.verification.timing import EventWriter, atomic_json, diagnostic, phase
     from loop_manager_internal.config.managed_config import load_managed_config
-    from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY
+    from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
     timeout = float(os.environ.get('LOOP_MANAGER_VERIFY_TIMEOUT', '600'))
     cap = os.environ.get('LOOP_MANAGER_VERIFY_PARALLELISM', 'auto')
     if (root / 'config/config.ini').is_file():
@@ -554,17 +554,61 @@ def windows_main(root):
         report['passed'] = report['windows'] == 'PASS'
         return 0 if report['passed'] else 1
     finally:
-        report['seconds'] = time.monotonic() - started
-        atomic_json(directory / 'result.json', report)
-        writer.emit('run_end', passed=report['passed'], wsl=report['wsl'], windows=report['windows'])
-        writer.close()
-        if previous_budget is None:
-            os.environ.pop(BUDGET_DIRECTORY, None)
-        else:
-            os.environ[BUDGET_DIRECTORY] = previous_budget
-        budget.__exit__(*sys.exc_info())
-        print(f'Loop Manager 자체 verify: {directory / "result.json"}', flush=True)
-        print(diagnostic(directory), flush=True)
+        primary = sys.exc_info()[1]
+        candidate = report['passed'] and primary is None
+        report['passed'] = False
+        budget_error = primary
+        while budget_error is not None and not isinstance(budget_error, VerifyBudgetError):
+            budget_error = budget_error.__cause__
+        if budget_error is not None and budget_error.diagnostic_directory is not None:
+            try:
+                shutil.copytree(budget_error.diagnostic_directory, directory / 'budget-error', symlinks=True)
+            except OSError as error:
+                budget_error.add_note(f'예산 오류 진단 복사 실패: {error}')
+        try:
+            report['seconds'] = time.monotonic() - started
+            atomic_json(directory / 'result.json', report)
+            print(f'Loop Manager 자체 verify: {directory / "result.json"}', flush=True)
+            print(diagnostic(directory), flush=True)
+            if primary is None:
+                check_budget(budget, timeout)
+            report['passed'] = candidate
+            atomic_json(directory / 'result.json', report)
+            if candidate:
+                print(diagnostic(directory), flush=True)
+                check_budget(budget, timeout)
+            writer.emit('run_end', passed=report['passed'], wsl=report['wsl'], windows=report['windows'])
+        except BaseException as error:
+            report['passed'] = False
+            if isinstance(error, VerifyBudgetError) and error.diagnostic_directory is not None:
+                try:
+                    shutil.copytree(error.diagnostic_directory, directory / 'budget-error', symlinks=True)
+                except OSError as copy_error:
+                    error.add_note(f'예산 오류 진단 복사 실패: {copy_error}')
+            try:
+                atomic_json(directory / 'result.json', report)
+            except OSError as write_error:
+                error.add_note(f'실패 결과 기록 실패: {write_error}')
+            if primary is None:
+                primary = error
+                raise
+            primary.add_note(f'최종 진단 실패: {error}')
+        finally:
+            try:
+                try:
+                    writer.close()
+                except OSError as error:
+                    if primary is None:
+                        primary = error
+                        raise
+                    primary.add_note(f'이벤트 로그 닫기 실패: {error}')
+            finally:
+                if previous_budget is None:
+                    os.environ.pop(BUDGET_DIRECTORY, None)
+                else:
+                    os.environ[BUDGET_DIRECTORY] = previous_budget
+                budget.__exit__(type(primary) if primary is not None else None, primary,
+                                primary.__traceback__ if primary is not None else None)
 
 
 if __name__ == '__main__':
