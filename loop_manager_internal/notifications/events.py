@@ -22,6 +22,16 @@ from .incidents import _preservation_checkpoint
 from .rendering import _checkpoint_link, _pieces
 
 
+def _redacted_payload(value):
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        return [_redacted_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redacted_payload(item) for key, item in value.items()}
+    return value
+
+
 @dataclass(frozen=True)
 class _BlockedPlanProjection:
     """Named inputs for one blocked-plan notification payload."""
@@ -531,7 +541,7 @@ def enqueue_completion_if_ready(
                        "work_cycle": work_cycle, "generation": saved[2], "reason": snapshot.describe(),
                        "last_completed_plan_id": saved[0], "last_completed_title": saved[1] or ''}
             _insert(connection, _key('project_completed', repo, snapshot.cycle + '\0' + work_cycle + '\0' + str(saved[2])),
-                    repo, 'project_completed', payload)
+                    repo, 'project_completed', _redacted_payload(payload))
     from .delivery import flush_project_events
     flush_project_events(connection, repo)
     return True
@@ -572,7 +582,7 @@ def enqueue_waiting_reason(
     if snapshot.completed:
         return False
     ensure_schema(connection)
-    payload = snapshot.payload(Path(repo).name or repo)
+    payload = _redacted_payload(snapshot.payload(Path(repo).name or repo))
     enqueue_draft_decisions(connection, repo)
     from .work_exhaustion import episode_signature
     signature = episode_signature(snapshot)

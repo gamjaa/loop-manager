@@ -113,6 +113,18 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(events[0]['canceled_at'])
         self.assertIsNone(events[1]['canceled_at'])
 
+    def test_completion_redacts_saved_title_before_delivery(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        self._complete_project(connection, 'cycle-one')
+        connection.execute("UPDATE project_completion_cycles SET last_completed_title='Bearer private-token' WHERE repo=?", (repo,))
+        self.assertTrue(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        self.assertNotIn('private-token', self.events(connection)[0]['payload'])
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        self.assertNotIn('private-token', adapter.call_args.args[2])
+        self.assertEqual(connection.execute('SELECT last_completed_title FROM project_completion_cycles').fetchone()[0], 'Bearer private-token')
+
     def test_completion_generation_migration_preserves_old_cycle(self):
         connection = sqlite3.connect(':memory:')
         self.addCleanup(connection.close)
@@ -183,6 +195,22 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(second['confirmed_pieces'], 0)
         self.assertIsNone(second['canceled_at'])
         self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 1)
+
+    def test_completion_rejects_uncertain_call_before_creation_and_claim(self):
+        from loop_manager_internal.notifications.policy import is_current
+        connection = self.connection()
+        repo = '/projects/alpha'
+        self._complete_project(connection, 'cycle-one')
+        connection.execute("INSERT INTO task_call_reservations (token,repo,plan_id,kind,uncertain) "
+                           "VALUES ('reserved', ?, 'G-999', 'verify', 1)", (repo,))
+        self.assertFalse(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        self.assertEqual(self.events(connection), [])
+        connection.execute("DELETE FROM task_call_reservations WHERE token='reserved'")
+        self.assertTrue(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        payload = json.loads(self.events(connection)[0]['payload'])
+        connection.execute("INSERT INTO task_call_reservations (token,repo,plan_id,kind,uncertain) "
+                           "VALUES ('reserved', ?, 'G-999', 'verify', 1)", (repo,))
+        self.assertFalse(is_current(connection, repo, 'project_completed', payload))
 
     def test_completion_claim_rechecks_maintenance_and_recovery(self):
         from loop_manager_internal.notifications.policy import is_current
@@ -420,6 +448,44 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertIn('First cause', first['payload'])
         self.assertIn('New cause', second['payload'])
         self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 1)
+
+    def test_wait_claim_rejects_uncertain_other_task_and_unfinished_invocation(self):
+        from loop_manager_internal.notifications.policy import is_current
+        connection = self.connection()
+        repo = '/projects/alpha'
+        connection.execute("UPDATE projects SET planning_fingerprint='cycle-one' WHERE repo=?", (repo,))
+        connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE repo=?", (repo,))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        payload = json.loads(self.events(connection)[0]['payload'])
+        connection.execute("INSERT INTO task_call_reservations (token,repo,plan_id,kind,uncertain) "
+                           "VALUES ('reserved', ?, 'G-999', 'verify', 1)", (repo,))
+        self.assertFalse(is_current(connection, repo, 'work_waiting', payload))
+        connection.execute("DELETE FROM task_call_reservations WHERE token='reserved'")
+        connection.execute("INSERT INTO agent_invocations "
+            "(invocation_id,repo,role,provider,model,effort,transition,attempt,started_at) "
+            "VALUES ('call', ?, 'worker', 'mock', 'mock', 'low', 'new', 1, 'now')", (repo,))
+        self.assertFalse(is_current(connection, repo, 'work_waiting', payload))
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 0)
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+
+    def test_wait_notice_redacts_diagnostics_without_changing_current_identity(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        secret = 'Bearer super-secret-token'
+        connection.execute("UPDATE projects SET planning_fingerprint='cycle-one' WHERE repo=?", (repo,))
+        connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                           "VALUES (?, 'G-018', 'plan', 'common_defect_pending', ?)", (repo, secret))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        saved = self.events(connection)[0]
+        self.assertNotIn('super-secret-token', saved['payload'])
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        self.assertNotIn('super-secret-token', adapter.call_args.args[2])
+        self.assertIn('<REDACTED>', adapter.call_args.args[2])
+        self.assertEqual(connection.execute("SELECT evidence FROM execplan_blocks WHERE repo=?", (repo,)).fetchone()[0], secret)
 
     def test_wait_notice_is_independent_and_cancels_stale_remaining_pieces(self):
         connection = self.connection()

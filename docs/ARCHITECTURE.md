@@ -462,7 +462,7 @@ Planner의 표준 결과는 `FINAL_SPECIFICATION_REVIEW: <JSON object>` 하나�
 
 최종 확인의 `work_cycle`은 MERGED 수·유지보수 revision·Merge된 작업의 검증 identity에 결합한다. 재사용은 확정된 `fulfilled`의 현재 입력·명세 지문·주기 일치를 요구하며, 원문 보존 archive-only 이동은 유효한 계획 선언과 정확한 이동을 검증한 예외로만 허용한다. 상태 공백·catalog 부재·일반 검토의 추가 계획 없음이나 검토 파일명만으로 완료를 합성하지 않는다.
 
-안정적 완료·작업 소진의 원본은 현재 원격 입력·catalog·SQLite 상태다. 완료 기록의 `cycle_key`는 유효 planning 입력 지문이며 최종 확인의 `work_cycle`과 구분한다. `project_completion_cycles`의 완료 시각·마지막 Merge 계획·세대와 `work_reason_episodes`의 원인 지문·세대는 Telegram 활성 여부와 독립적으로 유지한다. 안정 관측은 기존 선택·복구·유지보수 결과와 전체 대상 상태를 대조하며 관리 인계·순번만으로 실제 진행을 만들지 않는다. 완료와 대기 사건은 각각 해당 주기와 episode에 결합한다. Merge 후 worktree cleanup·ExecPlan archive pending은 완료를 막지 않지만 미완료 planning publication·활성 writer·안전 gate를 우회하는 근거로 사용하지 않는다.
+안정적 완료·작업 소진의 원본은 현재 원격 입력·catalog·SQLite 상태다. 완료 기록의 `cycle_key`는 유효 planning 입력 지문이며 최종 확인의 `work_cycle`과 구분한다. `project_completion_cycles`의 완료 시각·마지막 Merge 계획·세대와 `work_reason_episodes`의 원인 지문·세대는 Telegram 활성 여부와 독립적으로 유지한다. 안정 관측은 기존 선택·복구·유지보수 결과와 전체 대상 상태를 대조하고, 다른 대상의 호출 예약이나 종료 미확인 invocation이 남으면 보류한다. 관리 인계·순번만으로 실제 진행을 만들지 않는다. 완료와 대기 사건은 각각 해당 주기와 episode에 결합한다. Merge 후 worktree cleanup·ExecPlan archive pending은 완료를 막지 않지만 미완료 planning publication·활성 writer·안전 gate를 우회하는 근거로 사용하지 않는다.
 
 ### 계획 게시와 작업 공간
 

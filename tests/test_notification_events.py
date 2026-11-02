@@ -873,6 +873,46 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         delivered.assert_not_called()
         self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
 
+    def test_project_wait_is_independent_of_sent_draft_with_mixed_causes(self):
+        from loop_manager_internal.storage import execplan_draft_state
+        connection = self.connection()
+        repo = '/projects/alpha'
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        plan = {'id': 'G-018', 'title': 'Reliable notices', 'sources': ['docs/PRODUCT.md'],
+                'draft': True, 'draft_scope': 'scope', 'draft_question':
+                'Question: Choose A or B?\nOptions: A, B\nImpact: A retains history',
+                'draft_question_identity': 'question-1'}
+        with connection:
+            connection.execute("UPDATE projects SET origin='org/repo', planning_fingerprint='cycle' WHERE repo=?", (repo,))
+            connection.execute("UPDATE exec_plans SET current_revision_sha='remote-sha' WHERE repo=?", (repo,))
+            execplan_draft_state.observe(connection, repo, path, plan, 'hash', 'remote-sha',
+                                        remote_url='https://github.com/org/repo')
+            for plan_id, title, status, dependencies in (
+                    ('G-019', 'Merge', 'PR_OPEN', '[]'),
+                    ('G-020', 'Dependency', 'READY', '["G-019"]'),
+                    ('G-021', 'Blocked', 'PLAN_BLOCKED', '[]')):
+                connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+                    "VALUES (?,?,?,?, '[]',?,'normal','hash',?)",
+                    (repo, plan_id, f'docs/plans/[{plan_id}] {title}.md', title, dependencies, status))
+            connection.execute("INSERT INTO execplan_blocks (repo,plan_id,scope,reason_code,evidence) "
+                               "VALUES (?, 'G-021', 'plan', 'common_defect_pending', 'Correction pending')", (repo,))
+            notifications.enqueue_draft_decisions(connection, repo)
+        draft_sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=draft_sender), 1)
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle', active_requirements=(), base_revision='remote-sha')
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        rows = self.events(connection)
+        self.assertEqual([row['event_type'] for row in rows], ['draft_decisions', 'work_waiting'])
+        payload = json.loads(rows[1]['payload'])
+        self.assertFalse(payload['silent'])
+        self.assertEqual([item['status'] for item in payload['plans']], ['DRAFT', 'PR_OPEN', 'READY', 'PLAN_BLOCKED'])
+        wait_sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=wait_sender), 1)
+        text = wait_sender.call_args.args[2]
+        for item in ('G-018', 'G-019', 'G-020', 'G-021', 'Correction pending', 'PR Merge', 'dependency'):
+            self.assertIn(item, text)
+
     def test_draft_notice_tracks_question_revision_and_preserves_sent_audit(self):
         from loop_manager_internal.storage import execplan_draft_state
         connection = self.connection()

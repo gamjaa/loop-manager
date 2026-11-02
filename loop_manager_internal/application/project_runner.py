@@ -8,6 +8,7 @@ from loop_manager_internal.application.contracts import PROJECT_STEP_USAGE_PAUSE
 from loop_manager_internal.application.contracts import ProjectRunKind
 from loop_manager_internal.application.contracts import ProjectRunResult
 from loop_manager_internal.notifications import notifications
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.recovery import recovery_runtime
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.runtime.contracts import GitLockError
@@ -347,6 +348,8 @@ def _run_project_result(
             f"PROJECT_BLOCKED {project_block['reason_code']}: {project_block['evidence']}"
             if project_block is not None else detail
         )
+        if reason is not None:
+            reason = redact_secrets(reason)
         if project_block is not None and step_result in (0, 1):
             try:
                 snapshot = effects._stable_work_reason(
@@ -365,7 +368,7 @@ def _run_project_result(
     if step_result == PROJECT_STEP_PLANNING_PENDING:
         return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
     if row is not None and row["planning_error"]:
-        reason = f"planning_error: {row['planning_error']}"
+        reason = redact_secrets(f"planning_error: {row['planning_error']}")
         if runtime_state.planning_owns_execution_slot(row):
             effects.operation_log(reason, error=True)
             return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, reason)
@@ -391,7 +394,7 @@ def _run_project_result(
             connection, repo, refactoring_review_interval=refactoring_review_interval,
         )
     if snapshot is not None:
-        reason = snapshot.describe()
+        reason = redact_secrets(snapshot.describe())
         effects.operation_log(f"작업 선택 결과 ({repo}): {reason}")
         if snapshot.completed and step_result == 0:
             if notifications.enqueue_completion_if_ready(connection, repo, snapshot):

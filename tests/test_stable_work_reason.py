@@ -252,6 +252,15 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             ))
         connection.close()
 
+    def test_uncertain_call_prevents_stable_selection_despite_pr_projection(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("INSERT INTO task_call_reservations (token,repo,plan_id,kind,uncertain) "
+                           "VALUES ('reserved', ?, 'G-999', 'verify', 1)", (repo,))
+        with mock.patch('loop_manager.git') as git:
+            self.assertIsNone(loop_manager._stable_work_reason(connection, repo, refactoring_review_interval=5))
+            git.assert_not_called()
+
     def test_runnable_and_due_maintenance_do_not_emit_exhaustion(self):
         connection, repo = self._connection()
         connection.execute(

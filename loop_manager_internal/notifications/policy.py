@@ -431,6 +431,7 @@ def _matches_current_draft_item(connection, repo, item, current, *, legacy=False
 
 def completion_current(connection, repo, cycle, work_cycle):
     """Recheck durable completion evidence without another remote observation."""
+    from .work_exhaustion import execution_pending
     from loop_manager_internal.planning.specification_review import valid_final_receipt
     from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
     from loop_manager_internal.storage import maintenance_state, planning_review_state
@@ -439,7 +440,7 @@ def completion_current(connection, repo, cycle, work_cycle):
         (repo,),
     ).fetchone()
     if (project is None or project[0] is not None or project[1] != cycle or project[2]
-            or project[3] or catalog_held_plan_ids(connection, repo)
+            or project[3] or execution_pending(connection, repo) or catalog_held_plan_ids(connection, repo)
             or connection.execute("SELECT 1 FROM project_blocks WHERE repo=?", (repo,)).fetchone()):
         return False
     has_history = connection.execute(
@@ -471,6 +472,7 @@ def waiting_current(connection, repo, payload):
     ).fetchone()
     if (project is None or project['phase'] not in (None, 'PR_OPEN', 'PLAN_BLOCKED', 'PROJECT_BLOCKED')
             or project['planning_fingerprint'] != payload['cycle'] or project['pr_conflict_recovery']
+            or work_exhaustion.execution_pending(connection, repo)
             or planning_review_state.general_pending(connection, repo)):
         return False
     if project['planning_error']:

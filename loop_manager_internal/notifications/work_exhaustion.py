@@ -90,6 +90,17 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
+def execution_pending(connection: sqlite3.Connection, repo: str) -> bool:
+    """Unfinished or uncertain calls remain authoritative across projections."""
+    for table, condition in (("task_call_reservations", "1"),
+                             ("agent_invocations", "finished_at IS NULL")):
+        if _table_exists(connection, table) and connection.execute(
+            f"SELECT 1 FROM {table} WHERE repo=? AND {condition} LIMIT 1", (repo,),
+        ).fetchone():
+            return True
+    return False
+
+
 def _action_targets(connection: sqlite3.Connection, repo: str, plan_id: str,
                     reason_code: str, cause: str) -> list[str]:
     # Raw recovery user_targets alone do not establish a current user action.

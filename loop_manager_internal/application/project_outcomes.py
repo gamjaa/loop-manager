@@ -171,7 +171,7 @@ def _stable_work_reason(
     ).fetchone()
     if row is None or row["phase"] not in {None, "PR_OPEN", "PLAN_BLOCKED", "PROJECT_BLOCKED"}:
         return None
-    if row["pr_conflict_recovery"]:
+    if row["pr_conflict_recovery"] or work_exhaustion.execution_pending(connection, repo):
         return None
     if row["planning_error"]:
         if (row["planning_error_origin"] != "validation"
