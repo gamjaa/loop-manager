@@ -534,6 +534,9 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         from loop_manager_internal.verification.execution_clock import VerifyBudgetError
         bundle = self.root / 'bundle'
         bundle.mkdir()
+        (bundle / 'logs').mkdir()
+        (bundle / 'logs' / 'runner.log').write_text('partial output')
+        self.logs.mkdir()
         budget_directory = self.root / 'budget'
         budget_directory.mkdir()
         os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'] = str(budget_directory)
@@ -549,6 +552,35 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
                 self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
         self.assertEqual((raised.exception.diagnostic_directory / 'wait.json').read_text(), 'invalid')
         self.assertTrue((bundle / 'cleanup.json').exists())
+        self.assertEqual((self.logs / 'runner.log').read_text(), 'partial output')
+        self.assertTrue((self.logs / 'cleanup.json').exists())
+
+    def test_copy_error_does_not_replace_wsl_budget_error(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        bundle = self.root / 'bundle'
+        bundle.mkdir()
+        (bundle / 'logs').mkdir()
+        (bundle / 'logs' / 'runner.log').write_text('partial output')
+        self.logs.mkdir()
+        budget_directory = self.root / 'budget'
+        budget_directory.mkdir()
+        os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'] = str(budget_directory)
+        def run(*_args, execution_clock, **_kwargs):
+            (budget_directory / 'wait.json').write_text('invalid')
+            (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+            execution_clock.remaining(30)
+        copy2 = launcher.shutil.copy2
+        def copy(source, destination, **kwargs):
+            if Path(source).name == 'runner.log':
+                raise OSError('copy failed')
+            return copy2(source, destination, **kwargs)
+        with mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=run), \
+             mock.patch.object(launcher.shutil, 'copy2', side_effect=copy):
+            with self.assertRaises(VerifyBudgetError) as raised:
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertTrue(any('copy failed' in note for note in raised.exception.__notes__))
+        self.assertTrue(raised.exception.diagnostic_directory.exists())
 
 
 if __name__ == '__main__':

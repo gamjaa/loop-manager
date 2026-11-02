@@ -240,6 +240,7 @@ def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
         if budget_directory:
             lifecycle(budget_directory, 'starting')
         primary = None
+        output = None
         try:
             with heartbeat(bundle / 'heartbeat'):
                 passed, timed_out, output = run_verify_process(
@@ -269,15 +270,25 @@ def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
                 raise ValueError('incomplete cleanup receipt')
         except (OSError, ValueError, TypeError) as error:
             raise VerifyTerminationUncertain('WSL 자식 또는 전용 /tmp 정리를 확인하지 못했습니다.') from error
+        try:
+            for path in (bundle / 'logs').glob('*'):
+                if primary is None:
+                    try:
+                        check_budget(budget, timeout)
+                    except (TimeoutError, VerifyBudgetError) as error:
+                        primary = error
+                destination = directory / path.name
+                shutil.copytree(path, destination) if path.is_dir() else shutil.copy2(path, destination)
+            shutil.copy2(receipt, directory / 'cleanup.json')
+            if output is not None:
+                (directory / 'console.log').write_text(str(output), encoding='utf-8')
+                print(output, flush=True)
+        except BaseException as error:
+            if primary is None:
+                raise
+            primary.add_note(f'WSL 진단 복사 실패: {error}')
         if primary:
             raise primary
-        for path in (bundle / 'logs').glob('*'):
-            check_budget(budget, timeout)
-            destination = directory / path.name
-            shutil.copytree(path, destination) if path.is_dir() else shutil.copy2(path, destination)
-        shutil.copy2(receipt, directory / 'cleanup.json')
-        (directory / 'console.log').write_text(str(output), encoding='utf-8')
-        print(output, flush=True)
         check_budget(budget, timeout)
         return passed and not timed_out
 
