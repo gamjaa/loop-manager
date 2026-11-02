@@ -301,7 +301,8 @@ class ExecutionProgressLogTest(unittest.TestCase):
     def test_transient_git_lock_is_warn_while_preserving_success_exit(self):
         connection = mock.Mock()
         connection.execplans_schema_ready = True
-        connection.execute.side_effect = lambda *_args: ()
+        connection.execute.return_value = mock.MagicMock()
+        connection.execute.return_value.fetchone.return_value = None
         effects = project_runner_app.InternalRunProjectResultEffects(
             _checkpoint_dispatch_ready=mock.Mock(return_value=False),
             _record_project_recovery=mock.Mock(),
