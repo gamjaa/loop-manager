@@ -1080,6 +1080,28 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_published_batch_silent_flag_survives_split_and_http_retry(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        with connection:
+            connection.execute("UPDATE exec_plans SET title=?, publication_path=path, publication_sha='abc' WHERE repo=?", ('Long ' * 1000, repo))
+            notifications.record_planning_publication(connection, repo, [(path, {'id': 'G-018'})], 'abc')
+        requests = []
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        def send(request, timeout):
+            requests.append(json.loads(request.data))
+            if len(requests) == 2:
+                raise OSError('offline')
+            return response
+        with mock.patch.object(transport, 'urlopen', side_effect=send):
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 0)
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 1)
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(item['disable_notification'] is True for item in requests))
+        self.assertEqual(requests[1], requests[2])
+
     def test_late_publication_confirmation_removes_item_from_continuation(self):
         connection = self.connection()
         repo = '/projects/alpha'
@@ -1378,6 +1400,48 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
         with connection:
             notifications.enqueue_draft_decisions(connection, self.repo)
         self.assertEqual(len(self.events(connection)), 1)
+
+    def test_mixed_publication_keeps_http_notification_levels_separate(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Decision')
+            path = 'docs/plans/[G-019] General.md'
+            connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,publication_path,publication_sha) VALUES (?,'G-019',?,'General','[]','[]','normal','hash','READY',?,'remote-sha')", (self.repo, path, path))
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha' WHERE plan_id='G-018'")
+            plans = [('docs/plans/[G-018] Decision.md', {'id': 'G-018', 'draft': True}),
+                     (path, {'id': 'G-019'})]
+            notifications.record_planning_publication(connection, self.repo, plans, 'remote-sha')
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        with mock.patch.object(transport, 'urlopen', return_value=response) as send:
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 2)
+        requests = [json.loads(call.args[0].data) for call in send.call_args_list]
+        general = next(item for item in requests if 'G-019' in item['text'])
+        draft = next(item for item in requests if 'G-018' in item['text'])
+        self.assertTrue(general['disable_notification'])
+        self.assertFalse(draft['disable_notification'])
+        self.assertNotIn('G-018', general['text'])
+        self.assertNotIn('G-019', draft['text'])
+
+    def test_notification_failure_does_not_change_published_catalog(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Decision')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            notifications.record_planning_publication(connection, self.repo,
+                [('docs/plans/[G-018] Decision.md', {'id': 'G-018', 'draft': True})], 'remote-sha')
+        before = tuple(connection.execute('SELECT * FROM exec_plans').fetchone())
+        draft_before = tuple(connection.execute('SELECT * FROM execplan_drafts').fetchone())
+        with mock.patch.object(transport, 'urlopen', side_effect=OSError('offline')):
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 0)
+        self.assertEqual(tuple(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
+        self.assertEqual(tuple(connection.execute('SELECT * FROM execplan_drafts').fetchone()), draft_before)
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        with mock.patch.object(transport, 'urlopen', return_value=response):
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 1)
+        self.assertEqual(tuple(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
+        self.assertEqual(tuple(connection.execute('SELECT * FROM execplan_drafts').fetchone()), draft_before)
 
     def test_new_draft_without_question_is_still_notified(self):
         connection = self.connection()

@@ -317,6 +317,7 @@ class PlanningPublicationTest(PlanningCase):
         from loop_manager_internal.storage import database, planning_publication_state, verify_input_requests
         from loop_manager_internal.storage.database import GENERAL_PLANNING_PUBLICATIONS_SCHEMA
         from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
+        from loop_manager_internal.notifications import notifications
 
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -326,6 +327,7 @@ class PlanningPublicationTest(PlanningCase):
         database._ensure_execplans_schema(connection)
         repo = "/repo"
         connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
+        notifications.configure_session(connection, enabled=True)
         request = verify_input_requests.register(connection, repo, "a" * 40)
         path = "docs/plans/[G-900] Legacy Verify Inputs.md"
         text = (
@@ -406,7 +408,6 @@ class PlanningPublicationTest(PlanningCase):
 
         with mock.patch.object(planner_publication.planning_publication_state,
                                "apply_mutable_catalog_changes"), \
-             mock.patch("loop_manager_internal.notifications.notifications.record_planning_publication"), \
              mock.patch.object(planner_publication.planning_input_state,
                                "record_general"), \
              mock.patch("loop_manager_internal.catalog.remote_deletions.resolve_recovery"):
@@ -420,6 +421,14 @@ class PlanningPublicationTest(PlanningCase):
         self.assertEqual(outcome, "applied")
         self.assertEqual(tuple(row), ("normal", "READY"))
         self.assertIsNone(planning_publication_state.general_planning_publication(connection, repo))
+        notices = connection.execute("SELECT payload FROM notification_outbox WHERE event_type='plans_published'").fetchall()
+        self.assertEqual(len(notices), 1)
+        payload = json.loads(notices[0][0])
+        self.assertTrue(payload['silent'])
+        self.assertEqual([item['id'] for item in payload['plans']], ['G-900'])
+        with connection:
+            notifications.record_planning_publication(connection, repo, result.plans, commit)
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='plans_published'").fetchone()[0], 1)
 
     def test_publication_uses_current_changes_after_manager_validation(self):
         path = "docs/plans/[G-001] Plan.md"

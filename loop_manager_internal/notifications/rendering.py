@@ -49,7 +49,8 @@ def _message(kind: str, payload: dict[str, object]) -> str:
 def _event_message(kind: str, payload: dict[str, object]) -> str:
     if kind == "draft_decisions":
         plans = payload["plans"]
-        has_questions = any(plan.get('decision_identity') for plan in plans)
+        has_questions = any(plan.get('decision_identity') or not plan.get('publication_revision')
+                            for plan in plans)
         heading = "사용자 판단 대기" if has_questions else "새 draft 게시"
         lines = [f"[{payload['project']}] draft 작업 {len(plans)}건 · {heading}", ""]
         lines.extend(f"• {plan['id']} · {' '.join(str(plan['title']).split())}"
