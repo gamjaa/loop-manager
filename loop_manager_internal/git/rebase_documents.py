@@ -369,7 +369,9 @@ def resolve(*, context, identity, checkpoints, git, git_bytes, require_owned,
         if rebase_file_evidence.capture_originals(context.worktree, paths, revisions, git_bytes,
                                                 allow_incomplete=failed_files is not None) != (originals, blobs):
             raise RuntimeError('document originals changed during preservation')
-        if capture_snapshot(context.worktree) != before:
+        after = capture_snapshot(context.worktree)
+        if (workspace_evidence(after, ()) != workspace_evidence(before, ())
+                or after.config != before.config):
             raise RuntimeError('workspace changed during document preservation')
         item = {'state': 'prepared', 'position': position, 'revision': revision,
             'target': current.target_base_oid, 'before_head': current.expected_head,

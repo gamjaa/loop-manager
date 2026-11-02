@@ -345,6 +345,18 @@ class TargetedRecoveryTests(TestCase):
 
 
 class TargetedRunnerTests(TestCase):
+    def test_nested_phase_diagnostics_do_not_poison_test_outcomes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'targeted-a.jsonl'
+            outcome = dict(version=1, kind='test_end', run_id='a', utc='now',
+                           id='tests.Sample.test_case', result='failure')
+            phase = dict(kind='phase_start', name='bootstrap:parent_cli', phase_id='p')
+            path.write_text(''.join(json.dumps(item) + '\n' for item in (phase, outcome)))
+            self.assertEqual(targeted.collect(directory), (outcome,))
+            path.write_text(json.dumps({**outcome, 'run_id': 'foreign'}) + '\n')
+            with self.assertRaises(ValueError):
+                targeted.collect(directory)
+
     def test_unittest_records_native_results_for_each_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

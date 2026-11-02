@@ -385,8 +385,12 @@ class DocumentConflictPolicyTests(TestCase):
         self.assertEqual(checkpoints.get('repo', 'G-047'), uncertain)
         revision[0] = 'corrected-base'
         catalog = SimpleNamespace(all={}, active={'G-047': ports['context'].plan})
-        snapshot = SimpleNamespace(head='intermediate', branch=None, index={}, dirty={}, operations={})
-        ports['capture_snapshot'].return_value = snapshot
+        snapshot = SimpleNamespace(head='intermediate', branch=None, index={}, dirty={}, operations={},
+                                   config={}, refs={}, worktrees={})
+        # Another task may advance refs/create a worktree during preservation.
+        ports['capture_snapshot'].side_effect = [snapshot,
+            SimpleNamespace(**{**vars(snapshot), 'refs': {'other': 'advanced'},
+                               'worktrees': {'other': 'created'}}), *([snapshot] * 6)]
         original_b = {'base': desired, 'worktree': {'absent': True}, 'index': {}}
         applied_b = {'worktree': {'mode': '100644', 'blob': digest}, 'index': {'0': desired}}
         with tempfile.TemporaryDirectory() as directory:

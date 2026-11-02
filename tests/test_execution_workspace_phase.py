@@ -12,6 +12,21 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKi
 
 
 class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
+    def test_latest_base_fetch_only_updates_selected_base_under_the_fetch_lease(self):
+        from loop_manager_internal.execution import execution_latest_base_handler as latest
+        git = self.effects.workspace.git
+        git.side_effect = None
+        from types import SimpleNamespace
+        git.return_value = SimpleNamespace(stdout='current-base\n', returncode=0)
+        with mock.patch.object(latest, 'resource_locks') as leases:
+            result = self.handler._latest_base_handler()._fetch_latest_base()
+        self.assertEqual(result, 'current-base')
+        self.assertEqual(git.call_args_list, [
+            mock.call(Path('/repo'), 'fetch', '--no-tags', 'origin',
+                      '+refs/heads/main:refs/remotes/origin/main'),
+            mock.call(Path('/repo'), 'rev-parse', 'origin/main')])
+        leases.assert_called_once()
+
     def test_reserved_failure_uses_current_shared_evidence_for_scope(self):
         from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
         target = str(Path('/state/G-047').resolve())

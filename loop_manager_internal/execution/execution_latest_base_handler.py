@@ -58,10 +58,12 @@ class LatestBaseHandler:
         try:
             with resource_locks(self.ports.identity.state_dir, str(self.ports.identity.repo_path.resolve()),
                                 ['git:fetch'], owner='latest-base-fetch'):
-                self.ports.git(self.ports.identity.repo_path, 'fetch', 'origin')
-            return self.ports.git(
-                self.ports.identity.repo_path, 'rev-parse', f"origin/{self.ports.identity.base}"
-            ).stdout.strip()
+                base = self.ports.identity.base
+                self.ports.git(self.ports.identity.repo_path, 'fetch', '--no-tags', 'origin',
+                               f'+refs/heads/{base}:refs/remotes/origin/{base}')
+                return self.ports.git(
+                    self.ports.identity.repo_path, 'rev-parse', f'origin/{base}'
+                ).stdout.strip()
         except self.ports.contract.GitLockError as error:
             raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
         except (RuntimeError, OSError) as error:
