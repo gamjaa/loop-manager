@@ -143,6 +143,32 @@ class MaintenancePublicationPolicyTest(MaintenancePlanningCase):
                 self.connection, repo, self.repo, 'main', self.result, self.commit)
         send.assert_called_once()
 
+    def test_publication_retry_after_rollback_records_one_batch(self):
+        from loop_manager_internal.maintenance import maintenance_publication
+        from loop_manager_internal.notifications import notifications
+        from loop_manager_internal.storage.runtime_state import _transaction
+        repo = str(self.repo)
+        notifications.configure_session(self.connection, enabled=True)
+        notifications.ensure_schema(self.connection)
+        self.connection.commit()
+        loop_manager.record_maintenance_publication_intent(
+            self.connection, repo, self.repo, 'main', self.result, self.commit)
+        def retry(connection, operation):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted'), _transaction(connection):
+                operation(connection)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='plans_published'").fetchone()[0], 1)
+                raise RuntimeError('interrupted')
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='plans_published'").fetchone()[0], 0)
+            with _transaction(connection):
+                return operation(connection)
+        with mock.patch.object(maintenance_publication, 'run_database_request', side_effect=retry), \
+                mock.patch.object(notifications, 'flush_project_events'):
+            loop_manager._apply_maintenance_planning_batch(
+                self.connection, repo, self.repo, 'main', self.result, self.commit)
+        rows = self.connection.execute("SELECT payload FROM notification_outbox WHERE event_type='plans_published'").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual({item['id'] for item in json.loads(rows[0][0])['plans']}, {'G-002', 'G-003'})
+
     def test_batch_rejects_cycle_owner_and_catalog_races_during_observation(self):
         from loop_manager_internal.maintenance import maintenance_publication
         from loop_manager_internal.storage import manual_work_state
