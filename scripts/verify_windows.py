@@ -186,6 +186,24 @@ def heartbeat(path):
         thread.join()
 
 
+@contextmanager
+def owned_bundle():
+    from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
+    directory = Path(tempfile.mkdtemp(prefix='loop-manager-verify-'))
+    try:
+        yield directory
+    except VerifyTerminationUncertain as error:
+        error.add_note(f'종료 불명 자료를 보존합니다: {directory}')
+        raise
+    except BaseException as error:
+        try:
+            shutil.rmtree(directory)
+        except OSError as cleanup_error:
+            error.add_note(f'bundle 정리 실패: {cleanup_error}')
+        raise
+    else:
+        shutil.rmtree(directory)
+
 def wsl_environment():
     # Windows의 경로·조율 인증값을 Linux interpreter에 상속하지 않는다.
     return {key: value for key, value in os.environ.items()
@@ -195,7 +213,7 @@ def wsl_environment():
 
 def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
     from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
-    from loop_manager_internal.verification.execution_clock import ExecutionClock
+    from loop_manager_internal.verification.execution_clock import ExecutionClock, VerifyBudgetError
     environment = wsl_environment()
     with ExecutionClock() as budget:
         def translate(path):
@@ -232,8 +250,17 @@ def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
             primary = error
         # Windows Job 종료만으로 Linux 자식의 종료를 확정하지 않는다.
         receipt = bundle / 'cleanup.json'
-        while not receipt.is_file() and budget.remaining(timeout) > 0:
-            time.sleep(min(0.1, budget.remaining(timeout)))
+        cleanup_deadline = time.monotonic() + min(CLEANUP_SECONDS, max(0, timeout - budget.last_elapsed))
+        while not receipt.is_file():
+            try:
+                remaining_cleanup = budget.remaining(timeout)
+            except VerifyBudgetError as error:
+                if primary is None:
+                    primary = error
+                remaining_cleanup = cleanup_deadline - time.monotonic()
+            if remaining_cleanup <= 0:
+                break
+            time.sleep(min(0.1, remaining_cleanup))
         if not receipt.is_file():
             raise VerifyTerminationUncertain('WSL 자식 종료·전용 /tmp 정리 근거가 없습니다.') from primary
         try:
@@ -456,8 +483,7 @@ def windows_main(root):
     os.environ[BUDGET_DIRECTORY] = budget.environment[BUDGET_DIRECTORY]
     try:
         writer.emit('run_start', mode='windows+wsl', cap=cap)
-        with writer.activate(), phase('verify'), tempfile.TemporaryDirectory(prefix='loop-manager-verify-') as temporary:
-            bundle = Path(temporary)
+        with writer.activate(), phase('verify'), owned_bundle() as bundle:
             report.update(snapshot(root, bundle, entrypoint, budget, timeout - CLEANUP_SECONDS))
             atomic_json(directory / 'snapshot.json', {
                 'run_id': session, 'revision': report['revision'], 'bundle': str(bundle),

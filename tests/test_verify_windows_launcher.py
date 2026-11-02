@@ -420,12 +420,25 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertFalse((self.logs / 'result.json').exists())
 
     def test_windows_copy_cleanup_failure_cannot_claim_whole_success(self):
-        with mock.patch.object(launcher.tempfile, 'TemporaryDirectory') as temporary:
+        with mock.patch.object(launcher, 'owned_bundle') as temporary:
             temporary.return_value.__enter__.return_value = str(self.root / 'bundle')
             temporary.return_value.__exit__.side_effect = OSError('cleanup failed')
             with self.assertRaisesRegex(OSError, 'cleanup failed'):
                 launcher.windows_main(self.root)
         self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
+        self.assertFalse(self.report()['passed'])
+
+    def test_uncertain_child_preserves_its_bundle(self):
+        owned = []
+        def wsl(_root, bundle, *_args):
+            owned.append(bundle)
+            (bundle / 'marker').write_text('keep')
+            raise verify_process.VerifyTerminationUncertain('child state unknown')
+        self.wsl.side_effect = wsl
+        with self.assertRaises(verify_process.VerifyTerminationUncertain):
+            launcher.windows_main(self.root)
+        self.assertEqual((owned[0] / 'marker').read_text(), 'keep')
+        self.native.assert_not_called()
         self.assertFalse(self.report()['passed'])
 
     def test_successful_exit_without_linux_cleanup_proof_is_not_success(self):
@@ -454,6 +467,26 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertEqual(conversion.call_count, 1)
         self.native.assert_not_called()
         self.assertFalse((bundle / 'heartbeat').exists())
+
+    def test_budget_error_keeps_evidence_while_waiting_for_cleanup(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        bundle = self.root / 'bundle'
+        bundle.mkdir()
+        budget_directory = self.root / 'budget'
+        budget_directory.mkdir()
+        os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'] = str(budget_directory)
+        def run(*_args, execution_clock, **_kwargs):
+            (budget_directory / 'wait.json').write_text('invalid')
+            execution_clock.remaining(30)
+        def cleanup(_seconds):
+            (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+        with mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=run), \
+             mock.patch.object(launcher.time, 'sleep', side_effect=cleanup):
+            with self.assertRaises(VerifyBudgetError) as raised:
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertEqual((raised.exception.diagnostic_directory / 'wait.json').read_text(), 'invalid')
+        self.assertTrue((bundle / 'cleanup.json').exists())
 
 
 if __name__ == '__main__':
