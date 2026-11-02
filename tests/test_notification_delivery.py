@@ -1080,6 +1080,159 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_publication_waiting_list_excludes_merged_dependencies(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='abc', depends_on='[\"G-001\",\"G-002\"]' WHERE repo=?", (repo,))
+            connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) VALUES (?,'G-001','docs/plans/[G-001] Done.md','Done','[]','[]','normal','hash','MERGED')", (repo,))
+            notifications.record_planning_publication(connection, repo,
+                [('docs/plans/[G-018] Reliable notices.md', {'id': 'G-018'})], 'abc')
+        payload = json.loads(self.events(connection)[0]['payload'])
+        self.assertEqual(payload['plans'][0]['waiting_for'], ['G-002'])
+
+    def test_published_batch_silent_flag_survives_split_and_http_retry(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        with connection:
+            connection.execute("UPDATE exec_plans SET title=?, publication_path=path, publication_sha='abc' WHERE repo=?", ('Long ' * 1000, repo))
+            notifications.record_planning_publication(connection, repo, [(path, {'id': 'G-018'})], 'abc')
+        requests = []
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        def send(request, timeout):
+            requests.append(json.loads(request.data))
+            if len(requests) == 2:
+                raise OSError('offline')
+            return response
+        with mock.patch.object(transport, 'urlopen', side_effect=send):
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 0)
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 1)
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(item['disable_notification'] is True for item in requests))
+        self.assertEqual(requests[1], requests[2])
+
+    def test_late_publication_confirmation_removes_item_from_continuation(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute('DELETE FROM exec_plans WHERE repo=?', (repo,))
+            plans = []
+            for plan_id, title in (('G-018', 'Long ' * 1000), ('G-019', 'Removed'), ('G-020', 'Remaining')):
+                path = f'docs/plans/[{plan_id}] {title}.md'
+                connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,publication_path,publication_sha) VALUES (?,?,?,?,'[]','[]','normal','hash','READY',?,'abc')", (repo, plan_id, path, title, path))
+                plans.append((path, {'id': plan_id}))
+            notifications.record_planning_publication(connection, repo, plans, 'abc')
+        def send(_token, _chat, _text):
+            with connection:
+                connection.execute("DELETE FROM exec_plans WHERE repo=? AND plan_id='G-019'", (repo,))
+                notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        rows = self.events(connection)
+        self.assertEqual(rows[0]['confirmed_pieces'], 1)
+        self.assertEqual([item['id'] for item in json.loads(rows[1]['payload'])['plans']], ['G-018', 'G-020'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 0)
+        self.assertEqual([item['id'] for item in json.loads(self.events(connection)[2]['payload'])['plans']], ['G-020'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertNotIn('G-018', sender.call_args.args[2])
+
+    def test_publication_remains_current_after_catalog_rename(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        with connection:
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='abc' WHERE repo=?", (repo,))
+            notifications.record_planning_publication(connection, repo,
+                [(path, {'id': 'G-018'})], 'abc')
+            connection.execute("UPDATE exec_plans SET path='docs/plans/[G-018] Renamed.md', title='Renamed' WHERE repo=?", (repo,))
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-018 · Reliable notices', sender.call_args.args[2])
+        self.assertEqual(len(self.events(connection)), 1)
+
+    def test_partial_publication_withdrawal_retains_only_unconfirmed_valid_items(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        long_title = 'Long ' * 1000
+        plans = []
+        with connection:
+            connection.execute("DELETE FROM exec_plans WHERE repo=?", (repo,))
+            for plan_id, title in (('G-018', long_title), ('G-019', 'Withdrawn'), ('G-020', 'Retained')):
+                path = f'docs/plans/[{plan_id}] {title}.md'
+                connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,publication_path,publication_sha) VALUES (?,?,?,?,'[]','[]','normal','hash','READY',?,'abc')", (repo, plan_id, path, title, path))
+                plans.append((path, {'id': plan_id, 'title': title}))
+            notifications.record_planning_publication(connection, repo, plans, 'abc')
+        def send(_token, _chat, _text):
+            with connection:
+                connection.execute("DELETE FROM exec_plans WHERE repo=? AND plan_id='G-019'", (repo,))
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        old, continuation = self.events(connection)
+        self.assertEqual(old['confirmed_pieces'], 1)
+        self.assertIsNotNone(old['canceled_at'])
+        payload = json.loads(continuation['payload'])
+        self.assertEqual([item['id'] for item in payload['plans']], ['G-020'])
+        self.assertTrue(payload['silent'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-020 · Retained', sender.call_args.args[2])
+        self.assertNotIn('G-019', sender.call_args.args[2])
+
+    def test_publication_reobservation_retains_other_unsent_items(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='abc' WHERE repo=?", (repo,))
+            path = 'docs/plans/[G-019] Removed.md'
+            connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,publication_path,publication_sha) VALUES (?,'G-019',?,'Removed','[]','[]','normal','hash','READY',?,'abc')", (repo, path, path))
+            notifications.record_planning_publication(connection, repo, [
+                ('docs/plans/[G-018] Reliable notices.md', {'id': 'G-018'}),
+                (path, {'id': 'G-019'})], 'abc')
+            connection.execute("DELETE FROM exec_plans WHERE repo=? AND plan_id='G-019'", (repo,))
+            notifications.enqueue_current_project_events(connection, repo)
+        old, continuation = self.events(connection)
+        self.assertIsNotNone(old['canceled_at'])
+        self.assertEqual([item['id'] for item in json.loads(continuation['payload'])['plans']], ['G-018'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+
+    def test_registered_publication_is_deduplicated_and_sent_silently(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        with connection:
+            connection.execute("UPDATE projects SET origin='https://github.com/org/repo' WHERE repo=?", (repo,))
+            connection.execute("UPDATE exec_plans SET publication_path=?, publication_sha='abc', depends_on='[]' WHERE repo=? AND plan_id='G-018'", (path, repo))
+            plans = [(path, {'id': 'G-018', 'title': 'Reliable notices'})]
+            notifications.record_planning_publication(connection, repo, plans, 'abc')
+            notifications.record_planning_publication(connection, repo, plans, 'abc')
+        rows = self.events(connection)
+        self.assertEqual(len(rows), 1)
+        payload = json.loads(rows[0]['payload'])
+        self.assertTrue(payload['silent'])
+        self.assertEqual(payload['plans'][0]['url'],
+            'https://github.com/org/repo/blob/abc/docs/plans/%5BG-018%5D%20Reliable%20notices.md')
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        with mock.patch.object(transport, 'urlopen', return_value=response) as send:
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 1)
+        request = json.loads(send.call_args.args[0].data)
+        self.assertTrue(request['disable_notification'])
+        self.assertIn('G-018 · Reliable notices · 실행 대기', request['text'])
+
+    def test_published_plan_rendering_shows_links_and_actual_waiting_dependencies(self):
+        from loop_manager_internal.notifications.rendering import _message
+        text = _message('plans_published', {'project': 'alpha', 'plans': [
+            {'id': 'G-018', 'title': 'Ready\nwork', 'waiting_for': [],
+             'url': 'https://github.com/org/repo/blob/abc/docs/plans/one.md'},
+            {'id': 'G-019', 'title': 'Dependent', 'waiting_for': ['G-018'], 'url': None},
+        ]})
+        self.assertIn('새 작업 게시 2건', text)
+        self.assertIn('G-018 · Ready work · 실행 대기', text)
+        self.assertIn('https://github.com/org/repo/blob/abc/docs/plans/one.md', text)
+        self.assertIn('G-019 · Dependent · 선행 작업 대기: G-018', text)
+
     def test_action_delivery_waits_for_commit_and_preserves_legacy_silent_pieces(self):
         connection = self.connection()
         repo = '/projects/alpha'
@@ -1104,6 +1257,32 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
         with mock.patch.object(transport, 'urlopen', return_value=response) as open_url:
             transport.send_telegram('token', 'chat', 'notice', disable_notification=True)
         self.assertTrue(json.loads(open_url.call_args.args[0].data)['disable_notification'])
+
+    def test_silent_pieces_and_retry_reach_http_with_notification_disabled(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            candidate = self.prepare_pr_candidate(connection)
+            notifications._insert(connection, 'silent-http', repo, 'pr_created',
+                {'project': 'alpha', 'execplan_id': 'G-018', 'execplan_title': 'x' * 6000,
+                 **candidate, 'silent': True})
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        requests = []
+
+        def open_url(request, timeout):
+            requests.append(json.loads(request.data))
+            if len(requests) == 2:
+                raise OSError('offline')
+            return response
+
+        with mock.patch.object(transport, 'urlopen', side_effect=open_url):
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 0)
+            self.assertEqual(self.events(connection)[0]['confirmed_pieces'], 1)
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 1)
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(request['disable_notification'] is True for request in requests))
+        self.assertEqual(requests[1], requests[2])
 
 
 class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
@@ -1205,6 +1384,193 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
                             + quote(path, safe="/"))
         connection.execute("INSERT OR REPLACE INTO execplan_drafts VALUES (?, ?, 1, ?)",
                            (self.repo, plan_id, json.dumps(saved)))
+
+    def test_new_drafts_share_one_notice_with_current_questions(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Question')
+            self.draft(connection, 'G-019', 'No question')
+            connection.execute("UPDATE execplan_drafts SET evidence=json_remove(evidence, '$.question') WHERE plan_id='G-019'")
+            for plan_id in ('G-018', 'G-019'):
+                connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha' WHERE plan_id=?", (plan_id,))
+            plans = [(f'docs/plans/[{plan_id}] {title}.md', {'id': plan_id, 'draft': True})
+                     for plan_id, title in (('G-018', 'Question'), ('G-019', 'No question'))]
+            notifications.record_planning_publication(connection, self.repo, plans, 'remote-sha')
+            notifications.record_planning_publication(connection, self.repo, plans, 'remote-sha')
+        rows = self.events(connection)
+        self.assertEqual(len(rows), 1)
+        payload = json.loads(rows[0]['payload'])
+        self.assertFalse(payload['silent'])
+        self.assertEqual([item['id'] for item in payload['plans']], ['G-018', 'G-019'])
+        self.assertIn('decision_identity', payload['plans'][0])
+        self.assertNotIn('decision_identity', payload['plans'][1])
+        self.assertTrue(all(item['publication_revision'] == 'remote-sha' for item in payload['plans']))
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-019 · No question · 신규 게시', sender.call_args.args[2])
+        with connection:
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 1)
+
+    def test_mixed_publication_keeps_http_notification_levels_separate(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Decision')
+            path = 'docs/plans/[G-019] General.md'
+            connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,publication_path,publication_sha) VALUES (?,'G-019',?,'General','[]','[]','normal','hash','READY',?,'remote-sha')", (self.repo, path, path))
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha' WHERE plan_id='G-018'")
+            plans = [('docs/plans/[G-018] Decision.md', {'id': 'G-018', 'draft': True}),
+                     (path, {'id': 'G-019'})]
+            notifications.record_planning_publication(connection, self.repo, plans, 'remote-sha')
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        with mock.patch.object(transport, 'urlopen', return_value=response) as send:
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 2)
+        requests = [json.loads(call.args[0].data) for call in send.call_args_list]
+        general = next(item for item in requests if 'G-019' in item['text'])
+        draft = next(item for item in requests if 'G-018' in item['text'])
+        self.assertTrue(general['disable_notification'])
+        self.assertFalse(draft['disable_notification'])
+        self.assertNotIn('G-018', general['text'])
+        self.assertNotIn('G-019', draft['text'])
+
+    def test_notification_failure_does_not_change_published_catalog(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Decision')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            notifications.record_planning_publication(connection, self.repo,
+                [('docs/plans/[G-018] Decision.md', {'id': 'G-018', 'draft': True})], 'remote-sha')
+        before = tuple(connection.execute('SELECT * FROM exec_plans').fetchone())
+        draft_before = tuple(connection.execute('SELECT * FROM execplan_drafts').fetchone())
+        with mock.patch.object(transport, 'urlopen', side_effect=OSError('offline')):
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 0)
+        self.assertEqual(tuple(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
+        self.assertEqual(tuple(connection.execute('SELECT * FROM execplan_drafts').fetchone()), draft_before)
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        with mock.patch.object(transport, 'urlopen', return_value=response):
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 1)
+        self.assertEqual(tuple(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
+        self.assertEqual(tuple(connection.execute('SELECT * FROM execplan_drafts').fetchone()), draft_before)
+
+    def test_new_draft_without_question_is_still_notified(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Draft')
+            connection.execute("UPDATE execplan_drafts SET evidence=json_remove(evidence, '$.question')")
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            notifications.record_planning_publication(connection, self.repo,
+                [('docs/plans/[G-018] Draft.md', {'id': 'G-018', 'draft': True})], 'remote-sha')
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('새 draft 게시', sender.call_args.args[2])
+        self.assertNotIn('사용자 판단 대기', sender.call_args.args[2])
+
+    def test_new_question_after_creation_is_not_a_second_creation(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Draft')
+            connection.execute("UPDATE execplan_drafts SET evidence=json_remove(evidence, '$.question')")
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            notifications.record_planning_publication(connection, self.repo,
+                [('docs/plans/[G-018] Draft.md', {'id': 'G-018', 'draft': True})], 'remote-sha')
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        with connection:
+            connection.execute("UPDATE execplan_drafts SET evidence=json_set(evidence, '$.question', 'Question: New decision?', '$.identity', 'new-question', '$.revision', 'new-revision')")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        payload = json.loads(self.events(connection)[1]['payload'])
+        self.assertEqual(payload['plans'][0]['decision_identity'], 'new-question')
+        self.assertNotIn('publication_revision', payload['plans'][0])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertNotIn('신규 게시', sender.call_args.args[2])
+
+    def test_resolved_question_keeps_unsent_draft_creation(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Draft')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            notifications.record_planning_publication(connection, self.repo,
+                [('docs/plans/[G-018] Draft.md', {'id': 'G-018', 'draft': True})], 'remote-sha')
+            connection.execute("UPDATE execplan_drafts SET pending=0")
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 0)
+        rows = self.events(connection)
+        self.assertIsNotNone(rows[0]['canceled_at'])
+        self.assertEqual(len(rows), 2)
+        item = json.loads(rows[1]['payload'])['plans'][0]
+        self.assertEqual(item['publication_revision'], 'remote-sha')
+        self.assertNotIn('decision_identity', item)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-018 · Draft · 신규 게시', sender.call_args.args[2])
+
+    def test_draft_question_rename_keeps_original_publication_identity(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Original', remote_revision='remote-sha')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            notifications.record_planning_publication(connection, self.repo,
+                [('docs/plans/[G-018] Original.md', {'id': 'G-018', 'draft': True})], 'remote-sha')
+            new_path = 'docs/plans/[G-018] Renamed.md'
+            connection.execute("UPDATE exec_plans SET path=?, title='Renamed', current_revision_sha='new-sha'", (new_path,))
+            connection.execute("UPDATE execplan_drafts SET evidence=json_set(evidence, '$.path', ?)", (new_path,))
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 0)
+        old, continuation = self.events(connection)
+        self.assertIsNotNone(old['canceled_at'])
+        item = json.loads(continuation['payload'])['plans'][0]
+        self.assertEqual(item['source_path'], new_path)
+        self.assertEqual(item['publication_path'], 'docs/plans/[G-018] Original.md')
+        self.assertIn('/blob/new-sha/', item['url'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-018 · Renamed · 신규 게시', sender.call_args.args[2])
+
+    def test_partial_draft_notice_keeps_only_unconfirmed_creation(self):
+        connection = self.connection()
+        title = 'Long ' * 1000
+        with connection:
+            self.draft(connection, 'G-018', title)
+            self.draft(connection, 'G-019', 'Later')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            plans = [(f'docs/plans/[{plan_id}] {name}.md', {'id': plan_id, 'draft': True})
+                     for plan_id, name in (('G-018', title), ('G-019', 'Later'))]
+            notifications.record_planning_publication(connection, self.repo, plans, 'remote-sha')
+        def send(_token, _chat, _text):
+            with connection:
+                connection.execute("UPDATE execplan_drafts SET pending=0 WHERE plan_id='G-019'")
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        rows = self.events(connection)
+        self.assertEqual(rows[0]['confirmed_pieces'], 1)
+        self.assertIsNotNone(rows[0]['canceled_at'])
+        self.assertEqual([item['id'] for item in json.loads(rows[1]['payload'])['plans']], ['G-019'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-019 · Later · 신규 게시', sender.call_args.args[2])
+
+    def test_late_draft_confirmation_removes_creation_from_continuation(self):
+        connection = self.connection()
+        title = 'Long ' * 1000
+        with connection:
+            self.draft(connection, 'G-018', title)
+            self.draft(connection, 'G-019', 'Later')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            plans = [(f'docs/plans/[{plan_id}] {name}.md', {'id': plan_id, 'draft': True})
+                     for plan_id, name in (('G-018', title), ('G-019', 'Later'))]
+            notifications.record_planning_publication(connection, self.repo, plans, 'remote-sha')
+        def send(_token, _chat, _text):
+            with connection:
+                connection.execute("UPDATE execplan_drafts SET pending=0 WHERE plan_id='G-019'")
+                notifications.enqueue_current_project_events(connection, self.repo)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        rows = self.events(connection)
+        self.assertEqual(rows[0]['confirmed_pieces'], 1)
+        self.assertEqual([item['id'] for item in json.loads(rows[1]['payload'])['plans']], ['G-018', 'G-019'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 0)
+        self.assertEqual([item['id'] for item in json.loads(self.events(connection)[2]['payload'])['plans']], ['G-019'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertNotIn('G-018', sender.call_args.args[2])
 
     def test_publication_current_and_waiting_share_one_sorted_list(self):
         connection = self.connection()

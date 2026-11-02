@@ -1755,9 +1755,9 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 사건 선택·주의 수준·해제·완료·대기 정책은 [PRODUCT의 Telegram 알림 조건](PRODUCT.md#telegram-알림-조건)을 따른다. token·chat ID가 모두 있을 때만 outbox에 새 사건을 저장하고 전송한다. 모두 없으면 생성·전송하지 않으며 일부만 있으면 설정 오류다. 상태 소유 경계가 같은 SQLite transaction에 사건을 기록하고 commit 뒤 즉시 전송 경계가 새 건을 시도한다. 실패한 건은 다음 실행의 미확정 전송 처리로 이어가며 작업 상태와 전송 결과를 분리한다.
 
-일반 계획 게시·Worker 최초 시작·유지보수 cycle 시작/종료는 outbox 사건을 만들지 않는다. `enqueue_progress`는 draft 판단·PR 사건 종류만 허용한다. `record_process_start`는 실제 시작을 기존 incident 기록에 연결하며 일반 시작 알림을 위한 과거 outbox 조회는 수행하지 않는다. 유지보수 저장소는 알림용 계획 목록 조회·enqueue 없이 기존 cycle 상태·범위·Merge 확인·종료를 기록한다. 현재 draft 판단 목록은 `draft_decisions`로 저장한다. 미해결 targeted test와 단순 단계 실패는 별도 단순/지속 실패 사건을 만들지 않는다. 차단 통지는 아래 공통 조치 판정을 따른다.
+일반·유지보수 planning은 확인한 게시 commit의 신규 작업 등록 transaction에서 `plans_published`와 `draft_decisions`를 기록한다. 일반 작업과 draft/질문을 별도 묶음으로 저장해 주의 수준을 구분하고 등록 commit 뒤 정리 전에 즉시 전송을 시도한다. 기존 계획 개정이나 catalog 재관측으로 생성 사건을 만들지 않는다. `record_process_start`는 실제 시작을 기존 incident 기록에 연결하며 일반 시작 알림을 만들지 않는다. 유지보수 cycle 시작/종료, 미해결 targeted test와 단순 단계 실패도 별도 사건을 만들지 않는다. 차단 통지는 아래 공통 조치 판정을 따른다.
 
-조각 claim은 `blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision` 외 사건의 잔여 전송을 취소한다. 구정책 진행·완료·대기·재개 사건에도 적용하며 payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim을 사용한다. `policy.is_current`를 생성과 각 claim의 공통 판정으로 사용한다. PR은 같은 ExecPlan의 `PR_OPEN`·URL과 저장된 실제 PR head를 확인하고, 직렬화된 `DefinitionSnapshot`·`validated_base_sha`·`pr_head_oid`에서 기대 `review_token`과 `publication_token`을 다시 계산한다. Review 결과와 두 token이 현재 값과 일치해야 검토·Merge 대기로 인정하며 결과 문자열로 사용자 승인을 추론하지 않는다.
+조각 claim은 `plans_published`·`blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision`의 현재성을 확인하며 그 밖의 구정책 진행·완료·대기·재개 사건의 잔여 전송을 취소한다. payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim과 `policy.is_current`를 사용한다. PR은 같은 ExecPlan의 `PR_OPEN`·URL과 저장된 실제 PR head를 확인하고, 직렬화된 `DefinitionSnapshot`·`validated_base_sha`·`pr_head_oid`에서 기대 `review_token`과 `publication_token`을 다시 계산한다. Review 결과와 두 token이 현재 값과 일치해야 검토·Merge 대기로 인정하며 결과 문자열로 사용자 승인을 추론하지 않는다.
 
 신규 PR은 실제 생성 성공 또는 소유권 검증을 통과한 중단 복구 경계가 `pr_creation_publications`에 repository·ExecPlan·PR URL·최초 publication token과 선택적 검토 입력 identity를 기록한다. 생성 이력과 `PR_OPEN` 전이·Outbox 등록은 같은 transaction에 속한다. 복구는 `PUBLISHING`의 `pr_create` checkpoint intent·기대 head·게시 원격 OID가 관측한 PR head와 모두 일치해야 신규 생성으로 인정한다. 기존 URL 연결이나 증명 부재만으로 생성 이력을 만들지 않는다. 신규 사건 identity는 repository·PR URL·`creation:` 접두사와 URL·`review_merge` 행동에 결합되며 안정적인 Git diff·blame 증명은 요구하지 않는다. 현재성은 이 생성 이력과 현재 `PR_OPEN`·URL·Review/publication token으로 판정한다.
 
@@ -1806,10 +1806,12 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 |---|---|
 | `occurred_at`·`silent`·`status` | 발생 시각은 UTC ISO 8601 문자열, 무음 선택은 boolean, 처리 상태는 문자열이다. 전송 시각·재시도에 맞춰 원래 의미를 다시 쓰지 않는다. |
 | `project` | 표시할 프로젝트 이름 문자열. 사건의 저장 범위는 outbox의 `repo`에 결합한다. |
-| `plans` | 아직 같은 질문의 통지 확인이 없는 `draft_decisions` 항목 배열. ID 순으로 구성한다. |
-| `plans[].id`·`plans[].title`·`plans[].source_path` | ExecPlan ID·현재 제목·현재 catalog 경로 문자열. 경로는 active `docs/plans/[id] title.md` 형식이며 저장된 draft evidence 경로와 catalog 경로가 같아야 한다. 본문은 전체 건수와 항목별 ID·제목을 표시하고 제목의 공백을 정리한다. 경로는 URL snapshot 및 legacy 출처 확인에 사용하며 불일치 입력은 전송하지 않는다. |
-| `plans[].url` | 등록 remote·현재 catalog revision·경로로 검증해 만든 원격 문서 URL 또는 `null`. 값이 있을 때 ID에 링크하고 없으면 일반 텍스트로 표시한다. |
-| `plans[].decision_identity`·`plans[].decision_revision` | 현재 질문의 identity·revision 문자열. ID와 결합해 실제 사용자 행동과 질문별 통지 확인을 식별한다. URL·제목·경로 표시와 사건 identity에는 결합하지 않는다. |
+| `plans` | `plans_published`는 신규 일반 작업 배열, `draft_decisions`는 신규 draft와 아직 통지 확인이 없는 질문의 ID 순 배열이다. 생성 항목은 게시 revision과 원본 경로에, 질문은 판단 identity·revision과 현재 경로·링크에 결합한다. |
+| `plans[].id`·`plans[].title`·`plans[].source_path` | ExecPlan ID·표시 제목·문서 경로 문자열. 경로는 active `docs/plans/[id] title.md` 형식이다. 질문은 현재 catalog와 evidence 경로를 대조하고, 생성 항목은 게시 시점 경로를 보존한다. 본문은 전체 건수와 항목별 ID·제목을 표시하고 제목의 공백을 정리한다. |
+| `plans[].url` | 등록 remote·확인된 revision·경로에서 만든 원격 문서 URL 또는 `null`. draft는 값이 있으면 ID에 링크하고 일반 작업은 URL을 본문에 표시한다. |
+| `plans[].publication_revision`·`plans[].publication_path` | draft 생성 항목의 게시 revision과 선택적 게시 원본 경로 문자열. 경로가 없으면 `source_path`가 원본이다. 일반 작업은 payload의 `publication_revision`을 공유한다. |
+| `plans[].waiting_for` | 일반 작업 게시 시점에 미병합으로 확인한 선행 작업 ID 문자열 배열이다. 빈 배열은 실행 대기로 표시한다. |
+| `plans[].decision_identity`·`plans[].decision_revision` | 질문 항목의 identity·revision 문자열. ID와 결합해 실제 사용자 행동과 질문별 통지 확인을 식별한다. URL·제목·경로 표시와 사건 identity에는 결합하지 않는다. |
 
 `pr_created` payload는 기존 프로젝트·ExecPlan·PR URL·발생 시각·상태 필드와 함께 다음 후보 근거를 요구한다. 이 event type은 새 PR과 기존 PR의 새 게시 후보를 함께 표현하며 본문은 PR이 생성됐다고 단정하지 않는다.
 
@@ -1826,7 +1828,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 본문은 Python 문자열의 문자 위치로 최대 4096자씩 나눈다. draft 링크는 각 조각 안의 ID 구간에 `text_link` entity로 붙이며 `offset`·`length`는 UTF-16 code unit 수로 계산한다. 분할 위치와 entity 단위를 구분해 한글·이모지·조각 경계에서도 ID와 URL의 대응을 유지한다.
 
-`draft_decisions`의 identity는 질문 ID·판단 identity·revision이며 URL과 표시 제목은 포함하지 않는다. 생성과 조각 claim은 현재 pending 질문, saved question path와 ExecPlan catalog path, 현재 제목·revision, 등록 remote로 계산한 현재 URL이 payload snapshot과 일치하는지 확인한다. 지원되지 않거나 확인할 수 없는 remote URL은 `null`로 표시하며 질문 identity를 바꾸지 않는다. 목록 생성은 outbox의 기존 고정 본문과 `confirmed_pieces`를 읽어 확인된 ID가 들어간 조각의 질문만 통지된 것으로 기록한다. 따라서 새 목록에는 실제로 통지되지 않은 현재 질문만 포함한다. 목록이 유지되는 동안에는 해당 이벤트 자체의 확인 기록을 제외해 다음 조각이 계속 유효하게 claim되도록 한다. 새 질문·identity/revision·제목·출처·URL snapshot 변경은 오래된 미전송 조각을 취소한다. 이미 통지된 질문은 새로운 표시 snapshot에 다시 넣지 않고 아직 통지되지 않은 질문은 최신 제목·링크로 다시 준비한다. 취소된 행의 payload·고정 본문·cursor·attempt/error·확인된 조각은 변경하지 않으며, 취소와 성공 확인이 경합해도 뒤늦은 confirmed cursor가 질문별 통지 근거로 남는다. 빈 목록은 새 알림을 만들지 않는다.
+신규 게시 항목은 ID·게시 revision·원본 경로와 현재 catalog의 동일 등록 근거로 확인한다. `draft_decisions`의 질문은 ID·판단 identity·revision과 현재 pending 질문·경로·제목·등록 remote에서 계산한 URL을 별도로 확인한다. 한 항목에 두 근거가 있으면 게시 원본 경로와 현재 질문 경로를 각각 보존한다. 확인할 수 없는 remote URL은 `null`이며 표시 변경은 질문 identity를 바꾸지 않는다. 목록 생성과 조각 claim은 저장된 고정 본문·`confirmed_pieces`에서 ID가 포함된 확인 조각을 찾아 생성과 질문을 각각 중복 제거한다. 현재성이 바뀌면 원래 행과 확인 cursor·오류를 보존하고 미확인 유효 항목만 새 목록으로 구성한다. 취소와 경합한 늦은 확인도 다음 claim에서 다시 대조한다. 확인 불명 HTTP 요청은 재시도될 수 있으며 이미 취소된 과거 사건은 정책 변경만으로 부활시키지 않는다.
 
 개별 legacy `draft_decision`은 현재 pending 질문과 ID·identity·revision·질문 본문·source path·current URL이 모두 연결될 때만 새로 만들거나 계속 전송한다. 저장 근거가 불완전하거나 오래된 사건은 행·이미 전송된 조각·오류 감사를 보존하고 미전송분을 취소한다. 유효한 legacy 사건은 기존 payload·고정 텍스트·주의 수준·cursor를 유지하며 새 목록 형식으로 소급 재작성하지 않는다. 확인된 legacy 질문도 질문 identity·revision 기준으로 목록 중복을 막는다.
 

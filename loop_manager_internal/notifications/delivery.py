@@ -68,6 +68,14 @@ def _claim_piece(
             )
             return None
         if not is_current(connection, str(row[0]), str(row[1]), payload, event_key=event_key):
+            if row[1] == 'plans_published':
+                from .events import retain_unconfirmed_published_plans
+                retain_unconfirmed_published_plans(connection, str(row[0]), event_key)
+            if (row[1] == 'draft_decisions' and isinstance(payload.get('plans'), list)
+                    and any(isinstance(item, dict) and item.get('publication_revision')
+                            for item in payload['plans'])):
+                from .events import enqueue_draft_decisions
+                enqueue_draft_decisions(connection, str(row[0]))
             cancel_event(connection, event_key)
             return None
         if row[1] == "blocked":

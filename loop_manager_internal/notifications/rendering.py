@@ -49,14 +49,29 @@ def _message(kind: str, payload: dict[str, object]) -> str:
 def _event_message(kind: str, payload: dict[str, object]) -> str:
     if kind == "draft_decisions":
         plans = payload["plans"]
-        lines = [f"[{payload['project']}] draft 작업 {len(plans)}건 · 사용자 판단 대기", ""]
-        lines.extend(f"• {plan['id']} · {' '.join(str(plan['title']).split())}" for plan in plans)
-        lines.extend(["", "각 작업 문서에서 질문을 확인하고 결정을 반영해 주세요."])
+        has_questions = any(plan.get('decision_identity') or not plan.get('publication_revision')
+                            for plan in plans)
+        heading = "사용자 판단 대기" if has_questions else "새 draft 게시"
+        lines = [f"[{payload['project']}] draft 작업 {len(plans)}건 · {heading}", ""]
+        lines.extend(f"• {plan['id']} · {' '.join(str(plan['title']).split())}"
+                     + (" · 신규 게시" if plan.get('publication_revision') else "") for plan in plans)
+        if has_questions:
+            lines.extend(["", "각 작업 문서에서 질문을 확인하고 결정을 반영해 주세요."])
         return "\n".join(lines)
-    if kind in {"work_started", "stage_failed", "planning_result", "plans_published", "draft_decision",
+    if kind == "plans_published":
+        plans = payload["plans"]
+        lines = [f"[{payload['project']}] 새 작업 게시 {len(plans)}건"]
+        for plan in plans:
+            dependencies = plan["waiting_for"]
+            status = "선행 작업 대기: " + ", ".join(dependencies) if dependencies else "실행 대기"
+            lines.append(f"• {plan['id']} · {' '.join(str(plan['title']).split())} · {status}")
+            if plan.get("url"):
+                lines.append(str(plan["url"]))
+        return "\n".join(lines)
+    if kind in {"work_started", "stage_failed", "planning_result", "draft_decision",
                 "maintenance_started", "maintenance_completed"}:
         labels = {"work_started": "작업 시작", "stage_failed": "단계 실패",
-                  "planning_result": "계획 작성 결과", "plans_published": "새 계획 게시",
+                  "planning_result": "계획 작성 결과",
                   "draft_decision": "계획 게시 · 사용자 판단 대기",
                   "maintenance_started": "유지보수 시작", "maintenance_completed": "유지보수 종료"}
         lines = [f"[{payload['project']}] {labels[kind]}"]

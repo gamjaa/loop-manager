@@ -743,7 +743,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
 class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
     def test_progress_kinds_never_create_even_silent_outbox_rows(self):
         connection = self.connection()
-        for kind in ('plans_published', 'planning_result', 'work_started', 'resumed',
+        for kind in ('planning_result', 'work_started', 'resumed',
                      'stage_failed', 'maintenance_started', 'maintenance_completed',
                      'project_completed', 'work_waiting'):
             for silent in (False, True):
@@ -1258,7 +1258,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(sent.call_count, 9)
 
 
-    def test_planning_result_only_notifies_after_catalog_publication(self):
+    def test_unregistered_planning_results_do_not_create_publication_notices(self):
         from types import SimpleNamespace
         from loop_manager_internal.planning.state_ports import _PlanningStatePorts
         connection = self.connection()

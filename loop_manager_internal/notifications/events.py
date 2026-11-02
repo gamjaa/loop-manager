@@ -5,19 +5,21 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
+from urllib.parse import quote
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
 from .policy import (is_current, cancel_stale_events, block_recovery,
                      draft_questions_for_notice,
-                     cancel_event, pr_review_candidate, SOURCE_ACTION_REASONS)
+                     cancel_event, pr_review_candidate, SOURCE_ACTION_REASONS,
+                     confirmed_publication_keys)
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
                         _plan_block_key, _project_block_key,
                         _project_checkpoint, _project_checkpoint_suffix, record_work_start)
 from .incidents import _preservation_checkpoint
-from .rendering import _checkpoint_link
+from .rendering import _checkpoint_link, _pieces
 
 
 @dataclass(frozen=True)
@@ -602,7 +604,7 @@ def enqueue_waiting_reason(
 
 def enqueue_progress(connection, repo, kind, identity, **payload):
     """Persist a boundary observation in the owning state transaction."""
-    if kind not in {"draft_decisions", "draft_decision", "pr_created"} or not _enabled(connection):
+    if kind not in {"draft_decisions", "draft_decision", "pr_created", "plans_published"} or not _enabled(connection):
         return
     ensure_schema(connection)
     plan_id = payload.get("execplan_id")
@@ -650,25 +652,140 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
 def record_planning_publication(connection, repo, plans, revision):
     if not _enabled(connection):
         return
-    enqueue_draft_decisions(connection, repo)
+    project = connection.execute('SELECT origin FROM projects WHERE repo=?', (repo,)).fetchone()
+    link = _checkpoint_link(project['origin'], revision) if project else None
+    origin = link.split('/tree/', 1)[0] if link else None
+    items = []
+    drafts = []
+    for path, plan in plans:
+        if plan.get('draft'):
+            drafts.append((path, plan))
+            continue
+        row = connection.execute(
+            'SELECT title, depends_on FROM exec_plans WHERE repo=? AND plan_id=?',
+            (repo, plan['id']),
+        ).fetchone()
+        if row is None:
+            continue
+        dependencies = json.loads(row['depends_on'])
+        waiting = []
+        for dependency in dependencies:
+            state = connection.execute('SELECT status FROM exec_plans WHERE repo=? AND plan_id=?',
+                                       (repo, dependency)).fetchone()
+            if state is None or state['status'] != 'MERGED':
+                waiting.append(dependency)
+        items.append({'id': str(plan['id']), 'title': str(row['title']), 'source_path': path,
+                      'url': f'{origin}/blob/{revision}/{quote(path, safe="/")}' if origin else None,
+                      'waiting_for': waiting})
+    if items:
+        enqueue_progress(connection, repo, 'plans_published', str(revision),
+                         publication_revision=str(revision), plans=items, silent=True,
+                         status='실행 또는 선행 작업 대기')
+    enqueue_draft_decisions(connection, repo, publications=(drafts, str(revision)))
 
 
-def enqueue_draft_decisions(connection, repo):
+def retain_unconfirmed_published_plans(connection, repo, event_key):
+    """Continue only valid, unconfirmed items when a fixed batch becomes stale."""
+    if not _enabled(connection):
+        return
+    row = connection.execute(
+        "SELECT payload, rendered_text, confirmed_pieces FROM notification_outbox "
+        "WHERE event_key=? AND repo=? AND event_type='plans_published' "
+        "AND sent_at IS NULL AND canceled_at IS NULL", (event_key, repo),
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        payload = json.loads(row[0])
+        revision = payload['publication_revision']
+        plans = payload['plans']
+        if not isinstance(plans, list):
+            return
+        rendered = row[1] if isinstance(row[1], str) else ''
+        confirmed = ''.join(_pieces(rendered)[:int(row[2] or 0)])
+        confirmed_elsewhere = confirmed_publication_keys(connection, repo, 'plans_published',
+                                                         exclude_event_key=event_key)
+        remaining = []
+        for item in plans:
+            if not isinstance(item, dict):
+                continue
+            if (item.get('id'), revision) in confirmed_elsewhere:
+                continue
+            marker = f"\n• {item.get('id')} · "
+            position = rendered.find(marker)
+            if position >= 0 and position + len(f"\n• {item.get('id')}") <= len(confirmed):
+                continue
+            if is_current(connection, repo, 'plans_published',
+                          {'plans': [item], 'publication_revision': revision}):
+                remaining.append(item)
+        if remaining:
+            payload['plans'] = remaining
+            _insert(connection, _key('plans_published', repo, event_key), repo,
+                    'plans_published', payload)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return
+
+
+def enqueue_draft_decisions(connection, repo, *, publications=None):
     if not _enabled(connection):
         return
     ensure_schema(connection)
     previous = connection.execute(
-        "SELECT event_key, payload, canceled_at, sent_at FROM notification_outbox WHERE repo = ? "
+        "SELECT event_key, payload, canceled_at, sent_at, rendered_text, confirmed_pieces FROM notification_outbox WHERE repo = ? "
         "AND event_type = 'draft_decisions' ORDER BY rowid DESC LIMIT 1", (repo,),
     ).fetchone()
+    created = []
+    if publications:
+        entries, revision = publications
+        project = connection.execute('SELECT origin FROM projects WHERE repo=?', (repo,)).fetchone()
+        link = _checkpoint_link(project['origin'], revision) if project else None
+        origin = link.split('/tree/', 1)[0] if link else None
+        represented = set()
+        for row in connection.execute("SELECT payload FROM notification_outbox WHERE repo=? AND event_type='draft_decisions'", (repo,)):
+            try:
+                saved = json.loads(row[0])
+                represented.update((item['id'], item['publication_revision']) for item in saved['plans']
+                                   if 'publication_revision' in item)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+        for path, plan in entries:
+            plan_id = str(plan['id'])
+            if (plan_id, revision) in represented:
+                continue
+            row = connection.execute('SELECT title FROM exec_plans WHERE repo=? AND plan_id=?',
+                                     (repo, plan_id)).fetchone()
+            item = {'id': plan_id, 'title': str(row['title']) if row else '', 'source_path': path,
+                    'url': f'{origin}/blob/{revision}/{quote(path, safe="/")}' if origin else None,
+                    'publication_revision': revision}
+            if row and is_current(connection, repo, 'plans_published',
+                                  {'plans': [item], 'publication_revision': revision}):
+                created.append(item)
     if previous and not previous[2] and not previous[3]:
         try:
             payload = json.loads(previous[1])
         except (TypeError, ValueError):
             payload = None
-        if isinstance(payload, dict) and is_current(
+        if not created and isinstance(payload, dict) and is_current(
                 connection, repo, "draft_decisions", payload, event_key=str(previous[0])):
             return
+        if isinstance(payload, dict) and isinstance(payload.get('plans'), list):
+            rendered = previous[4] if isinstance(previous[4], str) else ''
+            confirmed = ''.join(_pieces(rendered)[:int(previous[5] or 0)])
+            confirmed_elsewhere = confirmed_publication_keys(
+                connection, repo, 'draft_decisions', exclude_event_key=str(previous[0]))
+            for item in payload['plans']:
+                if not isinstance(item, dict) or not item.get('publication_revision'):
+                    continue
+                if (item.get('id'), item['publication_revision']) in confirmed_elsewhere:
+                    continue
+                marker = f"\n• {item.get('id')} · "
+                position = rendered.find(marker)
+                if position >= 0 and position + len(f"\n• {item.get('id')}") <= len(confirmed):
+                    continue
+                if is_current(connection, repo, 'plans_published', {
+                        'plans': [item], 'publication_revision': item['publication_revision']}):
+                    created.append({key: item[key] for key in (
+                        'id', 'title', 'source_path', 'url', 'publication_revision', 'publication_path') if key in item})
 
     connection.execute(
         "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, delivery_started_at = NULL "
@@ -676,9 +793,19 @@ def enqueue_draft_decisions(connection, repo):
         "AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
     )
     plans = draft_questions_for_notice(connection, repo)
+    by_id = {item['id']: item for item in plans}
+    for item in created:
+        if item['id'] in by_id:
+            by_id[item['id']]['publication_revision'] = item['publication_revision']
+            by_id[item['id']]['publication_path'] = item.get('publication_path', item['source_path'])
+        else:
+            by_id[item['id']] = item
+    plans = [by_id[plan_id] for plan_id in sorted(by_id)]
     if not plans:
         return
-    decisions = [(plan["id"], plan["decision_identity"], plan["decision_revision"]) for plan in plans]
+    decisions = [(plan['id'], plan.get('decision_identity'), plan.get('decision_revision'),
+                  plan.get('publication_revision')) for plan in plans]
     identity = str(previous[0] if previous else "") + "\0" + json.dumps(decisions, ensure_ascii=False)
     enqueue_progress(connection, repo, "draft_decisions", identity,
-                     plans=plans, status="사용자 판단 대기", silent=False)
+                     plans=plans, status="사용자 판단 대기" if any(
+                         item.get('decision_identity') for item in plans) else "draft 게시", silent=False)
