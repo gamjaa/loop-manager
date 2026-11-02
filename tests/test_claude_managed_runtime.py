@@ -270,6 +270,119 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(row, ('new-session', 'prepared', 'executed', self.calls[-1][1]['env']['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'], 'collected'))
         self.assertEqual(connection.execute('SELECT count(*) FROM targeted_test_results').fetchone()[0], 0)
 
+    def test_real_records_follow_claude_retry_and_session_fallback(self):
+        from loop_manager_internal.agents.agent_invocation import AttemptSequence, TrackedAgentCall
+        from loop_manager_internal.verification.timing import EventWriter
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        state.ensure_schema(connection)
+        context = InvocationContext(str(self.boundary.source), 'G-191')
+        pin_common_guidance(connection, context, self.workspace, self.state,
+                            sessions=('old-session',), provider='claude')
+        def spawn(arguments, **kwargs):
+            process = self.spawn(arguments, **kwargs)
+            number = len(self.calls)
+            directory = Path(kwargs['env']['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'])
+            writer = EventWriter(directory / f'targeted-run-{number}.jsonl', identity={'run_id': f'run-{number}'})
+            writer.emit('test_end', id='suite.test_one', result='failure')
+            writer.close()
+            if number < 3:
+                message = 'connection reset' if number == 1 else 'session old-session not found'
+                process.stdout = io.StringIO(json.dumps({'type': 'result', 'session_id': 'old-session',
+                    'is_error': True, 'result': message}) + '\n')
+                process.wait.return_value = process.returncode = 1
+            return process
+        def invoke(session, fallback, invocation):
+            return manager.run_agent('claude', self.workspace, self.state, self.config, 'worker',
+                'prompt', read_only=False, session_id=session, connection=connection,
+                invocation=invocation, resolved_profile=self.profile, persist_session=True)
+        call = TrackedAgentCall(invoke, AttemptSequence(context.repo, context.plan_id))
+        with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+                mock.patch.object(provider_guidance, '_probe', return_value='--append-system-prompt-file --system-prompt-snapshot'), \
+                mock.patch.object(manager, '_handoff_popen', side_effect=spawn), \
+                mock.patch.object(process_receipt, 'started', side_effect=self.real_receipt_started), \
+                mock.patch.object(process_receipt, 'finished', side_effect=self.real_receipt_finished):
+            result = manager.run_agent_with_retries(call, session_id='old-session')
+        self.assertEqual((result.code, result.session_id), (0, 'new-session'))
+        self.assertEqual([args[args.index('--resume') + 1] if '--resume' in args else None
+                          for args, _ in self.calls], ['old-session', 'old-session', None])
+        rows = connection.execute("""SELECT r.run_id, r.test_id, r.result, o.invocation_id,
+            c.directory, c.receipt, a.process_receipt_path FROM targeted_test_results r
+            JOIN targeted_test_run_owners o USING(run_id) JOIN targeted_test_collections c USING(invocation_id)
+            JOIN agent_invocations a USING(invocation_id) ORDER BY r.sequence""").fetchall()
+        self.assertEqual([(r[1], r[2]) for r in rows], [('suite.test_one', 'failure')] * 3)
+        self.assertEqual(len({r[0] for r in rows}), 3)
+        self.assertEqual(len({r[3] for r in rows}), 3)
+        self.assertEqual({r[4] for r in rows}, {c['env']['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'] for _, c in self.calls})
+        for row in rows:
+            self.assertEqual(row[5], row[6])
+            self.assertEqual(Path(row[5]), Path(row[4]).parent / (Path(row[4]).name + '.process.json'))
+            self.assertTrue(process_receipt.observation(row[5], self.state, row[3])['finished_at'])
+        self.assertEqual(connection.execute('SELECT failures, repeated FROM targeted_test_streaks').fetchone(), (3, 0))
+
+    def test_targeted_binding_database_wait_prevents_spawn_until_recovered(self):
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        state.ensure_schema(connection)
+        context = InvocationContext(str(self.boundary.source), 'G-191')
+        pin_common_guidance(connection, context, self.workspace, self.state, provider='claude')
+        def invoke():
+            return manager.run_agent('claude', self.workspace, self.state, self.config, 'worker',
+                'prompt', read_only=False, connection=connection, invocation=context,
+                resolved_profile=self.profile, persist_session=True)
+        with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+                mock.patch.object(provider_guidance, '_probe', return_value='--append-system-prompt-file --system-prompt-snapshot'), \
+                mock.patch.object(manager, '_handoff_popen', side_effect=self.spawn), \
+                mock.patch.object(process_receipt, 'started', side_effect=self.real_receipt_started), \
+                mock.patch.object(process_receipt, 'finished', side_effect=self.real_receipt_finished):
+            with mock.patch.object(TargetedTestRepository, 'bind', side_effect=DatabaseWaitTimeout('binding wait')):
+                with self.assertRaises(DatabaseWaitTimeout):
+                    invoke()
+            self.assertEqual(len(self.calls), 0)
+            self.assertEqual(connection.execute('SELECT count(*) FROM targeted_test_results').fetchone()[0], 0)
+            self.assertEqual(invoke().code, 0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(connection.execute('SELECT count(*) FROM targeted_test_streaks').fetchone()[0], 0)
+
+    def test_record_collection_wait_recovers_without_relaunch(self):
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+        from loop_manager_internal.verification.timing import EventWriter
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        state.ensure_schema(connection)
+        context = InvocationContext(str(self.boundary.source), 'G-191')
+        pin_common_guidance(connection, context, self.workspace, self.state, provider='claude')
+        def spawn(arguments, **kwargs):
+            process = self.spawn(arguments, **kwargs)
+            directory = Path(kwargs['env']['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'])
+            writer = EventWriter(directory / 'targeted-run-wait.jsonl', identity={'run_id': 'run-wait'})
+            writer.emit('test_end', id='suite.test_one', result='failure')
+            writer.close()
+            return process
+        def invoke():
+            return manager.run_agent('claude', self.workspace, self.state, self.config, 'worker',
+                'prompt', read_only=False, connection=connection, invocation=context,
+                resolved_profile=self.profile, persist_session=True)
+        with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+                mock.patch.object(provider_guidance, '_probe', return_value='--append-system-prompt-file --system-prompt-snapshot'), \
+                mock.patch.object(manager, '_handoff_popen', side_effect=spawn), \
+                mock.patch.object(process_receipt, 'started', side_effect=self.real_receipt_started), \
+                mock.patch.object(process_receipt, 'finished', side_effect=self.real_receipt_finished):
+            with mock.patch.object(TargetedTestRepository, 'reconcile', side_effect=sqlite3.OperationalError('busy')):
+                first = invoke()
+            self.assertTrue(first.targeted_collection_pending)
+            directory, receipt = connection.execute('SELECT directory, receipt FROM targeted_test_collections').fetchone()
+            self.assertTrue((Path(directory) / 'targeted-run-wait.jsonl').is_file())
+            self.assertTrue(Path(receipt).is_file())
+            TargetedTestRepository(connection).reconcile(state_dir=self.state, repo=context.repo, plan_id=context.plan_id)
+            TargetedTestRepository(connection).reconcile(state_dir=self.state, repo=context.repo, plan_id=context.plan_id)
+        self.assertEqual((first.code, first.message, first.session_id), (0, 'done', 'new-session'))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(connection.execute('SELECT count(*) FROM targeted_test_results').fetchone()[0], 1)
+        self.assertEqual(connection.execute('SELECT failures, repeated FROM targeted_test_streaks').fetchone(), (1, 0))
+
     def test_database_wait_recovers_the_original_attempt_message_without_another_process(self):
         from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
         connection = sqlite3.connect(':memory:')
