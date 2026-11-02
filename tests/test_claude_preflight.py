@@ -281,6 +281,20 @@ class ClaudePreflightTests(unittest.TestCase):
             self.assertEqual(launch.environment['TMPDIR'], str(launch.bash_temporary))
             self.assertEqual(launch.environment['CLAUDE_CODE_TMPDIR'], str(launch.bash_temporary))
             self.assertEqual(launch.environment['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'], str(launch.attempt))
+            runner = Path(launch.environment['LOOP_MANAGER_TARGETED_TEST_RUNNER'])
+            package = runner.parents[1]
+            settings = json.loads(launch.arguments[launch.arguments.index('--settings') + 1])
+            filesystem = settings['sandbox']['filesystem']
+            self.assertIn(str(package), filesystem['allowRead'])
+            self.assertIn(str(package), filesystem['denyWrite'])
+            self.assertNotIn(str(package), filesystem['allowWrite'])
+            self.assertNotIn(str(package), settings['permissions']['additionalDirectories'])
+            # The runtime package covers the runner and its imports; cwd
+            # project imports and records remain in their existing boundaries.
+            self.assertTrue(runner.is_relative_to(package))
+            self.assertTrue((package / '__init__.py').is_file())
+            self.assertTrue((package / 'verification/manifest.py').is_file())
+            self.assertTrue((package / 'verification/timing.py').is_file())
             self.assertEqual(launch.attempt.stat().st_mode & 0o777, 0o700)
             self.assertEqual(json.loads(launch.reason)['runtime_enforcement'], 'not_observed')
             self.assertEqual(json.loads(launch.reason)['authentication_home'], str(self.home))

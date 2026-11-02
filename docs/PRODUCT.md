@@ -603,7 +603,7 @@ Loop Manager가 만드는 계획과 구현 변경은 대상 프로젝트 밖의 
 
 #### Claude 개발·지원 범위
 
-Claude 지원은 [R-023](requirements/%5BR-023%5D%20Self-Hosted%20Runtime%20Refresh%20Handoff.md)의 일반 호출 구성을 공식 문서·모의 테스트로 구현하는 범위다. Linux·macOS에서 CLI v2.1.307 이상의 시작 설정과 `auto` 지원을 확인하며 신규·재개·session-unavailable fallback에 같은 역할별 쓰기 제한·자동 승인 검토를 적용한다. Reviewer·읽기 전용 역할은 workspace 쓰기도 거부한다. Codex와 같은 실환경 검증 수준이나 모든 OS·CLI·기능 조합의 완전 지원은 완료 조건이 아니며, 문서/mock 확인과 실제 실행 확인을 구분한다.
+Claude 지원은 [R-023](requirements/%5BR-023%5D%20Self-Hosted%20Runtime%20Refresh%20Handoff.md)의 일반 호출 구성을 공식 문서·모의 테스트로 구현하는 범위다. Linux·macOS에서 CLI v2.1.307 이상의 시작 설정과 `auto` 지원을 확인하며 신규·재개·session-unavailable fallback에 같은 역할별 쓰기 제한·자동 승인 검토를 적용한다. Reviewer·읽기 전용 역할은 workspace 쓰기도 거부한다. 관리 Claude의 파일 변경은 native sandbox를 사용하는 Bash로 수행하고 직접 파일 변경 도구는 모든 역할에서 거부한다. Worker는 설치된 targeted runner와 import를 읽을 수 있지만 해당 설치 경로를 쓸 수 없다. Codex와 같은 실환경 검증 수준이나 모든 OS·CLI·기능 조합의 완전 지원은 완료 조건이 아니며, 문서/mock 확인과 실제 실행 확인을 구분한다.
 
 Claude의 인증·profile·지침 조회와 신규·재개·fallback 호출은 같은 공통 홈과 project·local·managed 설정을 검사한다. Manager는 사용자 settings를 만들거나 덮어쓰지 않는다. 공통 홈 설정의 부재·CLI 생성·수정·원자 교체·삭제·재생성은 다음 호출에 반영하며, 소비하지 않는 개인 settings·Hook 변경만으로 호출을 거부하지 않는다. 소비 설정의 읽기 실패·소유권 불명·확장/권한 충돌이나 조회·준비 뒤 변경은 원본을 보존하고 호출을 거부한다. 인증만 기본 파일로 연결하고 개인 설정·Plugin·Hook·규칙·지침을 자동 실행 홈에 가져오지 않는다. 공통 홈·개인 홈·다른 호출의 임시 경로는 Agent 도구의 쓰기 허용 범위에 추가하지 않는다.
 

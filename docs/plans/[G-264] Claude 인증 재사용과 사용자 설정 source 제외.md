@@ -67,6 +67,8 @@ Claude의 인증·profile 조회와 관리 모델 호출을 R-085의 같은 설�
 - [x] 현재 후보의 targeted runner 기록: 정책/preflight/managed runtime 50개는 최초 진단 문구 차이 2개 실패를 공통 재검사의 구체 진단 보존으로 교정한 뒤 동일 명령으로 50개 통과했다. 인증/조회 9개는 새 fixture의 부모 directory 누락 오류 1개를 수정하고 동일 명령으로 9개 통과했다. 이후 local root·조회 사이 검사와 fallback 회귀를 보강하고 preflight class 20개, 조회·관리 신규/재개/fallback·지침/바인딩/profile drift 6개를 최소 재실행해 모두 통과했다. 이전 후보의 검증을 재사용하지 않았다.
 - [x] 2026-11-01 결과 보고 교정: 최종 TARGETED_TESTS에서 과거 진단을 명령별 FAILED_COMMAND/RERUN 쌍 없이 요약해 미해결로 판정된 경로를 읽기 전용으로 확인했다. 기존 실행 기록은 보존하고 이번 호출의 targeted runner로 당시 관련 3개 case와 source lifecycle·개인 source 불변·local root·fallback·파일/명령 정책 5개 case를 다시 실행해 8개 모두 통과했다. 최종 보고는 이번 호출의 실제 결과로 작성한다. 구현 코드·Manager 판정·상태는 변경하지 않았다.
 - [x] 2026-11-01 Manager verify 피드백 `ef708afc4c8a5707ad10ac64d6124a9ea9d95dfdfde6f807ef0f114ca4df8a69`의 두 회귀를 교정했다. lifecycle fixture의 Git metadata 부재로 실제 `/tmp/.git`·상위 root 소유권이 native fallback 판정을 바꾸던 환경 의존성을 fixture의 linked-worktree pointer·commondir로 격리했다. 상위 홈 repository도 fixture 안에 명시해 같은 오염 조건에서 source local의 생성·교체·삭제·재생성 및 최종 drift 검사를 유지한다. provider preflight의 node 진단·인증/model 조회 중단 assertion을 보존하고 인증 성공 argv 기대를 현재 source·hook 차단 계약으로 갱신했다. 해당 두 case와 기존 local root case를 targeted runner로 실행해 3개 통과했고, 상위 홈 repository를 추가한 최종 lifecycle case도 1개 통과했다. 제품 코드는 변경하지 않았으며 Manager 전체 verify 재실행은 남아 있다.
+- [x] 2026-11-02 Review의 `outside-workspace-file-write`·`targeted-runner-read-access`를 교정했다. 일반 외부 파일 쓰기도 auto classifier에 갈 수 있으므로 앞선 working-directory·prompt 거부만의 쓰기 보장 설명을 폐기했다. 관리 호출에서 Edit 전체 deny·Edit/Write/NotebookEdit tool deny 및 도구 제외를 모든 역할에 적용하고 파일 변경은 기존 native Bash sandbox로 수행한다. Worker의 실제 targeted runner 경로가 속한 Manager Python 패키지만 allowRead로 열고 같은 root를 denyWrite에 넣었다. workspace·owned temporary·쓰기 허용 목록을 확대하지 않았으며 다른 역할에는 runner 읽기 예외를 추가하지 않았다.
+- [x] 이번 교정의 최소 targeted unit: 정책 class·preflight runner 결합·관리 신규/재개/fallback 13개 통과, native init에 Write가 나타나는 중단 회귀 1개 통과, 역할별 신규/재개의 도구 거부·Worker 전용 읽기 예외를 보강한 case 1개 통과. CLI·계정·실제 OS sandbox는 실행하지 않았다. PRODUCT·ARCHITECTURE·OPERATIONS를 현재의 sandboxed Bash 변경 경로와 runner 읽기/쓰기 분리에 맞췄다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
@@ -80,6 +82,8 @@ Claude의 인증·profile 조회와 관리 모델 호출을 R-085의 같은 설�
 - priority high: 개인 설정을 수정하지 않고 안전한 Claude 무인 호출의 조회·실행 계약을 맞추는 필수 작업이다. R-023/R-085의 기존 목표를 유지하고 실환경 미확인 때문에 추가 승인·infrastructure·완료 gate를 만들지 않는다.
 
 ## Implementation Notes
+
+파일 변경은 native sandbox가 적용되는 Bash에 한정한다. 직접 파일 변경 도구는 경로와 무관하게 classifier보다 먼저 거부하므로 일반 외부 파일·새 경로·symlink alias의 direct Write를 허용하지 않는다. source 소비·auto 검토·역할별 sandbox는 유지한다. Worker runner의 초기 Python import를 포함하는 설치 패키지 root는 읽기만 재개방하고 동일 경로의 쓰기를 명시적으로 거부한다. 판단 순서와 sandbox 적용 범위·읽기 예외의 공식 근거는 [R-023 설계](../ARCHITECTURE.md#r-023-workspace-쓰기-제한과-자동-승인-검토)에 통합했다.
 
 공식 근거는 [CLI reference](https://code.claude.com/docs/en/cli-reference)의 setting-sources·restricted·permission-prompts·init-only와 [settings precedence](https://code.claude.com/docs/en/settings#settings-precedence), [local root](https://code.claude.com/docs/en/settings#where-claude-code-keeps-the-local-file-in-a-git-repository), [working directories](https://code.claude.com/docs/en/permissions#working-directories), [범위 밖 파일 쓰기](https://code.claude.com/docs/en/permissions#symlinks)다. source를 무시하는 옵션을 홈 재사용의 근거로 삼지 않고 공통 홈·프로젝트를 실제 설정 입력으로 검증한다. managed 우선순위와 native 배열 병합을 유지하며 알려지지 않은 key·확장과 보안 충돌은 거부한다. 파일 source 원문·인증 비밀은 저장하지 않고 경로/내용 지문만 남긴다. 병합 설정 지문은 reason의 `effective_settings_digest`로 구분한다.
 

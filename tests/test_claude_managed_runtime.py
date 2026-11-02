@@ -124,6 +124,15 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
                     self.assertNotIn('--restricted', arguments)
                     self.assertEqual(context['env']['TMPDIR'], str(self.launches[-1].bash_temporary))
                     settings = json.loads(arguments[arguments.index('--settings') + 1])
+                    self.assertIn('Edit', settings['permissions']['deny'])
+                    self.assertFalse({'Edit', 'Write', 'NotebookEdit'} &
+                                     set(arguments[arguments.index('--tools') + 1].split(',')))
+                    package = str(Path(preflight.__file__).resolve().parents[1])
+                    filesystem = settings['sandbox']['filesystem']
+                    self.assertEqual(filesystem['allowRead'], [package] if role == 'worker' else [])
+                    if role == 'worker':
+                        self.assertIn(package, filesystem['denyWrite'])
+                        self.assertNotIn(package, settings['permissions']['additionalDirectories'])
                     self.assertEqual(str(self.workspace) in settings['sandbox']['filesystem']['denyWrite'],
                                      role in {'reviewer', 'planner_check'})
                     self.assertEqual(self.records[-1].status, 'prepared')
@@ -159,6 +168,7 @@ class ClaudeManagedRuntimeTests(unittest.TestCase):
     def test_invalid_native_init_is_stopped_and_observed_session_is_preserved(self):
         for mutation in ({'permissionMode': 'acceptEdits'}, {'model': 'other-model'},
                 {'cwd': '/other'}, {'claude_code_version': 'old'}, {'tools': ['Bash', 'Read', 'Agent']},
+                {'tools': ['Bash', 'Read', 'Write']},
                 {'mcp_servers': [{'name': 'external'}]}, {'plugins': [{'name': 'external'}]}):
             with self.subTest(mutation=mutation):
                 self.mutation = mutation

@@ -94,7 +94,7 @@ def validate_settings(inherited: dict) -> None:
 
 def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: bool,
                      *, fast_mode: bool = False, managed_settings: dict | None = None,
-                     bash_temporary: Path | None = None
+                     bash_temporary: Path | None = None, targeted_runtime: Path | None = None
                      ) -> tuple[str, ...]:
     """Compose explicit deny rules with working-directory checks and strict Bash.
 
@@ -111,8 +111,9 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
     workspace, temporary = _canonical(boundary.worktree), _canonical(temporary)
     temporaries = tuple(dict.fromkeys((temporary, *(() if bash_temporary is None else
                                                        (_canonical(bash_temporary),)))))
+    runtime_reads = () if targeted_runtime is None else (_canonical(targeted_runtime),)
     protected = tuple(dict.fromkeys(_canonical(path) for path in (
-        boundary.source, *boundary.other_worktrees, boundary.common_dir,
+        *runtime_reads, boundary.source, *boundary.other_worktrees, boundary.common_dir,
         boundary.git_dir, workspace / '.git')))
     for denied in protected:
         if (workspace == denied or workspace.is_relative_to(denied)
@@ -139,19 +140,19 @@ def policy_arguments(boundary: WorktreeBoundary, temporary: Path, read_only: boo
         raise IsolationError('Claude 호출 임시 경로와 기본 공유 임시 경로가 겹칩니다.')
     deny = [rule for path in protected
             for rule in (f'Edit(/{path})', f'Edit(/{path}/**)')]
-    if read_only:
-        deny.append('Edit')  # Covers Edit, Write and NotebookEdit together.
+    # Native file tools run outside the Bash sandbox. Deny them before auto
+    # classification; all file changes must use the sandboxed Bash tool.
+    deny.append('Edit')  # Covers Edit, Write and NotebookEdit together.
     settings = {'permissions': {'defaultMode': 'auto', 'deny': deny,
                                 'blockReadsOutsideWorkingDirectories': True,
                                 'additionalDirectories': [str(root) for root in temporaries]},
                 'autoMode': {'classifyAllShell': True}, 'disableAllHooks': True,
                 'fastMode': fast_mode,
                 'sandbox': dict(required, network=network_limits, filesystem={
-                    'disabled': False, 'allowWrite': [str(root) for root in temporaries],
+                    'disabled': False, 'allowRead': [str(root) for root in runtime_reads],
+                    'allowWrite': [str(root) for root in temporaries],
                     'denyWrite': [str(path) for path in denied_paths]})}
     tools = ['Bash', 'Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch']
-    if not read_only:
-        tools.extend(('Edit', 'Write', 'NotebookEdit'))
     return (*SOURCE_ARGUMENTS, '--permission-mode', 'auto',
-            '--tools', ','.join(tools), '--disallowedTools', 'mcp__*',
+            '--tools', ','.join(tools), '--disallowedTools', 'mcp__*,Edit,Write,NotebookEdit',
             '--settings', json.dumps(settings, sort_keys=True))

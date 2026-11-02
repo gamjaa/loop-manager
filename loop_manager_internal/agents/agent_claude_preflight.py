@@ -331,7 +331,9 @@ def prepare(boundary: WorktreeBoundary, state_dir: Path, role: str, read_only: b
         child['LOOP_MANAGER_TARGETED_TEST_RUNNER'] = str(Path(__file__).resolve().parents[1] / 'verification/targeted.py')
     effective, before, _ = configuration(child, config_path, boundary.worktree, boundary.source)
     arguments = policy_arguments(boundary, attempt, read_only, fast_mode=fast_mode, managed_settings=effective,
-                                 bash_temporary=bash_temporary) + CLI_GUARDS
+                                 bash_temporary=bash_temporary, targeted_runtime=(
+                                     Path(child['LOOP_MANAGER_TARGETED_TEST_RUNNER']).parents[1]
+                                     if role == 'worker' and not read_only else None)) + CLI_GUARDS
     def lookup(selection):
         # A preceding query may refresh native state. Refuse changed settings
         # before the next CLI can discover extensions from that new source.
