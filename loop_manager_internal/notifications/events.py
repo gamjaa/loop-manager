@@ -11,7 +11,8 @@ from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
 from .policy import (is_current, cancel_stale_events, block_recovery,
                      draft_questions_for_notice,
-                     cancel_event, pr_review_candidate, SOURCE_ACTION_REASONS)
+                     cancel_event, pr_review_candidate, SOURCE_ACTION_REASONS,
+                     confirmed_publication_keys)
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
@@ -702,9 +703,13 @@ def retain_unconfirmed_published_plans(connection, repo, event_key):
             return
         rendered = row[1] if isinstance(row[1], str) else ''
         confirmed = ''.join(_pieces(rendered)[:int(row[2] or 0)])
+        confirmed_elsewhere = confirmed_publication_keys(connection, repo, 'plans_published',
+                                                         exclude_event_key=event_key)
         remaining = []
         for item in plans:
             if not isinstance(item, dict):
+                continue
+            if (item.get('id'), revision) in confirmed_elsewhere:
                 continue
             marker = f"\n• {item.get('id')} · "
             position = rendered.find(marker)
@@ -766,8 +771,12 @@ def enqueue_draft_decisions(connection, repo, *, publications=None):
         if isinstance(payload, dict) and isinstance(payload.get('plans'), list):
             rendered = previous[4] if isinstance(previous[4], str) else ''
             confirmed = ''.join(_pieces(rendered)[:int(previous[5] or 0)])
+            confirmed_elsewhere = confirmed_publication_keys(
+                connection, repo, 'draft_decisions', exclude_event_key=str(previous[0]))
             for item in payload['plans']:
                 if not isinstance(item, dict) or not item.get('publication_revision'):
+                    continue
+                if (item.get('id'), item['publication_revision']) in confirmed_elsewhere:
                     continue
                 marker = f"\n• {item.get('id')} · "
                 position = rendered.find(marker)

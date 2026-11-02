@@ -360,6 +360,33 @@ def _confirmed_draft_question_keys(connection, repo, *, exclude_event_key=None):
     return confirmed
 
 
+def confirmed_publication_keys(connection, repo, kind, *, exclude_event_key=None):
+    """Identify published items whose ID was included in a confirmed piece."""
+    confirmed = set()
+    rows = connection.execute(
+        'SELECT event_key, payload, rendered_text, confirmed_pieces FROM notification_outbox '
+        'WHERE repo=? AND event_type=? AND confirmed_pieces>0', (repo, kind),
+    ).fetchall()
+    for row in rows:
+        if str(row['event_key']) == exclude_event_key or not isinstance(row['rendered_text'], str):
+            continue
+        try:
+            payload = json.loads(row['payload'])
+            rendered = row['rendered_text']
+            limit = len(''.join(_pieces(rendered)[:int(row['confirmed_pieces'])]))
+            for item in payload['plans']:
+                plan_id = item['id']
+                revision = item.get('publication_revision', payload.get('publication_revision'))
+                if not isinstance(plan_id, str) or not isinstance(revision, str) or not revision:
+                    continue
+                position = rendered.find(f'\n• {plan_id} · ')
+                if position >= 0 and position + len(f'\n• {plan_id}') <= limit:
+                    confirmed.add((plan_id, revision))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+    return confirmed
+
+
 def _pending_legacy_draft_question_keys(connection, repo):
     rows = connection.execute(
         "SELECT payload FROM notification_outbox WHERE repo=? AND event_type='draft_decision' "
@@ -410,9 +437,13 @@ def is_current(connection, repo, kind, payload, *, event_key=None):
             revision = payload['publication_revision']
             if not isinstance(plans, list) or not plans or not isinstance(revision, str) or not revision:
                 return False
+            confirmed = (confirmed_publication_keys(connection, repo, kind, exclude_event_key=event_key)
+                         if event_key else set())
             for item in plans:
                 if not isinstance(item, dict) or not _valid_draft_source_path(
                         item.get('publication_path', item.get('source_path')), item.get('id', '')):
+                    return False
+                if (item['id'], revision) in confirmed:
                     return False
                 row = connection.execute(
                     'SELECT path, publication_path, publication_sha, status FROM exec_plans '
@@ -441,6 +472,8 @@ def is_current(connection, repo, kind, payload, *, event_key=None):
                 return False
             confirmed = _confirmed_draft_question_keys(connection, repo, exclude_event_key=event_key)
             legacy = _pending_legacy_draft_question_keys(connection, repo)
+            confirmed_creations = (confirmed_publication_keys(connection, repo, kind, exclude_event_key=event_key)
+                                   if event_key else set())
             expected = [item for item in _current_draft_questions(connection, repo)
                         if _draft_question_key(item) not in confirmed | legacy]
             questions = [item for item in plans if isinstance(item, dict) and _draft_question_key(item)]
@@ -453,6 +486,8 @@ def is_current(connection, repo, kind, payload, *, event_key=None):
                     return False
                 revision = item.get('publication_revision')
                 if revision is not None:
+                    if (item.get('id'), revision) in confirmed_creations:
+                        return False
                     if not is_current(connection, repo, 'plans_published',
                                       {'plans': [item], 'publication_revision': revision}):
                         return False

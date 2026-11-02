@@ -1080,6 +1080,31 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_late_publication_confirmation_removes_item_from_continuation(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute('DELETE FROM exec_plans WHERE repo=?', (repo,))
+            plans = []
+            for plan_id, title in (('G-018', 'Long ' * 1000), ('G-019', 'Removed'), ('G-020', 'Remaining')):
+                path = f'docs/plans/[{plan_id}] {title}.md'
+                connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,publication_path,publication_sha) VALUES (?,?,?,?,'[]','[]','normal','hash','READY',?,'abc')", (repo, plan_id, path, title, path))
+                plans.append((path, {'id': plan_id}))
+            notifications.record_planning_publication(connection, repo, plans, 'abc')
+        def send(_token, _chat, _text):
+            with connection:
+                connection.execute("DELETE FROM exec_plans WHERE repo=? AND plan_id='G-019'", (repo,))
+                notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        rows = self.events(connection)
+        self.assertEqual(rows[0]['confirmed_pieces'], 1)
+        self.assertEqual([item['id'] for item in json.loads(rows[1]['payload'])['plans']], ['G-018', 'G-020'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 0)
+        self.assertEqual([item['id'] for item in json.loads(self.events(connection)[2]['payload'])['plans']], ['G-020'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertNotIn('G-018', sender.call_args.args[2])
+
     def test_publication_remains_current_after_catalog_rename(self):
         connection = self.connection()
         repo = '/projects/alpha'
@@ -1428,6 +1453,30 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
         sender = mock.Mock()
         self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
         self.assertIn('G-019 · Later · 신규 게시', sender.call_args.args[2])
+
+    def test_late_draft_confirmation_removes_creation_from_continuation(self):
+        connection = self.connection()
+        title = 'Long ' * 1000
+        with connection:
+            self.draft(connection, 'G-018', title)
+            self.draft(connection, 'G-019', 'Later')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            plans = [(f'docs/plans/[{plan_id}] {name}.md', {'id': plan_id, 'draft': True})
+                     for plan_id, name in (('G-018', title), ('G-019', 'Later'))]
+            notifications.record_planning_publication(connection, self.repo, plans, 'remote-sha')
+        def send(_token, _chat, _text):
+            with connection:
+                connection.execute("UPDATE execplan_drafts SET pending=0 WHERE plan_id='G-019'")
+                notifications.enqueue_current_project_events(connection, self.repo)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        rows = self.events(connection)
+        self.assertEqual(rows[0]['confirmed_pieces'], 1)
+        self.assertEqual([item['id'] for item in json.loads(rows[1]['payload'])['plans']], ['G-018', 'G-019'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 0)
+        self.assertEqual([item['id'] for item in json.loads(self.events(connection)[2]['payload'])['plans']], ['G-019'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertNotIn('G-018', sender.call_args.args[2])
 
     def test_publication_current_and_waiting_share_one_sorted_list(self):
         connection = self.connection()
