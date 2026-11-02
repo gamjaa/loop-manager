@@ -125,11 +125,16 @@ class PlanningSelectionTest(PlanningCase):
         state._connection = connection
         entries = {path: ('blob', 'after')}
         self.assertTrue(state.pending_user_decision('/repo', entries))
-        ports = self._code_check_ports()
-        ports.state.pending_user_decision = lambda *_: state.pending_user_decision('/repo', entries)
-        run = PlanningLifecycleCoordinator(ports)._new_run(self.context)
-        PlanningLifecycleCoordinator(ports)._selection._select_planning_work(run)
-        self.assertEqual(run.selection.kind, PlanningDecisionKind.RUN_SPECIFICATION_PLANNING)
+        for phase in (maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                      maintenance_state.MaintenancePhase.REFACTORING):
+            ports = self._code_check_ports()
+            ports.state.cycle = maintenance_cycle(phase=phase, refactoring_plan_ids=('G-001',))
+            ports.state.schedule_result.runnable_ready = None
+            ports.state.pending_user_decision = lambda *_: state.pending_user_decision('/repo', entries)
+            coordinator = PlanningLifecycleCoordinator(ports)
+            run = coordinator._new_run(self.context)
+            self.assertIsNone(coordinator._selection._select_planning_work(run))
+            self.assertEqual(run.selection.kind, PlanningDecisionKind.RUN_SPECIFICATION_PLANNING)
         planning_input_state.record_general(connection, '/repo', 'new', entries)
         self.assertFalse(state.pending_user_decision('/repo', entries))
 
@@ -404,7 +409,8 @@ class PlanningSelectionTest(PlanningCase):
                 ports.state.activate_ready.assert_not_called()
 
     def test_maintenance_wait_reports_its_actual_blocked_target(self):
-        ports = FakePorts(planning_snapshot(), maintenance_cycle(
+        ports = FakePorts(planning_snapshot(processed_sha='base', planning_fingerprint='fingerprint',
+            specification_fingerprint='specification'), maintenance_cycle(
             phase=maintenance_state.MaintenancePhase.REFACTORING,refactoring_plan_ids=('G-001',)))
         ports.state.execplan_rows = lambda _repo: [
             {'plan_id':'G-001','status':'PLAN_BLOCKED','depends_on':'[]'},
@@ -415,6 +421,40 @@ class PlanningSelectionTest(PlanningCase):
         self.assertIn('G-001(PLAN_BLOCKED)',outcome.detail)
         self.assertNotIn('G-002',outcome.detail)
         self.assertEqual(ports.agent.run_count,0)
+
+    def test_maintenance_wait_checks_changed_specification_and_draft(self):
+        for phase in (maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                      maintenance_state.MaintenancePhase.REFACTORING):
+            for change in ('specification', 'draft', 'code_only', 'input_error'):
+                with self.subTest(phase=phase, change=change):
+                    cycle = maintenance_cycle(phase=phase, refactoring_plan_ids=('G-001',))
+                    ports = FakePorts(planning_snapshot(processed_sha='old-base',
+                        planning_fingerprint='old-full', specification_fingerprint='old-spec'), cycle)
+                    ports.git.specification_fingerprints['old-base'] = 'old-spec'
+                    ports.git.specification_fingerprints['base'] = (
+                        'new-spec' if change == 'specification' else 'old-spec')
+                    ports.state.pending_user_decision = lambda *_: change == 'draft'
+                    ports.state.execplan_rows = lambda _repo: [
+                        {'plan_id': 'G-001', 'status': 'PLAN_BLOCKED', 'depends_on': '["G-002"]'},
+                        {'plan_id': 'G-002', 'status': 'PR_OPEN', 'depends_on': '[]'}]
+                    if change == 'input_error':
+                        ports.git.input_fingerprint = mock.Mock(side_effect=RuntimeError('input unavailable'))
+                    coordinator = PlanningLifecycleCoordinator(ports)
+                    run = coordinator._new_run(self.context)
+                    if change == 'input_error':
+                        with self.assertRaisesRegex(RuntimeError, 'input unavailable'):
+                            coordinator._selection._select_planning_work(run)
+                    else:
+                        outcome = coordinator._selection._select_planning_work(run)
+                        if change in ('specification', 'draft'):
+                            self.assertIsNone(outcome)
+                            self.assertEqual(run.selection.kind, PlanningDecisionKind.RUN_SPECIFICATION_PLANNING)
+                        else:
+                            self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+                            self.assertIn('G-001(PLAN_BLOCKED)', outcome.detail)
+                    self.assertEqual(ports.state.cycle, cycle)
+                    self.assertEqual(ports.agent.run_count, 0)
+                    self.assertIsNone(ports.state.snapshot.phase)
 
     def test_project_safety_block_prevents_maintenance_completion_transition(self):
         ports = FakePorts(planning_snapshot(), maintenance_cycle(
