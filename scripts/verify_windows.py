@@ -278,6 +278,9 @@ def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
                     or cleanup.get('removed') is not True):
                 raise ValueError('incomplete cleanup receipt')
         except (OSError, ValueError, TypeError) as error:
+            if primary is not None:
+                primary.add_note(f'WSL 정리 근거 오류: {error}')
+                raise VerifyTerminationUncertain('WSL 자식 또는 전용 /tmp 정리를 확인하지 못했습니다.') from primary
             raise VerifyTerminationUncertain('WSL 자식 또는 전용 /tmp 정리를 확인하지 못했습니다.') from error
         try:
             for path in (bundle / 'logs').glob('*'):

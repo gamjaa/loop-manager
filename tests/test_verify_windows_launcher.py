@@ -763,6 +763,24 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertTrue(any('copy failed' in note for note in raised.exception.__notes__))
         self.assertTrue(raised.exception.diagnostic_directory.exists())
 
+    def test_bad_cleanup_receipt_keeps_budget_error_as_cause(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        bundle, budget_dir = self.root / 'bundle', self.root / 'budget'
+        bundle.mkdir()
+        budget_dir.mkdir()
+        def run(*_args, execution_clock, on_started, **_kwargs):
+            on_started(object(), None)
+            (budget_dir / 'wait.json').write_text('invalid')
+            (bundle / 'cleanup.json').write_text('invalid')
+            execution_clock.remaining(30)
+        with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_BUDGET_DIR': str(budget_dir)}), \
+             mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=run):
+            with self.assertRaises(verify_process.VerifyTerminationUncertain) as raised:
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertIsInstance(raised.exception.__cause__, VerifyBudgetError)
+        self.assertEqual((raised.exception.__cause__.diagnostic_directory / 'wait.json').read_text(), 'invalid')
+
 
 if __name__ == '__main__':
     unittest.main()
