@@ -322,11 +322,19 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(saved['rendered_text'])
         self.assertIsNone(saved['sent_at'])
 
+    def test_plan_block_without_confirmed_cause_is_not_stable(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo=?", (repo,))
+        self.assertIsNone(work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=()))
+
     def test_blocked_requirement_does_not_infer_user_action(self):
         connection = self.connection()
         repo = '/projects/alpha'
         path = 'docs/requirements/[R-031] Waiting.md'
         connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED', sources=?", (json.dumps([path]),))
+        connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                           "VALUES (?, 'G-018', 'plan', 'common_defect_pending', 'Correction pending')", (repo,))
         snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=(path,))
         self.assertIn('차단 해소와 재평가', snapshot.requirements[0]['reason'])
         self.assertNotIn('사용자 조치', snapshot.requirements[0]['reason'])

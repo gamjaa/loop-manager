@@ -162,6 +162,14 @@ def collect(
     def document_url(path: str) -> str | None:
         return f'{origin}/blob/{base_revision}/{quote(path, safe="/")}' if origin else None
 
+    project_block = None
+    if _table_exists(connection, "project_blocks"):
+        block = connection.execute(
+            "SELECT reason_code, evidence FROM project_blocks WHERE repo = ?", (repo,),
+        ).fetchone()
+        if block:
+            project_block = {"code": str(block[0]), "reason": str(block[1])}
+
     plans = []
     for row in rows:
         plan_id = str(row["plan_id"])
@@ -192,22 +200,24 @@ def collect(
                 if statuses.get(str(dependency)) != "MERGED"
             ]
             if not missing:
-                return None
-            item["dependencies"] = missing
-            item["reason"] = "미충족 dependency " + ", ".join(
-                f"{entry['id']} ({entry['status']})" for entry in missing
-            )
+                if project_block is None:
+                    return None
+                item["reason"] = "프로젝트 차단 해소 후 실행 조건을 다시 확인합니다"
+            else:
+                item["dependencies"] = missing
+                item["reason"] = "미충족 dependency " + ", ".join(
+                    f"{entry['id']} ({entry['status']})" for entry in missing
+                )
         elif status == "PR_OPEN":
             item["reason"] = "PR Merge 대기"
             if row["pr_url"]:
                 item["pr_url"] = str(row["pr_url"])
         elif status == "PLAN_BLOCKED":
             block = blocks.get(plan_id)
-            if block:
-                item["reason_code"], item["evidence"] = block
-                item["reason"] = f"{block[0]}: {block[1]}"
-            else:
-                item["reason"] = "구조화된 차단 원인 확인 대기"
+            if not block or not block[0].strip() or not block[1].strip():
+                return None
+            item["reason_code"], item["evidence"] = block
+            item["reason"] = f"{block[0]}: {block[1]}"
             targets = _action_targets(connection, repo, plan_id)
             if targets:
                 item["action_targets"] = targets
@@ -222,13 +232,6 @@ def collect(
                   "reason_code": "execplan_catalog_invalid", "evidence": holds[key]}
                  for key in sorted(holds.keys() - known_ids))
     planning_error = str(project["planning_error"]) if project and project["planning_error"] else None
-    project_block = None
-    if _table_exists(connection, "project_blocks"):
-        block = connection.execute(
-            "SELECT reason_code, evidence FROM project_blocks WHERE repo = ?", (repo,),
-        ).fetchone()
-        if block:
-            project_block = {"code": str(block[0]), "reason": str(block[1])}
 
     requirement_reasons = []
     for path in sorted(active_requirements):

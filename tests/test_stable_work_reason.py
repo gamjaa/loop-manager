@@ -359,6 +359,37 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         connection.close()
 
     @dummy_worker_sessions
+    def test_project_block_waits_only_after_all_targets_and_recovery_are_stable(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE exec_plans SET status='READY' WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
+                           "VALUES (?, 'project', 'repository_state_unsafe', 'Unsafe worktree')", (repo,))
+        connection.execute("UPDATE projects SET phase='PROJECT_BLOCKED' WHERE repo=?", (repo,))
+        with (mock.patch('loop_manager._checkpoint_dispatch_ready', return_value=False),
+              mock.patch('loop_manager._run_project_step', return_value=1),
+              mock.patch('loop_manager.git') as command,
+              mock.patch('loop_manager._planning_input_fingerprint', return_value='cycle-one'),
+              mock.patch('loop_manager._specification_input_fingerprint', return_value='spec-one'),
+              mock.patch('loop_manager.plan_declarations', return_value={}),
+              mock.patch('loop_manager._git_tree_entries', return_value={})):
+            command.return_value.stdout = 'base-sha\n'
+            result = loop_manager._run_project_result(connection, Path('/unused'), repo, Path('/unused.ini'), None, False)
+            self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
+            event = connection.execute("SELECT payload FROM notification_outbox WHERE event_type='work_waiting'").fetchone()
+            self.assertIsNotNone(event)
+            payload = json.loads(event[0])
+            self.assertEqual(payload['project_block']['reason'], 'Unsafe worktree')
+            self.assertEqual(payload['plans'][0]['status'], 'READY')
+            connection.execute("UPDATE exec_plans SET status='VERIFYING' WHERE repo=?", (repo,))
+            self.assertIsNone(loop_manager._stable_work_reason(connection, repo, refactoring_review_interval=5))
+            connection.execute("UPDATE exec_plans SET status='READY' WHERE repo=?", (repo,))
+            connection.execute("INSERT INTO recovery_records (repo, subject, identity, reason_code, disposition, "
+                "pending_action, phase, fingerprint, progress_marker, occurrence, attempts, detail) "
+                "VALUES (?, 'G-018', 'id', 'git_lock', 'transient_retry', 'retry', 'WORKING', 'fp', 'm', 1, 1, 'lock')", (repo,))
+            self.assertIsNone(loop_manager._stable_work_reason(connection, repo, refactoring_review_interval=5))
+
+    @dummy_worker_sessions
     def test_project_block_and_planning_error_report_actual_causes(self):
         connection, repo = self._connection()
         connection.execute(

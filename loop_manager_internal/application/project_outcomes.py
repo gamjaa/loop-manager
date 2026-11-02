@@ -169,7 +169,7 @@ def _stable_work_reason(
     row = connection.execute(
         "SELECT * FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
-    if row is None or row["phase"] not in {None, "PR_OPEN", "PLAN_BLOCKED"}:
+    if row is None or row["phase"] not in {None, "PR_OPEN", "PLAN_BLOCKED", "PROJECT_BLOCKED"}:
         return None
     if row["pr_conflict_recovery"] or row["planning_error"]:
         return None
@@ -181,6 +181,17 @@ def _stable_work_reason(
     ).fetchone() is not None and connection.execute(
         "SELECT 1 FROM general_planning_publications WHERE repo = ?", (repo,),
     ).fetchone() is not None:
+        return None
+    if row["phase"] == "PROJECT_BLOCKED" and connection.execute(
+        "SELECT 1 FROM project_blocks WHERE repo=? AND reason_code IS NOT NULL AND evidence IS NOT NULL "
+        "AND reason_code != '' AND evidence != ''", (repo,),
+    ).fetchone() is None:
+        return None
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'"
+    ).fetchone() and connection.execute(
+        "SELECT 1 FROM recovery_records WHERE repo=? AND pending_action!='final_block' LIMIT 1", (repo,),
+    ).fetchone():
         return None
     schedule = effects.catalog_schedule_decision(connection, repo)
     if schedule.active is not None or schedule.runnable_ready is not None:

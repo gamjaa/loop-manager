@@ -879,14 +879,14 @@ class RequirementAuditWaitReasonTest(unittest.TestCase):
         connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
         connection.executescript("""
-            CREATE TABLE projects(repo TEXT PRIMARY KEY, planning_error TEXT);
+            CREATE TABLE projects(repo TEXT PRIMARY KEY, planning_error TEXT, origin TEXT);
             CREATE TABLE exec_plans(repo TEXT, plan_id TEXT, title TEXT, status TEXT,
-                depends_on TEXT, pr_url TEXT, sources TEXT);
-            INSERT INTO projects VALUES ('repo', NULL);
+                depends_on TEXT, pr_url TEXT, sources TEXT, path TEXT);
+            INSERT INTO projects VALUES ('repo', NULL, NULL);
         """)
         connection.execute(
-            "INSERT INTO exec_plans VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("repo", "G-001", "Feature", "PR_OPEN", "[]", "", json.dumps([SOURCE])),
+            "INSERT INTO exec_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("repo", "G-001", "Feature", "PR_OPEN", "[]", "", json.dumps([SOURCE]), "docs/plans/[G-001] Feature.md"),
         )
         renamed = "docs/requirements/[R-001] Renamed.md"
         snapshot = work_exhaustion.collect(
@@ -902,12 +902,12 @@ class RequirementAuditWaitReasonTest(unittest.TestCase):
         connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
         connection.executescript("""
-            CREATE TABLE projects(repo TEXT PRIMARY KEY, planning_error TEXT);
+            CREATE TABLE projects(repo TEXT PRIMARY KEY, planning_error TEXT, origin TEXT);
             CREATE TABLE exec_plans(repo TEXT, plan_id TEXT, title TEXT, status TEXT,
-                depends_on TEXT, pr_url TEXT, sources TEXT);
+                depends_on TEXT, pr_url TEXT, sources TEXT, path TEXT);
             CREATE TABLE requirement_audit(repo TEXT, source_path TEXT,
                 outcome TEXT, stage TEXT, reason TEXT);
-            INSERT INTO projects VALUES ('repo', NULL);
+            INSERT INTO projects VALUES ('repo', NULL, NULL);
         """)
         connection.execute(
             "INSERT INTO requirement_audit VALUES (?, ?, ?, ?, ?)",

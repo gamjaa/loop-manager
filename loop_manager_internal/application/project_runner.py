@@ -349,6 +349,15 @@ def _run_project_result(
             f"PROJECT_BLOCKED {project_block['reason_code']}: {project_block['evidence']}"
             if project_block is not None else detail
         )
+        if project_block is not None and step_result in (0, 1):
+            try:
+                snapshot = effects._stable_work_reason(
+                    connection, repo, refactoring_review_interval=refactoring_review_interval,
+                )
+            except (RuntimeError, OSError):
+                snapshot = None
+            if snapshot is not None and not snapshot.completed:
+                notifications.enqueue_waiting_reason(connection, repo, snapshot)
         effects.operation_log(str(reason), error=True)
         return ProjectRunResult(ProjectRunKind.BLOCKED, 1, reason)
     if step_result == PROJECT_STEP_TRANSIENT_PAUSE:
