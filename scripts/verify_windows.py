@@ -307,6 +307,7 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
     run_root = Path(tempfile.mkdtemp(prefix='loop-manager-verify-', dir='/tmp'))
     receipt = {'root': str(run_root), 'stopped': True, 'removed': False}
     passed = False
+    budget = None
     try:
         lifecycle(budget_directory,'running',root=str(run_root),pid=os.getpid())
         (bundle / 'started.json').write_text(json.dumps(receipt), encoding='utf-8')
@@ -315,15 +316,16 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
         for path in (project, runtime_root, temporary):
             path.mkdir()
         for filename, destination in (('project.tar', project), ('runtime.tar', runtime_root)):
+            if time.monotonic() - started >= timeout - CLEANUP_SECONDS:
+                raise TimeoutError('WSL 복사 준비 중 전체 verify 시간이 만료됐습니다.')
             with tarfile.open(bundle / filename) as archive:
                 archive.extractall(destination, filter='data')
-        os.environ.update(TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
-        tempfile.tempdir = str(temporary)
         sys.path.insert(0, str(runtime_root))
         from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
         logs = bundle / 'logs'
         logs.mkdir(exist_ok=True)
-        environment = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
+        environment = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary),
+            GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
             GIT_CONFIG_SYSTEM='/dev/null', PYTHONIOENCODING='utf-8',
             LOOP_MANAGER_VERIFY_LOG_DIR=str(logs), LOOP_MANAGER_VERIFY_PARALLELISM=str(cap))
         if parent_run_id:
@@ -331,6 +333,8 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
         from loop_manager_internal.verification.execution_clock import ExecutionClock
         budget = ExecutionClock(environment)
         budget.started = started
+        os.environ.update(TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
+        tempfile.tempdir = str(temporary)
         for arguments in (['git', 'init', '-q', '--initial-branch=main'], ['git', 'add', '-A'],
                           ['git', '-c', 'user.name=Verify', '-c', 'user.email=verify@example.invalid',
                            '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Windows verify snapshot']):
@@ -383,6 +387,18 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
             (bundle / 'cleanup.tmp').replace(bundle / 'cleanup.json')
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+            if budget is not None:
+                from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+                primary = sys.exc_info()[1]
+                try:
+                    if primary is None:
+                        check_budget(budget, timeout)
+                except BaseException as error:
+                    primary = error
+                    raise
+                finally:
+                    if not isinstance(primary, (VerifyBudgetError, VerifyTerminationUncertain)):
+                        budget.close()
     return 0 if passed else 1
 
 
