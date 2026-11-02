@@ -462,7 +462,7 @@ Planner의 표준 결과는 `FINAL_SPECIFICATION_REVIEW: <JSON object>` 하나�
 
 최종 확인의 `work_cycle`은 MERGED 수·유지보수 revision·Merge된 작업의 검증 identity에 결합한다. 재사용은 확정된 `fulfilled`의 현재 입력·명세 지문·주기 일치를 요구하며, 원문 보존 archive-only 이동은 유효한 계획 선언과 정확한 이동을 검증한 예외로만 허용한다. 상태 공백·catalog 부재·일반 검토의 추가 계획 없음이나 검토 파일명만으로 완료를 합성하지 않는다.
 
-안정적 완료·작업 소진의 원본은 현재 원격 입력·catalog·SQLite 상태다. 완료 기록의 `cycle_key`는 프로젝트의 유효 planning 입력 지문으로 관리하며 최종 확인의 `work_cycle`과 구분한다. `project_completion_cycles`의 완료 시각·마지막 Merge 계획과 `work_reason_episodes`의 snapshot 지문·세대는 Telegram 활성 여부와 독립적으로 유지한다. 완료·대기 outbox는 만들지 않는다. Merge 후 worktree cleanup·ExecPlan archive pending은 완료를 막지 않지만 미완료 planning publication·활성 writer·안전 gate를 우회하는 근거로 사용하지 않는다.
+안정적 완료·작업 소진의 원본은 현재 원격 입력·catalog·SQLite 상태다. 완료 기록의 `cycle_key`는 유효 planning 입력 지문이며 최종 확인의 `work_cycle`과 구분한다. `project_completion_cycles`의 완료 시각·마지막 Merge 계획·세대와 `work_reason_episodes`의 원인 지문·세대는 Telegram 활성 여부와 독립적으로 유지한다. 안정 관측은 기존 선택·복구·유지보수 결과와 전체 대상 상태를 대조하며 관리 인계·순번만으로 실제 진행을 만들지 않는다. 완료와 대기 사건은 각각 해당 주기와 episode에 결합한다. Merge 후 worktree cleanup·ExecPlan archive pending은 완료를 막지 않지만 미완료 planning publication·활성 writer·안전 gate를 우회하는 근거로 사용하지 않는다.
 
 ### 계획 게시와 작업 공간
 
@@ -1782,7 +1782,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 일반·유지보수 planning은 확인한 게시 commit의 신규 작업 등록 transaction에서 `plans_published`와 `draft_decisions`를 기록한다. 일반 작업과 draft/질문을 별도 묶음으로 저장해 주의 수준을 구분하고 등록 commit 뒤 정리 전에 즉시 전송을 시도한다. 기존 계획 개정이나 catalog 재관측으로 생성 사건을 만들지 않는다. `record_process_start`는 실제 시작을 기존 incident 기록에 연결하며 일반 시작 알림을 만들지 않는다. 유지보수 cycle 시작/종료, 미해결 targeted test와 단순 단계 실패도 별도 사건을 만들지 않는다. 차단 통지는 아래 공통 조치 판정을 따른다.
 
-조각 claim은 `plans_published`·`blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision`의 현재성을 확인하며 그 밖의 구정책 진행·완료·대기·재개 사건의 잔여 전송을 취소한다. payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim과 `policy.is_current`를 사용한다. PR은 같은 ExecPlan의 `PR_OPEN`·URL과 저장된 실제 PR head를 확인하고, 직렬화된 `DefinitionSnapshot`·`validated_base_sha`·`pr_head_oid`에서 기대 `review_token`과 `publication_token`을 다시 계산한다. Review 결과와 두 token이 현재 값과 일치해야 검토·Merge 대기로 인정하며 결과 문자열로 사용자 승인을 추론하지 않는다.
+조각 claim은 `plans_published`·`blocked`·`pr_created`·`draft_decisions`·기존 개별 `draft_decision`과 `work_waiting`·`project_completed`의 각 소유 근거를 재확인하며 유효하지 않은 사건과 그 밖의 구정책 진행·재개 사건의 잔여 전송을 취소한다. payload·고정 본문·cursor·attempts·오류는 보존한다. 일반 dispatch·즉시 전송·실패 재시도는 같은 claim과 `policy.is_current`를 사용한다. PR은 같은 ExecPlan의 `PR_OPEN`·URL과 저장된 실제 PR head를 확인하고, 직렬화된 `DefinitionSnapshot`·`validated_base_sha`·`pr_head_oid`에서 기대 `review_token`과 `publication_token`을 다시 계산한다. Review 결과와 두 token이 현재 값과 일치해야 검토·Merge 대기로 인정하며 결과 문자열로 사용자 승인을 추론하지 않는다.
 
 신규 PR은 실제 생성 성공 또는 소유권 검증을 통과한 중단 복구 경계가 `pr_creation_publications`에 repository·ExecPlan·PR URL·최초 publication token과 선택적 검토 입력 identity를 기록한다. 생성 이력과 `PR_OPEN` 전이·Outbox 등록은 같은 transaction에 속한다. 복구는 `PUBLISHING`의 `pr_create` checkpoint intent·기대 head·게시 원격 OID가 관측한 PR head와 모두 일치해야 신규 생성으로 인정한다. 기존 URL 연결이나 증명 부재만으로 생성 이력을 만들지 않는다. 신규 사건 identity는 repository·PR URL·`creation:` 접두사와 URL·`review_merge` 행동에 결합되며 안정적인 Git diff·blame 증명은 요구하지 않는다. 현재성은 이 생성 이력과 현재 `PR_OPEN`·URL·Review/publication token으로 판정한다.
 
@@ -1795,6 +1795,8 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 `RecoveryObservation.unavailable_recovery_routes`는 복구 소유자가 이미 확인한 복구 불가 사실만 전달하는 선택적 JSON object다. 최종 판단일 때 `final_evidence`에 보존하며 기존 복구 결정·예산·재개 정책은 바꾸지 않는다. 허용 키는 `reobservation`·`retry`·`correction`·`condition_wait`·`next_run`·`safe_recovery`의 정확한 여섯 개이며 값은 각 경로를 사용할 수 없는 근거인 비어 있지 않은 문자열이다. 현재 원인·지문·revision과 일치하는 최종 기록에 이 근거가 모두 있고 사용자 조치가 없을 때만 `unrecoverable`을 선택한다. 기존 기록의 필드 부재·부분 근거는 보류하며 일반 final 분류에서 자동 생성하지 않는다. 본문에는 원래 원인·보존 결과·경로별 근거를 표시하고 가짜 질문·조치 안내를 붙이지 않는다.
 
 `configure_session`은 credential 없이 연결별 TEMP 상태에 활성 여부와 현재 양의 정수 `verify_timeout_seconds`를 묶는다. scheduler·수동 recover·독립 task 연결은 transaction 밖에서 읽은 설정을 전달한다. 미확인 값은 NULL로 처리하며, 상한 조치는 현재 값·block 지문·실제 verify timeout 결과가 모두 같은 상한일 때만 허용한다. 값 변경·누락은 이전 통지의 잔여 조각을 취소하며 기존 설정·오류·감사를 덮지 않는다.
+
+대기 사건은 원인·목록과 관련 source 관계의 지문 및 episode 세대에 결합한다. 표시 링크·revision과 무관한 보관은 지문에서 제외하며 저장된 source 선언과 확인한 Requirement 관계를 claim에서 대조한다. 완료 사건은 `cycle_key`·완료 세대·최종 확인의 `work_cycle`에 결합하고 현재 receipt·미완료 계획·차단·유지보수·복구·게시 상태를 다시 검사한다. 대기/완료 사건은 독립 게시·질문·PR 통지의 전송 확인을 중복 제거나 완료 근거로 사용하지 않는다. 유효하지 않은 잔여 조각만 취소하며 이전 payload·고정 본문·cursor·실패 및 취소 감사를 보존한다.
 
 사건 투영은 Telegram 설정과 독립적으로 오래된 미전송 사건을 취소한 뒤 새 사건을 선택한다. planning_error enqueue와 과거 planning 사건의 released_at/canceled_at을 해제하던 복원 경로는 제거했다. legacy 통지 채택과 첫 확인 원인·확인 조각의 연결은 감사용으로 유지한다. 원격 관측과 설정 확인의 소유자는 transaction 밖에서 사실을 확보하고 현재 DB에 반영하며, 공통 판정은 전송 transaction에서 해당 현재 원인을 다시 대조한다.
 
@@ -1823,7 +1825,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 전송할 조각은 transaction에서 선택하고 HTTP 전송 뒤 현재 조각 위치를 대조해 확인 수를 전진시킨다. 고유 사건 키의 중복 삽입 방지와 외부 수신의 중복 방지는 별도다. 수신 후 확인 저장 전 중단·불명확한 실패는 같은 미확인 조각을 재시도하므로 외부 수신의 정확히 한 번을 보장하지 않는다.
 
-차단 해제와 해당 사건 해제·미전송 조각 취소는 같은 transaction에 반영한다. incident의 실제 시작은 기존 원인 해제·작업 identity·첫 시작 시각과 연결해 Telegram 설정과 독립적으로 보존한다. `record_work_start`는 처음 확정한 통지 확인·실제 시작 연결 수를 반환하므로 PR 재개 운영 로그는 메시지 생성에 의존하지 않는다. `resumed_at`은 기존 `confirmed_before` 또는 현재 outbox의 확인된 조각이 있고 해당 작업이 시작됐을 때 한 번 기록한다. 전송 확인 callback은 원래 조각 cursor와 incident 확인 감사를 전진시키고 이 연결만 확정하며 새 메시지는 만들지 않는다. 실패 callback과 시작 복구도 시작/재개 outbox를 만들지 않고, 시작 복구는 취소 사건의 중단된 claim 표식과 저장된 시작만 정리한다. 과거 planning 중복 사건의 확인 이력은 현재 사건에 연결하고 과거 행을 삭제하지 않는다. 안정적 작업 소진은 draft·계획 차단을 포함하되 프로젝트 차단을 제외하며 완료·대기 상태는 [프로젝트 최종 확인과 완료 판정](#프로젝트-최종-확인과-완료-판정)을 따른다. 새 PRODUCT·ARCHITECTURE·Requirement 변경 등으로 갱신된 완료 주기와 내용 보존 archive를 구분한다.
+차단 해제와 해당 사건 해제·미전송 조각 취소는 같은 transaction에 반영한다. incident의 실제 시작은 기존 원인 해제·작업 identity·첫 시작 시각과 연결해 Telegram 설정과 독립적으로 보존한다. `record_work_start`는 처음 확정한 통지 확인·실제 시작 연결 수를 반환하므로 PR 재개 운영 로그는 메시지 생성에 의존하지 않는다. `resumed_at`은 기존 `confirmed_before` 또는 현재 outbox의 확인된 조각이 있고 해당 작업이 시작됐을 때 한 번 기록한다. 전송 확인 callback은 원래 조각 cursor와 incident 확인 감사를 전진시키고 이 연결만 확정하며 새 메시지는 만들지 않는다. 실패 callback과 시작 복구도 시작/재개 outbox를 만들지 않고, 시작 복구는 취소 사건의 중단된 claim 표식과 저장된 시작만 정리한다. 과거 planning 중복 사건의 확인 이력은 현재 사건에 연결하고 과거 행을 삭제하지 않는다. 안정적 작업 소진은 draft·계획 차단과 실제 안정성이 확인된 프로젝트 차단을 포함하며 완료·대기 상태는 [프로젝트 최종 확인과 완료 판정](#프로젝트-최종-확인과-완료-판정)을 따른다. 새 PRODUCT·ARCHITECTURE·Requirement 변경 등으로 갱신된 완료 주기와 내용 보존 archive를 구분한다.
 
 `notifications/rendering.py`는 저장된 payload만으로 텍스트를 결정적으로 생성하며 모델을 호출하지 않는다. 확인된 질문·수정 대상·PR 상태 순으로 정보를 구성하고 원인·복구 시도·Checkpoint 근거를 보존한다. 공통 payload와 `draft_decisions` 목록의 계약은 다음과 같다.
 
