@@ -431,6 +431,8 @@ def windows_main(root):
             report['wsl_diagnostic'] = str(wsl_logs / 'summary.json')
             if not passed:
                 return 1
+            if budget.remaining(timeout) <= 0:
+                raise TimeoutError('WSL 종료 후 전체 verify 시간이 만료됐습니다.')
             native_logs = Path(str(directory) + '-windows')
             native_logs.mkdir()
             print(f'Windows 핵심 회귀 시작: {native_logs}', flush=True)
@@ -455,6 +457,8 @@ def windows_main(root):
                 pass
             report['windows'] = 'PASS' if passed and not timed_out else 'FAIL'
             report['windows_diagnostic'] = str(native_logs / 'summary.json')
+        if budget.remaining(timeout) <= 0:
+            raise TimeoutError('전체 verify 정리 중 시간이 만료됐습니다.')
         report['passed'] = report['windows'] == 'PASS'
         return 0 if report['passed'] else 1
     finally:

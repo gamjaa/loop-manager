@@ -289,14 +289,47 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
             budget = kwargs['execution_clock']
             self.assertIs(execution_clock.current_execution_clock.get(), budget)
             self.assertEqual(budget.remaining(args[2]), 20.0)
-            now[0] = 60.0
-            self.assertEqual(budget.remaining(args[2]), 0.0)
+            now[0] = 59.0
+            self.assertEqual(budget.remaining(args[2]), 1.0)
             return True, False, verify_process.VerifyProcessOutput('core PASS', exit_code=0)
         self.wsl.side_effect = wsl
         self.native.side_effect = native
         with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
                 clock_type(*args, **kwargs, clock=lambda: now[0])):
             self.assertEqual(launcher.windows_main(self.root), 0)
+
+    def test_wsl_deadline_blocks_native(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        def wsl(*args):
+            self.write_wsl_summary(args[2])
+            now[0] = 60.0
+            return True
+        self.wsl.side_effect = wsl
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])):
+            with self.assertRaises(TimeoutError):
+                launcher.windows_main(self.root)
+        self.native.assert_not_called()
+        self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'NOT_RUN'))
+        self.assertFalse(self.report()['passed'])
+
+    def test_native_completion_at_deadline_cannot_pass(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        def native(*args, **kwargs):
+            self.write_native_summary(args[0])
+            now[0] = 60.0
+            return self.native_result
+        self.native.side_effect = native
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])):
+            with self.assertRaises(TimeoutError):
+                launcher.windows_main(self.root)
+        self.assertEqual(self.report()['windows'], 'PASS')
+        self.assertFalse(self.report()['passed'])
 
     def test_partial_request_falls_back_without_executing_either_phase(self):
         os.environ.update(LOOP_MANAGER_VERIFY_PARTIAL_BASE='base', LOOP_MANAGER_VERIFY_SESSION='session')
