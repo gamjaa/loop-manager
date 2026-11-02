@@ -1080,6 +1080,17 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_publication_waiting_list_excludes_merged_dependencies(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='abc', depends_on='[\"G-001\",\"G-002\"]' WHERE repo=?", (repo,))
+            connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) VALUES (?,'G-001','docs/plans/[G-001] Done.md','Done','[]','[]','normal','hash','MERGED')", (repo,))
+            notifications.record_planning_publication(connection, repo,
+                [('docs/plans/[G-018] Reliable notices.md', {'id': 'G-018'})], 'abc')
+        payload = json.loads(self.events(connection)[0]['payload'])
+        self.assertEqual(payload['plans'][0]['waiting_for'], ['G-002'])
+
     def test_published_batch_silent_flag_survives_split_and_http_retry(self):
         connection = self.connection()
         repo = '/projects/alpha'
@@ -1455,6 +1466,25 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
         self.assertIn('새 draft 게시', sender.call_args.args[2])
         self.assertNotIn('사용자 판단 대기', sender.call_args.args[2])
+
+    def test_new_question_after_creation_is_not_a_second_creation(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Draft')
+            connection.execute("UPDATE execplan_drafts SET evidence=json_remove(evidence, '$.question')")
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            notifications.record_planning_publication(connection, self.repo,
+                [('docs/plans/[G-018] Draft.md', {'id': 'G-018', 'draft': True})], 'remote-sha')
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        with connection:
+            connection.execute("UPDATE execplan_drafts SET evidence=json_set(evidence, '$.question', 'Question: New decision?', '$.identity', 'new-question', '$.revision', 'new-revision')")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        payload = json.loads(self.events(connection)[1]['payload'])
+        self.assertEqual(payload['plans'][0]['decision_identity'], 'new-question')
+        self.assertNotIn('publication_revision', payload['plans'][0])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertNotIn('신규 게시', sender.call_args.args[2])
 
     def test_resolved_question_keeps_unsent_draft_creation(self):
         connection = self.connection()
