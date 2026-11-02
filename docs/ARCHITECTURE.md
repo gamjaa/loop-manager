@@ -1807,9 +1807,11 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 | `occurred_at`·`silent`·`status` | 발생 시각은 UTC ISO 8601 문자열, 무음 선택은 boolean, 처리 상태는 문자열이다. 전송 시각·재시도에 맞춰 원래 의미를 다시 쓰지 않는다. |
 | `project` | 표시할 프로젝트 이름 문자열. 사건의 저장 범위는 outbox의 `repo`에 결합한다. |
 | `plans` | `plans_published`는 신규 일반 작업 배열, `draft_decisions`는 신규 draft와 아직 통지 확인이 없는 질문의 ID 순 배열이다. 생성 항목은 게시 revision과 원본 경로에, 질문은 판단 identity·revision과 현재 경로·링크에 결합한다. |
-| `plans[].id`·`plans[].title`·`plans[].source_path` | ExecPlan ID·현재 제목·현재 catalog 경로 문자열. 경로는 active `docs/plans/[id] title.md` 형식이며 저장된 draft evidence 경로와 catalog 경로가 같아야 한다. 본문은 전체 건수와 항목별 ID·제목을 표시하고 제목의 공백을 정리한다. 경로는 URL snapshot 및 legacy 출처 확인에 사용하며 불일치 입력은 전송하지 않는다. |
-| `plans[].url` | 등록 remote·현재 catalog revision·경로로 검증해 만든 원격 문서 URL 또는 `null`. 값이 있을 때 ID에 링크하고 없으면 일반 텍스트로 표시한다. |
-| `plans[].decision_identity`·`plans[].decision_revision` | 현재 질문의 identity·revision 문자열. ID와 결합해 실제 사용자 행동과 질문별 통지 확인을 식별한다. URL·제목·경로 표시와 사건 identity에는 결합하지 않는다. |
+| `plans[].id`·`plans[].title`·`plans[].source_path` | ExecPlan ID·표시 제목·문서 경로 문자열. 경로는 active `docs/plans/[id] title.md` 형식이다. 질문은 현재 catalog와 evidence 경로를 대조하고, 생성 항목은 게시 시점 경로를 보존한다. 본문은 전체 건수와 항목별 ID·제목을 표시하고 제목의 공백을 정리한다. |
+| `plans[].url` | 등록 remote·확인된 revision·경로에서 만든 원격 문서 URL 또는 `null`. draft는 값이 있으면 ID에 링크하고 일반 작업은 URL을 본문에 표시한다. |
+| `plans[].publication_revision`·`plans[].publication_path` | draft 생성 항목의 게시 revision과 선택적 게시 원본 경로 문자열. 경로가 없으면 `source_path`가 원본이다. 일반 작업은 payload의 `publication_revision`을 공유한다. |
+| `plans[].waiting_for` | 일반 작업 게시 시점에 미병합으로 확인한 선행 작업 ID 문자열 배열이다. 빈 배열은 실행 대기로 표시한다. |
+| `plans[].decision_identity`·`plans[].decision_revision` | 질문 항목의 identity·revision 문자열. ID와 결합해 실제 사용자 행동과 질문별 통지 확인을 식별한다. URL·제목·경로 표시와 사건 identity에는 결합하지 않는다. |
 
 `pr_created` payload는 기존 프로젝트·ExecPlan·PR URL·발생 시각·상태 필드와 함께 다음 후보 근거를 요구한다. 이 event type은 새 PR과 기존 PR의 새 게시 후보를 함께 표현하며 본문은 PR이 생성됐다고 단정하지 않는다.
 

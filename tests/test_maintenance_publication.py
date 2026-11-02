@@ -141,7 +141,12 @@ class MaintenancePublicationPolicyTest(MaintenancePlanningCase):
         with mock.patch.object(notifications, 'flush_project_events', side_effect=flush) as send:
             loop_manager._apply_maintenance_planning_batch(
                 self.connection, repo, self.repo, 'main', self.result, self.commit)
-        send.assert_called_once()
+            loop_manager._apply_maintenance_planning_batch(
+                self.connection, repo, self.repo, 'main', self.result, self.commit)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type='plans_published'"
+        ).fetchone()[0], 1)
 
     def test_publication_retry_after_rollback_records_one_batch(self):
         from loop_manager_internal.maintenance import maintenance_publication
