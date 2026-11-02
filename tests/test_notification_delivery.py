@@ -1308,6 +1308,47 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
         self.assertIn('새 draft 게시', sender.call_args.args[2])
         self.assertNotIn('사용자 판단 대기', sender.call_args.args[2])
 
+    def test_resolved_question_keeps_unsent_draft_creation(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Draft')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            notifications.record_planning_publication(connection, self.repo,
+                [('docs/plans/[G-018] Draft.md', {'id': 'G-018', 'draft': True})], 'remote-sha')
+            connection.execute("UPDATE execplan_drafts SET pending=0")
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 0)
+        rows = self.events(connection)
+        self.assertIsNotNone(rows[0]['canceled_at'])
+        self.assertEqual(len(rows), 2)
+        item = json.loads(rows[1]['payload'])['plans'][0]
+        self.assertEqual(item['publication_revision'], 'remote-sha')
+        self.assertNotIn('decision_identity', item)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-018 · Draft · 신규 게시', sender.call_args.args[2])
+
+    def test_partial_draft_notice_keeps_only_unconfirmed_creation(self):
+        connection = self.connection()
+        title = 'Long ' * 1000
+        with connection:
+            self.draft(connection, 'G-018', title)
+            self.draft(connection, 'G-019', 'Later')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            plans = [(f'docs/plans/[{plan_id}] {name}.md', {'id': plan_id, 'draft': True})
+                     for plan_id, name in (('G-018', title), ('G-019', 'Later'))]
+            notifications.record_planning_publication(connection, self.repo, plans, 'remote-sha')
+        def send(_token, _chat, _text):
+            with connection:
+                connection.execute("UPDATE execplan_drafts SET pending=0 WHERE plan_id='G-019'")
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        rows = self.events(connection)
+        self.assertEqual(rows[0]['confirmed_pieces'], 1)
+        self.assertIsNotNone(rows[0]['canceled_at'])
+        self.assertEqual([item['id'] for item in json.loads(rows[1]['payload'])['plans']], ['G-019'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-019 · Later · 신규 게시', sender.call_args.args[2])
+
     def test_publication_current_and_waiting_share_one_sorted_list(self):
         connection = self.connection()
         with connection:

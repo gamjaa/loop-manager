@@ -18,7 +18,7 @@ from .incidents import (_key, _remote_inspection_suffix, _queue_block,
                         _plan_block_key, _project_block_key,
                         _project_checkpoint, _project_checkpoint_suffix, record_work_start)
 from .incidents import _preservation_checkpoint
-from .rendering import _checkpoint_link
+from .rendering import _checkpoint_link, _pieces
 
 
 @dataclass(frozen=True)
@@ -688,7 +688,7 @@ def enqueue_draft_decisions(connection, repo, *, publications=None):
         return
     ensure_schema(connection)
     previous = connection.execute(
-        "SELECT event_key, payload, canceled_at, sent_at FROM notification_outbox WHERE repo = ? "
+        "SELECT event_key, payload, canceled_at, sent_at, rendered_text, confirmed_pieces FROM notification_outbox WHERE repo = ? "
         "AND event_type = 'draft_decisions' ORDER BY rowid DESC LIMIT 1", (repo,),
     ).fetchone()
     created = []
@@ -725,6 +725,20 @@ def enqueue_draft_decisions(connection, repo, *, publications=None):
         if not created and isinstance(payload, dict) and is_current(
                 connection, repo, "draft_decisions", payload, event_key=str(previous[0])):
             return
+        if isinstance(payload, dict) and isinstance(payload.get('plans'), list):
+            rendered = previous[4] if isinstance(previous[4], str) else ''
+            confirmed = ''.join(_pieces(rendered)[:int(previous[5] or 0)])
+            for item in payload['plans']:
+                if not isinstance(item, dict) or not item.get('publication_revision'):
+                    continue
+                marker = f"\n• {item.get('id')} · "
+                position = rendered.find(marker)
+                if position >= 0 and position + len(f"\n• {item.get('id')}") <= len(confirmed):
+                    continue
+                if is_current(connection, repo, 'plans_published', {
+                        'plans': [item], 'publication_revision': item['publication_revision']}):
+                    created.append({key: item[key] for key in (
+                        'id', 'title', 'source_path', 'url', 'publication_revision') if key in item})
 
     connection.execute(
         "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, delivery_started_at = NULL "

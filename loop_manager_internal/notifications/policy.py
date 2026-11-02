@@ -493,4 +493,13 @@ def cancel_stale_events(connection, repo):
             payload = None
         if not isinstance(payload, dict) or not is_current(
                 connection, repo, row[1], payload, event_key=str(row[0])):
+            if (row[1] == 'draft_decisions' and isinstance(payload, dict)
+                    and isinstance(payload.get('plans'), list)
+                    and any(isinstance(item, dict) and item.get('publication_revision')
+                            for item in payload['plans'])):
+                from .repository import _enabled
+                if not _enabled(connection):
+                    continue
+                from .events import enqueue_draft_decisions
+                enqueue_draft_decisions(connection, repo)
             cancel_event(connection, row[0])
