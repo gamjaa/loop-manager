@@ -607,6 +607,47 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.native.assert_not_called()
         self.assertFalse((bundle / 'heartbeat').exists())
 
+    def test_wsl_excludes_confirmed_wait_but_counts_processing(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        for actual, succeeds in ((2.0, True), (21.0, False)):
+            with self.subTest(actual=actual):
+                case = self.root / str(actual)
+                case.mkdir()
+                bundle, logs, budget_dir = (case / name for name in ('bundle', 'logs', 'budget'))
+                for path in (bundle, logs, budget_dir):
+                    path.mkdir()
+                now = [0.0]
+                def run(*_args, execution_clock, **_kwargs):
+                    (budget_dir / 'wait.json').write_text(json.dumps({'waiting_seconds': 30.0}))
+                    now[0] = 30.0 + actual
+                    (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+                    return True, False, 'PASS'
+                with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_BUDGET_DIR': str(budget_dir)}), \
+                     mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                         clock_type(*args, **kwargs, clock=lambda: now[0])), \
+                     mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+                     mock.patch.object(verify_process, 'run_verify_process', side_effect=run) as process:
+                    if succeeds:
+                        self.assertTrue(self.real_wsl(self.root, bundle, logs, 20, 'auto'))
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            self.real_wsl(self.root, bundle, logs, 20, 'auto')
+                self.assertEqual(process.call_count, 1)
+                self.assertTrue((logs / 'cleanup.json').exists())
+
+    def test_wsl_launch_failure_is_not_reported_as_unknown_child(self):
+        bundle, budget_dir = self.root / 'bundle', self.root / 'budget'
+        bundle.mkdir()
+        budget_dir.mkdir()
+        with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_BUDGET_DIR': str(budget_dir)}), \
+             mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=OSError('cannot launch')):
+            with self.assertRaisesRegex(OSError, 'cannot launch'):
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertEqual(json.loads((budget_dir / 'wsl-lifecycle.json').read_text())['state'], 'stopped')
+        self.assertFalse((bundle / 'cleanup.json').exists())
+
     def test_budget_error_keeps_evidence_while_waiting_for_cleanup(self):
         from loop_manager_internal.verification.execution_clock import VerifyBudgetError
         bundle = self.root / 'bundle'
@@ -618,6 +659,7 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         budget_directory.mkdir()
         os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'] = str(budget_directory)
         def run(*_args, execution_clock, **_kwargs):
+            _kwargs['on_started'](object(), None)
             (budget_directory / 'wait.json').write_text('invalid')
             execution_clock.remaining(30)
         def cleanup(_seconds):
@@ -643,6 +685,7 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         budget_directory.mkdir()
         os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'] = str(budget_directory)
         def run(*_args, execution_clock, **_kwargs):
+            _kwargs['on_started'](object(), None)
             (budget_directory / 'wait.json').write_text('invalid')
             (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
             execution_clock.remaining(30)

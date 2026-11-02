@@ -241,14 +241,22 @@ def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
             lifecycle(budget_directory, 'starting')
         primary = None
         output = None
+        launched = False
+        def on_started(_process, _job):
+            nonlocal launched
+            launched = True
         try:
             with heartbeat(bundle / 'heartbeat'):
                 passed, timed_out, output = run_verify_process(
                     ['wsl.exe', '--exec', 'python3', translated + '/driver.py', '--wsl', translated,
                      str(remaining), str(cap), *budget_arguments], root, timeout - CLEANUP_SECONDS,
-                    environment=environment, job_scope=True, execution_clock=budget)
+                    environment=environment, job_scope=True, execution_clock=budget, on_started=on_started)
         except BaseException as error:
             primary = error
+        if primary is not None and not launched and not isinstance(primary, VerifyTerminationUncertain):
+            if budget_directory:
+                lifecycle(budget_directory, 'stopped')
+            raise primary
         # Windows Job 종료만으로 Linux 자식의 종료를 확정하지 않는다.
         receipt = bundle / 'cleanup.json'
         cleanup_deadline = time.monotonic() + min(CLEANUP_SECONDS, max(0, timeout - budget.last_elapsed))
