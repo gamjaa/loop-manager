@@ -1264,6 +1264,145 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 thread.join(3)
         self.assertEqual(errors, [])
 
+    def test_git_fifo_serializes_archive_with_mutations_but_keeps_other_projects_free(self):
+        from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned
+        scheduler = self.scheduler()
+        entered, errors, threads = [], [], []
+        other = threading.Event()
+        def request(repo, owner, resource):
+            token = scheduling.current_scheduler.set(scheduler)
+            try:
+                with resource_locks(self.directory, repo, [resource], owner=owner, wait=False):
+                    self.assertTrue(resource_owned(self.directory, repo, 'git:project'))
+                    # A nested Git operation shares the turn, including another owner.
+                    with resource_locks(self.directory, repo, ['git:nested'], owner='nested'):
+                        entered.append(owner)
+                    if repo == 'B':
+                        other.set()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                scheduling.current_scheduler.reset(token)
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            with resource_locks(self.directory, 'A', ['git:fetch'], owner='active'):
+                for number, owner, resource in ((2, 'execplan-archive', 'git:config'),
+                                                (3, 'next-fetch', 'git:fetch')):
+                    thread = threading.Thread(target=request, args=('A', owner, resource))
+                    threads.append(thread)
+                    thread.start()
+                    with scheduler.condition:
+                        self.assertTrue(scheduler.condition.wait_for(
+                            lambda: len(scheduler.git_waiters.get('A', ())) == number, 3))
+                thread = threading.Thread(target=request, args=('B', 'other-project', 'git:fetch'))
+                threads.append(thread)
+                thread.start()
+                self.assertTrue(other.wait(3))
+                self.assertEqual(entered, ['other-project'])
+        finally:
+            scheduling.current_scheduler.reset(token)
+            for thread in threads:
+                thread.join(4)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(entered, ['other-project', 'execplan-archive', 'next-fetch'])
+        self.assertEqual(scheduler.git_waiters, {})
+
+    def test_direct_git_writes_join_turn_but_read_only_queries_do_not(self):
+        from loop_manager_internal.runtime.resource_lock import resource_locks, resource_owned
+        from loop_manager_internal.git.command_adapter import GitEffects, git
+        scheduler = self.scheduler()
+        commands, errors = [], []
+        def command(arguments, **_kwargs):
+            if any(verb in arguments for verb in ('push', 'update-index', 'branch')):
+                self.assertTrue(resource_owned(self.directory, 'A', 'git:project'))
+            commands.append(arguments)
+            return SimpleNamespace(returncode=0, stdout='')
+        effects = GitEffects(mock.Mock(return_value=[]), mock.Mock(return_value=None),
+                             command, mock.Mock(return_value=False))
+        def write():
+            token = scheduling.current_scheduler.set(scheduler)
+            task = scheduling.current_task.set(scheduling.Task('A', 'G-001', self.connection))
+            try:
+                git(effects, Path('/owned-worktree'), 'push', 'origin', 'HEAD')
+                git(effects, Path('/owned-worktree'), '--literal-pathspecs', 'update-index', '--refresh')
+                git(effects, Path('/owned-worktree'), 'branch', '-r', '-d', 'origin/retired')
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                scheduling.current_task.reset(task)
+                scheduling.current_scheduler.reset(token)
+        token = scheduling.current_scheduler.set(scheduler)
+        thread = threading.Thread(target=write)
+        try:
+            with resource_locks(self.directory, 'A', ['git:fetch'], owner='active'):
+                thread.start()
+                with scheduler.condition:
+                    self.assertTrue(scheduler.condition.wait_for(
+                        lambda: len(scheduler.git_waiters.get('A', ())) == 2, 3))
+                git(effects, Path('/owned-worktree'), 'config', '--get', 'user.email')
+                self.assertEqual(len(commands), 1)
+        finally:
+            scheduling.current_scheduler.reset(token)
+            thread.join(4)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(commands), 4)
+        self.assertEqual(scheduler.git_waiters, {})
+
+    def test_git_fifo_rejects_database_transaction_without_leaking_a_turn(self):
+        from loop_manager_internal.runtime.resource_lock import resource_locks
+        from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        scheduler = self.scheduler()
+        token = scheduling.current_scheduler.set(scheduler)
+        task = scheduling.current_task.set(scheduling.Task('A', 'G-001', self.connection))
+        try:
+            with self.connection:
+                self.connection.execute("UPDATE projects SET processed_sha='held' WHERE repo='A'")
+                with self.assertRaises(DatabaseWaitTimeout):
+                    with resource_locks(self.directory, 'A', ['git:fetch'], owner='task-fetch'):
+                        self.fail('Git ran inside a database transaction')
+                self.assertTrue(self.connection.in_transaction)
+            self.assertEqual(scheduler.git_waiters, {})
+        finally:
+            scheduling.current_task.reset(task)
+            scheduling.current_scheduler.reset(token)
+
+    def test_git_fifo_cancellation_removes_waiter_and_keeps_project_fetch_eligible(self):
+        from loop_manager_internal.runtime.resource_lock import resource_locks
+        scheduler = self.scheduler()
+        rejected, errors = threading.Event(), []
+        def queued():
+            scheduler_token = scheduling.current_scheduler.set(scheduler)
+            task_token = scheduling.current_task.set(scheduling.Task('A', 'G-001', self.connection))
+            try:
+                with resource_locks(self.directory, 'A', ['git:config'], owner='task-write'):
+                    self.fail('cancelled Git request ran')
+            except scheduling.PlanningDrain:
+                rejected.set()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                scheduling.current_task.reset(task_token)
+                scheduling.current_scheduler.reset(scheduler_token)
+        token = scheduling.current_scheduler.set(scheduler)
+        thread = threading.Thread(target=queued)
+        try:
+            with resource_locks(self.directory, 'A', ['git:fetch'], owner='base-fetch'):
+                thread.start()
+                with scheduler.condition:
+                    self.assertTrue(scheduler.condition.wait_for(
+                        lambda: len(scheduler.git_waiters.get('A', ())) == 2, 3))
+                scheduler.pause_project('A')
+                self.assertTrue(rejected.wait(3))
+            with resource_locks(self.directory, 'A', ['git:fetch'], owner='base-fetch'):
+                pass
+        finally:
+            scheduling.current_scheduler.reset(token)
+            thread.join(4)
+        self.assertEqual(errors, [])
+        self.assertEqual(scheduler.git_waiters, {})
+
     def test_planning_drain_allows_project_fetch_but_keeps_task_and_handoff_gates(self):
         from loop_manager_internal.runtime.resource_lock import resource_locks
         from loop_manager_internal.runtime.handoff_gate import RuntimeHandoffGate, _runtime_handoff_signal, SelfMergeRuntimeHandoff
@@ -1671,7 +1810,8 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                             independent_thread.join(3)
                     thread.join(4)
                 self.assertFalse(thread.is_alive())
-                self.assertIn(('fetch', 'origin'), commands)
+                self.assertIn(('fetch', '--no-tags', 'origin',
+                               '+refs/heads/main:refs/remotes/origin/main'), commands)
                 if change in {'sibling', 'contention'}:
                     self.assertEqual(errors, [])
                     self.assertEqual(calls, ['verify'])

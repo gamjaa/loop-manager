@@ -30,8 +30,8 @@ def git(effects: GitEffects,
     input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command_index = 0
-    while command_index < len(arguments) and arguments[command_index] == "-c":
-        command_index += 2
+    while command_index < len(arguments) and arguments[command_index].startswith('-'):
+        command_index += 2 if arguments[command_index] == '-c' else 1
     if arguments[command_index : command_index + 1] == ("rebase",):
         rebase_arguments = arguments[command_index + 1:]
         overlap_error = None
@@ -58,11 +58,14 @@ def git(effects: GitEffects,
     options = ("-c", "remote.origin.followRemoteHEAD=never") if (
         arguments[command_index:command_index + 1] == ("fetch",)
     ) else ()
-    result = effects.command(
-        ["git", "-C", str(repo), *options, *arguments], check=False,
-        **({"env": env} if env is not None else {}),
-        **({"input": input} if input is not None else {}),
-    )
+    from loop_manager_internal.runtime.resource_lock import git_command_turn
+    command = arguments[command_index] if command_index < len(arguments) else ''
+    with git_command_turn(repo, command, arguments[command_index + 1:]):
+        result = effects.command(
+            ["git", "-C", str(repo), *options, *arguments], check=False,
+            **({"env": env} if env is not None else {}),
+            **({"input": input} if input is not None else {}),
+        )
     if check and result.returncode:
         output = result.stdout[-6000:].strip()
         message = f"명령 실패 (git -C {repo}):\n{output}"

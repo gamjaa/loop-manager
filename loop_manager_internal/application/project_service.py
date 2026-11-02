@@ -1200,7 +1200,7 @@ class ProjectService:
             if not candidates:
                 return ()
             resources = {f"archive:{self.state.base}", f"branch:{self.state.base}",
-                         f"git:refs/heads/{self.state.base}", "git:fetch", "git:config"}
+                         f"git:refs/heads/{self.state.base}", "git:fetch", "git:config", "git:project"}
             owners, writers, receipts = [], [], []
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             for item in candidates:

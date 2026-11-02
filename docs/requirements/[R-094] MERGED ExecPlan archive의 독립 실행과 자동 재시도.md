@@ -2,7 +2,7 @@
 
 ## Summary
 
-실제 PR Merge와 SQLite MERGED가 확정된 ExecPlan의 archive를 프로젝트 전체 유휴 상태와 분리한다. Manager의 기존 조율 경계에서 실제 공유 Git 자원·게시·소유권 충돌을 확인해 처리하고, 연속 작업 배정이나 재시작 뒤에도 미완료 후보를 다시 확인한다. 내용 보존 이동·fast-forward 게시·중단 복구를 유지하며, 보류 이유를 확인할 수 있게 하고 archive 미완료가 다른 작업이나 프로젝트 완료를 막지 않게 한다.
+실제 PR Merge와 SQLite MERGED가 확정된 ExecPlan의 archive를 프로젝트 전체 유휴 상태와 분리한다. Manager의 기존 조율 경계에서 실제 공유 Git 자원·게시·소유권 충돌을 확인해 처리하고, 연속 작업 배정이나 재시작 뒤에도 미완료 후보를 다시 확인한다. R-091의 프로젝트별 공유 Git FIFO 순번에 archive를 포함해 연속 작업의 추월을 막는다. 내용 보존 이동·fast-forward 게시·중단 복구를 유지하며, 보류 이유를 확인할 수 있게 하고 archive 미완료가 다른 작업이나 프로젝트 완료를 막지 않게 한다.
 
 ## Context
 
@@ -15,6 +15,8 @@ MERGED ExecPlan이 활성 경로에 계속 남으면 사용자가 미완료 작�
 ## Requirement
 
 ### 후보와 실행 조건
+
+- archive는 R-091의 프로젝트별 공유 Git FIFO 순번을 받아 실행한다. 순수한 Manager 간 Git 순번 대기는 반복 보류 경고로 남기지 않으며, 순번 확보 뒤에도 대상 writer·소유권·게시·후보 검증을 유지한다.
 
 - GitHub에서 실제 Merge를 확인하고 SQLite에 MERGED를 반영한 뒤, 활성 경로에 남아 있는 ExecPlan을 archive 후보로 유지한다. PR Open·미Merge Close·Worker 완료·verify 또는 Review PASS를 Merge로 간주하지 않는다.
 - 다른 Worker·verify·Reviewer의 진행, 독립 계획의 차단, Planner 실행 자리 점유나 유지보수 cycle의 존재만으로 archive를 금지하지 않는다. 해당 archive가 사용할 공유 Git 자원·원격 base 게시·소유권과 실제 경합하는지를 판단한다.
@@ -54,6 +56,8 @@ MERGED ExecPlan이 활성 경로에 계속 남으면 사용자가 미완료 작�
 차단·복구 범위는 [R-055](%5BR-055%5D%20차단%20경로%20전수%20조사와%20불필요한%20작업%20중단%20축소.md), 병렬 조율과 공유 자원 보호는 [R-091](%5BR-091%5D%20프로젝트%20공정%20배정과%20우선순위%20기반%20병렬%20작업.md), 유지보수 종료는 [R-074](%5BR-074%5D%20유지보수%201회%20평가와%20즉시%20종료.md)를 따른다. 보류 관측은 [R-076](%5BR-076%5D%20운영%20명령어와%20상태%20조회%20및%20Skill%20지원.md)의 읽기 전용 조회와 연결할 수 있으며 별도 운영 명령을 요구하지 않는다.
 
 ## Acceptance Criteria
+
+- 앞선 Git 처리 중 archive가 순번을 요청하면 뒤에 추가된 fetch·게시가 이를 추월하지 않는다. 대상 writer·수동 소유·외부 경합의 보류와 정상 Git 순번 대기를 구분하고, archive가 모델·verify 종료까지 Git 실행 자리를 점유하지 않는다.
 
 - 다른 Worker·verify·Reviewer가 진행 중이거나 독립 계획이 차단돼 있어도 실제 공유 자원 충돌이 없으면 MERGED ExecPlan을 archive한다. Planner 자리 점유·활성 유지보수 cycle만으로 전체 종료를 기다리지 않는다.
 - 같은 base의 다른 Manager 게시·미확정 Git 쓰기와 충돌하면 양쪽 작업을 보존하고 이유를 남기며, 자원 반환 뒤 다음 안전한 조율 경계에서 자동 재시도한다. Requirement 교정 게시의 기존 안전 조건도 유지된다.

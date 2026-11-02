@@ -330,6 +330,14 @@ Agent snapshot과 격리 ledger는 원문을 감사로 보존한다. 공유 ref�
 
 Agent preflight의 digest는 현재 역할·canonical worktree·repository·작업 identity에 결합한다. mutable Git snapshot을 digest에 넣거나 과거 OID와 일치시키지 않으며, provider가 실제 적용한 sandbox 정책과 설정 identity는 호출·재개·fallback마다 확인한다. 저장된 시작·결과 snapshot은 역할별 결과 유효성·성공 후보의 재사용과 실제 호출에 연결된 예약 workspace의 변경 귀속 증명에 사용한다. snapshot 일치만으로 접근 권한이나 성공을 만들지 않으며 현재 후보가 바뀌면 이전 verify·Review·게시 token을 무효화하고 필요한 단계부터 수행한다.
 
+### 프로젝트별 Git 순번과 자원 잠금
+
+`TaskScheduler`의 프로젝트별 FIFO와 기존 condition을 사용해 같은 프로젝트의 Git 변경 구간을 한 번에 하나씩 실행한다. 기존 `resource_locks`의 Git scope와 공통 Git 명령 adapter의 직접 변경 명령은 같은 순번을 사용한다. archive는 조율 스레드에서 같은 순번을 요청하므로 뒤에 들어온 fetch·게시가 먼저 실행되지 않는다. 읽기 전용 Git 조회·다른 프로젝트·모델·verify 실행은 이 순번으로 직렬화하지 않는다.
+
+순번 뒤에는 `git:project` 프로세스 잠금과 기존 개별 자원 잠금을 확보한다. 외부 CLI·다른 프로세스와의 실제 경합, 후보 writer·수동 소유·미완료 journal 검증은 유지한다. 같은 스레드의 중첩 Git scope와 detached 게시 worktree의 명령은 현재 등록 프로젝트의 순번을 재사용하며, 구체 자원 잠금의 소유자·lease는 각 기존 경계에서 확인한다. Git 순번을 모델 호출·충돌 해결·검증 전체의 실행 자리로 사용하지 않는다.
+
+대기 중에는 DB 요청을 유지하지 않고 기존 `_waiting` 구간으로 실행 시간에서 제외한다. planning·runtime 중단을 재확인하고 취소·예외·종료 때 FIFO 항목과 잠금을 반환해 뒤 요청을 깨운다. 프로젝트 준비용 base fetch의 planning 예외와 이미 확정한 runtime handoff는 유지한다. FIFO는 실행 중 메모리 순서이며 재시작 때 기존 checkpoint·journal·실제 자원에서 미완료 처리를 재구성한다. 새 영속 큐·설정·상주 스케줄러는 추가하지 않는다.
+
 ### 미확정 Git 작업의 단계별 자원 판단
 
 `manager_git_journal.has_conflicting_project_mutation()`은 planning 해제·Requirement 교정·archive 진입·수동 준비/slot/release가 사용하는 공통 관측 경계다. 프로젝트의 모든 pending intent를 읽으며 targets 밖이라는 이유로 공유 자원 안전을 추정하지 않는다. 원본 source fast-forward/rebase 기록은 기존 source 동기화가 진단하며 별도 관리 작업의 gate로 승격하지 않는다. 정확한 수동 own-operation 복구는 owner·kind뿐 아니라 생성 worktree 또는 push ref까지 일치해야 한다.

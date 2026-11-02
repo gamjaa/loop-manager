@@ -150,7 +150,7 @@ def _pending_category(reason: str) -> str:
 
 
 class ArchiveExecutionResources:
-    """Keep concrete archive leases through publication; never wait for another writer."""
+    """Keep archive leases through publication; queue Git turns, reject busy writers."""
 
     def __init__(self, connection, state_dir, repo_path, repo, base, git, leases: ExitStack, defer):
         self.connection, self.state_dir, self.repo_path = connection, state_dir, repo_path

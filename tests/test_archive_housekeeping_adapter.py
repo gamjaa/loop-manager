@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import threading
 import tempfile
 import subprocess
 import unittest
@@ -355,12 +356,14 @@ class ArchiveExecutionResourcesTest(unittest.TestCase):
         from loop_manager_internal.application.task_scheduling import current_scheduler
         scheduler = mock.Mock()
         scheduler.draining_projects = set()
+        scheduler.condition = threading.Condition()
+        scheduler.git_waiters = {}
         token = current_scheduler.set(scheduler)
         try:
             with resource_locks(self.root, self.repo, ["git:refs/heads/main"], owner="other-publication"):
                 with ExitStack() as leases:
                     self.assertFalse(self.guard(leases).safe())
-                scheduler.condition.wait.assert_not_called()
+                self.assertEqual(len(scheduler.git_waiters[self.repo]), 1)
             with ExitStack() as leases:
                 self.assertTrue(self.guard(leases).safe())
         finally:

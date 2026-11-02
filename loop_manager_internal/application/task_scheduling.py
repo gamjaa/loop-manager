@@ -100,6 +100,7 @@ class TaskScheduler:
         self.external_run_id = external_run_id
         self.priority_reader = priority_reader
         self.condition = threading.Condition()
+        self.git_waiters = {}
         self.waiters = {"agent": [], "verify": [], "management": []}
         self.running = {"agent": Counter(), "verify": Counter(), "management": Counter()}
         self.admitting = False
