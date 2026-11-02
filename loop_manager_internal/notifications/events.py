@@ -586,7 +586,7 @@ def enqueue_waiting_reason(
                    if key not in {"url", "pr_url", "path", "revision"}}
                   for plan in snapshot.plans],
         "requirements": [{key: value for key, value in requirement.items()
-                          if key != "path"} for requirement in snapshot.requirements],
+                          if key not in {"path", "url"}} for requirement in snapshot.requirements],
         "project_block": snapshot.project_block,
         "planning_error": snapshot.planning_error,
     }

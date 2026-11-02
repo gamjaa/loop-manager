@@ -49,6 +49,7 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         old_source = "docs/requirements/[R-031] Original.md"
         requirement_path = "docs/requirements/[R-031] Waiting.md"
         requirement = requirement_path.encode()
+        connection.execute("UPDATE projects SET origin='org/repo' WHERE repo=?", (repo,))
         connection.execute(
             "UPDATE exec_plans SET sources = ? WHERE repo = ?",
             (json.dumps([old_source]), repo),
@@ -77,6 +78,10 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             )
             self.assertIsNotNone(snapshot)
             self.assertIn("[R-031]", snapshot.describe())
+            self.assertEqual(snapshot.plans[0]["url"],
+                "https://github.com/org/repo/blob/base-sha/docs/plans/%5BG-018%5D%20Work.md")
+            self.assertEqual(snapshot.requirements[0]["url"],
+                "https://github.com/org/repo/blob/base-sha/docs/requirements/%5BR-031%5D%20Waiting.md")
             connection.execute(
                 "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,),
             )

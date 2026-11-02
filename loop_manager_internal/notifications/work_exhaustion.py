@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import json
 import re
 import sqlite3
+from urllib.parse import quote
+from .rendering import _checkpoint_link
 from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.storage import execplan_draft_state
 
@@ -91,6 +93,7 @@ def collect(
     cycle: str,
     active_requirements: tuple[str, ...],
     requirement_documents: dict[str, bytes] | None = None,
+    base_revision: str | None = None,
 ) -> WorkReasonSnapshot | None:
     """Read only confirmed SQLite causes; None means work may still be runnable."""
 
@@ -106,7 +109,7 @@ def collect(
         from loop_manager_internal.storage.execplan_catalog_state import verified_historical_merge_ids
         history.update({plan_id: True for plan_id in verified_historical_merge_ids(connection, repo)})
     rows = connection.execute(
-        "SELECT plan_id, title, status, depends_on, pr_url, sources "
+        "SELECT plan_id, title, status, depends_on, pr_url, sources, path "
         "FROM exec_plans WHERE repo = ? ORDER BY plan_id", (repo,),
     ).fetchall()
     holds = {}
@@ -136,6 +139,14 @@ def collect(
                 "WHERE repo = ?", (repo,),
             )
         }
+    project = connection.execute(
+        "SELECT planning_error, origin FROM projects WHERE repo = ?", (repo,),
+    ).fetchone()
+    tree = _checkpoint_link(project["origin"], base_revision) if project else None
+    origin = tree.split("/tree/", 1)[0] if tree else None
+    def document_url(path: str) -> str | None:
+        return f'{origin}/blob/{base_revision}/{quote(path, safe="/")}' if origin else None
+
     plans = []
     for row in rows:
         plan_id = str(row["plan_id"])
@@ -144,7 +155,10 @@ def collect(
         status = statuses[plan_id]
         item: dict[str, object] = {
             "id": plan_id, "title": str(row["title"]), "status": status,
+            "path": str(row["path"]),
         }
+        if document_url(str(row["path"])):
+            item["url"] = document_url(str(row["path"]))
         if status == "CATALOG_HELD":
             item.update(reason="ExecPlan catalog 오류의 교정 대기",
                         reason_code="execplan_catalog_invalid", evidence=holds[plan_id])
@@ -152,6 +166,7 @@ def collect(
             waiting = execplan_draft_state.evidence(connection, repo, plan_id)
             item.update(reason="ExecPlan 기존 결정 유효성 재검토" if waiting.get("reassessment") else "ExecPlan 사용자 판단 대기", question=waiting["question"],
                         path=waiting["path"], revision=waiting["revision"])
+            item.pop("url", None)
             if waiting.get("url"):
                 item["url"] = waiting["url"]
         elif status == "READY":
@@ -191,10 +206,7 @@ def collect(
                   "reason": "ExecPlan catalog 오류의 교정 대기",
                   "reason_code": "execplan_catalog_invalid", "evidence": holds[key]}
                  for key in sorted(holds.keys() - known_ids))
-    project = connection.execute(
-        "SELECT planning_error FROM projects WHERE repo = ?", (repo,),
-    ).fetchone()
-    planning_error = str(project[0]) if project and project[0] else None
+    planning_error = str(project["planning_error"]) if project and project["planning_error"] else None
     project_block = None
     if _table_exists(connection, "project_blocks"):
         block = connection.execute(
@@ -266,6 +278,7 @@ def collect(
         requirement_reasons.append({
             "id": identifier, "path": path, "reason": reason,
             "independent_wait": independent_wait,
+            **({"url": document_url(path)} if document_url(path) else {}),
         })
 
     return WorkReasonSnapshot(

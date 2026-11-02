@@ -226,14 +226,14 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
                 'path': 'docs/plans/old.md', 'url': 'https://example/old',
                 'revision': 'old'}
         requirement = {'id': '[R-031]', 'path': 'docs/requirements/old.md',
-                       'reason': 'Related plan pending'}
+                       'reason': 'Related plan pending', 'url': 'https://example/old-requirement'}
         def observe(cycle, plan, requirement):
             snapshot = work_exhaustion.WorkReasonSnapshot(cycle, (plan,), (requirement,), None, None)
             notifications.enqueue_waiting_reason(connection, repo, snapshot)
             return connection.execute('SELECT generation FROM work_reason_episodes').fetchone()[0]
         self.assertEqual(observe('old', plan, requirement), 1)
         moved = {**plan, 'path': 'docs/plans/new.md', 'url': 'https://example/new', 'revision': 'new'}
-        self.assertEqual(observe('new', moved, {**requirement, 'path': 'docs/requirements/archive/new.md'}), 1)
+        self.assertEqual(observe('new', moved, {**requirement, 'path': 'docs/requirements/archive/new.md', 'url': 'https://example/new-requirement'}), 1)
         self.assertEqual(observe('new', {**moved, 'question': 'Choose C'}, requirement), 2)
         self.assertEqual(observe('new', {**moved, 'reason': 'Different cause'}, requirement), 3)
 

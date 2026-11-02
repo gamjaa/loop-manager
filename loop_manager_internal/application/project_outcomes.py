@@ -248,7 +248,7 @@ def _stable_work_reason(
     snapshot = work_exhaustion.collect(
         connection, repo, cycle=str(row["planning_fingerprint"]),
         active_requirements=active_requirements,
-        requirement_documents=requirement_documents,
+        requirement_documents=requirement_documents, base_revision=base_sha,
     )
     if snapshot is not None and snapshot.completed:
         from loop_manager_internal.storage import planning_review_state
