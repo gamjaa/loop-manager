@@ -143,8 +143,8 @@ class NotificationRenderingTest(unittest.TestCase):
         original = json.dumps(payload, sort_keys=True)
         message = rendering._message("work_waiting", payload)
         positions = [message.index(value) for value in (
-            "사용자 확인 대기:", "- G-002", "- G-003", "- G-004", "- G-005", "- R-002",
-            "기타 대기:", "- G-001", "- R-001",
+            "- G-003", "- G-004", "- G-005", "- PROJECT_BLOCKED",
+            "- G-001", "- G-002", "- R-001", "- R-002", "- planning_error",
         )]
         self.assertEqual(positions, sorted(positions))
         for value in (
@@ -163,10 +163,12 @@ class NotificationRenderingTest(unittest.TestCase):
             "planning_error": "git lock busy; automatic retry pending",
         }
         message = rendering._message("work_waiting", payload)
-        self.assertLess(message.index("PROJECT_BLOCKED"), message.index("기타 대기:"))
-        self.assertLess(message.index("기타 대기:"), message.index("planning_error"))
+        self.assertLess(message.index("PROJECT_BLOCKED"), message.index("R-001"))
+        self.assertLess(message.index("R-001"), message.index("planning_error"))
         self.assertIn("automatic retry pending", message)
         self.assertNotIn("사용자 조치:", message)
+        self.assertNotIn("사용자 확인 대기:", message)
+        self.assertIn("user_decision_required", message)
 
     def test_long_block_keeps_diagnostics_and_local_checkpoint_across_pieces(self):
         payload = {
