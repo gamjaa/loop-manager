@@ -1105,6 +1105,32 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
             transport.send_telegram('token', 'chat', 'notice', disable_notification=True)
         self.assertTrue(json.loads(open_url.call_args.args[0].data)['disable_notification'])
 
+    def test_silent_pieces_and_retry_reach_http_with_notification_disabled(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            candidate = self.prepare_pr_candidate(connection)
+            notifications._insert(connection, 'silent-http', repo, 'pr_created',
+                {'project': 'alpha', 'execplan_id': 'G-018', 'execplan_title': 'x' * 6000,
+                 **candidate, 'silent': True})
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        requests = []
+
+        def open_url(request, timeout):
+            requests.append(json.loads(request.data))
+            if len(requests) == 2:
+                raise OSError('offline')
+            return response
+
+        with mock.patch.object(transport, 'urlopen', side_effect=open_url):
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 0)
+            self.assertEqual(self.events(connection)[0]['confirmed_pieces'], 1)
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 1)
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(request['disable_notification'] is True for request in requests))
+        self.assertEqual(requests[1], requests[2])
+
 
 class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
     def test_restart_recovers_canceled_inflight_start_before_worker_and_deduplicates(self):
