@@ -274,7 +274,8 @@ def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
             raise VerifyTerminationUncertain('WSL 자식 종료·전용 /tmp 정리 근거가 없습니다.') from primary
         try:
             cleanup = json.loads(receipt.read_text(encoding='utf-8'))
-            if not isinstance(cleanup, dict) or not cleanup.get('stopped') or not cleanup.get('removed'):
+            if (not isinstance(cleanup, dict) or cleanup.get('stopped') is not True
+                    or cleanup.get('removed') is not True):
                 raise ValueError('incomplete cleanup receipt')
         except (OSError, ValueError, TypeError) as error:
             raise VerifyTerminationUncertain('WSL 자식 또는 전용 /tmp 정리를 확인하지 못했습니다.') from error

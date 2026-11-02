@@ -589,6 +589,44 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
              self.assertRaises(verify_process.VerifyTerminationUncertain):
             self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
 
+    def test_malformed_cleanup_receipt_cannot_prove_termination(self):
+        bundle = self.root / 'bundle'
+        bundle.mkdir()
+        for content in ('invalid', json.dumps({'stopped': 'yes', 'removed': True})):
+            with self.subTest(content=content):
+                (bundle / 'cleanup.json').write_text(content)
+                with mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/bundle')), \
+                     mock.patch.object(verify_process, 'run_verify_process', return_value=(True, False, 'exit 0')), \
+                     self.assertRaises(verify_process.VerifyTerminationUncertain):
+                    self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+
+    def test_log_copy_deadline_fails_after_confirmed_cleanup(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        bundle, logs = self.root / 'bundle', self.root / 'wsl-logs'
+        bundle.mkdir()
+        logs.mkdir()
+        (bundle / 'logs').mkdir()
+        (bundle / 'logs' / 'runner.log').write_text('output')
+        (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+        original_copy = launcher.shutil.copy2
+        def copy(source, destination, **kwargs):
+            result = original_copy(source, destination, **kwargs)
+            if Path(source).name == 'runner.log':
+                now[0] = 30.0
+            return result
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])), \
+             mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/bundle')), \
+             mock.patch.object(verify_process, 'run_verify_process', return_value=(True, False, 'PASS')) as process, \
+             mock.patch.object(launcher.shutil, 'copy2', side_effect=copy):
+            with self.assertRaises(TimeoutError):
+                self.real_wsl(self.root, bundle, logs, 30, 'auto')
+        self.assertEqual(process.call_count, 1)
+        self.assertEqual((logs / 'runner.log').read_text(), 'output')
+        self.assertTrue((logs / 'cleanup.json').exists())
+
     def test_path_conversion_exhausts_budget_before_wsl_launch(self):
         from loop_manager_internal.verification import execution_clock
         clock_type = execution_clock.ExecutionClock
