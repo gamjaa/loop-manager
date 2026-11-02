@@ -471,6 +471,29 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
                 clock_type(*args, **kwargs, clock=lambda: now[0])):
             self.assertEqual(launcher.windows_main(self.root), 0)
 
+    def test_wsl_wait_and_processing_carry_over_to_native(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        def wsl(*args):
+            budget = execution_clock.current_execution_clock.get()
+            (budget.directory / 'wait.json').write_text(json.dumps({'waiting_seconds': 30.0}))
+            self.write_wsl_summary(args[2])
+            now[0] = 32.0
+            return True
+        def native(*args, **kwargs):
+            self.write_native_summary(args[0])
+            budget = kwargs['execution_clock']
+            self.assertEqual(budget.remaining(args[2]), 58.0)
+            now[0] = 33.0
+            return self.native_result
+        self.wsl.side_effect = wsl
+        self.native.side_effect = native
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])):
+            self.assertEqual(launcher.windows_main(self.root), 0)
+        self.assertTrue(self.report()['passed'])
+
     def test_wsl_deadline_blocks_native(self):
         from loop_manager_internal.verification import execution_clock
         clock_type = execution_clock.ExecutionClock
