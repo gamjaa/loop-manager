@@ -220,7 +220,7 @@ def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
             check_budget(budget, timeout - CLEANUP_SECONDS)
             result = subprocess.run(['wsl.exe', '--exec', 'wslpath', '-a', '-u', str(path)],
                 capture_output=True, text=True, encoding='utf-8',
-                timeout=min(10, budget.remaining(timeout - CLEANUP_SECONDS)), env=environment, check=True)
+                timeout=budget.remaining(timeout - CLEANUP_SECONDS), env=environment, check=True)
             check_budget(budget, timeout - CLEANUP_SECONDS)
             value = result.stdout.strip()
             if not value.startswith('/') or '\n' in value:

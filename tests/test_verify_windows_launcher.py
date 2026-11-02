@@ -607,6 +607,29 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.native.assert_not_called()
         self.assertFalse((bundle / 'heartbeat').exists())
 
+    def test_path_conversions_use_remaining_budget(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        bundle, logs, budget_dir = (self.root / name for name in ('bundle', 'logs', 'budget'))
+        for path in (bundle, logs, budget_dir):
+            path.mkdir()
+        limits = []
+        def convert(*_args, timeout, **_kwargs):
+            limits.append(timeout)
+            now[0] += 5.0
+            return SimpleNamespace(stdout='/tmp/path')
+        def run(*_args, **_kwargs):
+            (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+            return True, False, 'PASS'
+        with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_BUDGET_DIR': str(budget_dir)}), \
+             mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                 clock_type(*args, **kwargs, clock=lambda: now[0])), \
+             mock.patch.object(launcher.subprocess, 'run', side_effect=convert), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=run):
+            self.assertTrue(self.real_wsl(self.root, bundle, logs, 40, 'auto'))
+        self.assertEqual(limits, [30.0, 25.0])
+
     def test_wsl_excludes_confirmed_wait_but_counts_processing(self):
         from loop_manager_internal.verification import execution_clock
         clock_type = execution_clock.ExecutionClock
