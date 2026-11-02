@@ -36,6 +36,33 @@ class WindowsVerifyRuntimeTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux supervisor 정리 경계')
 class WslCleanupTests(unittest.TestCase):
+    def test_git_preparation_uses_one_budget_and_stops_before_next_command(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            for name in ('project', 'runtime'):
+                with tarfile.open(bundle / (name + '.tar'), 'w'):
+                    pass
+            original_mkdtemp = tempfile.mkdtemp
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                if dir == '/tmp':
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
+            calls = []
+            def run_verify(arguments, _project, timeout, *, execution_clock, **_options):
+                calls.append(arguments)
+                execution_clock.started -= 11
+                return True, False, 'PASS'
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
+                 mock.patch.object(verify_process, 'run_verify_process', side_effect=run_verify), \
+                 self.assertRaises(TimeoutError):
+                launcher.wsl_main(bundle, 30, 'auto')
+            self.assertEqual([command[:2] for command in calls], [['git', 'init'], ['git', 'add']])
+            receipt = json.loads((bundle / 'cleanup.json').read_text())
+            self.assertTrue(receipt['stopped'])
+            self.assertTrue(receipt['removed'])
+
     def test_output_disconnect_after_child_exit_still_removes_the_copy(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
              mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \

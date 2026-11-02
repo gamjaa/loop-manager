@@ -273,8 +273,24 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
         for arguments in (['git', 'init', '-q', '--initial-branch=main'], ['git', 'add', '-A'],
                           ['git', '-c', 'user.name=Verify', '-c', 'user.email=verify@example.invalid',
                            '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Windows verify snapshot']):
-            subprocess.run(arguments, cwd=project, env=environment, check=True, timeout=10)
-        remaining = budget.remaining(timeout)
+            if budget.remaining(timeout - CLEANUP_SECONDS) <= 0:
+                raise TimeoutError('WSL Git 준비 중 전체 verify 시간이 만료됐습니다.')
+            receipt['stopped'] = False
+            try:
+                success, timed_out, output = run_verify_process(
+                    arguments, project, timeout - CLEANUP_SECONDS,
+                    environment=environment, execution_clock=budget)
+            except VerifyTerminationUncertain:
+                raise
+            except BaseException:
+                receipt['stopped'] = True
+                raise
+            receipt['stopped'] = True
+            if timed_out:
+                raise TimeoutError('WSL Git 준비 중 전체 verify 시간이 만료됐습니다.')
+            if not success:
+                raise RuntimeError(f'WSL Git 준비에 실패했습니다: {output}')
+        remaining = budget.remaining(timeout - CLEANUP_SECONDS)
         if remaining <= 0:
             raise TimeoutError('WSL 복사 준비 중 전체 verify 시간이 만료됐습니다.')
         receipt['stopped'] = False
@@ -282,7 +298,7 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
             passed, timed_out, output = run_verify_process(
                 [sys.executable, '-u', str(runtime_root / 'loop_manager_internal/verification/entrypoint.py'),
                  '--project-python', sys.executable, '--timeout', str(remaining), '--parallelism', str(cap)],
-                project, remaining, environment=environment)
+                project, timeout - CLEANUP_SECONDS, environment=environment, execution_clock=budget)
         except VerifyTerminationUncertain:
             raise
         except BaseException:
