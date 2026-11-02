@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import hashlib
 import re
 import sqlite3
 from urllib.parse import quote
@@ -61,6 +62,20 @@ class WorkReasonSnapshot:
         if self.planning_error:
             parts.append("planning_error: " + self.planning_error)
         return "; ".join(parts)
+
+
+def episode_signature(snapshot: WorkReasonSnapshot) -> str:
+    identity = {
+        "plans": [{key: value for key, value in plan.items()
+                   if key not in {"url", "pr_url", "path", "revision"}}
+                  for plan in snapshot.plans],
+        "requirements": [{key: value for key, value in requirement.items()
+                          if key not in {"path", "url"}} for requirement in snapshot.requirements],
+        "project_block": snapshot.project_block,
+        "planning_error": snapshot.planning_error,
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":")).encode()).hexdigest()
 
 
 def _table_exists(connection: sqlite3.Connection, table: str) -> bool:

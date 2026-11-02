@@ -281,6 +281,47 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(observe('new', {**moved, 'question': 'Choose C'}, requirement), 2)
         self.assertEqual(observe('new', {**moved, 'reason': 'Different cause'}, requirement), 3)
 
+    def test_wait_episode_reobservation_and_new_progress_preserve_audit(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        connection.execute("UPDATE projects SET planning_fingerprint='cycle-one' WHERE repo=?", (repo,))
+        connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE repo=?", (repo,))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        self.assertEqual(len(self.events(connection)), 1)
+        notifications.mark_work_available(connection, repo)
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        self.assertEqual(len(self.events(connection)), 2)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 1)
+        self.assertIsNotNone(self.events(connection)[1]['sent_at'])
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        self.assertEqual(len(self.events(connection)), 2)
+
+    def test_wait_notice_is_independent_and_cancels_stale_remaining_pieces(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        connection.execute("UPDATE projects SET planning_fingerprint='cycle-one' WHERE repo=?", (repo,))
+        connection.execute("UPDATE exec_plans SET status='PR_OPEN', title=? WHERE repo=?", ('x' * 5000, repo))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        event = self.events(connection)[0]
+        self.assertFalse(json.loads(event['payload'])['silent'])
+        pieces = []
+        def send(_token, _chat, piece):
+            pieces.append(piece)
+            connection.execute("UPDATE exec_plans SET status='READY' WHERE repo=?", (repo,))
+            connection.commit()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        self.assertEqual(len(pieces), 1)
+        saved = self.events(connection)[0]
+        self.assertEqual(saved['confirmed_pieces'], 1)
+        self.assertIsNotNone(saved['canceled_at'])
+        self.assertIsNotNone(saved['rendered_text'])
+        self.assertIsNone(saved['sent_at'])
+
     def test_blocked_requirement_does_not_infer_user_action(self):
         connection = self.connection()
         repo = '/projects/alpha'

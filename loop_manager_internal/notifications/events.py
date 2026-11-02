@@ -556,34 +556,29 @@ def mark_work_available(connection: sqlite3.Connection, repo: str) -> None:
             "WHERE repo = ? AND signature != '__work_available__'", (repo,),
         )
         _cancel_pending_waiting(connection, repo)
+        connection.execute("UPDATE project_completion_cycles SET completed_at=NULL WHERE repo=?", (repo,))
+        connection.execute(
+            "UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP "
+            "WHERE repo=? AND event_type='project_completed' AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+        )
 
 
 def enqueue_waiting_reason(
     connection: sqlite3.Connection, repo: str, snapshot: WorkReasonSnapshot,
 ) -> bool:
-    """Record stable waiting episodes without creating a Telegram notice."""
+    """Record the stable episode and queue its independently validated notice."""
 
     if snapshot.completed:
         return False
     ensure_schema(connection)
     payload = snapshot.payload(Path(repo).name or repo)
     enqueue_draft_decisions(connection, repo)
-    # Links, paths and revision identifiers are presentation details, not a
-    # change to the observed waiting causes or membership of the episode.
-    identity = {
-        "plans": [{key: value for key, value in plan.items()
-                   if key not in {"url", "pr_url", "path", "revision"}}
-                  for plan in snapshot.plans],
-        "requirements": [{key: value for key, value in requirement.items()
-                          if key not in {"path", "url"}} for requirement in snapshot.requirements],
-        "project_block": snapshot.project_block,
-        "planning_error": snapshot.planning_error,
-    }
-    signature = hashlib.sha256(
-        json.dumps(identity, sort_keys=True, ensure_ascii=False,
-                   separators=(",", ":")).encode()
-    ).hexdigest()
+    from .work_exhaustion import episode_signature
+    signature = episode_signature(snapshot)
+    queued = False
     with connection:
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
         previous = connection.execute(
             "SELECT signature, generation FROM work_reason_episodes WHERE repo = ?",
             (repo,),
@@ -598,8 +593,24 @@ def enqueue_waiting_reason(
             "signature = excluded.signature, generation = excluded.generation",
             (repo, signature, generation),
         )
-        _cancel_pending_waiting(connection, repo)
-    return False
+        if previous is None or previous[0] != signature:
+            _cancel_pending_waiting(connection, repo)
+        payload.update(signature=signature, generation=generation)
+        current = is_current(connection, repo, 'work_waiting', payload)
+        if current:
+            connection.execute("UPDATE project_completion_cycles SET completed_at=NULL WHERE repo=?", (repo,))
+            connection.execute(
+                "UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP "
+                "WHERE repo=? AND event_type='project_completed' AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+            )
+        if _enabled(connection) and current:
+            key = _key('work_waiting', repo, str(generation))
+            existing = connection.execute("SELECT 1 FROM notification_outbox WHERE event_key=?", (key,)).fetchone()
+            _insert(connection, key, repo, 'work_waiting', payload)
+            queued = existing is None
+    from .delivery import flush_project_events
+    flush_project_events(connection, repo)
+    return queued
 
 
 def enqueue_progress(connection, repo, kind, identity, **payload):

@@ -457,9 +457,40 @@ def completion_current(connection, repo, cycle, work_cycle):
         and not planning_review_state.general_pending(connection, repo))
 
 
+def waiting_current(connection, repo, payload):
+    from . import work_exhaustion
+    from loop_manager_internal.storage import maintenance_state, planning_review_state
+    project = connection.execute(
+        "SELECT phase, planning_fingerprint, pr_conflict_recovery FROM projects WHERE repo=?", (repo,),
+    ).fetchone()
+    if (project is None or project[0] not in (None, 'PR_OPEN', 'PLAN_BLOCKED', 'PROJECT_BLOCKED')
+            or project[1] != payload['cycle'] or project[2]
+            or planning_review_state.general_pending(connection, repo)):
+        return False
+    maintenance = maintenance_state.MaintenanceRepository(connection).get(repo)
+    if maintenance.phase is not maintenance_state.MaintenancePhase.IDLE or maintenance.publication_stage is not None:
+        return False
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone():
+        if connection.execute("SELECT 1 FROM recovery_records WHERE repo=? AND pending_action!='final_block' LIMIT 1", (repo,)).fetchone():
+            return False
+    requirements = payload['requirements']
+    if not isinstance(requirements, list) or not all(isinstance(item, dict) and isinstance(item.get('path'), str) for item in requirements):
+        return False
+    observed = work_exhaustion.collect(connection, repo, cycle=payload['cycle'],
+        active_requirements=tuple(item['path'] for item in requirements))
+    return bool(observed and not observed.completed
+                and work_exhaustion.episode_signature(observed) == payload['signature'])
+
+
 def is_current(connection, repo, kind, payload, *, event_key=None):
     """Shared creation/claim boundary; callers provide already recorded facts."""
     try:
+        if kind == 'work_waiting':
+            episode = connection.execute(
+                'SELECT signature, generation FROM work_reason_episodes WHERE repo=?', (repo,),
+            ).fetchone()
+            return bool(episode and episode[0] == payload['signature'] and episode[1] == payload['generation']
+                        and waiting_current(connection, repo, payload))
         if kind == 'project_completed':
             saved = connection.execute(
                 'SELECT cycle_key, completed_at FROM project_completion_cycles WHERE repo=?', (repo,),
