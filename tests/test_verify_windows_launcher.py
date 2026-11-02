@@ -1,6 +1,7 @@
 """자체 Windows launcher의 복사·실패·부분 검증·정리 경계."""
 from contextlib import ExitStack
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -37,6 +38,38 @@ class WindowsVerifyRuntimeTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux supervisor 정리 경계')
 class WslCleanupTests(unittest.TestCase):
+    def test_extract_interruption_removes_unstarted_copy(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            source = bundle / 'large'
+            source.write_bytes(b'x' * (256 * 1024))
+            with tarfile.open(bundle / 'project.tar', 'w') as archive:
+                archive.add(source, arcname='large')
+            with tarfile.open(bundle / 'runtime.tar', 'w'):
+                pass
+            original_mkdtemp = tempfile.mkdtemp
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                if dir == '/tmp':
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
+            read = launcher.CheckedIO.read
+            def interrupted_read(stream, size=-1):
+                if size >= 8192:
+                    raise TimeoutError('extract deadline')
+                return read(stream, size)
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
+                 mock.patch.object(launcher.CheckedIO, 'read', new=interrupted_read), \
+                 mock.patch.object(verify_process, 'run_verify_process') as process:
+                with self.assertRaisesRegex(TimeoutError, 'extract deadline'):
+                    launcher.wsl_main(bundle, 30, 'auto')
+            process.assert_not_called()
+            receipt = json.loads((bundle / 'cleanup.json').read_text())
+            self.assertTrue(receipt['stopped'])
+            self.assertTrue(receipt['removed'])
+            self.assertFalse(Path(receipt['root']).exists())
+
     def test_final_cleanup_budget_error_preserves_snapshot(self):
         from loop_manager_internal.verification.execution_clock import VerifyBudgetError
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
@@ -263,6 +296,26 @@ class WindowsVerifySnapshotTests(unittest.TestCase):
 
 
 class WindowsVerifySnapshotBudgetTests(unittest.TestCase):
+    def test_snapshot_preserves_contents_and_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'file').write_bytes(b'content\r\n')
+            bundle = root / 'bundle'
+            bundle.mkdir()
+            runtime = root / 'runtime'
+            (runtime / 'loop_manager_internal/verification').mkdir(parents=True)
+            entrypoint = runtime / 'loop_manager_internal/verification/entrypoint.py'
+            entrypoint.write_text('pass\n')
+            def git(*args):
+                return b'revision\n' if args[4] == 'rev-parse' else b'file\0'
+            with ExecutionClock() as budget, mock.patch.object(launcher, 'git', side_effect=git):
+                evidence = launcher.snapshot(root, bundle, entrypoint, budget, 30)
+            with tarfile.open(bundle / 'project.tar') as archive:
+                self.assertEqual(archive.extractfile('file').read(), b'content\r\n')
+            with tarfile.open(bundle / 'runtime.tar') as archive:
+                self.assertEqual(archive.extractfile('loop_manager_internal/verification/entrypoint.py').read(), b'pass\n')
+            self.assertEqual(evidence['snapshot_sha256'], hashlib.sha256((bundle / 'project.tar').read_bytes()).hexdigest())
+
     def test_large_file_archive_checks_budget_between_chunks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
