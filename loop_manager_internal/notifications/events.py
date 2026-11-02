@@ -776,7 +776,7 @@ def enqueue_draft_decisions(connection, repo, *, publications=None):
                 if is_current(connection, repo, 'plans_published', {
                         'plans': [item], 'publication_revision': item['publication_revision']}):
                     created.append({key: item[key] for key in (
-                        'id', 'title', 'source_path', 'url', 'publication_revision') if key in item})
+                        'id', 'title', 'source_path', 'url', 'publication_revision', 'publication_path') if key in item})
 
     connection.execute(
         "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, delivery_started_at = NULL "
@@ -788,6 +788,7 @@ def enqueue_draft_decisions(connection, repo, *, publications=None):
     for item in created:
         if item['id'] in by_id:
             by_id[item['id']]['publication_revision'] = item['publication_revision']
+            by_id[item['id']]['publication_path'] = item.get('publication_path', item['source_path'])
         else:
             by_id[item['id']] = item
     plans = [by_id[plan_id] for plan_id in sorted(by_id)]

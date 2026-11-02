@@ -411,14 +411,15 @@ def is_current(connection, repo, kind, payload, *, event_key=None):
             if not isinstance(plans, list) or not plans or not isinstance(revision, str) or not revision:
                 return False
             for item in plans:
-                if not isinstance(item, dict) or not _valid_draft_source_path(item.get('source_path'), item.get('id', '')):
+                if not isinstance(item, dict) or not _valid_draft_source_path(
+                        item.get('publication_path', item.get('source_path')), item.get('id', '')):
                     return False
                 row = connection.execute(
                     'SELECT path, publication_path, publication_sha, status FROM exec_plans '
                     'WHERE repo=? AND plan_id=?', (repo, item['id']),
                 ).fetchone()
-                if (row is None or row['path'] != item['source_path']
-                        or row['publication_path'] != item['source_path']
+                if (row is None or not _valid_draft_source_path(row['path'], item['id'])
+                        or row['publication_path'] != item.get('publication_path', item.get('source_path'))
                         or row['publication_sha'] != revision or row['status'] == 'CANCELED'):
                     return False
             return True

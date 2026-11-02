@@ -1080,6 +1080,20 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_publication_remains_current_after_catalog_rename(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        with connection:
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='abc' WHERE repo=?", (repo,))
+            notifications.record_planning_publication(connection, repo,
+                [(path, {'id': 'G-018'})], 'abc')
+            connection.execute("UPDATE exec_plans SET path='docs/plans/[G-018] Renamed.md', title='Renamed' WHERE repo=?", (repo,))
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-018 · Reliable notices', sender.call_args.args[2])
+        self.assertEqual(len(self.events(connection)), 1)
+
     def test_partial_publication_withdrawal_retains_only_unconfirmed_valid_items(self):
         connection = self.connection()
         repo = '/projects/alpha'
@@ -1371,6 +1385,27 @@ class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
         self.assertNotIn('decision_identity', item)
         self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
         self.assertIn('G-018 · Draft · 신규 게시', sender.call_args.args[2])
+
+    def test_draft_question_rename_keeps_original_publication_identity(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, 'G-018', 'Original', remote_revision='remote-sha')
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='remote-sha'")
+            notifications.record_planning_publication(connection, self.repo,
+                [('docs/plans/[G-018] Original.md', {'id': 'G-018', 'draft': True})], 'remote-sha')
+            new_path = 'docs/plans/[G-018] Renamed.md'
+            connection.execute("UPDATE exec_plans SET path=?, title='Renamed', current_revision_sha='new-sha'", (new_path,))
+            connection.execute("UPDATE execplan_drafts SET evidence=json_set(evidence, '$.path', ?)", (new_path,))
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 0)
+        old, continuation = self.events(connection)
+        self.assertIsNotNone(old['canceled_at'])
+        item = json.loads(continuation['payload'])['plans'][0]
+        self.assertEqual(item['source_path'], new_path)
+        self.assertEqual(item['publication_path'], 'docs/plans/[G-018] Original.md')
+        self.assertIn('/blob/new-sha/', item['url'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-018 · Renamed · 신규 게시', sender.call_args.args[2])
 
     def test_partial_draft_notice_keeps_only_unconfirmed_creation(self):
         connection = self.connection()
