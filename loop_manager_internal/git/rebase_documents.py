@@ -147,14 +147,9 @@ def _split_frontmatter(raw):
 
 def restore_rebase_frontmatter(connection, repo, plan_id, worktree, branch, *,
                                git, capture_snapshot, metadata, service):
-    """Restore the pinned base declaration after Git, preserving the Worker body.
-
-    The saved byte/tree intent also resumes a crash during write, stage or commit.
-    It remains part of the same owned rebase; no new Agent result is synthesized.
-    """
+    """Resume only persisted legacy declaration writes, preserving the Worker body."""
     from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
     from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
-    from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
     checkpoints = ExecutionCheckpointRepository(connection)
     current = checkpoints.get(repo, plan_id)
     if current.operation != 'rebase' or metadata(worktree) is not None:
@@ -173,25 +168,15 @@ def restore_rebase_frontmatter(connection, repo, plan_id, worktree, branch, *,
         raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, 'rebase base declaration identity differs')
     header, _ = _split_frontmatter(original)
     raw = target.read_bytes()
-    candidate, body = _split_frontmatter(raw)
+    _split_frontmatter(raw)
     saved = current.snapshot or {}
     record = saved.get('rebase_frontmatter') or {}
     if record and (record.get('target'), record.get('before_head')) != (current.target_base_oid, current.expected_head):
         record = {}
     if not record:
-        if execplan_catalog.parse_frontmatter(candidate.decode()) == execplan_catalog.parse_frontmatter(header.decode()):
-            return False
-        _, decision = service().require_owned(checkpoint=current)
-        if decision.status is not RebaseStatus.COMPLETE:
-            return False
-        snapshot = capture_snapshot(worktree)
-        if any(set(kinds) - {'ignored'} for kinds, _signature in snapshot.dirty.values()):
-            raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, 'uncommitted Worker files precede declaration restore')
-        record = {'path': path, 'target': current.target_base_oid, 'before_head': current.expected_head,
-                  'start': snapshot.head, 'mode': target.lstat().st_mode,
-                  'index': list(snapshot.index.get(path, ())),
-                  'before': base64.b64encode(raw).decode(), 'after': base64.b64encode(header + body).decode(),
-                  'workspace': workspace_evidence(snapshot, (path,))}
+        # Official declarations arrive from base through rebase. Resume only
+        # an already persisted legacy write, never create a new repair commit.
+        return False
     before = base64.b64decode(record['before'], validate=True)
     after = base64.b64decode(record['after'], validate=True)
     if (record['path'] != path or _split_frontmatter(after)[0] != header

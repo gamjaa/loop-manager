@@ -105,15 +105,13 @@ class ImmediateRebasePublicationTests(TestCase):
         self.assertEqual(self.remote, 'owned-head')
         self.assertEqual(self.pushes[0][1], '--force-with-lease=refs/heads/loop-manager/G-047:remote')
 
-    def test_current_remote_without_durable_owner_is_never_used_as_a_lease(self):
-        from loop_manager_internal.git.managed_rebase_publication import RebasePublicationRejected
+    def test_current_remote_without_durable_owner_defers_without_push_or_project_block(self):
         with mock.patch.object(self.handler, '_publish_rebased_checkpoint'):
             self.complete()
         self.state.update_project('repo', publication_remote_oid='unrelated-published-head')
         self.fixture.connection.execute('DELETE FROM blocked_checkpoints')
         self.fixture.connection.commit()
-        with self.assertRaises(RebasePublicationRejected):
-            self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.handler._publish_rebased_checkpoint(self.handler._context())
         self.assertEqual(self.pushes, [])
         self.assertEqual(self.remote, 'remote')
 
@@ -1171,8 +1169,7 @@ class ImmediateRebasePublicationTests(TestCase):
         with self.fixture.connection:
             self.fixture.connection.execute("DELETE FROM blocked_checkpoints WHERE repo = 'repo'")
         self.assertFalse(self.fixture.connection.in_transaction)
-        with self.assertRaises(handlers.RecoveryFailure):
-            self.complete()
+        self.complete()
         saved = self.checkpoints.get('repo', 'G-047')
         self.assertEqual(saved.expected_head, 'owned-head')
         self.assertNotIn('rebase_publication_intent', saved.snapshot)

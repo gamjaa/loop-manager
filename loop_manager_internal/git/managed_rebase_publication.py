@@ -83,7 +83,9 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
             row['pr_head_oid'] if row['pr_url'] else None, owner[0] if owner else None,
         ) if value}
         if expected_oid not in known_remote_oids:
-            raise RebasePublicationRejected('current rebase remote has no durable publication identity')
+            # Observation alone cannot authorize a force push; normal branch
+            # integration must preserve the remote before the next publication.
+            return
     if not expected_oid:
         raise RebasePublicationRejected('intermediate checkpoint has no adopted remote OID')
     try:

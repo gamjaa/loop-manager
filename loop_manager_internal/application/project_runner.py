@@ -343,20 +343,20 @@ def _run_project_result(
         (repo,),
     ).fetchone()
     detail = str(row["last_error"] or "") if row else None
-    if step_result == PROJECT_STEP_TRANSIENT_PAUSE:
-        return ProjectRunResult(ProjectRunKind.TRANSIENT_PAUSE, 0, pause_detail or detail)
-    if step_result == PROJECT_STEP_USAGE_PAUSE:
-        return ProjectRunResult(ProjectRunKind.USAGE_LIMIT_PAUSE, 0, detail)
-    if step_result == PROJECT_STEP_PLANNING_PENDING:
-        return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
-    if row is not None and row["phase"] == "PROJECT_BLOCKED":
-        project_block = scoped_blocking.project_block(connection, repo)
+    project_block = scoped_blocking.project_block(connection, repo)
+    if project_block is not None or row is not None and row["phase"] == "PROJECT_BLOCKED":
         reason = (
             f"PROJECT_BLOCKED {project_block['reason_code']}: {project_block['evidence']}"
             if project_block is not None else detail
         )
         effects.operation_log(str(reason), error=True)
         return ProjectRunResult(ProjectRunKind.BLOCKED, 1, reason)
+    if step_result == PROJECT_STEP_TRANSIENT_PAUSE:
+        return ProjectRunResult(ProjectRunKind.TRANSIENT_PAUSE, 0, pause_detail or detail)
+    if step_result == PROJECT_STEP_USAGE_PAUSE:
+        return ProjectRunResult(ProjectRunKind.USAGE_LIMIT_PAUSE, 0, detail)
+    if step_result == PROJECT_STEP_PLANNING_PENDING:
+        return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
     if row is not None and row["planning_error"]:
         reason = f"planning_error: {row['planning_error']}"
         if runtime_state.planning_owns_execution_slot(row):

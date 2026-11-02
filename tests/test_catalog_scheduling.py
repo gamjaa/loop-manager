@@ -930,6 +930,27 @@ class PreservedPlanningSchedulingTest(AutomationCatalogFixture, unittest.TestCas
 
 
 class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.TestCase):
+    def test_actual_project_block_overrides_working_projection_and_waiting_reason(self):
+        from loop_manager_internal.application import project_runner
+        repo = str(Path('/registered-project').resolve())
+        connection = self._connection(repo=repo)
+        connection.execute("UPDATE projects SET phase='WORKING', last_error='stale waiting reason'")
+        connection.execute("INSERT INTO project_blocks (repo,scope,reason_code,plan_id,evidence) "
+                           "VALUES (?,'project','publication_ownership_uncertain','G-295','publication evidence missing')", (repo,))
+        connection.commit()
+        effects = project_runner.InternalRunProjectResultEffects(
+            _checkpoint_dispatch_ready=lambda *_: False,
+            _record_project_recovery=mock.Mock(), _run_project_step=mock.Mock(return_value=1),
+            _stable_work_reason=mock.Mock(), catalog_schedule_decision=mock.Mock(),
+            dispatch_blocked_checkpoints=mock.Mock(), is_loop_manager_repository=lambda _: False,
+            operation_log=mock.Mock())
+        result = project_runner._run_project_result(
+            effects, connection, Path('/state'), repo, Path('/config'), 'main', False)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn('publication evidence missing', result.detail)
+        effects._stable_work_reason.assert_not_called()
+
     def test_stable_work_reports_preserved_planning_waiting_and_actual_worker_error(self):
         from loop_manager_internal.application import project_runner
         from loop_manager_internal.storage import runtime_state

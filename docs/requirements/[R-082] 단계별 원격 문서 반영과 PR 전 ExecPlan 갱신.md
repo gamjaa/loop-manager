@@ -2,7 +2,7 @@
 
 ## Summary
 
-명세 변경의 작업 구성·개정은 프로젝트 일반 Planner에 모으고 원격 게시·catalog·DB 반영을 현재 작업 재개보다 먼저 확정한다. ExecPlan·코드 변경만으로 Planner를 호출하지 않으며 `PLAN_BLOCKED`를 포함한 관련 작업은 PR 등록 전까지 같은 ID·작업물·기록을 보존해 갱신한다. 개정 후에도 차단은 원인별 근거로 재평가하며 문서 변경 자체를 해제로 간주하지 않는다. 일반·유지보수 검토 범위에서는 session·이전 error를 제외하되 실제 입력 변경의 감지와 검증·게시 보호 조건을 유지한다. Worker는 선택 작업 본문과 허용 설계 문서만 수정하고, 최신 조건·진행 기록·문서 충돌을 구분해 필요한 구현·검증·Review를 이어간다. 최신 base의 무관한 Requirement·ExecPlan 채택만으로 Worker·verify·Reviewer를 재호출하지 않고 R-072의 단계별 성공 재사용을 적용한다. rebase 시작에는 소유 자원·보존 조건을 확인하고 Worker 종료와 Git 완료 후 각각 실제 변경·최종 선언을 검증한다. 오래된 시작 HEAD나 base에만 유입된 문서를 Worker 수정으로 판정하지 않는 비교·복구 기준은 R-055를 따른다. 마지막 연결 작업 Merge 뒤에는 해당 Requirement를 바로 재확인한다. 보류 중인 선행 ExecPlan에 의존하는 신규·허용 개정도 유효한 관계이면 등록하되, 선행의 실제 Merge 전에는 실행하지 않고 기존 보류를 보존한다. 병렬 작업의 신규·후속 배정을 중단하고 실행 중 호출이 반환한 뒤 planning을 반영한다. 게시 완료·자리 해제는 실제 충돌 자원에 한정해 확인하고, 안전하게 분리 보존할 수 있는 잔여 정리는 후속 실행과 분리해 재시도한다.
+명세 변경의 작업 구성·개정은 프로젝트 일반 Planner에 모으고 원격 게시·catalog·DB 반영을 현재 작업 재개보다 먼저 확정한다. ExecPlan·코드 변경만으로 Planner를 호출하지 않으며 `PLAN_BLOCKED`를 포함한 관련 작업은 PR 등록 전까지 같은 ID·작업물·기록을 보존해 갱신한다. 개정 후에도 차단은 원인별 근거로 재평가하며 문서 변경 자체를 해제로 간주하지 않는다. 일반·유지보수 검토 범위에서는 session·이전 error를 제외하되 실제 입력 변경의 감지와 검증·게시 보호 조건을 유지한다. Worker는 선택 작업 본문과 허용 설계 문서만 수정하고, 최신 조건·진행 기록·문서 충돌을 구분해 필요한 구현·검증·Review를 이어간다. 최신 base의 무관한 Requirement·ExecPlan 채택만으로 Worker·verify·Reviewer를 재호출하지 않고 R-072의 단계별 성공 재사용을 적용한다. 선언 불일치는 최신 원격 base에서 별도로 교정·게시하고 catalog·DB에 반영한 뒤 작업 브랜치에는 rebase로만 전달한다. rebase 시작에는 소유 자원·보존 조건을 확인하고 Worker 종료와 Git 완료 후 각각 실제 변경·최종 선언을 검증한다. 오래된 시작 HEAD나 base에만 유입된 문서를 Worker 수정으로 판정하지 않는 비교·복구 기준은 R-055를 따른다. 마지막 연결 작업 Merge 뒤에는 해당 Requirement를 바로 재확인한다. 보류 중인 선행 ExecPlan에 의존하는 신규·허용 개정도 유효한 관계이면 등록하되, 선행의 실제 Merge 전에는 실행하지 않고 기존 보류를 보존한다. 병렬 작업의 신규·후속 배정을 중단하고 실행 중 호출이 반환한 뒤 planning을 반영한다. 게시 완료·자리 해제는 실제 충돌 자원에 한정해 확인하고, 안전하게 분리 보존할 수 있는 잔여 정리는 후속 실행과 분리해 재시도한다.
 
 ## Context
 
@@ -80,6 +80,14 @@ Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소
 문서 게시와 DB 적용 사이 중단은 실제 원격 결과와 저장된 intent를 대조해 미완료 반영부터 재개한다. 원격 게시 또는 DB 일부 변경만으로 전체 동기화를 확정하지 않고, 같은 변경 재처리에서 중복 계획·취소·실행·지문 성공을 만들지 않는다. 변경의 의미를 판단하는 Planner와 검증·게시·원자 적용을 담당하는 Manager의 경계를 유지한다.
 
 현재 `planning/input_fingerprints.py`, `planning/planner_validation.py`, `planning/planner_publication.py`, `storage/planning_publication_state.py`, `storage/execplan_catalog_state.py`의 변경 감지·개정·원자 적용을 재사용하는 것이 기준이다. 경로는 `loop_manager_internal/` 아래다. 관련 `tests/test_incremental_planning.py`, `tests/test_execplan_catalog_state.py`, `tests/test_planning_publication.py`, `tests/test_planning_requirement_moves.py`에는 변경 감지·선언 delta·transaction·경합·archive 회귀가 있다. 이 기존 보장은 의미별 작업 동기화 전체의 완료 증거와 구분한다. 새 구현은 이미 있는 G-242·G-243·G-257~G-261과 중복하지 않는 미충족 범위만 계획한다.
+
+### 선언 불일치의 base 교정과 작업 반영
+
+- `depends_on` 등 공식 선언의 오류·불일치를 Manager가 교정할 때는 최신 원격 base 브랜치 상태에서 별도로 처리한다. 작업 브랜치의 선언을 직접 편집하거나 복원해 공식 교정을 대신하지 않는다. 작업 브랜치의 오래된 선언만 다른 경우에는 base를 불필요하게 수정하지 않고 유효한 최신 base를 반영한다.
+- 교정은 현재 명세·참조·의존 관계로 확정할 수 있는 범위에 한정한다. 실행을 허용하려고 필요한 dependency를 제거하거나 DB 값을 원본으로 삼아 유효한 사용자 선언을 덮어쓰지 않는다. 의미를 확정할 수 없으면 해당 작업과 근거를 보존해 기존 판단·복구 경로로 보류하고 유효한 독립 작업은 계속한다.
+- 최신 원격 base의 교정 게시와 같은 선언의 catalog·DB 반영을 확인한 뒤, 기존 작업물·본문 기록·session·실패 감사·checkpoint를 보존하며 해당 base를 작업 브랜치에 rebase한다. 작업 브랜치에는 선언 교정을 위한 별도 편집·복원 commit이나 cherry-pick을 적용하지 않는다. 충돌 처리는 기존 rebase 경계를 따르며 Git 완료 후 공식 선언과 최종 후보를 검증한다.
+- 교정 중 base가 전진하면 최신 base에서 교정의 필요성과 유효성을 다시 확인한다. 게시·DB 적용·rebase 사이 중단은 확인된 결과부터 이어가며 중복 교정·게시나 작업물 유실을 만들지 않는다. 교정 또는 rebase만으로 차단 해제·구현 완료·verify·Review 성공을 기록하지 않고 원인별 재평가와 필요한 후보 검증을 유지한다.
+- 아래 Worker 금지 변경의 부분 복원은 확인된 해당 호출의 변경을 되돌리는 데 한정한다. 공식 선언 불일치 교정이나 최신 base 반영의 대체 수단으로 사용하지 않는다.
 
 ### ExecPlan 갱신 경계
 
@@ -187,7 +195,7 @@ Worker의 최초 진입·재개·교정 진입은 필요한 일반 Planner 갱�
 
 Worker는 이미 채택된 Planner·사용자의 최신 계획·작업 문서를 입력으로 최신 base와 보존된 작업 형상을 대조한다. 코드 충돌은 한쪽 형상 전체를 관례적으로 선택하지 않고 최신 목표·제약·완료 조건에 맞춰 필요한 변경을 선택·결합한다. 이전 조건으로 문서를 되돌리거나 Planner 갱신·문서 교체만으로 기존 코드의 적합성을 확정하지 않는다. 계획·작업 문서 충돌만 코드로 해소됐다면 문서 충돌 자체를 이유로 Worker를 호출하지 않고 위 발견 단계별 대응을 따른다. Worker·Reviewer는 각자의 단계에서 실제 구현·검증 근거로 진행 상황과 미충족 조건을 재점검하며, Reviewer의 읽기 전용 권한은 유지한다.
 
-충돌 해결 Worker 종료 시 해당 호출이 만든 변경의 역할별 허용 범위를 검사한다. Git rebase가 남아 있으면 전체 선언·문서/archive의 최종 검사는 완료까지 유예한다. Git 완료 후 Manager가 그 operation의 고정 target에서 선택 ExecPlan의 frontmatter를 복원하고 Worker 본문·mode·다른 파일을 보존한 뒤 전체 최종 결과를 검증한다. 완료 형상의 잘못된 선언·금지 변경은 채택하지 않는다.
+충돌 해결 Worker 종료 시 해당 호출이 만든 변경의 역할별 허용 범위를 검사한다. Git rebase가 남아 있으면 전체 선언·문서/archive의 최종 검사는 완료까지 유예한다. 공식 선언 교정은 위 base 교정 경계에서 먼저 확정하고 작업 브랜치에는 rebase로 반영한다. Git 완료 후 Worker 본문·mode·다른 파일의 보존과 고정 target의 공식 선언·전체 최종 결과를 검증하며, 선언 일치를 만들기 위한 작업 브랜치 직접 복원은 수행하지 않는다. 완료 형상의 잘못된 선언·금지 변경은 채택하지 않는다.
 
 소유한 rebase에서 ExecPlan 본문·sources·연결 명세·archive 범위·공통 지침 등 구현 입력이 바뀌었다는 사실만으로 최종 차단하지 않는다. Manager가 변경된 조건·문서 교체·적용 revision·남은 충돌과 유효한 과거 근거를 구분해 전달하고 필요한 Worker 교정·검증으로 연결한다. dependency 미충족은 실행 준비 조건으로 별도 처리하며 충돌 교정을 이유로 우회하지 않는다. SHA만 바뀌거나 확인 가능한 진행 기록만 바뀐 경우와 최신 base에만 유입된 무관한 Requirement·ExecPlan의 추가·수정·archive는 R-072의 관련성·실제 변경 비교와 단계별 성공 재사용을 적용한다. 문서 충돌의 최신 base 자동 채택·전체 교체 자체로 Worker·완료한 targeted test·전체 verify·최종 Reviewer를 다시 실행하지 않는다. 실제 선택 작업의 조건·코드·검증 입력·검토 범위가 달라지면 영향받는 단계의 기존 교정·검증을 수행한다.
 
@@ -213,6 +221,9 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 - 문서 변경 또는 rebase 완료만으로 사용자 승인 대기, 명세 충돌, 독립적인 차단·실패 원인이나 실패·Worker level 이력을 초기화하지 않는다.
 
 ## Acceptance Criteria
+
+- `depends_on` 선언 오류는 최신 원격 base에서 별도로 교정·게시되고 같은 선언이 catalog·DB에 반영된 뒤 기존 작업 브랜치의 rebase로 유입된다. 작업 브랜치 직접 편집·선언 복원 commit·cherry-pick 없이 작업물·본문 기록·session·실패 감사가 보존된다.
+- base 선언이 이미 유효하고 작업 브랜치만 오래됐으면 교정 게시 없이 rebase로 반영한다. 교정 중 원격 base 전진과 게시·DB 반영·rebase 사이 중단·재시작에서도 최신 선언을 확인하며 중복 교정·작업물 유실·검증 성공 합성이 없다. 의미 불명 선언은 임의 dependency 제거로 우회하지 않고 해당 작업만 보류한다.
 
 - 독립 작업의 미완료 rebase intent가 남은 상태에서 일반·유지보수 planning 게시·DB 적용·최종 자리 해제가 완료되고 유효한 다음 작업이 진행된다. 원인 작업의 복구·차단·작업물은 보존하며 같은 자원 충돌·종료 불명 writer에는 해당 해제를 허용하지 않는다.
 - push 직후·DB 적용 직후·worktree 정리 전후·자리 해제 확정 전후의 중단에서 같은 publication을 멱등 재개한다. 이미 확인한 Planner·commit·push·제거의 반복이 없고, 분리 보존 가능한 정리 실패는 대기를 유지한 채 후속 실행을 허용한다. 실제 미게시 결과·소유권 불명·원격 경쟁과 다른 publication의 intent는 성공으로 채택하지 않는다.
@@ -256,7 +267,7 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 - 완료 조건만 추가되고 코드·verify 명령이 같아도, 추가 조건의 검증 근거가 없으면 이전 PASS를 새 조건의 성공으로 재사용하거나 PR을 게시하지 않는다. 기존 성공을 재사용한 경우에는 최신 조건 충족과 R-072의 입력 증명 근거를 확인할 수 있다.
 - 관련 문서와 코드가 함께 변경됐거나 rebase 충돌이 발생하면 단계별 문서 대응과 기존 코드 검증·충돌 복구를 함께 적용한다. 최신 후보에 필요한 구현·검증·Review가 끝나기 전에 PR을 게시하지 않는다.
 - Worker 최초·재개·교정 진입 전에 필요한 Planner 갱신·게시와 최신 base 반영을 수행한다. Requirement·ExecPlan 충돌은 Manager 코드로 최신 base를 채택하고, 그 외 파일 충돌은 이전 단계와 관계없이 Worker 교정으로 연결한다. Git operation의 계속 진행·완료는 Manager가 수행한다.
-- rebase 시작 시 소유 자원·target·원격·writer 경합·보존 조건과 target의 유효한 작업 identity를 확인하되 최신 frontmatter 일치·전체 최종 diff·문서/archive 내용·과거 definition snapshot 존재는 요구하지 않는다. Worker 종료 시 해당 호출의 실제 변경을 검사하고 Git이 남은 형상은 최종 후보로 판정하지 않는다. 완료·선언 복원 후 남은 금지 변경·잘못된 최종 선언은 채택하지 않으며 정상 시작·재시작·수동 해결·기존 차단 재평가에 같은 기준을 적용한다.
+- rebase 시작 시 소유 자원·target·원격·writer 경합·보존 조건과 target의 유효한 작업 identity를 확인하되 최신 frontmatter 일치·전체 최종 diff·문서/archive 내용·과거 definition snapshot 존재는 요구하지 않는다. Worker 종료 시 해당 호출의 실제 변경을 검사하고 Git이 남은 형상은 최종 후보로 판정하지 않는다. base 교정 반영과 rebase 완료 후 남은 금지 변경·잘못된 최종 선언은 채택하지 않으며 정상 시작·재시작·수동 해결·기존 차단 재평가에 같은 기준을 적용한다.
 - rebase 중 구현 입력이 달라져도 안전한 소유권·유효한 최신 조건을 확인할 수 있으면 최종 차단 대신 기존 코드를 보존한 Worker 교정·targeted test·필요한 verify·Review를 수행한다. 본문·sources·연결 명세·archive 범위·공통 지침 변화와 코드 충돌이 함께 있는 경우를 포함한다.
 - Requirement·ExecPlan 충돌에서 필요한 Planner 갱신 또는 사용자 변경이 반영된 최신 base의 내용·경로·삭제를 채택한다. 병합이 어렵다면 해당 파일 전체를 base 원문으로 교체해도 보존 가능한 이전 문서 원형·코드·세션·실행 및 실패 이력이 남는다. branch·코드·index 전체 reset을 하지 않고 충돌 복구가 불가능한 파일에만 R-055의 파일별 원본 복원·재작업을 적용한다. 삭제·archive·rename·dependency·PR 경계는 기존 유효성 검사로 확인한다.
 - 계획·작업 문서 충돌만 자동 해소되면 문서 충돌 자체로 Worker를 반복하지 않고 단계별 재점검을 적용한다. 선택 작업과 무관한 Requirement·ExecPlan의 최신 base 채택·전체 교체·archive 뒤 R-072의 입력 동일성과 유효한 성공이 확인되면 Worker·targeted test·verify·Reviewer를 모두 재호출하지 않는다. 실제 입력 변화·근거 부재와 그 외 파일과의 혼합 충돌은 기존 Worker 교정·필요한 검증·Review 기준을 적용한다. base 문서의 진행 표시를 현재 후보의 성공으로 간주하지 않으며 아직 수행하지 않은 필수 verify·최종 승인 없이 게시하지 않는다.
