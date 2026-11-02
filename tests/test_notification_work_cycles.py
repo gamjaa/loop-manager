@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -216,6 +217,15 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
         for field in before.keys() - {'canceled_at'}:
             self.assertEqual(after[field], before[field], field)
         self.assertEqual(connection.execute('SELECT generation FROM work_reason_episodes').fetchone()[0], 1)
+
+    def test_blocked_requirement_does_not_infer_user_action(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        path = 'docs/requirements/[R-031] Waiting.md'
+        connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED', sources=?", (json.dumps([path]),))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=(path,))
+        self.assertIn('차단 해소와 재평가', snapshot.requirements[0]['reason'])
+        self.assertNotIn('사용자 조치', snapshot.requirements[0]['reason'])
 
     def test_plan_and_project_waits_keep_causes_without_wait_notice(self):
         from dataclasses import replace

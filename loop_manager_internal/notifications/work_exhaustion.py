@@ -257,7 +257,7 @@ def collect(
         elif not related:
             reason = "Planner는 추가 계획이 없다고 확인했지만 활성 Requirement가 남아 있습니다"
         elif all(status in {"MERGED", "PLAN_BLOCKED"} for status in related):
-            reason = "관련 PLAN_BLOCKED 계획의 사용자 조치를 기다립니다"
+            reason = "관련 PLAN_BLOCKED 계획의 차단 해소와 재평가를 기다립니다"
         else:
             reason = "관련 계획 또는 archive 확인을 기다립니다"
         independent_wait = not related or all(
