@@ -543,6 +543,7 @@ class RequirementRetirementTest(unittest.TestCase):
     def test_uncertain_judgment_exposes_decision_and_resumes_on_requirement_edit(self):
         self.add_plan()
         self.connection.execute("ALTER TABLE projects ADD COLUMN planning_error TEXT")
+        self.connection.execute("ALTER TABLE projects ADD COLUMN origin TEXT")
         for column in ("title", "depends_on", "pr_url"):
             self.connection.execute(f"ALTER TABLE exec_plans ADD COLUMN {column} TEXT")
         (item,) = self.port.pending("repo", self.root, "base")

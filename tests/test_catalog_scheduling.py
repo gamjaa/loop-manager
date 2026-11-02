@@ -941,7 +941,7 @@ class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.Test
         effects = project_runner.InternalRunProjectResultEffects(
             _checkpoint_dispatch_ready=lambda *_: False,
             _record_project_recovery=mock.Mock(), _run_project_step=mock.Mock(return_value=1),
-            _stable_work_reason=mock.Mock(), catalog_schedule_decision=mock.Mock(),
+            _stable_work_reason=mock.Mock(return_value=None), catalog_schedule_decision=mock.Mock(),
             dispatch_blocked_checkpoints=mock.Mock(), is_loop_manager_repository=lambda _: False,
             operation_log=mock.Mock())
         result = project_runner._run_project_result(
@@ -949,7 +949,7 @@ class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.Test
         self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
         self.assertEqual(result.exit_code, 1)
         self.assertIn('publication evidence missing', result.detail)
-        effects._stable_work_reason.assert_not_called()
+        effects._stable_work_reason.assert_called_once_with(connection, repo, refactoring_review_interval=20)
 
     def test_stable_work_reports_preserved_planning_waiting_and_actual_worker_error(self):
         from loop_manager_internal.application import project_runner
@@ -979,6 +979,8 @@ class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.Test
                 self.assertEqual(result.exit_code, step_result)
                 self.assertIn('preserved failure' if step_result == 0 else 'worker CLI failed', result.detail)
                 if step_result == 0:
+                    effects._stable_work_reason.assert_called_once_with(connection, repo, refactoring_review_interval=20)
+                else:
                     effects._stable_work_reason.assert_not_called()
 
     def test_independent_ready_steps_continue_sequentially_with_preserved_error(self):
@@ -1007,7 +1009,7 @@ class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.Test
         effects = project_runner.InternalRunProjectResultEffects(
             _checkpoint_dispatch_ready=lambda *_: True,
             _record_project_recovery=mock.Mock(), _run_project_step=step,
-            _stable_work_reason=mock.Mock(), catalog_schedule_decision=loop_manager.catalog_schedule_decision,
+            _stable_work_reason=mock.Mock(return_value=None), catalog_schedule_decision=loop_manager.catalog_schedule_decision,
             dispatch_blocked_checkpoints=mock.Mock(), is_loop_manager_repository=lambda _: False,
             operation_log=mock.Mock(),
         )
@@ -1016,7 +1018,7 @@ class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.Test
         self.assertEqual(completed, ['G-001', 'G-002'])
         self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
         self.assertEqual(runtime.planning(repo).planning_preserved_state, saved)
-        effects._stable_work_reason.assert_not_called()
+        effects._stable_work_reason.assert_called_once_with(connection, repo, refactoring_review_interval=20)
 
 
 class EffectivePrioritySchedulingTest(AutomationCatalogFixture, unittest.TestCase):

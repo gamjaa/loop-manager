@@ -225,9 +225,12 @@ def _run_project_result(
                     request.request_identity for request in pending_before
                 )
         try:
-            progress_before = {str(row[0]): tuple(row[1:]) for row in connection.execute(
+            has_catalog = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='exec_plans'"
+            ).fetchone() is not None
+            progress_before = ({str(row[0]): tuple(row[1:]) for row in connection.execute(
                 "SELECT plan_id, verify_token, review_token, status FROM exec_plans WHERE repo=?", (repo,),
-            )}
+            )} if has_catalog else {})
             recovery_before = {
                 str(record["subject"]): int(record["generation"])
                 for record in connection.execute(
@@ -271,9 +274,9 @@ def _run_project_result(
                 0,
                 str(error),
             )
-        for observed in connection.execute(
+        for observed in (connection.execute(
             "SELECT plan_id, verify_token, review_token, status FROM exec_plans WHERE repo=?", (repo,),
-        ):
+        ) if progress_before else ()):
             previous = progress_before.get(str(observed[0]))
             if previous is not None and (
                 any(not previous[index] and observed[index + 1] for index in (0, 1))

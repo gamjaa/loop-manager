@@ -39,7 +39,7 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
         fetch = ('fetch', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main')
 
         def unavailable(path, *args, **kwargs):
-            if args == fetch:
+            if args in {fetch, ('fetch', 'origin')}:
                 raise loop_manager.GitLockError('external Git lock')
             return observe(path, *args, **kwargs)
 
