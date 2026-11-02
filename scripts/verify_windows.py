@@ -383,33 +383,52 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
         receipt['stopped'] = True
         print(output, flush=True)
         passed = passed and not timed_out
+    except BaseException as error:
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        if isinstance(error, VerifyBudgetError) and error.diagnostic_directory is not None:
+            try:
+                shutil.copytree(error.diagnostic_directory, bundle / 'logs' / 'budget-error', symlinks=True)
+            except OSError as copy_error:
+                error.add_note(f'WSL 예산 오류 진단 복사 실패: {copy_error}')
+        raise
     finally:
-        stopped.set()
-        if watcher.ident is not None:
-            watcher.join()
+        primary_error = sys.exc_info()[1]
         try:
-            if receipt['stopped']:
-                shutil.rmtree(run_root)
-        finally:
-            receipt['removed'] = not run_root.exists()
-            lifecycle(budget_directory,'stopped' if receipt['stopped'] and receipt['removed'] else 'uncertain',
-                      root=str(run_root),pid=os.getpid())
-            (bundle / 'cleanup.tmp').write_text(json.dumps(receipt), encoding='utf-8')
-            (bundle / 'cleanup.tmp').replace(bundle / 'cleanup.json')
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
-            if budget is not None:
-                from loop_manager_internal.verification.execution_clock import VerifyBudgetError
-                primary = sys.exc_info()[1]
-                try:
-                    if primary is None:
-                        check_budget(budget, timeout)
-                except BaseException as error:
-                    primary = error
-                    raise
-                finally:
-                    if not isinstance(primary, (VerifyBudgetError, VerifyTerminationUncertain)):
-                        budget.close()
+            stopped.set()
+            if watcher.ident is not None:
+                watcher.join()
+            try:
+                if receipt['stopped']:
+                    shutil.rmtree(run_root)
+            finally:
+                receipt['removed'] = not run_root.exists()
+                lifecycle(budget_directory,'stopped' if receipt['stopped'] and receipt['removed'] else 'uncertain',
+                          root=str(run_root),pid=os.getpid())
+                (bundle / 'cleanup.tmp').write_text(json.dumps(receipt), encoding='utf-8')
+                (bundle / 'cleanup.tmp').replace(bundle / 'cleanup.json')
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
+                if budget is not None:
+                    from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+                    primary = primary_error or sys.exc_info()[1]
+                    try:
+                        if primary is None:
+                            check_budget(budget, timeout)
+                    except BaseException as error:
+                        primary = error
+                        if isinstance(error, VerifyBudgetError) and error.diagnostic_directory is not None:
+                            try:
+                                shutil.copytree(error.diagnostic_directory, bundle / 'logs' / 'budget-error', symlinks=True)
+                            except OSError as copy_error:
+                                error.add_note(f'WSL 예산 오류 진단 복사 실패: {copy_error}')
+                        raise
+                    finally:
+                        if not isinstance(primary, (VerifyBudgetError, VerifyTerminationUncertain)):
+                            budget.close()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(f'WSL 정리 실패: {cleanup_error}')
     return 0 if passed else 1
 
 

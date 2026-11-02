@@ -37,6 +37,71 @@ class WindowsVerifyRuntimeTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux supervisor 정리 경계')
 class WslCleanupTests(unittest.TestCase):
+    def test_final_cleanup_budget_error_preserves_snapshot(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            for name in ('project', 'runtime'):
+                with tarfile.open(bundle / (name + '.tar'), 'w'):
+                    pass
+            budget_dir = bundle / 'budget'
+            budget_dir.mkdir()
+            original_mkdtemp = tempfile.mkdtemp
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                if dir == '/tmp':
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
+            original_rmtree = launcher.shutil.rmtree
+            def remove(path, *args, **kwargs):
+                original_rmtree(path, *args, **kwargs)
+                if Path(path).name.startswith('loop-manager-verify-'):
+                    (budget_dir / 'wait.json').write_text('invalid')
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
+                 mock.patch.object(verify_process, 'run_verify_process', return_value=(True, False, 'PASS')), \
+                 mock.patch.object(launcher.shutil, 'rmtree', side_effect=remove):
+                with self.assertRaises(VerifyBudgetError):
+                    launcher.wsl_main(bundle, 30, 'auto', budget_directory=str(budget_dir))
+            self.assertEqual((bundle / 'logs/budget-error/wait.json').read_text(), 'invalid')
+            self.assertTrue(json.loads((bundle / 'cleanup.json').read_text())['removed'])
+
+    def test_cleanup_failure_keeps_original_budget_error_and_snapshot(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            for name in ('project', 'runtime'):
+                with tarfile.open(bundle / (name + '.tar'), 'w'):
+                    pass
+            budget_dir = bundle / 'budget'
+            budget_dir.mkdir()
+            original_mkdtemp = tempfile.mkdtemp
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                if dir == '/tmp':
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
+            def run_verify(_arguments, _project, _timeout, *, execution_clock, **_options):
+                (budget_dir / 'wait.json').write_text('invalid')
+                execution_clock.remaining(30)
+            original_rmtree = launcher.shutil.rmtree
+            def remove(path, *args, **kwargs):
+                if Path(path).name.startswith('loop-manager-verify-'):
+                    raise OSError('cleanup failed')
+                return original_rmtree(path, *args, **kwargs)
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
+                 mock.patch.object(verify_process, 'run_verify_process', side_effect=run_verify), \
+                 mock.patch.object(launcher.shutil, 'rmtree', side_effect=remove):
+                with self.assertRaises(VerifyBudgetError) as raised:
+                    launcher.wsl_main(bundle, 30, 'auto', budget_directory=str(budget_dir))
+            self.assertTrue(any('cleanup failed' in note for note in raised.exception.__notes__))
+            self.assertEqual((bundle / 'logs/budget-error/wait.json').read_text(), 'invalid')
+            receipt = json.loads((bundle / 'cleanup.json').read_text())
+            self.assertTrue(receipt['stopped'])
+            self.assertFalse(receipt['removed'])
+            self.assertTrue(Path(receipt['root']).exists())
+
     def test_cleanup_deadline_rejects_success_after_receipt(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
              mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
