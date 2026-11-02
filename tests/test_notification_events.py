@@ -421,6 +421,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 notifications.record_merged_plan(
                     connection, repo, "G-018", "Reliable notices",
                 )
+                self.confirm_final_review(connection, repo, 'merge-cycle')
                 self.assertTrue(notifications.enqueue_completion_if_ready(
                     connection, repo, snapshot,
                 ))

@@ -34,6 +34,7 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         notifications.record_merged_plan(
             connection, "/projects/alpha", "G-018", "Reliable notices"
         )
+        self.confirm_final_review(connection, "/projects/alpha", fingerprint)
         connection.commit()
 
     def test_completion_requires_gates_and_preserves_last_work_without_notice(self):
@@ -99,11 +100,29 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         connection.execute("UPDATE projects SET planning_fingerprint = 'cycle-two'")
         connection.commit()
         self.assertFalse(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        self.confirm_final_review(connection, repo, 'cycle-two')
         self.assertTrue(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-two')))
         completion = connection.execute('SELECT cycle_key, completed_at FROM project_completion_cycles').fetchone()
         self.assertEqual(completion[0], 'cycle-two')
         self.assertNotEqual(completion[1], 'preserved completion time')
         self.assertEqual(self.events(connection), [])
+
+    def test_completion_rechecks_final_receipt_and_work_cycle(self):
+        from loop_manager_internal.storage import planning_review_state
+        connection = self.connection()
+        repo = '/projects/alpha'
+        self._complete_project(connection, 'cycle-one')
+        connection.execute("DELETE FROM planning_reviews WHERE repo=?", (repo,))
+        self.assertFalse(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        self.confirm_final_review(connection, repo, 'cycle-one')
+        connection.execute("UPDATE exec_plans SET verify_token='changed' WHERE repo=?", (repo,))
+        self.assertFalse(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        self.confirm_final_review(connection, repo, 'cycle-one')
+        planning_review_state.begin(connection, repo, purpose='delta', revision='new',
+            input_fingerprint='new', specification_fingerprint='spec',
+            work_cycle=planning_review_state.work_cycle(connection, repo), comparison_revision='base')
+        self.assertFalse(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        self.assertIsNone(connection.execute('SELECT completed_at FROM project_completion_cycles').fetchone()[0])
 
     def test_planning_error_blocks_completion(self):
         connection = self.connection()

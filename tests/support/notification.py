@@ -1,5 +1,6 @@
 """Shared SQLite fixture for notification unit tests."""
 import sqlite3
+import json
 from pathlib import Path
 import loop_manager
 from loop_manager_internal.notifications import notifications
@@ -46,6 +47,21 @@ class NotificationFixture:
         if database == ":memory:":
             self.addCleanup(connection.close)
         return connection
+
+    @staticmethod
+    def confirm_final_review(connection, repo, fingerprint):
+        from loop_manager_internal.storage import planning_review_state
+        cycle = planning_review_state.work_cycle(connection, repo)
+        planning_review_state.begin(connection, repo, purpose='final', revision='base',
+            input_fingerprint=fingerprint, specification_fingerprint='spec',
+            work_cycle=cycle, comparison_revision=None)
+        result = 'FINAL_SPECIFICATION_REVIEW: ' + json.dumps({
+            'revision': 'base', 'input_fingerprint': fingerprint,
+            'specification_fingerprint': 'spec', 'work_cycle': cycle,
+            'outcome': 'fulfilled', 'evidence': ['docs/PRODUCT.md'], 'reason': 'Reviewed',
+        })
+        planning_review_state.validate(connection, repo, 'base', result, 'fulfilled')
+        planning_review_state.confirm(connection, repo, 'base', 'base')
 
     @staticmethod
     def prepare_pr_candidate(

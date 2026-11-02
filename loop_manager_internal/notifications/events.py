@@ -530,6 +530,14 @@ def enqueue_completion_if_ready(
     ):
         return False
 
+    from loop_manager_internal.planning.specification_review import valid_final_receipt
+    from loop_manager_internal.storage import planning_review_state
+    receipt = planning_review_state.current_final(connection, repo)
+    if (not valid_final_receipt(receipt) or not receipt["confirmed_revision"]
+            or receipt["work_cycle"] != planning_review_state.work_cycle(connection, repo)
+            or planning_review_state.general_pending(connection, repo)):
+        return False
+
     cycle_key = str(project[1])
     with connection:
         _cancel_pending_waiting(connection, repo)
