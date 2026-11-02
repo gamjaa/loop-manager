@@ -115,6 +115,22 @@ def check_budget(budget, timeout):
         raise TimeoutError('자체 verify 준비 중 전체 실행 시간이 만료됐습니다.')
 
 
+class CheckedIO:
+    def __init__(self, stream, check):
+        self.stream, self.check = stream, check
+
+    def read(self, size=-1):
+        self.check()
+        return self.stream.read(size)
+
+    def write(self, data):
+        self.check()
+        return self.stream.write(data)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 def git(root, bundle, budget, timeout, *arguments):
     from loop_manager_internal.execution.verify_process import run_verify_process
     check_budget(budget, timeout)
@@ -143,7 +159,9 @@ def snapshot(root, bundle, entrypoint, budget, timeout):
     paths = [root / os.fsdecode(name) for name in names.split(b'\0') if name]
     paths = [path for path in paths if path.exists() or path.is_symlink()]
     before = {path: path.lstat() for path in paths}
-    with tarfile.open(bundle / 'project.tar', 'w') as archive:
+    check = lambda: check_budget(budget, timeout)
+    with (bundle / 'project.tar').open('wb') as stream, \
+         tarfile.open(fileobj=CheckedIO(stream, check), mode='w') as archive:
         for path in paths:
             check_budget(budget, timeout)
             if path.is_dir() and not path.is_symlink():
@@ -158,16 +176,23 @@ def snapshot(root, bundle, entrypoint, budget, timeout):
             or git(root, bundle, budget, timeout, 'ls-files', '--cached', '--others', '--exclude-standard', '-z') != names):
         raise RuntimeError('검증 복사 중 Git 입력이 변경됐습니다.')
     runtime_root = entrypoint.parents[2]
-    with tarfile.open(bundle / 'runtime.tar', 'w') as archive:
+    with (bundle / 'runtime.tar').open('wb') as stream, \
+         tarfile.open(fileobj=CheckedIO(stream, check), mode='w') as archive:
         for path in sorted((runtime_root / 'loop_manager_internal').rglob('*')):
             check_budget(budget, timeout)
             if path.is_file() and path.suffix in {'.py', '.pl', '.pm'} and '__pycache__' not in path.parts:
                 archive.add(path, arcname=path.relative_to(runtime_root).as_posix(), recursive=False)
     shutil.copyfile(__file__, bundle / 'driver.py')
+    digest = hashlib.sha256()
     with (bundle / 'project.tar').open('rb') as stream:
-        fingerprint = hashlib.file_digest(stream, 'sha256').hexdigest()
+        while True:
+            check()
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
     check_budget(budget, timeout)
-    return {'revision': revision, 'snapshot_sha256': fingerprint}
+    return {'revision': revision, 'snapshot_sha256': digest.hexdigest()}
 
 
 @contextmanager
@@ -338,10 +363,13 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
         project, runtime_root, temporary = (run_root / name for name in ('project', 'runtime', 'tmp'))
         for path in (project, runtime_root, temporary):
             path.mkdir()
-        for filename, destination in (('project.tar', project), ('runtime.tar', runtime_root)):
+        def check_preparation():
             if time.monotonic() - started >= timeout - CLEANUP_SECONDS:
                 raise TimeoutError('WSL 복사 준비 중 전체 verify 시간이 만료됐습니다.')
-            with tarfile.open(bundle / filename) as archive:
+        for filename, destination in (('project.tar', project), ('runtime.tar', runtime_root)):
+            check_preparation()
+            with (bundle / filename).open('rb') as stream, \
+                 tarfile.open(fileobj=CheckedIO(stream, check_preparation), mode='r') as archive:
                 archive.extractall(destination, filter='data')
         sys.path.insert(0, str(runtime_root))
         from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain

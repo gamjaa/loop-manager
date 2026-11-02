@@ -263,6 +263,28 @@ class WindowsVerifySnapshotTests(unittest.TestCase):
 
 
 class WindowsVerifySnapshotBudgetTests(unittest.TestCase):
+    def test_large_file_archive_checks_budget_between_chunks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'large').write_bytes(b'x' * (256 * 1024))
+            bundle = root / 'bundle'
+            bundle.mkdir()
+            now = [0.0]
+            with ExecutionClock(clock=lambda: now[0]) as budget:
+                def git(*args):
+                    return b'revision\n' if args[4] == 'rev-parse' else b'large\0'
+                write = launcher.CheckedIO.write
+                def slow_write(stream, data):
+                    result = write(stream, data)
+                    if len(data) >= 8192:
+                        now[0] = 10.0
+                    return result
+                with mock.patch.object(launcher, 'git', side_effect=git), \
+                     mock.patch.object(launcher.CheckedIO, 'write', new=slow_write):
+                    with self.assertRaises(TimeoutError):
+                        launcher.snapshot(root, bundle, ENTRYPOINT, budget, 10)
+            self.assertLess((bundle / 'project.tar').stat().st_size, 256 * 1024)
+
     def test_git_preserves_binary_output(self):
         with tempfile.TemporaryDirectory() as directory, ExecutionClock() as budget:
             root = Path(directory)
