@@ -372,6 +372,14 @@ def _run_project_result(
             effects.operation_log(reason, error=True)
             return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, reason)
         if step_result == 0:
+            try:
+                snapshot = effects._stable_work_reason(
+                    connection, repo, refactoring_review_interval=refactoring_review_interval,
+                )
+            except (RuntimeError, OSError):
+                snapshot = None
+            if snapshot is not None and not snapshot.completed:
+                notifications.enqueue_waiting_reason(connection, repo, snapshot)
             effects.operation_log(reason)
             return ProjectRunResult(ProjectRunKind.WAITING, 0, reason)
     if recovery_request_id is not None and step_result != 0:

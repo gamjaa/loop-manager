@@ -171,8 +171,20 @@ def _stable_work_reason(
     ).fetchone()
     if row is None or row["phase"] not in {None, "PR_OPEN", "PLAN_BLOCKED", "PROJECT_BLOCKED"}:
         return None
-    if row["pr_conflict_recovery"] or row["planning_error"]:
+    if row["pr_conflict_recovery"]:
         return None
+    if row["planning_error"]:
+        if (row["planning_error_origin"] != "validation"
+                or not row["planning_preserved_state"]
+                or runtime_state.planning_owns_execution_slot(row)
+                or not row["planning_error_fingerprint"]):
+            return None
+        try:
+            preserved = runtime_state._preserved_planning_values(row["planning_preserved_state"])
+        except runtime_state.RuntimeStateError:
+            return None
+        if preserved["planning_validation_error"] != row["planning_error"]:
+            return None
     if not row["planning_fingerprint"]:
         return None
     if connection.execute(
@@ -214,6 +226,8 @@ def _stable_work_reason(
     ).stdout.strip()
     current_input = effects._planning_input_fingerprint(repo_path, base_sha)
     current_specification = effects._specification_input_fingerprint(repo_path, base_sha)
+    if row["planning_error"] and row["planning_error_fingerprint"] != current_input:
+        return None
     current_plans = effects.plan_declarations(repo_path, base_sha)
     if not planning_input_state.matches(connection, repo, current_plans):
         return None

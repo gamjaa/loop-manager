@@ -459,14 +459,25 @@ def completion_current(connection, repo, cycle, work_cycle):
 
 def waiting_current(connection, repo, payload):
     from . import work_exhaustion
-    from loop_manager_internal.storage import maintenance_state, planning_review_state
+    from loop_manager_internal.storage import maintenance_state, planning_review_state, runtime_state
     project = connection.execute(
-        "SELECT phase, planning_fingerprint, pr_conflict_recovery FROM projects WHERE repo=?", (repo,),
+        "SELECT * FROM projects WHERE repo=?", (repo,),
     ).fetchone()
-    if (project is None or project[0] not in (None, 'PR_OPEN', 'PLAN_BLOCKED', 'PROJECT_BLOCKED')
-            or project[1] != payload['cycle'] or project[2]
+    if (project is None or project['phase'] not in (None, 'PR_OPEN', 'PLAN_BLOCKED', 'PROJECT_BLOCKED')
+            or project['planning_fingerprint'] != payload['cycle'] or project['pr_conflict_recovery']
             or planning_review_state.general_pending(connection, repo)):
         return False
+    if project['planning_error']:
+        if (project['planning_error_origin'] != 'validation'
+                or project['planning_error_fingerprint'] != payload['cycle']
+                or not project['planning_preserved_state'] or runtime_state.planning_owns_execution_slot(project)):
+            return False
+        try:
+            preserved = runtime_state._preserved_planning_values(project['planning_preserved_state'])
+        except runtime_state.RuntimeStateError:
+            return False
+        if preserved['planning_validation_error'] != project['planning_error']:
+            return False
     maintenance = maintenance_state.MaintenanceRepository(connection).get(repo)
     if maintenance.phase is not maintenance_state.MaintenancePhase.IDLE or maintenance.publication_stage is not None:
         return False
