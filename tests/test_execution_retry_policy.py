@@ -18,9 +18,10 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
         fixture.state.update_project(
             fixture.repo, worker_result='saved worker evidence', worker_session_id='worker-session')
         observe = fixture.effects.workspace.git.side_effect
+        fetch = ('fetch', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main')
 
         def unavailable(path, *args, **kwargs):
-            if args == ('fetch', 'origin'):
+            if args == fetch:
                 raise loop_manager.GitLockError('external Git lock')
             return observe(path, *args, **kwargs)
 
@@ -32,6 +33,7 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
         self.assertEqual(project['worker_result'], 'saved worker evidence')
         self.assertEqual(project['worker_session_id'], 'worker-session')
         fixture.effects.agent.run_agent.assert_not_called()
+        self.assertEqual(sum(call.args[1:] == fetch for call in fixture.effects.workspace.git.call_args_list), 3)
         recovery = fixture.connection.execute(
             'SELECT * FROM recovery_records WHERE repo = ?', (fixture.repo,)).fetchone()
         self.assertEqual(recovery['attempts'], 3)
