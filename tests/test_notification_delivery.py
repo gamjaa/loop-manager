@@ -1080,6 +1080,42 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_registered_publication_is_deduplicated_and_sent_silently(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        with connection:
+            connection.execute("UPDATE projects SET origin='https://github.com/org/repo' WHERE repo=?", (repo,))
+            connection.execute("UPDATE exec_plans SET publication_path=?, publication_sha='abc', depends_on='[]' WHERE repo=? AND plan_id='G-018'", (path, repo))
+            plans = [(path, {'id': 'G-018', 'title': 'Reliable notices'})]
+            notifications.record_planning_publication(connection, repo, plans, 'abc')
+            notifications.record_planning_publication(connection, repo, plans, 'abc')
+        rows = self.events(connection)
+        self.assertEqual(len(rows), 1)
+        payload = json.loads(rows[0]['payload'])
+        self.assertTrue(payload['silent'])
+        self.assertEqual(payload['plans'][0]['url'],
+            'https://github.com/org/repo/blob/abc/docs/plans/%5BG-018%5D%20Reliable%20notices.md')
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        with mock.patch.object(transport, 'urlopen', return_value=response) as send:
+            self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat'), 1)
+        request = json.loads(send.call_args.args[0].data)
+        self.assertTrue(request['disable_notification'])
+        self.assertIn('G-018 · Reliable notices · 실행 대기', request['text'])
+
+    def test_published_plan_rendering_shows_links_and_actual_waiting_dependencies(self):
+        from loop_manager_internal.notifications.rendering import _message
+        text = _message('plans_published', {'project': 'alpha', 'plans': [
+            {'id': 'G-018', 'title': 'Ready\nwork', 'waiting_for': [],
+             'url': 'https://github.com/org/repo/blob/abc/docs/plans/one.md'},
+            {'id': 'G-019', 'title': 'Dependent', 'waiting_for': ['G-018'], 'url': None},
+        ]})
+        self.assertIn('새 작업 게시 2건', text)
+        self.assertIn('G-018 · Ready work · 실행 대기', text)
+        self.assertIn('https://github.com/org/repo/blob/abc/docs/plans/one.md', text)
+        self.assertIn('G-019 · Dependent · 선행 작업 대기: G-018', text)
+
     def test_action_delivery_waits_for_commit_and_preserves_legacy_silent_pieces(self):
         connection = self.connection()
         repo = '/projects/alpha'

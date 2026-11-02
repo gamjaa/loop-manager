@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
+from urllib.parse import quote
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
@@ -602,7 +603,7 @@ def enqueue_waiting_reason(
 
 def enqueue_progress(connection, repo, kind, identity, **payload):
     """Persist a boundary observation in the owning state transaction."""
-    if kind not in {"draft_decisions", "draft_decision", "pr_created"} or not _enabled(connection):
+    if kind not in {"draft_decisions", "draft_decision", "pr_created", "plans_published"} or not _enabled(connection):
         return
     ensure_schema(connection)
     plan_id = payload.get("execplan_id")
@@ -650,6 +651,33 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
 def record_planning_publication(connection, repo, plans, revision):
     if not _enabled(connection):
         return
+    project = connection.execute('SELECT origin FROM projects WHERE repo=?', (repo,)).fetchone()
+    link = _checkpoint_link(project['origin'], revision) if project else None
+    origin = link.split('/tree/', 1)[0] if link else None
+    items = []
+    for path, plan in plans:
+        if plan.get('draft'):
+            continue
+        row = connection.execute(
+            'SELECT title, depends_on FROM exec_plans WHERE repo=? AND plan_id=?',
+            (repo, plan['id']),
+        ).fetchone()
+        if row is None:
+            continue
+        dependencies = json.loads(row['depends_on'])
+        waiting = []
+        for dependency in dependencies:
+            state = connection.execute('SELECT status FROM exec_plans WHERE repo=? AND plan_id=?',
+                                       (repo, dependency)).fetchone()
+            if state is None or state['status'] != 'MERGED':
+                waiting.append(dependency)
+        items.append({'id': str(plan['id']), 'title': str(row['title']), 'source_path': path,
+                      'url': f'{origin}/blob/{revision}/{quote(path, safe="/")}' if origin else None,
+                      'waiting_for': waiting})
+    if items:
+        enqueue_progress(connection, repo, 'plans_published', str(revision),
+                         publication_revision=str(revision), plans=items, silent=True,
+                         status='실행 또는 선행 작업 대기')
     enqueue_draft_decisions(connection, repo)
 
 
