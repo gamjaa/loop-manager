@@ -163,6 +163,27 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(row['rendered_text'])
         self.assertIsNone(row['sent_at'])
 
+    def test_late_completion_confirmation_does_not_advance_new_cycle(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        self._complete_project(connection, 'cycle-one')
+        connection.execute("UPDATE project_completion_cycles SET last_completed_title=?", ('x' * 5000,))
+        self.assertTrue(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        calls = []
+        def change_cycle(_token, _chat, piece):
+            calls.append(piece)
+            connection.execute("UPDATE projects SET planning_fingerprint='cycle-two' WHERE repo=?", (repo,))
+            self.confirm_final_review(connection, repo, 'cycle-two')
+            self.assertTrue(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-two')))
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=change_cycle), 0)
+        first, second = self.events(connection)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNotNone(first['canceled_at'])
+        self.assertEqual(first['confirmed_pieces'], 1)
+        self.assertEqual(second['confirmed_pieces'], 0)
+        self.assertIsNone(second['canceled_at'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 1)
+
     def test_completion_claim_rechecks_maintenance_and_recovery(self):
         from loop_manager_internal.notifications.policy import is_current
         connection = self.connection()
@@ -349,6 +370,56 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(self.events(connection)[1]['sent_at'])
         self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
         self.assertEqual(len(self.events(connection)), 2)
+
+    def test_wait_retry_preserves_frozen_body_and_confirmed_piece(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        connection.execute("UPDATE projects SET planning_fingerprint='cycle-one' WHERE repo=?", (repo,))
+        connection.execute("UPDATE exec_plans SET status='PR_OPEN', title=? WHERE repo=?", ('x' * 5000, repo))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        calls = []
+        def fail_second(_token, _chat, piece):
+            calls.append(piece)
+            if len(calls) == 2:
+                raise RuntimeError('temporary')
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=fail_second), 0)
+        before = dict(self.events(connection)[0])
+        self.assertEqual(before['confirmed_pieces'], 1)
+        self.assertIsNotNone(before['last_error'])
+        retry = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=retry), 1)
+        retry.assert_called_once_with('token', 'chat', calls[1])
+        after = self.events(connection)[0]
+        self.assertEqual(after['rendered_text'], before['rendered_text'])
+        self.assertEqual(after['confirmed_pieces'], 2)
+        self.assertIsNotNone(after['sent_at'])
+
+    def test_late_wait_confirmation_stays_with_original_episode(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        connection.execute("UPDATE projects SET planning_fingerprint='cycle-one' WHERE repo=?", (repo,))
+        connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED', title=? WHERE repo=?", ('x' * 5000, repo))
+        connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                           "VALUES (?, 'G-018', 'plan', 'common_defect_pending', 'First cause')", (repo,))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        calls = []
+        def update_during_send(_token, _chat, piece):
+            calls.append(piece)
+            connection.execute("UPDATE execplan_blocks SET evidence='New cause' WHERE repo=?", (repo,))
+            changed = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+            self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, changed))
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=update_during_send), 0)
+        first, second = self.events(connection)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first['confirmed_pieces'], 1)
+        self.assertIsNotNone(first['canceled_at'])
+        self.assertEqual(second['confirmed_pieces'], 0)
+        self.assertIsNone(second['canceled_at'])
+        self.assertIn('First cause', first['payload'])
+        self.assertIn('New cause', second['payload'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 1)
 
     def test_wait_notice_is_independent_and_cancels_stale_remaining_pieces(self):
         connection = self.connection()
