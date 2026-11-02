@@ -487,8 +487,11 @@ def waiting_current(connection, repo, payload):
     requirements = payload['requirements']
     if not isinstance(requirements, list) or not all(isinstance(item, dict) and isinstance(item.get('path'), str) for item in requirements):
         return False
+    relations = payload.get('source_relations')
+    if relations is not None and not isinstance(relations, dict):
+        return False
     observed = work_exhaustion.collect(connection, repo, cycle=payload['cycle'],
-        active_requirements=tuple(item['path'] for item in requirements))
+        active_requirements=tuple(item['path'] for item in requirements), source_relations=relations)
     return bool(observed and not observed.completed
                 and work_exhaustion.episode_signature(observed) == payload['signature'])
 

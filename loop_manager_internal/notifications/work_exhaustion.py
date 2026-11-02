@@ -20,6 +20,7 @@ class WorkReasonSnapshot:
     requirements: tuple[dict[str, object], ...]
     project_block: dict[str, str] | None
     planning_error: str | None
+    source_relations: dict[str, dict[str, object]] | None = None
 
     @property
     def completed(self) -> bool:
@@ -37,6 +38,7 @@ class WorkReasonSnapshot:
             "requirements": list(self.requirements),
             "project_block": self.project_block,
             "planning_error": self.planning_error,
+            "source_relations": self.source_relations,
         }
 
     def describe(self) -> str:
@@ -73,6 +75,9 @@ def episode_signature(snapshot: WorkReasonSnapshot) -> str:
                           if key not in {"path", "url"}} for requirement in snapshot.requirements],
         "project_block": snapshot.project_block,
         "planning_error": snapshot.planning_error,
+        "sources": {plan_id: [requirement_sources.source_requirement_id(source) or source
+                              for source in item["sources"]]
+                    for plan_id, item in (snapshot.source_relations or {}).items()},
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
         separators=(",", ":")).encode()).hexdigest()
@@ -109,6 +114,7 @@ def collect(
     active_requirements: tuple[str, ...],
     requirement_documents: dict[str, bytes] | None = None,
     base_revision: str | None = None,
+    source_relations: dict[str, dict[str, object]] | None = None,
 ) -> WorkReasonSnapshot | None:
     """Read only confirmed SQLite causes; None means work may still be runnable."""
 
@@ -233,18 +239,35 @@ def collect(
                  for key in sorted(holds.keys() - known_ids))
     planning_error = str(project["planning_error"]) if project and project["planning_error"] else None
 
+    relation_evidence = {}
+    for row in rows:
+        try:
+            sources = json.loads(str(row["sources"]))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(sources, list) or not all(isinstance(source, str) for source in sources):
+            return None
+        plan_id = str(row["plan_id"])
+        if source_relations is not None:
+            saved = source_relations.get(plan_id)
+            if not isinstance(saved, dict) or saved.get("sources") != sources or not isinstance(saved.get("requirements"), list):
+                return None
+        relation_evidence[plan_id] = {"sources": sources, "requirements": []}
+    if source_relations is not None and set(source_relations) != set(relation_evidence):
+        return None
+
     requirement_reasons = []
     for path in sorted(active_requirements):
         match = re.match(r"docs/requirements/(\[R-\d+\])", path)
         identifier = match.group(1) if match else path
         related = []
         for row in rows:
-            try:
-                sources = json.loads(str(row["sources"]))
-            except (TypeError, ValueError):
-                sources = []
+            plan_id = str(row["plan_id"])
+            sources = relation_evidence[plan_id]["sources"]
             relation = path in sources
-            if not relation and requirement_documents is not None:
+            if source_relations is not None:
+                relation = path in source_relations[plan_id]["requirements"]
+            elif not relation and requirement_documents is not None:
                 for source in sources:
                     if (not isinstance(source, str)
                         or not source.startswith("docs/requirements/")
@@ -262,7 +285,8 @@ def collect(
                         relation = True
                         break
             if relation:
-                related.append(statuses[str(row["plan_id"])])
+                relation_evidence[plan_id]["requirements"].append(path)
+                related.append(statuses[plan_id])
         if related and all(status == "MERGED" for status in related):
             judgment = None
             if _table_exists(connection, "requirement_judgments"):
@@ -301,4 +325,5 @@ def collect(
 
     return WorkReasonSnapshot(
         cycle, tuple(plans), tuple(requirement_reasons), project_block, planning_error,
+        relation_evidence,
     )

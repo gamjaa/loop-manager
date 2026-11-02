@@ -82,6 +82,14 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
                 "https://github.com/org/repo/blob/base-sha/docs/plans/%5BG-018%5D%20Work.md")
             self.assertEqual(snapshot.requirements[0]["url"],
                 "https://github.com/org/repo/blob/base-sha/docs/requirements/%5BR-031%5D%20Waiting.md")
+            self.assertTrue(loop_manager.notifications.enqueue_waiting_reason(connection, repo, snapshot))
+            event = connection.execute("SELECT payload FROM notification_outbox WHERE event_type='work_waiting'").fetchone()
+            from loop_manager_internal.notifications.policy import is_current
+            payload = json.loads(event[0])
+            self.assertTrue(is_current(connection, repo, 'work_waiting', payload))
+            connection.execute("UPDATE exec_plans SET sources='[]' WHERE repo=?", (repo,))
+            self.assertFalse(is_current(connection, repo, 'work_waiting', payload))
+            connection.execute("UPDATE exec_plans SET sources=? WHERE repo=?", (json.dumps([old_source]), repo))
             connection.execute(
                 "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,),
             )
