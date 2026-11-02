@@ -429,9 +429,43 @@ def _matches_current_draft_item(connection, repo, item, current, *, legacy=False
     return item.get('title') == current['title']
 
 
+def completion_current(connection, repo, cycle, work_cycle):
+    """Recheck durable completion evidence without another remote observation."""
+    from loop_manager_internal.planning.specification_review import valid_final_receipt
+    from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+    from loop_manager_internal.storage import planning_review_state
+    project = connection.execute(
+        "SELECT phase, planning_fingerprint, planning_error, pr_conflict_recovery FROM projects WHERE repo=?",
+        (repo,),
+    ).fetchone()
+    if (project is None or project[0] is not None or project[1] != cycle or project[2]
+            or project[3] or catalog_held_plan_ids(connection, repo)
+            or connection.execute("SELECT 1 FROM project_blocks WHERE repo=?", (repo,)).fetchone()):
+        return False
+    has_history = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_history'"
+    ).fetchone()
+    unfinished = "SELECT 1 FROM exec_plans e WHERE e.repo=? AND e.status!='MERGED' "
+    if has_history:
+        unfinished += ("AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h WHERE h.repo=e.repo "
+                       "AND h.plan_id=e.plan_id AND h.currently_archived=1) ")
+    if connection.execute(unfinished + "LIMIT 1", (repo,)).fetchone():
+        return False
+    receipt = planning_review_state.current_final(connection, repo)
+    return bool(valid_final_receipt(receipt) and receipt['confirmed_revision']
+        and receipt['work_cycle'] == work_cycle == planning_review_state.work_cycle(connection, repo)
+        and not planning_review_state.general_pending(connection, repo))
+
+
 def is_current(connection, repo, kind, payload, *, event_key=None):
     """Shared creation/claim boundary; callers provide already recorded facts."""
     try:
+        if kind == 'project_completed':
+            saved = connection.execute(
+                'SELECT cycle_key, completed_at FROM project_completion_cycles WHERE repo=?', (repo,),
+            ).fetchone()
+            return bool(saved and saved[0] == payload['cycle'] and saved[1]
+                        and completion_current(connection, repo, payload['cycle'], payload['work_cycle']))
         if kind == 'plans_published':
             plans = payload['plans']
             revision = payload['publication_revision']

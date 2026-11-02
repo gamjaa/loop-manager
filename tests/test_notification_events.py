@@ -402,7 +402,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             },
         )
 
-    def test_merged_completion_state_survives_restart_without_notice(self):
+    def test_merged_completion_state_survives_restart_with_one_notice(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
@@ -435,14 +435,14 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 restarted, repo, snapshot,
             ))
             delivered = mock.Mock()
-            self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=delivered), 0)
-            delivered.assert_not_called()
+            self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=delivered), 1)
+            delivered.assert_called_once()
             completion = restarted.execute('SELECT * FROM project_completion_cycles WHERE repo = ?', (repo,)).fetchone()
             self.assertEqual(completion['cycle_key'], 'merge-cycle')
             self.assertEqual(completion['last_completed_plan_id'], 'G-018')
             self.assertEqual(completion['last_completed_title'], 'Reliable notices')
             self.assertIsNotNone(completion['completed_at'])
-            self.assertEqual(self.events(restarted), [])
+            self.assertEqual(len(self.events(restarted)), 1)
 
     def test_disabled_and_partial_configuration_do_not_create_events(self):
         connection = self.connection(enabled=False)

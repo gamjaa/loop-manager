@@ -494,65 +494,46 @@ def enqueue_completion_if_ready(
 ) -> bool:
     """Record completion only for an already verified stable selection."""
 
-    from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
-    if catalog_held_plan_ids(connection, repo):
-        return False
     if snapshot is None or not snapshot.completed:
         return False
     ensure_schema(connection)
-    project = connection.execute(
-        "SELECT phase, planning_fingerprint, planning_error "
-        "FROM projects WHERE repo = ?",
-        (repo,),
-    ).fetchone()
-    has_historical_catalog = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'execplan_catalog_history'"
-    ).fetchone() is not None
-    unfinished_query = (
-        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
-        "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
-        "WHERE h.repo = exec_plans.repo AND h.currently_archived = 1 "
-        "AND h.plan_id = exec_plans.plan_id) LIMIT 1"
-        if has_historical_catalog else
-        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1"
-    )
-    if (
-        project is None
-        or project[0] is not None
-        or not project[1]
-        or str(project[1]) != snapshot.cycle
-        or project[2]
-        or connection.execute(unfinished_query, (repo,)).fetchone() is not None
-        or connection.execute(
-            "SELECT 1 FROM project_blocks WHERE repo = ?", (repo,),
-        ).fetchone() is not None
-    ):
-        return False
-
-    from loop_manager_internal.planning.specification_review import valid_final_receipt
+    from .policy import completion_current
     from loop_manager_internal.storage import planning_review_state
-    receipt = planning_review_state.current_final(connection, repo)
-    if (not valid_final_receipt(receipt) or not receipt["confirmed_revision"]
-            or receipt["work_cycle"] != planning_review_state.work_cycle(connection, repo)
-            or planning_review_state.general_pending(connection, repo)):
-        return False
-
-    cycle_key = str(project[1])
     with connection:
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        work_cycle = planning_review_state.work_cycle(connection, repo)
+        if not completion_current(connection, repo, snapshot.cycle, work_cycle):
+            return False
+        previous = connection.execute(
+            "SELECT cycle_key, completed_at FROM project_completion_cycles WHERE repo=?", (repo,),
+        ).fetchone()
         _cancel_pending_waiting(connection, repo)
+        if previous is None or previous[0] != snapshot.cycle:
+            connection.execute(
+                "UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP "
+                "WHERE repo=? AND event_type='project_completed' AND sent_at IS NULL AND canceled_at IS NULL",
+                (repo,),
+            )
         connection.execute(
-            """
-            INSERT INTO project_completion_cycles (repo, cycle_key, completed_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(repo) DO UPDATE SET
-                cycle_key = excluded.cycle_key,
-                completed_at = excluded.completed_at
-            WHERE project_completion_cycles.cycle_key IS NOT excluded.cycle_key
-                OR project_completion_cycles.completed_at IS NULL
-            """,
-            (repo, cycle_key),
+            "INSERT INTO project_completion_cycles (repo, cycle_key, completed_at) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(repo) DO UPDATE SET "
+            "cycle_key=excluded.cycle_key, completed_at=excluded.completed_at "
+            "WHERE project_completion_cycles.cycle_key IS NOT excluded.cycle_key "
+            "OR project_completion_cycles.completed_at IS NULL", (repo, snapshot.cycle),
         )
+        if _enabled(connection) and (previous is None or previous[0] != snapshot.cycle or not previous[1]):
+            saved = connection.execute(
+                "SELECT last_completed_plan_id, last_completed_title FROM project_completion_cycles WHERE repo=?",
+                (repo,),
+            ).fetchone()
+            payload = {"project": Path(repo).name or repo, "cycle": snapshot.cycle,
+                       "work_cycle": work_cycle, "reason": snapshot.describe(),
+                       "last_completed_plan_id": saved[0], "last_completed_title": saved[1] or ''}
+            _insert(connection, _key('project_completed', repo, snapshot.cycle + '\0' + work_cycle),
+                    repo, 'project_completed', payload)
+    from .delivery import flush_project_events
+    flush_project_events(connection, repo)
     return True
 
 

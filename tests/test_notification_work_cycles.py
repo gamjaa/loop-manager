@@ -37,7 +37,7 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         self.confirm_final_review(connection, "/projects/alpha", fingerprint)
         connection.commit()
 
-    def test_completion_requires_gates_and_preserves_last_work_without_notice(self):
+    def test_completion_requires_gates_and_sends_silent_notice(self):
         connection = self.connection()
         repo = '/projects/alpha'
         connection.execute("UPDATE projects SET planning_fingerprint = 'cycle-one'")
@@ -50,7 +50,10 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(row['last_completed_plan_id'], 'G-018')
         self.assertEqual(row['last_completed_title'], 'Reliable notices')
         self.assertIsNotNone(row['completed_at'])
-        self.assertEqual(self.events(connection), [])
+        event = self.events(connection)[0]
+        self.assertEqual(event['event_type'], 'project_completed')
+        self.assertTrue(json.loads(event['payload'])['silent'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 1)
 
     def test_completion_while_disabled_cancels_legacy_wait_and_survives_restart(self):
         for cursor in (0, 1):
@@ -105,7 +108,29 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         completion = connection.execute('SELECT cycle_key, completed_at FROM project_completion_cycles').fetchone()
         self.assertEqual(completion[0], 'cycle-two')
         self.assertNotEqual(completion[1], 'preserved completion time')
-        self.assertEqual(self.events(connection), [])
+        events = self.events(connection)
+        self.assertEqual(len(events), 2)
+        self.assertIsNotNone(events[0]['canceled_at'])
+        self.assertIsNone(events[1]['canceled_at'])
+
+    def test_completion_cancels_remaining_pieces_when_work_changes(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        self._complete_project(connection, 'cycle-one')
+        connection.execute("UPDATE project_completion_cycles SET last_completed_title=?", ('x' * 5000,))
+        self.assertTrue(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        calls = []
+        def send(_token, _chat, piece):
+            calls.append(piece)
+            connection.execute("UPDATE exec_plans SET status='READY' WHERE repo=?", (repo,))
+            connection.commit()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        self.assertEqual(len(calls), 1)
+        row = self.events(connection)[0]
+        self.assertEqual(row['confirmed_pieces'], 1)
+        self.assertIsNotNone(row['canceled_at'])
+        self.assertIsNotNone(row['rendered_text'])
+        self.assertIsNone(row['sent_at'])
 
     def test_completion_rechecks_final_receipt_and_work_cycle(self):
         from loop_manager_internal.storage import planning_review_state
