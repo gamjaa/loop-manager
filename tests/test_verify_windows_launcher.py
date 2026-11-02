@@ -13,6 +13,7 @@ from unittest import mock
 
 from scripts import verify_windows as launcher
 from loop_manager_internal.execution import verify_process
+from loop_manager_internal.verification.execution_clock import ExecutionClock
 from tests.support.git import isolated_git_test, make_remote_repository
 
 
@@ -136,7 +137,8 @@ class WindowsVerifySnapshotTests(unittest.TestCase):
             (root / 'README.md').unlink()
             bundle = Path(directory) / 'bundle'
             bundle.mkdir()
-            evidence = launcher.snapshot(root, bundle, ENTRYPOINT)
+            with ExecutionClock() as budget:
+                evidence = launcher.snapshot(root, bundle, ENTRYPOINT, budget, 600)
             with tarfile.open(bundle / 'project.tar') as archive:
                 names = archive.getnames()
                 self.assertNotIn('.git', names)
@@ -158,9 +160,56 @@ class WindowsVerifySnapshotTests(unittest.TestCase):
                 original(archive, path, **options)
                 if Path(path).name == 'app.py':
                     Path(path).write_text('CHANGED_DURING_COPY = 1\n')
-            with mock.patch.object(tarfile.TarFile, 'add', new=add), \
+            with ExecutionClock() as budget, mock.patch.object(tarfile.TarFile, 'add', new=add), \
                  self.assertRaisesRegex(RuntimeError, '복사 중 파일'):
-                launcher.snapshot(root, bundle, ENTRYPOINT)
+                launcher.snapshot(root, bundle, ENTRYPOINT, budget, 600)
+
+
+class WindowsVerifySnapshotBudgetTests(unittest.TestCase):
+    def test_git_preserves_binary_output(self):
+        with tempfile.TemporaryDirectory() as directory, ExecutionClock() as budget:
+            root = Path(directory)
+            def run(arguments, *_args, **_kwargs):
+                Path(arguments[3]).write_bytes(b'file-\xff\0')
+                return True, False, ''
+            with mock.patch.object(verify_process, 'run_verify_process', side_effect=run):
+                self.assertEqual(launcher.git(root, root, budget, 10, 'ls-files', '-z'), b'file-\xff\0')
+            self.assertFalse((root / 'git-output').exists())
+
+    def test_delayed_git_blocks_the_next_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = [0.0]
+            with ExecutionClock(clock=lambda: now[0]) as budget:
+                def run(arguments, *_args, **_kwargs):
+                    Path(arguments[3]).write_bytes(b'revision\n')
+                    now[0] = 10.0
+                    return True, False, 'PASS'
+                with mock.patch.object(verify_process, 'run_verify_process', side_effect=run) as process:
+                    with self.assertRaises(TimeoutError):
+                        launcher.snapshot(root, root, ENTRYPOINT, budget, 10)
+                self.assertEqual(process.call_count, 1)
+                self.assertFalse((root / 'project.tar').exists())
+
+    def test_archive_deadline_prevents_subsequent_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'file').write_text('contents')
+            bundle = root / 'bundle'
+            bundle.mkdir()
+            now = [0.0]
+            with ExecutionClock(clock=lambda: now[0]) as budget:
+                def git(*args):
+                    return b'revision\n' if args[4] == 'rev-parse' else b'file\0'
+                original_add = tarfile.TarFile.add
+                def add(archive, path, **options):
+                    original_add(archive, path, **options)
+                    now[0] = 10.0
+                with mock.patch.object(launcher, 'git', side_effect=git) as git_call, \
+                     mock.patch.object(tarfile.TarFile, 'add', new=add):
+                    with self.assertRaises(TimeoutError):
+                        launcher.snapshot(root, bundle, ENTRYPOINT, budget, 10)
+                self.assertEqual(git_call.call_count, 2)
 
 
 class WindowsVerifyPipelineTests(unittest.TestCase):

@@ -110,37 +110,63 @@ def runtime(root):
     return entrypoint.resolve(), python
 
 
-def git(root, *arguments):
-    return subprocess.check_output(['git', '-C', str(root), *arguments],
-                                   env=dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
+def check_budget(budget, timeout):
+    if budget.remaining(timeout) <= 0:
+        raise TimeoutError('자체 verify 준비 중 전체 실행 시간이 만료됐습니다.')
 
 
-def snapshot(root, bundle, entrypoint):
-    revision = git(root, 'rev-parse', 'HEAD').decode().strip()
-    names = git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
+def git(root, bundle, budget, timeout, *arguments):
+    from loop_manager_internal.execution.verify_process import run_verify_process
+    check_budget(budget, timeout)
+    output_path = bundle / 'git-output'
+    # Git의 NUL 구분 출력은 임의의 파일명 바이트를 담으므로 텍스트 출력으로 변환하지 않는다.
+    command = [sys.executable, '-c',
+        'import subprocess,sys; f=open(sys.argv[1],"wb"); '
+        'sys.exit(subprocess.call(sys.argv[2:],stdout=f))',
+        str(output_path), 'git', '-C', str(root), *arguments]
+    passed, timed_out, output = run_verify_process(
+        command, root, timeout, environment=dict(os.environ, GIT_OPTIONAL_LOCKS='0'),
+        job_scope=True, execution_clock=budget)
+    if timed_out:
+        raise TimeoutError('snapshot Git 실행 중 전체 verify 시간이 만료됐습니다.')
+    if not passed:
+        raise RuntimeError(f'snapshot Git 실행에 실패했습니다: {output}')
+    check_budget(budget, timeout)
+    data = output_path.read_bytes()
+    output_path.unlink()
+    return data
+
+
+def snapshot(root, bundle, entrypoint, budget, timeout):
+    revision = git(root, bundle, budget, timeout, 'rev-parse', 'HEAD').decode().strip()
+    names = git(root, bundle, budget, timeout, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
     paths = [root / os.fsdecode(name) for name in names.split(b'\0') if name]
     paths = [path for path in paths if path.exists() or path.is_symlink()]
     before = {path: path.lstat() for path in paths}
     with tarfile.open(bundle / 'project.tar', 'w') as archive:
         for path in paths:
+            check_budget(budget, timeout)
             if path.is_dir() and not path.is_symlink():
                 raise RuntimeError(f'자체 검증에서 지원하지 않는 Git 경로입니다: {path}')
             archive.add(path, arcname=path.relative_to(root).as_posix(), recursive=False)
     for path, old in before.items():
+        check_budget(budget, timeout)
         new = path.lstat()
         if any(getattr(old, key) != getattr(new, key) for key in ('st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
             raise RuntimeError(f'검증 복사 중 파일이 변경됐습니다: {path}')
-    if (git(root, 'rev-parse', 'HEAD').decode().strip() != revision
-            or git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z') != names):
+    if (git(root, bundle, budget, timeout, 'rev-parse', 'HEAD').decode().strip() != revision
+            or git(root, bundle, budget, timeout, 'ls-files', '--cached', '--others', '--exclude-standard', '-z') != names):
         raise RuntimeError('검증 복사 중 Git 입력이 변경됐습니다.')
     runtime_root = entrypoint.parents[2]
     with tarfile.open(bundle / 'runtime.tar', 'w') as archive:
         for path in sorted((runtime_root / 'loop_manager_internal').rglob('*')):
+            check_budget(budget, timeout)
             if path.is_file() and path.suffix in {'.py', '.pl', '.pm'} and '__pycache__' not in path.parts:
                 archive.add(path, arcname=path.relative_to(runtime_root).as_posix(), recursive=False)
     shutil.copyfile(__file__, bundle / 'driver.py')
     with (bundle / 'project.tar').open('rb') as stream:
         fingerprint = hashlib.file_digest(stream, 'sha256').hexdigest()
+    check_budget(budget, timeout)
     return {'revision': revision, 'snapshot_sha256': fingerprint}
 
 
@@ -424,7 +450,7 @@ def windows_main(root):
         writer.emit('run_start', mode='windows+wsl', cap=cap)
         with writer.activate(), phase('verify'), tempfile.TemporaryDirectory(prefix='loop-manager-verify-') as temporary:
             bundle = Path(temporary)
-            report.update(snapshot(root, bundle, entrypoint))
+            report.update(snapshot(root, bundle, entrypoint, budget, timeout - CLEANUP_SECONDS))
             atomic_json(directory / 'snapshot.json', {
                 'run_id': session, 'revision': report['revision'], 'bundle': str(bundle),
                 'snapshot_sha256': report.get('snapshot_sha256')})
