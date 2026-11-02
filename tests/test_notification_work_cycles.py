@@ -353,6 +353,52 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(saved['rendered_text'])
         self.assertIsNone(saved['sent_at'])
 
+    def test_archive_of_unrelated_merged_plan_does_not_change_episode(self):
+        plan = {'id': 'G-018', 'title': 'Wait', 'status': 'PR_OPEN', 'reason': 'PR Merge 대기'}
+        sources = {'G-018': {'sources': ['docs/PRODUCT.md'], 'requirements': []}}
+        before = work_exhaustion.WorkReasonSnapshot('old', (plan,), (), None, None,
+            {**sources, 'G-001': {'sources': ['docs/ARCHITECTURE.md'], 'requirements': []}})
+        after = work_exhaustion.WorkReasonSnapshot('new', (plan,), (), None, None, sources)
+        self.assertEqual(work_exhaustion.episode_signature(before), work_exhaustion.episode_signature(after))
+
+    def test_removing_unrelated_merged_catalog_row_keeps_wait_current(self):
+        from loop_manager_internal.notifications.policy import is_current
+        connection = self.connection()
+        repo = '/projects/alpha'
+        connection.execute("UPDATE projects SET planning_fingerprint='cycle-one' WHERE repo=?", (repo,))
+        connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status) "
+            "VALUES (?, 'G-001', 'docs/plans/[G-001] Done.md', 'Done', '[]', '[]', 'normal', 'hash', 'MERGED')", (repo,))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        payload = json.loads(self.events(connection)[0]['payload'])
+        connection.execute("DELETE FROM exec_plans WHERE repo=? AND plan_id='G-001'", (repo,))
+        self.assertTrue(is_current(connection, repo, 'work_waiting', payload))
+        fresh = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, fresh))
+        self.assertEqual(len(self.events(connection)), 1)
+
+    def test_confirmed_worker_decision_exposes_its_validated_location(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        self.decision_block(connection)
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertEqual(snapshot.plans[0]['action_targets'], ['docs/plans/[G-018] Reliable notices.md'])
+
+    def test_unverified_recovery_targets_do_not_request_user_action(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                           "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'Cause')", (repo,))
+        connection.execute("INSERT INTO recovery_records (repo, subject, identity, reason_code, disposition, "
+            "pending_action, phase, fingerprint, progress_marker, occurrence, attempts, detail, final_evidence) "
+            "VALUES (?, 'G-018', 'id', 'user_decision', 'user_action_required', 'final_block', 'WORKING', "
+            "'fp', 'marker', 1, 1, 'Cause', ?)", (repo, json.dumps({'user_targets': ['unverified']})))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertNotIn('action_targets', snapshot.plans[0])
+        self.assertNotIn('unverified', snapshot.describe())
+
     def test_plan_block_without_confirmed_cause_is_not_stable(self):
         connection = self.connection()
         repo = '/projects/alpha'

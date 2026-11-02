@@ -77,7 +77,8 @@ def episode_signature(snapshot: WorkReasonSnapshot) -> str:
         "planning_error": snapshot.planning_error,
         "sources": {plan_id: [requirement_sources.source_requirement_id(source) or source
                               for source in item["sources"]]
-                    for plan_id, item in (snapshot.source_relations or {}).items()},
+                    for plan_id, item in (snapshot.source_relations or {}).items()
+                    if any(plan["id"] == plan_id for plan in snapshot.plans)},
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
         separators=(",", ":")).encode()).hexdigest()
@@ -89,21 +90,22 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
-def _action_targets(connection: sqlite3.Connection, repo: str, plan_id: str) -> list[str]:
-    if not _table_exists(connection, "recovery_records"):
+def _action_targets(connection: sqlite3.Connection, repo: str, plan_id: str,
+                    reason_code: str, cause: str) -> list[str]:
+    # Raw recovery user_targets alone do not establish a current user action.
+    from .policy import block_action
+    action = block_action(connection, repo, {
+        "scope": "plan", "execplan_id": plan_id, "reason_code": reason_code, "cause": cause,
+    })
+    if not action:
         return []
-    record = connection.execute(
-        "SELECT final_evidence FROM recovery_records "
-        "WHERE repo = ? AND subject = ?", (repo, plan_id),
-    ).fetchone()
-    if not record or not record[0]:
-        return []
-    try:
-        evidence = json.loads(str(record[0]))
-    except (TypeError, ValueError):
-        return []
-    targets = evidence.get("user_targets") if isinstance(evidence, dict) else None
-    return [str(target) for target in targets] if isinstance(targets, list) else []
+    decision = action.get("decision")
+    if isinstance(decision, dict):
+        return [location["path"] for location in decision.get("locations", [])
+                if isinstance(location, dict) and isinstance(location.get("path"), str)]
+    if action.get("kind") == "guidance":
+        return [proposal[2] for proposal in action["proposals"]]
+    return []
 
 
 def collect(
@@ -224,7 +226,7 @@ def collect(
                 return None
             item["reason_code"], item["evidence"] = block
             item["reason"] = f"{block[0]}: {block[1]}"
-            targets = _action_targets(connection, repo, plan_id)
+            targets = _action_targets(connection, repo, plan_id, block[0], block[1])
             if targets:
                 item["action_targets"] = targets
         else:
@@ -253,7 +255,11 @@ def collect(
             if not isinstance(saved, dict) or saved.get("sources") != sources or not isinstance(saved.get("requirements"), list):
                 return None
         relation_evidence[plan_id] = {"sources": sources, "requirements": []}
-    if source_relations is not None and set(source_relations) != set(relation_evidence):
+    if source_relations is not None and any(
+        not isinstance(source_relations[plan_id], dict)
+        or source_relations[plan_id].get("requirements") != []
+        for plan_id in set(source_relations) - set(relation_evidence)
+    ):
         return None
 
     requirement_reasons = []
