@@ -200,23 +200,8 @@ def _run_project_result(
         observe_runtime()
         dispatch_checkpoints, checkpoint_plan_id = checkpoint_dispatch_scope()
         if dispatch_checkpoints and effects._checkpoint_dispatch_ready(connection, repo):
-            project_before = connection.execute(
-                "SELECT phase, pr_conflict_recovery FROM projects WHERE repo = ?",
-                (repo,),
-            ).fetchone()
             schedule_before = effects.catalog_schedule_decision(connection, repo)
-            maintenance_before = maintenance_state.MaintenanceRepository(
-                connection
-            ).get(repo)
-            if (
-                schedule_before.active is not None
-                or schedule_before.runnable_ready is not None
-                or project_before["phase"] not in {
-                    None, "PR_OPEN", "PLAN_BLOCKED", "PROJECT_BLOCKED",
-                }
-                or project_before["pr_conflict_recovery"]
-                or maintenance_before.phase is not maintenance_state.MaintenancePhase.IDLE
-            ):
+            if schedule_before.runnable_ready is not None:
                 notifications.mark_work_available(connection, repo)
             pending_before = (
                 blocked_checkpoint_state.BlockedCheckpointRepository(
@@ -239,6 +224,9 @@ def _run_project_result(
                     request.request_identity for request in pending_before
                 )
         try:
+            progress_before = {str(row[0]): tuple(row[1:]) for row in connection.execute(
+                "SELECT plan_id, verify_token, review_token, status FROM exec_plans WHERE repo=?", (repo,),
+            )}
             recovery_before = {
                 str(record["subject"]): int(record["generation"])
                 for record in connection.execute(
@@ -282,6 +270,16 @@ def _run_project_result(
                 0,
                 str(error),
             )
+        for observed in connection.execute(
+            "SELECT plan_id, verify_token, review_token, status FROM exec_plans WHERE repo=?", (repo,),
+        ):
+            previous = progress_before.get(str(observed[0]))
+            if previous is not None and (
+                any(not previous[index] and observed[index + 1] for index in (0, 1))
+                or previous[2] != "MERGED" and observed[3] == "MERGED"
+            ):
+                notifications.mark_work_available(connection, repo)
+                break
         if on_step_completed is not None:
             on_step_completed()
         if step_result == PROJECT_STEP_RETRY:

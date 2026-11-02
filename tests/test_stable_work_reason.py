@@ -305,6 +305,46 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         connection.close()
 
     @dummy_worker_sessions
+    def test_management_handoff_and_retry_order_do_not_retire_wait_episode(self):
+        from loop_manager_internal.storage import management_admission
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        management_admission.ensure_schema(connection)
+        connection.execute("UPDATE exec_plans SET status='VERIFYING' WHERE repo=?", (repo,))
+        connection.execute("UPDATE projects SET phase='VERIFYING' WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO work_reason_episodes(repo,signature,generation) VALUES (?, 'stable', 7)", (repo,))
+        connection.execute("INSERT INTO project_completion_cycles(repo,cycle_key,completed_at,generation) "
+                           "VALUES (?, 'cycle-one', 'preserved', 4)", (repo,))
+        connection.execute("INSERT INTO task_management_admissions(repo,plan_id,parked,pending,handoff,retry_order) "
+                           "VALUES (?, 'G-018', 1, 1, 0, 3)", (repo,))
+        with (mock.patch('loop_manager._checkpoint_dispatch_ready', return_value=True),
+              mock.patch('loop_manager._run_project_step', return_value=loop_manager.PROJECT_STEP_TRANSIENT_PAUSE)):
+            for parked, pending, handoff, retry in ((1, 1, 0, 3), (1, 0, 1, 3), (0, 0, 0, 4)):
+                connection.execute("UPDATE task_management_admissions SET parked=?,pending=?,handoff=?,retry_order=? WHERE repo=?",
+                                   (parked, pending, handoff, retry, repo))
+                result = loop_manager._run_project_result(connection, Path('/unused'), repo, Path('/unused.ini'), None, False)
+                self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+                self.assertEqual(tuple(connection.execute("SELECT signature,generation FROM work_reason_episodes WHERE repo=?", (repo,)).fetchone()), ('stable', 7))
+                self.assertEqual(tuple(connection.execute("SELECT completed_at,generation FROM project_completion_cycles WHERE repo=?", (repo,)).fetchone()), ('preserved', 4))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('work_waiting','project_completed')").fetchone()[0], 0)
+
+    @dummy_worker_sessions
+    def test_verified_progress_retires_episode_after_management_wait(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE exec_plans SET status='VERIFYING' WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO work_reason_episodes(repo,signature,generation) VALUES (?, 'stable', 7)", (repo,))
+        def completed_step(*_args, **_kwargs):
+            connection.execute("UPDATE exec_plans SET verify_token='verified-candidate' WHERE repo=?", (repo,))
+            return loop_manager.PROJECT_STEP_TRANSIENT_PAUSE
+        with (mock.patch('loop_manager._checkpoint_dispatch_ready', return_value=False),
+              mock.patch('loop_manager._run_project_step', side_effect=completed_step)):
+            result = loop_manager._run_project_result(connection, Path('/unused'), repo, Path('/unused.ini'), None, False)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+        self.assertEqual(tuple(connection.execute("SELECT signature,generation FROM work_reason_episodes WHERE repo=?", (repo,)).fetchone()),
+                         ('__work_available__', 7))
+
+    @dummy_worker_sessions
     def test_completion_gate_change_after_snapshot_does_not_report_completion(self):
         connection, repo = self._connection()
         self.addCleanup(connection.close)
