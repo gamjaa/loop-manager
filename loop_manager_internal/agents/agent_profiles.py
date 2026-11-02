@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 import configparser
 import os
@@ -17,6 +17,7 @@ from loop_manager_internal.agents.agent_invocation import AgentProfile
 from loop_manager_internal.config import execution_path
 from loop_manager_internal.config.managed_config import provider_fast_mode
 from loop_manager_internal.execution.validation_feedback import redact_secrets
+from .agent_claude_preflight import discovery
 from .provider_home import PROVIDERS, prepare_authentication, authentication_links, assert_authentication_links, login_instructions
 
 
@@ -312,13 +313,13 @@ def claude_model_efforts(
             configured_pairs.add((model, effort))
 
     environment = agent_environment("claude")
+    def lookup(selection):
+        with discovery(environment, worktree, config_path) as arguments:
+            return effects.command(['claude', *arguments, '--init-only', *selection],
+                                   cwd=worktree, check=False, env=environment)
+
     for model in sorted(set(aliases.values())):
-        result = effects.command(
-            ["claude", "--bare", "--init-only", "--model", model],
-            cwd=worktree,
-            check=False,
-            env=environment,
-        )
+        result = lookup(["--model", model])
         if result.returncode:
             if execution_path.command_lookup_failed(result.stdout or ''):
                 output = redact_secrets(
@@ -331,20 +332,7 @@ def claude_model_efforts(
         model: set() for model in set(aliases.values())
     }
     for model, effort in sorted(configured_pairs):
-        result = effects.command(
-            [
-                "claude",
-                "--bare",
-                "--init-only",
-                "--model",
-                model,
-                "--effort",
-                effort,
-            ],
-            cwd=worktree,
-            check=False,
-            env=environment,
-        )
+        result = lookup(["--model", model, "--effort", effort])
         if result.returncode:
             if execution_path.command_lookup_failed(result.stdout or ''):
                 output = redact_secrets(
@@ -420,12 +408,14 @@ def validate_provider_runtime(
         else ["claude", "auth", "status"]
     )
     try:
-        auth = effects.command(
-            auth_arguments,
-            cwd=worktree,
-            check=False,
-            env=environment,
-        )
+        scope = discovery(environment, worktree, config_path) if provider == "claude" else nullcontext(())
+        with scope as arguments:
+            auth = effects.command(
+                [executable, *arguments, *auth_arguments[1:]],
+                cwd=worktree,
+                check=False,
+                env=environment,
+            )
     except OSError as error:
         if execution_path.missing_executable(error, executable):
             raise RuntimeError(execution_path.with_path_recovery_hint(

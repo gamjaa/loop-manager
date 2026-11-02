@@ -144,6 +144,60 @@ class ProviderHomeTests(unittest.TestCase):
                                  str(self.state / f'automation-{provider}'))
                 self.assertEqual(observed[0][variable], effects.command.call_args.kwargs['env'][variable])
 
+    def test_claude_discovery_uses_consumed_sources_without_tool_or_hook_capability(self):
+        from loop_manager_internal.agents import agent_claude_preflight as preflight
+        from loop_manager_internal.agents import provider_guidance
+        from loop_manager_internal.agents.common_guidance import CommonGuidance
+        from tests.support.profiles import profile_config
+        from hashlib import sha256
+        config = profile_config(self)
+        environment = profiles.agent_environment('claude', environment_variables=self.variables,
+                                                 state_dir=self.state)
+        homes.prepare_authentication('claude', environment)
+        home = Path(environment['CLAUDE_CONFIG_DIR'])
+        (home / 'settings.json').write_text('{"model":"common"}')
+        project = self.root / 'project'
+        (project / '.claude').mkdir(parents=True)
+        (project / '.claude/settings.json').write_text('{"model":"project"}')
+        personal = Path(self.variables['HOME']) / '.claude'
+        personal.mkdir(parents=True, exist_ok=True)
+        (personal / 'settings.json').write_text('{"hooks":{"SessionStart":[]}}')
+        instruction = self.root / 'instruction.md'
+        instruction.write_text('guidance')
+        guidance = CommonGuidance('worker', 'guidance', sha256(b'guidance').hexdigest(), instruction)
+        calls = []
+        def command(arguments, **context):
+            calls.append(arguments)
+            self.assertEqual(context['env']['CLAUDE_CONFIG_DIR'], str(home))
+            self.assertEqual(arguments[arguments.index('--setting-sources') + 1], 'user,project,local')
+            self.assertEqual(arguments[arguments.index('--tools') + 1], '')
+            self.assertEqual(arguments[arguments.index('--disallowedTools') + 1], '*')
+            self.assertNotIn('--bare', arguments)
+            self.assertEqual(json.loads(arguments[arguments.index('--settings') + 1]),
+                             {'disableAllHooks': True})
+            output = '--append-system-prompt-file --system-prompt-snapshot' if arguments[-1] == '--help' else '{}'
+            return subprocess.CompletedProcess(arguments, 0, output, '')
+        effects = mock.Mock()
+        effects.command.side_effect = command
+        effects.claude_model_efforts.side_effect = lambda *_: profiles.claude_model_efforts(
+            config, project, effects=effects)
+        with mock.patch.dict(os.environ, self.variables), \
+             mock.patch.object(profiles.shutil, 'which', return_value='cli'), \
+             mock.patch.object(profiles, 'validate_provider_profiles'), \
+             mock.patch.object(preflight, '_system_directory', return_value=self.root / 'system'), \
+             mock.patch.object(provider_guidance.subprocess, 'run', side_effect=command):
+            profiles.validate_provider_runtime(config, 'claude', project, effects=effects, state_dir=self.state)
+            provider_guidance.claude_arguments(guidance, environment=environment, worktree=project)
+            self.assertGreater(len(calls), 2)
+            self.assertIn(['auth', 'status'], [arguments[-2:] for arguments in calls])
+            def drift(arguments, **context):
+                (home / 'settings.json').write_text('{"model":"changed"}')
+                return command(arguments, **context)
+            effects.command.side_effect = drift
+            with profiles.prepared_environment('claude', environment), self.assertRaisesRegex(RuntimeError, '조회 중'):
+                profiles.claude_model_efforts(config, project, effects=effects)
+        self.assertEqual((personal / 'settings.json').read_text(), '{"hooks":{"SessionStart":[]}}')
+
     def test_auth_failure_reports_the_selected_path_and_login_command(self):
         effects = mock.Mock()
         effects.command.return_value = subprocess.CompletedProcess([], 1, '')

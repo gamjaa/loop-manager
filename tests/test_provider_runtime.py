@@ -418,10 +418,12 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             "loop_manager.command", return_value=authenticated
         ) as auth_command:
             loop_manager.validate_provider_runtime(config, "claude")
-        self.assertEqual(
-            auth_command.call_args_list[0].args[0],
-            ["claude", "auth", "status"],
-        )
+        arguments = auth_command.call_args_list[0].args[0]
+        self.assertEqual(arguments[0], 'claude')
+        self.assertEqual(arguments[-2:], ['auth', 'status'])
+        self.assertEqual(arguments[arguments.index('--setting-sources') + 1], 'user,project,local')
+        self.assertEqual(json.loads(arguments[arguments.index('--settings') + 1]),
+                         {'disableAllHooks': True})
         self.assertTrue(
             any(
                 "--init-only" in call.args[0]
@@ -1035,7 +1037,7 @@ class CommonGuidanceProviderTests(unittest.TestCase):
     def native_probe(self, arguments, **context):
         if arguments == ['codex', '--version']:
             return 'codex-cli 0.159.3'
-        if arguments == ['claude', '--help']:
+        if arguments[0] == 'claude' and arguments[-1] == '--help':
             return '--append-system-prompt-file --system-prompt-snapshot'
         self.assertEqual(arguments[-2:], ['debug', 'prompt-input'])
         self.assertEqual(context['cwd'], self.worktree)
@@ -1109,7 +1111,8 @@ class CommonGuidanceProviderTests(unittest.TestCase):
                 'CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY')
             self.assertEqual(call.kwargs['env'], {key: inherited[key] for key in ('PATH', 'HOME', *allowed)})
         self.assertEqual(probe.call_args_list[0].args[0], ['codex', '--version'])
-        self.assertEqual(probe.call_args_list[4].args[0], ['claude', '--help'])
+        self.assertEqual(probe.call_args_list[4].args[0][-1], '--help')
+        self.assertIn('user,project,local', probe.call_args_list[4].args[0])
         for call in probe.call_args_list[5:]:
             self.assertIs(call.kwargs['env'], launch)
 

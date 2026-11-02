@@ -1,6 +1,7 @@
 """Read-only Claude startup checks, separate from native enforcement observations."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
 import json
@@ -13,7 +14,7 @@ import stat
 import subprocess
 import tempfile
 
-from .agent_claude_policy import policy_arguments
+from .agent_claude_policy import SOURCE_ARGUMENTS, policy_arguments, validate_settings
 from .agent_codex_sandbox import _owned_directory
 from .agent_write_isolation import IsolationError, IsolationEvidence, WorktreeBoundary, _policy_digest
 from loop_manager_internal.config import execution_path
@@ -21,6 +22,8 @@ from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 
 CLI_GUARDS = ('--permission-prompts', 'none', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}')
+DISCOVERY_ARGUMENTS = (*SOURCE_ARGUMENTS, *CLI_GUARDS, '--tools', '', '--disallowedTools', '*',
+                       '--settings', '{"disableAllHooks":true}')
 POLICY_DIAGNOSTIC = re.compile(
     r'settings? (?:error|warning):|(?:sandbox|auto mode).{0,60}(?:unavailable|disabled|fail(?:ed|ure))', re.I)
 MANAGED_KEYS = frozenset({
@@ -139,11 +142,15 @@ def _mdm_paths() -> tuple[Path, Path]:
     return directory / name, directory / username / name
 
 
-def _read(path: Path, observations: list[dict], *, parse: bool = True, plist: bool = False) -> dict:
+def _read(path: Path, observations: list[dict], *, parse: bool = True, plist: bool = False,
+          owned_root: Path | None = None) -> dict:
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
         try:
             info = os.fstat(descriptor)
+            if owned_root is not None and (info.st_uid != os.getuid()
+                    or not path.resolve().is_relative_to(owned_root.resolve())):
+                raise IsolationError('Claude 설정 source의 소유권·경로를 확인할 수 없습니다.')
             if not stat.S_ISREG(info.st_mode) or info.st_size > 2 * 1024 * 1024:
                 raise IsolationError('Claude 설정 source가 제한된 일반 파일이 아닙니다.')
             with os.fdopen(descriptor, 'rb', closefd=False) as stream:
@@ -171,8 +178,35 @@ def _read(path: Path, observations: list[dict], *, parse: bool = True, plist: bo
         raise IsolationError(f'Claude 설정 source 형식을 해석할 수 없습니다: {path}') from error
 
 
-def configuration(environment: dict[str, str], config_path: Path | None) -> tuple[dict, str, list[dict]]:
-    """Observe actual managed source identities, without persisting their values."""
+def _local_settings_root(worktree: Path, environment: dict[str, str], source: Path | None) -> Path:
+    """Match native local-scope root selection, including its ownership fallback."""
+    root = next((path for path in (worktree, *worktree.parents)
+                 if (path / '.git').exists()), worktree)
+    home = Path(environment.get('HOME', str(Path.home()))).resolve()
+    try:
+        if root == home or any(path.exists() and path.stat().st_uid != os.getuid()
+                               for path in (root, root / '.git', root / '.claude')):
+            return worktree
+        if source is not None:
+            return source
+        git = root / '.git'
+        if not git.is_file():
+            return root
+        pointer = git.read_text(encoding='utf-8').strip()
+        if not pointer.startswith('gitdir: '):
+            raise ValueError('invalid git pointer')
+        git_dir = (root / pointer[8:]).resolve()
+        common = (git_dir / (git_dir / 'commondir').read_text().strip()).resolve()
+        if common.name != '.git':
+            raise ValueError('unknown local settings root')
+        return common.parent
+    except (OSError, ValueError) as error:
+        raise IsolationError('Claude local 설정 root를 확인할 수 없습니다.') from error
+
+
+def configuration(environment: dict[str, str], config_path: Path | None,
+                  worktree: Path | None = None, source: Path | None = None) -> tuple[dict, str, list[dict]]:
+    """Observe consumed settings identities, without persisting their values."""
     observations: list[dict] = [{'environment': {key: value for key, value in environment.items()
         if key in {'HOME', 'USERPROFILE', 'CLAUDE_CONFIG_DIR', 'TMPDIR', 'TMP', 'TEMP',
                    'CLAUDE_CODE_TMPDIR', 'PATH'}}}]
@@ -201,12 +235,42 @@ def configuration(environment: dict[str, str], config_path: Path | None) -> tupl
             mdm = candidate or mdm
     if 'microsoft' in platform.release().lower():
         raise IsolationError('Claude WSL의 Windows managed 정책 상속을 확인할 수 없습니다.')
-    remote = _read(Path(environment['CLAUDE_CONFIG_DIR']) / 'remote-settings.json', observations)
+    home = Path(environment.get('CLAUDE_CONFIG_DIR',
+                                str(Path(environment.get('HOME', str(Path.home()))) / '.claude')))
+    remote = _read(home / 'remote-settings.json', observations)
     if config_path is not None:
         _read(config_path, observations, parse=False)
-    effective = resolve_managed(remote, mdm, files)
+    managed = resolve_managed(remote, mdm, files)
+    candidates = [(home / 'settings.json', home)]
+    if worktree is not None:
+        worktree = worktree.resolve()
+        candidates.append((worktree / '.claude/settings.json', worktree))
+        local_root = _local_settings_root(worktree, environment, source)
+        candidates.extend((root / '.claude/settings.local.json', root)
+                          for root in dict.fromkeys((worktree, local_root)))
+    lower = {}
+    # Check each consumed source: a higher scalar cannot hide an unsafe
+    # lower-source extension or security exception. Native arrays still merge.
+    for path, root in candidates:
+        settings = _read(path, observations, owned_root=root)
+        if set(settings) - MANAGED_KEYS:
+            raise IsolationError('Claude 설정 source key의 유효 경계를 확인할 수 없습니다.')
+        validate_settings(settings)
+        lower = _merge(lower, settings)
+    validate_settings(managed)
+    effective = _merge(lower, managed)
+    validate_settings(effective)
     fingerprint = sha256(json.dumps(observations, sort_keys=True).encode()).hexdigest()
     return effective, fingerprint, observations
+
+
+@contextmanager
+def discovery(environment: dict[str, str], worktree: Path | None, config_path: Path | None = None):
+    """Settings-aware read-only lookup; no model turn or tool capability."""
+    _, before, _ = configuration(environment, config_path, worktree)
+    yield DISCOVERY_ARGUMENTS
+    if configuration(environment, config_path, worktree)[1] != before:
+        raise IsolationError('Claude 조회 중 유효 설정 source가 변경됐습니다.')
 
 
 def _command(arguments: list[str], environment: dict[str, str], worktree: Path) -> str:
@@ -265,21 +329,33 @@ def prepare(boundary: WorktreeBoundary, state_dir: Path, role: str, read_only: b
     if role == 'worker' and not read_only:
         child['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'] = str(attempt)
         child['LOOP_MANAGER_TARGETED_TEST_RUNNER'] = str(Path(__file__).resolve().parents[1] / 'verification/targeted.py')
-    effective, _, _ = configuration(child, config_path)
+    effective, before, _ = configuration(child, config_path, boundary.worktree, boundary.source)
     arguments = policy_arguments(boundary, attempt, read_only, fast_mode=fast_mode, managed_settings=effective,
-                                 bash_temporary=bash_temporary) + CLI_GUARDS
-    version = _command(['claude', '--version'], child, boundary.worktree)
+                                 bash_temporary=bash_temporary, targeted_runtime=(
+                                     Path(child['LOOP_MANAGER_TARGETED_TEST_RUNNER']).parents[1]
+                                     if role == 'worker' and not read_only else None)) + CLI_GUARDS
+    def lookup(selection):
+        # A preceding query may refresh native state. Refuse changed settings
+        # before the next CLI can discover extensions from that new source.
+        if configuration(child, config_path, boundary.worktree, boundary.source)[1] != before:
+            raise IsolationError('Claude 시작 조회 중 유효 설정 source가 변경됐습니다.')
+        output = _command(['claude', *selection], child, boundary.worktree)
+        if configuration(child, config_path, boundary.worktree, boundary.source)[1] != before:
+            raise IsolationError('Claude 시작 조회 중 유효 설정 source가 변경됐습니다.')
+        return output
+
+    version = lookup(['--version'])
     match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?: \(Claude Code\))?', version)
-    # Includes restricted, excluded-source filesystem merging and the native
+    # Includes native working-directory checks and the
     # 2.1.307 fix that stops sandbox cleanup deleting nonempty objects/refs.
     if not match or tuple(map(int, match.groups())) < (2, 1, 307):
         raise IsolationError('Claude CLI가 지원되는 native 정책 버전(v2.1.307 이상)이 아닙니다.')
-    help_text = _command(['claude', '--help'], child, boundary.worktree)
-    if any(flag not in help_text for flag in ('--restricted', '--setting-sources', '--settings',
+    help_text = lookup([*DISCOVERY_ARGUMENTS, '--help'])
+    if any(flag not in help_text for flag in ('--setting-sources', '--settings',
             '--permission-mode', '--permission-prompts', '--tools', '--disallowedTools', '--strict-mcp-config')):
         raise IsolationError('Claude CLI의 필수 native 정책 옵션을 확인할 수 없습니다.')
     try:
-        authentication = json.loads(_command(['claude', *arguments, 'auth', 'status'], child, boundary.worktree))
+        authentication = json.loads(lookup([*DISCOVERY_ARGUMENTS, 'auth', 'status']))
         if (not isinstance(authentication, dict) or authentication.get('authMethod') not in
                 {'claude.ai', 'oauth_token', 'api_key', 'third_party'}
                 or not isinstance(authentication.get('configDirectory'), str)
@@ -289,12 +365,12 @@ def prepare(boundary: WorktreeBoundary, state_dir: Path, role: str, read_only: b
         raise IsolationError('Claude 인증 상태·선택 공통 홈을 확인할 수 없습니다.') from error
     # doctor is a documented read-only settings diagnostic. Neither its exit
     # status nor the requested settings are an OS write-probe success.
-    doctor = _command(['claude', *arguments, 'doctor'], child, boundary.worktree)
+    doctor = lookup([*DISCOVERY_ARGUMENTS, 'doctor'])
     if POLICY_DIAGNOSTIC.search(doctor):
         raise IsolationError('Claude 시작 설정 진단에서 정책 오류·무시를 관측했습니다.')
-    effective, digest, observations = configuration(child, config_path)
-    arguments = policy_arguments(boundary, attempt, read_only, fast_mode=fast_mode, managed_settings=effective,
-                                 bash_temporary=bash_temporary) + CLI_GUARDS
+    effective, digest, observations = configuration(child, config_path, boundary.worktree, boundary.source)
+    if digest != before:
+        raise IsolationError('Claude 시작 조회 중 유효 설정 source가 변경됐습니다.')
     specification = json.dumps({'worktree': str(boundary.worktree), 'source': str(boundary.source),
         'repository': boundary.repository_identity, 'read_only': read_only, 'role': role,
         'git_directory': str(boundary.git_dir), 'common_directory': str(boundary.common_dir),
@@ -304,7 +380,7 @@ def prepare(boundary: WorktreeBoundary, state_dir: Path, role: str, read_only: b
         'auto_mode_support': 'requires_invocation_init',
         'requested_policy_digest': sha256(json.dumps(arguments).encode()).hexdigest(),
         'settings_sources': observations,
-        'effective_managed_digest': sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()}, sort_keys=True)
+        'effective_settings_digest': sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()}, sort_keys=True)
     return ClaudeLaunch(arguments, child, runtime, attempt, specification, version, digest, reason, bash_temporary=bash_temporary)
 
 
@@ -331,7 +407,10 @@ def assert_current(launch: ClaudeLaunch, boundary: WorktreeBoundary, role: str,
             raise IsolationError('Claude 소유 runtime 경로·권한이 변경됐습니다.')
     if launch.attempt.parent != launch.runtime:
         raise IsolationError('Claude 호출별 임시 경로가 runtime에 속하지 않습니다.')
-    _, digest, _ = configuration(launch.environment, config_path)
+    try:
+        _, digest, _ = configuration(launch.environment, config_path, boundary.worktree, boundary.source)
+    except IsolationError as error:
+        raise IsolationError(f'Claude 시작 확인 뒤 유효 설정 source가 변경됐거나 읽기·정책 검사에 실패했습니다: {error}') from error
     if digest != launch.configuration_digest:
         raise IsolationError('Claude 시작 확인 뒤 유효 설정 source가 변경됐습니다.')
     if check_cli:

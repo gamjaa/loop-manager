@@ -104,10 +104,11 @@ class ClaudePreflightTests(unittest.TestCase):
         self.assertEqual(kwargs['env']['ANTHROPIC_API_KEY'], 'not-a-real-key')
         if arguments[1:] == ['--version']:
             output = '2.1.307 (Claude Code)'
-        elif arguments[1:] == ['--help']:
+        elif arguments[-1:] == ['--help']:
             output = '--restricted --setting-sources --settings --permission-mode --permission-prompts --tools --disallowedTools --strict-mcp-config'
         elif arguments[-2:] == ['auth', 'status']:
-            self.assertIn('--restricted', arguments)
+            self.assertNotIn('--restricted', arguments)
+            self.assertEqual(arguments[arguments.index('--setting-sources') + 1], 'user,project,local')
             self.assertIn('--strict-mcp-config', arguments)
             output = json.dumps({'authMethod': 'api_key', 'configDirectory': str(self.home)})
         elif arguments[-1] == 'doctor':
@@ -139,17 +140,119 @@ class ClaudePreflightTests(unittest.TestCase):
         self.assertEqual(settings, {'model': 'remote'})
         self.assertNotEqual(fingerprint, changed)
 
-    def test_ignored_personal_project_settings_and_auth_values_do_not_enter_source_identity(self):
-        (self.home / 'settings.json').write_text('{"sandbox":{"enabled":false}}')
-        project = self.workspace / '.claude'
-        project.mkdir()
-        (project / 'settings.json').write_text('local secret content')
-        _, fingerprint, observations = preflight.configuration(self.environment, None)
-        _, changed, _ = preflight.configuration(dict(self.environment, ANTHROPIC_API_KEY='another-secret'), None)
+    def test_personal_settings_and_auth_values_do_not_enter_source_identity(self):
+        personal = self.root / '.claude'
+        personal.mkdir()
+        path = personal / 'settings.json'
+        path.write_text('{"hooks":{"SessionStart":[{"command":"personal-hook"}]}}')
+        _, fingerprint, observations = preflight.configuration(self.environment, None, self.workspace)
+        path.write_text('invalid personal settings')
+        (self.root / '.claude.json').write_text('invalid personal global settings')
+        _, changed, _ = preflight.configuration(
+            dict(self.environment, ANTHROPIC_API_KEY='another-secret'), None, self.workspace)
         self.assertEqual(fingerprint, changed)
         self.assertNotIn('not-a-real-key', repr(observations))
-        self.assertNotIn('local secret content', repr(observations))
-        self.assertFalse(any(str(item.get('path', '')).endswith('/settings.json') for item in observations))
+        self.assertNotIn(str(path), repr(observations))
+
+    def test_consumed_settings_lifecycle_and_final_drift_preserve_original_files(self):
+        project = self.workspace / '.claude'
+        project.mkdir()
+        self.boundary.source.mkdir()
+        (self.boundary.source / '.claude').mkdir()
+        # A home/ancestor repository must not replace the linked-worktree root.
+        (self.root / '.git').mkdir()
+        # Anchor repository discovery inside the fixture, independent of any
+        # .git entry and ownership on the machine's temporary ancestors.
+        self.boundary.git_dir.mkdir(parents=True)
+        (self.boundary.git_dir / 'commondir').write_text('../..')
+        (self.workspace / '.git').write_text('gitdir: ' + str(self.boundary.git_dir))
+        for path in (self.home / 'settings.json', project / 'settings.json',
+                     project / 'settings.local.json',
+                     self.boundary.source / '.claude/settings.local.json'):
+            with self.subTest(path=path), mock.patch.object(preflight.subprocess, 'run', side_effect=self.native):
+                def fingerprint():
+                    return preflight.configuration(self.environment, None, self.workspace,
+                                                   self.boundary.source)[1]
+                absent = self.prepare()
+                absent_digest = fingerprint()
+                path.write_text('{"model":"created"}')
+                with self.assertRaisesRegex(IsolationError, 'source가 변경'):
+                    preflight.assert_current(absent, self.boundary, 'worker', False, None)
+                self.prepare()
+                created = fingerprint()
+                replacement = path.with_suffix('.new')
+                replacement.write_text('{"model":"replaced"}')
+                replacement.replace(path)
+                self.prepare()
+                replaced = fingerprint()
+                path.unlink()
+                self.prepare()
+                deleted = fingerprint()
+                path.write_text('{"model":"recreated"}')
+                self.prepare()
+                recreated = fingerprint()
+                self.assertEqual(len({created, replaced, deleted, recreated}), 4)
+                self.assertEqual(path.read_text(), '{"model":"recreated"}')
+                self.assertEqual(deleted, absent_digest)
+                path.unlink()
+
+    def test_linked_local_root_and_settings_merge_match_discovery_and_managed_calls(self):
+        source = self.boundary.source
+        git_dir = source / '.git/worktrees/task'
+        git_dir.mkdir(parents=True)
+        (git_dir / 'commondir').write_text('../..')
+        (self.workspace / '.git').write_text('gitdir: ' + str(git_dir))
+        (source / '.claude').mkdir()
+        (self.workspace / '.claude').mkdir()
+        (source / '.claude/settings.local.json').write_text(
+            '{"model":"root-local","permissions":{"deny":["Read(//root/**)"]}}')
+        (self.workspace / '.claude/settings.json').write_text(
+            '{"model":"project","permissions":{"deny":["Read(//project/**)"]}}')
+        (self.home / 'settings.json').write_text(
+            '{"model":"home","permissions":{"deny":["Read(//home/**)"]}}')
+        settings, fingerprint, _ = preflight.configuration(self.environment, None, self.workspace)
+        self.assertEqual(settings['model'], 'root-local')
+        self.assertEqual(settings['permissions']['deny'],
+                         ['Read(//home/**)', 'Read(//project/**)', 'Read(//root/**)'])
+        self.assertEqual(fingerprint, preflight.configuration(
+            self.environment, None, self.workspace, source)[1])
+        # Native local-scope ownership/home exception keeps the cwd file.
+        environment = dict(self.environment, HOME=str(self.workspace))
+        settings, _, observations = preflight.configuration(environment, None, self.workspace, source)
+        self.assertEqual(settings['model'], 'project')
+        self.assertNotIn(str(source / '.claude/settings.local.json'), repr(observations))
+        # Unresolved Git layout is diagnosed, never treated as absent settings.
+        (git_dir / 'commondir').unlink()
+        with self.assertRaisesRegex(IsolationError, 'local 설정 root'):
+            preflight.configuration(self.environment, None, self.workspace)
+
+    def test_consumed_conflicts_and_source_aliases_are_rejected_before_queries(self):
+        path = self.home / 'settings.json'
+        for contents in ('{"hooks":{"SessionStart":[]}}', '{"permissions":{"allow":["Edit"]}}',
+                         '{"sandbox":{"filesystem":{"disabled":true}}}', 'invalid'):
+            path.write_text(contents)
+            with self.subTest(contents=contents), mock.patch.object(preflight.subprocess, 'run') as native:
+                with self.assertRaises(IsolationError):
+                    self.prepare()
+                native.assert_not_called()
+                self.assertEqual(path.read_text(), contents)
+        path.unlink()
+        personal = self.root / 'personal-settings.json'
+        personal.write_text('{}')
+        path.symlink_to(personal)
+        with self.assertRaisesRegex(IsolationError, '소유권·경로'):
+            self.prepare()
+
+    def test_safe_source_change_during_authentication_is_refused(self):
+        def mutate(arguments, **kwargs):
+            if arguments[-2:] == ['auth', 'status']:
+                (self.home / 'settings.json').write_text('{"model":"changed"}')
+            return self.native(arguments, **kwargs)
+        with mock.patch.object(preflight.subprocess, 'run', side_effect=mutate) as native:
+            with self.assertRaisesRegex(IsolationError, '조회 중'):
+                self.prepare()
+        self.assertFalse(any(call.args[0][-1] == 'doctor' for call in native.call_args_list))
+        self.assertEqual((self.home / 'settings.json').read_text(), '{"model":"changed"}')
 
     def test_broken_links_bad_json_nonobjects_and_dropin_read_errors_are_not_absence(self):
         path = self.system / 'managed-settings.json'
@@ -178,6 +281,20 @@ class ClaudePreflightTests(unittest.TestCase):
             self.assertEqual(launch.environment['TMPDIR'], str(launch.bash_temporary))
             self.assertEqual(launch.environment['CLAUDE_CODE_TMPDIR'], str(launch.bash_temporary))
             self.assertEqual(launch.environment['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'], str(launch.attempt))
+            runner = Path(launch.environment['LOOP_MANAGER_TARGETED_TEST_RUNNER'])
+            package = runner.parents[1]
+            settings = json.loads(launch.arguments[launch.arguments.index('--settings') + 1])
+            filesystem = settings['sandbox']['filesystem']
+            self.assertIn(str(package), filesystem['allowRead'])
+            self.assertIn(str(package), filesystem['denyWrite'])
+            self.assertNotIn(str(package), filesystem['allowWrite'])
+            self.assertNotIn(str(package), settings['permissions']['additionalDirectories'])
+            # The runtime package covers the runner and its imports; cwd
+            # project imports and records remain in their existing boundaries.
+            self.assertTrue(runner.is_relative_to(package))
+            self.assertTrue((package / '__init__.py').is_file())
+            self.assertTrue((package / 'verification/manifest.py').is_file())
+            self.assertTrue((package / 'verification/timing.py').is_file())
             self.assertEqual(launch.attempt.stat().st_mode & 0o777, 0o700)
             self.assertEqual(json.loads(launch.reason)['runtime_enforcement'], 'not_observed')
             self.assertEqual(json.loads(launch.reason)['authentication_home'], str(self.home))
@@ -246,7 +363,7 @@ class ClaudePreflightTests(unittest.TestCase):
             def native(arguments, **kwargs):
                 if failure == 'old-version' and arguments[1:] == ['--version']:
                     return subprocess.CompletedProcess(arguments, 0, '2.1.248 (Claude Code)', '')
-                if failure == 'missing-options' and arguments[1:] == ['--help']:
+                if failure == 'missing-options' and arguments[-1:] == ['--help']:
                     return subprocess.CompletedProcess(arguments, 0, '--settings', '')
                 if failure == 'auth' and arguments[-2:] == ['auth', 'status']:
                     return subprocess.CompletedProcess(arguments, 1, '', 'authentication expired')

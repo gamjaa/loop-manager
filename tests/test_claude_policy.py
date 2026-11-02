@@ -33,8 +33,9 @@ class ClaudePolicyTests(unittest.TestCase):
 
     def test_file_and_command_policies_protect_git_source_and_other_worktrees(self):
         arguments, settings = self.settings()
-        self.assertIn('--restricted', arguments)
-        self.assertEqual(arguments[arguments.index('--setting-sources') + 1], '')
+        self.assertNotIn('--restricted', arguments)
+        self.assertEqual(arguments[arguments.index('--setting-sources') + 1], 'user,project,local')
+        self.assertTrue(settings['permissions']['blockReadsOutsideWorkingDirectories'])
         self.assertEqual(settings['permissions']['additionalDirectories'], [str(self.temporary)])
         for path in (self.boundary.source, *self.boundary.other_worktrees,
                      self.boundary.common_dir, self.boundary.git_dir, self.workspace / '.git'):
@@ -43,10 +44,45 @@ class ClaudePolicyTests(unittest.TestCase):
                 self.assertIn(f'Edit(/{path})', settings['permissions']['deny'])
                 self.assertIn(f'Edit(/{path}/**)', settings['permissions']['deny'])
         tools = arguments[arguments.index('--tools') + 1].split(',')
-        self.assertTrue({'Edit', 'Write', 'NotebookEdit', 'Bash'} <= set(tools))
+        self.assertIn('Bash', tools)
+        self.assertFalse({'Edit', 'Write', 'NotebookEdit'} & set(tools))
+        self.assertIn('Edit', settings['permissions']['deny'])
         self.assertNotIn('Agent', tools)
         self.assertNotIn(str(self.workspace), settings['sandbox']['filesystem']['denyWrite'])
         self.assertNotIn('allow', settings['permissions'])
+
+    def test_file_writes_outside_workspace_never_reach_the_classifier(self):
+        for read_only in (False, True):
+            arguments, settings = self.settings(read_only)
+            tools = arguments[arguments.index('--tools') + 1].split(',')
+            denied_tools = arguments[arguments.index('--disallowedTools') + 1].split(',')
+            for tool in ('Edit', 'Write', 'NotebookEdit'):
+                with self.subTest(read_only=read_only, tool=tool):
+                    self.assertNotIn(tool, tools)
+                    self.assertIn(tool, denied_tools)
+                    # A whole-tool rule covers every target, including an
+                    # ordinary external file, a new path, and a symlink alias.
+                    self.assertIn('Edit', settings['permissions']['deny'])
+            self.assertIn('Bash', tools)
+            self.assertEqual(arguments[arguments.index('--permission-mode') + 1], 'auto')
+            self.assertTrue(settings['sandbox']['enabled'])
+            self.assertTrue(settings['sandbox']['failIfUnavailable'])
+            self.assertFalse(settings['sandbox']['allowUnsandboxedCommands'])
+            self.assertEqual(str(self.workspace) in settings['sandbox']['filesystem']['denyWrite'],
+                             read_only)
+
+    def test_home_installed_targeted_runtime_is_readable_without_becoming_writable(self):
+        package = Path('/home/manager/runtime/loop_manager_internal')
+        _, settings = self.settings(targeted_runtime=package)
+        filesystem = settings['sandbox']['filesystem']
+        self.assertEqual(filesystem['allowRead'], [str(package)])
+        self.assertIn(str(package), filesystem['denyWrite'])
+        self.assertNotIn(str(package), filesystem['allowWrite'])
+        self.assertNotIn(str(package), settings['permissions']['additionalDirectories'])
+        self.assertNotIn(str(package.parent), filesystem['allowRead'])
+        for root in (self.workspace, self.workspace.parent, self.temporary / 'package'):
+            with self.subTest(root=root), self.assertRaises(IsolationError):
+                self.settings(targeted_runtime=root)
 
     def test_reviewer_keeps_read_commands_but_denies_workspace_and_all_file_edits(self):
         arguments, settings = self.settings(read_only=True)
