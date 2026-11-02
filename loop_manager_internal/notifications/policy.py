@@ -442,12 +442,21 @@ def is_current(connection, repo, kind, payload, *, event_key=None):
             legacy = _pending_legacy_draft_question_keys(connection, repo)
             expected = [item for item in _current_draft_questions(connection, repo)
                         if _draft_question_key(item) not in confirmed | legacy]
-            if len(plans) != len(expected) or any(
-                    not isinstance(item, dict) or not _matches_current_draft_item(
-                        connection, repo, item, current,
-                    )
-                    for item, current in zip(plans, expected)):
+            questions = [item for item in plans if isinstance(item, dict) and _draft_question_key(item)]
+            if len(questions) != len(expected) or any(
+                    not _matches_current_draft_item(connection, repo, item, current)
+                    for item, current in zip(questions, expected)):
                 return False
+            for item in plans:
+                if not isinstance(item, dict):
+                    return False
+                revision = item.get('publication_revision')
+                if revision is not None:
+                    if not is_current(connection, repo, 'plans_published',
+                                      {'plans': [item], 'publication_revision': revision}):
+                        return False
+                elif not _draft_question_key(item):
+                    return False
             if [item.get('id') for item in plans] != sorted(item['id'] for item in plans):
                 return False
             return True

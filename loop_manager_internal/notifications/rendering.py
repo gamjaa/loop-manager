@@ -49,9 +49,13 @@ def _message(kind: str, payload: dict[str, object]) -> str:
 def _event_message(kind: str, payload: dict[str, object]) -> str:
     if kind == "draft_decisions":
         plans = payload["plans"]
-        lines = [f"[{payload['project']}] draft 작업 {len(plans)}건 · 사용자 판단 대기", ""]
-        lines.extend(f"• {plan['id']} · {' '.join(str(plan['title']).split())}" for plan in plans)
-        lines.extend(["", "각 작업 문서에서 질문을 확인하고 결정을 반영해 주세요."])
+        has_questions = any(plan.get('decision_identity') for plan in plans)
+        heading = "사용자 판단 대기" if has_questions else "새 draft 게시"
+        lines = [f"[{payload['project']}] draft 작업 {len(plans)}건 · {heading}", ""]
+        lines.extend(f"• {plan['id']} · {' '.join(str(plan['title']).split())}"
+                     + (" · 신규 게시" if plan.get('publication_revision') else "") for plan in plans)
+        if has_questions:
+            lines.extend(["", "각 작업 문서에서 질문을 확인하고 결정을 반영해 주세요."])
         return "\n".join(lines)
     if kind == "plans_published":
         plans = payload["plans"]
