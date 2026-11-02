@@ -701,9 +701,12 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         bundle, budget_dir = self.root / 'bundle', self.root / 'budget'
         bundle.mkdir()
         budget_dir.mkdir()
+        def fail_before_launch(*_args, **_kwargs):
+            self.assertFalse((budget_dir / 'wsl-lifecycle.json').exists())
+            raise OSError('cannot launch')
         with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_BUDGET_DIR': str(budget_dir)}), \
              mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
-             mock.patch.object(verify_process, 'run_verify_process', side_effect=OSError('cannot launch')):
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=fail_before_launch):
             with self.assertRaisesRegex(OSError, 'cannot launch'):
                 self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
         self.assertEqual(json.loads((budget_dir / 'wsl-lifecycle.json').read_text())['state'], 'stopped')

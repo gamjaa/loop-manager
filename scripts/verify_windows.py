@@ -237,14 +237,14 @@ def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
         remaining = budget.remaining(timeout)
         if remaining <= CLEANUP_SECONDS:
             raise TimeoutError('전체 verify 제한 안에 WSL 실행·정리 시간을 확보하지 못했습니다.')
-        if budget_directory:
-            lifecycle(budget_directory, 'starting')
         primary = None
         output = None
         launched = False
         def on_started(_process, _job):
             nonlocal launched
             launched = True
+            if budget_directory:
+                lifecycle(budget_directory, 'starting')
         try:
             with heartbeat(bundle / 'heartbeat'):
                 passed, timed_out, output = run_verify_process(
