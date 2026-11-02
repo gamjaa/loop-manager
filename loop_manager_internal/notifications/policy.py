@@ -493,6 +493,12 @@ def cancel_stale_events(connection, repo):
             payload = None
         if not isinstance(payload, dict) or not is_current(
                 connection, repo, row[1], payload, event_key=str(row[0])):
+            if row[1] == 'plans_published':
+                from .repository import _enabled
+                if not _enabled(connection):
+                    continue
+                from .events import retain_unconfirmed_published_plans
+                retain_unconfirmed_published_plans(connection, repo, str(row[0]))
             if (row[1] == 'draft_decisions' and isinstance(payload, dict)
                     and isinstance(payload.get('plans'), list)
                     and any(isinstance(item, dict) and item.get('publication_revision')

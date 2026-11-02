@@ -683,6 +683,44 @@ def record_planning_publication(connection, repo, plans, revision):
     enqueue_draft_decisions(connection, repo, publications=(drafts, str(revision)))
 
 
+def retain_unconfirmed_published_plans(connection, repo, event_key):
+    """Continue only valid, unconfirmed items when a fixed batch becomes stale."""
+    if not _enabled(connection):
+        return
+    row = connection.execute(
+        "SELECT payload, rendered_text, confirmed_pieces FROM notification_outbox "
+        "WHERE event_key=? AND repo=? AND event_type='plans_published' "
+        "AND sent_at IS NULL AND canceled_at IS NULL", (event_key, repo),
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        payload = json.loads(row[0])
+        revision = payload['publication_revision']
+        plans = payload['plans']
+        if not isinstance(plans, list):
+            return
+        rendered = row[1] if isinstance(row[1], str) else ''
+        confirmed = ''.join(_pieces(rendered)[:int(row[2] or 0)])
+        remaining = []
+        for item in plans:
+            if not isinstance(item, dict):
+                continue
+            marker = f"\n• {item.get('id')} · "
+            position = rendered.find(marker)
+            if position >= 0 and position + len(f"\n• {item.get('id')}") <= len(confirmed):
+                continue
+            if is_current(connection, repo, 'plans_published',
+                          {'plans': [item], 'publication_revision': revision}):
+                remaining.append(item)
+        if remaining:
+            payload['plans'] = remaining
+            _insert(connection, _key('plans_published', repo, event_key), repo,
+                    'plans_published', payload)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return
+
+
 def enqueue_draft_decisions(connection, repo, *, publications=None):
     if not _enabled(connection):
         return

@@ -1080,6 +1080,51 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_partial_publication_withdrawal_retains_only_unconfirmed_valid_items(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        long_title = 'Long ' * 1000
+        plans = []
+        with connection:
+            connection.execute("DELETE FROM exec_plans WHERE repo=?", (repo,))
+            for plan_id, title in (('G-018', long_title), ('G-019', 'Withdrawn'), ('G-020', 'Retained')):
+                path = f'docs/plans/[{plan_id}] {title}.md'
+                connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,publication_path,publication_sha) VALUES (?,?,?,?,'[]','[]','normal','hash','READY',?,'abc')", (repo, plan_id, path, title, path))
+                plans.append((path, {'id': plan_id, 'title': title}))
+            notifications.record_planning_publication(connection, repo, plans, 'abc')
+        def send(_token, _chat, _text):
+            with connection:
+                connection.execute("DELETE FROM exec_plans WHERE repo=? AND plan_id='G-019'", (repo,))
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
+        old, continuation = self.events(connection)
+        self.assertEqual(old['confirmed_pieces'], 1)
+        self.assertIsNotNone(old['canceled_at'])
+        payload = json.loads(continuation['payload'])
+        self.assertEqual([item['id'] for item in payload['plans']], ['G-020'])
+        self.assertTrue(payload['silent'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+        self.assertIn('G-020 · Retained', sender.call_args.args[2])
+        self.assertNotIn('G-019', sender.call_args.args[2])
+
+    def test_publication_reobservation_retains_other_unsent_items(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute("UPDATE exec_plans SET publication_path=path, publication_sha='abc' WHERE repo=?", (repo,))
+            path = 'docs/plans/[G-019] Removed.md'
+            connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status,publication_path,publication_sha) VALUES (?,'G-019',?,'Removed','[]','[]','normal','hash','READY',?,'abc')", (repo, path, path))
+            notifications.record_planning_publication(connection, repo, [
+                ('docs/plans/[G-018] Reliable notices.md', {'id': 'G-018'}),
+                (path, {'id': 'G-019'})], 'abc')
+            connection.execute("DELETE FROM exec_plans WHERE repo=? AND plan_id='G-019'", (repo,))
+            notifications.enqueue_current_project_events(connection, repo)
+        old, continuation = self.events(connection)
+        self.assertIsNotNone(old['canceled_at'])
+        self.assertEqual([item['id'] for item in json.loads(continuation['payload'])['plans']], ['G-018'])
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender), 1)
+
     def test_registered_publication_is_deduplicated_and_sent_silently(self):
         connection = self.connection()
         repo = '/projects/alpha'
