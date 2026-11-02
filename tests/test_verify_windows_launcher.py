@@ -437,6 +437,24 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
              self.assertRaises(verify_process.VerifyTerminationUncertain):
             self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
 
+    def test_path_conversion_exhausts_budget_before_wsl_launch(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        bundle = self.root / 'bundle'
+        bundle.mkdir()
+        def convert(*_args, **_kwargs):
+            now[0] = 20.0
+            return SimpleNamespace(stdout='/tmp/bundle')
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])), \
+             mock.patch.object(launcher.subprocess, 'run', side_effect=convert) as conversion:
+            with self.assertRaises(TimeoutError):
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertEqual(conversion.call_count, 1)
+        self.native.assert_not_called()
+        self.assertFalse((bundle / 'heartbeat').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -195,56 +195,64 @@ def wsl_environment():
 
 def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
     from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
-    started = time.monotonic()
+    from loop_manager_internal.verification.execution_clock import ExecutionClock
     environment = wsl_environment()
-    translated = subprocess.run(['wsl.exe', '--exec', 'wslpath', '-a', '-u', str(bundle)],
-        capture_output=True, text=True, encoding='utf-8', timeout=min(10, timeout), env=environment, check=True).stdout.strip()
-    if not translated.startswith('/') or '\n' in translated:
-        raise RuntimeError('WSL 검증 경로 변환에 실패했습니다.')
-    budget_arguments = []
-    if os.environ.get('LOOP_MANAGER_VERIFY_BUDGET_DIR'):
-        budget_path = subprocess.run(['wsl.exe', '--exec', 'wslpath', '-a', '-u',
-            os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR']], capture_output=True, text=True,
-            encoding='utf-8', timeout=min(10, timeout), env=environment, check=True).stdout.strip()
-        if not budget_path.startswith('/') or '\n' in budget_path:
-            raise RuntimeError('WSL 실행 시간 기록 경로 변환에 실패했습니다.')
-        budget_arguments = [budget_path]
-        lifecycle(os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'],'starting')
-    if parent_run_id:
-        budget_arguments.extend(['--parent-run-id', parent_run_id])
-    timeout -= time.monotonic() - started
-    if timeout <= CLEANUP_SECONDS:
-        raise TimeoutError('전체 verify 제한 안에 WSL 실행·정리 시간을 확보하지 못했습니다.')
-    primary = None
-    try:
-        with heartbeat(bundle / 'heartbeat'):
-            from loop_manager_internal.verification.execution_clock import ExecutionClock
-            with ExecutionClock() as budget:
+    with ExecutionClock() as budget:
+        def translate(path):
+            check_budget(budget, timeout - CLEANUP_SECONDS)
+            result = subprocess.run(['wsl.exe', '--exec', 'wslpath', '-a', '-u', str(path)],
+                capture_output=True, text=True, encoding='utf-8',
+                timeout=min(10, budget.remaining(timeout - CLEANUP_SECONDS)), env=environment, check=True)
+            check_budget(budget, timeout - CLEANUP_SECONDS)
+            value = result.stdout.strip()
+            if not value.startswith('/') or '\n' in value:
+                raise RuntimeError('WSL 검증 경로 변환에 실패했습니다.')
+            return value
+
+        translated = translate(bundle)
+        budget_arguments = []
+        budget_directory = os.environ.get('LOOP_MANAGER_VERIFY_BUDGET_DIR')
+        if budget_directory:
+            budget_arguments = [translate(budget_directory)]
+        if parent_run_id:
+            budget_arguments.extend(['--parent-run-id', parent_run_id])
+        remaining = budget.remaining(timeout)
+        if remaining <= CLEANUP_SECONDS:
+            raise TimeoutError('전체 verify 제한 안에 WSL 실행·정리 시간을 확보하지 못했습니다.')
+        if budget_directory:
+            lifecycle(budget_directory, 'starting')
+        primary = None
+        try:
+            with heartbeat(bundle / 'heartbeat'):
                 passed, timed_out, output = run_verify_process(
                     ['wsl.exe', '--exec', 'python3', translated + '/driver.py', '--wsl', translated,
-                     str(timeout - CLEANUP_SECONDS), str(cap), *budget_arguments], root, timeout - CLEANUP_SECONDS,
+                     str(remaining), str(cap), *budget_arguments], root, timeout - CLEANUP_SECONDS,
                     environment=environment, job_scope=True, execution_clock=budget)
-    except BaseException as error:
-        primary = error
-    # Windows Job 종료만으로 Linux 자식의 종료를 확정하지 않는다.
-    receipt = bundle / 'cleanup.json'
-    deadline = time.monotonic() + CLEANUP_SECONDS
-    while not receipt.is_file() and time.monotonic() < deadline:
-        time.sleep(0.1)
-    if not receipt.is_file():
-        raise VerifyTerminationUncertain('WSL 자식 종료·전용 /tmp 정리 근거가 없습니다.')
-    cleanup = json.loads(receipt.read_text(encoding='utf-8'))
-    if not cleanup.get('stopped') or not cleanup.get('removed'):
-        raise VerifyTerminationUncertain('WSL 자식 또는 전용 /tmp 정리를 확인하지 못했습니다.')
-    if primary:
-        raise primary
-    for path in (bundle / 'logs').glob('*'):
-        destination = directory / path.name
-        shutil.copytree(path, destination) if path.is_dir() else shutil.copy2(path, destination)
-    shutil.copy2(receipt, directory / 'cleanup.json')
-    (directory / 'console.log').write_text(str(output), encoding='utf-8')
-    print(output, flush=True)
-    return passed and not timed_out
+        except BaseException as error:
+            primary = error
+        # Windows Job 종료만으로 Linux 자식의 종료를 확정하지 않는다.
+        receipt = bundle / 'cleanup.json'
+        while not receipt.is_file() and budget.remaining(timeout) > 0:
+            time.sleep(min(0.1, budget.remaining(timeout)))
+        if not receipt.is_file():
+            raise VerifyTerminationUncertain('WSL 자식 종료·전용 /tmp 정리 근거가 없습니다.') from primary
+        try:
+            cleanup = json.loads(receipt.read_text(encoding='utf-8'))
+            if not isinstance(cleanup, dict) or not cleanup.get('stopped') or not cleanup.get('removed'):
+                raise ValueError('incomplete cleanup receipt')
+        except (OSError, ValueError, TypeError) as error:
+            raise VerifyTerminationUncertain('WSL 자식 또는 전용 /tmp 정리를 확인하지 못했습니다.') from error
+        if primary:
+            raise primary
+        for path in (bundle / 'logs').glob('*'):
+            check_budget(budget, timeout)
+            destination = directory / path.name
+            shutil.copytree(path, destination) if path.is_dir() else shutil.copy2(path, destination)
+        shutil.copy2(receipt, directory / 'cleanup.json')
+        (directory / 'console.log').write_text(str(output), encoding='utf-8')
+        print(output, flush=True)
+        check_budget(budget, timeout)
+        return passed and not timed_out
 
 
 def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
