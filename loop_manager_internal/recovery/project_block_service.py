@@ -23,6 +23,8 @@ from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
 import sqlite3
+import re
+import json
 
 
 @dataclass(frozen=True)
@@ -125,18 +127,47 @@ class ReconcileRebaseEvidenceBlockEffects:
 
 def _reconcile_rebase_evidence_block(
     effects: ReconcileRebaseEvidenceBlockEffects, connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
-    repo: str, block: sqlite3.Row, *, plan_block: bool,
+    repo: str, block: sqlite3.Row, *, plan_block: bool, recovery_request_id: str | None = None,
 ) -> bool:
     """Recheck the owned current rebase and release only its saved cause."""
     plan_id = str(block["plan_id"] or "")
+    if recovery_request_id is not None:
+        from loop_manager_internal.runtime import refresh
+        if refresh.paused(state_dir, repo):
+            raise refresh.RuntimePaused()
+        from loop_manager_internal.storage import local_recovery_state
+        request = connection.execute(
+            "SELECT repo, plan_id, status, before_state FROM local_environment_recovery_requests WHERE request_id=?",
+            (recovery_request_id,),
+        ).fetchone()
+        if (request is None or request['repo'] != repo or request['status'] != 'pending'
+                or request['plan_id'] not in (None, plan_id)
+                or block['reason_code'] != scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value
+                or local_recovery_state.recheck_consumed(connection, recovery_request_id, plan_id, 'metadata')):
+            return False
     plan = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?", (repo, plan_id),
     ).fetchone()
-    project = runtime_state.project_row(connection, repo)
+    project = (runtime_state.project_row(connection, repo) if plan_block else
+               connection.execute('SELECT * FROM projects WHERE repo=?', (repo,)).fetchone())
     if plan is None or project is None or block['repo'] != repo:
         return False
     checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     checkpoint = checkpoints.get(repo, plan_id)
+    if recovery_request_id is not None:
+        try:
+            original = json.loads(request['before_state'])
+            selected = next(item for item in original['plans'] if item['plan_id'] == plan_id)
+            cause = next(item for item in original['blocks']
+                         if item['plan_id'] == plan_id and item['scope'] == ('plan' if plan_block else 'project'))
+            if (selected['checkpoint_generation'] != checkpoint.generation
+                    or cause['reason_code'] != block['reason_code']
+                    or cause['evidence_sha256'] != local_recovery_state._digest(block['evidence'])
+                    or cause['release_fingerprint_sha256'] != (
+                        local_recovery_state._digest(block['release_fingerprint']) if block['release_fingerprint'] else None)):
+                return False
+        except (KeyError, TypeError, ValueError, StopIteration):
+            return False
     recovery = recovery_state.RecoveryRepository(connection).row(repo, plan_id)
     if (not rebase_block_reconciliation.block_matches(block, recovery, checkpoint)
             and not (scoped_blocking.is_scope_baseline_block(block) and checkpoint.operation == 'rebase')):
@@ -156,12 +187,50 @@ def _reconcile_rebase_evidence_block(
     try:
         service = effects._current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch)
+        def metadata_trigger(observation=None):
+            saved_input = plan['blocked_worktree_fingerprint']
+            current_input = (effects._worktree_execplan_input_fingerprint(worktree, plan)
+                             if isinstance(saved_input, str)
+                             and re.fullmatch(r'[0-9a-f]{64}', saved_input)
+                             and worktree.is_dir() else None)
+            if (isinstance(current_input, str) and re.fullmatch(r'[0-9a-f]{64}', current_input)
+                    and current_input != saved_input):
+                return True
+            saved_git = (checkpoint.snapshot or {}).get('metadata_block_git')
+            if (not isinstance(saved_git, dict) or saved_git.get('generation') != checkpoint.generation
+                    or saved_git.get('block') != dict(block) or not saved_git.get('snapshot')):
+                return False
+            saved_remote = saved_git.get('remote_input')
+            if isinstance(saved_remote, str) and re.fullmatch(r'[0-9a-f]{64}', saved_remote):
+                try:
+                    remote_input = effects._revision_execplan_input_fingerprint(
+                        repo_path, f"refs/remotes/origin/{project['base_branch']}", plan)
+                except (OSError, RuntimeError, ValueError):
+                    remote_input = None
+                if (isinstance(remote_input, str) and re.fullmatch(r'[0-9a-f]{64}', remote_input)
+                        and remote_input != saved_remote):
+                    return True
+            try:
+                before = GitSnapshot.deserialize(str(saved_git['snapshot']))
+                if not ({'rebase-merge', 'rebase-apply'} & set(before.operations)):
+                    return False
+            except (KeyError, TypeError, ValueError, RuntimeError):
+                return False
+            if observation is None:
+                observation = service.require_owned(checkpoint=checkpoints.get(repo, plan_id))
+            return observation[1].status is managed_rebase_validation.RebaseStatus.START
+        automatic_metadata = (block['reason_code'] == scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value
+                              and recovery_request_id is None)
+        if automatic_metadata and not metadata_trigger():
+            return False
         if service.normalize_frontmatter():
             checkpoint = checkpoints.get(repo, plan_id)
             service = effects._current_rebase_service(
                 connection, repo_path, state_dir, repo, plan_id, worktree, branch)
         def observe():
             observation = service.require_owned(checkpoint=checkpoints.get(repo, plan_id))
+            if automatic_metadata and not metadata_trigger(observation):
+                raise RuntimeError('metadata block has no comparable changed input or Git transition')
             if (block['reason_code'] == scoped_blocking.BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
                     and observation[1].status is managed_rebase_validation.RebaseStatus.START):
                 raise RuntimeError('managed worktree conflict has not reached a rebase-owned state')
@@ -188,12 +257,14 @@ def _reconcile_rebase_evidence_block(
         confirmed = observe()
         from loop_manager_internal.recovery.plan_recovery import recovery_admission
         with recovery_admission(connection, repo, plan_id):
+            if recovery_request_id is not None and refresh.paused(state_dir, repo):
+                raise refresh.RuntimePaused()
             runtime_state.RuntimeStateRepository(connection).resume_rebase_block(
                 plan, project, block, checkpoints, observation, expected_checkpoint=checkpoint,
                 is_plan_block=plan_block,
                 reobserve=lambda: confirmed,
                 dependencies_ready=lambda: not effects.unmet_execplan_dependencies(connection, repo, plan_id),
-                pending_error=REBASE_IN_PROGRESS_ERROR)
+                pending_error=REBASE_IN_PROGRESS_ERROR, recovery_request_id=recovery_request_id)
         return True
     except (RuntimeError, OSError, ValueError, sqlite3.Error) as error:
         effects.operation_log(f"관리 rebase 차단 재평가 보류 ({plan_id}): {error}", error=True)
@@ -325,9 +396,9 @@ def resume_project_block_if_safe(
     effects: ResumeProjectBlockIfSafeEffects, connection: sqlite3.Connection,
     repo_path: Path,
     state_dir: Path,
-    repo: str,
+    repo: str, *, recovery_request_id: str | None = None,
 ) -> bool:
-    return scope_reconciliation.resume_project_block_if_safe(effects._scope_reconciliation_effects_resume_project_block_if_safe(), connection, repo_path, state_dir, repo)
+    return scope_reconciliation.resume_project_block_if_safe(effects._scope_reconciliation_effects_resume_project_block_if_safe(), connection, repo_path, state_dir, repo, recovery_request_id=recovery_request_id)
 
 
 @dataclass(frozen=True)

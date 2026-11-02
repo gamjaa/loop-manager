@@ -383,19 +383,27 @@ def recover_local_environment(
                     events.emit("로컬 복구 실행 대기", request_id=request.request_id,
                                 next_action="다음 run에서 재개")
                     return _local_recovery_waiting(effects, request)
+                from loop_manager_internal.runtime import refresh
+                if refresh.paused(state_dir, repository):
+                    events.emit('로컬 복구 실행 대기', request_id=request.request_id,
+                                next_action='일시 중지 해제 뒤 재확인')
+                    return _local_recovery_waiting(effects, request)
                 next_request = next_local_recovery_request(connection, repository)
                 if next_request is None or next_request.request_id != request.request_id:
                     events.emit("로컬 복구 실행 대기", request_id=request.request_id,
                                 next_action="앞선 실행 또는 소유 scope 종료 뒤 재확인")
                     return _local_recovery_waiting(effects, request)
-                return execute_local_recovery_request(
-                    LocalRecoveryExecutionEffects(effects.operation_print, effects.run_project_result),
-                    connection, state_dir, request, config.path,
-                    planner_mutex=threading.Lock(),
-                    refactoring_review_interval=config.refactoring_review_interval,
-                    verify_timeout_seconds=config.verify_timeout_seconds,
-                    runtime_mutation=runtime_mutation,
-                ).exit_code
+                try:
+                    return execute_local_recovery_request(
+                        LocalRecoveryExecutionEffects(effects.operation_print, effects.run_project_result),
+                        connection, state_dir, request, config.path,
+                        planner_mutex=threading.Lock(),
+                        refactoring_review_interval=config.refactoring_review_interval,
+                        verify_timeout_seconds=config.verify_timeout_seconds,
+                        runtime_mutation=runtime_mutation,
+                    ).exit_code
+                except refresh.RuntimePaused:
+                    return _local_recovery_waiting(effects, request)
 
 
 def _local_recovery_waiting(effects, request: local_recovery_state.LocalRecoveryRequest) -> int:
@@ -453,11 +461,15 @@ def execute_local_recovery_request(
     # Freeze this request's candidates before execution changes the active
     # projection. A failed first check must not starve independent plans.
     targets = [plan_id]
+    target_causes = {}
     if plan_id is None:
-        targets.extend(str(row[0]) for row in connection.execute(
-            "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
-            "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted') "
-            "ORDER BY plan_id", (repository,)))
+        candidates = connection.execute(
+            "SELECT plan_id, blocked_reason FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
+            "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted', 'plan_input_invalid') "
+            "ORDER BY plan_id", (repository,)).fetchall()
+        targets.extend(str(row[0]) for row in candidates)
+        target_causes = {str(row[0]): ('metadata' if row[1] == 'plan_input_invalid' else 'verify')
+                         for row in candidates}
         # Once bounded verify checks have released the execution slot,
         # revisit the project coordinator for its independent planning cause.
         if len(targets) > 1 and project["planning_error"]:
@@ -473,9 +485,9 @@ def execute_local_recovery_request(
                 for item in outcomes
             )):
                 continue
-        if plan_id is None and target is not None and local_recovery_state.recheck_consumed(
-                connection, request.request_id, target, "verify"):
-            continue
+        if plan_id is None and target is not None:
+            if local_recovery_state.recheck_consumed(connection, request.request_id, target, target_causes[target]):
+                continue
         with events.log_context(project=repository, plan=target, stage="RECOVERY"):
             with events.activity(
                 "로컬 환경 재검사 처리", heartbeat=True, error_level="ERROR",

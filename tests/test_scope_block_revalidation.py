@@ -2,6 +2,8 @@ from tests.support.rebase_block import rebase_block_fixture
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
+import sqlite3
+import tempfile
 from pathlib import Path
 from unittest import mock
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
@@ -491,16 +493,271 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
 
 
 class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase):
+    def test_metadata_observation_allows_independent_request_and_rejects_checkpoint_race(self):
+        from loop_manager_internal.storage import local_recovery_state, execution_checkpoint_state
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Path(temporary.name) / 'recovery.sqlite'
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        self.connection.backup(connection)
+        self.addCleanup(connection.close)
+        self.connection = self.case.fixture.connection = connection
+        self.checkpoints = self.case.checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+        request = local_recovery_state.begin_request(connection, 'repo', 'G-047')
+        original = self.snapshot()
+        invoked = []
+        def normalizer():
+            self.assertFalse(connection.in_transaction)
+            with sqlite3.connect(database, timeout=1) as other:
+                other.row_factory = sqlite3.Row
+                independent = local_recovery_state.begin_request(other, 'repo', 'G-999')
+                repository = execution_checkpoint_state.ExecutionCheckpointRepository(other)
+                current = repository.get('repo', 'G-047')
+                repository.record('repo', 'G-047', expected_generation=current.generation,
+                    operation=current.operation, expected_head=current.expected_head,
+                    target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                    snapshot=current.snapshot)
+                invoked.append(independent.request_id)
+            return False
+        self.factory.side_effect = lambda *_args, **_kwargs: replace(self.case.factory(None), normalizer=normalizer)
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            connection, Path('/repo'), Path('/state'), 'repo', 'main', plan_id='G-047',
+            force_timeout_recheck=True, recovery_request_id=request.request_id))
+        self.assertEqual(len(invoked), 1)
+        self.assertFalse(local_recovery_state.recheck_consumed(connection, request.request_id, 'G-047', 'metadata'))
+        after = self.snapshot()
+        for table in ('projects', 'exec_plans', 'execplan_blocks', 'recovery_records', 'notified_block_incidents'):
+            self.assertEqual(after[table], original[table])
+        self.assertEqual(after['execution_checkpoints'][0]['generation'], original['execution_checkpoints'][0]['generation'] + 1)
+        self.assertEqual(connection.execute("SELECT status FROM local_environment_recovery_requests WHERE request_id=?", (request.request_id,)).fetchone()[0], 'pending')
+        self.git_write.assert_not_called()
+
+    def test_metadata_block_records_fresh_git_evidence_for_start(self):
+        from loop_manager_internal.recovery import block_service
+        self.pending()
+        fresh = loop_manager.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
+        stale = replace(fresh, operations={}).serialize()
+        effects = SimpleNamespace(
+            _plan_id_from_path=lambda _: 'G-047', project_execplan=lambda *_: None,
+            _worktree_execplan_input_fingerprint=lambda *_: 'a' * 64,
+            _revision_execplan_input_fingerprint=lambda *_: 'c' * 64,
+            capture_git_snapshot=lambda *_: fresh,
+            _final_block_recovery_decision=lambda *_: None,
+        )
+        block_service.block_active_execplan(effects, self.connection, 'repo', Path('/state/G-047'),
+            'metadata failure', '', preserved_agent_result_snapshot=stale)
+        checkpoint = self.checkpoints.get('repo', 'G-047')
+        block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        self.assertEqual(checkpoint.snapshot['metadata_block_git'], {
+            'generation': checkpoint.generation, 'block': block, 'snapshot': fresh.serialize(), 'remote_input': 'c' * 64})
+        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0], stale)
+        self.case.observed = replace(self.case.observed, head='owned-head', branch='loop-manager/G-047',
+            branch_ref=('owned-head', ''), registration=('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'),
+            branch_worktrees=(str(Path('/state/G-047').resolve()),), operations=(), metadata=None,
+            index=(), staged=(), index_clean=True, base_is_ancestor=False)
+        with mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='c' * 64):
+            self.assertTrue(self.resume())
+
+    def test_project_metadata_recheck_consumes_only_matching_request(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.block(project=True, reason='plan_input_invalid')
+        self.pending()
+        wrong = local_recovery_state.begin_request(self.connection, 'repo', 'G-999')
+        request = local_recovery_state.begin_request(self.connection, 'repo', None)
+        from contextlib import nullcontext
+        from loop_manager_internal.recovery.plan_recovery import recovering_plan
+        before = self.snapshot()
+        with mock.patch('loop_manager_internal.recovery.plan_recovery.resource_locks', return_value=nullcontext()):
+            with recovering_plan(self.connection, Path('/state'), 'repo', 'G-047', project_recovery=True) as available:
+                self.assertTrue(available)
+                self.assertFalse(loop_manager.resume_project_block_if_safe(
+                    self.connection, Path('/repo'), Path('/state'), 'repo', recovery_request_id=wrong.request_id))
+        self.assertEqual(self.snapshot(), before)
+        self.factory.assert_not_called()
+        with mock.patch('loop_manager_internal.recovery.plan_recovery.resource_locks', return_value=nullcontext()):
+            with recovering_plan(self.connection, Path('/state'), 'repo', 'G-047', project_recovery=True) as available:
+                self.assertTrue(available)
+                self.assertTrue(loop_manager.resume_project_block_if_safe(
+                    self.connection, Path('/repo'), Path('/state'), 'repo', recovery_request_id=request.request_id),
+                    loop_manager.operation_log.call_args_list)
+        self.assertTrue(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').operation, 'rebase')
+
+    def test_explicit_metadata_recheck_consumes_request_with_release(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'rebase_block_release_policy': 'deferred_metadata'})
+        self.connection.execute("UPDATE exec_plans SET retry_count=3, review_failure_history='{\"issue\":2}'")
+        self.connection.commit()
+        original = self.checkpoints.get('repo', 'G-047')
+        original_observation = self.case.observed
+        notification_count = self.connection.execute('SELECT COUNT(*) FROM notified_block_incidents').fetchone()[0]
+        request = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+            plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id))
+        self.assertTrue(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        checkpoint = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual((checkpoint.operation, checkpoint.expected_head, checkpoint.target_base_oid),
+                         ('rebase', original.expected_head, original.target_base_oid))
+        self.assertEqual(checkpoint.snapshot['rebase_block_release_policy'], 'deferred_metadata')
+        self.assertIsNone(checkpoint.current_rebase_acceptance())
+        self.assertEqual(self.case.observed, original_observation)
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((row['worker_session_id'], row['retry_count'], row['review_failure_history']),
+                         ('saved-worker', 3, '{"issue":2}'))
+        for field in ('verify_token', 'review_token', 'publication_token'):
+            self.assertIsNone(row[field])
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM notified_block_incidents').fetchone()[0], notification_count)
+
+    def test_explicit_metadata_recheck_keeps_dependencies_remote_and_pr_gates(self):
+        from loop_manager_internal.storage import local_recovery_state
+        from loop_manager_internal.git.managed_rebase_validation import PullRequest
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        self.connection.execute("UPDATE exec_plans SET depends_on='[\"G-109\"]'")
+        self.connection.commit()
+        request = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        def resume():
+            return loop_manager.resume_plan_blocks(
+                self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+                plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id)
+        before = self.snapshot()
+        self.assertFalse(resume())
+        self.assertEqual(self.snapshot(), before)
+        self.factory.assert_not_called()
+        self.connection.execute("UPDATE exec_plans SET depends_on='[]'")
+        self.connection.commit()
+        before = self.snapshot()
+        original = self.case.observed
+        for remote in (replace(original.remote, oid='foreign'),
+                       replace(original.remote, pull_request=PullRequest('pr', 'repo', 'other', 'foreign', 'OPEN'))):
+            with self.subTest(remote=remote):
+                self.case.observed = replace(original, remote=remote)
+                self.assertFalse(resume())
+                self.assertEqual(self.snapshot(), before)
+                self.assertFalse(local_recovery_state.recheck_consumed(connection=self.connection,
+                    request_id=request.request_id, subject='G-047', cause='metadata'))
+        self.case.observed = original
+        self.assertTrue(resume())
+
+    def test_explicit_metadata_recheck_preserves_request_if_paused_before_apply(self):
+        from loop_manager_internal.storage import local_recovery_state
+        from loop_manager_internal.runtime.refresh import RuntimePaused
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        request = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        before = self.snapshot()
+        with mock.patch('loop_manager_internal.runtime.refresh.paused', side_effect=[False, True]):
+            with self.assertRaises(RuntimePaused):
+                loop_manager.resume_plan_blocks(
+                    self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+                    plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+
+    def test_explicit_metadata_recheck_waits_for_existing_writer(self):
+        from loop_manager_internal.storage import local_recovery_state, task_calls
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        task_calls.ensure_schema(self.connection)
+        self.connection.commit()
+        request = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        writer = task_calls.reserve(self.connection, Path('/state'), 'repo', 'G-047', 'agent', 'running')
+        before = self.snapshot()
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+            plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id))
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+        self.factory.assert_not_called()
+        task_calls.release(writer)
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+            plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id))
+
+    def test_explicit_metadata_recheck_rolls_back_consumption_on_interruption(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        request = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        before = self.snapshot()
+        def fault(_runtime, stage):
+            if stage == 'after_rebase_block_release':
+                raise RuntimeError('interrupted metadata release')
+        def resume():
+            return loop_manager.resume_plan_blocks(
+                self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+                plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id)
+        with mock.patch.object(loop_manager.runtime_state.RuntimeStateRepository, '_fault', fault):
+            self.assertFalse(resume())
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+        self.assertTrue(resume())
+
+    def test_explicit_metadata_recheck_rejects_changed_cause_and_generation(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        request = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        def resume():
+            return loop_manager.resume_plan_blocks(
+                self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+                plan_id='G-047', force_timeout_recheck=True, recovery_request_id=request.request_id)
+        original = scoped_blocking.plan_block(self.connection, 'repo', 'G-047')['evidence']
+        self.connection.execute("UPDATE execplan_blocks SET evidence='different failure'")
+        self.connection.commit()
+        self.assertFalse(resume())
+        self.connection.execute('UPDATE execplan_blocks SET evidence=?', (original,))
+        self.connection.commit()
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot=current.snapshot)
+        self.connection.commit()
+        self.assertFalse(resume())
+        self.factory.assert_not_called()
+        self.assertFalse(local_recovery_state.recheck_consumed(
+            self.connection, request.request_id, 'G-047', 'metadata'))
+        after = local_recovery_state.snapshot(self.connection, 'repo', 'G-047')
+        local_recovery_state.complete_request(self.connection, request, 'unresolved', after)
+        renewed = local_recovery_state.begin_request(self.connection, 'repo', 'G-047')
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, Path('/repo'), Path('/state'), 'repo', 'main',
+            plan_id='G-047', force_timeout_recheck=True, recovery_request_id=renewed.request_id))
+
     def test_metadata_release_policy_does_not_resume_unchanged_block(self):
         self.block(reason='plan_input_invalid')
         self.pending()
+        self.connection.execute("UPDATE exec_plans SET blocked_worktree_fingerprint=?", ('a' * 64,))
+        self.connection.commit()
+        self.enterContext(mock.patch.object(Path, 'is_dir', return_value=True))
+        inputs = self.enterContext(mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='a' * 64))
         original = self.case.observed
         block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
-        for policy in (None, 'deferred_metadata'):
-            with self.subTest(policy=policy):
+        for released, policy in ((False, None), (False, 'deferred_metadata'), (True, None), (True, 'deferred_metadata')):
+            with self.subTest(released=released, policy=policy):
                 current = self.checkpoints.get('repo', 'G-047')
-                snapshot = {**current.snapshot, 'rebase_block_release': block,
-                            'rebase_block_release_state': original.fingerprint}
+                snapshot = {key: value for key, value in current.snapshot.items()
+                            if key not in {'rebase_block_release', 'rebase_block_release_state', 'rebase_block_release_policy'}}
+                if released:
+                    snapshot.update(rebase_block_release=block, rebase_block_release_state=original.fingerprint)
                 if policy is not None:
                     snapshot['rebase_block_release_policy'] = policy
                 self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
@@ -514,12 +771,67 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
 
         self.case.expected = replace(self.case.expected, input_fingerprint='updated-plan-input')
         self.case.observed = replace(original, input_fingerprint='updated-plan-input')
+        inputs.return_value = 'b' * 64
         self.assertTrue(self.resume())
         row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual((row['status'], row['last_error'], row['worker_session_id']),
                          ('IMPLEMENTING', loop_manager.REBASE_IN_PROGRESS_ERROR, 'saved-worker'))
         self.assertEqual(self.checkpoints.get('repo', 'G-047').operation, 'rebase')
         self.git_write.assert_not_called()
+
+    def test_metadata_block_without_baseline_keeps_original_cause(self):
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        normalize = mock.Mock(side_effect=AssertionError('unchanged block must not restore declarations'))
+        self.factory.side_effect = lambda *_args, **_kwargs: replace(self.case.factory(None), normalizer=normalize)
+        before = self.snapshot()
+        self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+        normalize.assert_not_called()
+
+    def test_metadata_block_rejects_unrelated_head_and_incomparable_input(self):
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        self.connection.execute("UPDATE exec_plans SET blocked_worktree_fingerprint=?", ('a' * 64,))
+        self.connection.commit()
+        self.case.observed = replace(self.case.observed, head='unrelated-head')
+        before = self.snapshot()
+        with mock.patch.object(Path, 'is_dir', return_value=True), \
+             mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='unavailable'):
+            self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_metadata_rechecks_only_changed_remote_document_inputs(self):
+        self.block(reason='plan_input_invalid')
+        self.pending()
+        before = loop_manager.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
+        block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'metadata_block_git': {
+                'generation': current.generation + 1, 'block': block,
+                'snapshot': before.serialize(), 'remote_input': 'a' * 64}})
+        self.connection.commit()
+        with mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='a' * 64) as inputs:
+            saved = self.snapshot()
+            self.assertFalse(self.resume())
+            self.assertEqual(self.snapshot(), saved)
+            inputs.return_value = 'b' * 64
+            self.case.expected = replace(self.case.expected, input_fingerprint='new-remote-input')
+            self.case.observed = replace(self.case.observed, input_fingerprint='new-remote-input')
+            self.assertTrue(self.resume())
+
+    def test_metadata_start_without_saved_git_transition_remains_blocked(self):
+        self.block(reason='plan_input_invalid')
+        stale = loop_manager.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (stale.serialize(),))
+        self.connection.commit()
+        self.case.observed = replace(self.case.observed, base_is_ancestor=False)
+        before = self.snapshot()
+        self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
 
     def test_plan_input_block_uses_owned_rebase_before_ordinary_branch_recovery(self):
         from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
@@ -533,9 +845,13 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.connection.execute("UPDATE recovery_records SET final_evidence=? WHERE repo='repo' AND subject='G-047'",
             ('{"block_reason_code":"plan_input_invalid"}',))
         self.connection.commit()
+        self.connection.execute("UPDATE exec_plans SET blocked_worktree_fingerprint=?", ('a' * 64,))
+        self.connection.commit()
         original = self.case.observed
         with mock.patch.object(loop_manager, 'make_worktree',
-                               side_effect=AssertionError('detached rebase is not an ordinary worktree')):
+                               side_effect=AssertionError('detached rebase is not an ordinary worktree')), \
+             mock.patch.object(Path, 'is_dir', return_value=True), \
+             mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='b' * 64):
             self.assertTrue(self.resume())
         self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
         self.assertEqual(self.case.observed, original)
@@ -548,8 +864,16 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
     def test_plan_input_rebase_block_resumes_from_owned_original_head(self):
         from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
         self.block(reason='plan_input_invalid')
+        before = loop_manager.GitSnapshot('partial', None, {}, {}, {}, {}, {}, {'rebase-merge': 'operation'})
         self.case.observed = replace(self.case.observed, base_is_ancestor=False)
         block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'metadata_block_git': {
+                'generation': current.generation + 1, 'block': block, 'snapshot': before.serialize()}})
+        self.connection.commit()
         checkpoint_before = self.checkpoints.get('repo', 'G-047')
         decision = self.case.factory(None).require_owned(checkpoint=checkpoint_before)
         self.assertIs(decision[1].status, RebaseStatus.START)

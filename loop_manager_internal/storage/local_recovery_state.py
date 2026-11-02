@@ -115,6 +115,10 @@ def snapshot(connection: sqlite3.Connection, repo: str, plan_id: str | None) -> 
             "occurrence_index_sha256": _digest(row[11]),
             "detail_sha256": _digest(row[12]),
         } for row in rows]
+    generations = {}
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_checkpoints'").fetchone():
+        generations = {str(row[0]): int(row[1]) for row in connection.execute(
+            "SELECT plan_id, generation FROM execution_checkpoints WHERE repo=?", (repo,))}
     plans = [{
         "plan_id": str(row[0]), "status": str(row[1]),
         "blocked_reason": str(row[2]) if row[2] else None,
@@ -126,6 +130,7 @@ def snapshot(connection: sqlite3.Connection, repo: str, plan_id: str | None) -> 
         "effective_worker_level": int(row[8]) if row[8] is not None else None,
         "review_level_history_sha256": _digest(row[9]),
         "revision_sha256": _digest(row[10] or row[11]),
+        "checkpoint_generation": generations.get(str(row[0]), 0),
     } for row in selected_plans]
     failures = []
     if connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'persistent_execution_failures'").fetchone():
@@ -194,13 +199,14 @@ def recheck_consumed(connection: sqlite3.Connection, request_id: str, subject: s
     ).fetchone() is not None
 
 
-def consume_recheck(connection: sqlite3.Connection, request_id: str, subject: str, cause: str) -> bool:
+def consume_recheck(connection: sqlite3.Connection, request_id: str, subject: str, cause: str, *, repo: str | None = None) -> bool:
     """Claim once in the caller's transaction with the resumed phase transition."""
     row = connection.execute(
-        "SELECT 1 FROM local_environment_recovery_requests WHERE request_id = ? AND status = 'pending'",
+        "SELECT repo, plan_id FROM local_environment_recovery_requests WHERE request_id = ? AND status = 'pending'",
         (request_id,),
     ).fetchone()
-    if row is None:
+    if (row is None or (repo is not None and row[0] != repo)
+            or (row[1] is not None and row[1] != subject)):
         raise LocalRecoveryRequestError("유효한 재검사 요청이 없습니다.")
     changed = connection.execute(
         "INSERT OR IGNORE INTO local_environment_recheck_consumption (request_id, subject, cause) VALUES (?, ?, ?)",

@@ -260,12 +260,12 @@ def target_available(connection, repo, plan_id, *, project_recovery=False):
 
 
 @contextmanager
-def recovering_plan(connection, state_dir, repo, plan_id):
+def recovering_plan(connection, state_dir, repo, plan_id, *, project_recovery=False):
     key = (repo, plan_id)
     if key in _selected_recovery.get():
         yield True
         return
-    if not target_available(connection, repo, plan_id):
+    if not target_available(connection, repo, plan_id, project_recovery=project_recovery):
         yield False
         return
     plan = connection.execute("SELECT branch,worktree FROM exec_plans WHERE repo=? AND plan_id=?", key).fetchone()
@@ -274,7 +274,7 @@ def recovering_plan(connection, state_dir, repo, plan_id):
     entered = False
     try:
         with resource_locks(state_dir, repo, resources, owner='plan-block-recheck'):
-            if not target_available(connection, repo, plan_id):
+            if not target_available(connection, repo, plan_id, project_recovery=project_recovery):
                 yield False
                 return
             token = _selected_recovery.set(_selected_recovery.get() | {key})
@@ -298,7 +298,8 @@ def recovering_plan(connection, state_dir, repo, plan_id):
                 runtime = runtime_state.RuntimeStateRepository(connection)
                 current = runtime.get(repo, plan_id)
                 projection = connection.execute("SELECT plan_path FROM projects WHERE repo=?", (repo,)).fetchone()
-                if projection[0] in (None, current.path):
+                if (projection[0] in (None, current.path)
+                        and not (project_recovery and scoped_blocking.project_block(connection, repo) is not None)):
                     if current.status in runtime_state.ACTIVE_STATUSES:
                         runtime.hydrate_snapshot(repo, current)
                     elif current.status == 'READY' and projection[0] == current.path:

@@ -93,9 +93,13 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
     repo_path: Path,
     state_dir: Path,
     repo: str,
-    *, workspace_plan_id: str | None = None,
+    *, workspace_plan_id: str | None = None, recovery_request_id: str | None = None,
 ) -> bool:
     block = scoped_blocking.project_block(connection, repo)
+    if recovery_request_id is not None and (block is None or workspace_plan_id is not None
+            or block['reason_code'] != BlockReasonCode.PLAN_INPUT_INVALID.value
+            or not block['plan_id']):
+        return False
     if workspace_plan_id is not None:
         if block is not None:
             return False
@@ -127,7 +131,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
     if (plan is None or int(plan['workspace_owned']) != WORKSPACE_RESERVED
             and not (ownership_block and int(plan['workspace_owned']) == WORKSPACE_OWNED)):
         return _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo,
-                                                   workspace_block=block if workspace_plan_id else None)
+                                                   workspace_block=block if workspace_plan_id else None,
+                                                   recovery_request_id=recovery_request_id)
     try:
         with reserved_workspace_ownership(connection, state_dir, repo, str(plan['plan_id'])) as owner:
             expected_checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan['plan_id'])
@@ -136,7 +141,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             expected_request = blocked_checkpoint_state.scope_request_row(connection, repo, plan['plan_id'])
             result = _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo,
                                                    reservation_owner=owner,
-                                                   workspace_block=block if workspace_plan_id else None)
+                                                   workspace_block=block if workspace_plan_id else None,
+                                                   recovery_request_id=recovery_request_id)
             if (not result and workspace_plan_id is None
                     and int(plan['workspace_owned']) == WORKSPACE_RESERVED):
                 result = _narrow_workspace_project_block(effects, connection, repo_path, state_dir,
@@ -278,7 +284,7 @@ def _narrow_workspace_project_block(effects, connection, repo_path, state_dir, r
     return True
 
 
-def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo, *, reservation_owner=None, workspace_block=None):
+def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo, *, reservation_owner=None, workspace_block=None, recovery_request_id=None):
     """Release only a project block whose original safety boundary is restored."""
 
     block = workspace_block if workspace_block is not None else scoped_blocking.project_block(connection, repo)
@@ -298,6 +304,8 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                  else nullcontext())
     workspace_checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, str(block['plan_id'] or ''))
+    if recovery_request_id is not None and workspace_checkpoint.operation != 'rebase':
+        return False
     if workspace_block is not None:
         block = {**dict(block), 'reason_code': BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value}
 
@@ -382,6 +390,7 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
             or scoped_blocking.is_scope_baseline_block(block) and checkpoint.operation == 'rebase'):
         return effects._reconcile_rebase_evidence_block(
             connection, repo_path, state_dir, repo, block, plan_block=False,
+            **({'recovery_request_id': recovery_request_id} if recovery_request_id else {}),
         )
     if (not workspace_recovery and block['plan_id'] and block['reason_code'] in rebase_block_reconciliation.REBASE_BLOCK_REASONS
             and checkpoint.operation == 'rebase'):
@@ -808,7 +817,10 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value,
             BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
         }
-        if force_timeout_recheck and not local_verify_recheck:
+        local_metadata_recheck = bool(force_timeout_recheck and recovery_request_id
+            and current_reason == BlockReasonCode.PLAN_INPUT_INVALID.value
+            and workspace_checkpoint.operation == 'rebase')
+        if force_timeout_recheck and not (local_verify_recheck or local_metadata_recheck):
             continue
         if current_reason == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
             continue
@@ -824,6 +836,12 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
                 repo, str(blocked['plan_id']))
             if checkpoint.operation == 'rebase':
+                if local_metadata_recheck:
+                    if effects._reconcile_rebase_evidence_block(
+                            connection, repo_path, state_dir, repo, current_block,
+                            plan_block=True, recovery_request_id=recovery_request_id):
+                        return True
+                    continue
                 if effects.resume_blocked_execplan_if_inputs_changed(
                         connection, repo_path, repo, base, state_dir, plan_id=str(blocked['plan_id'])):
                     return True
@@ -1010,7 +1028,7 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             with connection:
                 if recovery_request_id is not None:
                     from loop_manager_internal.storage import local_recovery_state
-                    if not local_recovery_state.consume_recheck(connection, recovery_request_id, str(blocked["plan_id"]), "verify"):
+                    if not local_recovery_state.consume_recheck(connection, recovery_request_id, str(blocked["plan_id"]), "verify", repo=repo):
                         effects._clear_active_in_current_transaction(connection, repo)
                         continue
                 runtime_state.RuntimeStateRepository(connection).transition(

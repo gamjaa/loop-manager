@@ -272,10 +272,14 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE repo='A' AND plan_id=?",(pid,))
             self.connection.execute("INSERT INTO execplan_blocks(repo,plan_id,scope,reason_code,evidence) VALUES ('A',?,'plan',?,'original')",(pid,reason))
         self.connection.commit()
-        with self.assertRaises(ValueError):
-            admission.release_blocks(self.connection,'A',['G-001','G-002'])
-        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0],2)
-        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_management_admissions').fetchone()[0],0)
+        for reason in ('managed_worktree_conflict', 'plan_input_invalid'):
+            with self.subTest(reason=reason):
+                self.connection.execute("UPDATE execplan_blocks SET reason_code=? WHERE repo='A' AND plan_id='G-002'", (reason,))
+                self.connection.commit()
+                with self.assertRaises(ValueError):
+                    admission.release_blocks(self.connection,'A',['G-001','G-002'])
+                self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0],2)
+                self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_management_admissions').fetchone()[0],0)
 
     def test_unblock_cli_dispatch_and_live_reservation_drain(self):
         from loop_manager_internal.application.project_service import ProjectService

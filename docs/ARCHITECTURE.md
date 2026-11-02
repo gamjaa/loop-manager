@@ -1136,7 +1136,7 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 
 rebase의 검사 시점은 [R-055](requirements/%5BR-055%5D%20차단%20경로%20전수%20조사와%20불필요한%20작업%20중단%20축소.md#불필요한-중단의-수정)를 따른다. 시작에는 repository·계획·worktree·branch·시작 HEAD·고정 target·원격/PR·writer·index 안전·작업물 보존 조건만 확인하고 파일·선언을 비교·복구 기준으로 기록한다. 최신 target 선언과의 일치·역할별 전체 diff·문서/archive 최종 내용·과거 definition snapshot 존재는 시작 gate가 아니다. 공통 현재 상태 서비스는 현재 소유 branch가 아직 target을 포함하지 않는 형상을 시작 입력으로 구분한다. 시작 HEAD의 누락·노후화는 최종 범위 위반이 아니며, 실제 새 rebase를 시작할 때 현재 HEAD를 checkpoint와 journal에 결합하고 이전 시작 근거는 감사로 보존한다. 진행 중 operation의 `orig-head`·`head-name`·`onto` 검사는 유지한다. rebase 전 변경 관측은 target과 현재 HEAD의 merge-base를 사용하므로 base에만 추가된 문서·archive를 작업 branch의 삭제·되돌림으로 읽지 않는다. target 자체의 유효한 작업 identity·비draft 선언은 확인하고 현재 worktree의 최종 선언 검사는 유예한다. 시작·중간 형상에서 구성한 서비스가 완료 형상을 관측하면 최종 계약을 새로 구성하도록 요구하며 유예한 검사를 완료 승인으로 재사용하지 않는다.
 
-Worker 종료 후에는 해당 호출이 만든 변경의 역할별 허용 범위를 검사한다. commit 재생·일부 stage·autostash 복원 중간 형상은 전체 최종 후보로 검사하지 않는다. Git 완료 후 고정 target의 선택 ExecPlan frontmatter를 본문·mode·다른 작업물 보존 하에 복원하고 갱신한 checkpoint·서비스·HEAD에서 최종 선언·전체 diff·보호 문서·archive를 검사한 뒤 채택한다. 최종 금지 변경·잘못된 선언은 거부한다. 충돌 해결 Agent의 sandbox는 계속 적용하며 Git 전후 차이를 접근 권한 위반으로 추정하지 않는다. 관측 중 단계가 바뀌면 재관측하고 최종 archive 계약을 새로 구성한다. `REBASE_HEAD`·`MERGE_MSG`·`MERGE_MODE`·`AUTO_MERGE`만 남은 상태는 controlling operation이나 autostash 복원 대기로 취급하지 않는다. 이 구분은 rebase 채택뿐 아니라 차단 checkpoint·원격 재평가·명령·Agent 복구·bootstrap·source 동기화의 실행 gate에서도 같은 공통 판단을 사용한다. 원본 marker 관측은 보존하며 실제 조작 marker와 알 수 없는 marker는 계속 차단한다.
+Worker 종료 후에는 해당 호출이 만든 변경의 역할별 허용 범위를 검사한다. commit 재생·일부 stage·autostash 복원 중간 형상은 전체 최종 후보로 검사하지 않는다. Git 완료 후 현재 checkpoint·서비스·HEAD에서 공식 선언·전체 diff·보호 문서·archive와 작업물 보존을 검사한 뒤 채택한다. 공식 선언 교정과 저장된 과거 복원 intent의 처리는 아래 문서 충돌 경계를 따른다. 최종 금지 변경·잘못된 선언은 거부한다. 충돌 해결 Agent의 sandbox는 계속 적용하며 Git 전후 차이를 접근 권한 위반으로 추정하지 않는다. 관측 중 단계가 바뀌면 재관측하고 최종 archive 계약을 새로 구성한다. `REBASE_HEAD`·`MERGE_MSG`·`MERGE_MODE`·`AUTO_MERGE`만 남은 상태는 controlling operation이나 autostash 복원 대기로 취급하지 않는다. 이 구분은 rebase 채택뿐 아니라 차단 checkpoint·원격 재평가·명령·Agent 복구·bootstrap·source 동기화의 실행 gate에서도 같은 공통 판단을 사용한다. 원본 marker 관측은 보존하며 실제 조작 marker와 알 수 없는 marker는 계속 차단한다.
 
 `execution_checkpoints.snapshot.rebase_operation_history`는 이전 operation의 상태를 순서대로 보존하되 새 항목에서 같은 history 필드를 제외한다. 이전 history는 바깥 배열에 한 번만 유지하므로 새 rebase를 시작할 때 기존 이력 전체가 다시 중첩되지 않는다. 현재 실행·acceptance·원격 lease의 필드와 과거 operation 상태의 감사는 유지한다.
 
@@ -1154,7 +1154,9 @@ rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업�
 
 차단 계획의 원본 base 반영에서는 workspace identity·원격 lease·index·작업물 보존을 확인한 뒤 고정 target의 rebase와 중간 게시를 완료한다. 더 최신 base를 반영해야 하면 저장 target을 먼저 끝내고 후속 base까지 반영한 뒤 현재 계획 행으로 catalog metadata 전체 일치를 검사한다. 최종 불일치는 원래 차단 원인 평가·해제와 후속 자료 게시로 넘기지 않는다.
 
-metadata 차단의 재평가 계기는 ExecPlan 등 원인 관련 입력 변경 또는 명시적인 차단 해제·재개 요청이다. 현재 소유권·원격·실행 자리·dependency와 checkpoint generation을 다시 확인하며, 자동 재평가에서 동일 원인과 `rebase_block_release_state`의 관측 fingerprint가 그대로면 반복 재개를 거부한다. 과거 `rebase_block_release_policy` 값은 기존 감사 자료로 보존하되 재개 판단에 사용하지 않고 새 기록에도 추가하지 않는다. 코드·검사 정책 변경이나 이 필드의 부재는 재개 계기가 아니다. 완료 후 선언·범위 검사는 유지하며 명시적 요청도 현재 안전 검사를 생략하지 않는다.
+metadata 차단의 자동 재평가는 차단 당시와 현재의 선택 worktree 또는 원격 base의 ExecPlan·source 입력 지문을 비교한다. 차단 당시의 별도 Git 관측이 같은 block과 checkpoint generation에 결합되어 있고 rebase 진행 상태가 현재 소유 원래 HEAD의 START로 돌아온 경우도 계기가 된다. 증거가 없거나 비교할 수 없으면 보존하며, 무관한 SHA·코드·검사 정책 변경과 과거 해제 기록이나 `rebase_block_release_policy`의 유무는 계기가 아니다. 입력 판단을 통과한 뒤 현재 소유권·원격·실행 자리·dependency를 검사하고 저장된 과거 선언 복원 intent가 있으면 위 복구 조건을 적용한다. 이전 release의 같은 WAITING 상태는 자동으로 반복하지 않는다.
+
+명시적 `recover`는 접수 snapshot의 대상·원인·checkpoint generation이 유지되는 metadata 차단을 현재 상태에서 다시 검사한다. 같은 요청의 대상·원인 소비와 차단 해제·checkpoint 전이를 한 transaction에서 확정하므로 중단 시 함께 보존된다. 새 요청은 재검사의 계기이며 소유권·writer 종료·원격·PR·dependency·pause·관리 자리나 독립 차단을 우회하지 않는다. 원래 target·작업물·세션·실패 이력과 이전 정책 감사는 보존하고 START/WAITING 해제를 완료나 검증 성공으로 기록하지 않는다. Git 완료 후 선언·범위 검사와 검증·게시 gate는 유지한다.
 
 rebase target은 바꾸지 않으며 원격 재전진은 기존 operation 완료 후 반영한다. 문서 전용 충돌은 Manager가 continue/skip하고 혼합 충돌의 나머지 파일과 autostash 충돌은 기존 Worker 교정 경계에 남긴다. 문서 Progress는 현재 후보의 실행·검증 성공 증거가 아니며 완료 후의 입력 재평가·verify·Review·게시 gate는 유지한다
 
@@ -1340,6 +1342,8 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 | 요청 상태 | `pending`·`completed`. 같은 범위의 pending만 같은 request identity로 재사용하고 종결 뒤 후속 재검사는 새 요청으로 접수한다. |
 | 실행 결과 | 실행 전에는 결과가 없을 수 있다. `in_progress`는 pending, `resolved`·`unresolved`는 completed로 저장하며 전후 snapshot·소비·과거 결과를 감사로 보존한다. |
 | 제한 재검사 소비 | `local_environment_recheck_consumption`의 `(request_id, subject, cause)`별로 기록한다. 같은 pending 요청의 해당 대상·원인 재검사는 반복 소비하지 않는다. |
+
+요청 전 snapshot의 계획 항목은 정수 `checkpoint_generation`을 포함한다. metadata 재검사는 이 값과 해당 scope의 원인 코드·진단 및 해제 지문을 현재 block과 비교한다. generation이 없는 과거 요청이나 비교 불가한 근거는 기존 요청·진단을 보존하며 같은 원인의 재검사 허용으로 추정하지 않는다. metadata 차단의 선택적 checkpoint 관측은 block 사본·generation·Git snapshot과 원격 문서 입력 지문을 결합하며, 지문 부재는 원격 입력 변화의 증거가 아니다.
 
 요청 commit 뒤 managed config를 읽고 전역 process lock을 비차단 방식으로 얻는다. 선택한 계획의 실행 자리와 queue 순서가 허용할 때만 기존 복구 executor를 호출한다.
 
