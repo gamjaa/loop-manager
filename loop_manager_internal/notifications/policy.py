@@ -433,7 +433,7 @@ def completion_current(connection, repo, cycle, work_cycle):
     """Recheck durable completion evidence without another remote observation."""
     from loop_manager_internal.planning.specification_review import valid_final_receipt
     from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
-    from loop_manager_internal.storage import planning_review_state
+    from loop_manager_internal.storage import maintenance_state, planning_review_state
     project = connection.execute(
         "SELECT phase, planning_fingerprint, planning_error, pr_conflict_recovery FROM projects WHERE repo=?",
         (repo,),
@@ -451,6 +451,12 @@ def completion_current(connection, repo, cycle, work_cycle):
                        "AND h.plan_id=e.plan_id AND h.currently_archived=1) ")
     if connection.execute(unfinished + "LIMIT 1", (repo,)).fetchone():
         return False
+    maintenance = maintenance_state.MaintenanceRepository(connection).get(repo)
+    if maintenance.phase is not maintenance_state.MaintenancePhase.IDLE or maintenance.publication_stage is not None:
+        return False
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone():
+        if connection.execute("SELECT 1 FROM recovery_records WHERE repo=? AND pending_action!='final_block' LIMIT 1", (repo,)).fetchone():
+            return False
     receipt = planning_review_state.current_final(connection, repo)
     return bool(valid_final_receipt(receipt) and receipt['confirmed_revision']
         and receipt['work_cycle'] == work_cycle == planning_review_state.work_cycle(connection, repo)

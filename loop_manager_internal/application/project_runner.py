@@ -396,8 +396,9 @@ def _run_project_result(
         reason = snapshot.describe()
         effects.operation_log(f"작업 선택 결과 ({repo}): {reason}")
         if snapshot.completed and step_result == 0:
-            notifications.enqueue_completion_if_ready(connection, repo, snapshot)
-            return ProjectRunResult(ProjectRunKind.COMPLETED, 0, reason)
+            if notifications.enqueue_completion_if_ready(connection, repo, snapshot):
+                return ProjectRunResult(ProjectRunKind.COMPLETED, 0, reason)
+            return ProjectRunResult(ProjectRunKind.WAITING, 0, "완료 조건 재확인 대기")
         if not snapshot.completed:
             notifications.enqueue_waiting_reason(connection, repo, snapshot)
             return ProjectRunResult(ProjectRunKind.WAITING, 0, reason)

@@ -305,6 +305,20 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         connection.close()
 
     @dummy_worker_sessions
+    def test_completion_gate_change_after_snapshot_does_not_report_completion(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        from loop_manager_internal.notifications.work_exhaustion import WorkReasonSnapshot
+        snapshot = WorkReasonSnapshot('cycle-one', (), (), None, None)
+        with (mock.patch('loop_manager._checkpoint_dispatch_ready', return_value=False),
+              mock.patch('loop_manager._run_project_step', return_value=0),
+              mock.patch('loop_manager._stable_work_reason', return_value=snapshot),
+              mock.patch.object(loop_manager.notifications, 'enqueue_completion_if_ready', return_value=False)):
+            result = loop_manager._run_project_result(connection, Path('/unused'), repo, Path('/unused.ini'), None, False)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertIn('재확인', result.detail)
+
+    @dummy_worker_sessions
     def test_planner_no_change_with_active_requirement_waits_without_completion(self):
         connection, repo = self._connection()
         from loop_manager_internal.notifications import work_exhaustion

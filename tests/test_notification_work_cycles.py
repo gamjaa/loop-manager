@@ -163,6 +163,26 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(row['rendered_text'])
         self.assertIsNone(row['sent_at'])
 
+    def test_completion_claim_rechecks_maintenance_and_recovery(self):
+        from loop_manager_internal.notifications.policy import is_current
+        connection = self.connection()
+        repo = '/projects/alpha'
+        self._complete_project(connection, 'cycle-one')
+        self.assertTrue(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        payload = json.loads(self.events(connection)[0]['payload'])
+        self.assertTrue(is_current(connection, repo, 'project_completed', payload))
+        connection.execute("INSERT INTO maintenance_cycles (repo, phase) VALUES (?, 'assessment')", (repo,))
+        self.assertFalse(is_current(connection, repo, 'project_completed', payload))
+        connection.execute("UPDATE maintenance_cycles SET phase='idle', publication_stage='pending' WHERE repo=?", (repo,))
+        self.assertFalse(is_current(connection, repo, 'project_completed', payload))
+        connection.execute("UPDATE maintenance_cycles SET publication_stage=NULL WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO recovery_records (repo, subject, identity, reason_code, disposition, "
+            "pending_action, phase, fingerprint, progress_marker, occurrence, attempts, detail) "
+            "VALUES (?, '__project__', 'id', 'git_lock', 'transient_retry', 'retry', 'PLANNING', 'fp', 'm', 1, 1, 'lock')", (repo,))
+        self.assertFalse(is_current(connection, repo, 'project_completed', payload))
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 0)
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+
     def test_completion_rechecks_final_receipt_and_work_cycle(self):
         from loop_manager_internal.storage import planning_review_state
         connection = self.connection()
