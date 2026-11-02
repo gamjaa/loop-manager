@@ -846,7 +846,10 @@ def _apply_maintenance_planning_batch(
             )
         return next_cycle
 
-    return run_database_request(connection, apply)
+    result_value = run_database_request(connection, apply)
+    from loop_manager_internal.notifications import notifications
+    notifications.flush_project_events(connection, repo)
+    return result_value
 
 
 @dataclass(frozen=True)

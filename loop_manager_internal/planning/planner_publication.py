@@ -810,7 +810,10 @@ def _apply_general_planning_batch(
         if not retain_planning:
             planning_publication_state.delete_general_planning_publication(connection, repo)
 
-    return run_database_request(connection, apply)
+    result_value = run_database_request(connection, apply)
+    from loop_manager_internal.notifications import notifications
+    notifications.flush_project_events(connection, repo)
+    return result_value
 
 
 @dataclass(frozen=True)

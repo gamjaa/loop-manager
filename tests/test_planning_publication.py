@@ -546,7 +546,9 @@ class PlanningPublicationTest(PlanningCase):
                 with mock.patch.object(planner_publication.planning_publication_state, 'apply_mutable_catalog_changes'), \
                      mock.patch('loop_manager_internal.catalog.remote_deletions.resolve_recovery'), \
                      mock.patch.object(common_guidance, 'planning_content_hash', return_value='pinned-guidance'), \
-                     mock.patch.object(common_guidance, 'runtime_content_hash', side_effect=AssertionError('reload')):
+                     mock.patch.object(common_guidance, 'runtime_content_hash', side_effect=AssertionError('reload')), \
+                     mock.patch('loop_manager_internal.notifications.notifications.flush_project_events',
+                         side_effect=lambda db, repo: self.assertFalse(db.in_transaction)) as flush:
                     if fail_clear:
                         with self.assertRaisesRegex(RuntimeError, 'clear interrupted'):
                             planner_publication._apply_general_planning_batch(effects, connection, '/repo',
@@ -554,6 +556,7 @@ class PlanningPublicationTest(PlanningCase):
                     else:
                         planner_publication._apply_general_planning_batch(effects, connection, '/repo',
                             Path('/worktree'), result, 'commit', 'spec', 'input')
+                self.assertEqual(flush.call_count, 0 if fail_clear else 1)
                 self.assertEqual(reviews.get(connection, '/repo', 'general') is None, fail_clear)
                 self.assertEqual(reviews.get(connection, '/repo', 'attempt') is not None, fail_clear)
                 self.assertEqual(planning_input_state.has_baseline(connection, '/repo'), not fail_clear)

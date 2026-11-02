@@ -125,6 +125,24 @@ class MaintenancePublicationPolicyTest(MaintenancePlanningCase):
         self.assertEqual([row[0] for row in self.connection.execute(
             'SELECT plan_id FROM exec_plans ORDER BY plan_id')], ['G-000', 'G-001'])
 
+    def test_committed_batch_attempts_notification_before_cleanup(self):
+        from loop_manager_internal.notifications import notifications
+        repo = str(self.repo)
+        notifications.configure_session(self.connection, enabled=True)
+        self.connection.commit()
+        loop_manager.record_maintenance_publication_intent(
+            self.connection, repo, self.repo, 'main', self.result, self.commit)
+        def flush(connection, observed_repo):
+            self.assertFalse(connection.in_transaction)
+            self.assertEqual(observed_repo, repo)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM notification_outbox WHERE event_type='plans_published'"
+            ).fetchone()[0], 1)
+        with mock.patch.object(notifications, 'flush_project_events', side_effect=flush) as send:
+            loop_manager._apply_maintenance_planning_batch(
+                self.connection, repo, self.repo, 'main', self.result, self.commit)
+        send.assert_called_once()
+
     def test_batch_rejects_cycle_owner_and_catalog_races_during_observation(self):
         from loop_manager_internal.maintenance import maintenance_publication
         from loop_manager_internal.storage import manual_work_state
