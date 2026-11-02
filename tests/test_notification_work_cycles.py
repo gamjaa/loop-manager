@@ -218,6 +218,25 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(after[field], before[field], field)
         self.assertEqual(connection.execute('SELECT generation FROM work_reason_episodes').fetchone()[0], 1)
 
+    def test_episode_ignores_presentation_changes_but_tracks_wait_causes(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        plan = {'id': 'G-018', 'title': 'Choice', 'status': 'DRAFT',
+                'reason': 'Decision pending', 'question': 'Choose A or B',
+                'path': 'docs/plans/old.md', 'url': 'https://example/old',
+                'revision': 'old'}
+        requirement = {'id': '[R-031]', 'path': 'docs/requirements/old.md',
+                       'reason': 'Related plan pending'}
+        def observe(cycle, plan, requirement):
+            snapshot = work_exhaustion.WorkReasonSnapshot(cycle, (plan,), (requirement,), None, None)
+            notifications.enqueue_waiting_reason(connection, repo, snapshot)
+            return connection.execute('SELECT generation FROM work_reason_episodes').fetchone()[0]
+        self.assertEqual(observe('old', plan, requirement), 1)
+        moved = {**plan, 'path': 'docs/plans/new.md', 'url': 'https://example/new', 'revision': 'new'}
+        self.assertEqual(observe('new', moved, {**requirement, 'path': 'docs/requirements/archive/new.md'}), 1)
+        self.assertEqual(observe('new', {**moved, 'question': 'Choose C'}, requirement), 2)
+        self.assertEqual(observe('new', {**moved, 'reason': 'Different cause'}, requirement), 3)
+
     def test_blocked_requirement_does_not_infer_user_action(self):
         connection = self.connection()
         repo = '/projects/alpha'

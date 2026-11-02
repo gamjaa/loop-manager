@@ -579,8 +579,19 @@ def enqueue_waiting_reason(
     ensure_schema(connection)
     payload = snapshot.payload(Path(repo).name or repo)
     enqueue_draft_decisions(connection, repo)
+    # Links, paths and revision identifiers are presentation details, not a
+    # change to the observed waiting causes or membership of the episode.
+    identity = {
+        "plans": [{key: value for key, value in plan.items()
+                   if key not in {"url", "pr_url", "path", "revision"}}
+                  for plan in snapshot.plans],
+        "requirements": [{key: value for key, value in requirement.items()
+                          if key != "path"} for requirement in snapshot.requirements],
+        "project_block": snapshot.project_block,
+        "planning_error": snapshot.planning_error,
+    }
     signature = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=False,
+        json.dumps(identity, sort_keys=True, ensure_ascii=False,
                    separators=(",", ":")).encode()
     ).hexdigest()
     with connection:
