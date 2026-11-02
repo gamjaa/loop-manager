@@ -113,6 +113,37 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(events[0]['canceled_at'])
         self.assertIsNone(events[1]['canceled_at'])
 
+    def test_completion_generation_migration_preserves_old_cycle(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.executescript("""
+            CREATE TABLE projects(repo TEXT PRIMARY KEY);
+            INSERT INTO projects VALUES ('repo');
+            CREATE TABLE project_completion_cycles (
+                repo TEXT PRIMARY KEY, cycle_key TEXT, last_completed_plan_id TEXT,
+                last_completed_title TEXT, completed_at TEXT);
+            INSERT INTO project_completion_cycles VALUES ('repo', 'cycle', 'G-001', 'Title', 'old time');
+        """)
+        notifications.ensure_schema(connection)
+        self.assertEqual(connection.execute('SELECT cycle_key, last_completed_title, completed_at, generation '
+                                            'FROM project_completion_cycles').fetchone(),
+                         ('cycle', 'Title', 'old time', 0))
+
+    def test_actual_progress_allows_new_completion_with_same_inputs(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        self._complete_project(connection, 'cycle-one')
+        self.assertTrue(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 1)
+        notifications.mark_work_available(connection, repo)
+        notifications.mark_work_available(connection, repo)
+        self.assertTrue(notifications.enqueue_completion_if_ready(connection, repo, self._snapshot('cycle-one')))
+        events = self.events(connection)
+        self.assertEqual(len(events), 2)
+        self.assertNotEqual(json.loads(events[0]['payload'])['generation'], json.loads(events[1]['payload'])['generation'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock()), 1)
+        self.assertTrue(all(event['sent_at'] for event in self.events(connection)))
+
     def test_completion_cancels_remaining_pieces_when_work_changes(self):
         connection = self.connection()
         repo = '/projects/alpha'

@@ -506,7 +506,7 @@ def enqueue_completion_if_ready(
         if not completion_current(connection, repo, snapshot.cycle, work_cycle):
             return False
         previous = connection.execute(
-            "SELECT cycle_key, completed_at FROM project_completion_cycles WHERE repo=?", (repo,),
+            "SELECT cycle_key, completed_at, generation FROM project_completion_cycles WHERE repo=?", (repo,),
         ).fetchone()
         _cancel_pending_waiting(connection, repo)
         if previous is None or previous[0] != snapshot.cycle:
@@ -524,13 +524,13 @@ def enqueue_completion_if_ready(
         )
         if _enabled(connection) and (previous is None or previous[0] != snapshot.cycle or not previous[1]):
             saved = connection.execute(
-                "SELECT last_completed_plan_id, last_completed_title FROM project_completion_cycles WHERE repo=?",
+                "SELECT last_completed_plan_id, last_completed_title, generation FROM project_completion_cycles WHERE repo=?",
                 (repo,),
             ).fetchone()
             payload = {"project": Path(repo).name or repo, "cycle": snapshot.cycle,
-                       "work_cycle": work_cycle, "reason": snapshot.describe(),
+                       "work_cycle": work_cycle, "generation": saved[2], "reason": snapshot.describe(),
                        "last_completed_plan_id": saved[0], "last_completed_title": saved[1] or ''}
-            _insert(connection, _key('project_completed', repo, snapshot.cycle + '\0' + work_cycle),
+            _insert(connection, _key('project_completed', repo, snapshot.cycle + '\0' + work_cycle + '\0' + str(saved[2])),
                     repo, 'project_completed', payload)
     from .delivery import flush_project_events
     flush_project_events(connection, repo)
@@ -556,7 +556,8 @@ def mark_work_available(connection: sqlite3.Connection, repo: str) -> None:
             "WHERE repo = ? AND signature != '__work_available__'", (repo,),
         )
         _cancel_pending_waiting(connection, repo)
-        connection.execute("UPDATE project_completion_cycles SET completed_at=NULL WHERE repo=?", (repo,))
+        connection.execute("UPDATE project_completion_cycles SET completed_at=NULL, generation=generation+1 "
+                           "WHERE repo=? AND completed_at IS NOT NULL", (repo,))
         connection.execute(
             "UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP "
             "WHERE repo=? AND event_type='project_completed' AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
@@ -598,7 +599,8 @@ def enqueue_waiting_reason(
         payload.update(signature=signature, generation=generation)
         current = is_current(connection, repo, 'work_waiting', payload)
         if current:
-            connection.execute("UPDATE project_completion_cycles SET completed_at=NULL WHERE repo=?", (repo,))
+            connection.execute("UPDATE project_completion_cycles SET completed_at=NULL, generation=generation+1 "
+                           "WHERE repo=? AND completed_at IS NOT NULL", (repo,))
             connection.execute(
                 "UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP "
                 "WHERE repo=? AND event_type='project_completed' AND sent_at IS NULL AND canceled_at IS NULL", (repo,),

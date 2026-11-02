@@ -493,10 +493,10 @@ def is_current(connection, repo, kind, payload, *, event_key=None):
                         and waiting_current(connection, repo, payload))
         if kind == 'project_completed':
             saved = connection.execute(
-                'SELECT cycle_key, completed_at FROM project_completion_cycles WHERE repo=?', (repo,),
+                'SELECT cycle_key, completed_at, generation FROM project_completion_cycles WHERE repo=?', (repo,),
             ).fetchone()
             return bool(saved and saved[0] == payload['cycle'] and saved[1]
-                        and completion_current(connection, repo, payload['cycle'], payload['work_cycle']))
+                        and saved[2] == payload['generation'] and completion_current(connection, repo, payload['cycle'], payload['work_cycle']))
         if kind == 'plans_published':
             plans = payload['plans']
             revision = payload['publication_revision']
