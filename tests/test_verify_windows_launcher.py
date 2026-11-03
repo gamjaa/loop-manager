@@ -644,6 +644,79 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
         self.assertFalse(self.report()['passed'])
 
+    def test_slow_final_logging_and_cleanup_revoke_success(self):
+        from loop_manager_internal.verification import execution_clock, timing
+        clock_type = execution_clock.ExecutionClock
+        for operation in ('run_end', 'writer_close', 'budget_close'):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                self.logs = Path(directory) / 'logs'
+                os.environ['LOOP_MANAGER_VERIFY_LOG_DIR'] = str(self.logs)
+                now = [0.0]
+                emit, writer_close, budget_close = timing.EventWriter.emit, timing.EventWriter.close, clock_type.close
+                def observed_emit(writer, kind, **values):
+                    result = emit(writer, kind, **values)
+                    if operation == 'run_end' and kind == 'run_end':
+                        now[0] = 60.0
+                    return result
+                def observed_writer_close(writer):
+                    writer_close(writer)
+                    if operation == 'writer_close':
+                        now[0] = 60.0
+                def observed_budget_close(budget):
+                    budget_close(budget)
+                    if operation == 'budget_close':
+                        now[0] = 60.0
+                with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                        clock_type(*args, **kwargs, clock=lambda: now[0])), \
+                     mock.patch.object(timing.EventWriter, 'emit', new=observed_emit), \
+                     mock.patch.object(timing.EventWriter, 'close', new=observed_writer_close), \
+                     mock.patch.object(clock_type, 'close', new=observed_budget_close):
+                    with self.assertRaises(TimeoutError):
+                        launcher.windows_main(self.root)
+                self.assertFalse(self.report()['passed'])
+                self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
+
+    def test_phase_log_error_preserves_uncertain_bundle(self):
+        from loop_manager_internal.verification import timing
+        emit = timing.EventWriter.emit
+        bundle_paths = []
+        def wsl(_root, bundle, *_args):
+            bundle_paths.append(bundle)
+            (bundle / 'marker').write_text('keep')
+            raise verify_process.VerifyTerminationUncertain('child state unknown')
+        def emit_with_error(writer, kind, **values):
+            if kind == 'phase_end' and values.get('name') == 'wsl-full':
+                raise OSError('phase log failed')
+            return emit(writer, kind, **values)
+        self.wsl.side_effect = wsl
+        with mock.patch.object(timing.EventWriter, 'emit', new=emit_with_error):
+            with self.assertRaises(verify_process.VerifyTerminationUncertain) as raised:
+                launcher.windows_main(self.root)
+        self.assertTrue(any('phase log failed' in note for note in raised.exception.__notes__))
+        self.assertEqual((bundle_paths[0] / 'marker').read_text(), 'keep')
+        self.native.assert_not_called()
+        self.assertFalse(self.report()['passed'])
+
+    def test_phase_log_error_preserves_budget_error(self):
+        from loop_manager_internal.verification import execution_clock, timing
+        emit = timing.EventWriter.emit
+        def wsl(*_args):
+            budget = execution_clock.current_execution_clock.get()
+            (budget.directory / 'wait.json').write_text('invalid')
+            budget.remaining(60)
+        def emit_with_error(writer, kind, **values):
+            if kind == 'phase_end' and values.get('name') == 'wsl-full':
+                raise OSError('phase log failed')
+            return emit(writer, kind, **values)
+        self.wsl.side_effect = wsl
+        with mock.patch.object(timing.EventWriter, 'emit', new=emit_with_error):
+            with self.assertRaises(execution_clock.VerifyBudgetError) as raised:
+                launcher.windows_main(self.root)
+        self.assertTrue(any('phase log failed' in note for note in raised.exception.__notes__))
+        self.assertEqual((self.logs / 'budget-error/wait.json').read_text(), 'invalid')
+        self.assertTrue(raised.exception.diagnostic_directory.exists())
+        self.native.assert_not_called()
+
     def test_partial_request_falls_back_without_executing_either_phase(self):
         os.environ.update(LOOP_MANAGER_VERIFY_PARTIAL_BASE='base', LOOP_MANAGER_VERIFY_SESSION='session')
         self.assertEqual(launcher.windows_main(self.root), 0)

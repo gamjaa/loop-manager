@@ -535,6 +535,21 @@ def windows_main(root):
     from loop_manager_internal.verification.timing import EventWriter, atomic_json, diagnostic, phase
     from loop_manager_internal.config.managed_config import load_managed_config
     from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
+    @contextmanager
+    def preserving_phase(name):
+        primary = None
+        try:
+            with phase(name):
+                try:
+                    yield
+                except BaseException as error:
+                    primary = error
+                    raise
+        except BaseException as error:
+            if primary is not None and error is not primary:
+                primary.add_note(f'{name} phase 기록 실패: {error}')
+                raise primary from None
+            raise
     timeout = float(os.environ.get('LOOP_MANAGER_VERIFY_TIMEOUT', '600'))
     cap = os.environ.get('LOOP_MANAGER_VERIFY_PARALLELISM', 'auto')
     if (root / 'config/config.ini').is_file():
@@ -569,7 +584,7 @@ def windows_main(root):
     os.environ[BUDGET_DIRECTORY] = budget.environment[BUDGET_DIRECTORY]
     try:
         writer.emit('run_start', mode='windows+wsl', cap=cap)
-        with writer.activate(), phase('verify'), owned_bundle() as bundle:
+        with writer.activate(), preserving_phase('verify'), owned_bundle() as bundle:
             report.update(snapshot(root, bundle, entrypoint, budget, timeout - CLEANUP_SECONDS))
             atomic_json(directory / 'snapshot.json', {
                 'run_id': session, 'revision': report['revision'], 'bundle': str(bundle),
@@ -578,7 +593,7 @@ def windows_main(root):
             wsl_logs.mkdir()
             print(f'WSL 전체 verify 시작: {wsl_logs}', flush=True)
             report['wsl'] = 'FAIL'
-            with phase('wsl-full'):
+            with preserving_phase('wsl-full'):
                 passed = run_wsl(root, bundle, wsl_logs,
                                  budget.remaining(timeout), cap, session)
             report['temporary_directories']['wsl'] = wsl_temporary_directory(wsl_logs)
@@ -599,7 +614,7 @@ def windows_main(root):
             native_logs.mkdir()
             print(f'Windows 핵심 회귀 시작: {native_logs}', flush=True)
             report['windows'] = 'FAIL'
-            with phase('windows-core'):
+            with preserving_phase('windows-core'):
                 # 자체 실행기는 표준 라이브러리만 사용하며 venv redirector를 worker로 남기지 않는다.
                 native_environment = dict(os.environ, LOOP_MANAGER_VERIFY_PARENT_RUN_ID=session)
                 check_budget(budget, timeout)
@@ -627,6 +642,7 @@ def windows_main(root):
     finally:
         primary = sys.exc_info()[1]
         candidate = report['passed'] and primary is None
+        cleanup_deadline = None
         report['passed'] = False
         budget_error = primary
         while budget_error is not None and not isinstance(budget_error, VerifyBudgetError):
@@ -648,6 +664,8 @@ def windows_main(root):
             if candidate:
                 print(diagnostic(directory), flush=True)
                 check_budget(budget, timeout)
+            if primary is None:
+                cleanup_deadline = budget.clock() + budget.remaining(timeout)
             writer.emit('run_end', passed=report['passed'], wsl=report['wsl'], windows=report['windows'])
         except BaseException as error:
             report['passed'] = False
@@ -695,6 +713,10 @@ def windows_main(root):
                     if primary is None:
                         raise
                     primary.add_note(f'실행 시간 기록 정리 실패: {error}')
+                if primary is None and cleanup_deadline is not None and budget.clock() >= cleanup_deadline:
+                    report['passed'] = False
+                    atomic_json(directory / 'result.json', report)
+                    raise TimeoutError('전체 verify 최종 정리 중 시간이 만료됐습니다.')
 
 
 if __name__ == '__main__':
