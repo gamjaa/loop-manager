@@ -176,8 +176,11 @@ class ExecPlanArchiveRepository:
     def merged_candidates(self, repo: str) -> tuple[MergedArchiveCandidate, ...]:
         candidates: list[MergedArchiveCandidate] = []
         rows = self.connection.execute(
-            "SELECT plan_id, path, content_hash, current_revision_sha FROM exec_plans "
-            "WHERE repo = ? AND status = 'MERGED' ORDER BY plan_id",
+            "SELECT p.plan_id, p.path, p.content_hash, p.current_revision_sha FROM exec_plans p "
+            "WHERE p.repo = ? AND p.status = 'MERGED' AND NOT EXISTS ("
+            "SELECT 1 FROM execplan_archive_items i WHERE i.repo=p.repo AND i.plan_id=p.plan_id "
+            "AND i.archived=1 AND i.active_path=p.path AND i.expected_hash=p.content_hash "
+            "AND i.current_revision_sha=p.current_revision_sha) ORDER BY p.plan_id",
             (repo,),
         ).fetchall()
         for row in rows:

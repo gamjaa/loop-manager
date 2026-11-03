@@ -67,6 +67,23 @@ class ExecPlanArchiveStateTest(unittest.TestCase):
             "docs/plans/archive/[G-001] Merged.md",
         )
 
+    def test_completed_active_path_is_not_selected_again_unless_definition_changes(self):
+        for field, value in (("path", "docs/plans/[G-001] Renamed.md"),
+                             ("content_hash", "changed-hash"),
+                             ("current_revision_sha", "changed-revision")):
+            with self.subTest(field=field):
+                self.connection.execute("DELETE FROM exec_plans")
+                self.connection.execute("DELETE FROM execplan_archive_items")
+                self._insert("G-001", "Merged")
+                candidate = self.repository.merged_candidates("/repo")[0]
+                self.repository.record_success(
+                    "/repo", (candidate,), base_sha="base", operation_id=None,
+                    commit_oid=None, push_result="observed_remote",
+                )
+                self.assertEqual(self.repository.merged_candidates("/repo"), ())
+                self.connection.execute(f"UPDATE exec_plans SET {field}=?", (value,))
+                self.assertEqual(len(self.repository.merged_candidates("/repo")), 1)
+
     def test_execution_observation_survives_reopen_without_candidate_records(self):
         import tempfile
         from pathlib import Path

@@ -1660,6 +1660,8 @@ archive는 관리 배정 자리를 소비하지 않는다. 관리 배정의 park
 
 보관 근거는 최초 게시본이 아닌 catalog의 현재 최종 문서 hash와 `current_revision_sha`다. operation identity는 base·계획 ID·이전/보관 경로·최종 hash·revision에 결합하며 준비 commit의 실제 rename-only diff와 후보 정의를 게시 전에 다시 확인한다.
 
+완료 item의 활성 경로·최종 hash·revision이 현재 MERGED 정의와 같으면 catalog에 활성 경로가 남아 있어도 archive 후보에서 제외한다. 동일한 완료를 재확인하기 위해 Git 큐와 원격 조회를 반복하지 않는다. 정의가 바뀌면 다시 후보로 판단하며, 원격 게시 뒤 DB 확정이 끊긴 미완료 item의 복구는 유지한다.
+
 | 관측·중단 조건 | 보관·재개 결과 |
 |---|---|
 | 현재 revision이 있고 일반 파일 source의 최종 hash가 일치하며 destination·다른 동일 ID 보관 문서가 없음 | 안전한 후보만 묶어 게시한다. 충돌한 다른 후보는 pending으로 분리한다. |
