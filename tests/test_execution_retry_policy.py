@@ -15,8 +15,26 @@ from tests.support.worker import dummy_worker_sessions
 class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
     def test_git_observation_failure_pauses_without_discarding_saved_worker(self):
         fixture = execution_policy_fixture(self)
+        # Persist a Worker result produced for the current definition. The
+        # revision gate must recognize it and resume at base observation.
+        fixture.handler.guard(fixture.context())
+        snapshot = fixture.handler._definition_snapshot
+        fixture.effects.workspace.git.reset_mock()
         fixture.state.update_project(
-            fixture.repo, worker_result='saved worker evidence', worker_session_id='worker-session')
+            fixture.repo, phase='VERIFYING',
+            definition_snapshot=snapshot.serialize(),
+            worker_result='saved worker evidence', worker_session_id='worker-session',
+            worker_input_token=snapshot.worker_token,
+            archive_token=snapshot.archive_token)
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionPhase
+        accepted = fixture.handler.guard(fixture.context())
+        self.assertNotIsInstance(accepted, ExecutionOutcome)
+        self.assertEqual(accepted.phase, ExecutionPhase.VERIFYING)
+        project = fixture.state.row()
+        self.assertEqual(project['worker_result'], 'saved worker evidence')
+        self.assertEqual(project['worker_session_id'], 'worker-session')
+        fixture.effects.agent.run_agent.assert_not_called()
+        fixture.effects.workspace.git.reset_mock()
         observe = fixture.effects.workspace.git.side_effect
         fetch = ('fetch', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main')
 

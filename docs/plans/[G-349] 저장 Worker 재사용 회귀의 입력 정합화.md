@@ -40,10 +40,15 @@ Git 관측 실패 때 저장된 Worker 근거와 session을 보존하는 기존 
 ## Progress
 
 - [x] revision `f253d5aae8f393896268430517ee0caf2dcf411d`에서 보고 432의 원래 revision과 현재 테스트·fixture·coordinator·revision/session gate를 정적으로 대조했다. 현재 catalog에 같은 교정 목표의 비종료 계획이 없음을 확인했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 저장 Worker 근거·단계 준비 정합화와 기존 assertion 유지
-- [ ] 변경 관련 최소 targeted unit 및 영향받은 공유 소비자 확인
+- [x] 저장 Worker 근거·단계 준비 정합화와 기존 assertion 유지
+- [x] 변경 관련 최소 targeted unit 및 영향받은 공유 소비자 확인
+
+- `tests/test_execution_retry_policy.ExecutionRetryPolicyTest.test_git_observation_failure_pauses_without_discarding_saved_worker`: 프로젝트 targeted runner로 1개 통과. 현재 정의에서 snapshot을 얻고 Worker/archive token과 VERIFYING 단계를 저장해 revision gate·실제 최신 base 관측 경로를 통과했다. 준비 guard의 fetch 호출은 검증 구간 fetch 횟수에서 제외했고, 기존 3회 제한 재시도·TRANSIENT_PAUSE·결과/session 보존·Agent no-call assertion이 통과했다.
+- 첫 실행은 준비 snapshot 생성 과정의 fetch 1회가 기존 실행 fetch 집계에 포함돼 4회로 실패했다. 준비 단계 이후 mock call history를 초기화해 검증 구간의 정확한 3회를 측정하도록 교정하고 같은 targeted test를 재실행해 통과했다.
 
 ## Decision Log
+
+- 검토 피드백 후 저장 성공 근거를 기록한 다음 정상 Git 상태에서 실제 `guard()`를 추가 호출했다. `VERIFYING` 유지, 결과/session 보존, Agent no-call을 확인하고 그 뒤 call history를 초기화해 fetch 실패를 주입했다. 같은 targeted test 재실행에서 gate 검증과 기존 실패/재시도 assertion이 모두 통과했다.
 
 - 원인은 저장 결과를 준비하는 회귀의 입력 계약과 실제 dispatcher의 불일치다. session binding 오류는 그 뒤 고정 session double에서 드러나는 결과다. R-072가 요구하는 유효한 성공 근거를 준비하며 운영 단계 순서·session 검증을 바꾸지 않는다. 보고 432 이후 직접 반영된 정확한 fetch 인수의 실패 주입·3회 assertion과 G-339의 Git diff/merge-base fixture·물리 targeted 실행 귀속 검증은 재사용한다. 이 직접 보완에도 남은 단계/근거 준비만 맡으며 G-344의 질문·draft·임계값은 그대로 둔다.
 - 독립 테스트 입력 교정이므로 선행 dependency를 추가하지 않는다. 보고 원인의 교정과 영향 작업의 실제 전체 verify·Review·Merge 및 차단 재평가는 별개다. 다른 미확정 보고를 같은 원인으로 연결하지 않으며 이미 Merge된 계획을 재작성하지 않는다.
