@@ -351,7 +351,9 @@ class TargetedRunnerTests(TestCase):
             outcome = dict(version=1, kind='test_end', run_id='a', utc='now',
                            id='tests.Sample.test_case', result='failure')
             phase = dict(kind='phase_start', name='bootstrap:parent_cli', phase_id='p')
-            path.write_text(''.join(json.dumps(item) + '\n' for item in (phase, outcome)))
+            diagnostics = (phase, dict(kind='phase_end'), dict(kind='git_cost'),
+                           dict(kind='git_cost_incomplete'))
+            path.write_text(''.join(json.dumps(item) + '\n' for item in (*diagnostics, outcome)))
             self.assertEqual(targeted.collect(directory), (outcome,))
             path.write_text(json.dumps({**outcome, 'run_id': 'foreign'}) + '\n')
             with self.assertRaises(ValueError):

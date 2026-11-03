@@ -964,6 +964,30 @@ class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
         ).fetchone()[0], 'MERGED')
 
 
+    def test_conflicting_pr_selects_its_own_execution_with_independent_active_work(self):
+        from loop_manager_internal.recovery import waiting_pr_service
+        from loop_manager_internal.storage import runtime_state
+        self.plan('G-001', 'IMPLEMENTING', branch='loop/G-001')
+        plan = self.plan('G-003', 'PR_OPEN', branch='loop/G-003')
+        runtime_state.RuntimeStateRepository(self.connection)
+        before = tuple(self.connection.execute(
+            "SELECT status,branch,worktree,worker_session_id,last_error FROM exec_plans WHERE repo=? AND plan_id='G-001'", (self.repo,)).fetchone())
+        def reconcile(*args, **kwargs):
+            self.assertEqual(runtime_state.execution_selection.get(), (self.repo, 'G-003'))
+            self.assertIsNone(loop_manager.active_execplan(self.connection, self.repo))
+        effects = SimpleNamespace(active_execplan=loop_manager.active_execplan,
+            hydrate_execplan_project=loop_manager.hydrate_execplan_project,
+            reconcile_existing_pull_request=mock.Mock(side_effect=reconcile))
+        observation = loop_manager.WaitingPullRequestObservation(((plan, {}),), False)
+        with mock.patch('loop_manager_internal.storage.task_calls.management_available', return_value=True):
+            result = waiting_pr_service.select_waiting_pull_request_conflict(
+                effects, self.connection, Path(self.repo), Path('/state'), self.repo, observation)
+        self.assertTrue(result.conflict_started)
+        effects.reconcile_existing_pull_request.assert_called_once()
+        self.assertIsNone(runtime_state.execution_selection.get())
+        self.assertEqual(tuple(self.connection.execute(
+            "SELECT status,branch,worktree,worker_session_id,last_error FROM exec_plans WHERE repo=? AND plan_id='G-001'", (self.repo,)).fetchone()), before)
+
     def test_conflicting_pr_waits_for_planning_slot(self):
         plan = self.plan('G-003', 'PR_OPEN', branch='loop/G-003')
         self.connection.execute(

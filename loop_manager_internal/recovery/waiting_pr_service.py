@@ -315,8 +315,6 @@ def select_waiting_pull_request_conflict(
 ) -> PullRequestSyncResult:
     """Select one still-eligible conflict after all observations are durable."""
 
-    if effects.active_execplan(connection, repo) is not None:
-        return PullRequestSyncResult(merged=observation.merged)
     if not runtime_state.RuntimeStateRepository(
         connection
     ).recovery_slot_available(repo):
@@ -355,19 +353,24 @@ def select_waiting_pull_request_conflict(
     from loop_manager_internal.storage.task_calls import management_available
     if not management_available(connection,repo,str(plan['plan_id'])):
         return PullRequestSyncResult(merged=observation.merged)
-    effects.hydrate_execplan_project(connection, repo, plan)
-    project = runtime_state.project_row(connection, repo)
-    assert project is not None
     recovery_options = {"config_path": config_path} if config_path is not None else {}
-    result = effects.reconcile_existing_pull_request(
-        connection,
-        repo_path,
-        state_dir,
-        repo,
-        project,
-        pull_request,
-        **recovery_options,
-    )
+    with runtime_state.selected_execution(repo, str(plan['plan_id']), include_blocked=True):
+        effects.hydrate_execplan_project(connection, repo, plan)
+        project = runtime_state.project_row(connection, repo)
+        assert project is not None
+        result = effects.reconcile_existing_pull_request(
+            connection,
+            repo_path,
+            state_dir,
+            repo,
+            project,
+            pull_request,
+            **recovery_options,
+        )
+    current = connection.execute(
+        'SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan['plan_id']),
+    ).fetchone()
+    effects.hydrate_execplan_project(connection, repo, current)
     return PullRequestSyncResult(result, result is None, observation.merged)
 
 

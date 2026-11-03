@@ -67,8 +67,9 @@ def collect(directory):
             if not line.endswith('\n'):
                 break
             event = json.loads(line)
-            # Nested timing diagnostics carry no test outcome or run ownership.
-            if isinstance(event, dict) and event.get('kind') in {'phase_start', 'phase_end'}:
+            # Timing and Git cost diagnostics carry no test outcome or run ownership.
+            if isinstance(event, dict) and event.get('kind') in {
+                    'phase_start', 'phase_end', 'git_cost', 'git_cost_incomplete'}:
                 continue
             if not isinstance(event, dict) or event.get('run_id') != run_id or event.get('version') != 1:
                 raise ValueError('targeted test 실행 identity가 유효하지 않습니다.')
