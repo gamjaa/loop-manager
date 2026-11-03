@@ -716,7 +716,17 @@ def windows_main(root):
                 if primary is None and cleanup_deadline is not None and budget.clock() >= cleanup_deadline:
                     report['passed'] = False
                     atomic_json(directory / 'result.json', report)
-                    raise TimeoutError('전체 verify 최종 정리 중 시간이 만료됐습니다.')
+                    error = TimeoutError('전체 verify 최종 정리 중 시간이 만료됐습니다.')
+                    try:
+                        correction = EventWriter(directory / 'launcher.jsonl', identity={'run_id': session})
+                        try:
+                            correction.emit('run_end', passed=False, wsl=report['wsl'], windows=report['windows'])
+                        finally:
+                            correction.close()
+                        diagnostic(directory)
+                    except OSError as diagnostic_error:
+                        error.add_note(f'최종 시간 초과 진단 기록 실패: {diagnostic_error}')
+                    raise error
 
 
 if __name__ == '__main__':

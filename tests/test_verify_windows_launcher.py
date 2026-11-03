@@ -675,6 +675,9 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
                         launcher.windows_main(self.root)
                 self.assertFalse(self.report()['passed'])
                 self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
+                summary = json.loads((self.logs / 'summary.json').read_text())
+                self.assertFalse(summary['result']['passed'])
+                self.assertFalse(summary['windows_pipeline']['result']['passed'])
 
     def test_phase_log_error_preserves_uncertain_bundle(self):
         from loop_manager_internal.verification import timing
