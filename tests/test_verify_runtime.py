@@ -29,6 +29,20 @@ from loop_manager_internal.verification.timing import (
 
 
 class TimingAndManifestTests(unittest.TestCase):
+    def test_summary_does_not_adopt_unowned_nested_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            writer = EventWriter(root / 'runner.jsonl', identity={'run_id': 'actual'})
+            writer.emit('run_start')
+            writer.emit('run_end', passed=False)
+            writer.close()
+            (root / 'nested.jsonl').write_text(json.dumps({
+                'kind': 'phase_end', 'pid': 123, 'name': 'fixture', 'at': 1,
+            }) + '\n', encoding='utf-8')
+            summary = summarize(root)
+            self.assertEqual(summary['phases'], [])
+            self.assertIn('완료 결과', diagnostic(root))
+
     def test_diagnostic_preserves_active_events_without_comparable_clocks(self):
         for domain in (None, 'foreign', sys.platform):
             with self.subTest(domain=domain), tempfile.TemporaryDirectory() as temporary:

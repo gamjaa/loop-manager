@@ -889,11 +889,9 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                                 code = PROJECT_STEP_TRANSIENT_PAUSE
                                 break
                             elif exception_attempts >= 3:
-                                observed = (condition_before[0], scheduler.retry_inputs(current_task.get())[1])
-                                if not scheduler.wait_recheck(current_task.get(), observed):
-                                    code = PROJECT_STEP_TRANSIENT_PAUSE
-                                    break
-                                code = PROJECT_STEP_RETRY
+                                deferred_inputs[plan_id] = (condition_before[0], scheduler.retry_inputs(current_task.get())[1])
+                                code = PROJECT_STEP_TRANSIENT_PAUSE
+                                break
                             else:
                                 before, code = None, PROJECT_STEP_RETRY
                         if code == PROJECT_STEP_PLANNING_PENDING:
@@ -914,7 +912,7 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                         scheduler.requeue(current_task.get())
                         resumed = True
                 if code == PROJECT_STEP_TRANSIENT_PAUSE:
-                    deferred_inputs[plan_id] = scheduler.retry_inputs(Task(repo, plan_id, owned))
+                    deferred_inputs.setdefault(plan_id, scheduler.retry_inputs(Task(repo, plan_id, owned)))
             result.set_result(code)
         except PlanningDrain:
             result.set_result(PROJECT_STEP_RETRY)

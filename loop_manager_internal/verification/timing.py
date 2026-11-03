@@ -348,7 +348,7 @@ def summarize(directory: Path, *, now=None):
             if not line.endswith("\n"):
                 break
             event = json.loads(line)
-            if run_id is not None and event.get("run_id", run_id) != run_id:
+            if run_id is not None and event.get("run_id") != run_id:
                 continue
             kind = event["kind"]
             identity = event.get("id", event.get("name", ""))

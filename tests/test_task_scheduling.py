@@ -3178,6 +3178,9 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
     def test_pause_record_db_wait_is_inside_the_task_error_boundary(self):
         self._assert_exception_isolation('pause_record')
 
+    def test_repeated_exception_returns_without_waiting_for_external_input(self):
+        self._assert_exception_isolation('persistent')
+
     def _assert_exception_isolation(self, failure):
         from loop_manager_internal.application.project_service import ProjectIdentity, ProjectObservations, ProjectService
         from loop_manager_internal.application.contracts import PROJECT_STEP_TRANSIENT_PAUSE
@@ -3252,6 +3255,9 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                                 raise DatabaseWaitTimeout('DB queue deadline')
                             if failure == 'pause_record' and len(calls) == 1:
                                 return project_runner.PROJECT_STEP_RETRY
+                        if failure == 'persistent':
+                            failed.set()
+                            raise KeyError('duration')
                         if failure == 'pause' and len(calls) <= 3:
                             if len(calls) == 3:
                                 failed.set()
@@ -3326,11 +3332,11 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 result = scheduling.run_project_tasks(service, newly_activated=True)
         finally:
             scheduling.current_scheduler.reset(token)
-        self.assertEqual(len(calls), {'retry': 2, 'pause': 4, 'setup': 2, 'db_wait': 4, 'db_retry': 2,
+        self.assertEqual(len(calls), {'persistent': 3, 'retry': 2, 'pause': 4, 'setup': 2, 'db_wait': 4, 'db_retry': 2,
                                     'no_progress': 3, 'changed_recovery': 4, 'pause_record': 2, 'db_setup': 2,
                                     'setup_retry': 2, 'collection': 1, 'collection_error': 1, 'error_record': 2}[failure])
         self.assertEqual(dispatches.count('G-001'), len(calls))
-        self.assertEqual(result, {'retry': 0, 'pause': 0, 'setup': 0,
+        self.assertEqual(result, {'persistent': PROJECT_STEP_TRANSIENT_PAUSE, 'retry': 0, 'pause': 0, 'setup': 0,
                                  'db_wait': 0, 'db_retry': 0,
                                  'no_progress': PROJECT_STEP_TRANSIENT_PAUSE, 'changed_recovery': 0,
                                  'pause_record': 0, 'db_setup': 0,
