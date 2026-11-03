@@ -26,6 +26,15 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
             worker_result='saved worker evidence', worker_session_id='worker-session',
             worker_input_token=snapshot.worker_token,
             archive_token=snapshot.archive_token)
+        from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionPhase
+        accepted = fixture.handler.guard(fixture.context())
+        self.assertNotIsInstance(accepted, ExecutionOutcome)
+        self.assertEqual(accepted.phase, ExecutionPhase.VERIFYING)
+        project = fixture.state.row()
+        self.assertEqual(project['worker_result'], 'saved worker evidence')
+        self.assertEqual(project['worker_session_id'], 'worker-session')
+        fixture.effects.agent.run_agent.assert_not_called()
+        fixture.effects.workspace.git.reset_mock()
         observe = fixture.effects.workspace.git.side_effect
         fetch = ('fetch', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main')
 
