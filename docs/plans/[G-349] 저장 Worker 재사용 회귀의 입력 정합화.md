@@ -40,8 +40,11 @@ Git 관측 실패 때 저장된 Worker 근거와 session을 보존하는 기존 
 ## Progress
 
 - [x] revision `f253d5aae8f393896268430517ee0caf2dcf411d`에서 보고 432의 원래 revision과 현재 테스트·fixture·coordinator·revision/session gate를 정적으로 대조했다. 현재 catalog에 같은 교정 목표의 비종료 계획이 없음을 확인했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 저장 Worker 근거·단계 준비 정합화와 기존 assertion 유지
-- [ ] 변경 관련 최소 targeted unit 및 영향받은 공유 소비자 확인
+- [x] 저장 Worker 근거·단계 준비 정합화와 기존 assertion 유지
+- [x] 변경 관련 최소 targeted unit 및 영향받은 공유 소비자 확인
+
+- `tests/test_execution_retry_policy.ExecutionRetryPolicyTest.test_git_observation_failure_pauses_without_discarding_saved_worker`: 프로젝트 targeted runner로 1개 통과. 현재 정의에서 snapshot을 얻고 Worker/archive token과 VERIFYING 단계를 저장해 revision gate·실제 최신 base 관측 경로를 통과했다. 준비 guard의 fetch 호출은 검증 구간 fetch 횟수에서 제외했고, 기존 3회 제한 재시도·TRANSIENT_PAUSE·결과/session 보존·Agent no-call assertion이 통과했다.
+- 첫 실행은 준비 snapshot 생성 과정의 fetch 1회가 기존 실행 fetch 집계에 포함돼 4회로 실패했다. 준비 단계 이후 mock call history를 초기화해 검증 구간의 정확한 3회를 측정하도록 교정하고 같은 targeted test를 재실행해 통과했다.
 
 ## Decision Log
 
