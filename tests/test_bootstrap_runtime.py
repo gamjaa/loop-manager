@@ -478,6 +478,61 @@ class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
                                  expected if case != 'no_writer' else [])
                 self.assertEqual('collection incomplete' in stderr.getvalue(), case != 'no_writer')
 
+    def test_bootstrap_cost_normal_checks_require_complete_and_expected_records(self):
+        import json
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+
+        parent = {'kind': 'phase_end', 'name': 'bootstrap:parent_cli', 'pid': 1, 'at': 1}
+        child = {'kind': 'phase_end', 'name': 'bootstrap:runtime_child_cli', 'pid': 2, 'at': 2}
+        cost = {'kind': 'git_cost', 'pid': 2, 'at': 3, 'count': 1, 'seconds': 0.1}
+        fixture = BootstrapSavedScopeFixture()
+        for scenario in ('complete', 'partial', 'missing_parent', 'missing_child', 'missing_git'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                costs = state / 'bootstrap-costs'
+                costs.mkdir()
+                events = [parent, child, cost]
+                if scenario.startswith('missing_'):
+                    events.remove({'missing_parent': parent, 'missing_child': child, 'missing_git': cost}[scenario])
+                (costs / '1.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in events)
+                    + ('{' if scenario == 'partial' else ''), encoding='utf-8')
+                with contextlib.ExitStack() as cleanup:
+                    records, collect = _track_bootstrap_costs(cleanup, state)
+                    if scenario == 'complete':
+                        fixture._assert_bootstrap_costs(records, collect, 1, False)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            fixture._assert_bootstrap_costs(records, collect, 1, False)
+
+    def test_collected_incomplete_phase_keeps_unknown_elapsed_in_diagnostic(self):
+        import json
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+        from loop_manager_internal.verification.timing import EventWriter, diagnostic, summarize
+
+        for domain in (None, 'foreign'):
+            with self.subTest(domain=domain), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = root / 'state'
+                costs = state / 'bootstrap-costs'
+                costs.mkdir(parents=True)
+                output = root / 'output'
+                output.mkdir()
+                event = {'kind': 'phase_start', 'name': 'bootstrap:parent_cli',
+                         'phase_id': 'original', 'pid': 123, 'at': 10}
+                if domain is not None:
+                    event['clock_domain'] = domain
+                (costs / '123.jsonl').write_text(json.dumps(event) + '\n', encoding='utf-8')
+                writer = EventWriter(output / 'worker.jsonl')
+                with contextlib.closing(writer), writer.activate(), contextlib.ExitStack() as cleanup:
+                    records, collect = _track_bootstrap_costs(cleanup, state)
+                    self.assertTrue(collect())
+                    self.assertEqual(records, [event])
+                active = summarize(output, now=20)['active']
+                self.assertEqual(len(active), 1)
+                self.assertIsNone(active[0]['elapsed'])
+                self.assertEqual(active[0]['pid'], 123)
+                self.assertIn('미완료 경과 시간 미확인: bootstrap:parent_cli', diagnostic(output))
+
     def test_saved_scope_setup_combines_git_isolation_and_fixed_guidance(self):
         import os
         from loop_manager_internal.agents import common_guidance

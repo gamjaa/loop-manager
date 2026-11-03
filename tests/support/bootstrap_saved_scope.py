@@ -96,6 +96,14 @@ class BootstrapSavedScopeFixture(unittest.TestCase):
         return subprocess.CompletedProcess(command, output.exit_code, output)
 
 
+    def _assert_bootstrap_costs(self, records, collect_costs, attempts, interrupted_registration):
+        self.assertTrue(collect_costs(), 'bootstrap cost collection incomplete')
+        ends = [event for event in records if event['kind'] == 'phase_end']
+        self.assertEqual(sum(event['name'] == 'bootstrap:parent_cli' for event in ends),
+                         attempts + int(interrupted_registration))
+        self.assertEqual(sum(event['name'] == 'bootstrap:runtime_child_cli' for event in ends), attempts)
+        self.assertTrue(any(event['kind'] == 'git_cost' and event['count'] > 0 for event in records))
+
     def _assert_saved_scope_resume(self, advance_after_selection=False):
         import json
         import shutil
@@ -332,10 +340,4 @@ class BootstrapSavedScopeFixture(unittest.TestCase):
                         # A later parent must dispatch again, using the same SHA
                         # in the crash/reuse case or C after the B/C transition.
                         proof_path.unlink()
-                    # Preserve the normal phase and Git-cost checks when collection is complete.
-                    if collect_costs():
-                        ends = [event for event in records if event['kind'] == 'phase_end']
-                        self.assertEqual(sum(event['name'] == 'bootstrap:parent_cli' for event in ends),
-                                         attempts + int(interrupted_registration))
-                        self.assertEqual(sum(event['name'] == 'bootstrap:runtime_child_cli' for event in ends), attempts)
-                        self.assertTrue(any(event['kind'] == 'git_cost' and event['count'] > 0 for event in records))
+                    self._assert_bootstrap_costs(records, collect_costs, attempts, interrupted_registration)
