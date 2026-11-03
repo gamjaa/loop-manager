@@ -1,6 +1,7 @@
 """자체 Windows launcher의 복사·실패·부분 검증·정리 경계."""
 from contextlib import ExitStack
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -13,6 +14,7 @@ from unittest import mock
 
 from scripts import verify_windows as launcher
 from loop_manager_internal.execution import verify_process
+from loop_manager_internal.verification.execution_clock import ExecutionClock
 from tests.support.git import isolated_git_test, make_remote_repository
 
 
@@ -36,6 +38,162 @@ class WindowsVerifyRuntimeTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux supervisor 정리 경계')
 class WslCleanupTests(unittest.TestCase):
+    def test_extract_interruption_removes_unstarted_copy(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            source = bundle / 'large'
+            source.write_bytes(b'x' * (256 * 1024))
+            with tarfile.open(bundle / 'project.tar', 'w') as archive:
+                archive.add(source, arcname='large')
+            with tarfile.open(bundle / 'runtime.tar', 'w'):
+                pass
+            original_mkdtemp = tempfile.mkdtemp
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                if dir == '/tmp':
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
+            read = launcher.CheckedIO.read
+            def interrupted_read(stream, size=-1):
+                if size >= 8192:
+                    raise TimeoutError('extract deadline')
+                return read(stream, size)
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
+                 mock.patch.object(launcher.CheckedIO, 'read', new=interrupted_read), \
+                 mock.patch.object(verify_process, 'run_verify_process') as process:
+                with self.assertRaisesRegex(TimeoutError, 'extract deadline'):
+                    launcher.wsl_main(bundle, 30, 'auto')
+            process.assert_not_called()
+            receipt = json.loads((bundle / 'cleanup.json').read_text())
+            self.assertTrue(receipt['stopped'])
+            self.assertTrue(receipt['removed'])
+            self.assertFalse(Path(receipt['root']).exists())
+
+    def test_final_cleanup_budget_error_preserves_snapshot(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            for name in ('project', 'runtime'):
+                with tarfile.open(bundle / (name + '.tar'), 'w'):
+                    pass
+            budget_dir = bundle / 'budget'
+            budget_dir.mkdir()
+            original_mkdtemp = tempfile.mkdtemp
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                if dir == '/tmp':
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
+            original_rmtree = launcher.shutil.rmtree
+            def remove(path, *args, **kwargs):
+                original_rmtree(path, *args, **kwargs)
+                if Path(path).name.startswith('loop-manager-verify-'):
+                    (budget_dir / 'wait.json').write_text('invalid')
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
+                 mock.patch.object(verify_process, 'run_verify_process', return_value=(True, False, 'PASS')), \
+                 mock.patch.object(launcher.shutil, 'rmtree', side_effect=remove):
+                with self.assertRaises(VerifyBudgetError):
+                    launcher.wsl_main(bundle, 30, 'auto', budget_directory=str(budget_dir))
+            self.assertEqual((bundle / 'logs/budget-error/wait.json').read_text(), 'invalid')
+            self.assertTrue(json.loads((bundle / 'cleanup.json').read_text())['removed'])
+
+    def test_cleanup_failure_keeps_original_budget_error_and_snapshot(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            for name in ('project', 'runtime'):
+                with tarfile.open(bundle / (name + '.tar'), 'w'):
+                    pass
+            budget_dir = bundle / 'budget'
+            budget_dir.mkdir()
+            original_mkdtemp = tempfile.mkdtemp
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                if dir == '/tmp':
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
+            def run_verify(_arguments, _project, _timeout, *, execution_clock, **_options):
+                (budget_dir / 'wait.json').write_text('invalid')
+                execution_clock.remaining(30)
+            original_rmtree = launcher.shutil.rmtree
+            def remove(path, *args, **kwargs):
+                if Path(path).name.startswith('loop-manager-verify-'):
+                    raise OSError('cleanup failed')
+                return original_rmtree(path, *args, **kwargs)
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
+                 mock.patch.object(verify_process, 'run_verify_process', side_effect=run_verify), \
+                 mock.patch.object(launcher.shutil, 'rmtree', side_effect=remove):
+                with self.assertRaises(VerifyBudgetError) as raised:
+                    launcher.wsl_main(bundle, 30, 'auto', budget_directory=str(budget_dir))
+            self.assertTrue(any('cleanup failed' in note for note in raised.exception.__notes__))
+            self.assertEqual((bundle / 'logs/budget-error/wait.json').read_text(), 'invalid')
+            receipt = json.loads((bundle / 'cleanup.json').read_text())
+            self.assertTrue(receipt['stopped'])
+            self.assertFalse(receipt['removed'])
+            self.assertTrue(Path(receipt['root']).exists())
+
+    def test_cleanup_deadline_rejects_success_after_receipt(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            for name in ('project', 'runtime'):
+                with tarfile.open(bundle / (name + '.tar'), 'w'):
+                    pass
+            original_mkdtemp = tempfile.mkdtemp
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                if dir == '/tmp':
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
+            clocks = []
+            def run_verify(_arguments, _project, _timeout, *, execution_clock, **_options):
+                clocks.append(execution_clock)
+                return True, False, 'PASS'
+            original_rmtree = launcher.shutil.rmtree
+            def remove(path, *args, **kwargs):
+                original_rmtree(path, *args, **kwargs)
+                if Path(path).name.startswith('loop-manager-verify-'):
+                    clocks[0].started -= 31
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
+                 mock.patch.object(verify_process, 'run_verify_process', side_effect=run_verify), \
+                 mock.patch.object(launcher.shutil, 'rmtree', side_effect=remove):
+                with self.assertRaises(TimeoutError):
+                    launcher.wsl_main(bundle, 30, 'auto')
+            receipt = json.loads((bundle / 'cleanup.json').read_text())
+            self.assertTrue(receipt['stopped'])
+            self.assertTrue(receipt['removed'])
+            self.assertEqual(len(clocks), 4)
+
+    def test_git_preparation_uses_one_budget_and_stops_before_next_command(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
+             mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
+             mock.patch.object(sys, 'path', list(sys.path)):
+            bundle = Path(directory)
+            for name in ('project', 'runtime'):
+                with tarfile.open(bundle / (name + '.tar'), 'w'):
+                    pass
+            original_mkdtemp = tempfile.mkdtemp
+            def allocate_temp(suffix=None, prefix=None, dir=None, **options):
+                if dir == '/tmp':
+                    dir = directory
+                return original_mkdtemp(suffix=suffix, prefix=prefix, dir=dir, **options)
+            calls = []
+            def run_verify(arguments, _project, timeout, *, execution_clock, **_options):
+                calls.append(arguments)
+                execution_clock.started -= 11
+                return True, False, 'PASS'
+            with mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=allocate_temp), \
+                 mock.patch.object(verify_process, 'run_verify_process', side_effect=run_verify), \
+                 self.assertRaises(TimeoutError):
+                launcher.wsl_main(bundle, 30, 'auto')
+            self.assertEqual([command[:2] for command in calls], [['git', 'init'], ['git', 'add']])
+            receipt = json.loads((bundle / 'cleanup.json').read_text())
+            self.assertTrue(receipt['stopped'])
+            self.assertTrue(receipt['removed'])
+
     def test_output_disconnect_after_child_exit_still_removes_the_copy(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ), \
              mock.patch.object(tempfile, 'tempdir', tempfile.tempdir), \
@@ -109,7 +267,8 @@ class WindowsVerifySnapshotTests(unittest.TestCase):
             (root / 'README.md').unlink()
             bundle = Path(directory) / 'bundle'
             bundle.mkdir()
-            evidence = launcher.snapshot(root, bundle, ENTRYPOINT)
+            with ExecutionClock() as budget:
+                evidence = launcher.snapshot(root, bundle, ENTRYPOINT, budget, 600)
             with tarfile.open(bundle / 'project.tar') as archive:
                 names = archive.getnames()
                 self.assertNotIn('.git', names)
@@ -131,9 +290,98 @@ class WindowsVerifySnapshotTests(unittest.TestCase):
                 original(archive, path, **options)
                 if Path(path).name == 'app.py':
                     Path(path).write_text('CHANGED_DURING_COPY = 1\n')
-            with mock.patch.object(tarfile.TarFile, 'add', new=add), \
+            with ExecutionClock() as budget, mock.patch.object(tarfile.TarFile, 'add', new=add), \
                  self.assertRaisesRegex(RuntimeError, '복사 중 파일'):
-                launcher.snapshot(root, bundle, ENTRYPOINT)
+                launcher.snapshot(root, bundle, ENTRYPOINT, budget, 600)
+
+
+class WindowsVerifySnapshotBudgetTests(unittest.TestCase):
+    def test_snapshot_preserves_contents_and_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'file').write_bytes(b'content\r\n')
+            bundle = root / 'bundle'
+            bundle.mkdir()
+            runtime = root / 'runtime'
+            (runtime / 'loop_manager_internal/verification').mkdir(parents=True)
+            entrypoint = runtime / 'loop_manager_internal/verification/entrypoint.py'
+            entrypoint.write_text('pass\n')
+            def git(*args):
+                return b'revision\n' if args[4] == 'rev-parse' else b'file\0'
+            with ExecutionClock() as budget, mock.patch.object(launcher, 'git', side_effect=git):
+                evidence = launcher.snapshot(root, bundle, entrypoint, budget, 30)
+            with tarfile.open(bundle / 'project.tar') as archive:
+                self.assertEqual(archive.extractfile('file').read(), b'content\r\n')
+            with tarfile.open(bundle / 'runtime.tar') as archive:
+                self.assertEqual(archive.extractfile('loop_manager_internal/verification/entrypoint.py').read(), b'pass\n')
+            self.assertEqual(evidence['snapshot_sha256'], hashlib.sha256((bundle / 'project.tar').read_bytes()).hexdigest())
+
+    def test_large_file_archive_checks_budget_between_chunks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'large').write_bytes(b'x' * (256 * 1024))
+            bundle = root / 'bundle'
+            bundle.mkdir()
+            now = [0.0]
+            with ExecutionClock(clock=lambda: now[0]) as budget:
+                def git(*args):
+                    return b'revision\n' if args[4] == 'rev-parse' else b'large\0'
+                write = launcher.CheckedIO.write
+                def slow_write(stream, data):
+                    result = write(stream, data)
+                    if len(data) >= 8192:
+                        now[0] = 10.0
+                    return result
+                with mock.patch.object(launcher, 'git', side_effect=git), \
+                     mock.patch.object(launcher.CheckedIO, 'write', new=slow_write):
+                    with self.assertRaises(TimeoutError):
+                        launcher.snapshot(root, bundle, ENTRYPOINT, budget, 10)
+            self.assertLess((bundle / 'project.tar').stat().st_size, 256 * 1024)
+
+    def test_git_preserves_binary_output(self):
+        with tempfile.TemporaryDirectory() as directory, ExecutionClock() as budget:
+            root = Path(directory)
+            def run(arguments, *_args, **_kwargs):
+                Path(arguments[3]).write_bytes(b'file-\xff\0')
+                return True, False, ''
+            with mock.patch.object(verify_process, 'run_verify_process', side_effect=run):
+                self.assertEqual(launcher.git(root, root, budget, 10, 'ls-files', '-z'), b'file-\xff\0')
+            self.assertFalse((root / 'git-output').exists())
+
+    def test_delayed_git_blocks_the_next_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = [0.0]
+            with ExecutionClock(clock=lambda: now[0]) as budget:
+                def run(arguments, *_args, **_kwargs):
+                    Path(arguments[3]).write_bytes(b'revision\n')
+                    now[0] = 10.0
+                    return True, False, 'PASS'
+                with mock.patch.object(verify_process, 'run_verify_process', side_effect=run) as process:
+                    with self.assertRaises(TimeoutError):
+                        launcher.snapshot(root, root, ENTRYPOINT, budget, 10)
+                self.assertEqual(process.call_count, 1)
+                self.assertFalse((root / 'project.tar').exists())
+
+    def test_archive_deadline_prevents_subsequent_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'file').write_text('contents')
+            bundle = root / 'bundle'
+            bundle.mkdir()
+            now = [0.0]
+            with ExecutionClock(clock=lambda: now[0]) as budget:
+                def git(*args):
+                    return b'revision\n' if args[4] == 'rev-parse' else b'file\0'
+                original_add = tarfile.TarFile.add
+                def add(archive, path, **options):
+                    original_add(archive, path, **options)
+                    now[0] = 10.0
+                with mock.patch.object(launcher, 'git', side_effect=git) as git_call, \
+                     mock.patch.object(tarfile.TarFile, 'add', new=add):
+                    with self.assertRaises(TimeoutError):
+                        launcher.snapshot(root, bundle, ENTRYPOINT, budget, 10)
+                self.assertEqual(git_call.call_count, 2)
 
 
 class WindowsVerifyPipelineTests(unittest.TestCase):
@@ -289,14 +537,188 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
             budget = kwargs['execution_clock']
             self.assertIs(execution_clock.current_execution_clock.get(), budget)
             self.assertEqual(budget.remaining(args[2]), 20.0)
-            now[0] = 60.0
-            self.assertEqual(budget.remaining(args[2]), 0.0)
+            now[0] = 59.0
+            self.assertEqual(budget.remaining(args[2]), 1.0)
             return True, False, verify_process.VerifyProcessOutput('core PASS', exit_code=0)
         self.wsl.side_effect = wsl
         self.native.side_effect = native
         with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
                 clock_type(*args, **kwargs, clock=lambda: now[0])):
             self.assertEqual(launcher.windows_main(self.root), 0)
+
+    def test_wsl_wait_and_processing_carry_over_to_native(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        def wsl(*args):
+            budget = execution_clock.current_execution_clock.get()
+            (budget.directory / 'wait.json').write_text(json.dumps({'waiting_seconds': 30.0}))
+            self.write_wsl_summary(args[2])
+            now[0] = 32.0
+            return True
+        def native(*args, **kwargs):
+            self.write_native_summary(args[0])
+            budget = kwargs['execution_clock']
+            self.assertEqual(budget.remaining(args[2]), 58.0)
+            now[0] = 33.0
+            return self.native_result
+        self.wsl.side_effect = wsl
+        self.native.side_effect = native
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])):
+            self.assertEqual(launcher.windows_main(self.root), 0)
+        self.assertTrue(self.report()['passed'])
+
+    def test_wsl_deadline_blocks_native(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        def wsl(*args):
+            self.write_wsl_summary(args[2])
+            now[0] = 60.0
+            return True
+        self.wsl.side_effect = wsl
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])):
+            with self.assertRaises(TimeoutError):
+                launcher.windows_main(self.root)
+        self.native.assert_not_called()
+        self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'NOT_RUN'))
+        self.assertFalse(self.report()['passed'])
+
+    def test_native_completion_at_deadline_cannot_pass(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        def native(*args, **kwargs):
+            self.write_native_summary(args[0])
+            now[0] = 60.0
+            return self.native_result
+        self.native.side_effect = native
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])):
+            with self.assertRaises(TimeoutError):
+                launcher.windows_main(self.root)
+        self.assertEqual(self.report()['windows'], 'PASS')
+        self.assertFalse(self.report()['passed'])
+
+    def test_diagnostic_time_is_included_before_pass(self):
+        from loop_manager_internal.verification import execution_clock, timing
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        def diagnostic(_directory):
+            now[0] = 60.0
+            return 'diagnostic'
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])), \
+             mock.patch.object(timing, 'diagnostic', side_effect=diagnostic):
+            with self.assertRaises(TimeoutError):
+                launcher.windows_main(self.root)
+        self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
+        self.assertFalse(self.report()['passed'])
+
+    def test_diagnostic_failure_does_not_replace_budget_error(self):
+        from loop_manager_internal.verification import execution_clock, timing
+        def wsl(*_args):
+            budget = execution_clock.current_execution_clock.get()
+            (budget.directory / 'wait.json').write_text('invalid')
+            budget.remaining(60)
+        self.wsl.side_effect = wsl
+        with mock.patch.object(timing, 'diagnostic', side_effect=OSError('diagnostic failed')):
+            with self.assertRaises(execution_clock.VerifyBudgetError) as raised:
+                launcher.windows_main(self.root)
+        self.assertEqual((self.logs / 'budget-error' / 'wait.json').read_text(), 'invalid')
+        self.assertTrue(raised.exception.diagnostic_directory.exists())
+        self.assertFalse(self.report()['passed'])
+        self.native.assert_not_called()
+
+    def test_event_log_close_failure_revokes_whole_success(self):
+        from loop_manager_internal.verification import timing
+        original_close = timing.EventWriter.close
+        def close(writer):
+            original_close(writer)
+            raise OSError('event close failed')
+        with mock.patch.object(timing.EventWriter, 'close', new=close):
+            with self.assertRaisesRegex(OSError, 'event close failed'):
+                launcher.windows_main(self.root)
+        self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
+        self.assertFalse(self.report()['passed'])
+
+    def test_slow_final_logging_and_cleanup_revoke_success(self):
+        from loop_manager_internal.verification import execution_clock, timing
+        clock_type = execution_clock.ExecutionClock
+        for operation in ('run_end', 'writer_close', 'budget_close'):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                self.logs = Path(directory) / 'logs'
+                os.environ['LOOP_MANAGER_VERIFY_LOG_DIR'] = str(self.logs)
+                now = [0.0]
+                emit, writer_close, budget_close = timing.EventWriter.emit, timing.EventWriter.close, clock_type.close
+                def observed_emit(writer, kind, **values):
+                    result = emit(writer, kind, **values)
+                    if operation == 'run_end' and kind == 'run_end':
+                        now[0] = 60.0
+                    return result
+                def observed_writer_close(writer):
+                    writer_close(writer)
+                    if operation == 'writer_close':
+                        now[0] = 60.0
+                def observed_budget_close(budget):
+                    budget_close(budget)
+                    if operation == 'budget_close':
+                        now[0] = 60.0
+                with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                        clock_type(*args, **kwargs, clock=lambda: now[0])), \
+                     mock.patch.object(timing.EventWriter, 'emit', new=observed_emit), \
+                     mock.patch.object(timing.EventWriter, 'close', new=observed_writer_close), \
+                     mock.patch.object(clock_type, 'close', new=observed_budget_close):
+                    with self.assertRaises(TimeoutError):
+                        launcher.windows_main(self.root)
+                self.assertFalse(self.report()['passed'])
+                self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
+                summary = json.loads((self.logs / 'summary.json').read_text())
+                self.assertFalse(summary['result']['passed'])
+                self.assertFalse(summary['windows_pipeline']['result']['passed'])
+
+    def test_phase_log_error_preserves_uncertain_bundle(self):
+        from loop_manager_internal.verification import timing
+        emit = timing.EventWriter.emit
+        bundle_paths = []
+        def wsl(_root, bundle, *_args):
+            bundle_paths.append(bundle)
+            (bundle / 'marker').write_text('keep')
+            raise verify_process.VerifyTerminationUncertain('child state unknown')
+        def emit_with_error(writer, kind, **values):
+            if kind == 'phase_end' and values.get('name') == 'wsl-full':
+                raise OSError('phase log failed')
+            return emit(writer, kind, **values)
+        self.wsl.side_effect = wsl
+        with mock.patch.object(timing.EventWriter, 'emit', new=emit_with_error):
+            with self.assertRaises(verify_process.VerifyTerminationUncertain) as raised:
+                launcher.windows_main(self.root)
+        self.assertTrue(any('phase log failed' in note for note in raised.exception.__notes__))
+        self.assertEqual((bundle_paths[0] / 'marker').read_text(), 'keep')
+        self.native.assert_not_called()
+        self.assertFalse(self.report()['passed'])
+
+    def test_phase_log_error_preserves_budget_error(self):
+        from loop_manager_internal.verification import execution_clock, timing
+        emit = timing.EventWriter.emit
+        def wsl(*_args):
+            budget = execution_clock.current_execution_clock.get()
+            (budget.directory / 'wait.json').write_text('invalid')
+            budget.remaining(60)
+        def emit_with_error(writer, kind, **values):
+            if kind == 'phase_end' and values.get('name') == 'wsl-full':
+                raise OSError('phase log failed')
+            return emit(writer, kind, **values)
+        self.wsl.side_effect = wsl
+        with mock.patch.object(timing.EventWriter, 'emit', new=emit_with_error):
+            with self.assertRaises(execution_clock.VerifyBudgetError) as raised:
+                launcher.windows_main(self.root)
+        self.assertTrue(any('phase log failed' in note for note in raised.exception.__notes__))
+        self.assertEqual((self.logs / 'budget-error/wait.json').read_text(), 'invalid')
+        self.assertTrue(raised.exception.diagnostic_directory.exists())
+        self.native.assert_not_called()
 
     def test_partial_request_falls_back_without_executing_either_phase(self):
         os.environ.update(LOOP_MANAGER_VERIFY_PARTIAL_BASE='base', LOOP_MANAGER_VERIFY_SESSION='session')
@@ -311,12 +733,25 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
         self.assertFalse((self.logs / 'result.json').exists())
 
     def test_windows_copy_cleanup_failure_cannot_claim_whole_success(self):
-        with mock.patch.object(launcher.tempfile, 'TemporaryDirectory') as temporary:
+        with mock.patch.object(launcher, 'owned_bundle') as temporary:
             temporary.return_value.__enter__.return_value = str(self.root / 'bundle')
             temporary.return_value.__exit__.side_effect = OSError('cleanup failed')
             with self.assertRaisesRegex(OSError, 'cleanup failed'):
                 launcher.windows_main(self.root)
         self.assertEqual((self.report()['wsl'], self.report()['windows']), ('PASS', 'PASS'))
+        self.assertFalse(self.report()['passed'])
+
+    def test_uncertain_child_preserves_its_bundle(self):
+        owned = []
+        def wsl(_root, bundle, *_args):
+            owned.append(bundle)
+            (bundle / 'marker').write_text('keep')
+            raise verify_process.VerifyTerminationUncertain('child state unknown')
+        self.wsl.side_effect = wsl
+        with self.assertRaises(verify_process.VerifyTerminationUncertain):
+            launcher.windows_main(self.root)
+        self.assertEqual((owned[0] / 'marker').read_text(), 'keep')
+        self.native.assert_not_called()
         self.assertFalse(self.report()['passed'])
 
     def test_successful_exit_without_linux_cleanup_proof_is_not_success(self):
@@ -327,6 +762,201 @@ class WindowsVerifyPipelineTests(unittest.TestCase):
              mock.patch.object(verify_process, 'run_verify_process', return_value=(True, False, 'exit 0')), \
              self.assertRaises(verify_process.VerifyTerminationUncertain):
             self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+
+    def test_malformed_cleanup_receipt_cannot_prove_termination(self):
+        bundle = self.root / 'bundle'
+        bundle.mkdir()
+        for content in ('invalid', json.dumps({'stopped': 'yes', 'removed': True})):
+            with self.subTest(content=content):
+                (bundle / 'cleanup.json').write_text(content)
+                with mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/bundle')), \
+                     mock.patch.object(verify_process, 'run_verify_process', return_value=(True, False, 'exit 0')), \
+                     self.assertRaises(verify_process.VerifyTerminationUncertain):
+                    self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+
+    def test_log_copy_deadline_fails_after_confirmed_cleanup(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        bundle, logs = self.root / 'bundle', self.root / 'wsl-logs'
+        bundle.mkdir()
+        logs.mkdir()
+        (bundle / 'logs').mkdir()
+        (bundle / 'logs' / 'runner.log').write_text('output')
+        (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+        original_copy = launcher.shutil.copy2
+        def copy(source, destination, **kwargs):
+            result = original_copy(source, destination, **kwargs)
+            if Path(source).name == 'runner.log':
+                now[0] = 30.0
+            return result
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])), \
+             mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/bundle')), \
+             mock.patch.object(verify_process, 'run_verify_process', return_value=(True, False, 'PASS')) as process, \
+             mock.patch.object(launcher.shutil, 'copy2', side_effect=copy):
+            with self.assertRaises(TimeoutError):
+                self.real_wsl(self.root, bundle, logs, 30, 'auto')
+        self.assertEqual(process.call_count, 1)
+        self.assertEqual((logs / 'runner.log').read_text(), 'output')
+        self.assertTrue((logs / 'cleanup.json').exists())
+
+    def test_path_conversion_exhausts_budget_before_wsl_launch(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        bundle = self.root / 'bundle'
+        bundle.mkdir()
+        def convert(*_args, **_kwargs):
+            now[0] = 20.0
+            return SimpleNamespace(stdout='/tmp/bundle')
+        with mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                clock_type(*args, **kwargs, clock=lambda: now[0])), \
+             mock.patch.object(launcher.subprocess, 'run', side_effect=convert) as conversion:
+            with self.assertRaises(TimeoutError):
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertEqual(conversion.call_count, 1)
+        self.native.assert_not_called()
+        self.assertFalse((bundle / 'heartbeat').exists())
+
+    def test_path_conversions_use_remaining_budget(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        now = [0.0]
+        bundle, logs, budget_dir = (self.root / name for name in ('bundle', 'logs', 'budget'))
+        for path in (bundle, logs, budget_dir):
+            path.mkdir()
+        limits = []
+        def convert(*_args, timeout, **_kwargs):
+            limits.append(timeout)
+            now[0] += 5.0
+            return SimpleNamespace(stdout='/tmp/path')
+        def run(*_args, **_kwargs):
+            (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+            return True, False, 'PASS'
+        with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_BUDGET_DIR': str(budget_dir)}), \
+             mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                 clock_type(*args, **kwargs, clock=lambda: now[0])), \
+             mock.patch.object(launcher.subprocess, 'run', side_effect=convert), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=run):
+            self.assertTrue(self.real_wsl(self.root, bundle, logs, 40, 'auto'))
+        self.assertEqual(limits, [30.0, 25.0])
+
+    def test_wsl_excludes_confirmed_wait_but_counts_processing(self):
+        from loop_manager_internal.verification import execution_clock
+        clock_type = execution_clock.ExecutionClock
+        for actual, succeeds in ((2.0, True), (21.0, False)):
+            with self.subTest(actual=actual):
+                case = self.root / str(actual)
+                case.mkdir()
+                bundle, logs, budget_dir = (case / name for name in ('bundle', 'logs', 'budget'))
+                for path in (bundle, logs, budget_dir):
+                    path.mkdir()
+                now = [0.0]
+                def run(*_args, execution_clock, **_kwargs):
+                    (budget_dir / 'wait.json').write_text(json.dumps({'waiting_seconds': 30.0}))
+                    now[0] = 30.0 + actual
+                    (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+                    return True, False, 'PASS'
+                with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_BUDGET_DIR': str(budget_dir)}), \
+                     mock.patch.object(execution_clock, 'ExecutionClock', side_effect=lambda *args, **kwargs:
+                         clock_type(*args, **kwargs, clock=lambda: now[0])), \
+                     mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+                     mock.patch.object(verify_process, 'run_verify_process', side_effect=run) as process:
+                    if succeeds:
+                        self.assertTrue(self.real_wsl(self.root, bundle, logs, 20, 'auto'))
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            self.real_wsl(self.root, bundle, logs, 20, 'auto')
+                self.assertEqual(process.call_count, 1)
+                self.assertTrue((logs / 'cleanup.json').exists())
+
+    def test_wsl_launch_failure_is_not_reported_as_unknown_child(self):
+        bundle, budget_dir = self.root / 'bundle', self.root / 'budget'
+        bundle.mkdir()
+        budget_dir.mkdir()
+        def fail_before_launch(*_args, **_kwargs):
+            self.assertFalse((budget_dir / 'wsl-lifecycle.json').exists())
+            raise OSError('cannot launch')
+        with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_BUDGET_DIR': str(budget_dir)}), \
+             mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=fail_before_launch):
+            with self.assertRaisesRegex(OSError, 'cannot launch'):
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertEqual(json.loads((budget_dir / 'wsl-lifecycle.json').read_text())['state'], 'stopped')
+        self.assertFalse((bundle / 'cleanup.json').exists())
+
+    def test_budget_error_keeps_evidence_while_waiting_for_cleanup(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        bundle = self.root / 'bundle'
+        bundle.mkdir()
+        (bundle / 'logs').mkdir()
+        (bundle / 'logs' / 'runner.log').write_text('partial output')
+        self.logs.mkdir()
+        budget_directory = self.root / 'budget'
+        budget_directory.mkdir()
+        os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'] = str(budget_directory)
+        def run(*_args, execution_clock, **_kwargs):
+            _kwargs['on_started'](object(), None)
+            (budget_directory / 'wait.json').write_text('invalid')
+            execution_clock.remaining(30)
+        def cleanup(_seconds):
+            (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+        with mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=run), \
+             mock.patch.object(launcher.time, 'sleep', side_effect=cleanup):
+            with self.assertRaises(VerifyBudgetError) as raised:
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertEqual((raised.exception.diagnostic_directory / 'wait.json').read_text(), 'invalid')
+        self.assertTrue((bundle / 'cleanup.json').exists())
+        self.assertEqual((self.logs / 'runner.log').read_text(), 'partial output')
+        self.assertTrue((self.logs / 'cleanup.json').exists())
+
+    def test_copy_error_does_not_replace_wsl_budget_error(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        bundle = self.root / 'bundle'
+        bundle.mkdir()
+        (bundle / 'logs').mkdir()
+        (bundle / 'logs' / 'runner.log').write_text('partial output')
+        self.logs.mkdir()
+        budget_directory = self.root / 'budget'
+        budget_directory.mkdir()
+        os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'] = str(budget_directory)
+        def run(*_args, execution_clock, **_kwargs):
+            _kwargs['on_started'](object(), None)
+            (budget_directory / 'wait.json').write_text('invalid')
+            (bundle / 'cleanup.json').write_text(json.dumps({'stopped': True, 'removed': True}))
+            execution_clock.remaining(30)
+        copy2 = launcher.shutil.copy2
+        def copy(source, destination, **kwargs):
+            if Path(source).name == 'runner.log':
+                raise OSError('copy failed')
+            return copy2(source, destination, **kwargs)
+        with mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=run), \
+             mock.patch.object(launcher.shutil, 'copy2', side_effect=copy):
+            with self.assertRaises(VerifyBudgetError) as raised:
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertTrue(any('copy failed' in note for note in raised.exception.__notes__))
+        self.assertTrue(raised.exception.diagnostic_directory.exists())
+
+    def test_bad_cleanup_receipt_keeps_budget_error_as_cause(self):
+        from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+        bundle, budget_dir = self.root / 'bundle', self.root / 'budget'
+        bundle.mkdir()
+        budget_dir.mkdir()
+        def run(*_args, execution_clock, on_started, **_kwargs):
+            on_started(object(), None)
+            (budget_dir / 'wait.json').write_text('invalid')
+            (bundle / 'cleanup.json').write_text('invalid')
+            execution_clock.remaining(30)
+        with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_BUDGET_DIR': str(budget_dir)}), \
+             mock.patch.object(launcher.subprocess, 'run', return_value=SimpleNamespace(stdout='/tmp/path')), \
+             mock.patch.object(verify_process, 'run_verify_process', side_effect=run):
+            with self.assertRaises(verify_process.VerifyTerminationUncertain) as raised:
+                self.real_wsl(self.root, bundle, self.logs, 30, 'auto')
+        self.assertIsInstance(raised.exception.__cause__, VerifyBudgetError)
+        self.assertEqual((raised.exception.__cause__.diagnostic_directory / 'wait.json').read_text(), 'invalid')
 
 
 if __name__ == '__main__':

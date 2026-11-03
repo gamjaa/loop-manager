@@ -110,38 +110,89 @@ def runtime(root):
     return entrypoint.resolve(), python
 
 
-def git(root, *arguments):
-    return subprocess.check_output(['git', '-C', str(root), *arguments],
-                                   env=dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
+def check_budget(budget, timeout):
+    if budget.remaining(timeout) <= 0:
+        raise TimeoutError('자체 verify 준비 중 전체 실행 시간이 만료됐습니다.')
 
 
-def snapshot(root, bundle, entrypoint):
-    revision = git(root, 'rev-parse', 'HEAD').decode().strip()
-    names = git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
+class CheckedIO:
+    def __init__(self, stream, check):
+        self.stream, self.check = stream, check
+
+    def read(self, size=-1):
+        self.check()
+        return self.stream.read(size)
+
+    def write(self, data):
+        self.check()
+        return self.stream.write(data)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def git(root, bundle, budget, timeout, *arguments):
+    from loop_manager_internal.execution.verify_process import run_verify_process
+    check_budget(budget, timeout)
+    output_path = bundle / 'git-output'
+    # Git의 NUL 구분 출력은 임의의 파일명 바이트를 담으므로 텍스트 출력으로 변환하지 않는다.
+    command = [sys.executable, '-c',
+        'import subprocess,sys; f=open(sys.argv[1],"wb"); '
+        'sys.exit(subprocess.call(sys.argv[2:],stdout=f))',
+        str(output_path), 'git', '-C', str(root), *arguments]
+    passed, timed_out, output = run_verify_process(
+        command, root, timeout, environment=dict(os.environ, GIT_OPTIONAL_LOCKS='0'),
+        job_scope=True, execution_clock=budget)
+    if timed_out:
+        raise TimeoutError('snapshot Git 실행 중 전체 verify 시간이 만료됐습니다.')
+    if not passed:
+        raise RuntimeError(f'snapshot Git 실행에 실패했습니다: {output}')
+    check_budget(budget, timeout)
+    data = output_path.read_bytes()
+    output_path.unlink()
+    return data
+
+
+def snapshot(root, bundle, entrypoint, budget, timeout):
+    revision = git(root, bundle, budget, timeout, 'rev-parse', 'HEAD').decode().strip()
+    names = git(root, bundle, budget, timeout, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
     paths = [root / os.fsdecode(name) for name in names.split(b'\0') if name]
     paths = [path for path in paths if path.exists() or path.is_symlink()]
     before = {path: path.lstat() for path in paths}
-    with tarfile.open(bundle / 'project.tar', 'w') as archive:
+    check = lambda: check_budget(budget, timeout)
+    with (bundle / 'project.tar').open('wb') as stream, \
+         tarfile.open(fileobj=CheckedIO(stream, check), mode='w') as archive:
         for path in paths:
+            check_budget(budget, timeout)
             if path.is_dir() and not path.is_symlink():
                 raise RuntimeError(f'자체 검증에서 지원하지 않는 Git 경로입니다: {path}')
             archive.add(path, arcname=path.relative_to(root).as_posix(), recursive=False)
     for path, old in before.items():
+        check_budget(budget, timeout)
         new = path.lstat()
         if any(getattr(old, key) != getattr(new, key) for key in ('st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
             raise RuntimeError(f'검증 복사 중 파일이 변경됐습니다: {path}')
-    if (git(root, 'rev-parse', 'HEAD').decode().strip() != revision
-            or git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z') != names):
+    if (git(root, bundle, budget, timeout, 'rev-parse', 'HEAD').decode().strip() != revision
+            or git(root, bundle, budget, timeout, 'ls-files', '--cached', '--others', '--exclude-standard', '-z') != names):
         raise RuntimeError('검증 복사 중 Git 입력이 변경됐습니다.')
     runtime_root = entrypoint.parents[2]
-    with tarfile.open(bundle / 'runtime.tar', 'w') as archive:
+    with (bundle / 'runtime.tar').open('wb') as stream, \
+         tarfile.open(fileobj=CheckedIO(stream, check), mode='w') as archive:
         for path in sorted((runtime_root / 'loop_manager_internal').rglob('*')):
+            check_budget(budget, timeout)
             if path.is_file() and path.suffix in {'.py', '.pl', '.pm'} and '__pycache__' not in path.parts:
                 archive.add(path, arcname=path.relative_to(runtime_root).as_posix(), recursive=False)
     shutil.copyfile(__file__, bundle / 'driver.py')
+    digest = hashlib.sha256()
     with (bundle / 'project.tar').open('rb') as stream:
-        fingerprint = hashlib.file_digest(stream, 'sha256').hexdigest()
-    return {'revision': revision, 'snapshot_sha256': fingerprint}
+        while True:
+            check()
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    check_budget(budget, timeout)
+    return {'revision': revision, 'snapshot_sha256': digest.hexdigest()}
 
 
 @contextmanager
@@ -160,6 +211,24 @@ def heartbeat(path):
         thread.join()
 
 
+@contextmanager
+def owned_bundle():
+    from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
+    directory = Path(tempfile.mkdtemp(prefix='loop-manager-verify-'))
+    try:
+        yield directory
+    except VerifyTerminationUncertain as error:
+        error.add_note(f'종료 불명 자료를 보존합니다: {directory}')
+        raise
+    except BaseException as error:
+        try:
+            shutil.rmtree(directory)
+        except OSError as cleanup_error:
+            error.add_note(f'bundle 정리 실패: {cleanup_error}')
+        raise
+    else:
+        shutil.rmtree(directory)
+
 def wsl_environment():
     # Windows의 경로·조율 인증값을 Linux interpreter에 상속하지 않는다.
     return {key: value for key, value in os.environ.items()
@@ -169,56 +238,96 @@ def wsl_environment():
 
 def run_wsl(root, bundle, directory, timeout, cap, parent_run_id=None):
     from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
-    started = time.monotonic()
+    from loop_manager_internal.verification.execution_clock import ExecutionClock, VerifyBudgetError
     environment = wsl_environment()
-    translated = subprocess.run(['wsl.exe', '--exec', 'wslpath', '-a', '-u', str(bundle)],
-        capture_output=True, text=True, encoding='utf-8', timeout=min(10, timeout), env=environment, check=True).stdout.strip()
-    if not translated.startswith('/') or '\n' in translated:
-        raise RuntimeError('WSL 검증 경로 변환에 실패했습니다.')
-    budget_arguments = []
-    if os.environ.get('LOOP_MANAGER_VERIFY_BUDGET_DIR'):
-        budget_path = subprocess.run(['wsl.exe', '--exec', 'wslpath', '-a', '-u',
-            os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR']], capture_output=True, text=True,
-            encoding='utf-8', timeout=min(10, timeout), env=environment, check=True).stdout.strip()
-        if not budget_path.startswith('/') or '\n' in budget_path:
-            raise RuntimeError('WSL 실행 시간 기록 경로 변환에 실패했습니다.')
-        budget_arguments = [budget_path]
-        lifecycle(os.environ['LOOP_MANAGER_VERIFY_BUDGET_DIR'],'starting')
-    if parent_run_id:
-        budget_arguments.extend(['--parent-run-id', parent_run_id])
-    timeout -= time.monotonic() - started
-    if timeout <= CLEANUP_SECONDS:
-        raise TimeoutError('전체 verify 제한 안에 WSL 실행·정리 시간을 확보하지 못했습니다.')
-    primary = None
-    try:
-        with heartbeat(bundle / 'heartbeat'):
-            from loop_manager_internal.verification.execution_clock import ExecutionClock
-            with ExecutionClock() as budget:
+    with ExecutionClock() as budget:
+        def translate(path):
+            check_budget(budget, timeout - CLEANUP_SECONDS)
+            result = subprocess.run(['wsl.exe', '--exec', 'wslpath', '-a', '-u', str(path)],
+                capture_output=True, text=True, encoding='utf-8',
+                timeout=budget.remaining(timeout - CLEANUP_SECONDS), env=environment, check=True)
+            check_budget(budget, timeout - CLEANUP_SECONDS)
+            value = result.stdout.strip()
+            if not value.startswith('/') or '\n' in value:
+                raise RuntimeError('WSL 검증 경로 변환에 실패했습니다.')
+            return value
+
+        translated = translate(bundle)
+        budget_arguments = []
+        budget_directory = os.environ.get('LOOP_MANAGER_VERIFY_BUDGET_DIR')
+        if budget_directory:
+            budget_arguments = [translate(budget_directory)]
+        if parent_run_id:
+            budget_arguments.extend(['--parent-run-id', parent_run_id])
+        remaining = budget.remaining(timeout)
+        if remaining <= CLEANUP_SECONDS:
+            raise TimeoutError('전체 verify 제한 안에 WSL 실행·정리 시간을 확보하지 못했습니다.')
+        primary = None
+        output = None
+        launched = False
+        def on_started(_process, _job):
+            nonlocal launched
+            launched = True
+            if budget_directory:
+                lifecycle(budget_directory, 'starting')
+        try:
+            with heartbeat(bundle / 'heartbeat'):
                 passed, timed_out, output = run_verify_process(
                     ['wsl.exe', '--exec', 'python3', translated + '/driver.py', '--wsl', translated,
-                     str(timeout - CLEANUP_SECONDS), str(cap), *budget_arguments], root, timeout - CLEANUP_SECONDS,
-                    environment=environment, job_scope=True, execution_clock=budget)
-    except BaseException as error:
-        primary = error
-    # Windows Job 종료만으로 Linux 자식의 종료를 확정하지 않는다.
-    receipt = bundle / 'cleanup.json'
-    deadline = time.monotonic() + CLEANUP_SECONDS
-    while not receipt.is_file() and time.monotonic() < deadline:
-        time.sleep(0.1)
-    if not receipt.is_file():
-        raise VerifyTerminationUncertain('WSL 자식 종료·전용 /tmp 정리 근거가 없습니다.')
-    cleanup = json.loads(receipt.read_text(encoding='utf-8'))
-    if not cleanup.get('stopped') or not cleanup.get('removed'):
-        raise VerifyTerminationUncertain('WSL 자식 또는 전용 /tmp 정리를 확인하지 못했습니다.')
-    if primary:
-        raise primary
-    for path in (bundle / 'logs').glob('*'):
-        destination = directory / path.name
-        shutil.copytree(path, destination) if path.is_dir() else shutil.copy2(path, destination)
-    shutil.copy2(receipt, directory / 'cleanup.json')
-    (directory / 'console.log').write_text(str(output), encoding='utf-8')
-    print(output, flush=True)
-    return passed and not timed_out
+                     str(remaining), str(cap), *budget_arguments], root, timeout - CLEANUP_SECONDS,
+                    environment=environment, job_scope=True, execution_clock=budget, on_started=on_started)
+        except BaseException as error:
+            primary = error
+        if primary is not None and not launched and not isinstance(primary, VerifyTerminationUncertain):
+            if budget_directory:
+                lifecycle(budget_directory, 'stopped')
+            raise primary
+        # Windows Job 종료만으로 Linux 자식의 종료를 확정하지 않는다.
+        receipt = bundle / 'cleanup.json'
+        cleanup_deadline = time.monotonic() + min(CLEANUP_SECONDS, max(0, timeout - budget.last_elapsed))
+        while not receipt.is_file():
+            try:
+                remaining_cleanup = budget.remaining(timeout)
+            except VerifyBudgetError as error:
+                if primary is None:
+                    primary = error
+                remaining_cleanup = cleanup_deadline - time.monotonic()
+            if remaining_cleanup <= 0:
+                break
+            time.sleep(min(0.1, remaining_cleanup))
+        if not receipt.is_file():
+            raise VerifyTerminationUncertain('WSL 자식 종료·전용 /tmp 정리 근거가 없습니다.') from primary
+        try:
+            cleanup = json.loads(receipt.read_text(encoding='utf-8'))
+            if (not isinstance(cleanup, dict) or cleanup.get('stopped') is not True
+                    or cleanup.get('removed') is not True):
+                raise ValueError('incomplete cleanup receipt')
+        except (OSError, ValueError, TypeError) as error:
+            if primary is not None:
+                primary.add_note(f'WSL 정리 근거 오류: {error}')
+                raise VerifyTerminationUncertain('WSL 자식 또는 전용 /tmp 정리를 확인하지 못했습니다.') from primary
+            raise VerifyTerminationUncertain('WSL 자식 또는 전용 /tmp 정리를 확인하지 못했습니다.') from error
+        try:
+            for path in (bundle / 'logs').glob('*'):
+                if primary is None:
+                    try:
+                        check_budget(budget, timeout)
+                    except (TimeoutError, VerifyBudgetError) as error:
+                        primary = error
+                destination = directory / path.name
+                shutil.copytree(path, destination) if path.is_dir() else shutil.copy2(path, destination)
+            shutil.copy2(receipt, directory / 'cleanup.json')
+            if output is not None:
+                (directory / 'console.log').write_text(str(output), encoding='utf-8')
+                print(output, flush=True)
+        except BaseException as error:
+            if primary is None:
+                raise
+            primary.add_note(f'WSL 진단 복사 실패: {error}')
+        if primary:
+            raise primary
+        check_budget(budget, timeout)
+        return passed and not timed_out
 
 
 def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
@@ -246,6 +355,7 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
     run_root = Path(tempfile.mkdtemp(prefix='loop-manager-verify-', dir='/tmp'))
     receipt = {'root': str(run_root), 'stopped': True, 'removed': False}
     passed = False
+    budget = None
     try:
         lifecycle(budget_directory,'running',root=str(run_root),pid=os.getpid())
         (bundle / 'started.json').write_text(json.dumps(receipt), encoding='utf-8')
@@ -253,16 +363,20 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
         project, runtime_root, temporary = (run_root / name for name in ('project', 'runtime', 'tmp'))
         for path in (project, runtime_root, temporary):
             path.mkdir()
+        def check_preparation():
+            if time.monotonic() - started >= timeout - CLEANUP_SECONDS:
+                raise TimeoutError('WSL 복사 준비 중 전체 verify 시간이 만료됐습니다.')
         for filename, destination in (('project.tar', project), ('runtime.tar', runtime_root)):
-            with tarfile.open(bundle / filename) as archive:
+            check_preparation()
+            with (bundle / filename).open('rb') as stream, \
+                 tarfile.open(fileobj=CheckedIO(stream, check_preparation), mode='r') as archive:
                 archive.extractall(destination, filter='data')
-        os.environ.update(TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
-        tempfile.tempdir = str(temporary)
         sys.path.insert(0, str(runtime_root))
         from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
         logs = bundle / 'logs'
         logs.mkdir(exist_ok=True)
-        environment = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
+        environment = dict(os.environ, TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary),
+            GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
             GIT_CONFIG_SYSTEM='/dev/null', PYTHONIOENCODING='utf-8',
             LOOP_MANAGER_VERIFY_LOG_DIR=str(logs), LOOP_MANAGER_VERIFY_PARALLELISM=str(cap))
         if parent_run_id:
@@ -270,11 +384,29 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
         from loop_manager_internal.verification.execution_clock import ExecutionClock
         budget = ExecutionClock(environment)
         budget.started = started
+        os.environ.update(TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
+        tempfile.tempdir = str(temporary)
         for arguments in (['git', 'init', '-q', '--initial-branch=main'], ['git', 'add', '-A'],
                           ['git', '-c', 'user.name=Verify', '-c', 'user.email=verify@example.invalid',
                            '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Windows verify snapshot']):
-            subprocess.run(arguments, cwd=project, env=environment, check=True, timeout=10)
-        remaining = budget.remaining(timeout)
+            if budget.remaining(timeout - CLEANUP_SECONDS) <= 0:
+                raise TimeoutError('WSL Git 준비 중 전체 verify 시간이 만료됐습니다.')
+            receipt['stopped'] = False
+            try:
+                success, timed_out, output = run_verify_process(
+                    arguments, project, timeout - CLEANUP_SECONDS,
+                    environment=environment, execution_clock=budget)
+            except VerifyTerminationUncertain:
+                raise
+            except BaseException:
+                receipt['stopped'] = True
+                raise
+            receipt['stopped'] = True
+            if timed_out:
+                raise TimeoutError('WSL Git 준비 중 전체 verify 시간이 만료됐습니다.')
+            if not success:
+                raise RuntimeError(f'WSL Git 준비에 실패했습니다: {output}')
+        remaining = budget.remaining(timeout - CLEANUP_SECONDS)
         if remaining <= 0:
             raise TimeoutError('WSL 복사 준비 중 전체 verify 시간이 만료됐습니다.')
         receipt['stopped'] = False
@@ -282,7 +414,7 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
             passed, timed_out, output = run_verify_process(
                 [sys.executable, '-u', str(runtime_root / 'loop_manager_internal/verification/entrypoint.py'),
                  '--project-python', sys.executable, '--timeout', str(remaining), '--parallelism', str(cap)],
-                project, remaining, environment=environment)
+                project, timeout - CLEANUP_SECONDS, environment=environment, execution_clock=budget)
         except VerifyTerminationUncertain:
             raise
         except BaseException:
@@ -291,21 +423,52 @@ def wsl_main(bundle, timeout, cap, budget_directory=None, parent_run_id=None):
         receipt['stopped'] = True
         print(output, flush=True)
         passed = passed and not timed_out
+    except BaseException as error:
+        evidence = getattr(error, 'diagnostic_directory', None)
+        if evidence is not None:
+            try:
+                shutil.copytree(evidence, bundle / 'logs' / 'budget-error', symlinks=True)
+            except OSError as copy_error:
+                error.add_note(f'WSL 예산 오류 진단 복사 실패: {copy_error}')
+        raise
     finally:
-        stopped.set()
-        if watcher.ident is not None:
-            watcher.join()
+        primary_error = sys.exc_info()[1]
         try:
-            if receipt['stopped']:
-                shutil.rmtree(run_root)
-        finally:
-            receipt['removed'] = not run_root.exists()
-            lifecycle(budget_directory,'stopped' if receipt['stopped'] and receipt['removed'] else 'uncertain',
-                      root=str(run_root),pid=os.getpid())
-            (bundle / 'cleanup.tmp').write_text(json.dumps(receipt), encoding='utf-8')
-            (bundle / 'cleanup.tmp').replace(bundle / 'cleanup.json')
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
+            stopped.set()
+            if watcher.ident is not None:
+                watcher.join()
+            try:
+                if receipt['stopped']:
+                    shutil.rmtree(run_root)
+            finally:
+                receipt['removed'] = not run_root.exists()
+                lifecycle(budget_directory,'stopped' if receipt['stopped'] and receipt['removed'] else 'uncertain',
+                          root=str(run_root),pid=os.getpid())
+                (bundle / 'cleanup.tmp').write_text(json.dumps(receipt), encoding='utf-8')
+                (bundle / 'cleanup.tmp').replace(bundle / 'cleanup.json')
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
+                if budget is not None:
+                    from loop_manager_internal.verification.execution_clock import VerifyBudgetError
+                    primary = primary_error or sys.exc_info()[1]
+                    try:
+                        if primary is None:
+                            check_budget(budget, timeout)
+                    except BaseException as error:
+                        primary = error
+                        if isinstance(error, VerifyBudgetError) and error.diagnostic_directory is not None:
+                            try:
+                                shutil.copytree(error.diagnostic_directory, bundle / 'logs' / 'budget-error', symlinks=True)
+                            except OSError as copy_error:
+                                error.add_note(f'WSL 예산 오류 진단 복사 실패: {copy_error}')
+                        raise
+                    finally:
+                        if not isinstance(primary, (VerifyBudgetError, VerifyTerminationUncertain)):
+                            budget.close()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(f'WSL 정리 실패: {cleanup_error}')
     return 0 if passed else 1
 
 
@@ -371,7 +534,22 @@ def windows_main(root):
     from loop_manager_internal.execution.verify_process import run_verify_process
     from loop_manager_internal.verification.timing import EventWriter, atomic_json, diagnostic, phase
     from loop_manager_internal.config.managed_config import load_managed_config
-    from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY
+    from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
+    @contextmanager
+    def preserving_phase(name):
+        primary = None
+        try:
+            with phase(name):
+                try:
+                    yield
+                except BaseException as error:
+                    primary = error
+                    raise
+        except BaseException as error:
+            if primary is not None and error is not primary:
+                primary.add_note(f'{name} phase 기록 실패: {error}')
+                raise primary from None
+            raise
     timeout = float(os.environ.get('LOOP_MANAGER_VERIFY_TIMEOUT', '600'))
     cap = os.environ.get('LOOP_MANAGER_VERIFY_PARALLELISM', 'auto')
     if (root / 'config/config.ini').is_file():
@@ -406,9 +584,8 @@ def windows_main(root):
     os.environ[BUDGET_DIRECTORY] = budget.environment[BUDGET_DIRECTORY]
     try:
         writer.emit('run_start', mode='windows+wsl', cap=cap)
-        with writer.activate(), phase('verify'), tempfile.TemporaryDirectory(prefix='loop-manager-verify-') as temporary:
-            bundle = Path(temporary)
-            report.update(snapshot(root, bundle, entrypoint))
+        with writer.activate(), preserving_phase('verify'), owned_bundle() as bundle:
+            report.update(snapshot(root, bundle, entrypoint, budget, timeout - CLEANUP_SECONDS))
             atomic_json(directory / 'snapshot.json', {
                 'run_id': session, 'revision': report['revision'], 'bundle': str(bundle),
                 'snapshot_sha256': report.get('snapshot_sha256')})
@@ -416,7 +593,7 @@ def windows_main(root):
             wsl_logs.mkdir()
             print(f'WSL 전체 verify 시작: {wsl_logs}', flush=True)
             report['wsl'] = 'FAIL'
-            with phase('wsl-full'):
+            with preserving_phase('wsl-full'):
                 passed = run_wsl(root, bundle, wsl_logs,
                                  budget.remaining(timeout), cap, session)
             report['temporary_directories']['wsl'] = wsl_temporary_directory(wsl_logs)
@@ -431,13 +608,16 @@ def windows_main(root):
             report['wsl_diagnostic'] = str(wsl_logs / 'summary.json')
             if not passed:
                 return 1
+            if budget.remaining(timeout) <= 0:
+                raise TimeoutError('WSL 종료 후 전체 verify 시간이 만료됐습니다.')
             native_logs = Path(str(directory) + '-windows')
             native_logs.mkdir()
             print(f'Windows 핵심 회귀 시작: {native_logs}', flush=True)
             report['windows'] = 'FAIL'
-            with phase('windows-core'):
+            with preserving_phase('windows-core'):
                 # 자체 실행기는 표준 라이브러리만 사용하며 venv redirector를 worker로 남기지 않는다.
                 native_environment = dict(os.environ, LOOP_MANAGER_VERIFY_PARENT_RUN_ID=session)
+                check_budget(budget, timeout)
                 passed, timed_out, output = run_verify_process(
                     [runtime_python, '-u', str(Path(__file__).resolve()), '--native', str(root),
                      str(entrypoint), str(native_logs), str(getattr(sys, '_base_executable', sys.executable))],
@@ -455,20 +635,98 @@ def windows_main(root):
                 pass
             report['windows'] = 'PASS' if passed and not timed_out else 'FAIL'
             report['windows_diagnostic'] = str(native_logs / 'summary.json')
+        if budget.remaining(timeout) <= 0:
+            raise TimeoutError('전체 verify 정리 중 시간이 만료됐습니다.')
         report['passed'] = report['windows'] == 'PASS'
         return 0 if report['passed'] else 1
     finally:
-        report['seconds'] = time.monotonic() - started
-        atomic_json(directory / 'result.json', report)
-        writer.emit('run_end', passed=report['passed'], wsl=report['wsl'], windows=report['windows'])
-        writer.close()
-        if previous_budget is None:
-            os.environ.pop(BUDGET_DIRECTORY, None)
-        else:
-            os.environ[BUDGET_DIRECTORY] = previous_budget
-        budget.__exit__(*sys.exc_info())
-        print(f'Loop Manager 자체 verify: {directory / "result.json"}', flush=True)
-        print(diagnostic(directory), flush=True)
+        primary = sys.exc_info()[1]
+        candidate = report['passed'] and primary is None
+        cleanup_deadline = None
+        report['passed'] = False
+        budget_error = primary
+        while budget_error is not None and not isinstance(budget_error, VerifyBudgetError):
+            budget_error = budget_error.__cause__
+        if budget_error is not None and budget_error.diagnostic_directory is not None:
+            try:
+                shutil.copytree(budget_error.diagnostic_directory, directory / 'budget-error', symlinks=True)
+            except OSError as error:
+                budget_error.add_note(f'예산 오류 진단 복사 실패: {error}')
+        try:
+            report['seconds'] = time.monotonic() - started
+            atomic_json(directory / 'result.json', report)
+            print(f'Loop Manager 자체 verify: {directory / "result.json"}', flush=True)
+            print(diagnostic(directory), flush=True)
+            if primary is None:
+                check_budget(budget, timeout)
+            report['passed'] = candidate
+            atomic_json(directory / 'result.json', report)
+            if candidate:
+                print(diagnostic(directory), flush=True)
+                check_budget(budget, timeout)
+            if primary is None:
+                cleanup_deadline = budget.clock() + budget.remaining(timeout)
+            writer.emit('run_end', passed=report['passed'], wsl=report['wsl'], windows=report['windows'])
+        except BaseException as error:
+            report['passed'] = False
+            if isinstance(error, VerifyBudgetError) and error.diagnostic_directory is not None:
+                try:
+                    shutil.copytree(error.diagnostic_directory, directory / 'budget-error', symlinks=True)
+                except OSError as copy_error:
+                    error.add_note(f'예산 오류 진단 복사 실패: {copy_error}')
+            try:
+                atomic_json(directory / 'result.json', report)
+            except OSError as write_error:
+                error.add_note(f'실패 결과 기록 실패: {write_error}')
+            if primary is None:
+                primary = error
+                raise
+            primary.add_note(f'최종 진단 실패: {error}')
+        finally:
+            try:
+                try:
+                    writer.close()
+                except OSError as error:
+                    report['passed'] = False
+                    try:
+                        atomic_json(directory / 'result.json', report)
+                    except OSError as write_error:
+                        error.add_note(f'실패 결과 기록 실패: {write_error}')
+                    if primary is None:
+                        primary = error
+                        raise
+                    primary.add_note(f'이벤트 로그 닫기 실패: {error}')
+            finally:
+                if previous_budget is None:
+                    os.environ.pop(BUDGET_DIRECTORY, None)
+                else:
+                    os.environ[BUDGET_DIRECTORY] = previous_budget
+                try:
+                    budget.__exit__(type(primary) if primary is not None else None, primary,
+                                    primary.__traceback__ if primary is not None else None)
+                except BaseException as error:
+                    report['passed'] = False
+                    try:
+                        atomic_json(directory / 'result.json', report)
+                    except OSError as write_error:
+                        error.add_note(f'실패 결과 기록 실패: {write_error}')
+                    if primary is None:
+                        raise
+                    primary.add_note(f'실행 시간 기록 정리 실패: {error}')
+                if primary is None and cleanup_deadline is not None and budget.clock() >= cleanup_deadline:
+                    report['passed'] = False
+                    atomic_json(directory / 'result.json', report)
+                    error = TimeoutError('전체 verify 최종 정리 중 시간이 만료됐습니다.')
+                    try:
+                        correction = EventWriter(directory / 'launcher.jsonl', identity={'run_id': session})
+                        try:
+                            correction.emit('run_end', passed=False, wsl=report['wsl'], windows=report['windows'])
+                        finally:
+                            correction.close()
+                        diagnostic(directory)
+                    except OSError as diagnostic_error:
+                        error.add_note(f'최종 시간 초과 진단 기록 실패: {diagnostic_error}')
+                    raise error
 
 
 if __name__ == '__main__':

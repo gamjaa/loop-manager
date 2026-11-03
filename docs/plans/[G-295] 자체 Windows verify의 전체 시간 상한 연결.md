@@ -58,8 +58,8 @@ R-067/R-091의 신뢰된 `runner-integration`·상하위 순수 대기·누계 �
 
 - [x] `bbce8cd25cdaa34a547b736cfc2f5d20f96a2a6d`에서 launcher·두 단계/환경/정리 테스트와 R-065/R-067의 전체 시간 상한을 정적으로 대조했다. 직접 구현된 pipeline은 재구현하지 않으며 준비/단계 전환/정리에 남은 예산 누락을 확인했다. 구현·테스트·verify는 실행하지 않았다.
 - [x] `2219730c40def01f6c38ed1d68b8c35fa44c29e7`에서 native의 동일 clock/원래 timeout 전달과 이중 차감 방지 회귀가 직접 반영됐음을 정적으로 확인했다. 준비·실행 전 만료·정리의 남은 범위와 기존 수행 기록은 보존하며 Linux/Windows 테스트 성공을 뜻하지 않는다.
-- [ ] 준비·두 단계·정리의 공통 시간 상한과 실패 처리 연결
-- [ ] 최소 targeted unit과 기존 실제 OS 회귀·문서 정합성 대조
+- [x] 준비·두 단계·정리의 실행 시간 예산과 실패 자료 보존을 launcher에 연결했다. 실제 Windows 실행·전체 verify 결과는 포함하지 않는다.
+- [x] launcher의 fake clock·process 단위 회귀와 설계 문서를 대조했다. 실제 Windows 모체 종료 회귀와 전체 verify는 Manager 검증으로 남긴다.
 
 ## Decision Log
 
