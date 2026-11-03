@@ -24,11 +24,24 @@ from loop_manager_internal.verification.resources import Snapshot, MIB
 from loop_manager_internal.execution.validation_feedback import MAX_DIAGNOSTIC, format_verify_failure
 from loop_manager_internal.verification.timing import (
     EventWriter, TimedResult, bytecode_cache_changes, bytecode_cache_snapshot,
-    comparison, fixture_timing, phase, summarize,
+    comparison, diagnostic, fixture_timing, phase, summarize,
 )
 
 
 class TimingAndManifestTests(unittest.TestCase):
+    def test_diagnostic_preserves_active_events_without_comparable_clocks(self):
+        for domain in (None, 'foreign', sys.platform):
+            with self.subTest(domain=domain), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                event = {'kind': 'test_start', 'pid': 11, 'id': 'sample.test_active', 'at': 1}
+                if domain is not None:
+                    event['clock_domain'] = domain
+                (root / 'worker.jsonl').write_text(json.dumps(event) + '\n', encoding='utf-8')
+                with mock.patch('loop_manager_internal.verification.timing.time.monotonic', return_value=10):
+                    output = diagnostic(root)
+                elapsed = '9.000s' if domain == sys.platform else '경과 시간 미확인'
+                self.assertIn(f'미완료 {elapsed}: sample.test_active', output)
+
     def test_summary_terminal_stage_or_run_event_dominates_worker_starts(self):
         for terminal_kind in ("stage_end", "run_end"):
             with self.subTest(terminal=terminal_kind), tempfile.TemporaryDirectory() as temporary:

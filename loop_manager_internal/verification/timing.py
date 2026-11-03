@@ -652,5 +652,6 @@ def diagnostic(directory: Path):
     for event in summary["tests"][:5]:
         lines.append(f"느린 테스트 {event['duration']:.3f}s: {event['id']}")
     for event in summary["active"][:5]:
-        lines.append(f"미완료 {event['elapsed']:.3f}s: {event.get('id', event.get('name'))}")
+        elapsed = f"{event['elapsed']:.3f}s" if event['elapsed'] is not None else "경과 시간 미확인"
+        lines.append(f"미완료 {elapsed}: {event.get('id', event.get('name'))}")
     return "\n".join(lines)

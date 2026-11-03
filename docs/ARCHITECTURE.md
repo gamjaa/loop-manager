@@ -1401,6 +1401,8 @@ coordinator의 하위 session은 부모 ID·관측 전용 여부·PID/시작 ide
 
 EventWriter 이벤트는 `clock_domain=sys.platform`과 run/stage/unit/worker identity를 보존한다. Windows launcher의 parent summary는 `result.json`·`snapshot.json`과 `<run>-wsl`·`<run>-windows`의 summary 경로·run ID·결과·elapsed를 연결하고 각 자식 실행의 clock domain 안에서만 시간을 계산한다. WSL run ID는 `parent_run_id`로 launcher run에 연결된다. native child에도 launcher의 parent run ID를 전달하고, parent는 일치하는 parent identity를 확인한 child summary에서 실제 native run ID를 가져온다. live WSL worker JSONL은 공유 bundle log에서 읽고 cleanup 뒤 형제 디렉터리로 보존한다.
 
+미완료 이벤트의 clock domain이 현재 플랫폼과 다르거나 없는 legacy 기록이고 같은 실행의 종료 시각도 없으면 `elapsed`는 null로 보존한다. `timing.diagnostic()`은 이를 `경과 시간 미확인`으로 출력하고 대상 이벤트를 유지한다. 계산 가능한 시간은 초 단위 소수점 세 자리로 표시하며, 시간 미확인만으로 진단 생성을 실패시키거나 원래 verify 실패 결과의 처리를 막지 않는다.
+
 새 `phase_start`·`phase_end` 쌍은 같은 32자리 소문자 16진수 UUID `phase_id`를 사용한다. `timing.summarize()`와 Manager progress reader는 변경될 수 있는 stage/unit identity 대신 이 ID로 phase 종료를 연결한다. ID가 없는 legacy 이벤트는 같은 run·clock domain·PID·phase 이름·시작 시각으로 연결한다. 따라서 `verify` phase가 stage ID 변경을 가로질러 FALLBACK·예외로 종료되고 `run_end`가 없어도 실행 중 항목으로 남지 않는다.
 
 Manager progress reader는 현재 run의 완성된 줄만 한 번 소비하며 `test_interrupted`·stage 종료·run 종료를 파일 순서와 독립적으로 적용해 늦게 읽은 worker 시작이 active 표시를 되살리지 못하게 한다. 파일 읽기 실패는 미확인으로 남긴다. summary는 각 OS의 child metrics와 전체 parent elapsed를 분리해 PID나 monotonic clock을 합치지 않는다.
