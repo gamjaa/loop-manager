@@ -132,7 +132,7 @@ class RecoveryPolicyTests(unittest.TestCase):
             (RecoveryReason.ARCHIVE_MOVE_MISMATCH, 2, 0, RecoveryDisposition.AGENT_CORRECTION, RecoveryAction.CORRECT),
             (RecoveryReason.ARCHIVE_MOVE_MISMATCH, 3, 0, RecoveryDisposition.USER_ACTION_REQUIRED, RecoveryAction.FINAL_BLOCK),
             (RecoveryReason.REBASE_CONFLICT, 3, 0, RecoveryDisposition.AGENT_CORRECTION, RecoveryAction.CORRECT),
-            (RecoveryReason.REBASE_CONFLICT, 4, 0, RecoveryDisposition.USER_ACTION_REQUIRED, RecoveryAction.FINAL_BLOCK),
+            (RecoveryReason.REBASE_CONFLICT, 4, 0, RecoveryDisposition.CONDITION_WAIT, RecoveryAction.PAUSE),
             (RecoveryReason.GUIDANCE_APPROVAL_REQUIRED, 1, 0, RecoveryDisposition.USER_ACTION_REQUIRED, RecoveryAction.FINAL_BLOCK),
             (RecoveryReason.REMOTE_OID_UNCERTAIN, 1, 0, RecoveryDisposition.USER_ACTION_REQUIRED, RecoveryAction.FINAL_BLOCK),
         )
@@ -153,6 +153,24 @@ class RecoveryPolicyTests(unittest.TestCase):
         typed = RecoveryFailure(RecoveryReason.REBASE_CONTINUE_FAILED, "identical diagnostic")
         self.assertEqual(classify_exception(typed, operation=RecoveryReason.OWNERSHIP_UNCERTAIN),
                          RecoveryReason.REBASE_CONTINUE_FAILED)
+
+    def test_rebase_correction_budget_cannot_authorize_a_final_conflict_block(self):
+        for limit in (1, 4, 20):
+            for occurrence in (limit, limit + 1, 4001):
+                with self.subTest(limit=limit, occurrence=occurrence):
+                    decision = decide(
+                        observation(RecoveryReason.REBASE_CONFLICT),
+                        occurrence=occurrence, attempts=4001,
+                        correction_limit=limit,
+                        final_block_reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
+                    )
+                    self.assertEqual(decision.action, RecoveryAction.PAUSE)
+                    self.assertEqual(decision.disposition, RecoveryDisposition.CONDITION_WAIT)
+                    self.assertIsNone(decision.block_reason)
+                    self.assertIsNone(decision.scope)
+                    self.assertIsNone(decision.unresolved)
+                    with self.assertRaises(ValueError):
+                        require_final(decision)
 
     def test_only_final_decision_passes_blocking_gate(self):
         with self.assertRaises(ValueError):

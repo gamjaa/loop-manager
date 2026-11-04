@@ -91,7 +91,7 @@ RECONCILE = frozenset({
     RecoveryReason.CHECKPOINT_STALE,
 })
 CORRECTION = frozenset({
-    RecoveryReason.ARCHIVE_MOVE_MISMATCH, RecoveryReason.REBASE_CONFLICT,
+    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
     RecoveryReason.WORKER_CORRECTION,
     RecoveryReason.REVIEW_FEEDBACK_CORRECTION,
 })
@@ -261,6 +261,15 @@ def decide(
     elif reason is RecoveryReason.COMMON_DEFECT:
         disposition = RecoveryDisposition.CONDITION_WAIT
         action = RecoveryAction.FINAL_BLOCK
+    elif reason is RecoveryReason.REBASE_CONFLICT:
+        # A correction budget bounds this batch; it cannot prove that all
+        # authorized recovery routes are unavailable for the current inputs.
+        if occurrence < correction_limit:
+            disposition = RecoveryDisposition.AGENT_CORRECTION
+            action = RecoveryAction.CORRECT
+        else:
+            disposition = RecoveryDisposition.CONDITION_WAIT
+            action = RecoveryAction.PAUSE
     elif reason in CORRECTION and occurrence < correction_limit:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.CORRECT

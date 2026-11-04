@@ -91,7 +91,7 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         self.effects.validation.verify.assert_not_called()
 
 
-    def test_format_error_then_three_abnormal_results_reach_safety_gate(self):
+    def test_format_error_then_three_abnormal_results_pause_without_final_block(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -129,8 +129,11 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
             context, 'abnormal exit', corrected=True,
             worker_result='same abnormal result', abnormal_result=True,
         )
-        self.assertEqual(final.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(final.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
         self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 4)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
+        self.assertEqual(self.state.row()['worker_session_id'], 'same-session')
 
 
     def test_saved_worker_result_finishes_after_restart_without_second_agent_turn(self):

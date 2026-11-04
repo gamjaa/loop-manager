@@ -294,10 +294,12 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
 
         self.assertEqual([outcome.kind for outcome in outcomes], [
             ExecutionOutcomeKind.RETRY, ExecutionOutcomeKind.RETRY,
-            ExecutionOutcomeKind.FINAL_BLOCK,
+            ExecutionOutcomeKind.TRANSIENT_PAUSE,
         ])
         self.assertEqual(self.effects.agent.run_agent.call_count, 3)
         self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 3)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
 
 
     def test_saved_new_rebase_result_requires_outcome_before_finishing(self):

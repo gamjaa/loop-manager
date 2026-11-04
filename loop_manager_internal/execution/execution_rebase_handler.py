@@ -197,8 +197,8 @@ class RebaseHandler:
             return self.ports._recover(recovery_reason, detail, context=context,
                 attempts=int(targeted_evidence_missing), fingerprint=saved.fingerprint,
                 progress_marker=saved.progress)
-        # An abnormal Agent exit is the first failed correction. Block only
-        # after three further identical, progress-free results.
+        # An abnormal Agent exit is the first failed correction. After three
+        # further identical results, try file recovery or pause this batch.
         correction_limit = 4 if abnormal_result else 3
         if saved.occurrence >= correction_limit:
             if (self.ports.checkpoint is not None and self.ports.current_rebase_service is not None

@@ -294,7 +294,7 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
         self._assert_partial_stage_resume(changed=True)
 
 
-    def test_rebase_correction_blocks_only_after_three_identical_worker_results(self):
+    def test_rebase_correction_pauses_after_three_identical_worker_results(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -324,9 +324,12 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
         final = self.handler._rebase_conflict(
             context, 'conflict', corrected=True, worker_result='same output',
         )
-        self.assertEqual(final.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(final.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
         self.assertIn('same output', final.detail)
         self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 3)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(self.repository.get('repo', 'G-047').status, 'IMPLEMENTING')
+        self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
 
 
     def test_zero_exit_rebase_with_unmerged_index_keeps_conflict_correction(self):
