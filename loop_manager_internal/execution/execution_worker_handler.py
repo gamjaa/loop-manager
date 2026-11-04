@@ -103,6 +103,7 @@ class WorkerHandlerPorts:
     _unmerged_stages: Callable[..., Any]
     publish_worker_checkpoints: Callable[..., Any] | None = None
     _publish_rebased_checkpoint: Callable[..., Any] | None = None
+    git_bytes: Callable[..., bytes] | None = None
 
 
 class WorkerHandler:
@@ -266,6 +267,18 @@ class WorkerHandler:
                     return self._resume_saved_rebase_worker(
                         context, current, observation,
                     )
+                from loop_manager_internal.git.rebase_correction import conflict_wait_fingerprint
+                paused = recovery_state.RecoveryRepository(self.ports.state.connection).row(
+                    self.ports.identity.repo, context.plan.plan_id)
+                if (paused is not None and paused['reason_code'] == RecoveryReason.REBASE_CONFLICT.value
+                        and paused['pending_action'] == 'pause' and current is not None
+                        and not current.pending_turn
+                        and paused['fingerprint'] == conflict_wait_fingerprint(observation, row,
+                            checkpoint=self.ports.checkpoint, service=self.ports.current_rebase_service,
+                            git_bytes=self.ports.git_bytes)
+                        and paused['progress_marker'] == observation.progress):
+                    return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
+                        detail=str(paused['detail']))
                 if current is not None and current.pending_turn:
                     # Agent scope retains the pre-turn snapshot across a
                     # process restart, including partial Worker file edits.

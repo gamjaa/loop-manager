@@ -1067,7 +1067,11 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 | 수동 준비·제출의 게시 중단 | 아래의 소유 intent·후보·원격 OID·후속 계보로 게시 사실을 재확인한다. 완료 receipt는 보존하며 제거된 후보를 새 lease·대체 후보로 다시 게시하지 않는다. |
 
 
-복구 관측은 안정적인 원인 code와 repository·plan ID·phase·plan/base revision·진단 fingerprint·진전 marker를 기록한다. 복구 disposition은 `transient_retry`·`state_reconcile`·`agent_correction`·`user_action_required`이며 차단 scope와 별도로 판단한다. 원인별 같은 실행의 시도 한도에 도달하면 작업을 보존해 일시 중단하고, 최종 사용자 조치 판정에만 원인 code로 scope를 결합한다. 최종 차단 transaction은 판정의 repository·plan·원인 일치를 검증하며 복구 횟수·마지막 안정 revision·남은 불확실성·실제 조치 대상을 보존한다. 일시 중단은 차단용 게시·알림을 만들지 않고, 최종 차단의 게시·알림은 [차단 작업의 원격 반영과 보존](#차단-작업의-원격-반영과-보존)을 따른다.
+복구 관측은 안정적인 원인 code와 repository·plan ID·phase·plan/base revision·진단 fingerprint·진전 marker를 기록한다. 복구 disposition은 `transient_retry`·`state_reconcile`·`agent_correction`·`condition_wait`·`user_action_required`이며 차단 scope와 별도로 판단한다. 원인별 같은 실행의 시도 한도에 도달하면 작업을 보존해 일시 중단하고, 최종 사용자 조치 판정에만 원인 code로 scope를 결합한다. 최종 차단 transaction은 판정의 repository·plan·원인 일치를 검증하며 복구 횟수·마지막 안정 revision·남은 불확실성·실제 조치 대상을 보존한다. 일시 중단은 차단용 게시·알림을 만들지 않고, 최종 차단의 게시·알림은 [차단 작업의 원격 반영과 보존](#차단-작업의-원격-반영과-보존)을 따른다.
+
+rebase 교정 묶음의 소진은 `recovery_records`에 `rebase_conflict/condition_wait/pause`로 저장한다. 대기 fingerprint는 현재 구현 조건·소유 target/원래 HEAD·충돌 stages의 지문, 실행 base·PR URL/head·충돌 복구 head/base OID와 checkpoint·소유 rebase service·원본 byte reader의 가용성에 결합하며, 별도 progress marker는 파일 내용·staged diff·operation 위치·autostash를 구별한다. Worker 진입은 저장된 결과를 먼저 소비하고 진행 중 turn이 없는 동일 대기에서는 새 turn·Agent 호출을 만들지 않는다. session·재시작·시간 경과만으로 지문을 바꾸지 않으며, 실제 입력·파일 진전·복구 자원이 달라지면 기존 소유권·실행 gate에서 다시 판단한다. 파일별 복원 결과의 `paths`에서 `skipped_user_changes`를 뺀 실제 적용 범위가 있어야 재작업으로 전환한다.
+
+PR 복구 선택은 `selected_execution` 안에서 대상 계획의 원본만 수정한다. 해당 계획의 실제 conflict block이 저장됐고 프로젝트 안전 차단이 없으면 실패 반환을 프로젝트 중단으로 전파하지 않으며, 선택 context 밖에서 차단 계획을 hydrate해 독립 작업의 대표 투영을 덮지 않는다. 일반 실행 재개도 같은 차단 PR을 다시 부착하지 않는다. 대기 PR 관측은 PR이 연결된 충돌 차단 계획을 포함하되 OPEN에서는 원인별 재평가에 맡기고 Merge·Close만 기존 원격 전이 소유 경계로 전달한다. 이 반환 소비는 rebase 완료·예약 회수·검증 성공을 만들지 않는다.
 
 일반적인 PLAN_BLOCKED는 계획·원래 활성 sources의 내용 해시를 기준으로 재평가한다. 닫힌 PR은 같은 PR reopen을 요구한다. 과거 파일 승인 대기는 일반 작업·소유권 검사를 통과하면 기록을 보존한 채 재개한다. 독립 차단·planning 오류·실패 감사는 함께 지우지 않는다. planning_error는 실제 교정·재검증·게시 복구로 원인이 해소된 뒤에만 지운다. cleanup_pending과 ExecPlan archive pending은 상태 전이를 만들지 않는다.
 

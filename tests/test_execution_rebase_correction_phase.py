@@ -331,6 +331,99 @@ class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionP
         self.assertEqual(self.repository.get('repo', 'G-047').status, 'IMPLEMENTING')
         self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
 
+        correction = self.handler.rebase_corrections.get('repo', 'G-047')
+        intent = checkpoint.get('repo', 'G-047')
+        # Recreate the durable repository at the same saved input after restart.
+        self.handler.rebase_corrections = type(self.handler.rebase_corrections)(self.connection)
+        for _ in range(2):
+            waiting = self.handler.run(self.context())
+            self.assertEqual(waiting.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047'), correction)
+        self.assertEqual(checkpoint.get('repo', 'G-047'), intent)
+
+    def test_paused_rebase_rechecks_changed_inputs_and_returned_recovery_resource(self):
+        from loop_manager_internal.git.rebase_correction import conflict_wait_fingerprint
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record('repo', 'G-047', expected_generation=0, operation='rebase',
+                          expected_head='before', target_base_oid='base', observed_remote_oid=None, snapshot={})
+        self.state.update_project('repo', phase='WORKING', worker_session_id='same-session',
+                                  last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        context = self.context()
+        observed = self.handler._rebase_observation(context)
+        self.handler._rebase_conflict(context, 'conflict')
+        for _ in range(3):
+            self.handler._rebase_conflict(context, 'conflict', corrected=True, worker_result='same output')
+        paused = RecoveryRepository(self.connection).row('repo', 'G-047')
+        row = self.state.row()
+        before = conflict_wait_fingerprint(observed, row, checkpoint=checkpoint,
+            service=self.effects.workspace.current_rebase_service, git_bytes=self.effects.workspace.git_bytes)
+        self.assertEqual(paused['fingerprint'], before)
+        for key in ('active_sha', 'pr_url', 'pr_head_oid', 'pr_conflict_head_oid', 'pr_conflict_base_oid'):
+            with self.subTest(key=key):
+                self.assertNotEqual(conflict_wait_fingerprint(observed, {**row, key: 'new-input'},
+                    checkpoint=checkpoint, service=self.effects.workspace.current_rebase_service,
+                    git_bytes=self.effects.workspace.git_bytes), before)
+        self.assertNotEqual(conflict_wait_fingerprint(observed, row, checkpoint=checkpoint,
+            service=lambda: None, git_bytes=self.effects.workspace.git_bytes), before)
+        # A genuine changed worktree reaches the next Worker turn. Stop at the
+        # effect boundary so this test does not repeat full staging/publication.
+        original_snapshot = self.effects.agent.capture_git_snapshot.return_value
+        self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
+            head='owned-head', branch='loop-manager/G-047', dirty={'app.py': (('unstaged',), 'manual-progress')})
+        self.effects.agent.resolve_worker_profile.side_effect = RuntimeError('changed input reached Worker')
+        with self.assertRaisesRegex(RuntimeError, 'changed input reached Worker'):
+            self.handler.run(self.context())
+        self.assertIsNotNone(self.handler.rebase_corrections.get('repo', 'G-047').pending_turn)
+        self.effects.agent.run_agent.assert_not_called()
+        current = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.handler.rebase_corrections.abandon_turn('repo', 'G-047', expected_generation=current.generation)
+        self.effects.agent.capture_git_snapshot.return_value = original_snapshot
+        self.effects = replace(self.effects,
+            workspace=replace(self.effects.workspace, current_rebase_service=mock.Mock()))
+        self.handler.effects = self.effects
+        with self.assertRaisesRegex(RuntimeError, 'changed input reached Worker'):
+            self.handler.run(self.context())
+        self.assertIsNotNone(self.handler.rebase_corrections.get('repo', 'G-047').pending_turn)
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_file_recovery_without_applied_paths_does_not_claim_rework(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint,
+            workspace=replace(self.effects.workspace, current_rebase_service=mock.Mock()))
+        self.handler.effects = self.effects
+        checkpoint.record('repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'rebase_files': {'state': 'staged', 'paths': ['app.py'],
+                                      'skipped_user_changes': ['app.py']}})
+        self.state.update_project('repo', phase='WORKING', worker_session_id='same-session',
+                                  last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = lambda path, *args, **kwargs: (
+            SimpleNamespace(stdout='100644 ' + 'a' * 40 + ' 1\tapp.py\0', returncode=0)
+            if args[:2] == ('ls-files', '-u') else self.observed_git(path, *args, **kwargs))
+        context = self.context()
+        intent = checkpoint.get('repo', 'G-047')
+        with mock.patch('loop_manager_internal.git.rebase_documents.resolve', return_value=False) as restore:
+            self.handler._rebase_conflict(context, 'conflict')
+            for _ in range(3):
+                outcome = self.handler._rebase_conflict(context, 'conflict', corrected=True, worker_result='failed')
+            self.assertEqual(outcome.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+            restore.assert_called_once()
+            restore.return_value = True
+            skipped = self.handler._rebase_conflict(context, 'conflict', corrected=True, worker_result='failed')
+            self.assertEqual(skipped.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(checkpoint.get('repo', 'G-047'), intent)
+        self.assertNotIn('복원했습니다', self.state.row()['last_error'])
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
 
     def test_zero_exit_rebase_with_unmerged_index_keeps_conflict_correction(self):
         checkpoint = mock.Mock()
