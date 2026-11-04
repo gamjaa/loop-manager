@@ -252,3 +252,39 @@ class PrRecoveryFixture:
             ),
             tuple((path, (repo / path).read_bytes()) for path in paths),
         )
+def prepared_conflict_assessment(connection, repo, plan_id):
+    """Synthetic owner facts for SQLite policy tests; no Git or Agent success."""
+    from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+    from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+    head, base, original = 'a' * 40, 'b' * 40, 'd' * 40
+    branch, worktree, url = f'loop-manager/{plan_id}', f'/state/{plan_id}', 'https://example.test/pr/1'
+    connection.execute("UPDATE projects SET origin='owner/repo' WHERE repo=?", (repo,))
+    connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', workspace_owned=1, plan_sha='plan', "
+        "current_revision_sha='plan', branch=?,worktree=?,pr_url=?,pr_head_oid=?,pr_conflict_recovery=1, "
+        "pr_conflict_head_oid=?,pr_conflict_base_oid=?,worker_session_id='saved-worker' WHERE repo=? AND plan_id=?",
+        (branch, worktree, url, head, head, base, repo, plan_id))
+    checkpoints = ExecutionCheckpointRepository(connection)
+    checkpoint = checkpoints.record(repo, plan_id, expected_generation=0, operation='rebase',
+        expected_head=original, target_base_oid=base, observed_remote_oid=head, snapshot={'preserved': 'partial-work'})
+    routes = {
+        'reobservation': 'The owner checked the same immutable source inventory.',
+        'retry': 'The required original bytes are absent from that inventory.',
+        'correction': 'The attempted correction cannot reconstruct the absent source.',
+        'condition_wait': 'No pending resource or service supplies the required source.',
+        'next_run': 'Restarting does not alter the immutable source inventory.',
+        'safe_recovery': 'Owned checkpoints preserve partial work but contain no required source.',
+    }
+    proof = dict(version=1, repository='owner/repo', base_branch='main', plan_revision='plan',
+        pr_url=url, head_oid=head, base_oid=base, operation='rebase', branch=branch, worktree=worktree,
+        worker_session='saved-worker', checkpoint_generation=checkpoint.generation, checkpoint_head=original,
+        worktree_snapshot=loop_manager.GitSnapshot('e' * 40, None, {},
+            {'app.py': (('unstaged',), 'partial')}, {}, {}, {}, {'rebase-merge': 'owned'}).serialize(),
+        conflict_paths=['src/app.py'], attempted_routes={
+            'worker_correction': 'Attempted; required source cannot be reconstructed.',
+            'file_restore_rework': 'Checked pinned originals and owned copies; required source is absent.',
+            'revalidation': 'No valid candidate exists to revalidate; no validation success is asserted.'},
+        release_conditions=['New PR/base input or restored required source', 'Explicit cause-specific recheck'])
+    return RecoveryObservation(RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE, repo, plan_id,
+        'WORKING', 'plan', base, 'confirmed-source-inventory', 'preserved-partial-work',
+        'Required originals cannot be recovered safely.', operation='rebase',
+        unavailable_recovery_routes=routes, conflict_evidence=proof)

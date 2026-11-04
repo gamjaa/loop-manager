@@ -16,13 +16,16 @@ import subprocess
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
 from loop_manager_internal.execution.execution_runtime import ExecutionPlanMetadata
-from loop_manager_internal.git.rebase_correction import CorrectionAction, CorrectionSource, execute_git_step, observe_git, stage_evidence_preserved
+from loop_manager_internal.git.rebase_correction import CorrectionAction, CorrectionSource, execute_git_step, observe_git, stage_evidence_preserved, conflict_wait_fingerprint
 from loop_manager_internal.storage.rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot, RebaseWorkspaceContext
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
+from loop_manager_internal.execution.validation_feedback import redact_secrets
+from loop_manager_internal.storage import runtime_state
 
 @dataclass(frozen=True)
 class RebaseHandlerPorts:
@@ -153,12 +156,16 @@ class RebaseHandler:
 
     def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None,
                          abnormal_result=False, target=None, stash_oid=None,
-                         recovery_reason=RecoveryReason.REBASE_CONFLICT, targeted_evidence_missing=False):
+                         recovery_reason=RecoveryReason.REBASE_CONFLICT, targeted_evidence_missing=False,
+                         assessment=None):
         """Track actual Git progress before considering the final safety gate."""
         try:
             observation = self._rebase_observation(
                 context, target=target, stash_oid=stash_oid,
             )
+            if assessment is not None and (not observation.conflict_paths
+                    or set(assessment['conflict_paths']) != set(observation.conflict_paths)):
+                raise WorkerOutcomeError('PR 충돌 관측 파일이 현재 unmerged index와 일치하지 않습니다.')
             if not observation.target_base or not observation.before_head:
                 return self.ports._recover(
                     RecoveryReason.OWNERSHIP_UNCERTAIN,
@@ -173,18 +180,20 @@ class RebaseHandler:
                     final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
                 )
             current = self.ports.rebase_corrections.get(self.ports.identity.repo, context.plan.plan_id)
-            saved = self.ports.rebase_corrections.observe(
-                self.ports.identity.repo, context.plan.plan_id, observation,
-                corrected=corrected,
-                count_correction=recovery_reason not in {
-                    RecoveryReason.TARGETED_TEST_CORRECTION, RecoveryReason.TARGETED_COLLECTION_PENDING},
-                expected_generation=current.generation if current else None,
-                worker_session=self.ports._row()['worker_session_id'],
-                worker_result=worker_result,
-                # This result has been consumed by the correction decision.
-                # Only finish_turn() may retain an unconsumed result for restart.
-                persist_worker_result=False,
-            )
+            with runtime_state._transaction(self.ports.state.connection):
+                saved = self.ports.rebase_corrections.observe(
+                    self.ports.identity.repo, context.plan.plan_id, observation,
+                    corrected=corrected,
+                    count_correction=recovery_reason not in {
+                        RecoveryReason.TARGETED_TEST_CORRECTION, RecoveryReason.TARGETED_COLLECTION_PENDING},
+                    expected_generation=current.generation if current else None,
+                    worker_session=self.ports._row()['worker_session_id'],
+                    worker_result=worker_result,
+                    # The result has been consumed; finish_turn owns pending output.
+                    persist_worker_result=False,
+                )
+        except WorkerOutcomeError:
+            raise
         except CorrectionRace:
             return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                                  'rebase correction generation changed', context=context)
@@ -197,25 +206,34 @@ class RebaseHandler:
             return self.ports._recover(recovery_reason, detail, context=context,
                 attempts=int(targeted_evidence_missing), fingerprint=saved.fingerprint,
                 progress_marker=saved.progress)
-        # An abnormal Agent exit is the first failed correction. Block only
-        # after three further identical, progress-free results.
+        # An abnormal Agent exit is the first failed correction. After three
+        # further identical results, try file recovery or pause this batch.
         correction_limit = 4 if abnormal_result else 3
-        if saved.occurrence >= correction_limit:
+        if saved.occurrence >= correction_limit or assessment is not None:
             if (self.ports.checkpoint is not None and self.ports.current_rebase_service is not None
                     and observation.conflict_paths):
                 from loop_manager_internal.git import rebase_documents
-                rebase_documents.resolve(context=context, identity=self.ports.identity,
+                restored = rebase_documents.resolve(context=context, identity=self.ports.identity,
                     checkpoints=self.ports.checkpoint, git=self.ports.git, git_bytes=self.ports.git_bytes,
                     require_owned=lambda: self.ports._current_rebase_service(context).require_owned(),
                     capture_snapshot=self.ports.capture_git_snapshot, lookup_pr=self.ports.pr_for_branch,
                     failed_files=observation.conflict_paths,
                     failure_reason=f'{saved.occurrence}회 동일 충돌 correction 실패: {detail}')
-                self.ports.state.update_project(self.ports.identity.repo, last_error=
-                    '충돌 복구 실패 파일을 원격 원본으로 복원했습니다. 해당 파일을 재작업하세요: '
-                    + ', '.join(observation.conflict_paths), worker_result=None,
-                    verify_token=None, review_token=None, publication_token=None)
-                return self.ports._recover(RecoveryReason.WORKER_CORRECTION,
-                    '복원된 파일의 요구사항을 다시 구현합니다.', context=context)
+                if restored:
+                    intent = self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+                    files = (intent.snapshot or {}).get('rebase_files') or {}
+                    restored_paths = sorted(set(files.get('paths', ())) - set(files.get('skipped_user_changes', ())))
+                    if restored_paths:
+                        self.ports.state.update_project(self.ports.identity.repo, last_error=
+                            '충돌 복구 실패 파일을 원격 원본으로 복원했습니다. 해당 파일을 재작업하세요: '
+                            + ', '.join(restored_paths), worker_result=None,
+                            verify_token=None, review_token=None, publication_token=None)
+                        return self.ports._recover(RecoveryReason.WORKER_CORRECTION,
+                            '복원된 파일의 요구사항을 다시 구현합니다.', context=context)
+                if (assessment is not None and restored and self.ports.git_bytes is not None
+                        and files.get('state') == 'staged'
+                        and set(observation.conflict_paths) <= set(files.get('skipped_user_changes', ()))):
+                    return self._final_conflict_assessment(context, observation, assessment, worker_result)
             attempts = [
                 {
                     'occurrence': event['occurrence'],
@@ -236,7 +254,9 @@ class RebaseHandler:
             )
             return self.ports._recover(
                 RecoveryReason.REBASE_CONFLICT, detail, context=context,
-                fingerprint=saved.fingerprint, progress_marker=saved.progress,
+                fingerprint=conflict_wait_fingerprint(observation, self.ports._row(),
+                    checkpoint=self.ports.checkpoint, service=self.ports.current_rebase_service,
+                    git_bytes=self.ports.git_bytes), progress_marker=saved.progress,
                 correction_limit=1,
             )
         return self.ports._recover(
@@ -244,6 +264,56 @@ class RebaseHandler:
             fingerprint=saved.fingerprint, progress_marker=saved.progress,
             correction_limit=10**9,
         )
+
+    def _final_conflict_assessment(self, context, before, assessment, worker_result):
+        """The owner binds semantic Worker facts after safe file recovery failed."""
+        if self.ports.state.connection.in_transaction:
+            raise RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN,
+                                  '최종 충돌 관측 전에 DB 쓰기 처리를 반환해야 합니다.')
+        checkpoint = self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+        self.ports._current_rebase_service(context).require_owned(checkpoint=checkpoint)
+        latest = self.ports.git(self.ports.identity.repo_path, 'rev-parse',
+                               f'refs/remotes/origin/{self.ports.identity.base}^{{commit}}').stdout.strip()
+        if latest != checkpoint.target_base_oid:
+            return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                'PR 충돌 관측 뒤 최신 base 입력이 변경됐습니다.', context=context)
+        row = self.ports._row()
+        def current_pr():
+            return self.ports.pr_for_branch(self.ports.identity.repo_path, context.branch, row['pr_url'])
+        pr = current_pr()
+        if (not isinstance(pr, Mapping) or pr.get('url') != row['pr_url']
+                or pr.get('headRefName') != context.branch or pr.get('baseRefName') != self.ports.identity.base
+                or pr.get('headRefOid') != checkpoint.observed_remote_oid
+                or str(pr.get('state', '')).upper() != 'OPEN' or pr.get('mergedAt')):
+            return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                'PR 충돌 관측 뒤 원격 PR 입력이 달라졌거나 확인되지 않습니다.', context=context)
+        current = self._rebase_observation(context)
+        git_snapshot = self.ports.capture_git_snapshot(context.worktree).serialize()
+        if current.fingerprint != before.fingerprint or current.progress != before.progress or current_pr() != pr:
+            return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                'PR 충돌 근거 검사 중 작업물 또는 원격 입력이 변경됐습니다.', context=context)
+        plan = self.ports.state.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+            (self.ports.identity.repo, context.plan.plan_id)).fetchone()
+        project = self.ports.state.connection.execute('SELECT origin,base_branch FROM projects WHERE repo=?',
+            (self.ports.identity.repo,)).fetchone()
+        proof = dict(version=1, repository=project['origin'], base_branch=project['base_branch'],
+            plan_revision=plan['current_revision_sha'] or plan['plan_sha'], pr_url=pr['url'],
+            head_oid=pr['headRefOid'], base_oid=checkpoint.target_base_oid, operation=checkpoint.operation,
+            branch=context.branch, worktree=str(context.worktree), worker_session=row['worker_session_id'],
+            checkpoint_generation=checkpoint.generation, checkpoint_head=checkpoint.expected_head,
+            worktree_snapshot=git_snapshot,
+            conflict_paths=list(current.conflict_paths),
+            attempted_routes={key: redact_secrets(value) for key, value in assessment['attempted_routes'].items()},
+            release_conditions=[redact_secrets(value) for value in assessment['release_conditions']])
+        proof['attempted_routes']['worker_correction'] = ('현재 소유 Worker의 충돌 교정 관측: '
+            + proof['attempted_routes']['worker_correction'])
+        proof['attempted_routes']['file_restore_rework'] = ('Manager가 파일별 복원을 시도했으나 현재 변경 보존으로 적용 경로가 없습니다. '
+            + proof['attempted_routes']['file_restore_rework'])
+        proof['attempted_routes']['revalidation'] = '현재 unmerged index가 남아 검증할 최종 후보가 없습니다. 검증 성공을 기록하지 않습니다.'
+        return self.ports._recover(RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE,
+            redact_secrets(assessment['problem']), context=context, worker_result=worker_result,
+            conflict_evidence=proof, unavailable_recovery_routes={
+                key: redact_secrets(value) for key, value in assessment['unavailable_recovery_routes'].items()})
 
     def _record_rebase_intent(self, context, target_oid):
         checkpoint = self.ports.checkpoint

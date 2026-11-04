@@ -94,6 +94,13 @@ class ConflictObservation:
         return tuple(sorted({path for path, _, _ in self.stages}))
 
 
+def conflict_wait_fingerprint(observation, row, *, checkpoint, service, git_bytes):
+    """Bind a paused batch to its inputs and available recovery resources."""
+    return _digest((observation.fingerprint, row['active_sha'], row['pr_url'],
+                    row['pr_head_oid'], row['pr_conflict_head_oid'], row['pr_conflict_base_oid'],
+                    checkpoint is not None, service is not None, git_bytes is not None))
+
+
 def next_action(observation: ConflictObservation, *, worker_result: bool,
                 staged: bool, safe: bool = True) -> CorrectionAction:
     if not safe or (observation.source is CorrectionSource.AUTOSTASH and not observation.stash_oid):

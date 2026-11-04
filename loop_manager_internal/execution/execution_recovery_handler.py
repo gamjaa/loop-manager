@@ -45,7 +45,7 @@ class RecoveryHandler:
                  progress_marker=None, final_block_reason=None,
                  from_revision=False, correction_limit=None, attempts=0,
                  user_targets=(), verify_result=None, worker_result=None,
-                 worker_decision=None):
+                 worker_decision=None, conflict_evidence=None, unavailable_recovery_routes=None):
         """Persist a typed decision and apply the final gate in one transaction."""
 
         row = self.ports._row()
@@ -71,17 +71,20 @@ class RecoveryHandler:
             else f"{reason.value}|{detail}"
         )
         stable_fingerprint = fingerprint or hashlib.sha256(
-            fingerprint_input.encode()
+            (json.dumps(conflict_evidence, sort_keys=True) if conflict_evidence else fingerprint_input).encode()
         ).hexdigest()
         observation = RecoveryObservation(
             reason=reason, repo=self.ports.identity.repo, plan_id=plan_id,
             phase=str(row['phase'] or ''),
-            plan_revision=str(self.ports.snapshot().catalog_plan['current_revision_sha'] or '')
-            if self.ports.snapshot().catalog_plan is not None else None,
-            base_revision=base, fingerprint=stable_fingerprint,
+            plan_revision=(conflict_evidence['plan_revision'] if conflict_evidence else
+                str(self.ports.snapshot().catalog_plan['current_revision_sha'] or '')
+                if self.ports.snapshot().catalog_plan is not None else None),
+            base_revision=conflict_evidence['base_oid'] if conflict_evidence else base, fingerprint=stable_fingerprint,
             progress_marker=progress, detail=detail,
             user_targets=tuple(user_targets),
             worker_decision=worker_decision,
+            operation=conflict_evidence['operation'] if conflict_evidence else None,
+            conflict_evidence=conflict_evidence, unavailable_recovery_routes=unavailable_recovery_routes,
         )
         decision = self.ports.recovery.apply(
             observation,

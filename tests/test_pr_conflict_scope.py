@@ -100,7 +100,7 @@ class PrConflictScopeTest(PrRecoveryFixture, unittest.TestCase):
                 agent.assert_not_called()
                 verify.assert_not_called()
 
-    def test_conflicting_pr_blocks_ignored_path_overlapping_base_update(self):
+    def test_conflicting_pr_waits_without_overwriting_ignored_path_overlapping_base_update(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection, branch, worktree, url, head = (
                 self._pr_open_state(directory)
@@ -130,8 +130,8 @@ class PrConflictScopeTest(PrRecoveryFixture, unittest.TestCase):
                 "SELECT status, last_error FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-026'", (str(repo),),
             ).fetchone()
-            self.assertEqual(result, 1)
-            self.assertEqual(stored["status"], "PLAN_BLOCKED")
+            self.assertEqual(result, loop_manager.PROJECT_STEP_TRANSIENT_PAUSE)
+            self.assertEqual(stored["status"], "PR_OPEN")
             self.assertIn("overlap.txt", stored["last_error"])
             self.assertEqual(artifact.read_text(encoding="utf-8"), "preserve ignored artifact\n")
             self.assertFalse(any(call.args[1:2] == ("rebase",) for call in git_spy.call_args_list))
@@ -154,12 +154,12 @@ class PrConflictScopeTest(PrRecoveryFixture, unittest.TestCase):
                 "SELECT status, last_error FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-026'", (str(repo),),
             ).fetchone()
-            self.assertEqual(result, 1)
-            self.assertEqual(stored["status"], "PLAN_BLOCKED")
+            self.assertEqual(result, loop_manager.PROJECT_STEP_TRANSIENT_PAUSE)
+            self.assertEqual(stored["status"], "PR_OPEN")
             self.assertIn("index flags src/app.py", stored["last_error"])
             self.assertTrue(cache.is_file())
 
-    def test_conflicting_pr_still_blocks_nonignored_untracked_change(self):
+    def test_conflicting_pr_waits_and_preserves_nonignored_untracked_change(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -194,10 +194,13 @@ class PrConflictScopeTest(PrRecoveryFixture, unittest.TestCase):
                 (str(repo),),
             ).fetchone()
 
-        self.assertEqual(result, 1)
-        self.assertEqual(stored["status"], "PLAN_BLOCKED")
-        self.assertEqual(
-            stored["blocked_reason"],
-            loop_manager.BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value,
-        )
+            self.assertEqual((worktree / 'unexpected.txt').read_text(), 'publishable local change\n')
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0], 0)
+            recovery = loop_manager.recovery_state.RecoveryRepository(connection).row(str(repo), 'G-026')
+            self.assertEqual((recovery['reason_code'], recovery['pending_action']), ('git_input_uncertain', 'pause'))
+            self.assertIsNone(recovery['final_evidence'])
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='blocked'").fetchone()[0], 0)
+        self.assertEqual(result, loop_manager.PROJECT_STEP_TRANSIENT_PAUSE)
+        self.assertEqual(stored["status"], "PR_OPEN")
+        self.assertIsNone(stored["blocked_reason"])
         self.assertIn("unexpected.txt", stored["last_error"])

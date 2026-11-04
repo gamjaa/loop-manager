@@ -289,38 +289,68 @@ class CheckpointAssessmentTests(unittest.TestCase):
             complete.assert_not_called()
             update.assert_not_called()
 
-    def test_pr_rebase_resume_blocks_when_active_checkpoint_has_no_journal(self):
-        project = {
-            'pr_conflict_recovery': 1, 'phase': 'WORKING',
-            'last_error': loop_manager.REBASE_IN_PROGRESS_ERROR,
-            'pr_conflict_base_oid': 'base', 'pr_conflict_head_oid': 'head',
-            'verify_result': '',
-        }
-        plan = {'plan_id': 'G-044', 'pr_conflict_recovery': 1}
+    def test_pr_rebase_resume_waits_when_active_checkpoint_has_no_journal(self):
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.storage import runtime_state
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE projects SET planning_attempt_fingerprint=NULL")
+        connection.commit()
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.activate('repo', 'G-047', activation_sha='base', branch='loop/G-047', worktree='/owned')
+        runtime.update_project('repo', {'pr_conflict_recovery': 1, 'pr_conflict_base_oid': 'base',
+            'pr_conflict_head_oid': 'head', 'last_error': loop_manager.REBASE_IN_PROGRESS_ERROR})
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+        checkpoint = checkpoints.record('repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='head', target_base_oid='base', observed_remote_oid='head', snapshot={})
+        project = runtime_state.project_row(connection, 'repo')
         with (
             mock.patch.object(loop_manager, '_rebase_in_progress_for_branch',
                               return_value=False),
             mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(
                 stdout='', returncode=0,
             )),
-            mock.patch.object(loop_manager, 'active_execplan', return_value=plan),
             mock.patch.object(loop_manager, '_owned_rebase_state_dir',
                               return_value=None),
-            mock.patch.object(loop_manager.execution_checkpoint_state,
-                              'ExecutionCheckpointRepository') as checkpoints,
             mock.patch.object(loop_manager, 'block_active_execplan') as block,
             mock.patch.object(loop_manager, '_complete_direct_rebase_checkpoint') as complete,
         ):
-            checkpoints.return_value.get.return_value = SimpleNamespace(
-                operation='rebase',
-            )
             result = loop_manager.resume_pr_conflict_rebase(
-                object(), Path('/repo'), '/repo', project,
-                Path('/owned'), 'loop-manager/G-044',
+                connection, Path('/repo'), 'repo', project,
+                Path('/owned'), 'loop/G-047',
             )
-        self.assertEqual(result, 1)
-        block.assert_called_once()
+        self.assertEqual(result, loop_manager.PROJECT_STEP_TRANSIENT_PAUSE)
+        block.assert_not_called()
         complete.assert_not_called()
+        self.assertEqual(checkpoints.get('repo', 'G-047'), checkpoint)
+        self.assertEqual(runtime.get('repo', 'G-047').status, 'IMPLEMENTING')
+        recovery = RecoveryRepository(connection).row('repo', 'G-047')
+        self.assertEqual((recovery['reason_code'], recovery['pending_action']), ('git_input_uncertain', 'pause'))
+        self.assertIsNone(recovery['final_evidence'])
+
+    def test_mismatched_pr_rebase_journal_keeps_ownership_safety_refusal(self):
+        from loop_manager_internal.recovery import pull_request_recovery
+        project = {'pr_conflict_recovery': 1, 'phase': 'WORKING',
+            'last_error': loop_manager.REBASE_IN_PROGRESS_ERROR,
+            'pr_conflict_base_oid': 'base', 'pr_conflict_head_oid': 'head', 'verify_result': ''}
+        effects = SimpleNamespace(
+            _rebase_in_progress_for_branch=mock.Mock(return_value=False),
+            git=mock.Mock(return_value=SimpleNamespace(stdout='', returncode=0)),
+            active_execplan=mock.Mock(return_value={'plan_id': 'G-047', 'pr_conflict_recovery': 1,
+                                                   'worker_session_id': 'saved-worker'}),
+            _owned_rebase_state_dir=mock.Mock(return_value=Path('/state')),
+            _finish_owned_direct_rebase=mock.Mock(side_effect=loop_manager.manager_git_journal.MutationEvidenceError('operation owner differs')),
+            block_active_execplan=mock.Mock(), operation_print=mock.Mock(),
+            _complete_direct_rebase_checkpoint=mock.Mock())
+        with mock.patch.object(execution_checkpoint_state, 'ExecutionCheckpointRepository') as checkpoints:
+            checkpoints.return_value.get.return_value = SimpleNamespace(operation='rebase')
+            result = pull_request_recovery.resume_pr_conflict_rebase(effects, object(), Path('/repo'),
+                'repo', project, Path('/owned'), 'loop/G-047')
+        self.assertEqual(result, 1)
+        self.assertEqual(effects.block_active_execplan.call_args.kwargs['reason'],
+                         loop_manager.BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN)
+        effects._complete_direct_rebase_checkpoint.assert_not_called()
 
     def test_direct_rebase_completion_allows_only_preserved_worktree_delta(self):
         sealed = {

@@ -225,10 +225,19 @@ def _block_action(connection, repo, payload):
             action = {'kind': 'verify_timeout', 'seconds': int(limit)}
     elif evidence is not None and not evidence.get('user_targets') and not evidence.get('worker_decision'):
         routes = evidence.get('unavailable_recovery_routes')
-        if (isinstance(routes, dict) and set(routes) == {
-                'reobservation', 'retry', 'correction', 'condition_wait', 'next_run', 'safe_recovery'}
-                and all(isinstance(value, str) and value.strip() for value in routes.values())):
+        from loop_manager_internal.recovery.recovery_runtime import unavailable_routes_complete
+        if reason == 'managed_worktree_conflict':
+            from loop_manager_internal.storage.recovery_state import conflict_evidence_current
+            proof = evidence.get('conflict_evidence')
+            if (plan is None or plan['status'] != 'PLAN_BLOCKED'
+                    or recovery['reason_code'] != 'managed_conflict_unrecoverable'
+                    or not conflict_evidence_current(connection, repo, plan_id, proof)
+                    or payload.get('recovery', {}).get('conflict_evidence', proof) != proof):
+                return None
+        if unavailable_routes_complete(routes):
             action = {'kind': 'unrecoverable', 'recovery_identity': recovery['identity']}
+            if reason == 'managed_worktree_conflict':
+                action['conflict_evidence'] = proof
     if payload.get('action', action) != action:
         return None
     return action

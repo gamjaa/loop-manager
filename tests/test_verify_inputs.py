@@ -268,13 +268,13 @@ class VerifyInputObservationTest(unittest.TestCase):
                      '.agents/skills/specification-docs/scripts/next_requirement_id.py',
                      '.agents/skills/specification-docs/scripts/requirement_documents.py',
                      '.agents/skills/specification-docs/scripts/read_requirements.py',
-                     'requirements.txt', 'run.sh', 'run.ps1'):
+                     'requirements.txt', 'run.sh', 'run.ps1',
+                     'docs/AGENTS.common.md', 'docs/AGENTS.planner.md',
+                     'docs/AGENTS.planner_check.md', 'docs/AGENTS.worker.md',
+                     'docs/AGENTS.reviewer.md', 'docs/AGENTS.ponytail.md'):
             with self.subTest(path=path):
                 self.assertTrue(any(inputs.matches(path, pattern) for pattern in patterns))
         for path in ('AGENTS.md', 'README.md', 'config/config.ini.example',
-                     'docs/AGENTS.common.md', 'docs/AGENTS.planner.md',
-                     'docs/AGENTS.planner_check.md', 'docs/AGENTS.worker.md',
-                     'docs/AGENTS.reviewer.md', 'docs/AGENTS.ponytail.md',
                      'docs/PLANS.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md',
                      'docs/FUTURE_IDEAS.md', 'docs/VERIFY.md',
                      'docs/PRODUCT.template.md', 'docs/ARCHITECTURE.template.md',

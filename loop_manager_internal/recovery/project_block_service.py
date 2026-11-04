@@ -131,6 +131,10 @@ def _reconcile_rebase_evidence_block(
 ) -> bool:
     """Recheck the owned current rebase and release only its saved cause."""
     plan_id = str(block["plan_id"] or "")
+    request_cause = {
+        scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value: 'metadata',
+        scoped_blocking.BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value: 'conflict',
+    }.get(block['reason_code'])
     if recovery_request_id is not None:
         from loop_manager_internal.runtime import refresh
         if refresh.paused(state_dir, repo):
@@ -142,8 +146,8 @@ def _reconcile_rebase_evidence_block(
         ).fetchone()
         if (request is None or request['repo'] != repo or request['status'] != 'pending'
                 or request['plan_id'] not in (None, plan_id)
-                or block['reason_code'] != scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value
-                or local_recovery_state.recheck_consumed(connection, recovery_request_id, plan_id, 'metadata')):
+                or request_cause is None
+                or local_recovery_state.recheck_consumed(connection, recovery_request_id, plan_id, request_cause)):
             return False
     plan = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?", (repo, plan_id),
@@ -223,6 +227,19 @@ def _reconcile_rebase_evidence_block(
                               and recovery_request_id is None)
         if automatic_metadata and not metadata_trigger():
             return False
+        if (recovery_request_id is None and recovery is not None
+                and recovery['reason_code'] == 'managed_conflict_unrecoverable'
+                and recovery['pending_action'] == 'final_block'):
+            saved_evidence = json.loads(recovery['final_evidence'] or '{}')
+            saved_assessment = saved_evidence.get('conflict_evidence') if isinstance(saved_evidence, dict) else None
+            if recovery_state.conflict_evidence_current(connection, repo, plan_id, saved_assessment):
+                before = GitSnapshot.deserialize(saved_assessment['worktree_snapshot'])
+                if rebase_block_reconciliation.pending_block_unchanged(
+                        plan, block, recovery, before, effects.capture_git_snapshot(worktree),
+                        revision_input=effects._revision_execplan_input_fingerprint(
+                            repo_path, str(plan['current_revision_sha'] or plan['plan_sha']), plan),
+                        worktree_input=effects._worktree_execplan_input_fingerprint(worktree, plan)):
+                    return False
         if service.normalize_frontmatter():
             checkpoint = checkpoints.get(repo, plan_id)
             service = effects._current_rebase_service(
@@ -237,7 +254,7 @@ def _reconcile_rebase_evidence_block(
             effects.validate_blocked_agent_scope(
                 connection, repo_path, repo, str(project['base_branch']), worktree,
                 str(plan['path']), accepted_rebase=True, saved_plan=plan)
-            if (not scoped_blocking.is_scope_baseline_block(block)
+            if (recovery_request_id is None and not scoped_blocking.is_scope_baseline_block(block)
                     and observation[1].status is managed_rebase_validation.RebaseStatus.WAITING
                     and plan['agent_result_snapshot']
                     and plan['blocked_fingerprint'] and plan['blocked_worktree_fingerprint']):

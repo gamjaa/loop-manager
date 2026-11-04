@@ -468,10 +468,10 @@ def execute_local_recovery_request(
     if plan_id is None:
         candidates = connection.execute(
             "SELECT plan_id, blocked_reason FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
-            "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted', 'plan_input_invalid') "
+            "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted', 'plan_input_invalid', 'managed_worktree_conflict') "
             "ORDER BY plan_id", (repository,)).fetchall()
         targets.extend(str(row[0]) for row in candidates)
-        target_causes = {str(row[0]): ('metadata' if row[1] == 'plan_input_invalid' else 'verify')
+        target_causes = {str(row[0]): {'plan_input_invalid': 'metadata', 'managed_worktree_conflict': 'conflict'}.get(row[1], 'verify')
                          for row in candidates}
         # Once bounded verify checks have released the execution slot,
         # revisit the project coordinator for its independent planning cause.

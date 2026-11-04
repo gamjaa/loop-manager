@@ -103,6 +103,7 @@ class WorkerHandlerPorts:
     _unmerged_stages: Callable[..., Any]
     publish_worker_checkpoints: Callable[..., Any] | None = None
     _publish_rebased_checkpoint: Callable[..., Any] | None = None
+    git_bytes: Callable[..., bytes] | None = None
 
 
 class WorkerHandler:
@@ -196,6 +197,17 @@ class WorkerHandler:
             '범위 밖 공통 교정 반영 대기: ' + str(report['problem']), context=context,
             final_block_reason=BlockReasonCode.COMMON_DEFECT_PENDING, worker_result=message)
 
+    def _report_conflict_assessment(self, context, message, outcome, input_snapshot):
+        if not context.resolving_rebase or not self.ports._row()['pr_conflict_recovery']:
+            raise WorkerOutcomeError('PR 충돌 관측은 소유 PR의 진행 중 충돌에서만 수용합니다.')
+        checked = self._guard_rebase_worker_result(context, input_snapshot, refresh=False)
+        if isinstance(checked, ExecutionOutcome):
+            return checked
+        self.ports.clear_agent_scope(self.ports.identity.repo)
+        self.ports.state.update_project(self.ports.identity.repo, worker_result=message)
+        return self.ports._rebase_conflict(checked, outcome.problem, corrected=True,
+            worker_result=message, assessment=outcome.conflict_assessment)
+
     def run(self, context: ExecutionContext) -> ExecutionOutcome:
         self.ports.state.check_context(context)
         if self.ports.checkpoint is not None and not context.resolving_rebase:
@@ -266,6 +278,18 @@ class WorkerHandler:
                     return self._resume_saved_rebase_worker(
                         context, current, observation,
                     )
+                from loop_manager_internal.git.rebase_correction import conflict_wait_fingerprint
+                paused = recovery_state.RecoveryRepository(self.ports.state.connection).row(
+                    self.ports.identity.repo, context.plan.plan_id)
+                if (paused is not None and paused['reason_code'] == RecoveryReason.REBASE_CONFLICT.value
+                        and paused['pending_action'] == 'pause' and current is not None
+                        and not current.pending_turn
+                        and paused['fingerprint'] == conflict_wait_fingerprint(observation, row,
+                            checkpoint=self.ports.checkpoint, service=self.ports.current_rebase_service,
+                            git_bytes=self.ports.git_bytes)
+                        and paused['progress_marker'] == observation.progress):
+                    return ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE,
+                        detail=str(paused['detail']))
                 if current is not None and current.pending_turn:
                     # Agent scope retains the pre-turn snapshot across a
                     # process restart, including partial Worker file edits.
@@ -720,6 +744,9 @@ class WorkerHandler:
                 return self._common_defect_pending(context, message)
             if disposition.kind == 'needs_user_decision':
                 return self._block_worker_decision(context, message, disposition)
+            if disposition.kind == 'pr_conflict_unrecoverable':
+                return self._report_conflict_assessment(context, message, disposition,
+                    turn_definition.serialize() if turn_definition else None)
             if disposition.kind == 'checkpoint':
                 if result.targeted_collection_pending or targeted_tests.pending(self.ports.identity.repo, context.plan.plan_id):
                     return self._targeted_collection_pause(context, 'targeted test 실행 근거의 종료 확인·재수집 대기')
@@ -966,6 +993,9 @@ class WorkerHandler:
                 return self._block_worker_decision(
                     context, saved.worker_result, disposition,
                 )
+            if disposition.kind == 'pr_conflict_unrecoverable':
+                return self._report_conflict_assessment(context, saved.worker_result, disposition,
+                                                      getattr(saved, 'input_snapshot', None))
             checked = self._guard_rebase_worker_result(
                 context, getattr(saved, 'input_snapshot', None), refresh=False,
             )
@@ -1017,6 +1047,13 @@ class WorkerHandler:
 
     def _finish_worker(self, context, row, message, *, staged=False):
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
+        try:
+            disposition = parse_worker_outcome(message, plan_path=context.plan.path, sources=context.plan.sources,
+                                               documents={}, allow_legacy_ready=True)
+            if disposition.kind != 'ready_for_validation':
+                raise WorkerOutcomeError('관측·대기 결과를 완료 후보로 stage하거나 수용할 수 없습니다.')
+        except WorkerOutcomeError as error:
+            return self.ports._recover(RecoveryReason.WORKER_CORRECTION, str(error), context=context)
         latest_sha = str(row['active_sha'] or '')
         if not context.resolving_rebase:
             from loop_manager_internal.execution.worker_checkpoint import stage_candidate

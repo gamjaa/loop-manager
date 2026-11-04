@@ -1118,10 +1118,13 @@ class RuntimeStateRepository:
             check_owner()
             if recovery_request_id is not None:
                 from loop_manager_internal.storage import local_recovery_state
-                if (block['reason_code'] != scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value
-                        or not local_recovery_state.consume_recheck(
-                            self.connection, recovery_request_id, str(plan_id), 'metadata', repo=repo)):
-                    raise RuntimeStateError('metadata recheck request already consumed or cause changed')
+                request_cause = {
+                    scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value: 'metadata',
+                    scoped_blocking.BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value: 'conflict',
+                }.get(block['reason_code'])
+                if (request_cause is None or not local_recovery_state.consume_recheck(
+                            self.connection, recovery_request_id, str(plan_id), request_cause, repo=repo)):
+                    raise RuntimeStateError('rebase recheck request already consumed or cause changed')
             separate_block = not is_plan_block and expected_plan['status'] == 'PLAN_BLOCKED'
             values = revalidation_values(current_checkpoint.target_base_oid)
             retired_scope = scoped_blocking.is_scope_baseline_block(block)

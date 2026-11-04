@@ -328,6 +328,7 @@ def worker(effects: ExecutionEffects, identity: ExecutionIdentity,
         _run_document=callbacks["_run_document"],
         _stage_rebase_correction=callbacks["_stage_rebase_correction"],
         _unmerged_stages=callbacks["_unmerged_stages"],
+        git_bytes=getattr(effects.workspace, "git_bytes", None),
     ))
 
 

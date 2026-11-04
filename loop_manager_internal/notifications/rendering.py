@@ -166,6 +166,14 @@ def _event_message(kind: str, payload: dict[str, object]) -> str:
                 recovery_text += '\n복구 불가 근거:' + ''.join(
                     f'\n- {route}: {detail}'
                     for route, detail in sorted(recovery['unavailable_recovery_routes'].items()))
+                proof = recovery.get('conflict_evidence')
+                if isinstance(proof, dict):
+                    recovery_text += ('\nPR: ' + str(proof['pr_url'])
+                        + '\n충돌 파일: ' + ', '.join(proof['conflict_paths'])
+                        + '\nOperation: ' + str(proof['operation'])
+                        + '\n재평가 조건: ' + '; '.join(proof['release_conditions'])
+                        + '\n보존 worktree: ' + str(proof['worktree'])
+                        + '\n보존 branch/session: ' + str(proof['branch']) + ' / ' + str(proof['worker_session']))
             if recovery.get("unresolved"):
                 recovery_text += "\nUnresolved: " + str(recovery["unresolved"])
             counts = recovery.get("recovery_attempts")

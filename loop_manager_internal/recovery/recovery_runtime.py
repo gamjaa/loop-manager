@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
 import json
+import re
 
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, BlockScope, reason_scope
 
@@ -91,7 +92,7 @@ RECONCILE = frozenset({
     RecoveryReason.CHECKPOINT_STALE,
 })
 CORRECTION = frozenset({
-    RecoveryReason.ARCHIVE_MOVE_MISMATCH, RecoveryReason.REBASE_CONFLICT,
+    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
     RecoveryReason.WORKER_CORRECTION,
     RecoveryReason.REVIEW_FEEDBACK_CORRECTION,
 })
@@ -180,6 +181,7 @@ class RecoveryObservation:
     # Notification evidence supplied by the recovery owner, never inferred
     # from the disposition or the number of exhausted attempts.
     unavailable_recovery_routes: dict[str, str] | None = None
+    conflict_evidence: dict[str, object] | None = None
 
     @property
     def identity(self) -> str:
@@ -210,6 +212,38 @@ class RecoveryFailure(RuntimeError):
     def __init__(self, reason: RecoveryReason, detail: str):
         super().__init__(detail)
         self.reason = reason
+
+
+def unavailable_routes_complete(routes) -> bool:
+    return (isinstance(routes, dict) and set(routes) == {
+        'reobservation', 'retry', 'correction', 'condition_wait', 'next_run', 'safe_recovery'}
+        and all(isinstance(value, str) and value.strip() for value in routes.values()))
+
+
+def conflict_evidence_complete(evidence) -> bool:
+    """Validate owner-supplied facts; counts and diagnostic prose are not proof."""
+    if not isinstance(evidence, dict):
+        return False
+    from loop_manager_internal.git.managed_rebase_validation import _safe_path
+    from loop_manager_internal.agents.scope_contracts import GitSnapshot
+    try:
+        GitSnapshot.deserialize(evidence.get('worktree_snapshot'))
+    except (TypeError, ValueError, KeyError, AttributeError, RuntimeError):
+        return False
+    return (type(evidence.get('version')) is int and evidence['version'] == 1
+        and all(isinstance(evidence.get(key), str) and evidence[key].strip() for key in (
+            'repository', 'base_branch', 'plan_revision', 'pr_url', 'branch', 'worktree', 'worker_session', 'worktree_snapshot'))
+        and all(isinstance(evidence.get(key), str) and re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', evidence[key])
+                for key in ('head_oid', 'base_oid', 'checkpoint_head'))
+        and evidence.get('operation') == 'rebase'
+        and type(evidence.get('checkpoint_generation')) is int and evidence['checkpoint_generation'] > 0
+        and isinstance(evidence.get('conflict_paths'), list) and bool(evidence['conflict_paths'])
+        and all(isinstance(path, str) and _safe_path(path) for path in evidence['conflict_paths'])
+        and isinstance(evidence.get('attempted_routes'), dict)
+        and set(evidence['attempted_routes']) == {'worker_correction', 'file_restore_rework', 'revalidation'}
+        and all(isinstance(value, str) and value.strip() for value in evidence['attempted_routes'].values())
+        and isinstance(evidence.get('release_conditions'), list) and bool(evidence['release_conditions'])
+        and all(isinstance(value, str) and value.strip() for value in evidence['release_conditions']))
 
 
 def classify_exception(error: BaseException, *, operation: RecoveryReason) -> RecoveryReason:
@@ -261,12 +295,35 @@ def decide(
     elif reason is RecoveryReason.COMMON_DEFECT:
         disposition = RecoveryDisposition.CONDITION_WAIT
         action = RecoveryAction.FINAL_BLOCK
+    elif reason is RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE and not (
+            observation.plan_id and unavailable_routes_complete(observation.unavailable_recovery_routes)
+            and conflict_evidence_complete(observation.conflict_evidence)
+            and observation.operation == observation.conflict_evidence['operation']
+            and observation.plan_revision == observation.conflict_evidence['plan_revision']
+            and observation.base_revision == observation.conflict_evidence['base_oid']):
+        disposition = RecoveryDisposition.CONDITION_WAIT
+        action = RecoveryAction.PAUSE
+    elif reason is RecoveryReason.REBASE_CONFLICT:
+        # A correction budget bounds this batch; it cannot prove that all
+        # authorized recovery routes are unavailable for the current inputs.
+        if occurrence < correction_limit:
+            disposition = RecoveryDisposition.AGENT_CORRECTION
+            action = RecoveryAction.CORRECT
+        else:
+            disposition = RecoveryDisposition.CONDITION_WAIT
+            action = RecoveryAction.PAUSE
     elif reason in CORRECTION and occurrence < correction_limit:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.CORRECT
     else:
         disposition = RecoveryDisposition.USER_ACTION_REQUIRED
         action = RecoveryAction.FINAL_BLOCK
+    if (final_block_reason is BlockReasonCode.MANAGED_WORKTREE_CONFLICT
+            and reason is not RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE
+            or reason is RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE
+            and final_block_reason not in (None, BlockReasonCode.MANAGED_WORKTREE_CONFLICT)):
+        disposition = RecoveryDisposition.CONDITION_WAIT
+        action = RecoveryAction.PAUSE
     block_reason = (final_block_reason or BLOCK_REASON.get(reason, BlockReasonCode.REPOSITORY_STATE_UNSAFE)) if action is RecoveryAction.FINAL_BLOCK else None
     return RecoveryDecision(
         observation, disposition, action, occurrence, attempts, block_reason,
@@ -276,6 +333,13 @@ def decide(
 
 
 def require_final(decision: RecoveryDecision) -> RecoveryDecision:
+    if (decision.observation.reason is RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE
+            and decision.block_reason is not BlockReasonCode.MANAGED_WORKTREE_CONFLICT):
+        raise ValueError('final conflict assessment is plan scoped')
+    if (decision.block_reason is BlockReasonCode.MANAGED_WORKTREE_CONFLICT
+            and (decision.observation.reason is not RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE
+                 or decide(decision.observation).action is not RecoveryAction.FINAL_BLOCK)):
+        raise ValueError('final conflict block requires a current route assessment')
     condition_wait = (decision.disposition is RecoveryDisposition.CONDITION_WAIT
         and decision.observation.reason is RecoveryReason.COMMON_DEFECT
         and decision.block_reason is BlockReasonCode.COMMON_DEFECT_PENDING)

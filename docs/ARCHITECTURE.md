@@ -1067,7 +1067,35 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 | 수동 준비·제출의 게시 중단 | 아래의 소유 intent·후보·원격 OID·후속 계보로 게시 사실을 재확인한다. 완료 receipt는 보존하며 제거된 후보를 새 lease·대체 후보로 다시 게시하지 않는다. |
 
 
-복구 관측은 안정적인 원인 code와 repository·plan ID·phase·plan/base revision·진단 fingerprint·진전 marker를 기록한다. 복구 disposition은 `transient_retry`·`state_reconcile`·`agent_correction`·`user_action_required`이며 차단 scope와 별도로 판단한다. 원인별 같은 실행의 시도 한도에 도달하면 작업을 보존해 일시 중단하고, 최종 사용자 조치 판정에만 원인 code로 scope를 결합한다. 최종 차단 transaction은 판정의 repository·plan·원인 일치를 검증하며 복구 횟수·마지막 안정 revision·남은 불확실성·실제 조치 대상을 보존한다. 일시 중단은 차단용 게시·알림을 만들지 않고, 최종 차단의 게시·알림은 [차단 작업의 원격 반영과 보존](#차단-작업의-원격-반영과-보존)을 따른다.
+복구 관측은 안정적인 원인 code와 repository·plan ID·phase·plan/base revision·진단 fingerprint·진전 marker를 기록한다. 복구 disposition은 `transient_retry`·`state_reconcile`·`agent_correction`·`condition_wait`·`user_action_required`이며 차단 scope와 별도로 판단한다. 원인별 같은 실행의 시도 한도에 도달하면 작업을 보존해 일시 중단하고, 최종 사용자 조치 판정에만 원인 code로 scope를 결합한다. 최종 차단 transaction은 판정의 repository·plan·원인 일치를 검증하며 복구 횟수·마지막 안정 revision·남은 불확실성·실제 조치 대상을 보존한다. 일시 중단은 차단용 게시·알림을 만들지 않고, 최종 차단의 게시·알림은 [차단 작업의 원격 반영과 보존](#차단-작업의-원격-반영과-보존)을 따른다.
+
+rebase 교정 묶음의 소진은 `recovery_records`에 `rebase_conflict/condition_wait/pause`로 저장한다. 대기 fingerprint는 현재 구현 조건·소유 target/원래 HEAD·충돌 stages의 지문, 실행 base·PR URL/head·충돌 복구 head/base OID와 checkpoint·소유 rebase service·원본 byte reader의 가용성에 결합하며, 별도 progress marker는 파일 내용·staged diff·operation 위치·autostash를 구별한다. Worker 진입은 저장된 결과를 먼저 소비하고 진행 중 turn이 없는 동일 대기에서는 새 turn·Agent 호출을 만들지 않는다. session·재시작·시간 경과만으로 지문을 바꾸지 않으며, 실제 입력·파일 진전·복구 자원이 달라지면 기존 소유권·실행 gate에서 다시 판단한다. 파일별 복원 결과의 `paths`에서 `skipped_user_changes`를 뺀 실제 적용 범위가 있어야 재작업으로 전환한다.
+
+PR 복구 선택은 `selected_execution` 안에서 대상 계획의 원본만 수정한다. 해당 계획의 실제 conflict block이 저장됐고 프로젝트 안전 차단이 없으면 실패 반환을 프로젝트 중단으로 전파하지 않으며, 선택 context 밖에서 차단 계획을 hydrate해 독립 작업의 대표 투영을 덮지 않는다. 로컬 사전조건·marker 또는 journal 경로가 미확정이면 `git_input_uncertain/condition_wait/pause`와 원래 진단만 저장한다. 기록 transaction은 관측한 branch/worktree·PR URL/head·충돌 복구 OID가 현재 계획과 같은지 검사하며, 원인 operation과 checkpoint의 operation·원래 HEAD·target을 지문에 결합한다. 대상이 바뀌면 `remote_snapshot_race`로 거부하고 오래된 진단을 새 대상에 덮지 않는다.
+
+충돌 PR 선택은 적격 후보를 우선순위·계획 ID 순으로 순회하고 복구 하나를 시작하면 끝낸다. 선택 호출이 실제로 새 대기 generation을 기록했을 때만 로컬 입력 대기 반환을 소비하고 다음 후보로 넘어간다. 실제 계획별 충돌 차단도 프로젝트 안전 차단이 없으면 다음 후보를 확인한다. 과거 대기 row만으로 새 오류를 숨기지 않으며 프로젝트 안전 차단·그 밖의 오류는 즉시 상위 결과로 전달한다. 일반 실행 재개는 이미 선택에서 처리한 로컬 PR 대기와 같은 차단 PR을 다시 부착하지 않는다. 대기 PR 관측은 PR이 연결된 충돌 차단 계획을 포함하되 OPEN에서는 원인별 재평가에 맡기고 Merge·Close만 기존 원격 전이 소유 경계로 전달한다. 이 반환 소비는 rebase 완료·예약 회수·검증 성공을 만들지 않는다. 현재 operation의 소유권 근거가 일치하지 않으면 `workspace_ownership_uncertain`의 별도 안전 경계를 유지한다.
+
+충돌 최종 판정의 입력 계약은 `RecoveryObservation.conflict_evidence`와 기존 `unavailable_recovery_routes`다. 원인 코드·횟수·차단 scope만으로는 `managed_conflict_unrecoverable`을 최종 차단하지 않으며, 다른 원인에서 conflict block으로 override하거나 충돌 판정을 프로젝트 차단으로 넓히는 것도 거부한다. 저장 경계와 실제 차단 transaction은 같은 계획·현재 PR·소유 checkpoint를 다시 대조한다.
+
+| 근거 필드 | 필수 형식과 결합 |
+|---|---|
+| `version` | bool을 제외한 정수 `1` |
+| `repository`, `base_branch`, `plan_revision`, `pr_url`, `branch`, `worktree`, `worker_session` | 비어 있지 않은 문자열. 등록 origin/base와 계획의 개정·PR·작업 공간·Worker 세션에 정확히 일치 |
+| `head_oid`, `base_oid`, `checkpoint_head` | 소문자 16진수 40자리 또는 64자리 전체 Git OID. 저장 PR/head·충돌 복구 OID와 checkpoint의 관측 원격·target·원래 HEAD에 일치 |
+| `operation`, `checkpoint_generation` | `rebase`와 bool을 제외한 양의 정수. 현재 checkpoint operation/generation에 일치 |
+| `conflict_paths` | 하나 이상의 안전한 저장소 상대 경로 문자열. 기존 rebase 경로 검사를 재사용 |
+| `worktree_snapshot` | `GitSnapshot`으로 역직렬화 가능한 문자열. 실제 차단 직전 관측의 HEAD·branch·index·dirty·operation과 일치 |
+| `attempted_routes` | 정확히 `worker_correction`, `file_restore_rework`, `revalidation`의 결과·적용 불가 사유를 비어 있지 않은 문자열로 기록. 재검증 성공을 합성하지 않음 |
+| `release_conditions` | 하나 이상의 비어 있지 않은 재평가 조건 문자열 |
+| `unavailable_recovery_routes` | 기존 `reobservation`, `retry`, `correction`, `condition_wait`, `next_run`, `safe_recovery` 여섯 경로 각각의 비어 있지 않은 불가 사유 |
+
+소유 PR rebase의 Worker는 `pr_conflict_unrecoverable` 관측으로 문제·충돌 경로·세 가지 시도 결과·여섯 자동 경로의 불가 사유·재평가 조건을 보고할 수 있다. 각 설명은 2,000자, 경로는 128개, 재평가 조건은 8개 이내이며 기존 전체 JSON 크기 제한과 안전한 상대 경로 검사를 적용한다. 이 결과에는 완료 게시 필드를 허용하지 않으며 저장된 완료 경계에서도 stage 전에 거부한다. Manager는 현재 실행 조건·소유권과 실제 unmerged 경로를 대조하고 파일별 복원을 먼저 시도한다. 실제 적용 경로가 있으면 재작업하며, 복원 checkpoint가 staged이고 모든 충돌 경로가 사용자 변경 보존으로 제외된 경우에만 의미 관측과 현재 PR·checkpoint를 결합한다. 복원 미적용·자원 부재·입력 변경·잠금은 최종 근거를 만들지 않는다.
+
+최종 생산자는 현재 원격 PR을 두 번 관측하고 fetched base·소유 checkpoint·충돌 지문과 파일 진전을 대조한다. 검증을 실행할 수 없는 unmerged 상태는 재검증 성공 대신 적용 불가로 기록한다. Git 관측과 차단용 snapshot 수집은 SQLite 쓰기 transaction 밖에서 수행한다. 실제 차단 transaction에서 원본·checkpoint·선택 snapshot 필드를 재검사하고 근거 저장과 계획 차단을 함께 반영한다. 실패하면 둘 다 rollback하며 이미 열린 호출자 transaction에서는 최종 판정을 보류한다. managed conflict는 근거의 checkpoint generation을 유지하고 metadata 입력 차단의 별도 checkpoint 영수증을 추가하지 않는다.
+
+완전한 근거만 기존 `final_evidence` JSON에 보존하며 DB schema를 추가하지 않는다. outbox의 현재성 검사는 이 근거를 현재 계획·PR·checkpoint와 대조하고, 충돌 사건에는 그 근거를 action identity에도 결합한다. 원격 head/base 변경이나 mergeable 관측은 관련 recovery record와 해당 block의 보존 snapshot만 대기로 보류한다. 원래 최종 근거·차단·checkpoint·이미 전송한 조각과 독립 원인의 recovery record는 유지한다. 기존 조각별 재검사·취소가 미전송분을 중단하며 원격 head를 소유 근거 없이 채택하거나 차단 해제를 합성하지 않는다. 이 계약은 복구 소유자가 공급한 근거의 검증 경계이며, 진단 문구나 실패 횟수에서 불가 사유를 생성하지 않는다.
+
+현재 `managed_conflict_unrecoverable/final_block`의 자동 재평가는 정규화·Git 쓰기 전에 근거의 PR/checkpoint 현재성, 관련 문서 입력 fingerprint와 저장한 작업물 snapshot의 HEAD·branch·index·dirty·operation을 비교한다. 모두 같으면 새 교정으로 넘기지 않으며 독립 ref 변경은 이 비교에 포함하지 않는다. 실제 입력 변화 또는 기존 원격 관측에 의한 평가 보류는 현재 소유 rebase 검사로 이어진다. 명시적 로컬 복구 요청은 `conflict` 원인으로 기록하며 `metadata`·`verify` 소비와 구분한다. 접수 snapshot의 차단 원인·내용·해제 지문·checkpoint generation을 대조하고 소유권·원격·실행 자리·dependency를 재확인한 뒤 요청 소비와 해당 차단 해제를 같은 transaction에서 반영한다. 중단·경합은 둘 다 보존하고 성공한 요청을 새 차단에 재사용하지 않는다. 재개는 기존 artifact 감사와 진행 operation을 보존하며 검증 성공이나 rebase 완료를 합성하지 않는다.
 
 일반적인 PLAN_BLOCKED는 계획·원래 활성 sources의 내용 해시를 기준으로 재평가한다. 닫힌 PR은 같은 PR reopen을 요구한다. 과거 파일 승인 대기는 일반 작업·소유권 검사를 통과하면 기록을 보존한 채 재개한다. 독립 차단·planning 오류·실패 감사는 함께 지우지 않는다. planning_error는 실제 교정·재검증·게시 복구로 원인이 해소된 뒤에만 지운다. cleanup_pending과 ExecPlan archive pending은 상태 전이를 만들지 않는다.
 

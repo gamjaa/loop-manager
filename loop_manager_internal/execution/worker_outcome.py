@@ -30,6 +30,7 @@ class WorkerOutcome:
     plan_id: str = ""
     start_head: str = ""
     commit_title: str = ""
+    conflict_assessment: dict[str, object] | None = None
 
     def evidence(self) -> dict[str, object]:
         return {
@@ -82,6 +83,29 @@ def parse_worker_outcome(
     if not isinstance(value, dict):
         raise WorkerOutcomeError("Worker 결과 선언은 JSON 객체여야 합니다.")
     kind = value.get("kind")
+    if kind == 'pr_conflict_unrecoverable':
+        from loop_manager_internal.recovery.recovery_runtime import unavailable_routes_complete
+        from loop_manager_internal.git.managed_rebase_validation import _safe_path
+        if (set(value) != {'kind', 'problem', 'conflict_paths', 'attempted_routes',
+                          'unavailable_recovery_routes', 'release_conditions'} or _PUBLICATION.search(message)):
+            raise WorkerOutcomeError('PR 충돌 관측은 완료·checkpoint·사용자 질문과 혼합할 수 없습니다.')
+        problem = _required_text(value['problem'], 'problem')
+        paths = value['conflict_paths']
+        attempts = value['attempted_routes']
+        releases = value['release_conditions']
+        if (not isinstance(paths, list) or not 1 <= len(paths) <= 128
+                or any(not isinstance(path, str) or not _safe_path(path) for path in paths)
+                or len(set(paths)) != len(paths)
+                or not isinstance(attempts, dict)
+                or set(attempts) != {'worker_correction', 'file_restore_rework', 'revalidation'}
+                or not unavailable_routes_complete(value['unavailable_recovery_routes'])
+                or not isinstance(releases, list) or not 1 <= len(releases) <= 8):
+            raise WorkerOutcomeError('PR 충돌 관측의 파일·시도 경로·불가 사유·재평가 조건이 유효하지 않습니다.')
+        for key, text in {**attempts, **value['unavailable_recovery_routes']}.items():
+            _required_text(text, key)
+        for text in releases:
+            _required_text(text, 'release_condition')
+        return WorkerOutcome(kind, problem=problem, conflict_assessment=value)
     if kind == "common_defect_pending":
         from loop_manager_internal.execution.common_defect_report import parse_report
         try:
@@ -160,4 +184,15 @@ def worker_outcome_instruction() -> str:
         '"plan_id":"선택 G-ID","start_head":"이번 호출 시작 HEAD"} 와 '
         'COMMIT_TITLE: 구체적인 보존점 제목만 반환하라. PR_SUMMARY·TARGETED_TESTS와 '
         '완료 성공을 합성하지 마라. Manager가 종료·범위 검사 후 commit·게시한다.'
+        ' 소유 PR의 rebase 충돌에서만 안전한 자동 경로가 모두 불가능하다는 실제 관측을 '
+        'WORKER_OUTCOME: {"kind":"pr_conflict_unrecoverable","problem":"원인",'
+        '"conflict_paths":["실제 충돌 파일"],"attempted_routes":{"worker_correction":"실제 시도와 결과",'
+        '"file_restore_rework":"원본 복원/재작업의 관측","revalidation":"재검증 결과 또는 적용 불가 사유"},'
+        '"unavailable_recovery_routes":{"reobservation":"불가 근거","retry":"불가 근거",'
+        '"correction":"불가 근거","condition_wait":"대기할 자원이 없는 근거",'
+        '"next_run":"재시작으로 바뀌지 않는 근거","safe_recovery":"안전 복구 불가 근거"},'
+        '"release_conditions":["원인별 재평가 조건"]} 로 보고할 수 있다. '
+        '이 보고는 관측이며 Manager의 차단 결정이 아니다. 횟수 소진·사용 한도·조회 실패·잠금·'
+        '종료 불명만으로 보고하지 말고, 성공·질문·publication 선언을 섞지 마라. '
+        'Manager가 현재 입력·소유권과 파일 복원/재작업 가능성을 재검사한다.'
     )

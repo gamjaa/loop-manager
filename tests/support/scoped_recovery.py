@@ -161,6 +161,14 @@ class CurrentRebaseBlockFixture(RebaseBlockFixture):
         RecoveryRepository(self.connection).observe(RecoveryObservation(
             RecoveryReason.REBASE_CONFLICT, 'repo', 'G-047', 'WORKING',
             'old-revision', 'old-base', 'conflict', 'old-progress', detail), correction_limit=1)
+        # Model a persisted block from the old counter-based policy. Current
+        # observations pause instead and must not be used to create this fixture.
+        self.connection.execute(
+            "UPDATE recovery_records SET pending_action='final_block', "
+            "disposition='user_action_required', final_evidence=? "
+            "WHERE repo='repo' AND subject='G-047'",
+            (json.dumps({'block_reason_code': BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value}),),
+        )
         snapshot = loop_manager.GitSnapshot('partial', None,
             {'app.py': ('M 100644 manual 2',)},
             {'app.py': (('unstaged',), 'unresolved-content')},

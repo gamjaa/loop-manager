@@ -32,6 +32,23 @@ def parse(message):
 
 
 class WorkerOutcomeTests(unittest.TestCase):
+    def test_pr_conflict_assessment_is_an_observation_with_bounded_complete_routes(self):
+        from tests.support.worker import conflict_report
+        outcome = parse(conflict_report())
+        self.assertEqual(outcome.kind, 'pr_conflict_unrecoverable')
+        self.assertEqual(outcome.conflict_assessment['conflict_paths'], ['app.py'])
+        self.assertIn('pr_conflict_unrecoverable', worker_outcome_instruction())
+        for invalid in (conflict_report() + '\nCOMMIT_TITLE: premature',
+                        conflict_report() + '\nTARGETED_TESTS: PASS',
+                        conflict_report(question='invented approval'),
+                        conflict_report(conflict_paths=['../outside']),
+                        conflict_report(conflict_paths=['app.py', 'app.py']),
+                        conflict_report(attempted_routes={'worker_correction': 'failed'}),
+                        conflict_report(unavailable_recovery_routes={'retry': 'exhausted'}),
+                        conflict_report(release_conditions=[])):
+            with self.subTest(invalid=invalid), self.assertRaises(WorkerOutcomeError):
+                parse(invalid)
+
     def test_common_correction_wait_requires_a_report_and_never_changes_a_real_question(self):
         report = ('COMMON_DEFECT_REPORT: {"problem":"shared failure","scope":"outside selected work",'
                   '"evidence":"traceback","locations":[{"path":"shared.py","line":1}]}')

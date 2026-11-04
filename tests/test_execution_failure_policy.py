@@ -22,6 +22,60 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_conflict_report_cannot_stage_through_a_saved_completion_boundary(self):
+        from tests.support.worker import conflict_report
+        context = self.context()
+        self.effects.workspace.git.reset_mock()
+        with mock.patch.object(self.handler, '_record_rebase_suboperation') as stage:
+            outcome = self.handler._finish_worker(context, self.state.row(), conflict_report())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        stage.assert_not_called()
+        self.effects.workspace.git.assert_not_called()
+        self.effects.validation.parse_worker_result.assert_not_called()
+
+    def test_fresh_conflict_assessment_uses_the_owner_path_without_publication_validation(self):
+        from tests.support.worker import conflict_report
+        message = conflict_report()
+        self._save_rebase_worker_result(message)
+        current = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.handler.rebase_corrections.abandon_turn('repo', 'G-047', expected_generation=current.generation)
+        self.connection.commit()
+        self.state.update_project('repo', pr_conflict_recovery=1)
+        def report(*args, **options):
+            self.agent(*args, **options)
+            return lm.AgentResult(0, message, session_id='session')
+        self.effects.agent.run_agent.side_effect = report
+        with mock.patch.object(self.handler, '_rebase_conflict',
+                return_value=ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE)) as assess:
+            result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(assess.call_args.kwargs['assessment']['kind'], 'pr_conflict_unrecoverable')
+        self.effects.agent.run_agent.assert_called_once()
+        self.effects.validation.parse_worker_result.assert_not_called()
+
+    def test_saved_conflict_assessment_rechecks_inputs_without_a_second_agent_or_publication_claim(self):
+        from tests.support.worker import conflict_report
+        message = conflict_report()
+        self._save_rebase_worker_result(message)
+        self.state.update_project('repo', pr_conflict_recovery=1)
+        self.handler.rebase_corrections = type(self.handler.rebase_corrections)(self.connection)
+        with mock.patch.object(self.handler, '_rebase_conflict',
+                return_value=ExecutionOutcome(ExecutionOutcomeKind.TRANSIENT_PAUSE)) as assess:
+            result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(assess.call_args.kwargs['assessment']['kind'], 'pr_conflict_unrecoverable')
+        self.assertEqual(self.state.row()['worker_result'], message)
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.parse_worker_result.assert_not_called()
+
+    def test_conflict_assessment_cannot_be_used_outside_owned_pr_rebase(self):
+        from tests.support.worker import conflict_report
+        from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
+        outcome = self.handler._parse_worker_outcome(self.context(), conflict_report())
+        with self.assertRaises(WorkerOutcomeError):
+            self.handler._worker_handler()._report_conflict_assessment(self.context(), conflict_report(), outcome, None)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
     def test_published_legacy_dirty_rejection_preserves_journal_for_restored_files(self):
         self._legacy_rebase_false_block_recovery(
             plan_block=True, rejected='unstaged', published_checkpoint=True,
@@ -91,7 +145,7 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         self.effects.validation.verify.assert_not_called()
 
 
-    def test_format_error_then_three_abnormal_results_reach_safety_gate(self):
+    def test_format_error_then_three_abnormal_results_pause_without_final_block(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -129,8 +183,11 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
             context, 'abnormal exit', corrected=True,
             worker_result='same abnormal result', abnormal_result=True,
         )
-        self.assertEqual(final.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(final.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
         self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 4)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
+        self.assertEqual(self.state.row()['worker_session_id'], 'same-session')
 
 
     def test_saved_worker_result_finishes_after_restart_without_second_agent_turn(self):

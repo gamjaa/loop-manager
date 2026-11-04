@@ -19,6 +19,79 @@ from tests.support.database import runtime_connection
 
 
 class RecoveryRepositoryTests(unittest.TestCase):
+    def test_conflict_dispatch_observes_outside_write_and_rolls_back_failed_owner_commit(self):
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        observed = prepared_conflict_assessment(connection, 'repo', 'G-047')
+        connection.commit()
+        repository = RecoveryRepository(connection)
+        def interrupted(*_args, **options):
+            self.assertFalse(connection.in_transaction)
+            with runtime_state._transaction(connection):
+                repository.observe(options['recovery_decision'].observation)
+                raise RuntimeError('owner commit interrupted')
+        dispatcher = RecoveryDispatcher(connection, interrupted, mock.Mock())
+        with self.assertRaisesRegex(RuntimeError, 'owner commit interrupted'):
+            dispatcher.apply(observed, worktree=Path('/state/G-047'), repo_path=Path('/repo'),
+                             revision='base', verify_result='')
+        self.assertIsNone(repository.row('repo', 'G-047'))
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'IMPLEMENTING')
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0], 0)
+
+    def test_conflict_dispatch_defers_inside_a_callers_transaction_without_git_or_commit(self):
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        observed = prepared_conflict_assessment(connection, 'repo', 'G-047')
+        connection.commit()
+        blocked = mock.Mock(side_effect=AssertionError('Git observation under write transaction'))
+        dispatcher = RecoveryDispatcher(connection, blocked, blocked)
+        connection.execute('BEGIN')
+        result = dispatcher.apply(observed, worktree=Path('/state/G-047'), repo_path=Path('/repo'),
+                                  revision='base', verify_result='')
+        self.assertEqual(result.action, RecoveryAction.PAUSE)
+        self.assertTrue(connection.in_transaction)
+        blocked.assert_not_called()
+        connection.rollback()
+        self.assertIsNone(RecoveryRepository(connection).row('repo', 'G-047'))
+
+    def test_final_conflict_evidence_is_preserved_only_for_current_pr_and_owned_checkpoint(self):
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        observed = prepared_conflict_assessment(connection, 'repo', 'G-047')
+        repository = RecoveryRepository(connection)
+        final = repository.observe(observed)
+        self.assertEqual(final.decision.action, RecoveryAction.FINAL_BLOCK)
+        self.assertEqual(final.final_evidence['conflict_evidence'], observed.conflict_evidence)
+        self.assertEqual(final.final_evidence['unavailable_recovery_routes'], observed.unavailable_recovery_routes)
+        from loop_manager_internal.recovery.block_service import _final_block_recovery_decision
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertIs(_final_block_recovery_decision(connection, 'repo', plan, 'WORKING',
+            BlockReasonCode.MANAGED_WORKTREE_CONFLICT, observed.detail, observed.fingerprint, final.decision), final.decision)
+        for field in ('pr_head_oid', 'pr_conflict_base_oid', 'worktree', 'worker_session_id', 'current_revision_sha'):
+            with self.subTest(field=field):
+                original = connection.execute(f'SELECT {field} FROM exec_plans').fetchone()[0]
+                connection.execute(f'UPDATE exec_plans SET {field}=?', ('changed',))
+                paused = repository.observe(observed)
+                self.assertEqual(paused.decision.action, RecoveryAction.PAUSE)
+                self.assertIsNone(paused.final_evidence)
+                connection.execute(f'UPDATE exec_plans SET {field}=?', (original,))
+        checkpoints = ExecutionCheckpointRepository(connection)
+        saved = checkpoints.get('repo', 'G-047')
+        checkpoints.record('repo', 'G-047', expected_generation=saved.generation,
+            operation=saved.operation, expected_head=saved.expected_head, target_base_oid=saved.target_base_oid,
+            observed_remote_oid=saved.observed_remote_oid, snapshot={'new': 'resource input'})
+        self.assertEqual(repository.observe(observed).decision.action, RecoveryAction.PAUSE)
+        with self.assertRaises(RecoveryStateConflict):
+            _final_block_recovery_decision(connection, 'repo', plan, 'WORKING',
+                BlockReasonCode.MANAGED_WORKTREE_CONFLICT, observed.detail, observed.fingerprint, final.decision)
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'IMPLEMENTING')
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0], 0)
+
     def test_retired_git_failure_resolves_without_resetting_audit_or_other_causes(self):
         observation = RecoveryObservation(
             RecoveryReason.AGENT_SCOPE_VIOLATION, 'repo', 'G-042', 'WORKING',
@@ -180,7 +253,7 @@ class RecoveryRepositoryTests(unittest.TestCase):
             "plan-sha", "base-sha", fingerprint, progress, "conflict remains",
         )
 
-    def test_occurrence_progress_cas_and_final_evidence_survive_repository_restart(self):
+    def test_occurrence_progress_cas_and_budget_pause_survive_repository_restart(self):
         first = self.repository.observe(self.observation())
         self.assertEqual(first.decision.action, RecoveryAction.CORRECT)
         with self.assertRaises(RecoveryStateConflict):
@@ -196,13 +269,27 @@ class RecoveryRepositoryTests(unittest.TestCase):
             self.observation(), expected_generation=second.generation + 1)
         self.assertEqual(third.decision.occurrence, 3)
         self.assertEqual(third.decision.action, RecoveryAction.CORRECT)
-        final = self.repository.observe(
+        paused = self.repository.observe(
             self.observation(), expected_generation=third.generation)
+        self.assertEqual(paused.decision.action, RecoveryAction.PAUSE)
+        self.assertEqual(paused.decision.occurrence, 4)
+        self.assertIsNone(paused.final_evidence)
+        restarted = RecoveryRepository(self.connection)
+        saved = restarted.row('repo', 'G-042')
+        self.assertEqual(saved['pending_action'], 'pause')
+        self.assertEqual(saved['detail'], 'conflict remains')
+        self.assertEqual(json.loads(saved['recovery_counts'])['rebase_conflict'], 4)
+        self.assertEqual(json.loads(saved['recovery_counts'])['git_lock'], 1)
+
+        # An independent ownership safety failure still retains final evidence;
+        # the correction counter cannot establish this cause on its own.
+        final = restarted.observe(replace(
+            self.observation(), reason=RecoveryReason.OWNERSHIP_UNCERTAIN))
         self.assertEqual(final.decision.action, RecoveryAction.FINAL_BLOCK)
-        self.assertEqual(final.final_evidence["occurrence"], 4)
+        self.assertEqual(final.final_evidence["occurrence"], 1)
         self.assertEqual(final.final_evidence["last_stable_revision"], "base-sha")
         self.assertEqual(final.final_evidence["recovery_attempts"]["git_lock"], 1)
-        self.assertEqual(final.final_evidence["recovery_attempts"]["rebase_conflict"], 3)
+        self.assertEqual(final.final_evidence["recovery_attempts"]["rebase_conflict"], 4)
         progressed = self.repository.observe(self.observation(progress="worker:new-head"))
         self.assertEqual(progressed.decision.occurrence, 1)
         self.assertEqual(progressed.decision.action, RecoveryAction.CORRECT)
@@ -593,6 +680,48 @@ class RecoveryRepositoryTests(unittest.TestCase):
         self.assertEqual(decision.action, RecoveryAction.RETRY)
         blocked.assert_not_called()
 
+    def test_exhausted_conflict_preserves_execution_checkpoint_and_has_no_outbox_event(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.activate('repo', 'G-047', activation_sha='base',
+                         branch='loop-manager/G-047', worktree='/state/G-047')
+        connection.execute(
+            "UPDATE exec_plans SET pr_url='https://example.test/pr/1', "
+            "pr_head_oid='remote-head', pr_conflict_recovery=1, "
+            "pr_conflict_head_oid='remote-head', pr_conflict_base_oid='base', "
+            "worker_session_id='saved-worker' WHERE repo='repo' AND plan_id='G-047'"
+        )
+        checkpoints = ExecutionCheckpointRepository(connection)
+        checkpoint = checkpoints.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='original-head', target_base_oid='base',
+            observed_remote_oid='remote-head', snapshot={'stash_oid': 'saved-stash'},
+        )
+        loop_manager.notifications.configure_session(connection, enabled=True)
+        connection.commit()
+        before = dict(connection.execute('SELECT * FROM exec_plans').fetchone())
+        blocked = mock.Mock(side_effect=AssertionError('unexpected final block'))
+        dispatcher = RecoveryDispatcher(connection, blocked, blocked)
+        observation = replace(self.observation(), plan_id='G-047')
+        for _ in range(5):
+            decision = dispatcher.apply(
+                observation, worktree=Path('/state/G-047'), repo_path=Path('/repo'),
+                revision='base', verify_result='', correction_limit=1,
+            )
+            self.assertEqual(decision.action, RecoveryAction.PAUSE)
+        blocked.assert_not_called()
+        self.assertEqual(dict(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
+        self.assertEqual(checkpoints.get('repo', 'G-047'), checkpoint)
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0], 0)
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM project_blocks').fetchone()[0], 0)
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0], 0)
+        saved = RecoveryRepository(connection).row('repo', 'G-047')
+        self.assertEqual((saved['pending_action'], saved['occurrence']), ('pause', 5))
+        self.assertIsNone(saved['final_evidence'])
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -610,6 +739,11 @@ class RebaseCauseResolutionTests(unittest.TestCase):
         observation = RecoveryObservation(RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE, 'repo', 'G-042',
             'WORKING', 'old-input', 'old-base', 'failure', 'old-session-progress', detail)
         self.repository.observe(observation, final_block_reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT)
+        # Saved legacy blocks predate the assessment gate. Keep their release
+        # contract without producing them from the current policy.
+        self.connection.execute("UPDATE recovery_records SET pending_action='final_block', "
+            "disposition='user_action_required', final_evidence=?",
+            (json.dumps({'block_reason_code': BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value}),))
         return {'reason_code': 'managed_worktree_conflict', 'evidence': detail}
 
     def test_current_resolution_closes_only_matching_cause_and_keeps_failure_audit(self):
