@@ -1,6 +1,8 @@
 from tests.support.git import isolated_git_test
 from tests.support.fixed_samples import use_fixed_guidance
 import contextlib
+import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 import sqlite3
@@ -18,6 +20,83 @@ from tests.support.workspace import pin_common_guidance
 from tests.support.profiles import use_empty_provider_home
 
 
+
+
+def _collect_bootstrap_costs(state, records):
+    """Forward complete owned events once before the fixture directory disappears."""
+    from loop_manager_internal.verification.timing import _current_writer
+
+    writer = _current_writer.get()
+    complete = True
+    try:
+        paths = sorted((state / 'bootstrap-costs').glob('*.jsonl'))
+        if not paths:
+            complete = False
+        for path in paths:
+            try:
+                with path.open('rb') as stream:
+                    for line in stream:
+                        if not line.endswith(b'\n'):
+                            complete = False
+                            break
+                        try:
+                            text = line.decode('utf-8')
+                            event = json.loads(text)
+                            if (not isinstance(event, dict) or not isinstance(event.get('pid'), int)
+                                    or not isinstance(event.get('at'), (int, float))
+                                    or not isinstance(event.get('kind'), str)
+                                    or event.get('kind') not in {'phase_start', 'phase_end', 'git_cost', 'git_cost_incomplete'}
+                                    or (event['kind'].startswith('phase_') and not isinstance(event.get('name'), str))
+                                    or (event['kind'] == 'git_cost' and not all(
+                                        isinstance(event.get(key), (int, float)) for key in ('count', 'seconds')))):
+                                raise ValueError('invalid event')
+                        except (UnicodeError, ValueError):
+                            complete = False
+                            continue
+                        records.append(event)
+                        if writer is not None:
+                            writer.stream.write(text)
+            except (OSError, UnicodeError, ValueError):
+                complete = False
+        if writer is not None:
+            writer.stream.flush()
+    except (OSError, UnicodeError, ValueError):
+        complete = False
+    if not complete:
+        print('bootstrap cost collection incomplete', file=sys.stderr)
+    if writer is not None:
+        # Keep the raw events in the parent journal; a text sidecar exposes the
+        # nested view without making its events eligible for parent aggregation.
+        try:
+            from loop_manager_internal.verification.timing import diagnostic
+            with tempfile.TemporaryDirectory(dir=writer.path.parent) as directory:
+                path = Path(directory) / 'events.jsonl'
+                path.write_text(''.join(json.dumps(event, ensure_ascii=False) + '\n' for event in records),
+                                encoding='utf-8')
+                detail = diagnostic(Path(directory)).splitlines()[1:]
+                nested_summary = (Path(directory) / 'summary.json').read_text(encoding='utf-8')
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', prefix='bootstrap-cost-',
+                                             suffix='.txt', dir=writer.path.parent, delete=False) as report:
+                summary_path = Path(report.name).with_suffix('.json')
+                summary_path.write_text(nested_summary, encoding='utf-8')
+                report.write(f'raw events: {writer.path.name}\n')
+                report.write(f'nested summary: {summary_path.name}\n')
+                report.write(f'collection: {"complete" if complete else "incomplete"}\n')
+                report.write('\n'.join(detail) + '\n')
+            print(f'bootstrap cost diagnostic: {report.name}', file=sys.stderr)
+        except Exception:
+            print('bootstrap cost diagnostic unavailable', file=sys.stderr)
+    return complete
+
+
+def _track_bootstrap_costs(cleanup, state):
+    records, collected = [], []
+    def collect():
+        if not collected:
+            collected.append(_collect_bootstrap_costs(state, records))
+        return collected[0]
+    cleanup.callback(collect)
+    return records, collect
 
 
 @isolated_git_test
@@ -40,6 +119,14 @@ class BootstrapSavedScopeFixture(unittest.TestCase):
         return subprocess.CompletedProcess(command, output.exit_code, output)
 
 
+    def _assert_bootstrap_costs(self, records, collect_costs, attempts, interrupted_registration):
+        self.assertTrue(collect_costs(), 'bootstrap cost collection incomplete')
+        ends = [event for event in records if event['kind'] == 'phase_end']
+        self.assertEqual(sum(event['name'] == 'bootstrap:parent_cli' for event in ends),
+                         attempts + int(interrupted_registration))
+        self.assertEqual(sum(event['name'] == 'bootstrap:runtime_child_cli' for event in ends), attempts)
+        self.assertTrue(any(event['kind'] == 'git_cost' and event['count'] > 0 for event in records))
+
     def _assert_saved_scope_resume(self, advance_after_selection=False):
         import json
         import shutil
@@ -51,7 +138,6 @@ class BootstrapSavedScopeFixture(unittest.TestCase):
         from tests.support.runtime import record_saved_scope_invocation
         from loop_manager_internal.execution.worker_session import SessionBinding
         from loop_manager_internal.planning.planning_workspace import planning_workspace_path
-        from loop_manager_internal.verification.timing import _current_writer
 
         # 공통 bootstrap의 기본·비기본 브랜치와 역할별 저장 상태를 각각 연결한다.
         for base, roles in (('main', ('worker', 'reviewer')), ('develop', ('planner',))):
@@ -61,6 +147,7 @@ class BootstrapSavedScopeFixture(unittest.TestCase):
                     git(source, 'config', 'core.longpaths', 'true')
                     state = Path(directory) / 'state'
                     state.mkdir()
+                    records, collect_costs = _track_bootstrap_costs(cleanup, state)
                     copy_manager_import_fixture(source)
                     # Keep bootstrap, identity, SQLite, scope and dispatch real.
                     # Optional source-fact prompt enrichment has no assertion
@@ -276,20 +363,4 @@ class BootstrapSavedScopeFixture(unittest.TestCase):
                         # A later parent must dispatch again, using the same SHA
                         # in the crash/reuse case or C after the B/C transition.
                         proof_path.unlink()
-                    # Child instrumentation stays in this owned fixture. Forward
-                    # original PID/time values so nested CLI durations aren't
-                    # presented as independent end-to-end time.
-                    records = []
-                    parent_writer = _current_writer.get()
-                    for path in sorted((state / 'bootstrap-costs').glob('*.jsonl')):
-                        contents = path.read_text(encoding='utf-8')
-                        records.extend(json.loads(line) for line in contents.splitlines())
-                        if parent_writer is not None:
-                            parent_writer.stream.write(contents)
-                    if parent_writer is not None:
-                        parent_writer.stream.flush()
-                    ends = [event for event in records if event['kind'] == 'phase_end']
-                    self.assertEqual(sum(event['name'] == 'bootstrap:parent_cli' for event in ends),
-                                     attempts + int(interrupted_registration))
-                    self.assertEqual(sum(event['name'] == 'bootstrap:runtime_child_cli' for event in ends), attempts)
-                    self.assertTrue(any(event['kind'] == 'git_cost' and event['count'] > 0 for event in records))
+                    self._assert_bootstrap_costs(records, collect_costs, attempts, interrupted_registration)

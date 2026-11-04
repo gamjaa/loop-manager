@@ -399,6 +399,248 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
 
 
 class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
+    def test_bootstrap_cost_collection_survives_child_and_proof_outcomes(self):
+        import json
+        from types import SimpleNamespace
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+        from loop_manager_internal.verification.timing import EventWriter
+
+        event = {'kind': 'phase_start', 'name': 'bootstrap:parent_cli', 'phase_id': 'p',
+                 'pid': 123, 'at': 10, 'utc': 'original', 'clock_domain': 'test'}
+        child = {**event, 'name': 'bootstrap:runtime_child_cli', 'pid': 456}
+        for outcome in ('success', 'timeout', 'error', 'proof'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as resources:
+                writer = resources.enter_context(contextlib.closing(EventWriter(Path(root) / 'parent.jsonl')))
+                state_path = None
+                with writer.activate(), mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected process')):
+                    try:
+                        with tempfile.TemporaryDirectory(dir=root) as directory, contextlib.ExitStack() as cleanup:
+                            state_path = Path(directory)
+                            costs = state_path / 'bootstrap-costs'
+                            costs.mkdir()
+                            (costs / '123.jsonl').write_text(json.dumps(event) + '\n', encoding='utf-8')
+                            (costs / '456.jsonl').write_text(json.dumps(child) + '\n', encoding='utf-8')
+                            records, collect = _track_bootstrap_costs(cleanup, state_path)
+                            result = SimpleNamespace(exit_code=0)
+                            effect = RuntimeError('child error') if outcome == 'error' else (None, outcome == 'timeout', result)
+                            with mock.patch('loop_manager_internal.execution.verify_process.run_verify_process', side_effect=effect if isinstance(effect, Exception) else None, return_value=effect):
+                                BootstrapSavedScopeFixture()._run_child(state_path, state_path / 'manager', state_path, state_path / 'config')
+                            if outcome == 'proof':
+                                raise AssertionError('proof failure')
+                            self.assertTrue(collect())
+                            self.assertEqual(records, [event, child])
+                    except (AssertionError, RuntimeError) as exc:
+                        self.assertNotEqual(outcome, 'success')
+                        if outcome == 'error':
+                            self.assertEqual(str(exc), 'child error')
+                        elif outcome == 'proof':
+                            self.assertEqual(str(exc), 'proof failure')
+                        else:
+                            self.assertIn(str(result), str(exc))
+                    else:
+                        self.assertEqual(outcome, 'success')
+                self.assertFalse(state_path.exists())
+                self.assertEqual([json.loads(line) for line in writer.path.read_text().splitlines()], [event, child])
+
+    def test_bootstrap_cost_collection_preserves_complete_lines_and_limits(self):
+        import io
+        import json
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+        from loop_manager_internal.verification.timing import EventWriter
+
+        event = {'kind': 'phase_start', 'name': 'bootstrap:parent_cli', 'phase_id': 'p',
+                 'pid': 123, 'at': 10, 'utc': 'original', 'clock_domain': 'test'}
+        for case in ('missing', 'partial', 'json', 'read', 'no_writer'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as resources:
+                root = Path(directory)
+                costs = root / 'bootstrap-costs'
+                costs.mkdir()
+                path = costs / '123.jsonl'
+                if case != 'missing':
+                    path.write_bytes((json.dumps(event) + '\n').encode() +
+                                     (b'{partial' if case == 'partial' else b'{bad}\n' if case == 'json' else b''))
+                writer = resources.enter_context(contextlib.closing(EventWriter(root / 'parent.jsonl')))
+                stderr = io.StringIO()
+                original_open = Path.open
+                def open_file(target, *args, **kwargs):
+                    if case == 'read' and target == path:
+                        raise OSError('read failed')
+                    return original_open(target, *args, **kwargs)
+                with contextlib.redirect_stderr(stderr), mock.patch.object(Path, 'open', open_file):
+                    with (writer.activate() if case != 'no_writer' else contextlib.nullcontext()):
+                        with self.assertRaisesRegex(RuntimeError, 'original failure'):
+                            with contextlib.ExitStack() as cleanup:
+                                records, collect = _track_bootstrap_costs(cleanup, root)
+                                raise RuntimeError('original failure')
+                expected = [event] if case in ('partial', 'json', 'no_writer') else []
+                self.assertEqual(records, expected)
+                self.assertEqual([json.loads(line) for line in writer.path.read_text().splitlines()],
+                                 expected if case != 'no_writer' else [])
+                self.assertEqual('collection incomplete' in stderr.getvalue(), case != 'no_writer')
+
+    def test_malformed_cost_kind_preserves_original_exception_and_later_events(self):
+        import io
+        import json
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+        from loop_manager_internal.verification.timing import EventWriter
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            costs = root / 'bootstrap-costs'
+            costs.mkdir()
+            before = {'kind': 'phase_start', 'name': 'before', 'pid': 1, 'at': 1}
+            after = {'kind': 'phase_start', 'name': 'after', 'pid': 2, 'at': 2}
+            later = {'kind': 'phase_start', 'name': 'later', 'pid': 3, 'at': 3}
+            malformed = [{'pid': 1, 'at': 1, 'kind': []}, {'pid': 1, 'at': 1, 'kind': {}}]
+            (costs / '1.jsonl').write_text(''.join(json.dumps(event) + '\n'
+                for event in (before, *malformed, after)), encoding='utf-8')
+            (costs / '2.jsonl').write_text(json.dumps(later) + '\n', encoding='utf-8')
+            writer = EventWriter(root / 'parent.jsonl')
+            stderr = io.StringIO()
+            with contextlib.closing(writer), writer.activate(), contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(RuntimeError, 'original error'):
+                    with contextlib.ExitStack() as cleanup:
+                        records, collect = _track_bootstrap_costs(cleanup, root)
+                        raise RuntimeError('original error')
+                self.assertFalse(collect())
+            self.assertEqual(records, [before, after, later])
+            self.assertEqual([json.loads(line) for line in writer.path.read_text().splitlines()], records)
+            self.assertIn('bootstrap cost collection incomplete', stderr.getvalue())
+
+    def test_bootstrap_cost_normal_checks_require_complete_and_expected_records(self):
+        import json
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+
+        parent = {'kind': 'phase_end', 'name': 'bootstrap:parent_cli', 'pid': 1, 'at': 1}
+        child = {'kind': 'phase_end', 'name': 'bootstrap:runtime_child_cli', 'pid': 2, 'at': 2}
+        cost = {'kind': 'git_cost', 'pid': 2, 'at': 3, 'count': 1, 'seconds': 0.1}
+        fixture = BootstrapSavedScopeFixture()
+        for scenario in ('complete', 'partial', 'missing_parent', 'missing_child', 'missing_git'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                costs = state / 'bootstrap-costs'
+                costs.mkdir()
+                events = [parent, child, cost]
+                if scenario.startswith('missing_'):
+                    events.remove({'missing_parent': parent, 'missing_child': child, 'missing_git': cost}[scenario])
+                (costs / '1.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in events)
+                    + ('{' if scenario == 'partial' else ''), encoding='utf-8')
+                with contextlib.ExitStack() as cleanup:
+                    records, collect = _track_bootstrap_costs(cleanup, state)
+                    if scenario == 'complete':
+                        fixture._assert_bootstrap_costs(records, collect, 1, False)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            fixture._assert_bootstrap_costs(records, collect, 1, False)
+
+    def test_collected_incomplete_phase_keeps_unknown_elapsed_in_diagnostic(self):
+        import json
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+        from loop_manager_internal.verification.timing import EventWriter, diagnostic, summarize
+
+        for domain in (None, 'foreign'):
+            with self.subTest(domain=domain), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = root / 'state'
+                costs = state / 'bootstrap-costs'
+                costs.mkdir(parents=True)
+                output = root / 'output'
+                output.mkdir()
+                event = {'kind': 'phase_start', 'name': 'bootstrap:parent_cli',
+                         'phase_id': 'original', 'pid': 123, 'at': 10}
+                if domain is not None:
+                    event['clock_domain'] = domain
+                (costs / '123.jsonl').write_text(json.dumps(event) + '\n', encoding='utf-8')
+                writer = EventWriter(output / 'worker.jsonl')
+                with contextlib.closing(writer), writer.activate(), contextlib.ExitStack() as cleanup:
+                    records, collect = _track_bootstrap_costs(cleanup, state)
+                    self.assertTrue(collect())
+                    self.assertEqual(records, [event])
+                active = summarize(output, now=20)['active']
+                self.assertEqual(len(active), 1)
+                self.assertIsNone(active[0]['elapsed'])
+                self.assertEqual(active[0]['pid'], 123)
+                self.assertIn('미완료 경과 시간 미확인: bootstrap:parent_cli', diagnostic(output))
+
+    def test_collected_costs_are_accessible_without_polluting_parent_run(self):
+        import io
+        import json
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+        from loop_manager_internal.verification.timing import EventWriter, summarize
+
+        for nested_id in (None, 'other-run'):
+            with self.subTest(nested_id=nested_id), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / 'diagnostic'
+                output.mkdir()
+                (output / 'manifest.json').write_text(json.dumps({'run_id': 'parent'}), encoding='utf-8')
+                parent = EventWriter(output / 'runner.jsonl', identity={'run_id': 'parent'}, clock=lambda: 10)
+                parent.emit('run_start')
+                parent.emit('run_end', passed=False)
+                parent.close()
+                active = {'kind': 'phase_start', 'name': 'bootstrap:parent_cli', 'phase_id': 'open',
+                          'pid': 123, 'at': 1, 'clock_domain': 'foreign'}
+                end = {'kind': 'phase_end', 'name': 'bootstrap:runtime_child_cli', 'phase_id': 'done',
+                       'pid': 456, 'at': 2, 'start': 1, 'duration': 1, 'result': 'complete'}
+                cost = {'kind': 'git_cost', 'pid': 456, 'at': 2, 'count': 1, 'seconds': 1}
+                events = [active, end, cost]
+                if nested_id is not None:
+                    for event in events:
+                        event['run_id'] = nested_id
+                stderr = io.StringIO()
+                writer = EventWriter(output / 'worker.jsonl', identity={'run_id': 'parent'})
+                with contextlib.closing(writer), writer.activate(), contextlib.redirect_stderr(stderr):
+                    with tempfile.TemporaryDirectory(dir=root) as directory, contextlib.ExitStack() as cleanup:
+                        state = Path(directory)
+                        costs = state / 'bootstrap-costs'
+                        costs.mkdir()
+                        (costs / '123.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in events)
+                                                         + '{partial', encoding='utf-8')
+                        records, collect = _track_bootstrap_costs(cleanup, state)
+                        self.assertFalse(collect())
+                        self.assertEqual(records, events)
+                    self.assertFalse(state.exists())
+                self.assertEqual([json.loads(line) for line in (output / 'worker.jsonl').read_text().splitlines()], events)
+                reports = list(output.glob('bootstrap-cost-*.txt'))
+                self.assertEqual(len(reports), 1)
+                report = reports[0].read_text(encoding='utf-8')
+                self.assertIn(str(reports[0]), stderr.getvalue())
+                self.assertIn('raw events: worker.jsonl', report)
+                self.assertIn('collection: incomplete', report)
+                self.assertIn('미완료 경과 시간 미확인: bootstrap:parent_cli', report)
+                nested = json.loads(reports[0].with_suffix('.json').read_text(encoding='utf-8'))
+                self.assertIsNone(nested['active'][0]['elapsed'])
+                self.assertEqual(nested['active'][0]['pid'], 123)
+                summary = summarize(output, now=20)
+                self.assertEqual(summary['active'], [])
+                self.assertEqual(summary['phases'], [])
+                self.assertEqual(summary['git_commands'], [])
+                self.assertFalse(summary['result']['passed'])
+                self.assertEqual(summary['elapsed_seconds'], 0)
+
+    def test_nested_cost_diagnostic_error_preserves_original_exception(self):
+        import io
+        import json
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+        from loop_manager_internal.verification.timing import EventWriter
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            costs = root / 'bootstrap-costs'
+            costs.mkdir()
+            event = {'kind': 'phase_start', 'name': 'bootstrap:parent_cli', 'pid': 123, 'at': 1}
+            (costs / '123.jsonl').write_text(json.dumps(event) + '\n', encoding='utf-8')
+            writer = EventWriter(root / 'parent.jsonl')
+            stderr = io.StringIO()
+            with (contextlib.closing(writer), writer.activate(), contextlib.redirect_stderr(stderr),
+                  mock.patch('loop_manager_internal.verification.timing.diagnostic', side_effect=RuntimeError('unavailable'))):
+                with self.assertRaisesRegex(RuntimeError, 'original error'):
+                    with contextlib.ExitStack() as cleanup:
+                        _track_bootstrap_costs(cleanup, root)
+                        raise RuntimeError('original error')
+            self.assertEqual(json.loads(writer.path.read_text()), event)
+            self.assertIn('bootstrap cost diagnostic unavailable', stderr.getvalue())
+
     def test_saved_scope_setup_combines_git_isolation_and_fixed_guidance(self):
         import os
         from loop_manager_internal.agents import common_guidance
