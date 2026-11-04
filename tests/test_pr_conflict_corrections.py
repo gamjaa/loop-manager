@@ -266,9 +266,9 @@ class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
 
 @isolated_git_test
 class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
-    def test_worker_failure_blocks_after_three_corrections_and_stays_blocked(self):
-        # Retry/block policy uses supplied conflict observations. Real conflict
-        # and marker preservation after blocking remain in publication recovery.
+    def test_worker_failure_pauses_after_three_corrections_without_repeating_same_inputs(self):
+        # Supplied conflict observations exercise real handlers and SQLite.
+        # Exhausting a correction batch pauses without claiming final evidence.
         fixture = execution_policy_fixture(self, pr_conflict=True)
         roles = []
         def failed_agent(*args, **_kwargs):
@@ -283,26 +283,22 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
         agent.side_effect = failed_agent
         first = run_execution_policy(fixture)
         second = run_execution_policy(fixture)
-        blocked_plan = fixture.connection.execute(
-            'SELECT * FROM exec_plans WHERE repo = ?', (fixture.repo,),
-        ).fetchone()
-        loop_manager.hydrate_execplan_project(fixture.connection, fixture.repo, blocked_plan)
-        project = fixture.connection.execute(
-            'SELECT * FROM projects WHERE repo = ?', (fixture.repo,),
-        ).fetchone()
-        with mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected policy process')):
-            self.assertEqual(loop_manager.reconcile_existing_pull_request(
-                fixture.connection, Path(fixture.repo), Path('/state'), fixture.repo, project,
-                self._pull_request('loop-manager/G-047', 'https://example.test/pr/26',
-                                   'remote', 'CONFLICTING')), 1)
         stored = fixture.connection.execute(
             "SELECT status, pr_conflict_recovery, pr_conflict_head_oid, "
             "worker_session_id, reviewer_session_id FROM exec_plans WHERE repo = ?",
             (fixture.repo,),
         ).fetchone()
-        self.assertEqual(first.kind, loop_manager.ProjectRunKind.WAITING)
-        self.assertEqual(second.kind, loop_manager.ProjectRunKind.WAITING)
-        self.assertEqual(stored["status"], "PLAN_BLOCKED")
+        self.assertEqual(first.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+        self.assertEqual(second.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+        self.assertEqual(stored["status"], "IMPLEMENTING")
+        recovery = fixture.connection.execute(
+            'SELECT reason_code, disposition, pending_action FROM recovery_records WHERE repo=? AND subject=?',
+            (fixture.repo, 'G-047'),
+        ).fetchone()
+        self.assertEqual(tuple(recovery), ('rebase_conflict', 'condition_wait', 'pause'))
+        self.assertEqual(fixture.connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0], 0)
+        self.assertEqual(fixture.connection.execute('SELECT COUNT(*) FROM project_blocks').fetchone()[0], 0)
+        self.assertEqual(fixture.connection.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0], 0)
         self.assertEqual(stored["pr_conflict_recovery"], 1)
         self.assertEqual(stored["pr_conflict_head_oid"], 'remote')
         self.assertEqual(stored["worker_session_id"], "worker-existing")
