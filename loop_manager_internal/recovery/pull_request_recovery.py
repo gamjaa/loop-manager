@@ -17,6 +17,7 @@ from loop_manager_internal.runtime.contracts import GitLockError
 from loop_manager_internal.runtime.contracts import ManagedWorktreeConflictError
 from loop_manager_internal.runtime.contracts import PROJECT_STEP_PLANNING_PENDING
 from loop_manager_internal.runtime.contracts import PROJECT_STEP_RETRY
+from loop_manager_internal.application.contracts import PROJECT_STEP_TRANSIENT_PAUSE
 from loop_manager_internal.recovery.scoped_blocking import PR_CLOSED_BLOCK_REASON
 from loop_manager_internal.runtime.contracts import PR_CONFLICT_PREFLIGHT_BLOCK_REASON
 from loop_manager_internal.runtime.contracts import PR_CONFLICT_PREFLIGHT_ERROR_PREFIX
@@ -27,7 +28,10 @@ from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage.recovery_state import RecoveryRepository
 from pathlib import Path
+import hashlib
+import json
 import sqlite3
 import sys
 
@@ -74,6 +78,33 @@ class ResumePrConflictRebaseEffects:
     is_git_lock_failure: Callable[..., object]
     operation_print: Callable[..., object]
     update_project: Callable[..., object]
+
+
+def _wait_for_conflict_inputs(connection, repo, project, detail, operation):
+    """Preserve an unproven local conflict without creating a final block."""
+    with runtime_state._transaction(connection):
+        plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND path=?',
+                                  (repo, project['plan_path'])).fetchone()
+        if plan is None:
+            raise recovery_runtime.RecoveryFailure(recovery_runtime.RecoveryReason.GIT_INPUT_UNCERTAIN, detail)
+        if any(plan[key] != project[key] for key in ('branch', 'worktree', 'pr_url', 'pr_head_oid',
+                                                    'pr_conflict_head_oid', 'pr_conflict_base_oid')):
+            raise recovery_runtime.RecoveryFailure(recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                                   'PR 충돌 대기 기록 전에 대상 입력이 변경됐습니다.')
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan['plan_id'])
+        inputs = (operation, plan['branch'], plan['worktree'], plan['pr_url'], plan['pr_head_oid'],
+                  plan['pr_conflict_head_oid'], plan['pr_conflict_base_oid'],
+                  checkpoint.operation, checkpoint.expected_head, checkpoint.target_base_oid)
+        fingerprint = hashlib.sha256(json.dumps(inputs, separators=(',', ':')).encode()).hexdigest()
+        observation = recovery_runtime.RecoveryObservation(
+            reason=recovery_runtime.RecoveryReason.GIT_INPUT_UNCERTAIN, repo=repo, plan_id=plan['plan_id'],
+            phase=plan['status'], plan_revision=plan['current_revision_sha'] or plan['plan_sha'],
+            base_revision=plan['pr_conflict_base_oid'] or plan['active_sha'], fingerprint=fingerprint,
+            progress_marker=fingerprint, detail=detail, operation=operation)
+        RecoveryRepository(connection).observe(observation)
+        runtime_state.RuntimeStateRepository(connection).update_plan(
+            repo, plan['plan_id'], plan_values={'last_error': detail}, enqueue=False)
+    return PROJECT_STEP_TRANSIENT_PAUSE
 
 
 def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects,
@@ -425,11 +456,10 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
                 WorkspaceOwnershipError,
             ) as error:
                 recovery_error = f"PR_OPEN 충돌 복구 소유권 검증 실패: {error}"
-                reason = (
-                    BlockReasonCode.MANAGED_WORKTREE_CONFLICT
-                    if isinstance(error, ManagedWorktreeConflictError)
-                    else BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN
-                )
+                if isinstance(error, ManagedWorktreeConflictError):
+                    effects.operation_print(recovery_error, file=sys.stderr)
+                    return _wait_for_conflict_inputs(
+                        connection, repo, project, recovery_error, 'pr_conflict_preflight')
                 effects.block_active_execplan_from_revision(
                     connection,
                     repo_path,
@@ -437,7 +467,7 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
                     f"refs/remotes/origin/{project['base_branch']}",
                     recovery_error,
                     str(project["verify_result"] or ""),
-                    reason=reason,
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                     blocked_reason=PR_CONFLICT_PREFLIGHT_BLOCK_REASON,
                 )
                 effects.operation_print(recovery_error, file=sys.stderr)
@@ -653,16 +683,8 @@ def resume_pr_conflict_rebase(effects: ResumePrConflictRebaseEffects,
         or not observed_head
     ):
         error = "PR 충돌 복구 rebase marker 또는 관측 OID가 유효하지 않습니다."
-        effects.block_active_execplan(
-            connection,
-            repo,
-            worktree,
-            error,
-            str(project["verify_result"] or ""),
-            reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-        )
         effects.operation_print(error, file=sys.stderr)
-        return 1
+        return _wait_for_conflict_inputs(connection, repo, project, error, 'pr_conflict_marker')
 
     state_dir = effects._owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
     rebase_retry_pending = False
@@ -671,13 +693,8 @@ def resume_pr_conflict_rebase(effects: ResumePrConflictRebaseEffects,
     ).get(repo, str(plan['plan_id']))
     if state_dir is None and checkpoint_record.operation == 'rebase':
         error = 'PR 충돌 복구 rebase journal workspace가 없습니다.'
-        effects.block_active_execplan(
-            connection, repo, worktree, error,
-            str(project['verify_result'] or ''),
-            reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-        )
         effects.operation_print(error, file=sys.stderr)
-        return 1
+        return _wait_for_conflict_inputs(connection, repo, project, error, 'pr_conflict_journal')
     if state_dir is not None:
         try:
             effects._finish_owned_direct_rebase(
@@ -705,7 +722,7 @@ def resume_pr_conflict_rebase(effects: ResumePrConflictRebaseEffects,
             effects.block_active_execplan(
                 connection, repo, worktree, detail,
                 str(project['verify_result'] or ''),
-                reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
+                reason=BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
             )
             effects.operation_print(detail, file=sys.stderr)
             return 1

@@ -20,6 +20,57 @@ from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCh
 
 
 class WaitingPrConflictResultTests(AutomationCatalogFixture, unittest.TestCase):
+    def test_stale_preflight_diagnosis_does_not_replace_new_workspace_inputs(self):
+        from loop_manager_internal.recovery.pull_request_recovery import _wait_for_conflict_inputs
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        connection = self._connection()
+        self._insert_plan(connection, 'G-001', 'PR_OPEN')
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.hydrate('repo', 'G-001')
+        previous = runtime_state.project_row(connection, 'repo')
+        runtime.update_plan('repo', 'G-001', plan_values={'worktree': '/new-owned', 'last_error': 'new cause'})
+        with self.assertRaises(RecoveryFailure) as rejected:
+            _wait_for_conflict_inputs(connection, 'repo', previous, 'old cause', 'pr_conflict_preflight')
+        self.assertEqual(rejected.exception.reason, RecoveryReason.REMOTE_SNAPSHOT_RACE)
+        self.assertEqual(runtime.get('repo', 'G-001').last_error, 'new cause')
+        self.assertIsNone(RecoveryRepository(connection).row('repo', 'G-001'))
+
+    def test_local_preflight_wait_allows_independent_projection_but_old_wait_does_not_hide_an_error(self):
+        from loop_manager_internal.recovery.pull_request_recovery import _wait_for_conflict_inputs
+        connection = self._connection()
+        self._insert_plan(connection, 'G-001', 'PR_OPEN')
+        self._insert_plan(connection, 'G-002', 'VERIFYING')
+        connection.execute("UPDATE exec_plans SET branch='loop/G-001', pr_url='https://example/pr/1' "
+                           "WHERE plan_id='G-001'")
+        connection.execute('UPDATE projects SET max_tasks_per_project=2')
+        connection.commit()
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.hydrate('repo', 'G-002')
+        before = dict(connection.execute('SELECT * FROM projects').fetchone())
+        plan = connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
+        def wait(_connection, _root, _state, repo, project, _pr):
+            return _wait_for_conflict_inputs(connection, repo, project,
+                                            'preserved local changes', 'pr_conflict_preflight')
+        reconcile = mock.Mock(side_effect=wait)
+        effects = waiting_pr_service.SelectWaitingPullRequestConflictEffects(
+            loop_manager.active_execplan, loop_manager.hydrate_execplan_project, reconcile)
+        observation = loop_manager.WaitingPullRequestObservation(((plan, {}),), False)
+        result = waiting_pr_service.select_waiting_pull_request_conflict(
+            effects, connection, Path('/repo'), Path('/state'), 'repo', observation)
+        self.assertIsNone(result.step_result)
+        reconcile.assert_called_once()
+        self.assertFalse(result.conflict_started)
+        self.assertEqual(dict(connection.execute('SELECT * FROM projects').fetchone()), before)
+        self.assertEqual(runtime.get('repo', 'G-001').status, 'PR_OPEN')
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0], 0)
+        effects = waiting_pr_service.SelectWaitingPullRequestConflictEffects(
+            loop_manager.active_execplan, loop_manager.hydrate_execplan_project,
+            mock.Mock(return_value=loop_manager.PROJECT_STEP_TRANSIENT_PAUSE))
+        result = waiting_pr_service.select_waiting_pull_request_conflict(
+            effects, connection, Path('/repo'), Path('/state'), 'repo', observation)
+        self.assertEqual(result.step_result, loop_manager.PROJECT_STEP_TRANSIENT_PAUSE)
+
     def test_plan_conflict_result_preserves_independent_projection_and_pending_rebase(self):
         for project_safety_block in (False, True):
             with self.subTest(project_safety_block=project_safety_block):
@@ -115,6 +166,25 @@ class WaitingPrConflictResultTests(AutomationCatalogFixture, unittest.TestCase):
 
 
 class ProjectServiceCompositionTests(unittest.TestCase):
+    def test_resume_existing_execution_does_not_repeat_local_preflight_wait(self):
+        from loop_manager_internal.recovery.pull_request_recovery import _wait_for_conflict_inputs
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE exec_plans SET status='PR_OPEN', branch='loop/G-047', pr_url='https://example/pr/1'")
+        connection.commit()
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.hydrate('repo', 'G-047')
+        _wait_for_conflict_inputs(connection, 'repo', runtime_state.project_row(connection, 'repo'),
+                                  'preserved local changes', 'pr_conflict_preflight')
+        effects = SimpleNamespace(pr_for_branch=mock.Mock(), reconcile_existing_pull_request=mock.Mock())
+        service = project_service.ProjectService(effects, project_service.ProjectIdentity(connection,
+            Path('/state'), 'repo', Path('/config.ini'), None, False, None, True, None, 20, 600, None))
+        service.state.repo = 'repo'
+        service.state.row = connection.execute('SELECT * FROM projects').fetchone()
+        self.assertIsNone(service._resume_existing_execution())
+        effects.pr_for_branch.assert_not_called()
+        effects.reconcile_existing_pull_request.assert_not_called()
+
     def test_resume_existing_execution_leaves_local_conflict_to_cause_specific_recheck(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)

@@ -730,6 +730,13 @@ class ProjectService:
         if scheduler is not None and self.state.repo in scheduler.draining_projects:
             return None
         projected = runtime_state.RuntimeStateRepository(self.identity.connection).projected(self.state.repo)
+        if projected is not None and projected.status == 'PR_OPEN':
+            pending = RecoveryRepository(self.identity.connection).row(self.state.repo, projected.plan_id)
+            if (pending is not None and pending['reason_code'] == recovery_runtime.RecoveryReason.GIT_INPUT_UNCERTAIN.value
+                    and pending['pending_action'] == 'pause' and pending['phase'] == 'PR_OPEN'
+                    and pending['detail'] == projected.last_error
+                    and scoped_blocking.project_block(self.identity.connection, self.state.repo) is None):
+                return None  # The PR selection already preserved this local wait.
         if (projected is not None and projected.status == 'PLAN_BLOCKED'
                 and scoped_blocking.project_block(self.identity.connection, self.state.repo) is None):
             block = scoped_blocking.plan_block(self.identity.connection, self.state.repo, projected.plan_id)

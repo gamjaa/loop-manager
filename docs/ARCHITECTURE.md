@@ -1071,7 +1071,9 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 
 rebase 교정 묶음의 소진은 `recovery_records`에 `rebase_conflict/condition_wait/pause`로 저장한다. 대기 fingerprint는 현재 구현 조건·소유 target/원래 HEAD·충돌 stages의 지문, 실행 base·PR URL/head·충돌 복구 head/base OID와 checkpoint·소유 rebase service·원본 byte reader의 가용성에 결합하며, 별도 progress marker는 파일 내용·staged diff·operation 위치·autostash를 구별한다. Worker 진입은 저장된 결과를 먼저 소비하고 진행 중 turn이 없는 동일 대기에서는 새 turn·Agent 호출을 만들지 않는다. session·재시작·시간 경과만으로 지문을 바꾸지 않으며, 실제 입력·파일 진전·복구 자원이 달라지면 기존 소유권·실행 gate에서 다시 판단한다. 파일별 복원 결과의 `paths`에서 `skipped_user_changes`를 뺀 실제 적용 범위가 있어야 재작업으로 전환한다.
 
-PR 복구 선택은 `selected_execution` 안에서 대상 계획의 원본만 수정한다. 해당 계획의 실제 conflict block이 저장됐고 프로젝트 안전 차단이 없으면 실패 반환을 프로젝트 중단으로 전파하지 않으며, 선택 context 밖에서 차단 계획을 hydrate해 독립 작업의 대표 투영을 덮지 않는다. 일반 실행 재개도 같은 차단 PR을 다시 부착하지 않는다. 대기 PR 관측은 PR이 연결된 충돌 차단 계획을 포함하되 OPEN에서는 원인별 재평가에 맡기고 Merge·Close만 기존 원격 전이 소유 경계로 전달한다. 이 반환 소비는 rebase 완료·예약 회수·검증 성공을 만들지 않는다.
+PR 복구 선택은 `selected_execution` 안에서 대상 계획의 원본만 수정한다. 해당 계획의 실제 conflict block이 저장됐고 프로젝트 안전 차단이 없으면 실패 반환을 프로젝트 중단으로 전파하지 않으며, 선택 context 밖에서 차단 계획을 hydrate해 독립 작업의 대표 투영을 덮지 않는다. 로컬 사전조건·marker 또는 journal 경로가 미확정이면 `git_input_uncertain/condition_wait/pause`와 원래 진단만 저장한다. 기록 transaction은 관측한 branch/worktree·PR URL/head·충돌 복구 OID가 현재 계획과 같은지 검사하며, 원인 operation과 checkpoint의 operation·원래 HEAD·target을 지문에 결합한다. 대상이 바뀌면 `remote_snapshot_race`로 거부하고 오래된 진단을 새 대상에 덮지 않는다.
+
+선택 호출이 실제로 새 대기 generation을 기록했을 때만 그 대기 반환을 독립 진행으로 소비한다. 과거 대기 row만으로 새 오류를 숨기지 않는다. 일반 실행 재개는 이미 선택에서 처리한 로컬 PR 대기와 같은 차단 PR을 다시 부착하지 않는다. 대기 PR 관측은 PR이 연결된 충돌 차단 계획을 포함하되 OPEN에서는 원인별 재평가에 맡기고 Merge·Close만 기존 원격 전이 소유 경계로 전달한다. 이 반환 소비는 rebase 완료·예약 회수·검증 성공을 만들지 않는다. 현재 operation의 소유권 근거가 일치하지 않으면 `workspace_ownership_uncertain`의 별도 안전 경계를 유지한다.
 
 일반적인 PLAN_BLOCKED는 계획·원래 활성 sources의 내용 해시를 기준으로 재평가한다. 닫힌 PR은 같은 PR reopen을 요구한다. 과거 파일 승인 대기는 일반 작업·소유권 검사를 통과하면 기록을 보존한 채 재개한다. 독립 차단·planning 오류·실패 감사는 함께 지우지 않는다. planning_error는 실제 교정·재검증·게시 복구로 원인이 해소된 뒤에만 지운다. cleanup_pending과 ExecPlan archive pending은 상태 전이를 만들지 않는다.
 
