@@ -1955,6 +1955,103 @@ class TelegramEntityTransportTest(unittest.TestCase):
 class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
     repo = '/projects/alpha'
 
+    def _conflict_notice(self, *, detail=None):
+        from dataclasses import replace
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        connection = self.connection()
+        with connection:
+            observed = prepared_conflict_assessment(connection, self.repo, 'G-018')
+            if detail is not None:
+                observed = replace(observed, detail=detail)
+            RecoveryRepository(connection).observe(observed)
+            RuntimeStateRepository(connection).block_plan(self.repo, 'G-018',
+                reason_code='managed_worktree_conflict', evidence=observed.detail, release_fingerprint='input')
+            checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            checkpoints.finish_unpublished(checkpoints.get(self.repo, 'G-018'), 'local-only', retryable=False)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        return connection, observed
+
+    def test_confirmed_conflict_queues_one_notice_with_preserved_context_and_no_invented_action(self):
+        connection, observed = self._conflict_notice()
+        self.assertEqual(len(self.events(connection)), 1)
+        with connection:
+            RecoveryRepository(connection).observe(observed)
+            notifications.enqueue_current_project_events(connection, self.repo)
+            notifications.enqueue_current_project_events(connection, self.repo)
+        self.assertEqual(len(self.events(connection)), 1)
+        adapter = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 1)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        text = adapter.call_args.args[2]
+        for expected in ('자동 복구 불가', observed.conflict_evidence['pr_url'], 'src/app.py',
+                         '재평가 조건', '/state/G-018', 'saved-worker'):
+            self.assertIn(expected, text)
+        for invented in ('reset', 'force push', '사용자 조치:'):
+            self.assertNotIn(invented, text)
+
+    def test_changed_conflict_inputs_cancel_pending_notice_without_adopting_remote_head(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.recovery import waiting_pr_service
+        for changed in ('stored_head', 'checkpoint', 'observed_head', 'base', 'mergeable', 'replacement_record'):
+            with self.subTest(changed=changed):
+                connection, observed = self._conflict_notice()
+                before = dict(self.events(connection)[0])
+                proof = observed.conflict_evidence
+                original_checkpoint = tuple(connection.execute('SELECT * FROM execution_checkpoints').fetchone())
+                with connection:
+                    if changed == 'stored_head':
+                        connection.execute('UPDATE exec_plans SET pr_head_oid=?', ('e' * 40,))
+                    elif changed == 'checkpoint':
+                        connection.execute('UPDATE execution_checkpoints SET generation=generation+1')
+                    elif changed == 'replacement_record':
+                        from dataclasses import replace
+                        RecoveryRepository(connection).observe(replace(observed,
+                            reason=RecoveryReason.STATE_UNSAFE, detail='Independent shared cause',
+                            conflict_evidence=None, unavailable_recovery_routes=None))
+                        independent = dict(RecoveryRepository(connection).row(self.repo, 'G-018'))
+                if changed in ('observed_head', 'base', 'mergeable', 'replacement_record'):
+                    effects = waiting_pr_service.ObserveWaitingPullRequestsEffects(
+                        _block_closed_pull_request=mock.Mock(), _recorded_base_fetch=mock.Mock(),
+                        _resume_reopened_pull_request=mock.Mock(),
+                        classify_pull_request_mergeability=mock.Mock(return_value='mergeable' if changed == 'mergeable' else 'conflicting'),
+                        complete_merged_execplan_worktree=mock.Mock(), operation_log=mock.Mock(), operation_print=mock.Mock(),
+                        base_head=mock.Mock(return_value='f' * 40 if changed == 'base' else proof['base_oid']),
+                        pr_for_branch=mock.Mock(return_value={'state': 'OPEN', 'url': proof['pr_url'],
+                            'headRefName': proof['branch'], 'baseRefName': 'main',
+                            'headRefOid': 'e' * 40 if changed in ('observed_head', 'replacement_record') else proof['head_oid']}))
+                    waiting_pr_service.observe_waiting_pull_requests(effects, connection, Path('/repo'), Path('/state'), self.repo)
+                    self.assertEqual(connection.execute('SELECT pr_head_oid FROM exec_plans').fetchone()[0], proof['head_oid'])
+                    self.assertEqual(tuple(connection.execute('SELECT * FROM execution_checkpoints').fetchone()), original_checkpoint)
+                    if changed == 'replacement_record':
+                        self.assertEqual(dict(RecoveryRepository(connection).row(self.repo, 'G-018')), independent)
+                    else:
+                        self.assertEqual(RecoveryRepository(connection).row(self.repo, 'G-018')['pending_action'], 'pause')
+                adapter = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+                adapter.assert_not_called()
+                after = self.events(connection)[0]
+                self.assertIsNotNone(after['canceled_at'])
+                self.assertEqual(after['payload'], before['payload'])
+                self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+
+    def test_conflict_reassessment_between_pieces_preserves_sent_audit_and_cancels_remainder(self):
+        connection, observed = self._conflict_notice(detail='Confirmed unrecoverable input. ' * 250)
+        before = dict(self.events(connection)[0])
+        def send(_token, _chat, _text):
+            with connection:
+                RecoveryRepository(connection).defer_conflict_assessment(self.repo, 'G-018')
+        adapter = mock.Mock(side_effect=send)
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        adapter.assert_called_once()
+        after = self.events(connection)[0]
+        self.assertEqual(after['confirmed_pieces'], 1)
+        self.assertIsNotNone(after['canceled_at'])
+        self.assertEqual(after['payload'], before['payload'])
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=adapter), 0)
+        self.assertEqual(json.loads(RecoveryRepository(connection).row(self.repo, 'G-018')['final_evidence'])['conflict_evidence'],
+                         observed.conflict_evidence)
+
     def test_same_status_needs_concrete_current_question_before_one_notice(self):
         connection = self.connection()
         with connection:

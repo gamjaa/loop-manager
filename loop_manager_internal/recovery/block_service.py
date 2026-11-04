@@ -334,6 +334,10 @@ def _final_block_recovery_decision(
             observation, final_block_reason=reason,
         ).decision
     recovery_runtime.require_final(decision)
+    if (reason is BlockReasonCode.MANAGED_WORKTREE_CONFLICT
+            and not recovery_state.conflict_evidence_current(connection, repo, str(plan['plan_id']),
+                                                             decision.observation.conflict_evidence)):
+        raise recovery_state.RecoveryStateConflict('final conflict assessment changed before blocking')
     if decision.block_reason != reason or decision.observation.repo != repo or decision.observation.plan_id != str(plan["plan_id"]):
         raise ValueError("recovery decision and block target disagree")
     return decision

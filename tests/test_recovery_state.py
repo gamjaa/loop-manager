@@ -19,6 +19,42 @@ from tests.support.database import runtime_connection
 
 
 class RecoveryRepositoryTests(unittest.TestCase):
+    def test_final_conflict_evidence_is_preserved_only_for_current_pr_and_owned_checkpoint(self):
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        observed = prepared_conflict_assessment(connection, 'repo', 'G-047')
+        repository = RecoveryRepository(connection)
+        final = repository.observe(observed)
+        self.assertEqual(final.decision.action, RecoveryAction.FINAL_BLOCK)
+        self.assertEqual(final.final_evidence['conflict_evidence'], observed.conflict_evidence)
+        self.assertEqual(final.final_evidence['unavailable_recovery_routes'], observed.unavailable_recovery_routes)
+        from loop_manager_internal.recovery.block_service import _final_block_recovery_decision
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertIs(_final_block_recovery_decision(connection, 'repo', plan, 'WORKING',
+            BlockReasonCode.MANAGED_WORKTREE_CONFLICT, observed.detail, observed.fingerprint, final.decision), final.decision)
+        for field in ('pr_head_oid', 'pr_conflict_base_oid', 'worktree', 'worker_session_id', 'current_revision_sha'):
+            with self.subTest(field=field):
+                original = connection.execute(f'SELECT {field} FROM exec_plans').fetchone()[0]
+                connection.execute(f'UPDATE exec_plans SET {field}=?', ('changed',))
+                paused = repository.observe(observed)
+                self.assertEqual(paused.decision.action, RecoveryAction.PAUSE)
+                self.assertIsNone(paused.final_evidence)
+                connection.execute(f'UPDATE exec_plans SET {field}=?', (original,))
+        checkpoints = ExecutionCheckpointRepository(connection)
+        saved = checkpoints.get('repo', 'G-047')
+        checkpoints.record('repo', 'G-047', expected_generation=saved.generation,
+            operation=saved.operation, expected_head=saved.expected_head, target_base_oid=saved.target_base_oid,
+            observed_remote_oid=saved.observed_remote_oid, snapshot={'new': 'resource input'})
+        self.assertEqual(repository.observe(observed).decision.action, RecoveryAction.PAUSE)
+        with self.assertRaises(RecoveryStateConflict):
+            _final_block_recovery_decision(connection, 'repo', plan, 'WORKING',
+                BlockReasonCode.MANAGED_WORKTREE_CONFLICT, observed.detail, observed.fingerprint, final.decision)
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'IMPLEMENTING')
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0], 0)
+
     def test_retired_git_failure_resolves_without_resetting_audit_or_other_causes(self):
         observation = RecoveryObservation(
             RecoveryReason.AGENT_SCOPE_VIOLATION, 'repo', 'G-042', 'WORKING',
@@ -666,6 +702,11 @@ class RebaseCauseResolutionTests(unittest.TestCase):
         observation = RecoveryObservation(RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE, 'repo', 'G-042',
             'WORKING', 'old-input', 'old-base', 'failure', 'old-session-progress', detail)
         self.repository.observe(observation, final_block_reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT)
+        # Saved legacy blocks predate the assessment gate. Keep their release
+        # contract without producing them from the current policy.
+        self.connection.execute("UPDATE recovery_records SET pending_action='final_block', "
+            "disposition='user_action_required', final_evidence=?",
+            (json.dumps({'block_reason_code': BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value}),))
         return {'reason_code': 'managed_worktree_conflict', 'evidence': detail}
 
     def test_current_resolution_closes_only_matching_cause_and_keeps_failure_audit(self):

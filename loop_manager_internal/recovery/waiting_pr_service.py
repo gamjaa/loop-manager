@@ -202,6 +202,17 @@ def observe_waiting_pull_requests(
                 and stored['blocked_reason'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value):
             # Remote terminal transitions remain observable. OPEN is not proof
             # of recovery; the cause-specific recheck owns admission/release.
+            from loop_manager_internal.notifications.policy import block_recovery
+            recovery = block_recovery(connection, repo, str(stored['plan_id']), 'plan')
+            if (recovery is not None and recovery['reason_code'] == RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value
+                    and recovery['pending_action'] == 'final_block'):
+                base_oid = effects.base_head(repo_path, registered_base) if effects.base_head else None
+                if ((head_oid and head_oid != stored['pr_head_oid'])
+                        or (base_oid and base_oid != stored['pr_conflict_base_oid'])
+                        or effects.classify_pull_request_mergeability(pull_request) == 'mergeable'):
+                    with connection:
+                        recovery_state.RecoveryRepository(connection).defer_conflict_assessment(repo, str(stored['plan_id']))
+                        notifications.enqueue_current_project_events(connection, repo)
             continue
         from loop_manager_internal.recovery.work_branch_integration import published_branch
         if effects.git is not None and published_branch(connection, repo, stored):

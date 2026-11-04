@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import sqlite3
 import uuid
@@ -12,6 +12,7 @@ from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 from loop_manager_internal.recovery.recovery_runtime import (
     RecoveryAction, RecoveryDecision, RecoveryObservation, RecoveryReason, decide,
+    conflict_evidence_complete,
 )
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 
@@ -81,6 +82,32 @@ CREATE TABLE IF NOT EXISTS review_correction_turns (
 
 MAX_REVIEW_CORRECTIONS_PER_RUN = 3
 RETRY_DELAY_SECONDS = 30
+
+
+def conflict_evidence_current(connection, repo, plan_id, evidence) -> bool:
+    """Bind the assessment to the same durable PR, workspace and owned intent."""
+    if not conflict_evidence_complete(evidence):
+        return False
+    tables = {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('projects','exec_plans','execution_checkpoints')")}
+    if len(tables) != 3:
+        return False
+    plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
+    project = connection.execute('SELECT origin,base_branch FROM projects WHERE repo=?', (repo,)).fetchone()
+    checkpoint = connection.execute('SELECT * FROM execution_checkpoints WHERE repo=? AND plan_id=?',
+                                    (repo, plan_id)).fetchone()
+    return bool(plan is not None and project is not None and checkpoint is not None
+        and plan['status'] in {'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING', 'PLAN_BLOCKED'}
+        and plan['workspace_owned'] == 1 and plan['pr_conflict_recovery'] == 1
+        and project['origin'] == evidence['repository'] and project['base_branch'] == evidence['base_branch']
+        and (plan['current_revision_sha'] or plan['plan_sha']) == evidence['plan_revision']
+        and all(plan[key] == evidence[proof] for key, proof in (
+            ('branch', 'branch'), ('worktree', 'worktree'), ('pr_url', 'pr_url'),
+            ('pr_head_oid', 'head_oid'), ('pr_conflict_head_oid', 'head_oid'),
+            ('pr_conflict_base_oid', 'base_oid'), ('worker_session_id', 'worker_session')))
+        and all(checkpoint[key] == evidence[proof] for key, proof in (
+            ('operation', 'operation'), ('generation', 'checkpoint_generation'),
+            ('expected_head', 'checkpoint_head'), ('target_base_oid', 'base_oid'), ('observed_remote_oid', 'head_oid'))))
 
 
 def block_user_targets(
@@ -303,6 +330,10 @@ class RecoveryRepository:
     ) -> RecoveryRecord:
         """CAS an observation without touching workspace or validation fields."""
 
+        if (observation.reason is RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE
+                and not conflict_evidence_current(self.connection, observation.repo, observation.plan_id,
+                                                 observation.conflict_evidence)):
+            observation = replace(observation, conflict_evidence=None)
         previous = self.row(observation.repo, observation.plan_id)
         generation = int(previous["generation"]) if previous is not None else None
         if expected_generation is not None and generation != expected_generation:
@@ -350,6 +381,8 @@ class RecoveryRepository:
                 evidence["worker_decision"] = observation.worker_decision
             if observation.unavailable_recovery_routes is not None:
                 evidence["unavailable_recovery_routes"] = observation.unavailable_recovery_routes
+            if observation.conflict_evidence is not None:
+                evidence['conflict_evidence'] = observation.conflict_evidence
         values = (
             observation.identity, observation.reason.value,
             decision.disposition.value, decision.action.value,
@@ -423,6 +456,30 @@ class RecoveryRepository:
             "DELETE FROM recovery_records WHERE repo = ? AND subject = ?",
             (repo, self._subject(plan_id)),
         )
+
+    def defer_conflict_assessment(self, repo: str, plan_id: str) -> None:
+        """Invalidate only this assessment; retain its block, artifacts and audit."""
+        saved = self.row(repo, plan_id)
+        if (saved is not None and saved['reason_code'] == RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value
+                and saved['pending_action'] == 'final_block'):
+            changed = self.connection.execute(
+                "UPDATE recovery_records SET pending_action='pause', disposition='condition_wait', "
+                "generation=generation+1, updated_at=CURRENT_TIMESTAMP WHERE repo=? AND subject=? "
+                "AND generation=? AND identity=? AND pending_action='final_block'",
+                (repo, plan_id, saved['generation'], saved['identity']))
+            if changed.rowcount != 1:
+                raise RecoveryStateConflict('conflict assessment changed')
+        block = self.connection.execute('SELECT recovery_snapshot FROM execplan_blocks WHERE repo=? AND plan_id=? '
+            "AND reason_code='managed_worktree_conflict'", (repo, plan_id)).fetchone()
+        try:
+            snapshot = json.loads(block[0]) if block else None
+        except (TypeError, ValueError):
+            snapshot = None
+        if (isinstance(snapshot, dict) and snapshot.get('reason_code') == RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value
+                and snapshot.get('pending_action') == 'final_block'):
+            snapshot['pending_action'] = 'pause'
+            self.connection.execute('UPDATE execplan_blocks SET recovery_snapshot=? WHERE repo=? AND plan_id=? '
+                                    'AND recovery_snapshot=?', (json.dumps(snapshot), repo, plan_id, block[0]))
 
     @staticmethod
     def _retired_git_failure(row):

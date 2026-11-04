@@ -1075,6 +1075,21 @@ PR 복구 선택은 `selected_execution` 안에서 대상 계획의 원본만 �
 
 선택 호출이 실제로 새 대기 generation을 기록했을 때만 그 대기 반환을 독립 진행으로 소비한다. 과거 대기 row만으로 새 오류를 숨기지 않는다. 일반 실행 재개는 이미 선택에서 처리한 로컬 PR 대기와 같은 차단 PR을 다시 부착하지 않는다. 대기 PR 관측은 PR이 연결된 충돌 차단 계획을 포함하되 OPEN에서는 원인별 재평가에 맡기고 Merge·Close만 기존 원격 전이 소유 경계로 전달한다. 이 반환 소비는 rebase 완료·예약 회수·검증 성공을 만들지 않는다. 현재 operation의 소유권 근거가 일치하지 않으면 `workspace_ownership_uncertain`의 별도 안전 경계를 유지한다.
 
+충돌 최종 판정의 입력 계약은 `RecoveryObservation.conflict_evidence`와 기존 `unavailable_recovery_routes`다. 원인 코드·횟수·차단 scope만으로는 `managed_conflict_unrecoverable`을 최종 차단하지 않으며, 다른 원인에서 conflict block으로 override하거나 충돌 판정을 프로젝트 차단으로 넓히는 것도 거부한다. 저장 경계와 실제 차단 transaction은 같은 계획·현재 PR·소유 checkpoint를 다시 대조한다.
+
+| 근거 필드 | 필수 형식과 결합 |
+|---|---|
+| `version` | bool을 제외한 정수 `1` |
+| `repository`, `base_branch`, `plan_revision`, `pr_url`, `branch`, `worktree`, `worker_session` | 비어 있지 않은 문자열. 등록 origin/base와 계획의 개정·PR·작업 공간·Worker 세션에 정확히 일치 |
+| `head_oid`, `base_oid`, `checkpoint_head` | 소문자 16진수 40자리 또는 64자리 전체 Git OID. 저장 PR/head·충돌 복구 OID와 checkpoint의 관측 원격·target·원래 HEAD에 일치 |
+| `operation`, `checkpoint_generation` | `rebase`와 bool을 제외한 양의 정수. 현재 checkpoint operation/generation에 일치 |
+| `conflict_paths` | 하나 이상의 안전한 저장소 상대 경로 문자열. 기존 rebase 경로 검사를 재사용 |
+| `attempted_routes` | 정확히 `worker_correction`, `file_restore_rework`, `revalidation`의 결과·적용 불가 사유를 비어 있지 않은 문자열로 기록. 재검증 성공을 합성하지 않음 |
+| `release_conditions` | 하나 이상의 비어 있지 않은 재평가 조건 문자열 |
+| `unavailable_recovery_routes` | 기존 `reobservation`, `retry`, `correction`, `condition_wait`, `next_run`, `safe_recovery` 여섯 경로 각각의 비어 있지 않은 불가 사유 |
+
+완전한 근거만 기존 `final_evidence` JSON에 보존하며 DB schema를 추가하지 않는다. outbox의 현재성 검사는 이 근거를 현재 계획·PR·checkpoint와 대조하고, 충돌 사건에는 그 근거를 action identity에도 결합한다. 원격 head/base 변경이나 mergeable 관측은 관련 recovery record와 해당 block의 보존 snapshot만 대기로 보류한다. 원래 최종 근거·차단·checkpoint·이미 전송한 조각과 독립 원인의 recovery record는 유지한다. 기존 조각별 재검사·취소가 미전송분을 중단하며 원격 head를 소유 근거 없이 채택하거나 차단 해제를 합성하지 않는다. 이 계약은 복구 소유자가 공급한 근거의 검증 경계이며, 진단 문구나 실패 횟수에서 불가 사유를 생성하지 않는다.
+
 일반적인 PLAN_BLOCKED는 계획·원래 활성 sources의 내용 해시를 기준으로 재평가한다. 닫힌 PR은 같은 PR reopen을 요구한다. 과거 파일 승인 대기는 일반 작업·소유권 검사를 통과하면 기록을 보존한 채 재개한다. 독립 차단·planning 오류·실패 감사는 함께 지우지 않는다. planning_error는 실제 교정·재검증·게시 복구로 원인이 해소된 뒤에만 지운다. cleanup_pending과 ExecPlan archive pending은 상태 전이를 만들지 않는다.
 
 차단 재평가의 자리는 대상 계획의 호출 종료·branch/worktree 경합·관리 상한과 planning·유지보수 소유권으로 판단한다. 다른 계획의 실행 단계나 대표 투영만으로 독립 복구를 보류하지 않는다. 사용자 질문의 재평가 중 원격·계획·checkpoint가 달라지면 `remote_snapshot_race`로 남겨 같은 원인의 재검사 입력을 보존하며, 최종 거부나 처리 완료로 소비하지 않는다.

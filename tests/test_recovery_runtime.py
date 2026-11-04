@@ -26,6 +26,35 @@ def observation(reason, detail="same RuntimeError"):
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_final_conflict_requires_complete_owner_context_and_each_unavailable_route(self):
+        from tests.support.database import runtime_connection
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        confirmed = prepared_conflict_assessment(connection, 'repo', 'G-047')
+        final = decide(confirmed)
+        self.assertEqual(final.action, RecoveryAction.FINAL_BLOCK)
+        self.assertEqual(final.scope, BlockScope.PLAN)
+        self.assertIs(require_final(final), final)
+        incomplete = [replace(confirmed, conflict_evidence=None), replace(confirmed, operation=None)]
+        for route in confirmed.unavailable_recovery_routes:
+            incomplete.append(replace(confirmed, unavailable_recovery_routes={
+                key: value for key, value in confirmed.unavailable_recovery_routes.items() if key != route}))
+        for key, value in (('checkpoint_generation', True), ('head_oid', 'unobserved'),
+                           ('conflict_paths', ['../outside']), ('release_conditions', []),
+                           ('attempted_routes', {'worker_correction': 'failed'})):
+            incomplete.append(replace(confirmed, conflict_evidence={**confirmed.conflict_evidence, key: value}))
+        for candidate in incomplete:
+            decision = decide(candidate, occurrence=4001, attempts=4001)
+            self.assertEqual(decision.action, RecoveryAction.PAUSE)
+            self.assertIsNone(decision.scope)
+            with self.assertRaises(ValueError):
+                require_final(decision)
+        self.assertEqual(decide(confirmed, final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE).action,
+                         RecoveryAction.PAUSE)
+        self.assertEqual(decide(observation(RecoveryReason.OWNERSHIP_UNCERTAIN),
+            final_block_reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT).action, RecoveryAction.PAUSE)
+
     def test_unproven_git_history_waits_without_user_action_or_timer_retry(self):
         decision = decide(observation(RecoveryReason.GIT_INPUT_UNCERTAIN), attempts=4001)
         self.assertEqual(decision.disposition, RecoveryDisposition.CONDITION_WAIT)
@@ -189,6 +218,10 @@ class RecoveryPolicyTests(unittest.TestCase):
             with self.subTest(block_reason=block_reason):
                 reason = reason_from_block(block_reason)
                 decision = decide(observation(reason))
+                if block_reason is BlockReasonCode.MANAGED_WORKTREE_CONFLICT:
+                    self.assertEqual(decision.action, RecoveryAction.PAUSE)
+                    self.assertIsNone(decision.scope)
+                    continue  # A legacy reason code alone cannot authorize a new final block.
                 if block_reason is BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL:
                     # A current isolation proof selects this new code explicitly;
                     # the shared typed cause must retain its legacy project gate.
