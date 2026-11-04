@@ -1338,6 +1338,8 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 
 `recover`는 범위별 요청의 접수·실행 대기·제한 재검사·종결을 구분한다. 별도 runtime이 등록 프로젝트·선택 G·기존 DB를 검증한 뒤 짧은 SQLite `BEGIN IMMEDIATE` transaction으로 `local_environment_recovery_requests`에 요청을 저장한다. 미등록 대상·없는 G·상태 DB 오류는 접수 전에 거부하며 DB를 자동 생성하지 않는다.
 
+선택 계획이 관리 순번 대기(`parked`)이면 복구 요청은 pending으로 보존하고 일반 프로젝트 조율을 실행한다. 일반 관리 배정이 대기를 해제한 뒤 같은 요청의 복구를 이어간다. 대기 중인 계획을 실행 단계 부재로 오인해 복구만 반복하거나, 복구 요청이 관리 순번 해제와 독립 작업의 진행을 막지 않는다.
+
 | 저장 계약 | 식별·재사용 규칙 |
 |---|---|
 | 요청 범위 | `(repo, plan_id)`. 프로젝트 전체는 `plan_id = NULL`이며 계획별 범위와 별도 부분 unique 인덱스로 구분한다. |

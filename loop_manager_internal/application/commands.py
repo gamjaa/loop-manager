@@ -420,6 +420,9 @@ def local_recovery_request_ready(
     """Do not consume a selected plan's check while another scope owns the slot."""
     if request.plan_id is None:
         return True
+    from loop_manager_internal.storage.management_admission import parked
+    if parked(connection, request.repo, request.plan_id):
+        return False
     active = runtime_state.RuntimeStateRepository(connection).active_row(request.repo)
     if active is not None and str(active["plan_id"]) != request.plan_id:
         return False

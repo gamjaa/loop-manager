@@ -316,6 +316,29 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             self.assertTrue(local_recovery_state.recheck_consumed(connection, request.request_id, 'G-001', 'verify'))
             self.assertEqual(connection.execute('SELECT COUNT(*) FROM local_environment_recovery_requests').fetchone()[0], 1)
 
+    def test_parked_recovery_yields_to_normal_management_admission(self):
+        from loop_manager_internal.storage import management_admission
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        self.add_recovery_plans('G-001')
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            runtime_state.RuntimeStateRepository(connection).activate(
+                repo, 'G-001', activation_sha='base', branch='branch', worktree='/worktree')
+            management_admission.request(connection, repo, 'G-001')
+            connection.execute("UPDATE task_management_admissions SET parked=1,pending=1")
+            connection.commit()
+            request = local_recovery_state.begin_request(connection, repo, 'G-001')
+        def admit(connection, *_args, **kwargs):
+            self.assertNotIn('recovery_request_id', kwargs)
+            self.assertEqual(local_recovery_state.pending_request(connection, repo).request_id, request.request_id)
+            management_admission.reconcile(connection, repo, 1)
+            self.assertFalse(management_admission.parked(connection, repo, 'G-001'))
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        self.assertEqual(self.scheduled_recovery_run(admit), 0)
+        resume = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0))
+        self.assertEqual(self.scheduled_recovery_run(resume), 1)
+        self.assertEqual(resume.call_args.kwargs['recovery_request_id'], request.request_id)
+
     def test_other_active_plan_progresses_and_keeps_recovery_pending(self):
         self.config_path.write_text('[loop]\n', encoding='utf-8')
         args = self.add_recovery_plans('G-001', 'G-002')
