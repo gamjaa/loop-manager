@@ -71,6 +71,76 @@ class WaitingPrConflictResultTests(AutomationCatalogFixture, unittest.TestCase):
             effects, connection, Path('/repo'), Path('/state'), 'repo', observation)
         self.assertEqual(result.step_result, loop_manager.PROJECT_STEP_TRANSIENT_PAUSE)
 
+    def test_waiting_conflict_does_not_starve_an_independent_conflicting_pr(self):
+        from loop_manager_internal.recovery.pull_request_recovery import _wait_for_conflict_inputs
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        for outcome in ('local_wait', 'plan_block', 'project_block', 'unrecorded_pause'):
+            with self.subTest(outcome=outcome):
+                connection = self._connection()
+                self._insert_plan(connection, 'G-001', 'PR_OPEN', priority='critical')
+                self._insert_plan(connection, 'G-002', 'PR_OPEN')
+                with connection:
+                    connection.execute("UPDATE projects SET max_tasks_per_project=2")
+                    for plan_id in ('G-001', 'G-002'):
+                        connection.execute("UPDATE exec_plans SET branch=?, worktree=?, pr_url=?, "
+                            "pr_head_oid='head', worker_session_id='saved-worker' WHERE plan_id=?",
+                            ('loop/' + plan_id, '/state/' + plan_id, 'https://example/pr/' + plan_id, plan_id))
+                runtime = runtime_state.RuntimeStateRepository(connection)
+                checkpoints = ExecutionCheckpointRepository(connection)
+                pending = checkpoints.record('repo', 'G-001', expected_generation=0,
+                    operation='rebase', expected_head='head', target_base_oid='base',
+                    observed_remote_oid='head', snapshot={'stash_oid': 'preserved'})
+                plans = {row['plan_id']: row for row in connection.execute('SELECT * FROM exec_plans')}
+                original = runtime.get('repo', 'G-001')
+                attempts = []
+                def reconcile(_connection, _root, _state, repo, project, pr):
+                    plan_id = runtime_state.execution_selection.get()[1]
+                    attempts.append(plan_id)
+                    self.assertEqual(pr['url'], plans[plan_id]['pr_url'])
+                    if plan_id == 'G-002':
+                        self.assertEqual(runtime.get('repo', 'G-001').worker_session_id, 'saved-worker')
+                        runtime.update_plan(repo, plan_id, plan_values={
+                            'status': 'IMPLEMENTING', 'pr_conflict_recovery': 1})
+                        return None
+                    if outcome == 'local_wait':
+                        return _wait_for_conflict_inputs(connection, repo, project,
+                            'preserved local changes', 'pr_conflict_preflight')
+                    if outcome in {'plan_block', 'project_block'}:
+                        runtime.block_plan(repo, plan_id, reason_code='managed_worktree_conflict',
+                            evidence='preserved conflict', release_fingerprint='input')
+                        if outcome == 'project_block':
+                            scoped_blocking.record_project_block(connection, repo,
+                                scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                                'shared ownership uncertain', 'shared-input', plan_id=plan_id,
+                                previous_phase='PR_OPEN')
+                        return 1
+                    return loop_manager.PROJECT_STEP_TRANSIENT_PAUSE
+                effects = waiting_pr_service.SelectWaitingPullRequestConflictEffects(
+                    loop_manager.active_execplan, loop_manager.hydrate_execplan_project, reconcile)
+                # The observation order differs from scheduling priority.
+                observation = loop_manager.WaitingPullRequestObservation(tuple(
+                    (plans[plan_id], {'url': plans[plan_id]['pr_url']})
+                    for plan_id in ('G-002', 'G-001')), True)
+                result = waiting_pr_service.select_waiting_pull_request_conflict(
+                    effects, connection, Path('/repo'), Path('/state'), 'repo', observation)
+                can_start = outcome in {'local_wait', 'plan_block'}
+                self.assertEqual(attempts, ['G-001', 'G-002'] if can_start else ['G-001'])
+                self.assertEqual(result.conflict_started, can_start)
+                self.assertTrue(result.merged)
+                self.assertEqual(result.step_result, None if can_start else
+                    (1 if outcome == 'project_block' else loop_manager.PROJECT_STEP_TRANSIENT_PAUSE))
+                self.assertEqual(runtime.get('repo', 'G-002').status, 'IMPLEMENTING' if can_start else 'PR_OPEN')
+                self.assertEqual(checkpoints.get('repo', 'G-001'), pending)
+                self.assertEqual(runtime.get('repo', 'G-001').worker_session_id, original.worker_session_id)
+                if outcome == 'local_wait':
+                    self.assertEqual(runtime.get('repo', 'G-001').status, 'PR_OPEN')
+                    self.assertEqual(runtime.get('repo', 'G-001').last_error, 'preserved local changes')
+                    self.assertEqual(RecoveryRepository(connection).row('repo', 'G-001')['pending_action'], 'pause')
+                    self.assertIsNone(scoped_blocking.plan_block(connection, 'repo', 'G-001'))
+                if can_start:
+                    self.assertEqual(loop_manager.project_execplan(connection, 'repo')['plan_id'], 'G-002')
+                self.assertIsNone(runtime_state.execution_selection.get())
+
     def test_plan_conflict_result_preserves_independent_projection_and_pending_rebase(self):
         for project_safety_block in (False, True):
             with self.subTest(project_safety_block=project_safety_block):

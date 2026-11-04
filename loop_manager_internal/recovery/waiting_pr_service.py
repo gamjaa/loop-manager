@@ -331,7 +331,7 @@ def select_waiting_pull_request_conflict(
     *,
     config_path: Path | None = None,
 ) -> PullRequestSyncResult:
-    """Select one still-eligible conflict after all observations are durable."""
+    """Start one eligible recovery, passing over durable plan-local waits."""
 
     if not runtime_state.RuntimeStateRepository(
         connection
@@ -359,52 +359,51 @@ def select_waiting_pull_request_conflict(
             for dependency in json.loads(str(current["depends_on"]))
         ):
             eligible.append((current, pull_request))
-    if not eligible:
-        return PullRequestSyncResult(merged=observation.merged)
-    plan, pull_request = min(
+    from loop_manager_internal.storage.task_calls import management_available
+    for plan, pull_request in sorted(
         eligible,
         key=lambda item: (
             PRIORITY_ORDER[str(item[0]["priority"])],
             int(str(item[0]["plan_id"])[2:]),
         ),
-    )
-    from loop_manager_internal.storage.task_calls import management_available
-    if not management_available(connection,repo,str(plan['plan_id'])):
-        return PullRequestSyncResult(merged=observation.merged)
-    recovery_options = {"config_path": config_path} if config_path is not None else {}
-    previous_recovery = recovery_state.RecoveryRepository(connection).row(repo, str(plan['plan_id']))
-    with runtime_state.selected_execution(repo, str(plan['plan_id']), include_blocked=True):
-        effects.hydrate_execplan_project(connection, repo, plan)
-        project = runtime_state.project_row(connection, repo)
-        assert project is not None
-        result = effects.reconcile_existing_pull_request(
-            connection,
-            repo_path,
-            state_dir,
-            repo,
-            project,
-            pull_request,
-            **recovery_options,
-        )
-    current = connection.execute(
-        'SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan['plan_id']),
-    ).fetchone()
-    recorded = recovery_state.RecoveryRepository(connection).row(repo, str(plan['plan_id']))
-    if (result == PROJECT_STEP_TRANSIENT_PAUSE and current['status'] == 'PR_OPEN' and recorded is not None
-            and recorded['generation'] > (previous_recovery['generation'] if previous_recovery is not None else 0)
-            and recorded['reason_code'] == RecoveryReason.GIT_INPUT_UNCERTAIN.value
-            and recorded['pending_action'] == 'pause' and recorded['detail'] == current['last_error']
-            and scoped_blocking.project_block(connection, repo) is None):
-        return PullRequestSyncResult(merged=observation.merged)
-    if (current['status'] == 'PLAN_BLOCKED'
-            and current['blocked_reason'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
-            and scoped_blocking.plan_block(connection, repo, str(plan['plan_id'])) is not None
-            and scoped_blocking.project_block(connection, repo) is None):
-        # selected_execution kept writes in this plan's source row. Do not
-        # replace an independent project mirror with the failed recovery.
-        return PullRequestSyncResult(merged=observation.merged)
-    effects.hydrate_execplan_project(connection, repo, current)
-    return PullRequestSyncResult(result, result is None, observation.merged)
+    ):
+        if not management_available(connection,repo,str(plan['plan_id'])):
+            return PullRequestSyncResult(merged=observation.merged)
+        recovery_options = {"config_path": config_path} if config_path is not None else {}
+        previous_recovery = recovery_state.RecoveryRepository(connection).row(repo, str(plan['plan_id']))
+        with runtime_state.selected_execution(repo, str(plan['plan_id']), include_blocked=True):
+            effects.hydrate_execplan_project(connection, repo, plan)
+            project = runtime_state.project_row(connection, repo)
+            assert project is not None
+            result = effects.reconcile_existing_pull_request(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                project,
+                pull_request,
+                **recovery_options,
+            )
+        current = connection.execute(
+            'SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan['plan_id']),
+        ).fetchone()
+        recorded = recovery_state.RecoveryRepository(connection).row(repo, str(plan['plan_id']))
+        if (result == PROJECT_STEP_TRANSIENT_PAUSE and current['status'] == 'PR_OPEN' and recorded is not None
+                and recorded['generation'] > (previous_recovery['generation'] if previous_recovery is not None else 0)
+                and recorded['reason_code'] == RecoveryReason.GIT_INPUT_UNCERTAIN.value
+                and recorded['pending_action'] == 'pause' and recorded['detail'] == current['last_error']
+                and scoped_blocking.project_block(connection, repo) is None):
+            continue
+        if (current['status'] == 'PLAN_BLOCKED'
+                and current['blocked_reason'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
+                and scoped_blocking.plan_block(connection, repo, str(plan['plan_id'])) is not None
+                and scoped_blocking.project_block(connection, repo) is None):
+            # selected_execution kept writes in this plan's source row. Do not
+            # replace an independent project mirror with the failed recovery.
+            continue
+        effects.hydrate_execplan_project(connection, repo, current)
+        return PullRequestSyncResult(result, result is None, observation.merged)
+    return PullRequestSyncResult(merged=observation.merged)
 
 
 @dataclass(frozen=True)

@@ -1073,7 +1073,7 @@ rebase 교정 묶음의 소진은 `recovery_records`에 `rebase_conflict/conditi
 
 PR 복구 선택은 `selected_execution` 안에서 대상 계획의 원본만 수정한다. 해당 계획의 실제 conflict block이 저장됐고 프로젝트 안전 차단이 없으면 실패 반환을 프로젝트 중단으로 전파하지 않으며, 선택 context 밖에서 차단 계획을 hydrate해 독립 작업의 대표 투영을 덮지 않는다. 로컬 사전조건·marker 또는 journal 경로가 미확정이면 `git_input_uncertain/condition_wait/pause`와 원래 진단만 저장한다. 기록 transaction은 관측한 branch/worktree·PR URL/head·충돌 복구 OID가 현재 계획과 같은지 검사하며, 원인 operation과 checkpoint의 operation·원래 HEAD·target을 지문에 결합한다. 대상이 바뀌면 `remote_snapshot_race`로 거부하고 오래된 진단을 새 대상에 덮지 않는다.
 
-선택 호출이 실제로 새 대기 generation을 기록했을 때만 그 대기 반환을 독립 진행으로 소비한다. 과거 대기 row만으로 새 오류를 숨기지 않는다. 일반 실행 재개는 이미 선택에서 처리한 로컬 PR 대기와 같은 차단 PR을 다시 부착하지 않는다. 대기 PR 관측은 PR이 연결된 충돌 차단 계획을 포함하되 OPEN에서는 원인별 재평가에 맡기고 Merge·Close만 기존 원격 전이 소유 경계로 전달한다. 이 반환 소비는 rebase 완료·예약 회수·검증 성공을 만들지 않는다. 현재 operation의 소유권 근거가 일치하지 않으면 `workspace_ownership_uncertain`의 별도 안전 경계를 유지한다.
+충돌 PR 선택은 적격 후보를 우선순위·계획 ID 순으로 순회하고 복구 하나를 시작하면 끝낸다. 선택 호출이 실제로 새 대기 generation을 기록했을 때만 로컬 입력 대기 반환을 소비하고 다음 후보로 넘어간다. 실제 계획별 충돌 차단도 프로젝트 안전 차단이 없으면 다음 후보를 확인한다. 과거 대기 row만으로 새 오류를 숨기지 않으며 프로젝트 안전 차단·그 밖의 오류는 즉시 상위 결과로 전달한다. 일반 실행 재개는 이미 선택에서 처리한 로컬 PR 대기와 같은 차단 PR을 다시 부착하지 않는다. 대기 PR 관측은 PR이 연결된 충돌 차단 계획을 포함하되 OPEN에서는 원인별 재평가에 맡기고 Merge·Close만 기존 원격 전이 소유 경계로 전달한다. 이 반환 소비는 rebase 완료·예약 회수·검증 성공을 만들지 않는다. 현재 operation의 소유권 근거가 일치하지 않으면 `workspace_ownership_uncertain`의 별도 안전 경계를 유지한다.
 
 충돌 최종 판정의 입력 계약은 `RecoveryObservation.conflict_evidence`와 기존 `unavailable_recovery_routes`다. 원인 코드·횟수·차단 scope만으로는 `managed_conflict_unrecoverable`을 최종 차단하지 않으며, 다른 원인에서 conflict block으로 override하거나 충돌 판정을 프로젝트 차단으로 넓히는 것도 거부한다. 저장 경계와 실제 차단 transaction은 같은 계획·현재 PR·소유 checkpoint를 다시 대조한다.
 
