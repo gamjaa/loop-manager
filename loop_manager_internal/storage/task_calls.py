@@ -27,14 +27,18 @@ class CallDeferred(RuntimeError):
 def ensure_schema(connection):
     from .management_admission import ensure_schema as ensure_admission
     ensure_admission(connection)
+    connection.execute("CREATE TABLE IF NOT EXISTS task_scheduling_cursor (kind TEXT PRIMARY KEY, repo TEXT NOT NULL)")
     from loop_manager_internal.storage.execution_checkpoint_state import SCHEMA as checkpoints_schema
     connection.execute(checkpoints_schema)
     connection.execute("""CREATE TABLE IF NOT EXISTS task_call_reservations (
         token TEXT PRIMARY KEY, repo TEXT NOT NULL, plan_id TEXT NOT NULL, kind TEXT NOT NULL,
         invocation_id TEXT, receipt_path TEXT, run_id TEXT, uncertain INTEGER NOT NULL DEFAULT 0,
+        started INTEGER NOT NULL DEFAULT 0,
         UNIQUE(repo,plan_id,kind))""")
     if "uncertain" not in {row[1] for row in connection.execute("PRAGMA table_info(task_call_reservations)")}:
         connection.execute("ALTER TABLE task_call_reservations ADD COLUMN uncertain INTEGER NOT NULL DEFAULT 0")
+    if "started" not in {row[1] for row in connection.execute("PRAGMA table_info(task_call_reservations)")}:
+        connection.execute("ALTER TABLE task_call_reservations ADD COLUMN started INTEGER NOT NULL DEFAULT 0")
 
 
 def reserve(connection, state_dir, repo, plan_id, kind, run_id):
@@ -98,6 +102,24 @@ def bind_agent(invocation_id):
                                      (invocation_id,owner.token))
 
 
+def mark_started(connection, *, token=None, invocation_id=None):
+    """Consume this reservation's retry once, only after a proven process start."""
+    from .runtime_state import _transaction
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='task_call_reservations'").fetchone() is None:
+        return
+    with _transaction(connection):
+        row = connection.execute("SELECT token,repo,plan_id,kind FROM task_call_reservations "
+            "WHERE started=0 AND ((? IS NOT NULL AND token=?) OR "
+            "(? IS NOT NULL AND invocation_id=?))", (token,token,invocation_id,invocation_id)).fetchone()
+        if row is None:
+            return
+        connection.execute("UPDATE task_call_reservations SET started=1 WHERE token=?", (row['token'],))
+        connection.execute("INSERT INTO task_management_admissions(repo,plan_id,parked,resumed) VALUES (?,?,0,1) "
+            "ON CONFLICT(repo,plan_id) DO UPDATE SET resumed=1,retry_order=NULL", (row['repo'],row['plan_id']))
+        connection.execute("INSERT INTO task_scheduling_cursor VALUES (?,?) "
+            "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (row['kind'],row['repo']))
+
+
 def _write(path, value):
     from loop_manager_internal.verification.timing import atomic_json
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -125,6 +147,9 @@ def verify_started(path, process):
         from loop_manager_internal.agents.process_receipt import _linux_host, _boot
         value.update(host=_linux_host(),boot=_boot())
     _write(path,value)
+    owner = current_call.get()
+    if owner is not None:
+        mark_started(owner.connection, token=owner.token)
 
 
 def verify_stopped(path):
@@ -195,12 +220,38 @@ def execution_confirmed(connection, row, state_dir):
     return _confirmed(connection, row, state_dir)
 
 
+def _recover_verify_start(connection, row, state_dir):
+    if row['kind'] != 'verify' or not row['receipt_path']:
+        return
+    path = Path(row['receipt_path'])
+    expected = Path(state_dir) / 'logs/task-calls' / (row['token'] + '.json')
+    try:
+        value = json.loads(path.read_text(encoding='utf-8')) if path.absolute() == expected.absolute() and not path.is_symlink() else {}
+        if value.get('token') == row['token'] and value.get('platform') == sys.platform and type(value.get('pid')) is int and value['pid'] > 1:
+            mark_started(connection, token=row['token'])
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _recover_agent_start(connection, row, state_dir):
+    if row['kind'] != 'agent' or not row['receipt_path'] or row['started']:
+        return
+    from loop_manager_internal.agents.process_receipt import recover as recover_agent
+    proof = recover_agent(row['receipt_path'], Path(state_dir))
+    if proof is not None and proof.get('evidence') != 'not_started':
+        mark_started(connection, token=row['token'])
+
+
 def confirmed(owner):
     from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
     row=owner.connection.execute("SELECT * FROM task_call_reservations WHERE token=?",(owner.token,)).fetchone()
+    if row is not None:
+        _recover_verify_start(owner.connection, row, owner.state_dir)
     pending = (InvocationRepository(owner.connection).reconcile_observations(
         state_dir=owner.state_dir, invocation_id=row['invocation_id'])
         if row is not None and row['invocation_id'] is not None else set())
+    if row is not None and row['invocation_id'] not in pending:
+        _recover_agent_start(owner.connection, row, owner.state_dir)
     return row is not None and row['invocation_id'] not in pending and execution_confirmed(owner.connection,row,owner.state_dir)
 
 
@@ -215,9 +266,12 @@ def recover(connection, state_dir, *, tokens=None):
     for row in rows:
         if row['kind'] == 'agent' and row['invocation_id'] is not None:
             pending.update(repository.reconcile_observations(state_dir=state_dir, invocation_id=row['invocation_id']))
+        elif row['kind'] == 'verify':
+            _recover_verify_start(connection, row, state_dir)
     repository.reconcile_execution(state_dir=state_dir)
     for row in rows:
         if row['invocation_id'] not in pending and execution_confirmed(connection,row,state_dir):
+            _recover_agent_start(connection, row, state_dir)
             with connection:
                 connection.execute("DELETE FROM task_call_reservations WHERE token=?",(row["token"],))
     return tuple(row for row in connection.execute("SELECT * FROM task_call_reservations")

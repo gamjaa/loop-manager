@@ -427,6 +427,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
 
     def test_scheduled_call_waits_past_runtime_ttl_without_probe_and_honors_handoff(self):
         from loop_manager_internal.runtime import handoff_gate
+        from loop_manager_internal.storage import task_calls
         for stopped in (False, True):
             with self.subTest(handoff=stopped):
                 self._reset_catalog()
@@ -450,6 +451,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 @scheduling.scheduled_call('verify')
                 def verify():
                     observer.assert_called_once()
+                    task_calls.mark_started(self.connection, token=task_calls.current_call.get().token)
                     calls.append(True)
                 token = scheduling.current_scheduler.set(scheduler)
                 task = scheduling.Task('A', 'G-001', self.connection)
@@ -476,7 +478,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
                 self.assertEqual(sum(scheduler.running['verify'].values()), 0)
                 self.assertEqual(scheduler.retained, {})
-                self.assertEqual(scheduler.cursor.get('verify'), None if stopped else 'A')
+                self.assertEqual(scheduler.cursor.get('verify'), None)
                 cursor = self.connection.execute("SELECT repo FROM task_scheduling_cursor WHERE kind='verify'").fetchone()
                 self.assertEqual(cursor[0] if cursor else None, None if stopped else 'A')
                 self.assertEqual(task.retry_order, 1 if stopped else None)
@@ -756,6 +758,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
 
     def test_reservation_and_cursor_failure_return_unstarted_capacity_atomically(self):
         from loop_manager_internal.storage.db_access import DatabaseWaitTimeout
+        from loop_manager_internal.storage import task_calls
         scheduler = self.scheduler(max_workers=1)
         execute = self.connection.execute
         def fail_cursor(sql, *args, **kwargs):
@@ -765,7 +768,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         with mock.patch.object(self.connection, 'execute', side_effect=fail_cursor):
             with self.assertRaises(DatabaseWaitTimeout), scheduler.slot(
                     'agent', scheduling.Task('A', 'G-001', self.connection)):
-                self.fail('미확정 예약은 실행하면 안 됩니다.')
+                task_calls.mark_started(self.connection, token=task_calls.current_call.get().token)
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM task_call_reservations').fetchone()[0], 0)
         self.assertEqual(sum(scheduler.running['agent'].values()), 0)
         self.assertEqual(scheduler.retained, {})
@@ -1956,6 +1959,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                     ['MANUAL_PENDING', 'MANUAL_PENDING'])
 
     def test_actual_calls_allocate_basic_turn_before_priority_and_resume_cursor(self):
+        from loop_manager_internal.storage import task_calls
         self.connection.execute("INSERT INTO projects(repo,base_branch) VALUES ('C','main')")
         self.connection.commit()
         for repo, plan_id, priority in (('A','G-004','critical'), ('A','G-005','high'),
@@ -1967,12 +1971,15 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             try:
                 with closing(database.connect_database(self.directory, run_migrations=False)) as connection:
                     with scheduler.slot('agent', scheduling.Task(repo, plan_id, connection, resumed=False)):
+                        task_calls.mark_started(connection, token=task_calls.current_call.get().token)
                         order.append(plan_id)
                         self.assertLessEqual(sum(scheduler.running['agent'].values()), scheduler.limits['agent'])
             except BaseException as error:
                 errors.append(error)
         with scheduler.slot('agent', scheduling.Task('A', 'G-001', self.connection, resumed=False)):
+            task_calls.mark_started(self.connection, token=task_calls.current_call.get().token)
             with scheduler.slot('agent', scheduling.Task('B', 'G-003', self.connection, resumed=False)):
+                task_calls.mark_started(self.connection, token=task_calls.current_call.get().token)
                 threads = [threading.Thread(target=queued, args=(repo, plan_id))
                            for repo, plan_id in (('A','G-004'), ('C','G-006'), ('A','G-005'))]
                 for thread in threads:
@@ -2272,6 +2279,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             runtime.activate('A','G-004',activation_sha='base',branch='four',worktree='four')
 
     def test_verify_has_its_own_capacity_while_agent_call_is_running(self):
+        from loop_manager_internal.storage import task_calls
         scheduler = self.scheduler(max_workers=1, verify_concurrency=1)
         entered_agent, entered_verify, release = threading.Event(), threading.Event(), threading.Event()
         errors = []
@@ -2280,6 +2288,7 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
                 with closing(database.connect_database(self.directory,run_migrations=False)) as connection:
                     task=scheduling.Task(repo,plan_id,connection,resumed=False)
                     with scheduler.slot(kind,task):
+                        task_calls.mark_started(connection, token=task_calls.current_call.get().token)
                         entered.set()
                         if not release.wait(3):
                             raise AssertionError('다른 종류의 호출이 배정되지 않았습니다.')
@@ -2524,6 +2533,106 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             scheduler.requeue(task)
             scheduler.waiters['agent'].append((task, task.rank()))
         self.assertIs(scheduler._next('agent')[0], tasks[1])
+
+    def test_started_followup_precedes_new_and_unstarted_reservation_keeps_retry(self):
+        from loop_manager_internal.storage import task_calls
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        scheduler = self.scheduler(max_workers=1, verify_concurrency=1)
+        with scheduler.task('A', 'G-001', self.connection, resumed=False):
+            first = scheduling.current_task.get()
+            with scheduler.slot('agent', first):
+                pass
+            self.assertEqual(first.rank()[0], 3)
+            self.assertIsNone(self.connection.execute("SELECT repo FROM task_scheduling_cursor WHERE kind='agent'").fetchone())
+            with scheduler.slot('agent', first):
+                self.connection.execute("INSERT INTO agent_invocations(invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at) "
+                    "VALUES ('first','A','G-001','worker','codex','m','e','start',1,'now')")
+                self.connection.commit()
+                task_calls.bind_agent('first')
+                InvocationRepository(self.connection).mark_execution_started('first')
+            self.assertTrue(first.resumed)
+            self.connection.execute("UPDATE exec_plans SET status='REVIEWING' WHERE repo='A' AND plan_id='G-001'")
+            self.connection.commit()
+        with closing(database.connect_database(self.directory, run_migrations=False)) as other:
+            replacement = scheduling.TaskScheduler(self.config, database.connect_database, self.directory, other)
+            with replacement.task('A', 'G-001', other, resumed=False):
+                continued = scheduling.current_task.get()
+                new = scheduling.Task('A', 'G-002', other, resumed=False)
+                entries = [[new, new.rank()], [continued, continued.rank()]]
+                replacement.waiters['agent'].extend(entries)
+                self.assertIs(replacement._next('agent', other), entries[1])
+                replacement.waiters['agent'].clear()
+                order = []
+                for candidate in (continued, new):
+                    with replacement.slot('agent', candidate):
+                        task_calls.mark_started(other, token=task_calls.current_call.get().token)
+                        order.append(candidate.plan_id)
+                self.assertEqual(order, ['G-001', 'G-002'])
+                replacement.requeue(continued)
+                before = other.execute("SELECT retry_order,resumed FROM task_management_admissions WHERE repo='A' AND plan_id='G-001'").fetchone()
+                with replacement.slot('agent', continued):
+                    pass  # reservation alone is not an agent process start
+                after = other.execute("SELECT retry_order,resumed FROM task_management_admissions WHERE repo='A' AND plan_id='G-001'").fetchone()
+                self.assertEqual(tuple(after), tuple(before))
+                self.assertEqual(continued.retry_order, before['retry_order'])
+
+    def test_resumed_waiters_are_served_in_registration_order(self):
+        scheduler = self.scheduler()
+        first = scheduling.Task('A', 'G-002', self.connection)
+        second = scheduling.Task('A', 'G-001', self.connection)
+        entries = [[first, first.rank()], [second, second.rank()]]
+        scheduler.waiters['agent'].extend(entries)
+        self.assertIs(scheduler._next('agent', self.connection), entries[0])
+        scheduler.waiters['agent'].remove(entries[0])
+        scheduler.waiters['agent'].append([first, first.rank()])
+        self.assertIs(scheduler._next('agent', self.connection), entries[1])
+
+    def test_started_receipts_recover_once_without_consuming_later_retry(self):
+        from loop_manager_internal.storage import task_calls
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        scheduler = self.scheduler()
+        with scheduler.task('A', 'G-001', self.connection, resumed=False):
+            task = scheduling.current_task.get()
+            owner = task_calls.reserve(self.connection, self.directory, 'A', 'G-001', 'verify', 'run')
+            token = task_calls.current_call.set(owner)
+            try:
+                receipt = task_calls.prepare_verify_receipt()
+                with mock.patch.object(task_calls, 'mark_started', side_effect=sqlite3.OperationalError('busy')):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        task_calls.verify_started(receipt, SimpleNamespace(pid=12345))
+                task_calls.verify_stopped(receipt)
+                self.assertEqual(task.rank()[0], 3)
+                self.assertEqual(task_calls.recover(self.connection, self.directory), ())
+                self.assertEqual(task.rank()[0], 2)
+            finally:
+                task_calls.current_call.reset(token)
+            owner = task_calls.reserve(self.connection, self.directory, 'A', 'G-001', 'agent', 'run')
+            self.connection.execute("INSERT INTO agent_invocations(invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at) "
+                "VALUES ('actual','A','G-001','worker','codex','m','e','start',1,'now')")
+            self.connection.execute("UPDATE task_call_reservations SET invocation_id='actual' WHERE token=?", (owner.token,))
+            self.connection.commit()
+            ledger = InvocationRepository(self.connection)
+            ledger.mark_execution_started('actual')
+            scheduler.requeue(task)
+            retry = task.retry_order
+            ledger.mark_execution_started('actual')
+            self.assertEqual(self.connection.execute("SELECT retry_order FROM task_management_admissions "
+                "WHERE repo='A' AND plan_id='G-001'").fetchone()[0], retry)
+            task_calls.release(owner)
+
+        with scheduler.task('A', 'G-002', self.connection, resumed=False):
+            task = scheduling.current_task.get()
+            owner = task_calls.reserve(self.connection, self.directory, 'A', 'G-002', 'agent', 'run')
+            self.connection.execute("UPDATE task_call_reservations SET receipt_path='receipt' WHERE token=?", (owner.token,))
+            self.connection.commit()
+            row = self.connection.execute("SELECT * FROM task_call_reservations WHERE token=?", (owner.token,)).fetchone()
+            with mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value={'evidence':'not_started'}):
+                task_calls._recover_agent_start(self.connection, row, self.directory)
+                self.assertEqual(task.rank()[0], 3)
+            with mock.patch('loop_manager_internal.agents.process_receipt.recover', return_value={'evidence':'process_group_stopped'}):
+                task_calls._recover_agent_start(self.connection, row, self.directory)
+                self.assertEqual(task.rank()[0], 2)
+            task_calls.release(owner)
 
     def test_planning_drain_releases_queued_calls_but_keeps_running_and_other_projects(self):
         scheduler = self.scheduler(max_workers=1)

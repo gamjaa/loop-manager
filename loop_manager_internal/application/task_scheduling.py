@@ -395,6 +395,7 @@ class TaskScheduler:
         waiting = registered
         if connection is not None:
             waiting = [item for item in waiting if self._eligible(item[0], connection)]
+            cursor = connection.execute('SELECT repo FROM task_scheduling_cursor WHERE kind=?', (kind,)).fetchone()
             refreshed = []
             for item in waiting:
                 # SQLite 연결은 해당 대기 스레드가 소유한 연결만 사용한다.
@@ -407,6 +408,8 @@ class TaskScheduler:
             if self.waiters[kind] != registered:
                 return None
             if connection is not None:
+                if cursor is not None:
+                    self.cursor[kind] = cursor[0]
                 for item, rank, count in refreshed:
                     item[1] = rank
                     if count is not None:
@@ -415,6 +418,8 @@ class TaskScheduler:
                 return None
             category = min(item[1][0] for item in waiting)
             candidates = [item for item in waiting if item[1][0] == category]
+            if category == 2:
+                return candidates[0]
             if category < 3:
                 return min(candidates, key=lambda item: (item[1], item[0].repo, item[0].plan_id))
             basic = [item for item in candidates if not self.running[kind][item[0].repo]]
@@ -513,14 +518,6 @@ class TaskScheduler:
                 raise SchedulingChanged("호출 입력 재관측 중 작업 상태가 변경됐습니다.")
             if before_start is not None:
                 before_start()
-            with runtime_state._transaction(task.connection):
-                task.connection.execute(
-                    "INSERT INTO task_scheduling_cursor VALUES (?,?) "
-                    "ON CONFLICT(kind) DO UPDATE SET repo=excluded.repo", (kind, task.repo))
-                task.connection.execute('UPDATE task_management_admissions SET retry_order=NULL,resumed=1 '
-                    'WHERE repo=? AND plan_id=?', (task.repo,task.plan_id))
-            with self.condition:
-                self.cursor[kind] = task.repo
             events.emit("작업 호출 배정", kind=kind, project=task.repo, plan=task.plan_id,
                         running=sum(self.running[kind].values()), limit=self.limits[kind],
                         managed=managed_count(task.connection, task.repo),
@@ -548,21 +545,26 @@ class TaskScheduler:
                     released = True
             finally:
                 try:
-                    with self.condition:
-                        storage_only = owner.token in self.storage_waiting
-                        self.storage_waiting.discard(owner.token)
-                        if released:
-                            if not storage_only:
-                                self.running[kind][task.repo] -= 1
-                        else:
-                            if not storage_only:
-                                self.uncertain[kind] += 1
-                            self.retained[(task.repo, task.plan_id, kind)] = {"token": owner.token,
-                                                                          'storage_only': storage_only}
+                    try:
                         if launched:
-                            task.resumed = True
-                            task.retry_order = None
-                        self.condition.notify_all()
+                            saved = task.connection.execute('SELECT resumed,retry_order FROM task_management_admissions '
+                                'WHERE repo=? AND plan_id=?', (task.repo,task.plan_id)).fetchone()
+                            if saved is not None:
+                                task.resumed = bool(saved['resumed'])
+                                task.retry_order = saved['retry_order']
+                    finally:
+                        with self.condition:
+                            storage_only = owner.token in self.storage_waiting
+                            self.storage_waiting.discard(owner.token)
+                            if released:
+                                if not storage_only:
+                                    self.running[kind][task.repo] -= 1
+                            else:
+                                if not storage_only:
+                                    self.uncertain[kind] += 1
+                                self.retained[(task.repo, task.plan_id, kind)] = {"token": owner.token,
+                                                                              'storage_only': storage_only}
+                            self.condition.notify_all()
                 finally:
                     task_calls.current_call.reset(owner_token)
 
