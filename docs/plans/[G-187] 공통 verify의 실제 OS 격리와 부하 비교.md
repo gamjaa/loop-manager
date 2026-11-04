@@ -32,6 +32,7 @@ depends_on:
   - G-333
   - G-334
   - G-335
+  - G-356
 complexity: medium
 risk: high
 priority: normal
@@ -55,6 +56,7 @@ priority: normal
 
 ## Implementation
 
+- [ ] R-091의 새 큐 조율은 G-356의 선행 closure를 소비한 뒤 실제 Manager 자료를 수집한다. 프로젝트 단계·기존 작업의 후속 배정·Git/DB/Telegram 대기를 각 큐의 요청 identity와 실제 실행/종료 자료로 연결한다. 이미 구현된 coordinator·runner/adapter를 바꾸거나 큐 전환을 이 실측 작업에서 구현하지 않는다.
 - [ ] 기존 `loop_manager_internal/verification/resources.py`·`coordination.py`·`timing.py`의 진단과 확인한 `tests/support/verify_examples/python/`·`perl/`의 선언/launcher를 재사용해 bounded 실제 검증/비교 진입을 기존 verify 경계에 연결한다. 현재 `verification/integration.py:execute()`·`validate_example()`·`partial_case()`의 고정 suite와 `scripts/verify.json`의 필수 단계가 이전한 정상/native 실패·partial/full assertion을 소유한다. 삭제된 `tests/test_verify_language_examples.py`·`tests/support/verify_fixture.py`와 고정 sampler를 복원하거나 같은 실제 실행을 unittest에 추가하지 않는다. 통합 단계·상하위 시간 계산은 원격에 반영된 G-309 구현을 소비하며 별도 상시 benchmark 서비스나 새 루트 launcher를 만들지 않는다.
 - [ ] 확인한 `loop_manager_internal/verification/contract.py`·`runner.py`·`perl_adapter.py`의 version 1 dispatch·파일 suite/동적 TAP assertion·serial/independent·부분 FALLBACK을 실제 실행 자료에 연결한다. `perl_reporter.pl`·`LoopManagerVerifyGuard.pm`의 native 로그/TAP spool·BEGIN 이전 Agent/fork/network 거부를 보존한다. Perl의 미지원 AST 부분 선정·시간 큐 재사용이나 Windows native 지원을 새 목표로 추가하지 않는다.
 - [ ] 확인한 `scripts/verify.ps1`·`scripts/verify_windows.py`·`scripts/verify-windows-tests.json`, `tests/test_verify_windows_launcher.py`·`tests/test_verify_windows.py`를 실제 Windows 자료 수집의 기존 진입으로 사용한다. WSL의 독립 Linux coordinator와 native의 Manager Windows 예약 조율을 구분하고, WSL 프로젝트 snapshot bytes·원래 후보 revision과 재구성한 Linux Git revision의 관계를 보존한다. 두 단계/정리의 전체 시간 상한 보완은 G-295를 소비하며 timeout 구현을 이 실측 작업에서 중복하지 않는다.
@@ -65,6 +67,7 @@ priority: normal
 
 ## Validation
 
+- G-356 이후 같은 후보/환경에서 큐 대기·중앙 순회·실제 Agent/verify 실행을 구별한다. 독립 큐 지연이 verify 실행 시간이나 미수행 결과로 합산되지 않고, 기존 관리/실행 상한·상하위 대기 증명·자식 종료/예약 보존이 유지되는지 실제 자료로 확인한다. 큐 단위 정책 행렬은 선행 unit을 재사용하며 여기서는 실제 연결·OS 자료만 수집한다.
 - Worker는 resource reservation·process cleanup·diagnostic aggregation에서 변경한 경계의 최소 unit case만 실행한다. `tests/test_verify_runtime.py`·`test_verify_contract.py`·`test_verify_perl_adapter.py`와 현재 `tests/test_verify_integration.py`의 결과/소유권·종료 보존 unit을 재사용한다. 상위 집계의 ID 없는 중첩 진단 제외는 이미 직접 구현된 `TimingAndManifestTests.test_summary_does_not_adopt_unowned_nested_diagnostics`로 계속 검증하며 같은 unit을 복제하지 않는다. 고정 suite의 실제 실행은 전체 verify에 유지하고 결과 확인/배정 진단은 G-248, Windows 부하 관측은 G-249의 목표와 중복하지 않는다.
 - 선택기 버전 안내는 위 구현의 선언·선택 직렬화·이전 algorithm 거부·runner 결과 기록과 정적으로 대조한다. `tests/test_verify_impact.py`의 기존 계약 변경·삭제/rename·algorithm identity 회귀와 `tests/test_partial_verify_runner.py`의 실행 없는 FALLBACK·NOT_SELECTED 회귀를 보존하며, 안내 문구만의 교정에 고정 prose assertion을 추가하지 않는다.
 - Manager의 실제 실행에서 Windows·Linux timeout/취소·시작 실패·강제 종료 뒤 해당 자식/예약만 정리하고 다른 실행을 보존하는지 확인한다. Linux Perl reporter·테스트 자식의 부분 NDJSON/TAP spool과 suite 미완료, Windows 공통 Job 종료 불명·예약 보존을 실제 효과에 연결한다. Windows native는 이 효과를 확인할 최소 실행과 경로·인자·중첩 Python guard 회귀로 한정하고 자체 전체 verify·대규모 Git/CLI 통합은 WSL에서 수행한다. G-309의 별도 필수 통합 단계가 Manager·단독 전체 실행에서 같은 범위를 확인하며 Worker targeted command에는 넣지 않는다. WSL 실행은 AGENTS.md의 실행별 `/tmp/` 복사본·유효한 Git 메타데이터·임시 환경 변수·종료 후 정리 기준을 따른다. WSL 전체 PASS와 Windows 핵심 회귀를 Windows 전체 verify PASS로 합치지 않는다.
@@ -82,6 +85,7 @@ priority: normal
 
 ## Decision Log
 
+- 검토 revision `37e3ec6ec2bb12ee93907a79de1f8a312aac047d`와 snapshot token `06cc9502c2e4a5f69ce409cb645d39daa6134c635b823f2db161da886022e34a`의 원문 hash를 대조했다. started ID·경로·기존 수행/검증 기록과 OS 실측 목표를 보존하며, 최종 큐 연결을 실제 측정할 수 있도록 G-356 선행을 추가했다. G-347의 실패/정상 bootstrap 회수와 상위 run 집계 분리·대응 unit은 현재 Merge된 코드로 소비한다. 이 정적 개정은 보고 409의 timeout 원인 확정·실제 OS 실행·성능·기존 차단 해소나 프로젝트 최종 전문 확인이 아니다.
 - revision `79d56d1df767cbbd7c3a9fb0274ca0b53a0294ff`의 run ID 엄격 비교와 대응 unit은 직접 구현으로 소비한다. snapshot token `22f83effbf72610e55ef3eacb8b4134f17d50e530e98825c854dfb36bf245f60`의 원문 hash를 대조했고 started ID·경로·metadata·dependency·기존 기록을 보존했다. R-080의 실제 효과 검증·기존 assertion 보존은 이 실측 작업에도 적용되며, 보고 406·407의 과거 중첩 실행을 복원하거나 timeout을 늘리지 않는다. bootstrap 회수의 추가 연결은 G-347에 남기고 공통 필터·실제 OS 검증을 중복 계획하지 않는다. 정적 확인은 OS/통합 실행·성능·차단 해제의 성공이 아니다.
 
 - revision `97df4cae88d54e9fcb469f5366d7ee360e5469e5`의 R-065·PRODUCT·ARCHITECTURE와 `resources.py`·`test_verify_resources.py`를 대조했다. 최초/추가 실행의 같은 CPU 여유 기준과 평균·예약 경계는 직접 구현돼 별도 교정 작업을 만들지 않는다. 남은 실제 OS·동시 부하·동일 범위 비교는 이 기준으로 수행하며 알고리즘 unit을 복제하지 않는다. snapshot token `dba8d3c522069d8b703fbccbec09143be1fe2ec6e82673402ef36c7181a489ac`의 원문 hash를 확인했고 기존 ID·경로·metadata·dependency·수행 기록을 보존했다. archive-only 이동은 목표 철회가 아니며 실제 검증 성공·프로젝트 최종 전문 확인은 수행하지 않았다.
