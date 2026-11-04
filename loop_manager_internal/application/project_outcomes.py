@@ -169,10 +169,22 @@ def _stable_work_reason(
     row = connection.execute(
         "SELECT * FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
-    if row is None or row["phase"] not in {None, "PR_OPEN", "PLAN_BLOCKED"}:
+    if row is None or row["phase"] not in {None, "PR_OPEN", "PLAN_BLOCKED", "PROJECT_BLOCKED"}:
         return None
-    if row["pr_conflict_recovery"] or row["planning_error"]:
+    if row["pr_conflict_recovery"] or work_exhaustion.execution_pending(connection, repo):
         return None
+    if row["planning_error"]:
+        if (row["planning_error_origin"] != "validation"
+                or not row["planning_preserved_state"]
+                or runtime_state.planning_owns_execution_slot(row)
+                or not row["planning_error_fingerprint"]):
+            return None
+        try:
+            preserved = runtime_state._preserved_planning_values(row["planning_preserved_state"])
+        except runtime_state.RuntimeStateError:
+            return None
+        if preserved["planning_validation_error"] != row["planning_error"]:
+            return None
     if not row["planning_fingerprint"]:
         return None
     if connection.execute(
@@ -181,6 +193,17 @@ def _stable_work_reason(
     ).fetchone() is not None and connection.execute(
         "SELECT 1 FROM general_planning_publications WHERE repo = ?", (repo,),
     ).fetchone() is not None:
+        return None
+    if row["phase"] == "PROJECT_BLOCKED" and connection.execute(
+        "SELECT 1 FROM project_blocks WHERE repo=? AND reason_code IS NOT NULL AND evidence IS NOT NULL "
+        "AND reason_code != '' AND evidence != ''", (repo,),
+    ).fetchone() is None:
+        return None
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'"
+    ).fetchone() and connection.execute(
+        "SELECT 1 FROM recovery_records WHERE repo=? AND pending_action!='final_block' LIMIT 1", (repo,),
+    ).fetchone():
         return None
     schedule = effects.catalog_schedule_decision(connection, repo)
     if schedule.active is not None or schedule.runnable_ready is not None:
@@ -203,6 +226,8 @@ def _stable_work_reason(
     ).stdout.strip()
     current_input = effects._planning_input_fingerprint(repo_path, base_sha)
     current_specification = effects._specification_input_fingerprint(repo_path, base_sha)
+    if row["planning_error"] and row["planning_error_fingerprint"] != current_input:
+        return None
     current_plans = effects.plan_declarations(repo_path, base_sha)
     if not planning_input_state.matches(connection, repo, current_plans):
         return None
@@ -248,7 +273,7 @@ def _stable_work_reason(
     snapshot = work_exhaustion.collect(
         connection, repo, cycle=str(row["planning_fingerprint"]),
         active_requirements=active_requirements,
-        requirement_documents=requirement_documents,
+        requirement_documents=requirement_documents, base_revision=base_sha,
     )
     if snapshot is not None and snapshot.completed:
         from loop_manager_internal.storage import planning_review_state

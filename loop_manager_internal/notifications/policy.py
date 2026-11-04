@@ -438,9 +438,96 @@ def _matches_current_draft_item(connection, repo, item, current, *, legacy=False
     return item.get('title') == current['title']
 
 
+def completion_current(connection, repo, cycle, work_cycle):
+    """Recheck durable completion evidence without another remote observation."""
+    from .work_exhaustion import execution_pending
+    from loop_manager_internal.planning.specification_review import valid_final_receipt
+    from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+    from loop_manager_internal.storage import maintenance_state, planning_review_state
+    project = connection.execute(
+        "SELECT phase, planning_fingerprint, planning_error, pr_conflict_recovery FROM projects WHERE repo=?",
+        (repo,),
+    ).fetchone()
+    if (project is None or project[0] is not None or project[1] != cycle or project[2]
+            or project[3] or execution_pending(connection, repo) or catalog_held_plan_ids(connection, repo)
+            or connection.execute("SELECT 1 FROM project_blocks WHERE repo=?", (repo,)).fetchone()):
+        return False
+    has_history = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_history'"
+    ).fetchone()
+    unfinished = "SELECT 1 FROM exec_plans e WHERE e.repo=? AND e.status!='MERGED' "
+    if has_history:
+        unfinished += ("AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h WHERE h.repo=e.repo "
+                       "AND h.plan_id=e.plan_id AND h.currently_archived=1) ")
+    if connection.execute(unfinished + "LIMIT 1", (repo,)).fetchone():
+        return False
+    maintenance = maintenance_state.MaintenanceRepository(connection).get(repo)
+    if maintenance.phase is not maintenance_state.MaintenancePhase.IDLE or maintenance.publication_stage is not None:
+        return False
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone():
+        if connection.execute("SELECT 1 FROM recovery_records WHERE repo=? AND pending_action!='final_block' LIMIT 1", (repo,)).fetchone():
+            return False
+    receipt = planning_review_state.current_final(connection, repo)
+    return bool(valid_final_receipt(receipt) and receipt['confirmed_revision']
+        and receipt['work_cycle'] == work_cycle == planning_review_state.work_cycle(connection, repo)
+        and not planning_review_state.general_pending(connection, repo))
+
+
+def waiting_current(connection, repo, payload):
+    from . import work_exhaustion
+    from loop_manager_internal.storage import maintenance_state, planning_review_state, runtime_state
+    project = connection.execute(
+        "SELECT * FROM projects WHERE repo=?", (repo,),
+    ).fetchone()
+    if (project is None or project['phase'] not in (None, 'PR_OPEN', 'PLAN_BLOCKED', 'PROJECT_BLOCKED')
+            or project['planning_fingerprint'] != payload['cycle'] or project['pr_conflict_recovery']
+            or work_exhaustion.execution_pending(connection, repo)
+            or planning_review_state.general_pending(connection, repo)):
+        return False
+    if project['planning_error']:
+        if (project['planning_error_origin'] != 'validation'
+                or project['planning_error_fingerprint'] != payload['cycle']
+                or not project['planning_preserved_state'] or runtime_state.planning_owns_execution_slot(project)):
+            return False
+        try:
+            preserved = runtime_state._preserved_planning_values(project['planning_preserved_state'])
+        except runtime_state.RuntimeStateError:
+            return False
+        if preserved['planning_validation_error'] != project['planning_error']:
+            return False
+    maintenance = maintenance_state.MaintenanceRepository(connection).get(repo)
+    if maintenance.phase is not maintenance_state.MaintenancePhase.IDLE or maintenance.publication_stage is not None:
+        return False
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'").fetchone():
+        if connection.execute("SELECT 1 FROM recovery_records WHERE repo=? AND pending_action!='final_block' LIMIT 1", (repo,)).fetchone():
+            return False
+    requirements = payload['requirements']
+    if not isinstance(requirements, list) or not all(isinstance(item, dict) and isinstance(item.get('path'), str) for item in requirements):
+        return False
+    relations = payload.get('source_relations')
+    if relations is not None and not isinstance(relations, dict):
+        return False
+    observed = work_exhaustion.collect(connection, repo, cycle=payload['cycle'],
+        active_requirements=tuple(item['path'] for item in requirements), source_relations=relations)
+    return bool(observed and not observed.completed
+                and work_exhaustion.episode_signature(observed) == payload['signature'])
+
+
 def is_current(connection, repo, kind, payload, *, event_key=None):
     """Shared creation/claim boundary; callers provide already recorded facts."""
     try:
+        if kind == 'work_waiting':
+            episode = connection.execute(
+                'SELECT signature, generation FROM work_reason_episodes WHERE repo=?', (repo,),
+            ).fetchone()
+            return bool(episode and episode[0] == payload['signature'] and episode[1] == payload['generation']
+                        and waiting_current(connection, repo, payload))
+        if kind == 'project_completed':
+            saved = connection.execute(
+                'SELECT cycle_key, completed_at, generation FROM project_completion_cycles WHERE repo=?', (repo,),
+            ).fetchone()
+            return bool(saved and saved[0] == payload['cycle'] and saved[1]
+                        and saved[2] == payload['generation'] and completion_current(connection, repo, payload['cycle'], payload['work_cycle']))
         if kind == 'plans_published':
             plans = payload['plans']
             revision = payload['publication_revision']

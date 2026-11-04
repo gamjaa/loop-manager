@@ -63,6 +63,7 @@ class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.
                 "UPDATE projects SET phase = 'WORKING' WHERE repo = ?", (repo,)
             )
         loop_manager.notifications.configure_session(connection, enabled=True)
+        loop_manager.notifications.ensure_schema(connection)
         connection.commit()
 
         def failed_step(*_args, **_kwargs):

@@ -8,6 +8,7 @@ from loop_manager_internal.application.contracts import PROJECT_STEP_USAGE_PAUSE
 from loop_manager_internal.application.contracts import ProjectRunKind
 from loop_manager_internal.application.contracts import ProjectRunResult
 from loop_manager_internal.notifications import notifications
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.recovery import recovery_runtime
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.runtime.contracts import GitLockError
@@ -200,23 +201,8 @@ def _run_project_result(
         observe_runtime()
         dispatch_checkpoints, checkpoint_plan_id = checkpoint_dispatch_scope()
         if dispatch_checkpoints and effects._checkpoint_dispatch_ready(connection, repo):
-            project_before = connection.execute(
-                "SELECT phase, pr_conflict_recovery FROM projects WHERE repo = ?",
-                (repo,),
-            ).fetchone()
             schedule_before = effects.catalog_schedule_decision(connection, repo)
-            maintenance_before = maintenance_state.MaintenanceRepository(
-                connection
-            ).get(repo)
-            if (
-                schedule_before.active is not None
-                or schedule_before.runnable_ready is not None
-                or project_before["phase"] not in {
-                    None, "PR_OPEN", "PLAN_BLOCKED", "PROJECT_BLOCKED",
-                }
-                or project_before["pr_conflict_recovery"]
-                or maintenance_before.phase is not maintenance_state.MaintenancePhase.IDLE
-            ):
+            if schedule_before.runnable_ready is not None:
                 notifications.mark_work_available(connection, repo)
             pending_before = (
                 blocked_checkpoint_state.BlockedCheckpointRepository(
@@ -239,6 +225,12 @@ def _run_project_result(
                     request.request_identity for request in pending_before
                 )
         try:
+            has_catalog = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='exec_plans'"
+            ).fetchone() is not None
+            progress_before = ({str(row[0]): tuple(row[1:]) for row in connection.execute(
+                "SELECT plan_id, verify_token, review_token, status FROM exec_plans WHERE repo=?", (repo,),
+            )} if has_catalog else {})
             recovery_before = {
                 str(record["subject"]): int(record["generation"])
                 for record in connection.execute(
@@ -282,6 +274,16 @@ def _run_project_result(
                 0,
                 str(error),
             )
+        for observed in (connection.execute(
+            "SELECT plan_id, verify_token, review_token, status FROM exec_plans WHERE repo=?", (repo,),
+        ) if progress_before else ()):
+            previous = progress_before.get(str(observed[0]))
+            if previous is not None and (
+                any(not previous[index] and observed[index + 1] for index in (0, 1))
+                or previous[2] != "MERGED" and observed[3] == "MERGED"
+            ):
+                notifications.mark_work_available(connection, repo)
+                break
         if on_step_completed is not None:
             on_step_completed()
         if step_result == PROJECT_STEP_RETRY:
@@ -349,6 +351,17 @@ def _run_project_result(
             f"PROJECT_BLOCKED {project_block['reason_code']}: {project_block['evidence']}"
             if project_block is not None else detail
         )
+        if reason is not None:
+            reason = redact_secrets(reason)
+        if project_block is not None and step_result in (0, 1):
+            try:
+                snapshot = effects._stable_work_reason(
+                    connection, repo, refactoring_review_interval=refactoring_review_interval,
+                )
+            except (RuntimeError, OSError):
+                snapshot = None
+            if snapshot is not None and not snapshot.completed:
+                notifications.enqueue_waiting_reason(connection, repo, snapshot)
         effects.operation_log(str(reason), error=True)
         return ProjectRunResult(ProjectRunKind.BLOCKED, 1, reason)
     if step_result == PROJECT_STEP_TRANSIENT_PAUSE:
@@ -358,11 +371,19 @@ def _run_project_result(
     if step_result == PROJECT_STEP_PLANNING_PENDING:
         return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
     if row is not None and row["planning_error"]:
-        reason = f"planning_error: {row['planning_error']}"
+        reason = redact_secrets(f"planning_error: {row['planning_error']}")
         if runtime_state.planning_owns_execution_slot(row):
             effects.operation_log(reason, error=True)
             return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, reason)
         if step_result == 0:
+            try:
+                snapshot = effects._stable_work_reason(
+                    connection, repo, refactoring_review_interval=refactoring_review_interval,
+                )
+            except (RuntimeError, OSError):
+                snapshot = None
+            if snapshot is not None and not snapshot.completed:
+                notifications.enqueue_waiting_reason(connection, repo, snapshot)
             effects.operation_log(reason)
             return ProjectRunResult(ProjectRunKind.WAITING, 0, reason)
     if recovery_request_id is not None and step_result != 0:
@@ -376,11 +397,12 @@ def _run_project_result(
             connection, repo, refactoring_review_interval=refactoring_review_interval,
         )
     if snapshot is not None:
-        reason = snapshot.describe()
+        reason = redact_secrets(snapshot.describe())
         effects.operation_log(f"작업 선택 결과 ({repo}): {reason}")
         if snapshot.completed and step_result == 0:
-            notifications.enqueue_completion_if_ready(connection, repo, snapshot)
-            return ProjectRunResult(ProjectRunKind.COMPLETED, 0, reason)
+            if notifications.enqueue_completion_if_ready(connection, repo, snapshot):
+                return ProjectRunResult(ProjectRunKind.COMPLETED, 0, reason)
+            return ProjectRunResult(ProjectRunKind.WAITING, 0, "완료 조건 재확인 대기")
         if not snapshot.completed:
             notifications.enqueue_waiting_reason(connection, repo, snapshot)
             return ProjectRunResult(ProjectRunKind.WAITING, 0, reason)

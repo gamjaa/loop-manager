@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS project_completion_cycles (
     last_completed_plan_id TEXT,
     last_completed_title TEXT,
     completed_at TEXT,
+    generation INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (repo) REFERENCES projects(repo)
 )
 """
@@ -110,6 +111,9 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE notification_outbox ADD COLUMN canceled_at TEXT"
         )
     connection.execute(COMPLETION_SCHEMA)
+    completion_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(project_completion_cycles)")}
+    if "generation" not in completion_columns:
+        connection.execute("ALTER TABLE project_completion_cycles ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
     connection.execute(WORK_REASON_SCHEMA)
     connection.execute(PR_REVIEW_CANDIDATE_SCHEMA)
     connection.execute(PR_CREATION_SCHEMA)

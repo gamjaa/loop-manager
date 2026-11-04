@@ -143,8 +143,8 @@ class NotificationRenderingTest(unittest.TestCase):
         original = json.dumps(payload, sort_keys=True)
         message = rendering._message("work_waiting", payload)
         positions = [message.index(value) for value in (
-            "사용자 확인 대기:", "- G-002", "- G-003", "- G-004", "- G-005", "- R-002",
-            "기타 대기:", "- G-001", "- R-001",
+            "- G-003", "- G-004", "- G-005", "- PROJECT_BLOCKED",
+            "- G-001", "- G-002", "- R-001", "- R-002", "- planning_error",
         )]
         self.assertEqual(positions, sorted(positions))
         for value in (
@@ -163,10 +163,12 @@ class NotificationRenderingTest(unittest.TestCase):
             "planning_error": "git lock busy; automatic retry pending",
         }
         message = rendering._message("work_waiting", payload)
-        self.assertLess(message.index("PROJECT_BLOCKED"), message.index("기타 대기:"))
-        self.assertLess(message.index("기타 대기:"), message.index("planning_error"))
+        self.assertLess(message.index("PROJECT_BLOCKED"), message.index("R-001"))
+        self.assertLess(message.index("R-001"), message.index("planning_error"))
         self.assertIn("automatic retry pending", message)
         self.assertNotIn("사용자 조치:", message)
+        self.assertNotIn("사용자 확인 대기:", message)
+        self.assertIn("user_decision_required", message)
 
     def test_long_block_keeps_diagnostics_and_local_checkpoint_across_pieces(self):
         payload = {
@@ -400,7 +402,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             },
         )
 
-    def test_merged_completion_state_survives_restart_without_notice(self):
+    def test_merged_completion_state_survives_restart_with_one_notice(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
@@ -419,6 +421,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 notifications.record_merged_plan(
                     connection, repo, "G-018", "Reliable notices",
                 )
+                self.confirm_final_review(connection, repo, 'merge-cycle')
                 self.assertTrue(notifications.enqueue_completion_if_ready(
                     connection, repo, snapshot,
                 ))
@@ -432,14 +435,14 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 restarted, repo, snapshot,
             ))
             delivered = mock.Mock()
-            self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=delivered), 0)
-            delivered.assert_not_called()
+            self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=delivered), 1)
+            delivered.assert_called_once()
             completion = restarted.execute('SELECT * FROM project_completion_cycles WHERE repo = ?', (repo,)).fetchone()
             self.assertEqual(completion['cycle_key'], 'merge-cycle')
             self.assertEqual(completion['last_completed_plan_id'], 'G-018')
             self.assertEqual(completion['last_completed_title'], 'Reliable notices')
             self.assertIsNotNone(completion['completed_at'])
-            self.assertEqual(self.events(restarted), [])
+            self.assertEqual(len(self.events(restarted)), 1)
 
     def test_disabled_and_partial_configuration_do_not_create_events(self):
         connection = self.connection(enabled=False)
@@ -869,6 +872,46 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=delivered), 0)
         delivered.assert_not_called()
         self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+
+    def test_project_wait_is_independent_of_sent_draft_with_mixed_causes(self):
+        from loop_manager_internal.storage import execplan_draft_state
+        connection = self.connection()
+        repo = '/projects/alpha'
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        plan = {'id': 'G-018', 'title': 'Reliable notices', 'sources': ['docs/PRODUCT.md'],
+                'draft': True, 'draft_scope': 'scope', 'draft_question':
+                'Question: Choose A or B?\nOptions: A, B\nImpact: A retains history',
+                'draft_question_identity': 'question-1'}
+        with connection:
+            connection.execute("UPDATE projects SET origin='org/repo', planning_fingerprint='cycle' WHERE repo=?", (repo,))
+            connection.execute("UPDATE exec_plans SET current_revision_sha='remote-sha' WHERE repo=?", (repo,))
+            execplan_draft_state.observe(connection, repo, path, plan, 'hash', 'remote-sha',
+                                        remote_url='https://github.com/org/repo')
+            for plan_id, title, status, dependencies in (
+                    ('G-019', 'Merge', 'PR_OPEN', '[]'),
+                    ('G-020', 'Dependency', 'READY', '["G-019"]'),
+                    ('G-021', 'Blocked', 'PLAN_BLOCKED', '[]')):
+                connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+                    "VALUES (?,?,?,?, '[]',?,'normal','hash',?)",
+                    (repo, plan_id, f'docs/plans/[{plan_id}] {title}.md', title, dependencies, status))
+            connection.execute("INSERT INTO execplan_blocks (repo,plan_id,scope,reason_code,evidence) "
+                               "VALUES (?, 'G-021', 'plan', 'common_defect_pending', 'Correction pending')", (repo,))
+            notifications.enqueue_draft_decisions(connection, repo)
+        draft_sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=draft_sender), 1)
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle', active_requirements=(), base_revision='remote-sha')
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        rows = self.events(connection)
+        self.assertEqual([row['event_type'] for row in rows], ['draft_decisions', 'work_waiting'])
+        payload = json.loads(rows[1]['payload'])
+        self.assertFalse(payload['silent'])
+        self.assertEqual([item['status'] for item in payload['plans']], ['DRAFT', 'PR_OPEN', 'READY', 'PLAN_BLOCKED'])
+        wait_sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=wait_sender), 1)
+        text = wait_sender.call_args.args[2]
+        for item in ('G-018', 'G-019', 'G-020', 'G-021', 'Correction pending', 'PR Merge', 'dependency'):
+            self.assertIn(item, text)
 
     def test_draft_notice_tracks_question_revision_and_preserves_sent_audit(self):
         from loop_manager_internal.storage import execplan_draft_state

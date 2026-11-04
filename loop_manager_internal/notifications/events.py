@@ -22,6 +22,16 @@ from .incidents import _preservation_checkpoint
 from .rendering import _checkpoint_link, _pieces
 
 
+def _redacted_payload(value):
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list):
+        return [_redacted_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redacted_payload(item) for key, item in value.items()}
+    return value
+
+
 @dataclass(frozen=True)
 class _BlockedPlanProjection:
     """Named inputs for one blocked-plan notification payload."""
@@ -494,57 +504,46 @@ def enqueue_completion_if_ready(
 ) -> bool:
     """Record completion only for an already verified stable selection."""
 
-    from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
-    if catalog_held_plan_ids(connection, repo):
-        return False
     if snapshot is None or not snapshot.completed:
         return False
     ensure_schema(connection)
-    project = connection.execute(
-        "SELECT phase, planning_fingerprint, planning_error "
-        "FROM projects WHERE repo = ?",
-        (repo,),
-    ).fetchone()
-    has_historical_catalog = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'execplan_catalog_history'"
-    ).fetchone() is not None
-    unfinished_query = (
-        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
-        "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
-        "WHERE h.repo = exec_plans.repo AND h.currently_archived = 1 "
-        "AND h.plan_id = exec_plans.plan_id) LIMIT 1"
-        if has_historical_catalog else
-        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1"
-    )
-    if (
-        project is None
-        or project[0] is not None
-        or not project[1]
-        or str(project[1]) != snapshot.cycle
-        or project[2]
-        or connection.execute(unfinished_query, (repo,)).fetchone() is not None
-        or connection.execute(
-            "SELECT 1 FROM project_blocks WHERE repo = ?", (repo,),
-        ).fetchone() is not None
-    ):
-        return False
-
-    cycle_key = str(project[1])
+    from .policy import completion_current
+    from loop_manager_internal.storage import planning_review_state
     with connection:
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        work_cycle = planning_review_state.work_cycle(connection, repo)
+        if not completion_current(connection, repo, snapshot.cycle, work_cycle):
+            return False
+        previous = connection.execute(
+            "SELECT cycle_key, completed_at, generation FROM project_completion_cycles WHERE repo=?", (repo,),
+        ).fetchone()
         _cancel_pending_waiting(connection, repo)
+        if previous is None or previous[0] != snapshot.cycle:
+            connection.execute(
+                "UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP "
+                "WHERE repo=? AND event_type='project_completed' AND sent_at IS NULL AND canceled_at IS NULL",
+                (repo,),
+            )
         connection.execute(
-            """
-            INSERT INTO project_completion_cycles (repo, cycle_key, completed_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(repo) DO UPDATE SET
-                cycle_key = excluded.cycle_key,
-                completed_at = excluded.completed_at
-            WHERE project_completion_cycles.cycle_key IS NOT excluded.cycle_key
-                OR project_completion_cycles.completed_at IS NULL
-            """,
-            (repo, cycle_key),
+            "INSERT INTO project_completion_cycles (repo, cycle_key, completed_at) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(repo) DO UPDATE SET "
+            "cycle_key=excluded.cycle_key, completed_at=excluded.completed_at "
+            "WHERE project_completion_cycles.cycle_key IS NOT excluded.cycle_key "
+            "OR project_completion_cycles.completed_at IS NULL", (repo, snapshot.cycle),
         )
+        if _enabled(connection) and (previous is None or previous[0] != snapshot.cycle or not previous[1]):
+            saved = connection.execute(
+                "SELECT last_completed_plan_id, last_completed_title, generation FROM project_completion_cycles WHERE repo=?",
+                (repo,),
+            ).fetchone()
+            payload = {"project": Path(repo).name or repo, "cycle": snapshot.cycle,
+                       "work_cycle": work_cycle, "generation": saved[2], "reason": snapshot.describe(),
+                       "last_completed_plan_id": saved[0], "last_completed_title": saved[1] or ''}
+            _insert(connection, _key('project_completed', repo, snapshot.cycle + '\0' + work_cycle + '\0' + str(saved[2])),
+                    repo, 'project_completed', _redacted_payload(payload))
+    from .delivery import flush_project_events
+    flush_project_events(connection, repo)
     return True
 
 
@@ -567,23 +566,30 @@ def mark_work_available(connection: sqlite3.Connection, repo: str) -> None:
             "WHERE repo = ? AND signature != '__work_available__'", (repo,),
         )
         _cancel_pending_waiting(connection, repo)
+        connection.execute("UPDATE project_completion_cycles SET completed_at=NULL, generation=generation+1 "
+                           "WHERE repo=? AND completed_at IS NOT NULL", (repo,))
+        connection.execute(
+            "UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP "
+            "WHERE repo=? AND event_type='project_completed' AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+        )
 
 
 def enqueue_waiting_reason(
     connection: sqlite3.Connection, repo: str, snapshot: WorkReasonSnapshot,
 ) -> bool:
-    """Record stable waiting episodes without creating a Telegram notice."""
+    """Record the stable episode and queue its independently validated notice."""
 
     if snapshot.completed:
         return False
     ensure_schema(connection)
-    payload = snapshot.payload(Path(repo).name or repo)
+    payload = _redacted_payload(snapshot.payload(Path(repo).name or repo))
     enqueue_draft_decisions(connection, repo)
-    signature = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=False,
-                   separators=(",", ":")).encode()
-    ).hexdigest()
+    from .work_exhaustion import episode_signature
+    signature = episode_signature(snapshot)
+    queued = False
     with connection:
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
         previous = connection.execute(
             "SELECT signature, generation FROM work_reason_episodes WHERE repo = ?",
             (repo,),
@@ -598,8 +604,25 @@ def enqueue_waiting_reason(
             "signature = excluded.signature, generation = excluded.generation",
             (repo, signature, generation),
         )
-        _cancel_pending_waiting(connection, repo)
-    return False
+        if previous is None or previous[0] != signature:
+            _cancel_pending_waiting(connection, repo)
+        payload.update(signature=signature, generation=generation)
+        current = is_current(connection, repo, 'work_waiting', payload)
+        if current:
+            connection.execute("UPDATE project_completion_cycles SET completed_at=NULL, generation=generation+1 "
+                           "WHERE repo=? AND completed_at IS NOT NULL", (repo,))
+            connection.execute(
+                "UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP "
+                "WHERE repo=? AND event_type='project_completed' AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+            )
+        if _enabled(connection) and current:
+            key = _key('work_waiting', repo, str(generation))
+            existing = connection.execute("SELECT 1 FROM notification_outbox WHERE event_key=?", (key,)).fetchone()
+            _insert(connection, key, repo, 'work_waiting', payload)
+            queued = existing is None
+    from .delivery import flush_project_events
+    flush_project_events(connection, repo)
+    return queued
 
 
 def enqueue_progress(connection, repo, kind, identity, **payload):

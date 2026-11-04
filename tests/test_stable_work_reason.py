@@ -49,6 +49,7 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         old_source = "docs/requirements/[R-031] Original.md"
         requirement_path = "docs/requirements/[R-031] Waiting.md"
         requirement = requirement_path.encode()
+        connection.execute("UPDATE projects SET origin='org/repo' WHERE repo=?", (repo,))
         connection.execute(
             "UPDATE exec_plans SET sources = ? WHERE repo = ?",
             (json.dumps([old_source]), repo),
@@ -77,6 +78,18 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             )
             self.assertIsNotNone(snapshot)
             self.assertIn("[R-031]", snapshot.describe())
+            self.assertEqual(snapshot.plans[0]["url"],
+                "https://github.com/org/repo/blob/base-sha/docs/plans/%5BG-018%5D%20Work.md")
+            self.assertEqual(snapshot.requirements[0]["url"],
+                "https://github.com/org/repo/blob/base-sha/docs/requirements/%5BR-031%5D%20Waiting.md")
+            self.assertTrue(loop_manager.notifications.enqueue_waiting_reason(connection, repo, snapshot))
+            event = connection.execute("SELECT payload FROM notification_outbox WHERE event_type='work_waiting'").fetchone()
+            from loop_manager_internal.notifications.policy import is_current
+            payload = json.loads(event[0])
+            self.assertTrue(is_current(connection, repo, 'work_waiting', payload))
+            connection.execute("UPDATE exec_plans SET sources='[]' WHERE repo=?", (repo,))
+            self.assertFalse(is_current(connection, repo, 'work_waiting', payload))
+            connection.execute("UPDATE exec_plans SET sources=? WHERE repo=?", (json.dumps([old_source]), repo))
             connection.execute(
                 "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,),
             )
@@ -239,6 +252,15 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             ))
         connection.close()
 
+    def test_uncertain_call_prevents_stable_selection_despite_pr_projection(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("INSERT INTO task_call_reservations (token,repo,plan_id,kind,uncertain) "
+                           "VALUES ('reserved', ?, 'G-999', 'verify', 1)", (repo,))
+        with mock.patch('loop_manager.git') as git:
+            self.assertIsNone(loop_manager._stable_work_reason(connection, repo, refactoring_review_interval=5))
+            git.assert_not_called()
+
     def test_runnable_and_due_maintenance_do_not_emit_exhaustion(self):
         connection, repo = self._connection()
         connection.execute(
@@ -290,6 +312,60 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
         completed.assert_not_called()
         connection.close()
+
+    @dummy_worker_sessions
+    def test_management_handoff_and_retry_order_do_not_retire_wait_episode(self):
+        from loop_manager_internal.storage import management_admission
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        management_admission.ensure_schema(connection)
+        connection.execute("UPDATE exec_plans SET status='VERIFYING' WHERE repo=?", (repo,))
+        connection.execute("UPDATE projects SET phase='VERIFYING' WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO work_reason_episodes(repo,signature,generation) VALUES (?, 'stable', 7)", (repo,))
+        connection.execute("INSERT INTO project_completion_cycles(repo,cycle_key,completed_at,generation) "
+                           "VALUES (?, 'cycle-one', 'preserved', 4)", (repo,))
+        connection.execute("INSERT INTO task_management_admissions(repo,plan_id,parked,pending,handoff,retry_order) "
+                           "VALUES (?, 'G-018', 1, 1, 0, 3)", (repo,))
+        with (mock.patch('loop_manager._checkpoint_dispatch_ready', return_value=True),
+              mock.patch('loop_manager._run_project_step', return_value=loop_manager.PROJECT_STEP_TRANSIENT_PAUSE)):
+            for parked, pending, handoff, retry in ((1, 1, 0, 3), (1, 0, 1, 3), (0, 0, 0, 4)):
+                connection.execute("UPDATE task_management_admissions SET parked=?,pending=?,handoff=?,retry_order=? WHERE repo=?",
+                                   (parked, pending, handoff, retry, repo))
+                result = loop_manager._run_project_result(connection, Path('/unused'), repo, Path('/unused.ini'), None, False)
+                self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+                self.assertEqual(tuple(connection.execute("SELECT signature,generation FROM work_reason_episodes WHERE repo=?", (repo,)).fetchone()), ('stable', 7))
+                self.assertEqual(tuple(connection.execute("SELECT completed_at,generation FROM project_completion_cycles WHERE repo=?", (repo,)).fetchone()), ('preserved', 4))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type IN ('work_waiting','project_completed')").fetchone()[0], 0)
+
+    @dummy_worker_sessions
+    def test_verified_progress_retires_episode_after_management_wait(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE exec_plans SET status='VERIFYING' WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO work_reason_episodes(repo,signature,generation) VALUES (?, 'stable', 7)", (repo,))
+        def completed_step(*_args, **_kwargs):
+            connection.execute("UPDATE exec_plans SET verify_token='verified-candidate' WHERE repo=?", (repo,))
+            return loop_manager.PROJECT_STEP_TRANSIENT_PAUSE
+        with (mock.patch('loop_manager._checkpoint_dispatch_ready', return_value=False),
+              mock.patch('loop_manager._run_project_step', side_effect=completed_step)):
+            result = loop_manager._run_project_result(connection, Path('/unused'), repo, Path('/unused.ini'), None, False)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+        self.assertEqual(tuple(connection.execute("SELECT signature,generation FROM work_reason_episodes WHERE repo=?", (repo,)).fetchone()),
+                         ('__work_available__', 7))
+
+    @dummy_worker_sessions
+    def test_completion_gate_change_after_snapshot_does_not_report_completion(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        from loop_manager_internal.notifications.work_exhaustion import WorkReasonSnapshot
+        snapshot = WorkReasonSnapshot('cycle-one', (), (), None, None)
+        with (mock.patch('loop_manager._checkpoint_dispatch_ready', return_value=False),
+              mock.patch('loop_manager._run_project_step', return_value=0),
+              mock.patch('loop_manager._stable_work_reason', return_value=snapshot),
+              mock.patch.object(loop_manager.notifications, 'enqueue_completion_if_ready', return_value=False)):
+            result = loop_manager._run_project_result(connection, Path('/unused'), repo, Path('/unused.ini'), None, False)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertIn('재확인', result.detail)
 
     @dummy_worker_sessions
     def test_planner_no_change_with_active_requirement_waits_without_completion(self):
@@ -352,6 +428,72 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             "SELECT signature, generation FROM work_reason_episodes WHERE repo=?", (repo,)
         ).fetchone()), episode)
         connection.close()
+
+    @dummy_worker_sessions
+    def test_suspended_validation_error_waits_only_for_unchanged_input_and_idle_targets(self):
+        from loop_manager_internal.storage import runtime_state
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE projects SET phase='PLANNING', planning_error='Invalid result', "
+            "planning_validation_error='Invalid result', planning_error_origin='validation', "
+            "planning_error_fingerprint='cycle-one' WHERE repo=?", (repo,))
+        state = runtime_state.RuntimeStateRepository(connection)
+        state.suspend_planning(state.planning(repo))
+        with (mock.patch('loop_manager._checkpoint_dispatch_ready', return_value=False),
+              mock.patch('loop_manager._run_project_step', return_value=0),
+              mock.patch('loop_manager.git') as command,
+              mock.patch('loop_manager._planning_input_fingerprint', return_value='cycle-one') as fingerprint,
+              mock.patch('loop_manager._specification_input_fingerprint', return_value='spec-one'),
+              mock.patch('loop_manager.plan_declarations', return_value={}),
+              mock.patch('loop_manager._git_tree_entries', return_value={})):
+            command.return_value.stdout = 'base-sha\n'
+            result = loop_manager._run_project_result(connection, Path('/unused'), repo, Path('/unused.ini'), None, False)
+            self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+            event = connection.execute("SELECT payload FROM notification_outbox WHERE event_type='work_waiting'").fetchone()
+            self.assertIsNotNone(event)
+            payload = json.loads(event[0])
+            self.assertEqual(payload['planning_error'], 'Invalid result')
+            from loop_manager_internal.notifications.policy import is_current
+            self.assertTrue(is_current(connection, repo, 'work_waiting', payload))
+            connection.execute("UPDATE projects SET planning_error_origin='unsafe' WHERE repo=?", (repo,))
+            self.assertFalse(is_current(connection, repo, 'work_waiting', payload))
+            connection.execute("UPDATE projects SET planning_error_origin='validation' WHERE repo=?", (repo,))
+            fingerprint.return_value = 'changed'
+            self.assertIsNone(loop_manager._stable_work_reason(connection, repo, refactoring_review_interval=5))
+            fingerprint.return_value = 'cycle-one'
+            connection.execute("UPDATE exec_plans SET status='VERIFYING' WHERE repo=?", (repo,))
+            self.assertIsNone(loop_manager._stable_work_reason(connection, repo, refactoring_review_interval=5))
+
+    @dummy_worker_sessions
+    def test_project_block_waits_only_after_all_targets_and_recovery_are_stable(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE exec_plans SET status='READY' WHERE repo=?", (repo,))
+        connection.execute("INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
+                           "VALUES (?, 'project', 'repository_state_unsafe', 'Unsafe worktree')", (repo,))
+        connection.execute("UPDATE projects SET phase='PROJECT_BLOCKED' WHERE repo=?", (repo,))
+        with (mock.patch('loop_manager._checkpoint_dispatch_ready', return_value=False),
+              mock.patch('loop_manager._run_project_step', return_value=1),
+              mock.patch('loop_manager.git') as command,
+              mock.patch('loop_manager._planning_input_fingerprint', return_value='cycle-one'),
+              mock.patch('loop_manager._specification_input_fingerprint', return_value='spec-one'),
+              mock.patch('loop_manager.plan_declarations', return_value={}),
+              mock.patch('loop_manager._git_tree_entries', return_value={})):
+            command.return_value.stdout = 'base-sha\n'
+            result = loop_manager._run_project_result(connection, Path('/unused'), repo, Path('/unused.ini'), None, False)
+            self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
+            event = connection.execute("SELECT payload FROM notification_outbox WHERE event_type='work_waiting'").fetchone()
+            self.assertIsNotNone(event)
+            payload = json.loads(event[0])
+            self.assertEqual(payload['project_block']['reason'], 'Unsafe worktree')
+            self.assertEqual(payload['plans'][0]['status'], 'READY')
+            connection.execute("UPDATE exec_plans SET status='VERIFYING' WHERE repo=?", (repo,))
+            self.assertIsNone(loop_manager._stable_work_reason(connection, repo, refactoring_review_interval=5))
+            connection.execute("UPDATE exec_plans SET status='READY' WHERE repo=?", (repo,))
+            connection.execute("INSERT INTO recovery_records (repo, subject, identity, reason_code, disposition, "
+                "pending_action, phase, fingerprint, progress_marker, occurrence, attempts, detail) "
+                "VALUES (?, 'G-018', 'id', 'git_lock', 'transient_retry', 'retry', 'WORKING', 'fp', 'm', 1, 1, 'lock')", (repo,))
+            self.assertIsNone(loop_manager._stable_work_reason(connection, repo, refactoring_review_interval=5))
 
     @dummy_worker_sessions
     def test_project_block_and_planning_error_report_actual_causes(self):

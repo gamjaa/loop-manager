@@ -19,24 +19,6 @@ def _checkpoint_link(origin: object, oid: object) -> str | None:
     return value.removesuffix(".git") + "/tree/" + str(oid)
 
 
-def _needs_user_attention(item: dict[str, object]) -> bool:
-    # Requirement waits encode the confirmed decision in their existing reason.
-    # This affects display order only; the payload and deduplication key stay intact.
-    return bool(
-        item.get("status") in {"DRAFT", "PR_OPEN"}
-        or item.get("question") or item.get("action_targets")
-        or item.get("reason_code") in {
-            "execplan_catalog_invalid", "guidance_approval_required",
-            "user_decision_required", "review_specification_deadlock",
-            "pull_request_closed",
-        }
-        or (str(item.get("path", "")).startswith("docs/requirements/")
-            and str(item.get("reason", "")).startswith(
-                "전체 충족 판단이 불확실하여 사용자 결정을 기다립니다:"
-            ))
-    )
-
-
 def _message(kind: str, payload: dict[str, object]) -> str:
     text = _event_message(kind, payload)
     if payload.get("occurred_at"):
@@ -95,24 +77,19 @@ def _event_message(kind: str, payload: dict[str, object]) -> str:
         entries = [*payload["plans"], *payload["requirements"]]
         if payload.get("project_block"):
             entries.append({
-                "id": "PROJECT_BLOCKED", "reason": payload["project_block"]["reason"],
+                "id": "PROJECT_BLOCKED", "status": "PROJECT_BLOCKED",
+                "reason": payload["project_block"]["reason"],
                 "reason_code": payload["project_block"].get("code"),
             })
         if payload.get("planning_error"):
             entries.append({"id": "planning_error", "reason": str(payload["planning_error"])})
-        plans = sorted(
-            entries,
-            key=lambda item: not _needs_user_attention(item),
-        )
-        has_actions = any(_needs_user_attention(item) for item in plans)
-        section = None
+        priority = {"DRAFT", "PLAN_BLOCKED", "PROJECT_BLOCKED", "CATALOG_HELD"}
+        plans = sorted(entries, key=lambda item: item.get("status") not in priority)
         for plan in plans:
-            next_section = "사용자 확인 대기:" if _needs_user_attention(plan) else "기타 대기:"
-            if has_actions and section != next_section:
-                lines.append(next_section)
-                section = next_section
             title = " " + str(plan["title"]) if plan.get("title") else ""
             lines.append(f"- {plan['id']}{title}: {plan['reason']}")
+            if plan.get("reason_code") and str(plan["reason_code"]) not in str(plan["reason"]):
+                lines.append("  원인 코드: " + str(plan["reason_code"]))
             if plan.get("evidence") and str(plan["evidence"]) not in str(plan["reason"]):
                 lines.append("  원인: " + str(plan["evidence"]))
             if plan.get("question"):
