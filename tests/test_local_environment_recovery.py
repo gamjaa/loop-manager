@@ -612,6 +612,20 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         self.assertEqual(recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
         self.assertEqual(targets, [None, 'G-001'])
 
+    def test_project_command_enumerates_conflict_recheck_target(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha, blocked_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (repo, 'G-001', 'docs/plans/G-001.md', 'one', '[]', '[]', 'normal', 'hash', 'PLAN_BLOCKED', 'base', 'managed_worktree_conflict'))
+        targets = []
+        def run(connection, *_args, **kwargs):
+            targets.append(kwargs['recovery_plan_id'])
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        self.assertEqual(recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
+        self.assertEqual(targets, [None, 'G-001'])
+
     def test_project_request_does_not_dispatch_consumed_metadata_again(self):
         self.config_path.write_text('[loop]\n', encoding='utf-8')
         repo = str(self.repository.resolve())

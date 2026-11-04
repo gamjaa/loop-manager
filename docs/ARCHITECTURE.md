@@ -1095,6 +1095,8 @@ PR 복구 선택은 `selected_execution` 안에서 대상 계획의 원본만 �
 
 완전한 근거만 기존 `final_evidence` JSON에 보존하며 DB schema를 추가하지 않는다. outbox의 현재성 검사는 이 근거를 현재 계획·PR·checkpoint와 대조하고, 충돌 사건에는 그 근거를 action identity에도 결합한다. 원격 head/base 변경이나 mergeable 관측은 관련 recovery record와 해당 block의 보존 snapshot만 대기로 보류한다. 원래 최종 근거·차단·checkpoint·이미 전송한 조각과 독립 원인의 recovery record는 유지한다. 기존 조각별 재검사·취소가 미전송분을 중단하며 원격 head를 소유 근거 없이 채택하거나 차단 해제를 합성하지 않는다. 이 계약은 복구 소유자가 공급한 근거의 검증 경계이며, 진단 문구나 실패 횟수에서 불가 사유를 생성하지 않는다.
 
+현재 `managed_conflict_unrecoverable/final_block`의 자동 재평가는 정규화·Git 쓰기 전에 근거의 PR/checkpoint 현재성, 관련 문서 입력 fingerprint와 저장한 작업물 snapshot의 HEAD·branch·index·dirty·operation을 비교한다. 모두 같으면 새 교정으로 넘기지 않으며 독립 ref 변경은 이 비교에 포함하지 않는다. 실제 입력 변화 또는 기존 원격 관측에 의한 평가 보류는 현재 소유 rebase 검사로 이어진다. 명시적 로컬 복구 요청은 `conflict` 원인으로 기록하며 `metadata`·`verify` 소비와 구분한다. 접수 snapshot의 차단 원인·내용·해제 지문·checkpoint generation을 대조하고 소유권·원격·실행 자리·dependency를 재확인한 뒤 요청 소비와 해당 차단 해제를 같은 transaction에서 반영한다. 중단·경합은 둘 다 보존하고 성공한 요청을 새 차단에 재사용하지 않는다. 재개는 기존 artifact 감사와 진행 operation을 보존하며 검증 성공이나 rebase 완료를 합성하지 않는다.
+
 일반적인 PLAN_BLOCKED는 계획·원래 활성 sources의 내용 해시를 기준으로 재평가한다. 닫힌 PR은 같은 PR reopen을 요구한다. 과거 파일 승인 대기는 일반 작업·소유권 검사를 통과하면 기록을 보존한 채 재개한다. 독립 차단·planning 오류·실패 감사는 함께 지우지 않는다. planning_error는 실제 교정·재검증·게시 복구로 원인이 해소된 뒤에만 지운다. cleanup_pending과 ExecPlan archive pending은 상태 전이를 만들지 않는다.
 
 차단 재평가의 자리는 대상 계획의 호출 종료·branch/worktree 경합·관리 상한과 planning·유지보수 소유권으로 판단한다. 다른 계획의 실행 단계나 대표 투영만으로 독립 복구를 보류하지 않는다. 사용자 질문의 재평가 중 원격·계획·checkpoint가 달라지면 `remote_snapshot_race`로 남겨 같은 원인의 재검사 입력을 보존하며, 최종 거부나 처리 완료로 소비하지 않는다.

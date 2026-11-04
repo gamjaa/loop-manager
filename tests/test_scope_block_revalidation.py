@@ -492,6 +492,150 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         self.assertTrue(self.checkpoints.get('repo', 'G-047').snapshot['scope_block_release_audit'])
 
 
+class ConflictCauseRecheckTests(unittest.TestCase):
+    def test_current_final_proof_suppresses_unchanged_recheck_before_normalization(self):
+        import json
+        from tests.support.execution import execution_fixture
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        from loop_manager_internal.recovery import project_block_service
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        fixture = execution_fixture(self)
+        connection = fixture.connection
+        observation = prepared_conflict_assessment(connection, 'repo', 'G-047')
+        with connection:
+            connection.execute("UPDATE projects SET planning_attempt_fingerprint=NULL WHERE repo='repo'")
+        record = RecoveryRepository(connection).observe(observation)
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_conflict',
+            evidence=observation.detail, release_fingerprint='same',
+            plan_values={'blocked_fingerprint': 'same', 'blocked_worktree_fingerprint': 'same'})
+        baseline = loop_manager.GitSnapshot.deserialize(observation.conflict_evidence['worktree_snapshot'])
+        service = SimpleNamespace(normalize_frontmatter=mock.Mock(return_value=False),
+            require_owned=mock.Mock(side_effect=RuntimeError('changed input reached ownership gate')))
+        capture = mock.Mock(return_value=baseline)
+        effects = project_block_service.ReconcileRebaseEvidenceBlockEffects(
+            _current_rebase_service=lambda *_: service,
+            _revision_execplan_input_fingerprint=lambda *_: 'same',
+            _worktree_execplan_input_fingerprint=lambda *_: 'same', capture_git_snapshot=capture,
+            operation_log=mock.Mock(), unmet_execplan_dependencies=lambda *_: (),
+            validate_blocked_agent_scope=mock.Mock())
+        def reconcile():
+            return project_block_service._reconcile_rebase_evidence_block(effects, connection,
+                Path('/repo'), Path('/state'), 'repo',
+                scoped_blocking.plan_block(connection, 'repo', 'G-047'), plan_block=True)
+        original = dict(connection.execute('SELECT * FROM exec_plans').fetchone())
+        for _ in range(2):
+            self.assertFalse(reconcile())
+        self.assertTrue(capture.called)
+        service.normalize_frontmatter.assert_not_called()
+        service.require_owned.assert_not_called()
+        self.assertEqual(dict(connection.execute('SELECT * FROM exec_plans').fetchone()), original)
+        # Unrelated refs never trigger another correction of this worktree.
+        capture.return_value = replace(baseline, refs={'refs/heads/independent': ('new', '')})
+        self.assertFalse(reconcile())
+        service.normalize_frontmatter.assert_not_called()
+        capture.return_value = replace(baseline, dirty={'app.py': (('unstaged',), 'new-source')})
+        self.assertFalse(reconcile())
+        self.assertEqual(service.require_owned.call_count, 1, effects.operation_log.call_args_list)
+        self.assertEqual(dict(connection.execute('SELECT * FROM exec_plans').fetchone()), original)
+        self.assertEqual(RecoveryRepository(connection).row('repo', 'G-047')['generation'], record.generation)
+        self.assertEqual(json.loads(RecoveryRepository(connection).row('repo', 'G-047')['final_evidence'])
+                         ['conflict_evidence'], observation.conflict_evidence)
+
+    def test_explicit_conflict_request_releases_only_matching_cause_once(self):
+        from loop_manager_internal.storage import local_recovery_state
+        case = rebase_block_fixture(self)
+        case.block()
+        case.pending()
+        original = case.checkpoints.get('repo', 'G-047')
+        request = local_recovery_state.begin_request(case.connection, 'repo', 'G-047')
+        self.assertTrue(loop_manager.resume_plan_blocks(case.connection, Path('/repo'), Path('/state'),
+            'repo', 'main', plan_id='G-047', force_timeout_recheck=True,
+            recovery_request_id=request.request_id))
+        self.assertTrue(local_recovery_state.recheck_consumed(case.connection, request.request_id, 'G-047', 'conflict'))
+        self.assertFalse(local_recovery_state.recheck_consumed(case.connection, request.request_id, 'G-047', 'metadata'))
+        checkpoint = case.checkpoints.get('repo', 'G-047')
+        self.assertEqual((checkpoint.operation, checkpoint.expected_head, checkpoint.target_base_oid),
+            ('rebase', original.expected_head, original.target_base_oid))
+        self.assertIsNone(checkpoint.current_rebase_acceptance())
+        self.assertIsNone(scoped_blocking.plan_block(case.connection, 'repo', 'G-047'))
+        # The same request cannot release a newly observed block.
+        loop_manager.runtime_state.RuntimeStateRepository(case.connection).block_plan(
+            'repo', 'G-047', reason_code='managed_worktree_conflict', evidence='new conflict', release_fingerprint='new')
+        saved = case.snapshot()
+        self.assertFalse(loop_manager.resume_plan_blocks(case.connection, Path('/repo'), Path('/state'),
+            'repo', 'main', plan_id='G-047', force_timeout_recheck=True,
+            recovery_request_id=request.request_id))
+        self.assertEqual(case.snapshot(), saved)
+        case.git_write.assert_not_called()
+
+    def test_confirmed_conflict_releases_for_file_progress_or_one_explicit_request(self):
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        from loop_manager_internal.storage import local_recovery_state
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        for trigger in ('file_progress', 'request'):
+            with self.subTest(trigger=trigger):
+                case = rebase_block_fixture(self)
+                with case.connection:
+                    case.connection.execute('DELETE FROM execution_checkpoints')
+                observation = prepared_conflict_assessment(case.connection, 'repo', 'G-047')
+                RecoveryRepository(case.connection).observe(observation)
+                case.pending()
+                case.case.expected = replace(case.case.expected, before_head='d' * 40,
+                    target_base_oid='b' * 40, remote=replace(case.case.expected.remote, oid='a' * 40))
+                case.case.observed = replace(case.case.observed, remote=case.case.expected.remote,
+                    branch_ref=('d' * 40, ''), metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
+                              ('orig-head', 'd' * 40), ('onto', 'b' * 40)))
+                runtime = loop_manager.runtime_state.RuntimeStateRepository(case.connection)
+                runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_conflict',
+                    evidence=observation.detail, release_fingerprint='same',
+                    plan_values={'blocked_fingerprint': 'same', 'blocked_worktree_fingerprint': 'same'})
+                baseline = loop_manager.GitSnapshot.deserialize(observation.conflict_evidence['worktree_snapshot'])
+                request = (local_recovery_state.begin_request(case.connection, 'repo', 'G-047')
+                           if trigger == 'request' else None)
+                snapshot = (baseline if request else replace(baseline, dirty={'app.py': (('unstaged',), 'restored-source')}))
+                with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot), \
+                        mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='same'), \
+                        mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='same'):
+                    self.assertTrue(loop_manager.resume_plan_blocks(case.connection, Path('/repo'), Path('/state'),
+                        'repo', 'main', plan_id='G-047',
+                        **({'force_timeout_recheck': True, 'recovery_request_id': request.request_id} if request else {})), loop_manager.operation_log.call_args_list)
+                self.assertIsNone(scoped_blocking.plan_block(case.connection, 'repo', 'G-047'))
+                self.assertEqual(RecoveryRepository(case.connection).row('repo', 'G-047')['pending_action'], 'reconcile')
+                checkpoint = case.checkpoints.get('repo', 'G-047')
+                self.assertEqual(checkpoint.operation, 'rebase')
+                self.assertIsNone(checkpoint.current_rebase_acceptance())
+                self.assertEqual(checkpoint.snapshot['rebase_block_recovery_audit'][-1]['block']['evidence'], observation.detail)
+                if request:
+                    self.assertTrue(local_recovery_state.recheck_consumed(case.connection, request.request_id, 'G-047', 'conflict'))
+                case.git_write.assert_not_called()
+
+    def test_explicit_conflict_request_preserves_new_checkpoint_and_dependency_gate(self):
+        from loop_manager_internal.storage import local_recovery_state
+        for change in ('checkpoint', 'dependency'):
+            with self.subTest(change=change):
+                case = rebase_block_fixture(self)
+                case.block()
+                case.pending()
+                request = local_recovery_state.begin_request(case.connection, 'repo', 'G-047')
+                if change == 'checkpoint':
+                    current = case.checkpoints.get('repo', 'G-047')
+                    case.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+                        operation=current.operation, expected_head=current.expected_head,
+                        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                        snapshot=current.snapshot)
+                else:
+                    with case.connection:
+                        case.connection.execute("UPDATE exec_plans SET depends_on='[\"G-109\"]'")
+                saved = case.snapshot()
+                self.assertFalse(loop_manager.resume_plan_blocks(case.connection, Path('/repo'), Path('/state'),
+                    'repo', 'main', plan_id='G-047', force_timeout_recheck=True,
+                    recovery_request_id=request.request_id))
+                self.assertFalse(local_recovery_state.recheck_consumed(case.connection, request.request_id, 'G-047', 'conflict'))
+                self.assertEqual(case.snapshot(), saved)
+                case.git_write.assert_not_called()
+
+
 class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase):
     def test_metadata_observation_allows_independent_request_and_rejects_checkpoint_race(self):
         from loop_manager_internal.storage import local_recovery_state, execution_checkpoint_state

@@ -109,7 +109,8 @@ def pending_block_unchanged(plan, block, recovery, before, current, *,
     return bool(
         block['reason_code'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
         and recovery is not None and recovery['pending_action'] == 'final_block'
-        and recovery['reason_code'] == RecoveryReason.REBASE_CONFLICT.value
+        and recovery['reason_code'] in {RecoveryReason.REBASE_CONFLICT.value,
+                                        RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value}
         and recovery['detail'] == block['evidence']
         and plan['blocked_fingerprint'] and plan['blocked_worktree_fingerprint']
         and revision_input == plan['blocked_fingerprint']

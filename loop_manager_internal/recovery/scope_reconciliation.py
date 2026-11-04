@@ -820,7 +820,10 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
         local_metadata_recheck = bool(force_timeout_recheck and recovery_request_id
             and current_reason == BlockReasonCode.PLAN_INPUT_INVALID.value
             and workspace_checkpoint.operation == 'rebase')
-        if force_timeout_recheck and not (local_verify_recheck or local_metadata_recheck):
+        local_conflict_recheck = bool(force_timeout_recheck and recovery_request_id
+            and current_reason == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
+            and workspace_checkpoint.operation == 'rebase')
+        if force_timeout_recheck and not (local_verify_recheck or local_metadata_recheck or local_conflict_recheck):
             continue
         if current_reason == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
             continue
@@ -899,6 +902,7 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             if effects._reconcile_rebase_evidence_block(
                 connection, repo_path, state_dir, repo, current_block,
                 plan_block=True,
+                **({'recovery_request_id': recovery_request_id} if local_conflict_recheck else {}),
             ):
                 return True
             continue
