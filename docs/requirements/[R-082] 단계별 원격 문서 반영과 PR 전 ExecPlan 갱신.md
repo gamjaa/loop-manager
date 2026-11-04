@@ -124,6 +124,10 @@ Manager는 최신 원격의 PRODUCT·활성 Requirement·ARCHITECTURE 변경을 
 
 프로젝트 전체 planning은 작업 구성과 명세의 관련성을 판단한다. 개별 작업의 실행 대응 확인은 Worker·Reviewer와 Manager의 검증 책임으로 처리하며, 같은 명세 변경의 관련성이나 ExecPlan의 구현 적합성을 별도 Planner에게 다시 맡기지 않는다. 이 실행 대응을 프로젝트 전체 planning 성공으로 기록하지 않는다. Requirement 완료 재확인 뒤 일반 작업 간 우선순위와 유지보수의 대상·안전 제한은 유지한다.
 
+프로젝트의 평상시 실행은 R-091의 독립 ExecPlan 병렬 배정으로 이어간다. 새 원격 base SHA를 발견해도 원격 명세의 실제 변화와 위 Planner 실행 조건을 먼저 비교하고, 필요하지 않으면 Planner를 재호출하지 않는다. **Planner가 필요한 경우에는 게시·catalog·DB에 확정한 최신 base를 기준으로 기존 PR의 충돌 해결을 진행한 후 일반 신규 작업을 배정한다.** 단, Planner의 안전한 해제에 필요한 미완료 Git/게시·원인 복구와 PR Merge·Close 같은 상태 관측·확정은 R-055·R-091의 선행 안전 경계에서 수행하며, 이를 일반 신규 Worker 선행 허가로 확대하지 않는다.
+
+Planner가 불필요해도 PR head·mergeability·Merge·Close 등의 원격 상태가 달라지면 그 PR에 필요한 관측·복구를 진행한다. 원격 base 변화만으로 모든 PR을 무조건 rebase하지 않고, 실제 관련성·충돌과 후보·checkpoint·현재 원격 identity를 확인한다. PR 충돌 복구의 Worker는 해당 복구 대상에서만 허가되며, 해결할 수 없는 충돌은 R-055의 계획별 최종 차단, R-053의 사용자 알림으로 연결한다. 다른 ExecPlan은 변경 영향·dependency·소유 Git 자원이 독립적이면 계속 진행하고, 같은 입력에 대한 Planner·복구 반복은 금지한다.
+
 ### 게시 완료·자리 해제와 잔여 정리
 
 - 일반·유지보수 planning의 원격 게시 확인, catalog·DB 적용, planning 자리 해제와 잔여 worktree 정리는 각각 실제 결과로 확인한다. 최종 해제 검사는 해당 publication의 입력·소유권·원격 결과와 실제 충돌 자원에 한정한다. 별도 작업의 미확정 rebase 등은 R-055의 독립성이 검증되면 완료 조건으로 끌어오지 않는다.
@@ -221,6 +225,9 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 - 문서 변경 또는 rebase 완료만으로 사용자 승인 대기, 명세 충돌, 독립적인 차단·실패 원인이나 실패·Worker level 이력을 초기화하지 않는다.
 
 ## Acceptance Criteria
+
+- 원격 base가 변했어도 관련 명세·명시적 Planner 조건이 동일한 경우 Planner를 다시 호출하지 않고, 충돌이 없는 기존 PR에는 rebase를 발생시키지 않는다. 반대로 동일 base에서 PR head·상태가 바뀌면 필요한 PR 관측·복구만 수행한다. 사용자 판단·유지보수 요청·미완료 planning 복구·Requirement 최종 완료 확인 등 이 문서의 기존 Planner 조건은 base SHA가 동일해도 적용된다.
+- 관련 명세가 변경된 프로젝트는 기존 호출의 안전 반환과 Planner 결과의 원격 게시·catalog·DB 적용을 확인한 뒤 PR 충돌 복구 및 일반 작업을 재개한다. PR 복구 전용 Worker나 planning 해제에 필요한 소유 operation 복구는 허용하되, 일반 신규 Worker를 먼저 실행하거나 작업별 검증·dependency·게시 증거를 생략하지 않는다. 복구 불가 PR의 작업별 `PLAN_BLOCKED`가 무관한 ExecPlan을 중단시키지 않는다.
 
 - `depends_on` 선언 오류는 최신 원격 base에서 별도로 교정·게시되고 같은 선언이 catalog·DB에 반영된 뒤 기존 작업 브랜치의 rebase로 유입된다. 작업 브랜치 직접 편집·선언 복원 commit·cherry-pick 없이 작업물·본문 기록·session·실패 감사가 보존된다.
 - base 선언이 이미 유효하고 작업 브랜치만 오래됐으면 교정 게시 없이 rebase로 반영한다. 교정 중 원격 base 전진과 게시·DB 반영·rebase 사이 중단·재시작에서도 최신 선언을 확인하며 중복 교정·작업물 유실·검증 성공 합성이 없다. 의미 불명 선언은 임의 dependency 제거로 우회하지 않고 해당 작업만 보류한다.
