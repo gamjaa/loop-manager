@@ -257,6 +257,9 @@ def run_agent(
             except sqlite3.Error:
                 # An unavailable optional callback column must not discard an
                 # already observed provider outcome. Missing safety proof stays missing.
+                if execution_started:
+                    from loop_manager_internal.storage import task_calls
+                    _database_request(connection, lambda: task_calls.mark_started(connection, invocation_id=identity))
                 outcome = observations['outcome']
                 _database_request(connection, lambda: ledger.finish(
                     identity, outcome['kind'], outcome['code'], outcome['duration_ms'], outcome['session_id'],

@@ -153,6 +153,8 @@ class InvocationRepository:
                 execution_started_at = COALESCE(execution_started_at, ?)
                 WHERE invocation_id = ? AND finished_at IS NULL""",
                 (observed_at or utc_now(), identity))
+            from .task_calls import mark_started
+            mark_started(self.connection, invocation_id=identity)
 
     def mark_execution_finished(self, identity: str, duration_ms: int, *, observed_at: str | None = None) -> None:
         with _transaction(self.connection):
