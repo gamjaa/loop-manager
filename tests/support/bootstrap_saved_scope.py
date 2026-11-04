@@ -44,6 +44,7 @@ def _collect_bootstrap_costs(state, records):
                             event = json.loads(text)
                             if (not isinstance(event, dict) or not isinstance(event.get('pid'), int)
                                     or not isinstance(event.get('at'), (int, float))
+                                    or not isinstance(event.get('kind'), str)
                                     or event.get('kind') not in {'phase_start', 'phase_end', 'git_cost', 'git_cost_incomplete'}
                                     or (event['kind'].startswith('phase_') and not isinstance(event.get('name'), str))
                                     or (event['kind'] == 'git_cost' and not all(

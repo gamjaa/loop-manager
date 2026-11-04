@@ -478,6 +478,35 @@ class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
                                  expected if case != 'no_writer' else [])
                 self.assertEqual('collection incomplete' in stderr.getvalue(), case != 'no_writer')
 
+    def test_malformed_cost_kind_preserves_original_exception_and_later_events(self):
+        import io
+        import json
+        from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
+        from loop_manager_internal.verification.timing import EventWriter
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            costs = root / 'bootstrap-costs'
+            costs.mkdir()
+            before = {'kind': 'phase_start', 'name': 'before', 'pid': 1, 'at': 1}
+            after = {'kind': 'phase_start', 'name': 'after', 'pid': 2, 'at': 2}
+            later = {'kind': 'phase_start', 'name': 'later', 'pid': 3, 'at': 3}
+            malformed = [{'pid': 1, 'at': 1, 'kind': []}, {'pid': 1, 'at': 1, 'kind': {}}]
+            (costs / '1.jsonl').write_text(''.join(json.dumps(event) + '\n'
+                for event in (before, *malformed, after)), encoding='utf-8')
+            (costs / '2.jsonl').write_text(json.dumps(later) + '\n', encoding='utf-8')
+            writer = EventWriter(root / 'parent.jsonl')
+            stderr = io.StringIO()
+            with contextlib.closing(writer), writer.activate(), contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(RuntimeError, 'original error'):
+                    with contextlib.ExitStack() as cleanup:
+                        records, collect = _track_bootstrap_costs(cleanup, root)
+                        raise RuntimeError('original error')
+                self.assertFalse(collect())
+            self.assertEqual(records, [before, after, later])
+            self.assertEqual([json.loads(line) for line in writer.path.read_text().splitlines()], records)
+            self.assertIn('bootstrap cost collection incomplete', stderr.getvalue())
+
     def test_bootstrap_cost_normal_checks_require_complete_and_expected_records(self):
         import json
         from tests.support.bootstrap_saved_scope import _track_bootstrap_costs
