@@ -57,6 +57,56 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         return scheduling.TaskScheduler(replace(self.config, **values), database.connect_database,
                                          self.directory, self.connection)
 
+    def test_selected_pr_conflict_block_allows_independent_tasks_and_preserves_unknown_writer(self):
+        from loop_manager_internal.recovery import waiting_pr_service
+        from loop_manager_internal.storage import task_calls
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN', branch='one', worktree='one', "
+            "pr_url='https://example/pr/1' WHERE repo='A' AND plan_id='G-001'")
+        self._insert_plan(self.connection, 'G-004', 'READY', repo='A', depends_on=('G-001',))
+        self.connection.commit()
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        original = checkpoints.record('A', 'G-001', expected_generation=0, operation='rebase',
+            expected_head='head', target_base_oid='base', observed_remote_oid='head',
+            snapshot={'worker_session': 'saved-worker'})
+        plan = self.connection.execute("SELECT * FROM exec_plans WHERE repo='A' AND plan_id='G-001'").fetchone()
+        # An unconfirmed old call retains its real global execution reservation;
+        # the plan transition must neither release it nor invent a clean exit.
+        owner = task_calls.reserve(self.connection, self.directory, 'A', 'G-001', 'agent', 'run')
+        task_calls.mark_uncertain(owner)
+        calls_before = [tuple(row) for row in self.connection.execute('SELECT * FROM task_call_reservations')]
+        def stop(*_args, **_kwargs):
+            runtime.block_plan('A', 'G-001', reason_code='managed_worktree_conflict',
+                               evidence='preserved conflict', release_fingerprint='input')
+            return 1
+        effects = waiting_pr_service.SelectWaitingPullRequestConflictEffects(
+            loop_manager.active_execplan, loop_manager.hydrate_execplan_project, stop)
+        result = waiting_pr_service.select_waiting_pull_request_conflict(
+            effects, self.connection, Path('A'), self.directory, 'A',
+            loop_manager.WaitingPullRequestObservation(((plan, {}),), False))
+        self.assertIsNone(result.step_result)
+        scheduler = self.scheduler(max_workers=3)
+        self.assertFalse(scheduler._eligible(scheduling.Task('A', 'G-001', self.connection), self.connection))
+        self.assertFalse(scheduler._eligible(scheduling.Task('A', 'G-004', self.connection), self.connection))
+        # Exercise the actual call boundary for both independent projects.
+        calls = []
+        @scheduling.scheduled_call('agent')
+        def worker(**_options):
+            calls.append(scheduling.current_task.get().plan_id)
+        token = scheduling.current_scheduler.set(scheduler)
+        try:
+            for repo, plan_id in (('A', 'G-002'), ('B', 'G-003')):
+                self.assertTrue(scheduler._eligible(scheduling.Task(repo, plan_id, self.connection), self.connection))
+                with scheduler.task(repo, plan_id, self.connection, resumed=False):
+                    worker(role_name='worker')
+        finally:
+            scheduling.current_scheduler.reset(token)
+        self.assertEqual(calls, ['G-002', 'G-003'])
+        self.assertEqual(checkpoints.get('A', 'G-001'), original)
+        self.assertEqual([tuple(row) for row in self.connection.execute('SELECT * FROM task_call_reservations')], calls_before)
+        self.assertEqual(scheduler.uncertain['agent'], 1)
+
     def test_explicit_release_queues_at_capacity_and_preserves_rebase_then_yields_last(self):
         from loop_manager_internal.storage import management_admission as admission
         self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE repo='A'")

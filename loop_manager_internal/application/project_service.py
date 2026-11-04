@@ -729,6 +729,14 @@ class ProjectService:
         scheduler = current_scheduler.get()
         if scheduler is not None and self.state.repo in scheduler.draining_projects:
             return None
+        projected = runtime_state.RuntimeStateRepository(self.identity.connection).projected(self.state.repo)
+        if (projected is not None and projected.status == 'PLAN_BLOCKED'
+                and scoped_blocking.project_block(self.identity.connection, self.state.repo) is None):
+            block = scoped_blocking.plan_block(self.identity.connection, self.state.repo, projected.plan_id)
+            if block is not None and block['reason_code'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value:
+                # Cause-specific recovery already ran above. A normal PR
+                # attachment must not retry it or stop independent admission.
+                return None
         if (self.identity.recovery_request_id
                 and self.identity.recovery_plan_id is not None):
             active = runtime_state.RuntimeStateRepository(

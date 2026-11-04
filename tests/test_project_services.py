@@ -13,9 +13,133 @@ import loop_manager
 from loop_manager_internal.application import commands, project_service
 from loop_manager_internal.planning import git_ports, state_ports
 from tests.support.database import runtime_connection
+from tests.support.database import AutomationCatalogFixture
+from loop_manager_internal.recovery import waiting_pr_service, scoped_blocking
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+
+
+class WaitingPrConflictResultTests(AutomationCatalogFixture, unittest.TestCase):
+    def test_plan_conflict_result_preserves_independent_projection_and_pending_rebase(self):
+        for project_safety_block in (False, True):
+            with self.subTest(project_safety_block=project_safety_block):
+                connection = self._connection()
+                self._insert_plan(connection, 'G-001', 'PR_OPEN')
+                self._insert_plan(connection, 'G-002', 'VERIFYING')
+                connection.execute("UPDATE exec_plans SET branch='loop/G-001', worktree='/state/G-001', "
+                                   "pr_url='https://example/pr/1', pr_head_oid='head', "
+                                   "worker_session_id='saved-worker' WHERE plan_id='G-001'")
+                connection.commit()
+                runtime = runtime_state.RuntimeStateRepository(connection)
+                runtime.hydrate('repo', 'G-002')
+                checkpoints = ExecutionCheckpointRepository(connection)
+                pending = checkpoints.record('repo', 'G-001', expected_generation=0,
+                    operation='rebase', expected_head='head', target_base_oid='base',
+                    observed_remote_oid='head', snapshot={'stash_oid': 'saved-stash'})
+                before = dict(connection.execute('SELECT * FROM projects').fetchone())
+                independent = runtime.get('repo', 'G-002')
+                plan = connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
+
+                def stop(*_args, **_kwargs):
+                    self.assertEqual(runtime_state.execution_selection.get(), ('repo', 'G-001'))
+                    runtime.block_plan('repo', 'G-001', reason_code='managed_worktree_conflict',
+                        evidence='preserved conflict', release_fingerprint='input')
+                    if project_safety_block:
+                        scoped_blocking.record_project_block(connection, 'repo',
+                            scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                            'shared ownership uncertain', 'shared-input',
+                            plan_id='G-001', previous_phase='PR_OPEN')
+                    return 1
+
+                effects = waiting_pr_service.SelectWaitingPullRequestConflictEffects(
+                    loop_manager.active_execplan, loop_manager.hydrate_execplan_project, stop)
+                result = waiting_pr_service.select_waiting_pull_request_conflict(
+                    effects, connection, Path('/repo'), Path('/state'), 'repo',
+                    loop_manager.WaitingPullRequestObservation(((plan, {}),), True))
+                self.assertEqual(result.step_result, 1 if project_safety_block else None)
+                self.assertFalse(result.conflict_started)
+                self.assertTrue(result.merged)
+                self.assertEqual(runtime.get('repo', 'G-002'), independent)
+                self.assertEqual(checkpoints.get('repo', 'G-001'), pending)
+                self.assertEqual(runtime.get('repo', 'G-001').status, 'PLAN_BLOCKED')
+                self.assertEqual(runtime.get('repo', 'G-001').worker_session_id, 'saved-worker')
+                self.assertIsNone(runtime_state.execution_selection.get())
+                if not project_safety_block:
+                    self.assertEqual(dict(connection.execute('SELECT * FROM projects').fetchone()), before)
+
+    def test_conflict_error_without_a_durable_plan_block_is_not_swallowed(self):
+        connection = self._connection()
+        self._insert_plan(connection, 'G-001', 'PR_OPEN')
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        effects = waiting_pr_service.SelectWaitingPullRequestConflictEffects(
+            loop_manager.active_execplan, loop_manager.hydrate_execplan_project,
+            mock.Mock(return_value=1))
+        result = waiting_pr_service.select_waiting_pull_request_conflict(
+            effects, connection, Path('/repo'), Path('/state'), 'repo',
+            loop_manager.WaitingPullRequestObservation(((plan, {}),), False))
+        self.assertEqual(result.step_result, 1)
+        self.assertFalse(result.conflict_started)
+
+    def test_blocked_conflict_observes_remote_terminal_state_without_restarting_open_pr(self):
+        for state in ('OPEN', 'CLOSED', 'MERGED'):
+            with self.subTest(state=state):
+                connection = self._connection()
+                self._insert_plan(connection, 'G-001', 'PR_OPEN')
+                connection.execute("UPDATE exec_plans SET branch='loop/G-001', "
+                    "pr_url='https://example/pr/1', pr_head_oid='head'")
+                connection.commit()
+                runtime = runtime_state.RuntimeStateRepository(connection)
+                runtime.block_plan('repo', 'G-001', reason_code='managed_worktree_conflict',
+                                   evidence='preserved conflict', release_fingerprint='input')
+                original = runtime.get('repo', 'G-001')
+                effects = waiting_pr_service.ObserveWaitingPullRequestsEffects(
+                    _block_closed_pull_request=mock.Mock(), _recorded_base_fetch=mock.Mock(),
+                    _resume_reopened_pull_request=mock.Mock(),
+                    classify_pull_request_mergeability=mock.Mock(),
+                    complete_merged_execplan_worktree=mock.Mock(return_value=SimpleNamespace(status='safe')),
+                    operation_log=mock.Mock(), operation_print=mock.Mock(),
+                    pr_for_branch=mock.Mock(return_value={'url': original.pr_url,
+                        'headRefName': original.branch, 'headRefOid': 'head',
+                        'baseRefName': 'main', 'state': state}))
+                result = waiting_pr_service.observe_waiting_pull_requests(
+                    effects, connection, Path('/repo'), Path('/state'), 'repo')
+                effects.pr_for_branch.assert_called_once_with(Path('/repo'), original.branch, original.pr_url)
+                self.assertEqual(result.merged, state == 'MERGED')
+                self.assertEqual(result.conflicts, ())
+                self.assertEqual(effects._block_closed_pull_request.call_count, int(state == 'CLOSED'))
+                self.assertEqual(effects.complete_merged_execplan_worktree.call_count, int(state == 'MERGED'))
+                self.assertEqual(effects._recorded_base_fetch.call_count, int(state == 'MERGED'))
+                effects.classify_pull_request_mergeability.assert_not_called()
+                effects._resume_reopened_pull_request.assert_not_called()
+                self.assertEqual(runtime.get('repo', 'G-001'), original)
 
 
 class ProjectServiceCompositionTests(unittest.TestCase):
+    def test_resume_existing_execution_leaves_local_conflict_to_cause_specific_recheck(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        connection.execute('UPDATE projects SET planning_attempt_fingerprint=NULL')
+        connection.commit()
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.activate('repo', 'G-047', activation_sha='base',
+                         branch='loop/G-047', worktree='/state/G-047')
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_conflict',
+                           evidence='preserved conflict', release_fingerprint='input')
+        runtime.hydrate('repo', 'G-047')
+        effects = SimpleNamespace(pr_for_branch=mock.Mock(),
+                                  reconcile_existing_pull_request=mock.Mock())
+        identity = project_service.ProjectIdentity(connection, Path('/state'), 'repo',
+            Path('/config.ini'), None, False, None, True, None, 20, 600, None)
+        service = project_service.ProjectService(effects, identity)
+        service.state.repo = 'repo'
+        service.state.row = connection.execute('SELECT * FROM projects').fetchone()
+        before = runtime.get('repo', 'G-047')
+        for _ in range(2):
+            self.assertIsNone(service._resume_existing_execution())
+        effects.pr_for_branch.assert_not_called()
+        effects.reconcile_existing_pull_request.assert_not_called()
+        self.assertEqual(runtime.get('repo', 'G-047'), before)
+
     def test_scheduled_planning_wait_still_dispatches_task_recovery(self):
         from loop_manager_internal.application.task_scheduling import current_scheduler, current_task
         for scheduled, nested, kind in (

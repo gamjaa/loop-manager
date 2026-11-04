@@ -89,13 +89,14 @@ def observe_waiting_pull_requests(
     rows = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND "
         "(status = 'PR_OPEN' OR (status = 'PLAN_BLOCKED' AND (blocked_reason = ? "
-        "OR (blocked_reason = ? AND pr_url IS NOT NULL))) "
+        "OR (blocked_reason IN (?, ?) AND pr_url IS NOT NULL))) "
         "OR (status IN ('MANUAL_PENDING','IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') "
         "AND pr_url IS NOT NULL AND EXISTS (SELECT 1 FROM manual_work_members m "
         "JOIN manual_work_groups g ON g.repo=m.repo AND g.group_id=m.group_id "
         "WHERE m.repo=exec_plans.repo AND m.plan_id=exec_plans.plan_id AND g.state='AUTOMATIC'))) "
         "ORDER BY plan_id",
-        (repo, PR_CLOSED_BLOCK_REASON, BlockReasonCode.REMOTE_BRANCH_DELETED.value),
+        (repo, PR_CLOSED_BLOCK_REASON, BlockReasonCode.REMOTE_BRANCH_DELETED.value,
+         BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value),
     ).fetchall()
     registered_base = ""
     if rows:
@@ -195,6 +196,11 @@ def observe_waiting_pull_requests(
                 effects._block_closed_pull_request(connection, repo, stored, url, head_oid)
             continue
         if stored['blocked_reason'] == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
+            continue
+        if (stored['status'] == 'PLAN_BLOCKED'
+                and stored['blocked_reason'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value):
+            # Remote terminal transitions remain observable. OPEN is not proof
+            # of recovery; the cause-specific recheck owns admission/release.
             continue
         from loop_manager_internal.recovery.work_branch_integration import published_branch
         if effects.git is not None and published_branch(connection, repo, stored):
@@ -370,6 +376,13 @@ def select_waiting_pull_request_conflict(
     current = connection.execute(
         'SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan['plan_id']),
     ).fetchone()
+    if (current['status'] == 'PLAN_BLOCKED'
+            and current['blocked_reason'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
+            and scoped_blocking.plan_block(connection, repo, str(plan['plan_id'])) is not None
+            and scoped_blocking.project_block(connection, repo) is None):
+        # selected_execution kept writes in this plan's source row. Do not
+        # replace an independent project mirror with the failed recovery.
+        return PullRequestSyncResult(merged=observation.merged)
     effects.hydrate_execplan_project(connection, repo, current)
     return PullRequestSyncResult(result, result is None, observation.merged)
 
