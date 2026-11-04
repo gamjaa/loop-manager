@@ -277,6 +277,8 @@ def prepared_conflict_assessment(connection, repo, plan_id):
     proof = dict(version=1, repository='owner/repo', base_branch='main', plan_revision='plan',
         pr_url=url, head_oid=head, base_oid=base, operation='rebase', branch=branch, worktree=worktree,
         worker_session='saved-worker', checkpoint_generation=checkpoint.generation, checkpoint_head=original,
+        worktree_snapshot=loop_manager.GitSnapshot('e' * 40, None, {},
+            {'app.py': (('unstaged',), 'partial')}, {}, {}, {}, {'rebase-merge': 'owned'}).serialize(),
         conflict_paths=['src/app.py'], attempted_routes={
             'worker_correction': 'Attempted; required source cannot be reconstructed.',
             'file_restore_rework': 'Checked pinned originals and owned copies; required source is absent.',

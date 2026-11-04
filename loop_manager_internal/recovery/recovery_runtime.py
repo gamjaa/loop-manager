@@ -225,9 +225,14 @@ def conflict_evidence_complete(evidence) -> bool:
     if not isinstance(evidence, dict):
         return False
     from loop_manager_internal.git.managed_rebase_validation import _safe_path
+    from loop_manager_internal.agents.scope_contracts import GitSnapshot
+    try:
+        GitSnapshot.deserialize(evidence.get('worktree_snapshot'))
+    except (TypeError, ValueError, KeyError, AttributeError, RuntimeError):
+        return False
     return (type(evidence.get('version')) is int and evidence['version'] == 1
         and all(isinstance(evidence.get(key), str) and evidence[key].strip() for key in (
-            'repository', 'base_branch', 'plan_revision', 'pr_url', 'branch', 'worktree', 'worker_session'))
+            'repository', 'base_branch', 'plan_revision', 'pr_url', 'branch', 'worktree', 'worker_session', 'worktree_snapshot'))
         and all(isinstance(evidence.get(key), str) and re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', evidence[key])
                 for key in ('head_oid', 'base_oid', 'checkpoint_head'))
         and evidence.get('operation') == 'rebase'

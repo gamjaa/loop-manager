@@ -5,6 +5,7 @@
     "loop_manager_internal/**",
     "tests/**",
     "requirements.txt",
+    "docs/AGENTS.*.md",
     "scripts/verify.json",
     "scripts/verify.sh",
     "scripts/verify.ps1",

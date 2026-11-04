@@ -55,6 +55,16 @@ Manager가 원본 작업·실패와 보고를 보존해 기존 일반 planning�
 실제 제품 선택·명세 충돌·권한 불명은 기존 `needs_user_decision`으로 구분하며,
 이미 저장된 질문·draft·User Decision을 이 대기로 대체하지 않는다.
 checkpoint·판단 대기는 완료 후보와 구분하며 Manager의 검증·Review를 대신하지 않는다.
+소유 PR의 진행 중 rebase 충돌에서 안전한 자동 경로가 남지 않은 실제 근거를 확인했다면
+`pr_conflict_unrecoverable` 관측 결과를 보고할 수 있다. WORKER_OUTCOME 객체에는 `kind`,
+`problem`, 현재 `conflict_paths`, `attempted_routes`의 `worker_correction`·`file_restore_rework`·
+`revalidation` 결과, `unavailable_recovery_routes`의 `reobservation`·`retry`·`correction`·
+`condition_wait`·`next_run`·`safe_recovery`별 불가 사유와 `release_conditions`를 포함한다.
+시도하지 않은 경로·검증 성공·사용자 조치를 만들거나 횟수 소진·사용 한도·조회 실패·잠금·
+종료 불명만으로 보고하지 않는다. 완료 publication·checkpoint·사용자 질문과 혼합하지 않는다.
+관측은 차단 권한이 아니며 Manager가 현재 PR·소유권·입력과 파일 복원·재작업 가능성을
+먼저 확인하고 계획별 대기 또는 최종 차단을 결정한다. 실제 명세 판단은 기존
+`needs_user_decision`으로 보고하며 이 관측으로 질문이나 draft를 해제하지 않는다.
 검증 adapter 문맥은 scripts/verify.json의 선택 adapter·환경과 docs/VERIFY.md에서 확인한다.
 
 목록 밖 파일의 제외 근거는 verify PASS와 별도로 확인한다. 최종 코드의 실제 verify

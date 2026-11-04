@@ -13,6 +13,7 @@ from loop_manager_internal.recovery.scoped_blocking import BlockScope
 from loop_manager_internal.storage import review_correction_state
 from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from pathlib import Path
 import json
 import re
@@ -117,7 +118,7 @@ def block_active_execplan(
     recovery_decision: recovery_runtime.RecoveryDecision | None = None,
     release_fingerprint: str | None = None,
     worker_result: str | None = None,
-) -> None:
+) -> recovery_runtime.RecoveryDecision | None:
     project = runtime_state.project_row(connection, repo)
     plan_id = effects._plan_id_from_path(str(project["plan_path"] or "")) if project else None
     plan = (
@@ -138,7 +139,7 @@ def block_active_execplan(
     checkpoints = blocked_checkpoint = None
     blocked_git_snapshot = None
     blocked_remote_input = None
-    if reason is BlockReasonCode.PLAN_INPUT_INVALID:
+    if reason in {BlockReasonCode.PLAN_INPUT_INVALID, BlockReasonCode.MANAGED_WORKTREE_CONFLICT}:
         from loop_manager_internal.storage import execution_checkpoint_state
         checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
         blocked_checkpoint = checkpoints.get(repo, str(plan['plan_id']))
@@ -220,6 +221,14 @@ def block_active_execplan(
             connection, repo, plan, str(project["phase"] or "") if project else "",
             reason, error, fingerprint, recovery_decision,
         )
+        if reason is BlockReasonCode.MANAGED_WORKTREE_CONFLICT:
+            if blocked_git_snapshot is None:
+                raise recovery_state.RecoveryStateConflict('conflict worktree could not be reobserved before blocking')
+            expected_git = GitSnapshot.deserialize(decision.observation.conflict_evidence['worktree_snapshot'])
+            actual_git = GitSnapshot.deserialize(blocked_git_snapshot)
+            if any(getattr(expected_git, field) != getattr(actual_git, field)
+                   for field in ('head', 'branch', 'index', 'dirty', 'operations')):
+                raise recovery_state.RecoveryStateConflict('conflict worktree changed before blocking')
         if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
             runtime_state.RuntimeStateRepository(connection).block_plan(
                 repo,
@@ -230,7 +239,7 @@ def block_active_execplan(
                 plan_values=plan_values,
                 clear_projection=True,
             )
-            if blocked_git_snapshot is not None:
+            if blocked_git_snapshot is not None and reason is not BlockReasonCode.MANAGED_WORKTREE_CONFLICT:
                 current_checkpoint = checkpoints.get(repo, plan_id)
                 block = scoped_blocking.plan_block(connection, repo, plan_id)
                 checkpoints.record(
@@ -267,6 +276,7 @@ def block_active_execplan(
                 recovery_decision=decision,
             )
             notifications.enqueue_current_project_events(connection, repo)
+    return decision if reason is BlockReasonCode.MANAGED_WORKTREE_CONFLICT else None
 
 
 @dataclass(frozen=True)
@@ -338,6 +348,19 @@ def _final_block_recovery_decision(
             and not recovery_state.conflict_evidence_current(connection, repo, str(plan['plan_id']),
                                                              decision.observation.conflict_evidence)):
         raise recovery_state.RecoveryStateConflict('final conflict assessment changed before blocking')
+    if reason is BlockReasonCode.MANAGED_WORKTREE_CONFLICT:
+        repository = recovery_state.RecoveryRepository(connection)
+        previous = repository.row(repo, str(plan['plan_id']))
+        try:
+            saved = json.loads(previous['final_evidence']) if previous is not None else None
+        except (TypeError, ValueError):
+            saved = None
+        if (previous is None or previous['identity'] != decision.identity
+                or previous['pending_action'] != 'final_block' or not isinstance(saved, dict)
+                or saved.get('conflict_evidence') != decision.observation.conflict_evidence
+                or saved.get('unavailable_recovery_routes') != decision.observation.unavailable_recovery_routes):
+            decision = repository.observe(decision.observation).decision
+            recovery_runtime.require_final(decision)
     if decision.block_reason != reason or decision.observation.repo != repo or decision.observation.plan_id != str(plan["plan_id"]):
         raise ValueError("recovery decision and block target disagree")
     return decision

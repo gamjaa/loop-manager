@@ -225,8 +225,8 @@ class ExecutionHandlers:
     def _retry(detail=None):
         return execution_assembly.RecoveryHandler._retry(detail)
 
-    def _recover(self, reason, detail, *, context=None, fingerprint=None, progress_marker=None, final_block_reason=None, from_revision=False, correction_limit=None, attempts=0, user_targets=(), verify_result=None, worker_result=None, worker_decision=None):
-        return self._recovery_handler()._recover(reason, detail, context=context, fingerprint=fingerprint, progress_marker=progress_marker, final_block_reason=final_block_reason, from_revision=from_revision, correction_limit=correction_limit, attempts=attempts, user_targets=user_targets, verify_result=verify_result, worker_result=worker_result, worker_decision=worker_decision)
+    def _recover(self, reason, detail, *, context=None, fingerprint=None, progress_marker=None, final_block_reason=None, from_revision=False, correction_limit=None, attempts=0, user_targets=(), verify_result=None, worker_result=None, worker_decision=None, conflict_evidence=None, unavailable_recovery_routes=None):
+        return self._recovery_handler()._recover(reason, detail, context=context, fingerprint=fingerprint, progress_marker=progress_marker, final_block_reason=final_block_reason, from_revision=from_revision, correction_limit=correction_limit, attempts=attempts, user_targets=user_targets, verify_result=verify_result, worker_result=worker_result, worker_decision=worker_decision, conflict_evidence=conflict_evidence, unavailable_recovery_routes=unavailable_recovery_routes)
 
     def _block_final(self, repo, worktree, detail, verify_result, *, reason, recovery_reason=None, user_targets=()):
         return self._recovery_handler()._block_final(repo, worktree, detail, verify_result, reason=reason, recovery_reason=recovery_reason, user_targets=user_targets)
@@ -353,8 +353,8 @@ class ExecutionHandlers:
     def _rebase_observation(self, context, *, target=None, stash_oid=None):
         return self._rebase_handler()._rebase_observation(context, target=target, stash_oid=stash_oid)
 
-    def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None, abnormal_result=False, target=None, stash_oid=None, recovery_reason=RecoveryReason.REBASE_CONFLICT, targeted_evidence_missing=False):
-        return self._rebase_handler()._rebase_conflict(context, detail, corrected=corrected, worker_result=worker_result, abnormal_result=abnormal_result, target=target, stash_oid=stash_oid, recovery_reason=recovery_reason, targeted_evidence_missing=targeted_evidence_missing)
+    def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None, abnormal_result=False, target=None, stash_oid=None, recovery_reason=RecoveryReason.REBASE_CONFLICT, targeted_evidence_missing=False, assessment=None):
+        return self._rebase_handler()._rebase_conflict(context, detail, corrected=corrected, worker_result=worker_result, abnormal_result=abnormal_result, target=target, stash_oid=stash_oid, recovery_reason=recovery_reason, targeted_evidence_missing=targeted_evidence_missing, assessment=assessment)
 
     def _record_rebase_intent(self, context, target_oid):
         return self._rebase_handler()._record_rebase_intent(context, target_oid)

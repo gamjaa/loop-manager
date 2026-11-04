@@ -1084,9 +1084,14 @@ PR 복구 선택은 `selected_execution` 안에서 대상 계획의 원본만 �
 | `head_oid`, `base_oid`, `checkpoint_head` | 소문자 16진수 40자리 또는 64자리 전체 Git OID. 저장 PR/head·충돌 복구 OID와 checkpoint의 관측 원격·target·원래 HEAD에 일치 |
 | `operation`, `checkpoint_generation` | `rebase`와 bool을 제외한 양의 정수. 현재 checkpoint operation/generation에 일치 |
 | `conflict_paths` | 하나 이상의 안전한 저장소 상대 경로 문자열. 기존 rebase 경로 검사를 재사용 |
+| `worktree_snapshot` | `GitSnapshot`으로 역직렬화 가능한 문자열. 실제 차단 직전 관측의 HEAD·branch·index·dirty·operation과 일치 |
 | `attempted_routes` | 정확히 `worker_correction`, `file_restore_rework`, `revalidation`의 결과·적용 불가 사유를 비어 있지 않은 문자열로 기록. 재검증 성공을 합성하지 않음 |
 | `release_conditions` | 하나 이상의 비어 있지 않은 재평가 조건 문자열 |
 | `unavailable_recovery_routes` | 기존 `reobservation`, `retry`, `correction`, `condition_wait`, `next_run`, `safe_recovery` 여섯 경로 각각의 비어 있지 않은 불가 사유 |
+
+소유 PR rebase의 Worker는 `pr_conflict_unrecoverable` 관측으로 문제·충돌 경로·세 가지 시도 결과·여섯 자동 경로의 불가 사유·재평가 조건을 보고할 수 있다. 각 설명은 2,000자, 경로는 128개, 재평가 조건은 8개 이내이며 기존 전체 JSON 크기 제한과 안전한 상대 경로 검사를 적용한다. 이 결과에는 완료 게시 필드를 허용하지 않으며 저장된 완료 경계에서도 stage 전에 거부한다. Manager는 현재 실행 조건·소유권과 실제 unmerged 경로를 대조하고 파일별 복원을 먼저 시도한다. 실제 적용 경로가 있으면 재작업하며, 복원 checkpoint가 staged이고 모든 충돌 경로가 사용자 변경 보존으로 제외된 경우에만 의미 관측과 현재 PR·checkpoint를 결합한다. 복원 미적용·자원 부재·입력 변경·잠금은 최종 근거를 만들지 않는다.
+
+최종 생산자는 현재 원격 PR을 두 번 관측하고 fetched base·소유 checkpoint·충돌 지문과 파일 진전을 대조한다. 검증을 실행할 수 없는 unmerged 상태는 재검증 성공 대신 적용 불가로 기록한다. Git 관측과 차단용 snapshot 수집은 SQLite 쓰기 transaction 밖에서 수행한다. 실제 차단 transaction에서 원본·checkpoint·선택 snapshot 필드를 재검사하고 근거 저장과 계획 차단을 함께 반영한다. 실패하면 둘 다 rollback하며 이미 열린 호출자 transaction에서는 최종 판정을 보류한다. managed conflict는 근거의 checkpoint generation을 유지하고 metadata 입력 차단의 별도 checkpoint 영수증을 추가하지 않는다.
 
 완전한 근거만 기존 `final_evidence` JSON에 보존하며 DB schema를 추가하지 않는다. outbox의 현재성 검사는 이 근거를 현재 계획·PR·checkpoint와 대조하고, 충돌 사건에는 그 근거를 action identity에도 결합한다. 원격 head/base 변경이나 mergeable 관측은 관련 recovery record와 해당 block의 보존 snapshot만 대기로 보류한다. 원래 최종 근거·차단·checkpoint·이미 전송한 조각과 독립 원인의 recovery record는 유지한다. 기존 조각별 재검사·취소가 미전송분을 중단하며 원격 head를 소유 근거 없이 채택하거나 차단 해제를 합성하지 않는다. 이 계약은 복구 소유자가 공급한 근거의 검증 경계이며, 진단 문구나 실패 횟수에서 불가 사유를 생성하지 않는다.
 

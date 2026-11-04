@@ -19,6 +19,43 @@ from tests.support.database import runtime_connection
 
 
 class RecoveryRepositoryTests(unittest.TestCase):
+    def test_conflict_dispatch_observes_outside_write_and_rolls_back_failed_owner_commit(self):
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        observed = prepared_conflict_assessment(connection, 'repo', 'G-047')
+        connection.commit()
+        repository = RecoveryRepository(connection)
+        def interrupted(*_args, **options):
+            self.assertFalse(connection.in_transaction)
+            with runtime_state._transaction(connection):
+                repository.observe(options['recovery_decision'].observation)
+                raise RuntimeError('owner commit interrupted')
+        dispatcher = RecoveryDispatcher(connection, interrupted, mock.Mock())
+        with self.assertRaisesRegex(RuntimeError, 'owner commit interrupted'):
+            dispatcher.apply(observed, worktree=Path('/state/G-047'), repo_path=Path('/repo'),
+                             revision='base', verify_result='')
+        self.assertIsNone(repository.row('repo', 'G-047'))
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'IMPLEMENTING')
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM execplan_blocks').fetchone()[0], 0)
+
+    def test_conflict_dispatch_defers_inside_a_callers_transaction_without_git_or_commit(self):
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        observed = prepared_conflict_assessment(connection, 'repo', 'G-047')
+        connection.commit()
+        blocked = mock.Mock(side_effect=AssertionError('Git observation under write transaction'))
+        dispatcher = RecoveryDispatcher(connection, blocked, blocked)
+        connection.execute('BEGIN')
+        result = dispatcher.apply(observed, worktree=Path('/state/G-047'), repo_path=Path('/repo'),
+                                  revision='base', verify_result='')
+        self.assertEqual(result.action, RecoveryAction.PAUSE)
+        self.assertTrue(connection.in_transaction)
+        blocked.assert_not_called()
+        connection.rollback()
+        self.assertIsNone(RecoveryRepository(connection).row('repo', 'G-047'))
+
     def test_final_conflict_evidence_is_preserved_only_for_current_pr_and_owned_checkpoint(self):
         from tests.support.pr_recovery import prepared_conflict_assessment
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository

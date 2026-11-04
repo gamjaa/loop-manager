@@ -4,6 +4,7 @@ from tests.support.current_rebase import current_rebase_case
 from tests.support.runtime import runtime_rebase_fixture
 from tests.support.execution import ExecutionFixture
 from dataclasses import replace
+import json
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
@@ -1120,3 +1121,96 @@ class SavedRebaseInputTests(ExecutionRecoveryScenarios, ExecutionFixture, TestCa
 
     def test_restart_after_continue_reenters_worker_without_replaying_ready(self):
         self._assert_next_conflict_reentry(interrupted=True)
+class ConflictAssessmentOwnerTests(TestCase):
+    def test_owner_tries_file_recovery_before_binding_current_pr_evidence_or_waiting(self):
+        from tests.support.execution import execution_fixture
+        from tests.support.pr_recovery import prepared_conflict_assessment
+        from tests.support.worker import conflict_report
+        from loop_manager_internal.execution.worker_outcome import parse_worker_outcome
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        for condition in ('preserved', 'restored', 'no_apply', 'new_head', 'new_base', 'missing_resource', 'git_lock'):
+            with self.subTest(condition=condition):
+                fixture = execution_fixture(self)
+                prepared = prepared_conflict_assessment(fixture.connection, 'repo', 'G-047')
+                fixture.connection.commit()
+                fixture.state.expected = fixture.repository.projected('repo')
+                fixture.handler.catalog_plan = fixture.repository.active_row('repo')
+                checkpoint = ExecutionCheckpointRepository(fixture.connection)
+                proof = prepared.conflict_evidence
+                fixture.remote = proof['base_oid']
+                fixture.effects = replace(fixture.effects, checkpoint=checkpoint,
+                    workspace=replace(fixture.effects.workspace,
+                        current_rebase_service=None if condition == 'missing_resource' else mock.Mock()))
+                fixture.handler.effects = fixture.effects
+                def read_snapshot(*_args):
+                    self.assertFalse(fixture.connection.in_transaction)
+                    return lm.GitSnapshot.deserialize(proof['worktree_snapshot'])
+                fixture.effects.agent.capture_git_snapshot.side_effect = read_snapshot
+                fixture.state.update_project('repo', phase='WORKING', last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+                fixture.effects.workspace.is_directory.return_value = True
+                fixture.effects.workspace._rebase_in_progress_for_branch.return_value = True
+                def git(path, *args, **kwargs):
+                    if args[:2] == ('ls-files', '-u'):
+                        return SimpleNamespace(stdout='100644 ' + 'e' * 40 + ' 1\tapp.py\0', returncode=0)
+                    if args == ('rev-parse', 'refs/remotes/origin/main^{commit}') and condition == 'new_base':
+                        return SimpleNamespace(stdout='f' * 40, returncode=0)
+                    return fixture.observed_git(path, *args, **kwargs)
+                fixture.effects.workspace.git.side_effect = git
+                def pr(*_args, **_kwargs):
+                    self.assertFalse(fixture.connection.in_transaction)
+                    return {'url': proof['pr_url'], 'headRefName': proof['branch'], 'baseRefName': 'main',
+                            'headRefOid': 'f' * 40 if condition == 'new_head' else proof['head_oid'], 'state': 'OPEN'}
+                fixture.effects.publication.pr_for_branch.side_effect = pr
+                def block(repo, worktree, detail, verify, **options):
+                    from loop_manager_internal.recovery import block_service
+                    effects = block_service.BlockActiveExecplanEffects(
+                        block_service._final_block_recovery_decision,
+                        lambda _path: 'G-047', lambda *_args: '1' * 64,
+                        mock.Mock(), lambda *_args: '1' * 64,
+                        fixture.effects.agent.capture_git_snapshot,
+                        lambda *_args: fixture.repository.projected_row(repo))
+                    return block_service.block_active_execplan(effects, fixture.connection, repo, worktree, detail, verify, **options)
+                fixture.effects.blocking.block_active_execplan.side_effect = block
+                def restore(**_options):
+                    self.assertFalse(fixture.connection.in_transaction)
+                    if condition == 'git_lock':
+                        raise RecoveryFailure(RecoveryReason.GIT_LOCK, 'index.lock is held')
+                    if condition == 'no_apply':
+                        return False
+                    current = checkpoint.get('repo', 'G-047')
+                    checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+                        operation=current.operation, expected_head=current.expected_head,
+                        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                        snapshot={**current.snapshot, 'rebase_files': {'state': 'staged', 'paths': ['app.py'],
+                            'skipped_user_changes': [] if condition == 'restored' else ['app.py']}})
+                    return True
+                message = conflict_report()
+                report = parse_worker_outcome(message, plan_path=fixture.handler.catalog_plan['path'],
+                                               sources=(), documents={}).conflict_assessment
+                context = fixture.context()
+                with mock.patch('loop_manager_internal.git.rebase_documents.resolve', side_effect=restore) as fallback:
+                    try:
+                        result = fixture.handler._rebase_conflict(context, report['problem'], corrected=True,
+                            worker_result=message, assessment=report)
+                    except RecoveryFailure as error:
+                        self.assertEqual(condition, 'git_lock')
+                        result = fixture.handler.recover_failure(context, error)
+                self.assertEqual(fallback.call_count, 0 if condition == 'missing_resource' else 1)
+                final = RecoveryRepository(fixture.connection).row('repo', 'G-047')
+                current = fixture.repository.get('repo', 'G-047')
+                if condition == 'preserved':
+                    self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+                    self.assertEqual(current.status, 'PLAN_BLOCKED')
+                    saved = json.loads(final['final_evidence'])['conflict_evidence']
+                    self.assertEqual(saved['pr_url'], proof['pr_url'])
+                    self.assertEqual(saved['checkpoint_generation'], checkpoint.get('repo', 'G-047').generation)
+                    self.assertIn('Manager', saved['attempted_routes']['file_restore_rework'])
+                else:
+                    self.assertNotEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+                    self.assertEqual(current.status, 'IMPLEMENTING')
+                    self.assertIsNone(final['final_evidence'])
+                self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
+                self.assertEqual(current.pr_head_oid, proof['head_oid'])
+                fixture.effects.agent.run_agent.assert_not_called()
+                fixture.effects.validation.verify.assert_not_called()

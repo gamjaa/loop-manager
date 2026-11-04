@@ -132,6 +132,25 @@ def decision(**changes):
     return "WORKER_OUTCOME: " + json.dumps(value, ensure_ascii=False)
 
 
+def conflict_report(**changes):
+    """A semantic observation; tests supply current Git facts separately."""
+    value = dict(kind='pr_conflict_unrecoverable', problem='Protected resolution cannot be reconstructed.',
+        conflict_paths=['app.py'], attempted_routes={
+            'worker_correction': 'The current correction could not resolve the owned conflict.',
+            'file_restore_rework': 'The preserved current edit cannot be replaced safely.',
+            'revalidation': 'There is no complete candidate to validate.'},
+        unavailable_recovery_routes={
+            'reobservation': 'The same protected resolution and originals were inspected.',
+            'retry': 'Retrying cannot supply the required resolution.',
+            'correction': 'No further correction is possible with these inputs.',
+            'condition_wait': 'No resource or service is pending.',
+            'next_run': 'Restarting does not change the required inputs.',
+            'safe_recovery': 'Restoring the originals would overwrite the preserved current edit.'},
+        release_conditions=['Changed relevant source or PR/base input', 'Explicit cause-specific recheck'])
+    value.update(changes)
+    return 'WORKER_OUTCOME: ' + json.dumps(value)
+
+
 def make_active_worker_project(
     owner,
     directory: str,
