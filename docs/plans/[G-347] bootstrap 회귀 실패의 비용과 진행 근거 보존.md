@@ -30,11 +30,11 @@ bootstrap 저장 상태 회귀가 timeout이나 assertion 실패로 끝나도 �
 
 ## Implementation
 
-- [ ] 보존 후보의 `tests/support/bootstrap_saved_scope.py:_collect_bootstrap_costs()`·`_track_bootstrap_costs()`와 `_run_child()`·`_assert_bootstrap_costs()`의 정리 순서를 최신 base에 통합한다. HEAD `52aa404`에 구현된 회수·중복 방지·수집 완결성 검사·필수 assertion을 보존하고 실제 통합 차이만 교정한다. 실패 경로에서는 회수 오류가 원래 timeout·실행/proof 오류를 덮지 않도록 구분한다. 파일/프로세스 소유 범위와 기존 `run_verify_process()`의 종료 결과를 바꾸지 않는다.
-- [ ] 회수는 이 fixture가 생성한 파일만 읽고 기존 이벤트 identity를 보존한다. 중단된 JSONL의 완전한 줄·마지막 미완성 줄, 읽기 오류와 원래 테스트 예외를 구분한다. 필요한 수집 한계는 기존 테스트 진단 방식에 남기며 조율 인증값·전체 환경이나 사용자 문서를 출력하지 않는다. 공통 runner의 결과 판정·시간 합산·reservation schema를 이 fixture 문제로 변경하지 않는다.
-- [ ] 상위 writer에 회수한 raw JSONL과 기존 테스트 진단을 재사용해 소유 중첩 기록의 위치·수집 상태를 연결한다. `verification/timing.py:summarize()`의 엄격한 run 필터를 유지하면서, 요약에서 제외된 원문도 fixture 정리 뒤 조회할 수 있게 한다. 필요한 별도 보존 경로는 같은 verify 진단 디렉터리 안에 한정하며 새 진단 저장소·전역 이벤트 schema를 만들지 않는다. `tests/test_verify_runtime.py:TimingAndManifestTests.test_summary_does_not_adopt_unowned_nested_diagnostics`의 직접 교정은 다시 구현하지 않는다.
-- [ ] 확인한 `tests/test_bootstrap_runtime.py:BootstrapSavedScopeFixtureUnitTests`의 고정 지침·Git 격리·실제 저장 invocation 근거 fixture에 최소 unit 회귀를 통합한다. 임시 JSONL·기존 EventWriter와 명령 결과 double을 사용하고 부모/자식 CLI를 새로 실행하지 않는다. `tests/support/git.py:copy_manager_import_fixture()`·`isolated_git_test`와 `tests/support/runtime.py:record_saved_scope_invocation()`을 그대로 재사용한다.
-- [ ] 확인한 `tests/test_bootstrap_saved_scope.py`·`tests/test_bootstrap_runtime_selection.py`의 실제 연결 회귀와 `docs/ARCHITECTURE.md`의 자체 테스트 Git 경계/부모·자식 계측 계약을 대조한다. 필요한 설명만 기존 소유 절에 통합하고 실제 연결을 unit으로 대체하거나 R-020의 지원 조건을 줄이지 않는다. 실패 원인 조사에서 이 작업 밖의 제품 결함이 확인되면 관측 근거를 보존해 기존 공통 결함 경계로 보고한다.
+- [x] 보존 후보의 `tests/support/bootstrap_saved_scope.py:_collect_bootstrap_costs()`·`_track_bootstrap_costs()`와 `_run_child()`·`_assert_bootstrap_costs()`의 정리 순서를 최신 base에 통합한다. HEAD `52aa404`에 구현된 회수·중복 방지·수집 완결성 검사·필수 assertion을 보존하고 실제 통합 차이만 교정한다. 실패 경로에서는 회수 오류가 원래 timeout·실행/proof 오류를 덮지 않도록 구분한다. 파일/프로세스 소유 범위와 기존 `run_verify_process()`의 종료 결과를 바꾸지 않는다.
+- [x] 회수는 이 fixture가 생성한 파일만 읽고 기존 이벤트 identity를 보존한다. 중단된 JSONL의 완전한 줄·마지막 미완성 줄, 읽기 오류와 원래 테스트 예외를 구분한다. 필요한 수집 한계는 기존 테스트 진단 방식에 남기며 조율 인증값·전체 환경이나 사용자 문서를 출력하지 않는다. 공통 runner의 결과 판정·시간 합산·reservation schema를 이 fixture 문제로 변경하지 않는다.
+- [x] 상위 writer에 회수한 raw JSONL과 기존 테스트 진단을 재사용해 소유 중첩 기록의 위치·수집 상태를 연결한다. `verification/timing.py:summarize()`의 엄격한 run 필터를 유지하면서, 요약에서 제외된 원문도 fixture 정리 뒤 조회할 수 있게 한다. 필요한 별도 보존 경로는 같은 verify 진단 디렉터리 안에 한정하며 새 진단 저장소·전역 이벤트 schema를 만들지 않는다. `tests/test_verify_runtime.py:TimingAndManifestTests.test_summary_does_not_adopt_unowned_nested_diagnostics`의 직접 교정은 다시 구현하지 않는다.
+- [x] 확인한 `tests/test_bootstrap_runtime.py:BootstrapSavedScopeFixtureUnitTests`의 고정 지침·Git 격리·실제 저장 invocation 근거 fixture에 최소 unit 회귀를 통합한다. 임시 JSONL·기존 EventWriter와 명령 결과 double을 사용하고 부모/자식 CLI를 새로 실행하지 않는다. `tests/support/git.py:copy_manager_import_fixture()`·`isolated_git_test`와 `tests/support/runtime.py:record_saved_scope_invocation()`을 그대로 재사용한다.
+- [x] 확인한 `tests/test_bootstrap_saved_scope.py`·`tests/test_bootstrap_runtime_selection.py`의 실제 연결 회귀와 `docs/ARCHITECTURE.md`의 자체 테스트 Git 경계/부모·자식 계측 계약을 대조한다. 필요한 설명만 기존 소유 절에 통합하고 실제 연결을 unit으로 대체하거나 R-020의 지원 조건을 줄이지 않는다. 실패 원인 조사에서 이 작업 밖의 제품 결함이 확인되면 관측 근거를 보존해 기존 공통 결함 경계로 보고한다.
 
 ## Validation
 
@@ -51,10 +51,10 @@ bootstrap 저장 상태 회귀가 timeout이나 assertion 실패로 끝나도 �
 - [x] 보존 후보 `8d63b8f5c7a3b7f8b24166d9b330eba7644705c5`의 회수 구현·unit과 후보 본문의 완료 표시를 읽기 전용으로 확인했다. 기존 구현·검증 기록은 해당 작업 공간에 보존하며 이번 확인을 최신 후보의 verify·Review 성공으로 승계하지 않는다.
 - [x] 이번 revision에서 보존 worktree의 HEAD `dec1a217e789807c2818bd190035b247d635f105`와 미커밋 diff를 읽기 전용으로 확인했다. 정상 수집 완결성·필수 assertion 및 정상/미확인 시간 연결 unit의 구현과 후보 본문의 완료 기록은 보존한다. 작업 공간·Git·실행 이력을 수정하거나 후보의 검증 성공을 새로 확정하지 않았다.
 - [x] revision `79d56d1df767cbbd7c3a9fb0274ca0b53a0294ff`에서 보존 worktree의 clean HEAD `52aa404ded19ca5f684717184074b5f9e7bd59e1`와 회수·필수 assertion·기존 unit 및 본문 완료 기록을 읽기 전용으로 대조했다. 최신 base의 ID 없는 중첩 기록 제외와 후보 unit의 상위 run/manifest 부재를 확인했다. 기존 수행 기록을 보존하며 이번 확인으로 실행 검증 성공을 새로 기록하지 않았다.
-- [ ] 보존 구현·완료 기록의 최신 base 통합 및 실제로 남은 차이 확인
-- [ ] 기존 실패 회수·정상/미확인 시간 unit 보존과 변경 관련 최소 검증
-- [ ] 실제 상위 run/manifest 아래 원문 접근·중첩 진단과 엄격한 상위 집계 분리 확인
-- [ ] 기존 실제 bootstrap 연결 회귀와 실패 진단 보존 확인
+- [x] 보존 구현·완료 기록의 최신 base 통합 및 실제로 남은 차이 확인
+- [x] 기존 실패 회수·정상/미확인 시간 unit 보존과 변경 관련 최소 검증
+- [x] 실제 상위 run/manifest 아래 원문 접근·중첩 진단과 엄격한 상위 집계 분리 확인
+- [x] 기존 실제 bootstrap 연결 회귀 정적 대조; 실제 실행과 실패 진단 대조는 Manager 전체 verify에서 수행한다.
 
 ## Decision Log
 

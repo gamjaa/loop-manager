@@ -63,6 +63,28 @@ def _collect_bootstrap_costs(state, records):
         complete = False
     if not complete:
         print('bootstrap cost collection incomplete', file=sys.stderr)
+    if writer is not None:
+        # Keep the raw events in the parent journal; a text sidecar exposes the
+        # nested view without making its events eligible for parent aggregation.
+        try:
+            from loop_manager_internal.verification.timing import diagnostic
+            with tempfile.TemporaryDirectory(dir=writer.path.parent) as directory:
+                path = Path(directory) / 'events.jsonl'
+                path.write_text(''.join(json.dumps(event, ensure_ascii=False) + '\n' for event in records),
+                                encoding='utf-8')
+                detail = diagnostic(Path(directory)).splitlines()[1:]
+                nested_summary = (Path(directory) / 'summary.json').read_text(encoding='utf-8')
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', prefix='bootstrap-cost-',
+                                             suffix='.txt', dir=writer.path.parent, delete=False) as report:
+                summary_path = Path(report.name).with_suffix('.json')
+                summary_path.write_text(nested_summary, encoding='utf-8')
+                report.write(f'raw events: {writer.path.name}\n')
+                report.write(f'nested summary: {summary_path.name}\n')
+                report.write(f'collection: {"complete" if complete else "incomplete"}\n')
+                report.write('\n'.join(detail) + '\n')
+            print(f'bootstrap cost diagnostic: {report.name}', file=sys.stderr)
+        except Exception:
+            print('bootstrap cost diagnostic unavailable', file=sys.stderr)
     return complete
 
 
