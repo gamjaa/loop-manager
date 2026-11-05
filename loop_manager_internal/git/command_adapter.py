@@ -8,6 +8,7 @@ from loop_manager_internal.runtime.contracts import GitLockError
 from loop_manager_internal.runtime.contracts import ManagedWorktreeConflictError
 from pathlib import Path
 import subprocess
+import tempfile
 
 
 @dataclass(frozen=True)
@@ -84,8 +85,11 @@ def commit_ref_transaction(arguments, *, input, before_commit, cwd=None, env=Non
     EOF aborts a started transaction. Never send commit after a failed check.
     Binary pipes preserve LF on Windows as well as UTF-8 ref names.
     """
-    with _handoff_popen(arguments, cwd=cwd, env=env, stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+    # A hook can emit more than a pipe buffer before prepare replies. Spool
+    # diagnostics separately so they neither block Git nor become protocol.
+    with tempfile.TemporaryFile() as diagnostics, _handoff_popen(
+            arguments, cwd=cwd, env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=diagnostics) as process:
         try:
             process.stdin.write(input.encode("utf-8"))
             process.stdin.flush()
@@ -94,18 +98,24 @@ def commit_ref_transaction(arguments, *, input, before_commit, cwd=None, env=Non
                 output += process.stdout.readline().replace(b"\r\n", b"\n")
             if output != b"start: ok\nprepare: ok\n":
                 remainder, _ = process.communicate()
-                return subprocess.CompletedProcess(
-                    arguments, process.returncode or 1,
-                    (output + remainder).decode("utf-8", errors="replace"))
-            before_commit()
-            remainder, _ = process.communicate(b"commit\n")
+                returncode = process.returncode or 1
+            else:
+                before_commit()
+                remainder, _ = process.communicate(b"commit\n")
+                returncode = process.returncode
             output += remainder
-        except BaseException:
-            # Closing stdin aborts even a prepared transaction and releases its
-            # lock. Reap the child before returning the original failure.
+        except BaseException as error:
+            # EOF aborts even a prepared transaction; reap before releasing
+            # the FIFO turn, retaining hook diagnostics with the original error.
             process.communicate()
+            diagnostics.seek(0)
+            detail = diagnostics.read().decode("utf-8", errors="replace")
+            if detail:
+                error.add_note(detail)
             raise
-    return subprocess.CompletedProcess(arguments, process.returncode,
+        diagnostics.seek(0)
+        output += diagnostics.read()
+    return subprocess.CompletedProcess(arguments, returncode,
                                        output.decode("utf-8", errors="replace"))
 
 

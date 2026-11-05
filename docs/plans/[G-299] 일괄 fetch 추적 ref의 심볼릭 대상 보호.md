@@ -52,3 +52,11 @@ R-092의 일괄 수신 뒤 추적 ref 반영이 심볼릭 ref를 따라 사용�
 - [Git update-ref 공식 계약](https://git-scm.com/docs/git-update-ref#_description)은 기본 쓰기가 심볼릭 ref를 역참조하고 `--no-deref`는 ref 자체를 덮는다고 설명한다. 현재 코드와 이 계약의 대조로 대상 밖 쓰기 가능성을 식별했다. alias 보존과 쓰기 시점의 경쟁도 함께 검증하며 실제 손실 발생이나 수정 성공으로 기록하지 않는다.
 - R-092의 정확한 ref·사용자 작업 보존을 구현하는 국소 교정이다. 새 원격 동기화 기능·사용자 ref 정리·branch 정책·비호환 journal migration을 도입하지 않는다. G-300은 남은 R-092 회귀/비용 근거를, G-189는 Merge 뒤 후속 차단·복구 소비자를 담당한다.
 - complexity high: OID가 같아도 다른 raw ref 종류·쓰기 대상이 되는 경쟁을 기존 잠금·미완료 journal과 결합해 막아야 한다. risk critical: 잘못된 역참조는 소유권 밖 사용자 branch를 갱신해 미게시 commit의 연결을 잃게 하며 코드 rollback이 이를 복구하지 않는다. 쓰기 전 보존·정확한 대상 강제와 최소 실제 Git 회귀로 방지하고 불확실한 상태는 원문·intent를 남긴다. 최초 level은 6이며 Model·Effort는 Manager의 명시 설정을 따른다.
+
+## Review Correction — stderr protocol contamination
+
+- `commit_ref_transaction`이 stderr를 stdout에 섞어 정상 `reference-transaction` hook 진단을 제어 응답으로 오인하던 경계를 교정했다. stdout의 start/prepare 응답만 검사하고 stderr는 별도 임시 파일로 수집한다. pipe 용량을 넘는 hook 출력도 응답 대기를 막지 않으며, 정상·명령 거부 결과에는 수집한 진단을 합쳐 기존 명령 결과 계약을 유지한다. 형상 검사 예외에는 EOF 중단·자식 회수 뒤 원래 예외의 note로 진단을 보존한다.
+- 기존 실제 Git 회귀에 정상 종료하며 prepared/committed 진단을 출력하는 hook을 추가했다. 먼저 정상 직접 ref가 갱신되고 진단이 보존되는지 확인한 뒤, 같은 실행의 동일 OID alias 전환은 여전히 정확한 잠금 안에서 거부되고 alias·referent·사용자 HEAD/index/파일·미완료 intent가 보존됨을 확인한다. 별도 저장소 시나리오를 중복 추가하지 않았다.
+- 신규 mock case는 pipe 용량보다 긴 진단을 정상 prepare·형상 거부·prepare 실패 각각에서 검사한다. 성공 판단은 실제 helper를 사용하며, 기존 transaction protocol 회귀의 commit/EOF assertion을 유지했다.
+- 지정 targeted runner로 `ProjectFetchBranchDeletionTest.test_hook_diagnostics_are_separate_from_transaction_responses`, `ProjectFetchBranchDeletionTest.test_transaction_protocol_commits_only_after_the_locked_check`, `OriginIsolationScopeTest.test_prepared_fetch_rejects_same_oid_alias_without_touching_user_work`를 실행해 3개 모두 PASS다. 전체 verify·integration suite·Windows native 검증은 실행하지 않았다.
+- PRODUCT의 기존 alias·사용자 작업 보존 조건은 유지하고 ARCHITECTURE의 transaction 절에 진단 분리·보존 계약을 반영했다. Requirement·다른 ExecPlan·frontmatter는 수정하지 않았다.

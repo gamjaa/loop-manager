@@ -65,7 +65,7 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
             self.assertEqual(sum(call.args[1] == 'ls-remote' for call in calls.call_args_list), 1)
 
     def test_prepared_fetch_rejects_same_oid_alias_without_touching_user_work(self):
-        """Only real Git proves no-deref prepare holds the alias's exact lock."""
+        """Real Git proves noisy hooks allow direct updates and preserve alias locks."""
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)
             state = Path(directory) / 'state'
@@ -82,6 +82,11 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
             derived_head = git(source, 'symbolic-ref', 'refs/remotes/origin/HEAD')
             real_git = loop_manager.git
             locked = []
+            diagnostics = []
+            hook = source / '.git/hooks/reference-transaction'
+            hook.parent.mkdir(exist_ok=True)
+            hook.write_text('#!/bin/sh\nprintf "hook: %s\\n" "$1" >&2\nexit 0\n', encoding='utf-8')
+            hook.chmod(hook.stat().st_mode | 0o111)
 
             def race(repo, *args, **kwargs):
                 if args[:1] == ('update-ref',) and f'update {ref} ' in kwargs.get('input', ''):
@@ -93,12 +98,19 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
                         locked.append(attempt.returncode != 0)
                         check()
                     kwargs['before_commit'] = while_locked
-                return real_git(repo, *args, **kwargs)
+                result = real_git(repo, *args, **kwargs)
+                if args[:1] == ('update-ref',):
+                    diagnostics.append(result.stdout)
+                return result
 
             with mock.patch.object(loop_manager, 'git', side_effect=race):
-                with self.assertRaises(manager_git_journal.MutationEvidenceError):
+                with self.assertRaises(manager_git_journal.MutationEvidenceError) as caught:
                     loop_manager.remote_base(source, 'main', state_dir=state)
             self.assertEqual(locked, [True])
+            self.assertEqual(len(diagnostics), 1)
+            self.assertIn('hook: prepared', diagnostics[0])
+            self.assertIn('hook: committed', diagnostics[0])
+            self.assertIn('hook: prepared', '\n'.join(caught.exception.__notes__))
             self.assertEqual(git(source, 'symbolic-ref', ref), 'refs/heads/user-work')
             self.assertEqual(git(source, 'rev-parse', 'refs/heads/user-work'), original)
             self.assertEqual(git(source, 'rev-parse', 'origin/main'), selected)

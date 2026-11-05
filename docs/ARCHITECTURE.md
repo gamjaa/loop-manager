@@ -1946,6 +1946,8 @@ fetch의 관측·완료·복구 경계는 `symbolic-ref --quiet --no-recurse`로
 
 실제 쓰기는 프로젝트 Git FIFO 보호 안에서 수행하며, prepare·raw 형상 검사·commit 또는 중단과 자식 회수까지 같은 순번을 유지한다. 일괄·단일·안내용 fetch가 공유하는 helper는 `update-ref --no-deref --stdin`의 `start` → `update <정확한 ref> <새 OID> <이전 OID 또는 0>` → `prepare`로 수행한다. Git이 정확한 대상의 잠금을 잡고 OID CAS를 검증한 응답을 받은 뒤, 그 잠금 안에서 raw 형상을 다시 확인하고 같은 프로세스에 `commit`을 보낸다. 확인 실패·중단 시 commit 없이 stdin을 닫고 자식을 회수해 prepared transaction을 중단한다. 사전 심볼릭 검사만으로 경쟁을 막거나 `--no-deref`만으로 alias를 보존한다고 가정하지 않는다. 이 조합은 관측 뒤 같은 OID의 alias로 바뀐 경우에도 referent를 따라 쓰거나 alias 자체를 치환하지 않으며 ref별 lease·journal과 실제 쓰기 대상을 일치시킨다. 기존 Git transaction 계약을 사용하고, 새 `symref-*` 명령이나 저장소 파일 형식에 의존하지 않는다. [Git update-ref 계약](https://git-scm.com/docs/git-update-ref)의 prepare 잠금·명시적 commit·EOF 중단을 따르며 Git 2.43에서도 제공하는 transaction을 사용한다.
 
+transaction의 stdout 제어 응답과 hook·Git의 stderr 진단은 분리한다. stderr는 별도 임시 파일에 수집해 긴 hook 출력도 prepare 응답을 막지 않게 하고, 종료 후 기존 명령 결과의 진단에 합친다. 잠금 안의 형상 검사가 예외로 종료되면 transaction을 중단·회수한 뒤 원래 예외의 note에 진단을 보존한다. 정상 hook 진단 출력 자체는 ref 갱신을 거부할 근거가 아니다.
+
 Codex의 `refs/codex/turn-diffs/*`와 다른 작업의 정상 공유 ref 변화를 해당 Agent에 귀속하지 않는다. 현재 게시 branch의 원격 tip은 이번 push의 통합·명시적 `--force-with-lease` 조건으로 관측한다.
 
 Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내장 쓰기 제한과 granular 자동 승인 검토를 유지한다. Codex 프로세스 전체를 감싸는 바깥 sandbox와 중첩 sandbox 호환성은 호출 조건이 아니며 정상 session·로그 저장을 Agent의 workspace 밖 쓰기 권한과 구분한다.

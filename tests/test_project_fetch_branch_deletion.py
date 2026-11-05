@@ -375,3 +375,39 @@ class ProjectFetchBranchDeletionTest(unittest.TestCase):
                             input='start\nprepare\n', before_commit=check)
                 self.assertEqual(events,
                     ['enter', 'command', 'check'] + ([] if rejected else ['commit']) + ['exit'])
+
+    def test_hook_diagnostics_are_separate_from_transaction_responses(self):
+        import io
+        from loop_manager_internal.git import command_adapter
+        diagnostic = b'hook prepared diagnostic\n' * 8192
+        for prepared, rejected in ((True, False), (True, True), (False, False)):
+            with self.subTest(prepared=prepared, rejected=rejected):
+                process = mock.MagicMock()
+                process.__enter__.return_value = process
+                process.stdin = io.BytesIO()
+                process.stdout = io.BytesIO(b'start: ok\n' + (b'prepare: ok\n' if prepared else b''))
+                process.communicate.return_value = (b'commit: ok\n' if prepared else b'', None)
+                process.returncode = 0 if prepared else 128
+                def spawn(*args, **kwargs):
+                    self.assertEqual(kwargs['stdout'], subprocess.PIPE)
+                    kwargs['stderr'].write(diagnostic)
+                    return process
+                checked = mock.Mock(side_effect=RuntimeError('raw alias') if rejected else None)
+                with mock.patch.object(command_adapter, '_handoff_popen', side_effect=spawn):
+                    if rejected:
+                        with self.assertRaisesRegex(RuntimeError, 'raw alias') as caught:
+                            loop_manager.command(['git', 'update-ref', '--stdin'],
+                                input='start\nprepare\n', before_commit=checked)
+                        self.assertIn(diagnostic.decode(), caught.exception.__notes__)
+                        process.communicate.assert_called_once_with()
+                    else:
+                        result = loop_manager.command(['git', 'update-ref', '--stdin'], check=False,
+                            input='start\nprepare\n', before_commit=checked)
+                        self.assertTrue(result.stdout.endswith(diagnostic.decode()))
+                        self.assertEqual(result.returncode, 0 if prepared else 128)
+                        if prepared:
+                            checked.assert_called_once_with()
+                            process.communicate.assert_called_once_with(b'commit\n')
+                        else:
+                            checked.assert_not_called()
+                            process.communicate.assert_called_once_with()
