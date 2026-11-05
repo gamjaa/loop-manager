@@ -383,19 +383,25 @@ def command(
     check: bool = True,
     env: dict[str, str] | None = None,
     input: str | None = None,
+    before_commit: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     # Windows text pipes turn LF into CRLF; Git --stdin treats the CR as ref data.
     transport = ({"input": input.encode("utf-8")} if input is not None else
                  {"text": True, "encoding": "utf-8", "errors": "replace"})
-    result = effects._handoff_run(
-        arguments,
-        cwd=cwd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        **transport,
-    )
-    if input is not None:
+    if before_commit is not None:
+        result = command_adapter.commit_ref_transaction(
+            arguments, input=input, before_commit=before_commit, cwd=cwd, env=env,
+        )
+    else:
+        result = effects._handoff_run(
+            arguments,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            **transport,
+        )
+    if input is not None and before_commit is None:
         result.stdout = result.stdout.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     if check and result.returncode:
         output = result.stdout[-6000:].strip()
@@ -429,9 +435,11 @@ def git(
     effects: GitEffects, repo: Path, *arguments: str, check: bool = True,
     env: dict[str, str] | None = None,
     input: str | None = None,
+    before_commit: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return command_adapter.git(effects._command_adapter_effects_git(), repo, *arguments, check=check, env=env,
-                               **({"input": input} if input is not None else {}))
+                               **({"input": input} if input is not None else {}),
+                               **({"before_commit": before_commit} if before_commit is not None else {}))
 
 
 def github_repository(origin_url: str) -> str:
