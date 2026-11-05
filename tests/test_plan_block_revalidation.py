@@ -23,6 +23,41 @@ from tests.support.git import git_command
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_pending_metadata_rebase_routes_new_remote_to_owned_integration(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan(self.repo, 'G-106', reason_code='plan_input_invalid',
+                           evidence='pinned document mismatch', release_fingerprint='input', clear_projection=False)
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        checkpoint = store.record(self.repo, 'G-106', expected_generation=0, operation='rebase',
+            expected_head=self.head, target_base_oid=self.base, observed_remote_oid='c' * 40, snapshot={})
+        self.connection.execute("UPDATE blocked_remote_observations SET branch_result='present', branch_oid=? "
+                                "WHERE plan_id='G-106'", ('d' * 40,))
+        self.connection.commit()
+        with (mock.patch.object(blocked_plan_reconciliation.BlockedPlanReconciler, 'reconcile',
+                                return_value='deferred') as reconcile,
+              mock.patch.object(loop_manager, 'resume_blocked_execplan_if_inputs_changed') as old_lease):
+            self.assertFalse(loop_manager.resume_plan_blocks(self.connection, Path('/repo'), Path('/state'),
+                self.repo, 'main', plan_id='G-106'))
+        reconcile.assert_called_once_with('G-106')
+        old_lease.assert_not_called()
+        self.assertEqual(store.get(self.repo, 'G-106'), checkpoint)
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+
+    def test_dependency_gate_precedes_user_question_agent_assessment(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan(self.repo, 'G-106', reason_code='user_decision_required',
+                           evidence='Original question', release_fingerprint='question', clear_projection=False)
+        self.connection.execute("UPDATE exec_plans SET depends_on='[\"G-107\"]' WHERE plan_id='G-106'")
+        self.connection.commit()
+        before = self.plan()
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause') as assess:
+            self.assertFalse(loop_manager.resume_plan_blocks(self.connection, Path('/repo'), Path('/state'),
+                self.repo, 'main', plan_id='G-106'))
+        assess.assert_not_called()
+        self.assertEqual(self.plan()['status'], before['status'])
+        self.assertEqual(self.plan()['blocked_reason'], before['blocked_reason'])
+        self.assertEqual(self.plan()['last_error'], before['last_error'])
+
     def test_scheduler_preparation_defers_question_assessment_to_selected_task(self):
         from loop_manager_internal.application.task_scheduling import current_scheduler, current_task, Task
         runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
@@ -1951,6 +1986,85 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
             self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
         self.ports._journaled_direct_rebase.assert_not_called()
         self.ports._complete_direct_rebase_checkpoint.assert_called_once()
+
+    def _pending_common_rebase(self):
+        from loop_manager_internal.git.managed_rebase_validation import RebaseDecision, RebaseStatus
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan(self.repo, 'G-106', reason_code='common_defect_pending',
+                           evidence='shared runner failure', release_fingerprint='input', clear_projection=False)
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        checkpoint = store.record(self.repo, 'G-106', expected_generation=0, operation='rebase',
+            expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None,
+            snapshot={'original_conflict': 'preserved'})
+        self.connection.commit()
+        observed = SimpleNamespace(head=self.head, fingerprint='owned-conflict', files={'work.py': 'conflict'})
+        service = self.ports._current_rebase_service.return_value
+        service.require_owned.return_value = (observed, RebaseDecision(RebaseStatus.WAITING))
+        for patch in (
+                mock.patch.object(self.coordinator, '_validate', return_value=(Path('/state/G-106'), 'loop-manager/G-106')),
+                mock.patch.object(self.coordinator, '_adopt')):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return store, checkpoint, service
+
+    def test_resolved_common_cause_resumes_owned_conflict_without_completing_rebase(self):
+        store, checkpoint, _ = self._pending_common_rebase()
+        sibling = dict(self.plan('G-107'))
+        original = dict(self.plan())
+        self.ports._evaluate_remote_checkpoint_cause.return_value = (
+            True, 'current runner correction confirmed', 'worker')
+        with mock.patch.object(blocked_plan_reconciliation.common_defect_state, 'unlinked_reports',
+                               return_value=[{'original_failure': 'runner'}]):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'resumed')
+        current = store.get(self.repo, 'G-106')
+        self.assertEqual((current.operation, current.expected_head, current.target_base_oid),
+                         (checkpoint.operation, checkpoint.expected_head, checkpoint.target_base_oid))
+        self.assertEqual(current.snapshot['original_conflict'], 'preserved')
+        self.assertNotIn('current_rebase_acceptance', current.snapshot)
+        self.assertEqual(self.plan()['status'], 'IMPLEMENTING')
+        for field in ('worker_session_id', 'verify_failure_history', 'review_failure_history'):
+            self.assertEqual(self.plan()[field], original[field])
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+        self.assertEqual(dict(self.plan('G-107')), sibling)
+        self.ports._complete_direct_rebase_checkpoint.assert_not_called()
+        self.ports._journaled_direct_rebase.assert_not_called()
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+
+    def test_unresolved_common_cause_keeps_pending_rebase_and_block(self):
+        store, checkpoint, _ = self._pending_common_rebase()
+        with mock.patch.object(self.coordinator, '_evaluate', return_value={
+                'resolved': False, 'detail': 'same cause', 'stage': None}):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(store.get(self.repo, 'G-106'), checkpoint)
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+        self.ports._complete_direct_rebase_checkpoint.assert_not_called()
+
+    def test_pending_rebase_does_not_release_a_user_decision(self):
+        store, checkpoint, _ = self._pending_common_rebase()
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan(self.repo, 'G-106', reason_code='user_decision_required',
+                           evidence='explicit choice required', release_fingerprint='input', clear_projection=False)
+        with mock.patch.object(self.coordinator, '_evaluate') as assess:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        assess.assert_not_called()
+        self.assertEqual(store.get(self.repo, 'G-106'), checkpoint)
+        self.assertEqual(self.plan()['blocked_reason'], 'user_decision_required')
+        self.ports._complete_direct_rebase_checkpoint.assert_not_called()
+
+    def test_pending_common_rebase_release_rejects_changed_git_observation(self):
+        from loop_manager_internal.git.managed_rebase_validation import RebaseDecision, RebaseStatus
+        store, checkpoint, service = self._pending_common_rebase()
+        original = service.require_owned.return_value
+        service.require_owned.side_effect = [original, (
+            SimpleNamespace(head='changed', fingerprint='competing-writer', files={}),
+            RebaseDecision(RebaseStatus.WAITING))]
+        with mock.patch.object(self.coordinator, '_evaluate', return_value={
+                'resolved': True, 'detail': 'cause resolved', 'stage': 'worker'}):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(store.get(self.repo, 'G-106'), checkpoint)
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+        self.assertIsNotNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+        self.ports._complete_direct_rebase_checkpoint.assert_not_called()
 
 
     def test_new_verify_failure_does_not_clear_a_saved_review_cause(self):

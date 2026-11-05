@@ -509,9 +509,29 @@ class BlockedPlanReconciler:
                     raise RuntimeError('차단 계획 관리 rebase가 충돌 해결을 기다립니다: ' + rebased.stdout[-2000:])
         checkpoint = checkpoints.get(self.repo, plan_id)
         if checkpoint.operation == 'rebase':
-            _, decision = self.ports._current_rebase_service(
+            service = self.ports._current_rebase_service(
                 self.connection, self.repo_path, self.state_dir, self.repo, plan_id,
-                worktree, branch).require_owned(checkpoint=checkpoint)
+                worktree, branch)
+            observation = service.require_owned(checkpoint=checkpoint)
+            _, decision = observation
+            if decision.status.value == 'waiting_for_resolution':
+                if context['block']['reason_code'] == BlockReasonCode.COMMON_DEFECT_PENDING.value:
+                    context['evaluation'] = self._evaluate(self._check_owner(plan_id, context), context)
+                    if context['evaluation']['resolved']:
+                        plan = self._check_owner(plan_id, context)
+                        checkpoint = checkpoints.get(self.repo, plan_id)
+                        project = runtime_state.project_row(self.connection, self.repo)
+                        from loop_manager_internal.recovery.plan_recovery import recovery_admission
+                        with recovery_admission(self.connection, self.repo, plan_id):
+                            runtime_state.RuntimeStateRepository(self.connection).resume_rebase_block(
+                                plan, project, context['block'], checkpoints, observation,
+                                expected_checkpoint=checkpoint, is_plan_block=True,
+                                reobserve=lambda: service.require_owned(checkpoint=checkpoints.get(self.repo, plan_id)),
+                                dependencies_ready=lambda: self._check_owner(plan_id, context) is not None,
+                                pending_error=context['evaluation']['detail'])
+                        self._save(plan_id, context['input_identity'], 'complete', context)
+                        return True
+                raise AssessmentPending('차단 계획 관리 rebase가 충돌 해결을 기다립니다.')
             if decision.status.value == 'ready_to_start':
                 rebased = self.ports._journaled_direct_rebase(
                     self.connection, self.repo_path, self.repo, plan_id, worktree, branch,
@@ -829,7 +849,8 @@ class BlockedPlanReconciler:
                 stage = 'adopted'
                 self._save(plan_id, key, stage, context)
             if stage == 'adopted':
-                self._incorporate(self._check_owner(plan_id, context), context)
+                if self._incorporate(self._check_owner(plan_id, context), context) is True:
+                    return 'resumed'
                 stage = 'incorporated'
                 self._save(plan_id, key, stage, context)
             if stage == 'incorporated':

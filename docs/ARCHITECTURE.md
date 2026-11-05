@@ -1521,7 +1521,7 @@ Scheduler 실행의 프로젝트 준비 단계는 workspace 소유권 hold 복�
 
 교정 계획 연결이 없는 현재 공통 결함은 `validation_results`의 현재 Worker 원문 또는 활성 feedback에 결합된 불변 `common_defect_reports`를 입력으로 사용한다. 코드 비교 기준은 해당 보고의 `definition_revision`이며, rebase 후 `active_sha`로 바꾸지 않는다. 보고의 관련 코드 변경·부재가 있을 때만 읽기 전용 원인 재평가를 수행하고 현재 코드·상위 명세 인용과 입력 identity를 검증한다. 인용의 `source`는 전달한 `sources`의 저장소 상대 경로를 정확히 사용하고 행 번호·링크를 붙이지 않으며, `quote`는 해당 현재 원문의 실제 부분 문자열이어야 한다. 추가 파일의 설명은 판정 detail과 구분하고 미확인 인용으로 해소하지 않는다. 연결된 교정 계획의 실제 Merge·검증 gate는 그대로 적용한다. 입력이 바뀌거나 판정이 불확실하면 차단을 유지한다. 공통 구현 결함의 읽기 전용 재평가는 현재 원격의 상위 명세를 읽으며 후속 일반 planning의 명세 반영 확정만을 기다리지 않는다. 실제 진행 중인 planning과 후보·소유권 경계는 유지하고, 기존 사용자 결정 차단은 후속 명세의 planning 확정을 계속 요구한다.
 
-재평가와 해제는 기존 `BlockedPlanReconciler`의 현재 소유권·원격·checkpoint 검사를 통과해야 한다. `common_defect_assessment`와 이력은 checkpoint 갱신에서도 보존하며 다음 Worker의 context delta에 전달한다. 현재 원인 해소 판단은 과거 실패 감사를 지우거나 후보의 verify·Review 성공을 생성하지 않는다. 같은 입력의 재평가는 재사용하고 재개 후 현재 후보의 필수 검증을 이어간다.
+재평가와 해제는 기존 `BlockedPlanReconciler`의 현재 소유권·원격·checkpoint 검사를 통과해야 한다. 공통 결함 대기와 소유 rebase 충돌이 겹치면 rebase 완료 전에 현재 원인을 읽기 전용으로 재평가한다. 해소가 확인된 경우에만 기존 `resume_rebase_block`의 재관측·배정·원인·입력·generation 검사로 차단을 해제하고, 원래 HEAD·target·충돌을 보존해 Worker가 남은 해결을 이어간다. `common_defect_assessment`와 이력은 checkpoint 갱신에서도 보존하며 다음 Worker의 context delta에 전달한다. 현재 원인 해소 판단은 과거 실패 감사를 지우거나 후보의 verify·Review 성공을 생성하지 않는다. 같은 입력의 재평가는 재사용하고 재개 후 현재 후보의 필수 검증을 이어간다.
 
 ### targeted test와 실패 수집
 

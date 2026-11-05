@@ -828,6 +828,8 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
         if current_reason == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
             continue
         if current_reason == BlockReasonCode.USER_DECISION_REQUIRED.value:
+            if effects.unmet_execplan_dependencies(connection, repo, str(blocked['plan_id'])):
+                continue
             if not blocked_plan_reconciliation.slot_available(connection, repo, str(blocked['plan_id'])):
                 continue
             resolved, _detail, _stage = effects.plan_recovery_effects()._evaluate_remote_checkpoint_cause(
@@ -839,6 +841,18 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
             checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
                 repo, str(blocked['plan_id']))
             if checkpoint.operation == 'rebase':
+                remote = connection.execute(
+                    'SELECT registered_origin, branch_result, branch_oid FROM blocked_remote_observations '
+                    'WHERE repo=? AND plan_id=?', (repo, blocked['plan_id'])).fetchone()
+                if (not local_metadata_recheck and remote is not None and remote['registered_origin']
+                        and remote['branch_result'] == 'present'
+                        and remote['branch_oid'] != checkpoint.observed_remote_oid):
+                    result = blocked_plan_reconciliation.BlockedPlanReconciler(
+                        effects.plan_recovery_effects(), connection, repo_path, state_dir, repo, base,
+                        config_path, verify_timeout_seconds).reconcile(str(blocked['plan_id']))
+                    if result == 'resumed':
+                        return True
+                    continue
                 if local_metadata_recheck:
                     if effects._reconcile_rebase_evidence_block(
                             connection, repo_path, state_dir, repo, current_block,
