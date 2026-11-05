@@ -947,6 +947,19 @@ class DefinitionStateRepository:
                             changed.append(plan_id)
                             self._fault(f"after-plan:{plan_id}")
                         continue
+                    history = CatalogStateRepository(self.connection, ensure=False)
+                    if (entry.archived and row['status'] == 'MERGED'
+                            and row['path'] in {entry.active_path, entry.path}
+                            and row['content_hash'] == entry.content_hash and row['plan_sha']
+                            and history.historical_row(repo, plan_id) is None):
+                        history.record(
+                            repo, entry, original_path=entry.active_path,
+                            original_content_hash=row['publication_content_hash'] or entry.content_hash,
+                            plan_sha=row['plan_sha'],
+                            proof=MergeProof(True, kind=MergeProofKind.ARCHIVE_DOCUMENT,
+                                             revision=pinned.revision_sha),
+                            diagnostic=None, identity_verified=True,
+                        )
                     if not self._has_execution_history(row) and not row["workspace_owned"]:
                         execplan_draft_state.observe(
                             self.connection, repo, entry.path, entry.metadata(), entry.content_hash,

@@ -375,8 +375,24 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
         self.assertEqual(self.row('G-002')['path'], 'docs/plans/archive/[G-002] Dependency.md')
         self.assertEqual(self.row('G-002')['current_revision_sha'], self.sha)
         self.assertEqual(self.row('G-002')['status'], 'MERGED')
+        history = state.CatalogStateRepository(self.connection).historical_row(self.repo, 'G-002')
+        self.assertTrue(history['identity_verified'])
+        self.assertTrue(history['merge_confirmed'])
+        self.assertEqual(history['proof_revision'], self.sha)
+        self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
+            self.connection, self.repo)}, {'G-001', 'G-002'})
         self.boundary.refresh()
         self.assertEqual(len(self.loads), 1)
+
+    def test_reconciliation_repairs_missing_archive_history_from_matching_merged_definition(self):
+        self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
+        self.connection.execute('DELETE FROM execplan_catalog_history WHERE repo=?', (self.repo,))
+        self.connection.commit()
+        repository = state.DefinitionStateRepository(self.connection)
+        self.assertIsNotNone(repository.apply(
+            self.repo, self.boundary.pinned, repository.capture(self.repo), revision_is_current=lambda: True))
+        self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
+            self.connection, self.repo)}, {'G-001', 'G-002'})
 
     def test_archive_unconfirmed_remote_does_not_record_success(self):
         self.assertEqual(self.archive(remote=False), archive_state.ArchiveWriteResult.SUPERSEDED)
