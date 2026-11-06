@@ -68,7 +68,7 @@ def _advance_maintenance_cycle_after_merges(
     if error is not None:
         raise MaintenancePlanningError(error)
     legacy_prerequisites = (cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
-                            and cycle.cycle_id is None and cycle.prerequisite_plan_ids)
+                            and cycle.cycle_id is None and (cycle.prerequisite_plan_ids or cycle.legacy_prerequisite_wait))
     if (legacy_prerequisites or cycle.phase in {
         maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
         maintenance_state.MaintenancePhase.REFACTORING,

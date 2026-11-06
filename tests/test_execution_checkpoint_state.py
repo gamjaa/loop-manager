@@ -1020,6 +1020,64 @@ class CancelledCheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(MaintenanceStateError, '실제 Merge'):
             store.finish_cycle('repo', expected=current, source_sha='a' * 40)
 
+    def test_legacy_assessment_prerequisites_finish_after_cancellation_without_new_assessment(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        from loop_manager_internal.maintenance import cycle_service, maintenance_orchestration
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,prerequisite_plan_ids,last_success_commit) "
+            "VALUES ('repo','assessment','[\"G-047\"]','old-assessment')")
+        self.connection.commit()
+        self.cancel()
+        current = store.get('repo')
+        self.assertEqual(current.prerequisite_plan_ids, ())
+        self.assertTrue(current.legacy_prerequisite_wait)
+        self.assertEqual(current.cancelled_scope_plan_ids, ('G-047',))
+        with self.assertRaisesRegex(MaintenanceStateError, 'source revision'):
+            store.finish_cycle('repo', expected=current, source_sha='unconfirmed')
+        source = 'a' * 40
+        self.connection.execute('INSERT INTO execplan_catalog_revisions(repo,revision_sha,catalog_fingerprint) '
+            'VALUES (?,?,?) ON CONFLICT(repo) DO UPDATE SET revision_sha=excluded.revision_sha', ('repo', source, 'confirmed'))
+        self.connection.execute('INSERT INTO execplan_catalog_holds(repo,plan_id,revision_sha,evidence) VALUES (?,?,?,?)',
+                                ('repo', 'G-047', source, '{}'))
+        self.connection.commit()
+        effects = cycle_service.AdvanceMaintenanceCycleAfterMergesEffects(
+            maintenance_orchestration.all_cycle_plans_merged, maintenance_orchestration.cycle_plan_status_error)
+        waiting = cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source)
+        self.assertEqual(waiting.phase.value, 'prerequisite_wait')
+        self.assertEqual(waiting.last_success_commit, 'old-assessment')
+        self.assertIsNone(waiting.last_cycle_commit)
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE plan_id='G-047'")
+        self.connection.commit()
+        completed = cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source)
+        self.assertEqual(completed.phase.value, 'idle')
+        self.assertEqual(completed.last_cycle_commit, source)
+        self.assertEqual(completed.last_cycle_merged_count, 0)
+        self.assertEqual(completed.last_success_commit, 'old-assessment')
+        self.assertFalse(completed.full_assessment_completed)
+        self.assertIsNone(completed.full_assessment_result)
+
+    def test_assessment_without_confirmed_legacy_prerequisites_is_not_finished_by_cancellation(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        from loop_manager_internal.maintenance import cycle_service, maintenance_orchestration
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,assessment_plan_ids,cycle_id) "
+            "VALUES ('repo','assessment','[\"G-047\"]','current-cycle')")
+        self.connection.commit()
+        self.cancel()
+        effects = cycle_service.AdvanceMaintenanceCycleAfterMergesEffects(
+            maintenance_orchestration.all_cycle_plans_merged, maintenance_orchestration.cycle_plan_status_error)
+        for cycle_id in ('current-cycle', None):
+            with self.subTest(cycle_id=cycle_id):
+                self.connection.execute('UPDATE maintenance_cycles SET cycle_id=?', (cycle_id,))
+                self.connection.commit()
+                current = store.get('repo')
+                self.assertFalse(current.legacy_prerequisite_wait)
+                before = tuple(self.connection.iterdump())
+                self.assertEqual(cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', 'a' * 40), current)
+                with self.assertRaisesRegex(MaintenanceStateError, '미확정 평가'):
+                    store.finish_cycle('repo', expected=current, source_sha='a' * 40)
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+
     def test_mixed_cycle_keeps_cancelled_scope_holds_and_requires_surviving_merge(self):
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
         from loop_manager_internal.maintenance import cycle_service, maintenance_orchestration

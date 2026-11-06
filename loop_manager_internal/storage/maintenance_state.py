@@ -122,6 +122,7 @@ class MaintenanceCycle:
     legacy_release_identity: str | None = None
     publication_id_allocations: tuple[tuple[str, str, str, str], ...] = ()
     cancelled_scope_plan_ids: tuple[str, ...] = ()
+    legacy_prerequisite_wait: bool = False
 
 
 @dataclass(frozen=True)
@@ -663,6 +664,8 @@ class MaintenanceRepository:
                 row["publication_id_allocations"]
             ),
             cancelled_scope_plan_ids=cancelled_scope,
+            legacy_prerequisite_wait=(phase is MaintenancePhase.ASSESSMENT and row['cycle_id'] is None
+                and bool(_decode_plan_ids(row['prerequisite_plan_ids'], 'prerequisite_plan_ids'))),
         )
 
     def due(self, repo: str, interval: int, *, self_repository: bool = False) -> ReviewDue:
@@ -746,7 +749,8 @@ class MaintenanceRepository:
                 MaintenancePhase.POST_REFACTOR_REVALIDATION,
             }:
                 raise MaintenanceStateError("유지보수 종료 단계 또는 revision이 변경됐습니다.")
-            if state.phase is MaintenancePhase.ASSESSMENT and (state.cycle_id is not None or not state.prerequisite_plan_ids):
+            if state.phase is MaintenancePhase.ASSESSMENT and (state.cycle_id is not None
+                    or not (state.prerequisite_plan_ids or state.legacy_prerequisite_wait)):
                 raise MaintenanceStateError("미확정 평가를 Merge 종료로 처리할 수 없습니다.")
             if state.legacy_release_identity is not None:
                 raise MaintenanceStateError("미완료 workspace 해제를 유지보수 종료로 처리할 수 없습니다.")

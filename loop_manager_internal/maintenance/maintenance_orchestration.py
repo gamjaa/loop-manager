@@ -351,7 +351,7 @@ def cycle_plan_status_error(
     """Return a diagnostic when a cycle plan set cannot make safe progress."""
 
     legacy_prerequisites = (cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
-                            and cycle.cycle_id is None and cycle.prerequisite_plan_ids)
+                            and cycle.cycle_id is None and (cycle.prerequisite_plan_ids or cycle.legacy_prerequisite_wait))
     if not legacy_prerequisites and cycle.phase not in {maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
                            maintenance_state.MaintenancePhase.REFACTORING,
                            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION}:
