@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import re
 import sqlite3
 from loop_manager_internal.notifications import notifications
 from .execplan_catalog_state import is_cancelled
@@ -157,6 +158,71 @@ def cancelled_checkpoint_without_resources(row, repo: str, plan_id: str, *, bloc
                 and row['request_identity'] == request_identity(repo, plan_id, row['reason_code'],
                                                                row['evidence'], None, None, fingerprint))
     except (TypeError, ValueError, RecursionError):
+        return False
+
+
+def cancelled_checkpoint_after_resource_retirement(row, repo, plan_id, saved_row, *, block=None):
+    """Validate owned history after the caller proves every actual resource absent."""
+    if cancelled_checkpoint_without_resources(row, repo, plan_id, block=block):
+        return True
+    empty = {'branch', 'pr_url', 'worktree', 'expected_remote_oid', 'commit_identity',
+             'identity_reason_code', 'identity_evidence', 'tree_oid', 'local_oid', 'remote_oid',
+             'published_oid', 'accepted_remote_oid', 'pending_remote_oid', 'inspected_remote_oid',
+             'inspected_input', 'inspection_reason'}
+    zero = {'remote_observed', 'inspection_retryable', 'rebase_recovery', 'retryable'}
+    oids = {'expected_remote_oid', 'tree_oid', 'local_oid', 'remote_oid', 'published_oid',
+            'accepted_remote_oid', 'pending_remote_oid', 'inspected_remote_oid'}
+    try:
+        if (not isinstance(row, dict) or not (all(row[field] is None for field in ('branch', 'worktree', 'pr_url'))
+                or all(row[field] == saved_row[field] for field in ('branch', 'worktree', 'pr_url')))
+                or not isinstance(row['request_identity'], str) or not re.fullmatch(r'[0-9a-f]{64}', row['request_identity'])
+                or any(not isinstance(row[field], str) or not row[field].strip() for field in ('reason_code', 'evidence'))
+                or row['unpublished_reason'] is not None and not isinstance(row['unpublished_reason'], str)
+                or row['phase'] not in {phase.value for phase in CheckpointPhase}
+                or row['result'] not in (None, 'local_only', 'published')
+                or any(type(row[field]) is not int or row[field] not in (0, 1) for field in zero)
+                or any(row[field] is not None and (not isinstance(row[field], str)
+                    or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', row[field])) for field in oids)
+                or any(row[field] is not None and (not isinstance(row[field], str) or not row[field].strip())
+                       for field in empty - oids - {'branch', 'worktree', 'pr_url'})
+                or row['commit_identity'] is not None and not re.fullmatch(r'[0-9a-f]{64}', row['commit_identity'])):
+            return False
+        history = json.loads(row['publication_history'])
+        fields = {'published_oid', 'accepted_remote_oid', 'commit_identity', 'tree_oid',
+                  'identity_reason_code', 'identity_evidence'}
+        if not isinstance(history, list):
+            return False
+        for entry in history:
+            if isinstance(entry, dict) and set(entry) == {'superseded_request'}:
+                previous = entry['superseded_request']
+                if not isinstance(previous, dict) or set(previous) != set(row) - {'publication_history', 'created_at', 'updated_at'}:
+                    return False
+                previous = {**previous, 'created_at': row['created_at'], 'updated_at': row['updated_at'], 'publication_history': '[]'}
+                if not cancelled_checkpoint_after_resource_retirement(previous, repo, plan_id, saved_row):
+                    return False
+                continue
+            if (not isinstance(entry, dict) or set(entry) != fields
+                    or any(entry[field] is not None and (not isinstance(entry[field], str)
+                        or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', entry[field]))
+                           for field in ('published_oid', 'accepted_remote_oid', 'tree_oid'))
+                    or entry['commit_identity'] is not None and (not isinstance(entry['commit_identity'], str)
+                        or not re.fullmatch(r'[0-9a-f]{64}', entry['commit_identity']))
+                    or any(entry[field] is not None and not isinstance(entry[field], str)
+                           for field in ('identity_reason_code', 'identity_evidence'))):
+                return False
+        fingerprint = block.get('release_fingerprint') if isinstance(block, dict) else None
+        # Request identities are historical data here. An old cause/fingerprint
+        # is not reused as execution permission; resource ownership is bound to
+        # the retired parent row. Validate the current block independently.
+        reason = block['reason_code'] if isinstance(block, dict) else row['reason_code']
+        evidence = block['evidence'] if isinstance(block, dict) else row['evidence']
+        inert = {**row, **dict.fromkeys(empty), **dict.fromkeys(zero, 0),
+                 'reason_code': reason, 'evidence': evidence,
+                 'phase': CheckpointPhase.REQUESTED.value, 'result': None,
+                 'unpublished_reason': None, 'publication_history': '[]',
+                 'request_identity': request_identity(repo, plan_id, reason, evidence, None, None, fingerprint)}
+        return cancelled_checkpoint_without_resources(inert, repo, plan_id, block=block)
+    except (KeyError, TypeError, ValueError, RuntimeError, RecursionError):
         return False
 
 
@@ -795,9 +861,15 @@ class DiagnosticPublicationRepository:
 
     def preserve(self, repo, scope, owner, identity, payload, *, ref=None,
                  tree=None, commit=None, retryable=False, revalidate=None):
+        if is_cancelled(self.connection, repo, owner):
+            raise RuntimeError('취소·최종 삭제된 작업의 진단 보존을 다시 기록할 수 없습니다.')
         with self.connection:
             if revalidate is not None:
                 revalidate()
+            if not self.connection.in_transaction:
+                self.connection.execute('BEGIN IMMEDIATE')
+            if is_cancelled(self.connection, repo, owner):
+                raise RuntimeError('진단 보존 대상이 writer 예약 전에 취소됐습니다.')
             previous = self.preservation(repo, scope, owner, identity)
             if previous and previous['commit_oid'] and (
                     previous['ref'], previous['tree_oid'], previous['commit_oid']) != (ref, tree, commit):

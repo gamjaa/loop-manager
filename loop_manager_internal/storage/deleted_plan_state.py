@@ -16,7 +16,7 @@ def ensure_schema(connection):
         PRIMARY KEY(repo,plan_id,path))''')
 
 
-def forget(connection, repo, plan_id, *, artifacts=()):
+def forget(connection, repo, plan_id, *, artifacts=(), diagnostic_snapshot=None):
     """Caller holds resource leases and has finished physical cleanup and publication."""
     with _transaction(connection):
         tables = {row[0]: {column[1] for column in connection.execute(f'PRAGMA table_info("{row[0]}")')}
@@ -29,6 +29,13 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         for row in connection.execute('SELECT plan_id,depends_on FROM exec_plans WHERE repo=? AND plan_id<>?', (repo, plan_id)):
             if plan_id in json.loads(row['depends_on']):
                 raise ValueError('삭제된 작업의 선행 관계가 아직 남아 있습니다.')
+        from . import deleted_diagnostic_state
+        observed_diagnostics = deleted_diagnostic_state.capture(connection, repo, plan_id)
+        if diagnostic_snapshot is None:
+            if observed_diagnostics['refs'] or observed_diagnostics['worktrees']:
+                raise CallDeferred('진단 ref·worktree의 현재 부재를 확인한 뒤 기록을 제거해야 합니다.')
+            diagnostic_snapshot = observed_diagnostics
+        deleted_diagnostic_state.forget(connection, repo, plan_id, diagnostic_snapshot)
         from .manual_work_state import forget_plan as forget_manual_plan
         forget_manual_plan(connection, repo, plan_id)
         from .common_defect_state import assert_plan_erasure_available
@@ -110,8 +117,6 @@ def forget(connection, repo, plan_id, *, artifacts=()):
             if table in tables:
                 connection.execute(f'DELETE FROM "{table}" WHERE repo=? AND subject IN (?,?)',
                                    (repo, plan_id, 'plan:' + plan_id))
-        if 'diagnostic_preservations' in tables:
-            connection.execute("DELETE FROM diagnostic_preservations WHERE repo=? AND scope='plan' AND owner=?", (repo, plan_id))
         if 'notification_outbox' in tables:
             for event in connection.execute('SELECT * FROM notification_outbox WHERE repo=?', (repo,)).fetchall():
                 if event['event_key'] in incident_events:

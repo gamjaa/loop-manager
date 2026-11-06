@@ -32,10 +32,43 @@ def historical_agent_snapshots_match(saved_row, snapshots):
 
 def cancelled_snapshot_without_new_resources(snapshot, repo, plan_id, saved_row):
     """Recognize owned history; this never grants a stage-result reuse token."""
-    if (not isinstance(snapshot, dict) or set(snapshot) - {
-            'document_revision', 'retired_document_assessment', 'stage_result_origins', 'worker_candidate_token',
-            'retired_agent_scopes'}):
+    from dataclasses import fields
+    from loop_manager_internal.execution.execution_checkpoint import CheckpointSnapshot
+    native_fields = {field.name for field in fields(CheckpointSnapshot)}
+    history_fields = {'document_revision', 'retired_document_assessment', 'stage_result_origins',
+                      'worker_candidate_token', 'retired_agent_scopes', 'fetch_in_progress', 'fetched_base_oid'}
+    if not isinstance(snapshot, dict) or set(snapshot) - native_fields - history_fields:
         return False
+    if 'fetch_in_progress' in snapshot and type(snapshot['fetch_in_progress']) is not bool:
+        return False
+    if 'fetched_base_oid' in snapshot and (not isinstance(snapshot['fetched_base_oid'], str)
+            or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', snapshot['fetched_base_oid'])):
+        return False
+    if set(snapshot) & native_fields:
+        # A complete native observation is history only after its original
+        # workspace has retired; pending operations/stashes still own resources.
+        if (not native_fields <= set(snapshot) or not saved_row.get('workspace_owned')
+                or snapshot['plan_id'] != plan_id or snapshot['branch'] != saved_row['branch']
+                or snapshot['local_branch'] not in (None, saved_row['branch'])
+                or snapshot['phase'] not in {'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'}
+                or type(snapshot['worktree_owned']) is not bool
+                or snapshot['base_is_ancestor'] is not None and type(snapshot['base_is_ancestor']) is not bool
+                or snapshot['rebase_intent'] is not False
+                or any(snapshot[field] is not None for field in ('pending_operation', 'git_operation', 'stash_oid'))
+                or any(snapshot[field] not in ([], ()) for field in ('git_operation_markers', 'unmerged_stages'))
+                or not isinstance(snapshot['staged_paths'], (list, tuple))
+                or any(not isinstance(path, str) for path in snapshot['staged_paths'])
+                or snapshot['pr_state'] not in (None, 'OPEN', 'CLOSED')):
+            return False
+        oid_fields = {'base_oid', 'local_head', 'recorded_local_head', 'active_sha', 'validated_base_sha',
+                      'rebase_before_head', 'rebase_target_oid', 'remote_oid', 'recorded_remote_oid',
+                      'pr_head_oid', 'recorded_pr_head_oid'}
+        if any(snapshot[field] is not None and (not isinstance(snapshot[field], str)
+                or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', snapshot[field])) for field in oid_fields):
+            return False
+        if any(snapshot[field] is not None and not isinstance(snapshot[field], str)
+                for field in ('definition_revision', 'verify_token', 'review_token', 'archive_token', 'publication_token')):
+            return False
     token = snapshot.get('worker_candidate_token')
     if token is not None and (not isinstance(token, str) or not re.fullmatch(r'[0-9a-f]{64}', token)):
         return False

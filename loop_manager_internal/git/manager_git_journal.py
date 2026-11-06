@@ -559,7 +559,7 @@ def verified_transition(
         workspace = Path(target)
         owner_id = str(intent.get('owner', '')).removeprefix('plan:')
         document_remove = (kind == 'managed_worktree_remove' and isinstance(registration, dict)
-            and branch is None and re.fullmatch(r'G-\d+', owner_id)
+            and branch is None and intent.get('owner') == 'plan:' + owner_id and re.fullmatch(r'G-\d+', owner_id)
             and workspace.is_absolute() and '..' not in workspace.parts
             and workspace.parent.name == owner_id
             and workspace.parent.parent.name in {'document-revisions', 'document-assessments'}

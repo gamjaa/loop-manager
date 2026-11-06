@@ -485,6 +485,35 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
 
 
 class CancelledCheckpointTests(unittest.TestCase):
+    def test_diagnostic_preservation_cannot_replay_cancelled_or_erased_owner_after_writer_reservation(self):
+        from loop_manager_internal.storage import blocked_checkpoint_state as checkpoint_state, deleted_plan_state
+        self.cancel()
+        store = checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        for erased in (False, True):
+            if erased:
+                deleted_plan_state.ensure_schema(self.connection)
+                self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+                self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('repo','G-047')")
+                self.connection.commit()
+            before = list(self.connection.iterdump())
+            for scope in ('plan', 'project'):
+                revalidate = mock.Mock()
+                with self.assertRaises(RuntimeError):
+                    store.preserve('repo', scope, 'G-047', 'old', {'result': 'published'}, revalidate=revalidate)
+                revalidate.assert_not_called()
+                checks = []
+                def raced(connection, repo, owner):
+                    checks.append(connection.in_transaction)
+                    return len(checks) > 1
+                def observed():
+                    self.assertFalse(self.connection.in_transaction)
+                with mock.patch.object(checkpoint_state, 'is_cancelled', side_effect=raced), self.assertRaises(RuntimeError):
+                    store.preserve('repo', scope, 'G-047', 'old', {'result': 'published'}, revalidate=observed)
+                self.assertEqual(checks, [False, True])
+                self.assertEqual(list(self.connection.iterdump()), before)
+        store.preserve('repo', 'plan', 'G-999', 'independent', {'result': 'local_only'})
+        self.assertEqual(store.preservation('repo', 'plan', 'G-999', 'independent')['input_identity'], 'independent')
+
     def test_stage_origins_do_not_read_removed_row_or_reconnect_cancelled_identity(self):
         from types import SimpleNamespace
         from loop_manager_internal.execution import stage_results

@@ -314,7 +314,7 @@ class ManagerGitTransitionTests(unittest.TestCase):
                           before=before, expected=expected)
             with self.subTest(folder=folder):
                 self.assertEqual(journal.verified_transition(intent, expected, True), {'refs': {}, 'worktrees': {target: None}})
-                for invalid in ({**intent, 'owner': 'plan:G-002'}, {**intent, 'repo': '/other'},
+                for invalid in ({**intent, 'owner': 'plan:G-002'}, {**intent, 'owner': 'G-001'}, {**intent, 'repo': '/other'},
                         {**intent, 'kind': 'managed_worktree_create'},
                         {**intent, 'target': target.replace(folder, 'unowned')},
                         {**intent, 'target': target.replace('/' + folder + '/', '/' + folder + '/../' + folder + '/')},

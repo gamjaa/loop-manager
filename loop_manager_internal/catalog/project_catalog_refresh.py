@@ -204,8 +204,10 @@ class ProjectCatalogRefresh:
         ).fetchone() is not None and connection.execute(
             'SELECT 1 FROM deleted_plan_files WHERE repo=? LIMIT 1', (self.repo,),
         ).fetchone() is not None)
+        from loop_manager_internal.storage.deleted_diagnostic_state import marked_owners
+        pending_diagnostics = bool(marked_owners(connection, self.repo))
         if (revision == self.revision
-                and not pending_deletion and not pending_files
+                and not pending_deletion and not pending_files and not pending_diagnostics
                 and self.declarations == self._declarations()
                 and self.current_revision() == revision):
             return revision

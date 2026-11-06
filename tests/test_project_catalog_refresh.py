@@ -256,6 +256,30 @@ class CatalogCacheAndCasTests(_CatalogRefreshCase):
         self.boundary.refresh()
         self.assertEqual(len(calls), 2)
 
+    def test_final_marker_diagnostic_owner_rechecks_cleanup_at_same_revision(self):
+        from loop_manager_internal.storage import deleted_plan_state, blocked_checkpoint_state
+        deleted_plan_state.ensure_schema(self.connection)
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.boundary.refresh()
+        calls = []
+        def reconcile(revision, remember):
+            calls.append(revision)
+            remember(self.pinned(revision))
+            if len(calls) == 2:
+                self.connection.execute("DELETE FROM diagnostic_preservations WHERE repo=? AND owner='G-999'", (self.repo,))
+                self.connection.commit()
+            return state.CatalogReconciliationResult(state.ReconciliationKind.RECONCILED, revision_sha=revision)
+        self.boundary.reconcile = reconcile
+        self.connection.execute("INSERT INTO deleted_plan_ids VALUES (?,'G-999')", (self.repo,))
+        self.connection.execute("INSERT INTO diagnostic_preservations (repo,scope,owner,input_identity,payload) VALUES (?,'project','G-999','legacy','{}')", (self.repo,))
+        self.connection.commit()
+        self.boundary.refresh()
+        self.boundary.refresh()
+        self.assertEqual(calls, [self.sha] * 2)
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 2)
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM deleted_plan_ids WHERE repo=? AND plan_id='G-999'", (self.repo,)).fetchone())
+
     def test_pending_file_cleanup_bypasses_cache_until_queue_is_drained(self):
         from loop_manager_internal.storage import deleted_plan_state
         deleted_plan_state.ensure_schema(self.connection)
