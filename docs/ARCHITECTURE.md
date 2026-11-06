@@ -309,7 +309,7 @@ Requirement 철회의 `prepare_withdrawals`는 같은 외부 자원 helper를 �
 
 삭제 확정의 최종 제거는 일반 취소와 달리 `maintenance_state.forget_plan`으로 공유 cycle의 대상 부분을 제거한다. prerequisite·refactoring·assessment·revalidation과 게시 대상 배열에서 정확히 일치하는 ID만 제외하고, publication ID 배정 mapping은 실제 게시 대상 ID(네 번째 항목)가 일치할 때만 제거한다. 원본 ID가 같아도 다른 대상으로 배정된 독립 mapping은 유지한다. 기존 decoder로 형식을 확인하고 변경이 없으면 row를 쓰지 않는다.
 
-관련 cycle에 publication stage(원격 확인 뒤 해제 전 상태 포함)·legacy workspace 해제 intent가 남거나 평가 원문의 귀속 분리가 미완료이면 전체 제거 transaction을 롤백하고 해당 삭제를 보류한다. 게시가 없는 목록 개정은 같은 transaction에서 revision을 한 번 전진시켜 과거 context의 CAS를 무효화한다. 독립 대상·다른 repository·phase·요청 identity·성공/Merge 기준은 유지하며, 빈 대상 배열을 완료나 새 성공으로 만들지 않는다. cycle 종료 판단은 기존 유지보수 흐름의 별도 책임이다.
+관련 cycle에 publication stage(원격 확인 뒤 해제 전 상태 포함)·legacy workspace 해제 intent가 남으면 전체 제거 transaction을 롤백하고 해당 삭제를 보류한다. 평가 원문은 대상 배열의 변경 유무와 독립적으로 기존 저장 평가 validator로 형식·저장 source identity를 확인한다. 이 검사는 원문에 저장된 경로/hash 목록을 사용하며 현재 Git 파일의 재검증이나 새 평가 성공이 아니다. 발견의 plan_ids에 대상이 남거나 형식·source 귀속이 불명확하면 제거를 보류하고, 유효한 무관 평가 원문은 byte 내용과 완료/성공 기준을 그대로 보존한다. 발견을 지우거나 resolved로 바꿔 평가 의미를 합성하지 않는다. 게시가 없는 목록 개정은 같은 transaction에서 revision을 한 번 전진시켜 과거 context의 CAS를 무효화한다. 독립 대상·다른 repository·phase·요청 identity·성공/Merge 기준은 유지하며, 빈 대상 배열을 완료나 새 성공으로 만들지 않는다. cycle 종료 판단은 기존 유지보수 흐름의 별도 책임이다.
 
 삭제 관측·취소 경로가 있다는 사실만으로 후속 정리가 모두 완료된 것은 아니다. 취소 감사는 원문·실행 이력·예약과 소유 자원의 `cleanup_pending`을 보존한다. 유지하는 관리 브랜치의 문서 동기화, 취소·완료 작업의 소유 로컬·원격 branch 및 worktree 정리와 각 확정 지점의 중단 복구는 [R-055의 삭제 반영·복구 목표](requirements/%5BR-055%5D%20%EC%B0%A8%EB%8B%A8%20%EA%B2%BD%EB%A1%9C%20%EC%A0%84%EC%88%98%20%EC%A1%B0%EC%82%AC%EC%99%80%20%EB%B6%88%ED%95%84%EC%9A%94%ED%95%9C%20%EC%9E%91%EC%97%85%20%EC%A4%91%EB%8B%A8%20%EC%B6%95%EC%86%8C.md#삭제의-db브랜치-반영과-중단-복구)에 남은 범위다. 현재 Merge 정리와 삭제 처리의 권한을 이 목표로 확대하지 않는다.
 

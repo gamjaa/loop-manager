@@ -413,13 +413,26 @@ def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None
                     [item for item in json.loads(cycle['publication_id_allocations']) if item[3] != plan_id], separators=(',', ':'))
     except MaintenanceStateError as error:
         raise CallDeferred('유지보수 공유 목록의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+    if cycle['full_assessment_result']:
+        from loop_manager_internal.maintenance.maintenance_validation import validate_saved_assessment_result
+        try:
+            if not isinstance(cycle['full_assessment_source_sha'], str) or not cycle['full_assessment_source_sha']:
+                raise ValueError('missing historical assessment source')
+            report = json.loads(cycle['full_assessment_result'])
+            # Check the stored contract against its own historical path/hash
+            # inventory; this does not revalidate current Git files or success.
+            inventory = {item['path']: item['source_hash'] for item in report['findings']}
+            validate_saved_assessment_result(cycle['full_assessment_result'], inventory,
+                                             cycle['full_assessment_source_sha'])
+        except (TypeError, ValueError, KeyError, RecursionError) as error:
+            raise CallDeferred('유지보수 평가 원문의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+        if any(plan_id in finding['plan_ids'] for finding in report['findings']):
+            raise CallDeferred('유지보수 평가 원문의 대상별 귀속 분리가 필요합니다.')
     if not changes:
         return
     if (cycle['publication_stage'] is not None
             or 'legacy_release_identity' in cycle.keys() and cycle['legacy_release_identity'] is not None):
         raise CallDeferred('유지보수 게시·workspace 해제 intent의 종료 전에 공유 기록을 제거할 수 없습니다.')
-    if cycle['full_assessment_result']:
-        raise CallDeferred('유지보수 평가 원문의 대상별 귀속 분리가 필요합니다.')
     connection.execute('UPDATE maintenance_cycles SET ' + ', '.join(field + '=?' for field in changes)
         + ', revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE repo=?', (*changes.values(), repo))
 

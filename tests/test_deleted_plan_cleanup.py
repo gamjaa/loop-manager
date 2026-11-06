@@ -477,6 +477,57 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.assertEqual(after['last_cycle_merged_count'], before['last_cycle_merged_count'])
         self.assertEqual(after['last_success_commit'], before['last_success_commit'])
 
+    def assessment_report(self, plan_ids):
+        from loop_manager_internal.maintenance.maintenance_validation import parse_assessment_result
+        report = {'source_revision': 'a' * 40,
+            'coverage': {key: 'Preserved historical coverage evidence.' for key in ('code', 'tests', 'documents')},
+            'findings': [{'id': 'historical-issue', 'kind': 'code', 'path': 'module.py',
+                'evidence': 'Historical issue is linked to the recorded work.', 'status': 'existing_plan',
+                'plan_ids': list(plan_ids), 'source_hash': 'b' * 64}]}
+        return parse_assessment_result('FULL_ASSESSMENT_RESULT: ' + json.dumps(report),
+            {'module.py': 'b' * 64}, 'a' * 40, (), set(plan_ids))
+
+    def test_assessment_reference_without_cycle_membership_keeps_erasure_pending(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        MaintenanceRepository(self.connection)
+        self.connection.execute('INSERT INTO maintenance_cycles '
+            '(repo,full_assessment_source_sha,full_assessment_result) VALUES (?,?,?)',
+            ('/repo', 'a' * 40, self.assessment_report(('G-001', 'G-002'))))
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaisesRegex(CallDeferred, '대상별 귀속 분리'):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        for result, source in (('broken', 'a' * 40), ('{}', 'a' * 40),
+                (self.assessment_report(('G-002',)), 'c' * 40),
+                (self.assessment_report(('G-002',)), None)):
+            with self.subTest(result=result, source=source):
+                self.connection.execute('UPDATE maintenance_cycles SET full_assessment_result=?,full_assessment_source_sha=?',
+                                        (result, source))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_unrelated_valid_assessment_is_preserved_during_membership_erasure(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        MaintenanceRepository(self.connection)
+        report = self.assessment_report(('G-002',))
+        self.connection.execute('INSERT INTO maintenance_cycles '
+            '(repo,phase,revision,refactoring_plan_ids,full_assessment_source_sha,full_assessment_result) '
+            'VALUES (?,?,?,?,?,?)', ('/repo', 'refactoring', 7, json.dumps(['G-001', 'G-002']), 'a' * 40, report))
+        self.connection.commit()
+        original = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        current = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.assertEqual(current, {**original, 'refactoring_plan_ids': '["G-002"]',
+            'revision': 8, 'updated_at': current['updated_at']})
+        before = tuple(self.connection.iterdump())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
     def test_live_common_correction_link_requires_same_goal_successor_before_erasure(self):
         from loop_manager_internal.storage import validation_feedback_state
         from loop_manager_internal.storage.task_calls import CallDeferred
