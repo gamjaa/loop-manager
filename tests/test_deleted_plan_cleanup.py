@@ -9,6 +9,157 @@ from tests.support.catalog import catalog_reconciliation_fixture
 
 
 class DeletedPlanCleanupTest(unittest.TestCase):
+    def artifact_call(self, identity, repo, plan_id, receipt=None):
+        self.connection.execute('INSERT INTO agent_invocations '
+            '(invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at,finished_at,'
+            'execution_status,execution_started_at,execution_finished_at,execution_finish_evidence,process_receipt_path,session_id) '
+            "VALUES (?,?,?,'worker','codex','model','high','start',1,'prepared','collected','executed',"
+            "'started','stopped','provider_process_finished',?,'shared-session')",
+            (identity, repo, plan_id, str(receipt) if receipt else None))
+
+    def test_artifact_selection_removes_only_owned_attempt_in_shared_nested_runtime(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from loop_manager_internal.catalog.deleted_plan_cleanup import artifact_paths, remove_pending_files
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            runtime = state / 'agent-runtime' / 'runtime'
+            attempt = runtime / 'call-target'
+            attempt.mkdir(parents=True)
+            own = runtime / 'call-target.process.json'
+            own.write_text('target process proof')
+            (attempt / 'last-message.txt').write_text('target response')
+            independent = runtime / 'nested' / 'call-other.process.json'
+            independent.parent.mkdir()
+            independent.write_text('independent process proof')
+            self.artifact_call('target', '/repo', 'G-001', own)
+            self.artifact_call('other', '/other', 'G-002', independent)
+            self.connection.commit()
+            preserved = dict(self.connection.execute("SELECT * FROM agent_invocations WHERE invocation_id='other'").fetchone())
+            paths = artifact_paths(self.connection, '/repo', dict(plan_id='G-001', worktree=None), state)
+            self.assertEqual(set(paths), {own, attempt})
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001', artifacts=paths)
+            self.assertEqual(remove_pending_files(self.connection, '/repo', state), set())
+            self.assertFalse(own.exists())
+            self.assertFalse(attempt.exists())
+            self.assertEqual(independent.read_text(), 'independent process proof')
+            self.assertEqual(dict(self.connection.execute("SELECT * FROM agent_invocations WHERE invocation_id='other'").fetchone()), preserved)
+
+    def test_same_receipt_alias_cannot_erase_another_repositorys_process_proof(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from loop_manager_internal.catalog.deleted_plan_cleanup import artifact_paths
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            runtime = state / 'agent-runtime' / 'runtime'
+            (runtime / 'nested').mkdir(parents=True)
+            receipt = runtime / 'call.process.json'
+            receipt.write_text('shared proof')
+            self.artifact_call('target', '/repo', 'G-001', receipt)
+            self.artifact_call('other', '/other', 'G-001', runtime / 'nested' / '..' / receipt.name)
+            self.connection.commit()
+            before = tuple(self.connection.iterdump())
+            with self.assertRaises(CallDeferred):
+                deleted_plan_state.forget(self.connection, '/repo', 'G-001',
+                    artifacts=artifact_paths(self.connection, '/repo', dict(plan_id='G-001', worktree=None), state))
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            self.assertEqual(receipt.read_text(), 'shared proof')
+
+    def test_file_queue_rechecks_new_collection_owner_without_stalling_independent_cleanup(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from loop_manager_internal.catalog.deleted_plan_cleanup import artifact_paths, remove_pending_files
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            runtime = state / 'agent-runtime' / 'runtime'
+            runtime.mkdir(parents=True)
+            receipt = runtime / 'call.process.json'
+            receipt.write_text('target proof')
+            self.artifact_call('target', '/repo', 'G-001', receipt)
+            self.connection.commit()
+            paths = artifact_paths(self.connection, '/repo', dict(plan_id='G-001', worktree=None), state)
+            self.assertEqual(paths, (runtime,))
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001', artifacts=paths)
+            collection = runtime / 'independent-tests'
+            collection.mkdir()
+            (collection / 'receipt.json').write_text('independent collection proof')
+            self.artifact_call('other', '/repo', 'G-002')
+            self.connection.execute('INSERT INTO targeted_test_collections '
+                "(invocation_id,directory,device,inode,receipt) VALUES ('other',?,'1','2','receipt')", (str(collection),))
+            self.connection.commit()
+            free = state / 'logs' / 'free.log'
+            free.parent.mkdir()
+            free.write_text('another deleted task')
+            deleted_plan_state.forget(self.connection, '/repo', 'G-999', artifacts=(free,))
+            queued = [tuple(row) for row in self.connection.execute("SELECT * FROM deleted_plan_files WHERE plan_id='G-001'")]
+            self.assertEqual(remove_pending_files(self.connection, '/repo', state), {'G-001'})
+            self.assertFalse(free.exists())
+            self.assertEqual([tuple(row) for row in self.connection.execute('SELECT * FROM deleted_plan_files')], queued)
+            self.assertEqual((collection / 'receipt.json').read_text(), 'independent collection proof')
+            # A later ownership relocation supplies a fresh, disjoint path.
+            relocated = state / 'logs' / 'independent-tests'
+            collection.rename(relocated)
+            self.connection.execute("UPDATE targeted_test_collections SET directory=? WHERE invocation_id='other'", (str(relocated),))
+            self.connection.commit()
+            self.assertEqual(remove_pending_files(self.connection, '/repo', state), set())
+            self.assertFalse(runtime.exists())
+            self.assertEqual((relocated / 'receipt.json').read_text(), 'independent collection proof')
+            self.assertEqual(self.connection.execute('SELECT count(*) FROM deleted_plan_files').fetchone()[0], 0)
+
+    def test_orphan_or_relative_collection_reference_keeps_file_queue_pending(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from loop_manager_internal.catalog.deleted_plan_cleanup import remove_pending_files
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            retained = state / 'logs' / 'retained'
+            retained.mkdir(parents=True)
+            proof = retained / 'proof.json'
+            proof.write_text('unattributed verification evidence')
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001', artifacts=(retained,))
+            self.connection.execute('INSERT INTO targeted_test_collections '
+                "(invocation_id,directory,device,inode,receipt) VALUES ('legacy-orphan',?,'1','2','receipt')", (str(retained),))
+            self.connection.commit()
+            for path in (str(retained), 'relative-collection'):
+                self.connection.execute("UPDATE targeted_test_collections SET directory=? WHERE invocation_id='legacy-orphan'", (path,))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                self.assertEqual(remove_pending_files(self.connection, '/repo', state), {'G-001'})
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+                self.assertEqual(proof.read_text(), 'unattributed verification evidence')
+
+    def test_shared_worktree_log_is_protected_by_independent_execution_history(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from loop_manager_internal.catalog.deleted_plan_cleanup import artifact_paths
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        self.connection.execute("UPDATE exec_plans SET worktree='/shared/worktree'")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with TemporaryDirectory() as directory, self.assertRaises(CallDeferred):
+            artifact_paths(self.connection, '/repo', dict(plan_id='G-001', worktree='/shared/worktree'), Path(directory))
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_dedicated_collection_without_receipt_is_queued_and_removed(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from loop_manager_internal.catalog.deleted_plan_cleanup import artifact_paths, remove_pending_files
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            collection = state / 'agent-runtime' / 'target-tests'
+            collection.mkdir(parents=True)
+            (collection / 'result.json').write_text('target evidence')
+            self.artifact_call('target', '/repo', 'G-001')
+            self.connection.execute('INSERT INTO targeted_test_collections '
+                "(invocation_id,directory,device,inode,receipt) VALUES ('target',?,'1','2','receipt')", (str(collection),))
+            self.connection.commit()
+            paths = artifact_paths(self.connection, '/repo', dict(plan_id='G-001', worktree=None), state)
+            self.assertEqual(paths, (collection,))
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001', artifacts=paths)
+            self.assertEqual(remove_pending_files(self.connection, '/repo', state), set())
+            self.assertFalse(collection.exists())
+
     def test_maintenance_erasure_prunes_exact_membership_and_target_allocations_atomically(self):
         import sqlite3
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
