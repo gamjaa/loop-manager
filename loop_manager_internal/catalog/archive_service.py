@@ -175,10 +175,18 @@ class ArchiveExecutionResources:
 
     def _report_journal(self, message, **fields):
         from loop_manager_internal.runtime import operation_events
+        # This native decision follows immutable intent, DB owner, writer and
+        # shared-resource checks in manager_git_journal._stage_rebase_is_independent.
+        owner_plan_id = None
+        if (fields.get('decision') == 'allow' and fields.get('reason') == 'separate_rebase'
+                and fields.get('operation') == 'managed_rebase'
+                and str(fields.get('owner', '')).startswith('plan:')):
+            owner_plan_id = fields['owner'].removeprefix('plan:')
         if execplan_archive_state.ExecPlanArchiveRepository(self.connection).observe(
             self.repo, "git:" + fields["intent_id"], category="shared_resource",
             resource=fields["resource"], reason=fields["decision"] + ":" + fields["reason"],
             resume_condition=fields["next_condition"],
+            owner_plan_id=owner_plan_id,
         ):
             operation_events.emit(message, **fields)
 

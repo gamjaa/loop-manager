@@ -28,6 +28,22 @@ def forget(connection, repo, plan_id, *, artifacts=()):
                 raise ValueError('삭제된 작업의 선행 관계가 아직 남아 있습니다.')
         if connection.execute('SELECT 1 FROM manual_work_members WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone():
             raise ValueError('수동 소유 작업은 자동 제거할 수 없습니다.')
+        if 'execplan_archive_observations' in tables:
+            from .task_calls import CallDeferred
+            resources = {plan[key] for key in ('branch', 'worktree') if plan is not None and plan[key]}
+            owner_column = 'owner_plan_id' in tables['execplan_archive_observations']
+            for observation in connection.execute(
+                'SELECT * FROM execplan_archive_observations WHERE repo=?', (repo,),
+            ).fetchall():
+                owner = observation['owner_plan_id'] if owner_column else None
+                if observation['scope'] == plan_id and observation['category'] == 'complete':
+                    raise CallDeferred('완료된 archive 관측은 삭제 확정 대상에서 보호합니다.')
+                if (observation['scope'].startswith('git:') and owner is None
+                        and observation['resource'] in resources):
+                    raise CallDeferred('삭제 대상 자원의 archive Git 관측 귀속을 확인할 수 없습니다.')
+                if observation['scope'] == plan_id or owner == plan_id:
+                    connection.execute('DELETE FROM execplan_archive_observations WHERE repo=? AND scope=?',
+                                       (repo, observation['scope']))
         calls = [row[0] for row in connection.execute('SELECT invocation_id FROM agent_invocations WHERE repo=? AND plan_id=?', (repo, plan_id))]
         # Audit immutability remains in force outside this explicit erasure transaction.
         triggers = connection.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' "

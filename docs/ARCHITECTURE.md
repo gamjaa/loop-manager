@@ -1726,6 +1726,10 @@ archive는 관리 배정 자리를 소비하지 않는다. 관리 배정의 park
 
 `execplan_archive_observations`는 `(repo, scope)`를 문자열 key로 사용한다. scope는 실행 전체의 `dispatch`, 후보 G ID 또는 미확정 Git 판단의 `git:<intent_id>`다. Git 판단의 reason에는 allow/hold와 실제 원인을 함께 기록하며 같은 판단의 반복 출력만 억제하고 판단 자체는 매번 수행한다. `category`는 `execution_opportunity`·`shared_resource`·`remote_observation`·`candidate`·`publication_confirmation`·`execution_result`·`complete`를 구분하고, 문자열 `resource`·`reason`·`resume_condition`과 음이 아닌 정수 `attempts`, 마지막 갱신 시각을 보존한다. `attempts`는 해당 scope의 실제 dispatch 결과 관측 누계이며 commit/push 횟수가 아니다. 같은 보류는 로그를 생략해도 실제 시도 누계는 유지하고, 사유 변경·완료와 완료 뒤 재발은 다시 기록한다. 후보 row 없는 진입 전 보류도 실행 scope에 남고, 관측 저장 실패는 기록 미확정 사실과 원인·재개 조건을 로그에 남긴다. 이 관측은 실행 상태·Telegram outbox를 변경하지 않는다.
 
+관측의 nullable 문자열 `owner_plan_id`는 소유가 확인된 전용 Git 관측의 작업 관계다. 기존 DB에는 이 컬럼을 추가하고 과거 값은 `NULL`로 유지한다. archive의 journal callback은 기존 `manager_git_journal`이 immutable intent·현재 DB 소유권·writer 종료·공유 자원을 대조해 `managed_rebase`의 `allow/separate_rebase`를 확정한 경우에만 실제 `plan:<G ID>` owner를 저장한다. 메시지나 resource 문자열의 ID 포함 여부로 관계를 추정하지 않는다. 이후 미확정 판단은 이 관계를 다시 비우며 관측의 시도 누계 의미는 유지한다.
+
+삭제 확정 transaction은 대상 G scope와 확인된 `owner_plan_id`의 전용 관측만 제거한다. `dispatch`·다른 repository·독립 MERGED G·다른 intent의 관측과 시도 누계는 유지한다. 대상 branch/worktree와 resource가 정확히 일치하는 Git 관측의 소유가 미확정이면 최종 제거를 보류하며 재관측을 기다린다. 완료된 archive 관측도 제거 대상에서 보호한다. 관측 정리는 실제 writer·Git intent·물리 자원 정리의 선행 조건을 대신하지 않으며, 일반 취소의 감사 보존 경로에는 적용하지 않는다.
+
 후보는 보류 지문에 고정하지 않고 다음 PR 후속·조율 경계와 재시작에서 DB MERGED 및 최신 catalog로 다시 찾는다. 경쟁·게시·정리 실패는 operation·OID·이유를 보존하며 독립 후속 작업·완료를 막지 않는다. archive-only 이동의 planning·작업 주기·Merge 집계 보존은 기존 검증된 delta 적용을 재사용한다.
 
 ### Requirement 교정 게시와 복구

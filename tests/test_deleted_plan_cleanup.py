@@ -9,6 +9,66 @@ from tests.support.catalog import catalog_reconciliation_fixture
 
 
 class DeletedPlanCleanupTest(unittest.TestCase):
+    def test_archive_erasure_preserves_dispatch_independent_candidates_and_intents(self):
+        from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+        import sqlite3
+        archive = ExecPlanArchiveRepository(self.connection)
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-002'")
+        merged = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone())
+        for repo, scope, owner in (('/repo', 'dispatch', None), ('/repo', 'G-001', None),
+                ('/repo', 'G-002', None), ('/repo', 'git:owned', 'G-001'),
+                ('/repo', 'git:other-G-001', 'G-002'), ('/other', 'git:owned', 'G-001')):
+            archive.observe(repo, scope, category='complete' if scope == 'G-002' else 'shared_resource', resource='G-001 appears here',
+                reason='saved reason G-001', resume_condition='next_safe_boundary', attempted=True,
+                owner_plan_id=owner)
+        self.connection.commit()
+        before = [dict(row) for row in self.connection.execute('SELECT * FROM execplan_archive_observations')]
+        self.connection.execute("UPDATE execplan_archive_observations SET category='complete' WHERE repo='/repo' AND scope='G-001'")
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        with self.assertRaises(CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.connection.execute("UPDATE execplan_archive_observations SET category='shared_resource' WHERE repo='/repo' AND scope='G-001'")
+        self.connection.execute("CREATE TRIGGER reject_archive_erasure BEFORE DELETE ON exec_plans "
+                                "BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM execplan_archive_observations')], before)
+        self.connection.execute('DROP TRIGGER reject_archive_erasure')
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        expected = [row for row in before if (row['repo'], row['scope']) not in {
+            ('/repo', 'G-001'), ('/repo', 'git:owned')}]
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM execplan_archive_observations')], expected)
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()), merged)
+
+    def test_unattributed_legacy_archive_resource_holds_final_erasure_until_reobserved(self):
+        from loop_manager_internal.storage import execplan_archive_state
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        self.connection.execute(execplan_archive_state.ARCHIVE_OBSERVATIONS_SCHEMA.replace('    owner_plan_id TEXT,\n', ''))
+        self.connection.execute("INSERT INTO execplan_archive_observations "
+            "(repo,scope,category,resource,reason,resume_condition,attempts) "
+            "VALUES ('/repo','git:old','shared_resource','owned','unconfirmed','reobserve',3)")
+        self.connection.execute("UPDATE exec_plans SET branch='owned' WHERE plan_id='G-001'")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaises(CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        archive = execplan_archive_state.ExecPlanArchiveRepository(self.connection)
+        self.assertIsNone(self.connection.execute('SELECT owner_plan_id FROM execplan_archive_observations').fetchone()[0])
+        with self.assertRaises(CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        archive.observe('/repo', 'git:old', category='shared_resource', resource='owned',
+            reason='allow:separate_rebase', resume_condition='current_stage_gates', owner_plan_id='G-001')
+        archive.observe('/repo', 'git:old', category='shared_resource', resource='owned',
+            reason='hold:writer_unknown', resume_condition='reobserve')
+        with self.assertRaises(CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        archive.observe('/repo', 'git:old', category='shared_resource', resource='owned',
+            reason='allow:separate_rebase', resume_condition='current_stage_gates', owner_plan_id='G-001')
+        self.assertEqual(self.connection.execute('SELECT attempts FROM execplan_archive_observations').fetchone()[0], 3)
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_archive_observations').fetchone())
+
     def recovery_fixture(self):
         from loop_manager_internal.storage import local_recovery_state
         from loop_manager_internal.notifications import notifications
