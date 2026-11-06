@@ -14,38 +14,38 @@ draft: true
 
 ## Purpose
 
-동일 targeted test의 연속 실패 차단 기준이 활성 명세에서 3회와 5회로 갈리는 범위를 사용자 판단 대기로 보존한다. 현재 구현과 회귀는 5회를 사용한다. 이를 새 구현의 성공이나 R-091의 충족으로 확정하지 않으며, 사용자 결정·명세 정합화 뒤 실제로 남는 구현·검증만 수행한다. 독립적인 rebase·pause·배정 개선은 이 임계값 선택과 분리한다.
+최신 PRODUCT·R-055·R-091의 동일 targeted test 연속 5회 실패 기준을 유지한다. 저장·Worker/verify gate·회귀에는 이 기준에 따른 구현 변경이 남아 있지 않다. 사용자의 5회 유지 답변과 R-091 정정은 보존하되, 현재 Manager가 User Decision의 판단 근거 결합을 거부하므로 이번 결과는 질문 해소·대기 해제로 확정하지 않는다. 원인 교정은 독립 G-357이 담당하고 이 작업의 Worker·추가 테스트는 시작하지 않는다.
 
 ## Acceptance Criteria
 
-- 사용자 출처가 확인된 결정과 일치하는 PRODUCT·R-055·R-091에서 적용할 하나의 임계값을 확인한다. Planner나 Worker가 명세의 숫자를 선택·수정하거나 현재 코드·문서의 수정 시점으로 우선순위를 만들지 않는다.
-- 5회 유지가 결정되면 현재 저장·차단·회귀와 대조해 실제 미충족 구현이 있는지만 판단한다. R-091 정정만 남고 구현이 이미 충족하면 소급 구현·불필요한 테스트를 만들지 않으며, 이 draft의 안전한 철회·후속 관계 반영은 Manager가 담당한다.
-- 3회 변경이 결정되면 사용자 명세가 정합해진 뒤 같은 테스트의 세 번째 고유한 실제 실패에서만 도달 표식을 만들고 기존 Worker/verify 진입 gate가 소비하도록 필요한 국소 변경을 한다. 기존 저장 이력도 확인된 실패 수와 결정에 맞게 처리하되 결과를 재생·중복 집계하거나 session·실패 원문을 초기화하지 않는다. 미완료 수집·귀속 불명은 실제 실패로 추가하지 않는다.
-- 어느 선택에서도 다른 테스트 비합산·동일 실행 중복 비소비·성공/skip/expected failure 초기화·fixture/불명확 결과 보존과 작업별 격리를 유지한다. 세 물리 CLI 호출·session fallback과 호출별 결과/귀속 assertion은 유지하며 임계값에 해당하는 도달 기대만 결정에 맞춘다. 전체 verify·Review·문서 오류의 별도 집계를 바꾸지 않는다.
+- 현재 PRODUCT·R-055·R-091과 저장 구현의 기준은 5회다. 세 번째 실패로 동작을 변경하거나 새 설정·저장 형식·기존 이력 변환을 추가하지 않는다.
+- 현재 `TargetedTestRepository.observe()`의 `failures >= 5`와 Worker/verify gate를 유지한다. 다른 테스트 비합산·동일 실행 중복 비소비·성공/skip/expected failure 초기화·fixture/불명확 결과 보존·재시작과 작업별 격리는 기존 구현·회귀로 확인한다.
+- 세 물리 CLI 호출·session fallback의 회귀는 고유 실행 3건·실패 누계 3·도달 표식 없음을 검사한다. 다섯 번째 실패의 별도 도달/차단 회귀를 유지하며 호출 횟수를 늘리거나 같은 테스트를 복제하지 않는다.
+- Manager가 현재 질문과 검증된 사용자 변경·원격 입력·소유권을 연결하기 전에는 draft·기존 질문·User Decision·판단 대기와 후속 dependency를 유지한다. 문서 정합성과 구현 잔여 없음은 승인·검증 성공·차단 해제의 근거로 대용하지 않는다. 사용자에게 같은 양식 재작성을 요구하지 않고 G-357의 정상 교정 뒤 기존 입력을 재평가한다.
 
 ## Implementation
 
-- [ ] Manager가 검증한 사용자 결정과 최신 source를 대조해 실제 잔여 구현을 확정한다. 5회 유지로 구현 부족이 없으면 Worker를 시작하지 않고 Manager에 그 근거를 반환한다. PRODUCT·Requirement 정정은 이 작업의 Worker 수정 범위가 아니다.
-- [ ] 구현 변경이 필요한 경우 확인한 `loop_manager_internal/storage/targeted_test_state.py:TargetedTestRepository.observe()`의 실패 누계·도달 표식과 기존 저장 호환 경계만 보완한다. 별도 설정·범용 정책 엔진·새 DB 원본을 만들지 않는다. 이미 저장된 누계/표식의 처리도 실제 결과·기존 소비 감사와 연결하고 파괴적 초기화나 원문 삭제로 전환하지 않는다.
-- [ ] 확인한 `loop_manager_internal/execution/execution_worker_handler.py:_targeted_test_block()`과 `loop_manager_internal/execution/execution_verify_handler.py:_targeted_test_gate()`의 기존 gate를 재사용한다. G-236의 pause 보존, G-297의 호출 배정, G-313의 Git/게시 복구와 G-325의 지속 이력은 재구현하지 않는다.
-- [ ] 확인한 `tests/test_targeted_test_streak.py`의 저장·중복·초기화·재시작·Worker 진입 회귀와 `tests/test_agent_invocation.py:test_targeted_records_follow_each_physical_retry_and_session_fallback`을 결정에 맞춰 최소 수정한다. G-339의 Git fixture 교정과 세 실행의 결과·귀속 검증은 현재 원격 구현으로 재사용한다.
+- [x] 검토 revision의 PRODUCT·R-055·정정된 R-091과 `loop_manager_internal/storage/targeted_test_state.py:TargetedTestRepository.observe()`·`execution/execution_worker_handler.py:_targeted_test_block()`·`execution/execution_verify_handler.py:_targeted_test_gate()`를 정적으로 대조했다. 5회 기준에 따른 코드·저장 호환 변경은 없다.
+- [x] 이전 게시 준비의 오류 “User Decision의 현재 사용자 판단 근거를 확인할 수 없습니다.”와 `catalog/draft_decisions.py:prepare()`·`storage/execplan_draft_state.py:observe()`를 대조했다. 비어 있지 않은 User Decision은 `decision_ready`가 거짓이면 인용 source 검사 전에 거부되며, 현재 observe는 `Decision == approve`와 전체 basis 동일성을 요구한다. R-091 인용으로 source만 바꿔서는 이 거부를 해결하지 못한다.
+- [ ] G-357의 실제 교정 반영 뒤 Manager가 같은 질문·현재 verified 원문·입력 hash·소유권을 재검사해 결과를 본문에 통합하고 draft 정리·관계 반영·철회 여부를 판단한다. Planner는 User Decision·draft·실행 상태를 직접 변경하지 않는다.
 
 ## Validation
 
-- 구현 변경이 있을 때의 Worker targeted unit은 `tests.test_targeted_test_streak.TargetedHistoryTests`의 변경한 경계와 위 `RunnerTests`의 물리 재시도 case다. 실제 SQLite와 기존 관측 double로 임계값 직전·도달·후속 성공, 재시작과 같은 실행 재관측을 확인한다. 세 물리 호출 자체를 늘려 새 임계값에 맞추지 않는다.
-- 저장된 임계값 전후 누계와 소비된/미소비 표식의 호환 처리를 실제 저장 결과로 확인한다. 새 실패 없이 임의 초기화·중복 집계하거나 다른 계획의 이력을 바꾸면 실패해야 한다. 필요한 Worker/verify gate 연결은 기존 `WorkerTargetedFailureTests`·`tests/test_execution_verify_phase.py`의 회귀를 재사용하고 전체 lifecycle을 반복하지 않는다.
-- 명세 정정만으로 현재 구현이 충족되면 새로운 테스트 실행이나 성공 기록을 만들지 않는다. 사용자 결정·source 정합화·구현 충족과 영향 작업의 실제 검증/차단 해제는 각각 구분한다.
+- 정적 근거는 `tests/test_targeted_test_streak.py:TargetedHistoryTests`의 다섯 고유 실행·중복 비소비·다른 테스트 격리·초기화·재시작과 `WorkerTargetedFailureTests`의 다섯 번째 실패 도달 뒤 다음 Worker/verify 미호출·같은 turn 후속 성공 회귀다.
+- `tests/test_agent_invocation.py:test_targeted_records_follow_each_physical_retry_and_session_fallback`은 세 호출·서로 다른 run/invocation·누계 `(3, 0)`과 원래 실패 결과를 확인한다. 이 동작은 변경하지 않으며 문서의 정적 대조를 위해 targeted test·전체 verify를 실행하지 않는다.
+- G-357의 회귀는 현재 G-344와 같은 verified R-091 정정·Answer만 있는 User Decision·현재 질문/입력 결합을 검사한다. 그 검증·Merge와 현재 원인 재평가 전에는 이 문서에서 해소를 확정하지 않고 기존 질문 전체를 `outcome: uncertain`으로 반환한다. 사용자 의미 선택의 재질문과 구현된 기준의 재작업은 만들지 않는다.
 
 ## Progress
 
 - [x] revision `42b79e867779a261371e27b47b100f795408f6fe`에서 PRODUCT의 5회, R-055의 5회, R-091 본문의 3회와 저장 구현 `failures >= 5`·기존 회귀를 정적으로 대조했다. 사용자 판단을 요청했으며 구현·테스트·verify는 실행하지 않았다.
-- [ ] 사용자 결정·source 정합화와 실제 미충족 구현의 유무 확인
-- [ ] 필요한 경우에만 국소 구현·저장 호환·관련 회귀 확인
+- [x] 검토 revision `d59136fc6d559ba21c69e2232a21bb4a4be9fd90`에서 현재 명세·코드/회귀의 5회 일치와 게시 준비의 근거 결합 오류를 정적으로 확인했다. 이전 Planner의 해소 결과는 Manager가 수락한 결정이 아니며 이번 호출도 구현·테스트·verify를 실행하지 않았다.
+- [ ] G-357 교정 반영 뒤 Manager의 현재 근거 재평가·draft/후속 관계 정리
 
 ## Decision Log
 
-- 보고 369의 세 물리 실패/도달 assertion은 현재 G-339 교정으로 구현돼 있다. 이번 draft는 그 교정을 되돌리거나 재수행하는 작업이 아니라 서로 다른 활성 명세가 요구하는 임계값을 아직 선택할 수 없다는 판단을 보존한다. 질문 해소·draft 전환·철회·실행 상태는 Manager가 검증한다.
-- complexity low: 사용자 결정 뒤 필요한 기술 변경은 기존 실패 누계와 gate·회귀의 국소 정합화다. 정책 모호함을 높은 effort로 대신 결정하지 않는다. risk medium: 임계값 변경 시 저장된 누계와 표식을 잘못 처리하면 작업을 일찍 차단하거나 필요한 차단을 놓칠 수 있으므로 원문/소비 감사 보존·재시작·경계 회귀가 필요하다. priority high는 자동 차단의 실제 기준과 관련 검증 판정을 명확히 하기 위한 것이다.
+- 사용자는 5회 유지를 답했고 현재 R-091도 같은 기준이다. 이 의미와 원문은 보존하지만 현재 Manager가 그 답변을 질문별 근거에 결합하지 못하므로 질문 해소 결과를 확정하지 않는다. `Decision: approve`를 Agent가 추가하거나 판단 상태를 직접 바꾸지 않으며 이번 `DRAFT_DECISION_RESULT`는 원래 질문 전체를 uncertain으로 보존한다. 이는 사용자에게 새로운 정책 선택을 요구하는 판단이 아니다.
+- `prepare()`의 거부는 `_clean_answers()`보다 먼저 적용되므로 R-091을 인용 source로 바꾸는 것만으로 해결되지 않는다. G-357은 기존 R-061의 본문 답변·출처/현재 입력 검증을 구현할 독립 교정이며, 이 계획의 저장 임계값 변경이나 소급 구현이 아니다. 근거 결합·정리와 실제 영향 후보의 검증·재개는 Manager가 담당한다.
+- 보고 369의 Git 관측 fixture·세 물리 실패/비도달 assertion은 현재 코드에 반영돼 있다. 이 질문이나 기술적 근거 결합 오류로 그 교정을 반복하지 않는다. complexity low·risk medium·priority high와 ID·경로·기존 정적 조사 기록을 보존한다.
 
 ## Draft Decision
 

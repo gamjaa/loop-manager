@@ -13,6 +13,7 @@ sources:
   - docs/requirements/[R-093] 원격 작업 브랜치로 새 환경에서 이어하기.md
   - docs/requirements/[R-061] Agent 역할·문서 권한과 draft ExecPlan 사용자 판단.md
   - docs/requirements/[R-094] MERGED ExecPlan archive의 독립 실행과 자동 재시도.md
+  - docs/requirements/[R-053] 이벤트 시점에 맞춘 진행 상황 알림.md
 depends_on: []
 complexity: high
 risk: high
@@ -25,7 +26,7 @@ priority: high
 
 ## Acceptance Criteria
 
-- R-076/R-055: metadata `recover`의 요청 접수와 실제 재검사를 pause에서 구분한다. pause 전/중 접수한 pending 요청의 대상·원인·접수 snapshot과 `checkpoint_generation`, 미소비 기록을 보존하고, pause가 유지되면 자동 재검사·차단 해제·새 호출을 시작하지 않는다. 재검사 관측 뒤 적용 전 pause에는 요청 소비와 차단/checkpoint 전이 모두 미확정으로 남는다. 이미 같은 transaction에서 확정한 소비·해제는 되돌리거나 반복하지 않는다. 사용자 resume 자체는 metadata 재검사·소비·해제를 수행하지 않으며, 이후 실행은 접수 원인/generation·현재 소유권·writer·원격·dependency·관리 자리와 독립 차단을 다시 검사한다.
+- R-076/R-055: metadata `recover`의 요청 접수와 실제 재검사를 pause에서 구분한다. pause 전/중 접수한 pending 요청의 대상·원인·접수 snapshot과 `checkpoint_generation`, 미소비 기록을 보존하고, pause가 유지되면 자동 재검사·차단 해제·새 호출을 시작하지 않는다. 재검사 관측 뒤 적용 전 pause에는 요청 소비와 차단/checkpoint 전이 모두 미확정으로 남는다. 이미 같은 transaction에서 확정한 소비·해제는 되돌리거나 반복하지 않는다. 사용자 resume 자체는 metadata 재검사·소비·해제를 수행하지 않으며, 이후 실행은 접수 원인/generation·현재 소유권·writer·원격·dependency·관리 자리와 독립 차단을 다시 검사한다. R-053의 명시적 recover 미해결 통지는 실제 재검사가 종결된 요청에만 결합한다. pause로 보존한 pending·진행 중 요청을 completed/unresolved로 바꾸거나 통지하지 않으며, 이미 확정한 완료·outbox는 보존해 같은 요청의 결과를 중복 생성하지 않는다. 전체 pause의 새 알림 전송 금지도 유지한다.
 
 - R-091의 명시적 수동 제출/unblock 수락·관리 보존 대기/인계 기록도 pause에서 보존한다. pause 중 유효 요청 접수·명시 해제 상태 반영은 가능하지만 자동 후속 배정은 시작하지 않는다. pause resume 자체는 독립 차단을 해제하거나 admission을 재정렬/소비하지 않고 다음 자동 실행만 현재 자격·자리·종료를 확인한다. 사용자 pause의 종료 요청과 관리 인계의 안전 반환 대기는 구별한다.
 
@@ -48,7 +49,9 @@ priority: high
 
 ## Implementation
 
-- [ ] 현재 `application/commands.py:recover_local_environment()`·`execute_local_recovery_request()`, `project_service.py`와 `recovery/project_block_service.py:_reconcile_rebase_evidence_block()`의 metadata 요청 전달·pause 전/후 검사를 보존 후보의 pause 저장/조회와 통합한다. `storage/local_recovery_state.py`의 접수 snapshot·대상별 metadata 소비와 `runtime_state.py:resume_rebase_block()`의 원자 전이는 그대로 소비한다. 원격에 구현된 G-343의 입력 지문·START 전이·generation 검사나 요청 엔진을 재구현하지 않고, pause 제어 신호가 일반 실패·완료 결과로 바뀌지 않게 한다.
+- [ ] 최신 `recovery/checkpoint_recovery.py:_retire_superseded_rebase()`·`blocked_plan_reconciliation.py:_reconcile()`·`scope_reconciliation.py:_resume_plan_blocks()`의 현재 게시 입력 채택을 기존 pause 경계에 연결한다. 정확한 게시 receipt·현재 로컬/원격·원래 target 포함·깨끗한 소유 branch가 확인된 경우의 `superseded_rebases` 원문/감사와 현재 checkpoint를 함께 보존한다. 명시 재검사의 원격 채택 전·관측 후 확정 전·확정 뒤 pause에서 현재 원인과 generation·요청을 유지하며, resume가 과거 rebase를 되살리거나 현재 입력 채택·검증 성공을 수행하지 않게 한다. 직접 구현된 채택·원인 변경 재평가·catalog 문서 hash 확인을 재구현하지 않는다.
+
+- [ ] 현재 `application/commands.py:recover_local_environment()`·`execute_local_recovery_request()`, `project_service.py`와 `recovery/project_block_service.py:_reconcile_rebase_evidence_block()`의 metadata 요청 전달·pause 전/후 검사를 보존 후보의 pause 저장/조회와 통합한다. `storage/local_recovery_state.py`의 접수 snapshot·대상별 metadata 소비·`causes_remain()`과 `runtime_state.py:resume_rebase_block()`의 원자 전이는 그대로 소비한다. `execute_local_recovery_request()`의 완료 기록 뒤 `notifications/events.py`로 전달하는 `recovery_unresolved`도 실제 종결과 pause 반환을 구분해 연결한다. 현재 요청 ID별 생성·중복 제거·새 요청/원인 해소의 취소 정책은 재구현하지 않는다. 원격에 구현된 G-343의 입력 지문·START 전이·generation 검사나 요청 엔진을 재구현하지 않고, pause 제어 신호가 일반 실패·완료 결과로 바뀌지 않게 한다.
 
 - [ ] 현재 `storage/management_admission.py`·`storage/task_calls.py`·`application/task_scheduling.py`·`project_service.py`의 수락/parked·단계 진입 gate를 기존 pause 구현에 연결한다. 수락 또는 관리 대기 전/후의 원래 단계·순서·해제 감사·미완료 rebase/호출 예약을 보존하며 관리 인계가 사용자 pause의 기존 종료/확인 절차를 생략하지 않게 한다. 직접 구현된 unblock·포화 수락과 G-345의 순서 교정은 재구현하지 않는다.
 
@@ -72,6 +75,9 @@ priority: high
 - [ ] 현재 base의 `execution/worker_checkpoint.py`·`execution_ports.py:publish_worker_checkpoints()`·`execution_worker_handler.py`와 `storage/validation_feedback_state.py`의 요청/게시/실제 session 전달 확인 경계를 pause에 연결한다. `recovery/work_branch_integration.py:synchronize()`의 완료 원형 비교·원격 수용/검증 무효화 transaction과 `git/publication_service.py`의 낡은 intent 폐기/CAS는 직접 구현으로 소비한다. pause가 transaction을 쪼개거나 소유 통합을 임의 abort하지 않고, 전이 전/후 중 확정된 쪽의 request·원형·현재 후보·감사를 유지하도록 효과 진입/반환을 연결한다. 원래 pause 구현·종료 receipt를 재사용해 같은 요청/commit/session으로 남은 관측/저장을 재개하고 새 checkpoint/모델 호출이나 cursor 조기 확정을 만들지 않는다. `execution_ports.py:publish_worker_checkpoints()`의 공통 경로 선택과 `git/managed_rebase_publication.py:publish_checkpoint()`의 현재 후보/lease 재검사는 직접 구현으로 소비한다. 수용된 rebase 후보·미완료 게시 intent를 선형 ancestry 검사 전에 처리하고 통합 뒤 현재 후보도 같은 경계로 게시하는 순서, 미확정 시 `TRANSIENT_PAUSE` 반환을 유지한다. `worker_checkpoint.py`에 별도 rebase fallback을 복원하지 않는다. 미완료 `rebase_publish` 또는 보류 rebase의 후속 요청에서 intent 저장 전·후, push 확인 뒤·요청 소비 전 pause도 같은 원문/commit/정확한 lease를 보존해 남은 확정만 이어가게 한다. `execution_workspace_handler.py:recover()`·`execution_worker_handler.py:run()`의 진행 중 rebase 우선 처리와 `execution_ownership_handler.py:_owned_checkpoint_remote()`의 완료 게시 근거 재검사는 직접 구현으로 재사용한다. pause가 일반 요청을 먼저 소비하거나 과거 차단 receipt를 복구할 목적으로 이미 확인된 push를 반복하지 않도록 현재 intent/result·acceptance와 결과 ID에 맞는 보존 intent를 함께 보존한다. 현재 `_rebased_request_commit()`의 원래 commit 증거·현재 소유권 재검사와 `worker_checkpoint_requests`의 `original_head` 기록은 직접 구현으로 재사용한다. pause가 history나 보존 intent를 잃거나 새 요청/과거 tree 동일성 검사로 대체하지 않도록 기존 snapshot/CAS·종료 제어에 연결한다. 후보 통합 뒤 요청 확정의 잔여 교정은 G-313에 남기며 이 작업은 pause 보존만 담당한다. G-313은 이 작업을 G-312 경유로 소비하므로 역방향 dependency를 만들지 않는다. 기존 pending 요청 회수·literal staging·scope 검사와 prompt 축약 자체는 재구현하지 않는다.
 
 ## Validation
+
+- `tests/test_checkpoint_remote_recovery.py:PublishedRebaseReceiptUnitTests`의 정확한 게시 입력 채택·원인 교체·명시 metadata 재검사의 원격 채택·중단된 adoption 재진입·catalog 문서 동일성 회귀를 재사용한다. 후보의 pause fixture에 채택 확정 전/후만 최소 연결해 미확정 전이·원래 rebase 감사·확정 checkpoint·요청 소비가 각각 보존되고 resume 자체의 rebase/Git/Agent/verify/Review 효과가 0회인지 확인한다. dirty·등록/소유권·원격/generation 경쟁의 기존 거부 행렬은 복제하지 않는다.
+- `tests/test_notification_delivery.py:RecoveryResultNoticeTests`와 local recovery fixture를 재사용해 pending/관측 중 pause에서는 미해결 사건 0건, 이미 확정된 종결 요청은 원래 request ID·outbox/cursor를 보존하고 재개 후 중복 생성/전송이 없는지 확인한다. 다음 자동 경계에서만 현재 요청·원인을 재검사하며 이 알림을 차단 해제·작업 시작 사건으로 사용하지 않는다.
 
 - `tests/test_local_environment_recovery.py`의 `test_paused_project_keeps_recovery_request_pending`·`test_pause_during_recovery_keeps_same_request_pending`과 `tests/test_scope_block_revalidation.py:EvidenceFreeRebaseBlockTests`의 적용 직전 pause·rollback 회귀를 재사용한다. 후보의 실제 pause 저장·조회와 기존 SQLite fixture를 연결해 접수 뒤/관측 뒤 적용 전 pause의 요청·원인·generation·미소비 보존, 확정 뒤 pause의 중복 소비 없음, resume 명령의 복구/Agent/Git 효과 0회를 최소 case로 검사한다. pause 해제 뒤 요청 근거가 낡았으면 기존 거부·보존 경계로 돌아가야 하며 G-343의 전체 요청/원격/경쟁 행렬은 복제하지 않는다.
 
@@ -121,6 +127,8 @@ priority: high
 
 ## Decision Log
 
+- 검토 revision `d59136fc6d559ba21c69e2232a21bb4a4be9fd90`의 직접 게시 입력 채택·중단 adoption 재진입과 명시 recover 결과 통지는 현재 코드/회귀로 소비한다. 새 미충족 범위는 기존 pause와 그 확정 전후의 요청·감사·outbox 보존 연결이다. R-053은 이 결과 통지의 구분 근거로 추가하며 새로운 알림 종류·복구 정책은 만들지 않는다. snapshot token `297ddb392e559269d15ae86da968860bb3839cfed33bfb5df435969d3d637ccc`의 started ID·경로·무dependency·분류·기존 구현/검증 기록을 보존한다. 후보·Git·실행 이력은 변경하지 않았고 테스트·verify·차단 해제를 확정하지 않는다.
+
 - 이번 delta의 metadata 자동 입력 비교·명시 `recover` 전달·원자 소비와 pause 시 pending 보존은 원격 코드/회귀로 소비한다. G-343의 archive 이동은 같은 ID의 완료 보관이며 새 dependency나 재구현 사유가 아니다. 남은 범위는 보존된 사용자 pause 구현과 이 요청 수명의 연결이다. snapshot token `7b52c07e28a762a9132691c8f24dc300fe40dadae8afc732ae607d67de6b7387`의 started ID·경로·metadata·무dependency·기존 구현/검증·사용자 판단 기록을 유지한다. 후보·Git·실행 이력은 수정하지 않았으며 문서 개정은 독립 차단 해제·검증 성공을 뜻하지 않는다.
 
 - revision `bc70b7392453c95fc13b39c498c7866ed6733074`의 archive 실행 기회·비대기 lease·게시/DB 분리는 직접 구현으로 소비한다. R-094는 새 자동 효과에 기존 사용자 pause를 적용하고 MERGED·독립 진행을 보존하는 조건으로만 추가한다. archive 엔진이나 별도 정지 정책을 구현하지 않는다. snapshot token `6fd1ab5481b11cccc0c2bb5b704bcc39df85e22a34c6a334652c339a25e20626`의 원문 hash를 대조했고 started ID·경로·기존 분류·무dependency·구현/검증 기록을 보존한다. 새 연결은 미충족이며 후보 수정·차단 해제·실행 검증 성공을 뜻하지 않는다.
@@ -132,7 +140,7 @@ priority: high
 
 - 이번 delta의 공통 checkpoint 게시 경로와 프로젝트 차단 활성 소유자의 admission·투영 없는 중간 게시 StatePort의 선택/자격 재확인은 현재 코드·회귀로 소비한다. 남은 작업은 해당 복구/게시 효과의 사용자 pause·일시 대기·확정 경계와 원문/두 HEAD/미확인 전달의 보존 연결이다. 보고 387의 admission 교정을 pause 구현 안에서 다시 수행하지 않는다. snapshot token `6a453b348004e724718d0269fc21c65d78f19be865e079859fd240a32861a5db`의 started ID·경로·기존 구현/검증 기록·무dependency를 유지한다. 앞선 보존 후보 HEAD `2eecf40d2105120b0b928c7e51e19a4ba7688da8`의 clean 상태·pause 구현/기록 확인은 당시 사실로 보존하며 이번에 다시 검사하거나 최신 검증 성공으로 승계하지 않는다. 후보·Git·실행 이력은 변경하지 않는다.
 
-- targeted 임계값의 R-055/PRODUCT 5회와 R-091 3회 충돌은 G-344 draft의 사용자 판단으로 분리한다. 이 작업은 숫자를 선택하거나 기존 표식·실패 원문을 초기화하지 않고 현재 gate·저장 근거를 pause 전후 보존한다. 위 5회 언급은 현재 R-055·구현의 보존 대상을 설명하며 충돌 해소를 뜻하지 않는다. pause 구현에는 임계값 변경이 필요하지 않아 G-344를 선행으로 추가하지 않는다.
+- 현재 R-091·R-055·PRODUCT의 targeted 기준은 기존 5회다. 이 작업은 숫자·표식·실패 원문을 변경하지 않고 pause 전후 현재 gate·저장 근거를 보존한다. G-344의 판단 근거 결합 오류와 draft 대기는 유지하며 정상 교정은 G-357·Manager가 담당한다. pause 구현에는 임계값 변경이나 그 교정이 필요하지 않아 새 선행으로 추가하지 않는다.
 
 - 이번 검토 revision `42b79e867779a261371e27b47b100f795408f6fe`과 snapshot token `df4cc979589a8a68ca690cb76f0e4770d3a59b14f5034f4e884e19c6fde81550`에서 일반 요청이 미완료 rebase를 앞서 소비하지 않는 처리와 과거 차단 receipt 상태에 독립적인 완료 게시 소유권 검사를 직접 코드/회귀로 확인했다. 새 구현 목표는 그 전이의 pause 보존 연결이며 게시·소유권 엔진은 재구현하지 않는다. 보존 후보 HEAD `e625b244213e99654863ac3d4f745eda9013fc6b`의 pause 구현과 기존 기록을 읽기 전용으로 확인했다. started ID·경로·metadata·무dependency·기존 수행 기록과 후보 파일/Git/실행 이력은 보존하며 현재 조건의 테스트·verify·Review 성공을 확정하지 않는다.
 
