@@ -2,7 +2,7 @@
 
 ## Summary
 
-같은 Worker 세션의 사용자 prompt에는 직전 turn 이후 새 작업 변화·미해결 교정만 전달하고, 현재 runtime의 common+Worker instruction은 매 호출 유지한다. provider·Model 변경이나 session 복구로 새 세션을 시작할 때만 선택 작업·작업 공간·미완료 요점을 최소 문맥으로 전달하며 결과 형식·권한·검증 책임을 보존한다.
+같은 Worker 세션의 사용자 prompt에는 새 작업 변화·교정 delta와 해결 확인 전의 짧은 실패 목록을 전달하고, 전체 ExecPlan 완료 책임을 재안내한다. 현재 runtime의 common+Worker instruction은 매 호출 유지한다. provider·Model 변경이나 session 복구로 새 세션을 시작할 때만 선택 작업·작업 공간·미완료 요점을 최소 문맥으로 전달하며 결과 형식·권한·검증 책임을 보존한다.
 
 ## Context
 
@@ -10,14 +10,14 @@ Loop Manager는 Codex CLI 또는 Claude Code의 Worker 세션을 재개하지만
 
 ## Requirement
 
-Loop Manager는 R-064의 현재 runtime의 common+Worker 역할 instruction을 매 호출의 실행 설정에 유지한다. 같은 Worker 세션의 사용자 prompt에는 최초 작업 지시와 변경되지 않은 작업 문맥을 반복 전송하지 않고, 직전 Worker turn 이후 새로 확인된 작업 변화와 교정 요청만 전달해야 한다. verify·Review 피드백은 기존의 중복 없는 delta 계약을 따르며, archive 후보·비검증 오류도 새롭거나 달라진 내용만 전달해야 한다. 기존 세션의 대화 보존과 압축은 Codex CLI 또는 Claude Code에 맡긴다.
+Loop Manager는 R-064의 현재 runtime의 common+Worker 역할 instruction을 매 호출의 실행 설정에 유지한다. 같은 Worker 세션의 사용자 prompt에는 최초 작업 지시와 변경되지 않은 작업 문맥을 반복 전송하지 않고, 직전 Worker turn 이후 새로 확인된 작업 변화·교정 요청과 아래의 미해결 요약·완료 목표를 전달한다. verify·Review의 상세 진단은 기존의 중복 없는 delta 계약을 따르되, 이미 전달한 active 실패는 해결 확인 전까지 identity·관측 횟수·revision과 실패 이름 또는 짧은 진단 요약으로 다시 안내한다. 요약은 traceback·원문 전체를 반복하거나 새 실패 관측·재발 횟수를 만들지 않으며 해당 단계의 새 관측에서 해결 확인되면 제거한다. 전체 ExecPlan 구현·교정 완료와 완료 조건별 잔여 작업 대조는 매 호출에 짧게 재안내한다. archive 후보·비검증 오류도 새롭거나 달라진 내용만 전달해야 한다. 기존 세션의 대화 보존과 압축은 Codex CLI 또는 Claude Code에 맡긴다.
 
-실제 provider 또는 Model 변경이나 저장된 세션을 사용할 수 없어 새 Worker 세션을 시작하면, 현재 선택 runtime의 원본에서 common+Worker instruction을 다시 전달한다. 사용자 prompt에는 결과 형식·선택된 ExecPlan과 worktree 위치·미완료 작업의 요점·미해결 피드백만 한 번 전달하고 정적 역할·권한·검증 규칙이나 이전 대화·검증 원문 전체를 복사하지 않아야 한다. 실제 worktree와 계획 목표를 기준으로 이미 수행한 변경·미해결 실패·다음 작업을 확인해 이어가며 정상 세션 재개에 전체 상태 요약을 요구하지 않는다.
+실제 provider 또는 Model 변경이나 저장된 세션을 사용할 수 없어 새 Worker 세션을 시작하면, 현재 선택 runtime의 원본에서 common+Worker instruction을 다시 전달한다. 사용자 prompt에는 결과 형식·선택된 ExecPlan과 worktree 위치·미완료 작업의 요점·미해결 피드백만 한 번 전달하고 정적 역할·권한·검증 규칙이나 이전 대화·검증 원문 전체를 복사하지 않아야 한다. 실제 worktree와 계획 목표를 기준으로 이미 수행한 변경·미해결 실패·다음 작업을 확인해 이어가며 정상 세션 재개에 전체 대화나 저장소 상태 요약을 요구하지 않는다. 현재 코드·테스트에 따른 완료 조건별 충족 근거와 잔여 작업은 선택된 ExecPlan 본문에 갱신한다.
 
 
 ## Acceptance Criteria
 
-- 같은 Worker 세션의 일반 수정, effort 변경, verify·Review 교정에서 사용자 prompt에는 역할 규칙·ExecPlan·변경되지 않은 작업 범위와 이미 전달한 결과가 반복되지 않고 새 변경 및 교정만 전달된다. 현재 runtime의 instruction은 매 호출 전달된다.
+- 같은 Worker 세션의 일반 수정, effort 변경, verify·Review 교정에서 사용자 prompt에는 권한 규칙·ExecPlan 경로·변경되지 않은 작업 범위와 이미 전달한 결과 원문은 반복하지 않는다. 새 변경·교정 delta에 더해 전체 완료 목표와 해결 확인 전의 짧은 실패 목록을 재안내한다. 현재 runtime의 instruction은 매 호출 전달된다.
 - archive 후보 또는 비검증 오류가 새로 생기거나 바뀌면 같은 세션에 필요한 내용이 한 번 전달된다. 변경이 없으면 같은 내용을 재전송하지 않는다.
 - provider·Model 변경 또는 session-unavailable fallback의 새 세션에도 현재 runtime 원본의 common+Worker instruction을 전달한다. 사용자 prompt에는 현재 작업의 결과 형식·계획·작업 공간 위치·미완료 상태만 담으며 역할 규칙·이전 대화·Worker 결과·verify·Review 원문 전체는 포함하지 않는다.
 - 재시도는 미해결 검증 실패와 관련 변경을 우선하고 기존 성공 작업을 불필요하게 반복하거나 범위 밖 기능으로 확대하지 않는다. 필요한 리팩토링·코드 제거는 허용하며 검증 없이 성공을 보고하지 않는다.
@@ -26,7 +26,7 @@ Loop Manager는 R-064의 현재 runtime의 common+Worker 역할 instruction을 �
 
 ## Product Impact
 
-- 같은 Worker 세션에는 새 사실만 전달하고, 새 세션에는 미완료 작업을 잇는 데 필요한 정보만 다시 전달한다.
+- 같은 Worker 세션에는 새 사실과 짧은 미해결 실패 목록·전체 완료 목표를 전달하고, 새 세션에는 미완료 작업을 잇는 데 필요한 정보를 다시 전달한다.
 
 ## Non-Goals
 

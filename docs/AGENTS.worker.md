@@ -4,6 +4,10 @@
 
 - 선택된 ExecPlan 하나를 구현하고 현재 변경을 안전하게 수용하는 데 필요한 리팩토링을
   함께 수행한다. 기존 동작을 보존하는 테스트를 포함하고 범위 밖 개선으로 확대하지 않는다.
+- 매 호출에서 현재 코드·테스트를 전체 완료 조건과 대조하고 충족 근거·잔여 구현·미해결 실패를
+  본문에 갱신한다. 기존 검증 실패 전체의 교정을 우선하며 작은 변경의 테스트 통과만으로
+  종료하지 않는다. 최소 변경·최소 테스트는 전체 요구사항을 충족하는 범위에 적용한다.
+  같은 잔여 항목이 반복되면 원인·접근법을 재평가하고, 범위·정책 변경은 권한에 따라 판단을 요청한다.
 - 실행 전에 최신 ExecPlan·sources·dependency와 현재 코드를 확인한다. 진행 중 조건이 바뀌면
   기존 구현의 충족 여부를 판단하고 필요한 수정·targeted test를 같은 세션에서 이어간다.
 - 현재 작업과 관련된 불필요한 테스트를 발견하면 공통 품질 기준에 따라 같은 변경에서 제거하고,
@@ -24,8 +28,9 @@
   결정을 대신 작성·변경하지 않는다.
 - Requirement의 완료 판단·archive 이동은 Manager의 책임이며 Worker가 수행하지 않는다.
   `docs/PLANS.md` 수정은 게시된 ExecPlan이 해당 변경을 명시한 경우에만 허용한다.
-- Worker는 Git add·commit·fetch·rebase·push·PR 조작을 직접 실행하지 않는다. 의미 있는 작업
-  단위의 보존점은 `WORKER_OUTCOME: {"kind":"checkpoint","plan_id":"선택 G-ID",
+- Worker는 Git add·commit·fetch·rebase·push·PR 조작을 직접 실행하지 않는다. 복구점 확보 등
+  중간 보존이 필요한 경우에만 본문에 이유·전진한 완료 조건·잔여 작업을 기록하고
+  `WORKER_OUTCOME: {"kind":"checkpoint","plan_id":"선택 G-ID",
   "start_head":"이번 호출 시작 HEAD"}`와 `COMMIT_TITLE: 구체적인 보존점 제목`으로 요청하고 종료한다.
   checkpoint 결과에는 PR_SUMMARY·TARGETED_TESTS나 구현 완료·검증 성공을 합성하지 않는다.
   Manager가 종료·범위·선언·index 확인 후 허용 파일만 commit하고 게시한다. 게시가 확인되거나

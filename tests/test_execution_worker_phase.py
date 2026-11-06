@@ -462,7 +462,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
                 ), expected)
 
 
-    def test_worker_prompt_delivers_validation_once_and_keeps_other_errors(self):
+    def test_worker_prompt_keeps_delivered_failure_reminders_and_other_errors(self):
         feedback = ValidationFeedbackRepository(self.connection)
         self._with_feedback(feedback)
         feedback.observe(
@@ -490,12 +490,17 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertNotIn('docs/plans/', second_prompt)
         self.assertEqual(first_prompt.count('first failure'), 1)
         self.assertNotIn('private raw prelude', first_prompt)
-        self.assertNotIn('first failure', second_prompt)
-        self.assertNotIn('verify:fingerprint', second_prompt)
+        self.assertIn('이미 전달했지만 해결 확인이 남은 검증 피드백', second_prompt)
+        self.assertIn('first failure', second_prompt)
+        self.assertIn('verify:fingerprint occurrence=1 revision=1', second_prompt)
+        self.assertNotIn('private raw prelude', second_prompt)
+        self.assertNotIn('미해결 검증 피드백 delta', second_prompt)
+        feedback.observe('repo', 'G-047', 'revision', 'verify', True, 'passed')
         self.state.update_project('repo', last_error='Worker 결과 검증 실패:\nbad format')
         with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
             self.handler.run(self.context())
         self.assertIn('bad format', self.effects.agent.run_agent.call_args.args[5])
+        self.assertNotIn('verify:fingerprint', self.effects.agent.run_agent.call_args.args[5])
 
 
     def test_timeout_prompt_requests_cause_check_and_progress_evidence(self):

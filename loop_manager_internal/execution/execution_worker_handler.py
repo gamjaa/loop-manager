@@ -28,7 +28,7 @@ from loop_manager_internal.execution.execution_revision import DefinitionSnapsho
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.git.rebase_correction import CorrectionAction, next_action
 from loop_manager_internal.storage.rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
-from loop_manager_internal.execution.validation_feedback import is_validation_error, render_delta
+from loop_manager_internal.execution.validation_feedback import is_validation_error, render_delta, render_reminders
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.execution.worker_outcome import WorkerOutcome, WorkerOutcomeError, parse_worker_outcome
 from loop_manager_internal.execution.common_defect_report import has_report, result_observation
@@ -511,6 +511,11 @@ class WorkerHandler:
                 changed = context_values
                 initial = not current_session_id or recovering
             extras = []
+            if delivery is not None and delivery.reminders:
+                extras.append('이미 전달했지만 해결 확인이 남은 검증 피드백:\n'
+                              + render_reminders(delivery.reminders)
+                              + '\n전달·checkpoint 게시를 해결로 간주하지 마라. 현재 코드에서 미해결 원인부터 확인·교정하라. '
+                              '이 목록은 과거 실패의 재발이나 현재 후보의 새 실패 관측이 아니다.')
             if 'cause_assessment' in changed:
                 extras.append('Manager의 현재 원인 재평가(검증 성공 아님): ' + context_values['cause_assessment']
                               + '\n과거 실패는 감사로 보존한다. 현재 코드·후보에서 다시 확인하고 과거 로그만으로 같은 결함을 새 실패로 보고하지 마라.')
@@ -523,7 +528,8 @@ class WorkerHandler:
             if 'checkpoint' in changed and saved.get('worker_checkpoint_result'):
                 result_info = saved['worker_checkpoint_result']
                 extras.append('Manager가 확인한 복구점: ' + result_info['head'] + ' ' + result_info['title']
-                              + '. 미완료 작업을 이어가라.')
+                              + '. 저장된 변경을 전체 완료 조건과 대조하고 남은 구현·교정을 끝내라. '
+                              '같은 잔여 항목이 반복되면 원인과 접근법을 재평가하라.')
             if ('frontmatter' in changed and saved.get('worker_frontmatter_restores')
                     and 'frontmatter' not in str(prompt_error or '')):
                 extras.append('Manager가 선택된 ExecPlan의 frontmatter만 공식 선언으로 복원했다. '

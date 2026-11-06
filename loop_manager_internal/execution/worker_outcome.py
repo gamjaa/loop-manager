@@ -180,7 +180,9 @@ def worker_outcome_instruction() -> str:
         "실제로 존재하는 경로·절만 사용하라."
         ' 기존 명세가 정한 범위 밖 공통 교정 때문에 미완료라면 유효한 COMMON_DEFECT_REPORT와 '
         'WORKER_OUTCOME: {"kind":"common_defect_pending"}만 보고하고 완료 publication 선언은 쓰지 마라. '
-        ' 중간 보존점만 요청한다면 WORKER_OUTCOME: {"kind":"checkpoint",'
+        ' 전체 구현·교정 완료를 기본 목표로 하며 작은 변경마다 종료하지 마라. '
+        '복구점 확보 등 중간 보존이 필요한 경우에만 본문에 이유·전진한 완료 조건·잔여 작업을 기록하고 '
+        'WORKER_OUTCOME: {"kind":"checkpoint",'
         '"plan_id":"선택 G-ID","start_head":"이번 호출 시작 HEAD"} 와 '
         'COMMIT_TITLE: 구체적인 보존점 제목만 반환하라. PR_SUMMARY·TARGETED_TESTS와 '
         '완료 성공을 합성하지 마라. Manager가 종료·범위 검사 후 commit·게시한다.'

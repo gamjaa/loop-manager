@@ -5,13 +5,40 @@ import unittest
 import loop_manager as lm
 from loop_manager_internal.execution.validation_feedback import (MAX_DIAGNOSTIC, format_verify_failure,
                                  is_validation_error, normalize_feedback,
-                                 redact_secrets, render_delta)
+                                 redact_secrets, render_delta, render_reminders)
 from loop_manager_internal.storage.validation_feedback_state import (
     ValidationFeedbackRepository, ensure_schema,
 )
 
 
 class ValidationFeedbackTests(unittest.TestCase):
+    def test_reminder_keeps_failure_names_and_omissions_without_tracebacks(self):
+        rows = [dict(identity='verify:one', occurrence=2, revision=3,
+                     diagnostic='verify exit code: 1\nFAILED: test_first\n'
+                     'Traceback: private details\nFAILED: test_second\n'
+                     '[2 recognizable failures omitted]\n[diagnostic truncated]'),
+                dict(identity='review:two', occurrence=1, revision=1,
+                     diagnostic='API_KEY=private-value\n' + 'x' * 2000)]
+        summary = render_reminders(rows)
+        self.assertIn('verify:one occurrence=2 revision=3', summary)
+        self.assertIn('FAILED: test_first', summary)
+        self.assertIn('FAILED: test_second', summary)
+        self.assertIn('[2 recognizable failures omitted]', summary)
+        self.assertIn('[diagnostic truncated]', summary)
+        self.assertNotIn('private details', summary)
+        self.assertNotIn('private-value', summary)
+        self.assertNotIn('x' * 201, summary)
+
+    def test_worker_initial_and_resumed_prompts_require_whole_plan_completion(self):
+        for options in ({}, {'session_resume': True}, {'session_recovery': True}):
+            with self.subTest(options=options):
+                prompt = lm.worker_prompt('docs/plans/[G-040] Plan.md', None, **options)
+                self.assertIn('ExecPlan 전체의 구현과 관련 교정을 완료', prompt)
+                self.assertIn('모든 완료 조건', prompt)
+                self.assertIn('기존 미해결 검증 실패부터', prompt)
+                self.assertIn('중간 보존이 필요한 경우에만', prompt)
+                self.assertIn('같은 잔여 작업이 반복되면', prompt)
+
     def test_duplicate_review_ids_combine_diagnostics_deterministically(self):
         sections = ["ISSUE_ID: File.py::Func::Bug\nFix A.",
                     "ISSUE_ID: file.py::func::bug\nFix B.",

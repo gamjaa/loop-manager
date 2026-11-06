@@ -18,7 +18,8 @@ mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서�
 - 사용자의 승인·거절·대체 결정은 Agent가 작성하거나 변경하지 않는다. draft 표시를
   해제하거나 요구사항·필수 검증을 삭제해 사용자 판단이나 실패를 우회하지 않는다.
 - Manager의 SQLite 상태·실행 기록·Git 소유권을 직접 변경하거나 수행하지 않은 검증의
-  성공을 기록하지 않는다. Worker는 checkpoint를 요청하고 종료하며, Git add·commit·fetch·
+  성공을 기록하지 않는다. Worker는 선택된 ExecPlan 전체의 구현·관련 교정을 완료하는 것을
+  기본 목표로 한다. 중간 보존이 필요할 때만 checkpoint를 요청하고 종료하며, Git add·commit·fetch·
   rebase·push·PR 생성은 Manager가 담당한다. checkpoint 게시 대기가 해결될 때까지 새 Worker
   작업을 시작하지 않는다.
 

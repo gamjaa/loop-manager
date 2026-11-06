@@ -288,6 +288,21 @@ def render_delta(rows) -> str:
     return "\n\n".join(lines)
 
 
+def render_reminders(rows) -> str:
+    """Keep delivered failures visible without replaying their tracebacks."""
+    lines = []
+    for row in rows:
+        diagnostic = str(row['diagnostic']).splitlines()
+        names = [line for line in diagnostic
+                 if line.startswith('FAILED:') or line == _TRUNCATED
+                 or line.endswith('recognizable failures omitted]')]
+        summary = '\n'.join(names) if names else next(
+            (line[:200] for line in diagnostic if line.strip()), '')
+        lines.append(f"{row['identity']} occurrence={row['occurrence']} "
+                     f"revision={row['revision']}\n{summary}")
+    return redact_secrets('\n\n'.join(lines))
+
+
 def is_validation_error(error: str | None, verify_result: str | None,
                         review_result: str | None) -> bool:
     if not error:

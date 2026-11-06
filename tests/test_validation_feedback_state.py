@@ -7,6 +7,26 @@ from loop_manager_internal.storage.validation_feedback_state import ValidationFe
 
 
 class ValidationFeedbackStateTests(unittest.TestCase):
+    def test_delivered_failures_remain_reminders_until_new_stage_observation(self):
+        failure = Feedback('verify', 'verify:one', 'FAILED: test_first\nTraceback: detail')
+        self.observe('verify', 'failed', (failure,))
+        first = self.pending()
+        self.assertEqual(first.reminders, ())
+        self.repo.delivered(first.attempt_id, 'session')
+        before = tuple(self.connection.execute(
+            'SELECT occurrence,revision,sequence,active FROM validation_feedback_current').fetchone())
+        resumed = self.pending()
+        self.assertEqual(resumed.rows, ())
+        self.assertEqual([row['identity'] for row in resumed.reminders], ['verify:one'])
+        self.repo.delivered(resumed.attempt_id, 'session')
+        self.assertEqual(tuple(self.connection.execute(
+            'SELECT occurrence,revision,sequence,active FROM validation_feedback_current').fetchone()), before)
+        self.assertEqual(self.pending(recovery=True).reminders, ())
+        self.assertEqual(self.pending('other-session').reminders, ())
+        self.observe('verify', 'passed', passed=True)
+        self.assertEqual(self.pending().reminders, ())
+        self.assertEqual(self.pending().rows, ())
+
     def test_delivery_cannot_be_acknowledged_by_another_session(self):
         attempt = self.repo.prepare('repo', 'G-040', 'first', context={'task': 'plan'})
         for action in (self.repo.bind_session, self.repo.delivered):

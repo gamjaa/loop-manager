@@ -758,7 +758,7 @@ archive가 최초 평가 workspace 생성 전에 base를 전진시키면, 게시
 - runtime 갱신 비교는 `docs/AGENTS.*.md`를 일반 문서 prose 제외 대상에서 빼므로 지침만 바뀌어도 기존 안전한 handoff로 새 runtime을 선택한다. 실행 중인 호출의 내용은 도중에 바꾸지 않는다.
 
 - Planner, Worker와 Reviewer의 작업별 prompt는 Loop Manager에 내장하며 목표·snapshot·승인 사실·피드백·결과 형식 등의 문맥을 구성한다. 정적 공통·역할 규칙을 이 사용자 메시지에 중복하지 않는다
-- Worker 사용자 메시지는 최초·교체 session에 선택 계획·worktree·결과 형식과 미완료 문맥을 보내고 같은 provider/Model session에는 확인되지 않은 새 조건·archive 후보·비검증 오류·checkpoint/선언 복원 사실·검증 피드백 delta만 보낸다. effort 변경은 같은 session의 재개다. 이전 Worker 결과와 verify/Review 원문은 복사하지 않으며 수동 교정도 전체 G·후보 R·사용자 생략과 미확인 외부 테스트만 유지한다.
+- Worker 사용자 메시지는 최초·교체 session에 선택 계획·worktree·결과 형식과 미완료 문맥을 보내고 같은 provider/Model session에는 확인되지 않은 새 조건·archive 후보·비검증 오류·checkpoint/선언 복원 사실·검증 피드백 delta를 보낸다. 전체 완료 책임과 완료 조건별 충족 근거·잔여 작업 대조는 매 호출에 안내한다. 같은 session에 이미 전달한 active 검증 피드백은 identity·occurrence·revision과 인식된 실패 이름(없으면 진단 첫 줄 최대 200자)의 짧은 미해결 목록으로 다시 보낸다. 진단 잘림·누락 표식은 유지하고 traceback·이전 결과 원문을 반복하지 않는다. 이 목록은 전달 cursor나 실패 관측·해결 상태를 변경하지 않으며 해당 단계의 새 관측에서 active가 해제되면 사라진다. effort 변경은 같은 session의 재개다. 이전 Worker 결과와 verify/Review 원문은 복사하지 않으며 수동 교정도 전체 G·후보 R·사용자 생략과 미확인 외부 테스트만 유지한다.
 - 기존 validation delivery attempt/cursor에 작업 문맥 JSON과 attempt 순서를 결합한다. 호출 전 revision을 고정하고 실제 session에 결합하되 정상 scope·결과 검증 뒤에만 두 채널의 전달을 확인한다. timeout·손상 결과·저장 실패는 미확인 문맥을 재전송하고 호출 중 발생한 새 revision은 확인하지 않는다. 늦게 도착한 과거 attempt가 최신 문맥 cursor를 되돌리지 않는다. source 지문·revision이나 순수 수행 기록만의 변화는 작업 조건 재전송을 만들지 않는다.
 - 프로젝트별 prompt 재정의는 지원하지 않으며 프로젝트 파일이나 작업 prompt로 자동 역할 권한을 확대하지 않는다
 
@@ -1631,7 +1631,7 @@ Worker 요청의 로컬 commit·checkpoint 게시·PR 생성과 최종 후보 �
 
 #### Worker checkpoint 게시와 새 환경 인수
 
-Worker의 `WORKER_OUTCOME`은 `ready_for_validation`, `needs_user_decision`, `checkpoint`를 구분한다. checkpoint JSON의 필수 필드는 `kind`, 선택된 `plan_id`, 해당 호출의 전체 `start_head` OID이며 별도 `COMMIT_TITLE` 한 줄만 받는다. 중복·손상·다른 작업/HEAD·임의 명령 필드와 완료 publication 선언의 혼합은 거부한다. 완료 후보의 기존 COMMIT_TITLE·PR_SUMMARY·TARGETED_TESTS 계약과 사용자 판단 대기·legacy 완료 결과는 유지한다.
+Worker의 `WORKER_OUTCOME`은 `ready_for_validation`, `needs_user_decision`, `checkpoint`를 구분한다. Worker 지침과 최초·재개 prompt는 전체 ExecPlan 구현·교정을 기본 목표로 지정하고, checkpoint는 중간 보존 필요성이 있을 때만 요청하도록 한다. Worker는 본문에 보존 이유·전진한 완료 조건·잔여 작업을 갱신하며 게시 후에도 이를 전체 완료 조건과 대조한다. 동일 잔여 작업의 반복은 원인·접근법 재평가 대상으로 안내하고 범위·정책 변경은 역할 권한에 따른 판단으로 연결한다. 이는 Worker의 수행 지침이며 Manager가 checkpoint 횟수로 완료를 합성하거나 강제 검증·새 차단 상태를 만드는 규칙은 아니다. checkpoint JSON의 필수 필드는 `kind`, 선택된 `plan_id`, 해당 호출의 전체 `start_head` OID이며 별도 `COMMIT_TITLE` 한 줄만 받는다. 중복·손상·다른 작업/HEAD·임의 명령 필드와 완료 publication 선언의 혼합은 거부한다. 완료 후보의 기존 COMMIT_TITLE·PR_SUMMARY·TARGETED_TESTS 계약과 사용자 판단 대기·legacy 완료 결과는 유지한다.
 
 Worker가 종료하면 기존 scope 검사와 선택 frontmatter의 부분 복원 뒤 허용된 호출 변경 경로를 결정한다. 요청 밖 staged entry와 index flags·미확정 operation은 보존하고 commit하지 않는다. `execution_checkpoints.snapshot.worker_checkpoint_request`는 repository·작업·branch·worktree·시작 HEAD·요청 원문·제목·파일별 mode/content 지문·실제 session·호출 ID와 전달 attempt를 고정한다. 실제 호출의 writer 종료 근거를 확인하고 명시적 literal pathspec만 staging한다. 기존 Manager commit intent의 parent/tree/message와 실제 commit을 대조하며 저장 중단 뒤 commit이나 모델 호출을 반복하지 않는다. 원격 게시 확인 뒤 같은 transaction에서 요청 완료·scope 정리·전달 확인을 적용한다. 보존점은 Worker/targeted/verify/Review 성공 token을 만들지 않으며 기존 실패·session을 유지한다. 완료 후보를 Manager가 commit한 때도 다음 Worker 변경 전에 같은 게시 경계를 적용한다.
 

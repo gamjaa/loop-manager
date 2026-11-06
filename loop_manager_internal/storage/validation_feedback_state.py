@@ -142,6 +142,7 @@ class Delivery:
     recovery: bool
     context: dict[str, str] = field(default_factory=dict)
     initial: bool = False
+    reminders: tuple[dict[str, object], ...] = ()
 
 
 class ValidationFeedbackRepository:
@@ -287,9 +288,11 @@ class ValidationFeedbackRepository:
             rows = self.connection.execute(
                 "SELECT stage,identity,occurrence,revision,diagnostic,sequence "
                 "FROM validation_feedback_current WHERE repo=? AND plan_id=? "
-                "AND active=1 AND sequence>? ORDER BY stage,identity",
-                (repo, plan_id, since),
+                "AND active=1 ORDER BY stage,identity",
+                (repo, plan_id),
             ).fetchall()
+            reminders = tuple(dict(row) for row in rows if row['sequence'] <= since)
+            rows = [row for row in rows if row['sequence'] > since]
             rendered = []
             for row in rows:
                 prior = self.connection.execute(
@@ -323,7 +326,7 @@ class ValidationFeedbackRepository:
             )
             self.connection.execute('UPDATE validation_delivery_attempts SET context=? WHERE id=?',
                                     (json.dumps(context, sort_keys=True), attempt_id))
-            return Delivery(attempt_id, tuple(rendered), recovery, delta, initial)
+            return Delivery(attempt_id, tuple(rendered), recovery, delta, initial, reminders)
 
     def bind_session(self, attempt_id: str, session_id: str) -> None:
         """Attach a newly started session before exposing it to runtime state."""

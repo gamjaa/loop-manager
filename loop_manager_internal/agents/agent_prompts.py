@@ -167,8 +167,13 @@ def worker_prompt(
     task_changed: bool = False,
     context_delta: str = '',
 ) -> str:
-    """Task input and unacknowledged changes; static rules live in instructions."""
-    parts = []
+    """Whole-plan completion reminder, task input and unacknowledged changes."""
+    parts = ['선택된 ExecPlan 전체의 구현과 관련 교정을 완료하는 것이 목표다. '
+             '현재 코드·테스트를 모든 완료 조건과 대조해 충족 근거와 잔여 작업을 본문에 갱신하고, '
+             '기존 미해결 검증 실패부터 처리하라. 작은 변경 하나의 테스트 통과만으로 호출을 끝내지 마라. '
+             '전체 구현·관련 교정을 마쳤으면 완료 후보로 인계하라. '
+             '중간 보존이 필요한 경우에만 checkpoint를 요청하고 본문에 보존 이유·전진한 완료 조건·잔여 작업을 남겨라. '
+             '같은 잔여 작업이 반복되면 원인과 접근법을 재평가하고, 범위·정책 변경은 역할 권한에 따라 판단을 요청하라.']
     if not session_resume or session_recovery or task_changed:
         parts.append(f'선택된 ExecPlan: {plan_path}')
         if task_changed and session_resume and not session_recovery:
@@ -196,8 +201,6 @@ def worker_prompt(
                      'PR_SUMMARY 안에 VERIFY_TIMEOUT_LIMIT_INSUFFICIENT: <진행 근거와 필요한 설정 조정>을 보고하라.')
     if not session_resume or session_recovery:
         parts.append(worker_outcome_instruction())
-    if not parts:
-        parts.append('미완료 작업을 이어가라.')
     return '\n\n'.join(parts)
 
 
