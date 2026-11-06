@@ -25,7 +25,9 @@ priority: high
 
 ## Purpose
 
-확인된 문서 삭제를 반영한 취소·완료 작업의 정확한 Manager 소유 로컬·원격 브랜치와 worktree를, 작업물 보존과 기대 OID 검증 뒤 정리한다. 원격 ref 삭제까지 확장하는 경계는 아래 User Decision의 선택지 A로 승인됐다. 현재 원격 ref가 이미 없는 정확한 소유 worktree/로컬 ref 정리는 직접 구현으로 소비한다. 살아 있는 원격 ref의 lease 삭제·row 없는 취소 자원의 정리와 중단 복구가 남아 있다. 최신 R-055의 삭제 확정 대상은 정리의 필수 증거/전용 보존 사본을 완료 시 G-260의 경계로 제거하고 ID 표식만 남기며, 일반 취소·MERGED·다른 작업은 기존 보존을 유지한다.
+확인된 문서 삭제를 반영한 취소·완료 작업의 살아 있는 정확한 Manager 소유 로컬·원격 branch와 worktree를, 작업물 보존과 기대 OID 검증 뒤 정리한다. 원격 ref 삭제 경계는 아래 기존 User Decision의 선택지 A를 유지한다. 현재 원격 ref 부재의 소유 worktree/local ref 정리와 G-260의 취소 감사·퇴역 자료/문서 사본·기록/파일 최종 제거는 직접 구현으로 소비한다.
+
+남은 범위는 실제 자원이 남은 취소 감사도 원래 승인된 작업/자원 소유권과 보존 근거로 확인해 안전한 물리 정리에 연결하고, 정확한 살아 있는 원격 ref의 lease 삭제·부분 정리와 중단 재개를 완성하는 것이다. G-260의 이미 사라진 자원 확인과 최종 기록 제거를 새로 구현하거나, 취소 감사의 native 형식이 맞는다는 이유만으로 살아 있는 자원 삭제를 허용하지 않는다. 일반 취소·실제 MERGED·독립 작업의 기존 보존은 유지한다.
 
 ## Draft Decision
 
@@ -53,8 +55,8 @@ Answer: 선택지 A를 승인한다. 앞으로 작업 문서의 확인된 삭제
 
 ## Implementation
 
-- [ ] 확인한 `catalog/deleted_plan_cleanup.py:cleanup()`의 원격 ref 부재 시 worktree/정확한 local ref 정리와 `storage/deleted_plan_state.py`의 파일 queue를 재사용한다. 현재 `ls-remote`에 ref가 있으면 보류하는 경계를 기존 Manager journal·정확한 기대 OID의 삭제 lease로 연결한다. G-260의 활성 row 없는 근거/한시적 정리 상태도 같은 자원 경계로 소비한다. 일반 Merge cleanup·원격 사용자/base/다른 작업·수동 소유 보호를 확대하지 않는다.
-- [ ] 물리 정리 완료와 대상별 전용 보존 사본의 최종 제거를 G-260의 기존 transaction/파일 재시도에 연결한다. 작업물/PR head 보존·소유/종료 확인에 필요한 자료를 먼저 지우지 않고, 일반 취소·실제 MERGED의 원문/실행 이력과 타 작업의 공유 자료는 유지한다. 별도 무차별 보존 폴더 삭제·새 정리 엔진은 만들지 않는다.
+- [ ] 확인한 `catalog/deleted_plan_cleanup.py:cleanup()`의 원격 ref 부재 시 worktree/정확한 local ref 정리와 `storage/deleted_plan_state.py`의 파일 queue를 재사용한다. 현재 ref가 있으면 보류하는 경계를 기존 Manager journal·정확한 기대 OID의 삭제 lease로 연결한다. 확인한 `_rowless_cancellations()`의 native 감사와 `_rowless_ownership()`의 실제 부재 판정은 최종 제거 근거로 재사용한다. 실제 자원이 있는 후보는 별도 소유/보존 확인 뒤 물리 정리하고, 부재가 확인된 뒤에만 기존 최종 제거로 넘긴다. 형식 검사나 과거 cleanup_pending을 살아 있는 자원 소유의 증명으로 대신 쓰지 않는다. 일반 Merge cleanup·원격 사용자/base/다른 작업·수동 소유 보호를 확대하지 않는다.
+- [ ] 물리 정리 완료를 G-260의 기존 `storage/deleted_plan_state.py`·`catalog/deleted_document_cleanup.py`·파일 queue의 최종 제거/재시도에 연결한다. 문서 사본/native journal 복구·퇴역 acceptance/retired 사본의 실제 부재 확인·공유 usage/outbox/공통 결함/완료 Merge 보호는 이미 구현된 경계를 소비한다. 원래 자원 정리와 후속 기록 제거의 확정 지점을 구분하며 같은 엔진을 복제하지 않는다. 작업물/PR head 보존·소유/종료 확인에 필요한 자료를 먼저 지우지 않고, 일반 취소·실제 MERGED의 원문/실행 이력과 타 작업의 공유 자료는 유지한다. 별도 무차별 보존 폴더 삭제·새 정리 엔진은 만들지 않는다.
 
 아래 User Decision의 승인 범위에서 `git/cleanup_service.py`·`merge_cleanup_service.py`의 소유권·재검사·pending 처리, 기존 Manager Git journal·자원 claim·PR 관측·게시 lease를 재사용한다. 취소/완료의 현재 수명과 자원별 보존·삭제 intent를 연결하고 실제 ref 삭제 효과를 의미 판단·DB 취소와 분리한다. 복구 가능한 보존·정확한 기대 OID의 거부를 기존 관리 저장 경계 안에서 구현하며 새로운 외부 서비스·비호환 migration·독립 운영 상태 원본을 만들지 않는다.
 
@@ -62,7 +64,7 @@ G-238의 명시적 reset/manual stop·READY 복귀는 이 작업에 포함하지
 
 ## Validation
 
-- 현재 `tests/test_deleted_plan_cleanup.py`의 원격 ref 부재 정리·writer/PR/원격 revision 경쟁·파일 queue 재시도 회귀는 소비한다. 새 검증은 살아 있는 정확한 소유 ref의 기대 OID 삭제와 거부, row 없는 취소 근거의 자원 정리, 최종 삭제 예외의 전용 사본 제거에 둔다. 공유 로그/사본의 타 작업 bytes·실제 MERGED 근거는 불변이어야 한다.
+- 현재 `tests/test_deleted_plan_cleanup.py`의 원격 ref 부재 정리·writer/PR/원격 revision 경쟁·파일 queue 재시도 회귀는 소비한다. 새 검증은 살아 있는 정확한 소유 ref의 기대 OID 삭제와 거부, row 없는 취소 근거의 실제 자원 정리와 기존 최종 제거로의 인계에 둔다. G-260의 native 문서/retired 사본·기록/파일 제거 행렬은 재실행하는 새 lifecycle로 복제하지 않는다. 공유 로그/사본의 타 작업 bytes·실제 MERGED 근거는 불변이어야 한다.
 - 원격 삭제 뒤 DB 미확정·일부 local/worktree 정리·전용 사본 제거 실패/재시작에서 필수 증거가 남고 완료 보고가 없어야 한다. 완료 뒤 ID 표식 외 대상별 기록/전용 사본이 없고 같은 이름 새 ref/새 소유자는 제거되지 않아야 한다. 기존 실제 임시 원격 lease/ref 효과 회귀를 최소 확장하며 정책 조합은 Git 관측 double·실제 SQLite/파일로 검사한다.
 
 - `tests/test_worktree_cleanup.py`, `tests/test_cleanup_pending_state.py`, `tests/test_workspace_cleanup_ownership.py`의 최소 targeted unit으로 취소·완료 자격, base/사용자/다른 작업·수동 소유 거부, 미종료·보존 실패·dirty/local-only·PR head 사용 불확실·권한/보호 정책 실패를 실제 정책·SQLite·파일 보존으로 확인한다. Git·PR 관측은 mock하며 정리 판정을 성공값으로 대체하지 않는다.
@@ -72,7 +74,7 @@ G-238의 명시적 reset/manual stop·READY 복귀는 이 작업에 포함하지
 
 ## Progress
 
-- [ ] 최신 삭제 확정 예외의 row 없는 자원·살아 있는 원격 ref 정리 및 최종 제거 연결. 원격의 좁은 정리 코드는 정적으로 확인했으며 이번 Planner는 구현·테스트를 실행하지 않았다.
+- [ ] 살아 있는 원격 ref·row 없는 취소 감사의 실제 소유 자원 정리와 기존 최종 제거 인계. 이미 부재한 자원/문서 사본·기록/파일 제거는 G-260의 직접 구현을 소비한다.
 
 - [x] 2026-10-10 delta·R-055 D09/D10·ARCHITECTURE의 현행 정리/변경 정책·cleanup 구현과 기존 회귀를 정적으로 대조했다. 구현·테스트·전체 verify를 실행하지 않았다.
 - [x] 2026-10-11 사용자 Architecture Change Policy 판단: 선택지 A 승인 및 draft 해제 요청을 위 User Decision에 기록했다.
@@ -80,6 +82,8 @@ G-238의 명시적 reset/manual stop·READY 복귀는 이 작업에 포함하지
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- revision `249477cd835923fa7923e92e55482efdc4ddce11`과 snapshot token `22ad530edef08485a2e956e3db5a8749e250ce80bf27d9743f680c72df20a993`에서 원본 hash·ID·경로·기존 수행 기록과 User Decision 원문을 확인했다. G-260의 실제 Merge·내용 보존 archive와 현재 `deleted_plan_cleanup.py`/`deleted_document_cleanup.py`·native 자원 inventory·기록/파일 보호 회귀를 소비한다. 이 개정은 이미 없는 자원의 후속 제거를 다시 계획하지 않고 남은 살아 있는 자원의 소유·보존·정확한 ref 삭제·중단 인계만 구체화한다. 새 사용자 승인을 만들거나 기존 결정/판단 양식을 정리하지 않는다. 구현·테스트·전체 verify는 실행하지 않았다.
 
 - 최신 R-055는 정리에 필요한 검증된 보존과 완료 후 대상 전용 사본 제거를 구분한다. 아래 사용자 승인·거절 문구와 수행 기록은 변경하지 않는다. 일반 취소·MERGED의 기존 보존/승인 범위를 유지하고 확인된 미Merge 목표 철회에만 최종 제거 예외를 적용한다. 원격 ref 부재의 직접 구현은 재계획하지 않으며 G-260의 새 기록 수명을 선행 소비한다.
 - 새 분류 risk critical: 삭제 확정의 최종 사본 제거는 복구 불가능할 수 있어 아래 과거 high risk의 백업 복구 설명을 그대로 적용할 수 없다. 필수 보존/소유/PR head·정확한 lease와 타 작업 귀속을 먼저 확인하고 미완료 중단에는 근거를 유지하며 최종 제거/타 작업 불변을 검증한다. complexity high는 비원자 자원 삭제·한시 증거·DB/파일 확정의 재시작 연결에 따른다.
