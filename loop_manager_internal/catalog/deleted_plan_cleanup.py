@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import execplan_catalog as catalog
 from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
-from loop_manager_internal.storage import deleted_plan_state, runtime_state
+from loop_manager_internal.storage import deleted_plan_state, local_recovery_state, runtime_state
 from loop_manager_internal.storage.task_calls import CallDeferred
 
 
@@ -218,6 +218,6 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                     release_reference_holds(connection, repo, key, path, resolved)
                 remove_pending_files(connection, repo, state_dir)
                 deleted.append(key)
-        except CallDeferred:
+        except (CallDeferred, local_recovery_state.LocalRecoveryRequestError):
             continue
     return tuple(deleted)

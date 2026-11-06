@@ -36,6 +36,10 @@ def forget(connection, repo, plan_id, *, artifacts=()):
             "'common_defect_merges_delete_immutable')").fetchall()
         for trigger in triggers:
             connection.execute(f'DROP TRIGGER "{trigger[0]}"')
+        recovery_requests = set()
+        if 'local_environment_recovery_requests' in tables:
+            from .local_recovery_state import forget_plan
+            recovery_requests = forget_plan(connection, repo, plan_id)
         if 'validation_delivery_items' in tables:
             connection.execute('''DELETE FROM validation_delivery_items WHERE attempt_id IN
                 (SELECT id FROM validation_delivery_attempts WHERE repo=? AND plan_id=?)
@@ -58,9 +62,11 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         if 'diagnostic_preservations' in tables:
             connection.execute("DELETE FROM diagnostic_preservations WHERE repo=? AND scope='plan' AND owner=?", (repo, plan_id))
         if 'notification_outbox' in tables:
-            for event in connection.execute('SELECT event_key,payload FROM notification_outbox WHERE repo=?', (repo,)).fetchall():
+            for event in connection.execute('SELECT event_key,event_type,payload FROM notification_outbox WHERE repo=?', (repo,)).fetchall():
                 payload = json.loads(event['payload'])
-                if payload.get('execplan_id') == plan_id:
+                owned_event = (payload.get('request_id') in recovery_requests if event['event_type'] == 'recovery_unresolved'
+                               else payload.get('execplan_id') == plan_id)
+                if owned_event:
                     connection.execute('DELETE FROM notification_outbox WHERE event_key=?', (event['event_key'],))
         if 'manager_metadata' in tables:
             for prefix in ('workspace_seen:', 'remote_adoption:'):

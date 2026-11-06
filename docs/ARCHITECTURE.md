@@ -1393,6 +1393,10 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 
 요청 전 snapshot의 계획 항목은 정수 `checkpoint_generation`을 포함한다. metadata 재검사는 이 값과 해당 scope의 원인 코드·진단 및 해제 지문을 현재 block과 비교한다. generation이 없는 과거 요청이나 비교 불가한 근거는 기존 요청·진단을 보존하며 같은 원인의 재검사 허용으로 추정하지 않는다. metadata 차단의 선택적 checkpoint 관측은 block 사본·generation·Git snapshot과 원격 문서 입력 지문을 결합하며, 지문 부재는 원격 입력 변화의 증거가 아니다.
 
+삭제 확정의 `deleted_plan_state.forget`는 같은 제거 transaction에서 `local_recovery_state.forget_plan`을 호출한다. 실제 `(repo, plan_id)`에 속한 요청 ID를 먼저 확보해 전용 요청과 그 하위 소비를 제거하며, 같은 repository의 공유 요청에서는 대상 subject의 소비만 제거한다. 남은 요청의 전후 snapshot은 `plans`·`blocks`의 `plan_id`, `recoveries`의 `subject`, `current_failures`의 문자열 identity가 정확히 일치하는 항목만 제거한다. 다른 항목·프로젝트 상태·원래 요청 결과와 시각은 유지하고 대상 항목이 없으면 snapshot 원본 bytes도 바꾸지 않는다. 알 수 없는 최상위 필드·잘못된 JSON/배열·항목 identity 부재는 귀속 미확인으로 transaction 전체를 롤백한다. 기존 cleanup은 이 요청 오류를 해당 삭제의 보류로 처리해 다른 대상의 정리를 계속하며, 원인이 해소된 다음 관측에서 남은 제거를 재개한다.
+
+`recovery_unresolved` outbox의 최종 제거는 확보한 요청 ID와 outbox repository의 일치로 결정한다. payload의 오래된 작업 ID만으로 프로젝트·다른 작업의 사건을 삭제하지 않는다. 제거 대상의 부분 전송 본문·cursor·오류도 전용 사건과 함께 지우며, 일반 취소의 감사 보존 규칙을 이 최종 제거에 적용하지 않는다. 중단 뒤에는 남은 요청 관계로 멱등 재개하며 별도 삭제 감사나 익명 사본을 만들지 않는다.
+
 요청 commit 뒤 managed config를 읽고 전역 process lock을 비차단 방식으로 얻는다. 선택한 계획의 실행 자리와 queue 순서가 허용할 때만 기존 복구 executor를 호출한다.
 
 | 접수·실행 결과 | 상태·재개와 명령 결과 |

@@ -300,3 +300,53 @@ def causes_remain(after: dict, plan_id: str | None) -> bool:
     if relevant_blocks:
         return True
     return False
+
+
+def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> set[str]:
+    """Erase the exact request scope in the caller's final-erasure transaction."""
+    rows = connection.execute(
+        'SELECT request_id,plan_id,before_state,after_state FROM local_environment_recovery_requests WHERE repo=?',
+        (repo,),
+    ).fetchall()
+    removed = {row['request_id'] for row in rows if row['plan_id'] == plan_id}
+    fields = {'plans': 'plan_id', 'blocks': 'plan_id', 'recoveries': 'subject'}
+    for row in rows:
+        if row['request_id'] in removed:
+            continue
+        for column in ('before_state', 'after_state'):
+            raw = row[column]
+            if raw is None:
+                continue
+            try:
+                saved = json.loads(raw)
+            except (TypeError, ValueError) as error:
+                raise LocalRecoveryRequestError('로컬 복구 snapshot의 귀속을 확인할 수 없습니다.') from error
+            if (not isinstance(saved, dict) or set(saved) - {
+                    *fields, 'current_failures', 'phase', 'planning_error_sha256', 'pr_conflict_recovery'}):
+                raise LocalRecoveryRequestError('로컬 복구 snapshot의 귀속을 확인할 수 없습니다.')
+            changed = False
+            for field, identity in (*fields.items(), ('current_failures', None)):
+                if field not in saved:
+                    continue
+                items = saved[field]
+                if (not isinstance(items, list) or any(
+                        not isinstance(item, str) if identity is None else
+                        not isinstance(item, dict) or identity not in item
+                        or not (isinstance(item[identity], str) or field == 'blocks' and item[identity] is None)
+                        for item in items)):
+                    raise LocalRecoveryRequestError('로컬 복구 snapshot의 귀속을 확인할 수 없습니다.')
+                retained = [item for item in items if (item if identity is None else item[identity]) != plan_id]
+                changed = changed or len(retained) != len(items)
+                saved[field] = retained
+            if changed:
+                connection.execute(
+                    f'UPDATE local_environment_recovery_requests SET {column}=? WHERE request_id=?',
+                    (json.dumps(saved, sort_keys=True, separators=(',', ':')), row['request_id']),
+                )
+    connection.execute(
+        'DELETE FROM local_environment_recheck_consumption WHERE request_id IN '
+        '(SELECT request_id FROM local_environment_recovery_requests WHERE repo=? AND (plan_id=? OR local_environment_recheck_consumption.subject=?))',
+        (repo, plan_id, plan_id),
+    )
+    connection.execute('DELETE FROM local_environment_recovery_requests WHERE repo=? AND plan_id=?', (repo, plan_id))
+    return removed

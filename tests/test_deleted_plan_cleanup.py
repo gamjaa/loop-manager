@@ -9,6 +9,90 @@ from tests.support.catalog import catalog_reconciliation_fixture
 
 
 class DeletedPlanCleanupTest(unittest.TestCase):
+    def recovery_fixture(self):
+        from loop_manager_internal.storage import local_recovery_state
+        from loop_manager_internal.notifications import notifications
+        local_recovery_state.ensure_schema(self.connection)
+        notifications.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO projects (repo,base_branch) VALUES ('/other','main')")
+        snapshot = local_recovery_state.snapshot(self.connection, '/repo', None)
+        snapshot['blocks'] = [dict(scope='plan', plan_id=key, reason_code='failure') for key in ('G-001', 'G-002')]
+        snapshot['recoveries'] = [dict(subject=key, generation=2) for key in ('G-001', 'G-002', '__project__')]
+        snapshot['current_failures'] = ['G-001', 'G-002', '__project__']
+        raw = json.dumps(snapshot)
+        for identity, repo, plan, status in (
+            ('target', '/repo', 'G-001', 'completed'), ('pending', '/repo', 'G-001', 'pending'),
+            ('project', '/repo', None, 'completed'), ('other', '/repo', 'G-002', 'completed'),
+            ('foreign', '/other', 'G-001', 'completed'),
+        ):
+            saved = raw if identity == 'project' else '{}'
+            self.connection.execute('INSERT INTO local_environment_recovery_requests '
+                '(request_id,repo,plan_id,status,before_state,after_state,result) VALUES (?,?,?,?,?,?,?)',
+                (identity, repo, plan, status, saved, saved, 'unresolved'))
+            # Payload aliases are deliberately stale: the request is the owner.
+            payload = dict(request_id=identity, execplan_id='G-002' if plan == 'G-001' else 'G-001')
+            self.connection.execute('INSERT INTO notification_outbox '
+                '(event_key,repo,event_type,payload,rendered_text,confirmed_pieces,last_error) '
+                "VALUES (?,?,'recovery_unresolved',?,'saved notice',1,'saved error')",
+                (identity, repo, json.dumps(payload)))
+        self.connection.executemany('INSERT INTO local_environment_recheck_consumption VALUES (?,?,?)',
+            [('target', 'G-001', 'verify'), ('target', '__project__', 'metadata'),
+             ('project', 'G-001', 'verify'), ('project', 'G-002', 'verify'),
+             ('project', '__project__', 'metadata'), ('other', 'G-002', 'verify'),
+             ('foreign', 'G-001', 'verify')])
+        self.connection.commit()
+        return snapshot
+
+    def test_erasure_removes_exact_recovery_request_scope_and_shared_snapshot_parts(self):
+        snapshot = self.recovery_fixture()
+        independent = {row['event_key']: dict(row) for row in self.connection.execute(
+            "SELECT * FROM notification_outbox WHERE event_key IN ('project','other','foreign')")}
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual({row[0] for row in self.connection.execute(
+            'SELECT request_id FROM local_environment_recovery_requests')}, {'project', 'other', 'foreign'})
+        self.assertEqual({tuple(row) for row in self.connection.execute(
+            'SELECT * FROM local_environment_recheck_consumption')}, {
+                ('project', 'G-002', 'verify'), ('project', '__project__', 'metadata'),
+                ('other', 'G-002', 'verify'), ('foreign', 'G-001', 'verify')})
+        expected = {**snapshot,
+            'plans': [item for item in snapshot['plans'] if item['plan_id'] != 'G-001'],
+            'blocks': [snapshot['blocks'][1]], 'recoveries': snapshot['recoveries'][1:],
+            'current_failures': snapshot['current_failures'][1:]}
+        shared = self.connection.execute(
+            "SELECT before_state,after_state FROM local_environment_recovery_requests WHERE request_id='project'").fetchone()
+        self.assertEqual([json.loads(raw) for raw in shared], [expected, expected])
+        self.assertEqual({row['event_key']: dict(row) for row in self.connection.execute(
+            'SELECT * FROM notification_outbox')}, independent)
+        # Restart/retry without the execution row does not touch independent audit.
+        before = tuple(self.connection.iterdump())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        from loop_manager_internal.notifications import notifications
+        notifications.enqueue_current_project_events(self.connection, '/repo')
+        self.assertFalse(any(json.loads(row[0]).get('request_id') in {'target', 'pending'}
+            for row in self.connection.execute("SELECT payload FROM notification_outbox WHERE repo='/repo'")))
+
+    def test_recovery_erasure_rolls_back_and_unattributed_snapshots_stay_pending(self):
+        import sqlite3
+        from loop_manager_internal.storage.local_recovery_state import LocalRecoveryRequestError
+        self.recovery_fixture()
+        self.connection.execute("CREATE TRIGGER reject_recovery_erasure BEFORE DELETE ON exec_plans "
+                                "BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'interrupted'):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute('DROP TRIGGER reject_recovery_erasure')
+        for raw in ('broken JSON', '{"plans":{}}', '{"plans":[{}]}', '{"unknown":"G-001"}'):
+            with self.subTest(raw=raw):
+                self.connection.execute("UPDATE local_environment_recovery_requests SET after_state=? WHERE request_id='project'", (raw,))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(LocalRecoveryRequestError):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+
     def setUp(self):
         self.fixture = catalog_reconciliation_fixture(self)
         self.connection = self.fixture.connection
@@ -92,6 +176,17 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                         state_dir=self.fixture.state_dir if hasattr(self.fixture,'state_dir') else '/tmp',
                         revision_is_current=lambda: current), ())
                     self.assertIsNotNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE plan_id='G-001'").fetchone())
+            from loop_manager_internal.storage import local_recovery_state
+            local_recovery_state.ensure_schema(self.connection)
+            self.connection.execute("INSERT INTO local_environment_recovery_requests "
+                "(request_id,repo,status,before_state) VALUES ('shared','/repo','completed','{\"unknown\":1}')")
+            self.connection.commit()
+            self.assertEqual(cleanup(self.connection, '/repo', '/repo', pinned, (), git=git,
+                git_bytes=lambda *a: b'original', pr_for_branch=lambda *a: pr, state_dir='/tmp',
+                revision_is_current=lambda: True), ())
+            self.assertIsNotNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE plan_id='G-001'").fetchone())
+            self.connection.execute("UPDATE local_environment_recovery_requests SET before_state='{}'")
+            self.connection.commit()
             self.assertEqual(cleanup(self.connection, '/repo', '/repo', pinned, (), git=git,
                 git_bytes=lambda *a: b'original', pr_for_branch=lambda *a: pr, state_dir='/tmp',
                 revision_is_current=lambda: True), ('G-001',))
