@@ -236,6 +236,26 @@ class CatalogCacheAndCasTests(_CatalogRefreshCase):
         self.boundary.refresh()
         self.assertEqual(len(calls), 3)
 
+    def test_rowless_deleted_hold_rechecks_external_release_at_same_revision(self):
+        self.boundary.refresh()
+        calls = []
+        def reconcile(revision, remember):
+            calls.append(revision)
+            remember(self.pinned(revision))
+            if len(calls) == 2:
+                self.connection.execute("DELETE FROM execplan_catalog_holds WHERE repo=? AND plan_id='G-999'", (self.repo,))
+                self.connection.commit()
+            return state.CatalogReconciliationResult(state.ReconciliationKind.RECONCILED, revision_sha=revision)
+        self.boundary.reconcile = reconcile
+        self.connection.execute('INSERT INTO execplan_catalog_holds VALUES (?,?,?,?,NULL)',
+            (self.repo, 'G-999', self.sha, json.dumps({'path': 'docs/plans/[G-999] Gone.md'})))
+        self.connection.commit()
+        self.boundary.refresh()
+        self.boundary.refresh()
+        self.assertEqual(calls, [self.sha] * 2)
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 2)
+
     def test_pending_file_cleanup_bypasses_cache_until_queue_is_drained(self):
         from loop_manager_internal.storage import deleted_plan_state
         deleted_plan_state.ensure_schema(self.connection)

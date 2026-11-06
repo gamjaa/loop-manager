@@ -398,23 +398,39 @@ _CYCLE_PLAN_ID_FIELDS = (
 def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None:
     """Remove exact task membership in the caller's final-erasure transaction."""
     from .task_calls import CallDeferred
+    cycle_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_cycles'").fetchone()
+    cycle = connection.execute('SELECT * FROM maintenance_cycles WHERE repo=?', (repo,)).fetchone() if cycle_table else None
+    root_changes = []
     if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tiered_maintenance_root_plan_links'").fetchone():
         from loop_manager_internal.maintenance.maintenance_validation import _plan_id_from_path
-        for row in connection.execute('SELECT links_json FROM tiered_maintenance_root_plan_links WHERE repo=?', (repo,)):
+        for row in connection.execute('SELECT * FROM tiered_maintenance_root_plan_links WHERE repo=?', (repo,)):
             try:
                 links = json.loads(row['links_json'])
                 fields = {'path', 'destination', 'root_review_hash', 'status', 'plan_id', 'plan_path', 'plan_hash', 'reason'}
                 if (not isinstance(links, list) or any(not isinstance(item, dict) or set(item) != fields
                         or not isinstance(item['plan_id'], str) or not isinstance(item['plan_path'], str)
-                        or _plan_id_from_path(item['plan_path']) != item['plan_id'] for item in links)):
+                        or _plan_id_from_path(item['plan_path']) != item['plan_id']
+                        or item['status'] not in ('new_plan', 'existing_plan')
+                        or any(not isinstance(item[field], str) or not re.fullmatch(r'[0-9a-f]{64}', item[field])
+                               for field in ('root_review_hash', 'plan_hash'))
+                        or not isinstance(item['reason'], str) or not 12 <= len(item['reason'].strip()) <= 2000
+                        or any(not isinstance(item[field], str) or not item[field] or item[field].startswith('/')
+                               or '\\' in item[field] or any(part in ('', '.', '..') for part in item[field].split('/'))
+                               for field in ('path', 'destination')) for item in links)):
                     raise ValueError('unattributed root plan links')
             except (TypeError, ValueError, RecursionError) as error:
                 raise CallDeferred('루트 이동 계획 연결의 삭제 대상 귀속을 확인할 수 없습니다.') from error
             if any(item['plan_id'] == plan_id for item in links):
-                raise CallDeferred('유지보수 루트 이동의 계획 연결이 남아 있어 최종 제거를 보류합니다.')
-    if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_cycles'").fetchone():
-        return
-    cycle = connection.execute('SELECT * FROM maintenance_cycles WHERE repo=?', (repo,)).fetchone()
+                if (cycle is None or cycle['phase'] != MaintenancePhase.IDLE.value
+                        or not isinstance(cycle['last_cycle_commit'], str)
+                        or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', cycle['last_cycle_commit'])
+                        or type(cycle['last_cycle_merged_count']) is not int or cycle['last_cycle_merged_count'] < 0
+                        or type(row['cycle']) is not int or row['cycle'] < 0
+                        or row['cycle'] >= cycle['revision'] or cycle['publication_stage'] is not None
+                        or cycle['legacy_release_identity'] is not None):
+                    raise CallDeferred('유지보수 루트 이동의 현재 소유권·정상 종료 확인 전에 최종 제거를 보류합니다.')
+                root_changes.append((row, [item for item in links if item['plan_id'] != plan_id]))
     if cycle is None:
         return
     changes = {}
@@ -444,21 +460,29 @@ def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None
             raise CallDeferred('유지보수 평가 원문의 삭제 대상 귀속을 확인할 수 없습니다.') from error
         from .execplan_catalog_state import is_cancelled
         report_changed = False
+        retained_findings = []
         for finding in report['findings']:
             if plan_id not in finding['plan_ids']:
+                retained_findings.append(finding)
                 continue
             retained = [key for key in finding['plan_ids'] if key != plan_id]
-            if not retained or any(is_cancelled(connection, repo, key) or not connection.execute(
+            if not retained:
+                # Final withdrawal removes target-only records, not a synthetic resolution.
+                report_changed = True
+                continue
+            if any(is_cancelled(connection, repo, key) or not connection.execute(
                     'SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
                     for key in retained):
                 raise CallDeferred('유지보수 평가 원문의 대상별 귀속 분리가 필요합니다.')
             finding['plan_ids'] = retained
+            retained_findings.append(finding)
             report_changed = True
         if report_changed:
+            report['findings'] = retained_findings
             changes['full_assessment_result'] = validate_saved_assessment_result(
                 json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
                 inventory, cycle['full_assessment_source_sha'])
-    if not changes:
+    if not changes and not root_changes:
         return
     if (cycle['publication_stage'] is not None
             or 'legacy_release_identity' in cycle.keys() and cycle['legacy_release_identity'] is not None):
@@ -470,8 +494,18 @@ def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None
             # Catalog adoption and normal cycle completion must consume the
             # confirmed scope before final erasure removes its last identity.
             raise CallDeferred('활성 유지보수 cycle의 정상 종료 전에 마지막 대상 연결을 제거할 수 없습니다.')
-    connection.execute('UPDATE maintenance_cycles SET ' + ', '.join(field + '=?' for field in changes)
-        + ', revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE repo=?', (*changes.values(), repo))
+    for row, retained in root_changes:
+        identity = (repo, row['cycle'], row['source_revision'])
+        if retained:
+            connection.execute('UPDATE tiered_maintenance_root_plan_links SET links_json=? '
+                'WHERE repo=? AND cycle=? AND source_revision=?',
+                (json.dumps(retained, ensure_ascii=False, separators=(',', ':')), *identity))
+        else:
+            connection.execute('DELETE FROM tiered_maintenance_root_plan_links WHERE repo=? AND cycle=? AND source_revision=?', identity)
+    assignments = [field + '=?' for field in changes]
+    assignments.extend(('revision=revision+1', 'updated_at=CURRENT_TIMESTAMP'))
+    connection.execute('UPDATE maintenance_cycles SET ' + ', '.join(assignments) + ' WHERE repo=?',
+                       (*changes.values(), repo))
 
 
 def cycle_for_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> sqlite3.Row | None:

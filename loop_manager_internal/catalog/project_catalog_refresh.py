@@ -194,7 +194,9 @@ class ProjectCatalogRefresh:
         pending_deletion = (self.pinned is not None and self.pinned.regular_paths is not None
             and any(row[0] not in self.pinned.regular_paths for row in self.repository.connection.execute(
                 "SELECT path FROM exec_plans WHERE repo=? AND status<>'MERGED' "
-                "UNION ALL SELECT path FROM execplan_cancellations WHERE repo=?", (self.repo, self.repo),
+                "UNION ALL SELECT path FROM execplan_cancellations WHERE repo=? "
+                "UNION ALL SELECT CASE WHEN json_valid(evidence) THEN json_extract(evidence,'$.path') END "
+                "FROM execplan_catalog_holds WHERE repo=?", (self.repo, self.repo, self.repo),
             )))
         connection = self.repository.connection
         pending_files = (connection.execute(

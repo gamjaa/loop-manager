@@ -233,6 +233,87 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()), independent)
         self.assertEqual(self.cleanup_rowless(text), ())
 
+    def test_pre_registration_hold_finishes_from_published_current_reference_recovery(self):
+        from loop_manager_internal.catalog import execplan_catalog as catalog, deleted_plan_cleanup, remote_deletions
+        from tempfile import TemporaryDirectory
+        text = self.rowless_cancellation()
+        canceled = self.connection.execute('SELECT * FROM execplan_cancellations').fetchone()
+        original = json.loads(canceled['recovery_evidence'])['row']
+        held_evidence = dict(path=original['path'], content_hash=original['content_hash'],
+            deleted_goal=dict(path=original['path'], original_revision='a' * 40, observed_revision='b' * 40,
+                last_observed_revision='c' * 40, text=text, row=original, affected=['G-002'], resolved={},
+                unknown_reason='The pre-registration goal needs semantic confirmation.'))
+        self.connection.execute('DELETE FROM execplan_cancellations')
+        self.connection.execute('INSERT INTO execplan_catalog_holds VALUES (?,?,?,?,NULL)',
+            ('/repo', 'G-001', 'c' * 40, json.dumps(held_evidence)))
+        recovery_text = self.fixture._text('G-002', 'Dependency') + '\n## Decision Log\nDEPENDENCY_RECOVERY: ' + json.dumps(
+            dict(deleted_id='G-001', outcome='obsolete', replacement_ids=[], sources=['docs/PRODUCT.md'],
+                 reason='The obsolete prerequisite goal was withdrawn.')) + '\n'
+        self.connection.execute("UPDATE exec_plans SET status='READY',content_hash=?,path=?,sources=? WHERE plan_id='G-002'",
+            (catalog.plan_content_hash(recovery_text), 'docs/plans/[G-002] Dependency.md', '["docs/PRODUCT.md"]'))
+        self.connection.commit()
+        pinned = SimpleNamespace(regular_paths=set(), revision_sha='c' * 40,
+            snapshot=SimpleNamespace(observed_ids={'G-002'}, all={
+                'G-002': SimpleNamespace(path='docs/plans/[G-002] Dependency.md', text=recovery_text)}, withheld=()))
+        def observe(_repo, *args, **kwargs):
+            self.assertFalse(self.connection.in_transaction)
+            return SimpleNamespace(returncode=int(args[0] == 'rev-parse'), stdout='')
+        with TemporaryDirectory() as state:
+            def run(pr=None):
+                return deleted_plan_cleanup.cleanup(self.connection, '/repo', '/repo', pinned, (), git=observe,
+                    git_bytes=lambda *_: text.encode(), pr_for_branch=pr or (lambda *_: None),
+                    state_dir=state, revision_is_current=lambda: True)
+            before = list(self.connection.iterdump())
+            self.assertEqual(run(), ())  # No semantic decision has been published yet.
+            self.assertEqual(list(self.connection.iterdump()), before)
+            goal = dict(id='G-001', path=original['path'], kind='missing-plan', affected_ids=['G-002'])
+            remote_deletions.resolve_recovery(self.connection,
+                SimpleNamespace(repo='/repo', recovery_goals=(json.dumps(goal),), by_id={'G-002': None}), 'c' * 40, {'G-002'})
+            self.connection.commit()
+            published = list(self.connection.iterdump())
+            self.assertEqual(run(pr=lambda *_: {'state': 'OPEN'}), ())
+            self.assertEqual(list(self.connection.iterdump()), published)
+            def change_dependent(*_args):
+                self.connection.execute("UPDATE exec_plans SET title='concurrent declaration' WHERE plan_id='G-002'")
+                self.connection.commit()
+            self.assertEqual(run(pr=change_dependent), ())
+            self.assertEqual(self.connection.execute("SELECT title FROM exec_plans WHERE plan_id='G-002'").fetchone()[0],
+                             'concurrent declaration')
+            self.assertIsNone(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone())
+            self.connection.execute("UPDATE exec_plans SET title='Dependency' WHERE plan_id='G-002'")
+            self.connection.commit()
+            # A post-publication declaration race invalidates the exact approval.
+            self.connection.execute("UPDATE exec_plans SET content_hash='changed' WHERE plan_id='G-002'")
+            self.connection.commit()
+            changed = list(self.connection.iterdump())
+            self.assertEqual(run(), ())
+            self.assertEqual(list(self.connection.iterdump()), changed)
+            self.connection.execute("UPDATE exec_plans SET content_hash=? WHERE plan_id='G-002'",
+                                    (catalog.plan_content_hash(recovery_text),))
+            self.connection.commit()
+            import hashlib
+            from pathlib import Path
+            copies = [Path(state) / 'worktrees' / hashlib.sha256(b'/repo').hexdigest()[:16] / folder / 'G-001'
+                      for folder in ('document-revisions', 'document-assessments')]
+            for root in copies:
+                leaf = root / ('a' * 40)
+                leaf.mkdir(parents=True)
+                (leaf / 'saved-document.md').write_text('dedicated document copy')
+            before_copies = list(self.connection.iterdump())
+            self.assertEqual(run(), ())
+            self.assertEqual(list(self.connection.iterdump()), before_copies)
+            for root in copies:
+                leaf = root / ('a' * 40)
+                self.assertEqual((leaf / 'saved-document.md').read_text(), 'dedicated document copy')
+                (leaf / 'saved-document.md').unlink()
+                leaf.rmdir()
+            self.assertEqual(run(), ('G-001',))
+            self.assertTrue(all(not root.exists() for root in copies))
+            self.assertIsNone(self.connection.execute("SELECT * FROM execplan_catalog_holds WHERE plan_id='G-001'").fetchone())
+            self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+            self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
+            self.assertEqual(run(), ())
+
     def test_rowless_cancellation_keeps_legacy_resource_and_checkpoint_uncertainty(self):
         from unittest import mock
         text = self.rowless_cancellation()
@@ -981,6 +1062,60 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM tiered_maintenance_root_plan_links')], retained)
         self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
 
+    def test_completed_cycle_prunes_only_historical_target_root_links(self):
+        import sqlite3
+        from loop_manager_internal.maintenance import tiered_review
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        tiered_review.ensure_schema(self.connection)
+        MaintenanceRepository(self.connection)
+        target = dict(path='legacy', destination='src/legacy', root_review_hash='a' * 64,
+            status='new_plan', plan_id='G-001', plan_path='docs/plans/[G-001] Old.md',
+            plan_hash='b' * 64, reason='Preserve the investigated root tree.')
+        independent = {**target, 'path': 'other', 'destination': 'src/other',
+            'plan_id': 'G-002', 'plan_path': 'docs/plans/[G-002] Dependency.md'}
+        self.connection.execute('INSERT INTO maintenance_cycles '
+            '(repo,phase,revision,last_cycle_commit,last_cycle_merged_count) VALUES (?,?,?,?,?)',
+            ('/repo', 'idle', 4, 'c' * 40, 1))
+        for repo, cycle, links in (('/repo', 1, [target, independent]), ('/repo', 2, [target]),
+                                   ('/other', 1, [target])):
+            self.connection.execute('INSERT INTO tiered_maintenance_root_plan_links VALUES (?,?,?,?,?)',
+                (repo, cycle, 'a' * 40, 'b' * 64, json.dumps(links)))
+        self.connection.commit()
+        for field, value in (('phase', 'refactoring'), ('last_cycle_commit', None),
+                ('revision', 2), ('publication_stage', 'prepared'), ('legacy_release_identity', 'release')):
+            with self.subTest(field=field):
+                original = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+                self.connection.execute('UPDATE maintenance_cycles SET ' + field + '=?', (value,))
+                self.connection.commit()
+                before = list(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(list(self.connection.iterdump()), before)
+                self.connection.execute('UPDATE maintenance_cycles SET ' + field + '=?', (original[field],))
+                self.connection.commit()
+        original = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        foreign = dict(self.connection.execute("SELECT * FROM tiered_maintenance_root_plan_links WHERE repo='/other'").fetchone())
+        self.connection.execute("CREATE TRIGGER interrupt_root_erasure BEFORE DELETE ON exec_plans "
+                                "BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        self.connection.commit()
+        before = list(self.connection.iterdump())
+        with self.assertRaises(sqlite3.IntegrityError):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(list(self.connection.iterdump()), before)
+        self.connection.execute('DROP TRIGGER interrupt_root_erasure')
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        links = self.connection.execute("SELECT * FROM tiered_maintenance_root_plan_links WHERE repo='/repo'").fetchall()
+        self.assertEqual(len(links), 1)
+        self.assertEqual((links[0]['cycle'], links[0]['assessment_digest'], json.loads(links[0]['links_json'])),
+                         (1, 'b' * 64, [independent]))
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM tiered_maintenance_root_plan_links WHERE repo='/other'").fetchone()), foreign)
+        current = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.assertEqual(current, {**original, 'revision': 5, 'updated_at': current['updated_at']})
+        before = list(self.connection.iterdump())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(list(self.connection.iterdump()), before)
+
     def test_maintenance_publication_release_or_unattributed_assessment_keeps_erasure_pending(self):
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
         from loop_manager_internal.storage.task_calls import CallDeferred
@@ -1014,6 +1149,9 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.connection.execute('INSERT INTO maintenance_cycles '
             '(repo,phase,refactoring_plan_ids,last_success_commit,last_success_merged_count) '
             "VALUES ('/repo','refactoring','[\"G-001\"]','original-assessment',0)")
+        report = self.assessment_report(('G-001',))
+        self.connection.execute('UPDATE maintenance_cycles SET full_assessment_source_sha=?,full_assessment_result=?',
+                                ('a' * 40, report))
         self.connection.commit()
         text = self.rowless_cancellation()
         before = tuple(self.connection.iterdump())
@@ -1034,6 +1172,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.assertEqual((completed.last_success_commit, completed.last_success_merged_count), ('original-assessment', 0))
         self.assertEqual(self.cleanup_rowless(text), ('G-001',))
         after = store.get('/repo')
+        self.assertEqual(json.loads(after.full_assessment_result), {**json.loads(report), 'findings': []})
         self.assertEqual(after.phase.value, 'idle')
         self.assertEqual(after.refactoring_plan_ids, ())
         self.assertEqual(after.cancelled_scope_plan_ids, ())
@@ -1052,7 +1191,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         return parse_assessment_result('FULL_ASSESSMENT_RESULT: ' + json.dumps(report),
             {'module.py': 'b' * 64}, 'a' * 40, (), set(plan_ids))
 
-    def test_assessment_reference_without_cycle_membership_keeps_erasure_pending(self):
+    def test_unconfirmed_assessment_without_cycle_membership_keeps_erasure_pending(self):
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
         from loop_manager_internal.storage.task_calls import CallDeferred
         MaintenanceRepository(self.connection)
@@ -1060,10 +1199,6 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             '(repo,full_assessment_source_sha,full_assessment_result) VALUES (?,?,?)',
             ('/repo', 'a' * 40, self.assessment_report(('G-001',))))
         self.connection.commit()
-        before = tuple(self.connection.iterdump())
-        with self.assertRaisesRegex(CallDeferred, '대상별 귀속 분리'):
-            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
-        self.assertEqual(tuple(self.connection.iterdump()), before)
         for result, source in (('broken', 'a' * 40), ('{}', 'a' * 40),
                 (self.assessment_report(('G-002',)), 'c' * 40),
                 (self.assessment_report(('G-002',)), None)):
@@ -1075,6 +1210,35 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 with self.assertRaises(CallDeferred):
                     deleted_plan_state.forget(self.connection, '/repo', 'G-001')
                 self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_exclusive_assessment_finding_is_erased_without_resolving_independent_findings(self):
+        import sqlite3
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        MaintenanceRepository(self.connection)
+        report = json.loads(self.assessment_report(('G-001',)))
+        independent = {**report['findings'][0], 'id': 'independent-issue', 'plan_ids': ['G-002']}
+        report['findings'].append(independent)
+        self.connection.execute('INSERT INTO maintenance_cycles '
+            '(repo,phase,revision,last_success_commit,last_success_merged_count,full_assessment_source_sha,full_assessment_result) '
+            'VALUES (?,?,?,?,?,?,?)', ('/repo', 'idle', 7, 'old-success', 2, 'a' * 40, json.dumps(report)))
+        self.connection.commit()
+        original = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.connection.execute("CREATE TRIGGER interrupt_assessment_erasure BEFORE DELETE ON exec_plans "
+                                "BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        self.connection.commit()
+        before = list(self.connection.iterdump())
+        with self.assertRaises(sqlite3.IntegrityError):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(list(self.connection.iterdump()), before)
+        self.connection.execute('DROP TRIGGER interrupt_assessment_erasure')
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        current = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.assertEqual(json.loads(current['full_assessment_result']), {**report, 'findings': [independent]})
+        self.assertEqual(current, {**original, 'full_assessment_result': current['full_assessment_result'],
+            'revision': 8, 'updated_at': current['updated_at']})
+        before = list(self.connection.iterdump())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(list(self.connection.iterdump()), before)
 
     def test_unrelated_valid_assessment_is_preserved_during_membership_erasure(self):
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository

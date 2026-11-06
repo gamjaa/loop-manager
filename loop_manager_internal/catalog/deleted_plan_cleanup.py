@@ -334,6 +334,61 @@ def _rowless_cancellations(connection, repo, state_dir):
         yield saved, dict(canceled)
 
 
+def _rowless_holds(connection, repo, pinned):
+    """Reuse published reference recovery to retire never-registered holds."""
+    from loop_manager_internal.storage.execplan_catalog_state import verified_historical_merge_ids
+    historical = verified_historical_merge_ids(connection, repo)
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for held in connection.execute('SELECT * FROM execplan_catalog_holds WHERE repo=?', (repo,)).fetchall():
+        key = held['plan_id']
+        if key in historical or held['resume_status'] is not None or any(
+                connection.execute('SELECT 1 FROM ' + table + ' WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
+                for table in ('exec_plans', 'execplan_cancellations', 'agent_invocations',
+                              'execution_checkpoints', 'blocked_checkpoints') if table in tables):
+            continue
+        try:
+            evidence = json.loads(held['evidence'])
+            goal = evidence['deleted_goal']
+            original = goal['row']
+            path, text = goal['path'], goal['text']
+            plan = catalog.parse_execplan_text(path, text, validate_sources=False)
+            revision, deletion = goal['original_revision'], goal['observed_revision']
+            if (plan['id'] != key or original['plan_id'] != key or original['path'] != path
+                    or evidence['path'] != path or original['plan_sha'] != revision
+                    or original['current_revision_sha'] != revision
+                    or original['content_hash'] != catalog.plan_content_hash(text)
+                    or evidence['content_hash'] != original['content_hash']
+                    or not all(re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', item) for item in (revision, deletion))
+                    or plan['title'] != original['title'] or plan['sources'] != json.loads(original['sources'])
+                    or plan['depends_on'] != json.loads(original['depends_on'])):
+                continue
+            approvals = evidence['resolved_references']
+            if not isinstance(approvals, dict) or not approvals:
+                continue  # Absence alone never proves the held goal was withdrawn.
+            dependents, approval_revisions = [], []
+            for other, approval in approvals.items():
+                current = connection.execute('SELECT path,content_hash FROM exec_plans WHERE repo=? AND plan_id=?',
+                                             (repo, other)).fetchone()
+                entry = pinned.snapshot.all.get(other)
+                if (not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', approval['revision'])
+                        or current is None or entry is None or current['path'] != approval['path']
+                        or current['content_hash'] != approval['content_hash'] or entry.path != current['path']
+                        or catalog.plan_content_hash(entry.text) != current['content_hash']):
+                    raise ValueError('published recovery declaration changed')
+                # The existing recovery validator/cleanup helper verifies the actual
+                # Decision Log, source, replacement dependencies and current graph.
+                dependents.append(other)
+                approval_revisions.append(approval['revision'])
+            if not isinstance(goal['affected'], list) or set(goal['affected']) - set(approvals):
+                continue
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            continue
+        yield dict(plan_id=key, path=path, sources=original['sources'], branch=None, worktree=None,
+                   pr_url=None, publication_remote_oid=None, plan_sha=revision, current_revision_sha=revision,
+                   content_hash=original['content_hash'], _deletion_revision=deletion,
+                   _withdrawal_dependents=tuple(dependents), _approval_revisions=tuple(approval_revisions)), dict(held)
+
+
 @contextmanager
 def _rowless_ownership(connection, state_dir, repo, row, canceled):
     from loop_manager_internal.runtime.resource_lock import resource_locks
@@ -348,8 +403,20 @@ def _rowless_ownership(connection, state_dir, repo, row, canceled):
         if connection.in_transaction:
             raise CallDeferred('row 없는 삭제 대상의 외부 관측은 DB transaction 밖에서 수행해야 합니다.')
         def check():
-            current = connection.execute('SELECT * FROM execplan_cancellations WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
+            table = 'execplan_cancellations' if 'recovery_evidence' in canceled else 'execplan_catalog_holds'
+            current = connection.execute('SELECT * FROM ' + table + ' WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
             project = connection.execute('SELECT plan_path FROM projects WHERE repo=?', (repo,)).fetchone()
+            if table == 'execplan_catalog_holds':
+                tables = {item[0] for item in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if any(connection.execute('SELECT 1 FROM ' + store + ' WHERE repo=? AND plan_id=?',
+                                          (repo, key)).fetchone() for store in (
+                        'execplan_cancellations', 'agent_invocations', 'execution_checkpoints', 'blocked_checkpoints') if store in tables):
+                    raise CallDeferred('등록 전 hold의 실행·취소 근거가 변경됐습니다.')
+                for other, approval in json.loads(canceled['evidence'])['resolved_references'].items():
+                    dependent = connection.execute('SELECT path,content_hash FROM exec_plans WHERE repo=? AND plan_id=?',
+                                                   (repo, other)).fetchone()
+                    if dependent is None or any(dependent[field] != approval[field] for field in ('path', 'content_hash')):
+                        raise CallDeferred('등록 전 hold의 게시된 참조 복구 선언이 변경됐습니다.')
             if (current is None or dict(current) != canceled
                     or project is not None and _plan_id_from_path(project['plan_path'] or '') == key
                     or connection.execute('SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
@@ -365,7 +432,8 @@ def _rowless_ownership(connection, state_dir, repo, row, canceled):
                     'SELECT 1 FROM execution_checkpoints WHERE repo=? AND plan_id=? AND operation IS NOT NULL', (repo, key)).fetchone():
                 raise CallDeferred('row 없는 삭제 대상의 미확정 Git operation이 남아 있습니다.')
             try:
-                _state, owned = work_claims.manual_plan_ownership(connection, repo, key, row)
+                _state, owned = work_claims.manual_plan_ownership(connection, repo, key,
+                    row if table == 'execplan_cancellations' else None)
                 ids, paths = work_claims.publication_claims(connection, repo)
                 if owned or key in ids or {row['path'], *json.loads(row['sources'])} & paths:
                     raise CallDeferred('row 없는 삭제 대상의 수동·게시 소유권이 남아 있습니다.')
@@ -384,7 +452,9 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
     deleted = []
     rows = [(row, None) for row in connection.execute("SELECT * FROM exec_plans WHERE repo=? AND status!='MERGED' AND agent_role IS NULL", (repo,)).fetchall()]
     rows.extend(_rowless_cancellations(connection, repo, state_dir))
+    rows.extend(_rowless_holds(connection, repo, pinned))
     for row, canceled in rows:
+        row = dict(row)
         key, path = row['plan_id'], row['path']
         if path in pinned.regular_paths or key in pinned.snapshot.observed_ids:
             continue
@@ -393,7 +463,10 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
             continue
         if git(repo_path, 'merge-base', '--is-ancestor', revision, pinned.revision_sha, check=False).returncode:
             continue
-        if canceled is not None and git(repo_path, 'merge-base', '--is-ancestor', canceled['deletion_commit'], pinned.revision_sha, check=False).returncode:
+        if canceled is not None and git(repo_path, 'merge-base', '--is-ancestor', canceled.get('deletion_commit', row.get('_deletion_revision')), pinned.revision_sha, check=False).returncode:
+            continue
+        if any(git(repo_path, 'merge-base', '--is-ancestor', approved, pinned.revision_sha, check=False).returncode
+               for approved in row.get('_approval_revisions', ())):
             continue
         contents = git_bytes(repo_path, 'show', f'{revision}:{path}')
         if catalog.plan_content_hash(contents) != row['content_hash']:
@@ -403,7 +476,9 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
         for held_key, held_path, _hash in pinned.snapshot.withheld:
             text = git_bytes(repo_path, 'show', f'{pinned.revision_sha}:{held_path}').decode('utf-8')
             documents[held_key] = SimpleNamespace(path=held_path, text=text)
-        resolved = resolved_references(key, references, documents)
+        related = (*references, *(SimpleNamespace(plan_id=other, source=path)
+                    for other in row.get('_withdrawal_dependents', ())))
+        resolved = resolved_references(key, related, documents)
         if resolved is None:
             continue
         if any(key in json.loads(other['depends_on']) and other['plan_id'] not in resolved
@@ -411,12 +486,33 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
             continue
         if row['branch'] and row['branch'] != 'loop-manager/' + key:
             continue
+        related_rows = {other: connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                                                 (repo, other)).fetchone() for other in resolved}
+        if any(record is None for record in related_rows.values()):
+            continue
+        related_rows = {other: dict(record) for other, record in related_rows.items()}
         try:
             lease = (reserved_workspace_ownership(connection, state_dir, repo, key) if canceled is None
                      else _rowless_ownership(connection, state_dir, repo, row, canceled))
             with lease as ownership:
+                def check_ownership():
+                    ownership.check()
+                    for other, expected in related_rows.items():
+                        current = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, other)).fetchone()
+                        if current is None or dict(current) != expected:
+                            raise CallDeferred('삭제 대상의 참조 복구 row가 관측 중 변경됐습니다.')
                 if not revision_is_current():
                     continue
+                # stage_documents owns these exact per-task namespaces. A saved
+                # document worktree must not lose its DB cleanup evidence first.
+                managed = Path(state_dir).resolve() / 'worktrees' / hashlib.sha256(repo.encode()).hexdigest()[:16]
+                document_roots = [managed / folder / key for folder in ('document-revisions', 'document-assessments')]
+                try:
+                    if any(any(parent.is_symlink() for parent in (root, *root.parents) if parent != Path(state_dir).resolve())
+                            or root.exists() and (not root.is_dir() or any(root.iterdir())) for root in document_roots):
+                        continue
+                except OSError as error:
+                    raise CallDeferred('전용 문서 사본의 현재 정리 상태를 확인할 수 없습니다.') from error
                 if canceled is not None:
                     canonical = 'loop-manager/' + key
                     try:
@@ -437,7 +533,7 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                 if pr is not None and (pr.get('state') != 'CLOSED' or pr.get('mergedAt')
                         or pr.get('headRefName') != row['branch']):
                     continue
-                ownership.check()
+                check_ownership()
                 if canceled is None and dict(connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()) != dict(row):
                     continue
                 from loop_manager_internal.git.manager_git_journal import has_pending_project_mutation
@@ -467,7 +563,7 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                         if (git(workspace, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()
                                 != git(repo_path, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()):
                             continue
-                        ownership.check()
+                        check_ownership()
                         if assess_cleanup is None or remove_cleanup_worktree is None:
                             continue
                         head = pr.get('headRefOid') if pr else row['publication_remote_oid']
@@ -482,14 +578,20 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                     ref = f"refs/heads/{row['branch']}"
                     local = git(repo_path, 'rev-parse', '--verify', ref, check=False)
                     if local.returncode == 0:
-                        ownership.check()
+                        check_ownership()
                         git(repo_path, 'update-ref', '-d', ref, local.stdout.strip())
                 if not revision_is_current():
                     continue
-                ownership.check()
+                check_ownership()
+                for root in document_roots:
+                    if root.exists():
+                        try:
+                            root.rmdir()  # Empty native namespace only; no recursive worktree deletion.
+                        except OSError as error:
+                            raise CallDeferred('전용 문서 사본의 정리가 아직 끝나지 않았습니다.') from error
                 artifacts = artifact_paths(connection, repo, row, state_dir)
                 with runtime_state._transaction(connection):
-                    ownership.check()
+                    check_ownership()
                     for other, dependencies in resolved.items():
                         connection.execute('UPDATE exec_plans SET depends_on=? WHERE repo=? AND plan_id=?',
                                            (json.dumps(dependencies, ensure_ascii=False, separators=(',', ':')), repo, other))
