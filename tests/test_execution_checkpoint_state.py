@@ -1020,6 +1020,62 @@ class CancelledCheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(MaintenanceStateError, '실제 Merge'):
             store.finish_cycle('repo', expected=current, source_sha='a' * 40)
 
+    def test_mixed_cycle_keeps_cancelled_scope_holds_and_requires_surviving_merge(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        from loop_manager_internal.maintenance import cycle_service, maintenance_orchestration
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO exec_plans(repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+            "VALUES ('repo','G-999','other.md','Other','[]','[]','normal','other','READY')")
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,refactoring_plan_ids) "
+            "VALUES ('repo','refactoring','[\"G-047\",\"G-999\"]')")
+        self.connection.commit()
+        self.cancel()
+        current = store.get('repo')
+        self.assertEqual(current.refactoring_plan_ids, ('G-999',))
+        self.assertEqual(current.cancelled_scope_plan_ids, ('G-047',))
+        effects = cycle_service.AdvanceMaintenanceCycleAfterMergesEffects(
+            maintenance_orchestration.all_cycle_plans_merged, maintenance_orchestration.cycle_plan_status_error)
+        source = 'a' * 40
+        self.connection.execute('INSERT INTO execplan_catalog_revisions(repo,revision_sha,catalog_fingerprint) '
+            'VALUES (?,?,?) ON CONFLICT(repo) DO UPDATE SET revision_sha=excluded.revision_sha', ('repo', source, 'confirmed'))
+        self.connection.commit()
+        self.assertEqual(cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source), current)
+        with self.assertRaisesRegex(MaintenanceStateError, '실제 Merge'):
+            store.finish_cycle('repo', expected=current, source_sha=source)
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-999'")
+        self.connection.execute('INSERT INTO execplan_catalog_holds(repo,plan_id,revision_sha,evidence) VALUES (?,?,?,?)',
+                                ('repo', 'G-047', source, '{}'))
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source), current)
+        with self.assertRaisesRegex(MaintenanceStateError, 'catalog 보류'):
+            store.finish_cycle('repo', expected=current, source_sha=source)
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE plan_id='G-047'")
+        self.connection.commit()
+        completed = cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source)
+        self.assertEqual(completed.phase.value, 'idle')
+        self.assertEqual(completed.last_cycle_merged_count, 1)
+        self.assertIsNotNone(self.connection.execute("SELECT 1 FROM execplan_cancellations WHERE plan_id='G-047'").fetchone())
+
+    def test_cancelled_cycle_with_conflicting_live_row_preserves_all_state(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,refactoring_plan_ids) VALUES ('repo','refactoring','[\"G-047\"]')")
+        self.connection.commit()
+        self.cancel()
+        current = store.get('repo')
+        # Model a legacy runtime that wrote a row without the registration gate.
+        self.connection.execute("INSERT INTO exec_plans(repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+            "VALUES ('repo','G-047','old.md','Old','[]','[]','normal','old','READY')")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaisesRegex(MaintenanceStateError, '현재 실행 row'):
+            store.get('repo')
+        with self.assertRaisesRegex(MaintenanceStateError, '현재 실행 row'):
+            store.finish_cycle('repo', expected=current, source_sha='a' * 40)
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
     def test_cancelled_document_snapshots_do_not_replay_after_repository_restart(self):
         import json
         from types import SimpleNamespace

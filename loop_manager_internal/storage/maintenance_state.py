@@ -570,8 +570,9 @@ class MaintenanceRepository:
         cancelled_plan_ids = collect_cancelled_ids(self.connection, repo)
         original_roots = set().union(*(_decode_plan_ids(row[field], field) for field in (
             'prerequisite_plan_ids', 'refactoring_plan_ids', 'assessment_plan_ids')))
-        cancelled_scope = (tuple(sorted(original_roots, key=_plan_sort_key))
-            if original_roots and original_roots <= cancelled_plan_ids and not original_roots & known_plan_ids else ())
+        if original_roots & cancelled_plan_ids & known_plan_ids:
+            raise MaintenanceStateError('유지보수 취소 범위에 현재 실행 row가 남아 있습니다.')
+        cancelled_scope = tuple(sorted(original_roots & cancelled_plan_ids, key=_plan_sort_key))
 
         def stored_plan_ids(field: str) -> tuple[str, ...]:
             plan_ids = _decode_plan_ids(row[field], field)

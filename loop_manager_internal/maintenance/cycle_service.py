@@ -76,7 +76,7 @@ def _advance_maintenance_cycle_after_merges(
     }) and cycle.publication_stage in (None, "remote_confirmed"):
         scope = cycle_scope_plan_ids(rows, cycle)
         if (not catalog_held_plan_ids(connection, repo).intersection((*scope, *cycle.cancelled_scope_plan_ids))
-                and (cycle.cancelled_scope_plan_ids or effects.all_cycle_plans_merged(rows, scope))):
+                and ((not scope and cycle.cancelled_scope_plan_ids) or effects.all_cycle_plans_merged(rows, scope))):
             return repository.finish_cycle(repo, expected=cycle, source_sha=base_sha)
         if legacy_prerequisites:
             # A hold delays confirmed work; it must not reopen its assessment.
