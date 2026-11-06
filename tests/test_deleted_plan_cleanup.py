@@ -142,7 +142,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual(list(self.connection.iterdump()), before)
 
-    def rowless_cancellation(self, *, started=False, empty_checkpoint=False):
+    def rowless_cancellation(self, *, started=False, empty_checkpoint=False, blocked=False):
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         from loop_manager_internal.planning.planning_catalog import PlanDeletion
@@ -159,6 +159,8 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             self.connection.execute("UPDATE exec_plans SET ever_started=1,retry_count=2,worker_session_id='old-session',"
                 "worker_result='saved result',verify_result='saved failure',last_error='historical failure',"
                 "verify_failure_history='{}' WHERE plan_id='G-001'")
+        if blocked:
+            self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED',blocked_reason='saved block' WHERE plan_id='G-001'")
         self.connection.commit()
         row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
         plan = ReadyPlanSnapshot('G-001', row['path'], row['title'], tuple(json.loads(row['sources'])), (),
@@ -387,6 +389,47 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.assertIsNone(self.connection.execute("SELECT 1 FROM agent_invocations WHERE invocation_id='old-call'").fetchone())
         self.assertIsNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE plan_id='G-001'").fetchone())
         self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
+
+    def test_resource_free_blocked_audit_erases_only_after_call_handoff_and_termination(self):
+        text = self.rowless_cancellation(started=True, blocked=True)
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertEqual(audit['row']['status'], 'PLAN_BLOCKED')
+        self.assertEqual(audit['row']['blocked_reason'], 'saved block')
+        self.artifact_call('blocked-call', '/repo', 'G-001')
+        self.connection.execute("UPDATE agent_invocations SET finished_at=NULL WHERE invocation_id='blocked-call'")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("UPDATE agent_invocations SET finished_at='collected',execution_finish_evidence=NULL WHERE invocation_id='blocked-call'")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("UPDATE agent_invocations SET execution_finish_evidence='provider_process_finished' WHERE invocation_id='blocked-call'")
+        self.connection.execute("CREATE TRIGGER reject_blocked_rowless_resurrection BEFORE INSERT ON exec_plans "
+            "WHEN NEW.plan_id='G-001' BEGIN SELECT RAISE(ABORT,'execution resurrection'); END")
+        self.connection.commit()
+        self.assertEqual(self.cleanup_rowless(text), ('G-001',))
+        for table in ('exec_plans', 'execplan_cancellations', 'agent_invocations'):
+            self.assertIsNone(self.connection.execute(f"SELECT 1 FROM {table} WHERE plan_id='G-001'").fetchone())
+        self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
+
+    def test_blocked_rowless_audit_does_not_authorize_merged_or_active_stage_cleanup(self):
+        from unittest import mock
+        text = self.rowless_cancellation(started=True, blocked=True)
+        self.artifact_call('blocked-call', '/repo', 'G-001')
+        self.connection.commit()
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        for status in ('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING', 'MERGED'):
+            with self.subTest(status=status):
+                audit['row']['status'] = status
+                self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                git = mock.Mock(side_effect=AssertionError('unconfirmed historical stage'))
+                self.assertEqual(self.cleanup_rowless(text, git=git), ())
+                self.assertEqual(tuple(self.connection.iterdump()), before)
 
     def test_empty_checkpoint_audit_does_not_hold_resource_free_rowless_erasure(self):
         text = self.rowless_cancellation(empty_checkpoint=True)

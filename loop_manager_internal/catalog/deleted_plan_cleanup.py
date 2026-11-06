@@ -214,7 +214,7 @@ def release_reference_holds(connection, repo, key, path, resolved):
 
 
 def _unowned_cancellations(connection, repo):
-    """Read complete READY audits that retain no resource ownership."""
+    """Read complete READY or started PLAN_BLOCKED audits without resource ownership."""
     from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
     if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'").fetchone():
         return
@@ -261,7 +261,8 @@ def _unowned_cancellations(connection, repo):
                     "AND execution_status='executed' AND execution_started_at IS NOT NULL",
                     (repo, canceled['plan_id'])).fetchone():
                 continue  # Missing historical calls cannot prove a started writer's termination.
-            if (not isinstance(saved, dict) or saved['status'] != 'READY'
+            if (not isinstance(saved, dict) or (saved['status'] != 'READY'
+                    and not (started and saved['status'] == 'PLAN_BLOCKED'))
                     or type(saved['ever_started']) is not int or saved['ever_started'] not in (0, 1)
                     or type(saved['workspace_owned']) is not int or saved['workspace_owned'] != 0
                     or type(saved['retry_count']) is not int or saved['retry_count'] < 0
