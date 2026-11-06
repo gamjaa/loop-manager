@@ -485,6 +485,38 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
 
 
 class CancelledCheckpointTests(unittest.TestCase):
+    def test_saved_registration_cannot_restore_cancelled_or_erased_identity(self):
+        from loop_manager_internal.storage import deleted_plan_state, execplan_catalog_state as catalog
+        plan = dict(id='G-047', title='Saved', sources=['docs/PRODUCT.md'], depends_on=[],
+                    priority='normal', complexity='low', risk='low')
+        path = 'docs/plans/[G-047] Saved.md'
+        self.cancel()
+        for marker_only in (False, True):
+            if marker_only:
+                deleted_plan_state.ensure_schema(self.connection)
+                self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+                self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('repo','G-047')")
+                self.connection.commit()
+            before = tuple(self.connection.iterdump())
+            native_check = catalog.is_cancelled
+            def check_locked(connection, repo, plan_id):
+                self.assertTrue(connection.in_transaction)
+                return native_check(connection, repo, plan_id)
+            with mock.patch.object(catalog, 'is_cancelled', side_effect=check_locked):
+                for register, options in ((catalog.register_published_plan_row, {}),
+                        (catalog.insert_published_plan_row, {}),
+                        (catalog.insert_published_plan_row, {'archive_fallback': True}),
+                        (catalog.insert_published_plan_row, {'allow_legacy_priority': True})):
+                    with self.subTest(marker_only=marker_only, register=register.__name__, options=options):
+                        with self.assertRaisesRegex(RuntimeError, '재등록할 수 없습니다'):
+                            register(self.connection, 'repo', path, plan, 'hash', 'saved-revision', **options)
+                        self.assertEqual(tuple(self.connection.iterdump()), before)
+                        self.connection.rollback()
+        self.connection.execute("INSERT INTO projects(repo,base_branch) VALUES ('other-repo','main')")
+        catalog.register_published_plan_row(self.connection, 'other-repo', path, plan, 'hash', 'revision')
+        catalog.register_published_plan_row(self.connection, 'other-repo', path, plan, 'hash', 'revision')
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM exec_plans WHERE repo='other-repo'").fetchone()[0], 1)
+
     def test_cancelled_identity_set_reads_available_tables_without_schema_changes(self):
         from loop_manager_internal.storage.execplan_catalog_state import cancelled_plan_ids
         with sqlite3.connect(':memory:') as connection:
@@ -499,6 +531,25 @@ class CancelledCheckpointTests(unittest.TestCase):
                 self.assertEqual(cancelled_plan_ids(connection, 'repo'),
                     frozenset({'G-001'} if table == 'deleted_plan_ids' else {'G-001', 'G-002'}))
                 self.assertEqual(connection.execute('SELECT * FROM sqlite_master').fetchall(), before)
+
+    def test_saved_mixed_registration_rolls_back_independent_row_and_planning_state(self):
+        from pathlib import Path
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.storage import database
+        self.cancel()
+        before = tuple(self.connection.iterdump())
+        plans = [(f'docs/plans/[{key}] Saved.md', dict(id=key, title='Saved', sources=['docs/PRODUCT.md'],
+                  depends_on=[], priority='normal', complexity='low', risk='low')) for key in ('G-999', 'G-047')]
+        rows = planner_publication.RegisterExecplanRowsEffects(
+            _ensure_execplans_schema=database._ensure_execplans_schema,
+            file_hash=lambda _path: 'hash', git=mock.Mock(), git_bytes=lambda *_args: b'saved')
+        effects = planner_publication.RegisterExecplansEffects(
+            _prepare_execplan_rows=lambda *args: planner_publication._prepare_execplan_rows(rows, *args),
+            _register_execplan_rows=lambda *args, **kwargs: planner_publication._register_execplan_rows(rows, *args, **kwargs))
+        with self.assertRaisesRegex(RuntimeError, '재등록할 수 없습니다'):
+            planner_publication.register_execplans(effects, self.connection, 'repo', Path('/saved'),
+                                                  plans, 'old-revision', 'old-fingerprint')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
 
     def test_local_recovery_requests_cannot_resume_cancelled_or_erased_identity(self):
         from loop_manager_internal.storage import local_recovery_state, deleted_plan_state

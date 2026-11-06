@@ -565,6 +565,10 @@ def insert_published_plan_row(
 ) -> None:
     """Register validated publication metadata without reading a worktree."""
 
+    if not connection.in_transaction:
+        connection.execute('BEGIN IMMEDIATE')
+    if is_cancelled(connection, repo, str(plan['id'])):
+        raise RuntimeError(f"취소되거나 최종 삭제된 ExecPlan은 재등록할 수 없습니다: {plan['id']}")
     if not archive_fallback and not allow_legacy_priority:
         from . import verify_input_requests
         verify_input_requests.validate_new_priority(plan.get("sources", ()), plan.get("priority"))
@@ -1971,6 +1975,10 @@ def register_published_plan_row(
 ) -> None:
     """Apply a validated publication row without committing the caller event."""
     plan_id = str(plan["id"])
+    if not connection.in_transaction:
+        connection.execute('BEGIN IMMEDIATE')
+    if is_cancelled(connection, repo, plan_id):
+        raise RuntimeError(f"취소되거나 최종 삭제된 ExecPlan은 재등록할 수 없습니다: {plan_id}")
     sources, dependencies, priority = serialize_plan_metadata(plan)
     initial_level = worker_level(plan)
     historical = connection.execute(
