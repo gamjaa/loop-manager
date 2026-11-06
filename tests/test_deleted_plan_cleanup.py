@@ -9,6 +9,77 @@ from tests.support.catalog import catalog_reconciliation_fixture
 
 
 class DeletedPlanCleanupTest(unittest.TestCase):
+    def test_live_common_correction_link_requires_same_goal_successor_before_erasure(self):
+        from loop_manager_internal.storage import validation_feedback_state
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        validation_feedback_state.ensure_schema(self.connection)
+        self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED' WHERE plan_id='G-002'")
+        self.connection.execute("INSERT INTO validation_results "
+            "(id,repo,plan_id,stage,classification,raw_output,identities,created_at) "
+            "VALUES (1,'/repo','G-002','verify','failed','independent failure','[]','now')")
+        self.connection.execute("INSERT INTO common_defect_reports VALUES (1,'{}',NULL)")
+        self.connection.execute("INSERT INTO common_defect_links "
+            "(repo,result_id,goal_key,correction_plan_id,reviewed_revision,confirmed_revision,evidence) "
+            "VALUES ('/repo',1,'goal','G-001','old','first','{}')")
+        self.connection.execute("INSERT INTO common_defect_merges "
+            "(repo,plan_id,pr_url,head,merge_oid,verification) VALUES ('/other','G-001','pr','head','merged','proof')")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaises(CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("INSERT INTO exec_plans "
+            "(repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+            "VALUES ('/repo','G-003','new.md','Replacement','[]','[]','normal','hash','READY')")
+        for goal, revision in (('different-goal', 'second'), ('goal', 'third')):
+            self.connection.execute("INSERT INTO common_defect_links "
+                "(repo,result_id,goal_key,correction_plan_id,reviewed_revision,confirmed_revision,evidence) "
+                "VALUES ('/repo',1,?,'G-003','new',?,'{}')", (goal, revision))
+            self.connection.commit()
+            if goal == 'different-goal':
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        tables = ('validation_results', 'common_defect_reports', 'common_defect_merges')
+        preserved = {table: [dict(row) for row in self.connection.execute(f'SELECT * FROM {table}')] for table in tables}
+        successors = [dict(row) for row in self.connection.execute("SELECT * FROM common_defect_links WHERE correction_plan_id='G-003'")]
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        for table in tables:
+            self.assertEqual([dict(row) for row in self.connection.execute(f'SELECT * FROM {table}')], preserved[table])
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM common_defect_links')], successors)
+
+    def test_common_correction_merge_receipt_protects_history_without_execution_row(self):
+        from loop_manager_internal.storage import common_defect_state
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        common_defect_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO common_defect_merges "
+            "(repo,plan_id,pr_url,head,merge_oid,verification) VALUES ('/repo','G-001','pr','head','merged','proof')")
+        self.connection.execute("DELETE FROM exec_plans WHERE plan_id='G-001'")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaises(CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_common_correction_link_with_missing_or_foreign_report_keeps_erasure_pending(self):
+        from loop_manager_internal.storage import validation_feedback_state
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        validation_feedback_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO common_defect_links "
+            "(repo,result_id,goal_key,correction_plan_id,reviewed_revision,confirmed_revision,evidence) "
+            "VALUES ('/repo',1,'goal','G-001','old','first','{}')")
+        self.connection.commit()
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign):
+                if foreign:
+                    self.connection.execute("INSERT INTO validation_results "
+                        "(id,repo,plan_id,stage,classification,raw_output,identities,created_at) "
+                        "VALUES (1,'/other','G-002','verify','failed','foreign failure','[]','now')")
+                    self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+
     def test_notification_erasure_removes_incident_versions_with_foreign_keys_and_preserves_independent_audit(self):
         import sqlite3
         from loop_manager_internal.notifications import notifications
@@ -400,6 +471,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         import sqlite3
         from loop_manager_internal.storage import validation_feedback_state
         validation_feedback_state.ensure_schema(self.connection)
+        self.connection.execute("UPDATE exec_plans SET status='READY' WHERE plan_id='G-002'")
         for key in ('G-001', 'G-002'):
             self.connection.execute('''INSERT INTO validation_results
                 (repo,plan_id,stage,classification,raw_output,identities,created_at)
@@ -410,6 +482,14 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.connection.execute("DELETE FROM validation_results WHERE plan_id='G-001'")
         self.connection.rollback()
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        before = tuple(self.connection.iterdump())
+        with self.assertRaises(CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        # The independent correction has now actually completed; its own audit stays.
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-002'")
+        self.connection.commit()
         deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual([r[0] for r in self.connection.execute('SELECT plan_id FROM validation_results')], ['G-002'])
         self.assertEqual(self.connection.execute('SELECT count(*) FROM common_defect_reports').fetchone()[0], 0)

@@ -1511,7 +1511,11 @@ Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현�
 
 ### 공통 결함 보고의 감사 보존
 
-`ValidationFeedbackRepository`는 결과 감사와 공통 결함 관측을 같은 transaction에 추가한다. `common_defect_reports.result_id`는 불변 `validation_results`를 참조하며 프로젝트·작업·명세 revision·단계·원래 판정과 정제된 원문을 연결한다. 보고와 결과의 수정·삭제는 거부한다. 이후 verify 성공으로 활성 피드백이 해소돼도 과거 보고는 유지한다.
+`ValidationFeedbackRepository`는 결과 감사와 공통 결함 관측을 같은 transaction에 추가한다. `common_defect_reports.result_id`는 불변 `validation_results`를 참조하며 프로젝트·작업·명세 revision·단계·원래 판정과 정제된 원문을 연결한다. 일반 실행에서 보고와 결과의 수정·삭제는 거부한다. 이후 verify 성공으로 활성 피드백이 해소돼도 과거 보고는 유지한다. 확인된 작업 철회의 최종 기록 제거는 아래 공유 관계 보호와 기존 원자 제거 transaction을 통과한 경우의 별도 예외다.
+
+최종 제거는 불변 감사 trigger를 해제하기 전에 `common_defect_state.assert_plan_erasure_available`로 공유 연결을 대조한다. 현재 연결은 기존 소비자와 같이 `(repo, result_id, goal_key)`별 마지막 채택 row로 판단하며, 같은 결과의 다른 목표에 새 연결이 있다는 이유로 대체됐다고 보지 않는다. 삭제 대상이 보고 소유자이거나 교정 작업인 양쪽 관계에서, 미완료·미취소 독립 작업이 현재 연결을 필요로 하면 `CallDeferred`로 해당 삭제를 보류한다. 같은 목표의 후속 채택 연결·독립 작업의 실제 MERGED 상태/교정 Merge 영수증·취소 표식을 확인한 뒤 더 이상 필요한 연결을 잃지 않는 범위만 제거한다. 원본 결과 부재·repository 불일치는 귀속 미확인으로 보존한다.
+
+삭제 대상 자체의 `common_defect_merges` 영수증은 실행 row가 없어도 최종 제거를 거부한다. 이 보호는 단순 Worker 완료나 PR close를 Merge로 취급하지 않는다. 공유 관계 확인은 같은 SQLite 제거 transaction의 읽기 전용 경계에서 수행하며, 허용 뒤 기존 대상별 결과·보고·연결의 제거와 trigger 복원만 진행한다. 독립 원본 결과·현재 후속 연결·다른 repository의 Merge 근거는 변경하거나 삭제 대상의 새 사본으로 복제하지 않는다.
 
 선택적 `COMMON_DEFECT_REPORT:` JSON은 `problem`, `scope`, `evidence`, `locations`만 받는다. 앞의 세 필드는 비어 있지 않은 2,000자 이하 문자열이고 `locations`는 1~8개의 `{path, line}` 객체다. `path`는 traversal·빈 구성 요소·역슬래시·콜론·줄바꿈·탭이 없는 저장소 상대 경로이며 `line`은 1~2,147,483,647의 정수다. 전체 JSON은 UTF-8 12,000바이트 이하이며 중복 선언·중복 key·추가 필드·잘못된 타입은 거부한다. 기존 결과 포맷 정규화와 비밀값 정제를 재사용하며 거부 시 원본 결과와 비밀값을 포함하지 않는 형식 오류를 함께 보존한다. 선택적 보고 오류로 기존 verify·Review 판정을 변경하지 않는다.
 

@@ -7,6 +7,42 @@ import sqlite3
 import re
 
 
+def assert_plan_erasure_available(connection: sqlite3.Connection, repo: str, plan_id: str) -> None:
+    """Keep live independent correction evidence until its own relation is resolved."""
+    from .task_calls import CallDeferred
+    from .execplan_catalog_state import is_cancelled
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'common_defect_merges' in tables and connection.execute(
+        'SELECT 1 FROM common_defect_merges WHERE repo=? AND plan_id=?', (repo, plan_id),
+    ).fetchone():
+        raise CallDeferred('확인된 공통 교정 Merge 근거는 삭제할 수 없습니다.')
+    if 'common_defect_links' not in tables:
+        return
+    if 'validation_results' not in tables:
+        raise CallDeferred('공통 결함 연결의 원본 저장소를 확인할 수 없습니다.')
+    for link in connection.execute(
+        'SELECT l.*,r.repo AS report_repo,r.plan_id AS report_plan FROM common_defect_links l '
+        'LEFT JOIN validation_results r ON r.id=l.result_id '
+        'WHERE (l.repo=? AND l.correction_plan_id=?) OR (r.repo=? AND r.plan_id=?)',
+        (repo, plan_id, repo, plan_id),
+    ).fetchall():
+        if link['report_repo'] != link['repo']:
+            raise CallDeferred('공통 결함 연결의 repository 귀속을 확인할 수 없습니다.')
+        if connection.execute('SELECT 1 FROM common_defect_links WHERE repo=? AND result_id=? AND goal_key=? AND id>?',
+                              (repo, link['result_id'], link['goal_key'], link['id'])).fetchone():
+            continue  # An adopted successor owns this result/goal now.
+        independent = link['report_plan'] if link['correction_plan_id'] == plan_id else link['correction_plan_id']
+        if independent == plan_id or is_cancelled(connection, repo, independent):
+            continue
+        row = connection.execute('SELECT status FROM exec_plans WHERE repo=? AND plan_id=?', (repo, independent)).fetchone()
+        merged = row is not None and row['status'] == 'MERGED'
+        if not merged and 'common_defect_merges' in tables:
+            merged = connection.execute('SELECT 1 FROM common_defect_merges WHERE repo=? AND plan_id=?',
+                                        (repo, independent)).fetchone() is not None
+        if not merged:
+            raise CallDeferred('독립 작업의 공통 결함 근거가 삭제 대상 연결을 아직 필요로 합니다.')
+
+
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute("""CREATE TABLE IF NOT EXISTS common_defect_links (
         id INTEGER PRIMARY KEY, repo TEXT NOT NULL,
