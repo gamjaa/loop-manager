@@ -55,10 +55,17 @@ def document_resources(snapshot, state_dir, repo, plan_id):
         for prior in history:
             read(prior, historical=True)
 
-    if not isinstance(snapshot, dict):
-        raise ValueError('unknown checkpoint snapshot')
-    for field in ('document_revision', 'retired_document_assessment'):
-        read(snapshot.get(field))
+    def read_snapshot(item):
+        if not isinstance(item, dict):
+            raise ValueError('unknown checkpoint snapshot')
+        for field in ('document_revision', 'retired_document_assessment'):
+            read(item.get(field))
+        history = item.get('rebase_operation_history', [])
+        if not isinstance(history, list):
+            raise ValueError('unknown operation history')
+        for previous in history:
+            read_snapshot(previous)
+    read_snapshot(snapshot)
     return roots, resources
 
 

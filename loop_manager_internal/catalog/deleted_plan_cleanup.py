@@ -314,6 +314,22 @@ def retired_baseline_refs(row, repo):
         raise CallDeferred('baseline의 저장 자원 귀속을 확인할 수 없습니다.') from error
 
 
+def retired_integration_baselines(snapshot, row, repo):
+    """Inventory native preservation refs in current and historical integrations."""
+    refs = []
+    for field in ('base_rebase_restart', 'work_branch_integration'):
+        frames = [*snapshot.get(field + '_history', []), *([snapshot[field]] if snapshot.get(field) else [])]
+        for frame in frames:
+            for item in (frame, *([frame['restart']] if 'restart' in frame else [])):
+                if item.get('baseline') is not None:
+                    source = item.get('snapshot', item.get('before'))
+                    refs.extend(retired_baseline_refs({**row, 'agent_baseline': item['baseline'],
+                                                       'agent_snapshot': source}, repo))
+    for previous in snapshot.get('rebase_operation_history', []):
+        refs.extend(retired_integration_baselines(previous, row, repo))
+    return tuple(dict.fromkeys(refs))
+
+
 def _rowless_cancellations(connection, repo, state_dir):
     """Read complete audits whose saved resources can be proved absent now."""
     from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
@@ -364,6 +380,7 @@ def _rowless_cancellations(connection, repo, state_dir):
                 allowed_statuses.add('PLAN_BLOCKED')
             if retired_workspace:
                 allowed_statuses.update(('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'))
+            integration_refs = ()
             checkpoints = audit.get('checkpoints')
             if checkpoints is not None and not isinstance(checkpoints, dict):
                 continue
@@ -399,6 +416,7 @@ def _rowless_cancellations(connection, repo, state_dir):
                 from loop_manager_internal.storage.execution_checkpoint_state import cancelled_snapshot_without_new_resources
                 if not cancelled_snapshot_without_new_resources(snapshot, repo, canceled['plan_id'], saved):
                     continue
+                integration_refs = retired_integration_baselines(snapshot, saved, repo)
                 deleted_document_cleanup.document_resources(snapshot, state_dir, repo, canceled['plan_id'])
             judgment = audit.get('judgment')
             decision = judgment.get('decision') if isinstance(judgment, dict) else None
@@ -439,7 +457,7 @@ def _rowless_cancellations(connection, repo, state_dir):
                 continue
         except (KeyError, TypeError, ValueError, RuntimeError):
             continue
-        yield saved, dict(canceled)
+        yield {**saved, '_retired_baseline_refs': integration_refs}, dict(canceled)
 
 
 def _rowless_holds(connection, repo, pinned):
@@ -625,7 +643,16 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
         related_rows = {other: dict(record) for other, record in related_rows.items()}
         try:
             diagnostics = deleted_diagnostic_state.capture(connection, repo, key)
-            baselines = retired_baseline_refs(row, repo)
+            extra_baselines = row.get('_retired_baseline_refs', ())
+            if canceled is None and connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_checkpoints'").fetchone():
+                checkpoint = connection.execute('SELECT snapshot FROM execution_checkpoints WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
+                if checkpoint is not None:
+                    try:
+                        extra_baselines = retired_integration_baselines(json.loads(checkpoint['snapshot'] or '{}'), row, repo)
+                    except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, RecursionError) as error:
+                        raise CallDeferred('과거 통합의 baseline 소유권을 확인할 수 없습니다.') from error
+            baselines = tuple(dict.fromkeys((*retired_baseline_refs(row, repo), *extra_baselines)))
             diagnostic_resources = ['diagnostic:' + ref for ref in diagnostics['refs']] + ['git:' + ref for ref in baselines]
             diagnostic_resources += [prefix + path for path in diagnostics['worktrees'] for prefix in ('worktree:', 'git:')]
             diagnostic_resources = [resource for resource in diagnostic_resources if not resource_owned(Path(state_dir), repo, resource)]

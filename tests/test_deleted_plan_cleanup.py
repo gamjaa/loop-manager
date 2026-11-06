@@ -145,7 +145,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
 
     def rowless_cancellation(self, *, started=False, empty_checkpoint=False, blocked=False,
                              empty_blocked_checkpoint=False, resolved_blocked_checkpoint=False,
-                             requested_blocked_checkpoint=False, native_block=False, checkpoint_snapshot=None, owned_workspace=None, published_blocked=False):
+                             requested_blocked_checkpoint=False, native_block=False, checkpoint_snapshot=None, owned_workspace=None, published_blocked=False, checkpoint_builder=None):
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         from loop_manager_internal.planning.planning_catalog import PlanDeletion
@@ -202,6 +202,8 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             ExecutionCheckpointRepository(self.connection).record('/repo', 'G-001', expected_generation=0,
                 operation=None, expected_head=None, target_base_oid=None, observed_remote_oid=None,
                 snapshot=checkpoint_snapshot if checkpoint_snapshot is not None else {})
+        if checkpoint_builder is not None:
+            checkpoint_builder()
         if empty_blocked_checkpoint or resolved_blocked_checkpoint or requested_blocked_checkpoint:
             from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
             checkpoints = BlockedCheckpointRepository(self.connection)
@@ -568,7 +570,10 @@ class DeletedPlanCleanupTest(unittest.TestCase):
     def test_active_document_copy_cleanup_reuses_native_assessment_and_resumes_after_physical_removal(self):
         self.document_copy_cleanup(active=True)
 
-    def document_copy_cleanup(self, *, active):
+    def test_nested_rebase_history_document_copy_uses_same_native_cleanup_and_recovery(self):
+        self.document_copy_cleanup(active=False, historical=True)
+
+    def document_copy_cleanup(self, *, active, historical=False):
         from tempfile import TemporaryDirectory
         from pathlib import Path
         import hashlib
@@ -582,6 +587,8 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             (workspace / 'proposal.md').write_text('only this task document proposal')
             snapshot = dict(document_revision=dict(version=1, base='a' * 40, stage='prepared', phase='IMPLEMENTING',
                 scope='execplan', document_only=True, workspace=str(workspace), commit='b' * 40))
+            if historical:
+                snapshot = {'rebase_operation_history': [snapshot]}
             text = self.rowless_cancellation(started=True, empty_checkpoint=True, checkpoint_snapshot=snapshot)
             if active:
                 audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
@@ -732,6 +739,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 superseded=[dict(base='d' * 40, workspace=str(managed / 'document-revisions' / 'G-001' / ('d' * 40)), commit='e' * 40)])
             roots, paths = document_resources({'retired_document_assessment': item}, directory, '/repo', 'G-001')
             self.assertEqual(paths, {str(workspace): 'c' * 40, str(roots[0] / ('d' * 40)): 'e' * 40})
+            self.assertEqual(document_resources({'rebase_operation_history': [{'retired_document_assessment': item}]}, directory, '/repo', 'G-001'), (roots, paths))
             for invalid in ({**item, 'version': 2}, {**item, 'planner_generation': 3},
                     {**item, 'planner_scope': {**item['planner_scope'], 'role': 'worker'}},
                     {**item, 'planner_scope': {**item['planner_scope'], 'before': '[]'}},
@@ -1024,6 +1032,130 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             self.assertEqual(run(), ('G-001',))
             self.assertIsNone(self.connection.execute("SELECT * FROM execplan_archive_observations WHERE scope='git:old'").fetchone())
             self.assertIsNone(self.connection.execute("SELECT * FROM execplan_cancellations WHERE plan_id='G-001'").fetchone())
+            self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
+            self.assertEqual(run(), ())
+
+    def test_retired_native_rebase_publications_and_history_erase_without_replaying_tokens(self):
+        import copy
+        import sqlite3
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from dataclasses import replace
+        from loop_manager_internal.catalog.deleted_plan_cleanup import cleanup
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from tests.support.rebase_observations import expectation, observation, decision_for
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            workspace = state / 'worktrees' / 'repo-key' / 'G-001'
+            def build():
+                checkpoints = ExecutionCheckpointRepository(self.connection)
+                for head in ('c' * 40, 'd' * 40):
+                    current = checkpoints.get('/repo', 'G-001')
+                    expected = expectation(repo='/repo', plan_id='G-001', plan_path='docs/plans/[G-001] Gone.md',
+                        branch='loop-manager/G-001', worktree=str(workspace), generation=current.generation,
+                        target_base_oid='a' * 40)
+                    expected = replace(expected, remote=replace(expected.remote, branch=expected.branch,
+                        oid=current.observed_remote_oid or 'b' * 40))
+                    accepted = decision_for(expected, observation(expected, head=head, branch_ref=(head, ''),
+                        registration=('HEAD=' + head, 'branch=refs/heads/' + expected.branch))).acceptance
+                    saved = checkpoints.accept_current_rebase('/repo', 'G-001', acceptance=accepted,
+                        prior_artifacts=dict(version=1, repo='/repo', plan_id='G-001', branch=expected.branch,
+                                             worktree=str(workspace), worker_result='old result'))
+                    pending = checkpoints.begin_rebase_publication('/repo', 'G-001', expected_generation=saved.generation,
+                                                                  acceptance=accepted, remote_before=expected.remote.oid)
+                    after = replace(expected, generation=pending.generation, remote=replace(expected.remote, oid=head))
+                    result = decision_for(after, observation(after, head=head, branch_ref=(head, ''),
+                        registration=('HEAD=' + head, 'branch=refs/heads/' + after.branch))).acceptance
+                    saved = checkpoints.finish_rebase_publication('/repo', 'G-001',
+                        intent=pending.snapshot['rebase_publication_intent'], acceptance=result)
+                # The engine retains the previous snapshot separately when a
+                # new rebase begins. No execution success is inferred from it.
+                from loop_manager_internal.agents.scope_contracts import GitSnapshot
+                import hashlib
+                scope = GitSnapshot('f' * 40, 'refs/heads/loop-manager/G-001', {}, {}, {}, {}, {}, {}).serialize()
+                baseline_id = hashlib.sha256(('f' * 40 + '\0' + 'a' * 40 + '\0' + 'b' * 40).encode()).hexdigest()
+                baseline_ref = 'refs/loop-manager/baselines/' + hashlib.sha256(b'/repo').hexdigest()[:16] + '/' + baseline_id
+                baseline = json.dumps(dict(version=1, ref=baseline_ref, ref_target='e' * 40,
+                    index_tree='a' * 40, worktree_tree='b' * 40))
+                preserved = dict(remote='d' * 40, original_head='f' * 40, snapshot=scope,
+                                 baseline=baseline, phase='complete')
+                origin = dict(version=1, repo='/repo', plan_id='G-001', branch='loop-manager/G-001',
+                    worktree=str(workspace), pr_url=None, pr_head_oid=None, worker_result='historical source')
+                origin_id = hashlib.sha256(json.dumps(origin, sort_keys=True, ensure_ascii=False,
+                                                       separators=(',', ':')).encode()).hexdigest()
+                snapshot = {**saved.snapshot,
+                    'stage_result_origins': {origin_id: dict(evidence=origin, reason='rebase_start')},
+                    'rebase_operation_history': [{**copy.deepcopy(saved.snapshot), 'rebase_stage_origin': origin_id}],
+                    'integration_repo': '/repo', 'base_rebase_restart': preserved,
+                    'base_rebase_restart_history': [{**preserved, 'phase': 'preserving'}]}
+                checkpoints.record('/repo', 'G-001', expected_generation=saved.generation, operation=None,
+                    expected_head=saved.expected_head, target_base_oid=saved.target_base_oid,
+                    observed_remote_oid=saved.observed_remote_oid, snapshot=snapshot)
+                self.connection.commit()
+            text = self.rowless_cancellation(started=True, empty_checkpoint=True, owned_workspace=workspace,
+                                             checkpoint_builder=build)
+            self.artifact_call('retired-rebase', '/repo', 'G-001')
+            self.connection.commit()
+            original = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+            snapshot = json.loads(original['checkpoints']['execution_checkpoints']['snapshot'])
+            self.assertEqual(len(snapshot['rebase_publication_history']), 1)
+            pinned = SimpleNamespace(regular_paths=set(), revision_sha='e' * 40,
+                snapshot=SimpleNamespace(observed_ids={'G-002'}, all={}, withheld=()))
+            observations = []
+            baseline_present = False
+            def git(_repo, *args, **kwargs):
+                observations.append(args)
+                self.assertFalse(self.connection.in_transaction)
+                return SimpleNamespace(returncode=int(args[0] == 'rev-parse' and not baseline_present), stdout='')
+            def run():
+                return cleanup(self.connection, '/repo', '/repo', pinned, (), git=git,
+                    git_bytes=lambda *_: text.encode(), pr_for_branch=lambda *_: None,
+                    state_dir=state, revision_is_current=lambda: True)
+            before = tuple(self.connection.iterdump())
+            baseline_present = True
+            self.assertEqual(run(), ())
+            self.assertTrue(any(args[0] == 'rev-parse' and args[-1].startswith('refs/loop-manager/baselines/') for args in observations))
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            baseline_present = False
+            for change in ('foreign', 'intent', 'result', 'nested', 'baseline', 'origin'):
+                invalid = copy.deepcopy(snapshot)
+                if change == 'foreign':
+                    acceptance = invalid['current_rebase_acceptance']
+                    acceptance['worktree'] = '/independent'
+                    from loop_manager_internal.git.managed_rebase_validation import fingerprint
+                    acceptance['id'] = fingerprint({key: value for key, value in acceptance.items() if key != 'id'})
+                elif change == 'intent':
+                    invalid['rebase_publication_intent']['id'] = 'forged'
+                elif change == 'result':
+                    invalid['rebase_publication_result']['intent_id'] = 'other-request'
+                elif change == 'baseline':
+                    invalid['base_rebase_restart']['baseline'] = '{}'
+                elif change == 'origin':
+                    invalid['stage_result_origins'] = {}
+                else:
+                    invalid['rebase_operation_history'][0]['unknown_resource'] = '/independent'
+                audit = copy.deepcopy(original)
+                audit['checkpoints']['execution_checkpoints']['snapshot'] = json.dumps(invalid)
+                self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                observations.clear()
+                self.assertEqual(run(), ())
+                self.assertEqual(observations, [])
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+            self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(original),))
+            self.connection.execute("CREATE TRIGGER interrupt_retired_rebase BEFORE DELETE ON agent_invocations "
+                                    "BEGIN SELECT RAISE(ABORT,'retain rebase history'); END")
+            self.connection.commit()
+            before = tuple(self.connection.iterdump())
+            with self.assertRaisesRegex(sqlite3.IntegrityError, 'retain rebase history'):
+                run()
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            self.connection.execute('DROP TRIGGER interrupt_retired_rebase')
+            self.connection.commit()
+            self.assertEqual(run(), ('G-001',))
+            self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+            self.assertIsNone(self.connection.execute('SELECT * FROM agent_invocations').fetchone())
             self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
             self.assertEqual(run(), ())
 
