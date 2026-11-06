@@ -114,14 +114,17 @@ def _independent_artifact(path, owner, references):
                for stored, other in references)
 
 
+def _managed_artifact_path(path, state_dir):
+    root, candidate = Path(state_dir).resolve(), path.resolve()
+    return any(candidate.is_relative_to(root / folder) and candidate != root / folder
+               for folder in ('agent-runtime', 'logs'))
+
+
 def remove_pending_files(connection, repo, state_dir):
-    root = Path(state_dir).resolve()
     pending = set()
     for row in connection.execute('SELECT plan_id,path FROM deleted_plan_files WHERE repo=?', (repo,)).fetchall():
         path = Path(row['path'])
-        allowed = any(path.resolve().is_relative_to(root / folder) and path.resolve() != root / folder
-                      for folder in ('agent-runtime', 'logs'))
-        if not allowed or path.is_symlink():
+        if not _managed_artifact_path(path, state_dir) or path.is_symlink():
             raise ValueError('삭제할 작업 산출물 경로가 관리 범위 밖입니다.')
         # ponytail: O(queued paths * owners) keeps each destructive step fresh.
         # Index exact path/owner relations if queues grow; retain this recheck.
@@ -162,7 +165,7 @@ def artifact_paths(connection, repo, row, state_dir):
             raise CallDeferred('호출 산출물의 symlink 소유권을 확인할 수 없습니다.')
         receipt = source.resolve()
         shared = _independent_artifact(receipt.parent, owner, references)
-        if not shared:
+        if not shared and _managed_artifact_path(receipt.parent, state_dir):
             paths.append(receipt.parent)
         elif receipt.name.endswith('.process.json'):
             paths.extend((receipt, receipt.with_name(receipt.name.removesuffix('.process.json'))))
@@ -178,6 +181,8 @@ def artifact_paths(connection, repo, row, state_dir):
                 paths.append(path)
     if any(path.is_symlink() or _independent_artifact(path, owner, references) for path in paths):
         raise CallDeferred('독립 작업이 참조하는 공유 산출물은 제거할 수 없습니다.')
+    if any(not _managed_artifact_path(path, state_dir) for path in paths):
+        raise CallDeferred('삭제 산출물의 관리 경로를 확인할 수 없어 작업 기록을 보존합니다.')
     return tuple(dict.fromkeys(paths))
 
 

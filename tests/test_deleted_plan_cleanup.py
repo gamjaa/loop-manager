@@ -504,6 +504,45 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             self.assertEqual(remove_pending_files(self.connection, '/repo', state), set())
             self.assertFalse(log.exists())
 
+    def test_unmanaged_receipt_preserves_call_and_cancellation_before_final_erasure(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        text = self.rowless_cancellation()
+        with TemporaryDirectory() as directory:
+            receipt = Path(directory) / 'external.process.json'
+            receipt.write_text('external process evidence')
+            self.artifact_call('external-call', '/repo', 'G-001', receipt)
+            self.connection.commit()
+            before = tuple(self.connection.iterdump())
+            self.assertEqual(self.cleanup_rowless(text), ())
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            self.assertEqual(receipt.read_text(), 'external process evidence')
+            self.assertIsNone(self.connection.execute('SELECT 1 FROM deleted_plan_ids').fetchone())
+            self.assertIsNone(self.connection.execute('SELECT 1 FROM deleted_plan_files').fetchone())
+
+    def test_receipt_at_managed_root_queues_only_owned_pair_and_preserves_siblings(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from loop_manager_internal.catalog.deleted_plan_cleanup import artifact_paths, remove_pending_files
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            root = state / 'agent-runtime'
+            root.mkdir()
+            receipt, attempt, independent = (root / name for name in ('target.process.json', 'target', 'independent'))
+            for path in (receipt, attempt, independent):
+                path.write_text(path.name)
+            self.artifact_call('root-call', '/repo', 'G-001', receipt)
+            self.connection.commit()
+            paths = artifact_paths(self.connection, '/repo', dict(plan_id='G-001', worktree=None), state)
+            self.assertEqual(paths, (receipt, attempt))
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001', artifacts=paths)
+            self.assertEqual(remove_pending_files(self.connection, '/repo', state), set())
+            self.assertFalse(receipt.exists())
+            self.assertFalse(attempt.exists())
+            self.assertEqual(independent.read_text(), 'independent')
+            self.assertTrue(root.is_dir())
+            self.assertIsNone(self.connection.execute('SELECT 1 FROM deleted_plan_files').fetchone())
+
     def test_unattributed_cancellation_preserves_logs_but_allows_independent_runtime_cleanup(self):
         from pathlib import Path
         from tempfile import TemporaryDirectory
