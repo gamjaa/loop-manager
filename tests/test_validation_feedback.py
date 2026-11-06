@@ -29,6 +29,30 @@ class ValidationFeedbackTests(unittest.TestCase):
         self.assertNotIn('private-value', summary)
         self.assertNotIn('x' * 201, summary)
 
+    def test_reminder_summarizes_unnamed_diagnostics_and_keeps_markers(self):
+        first_line = 'API_KEY=private-value ' + 'diagnostic detail ' * 20
+        rows = [
+            dict(identity='verify:truncated', occurrence=1, revision=2,
+                 diagnostic=first_line + '\n' + '[diagnostic truncated]'),
+            dict(identity='verify:omitted', occurrence=1, revision=2,
+                 diagnostic='useful first line\n[3 recognizable failures omitted]'),
+            dict(identity='verify:marker-only', occurrence=1, revision=2,
+                 diagnostic='[diagnostic truncated]\n[3 recognizable failures omitted]'),
+        ]
+        summary = render_reminders(rows)
+        truncated = summary.split('verify:truncated', 1)[1].split('verify:omitted', 1)[0]
+        omitted = summary.split('verify:omitted', 1)[1].split('verify:marker-only', 1)[0]
+        marker_only = summary.split('verify:marker-only', 1)[1]
+        self.assertIn('diagnostic detail', truncated)
+        self.assertIn('[diagnostic truncated]', truncated)
+        self.assertIn('useful first line', omitted)
+        self.assertIn('[3 recognizable failures omitted]', omitted)
+        self.assertNotIn('diagnostic detail', marker_only)
+        self.assertEqual(marker_only.count('[diagnostic truncated]'), 1)
+        self.assertEqual(marker_only.count('[3 recognizable failures omitted]'), 1)
+        self.assertNotIn('private-value', summary)
+        self.assertLessEqual(len(truncated.splitlines()[1]), 200)
+
     def test_worker_initial_and_resumed_prompts_require_whole_plan_completion(self):
         for options in ({}, {'session_resume': True}, {'session_recovery': True}):
             with self.subTest(options=options):

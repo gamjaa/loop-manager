@@ -293,11 +293,13 @@ def render_reminders(rows) -> str:
     lines = []
     for row in rows:
         diagnostic = str(row['diagnostic']).splitlines()
-        names = [line for line in diagnostic
-                 if line.startswith('FAILED:') or line == _TRUNCATED
-                 or line.endswith('recognizable failures omitted]')]
+        names = [line for line in diagnostic if line.startswith('FAILED:')]
+        markers = [line for line in diagnostic
+                   if line == _TRUNCATED or line.endswith('recognizable failures omitted]')]
         summary = '\n'.join(names) if names else next(
-            (line[:200] for line in diagnostic if line.strip()), '')
+            (line.strip()[:200] for line in diagnostic if line.strip()
+             and line not in markers), '')
+        summary = '\n'.join(part for part in (summary, *markers) if part)
         lines.append(f"{row['identity']} occurrence={row['occurrence']} "
                      f"revision={row['revision']}\n{summary}")
     return redact_secrets('\n\n'.join(lines))
