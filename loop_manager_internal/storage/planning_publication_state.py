@@ -291,15 +291,14 @@ def apply_mutable_catalog_changes(
         from .maintenance_state import cycle_for_plan
         cycle = cycle_for_plan(connection, repo, original.plan_id)
         maintenance_audit = dict(cycle) if cycle is not None else None
-        if preserved or deletion.judgment or checkpoint_audit or maintenance_audit:
-            audit = preserved or {"text": original.text, "row": json.loads(original.execution_state or "{}"),
-                                  "affected": [], "resolved": {}, "judgment": deletion.judgment}
-            if checkpoint_audit:
-                audit["checkpoints"] = checkpoint_audit
-            if maintenance_audit:
-                audit['maintenance_cycle'] = maintenance_audit
-            connection.execute("UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",
-                               (json.dumps(audit, ensure_ascii=False, sort_keys=True), repo, original.plan_id))
+        audit = preserved or {"text": original.text, "row": dict(row),
+                              "affected": [], "resolved": {}, "judgment": deletion.judgment}
+        if checkpoint_audit:
+            audit["checkpoints"] = checkpoint_audit
+        if maintenance_audit:
+            audit['maintenance_cycle'] = maintenance_audit
+        connection.execute("UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",
+                           (json.dumps(audit, ensure_ascii=False, sort_keys=True), repo, original.plan_id))
         project = connection.execute("SELECT phase, plan_path FROM projects WHERE repo=?", (repo,)).fetchone()
         if project and project["plan_path"] == original.path and project["phase"] != "PLANNING":
             from .runtime_state import RuntimeStateRepository

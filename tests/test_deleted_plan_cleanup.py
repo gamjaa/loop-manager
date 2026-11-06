@@ -9,6 +9,119 @@ from tests.support.catalog import catalog_reconciliation_fixture
 
 
 class DeletedPlanCleanupTest(unittest.TestCase):
+    def rowless_cancellation(self):
+        from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes, _MUTABLE_READY_EVIDENCE_FIELDS
+        from loop_manager_internal.storage.runtime_state import _transaction
+        text = self.fixture._text('G-001', 'Gone')
+        self.connection.execute('UPDATE exec_plans SET ' + ','.join(field + '=NULL' for field in _MUTABLE_READY_EVIDENCE_FIELDS)
+            + ",status='READY',ever_started=0,workspace_owned=0,retry_count=0,pr_conflict_recovery=0 WHERE plan_id='G-001'")
+        self.connection.execute('UPDATE projects SET phase=NULL,plan_path=NULL,branch=NULL,worktree=NULL,worker_session_id=NULL,pr_url=NULL')
+        self.connection.execute("UPDATE exec_plans SET path='docs/plans/[G-001] Gone.md',title='Gone',"
+            "priority='normal',content_hash=?,plan_sha=?,current_revision_sha=? WHERE plan_id='G-001'",
+            (plan_content_hash(text), 'a' * 40, 'a' * 40))
+        self.connection.commit()
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
+        plan = ReadyPlanSnapshot('G-001', row['path'], row['title'], tuple(json.loads(row['sources'])), (),
+            'low', 'low', row['priority'], row['content_hash'], 'a' * 40, text,
+            current_complexity=row['current_complexity'], current_risk=row['current_risk'], current_metadata_recorded=True)
+        with _transaction(self.connection):
+            apply_mutable_catalog_changes(self.connection, '/repo', deletions=(PlanDeletion(plan),), revisions=(),
+                snapshot_token='saved', plan_commit='b' * 40, content_hash=lambda _: '', agent=False)
+        audit = json.loads(self.connection.execute("SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0])
+        self.assertEqual(audit['row'], dict(row))
+        self.assertEqual(audit['text'], text)
+        return text
+
+    def cleanup_rowless(self, text, *, git=None, pr=None, current=lambda: True):
+        from tempfile import TemporaryDirectory
+        from unittest import mock
+        from loop_manager_internal.catalog.deleted_plan_cleanup import cleanup
+        pinned = SimpleNamespace(regular_paths=set(), revision_sha='c' * 40,
+            snapshot=SimpleNamespace(observed_ids={'G-002'}, all={}, withheld=()))
+        def observe(_repo, *args, **kwargs):
+            self.assertFalse(self.connection.in_transaction)
+            return SimpleNamespace(returncode=1 if args[0] == 'rev-parse' else 0, stdout='')
+        with TemporaryDirectory() as state:
+            return cleanup(self.connection, '/repo', '/repo', pinned, (), git=git or observe,
+                git_bytes=lambda *_: text.encode(), pr_for_branch=pr or mock.Mock(return_value=None),
+                state_dir=state, revision_is_current=current)
+
+    def test_complete_unstarted_cancellation_can_finish_without_recreating_execution_row(self):
+        text = self.rowless_cancellation()
+        self.connection.execute("CREATE TRIGGER reject_rowless_resurrection BEFORE INSERT ON exec_plans "
+            "WHEN NEW.plan_id='G-001' BEGIN SELECT RAISE(ABORT,'execution resurrection'); END")
+        self.connection.commit()
+        independent = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone())
+        self.assertEqual(self.cleanup_rowless(text), ('G-001',))
+        self.assertIsNone(self.connection.execute("SELECT * FROM execplan_cancellations WHERE plan_id='G-001'").fetchone())
+        self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()), independent)
+        self.assertEqual(self.cleanup_rowless(text), ())
+
+    def test_rowless_cancellation_keeps_legacy_resource_and_checkpoint_uncertainty(self):
+        from unittest import mock
+        text = self.rowless_cancellation()
+        original = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        for audit in ({'text': text, 'row': {}},
+                      {**original, 'row': {**original['row'], 'branch': 'owned'}},
+                      {**original, 'checkpoints': {'execution_checkpoints': {'snapshot': 'saved'}}},
+                      {**original, 'row': {**original['row'], 'retry_count': 1}},
+                      {**original, 'row': {**original['row'], 'ever_started': 1}}):
+            with self.subTest(audit=audit):
+                self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                git = mock.Mock(side_effect=AssertionError('uncertain audit must not authorize external cleanup'))
+                self.assertEqual(self.cleanup_rowless(text, git=git), ())
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(original),))
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        ExecutionCheckpointRepository(self.connection)
+        self.connection.execute("INSERT INTO execution_checkpoints (repo,plan_id,generation,operation) VALUES ('/repo','G-001',1,'rebase')")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_rowless_remote_and_audit_races_preserve_cancellation(self):
+        from unittest import mock
+        text = self.rowless_cancellation()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text, current=lambda: False), ())
+        self.assertEqual(self.cleanup_rowless(text + '\nchanged'), ())
+        self.assertEqual(self.cleanup_rowless(text, pr=mock.Mock(return_value={'state': 'OPEN'})), ())
+        self.assertEqual(self.cleanup_rowless(text, pr=mock.Mock(side_effect=RuntimeError('query unavailable'))), ())
+        def changed_history(_repo, *args, **kwargs):
+            return SimpleNamespace(returncode=int(args[0] == 'merge-base' and args[2] == 'b' * 40), stdout='')
+        self.assertEqual(self.cleanup_rowless(text, git=changed_history), ())
+        def remote_present(_repo, *args, **kwargs):
+            return SimpleNamespace(returncode=1 if args[0] == 'rev-parse' else 0,
+                                   stdout='owned-ref' if args[0] == 'ls-remote' else '')
+        self.assertEqual(self.cleanup_rowless(text, git=remote_present), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        for name, value in (('manual_plan_ownership', ('manual', True)),
+                            ('publication_claims', (frozenset({'G-001'}), frozenset()))):
+            with mock.patch('loop_manager_internal.storage.work_claims.' + name, return_value=value):
+                self.assertEqual(self.cleanup_rowless(text), ())
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("UPDATE projects SET plan_path='docs/plans/[G-001] Old.md'")
+        self.connection.commit()
+        projected = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), projected)
+        self.connection.execute('UPDATE projects SET plan_path=NULL')
+        self.connection.commit()
+        def replace_audit(*_args):
+            self.connection.execute("UPDATE execplan_cancellations SET recovery_evidence='{}'")
+            self.connection.commit()
+        self.assertEqual(self.cleanup_rowless(text, pr=replace_audit), ())
+        self.assertEqual(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0], '{}')
+        self.assertIsNone(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone())
+
     def artifact_call(self, identity, repo, plan_id, receipt=None):
         self.connection.execute('INSERT INTO agent_invocations '
             '(invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at,finished_at,'

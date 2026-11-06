@@ -6,6 +6,8 @@ import hashlib
 import shutil
 from types import SimpleNamespace
 from pathlib import Path
+from contextlib import contextmanager
+import re
 
 from . import execplan_catalog as catalog
 from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
@@ -187,6 +189,73 @@ def release_reference_holds(connection, repo, key, path, resolved):
             connection.execute('DELETE FROM execplan_catalog_holds WHERE repo=? AND plan_id=?', (repo, held['plan_id']))
 
 
+def _unowned_cancellations(connection, repo):
+    """Only complete, never-started audit can prove the resource-free rowless case."""
+    from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'").fetchone():
+        return
+    for canceled in connection.execute('SELECT * FROM execplan_cancellations WHERE repo=?', (repo,)).fetchall():
+        if connection.execute('SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?', (repo, canceled['plan_id'])).fetchone():
+            continue
+        try:
+            audit = json.loads(canceled['recovery_evidence'] or '{}')
+            saved = audit['row']
+            if (not isinstance(saved, dict) or saved['status'] != 'READY'
+                    or type(saved['ever_started']) is not int or saved['ever_started'] != 0
+                    or type(saved['workspace_owned']) is not int or saved['workspace_owned'] != 0
+                    or saved['retry_count'] != 0 or saved['pr_conflict_recovery'] != 0
+                    or any(saved[field] != '{}' for field in ('verify_failure_history', 'review_failure_history', 'review_level_history'))
+                    or any(saved[field] is not None for field in _MUTABLE_READY_EVIDENCE_FIELDS)
+                    or audit.get('checkpoints') or audit.get('cleanup_pending')
+                    or any(saved[field] != canceled[field] for field in (
+                        'repo', 'plan_id', 'path', 'title', 'sources', 'depends_on', 'priority', 'content_hash'))
+                    or (saved['current_revision_sha'] or saved['plan_sha']) != canceled['plan_sha']
+                    or not all(re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', canceled[field] or '')
+                               for field in ('plan_sha', 'deletion_commit'))
+                    or catalog.plan_content_hash(audit['text']) != canceled['content_hash']):
+                continue
+            parsed = catalog.parse_execplan_text(saved['path'], audit['text'], validate_sources=False)
+            if (parsed['id'] != saved['plan_id'] or parsed['title'] != saved['title']
+                    or parsed['sources'] != json.loads(saved['sources'])
+                    or parsed['depends_on'] != json.loads(saved['depends_on'])
+                    or any(parsed[field] != canceled[field] for field in ('priority', 'complexity', 'risk'))):
+                continue
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            continue
+        yield saved, dict(canceled)
+
+
+@contextmanager
+def _rowless_ownership(connection, state_dir, repo, row, canceled):
+    from loop_manager_internal.runtime.resource_lock import resource_locks
+    from loop_manager_internal.storage import task_calls, work_claims
+    from loop_manager_internal.maintenance.maintenance_validation import _plan_id_from_path
+    key = row['plan_id']
+    with resource_locks(Path(state_dir), repo, ['plan:' + key], owner='deleted-plan-cleanup'):
+        if connection.in_transaction:
+            raise CallDeferred('row 없는 삭제 대상의 외부 관측은 DB transaction 밖에서 수행해야 합니다.')
+        def check():
+            current = connection.execute('SELECT * FROM execplan_cancellations WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
+            project = connection.execute('SELECT plan_path FROM projects WHERE repo=?', (repo,)).fetchone()
+            if (current is None or dict(current) != canceled
+                    or project is not None and _plan_id_from_path(project['plan_path'] or '') == key
+                    or connection.execute('SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
+                    or task_calls.pending_for_plan(connection, repo, key)):
+                raise CallDeferred('row 없는 삭제 대상의 감사·writer 상태가 변경됐습니다.')
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_checkpoints'").fetchone() and connection.execute(
+                    'SELECT 1 FROM execution_checkpoints WHERE repo=? AND plan_id=? AND operation IS NOT NULL', (repo, key)).fetchone():
+                raise CallDeferred('row 없는 삭제 대상의 미확정 Git operation이 남아 있습니다.')
+            try:
+                _state, owned = work_claims.manual_plan_ownership(connection, repo, key, row)
+                ids, paths = work_claims.publication_claims(connection, repo)
+                if owned or key in ids or {row['path'], *json.loads(row['sources'])} & paths:
+                    raise CallDeferred('row 없는 삭제 대상의 수동·게시 소유권이 남아 있습니다.')
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                raise CallDeferred('row 없는 삭제 대상의 현재 소유권을 확인할 수 없습니다.') from error
+        check()
+        yield SimpleNamespace(check=check)
+
+
 def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, pr_for_branch, state_dir, revision_is_current,
             assess_cleanup=None, remove_cleanup_worktree=None):
     """Observe outside the DB writer; recheck under task resource leases before erasure."""
@@ -194,8 +263,9 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
     if pinned.regular_paths is None or pr_for_branch is None:
         return ()
     deleted = []
-    rows = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND status!='MERGED' AND agent_role IS NULL", (repo,)).fetchall()
-    for row in rows:
+    rows = [(row, None) for row in connection.execute("SELECT * FROM exec_plans WHERE repo=? AND status!='MERGED' AND agent_role IS NULL", (repo,)).fetchall()]
+    rows.extend(_unowned_cancellations(connection, repo))
+    for row, canceled in rows:
         key, path = row['plan_id'], row['path']
         if path in pinned.regular_paths or key in pinned.snapshot.observed_ids:
             continue
@@ -203,6 +273,8 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
         if not revision:
             continue
         if git(repo_path, 'merge-base', '--is-ancestor', revision, pinned.revision_sha, check=False).returncode:
+            continue
+        if canceled is not None and git(repo_path, 'merge-base', '--is-ancestor', canceled['deletion_commit'], pinned.revision_sha, check=False).returncode:
             continue
         contents = git_bytes(repo_path, 'show', f'{revision}:{path}')
         if catalog.plan_content_hash(contents) != row['content_hash']:
@@ -221,19 +293,35 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
         if row['branch'] and row['branch'] != 'loop-manager/' + key:
             continue
         try:
-            with reserved_workspace_ownership(connection, state_dir, repo, key) as ownership:
+            lease = (reserved_workspace_ownership(connection, state_dir, repo, key) if canceled is None
+                     else _rowless_ownership(connection, state_dir, repo, row, canceled))
+            with lease as ownership:
                 if not revision_is_current():
                     continue
+                if canceled is not None:
+                    canonical = 'loop-manager/' + key
+                    try:
+                        remote = git(repo_path, 'ls-remote', '--heads', 'origin', 'refs/heads/' + canonical, check=False)
+                        local = git(repo_path, 'rev-parse', '--verify', 'refs/heads/' + canonical, check=False)
+                        pr = pr_for_branch(repo_path, canonical)
+                    except (OSError, RuntimeError) as error:
+                        raise CallDeferred('row 없는 삭제 대상의 실제 PR·ref를 확인할 수 없습니다.') from error
+                    if (pr is not None or remote.returncode or remote.stdout.strip() or local.returncode not in (1, 128)):
+                        continue
                 pr = pr_for_branch(repo_path, row['branch'], row['pr_url']) if row['branch'] else None
                 if row['pr_url'] and (pr is None or pr.get('url') != row['pr_url']):
                     continue
                 if pr is not None and (pr.get('state') != 'CLOSED' or pr.get('mergedAt')
                         or pr.get('headRefName') != row['branch']):
                     continue
-                if dict(connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()) != dict(row):
+                ownership.check()
+                if canceled is None and dict(connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()) != dict(row):
                     continue
                 from loop_manager_internal.git.manager_git_journal import has_pending_project_mutation
                 if has_pending_project_mutation(Path(state_dir), repo, targets={row['worktree'], row['branch']}):
+                    continue
+                if canceled is not None and has_pending_project_mutation(Path(state_dir), repo,
+                        recoverable=lambda intent: intent['owner'] != 'plan:' + key):
                     continue
                 # shortcut: surviving remote refs stay pending until lease-aware deletion is available.
                 if row['branch'] and git(repo_path, 'ls-remote', '--heads', 'origin', f"refs/heads/{row['branch']}").stdout.strip():
@@ -276,13 +364,13 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                 if not revision_is_current():
                     continue
                 ownership.check()
+                artifacts = artifact_paths(connection, repo, row, state_dir)
                 with runtime_state._transaction(connection):
                     ownership.check()
                     for other, dependencies in resolved.items():
                         connection.execute('UPDATE exec_plans SET depends_on=? WHERE repo=? AND plan_id=?',
                                            (json.dumps(dependencies, ensure_ascii=False, separators=(',', ':')), repo, other))
-                    deleted_plan_state.forget(connection, repo, key,
-                        artifacts=artifact_paths(connection, repo, row, state_dir))
+                    deleted_plan_state.forget(connection, repo, key, artifacts=artifacts)
                     release_reference_holds(connection, repo, key, path, resolved)
                 if key not in remove_pending_files(connection, repo, state_dir):
                     deleted.append(key)
