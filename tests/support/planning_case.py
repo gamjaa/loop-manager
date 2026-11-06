@@ -396,6 +396,8 @@ class FakeStatePort:
         return self.recovered_cycle
 
     def record_maintenance_intent(self, *_args, **_kwargs):
+        if self.cycle.publication_stage == 'prepared':
+            return self.cycle
         raise AssertionError("unexpected maintenance publication intent")
 
     def publish_maintenance_batch(self, *_args, **_kwargs):
