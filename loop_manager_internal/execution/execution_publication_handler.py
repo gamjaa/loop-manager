@@ -250,14 +250,14 @@ class PublicationHandler:
                           current.completed_rebase()) else {})},
         )
 
-    def _publication_resume(self):
+    def _publication_resume(self, *, terminal=False):
         return PublicationResume(
             self.ports.pr_for_branch,
             self.ports.live_remote_branch_oid or (
                 lambda repo, branch: manager_git_journal.live_remote_branch_oid(
                     self.ports.git, repo, branch)),
             self.ports.git,
-            self._publication_workspace,
+            self._publication_workspace_identity if terminal else self._publication_workspace,
         )
 
     def _reconcile_terminal_publication(self, context):
@@ -270,9 +270,9 @@ class PublicationHandler:
             )
             if pr is None or str(pr.get('state') or '').upper() not in {'MERGED', 'CLOSED'}:
                 return None
-            # Reuse the live observation boundary, including workspace identity,
-            # candidate tokens and a second head check across the PR query.
-            observed = self._publication_resume().observe(
+            # A terminal PR needs live ownership/HEAD checks, not approval for
+            # another publication. Definition loading follows this recovery.
+            observed = self._publication_resume(terminal=True).observe(
                 self.ports.identity.repo_path, context.worktree, context.branch,
                 self._accepted_remote(context, row), pr_url,
             )
@@ -297,12 +297,19 @@ class PublicationHandler:
                 reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
             )
 
-    def _publication_workspace(self, repo, worktree, branch, expected_oid):
-        row = self.ports._row()
+    def _publication_workspace_identity(self, repo, worktree, branch, expected_oid):
+        self.ports.state.check()
         self.ports.validate_execplan_workspace_identity(
             self.ports.identity.state_dir, self.ports.identity.repo, self.ports.state.plan_id, branch, worktree)
         self.ports.validate_managed_worktree(repo, worktree, branch)
         head = self.ports.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+        if expected_oid is not None and head != expected_oid:
+            raise self.ports.contract.PublicationSafetyError('게시 관측 중 관리 HEAD가 변경됐습니다.')
+        return head
+
+    def _publication_workspace(self, repo, worktree, branch, expected_oid):
+        head = self._publication_workspace_identity(repo, worktree, branch, expected_oid)
+        row = self.ports._row()
         from loop_manager_internal.storage import pre_review
         from loop_manager_internal.execution import preliminary_review
         preliminary = pre_review.current(self.ports.state.connection, self.ports.identity.repo, self.ports.state.plan_id)
@@ -314,8 +321,6 @@ class PublicationHandler:
         from loop_manager_internal.execution import final_review
         if not final_review.publication_valid(self.ports, self.ports._context()):
             raise self.ports.contract.PublicationSafetyError('게시 직전 최종 Review 승인 입력을 확인할 수 없습니다.')
-        if expected_oid is not None and head != expected_oid:
-            raise self.ports.contract.PublicationSafetyError('게시 관측 중 관리 HEAD가 변경됐습니다.')
         if self.ports.snapshot()._definition_snapshot is not None and (
                 row['verify_token'] != self.ports.snapshot()._definition_snapshot.verify_token(
                     str(row['validated_base_sha'] or ''), head,

@@ -108,11 +108,11 @@ class FinalReviewTests(ExecutionFixture, unittest.TestCase):
         planning_review_state.confirm(self.connection, self.repo, self.remote, self.remote)
         self.connection.commit()
 
-    def test_final_pass_rebase_restart_and_publication_keep_original_approval_without_calls(self):
+    def test_final_pass_rebase_checkpoint_reload_and_publication_keep_original_approval_without_calls(self):
         original = self.approved()
         self.rebase()
         self.effects.agent.run_agent.reset_mock()
-        # Reconstruct the consumer from durable checkpoint state as after restart.
+        # Reload the durable checkpoint repository while retaining the prepared definition.
         self.handler.effects = replace(self.effects, checkpoint=ExecutionCheckpointRepository(self.connection))
         self.assertEqual(self.review().kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         saved = final_review.current(self.ports, self.context())
@@ -404,3 +404,95 @@ class FinalReviewTests(ExecutionFixture, unittest.TestCase):
         self.assertEqual(self.state.row()['phase'], 'REVIEWING')
         self.assertIsNone(self.state.row()['review_token'])
         self.effects.agent.run_agent.assert_called_once()
+
+    def terminal_restart(self, state='MERGED'):
+        """Restore persisted approval into a new handler before definition loading."""
+        from loop_manager_internal.execution.execution_state import ExecutionStatePort
+        saved = self.approved()
+        self.state.update_project(self.repo, pr_url='https://example/pr/1',
+            pr_head_oid=self.head, publication_remote_oid=self.head)
+        identity = self.handler._identity
+        effects = replace(self.effects,
+            state=ExecutionStatePort(self.connection, self.repository, self.repo),
+            checkpoint=ExecutionCheckpointRepository(self.connection))
+        fresh = type(self.handler)(effects, **vars(identity))
+        fresh.plan = fresh._cached_plan(self.repository.active_row(self.repo))
+        self.assertIsNone(fresh._snapshot()._definition_snapshot)
+        pr = {'url': 'https://example/pr/1', 'state': state,
+            'headRefName': self.context().branch, 'headRefOid': self.head}
+        effects.publication.pr_for_branch.side_effect = [{**pr, 'state': 'OPEN'}, pr, pr]
+        effects.workspace.live_remote_branch_oid.return_value = None  # Deleted after Merge/Close.
+        effects.publication.reconcile_existing_pull_request.return_value = 0 if state == 'MERGED' else 1
+        # Model a terminal transition after the initial PUBLISHING PR query.
+        self.assertEqual(effects.publication.pr_for_branch(
+            identity.repo_path, self.context().branch, pr['url'])['state'], 'OPEN')
+        effects.agent.run_agent.reset_mock()
+        effects.workspace.validate_managed_worktree.reset_mock()
+        effects.validation.observe_verify_inputs.reset_mock()
+        return fresh, saved, pr
+
+    def test_terminal_pr_after_real_handler_restart_reconciles_persistent_pass_before_definition(self):
+        fresh, saved, pr = self.terminal_restart()
+        result = fresh.guard(fresh._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
+        self.assertIsNone(fresh._snapshot()._definition_snapshot)
+        reconciled = fresh.effects.publication.reconcile_existing_pull_request.call_args.args[-1]
+        self.assertEqual(reconciled, pr)
+        self.assertEqual(fresh.effects.workspace.validate_managed_worktree.call_count, 2)
+        self.assertEqual(fresh.effects.checkpoint.get(self.repo, 'G-047').snapshot['final_review'], saved)
+        fresh.effects.blocking.block_active_execplan.assert_not_called()
+        fresh.effects.revision.reconcile_catalog.assert_not_called()
+        fresh.effects.validation.observe_verify_inputs.assert_not_called()
+        fresh.effects.agent.run_agent.assert_not_called()
+        fresh.effects.publication.push_managed_publication_branch.assert_not_called()
+
+    def test_closed_pr_restart_keeps_existing_reconciliation_outcome_without_definition(self):
+        fresh, _, pr = self.terminal_restart('CLOSED')
+        result = fresh.guard(fresh._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(fresh.effects.publication.reconcile_existing_pull_request.call_args.args[-1], pr)
+        fresh.effects.blocking.block_active_execplan.assert_not_called()
+        fresh.effects.validation.observe_verify_inputs.assert_not_called()
+        self.assertIsNone(fresh._snapshot()._definition_snapshot)
+
+    def test_terminal_pr_restart_rejects_mismatched_pr_head(self):
+        fresh, _, pr = self.terminal_restart()
+        changed = {**pr, 'headRefOid': 'another-candidate'}
+        fresh.effects.publication.pr_for_branch.side_effect = [changed, changed]
+        self.assertEqual(fresh.guard(fresh._context()).kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        fresh.effects.publication.reconcile_existing_pull_request.assert_not_called()
+        fresh.effects.blocking.block_active_execplan.assert_called_once()
+
+    def test_terminal_pr_restart_rejects_head_race_across_pr_query(self):
+        fresh, _, pr = self.terminal_restart()
+        queries = 0
+        def lookup(*_args):
+            nonlocal queries
+            queries += 1
+            if queries == 2:
+                self.head = 'changed-during-terminal-query'
+            return pr
+        fresh.effects.publication.pr_for_branch.side_effect = lookup
+        self.assertEqual(fresh.guard(fresh._context()).kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        fresh.effects.publication.reconcile_existing_pull_request.assert_not_called()
+        fresh.effects.blocking.block_active_execplan.assert_called_once()
+
+    def test_terminal_pr_restart_rechecks_workspace_ownership_after_pr_query(self):
+        fresh, _, _ = self.terminal_restart()
+        fresh.effects.workspace.validate_managed_worktree.side_effect = [
+            None, lm.WorkspaceOwnershipError('ownership changed during terminal query')]
+        self.assertEqual(fresh.guard(fresh._context()).kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        fresh.effects.publication.reconcile_existing_pull_request.assert_not_called()
+        self.assertEqual(fresh.effects.workspace.validate_managed_worktree.call_count, 2)
+        fresh.effects.blocking.block_active_execplan.assert_called_once()
+
+    def test_default_publication_observation_keeps_approval_checks_after_restart(self):
+        fresh, _, _ = self.terminal_restart()
+        fresh._definition_snapshot = self.handler._definition_snapshot
+        self.identity = {**REVIEW_IDENTITY, 'policy': 'new-publication-policy'}
+        context = fresh._context()
+        with self.assertRaisesRegex(lm.PublicationSafetyError, '최종 Review'):
+            fresh._publication_resume().observe(context.repo_path, context.worktree,
+                context.branch, self.head, context.pr_url)
+        fresh.effects.publication.reconcile_existing_pull_request.assert_not_called()
+        fresh.effects.publication.push_managed_publication_branch.assert_not_called()

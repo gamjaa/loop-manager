@@ -126,7 +126,7 @@ priority: high
 | 무관한 base 문서 뒤 원래 성공 재연결 | `test_verify_reuse_then_final_review_and_publication_keep_all_execution_counts_zero`가 실제 verify handler의 재사용 → Review handler → 게시 입력 검사로 이어지며 원래 승인/run ID를 보존한다. Worker/Reviewer Agent 호출·verify 실행은 0이고 targeted 결과도 추가되지 않는다. G-320 Worker 재연결/문서 채택 조건은 현재 `StageResultProvenanceTest` 13개로 소비하며 해당 엔진을 재구현하지 않는다. |
 | 현재 지침·실제 전달/profile·환경·정책 | runtime 전체 원본과 실제 invocation identity를 별도로 비교한다. 동일 원본의 runtime 경로 이동은 재사용하고 Ponytail 변경·역할 변경·실제 호출 policy 불일치는 거부한다. 새 관측 경합 및 handler token 미생성 회귀를 추가했다. root CLI 지침의 별도 gate, 과거 snapshot 복원·인증값 저장·native probe는 없다. |
 | 원래 최종 승인·작업 주기·실패 보존 | `stage_result_origins`의 PUBLISHING 원문/token·raw 변경·verify receipt와 immutable approval을 소비한다. `FinalReviewTests`의 원문 누락·빈 invocation/손상·다른 작업·새 verify 실패/pending/cycle·호출 중단 사례가 이전 승인을 거부하며 원래 승인과 실패 감사를 보존한다. |
-| revision/rebase/재시작·저장 경쟁·게시 | `reconnect()`가 두 입력 관측 후 transaction에서 row/checkpoint/selection/planning을 재확인하고 게시 진입·마지막 workspace에서 binding을 검사한다. 최종 승인 재시작·저장 경합·게시 policy 변경, revision lifecycle·source/무관 명세 변경·복구 marker 사례를 현재 후보에서 실행했다. |
+| revision/rebase/재시작·저장 경쟁·게시 | `reconnect()`가 두 입력 관측 후 transaction에서 row/checkpoint/selection/planning을 재확인하고 게시 진입·마지막 workspace에서 binding을 검사한다. 최종 승인 checkpoint 재조회·저장 경합·게시 policy 변경, revision lifecycle·source/무관 명세 변경·복구 marker 사례를 실행했다. 이후 아래 Review 교정에서 별도로 새 handler의 definition 설치 전 terminal PR 복구를 검증했다. |
 | 일반/문서 선행 및 Claude 경계 | 현재 `PreliminaryReviewTests` 22개가 일반 선행 PASS 뒤 실제 전체 run과 최종 승격, 실패·다른 receipt·문서 선행과의 구분을 유지한다. `FinalReviewTests`는 최종 승격 후 재연결과 Claude 비교 불가에서 verify만 재사용하고 Reviewer를 호출하는 분기를 확인한다. |
 | R-033/R-055/R-079 관련 재개 조건 | 전체 목표·미해결 실패 delta 안내는 기존 prompt 계층을 소비하고 Worker 결과·지침/실제 호출 입력의 차이는 기존 재사용 비교에 남긴다. 이전 공통 결함 교정의 반영만으로 후보를 승인하지 않고 아래 현재 회귀를 실행했다. 공통/모든 역할/Ponytail 내용 변경을 누락하거나 예전 전달 해시를 현재 값으로 덮지 않는다. |
 
@@ -139,6 +139,22 @@ priority: high
 - 모든 위 실행은 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest <나열한 test ID/class/module>`로 현재 worktree에서 수행했다. 현재 고유 사례 94개가 통과했고 새 회귀의 교정 전 실패 1회와 동일 명령 재실행 결과를 구분해 보존한다. 전체 suite·integration·실계정/native probe·전체 verify는 Worker가 실행하지 않았다.
 
 구현 및 관련 교정의 미해결 항목은 없다. 남은 완료 단계는 Manager의 현재 후보 전체 verify·독립 Reviewer·게시 안전 검사와 사용자 PR Merge다. 이번 targeted 성공은 그 단계의 성공이나 Manager 상태 변경을 대신하지 않는다. verify 입력 목록은 새 코드·테스트를 기존 `loop_manager_internal/**`·`tests/**`로 포함하며 새 목록 밖 제외 승인을 선언하지 않는다.
+
+### Review 교정: terminal PR 복구와 신규 게시 승인 분리 (2026-11-06)
+
+`review:loop_manager_internal/execution/execution_publication_handler.py::_publication_workspace::terminal-pr-reconciliation-blocked`를 현재 코드에서 재현하고 교정했다. 시작 HEAD는 `d8f4d18bee6b965798b9e810eba8286b28331b10`이다. 기존 checkpoint repository 교체 테스트는 prepared definition을 유지한 재조회였으며 새 handler 재시작의 근거가 아니므로 테스트 이름과 주석도 그 범위에 맞췄다.
+
+- `final_review`의 PASS receipt를 실제 SQLite checkpoint에 저장한 뒤 새 `ExecutionHandlers`·`ExecutionStatePort`·checkpoint repository를 만들고 plan metadata만 DB에서 복구했다. 최초 PR 조회 OPEN → guard 진입의 MERGED 관측을 구성했다. definition snapshot이 없는 상태에서 기존 코드는 `FINAL_BLOCK`을 반환해 Merge 반영에 실패했다.
+- workspace 실행 귀속·소유권·조회 전후 HEAD 확인을 `_publication_workspace_identity()`로 분리했다. 신규 게시의 `_publication_workspace()`는 이 확인 뒤 verify·일반 선행/최종 Review 승인을 계속 검사한다. terminal reconciliation만 identity 검사를 사용하며 실제 PR branch/head·존재하는 원격 head의 일치는 기존 `assess_publication`에서 계속 확인한다. terminal 재조회에서 PR이 다시 OPEN으로 바뀌면 기존 복구처럼 정상 revision 경로로 돌아간다.
+- 새 handler에서도 MERGED는 기존 reconciliation 성공으로, CLOSED는 기존 미Merge 종료 처리로 이어진다. PR head 불일치·조회 중 로컬 HEAD 변경·조회 뒤 workspace 소유권 변경은 계속 거부한다. terminal 처리는 receipt를 갱신하거나 새 verify/Reviewer·push를 실행하지 않으며, 일반 게시 observer는 policy 변경을 계속 거부한다.
+- 전체 Acceptance Criteria를 다시 대조했다. 기존 raw 변경·명세/지침·실제 invocation·작업 주기 비교, verify/Review 독립 재사용, R-086 선행 승인 뒤 실제 전체 run, Claude 비교 불가, 원래 결과·실패 감사와 신규 게시의 마지막 승인 검사에는 변경이 없다. 이번 변경은 이미 종료된 PR의 상태 반영과 새로운 게시 승인 사이의 호출 책임을 바로잡는다. Requirement·frontmatter·사용자 결정·필수 검증은 변경하지 않았다.
+
+#### 이번 Review 교정의 targeted 결과
+
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_final_review.FinalReviewTests.test_terminal_pr_after_real_handler_restart_reconciles_persistent_pass_before_definition` → 교정 전 FAIL (1 test, 예상 SUCCESS 대신 FINAL_BLOCK). 교정 후 같은 명령 → PASS (1 test).
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_final_review` → PASS (29 tests). 그 뒤 새 handler의 plan metadata를 이전 handler에서 복사하지 않고 DB의 cached plan으로 복구하도록 fixture를 강화했으며, 새 terminal/신규 게시 경계 6개를 같은 runner로 개별 지정해 다시 실행했다 → PASS (6 tests).
+- `tests.test_preliminary_review.PreliminaryReviewTests` 22개, `tests.test_execution_task_relevant_publication_boundary.TaskRelevantPublicationBoundaryTests` 중 live remote·HEAD 변경·workspace 소유권·review 뒤 후보 변경·post-push Merge/Close·base 전진·삭제된 remote·불일치/OPEN PR의 9개, `tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_revision_guard_tokens_follow_complete_phase_lifecycle` 1개를 runner의 `--unittest`로 지정 → PASS (32 tests).
+- 이번 교정의 고유 targeted 사례 61개가 통과했다. 과거 후보의 94개 성공이나 원래 전체 verify 실패 로그를 현재 후보의 새 실행으로 합산하지 않는다. 전체 verify·integration·실제 CLI/계정은 실행하지 않았으며 Manager의 전체 verify·독립 Review·게시 검사와 사용자 PR Merge가 남아 있다. 구현·관련 교정의 미해결 항목은 없다. 새 verify 입력 제외 승인은 선언하지 않는다.
 
 ## Decision Log
 

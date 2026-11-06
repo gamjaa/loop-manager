@@ -1224,7 +1224,10 @@ base가 달라지면 `stage_result_origins`의 원래 PUBLISHING 결과·definit
 | 현재 후보 재연결 | 같은 전체 성공 run·cycle과 증명된 입력을 두 번 관측하고, 짧은 transaction에서 row·checkpoint generation·verify selection·planning을 재확인해 binding과 현재 token을 함께 확정한다. 경쟁·저장 실패에는 새 승인을 만들지 않는다. |
 | 새 Reviewer 시작 | 원래 approval을 보존한 채 `running`으로 바꿔 실패·중단 뒤 이전 PASS가 되살아나지 않게 한다. 문서 선행·부분 성공·면제는 재사용 가능한 최종 승인을 만들지 않는다. |
 | 일반 선행 승인 | 실제 전체 run과 기존 최종 승격 gate를 통과한 뒤에만 최종 approval을 저장한다. 이후 rebase 재연결은 `finalized_reconnected`로 구분하며 이전 preliminary candidate의 HEAD gate를 새 후보 승인으로 사용하지 않는다. |
-| 게시 | 진입과 마지막 workspace 검사에서 현재 binding·전체 verify·실제 호출 identity·명세·지침을 다시 대조한다. 입력 변화는 필요한 Review로 돌아가고 원격 변경 직전 경쟁은 기존 게시 안전 경계에서 거부한다. |
+| 신규 게시 | 진입과 마지막 workspace 검사에서 현재 binding·전체 verify·실제 호출 identity·명세·지침을 다시 대조한다. 입력 변화는 필요한 Review로 돌아가고 원격 변경 직전 경쟁은 기존 게시 안전 경계에서 거부한다. |
+| terminal PR 복구 | revision guard가 definition을 설치하기 전에도 이미 MERGED/CLOSED인 PR의 기존 처리를 수행한다. PR 재조회 전후 workspace 소유권·로컬 HEAD를 확인하고 실제 PR branch/head·존재하는 원격 head와 대조하며, 신규 게시 승인 gate는 적용하지 않는다. |
+
+`_publication_workspace_identity()`는 실행 귀속·workspace 소유권과 PR 조회 전후 HEAD 확인을 담당한다. `_publication_workspace()`는 이 확인에 전체 verify·일반 선행/최종 Review 승인을 더한다. `_reconcile_terminal_publication()`만 identity 검사를 사용하는 terminal 관측을 선택하며, 신규 게시 관측은 기본 승인 검사 경로를 유지한다. 따라서 새 handler의 definition snapshot이 아직 없어도 기존 Merge/Close를 반영할 수 있고, 이 분리는 새 게시 권한이나 새 성공 receipt를 만들지 않는다.
 
 실제 Reviewer identity는 `preliminary_review.review_identity()`와 `provider_execution.observe()`의 기존 invocation ledger 검증을 사용한다. 입력 snapshot에 함께 관측한 identity를 실제 invocation과 직접 대조하며, 이후 별도로 다시 읽은 현재 설정으로 그 관측을 대용하지 않는다. 관측 가능한 실제 호출 identity가 다르면 최종 승인을 무효화하고, 실제/현재 관측 자체가 불가능하면 정상 호출 결과는 유지하되 재사용 가능한 증거로 저장하지 않는다. 현재 환경을 과거 호출로 소급 채택하지 않으며 Claude `observe() is None`·`prepared`는 재사용 증거가 아니다. 인증값은 저장하지 않고 환경 관측 불가를 Claude 정상 실행·지원 완료의 거부 조건으로 확대하지 않는다.
 
