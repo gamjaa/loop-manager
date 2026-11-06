@@ -9,6 +9,89 @@ from tests.support.catalog import catalog_reconciliation_fixture
 
 
 class DeletedPlanCleanupTest(unittest.TestCase):
+    def manual_history(self, repo='/repo', plan_id='G-001'):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        store = ManualWorkRepository(self.connection)
+        group = store.create(repo, 'start', 'manual-' + plan_id, [], 'head', 'base', members=(plan_id,),
+            documents=({'path': 'saved.md', 'text': 'original', 'plan': {'id': plan_id}},))
+        group = store.update(group, owner_id=plan_id)
+        request = store.accept(group, head='head', base='base', input_token='token')
+        group = store.get(repo, group['group_id'])
+        store.record(group, 'verify', 'head', 'base', 'token', 'FAIL', 'saved failure')
+        group = store.update(group, state='CLOSED')
+        self.connection.commit()
+        return store, group, request
+
+    def test_erasure_removes_released_exclusive_manual_history_only(self):
+        store, target, _request = self.manual_history()
+        self.manual_history('/repo', 'G-002')
+        self.manual_history('/other', 'G-001')
+        tables = ('manual_work_groups', 'manual_work_members', 'manual_work_requests', 'manual_work_results')
+        retained = {table: [dict(row) for row in self.connection.execute(
+            f'SELECT * FROM {table} WHERE repo<>? OR group_id<>? ORDER BY rowid', ('/repo', target['group_id']))]
+            for table in tables}
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        for table in tables:
+            self.assertEqual([dict(row) for row in self.connection.execute(f'SELECT * FROM {table} ORDER BY rowid')],
+                             retained[table])
+        self.assertIsNone(store.for_plan('/repo', 'G-001'))
+        self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+
+    def test_unconfirmed_or_shared_manual_history_keeps_final_erasure_pending(self):
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        _store, group, request = self.manual_history()
+        scenarios = (
+            ("UPDATE manual_work_groups SET state='AUTOMATIC' WHERE group_id=?", (group['group_id'],)),
+            ("UPDATE manual_work_groups SET state='MERGED' WHERE group_id=?", (group['group_id'],)),
+            ("UPDATE manual_work_groups SET branch='owned' WHERE group_id=?", (group['group_id'],)),
+            ("UPDATE manual_work_groups SET documents='{}' WHERE group_id=?", (group['group_id'],)),
+            ("UPDATE manual_work_groups SET members='[]',owner_id=NULL WHERE group_id=?", (group['group_id'],)),
+            ("UPDATE manual_work_results SET plan_id='G-002' WHERE group_id=?", (group['group_id'],)),
+            ("UPDATE manual_work_requests SET repo='/other' WHERE request_id=?", (request['request_id'],)),
+            ("INSERT INTO manual_work_publications(repo,group_id,pr_url,head,base_sha,evidence) VALUES ('/repo',?,'pr','head','base','proof')",
+             (group['group_id'],)),
+        )
+        for sql, parameters in scenarios:
+            with self.subTest(sql=sql):
+                self.connection.execute(sql, parameters)
+                before = list(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(list(self.connection.iterdump()), before)
+                self.connection.rollback()
+
+    def test_manual_erasure_rolls_back_when_later_task_deletion_fails(self):
+        import sqlite3
+        self.manual_history()
+        self.connection.execute("CREATE TRIGGER interrupt_manual_erasure BEFORE DELETE ON exec_plans "
+            "BEGIN SELECT RAISE(ABORT,'later deletion failed'); END")
+        self.connection.commit()
+        before = list(self.connection.iterdump())
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'later deletion failed'):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(list(self.connection.iterdump()), before)
+
+    def test_shared_manual_membership_and_cross_group_request_are_preserved(self):
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        _store, target, request = self.manual_history()
+        _store, other, _other_request = self.manual_history('/repo', 'G-002')
+        self.connection.execute("DELETE FROM manual_work_members WHERE repo='/repo' AND plan_id='G-002'")
+        self.connection.execute("INSERT INTO manual_work_members VALUES ('/repo','G-002',?)", (target['group_id'],))
+        self.connection.execute('UPDATE manual_work_groups SET members=? WHERE group_id=?',
+                                (json.dumps(['G-001', 'G-002']), target['group_id']))
+        before = list(self.connection.iterdump())
+        with self.assertRaises(CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(list(self.connection.iterdump()), before)
+        self.connection.rollback()
+        self.connection.execute('UPDATE manual_work_groups SET request_id=? WHERE group_id=?',
+                                (request['request_id'], other['group_id']))
+        before = list(self.connection.iterdump())
+        with self.assertRaisesRegex(CallDeferred, '독립 묶음'):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(list(self.connection.iterdump()), before)
+
     def rowless_cancellation(self):
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot

@@ -246,6 +246,61 @@ def acceptance_snapshot(connection, repo, group_id, plan_ids):
     })
 
 
+def forget_plan(connection, repo, plan_id):
+    """Erase only released, exclusive manual journals inside the caller's transaction."""
+    from .task_calls import CallDeferred
+    try:
+        _fingerprint, owned = planning_ownership_state(connection, repo, plan_id, None)
+    except runtime_state.RuntimeStateError as error:
+        raise CallDeferred('수동 소유권의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+    if owned:
+        raise CallDeferred('수동 소유 작업은 자동 제거할 수 없습니다.')
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_groups'").fetchone():
+        return
+    for group in connection.execute('SELECT * FROM manual_work_groups WHERE repo=?', (repo,)).fetchall():
+        try:
+            members = json.loads(group['members'])
+        except (TypeError, ValueError) as error:
+            raise CallDeferred('수동 묶음의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+        if not isinstance(members, list):
+            raise CallDeferred('수동 묶음의 삭제 대상 귀속을 확인할 수 없습니다.')
+        if plan_id not in members and plan_id not in (group['owner_id'], group['active_id']):
+            continue
+        try:
+            declared, _stored = _validated_group_members(connection, repo, group)
+        except runtime_state.RuntimeStateError as error:
+            raise CallDeferred('수동 묶음의 전체 소유 목록을 확인할 수 없습니다.') from error
+        if (declared != [plan_id] or group['state'] != 'CLOSED'
+                or any(group[key] for key in ('branch', 'worktree', 'workspace_created', 'active_id',
+                    'pending_source_head', 'source_update_candidate', 'source_update_remote_oid', 'source_update_conflict'))):
+            raise CallDeferred('공유 묶음 또는 수동 자원·복구 근거가 남아 있어 제거를 보류합니다.')
+        try:
+            documents = json.loads(group['documents'])
+            if (not isinstance(documents, list) or any(not isinstance(item, dict)
+                    or not isinstance(item.get('plan'), dict) or item['plan'].get('id') != plan_id
+                    for item in documents)):
+                raise ValueError('unattributed manual documents')
+        except (TypeError, ValueError) as error:
+            raise CallDeferred('수동 문서 snapshot의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+        group_id = group['group_id']
+        if connection.execute('SELECT 1 FROM manual_work_publications WHERE repo=? AND group_id=?',
+                              (repo, group_id)).fetchone():
+            raise CallDeferred('수동 PR 게시 근거는 확인 없이 제거할 수 없습니다.')
+        if connection.execute('SELECT 1 FROM manual_work_results WHERE repo=? AND group_id=? AND plan_id<>?',
+                              (repo, group_id, plan_id)).fetchone():
+            raise CallDeferred('수동 묶음에 독립 작업의 결과가 남아 있습니다.')
+        if group['request_id'] and not connection.execute(
+                'SELECT 1 FROM manual_work_requests WHERE request_id=? AND repo=? AND group_id=?',
+                (group['request_id'], repo, group_id)).fetchone():
+            raise CallDeferred('수동 요청의 묶음 귀속을 확인할 수 없습니다.')
+        if connection.execute('SELECT 1 FROM manual_work_groups g JOIN manual_work_requests r '
+                'ON g.request_id=r.request_id WHERE r.repo=? AND r.group_id=? '
+                'AND (g.repo<>? OR g.group_id<>?)', (repo, group_id, repo, group_id)).fetchone():
+            raise CallDeferred('삭제할 수동 요청이 독립 묶음에도 연결돼 있습니다.')
+        for table in ('manual_work_results', 'manual_work_requests', 'manual_work_members', 'manual_work_groups'):
+            connection.execute(f'DELETE FROM {table} WHERE repo=? AND group_id=?', (repo, group_id))
+
+
 class ManualWorkRepository:
     def __init__(self, connection):
         self.connection = connection

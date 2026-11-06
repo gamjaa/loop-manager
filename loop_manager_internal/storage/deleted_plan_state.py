@@ -29,8 +29,8 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         for row in connection.execute('SELECT plan_id,depends_on FROM exec_plans WHERE repo=? AND plan_id<>?', (repo, plan_id)):
             if plan_id in json.loads(row['depends_on']):
                 raise ValueError('삭제된 작업의 선행 관계가 아직 남아 있습니다.')
-        if connection.execute('SELECT 1 FROM manual_work_members WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone():
-            raise ValueError('수동 소유 작업은 자동 제거할 수 없습니다.')
+        from .manual_work_state import forget_plan as forget_manual_plan
+        forget_manual_plan(connection, repo, plan_id)
         from .common_defect_state import assert_plan_erasure_available
         assert_plan_erasure_available(connection, repo, plan_id)
         from .maintenance_state import forget_plan as forget_maintenance_plan
