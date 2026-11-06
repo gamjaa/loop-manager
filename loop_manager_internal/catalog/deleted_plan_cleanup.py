@@ -68,6 +68,13 @@ def _artifact_references(connection, state_dir):
         return path
 
     references = []
+
+    def log_reference(workspace, owner):
+        logs = Path(state_dir).resolve() / 'logs'
+        if isinstance(workspace, str) and workspace and Path(workspace).is_absolute():
+            logs = logs / hashlib.sha256(workspace.encode()).hexdigest()[:16]
+        references.append((logs, owner))
+
     for call in connection.execute('SELECT repo,plan_id,process_receipt_path FROM agent_invocations'):
         if call['process_receipt_path']:
             receipt = stored_path(call['process_receipt_path'])
@@ -83,13 +90,32 @@ def _artifact_references(connection, state_dir):
     if 'task_call_reservations' in tables:
         references.extend((stored_path(row['receipt_path']), (row['repo'], row['plan_id'])) for row in connection.execute(
             'SELECT repo,plan_id,receipt_path FROM task_call_reservations WHERE receipt_path IS NOT NULL'))
-    references.extend((Path(state_dir).resolve() / 'logs' / hashlib.sha256(row['worktree'].encode()).hexdigest()[:16],
-                       (row['repo'], row['plan_id'])) for row in connection.execute(
-                           'SELECT repo,plan_id,worktree FROM exec_plans WHERE worktree IS NOT NULL'))
+    for row in connection.execute('SELECT repo,plan_id,worktree FROM exec_plans WHERE worktree IS NOT NULL'):
+        log_reference(row['worktree'], (row['repo'], row['plan_id']))
+    from loop_manager_internal.maintenance.maintenance_validation import _plan_id_from_path
+    for project in connection.execute('SELECT * FROM projects'):
+        if project['worktree'] is not None:
+            try:
+                plan_id = (None if runtime_state.planning_owns_execution_slot(project)
+                           else _plan_id_from_path(project['plan_path'] or ''))
+            except (TypeError, RecursionError):
+                plan_id = None
+            log_reference(project['worktree'], (project['repo'], plan_id))
+        if project['planning_preserved_state']:
+            try:
+                workspace = runtime_state._preserved_planning_values(project['planning_preserved_state'])['worktree']
+            except (runtime_state.RuntimeStateError, RecursionError):
+                log_reference(None, (project['repo'], None))
+            else:
+                if workspace is not None:
+                    log_reference(workspace, (project['repo'], None))
+    if 'manual_work_groups' in tables:
+        for group in connection.execute('SELECT repo,worktree FROM manual_work_groups WHERE worktree IS NOT NULL'):
+            log_reference(group['worktree'], (group['repo'], None))
     if 'execplan_cancellations' in tables:
         for canceled in connection.execute('SELECT repo,plan_id,recovery_evidence FROM execplan_cancellations'):
             owner = (canceled['repo'], canceled['plan_id'])
-            logs = Path(state_dir).resolve() / 'logs'
+            workspace = None
             try:
                 saved = json.loads(canceled['recovery_evidence'])['row']
                 if not isinstance(saved, dict) or (saved['repo'], saved['plan_id']) != owner:
@@ -99,12 +125,11 @@ def _artifact_references(connection, state_dir):
                     continue
                 if not isinstance(workspace, str) or not workspace or not Path(workspace).is_absolute():
                     raise ValueError('unconfirmed cancellation workspace')
-                logs = logs / hashlib.sha256(workspace.encode()).hexdigest()[:16]
             except (KeyError, TypeError, ValueError, RecursionError):
                 # Unknown historical workspace ownership protects only logs;
                 # independent receipt/collection cleanup can still proceed.
-                pass
-            references.append((logs, owner))
+                workspace = None
+            log_reference(workspace, owner)
     return [(candidate, owner) for path, owner in references for candidate in (path, path.resolve())]
 
 

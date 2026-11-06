@@ -622,6 +622,58 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             self.assertEqual(remove_pending_files(self.connection, '/repo', state), set())
             self.assertFalse(log.exists())
 
+    def test_file_queue_preserves_project_manual_and_suspended_planning_log_references(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from loop_manager_internal.agents.provider_adapters import _provider_log_directory
+        from loop_manager_internal.catalog.deleted_plan_cleanup import artifact_paths, remove_pending_files
+        from loop_manager_internal.storage import runtime_state
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        _store, group, _request = self.manual_history('/repo', 'G-002')
+        workspace = '/shared/log-workspace'
+        self.connection.execute("UPDATE projects SET worktree=NULL,plan_path=NULL,phase=NULL")
+        self.connection.execute("UPDATE exec_plans SET worktree=NULL WHERE plan_id='G-002'")
+        self.connection.execute("UPDATE exec_plans SET worktree=? WHERE plan_id='G-001'", (workspace,))
+        self.connection.commit()
+        row = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        suspended = {**runtime_state.EXECUTION_CLEAR_VALUES, **runtime_state.PLANNING_CLEAR_VALUES,
+                     'phase': 'PLANNING', 'planning_error': 'saved planning failure', 'worktree': workspace}
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            log = _provider_log_directory(Path(workspace), state)
+            proof = log / 'independent.log'
+            proof.write_text('retained provider output')
+            self.connection.execute("UPDATE projects SET phase='IMPLEMENTING',plan_path=?,worktree=?", (row['path'], workspace))
+            self.connection.commit()
+            self.assertEqual(artifact_paths(self.connection, '/repo', row, state), (log,))
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001', artifacts=(log,))
+            for sql, parameters in (
+                ("UPDATE projects SET worktree=?,plan_path='docs/plans/[G-002] Independent.md'", (workspace,)),
+                ("UPDATE projects SET worktree=?,phase='PLANNING',plan_path='docs/plans/[G-001] Gone.md'", (workspace,)),
+                ('UPDATE projects SET planning_preserved_state=?', (json.dumps(suspended),)),
+                ("UPDATE projects SET planning_preserved_state='broken snapshot'", ()),
+                ('UPDATE projects SET worktree=?,planning_preserved_state=?', (workspace, '[' * 1100)),
+                ('UPDATE manual_work_groups SET worktree=? WHERE group_id=?', (workspace, group['group_id'])),
+                ("UPDATE manual_work_groups SET worktree='relative-workspace' WHERE group_id=?", (group['group_id'],)),
+                ("INSERT INTO projects(repo,base_branch,worktree,plan_path) VALUES "
+                 "('/other','main',?,'docs/plans/[G-001] Other.md')", (workspace,)),
+            ):
+                with self.subTest(sql=sql):
+                    self.connection.execute(sql, parameters)
+                    self.connection.commit()
+                    before = tuple(self.connection.iterdump())
+                    with self.assertRaises(CallDeferred):
+                        artifact_paths(self.connection, '/repo', row, state)
+                    self.assertEqual(remove_pending_files(self.connection, '/repo', state), {'G-001'})
+                    self.assertEqual(tuple(self.connection.iterdump()), before)
+                    self.assertEqual(proof.read_text(), 'retained provider output')
+                    self.connection.execute('UPDATE projects SET worktree=NULL,plan_path=NULL,phase=NULL,planning_preserved_state=NULL')
+                    self.connection.execute('UPDATE manual_work_groups SET worktree=NULL')
+                    self.connection.execute("DELETE FROM projects WHERE repo='/other'")
+                    self.connection.commit()
+            self.assertEqual(remove_pending_files(self.connection, '/repo', state), set())
+            self.assertFalse(log.exists())
+
     def test_unmanaged_receipt_preserves_call_and_cancellation_before_final_erasure(self):
         from pathlib import Path
         from tempfile import TemporaryDirectory
