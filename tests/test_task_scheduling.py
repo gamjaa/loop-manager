@@ -2985,6 +2985,47 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(checks, ['wait', 'wait'])
         self.assertEqual(self.connection.execute('SELECT result_kind FROM agent_invocations WHERE invocation_id=?', (failed,)).fetchone()[0], 'usage_limit')
 
+    def test_retry_wait_stops_after_erasure_without_consuming_saved_deadline(self):
+        from loop_manager_internal.storage import deleted_plan_state, recovery_state
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        for at_finish in (False, True):
+            with self.subTest(at_finish=at_finish):
+                self._reset_catalog()
+                scheduler = self.scheduler()
+                repository = recovery_state.RecoveryRepository(self.connection)
+                repository.observe(RecoveryObservation(RecoveryReason.SERVICE_UNAVAILABLE, 'A', 'G-001',
+                    'WORKING', 'revision', 'base', 'cli', 'same-session', 'original failure'), attempts=3)
+                self.connection.commit()
+                erased = []
+                def erase():
+                    deleted_plan_state.forget(self.connection, 'A', 'G-001')
+                    erased.extend(self.connection.iterdump())
+                finish = recovery_state.RecoveryRepository.finish_retry_wait
+                def erase_before_finish(current, saved):
+                    erase()
+                    return finish(current, saved)
+                clock = [100.0]
+                with mock.patch.object(recovery_state.time, 'time', side_effect=lambda: clock[0]):
+                    saved = repository.defer_retry('A', 'G-001')
+                    self.assertEqual(saved['retry_after'], 130)
+                    if at_finish:
+                        clock[0] = 131
+                        with mock.patch.object(recovery_state.RecoveryRepository, 'finish_retry_wait',
+                                autospec=True, side_effect=erase_before_finish), \
+                             mock.patch.object(scheduler.condition, 'wait') as wait:
+                            self.assertFalse(scheduler.wait_retry(self.connection, 'A', 'G-001', resume=True))
+                        wait.assert_not_called()
+                    else:
+                        with mock.patch.object(scheduler.condition, 'wait', side_effect=lambda _seconds: erase()) as wait, \
+                             mock.patch.object(recovery_state.RecoveryRepository, 'finish_retry_wait',
+                                side_effect=AssertionError('canceled wait must not consume deadline')):
+                            self.assertFalse(scheduler.wait_retry(self.connection, 'A', 'G-001', resume=True))
+                        wait.assert_called_once()
+                    self.assertTrue(erased)
+                    self.assertEqual(list(self.connection.iterdump()), erased)
+                    self.assertFalse(scheduler.wait_retry(self.connection, 'A', 'G-001', resume=True))
+                    self.assertEqual(list(self.connection.iterdump()), erased)
+
     def test_retry_due_time_survives_runtime_replacement_and_no_early_dispatch(self):
         from loop_manager_internal.storage import recovery_state
         from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason

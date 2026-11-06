@@ -1610,7 +1610,7 @@ Scheduler 실행의 프로젝트 준비 단계는 workspace 소유권 hold 복�
 
 [Agent CLI 실패](PRODUCT.md#외부-cli-실패)는 위 구현·검증 실패와 별도로 처리한다.
 
-Agent CLI 실행 실패·timeout·일시적 서비스 오류는 한 호출 요청에서 최초 실행 외 최대 3회 재시도한다. 세션 재개 불가로 새 세션을 한 번 시작하는 복구는 별도로 집계한다. 묶음이 소진되면 recovery record의 identity/generation에 결합한 `retry_after`를 저장한다. 작업별 30초 대기는 호출 자리를 점유하지 않고 pause·확정된 handoff 신호를 확인하며 같은 실행에서 저장 단계를 다시 배정한다. runtime 원격 관측은 대기 해소 뒤 실제 단계 진입에서만 수행한다. runtime 교체 후에도 저장된 시각과 누적 감사를 유지한다. Review 교정은 시작한 turn만 세며 같은 피드백 turn의 예약·재처리는 중복 집계하지 않는다. AI 사용 한도는 실제 종료가 확인된 같은 provider/model의 독립 성공 기록 이후에만 재개하고 유료 probe·새 session·provider 전환으로 우회하지 않는다. 종료 불명 예약은 해당 token의 기존 receipt로 종료를 재확인한 뒤에만 회수한다.
+Agent CLI 실행 실패·timeout·일시적 서비스 오류는 한 호출 요청에서 최초 실행 외 최대 3회 재시도한다. 세션 재개 불가로 새 세션을 한 번 시작하는 복구는 별도로 집계한다. 묶음이 소진되면 recovery record의 identity/generation에 결합한 `retry_after`를 저장한다. 작업별 30초 대기는 호출 자리를 점유하지 않고 pause·확정된 handoff 신호를 확인하며 같은 실행에서 저장 단계를 다시 배정한다. runtime 원격 관측은 대기 해소 뒤 실제 단계 진입에서만 수행한다. runtime 교체 후에도 저장된 시각과 누적 감사를 유지한다. Review 교정은 시작한 turn만 세며 같은 피드백 turn의 예약·재처리는 중복 집계하지 않는다. 교정 후보 조회는 취소/최종 삭제 ID이면 None을 반환하며, 예약·시작은 외부 run 기록이 없는 호환 경로도 같은 ID를 확인한다. 저장 값을 쓰는 예약·시작과 retry deadline 생성/소비는 공통 writer 예약 뒤 ID를 다시 읽고, 자격 소멸은 기존 RecoveryStateConflict로 거부해 turn·deadline·감사를 유지한다. scheduler는 재시도 대기 진입과 각 대기 반복에서 ID를 확인하고, 저장/소비 경합도 현재 취소가 확인될 때만 False로 반환한다. 이 반환은 재시도 완료가 아니며 취소 외의 generation/identity 경합은 기존 오류를 그대로 유지한다. AI 사용 한도는 실제 종료가 확인된 같은 provider/model의 독립 성공 기록 이후에만 재개하고 유료 probe·새 session·provider 전환으로 우회하지 않는다. 종료 불명 예약은 해당 token의 기존 receipt로 종료를 재확인한 뒤에만 회수한다.
 
 ### 자체 테스트의 Git 경계
 

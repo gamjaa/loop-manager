@@ -206,7 +206,10 @@ class TaskScheduler:
 
     def wait_retry(self, connection, repo, plan_id=None, *, resume=False):
         from loop_manager_internal.storage import recovery_state
+        from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
         from loop_manager_internal.recovery.recovery_runtime import TRANSIENT, RECONCILE, RecoveryReason
+        if plan_id is not None and is_cancelled(connection, repo, plan_id):
+            return False
         repository = recovery_state.RecoveryRepository(connection)
         saved = repository.row(repo, plan_id)
         eligible = {reason.value for reason in TRANSIENT | RECONCILE} | {
@@ -224,17 +227,31 @@ class TaskScheduler:
                         reason_code=saved['reason_code'], occurrence=saved['occurrence'],
                         next_action='작업 보존·입력 또는 복구 조건 변경 후 재검사')
             return False
-        saved = repository.defer_retry(repo, plan_id)
+        try:
+            saved = repository.defer_retry(repo, plan_id)
+        except recovery_state.RecoveryStateConflict:
+            if plan_id is not None and is_cancelled(connection, repo, plan_id):
+                return False
+            raise
+        if saved is None:
+            return False
         events.emit('작업 재시도 대기', project=repo, plan=plan_id, reason_code=saved['reason_code'],
                     retry_after=saved['retry_after'])
         while True:
             self.check_project(repo)
+            if plan_id is not None and is_cancelled(connection, repo, plan_id):
+                return False
             remaining = saved['retry_after'] - time.time()
             if remaining <= 0:
                 break
             with self.condition:
                 self.condition.wait(min(remaining, .2))
-        repository.finish_retry_wait(saved)
+        try:
+            repository.finish_retry_wait(saved)
+        except recovery_state.RecoveryStateConflict:
+            if plan_id is not None and is_cancelled(connection, repo, plan_id):
+                return False
+            raise
         return True
 
     def wait_usage(self, connection, repo, plan_id):

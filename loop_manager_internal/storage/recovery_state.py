@@ -204,6 +204,9 @@ def pending_review_correction(
 ) -> int | None:
     """Identify an undischarged Review FAIL, including a source retained across rebase."""
 
+    from .execplan_catalog_state import is_cancelled
+    if is_cancelled(connection, repo, plan_id):
+        return None
     if not review_result and source_id is None:
         return None
     recovery = connection.execute(
@@ -238,10 +241,15 @@ def reserve_review_correction(
 ) -> tuple[bool, int, str | None]:
     """Reserve one logical Review Worker turn before invoking any provider."""
 
+    from .execplan_catalog_state import is_cancelled
+    if is_cancelled(connection, repo, plan_id):
+        raise RecoveryStateConflict('취소·최종 삭제된 작업의 Review 교정을 예약할 수 없습니다.')
     run_id = _external_run_id(connection)
     if run_id is None:
         return True, 0, None
     with connection:
+        if not _reserve_live_recovery_subject(connection, repo, plan_id):
+            raise RecoveryStateConflict('Review correction target changed')
         existing = connection.execute(
             "SELECT run_id FROM review_correction_turns WHERE repo = ? AND plan_id = ? "
             "AND review_result_id = ?",
@@ -278,9 +286,14 @@ def start_review_correction(
 ) -> None:
     """Durably mark the reserved turn immediately before the provider call."""
 
+    from .execplan_catalog_state import is_cancelled
+    if is_cancelled(connection, repo, plan_id):
+        raise RecoveryStateConflict('취소·최종 삭제된 작업의 Review 교정을 시작할 수 없습니다.')
     if run_id is None or review_result_id is None:
         return
     with connection:
+        if not _reserve_live_recovery_subject(connection, repo, plan_id):
+            raise RecoveryStateConflict('Review correction target changed')
         changed = connection.execute(
             "UPDATE review_correction_turns "
             "SET started_at = COALESCE(started_at, CURRENT_TIMESTAMP) "
@@ -872,21 +885,31 @@ class RecoveryRepository:
 
     def defer_retry(self, repo: str, plan_id: str | None):
         """Preserve the due time and audit across physical runtime replacements."""
+        from .execplan_catalog_state import is_cancelled
+        if plan_id is not None and is_cancelled(self.connection, repo, plan_id):
+            return None
         saved = self.row(repo, plan_id)
         if saved is None or saved['pending_action'] == 'final_block':
             return None
         if saved['retry_after'] is None:
             with self.connection:
+                if not _reserve_live_recovery_subject(self.connection, repo, plan_id):
+                    raise RecoveryStateConflict('retry wait target changed')
                 changed = self.connection.execute(
                     'UPDATE recovery_records SET retry_after=? WHERE repo=? AND subject=? AND generation=?',
                     (time.time() + RETRY_DELAY_SECONDS, repo, self._subject(plan_id), saved['generation']))
                 if changed.rowcount != 1:
                     raise RecoveryStateConflict('retry wait target changed')
             saved = self.row(repo, plan_id)
+        if plan_id is not None and is_cancelled(self.connection, repo, plan_id):
+            return None
         return dict(saved)
 
     def finish_retry_wait(self, saved):
         with self.connection:
+            plan_id = None if saved['subject'] == '__project__' else saved['subject'].removeprefix('plan:')
+            if not _reserve_live_recovery_subject(self.connection, saved['repo'], plan_id):
+                raise RecoveryStateConflict('retry wait target changed')
             changed = self.connection.execute(
                 'UPDATE recovery_records SET retry_after=NULL WHERE repo=? AND subject=? AND generation=? AND identity=?',
                 (saved['repo'], saved['subject'], saved['generation'], saved['identity']))

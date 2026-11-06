@@ -19,6 +19,46 @@ from tests.support.database import runtime_connection
 
 
 class RecoveryRepositoryTests(unittest.TestCase):
+    def test_cancelled_review_turn_and_retry_deadline_are_not_reselected_or_consumed(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repository = RecoveryRepository(connection)
+        deleted_plan_state.ensure_schema(connection)
+        connection.execute("INSERT INTO validation_results "
+            "(id,repo,plan_id,stage,classification,raw_output,identities,created_at) "
+            "VALUES (1,'repo','G-047','review','failure','saved review','[]','now')")
+        run = begin_external_run(connection, 'review-run')
+        self.assertEqual(pending_review_correction(connection, 'repo', 'G-047', 'saved review'), 1)
+        self.assertEqual(reserve_review_correction(connection, 'repo', 'G-047', 1), (True, 1, run))
+        target = replace(self.observation(), plan_id='G-047', reason=RecoveryReason.SERVICE_UNAVAILABLE)
+        repository.observe(target, attempts=3)
+        connection.commit()
+        with mock.patch('loop_manager_internal.storage.recovery_state.time.time', return_value=100):
+            saved = repository.defer_retry('repo', 'G-047')
+        self.assertEqual(saved['retry_after'], 130)
+        connection.execute("INSERT INTO execplan_cancellations "
+            "(repo,plan_id,path,title,sources,depends_on,complexity,risk,priority,content_hash,plan_sha,deletion_commit) "
+            "SELECT repo,plan_id,path,title,sources,depends_on,'low','low',priority,content_hash,plan_sha,'deleted' "
+            "FROM exec_plans WHERE plan_id='G-047'")
+        connection.commit()
+        for erased in (False, True):
+            with self.subTest(erased=erased):
+                if erased:
+                    deleted_plan_state.forget(connection, 'repo', 'G-047')
+                before = tuple(connection.iterdump())
+                self.assertIsNone(pending_review_correction(connection, 'repo', 'G-047', 'saved review'))
+                self.assertIsNone(pending_review_correction(connection, 'repo', 'G-047', None, source_id=1))
+                with self.assertRaises(RecoveryStateConflict):
+                    reserve_review_correction(connection, 'repo', 'G-047', 1)
+                for turn_run in (run, None):
+                    with self.assertRaises(RecoveryStateConflict):
+                        start_review_correction(connection, 'repo', 'G-047', turn_run, 1)
+                self.assertIsNone(repository.defer_retry('repo', 'G-047'))
+                with self.assertRaises(RecoveryStateConflict):
+                    repository.finish_retry_wait(saved)
+                self.assertEqual(tuple(connection.iterdump()), before)
+
     def test_cancelled_and_erased_subjects_cannot_replay_recovery_or_persistent_failure(self):
         from loop_manager_internal.storage import deleted_plan_state
         connection = runtime_connection()
