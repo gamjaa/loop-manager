@@ -466,10 +466,7 @@ def _rowless_cancellations(connection, repo, state_dir):
             dependents = tuple(other for other in affected if not is_cancelled(connection, repo, other) and connection.execute(
                 "SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=? AND status<>'MERGED'", (repo, other)).fetchone())
             if started and (type(audit.get('cleanup_pending')) is not bool
-                    or audit['cleanup_pending'] and not retired_workspace
-                    or decision.get('id') != saved['plan_id'] or decision.get('outcome') != 'withdrawn'
-                    or decision.get('source') not in json.loads(saved['sources'])
-                    or not isinstance(decision.get('reason'), str) or not decision['reason'].strip()):
+                    or audit['cleanup_pending'] and not retired_workspace):
                 continue
             if started and not connection.execute(
                     "SELECT 1 FROM agent_invocations WHERE repo=? AND plan_id=? "

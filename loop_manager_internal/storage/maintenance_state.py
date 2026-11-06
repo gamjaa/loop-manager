@@ -470,10 +470,14 @@ def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None
                 # Final withdrawal removes target-only records, not a synthetic resolution.
                 report_changed = True
                 continue
-            if any(is_cancelled(connection, repo, key) or not connection.execute(
+            for key in retained:
+                existing = connection.execute(
                     'SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
-                    for key in retained):
-                raise CallDeferred('유지보수 평가 원문의 대상별 귀속 분리가 필요합니다.')
+                cancelled = is_cancelled(connection, repo, key)
+                # A rowless cancellation remains an attributable historical link;
+                # a missing identity or a live row with that marker does not.
+                if (existing is None and not cancelled) or (existing is not None and cancelled):
+                    raise CallDeferred('유지보수 평가 원문의 대상별 귀속 분리가 필요합니다.')
             finding['plan_ids'] = retained
             retained_findings.append(finding)
             report_changed = True

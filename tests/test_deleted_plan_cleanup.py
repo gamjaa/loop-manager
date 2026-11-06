@@ -270,6 +270,41 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         text = self.fixture._text('G-002', 'Dependency') + '\n## Decision Log\nDEPENDENCY_RECOVERY: ' + json.dumps(decision) + '\n'
         return {'G-002': SimpleNamespace(path=path, text=text)}
 
+    def test_started_remote_cancellation_erases_from_published_recovery_without_judgment(self):
+        text = self.rowless_cancellation(started=True, blocked=True, withdrawn=False)
+        self.artifact_call('finished-call', '/repo', 'G-001')
+        self.connection.execute("UPDATE agent_invocations SET input_tokens=123 WHERE invocation_id='finished-call'")
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertIsNone(audit.pop('judgment'))
+        audit['affected'] = ['G-002']
+        self.connection.execute("UPDATE exec_plans SET status='READY' WHERE plan_id='G-002'")
+        self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+        self.connection.execute("CREATE TRIGGER reject_started_recovery_resurrection BEFORE INSERT ON exec_plans "
+            "WHEN NEW.plan_id='G-001' BEGIN SELECT RAISE(ABORT,'execution resurrection'); END")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        documents = self.published_withdrawal()
+        entry = documents['G-002']
+        invalid = {'G-002': SimpleNamespace(path=entry.path, text=entry.text.replace('"obsolete"', '"unknown"'))}
+        self.assertEqual(self.cleanup_rowless(text, documents=invalid), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("UPDATE agent_invocations SET execution_finish_evidence=NULL WHERE invocation_id='finished-call'")
+        self.connection.commit()
+        unfinished = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text, documents=documents), ())
+        self.assertEqual(tuple(self.connection.iterdump()), unfinished)
+        self.connection.execute("UPDATE agent_invocations SET execution_finish_evidence='provider_process_finished' WHERE invocation_id='finished-call'")
+        self.connection.commit()
+        independent = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone())
+        self.assertEqual(self.cleanup_rowless(text, documents=documents), ('G-001',))
+        for table in ('exec_plans', 'execplan_cancellations', 'agent_invocations'):
+            self.assertIsNone(self.connection.execute(f"SELECT 1 FROM {table} WHERE plan_id='G-001'").fetchone())
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()), independent)
+        self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
+        self.assertEqual(self.cleanup_rowless(text, documents=documents), ())
+
     def test_complete_unstarted_cancellation_can_finish_without_recreating_execution_row(self):
         text = self.rowless_cancellation(empty_checkpoint=True, checkpoint_snapshot=dict(
             worktree_recovery_pending=False, branch='', worktree='', stored_active_sha=''))
@@ -1408,8 +1443,15 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
                 self.connection.commit()
                 before = tuple(self.connection.iterdump())
-                git = mock.Mock(side_effect=AssertionError('uncertain audit must be preserved'))
+                if audit['judgment'] != original['judgment']:
+                    # A missing judgment can now use published recovery, but
+                    # without that proof only read-only ancestry checks occur.
+                    git = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=''))
+                else:
+                    git = mock.Mock(side_effect=AssertionError('uncertain audit must be preserved'))
                 self.assertEqual(self.cleanup_rowless(text, git=git), ())
+                self.assertTrue(all(call.args[1:3] == ('merge-base', '--is-ancestor')
+                                    for call in git.call_args_list))
                 self.assertEqual(tuple(self.connection.iterdump()), before)
 
     def test_orphan_or_relative_collection_reference_keeps_file_queue_pending(self):
@@ -1900,7 +1942,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual(tuple(self.connection.iterdump()), before)
 
-    def test_shared_assessment_erasure_preserves_missing_or_cancelled_links_and_rolls_back(self):
+    def test_shared_assessment_erasure_preserves_unknown_or_conflicting_links_and_rolls_back(self):
         import sqlite3
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
         from loop_manager_internal.storage.task_calls import CallDeferred
@@ -1925,6 +1967,62 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         before = tuple(self.connection.iterdump())
         with self.assertRaisesRegex(sqlite3.IntegrityError, 'interrupted assessment erasure'):
             deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_shared_assessment_all_cancelled_tasks_erase_sequentially_after_cycle_finish(self):
+        from loop_manager_internal.storage import maintenance_state, planning_publication_state, runtime_state
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion
+        maintenance_state.MaintenanceRepository(self.connection)
+        report = self.assessment_report(('G-001', 'G-002'))
+        self.connection.execute('INSERT INTO maintenance_cycles '
+            '(repo,phase,revision,last_cycle_commit,last_cycle_merged_count,full_assessment_source_sha,full_assessment_result) '
+            "VALUES ('/repo','idle',9,?,0,?,?)", ('c' * 40, 'a' * 40, report))
+        self.connection.execute('UPDATE projects SET phase=NULL,plan_path=NULL,branch=NULL,worktree=NULL,worker_session_id=NULL,pr_url=NULL')
+        fields = planning_publication_state._MUTABLE_READY_EVIDENCE_FIELDS
+        self.connection.execute('UPDATE exec_plans SET ' + ','.join(field + '=NULL' for field in fields)
+            + ",status='READY',ever_started=0,workspace_owned=0,retry_count=0,pr_conflict_recovery=0")
+        deletions = []
+        for key in ('G-001', 'G-002'):
+            row = self.connection.execute('SELECT * FROM exec_plans WHERE plan_id=?', (key,)).fetchone()
+            snapshot = ReadyPlanSnapshot(key, row['path'], row['title'], tuple(json.loads(row['sources'])), (),
+                'low', 'low', row['priority'], row['content_hash'], row['plan_sha'], self.fixture._text(key, row['title']),
+                current_complexity=row['current_complexity'], current_risk=row['current_risk'], current_metadata_recorded=True)
+            deletions.append(PlanDeletion(snapshot, {'decision': {'id': key, 'source': snapshot.sources[0],
+                'outcome': 'withdrawn', 'reason': 'Both linked goals were withdrawn.'}}))
+        self.connection.commit()
+        with runtime_state._transaction(self.connection):
+            planning_publication_state.apply_mutable_catalog_changes(self.connection, '/repo', deletions=tuple(deletions),
+                revisions=(), snapshot_token='withdrawn', plan_commit='b' * 40, content_hash=lambda _: '', agent=False)
+        for key, tokens in (('G-001', 100), ('G-002', 200)):
+            self.artifact_call('call-' + key, '/repo', key)
+            self.connection.execute('UPDATE agent_invocations SET input_tokens=? WHERE plan_id=?', (tokens, key))
+        self.artifact_call('independent-call', '/other', 'G-001')
+        self.connection.commit()
+        cycle = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        surviving_audit = dict(self.connection.execute("SELECT * FROM execplan_cancellations WHERE plan_id='G-002'").fetchone())
+        surviving_call = dict(self.connection.execute("SELECT * FROM agent_invocations WHERE plan_id='G-002'").fetchone())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        current = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.assertEqual(json.loads(current['full_assessment_result']),
+            {**json.loads(report), 'findings': [{**json.loads(report)['findings'][0], 'plan_ids': ['G-002']}]})
+        self.assertEqual(current, {**cycle, 'full_assessment_result': current['full_assessment_result'],
+            'revision': 10, 'updated_at': current['updated_at']})
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone()), surviving_audit)
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM agent_invocations WHERE repo='/repo'").fetchone()), surviving_call)
+        deleted_plan_state.forget(self.connection, '/repo', 'G-002')
+        current = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.assertEqual(json.loads(current['full_assessment_result']), {**json.loads(report), 'findings': []})
+        self.assertEqual(current, {**cycle, 'full_assessment_result': current['full_assessment_result'],
+            'revision': 11, 'updated_at': current['updated_at']})
+        for table in ('execplan_cancellations', 'agent_invocations'):
+            self.assertIsNone(self.connection.execute(f"SELECT 1 FROM {table} WHERE repo='/repo'").fetchone())
+        self.assertEqual({row[0] for row in self.connection.execute(
+            "SELECT plan_id FROM deleted_plan_ids WHERE repo='/repo'")}, {'G-001', 'G-002'})
+        self.assertEqual(self.connection.execute('SELECT invocation_id FROM agent_invocations').fetchone()[0], 'independent-call')
+        before = tuple(self.connection.iterdump())
+        for key in ('G-001', 'G-002'):
+            deleted_plan_state.forget(self.connection, '/repo', key)
         self.assertEqual(tuple(self.connection.iterdump()), before)
 
     def test_live_common_correction_link_requires_same_goal_successor_before_erasure(self):
