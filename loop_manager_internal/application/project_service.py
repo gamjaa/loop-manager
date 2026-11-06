@@ -503,7 +503,7 @@ class ProjectService:
                         f"refs/remotes/origin/{self.state.base}^{{commit}}").stdout.strip(),
             lambda revision, remember: self.effects.reconcile_execplan_catalog(
                 self.identity.connection, self.state.repo_path, self.state.repo, self.state.base, remote_sha=revision,
-                on_reconciled=remember,
+                on_reconciled=remember, state_dir=self.identity.state_dir,
             ),
         )
 

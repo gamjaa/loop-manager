@@ -517,6 +517,9 @@ def is_current(connection, repo, kind, payload, *, event_key=None):
     """Shared creation/claim boundary; callers provide already recorded facts."""
     try:
         if kind == 'recovery_unresolved':
+            from .repository import cancelled_plan_event
+            if cancelled_plan_event(connection, repo, kind, payload):
+                return False
             request = connection.execute(
                 "SELECT plan_id, status, result FROM local_environment_recovery_requests WHERE repo=? AND request_id=?",
                 (repo, payload['request_id'])).fetchone()

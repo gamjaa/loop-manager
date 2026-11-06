@@ -43,7 +43,7 @@ class _PlanningLifecyclePorts:
         from loop_manager_internal.planning.requirement_retirement import RequirementRetirementPort
         self.retirement = RequirementRetirementPort(connection, self.git)
         self.agent = self._effects._PlanningAgentPorts(connection, context, planner_mutex)
-        self.validation = self._effects._PlanningValidationPorts(connection)
+        self.validation = self._effects._PlanningValidationPorts(connection, context.state_dir)
         self.file_review = self._effects._PlanningFileReviewPorts(connection)
         self.reconciliation = self._effects._PlanningReconciliationPorts(connection)
         from loop_manager_internal.maintenance.tiered_ports import TieredMaintenancePort

@@ -40,6 +40,9 @@ class PlanningStatePortsEffects:
     reconcile_execplan_catalog: Callable[..., object]
     register_execplans: Callable[..., object]
     preserve_remote_planning_diagnostics: Callable[..., object] | None = None
+    planning_result_from_manifest: Callable[..., object] | None = None
+    deletion_resources_available: Callable[..., bool] | None = None
+    pr_for_branch: Callable[..., object] | None = None
 
 
 class _PlanningStatePorts:
@@ -63,7 +66,7 @@ class _PlanningStatePorts:
     ) -> None:
         result = self._effects.reconcile_execplan_catalog(
             self._connection, repository, repo, base_branch,
-            remote_sha=revision,
+            remote_sha=revision, state_dir=self._state_dir,
         )
         if not result.usable:
             detail = result.diagnostic.message if result.diagnostic else result.kind.value
@@ -502,8 +505,8 @@ class _PlanningStatePorts:
         )
 
     def record_maintenance_scope(self, repo: str, revision: int, plan_ids: tuple[str, ...],
-                                 prerequisite_plan_ids: tuple[str, ...] = ()) -> None:
-        self._maintenance_repository.record_assessment_plans(repo, revision, plan_ids, prerequisite_plan_ids)
+                                 prerequisite_plan_ids: tuple[str, ...] = ()) -> maintenance_state.MaintenanceCycle:
+        return self._maintenance_repository.record_assessment_plans(repo, revision, plan_ids, prerequisite_plan_ids)
 
     def advance_success_baseline(
         self,
@@ -640,6 +643,39 @@ class _PlanningStatePorts:
             self._connection, repo, worktree, base, retain_planning=True
         )
 
+    def assert_general_deletion_resources(
+        self, repo: str, result: ValidatedPlanningResult | None = None,
+    ) -> None:
+        if result is None:
+            intent = self.general_publication(repo)
+            if intent is None:
+                return
+            if self._effects.planning_result_from_manifest is None:
+                raise RuntimeError('철회 게시의 저장된 manifest를 확인할 수 없습니다.')
+            result = self._effects.planning_result_from_manifest(intent.manifest)
+        if not result.deletions:
+            return
+        if self._connection.in_transaction:
+            raise RuntimeError('철회 게시의 외부 자원 확인은 SQLite transaction 밖에서 수행해야 합니다.')
+        from loop_manager_internal.storage.work_claims import cancellation_available
+        for deletion in result.deletions:
+            plan_id = deletion.snapshot.plan_id
+            row = self._connection.execute(
+                'SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id),
+            ).fetchone()
+            if not cancellation_available(self._connection, repo, plan_id, row):
+                raise RuntimeError(f'철회 게시의 현재 writer·소유권을 확인할 수 없습니다: {plan_id}')
+            if row['branch'] and self._effects.pr_for_branch is not None:
+                if self._effects.pr_for_branch(Path(repo), str(row['branch'])) is not None:
+                    from .planner_validation import MutableReadyPRConflict
+                    raise MutableReadyPRConflict(f'철회 게시 전에 PR이 등록됐습니다: {plan_id}')
+            if (row['branch'] or row['worktree']) and (
+                self._effects.deletion_resources_available is None
+                or not self._effects.deletion_resources_available(
+                    row, repo, Path(repo), state_dir=self._state_dir)
+            ):
+                raise RuntimeError(f'철회 게시의 PR·worktree·Git operation·journal 안전을 확인할 수 없습니다: {plan_id}')
+
     def record_general_intent(
         self,
         repo: str,
@@ -649,6 +685,7 @@ class _PlanningStatePorts:
         specification_fingerprint: str,
         planning_fingerprint: str,
     ) -> GeneralPlanningPublication:
+        self.assert_general_deletion_resources(repo, validated_result)
         return self._effects.record_general_planning_publication_intent(
             self._connection,
             repo,

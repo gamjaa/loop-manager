@@ -107,7 +107,8 @@ class ManualWorkTest(ManualWorkCase):
             "skip_verify INTEGER NOT NULL,skip_review INTEGER NOT NULL,reason TEXT NOT NULL,created_at TEXT NOT NULL)")
         connection.execute("INSERT INTO manual_work_requests VALUES (?,?,?,?,?,?,?,?,?,?)",
             ('old-request','repo','group','head','base','candidate',1,1,'external','2026-10-07T00:00:00+00:00'))
-        ManualWorkRepository(connection)
+        repository = ManualWorkRepository(connection)
+        self.assertEqual(repository.pending('repo'), [])
         request=connection.execute('SELECT * FROM manual_work_requests WHERE request_id=?',('old-request',)).fetchone()
         self.assertIsNone(request['verify_input_token'])
         self.assertIsNone(request['review_input_token'])

@@ -13,6 +13,21 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
+    @dummy_worker_sessions
+    def test_catalog_port_supplies_state_directory_without_widening_revision_handler(self):
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repository = RuntimeStateRepository(connection)
+        repository.activate('repo', 'G-047', activation_sha='base', branch='owned', worktree='/owned')
+        with mock.patch.object(loop_manager, 'reconcile_execution_execplan_catalog', return_value='observed') as reconcile:
+            ports = loop_manager._ExecutionLifecyclePorts(connection, repository,
+                repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'), base='main', base_sha='base',
+                provider='codex', config_path=Path('unused.ini'), newly_activated=False)
+            self.assertEqual(ports.effects.revision.reconcile_catalog(Path('/repo'), 'repo', 'main'), 'observed')
+        reconcile.assert_called_once_with(connection, Path('/repo'), 'repo', 'main', state_dir=Path('/state'))
+
     def test_git_observation_failure_pauses_without_discarding_saved_worker(self):
         fixture = execution_policy_fixture(self)
         # Persist a Worker result produced for the current definition. The

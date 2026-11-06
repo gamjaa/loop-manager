@@ -248,12 +248,14 @@ class ExecutionProgressLogTest(unittest.TestCase):
         }
         with mock.patch.object(commands_app.local_recovery_state, "snapshot", return_value=after), \
              mock.patch.object(commands_app.local_recovery_state, "complete_request"), \
+             mock.patch.object(loop_manager.notifications, "enqueue_current_project_events") as enqueue, \
              mock.patch.object(events, "emit", side_effect=record):
             result = commands_app.execute_local_recovery_request(
                 effects, connection, Path("state"), request, Path("config.ini"),
                 planner_mutex=threading.Lock(),
                 refactoring_review_interval=20, verify_timeout_seconds=600,
             )
+        enqueue.assert_called_once_with(connection, request.repo)
         self.assertEqual(result.exit_code, 1)
         self.assertEqual(result.kind, ProjectRunKind.TRANSIENT_PAUSE)
         self.assertEqual(nested_results, [True])

@@ -362,6 +362,14 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
     def test_proven_finished_writer_cancellation_preserves_started_history(self):
         self._remote_deletion(started=True, new_plan=True)
         self.connection.execute("UPDATE exec_plans SET worker_result='완료된 Worker 결과' WHERE plan_id='G-001'")
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        checkpoints.record(
+            str(self.repo), 'G-001', expected_generation=0, operation=None,
+            expected_head='saved-head', target_base_oid=self.base, observed_remote_oid=None,
+            snapshot={'worker_result': 'saved result', 'pushed_checkpoint_head': 'confirmed-head'},
+        )
+        saved_checkpoint = dict(self.connection.execute('SELECT * FROM execution_checkpoints').fetchone())
         self.connection.commit()
         result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
         self.assertEqual(set(result.withheld_plan_ids), {"G-002"})
@@ -371,10 +379,74 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertEqual(history["row"]["worker_session_id"], "saved")
         self.assertEqual(history["row"]["worker_result"], "완료된 Worker 결과")
         self.assertEqual(history["affected"], ["G-002"])
+        self.assertEqual(history['checkpoints']['execution_checkpoints'], saved_checkpoint)
+        self.assertIsNone(self.connection.execute('SELECT * FROM execution_checkpoints').fetchone())
         repeated = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
         self.assertEqual(set(repeated.withheld_plan_ids), {"G-002"})
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 1)
+        self.assertEqual(json.loads(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'"
+        ).fetchone()[0])['checkpoints'], history['checkpoints'])
         self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+
+    def test_remote_deletion_waits_for_physical_writer_finish_after_result_collection(self):
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile
+        self._remote_deletion(started=True, new_plan=True)
+        self.connection.execute("UPDATE exec_plans SET worker_result='saved result' WHERE plan_id='G-001'")
+        invocations = InvocationRepository(self.connection)
+        identity = invocations.start(InvocationContext(str(self.repo), 'G-001'),
+                                     'worker', 'codex', ResolvedProfile('model', 'high'), 'saved')
+        invocations.mark_execution_started(identity)
+        self.connection.execute("UPDATE agent_invocations SET finished_at='collected', result_kind='success', "
+                                "result_code=0 WHERE invocation_id=?", (identity,))
+        self.connection.commit()
+        deferred = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertIn('G-001', deferred.withheld_plan_ids)
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+        self.connection.execute("UPDATE agent_invocations SET execution_finished_at='stopped', "
+                                "execution_finish_evidence='receipt' WHERE invocation_id=?", (identity,))
+        self.connection.commit()
+        resumed = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertNotIn('G-001', resumed.withheld_plan_ids)
+        self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM agent_invocations WHERE invocation_id=?', (identity,)).fetchone())
+
+    def test_remote_deletion_preserves_git_operation_and_manual_preparation(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        self._remote_deletion(started=True, new_plan=True)
+        self.connection.execute("UPDATE exec_plans SET worker_result='saved result' WHERE plan_id='G-001'")
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        saved = checkpoints.record(
+            str(self.repo), 'G-001', expected_generation=0, operation='rebase',
+            expected_head='head', target_base_oid=self.base, observed_remote_oid=None, snapshot={'audit': 'saved'},
+        )
+        self.connection.commit()
+        deferred = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertIn('G-001', deferred.withheld_plan_ids)
+        self.assertEqual(checkpoints.get(str(self.repo), 'G-001'), saved)
+        checkpoints.record(
+            str(self.repo), 'G-001', expected_generation=saved.generation, operation=None,
+            expected_head=saved.expected_head, target_base_oid=saved.target_base_oid,
+            observed_remote_oid=None, snapshot=saved.snapshot,
+        )
+        store = ManualWorkRepository(self.connection)
+        group = store.create(str(self.repo), 'start', 'manual', [], 'head', self.base, members=('G-001',))
+        group = store.update(group, owner_id='G-001')
+        self.connection.commit()
+        deferred = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertIn('G-001', deferred.withheld_plan_ids)
+        self.assertEqual(dict(store.get(str(self.repo), group['group_id'])), dict(group))
+        group = store.update(group, state='CLOSED')
+        self.connection.commit()
+        resumed = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertNotIn('G-001', resumed.withheld_plan_ids)
+        self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+        self.assertEqual(dict(store.get(str(self.repo), group['group_id'])), dict(group))
 
     def test_requirement_deletion_cancels_only_withdrawn_and_preserves_shared_goal(self):
         self._requirement_deletion_recovers()
@@ -460,15 +532,48 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                     observe.side_effect = response
                 else:
                     observe.return_value = response
-                result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+                result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main", state_dir=self.repo / 'state')
                 self.assertIn("G-001", result.withheld_plan_ids)
                 self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 0)
                 self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
         with mock.patch.object(loop_manager, "pr_for_branch", return_value=None):
-            loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+            loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main", state_dir=self.repo / 'state')
         audit = json.loads(self.connection.execute("SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0])
         self.assertEqual(audit["row"]["branch"], "loop-manager/G-001")
         self.assertTrue(audit["cleanup_pending"])
+
+    def test_remote_deletion_rechecks_worktree_and_pr_before_database_apply(self):
+        self._remote_deletion(started=True, new_plan=True)
+        self.connection.execute("UPDATE exec_plans SET branch='owned', worktree='/owned/G-001', "
+                                "worker_result='completed' WHERE plan_id='G-001'")
+        self.connection.commit()
+        with mock.patch.object(loop_manager, 'validate_managed_worktree') as validate, \
+             mock.patch.object(loop_manager, '_git_operation_entries', return_value={'rebase-merge': 'active'}) as operations, \
+             mock.patch.object(loop_manager, 'pr_for_branch', return_value=None) as observe:
+            def refresh():
+                return loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo),
+                    'main', state_dir=self.repo / 'state')
+            deferred = refresh()
+            self.assertIn('G-001', deferred.withheld_plan_ids)
+            self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+            operations.return_value = {}
+            def pr_race(*_args):
+                self.assertFalse(self.connection.in_transaction)
+                return None if observe.call_count == 1 else {'state': 'OPEN'}
+            observe.reset_mock()
+            observe.side_effect = pr_race
+            raced = refresh()
+            self.assertEqual(raced.kind, execplan_catalog_state.ReconciliationKind.STALE)
+            self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+            self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+            observe.side_effect = None
+            resumed = refresh()
+            self.assertNotIn('G-001', resumed.withheld_plan_ids)
+            validate.assert_called_with(self.repo, Path('/owned/G-001'), 'owned')
+            audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+            self.assertEqual(audit['row']['worktree'], '/owned/G-001')
+            self.assertTrue(audit['cleanup_pending'])
+            self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
 
     def test_requirement_body_answer_is_proven_and_cleanup_is_publication_bound(self):
         from loop_manager_internal.catalog import draft_decisions, execplan_catalog, execplan_drafts
@@ -2868,6 +2973,56 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
             token=mutable_snapshot_token("repo", "base", (plan,)),
         )
 
+    def test_cancellation_markers_override_live_row_in_mutable_snapshot_boundaries(self):
+        from loop_manager_internal.planning import planner_validation as validation
+        from loop_manager_internal.storage import deleted_plan_state, execplan_catalog_state
+        execplan_catalog_state.ensure_schema(self.connection)
+        deleted_plan_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO projects(repo,base_branch) VALUES ('other','main')")
+        self.connection.commit()
+        read_plan = mock.Mock(return_value=self.snapshot.plans[0])
+        observer = mock.Mock(return_value=None)
+        snapshot_effects = validation.MutableReadySnapshotEffects(
+            lambda connection: None, read_plan, loop_manager._row_is_mutable_ready,
+            mutable_snapshot_token, observer)
+        check_effects = validation.AssertMutableReadySnapshotCurrentEffects(
+            loop_manager._execplan_metadata, loop_manager._row_is_mutable_ready, observer)
+        cancellation = ("INSERT INTO execplan_cancellations "
+            "(repo,plan_id,path,title,sources,depends_on,complexity,risk,priority,content_hash,plan_sha,deletion_commit) "
+            "SELECT ?,plan_id,path,title,sources,depends_on,'low','low',priority,content_hash,plan_sha,'deleted' FROM exec_plans")
+        for marker in ('cancellation', 'deleted'):
+            with self.subTest(marker=marker):
+                def mark(repo):
+                    if marker == 'cancellation':
+                        self.connection.execute(cancellation, (repo,))
+                    else:
+                        self.connection.execute('INSERT INTO deleted_plan_ids VALUES (?,?)', (repo, 'G-001'))
+                # The same ID in another repository does not retire this candidate.
+                mark('other')
+                self.connection.commit()
+                selected = validation.mutable_ready_snapshot(snapshot_effects, self.connection, 'repo', Path('/unused'), 'base')
+                self.assertEqual([plan.plan_id for plan in selected.plans], ['G-001'])
+                validation._assert_mutable_ready_snapshot_current(check_effects, self.connection, self.snapshot)
+                prepared = validation._observe_mutable_ready_prs(check_effects, self.connection, self.snapshot)
+                mark('repo')
+                self.connection.commit()
+                read_plan.reset_mock()
+                before = tuple(self.connection.iterdump())
+                selected = validation.mutable_ready_snapshot(snapshot_effects, self.connection, 'repo', Path('/unused'), 'base')
+                self.assertEqual(selected.plans, ())
+                read_plan.assert_not_called()
+                with self.assertRaisesRegex(validation.PlannerValidationError, '실행 상태가 변경'):
+                    validation._observe_mutable_ready_prs(check_effects, self.connection, self.snapshot)
+                for observation in (None, prepared):
+                    with self.assertRaisesRegex(validation.PlannerValidationError, '실행 상태가 변경'):
+                        validation._assert_mutable_ready_snapshot_current(
+                            check_effects, self.connection, self.snapshot, pr_observation=observation)
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+                self.connection.execute('DELETE FROM execplan_cancellations')
+                self.connection.execute('DELETE FROM deleted_plan_ids')
+                self.connection.commit()
+        observer.assert_not_called()
+
     def test_prepared_pr_check_preserves_cas_without_repeating_observation(self):
         from loop_manager_internal.planning import planner_validation as validation
         from loop_manager_internal.storage import runtime_state
@@ -3211,3 +3366,64 @@ class EverStartedMigrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeletionExternalResourcesTests(unittest.TestCase):
+    def setUp(self):
+        from loop_manager_internal.catalog.remote_deletions import deletion_resources_available
+        self.check = deletion_resources_available
+        self.row = {'branch': 'owned', 'worktree': '/owned/worktree'}
+        self.pr = mock.Mock(return_value=None)
+        self.validate = mock.Mock()
+        self.operations = mock.Mock(return_value={})
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.state = Path(temporary.name)
+
+    def available(self, **kwargs):
+        kwargs.setdefault('state_dir', self.state)
+        return self.check(self.row, 'repo', Path('/repo'), pr_for_branch=self.pr,
+                          validate_worktree=self.validate, git_operations=self.operations, **kwargs)
+
+    def test_live_git_control_and_ownership_failures_preserve_resources(self):
+        self.assertTrue(self.available())
+        self.validate.assert_called_with(Path('/repo'), Path('/owned/worktree'), 'owned')
+        for markers in ({'rebase-merge': 'active'}, {'MERGE_HEAD': 'active'}, {'sequencer': 'active'}):
+            with self.subTest(markers=markers):
+                self.operations.return_value = markers
+                self.assertFalse(self.available())
+        self.operations.return_value = {'REBASE_HEAD': 'old', 'MERGE_MSG': 'old message'}
+        self.assertTrue(self.available())
+        self.validate.side_effect = RuntimeError('ownership unknown')
+        self.assertFalse(self.available())
+        self.validate.side_effect = None
+        self.operations.side_effect = OSError('unreadable operation')
+        self.assertFalse(self.available())
+        self.assertFalse(self.check(self.row, 'repo', Path('/repo'), pr_for_branch=self.pr))
+
+    def test_actual_pr_and_query_uncertainty_are_never_cancellation_evidence(self):
+        for state in ('OPEN', 'CLOSED', 'MERGED'):
+            with self.subTest(state=state):
+                self.pr.return_value = {'state': state, 'url': 'pr'}
+                self.assertFalse(self.available())
+        self.pr.side_effect = RuntimeError('query failed')
+        self.assertFalse(self.available())
+
+    def test_only_the_owned_resource_journal_defers_deletion(self):
+        from loop_manager_internal.git import manager_git_journal as journal
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            def interrupt(_identity):
+                raise RuntimeError('stopped after intent')
+            with self.assertRaisesRegex(RuntimeError, 'stopped after intent'):
+                journal.execute(state, owner='manager', kind='managed_rebase', repo='repo', target='independent',
+                    before={'head': 'before'}, expected={'head': 'after'}, observe=lambda: {'head': 'before'},
+                    apply=interrupt, marker=lambda _: False)
+            self.assertTrue(self.available(state_dir=state))
+            with self.assertRaisesRegex(RuntimeError, 'stopped after intent'):
+                journal.execute(state, owner='manager', kind='managed_rebase', repo='repo', target=self.row['worktree'],
+                    before={'head': 'before'}, expected={'head': 'after'}, observe=lambda: {'head': 'before'},
+                    apply=interrupt, marker=lambda _: False)
+            files = {path: path.read_bytes() for path in state.rglob('*.json')}
+            self.assertFalse(self.available(state_dir=state))
+            self.assertEqual({path: path.read_bytes() for path in files}, files)

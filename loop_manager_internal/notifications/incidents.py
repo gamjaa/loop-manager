@@ -93,6 +93,9 @@ def _queue_block(
 ) -> None:
     """Give each separately notified block its own durable delivery identity."""
 
+    from .repository import cancelled_plan_event
+    if cancelled_plan_event(connection, repo, 'blocked', payload):
+        return
     action = block_action(connection, repo, payload)
     if action is None:
         return
@@ -221,6 +224,36 @@ def release_block(connection: sqlite3.Connection, repo: str, subject: str) -> No
         )
 
 
+def cancel_plan_notifications(connection, repo, plan_id):
+    """Called in the cancellation transaction; retain all sent/error/incident audit."""
+    from .repository import cancelled_plan_event
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='notification_outbox'"
+    ).fetchone():
+        return
+    redraw_drafts = False
+    for row in connection.execute(
+        "SELECT event_key, event_type, payload FROM notification_outbox "
+        "WHERE repo=? AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+    ).fetchall():
+        if cancelled_plan_event(connection, repo, str(row[1]), json.loads(row[2])):
+            redraw_drafts = redraw_drafts or row[1] == 'draft_decisions'
+            connection.execute(
+                "UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP, "
+                "delivery_started_at=NULL WHERE event_key=?", (row[0],),
+            )
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='notified_block_incidents'"
+    ).fetchone():
+        connection.execute(
+            "UPDATE notified_block_incidents SET released_at=CURRENT_TIMESTAMP "
+            "WHERE repo=? AND subject=? AND released_at IS NULL", (repo, f'plan:{plan_id}'),
+        )
+    if redraw_drafts:
+        from .events import enqueue_draft_decisions
+        enqueue_draft_decisions(connection, repo)
+
+
 def record_work_start(
     connection: sqlite3.Connection, repo: str, operation: str,
     *, plan_id: str | None = None, start_identity: str | None = None,
@@ -228,6 +261,9 @@ def record_work_start(
 ) -> int:
     """Record starts without Telegram; count newly finalized confirmed incidents."""
 
+    from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
+    if plan_id and is_cancelled(connection, repo, plan_id):
+        return 0
     tables = {
         str(row[0]) for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
@@ -315,12 +351,17 @@ def recover_interrupted_starts(connection):
 def _materialize_resumption(connection: sqlite3.Connection, incident_id: int) -> int:
     """Finalize a confirmed incident's actual start without another message."""
     row = connection.execute(
-        "SELECT i.confirmed_before, o.confirmed_pieces FROM notified_block_incidents i "
+        "SELECT i.confirmed_before, o.confirmed_pieces, i.repo, i.payload, i.started_operation "
+        "FROM notified_block_incidents i "
         "JOIN notification_outbox o ON o.event_key = i.event_key "
         "WHERE i.id = ? AND i.released_at IS NOT NULL AND i.resumed_at IS NULL "
         "AND i.started_operation IS NOT NULL", (incident_id,),
     ).fetchone()
     if row is None or max(int(row[0]), int(row[1])) == 0:
+        return 0
+    from .repository import cancelled_plan_event
+    payload = json.loads(str(row[3]))
+    if cancelled_plan_event(connection, str(row[2]), 'resumed', {**payload, 'operation': row[4]}):
         return 0
     return connection.execute(
         "UPDATE notified_block_incidents SET resumed_at = CURRENT_TIMESTAMP "
@@ -387,6 +428,9 @@ def _current_block_key(
 ) -> str | None:
     """Rebuild the identity of the block currently owning this notice."""
 
+    from .repository import cancelled_plan_event
+    if cancelled_plan_event(connection, repo, 'blocked', payload):
+        return None
     subject = payload.get("execplan_id")
     reason = payload.get("reason_code")
     if payload.get("stage") == "planning":

@@ -482,3 +482,737 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
                 with self.assertRaises(CheckpointRace):
                     self.checkpoints.record('repo', 'G-047', expected_generation=pending.generation, **values)
                 self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+
+
+class CancelledCheckpointTests(unittest.TestCase):
+    def test_diagnostic_preservation_cannot_replay_cancelled_or_erased_owner_after_writer_reservation(self):
+        from loop_manager_internal.storage import blocked_checkpoint_state as checkpoint_state, deleted_plan_state
+        self.cancel()
+        store = checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        for erased in (False, True):
+            if erased:
+                deleted_plan_state.ensure_schema(self.connection)
+                self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+                self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('repo','G-047')")
+                self.connection.commit()
+            before = list(self.connection.iterdump())
+            for scope in ('plan', 'project'):
+                revalidate = mock.Mock()
+                with self.assertRaises(RuntimeError):
+                    store.preserve('repo', scope, 'G-047', 'old', {'result': 'published'}, revalidate=revalidate)
+                revalidate.assert_not_called()
+                checks = []
+                def raced(connection, repo, owner):
+                    checks.append(connection.in_transaction)
+                    return len(checks) > 1
+                def observed():
+                    self.assertFalse(self.connection.in_transaction)
+                with mock.patch.object(checkpoint_state, 'is_cancelled', side_effect=raced), self.assertRaises(RuntimeError):
+                    store.preserve('repo', scope, 'G-047', 'old', {'result': 'published'}, revalidate=observed)
+                self.assertEqual(checks, [False, True])
+                self.assertEqual(list(self.connection.iterdump()), before)
+        store.preserve('repo', 'plan', 'G-999', 'independent', {'result': 'local_only'})
+        self.assertEqual(store.preservation('repo', 'plan', 'G-999', 'independent')['input_identity'], 'independent')
+
+    def test_stage_origins_do_not_read_removed_row_or_reconnect_cancelled_identity(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.execution import stage_results
+        from loop_manager_internal.storage import deleted_plan_state
+        self.cancel()
+        ports = SimpleNamespace(checkpoint=self.execution, identity=SimpleNamespace(repo='repo'),
+            state=SimpleNamespace(connection=self.connection, row=mock.Mock(side_effect=AssertionError('removed row'))),
+            git=mock.Mock(side_effect=AssertionError('cancelled Git observation')))
+        context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-047'))
+        for marker_only in (False, True):
+            if marker_only:
+                deleted_plan_state.ensure_schema(self.connection)
+                self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+                self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('repo','G-047')")
+                self.connection.commit()
+            before = tuple(self.connection.iterdump())
+            self.assertIsNone(stage_results.preserve(ports, context, reason='stale rebase'))
+            self.assertFalse(stage_results.reconnect_worker(ports, context, None))
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+        ports.state.row.assert_not_called()
+        ports.git.assert_not_called()
+
+    def test_saved_registration_cannot_restore_cancelled_or_erased_identity(self):
+        from loop_manager_internal.storage import deleted_plan_state, execplan_catalog_state as catalog
+        plan = dict(id='G-047', title='Saved', sources=['docs/PRODUCT.md'], depends_on=[],
+                    priority='normal', complexity='low', risk='low')
+        path = 'docs/plans/[G-047] Saved.md'
+        self.cancel()
+        for marker_only in (False, True):
+            if marker_only:
+                deleted_plan_state.ensure_schema(self.connection)
+                self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+                self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('repo','G-047')")
+                self.connection.commit()
+            before = tuple(self.connection.iterdump())
+            native_check = catalog.is_cancelled
+            def check_locked(connection, repo, plan_id):
+                self.assertTrue(connection.in_transaction)
+                return native_check(connection, repo, plan_id)
+            with mock.patch.object(catalog, 'is_cancelled', side_effect=check_locked):
+                for register, options in ((catalog.register_published_plan_row, {}),
+                        (catalog.insert_published_plan_row, {}),
+                        (catalog.insert_published_plan_row, {'archive_fallback': True}),
+                        (catalog.insert_published_plan_row, {'allow_legacy_priority': True})):
+                    with self.subTest(marker_only=marker_only, register=register.__name__, options=options):
+                        with self.assertRaisesRegex(RuntimeError, '재등록할 수 없습니다'):
+                            register(self.connection, 'repo', path, plan, 'hash', 'saved-revision', **options)
+                        self.assertEqual(tuple(self.connection.iterdump()), before)
+                        self.connection.rollback()
+        self.connection.execute("INSERT INTO projects(repo,base_branch) VALUES ('other-repo','main')")
+        catalog.register_published_plan_row(self.connection, 'other-repo', path, plan, 'hash', 'revision')
+        catalog.register_published_plan_row(self.connection, 'other-repo', path, plan, 'hash', 'revision')
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM exec_plans WHERE repo='other-repo'").fetchone()[0], 1)
+
+    def test_cancelled_identity_set_reads_available_tables_without_schema_changes(self):
+        from loop_manager_internal.storage.execplan_catalog_state import cancelled_plan_ids
+        with sqlite3.connect(':memory:') as connection:
+            self.assertEqual(cancelled_plan_ids(connection, 'repo'), frozenset())
+            self.assertEqual(connection.execute('SELECT name FROM sqlite_master').fetchall(), [])
+            for table in ('deleted_plan_ids', 'execplan_cancellations'):
+                connection.execute(f'CREATE TABLE {table} (repo TEXT, plan_id TEXT)')
+                connection.executemany(f'INSERT INTO {table} VALUES (?,?)',
+                    [('repo', 'G-001' if table == 'deleted_plan_ids' else 'G-002'),
+                     ('other-repo', 'G-999')])
+                before = connection.execute('SELECT * FROM sqlite_master').fetchall()
+                self.assertEqual(cancelled_plan_ids(connection, 'repo'),
+                    frozenset({'G-001'} if table == 'deleted_plan_ids' else {'G-001', 'G-002'}))
+                self.assertEqual(connection.execute('SELECT * FROM sqlite_master').fetchall(), before)
+
+    def test_saved_mixed_registration_rolls_back_independent_row_and_planning_state(self):
+        from pathlib import Path
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.storage import database
+        self.cancel()
+        before = tuple(self.connection.iterdump())
+        plans = [(f'docs/plans/[{key}] Saved.md', dict(id=key, title='Saved', sources=['docs/PRODUCT.md'],
+                  depends_on=[], priority='normal', complexity='low', risk='low')) for key in ('G-999', 'G-047')]
+        rows = planner_publication.RegisterExecplanRowsEffects(
+            _ensure_execplans_schema=database._ensure_execplans_schema,
+            file_hash=lambda _path: 'hash', git=mock.Mock(), git_bytes=lambda *_args: b'saved')
+        effects = planner_publication.RegisterExecplansEffects(
+            _prepare_execplan_rows=lambda *args: planner_publication._prepare_execplan_rows(rows, *args),
+            _register_execplan_rows=lambda *args, **kwargs: planner_publication._register_execplan_rows(rows, *args, **kwargs))
+        with self.assertRaisesRegex(RuntimeError, '재등록할 수 없습니다'):
+            planner_publication.register_execplans(effects, self.connection, 'repo', Path('/saved'),
+                                                  plans, 'old-revision', 'old-fingerprint')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_local_recovery_requests_cannot_resume_cancelled_or_erased_identity(self):
+        from loop_manager_internal.storage import local_recovery_state, deleted_plan_state
+        requests = local_recovery_state
+        target = requests.begin_request(self.connection, 'repo', 'G-047')
+        project = requests.begin_request(self.connection, 'repo', None)
+        independent = requests.begin_request(self.connection, 'repo', 'G-999')
+        before = [dict(row) for row in self.connection.execute(
+            'SELECT * FROM local_environment_recovery_requests ORDER BY rowid')]
+        self.cancel()
+        self.assertEqual([request.request_id for request in requests.pending_requests(self.connection, 'repo')],
+                         [project.request_id, independent.request_id])
+        for request in (target, project):
+            with self.assertRaises(requests.LocalRecoveryRequestError):
+                requests.consume_recheck(self.connection, request.request_id, 'G-047', 'verify', repo='repo')
+        after = requests.snapshot(self.connection, 'repo', 'G-047')
+        for action in (lambda: requests.begin_request(self.connection, 'repo', 'G-047'),
+                       lambda: requests.record_progress(self.connection, target, after),
+                       lambda: requests.complete_request(self.connection, target, 'resolved', after)):
+            with self.assertRaises(requests.LocalRecoveryRequestError):
+                action()
+        self.assertEqual([dict(row) for row in self.connection.execute(
+            'SELECT * FROM local_environment_recovery_requests ORDER BY rowid')], before)
+        self.assertFalse(requests.recheck_consumed(self.connection, target.request_id, 'G-047', 'verify'))
+        # The final erasure marker keeps the same guard after the audit is gone.
+        deleted_plan_state.ensure_schema(self.connection)
+        self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+        self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('repo','G-047')")
+        self.connection.commit()
+        self.assertEqual([request.request_id for request in requests.pending_requests(self.connection, 'repo')],
+                         [project.request_id, independent.request_id])
+        with self.assertRaises(requests.LocalRecoveryRequestError):
+            requests.begin_request(self.connection, 'repo', 'G-047')
+        self.assertTrue(requests.consume_recheck(self.connection, project.request_id, 'G-999', 'verify', repo='repo'))
+
+    def setUp(self):
+        import json
+        from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        self.connection = runtime_connection()
+        self.addCleanup(self.connection.close)
+        # This READY fixture has no execution ownership; checkpoint receipts
+        # below model pending requests and older confirmed publication audit.
+        self.connection.execute("UPDATE exec_plans SET workspace_owned=0 WHERE repo='repo'")
+        self.connection.commit()
+        self.execution = ExecutionCheckpointRepository(self.connection)
+        self.blocked = BlockedCheckpointRepository(self.connection)
+        self.execution.record(
+            'repo', 'G-047', expected_generation=0, operation=None,
+            expected_head='head', target_base_oid='base', observed_remote_oid='remote',
+            snapshot={'worker_result': 'saved', 'pushed_checkpoint_head': 'published'},
+        )
+        self.request = self.blocked.request(
+            repo='repo', plan_id='G-047', reason_code='failure', evidence='saved failure',
+            branch=None, worktree=None, expected_remote_oid='remote', rebase_recovery=False,
+        )
+        self.connection.execute("UPDATE blocked_checkpoints SET publication_history=?",
+                                (json.dumps([{'published_oid': 'confirmed'}]),))
+        self.connection.commit()
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.original = ReadyPlanSnapshot(
+            row['plan_id'], row['path'], row['title'], ('docs/PRODUCT.md',), (),
+            'low', 'low', row['priority'], row['content_hash'], row['plan_sha'],
+            '---\nid: G-047\n---\nSaved plan',
+            current_metadata_recorded=True,
+        )
+        self.receipts = {table: dict(self.connection.execute(f'SELECT * FROM {table}').fetchone())
+                         for table in ('execution_checkpoints', 'blocked_checkpoints')}
+
+    def cancel(self):
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
+        from loop_manager_internal.storage.runtime_state import _transaction
+        with _transaction(self.connection):
+            apply_mutable_catalog_changes(
+                self.connection, 'repo', deletions=(PlanDeletion(self.original),), revisions=(),
+                snapshot_token='snapshot', plan_commit='deletion', content_hash=lambda _: '',
+                agent=False,
+            )
+
+    def test_cancellation_moves_requests_and_confirmed_receipts_to_audit(self):
+        import json
+        self.cancel()
+        audit = json.loads(self.connection.execute(
+            'SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertEqual(audit['checkpoints'], self.receipts)
+        self.assertIsNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        for table in self.receipts:
+            self.assertIsNone(self.connection.execute(f'SELECT * FROM {table}').fetchone())
+        self.assertEqual(self.execution.get('repo', 'G-047').generation, 0)
+        self.assertEqual(self.blocked.pending('repo'), ())
+        self.assertIsNone(self.blocked.reconcile_cause(self.request))
+        with self.assertRaises(CheckpointRace):
+            self.execution.record(
+                'repo', 'G-047', expected_generation=0, operation='checkpoint',
+                expected_head='new', target_base_oid='base', observed_remote_oid=None, snapshot={},
+            )
+        with self.assertRaisesRegex(RuntimeError, '취소된 작업'):
+            self.blocked.request(
+                repo='repo', plan_id='G-047', reason_code='failure', evidence='stale',
+                branch=None, worktree=None, expected_remote_oid=None, rebase_recovery=False,
+            )
+        with self.assertRaisesRegex(RuntimeError, '취소된 작업'):
+            self.blocked.record_local(self.request, 'stale-head')
+        # An unrelated identity continues to accept independent Git intent.
+        other = self.execution.record(
+            'repo', 'G-999', expected_generation=0, operation='checkpoint',
+            expected_head='other', target_base_oid='base', observed_remote_oid=None, snapshot={},
+        )
+        self.assertEqual(other.generation, 1)
+        self.assertEqual(json.loads(self.connection.execute(
+            'SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0]), audit)
+
+    def test_cancellation_failure_restores_requests_with_execution_row(self):
+        self.connection.execute("CREATE TRIGGER reject_cancel BEFORE INSERT ON execplan_cancellations "
+                                "BEGIN SELECT RAISE(ABORT, 'interrupted cancellation'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'interrupted cancellation'):
+            self.cancel()
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+        for table, receipt in self.receipts.items():
+            self.assertEqual(dict(self.connection.execute(f'SELECT * FROM {table}').fetchone()), receipt)
+        self.connection.execute('DROP TRIGGER reject_cancel')
+        self.cancel()
+        self.assertEqual(self.blocked.pending('repo'), ())
+
+    def test_legacy_orphan_requests_cannot_resume_after_restart(self):
+        self.cancel()
+        # Older runtimes could leave rows behind. Reopening repositories must
+        # honor the cancellation even while those old receipts remain intact.
+        for table, receipt in self.receipts.items():
+            self.connection.execute(
+                f"INSERT INTO {table} ({', '.join(receipt)}) VALUES ({', '.join('?' for _ in receipt)})",
+                tuple(receipt.values()),
+            )
+        self.connection.commit()
+        from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
+        execution = ExecutionCheckpointRepository(self.connection)
+        blocked = BlockedCheckpointRepository(self.connection)
+        self.assertIsNone(execution.get('repo', 'G-047').operation)
+        self.assertEqual(blocked.pending('repo'), ())
+        with self.assertRaisesRegex(RuntimeError, '취소된 작업'):
+            blocked.get('repo', 'G-047')
+        self.assertIsNone(blocked.reconcile_cause(self.request))
+        for table, receipt in self.receipts.items():
+            self.assertEqual(dict(self.connection.execute(f'SELECT * FROM {table}').fetchone()), receipt)
+
+    def test_pending_call_reservation_preserves_plan_and_cannot_be_recreated_after_cancel(self):
+        from pathlib import Path
+        from loop_manager_internal.storage import task_calls
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        task_calls.ensure_schema(self.connection)
+        target = task_calls.reserve(self.connection, Path('/unused'), 'repo', 'G-047', 'verify', 'run')
+        other = task_calls.reserve(self.connection, Path('/unused'), 'repo', 'G-999', 'agent', 'other')
+        with self.assertRaisesRegex(PlannerValidationError, '호출 예약'):
+            self.cancel()
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        for table, receipt in self.receipts.items():
+            self.assertEqual(dict(self.connection.execute(f'SELECT * FROM {table}').fetchone()), receipt)
+        task_calls.release(target)
+        self.cancel()
+        with self.assertRaises(task_calls.CallDeferred):
+            task_calls.reserve(self.connection, Path('/unused'), 'repo', 'G-047', 'verify', 'late')
+        self.assertEqual([row[0] for row in self.connection.execute('SELECT token FROM task_call_reservations')], [other.token])
+
+    def test_collected_agent_result_requires_physical_finish_before_cancellation(self):
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        repository = InvocationRepository(self.connection)
+        context = InvocationContext('repo', 'G-047')
+        profile = ResolvedProfile('model', 'high')
+        invocation = repository.start(context, 'worker', 'codex', profile, 'saved-session')
+        repository.mark_execution_started(invocation)
+        self.connection.execute("UPDATE agent_invocations SET finished_at='collected', result_kind='success', "
+                                "result_code=0 WHERE invocation_id=?", (invocation,))
+        self.connection.commit()
+        with self.assertRaisesRegex(PlannerValidationError, 'writer 종료'):
+            self.cancel()
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.connection.execute("UPDATE agent_invocations SET execution_finished_at='stopped', "
+                                "execution_finish_evidence='receipt' WHERE invocation_id=?", (invocation,))
+        self.connection.commit()
+        audit = dict(self.connection.execute('SELECT * FROM agent_invocations').fetchone())
+        self.cancel()
+        with self.assertRaises(CallDeferred):
+            repository.start(context, 'worker', 'codex', profile, 'saved-session')
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM agent_invocations').fetchone()), audit)
+
+    def test_git_operation_defers_cancellation_without_consuming_requests(self):
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        current = self.execution.get('repo', 'G-047')
+        saved = self.execution.record(
+            'repo', 'G-047', expected_generation=current.generation, operation='rebase',
+            expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid, snapshot=current.snapshot,
+        )
+        self.connection.commit()
+        with self.assertRaisesRegex(PlannerValidationError, 'Git operation'):
+            self.cancel()
+        self.assertEqual(self.execution.get('repo', 'G-047'), saved)
+        self.assertEqual(self.blocked.get('repo', 'G-047'), self.request)
+        self.execution.record(
+            'repo', 'G-047', expected_generation=saved.generation, operation=None,
+            expected_head=saved.expected_head, target_base_oid=saved.target_base_oid,
+            observed_remote_oid=saved.observed_remote_oid, snapshot=saved.snapshot,
+        )
+        self.connection.commit()
+        self.cancel()
+        self.assertIsNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+
+    def test_manual_preparation_preserves_group_and_execution_until_owner_releases(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        store = ManualWorkRepository(self.connection)
+        group = store.create('repo', 'start', 'manual', [], 'head', 'base', members=('G-047',))
+        group = store.update(group, owner_id='G-047')
+        self.connection.commit()
+        with self.assertRaisesRegex(PlannerValidationError, '수동'):
+            self.cancel()
+        self.assertEqual(dict(store.get('repo', group['group_id'])), dict(group))
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        # A previously closed, unowned group remains historical audit. It is
+        # not a manual stop/reset request and is not rewritten by cancellation.
+        group = store.update(group, state='CLOSED')
+        self.connection.commit()
+        self.cancel()
+        self.assertEqual(dict(store.get('repo', group['group_id'])), dict(group))
+        with self.assertRaisesRegex(runtime_state.RuntimeStateError, '취소된 작업'):
+            store.accept(group, head='new', base='base', input_token='token')
+        self.assertIsNone(self.connection.execute('SELECT * FROM manual_work_requests').fetchone())
+
+    def test_stale_manual_request_is_not_selected_after_cancellation(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        store = ManualWorkRepository(self.connection)
+        self.connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+            "VALUES ('repo','G-999','other.md','Other','[]','[]','normal','other','READY')")
+        group = store.create('repo', 'start', 'manual', [], 'head', 'base', members=('G-047',))
+        group = store.update(group, state='CLOSED', owner_id='G-047')
+        self.connection.commit()
+        self.cancel()
+        # Preserve an old runtime's request verbatim, including audit identity.
+        self.connection.execute("INSERT INTO manual_work_requests "
+            "(request_id,repo,group_id,source_head,base_sha,input_token,skip_verify,skip_review,reason,created_at) "
+            "VALUES ('legacy','repo',?,'head','base','token',0,0,'old','earlier')", (group['group_id'],))
+        group = store.update(group, state='AUTOMATIC', request_id='legacy')
+        other = store.create('repo', 'start', 'independent', [], 'head', 'base', members=('G-999',))
+        other = store.update(other, owner_id='G-999', state='AUTOMATIC')
+        request = store.accept(other, head='head', base='base', input_token='token')
+        self.connection.commit()
+        self.assertEqual([row['group_id'] for row in store.pending('repo')], [other['group_id']])
+        self.assertEqual(dict(store.get('repo', group['group_id'])), dict(group))
+        self.assertEqual(store.request(group)['request_id'], 'legacy')
+        self.assertEqual(dict(store.request(store.get('repo', other['group_id']))), dict(request))
+        # After final erasure only the ID marker remains; old requests must
+        # still stay out of selection without rewriting either group's audit.
+        from loop_manager_internal.storage import deleted_plan_state
+        deleted_plan_state.ensure_schema(self.connection)
+        self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+        self.connection.executemany('INSERT INTO deleted_plan_ids VALUES (?,?)',
+                                    [('repo', 'G-047'), ('other-repo', 'G-999')])
+        self.connection.commit()
+        self.assertEqual([row['group_id'] for row in store.pending('repo')], [other['group_id']])
+        self.assertEqual(dict(store.get('repo', group['group_id'])), dict(group))
+        self.assertEqual(store.request(group)['request_id'], 'legacy')
+        self.assertEqual(dict(store.request(store.get('repo', other['group_id']))), dict(request))
+
+    def test_shared_resource_owner_preserves_both_execution_rows(self):
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        self.connection.execute("UPDATE exec_plans SET branch='shared', worktree='/shared'")
+        self.connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,"
+            "content_hash,status,branch,worktree) VALUES ('repo','G-999','other.md','Other','[]','[]',"
+            "'normal','other','VERIFYING','shared','/shared')")
+        self.connection.commit()
+        before = [dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')]
+        with self.assertRaisesRegex(PlannerValidationError, '공유 자원'):
+            self.cancel()
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')], before)
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+
+    def test_external_deletion_recheck_precedes_transaction_and_preserves_audit_on_race(self):
+        from loop_manager_internal.catalog import execplan_catalog, remote_deletions
+        from loop_manager_internal.storage.execplan_catalog_state import DefinitionStateRepository, PinnedCatalog
+        repository = DefinitionStateRepository(self.connection)
+        expected = repository.capture('repo')
+        safe = [False]
+        def recheck():
+            self.assertFalse(self.connection.in_transaction)
+            return safe[0]
+        deletion = remote_deletions.RemoteDeletion(self.original, '{}', recheck)
+        pinned = PinnedCatalog('revision', execplan_catalog.snapshot_from_documents({}), deletions=(deletion,))
+        self.assertIsNone(repository.apply('repo', pinned, expected, revision_is_current=lambda: True))
+        self.assertEqual(repository.capture('repo'), expected)
+        for table, receipt in self.receipts.items():
+            self.assertEqual(dict(self.connection.execute(f'SELECT * FROM {table}').fetchone()), receipt)
+        safe[0] = True
+        self.assertEqual(repository.apply('repo', pinned, expected, revision_is_current=lambda: True), ('G-047',))
+        self.assertIsNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+
+    def test_cancellation_preserves_cycle_audit_and_surviving_selection_and_revalidation(self):
+        import json
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        from loop_manager_internal.maintenance.maintenance_orchestration import cycle_plan_status_error, select_cycle_ready_execplan
+        from loop_manager_internal.maintenance.maintenance_validation import (
+            MaintenanceModeAndRowsEffects, _maintenance_mode_and_rows,
+        )
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+            "VALUES ('repo','G-999','other.md','Other','[]','[]','normal','other','READY')")
+        self.connection.execute("INSERT INTO maintenance_cycles "
+            "(repo,phase,refactoring_plan_ids,revalidation_plan_ids,assessment_plan_ids,publication_refactoring_plan_ids,"
+            "last_success_commit,last_success_merged_count,last_cycle_commit,last_cycle_merged_count,revision) "
+            "VALUES ('repo','post_refactor_revalidation',?,?,?,?,'assessed',0,'previous',0,7)",
+            (json.dumps(['G-047', 'G-999']),) * 4)
+        self.connection.commit()
+        raw = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.connection.execute("CREATE TRIGGER interrupt_cycle_audit BEFORE UPDATE OF recovery_evidence "
+            "ON execplan_cancellations BEGIN SELECT RAISE(ABORT, 'cycle audit interrupted'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'cycle audit interrupted'):
+            self.cancel()
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-047'").fetchone())
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone()), raw)
+        self.connection.execute('DROP TRIGGER interrupt_cycle_audit')
+        self.cancel()
+        current = MaintenanceRepository(self.connection).get('repo')
+        for ids in (current.refactoring_plan_ids, current.revalidation_plan_ids, current.assessment_plan_ids):
+            self.assertEqual(ids, ('G-999',))
+        self.assertEqual(current.publication_refactoring_plan_ids, ('G-047', 'G-999'))
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone()), raw)
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertEqual(audit['maintenance_cycle'], raw)
+        self.assertEqual(audit['checkpoints'], self.receipts)
+        from loop_manager_internal.storage import deleted_plan_state
+        deleted_plan_state.ensure_schema(self.connection)
+        self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+        self.connection.executemany('INSERT INTO deleted_plan_ids VALUES (?,?)',
+                                    [('repo', 'G-047'), ('other-repo', 'G-999')])
+        self.connection.commit()
+        current = MaintenanceRepository(self.connection).get('repo')
+        for ids in (current.refactoring_plan_ids, current.revalidation_plan_ids, current.assessment_plan_ids):
+            self.assertEqual(ids, ('G-999',))
+        self.assertEqual(current.publication_refactoring_plan_ids, ('G-047', 'G-999'))
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone()), raw)
+        rows = store.plan_rows('repo')
+        self.assertIsNone(cycle_plan_status_error(rows, current))
+        self.assertEqual(select_cycle_ready_execplan(rows, current)['plan_id'], 'G-999')
+        _mode, revalidation = _maintenance_mode_and_rows(
+            MaintenanceModeAndRowsEffects(lambda _: True), self.connection, 'repo', current, 'base')
+        self.assertEqual([row['plan_id'] for row in revalidation], ['G-999'])
+        self.connection.execute("UPDATE maintenance_cycles SET assessment_plan_ids='[\"G-404\"]'")
+        with self.assertRaisesRegex(MaintenanceStateError, '알 수 없는'):
+            store.get('repo')
+
+    def test_pending_maintenance_publication_preserves_execution_and_owned_requests(self):
+        import json
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+        MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles "
+            "(repo,phase,refactoring_plan_ids,publication_refactoring_plan_ids,publication_stage,"
+            "publication_base_sha,publication_commit_sha,publication_remote_oid) "
+            "VALUES ('repo','refactoring','[\"G-047\"]','[\"G-047\"]','prepared','base','head',NULL)")
+        self.connection.commit()
+        before = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        with self.assertRaisesRegex(PlannerValidationError, '소유권'):
+            self.cancel()
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone()), before)
+        self.assertEqual(self.execution.get('repo', 'G-047').snapshot['worker_result'], 'saved')
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+        self.connection.execute("UPDATE maintenance_cycles SET publication_stage='remote_confirmed', publication_remote_oid='head'")
+        self.connection.commit()
+        self.connection.execute("UPDATE maintenance_cycles SET legacy_release_identity='pending-release'")
+        self.connection.commit()
+        with self.assertRaisesRegex(PlannerValidationError, '소유권'):
+            self.cancel()
+        self.connection.execute('UPDATE maintenance_cycles SET legacy_release_identity=NULL')
+        self.connection.commit()
+        receipt = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.cancel()
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertEqual(audit['maintenance_cycle'], receipt)
+        self.assertEqual(audit['checkpoints'], self.receipts)
+
+    def test_all_cancelled_cycle_does_not_fabricate_merge_or_success(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        from loop_manager_internal.maintenance.maintenance_orchestration import cycle_plan_status_error
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles (repo,phase,refactoring_plan_ids,"
+            "last_success_commit,last_success_merged_count,last_cycle_commit,last_cycle_merged_count) "
+            "VALUES ('repo','refactoring','[\"G-047\"]','assessed',0,'previous',0)")
+        self.connection.commit()
+        self.cancel()
+        current = store.get('repo')
+        self.assertEqual(current.refactoring_plan_ids, ())
+        self.assertEqual(current.cancelled_scope_plan_ids, ('G-047',))
+        self.assertIsNone(cycle_plan_status_error(store.plan_rows('repo'), current))
+        with self.assertRaisesRegex(MaintenanceStateError, 'source revision'):
+            store.finish_cycle('repo', expected=current, source_sha='source')
+        self.assertEqual(store.get('repo'), current)
+        self.assertEqual((current.last_success_commit, current.last_cycle_commit), ('assessed', 'previous'))
+        source = 'a' * 40
+        self.connection.execute('INSERT INTO execplan_catalog_revisions(repo,revision_sha,catalog_fingerprint) '
+            'VALUES (?,?,?) ON CONFLICT(repo) DO UPDATE SET revision_sha=excluded.revision_sha', ('repo', source, 'confirmed'))
+        self.connection.commit()
+        for field, value in (('publication_stage', 'prepared'), ('legacy_release_identity', 'release')):
+            with self.subTest(field=field):
+                self.connection.execute(f'UPDATE maintenance_cycles SET {field}=?', (value,))
+                expected = store.get('repo')
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(MaintenanceStateError):
+                    store.finish_cycle('repo', expected=expected, source_sha=source)
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+                self.connection.rollback()
+        self.connection.execute('INSERT INTO execplan_catalog_holds(repo,plan_id,revision_sha,evidence) VALUES (?,?,?,?)',
+                                ('repo', 'G-047', source, '{}'))
+        before = tuple(self.connection.iterdump())
+        with self.assertRaisesRegex(MaintenanceStateError, 'catalog 보류'):
+            store.finish_cycle('repo', expected=store.get('repo'), source_sha=source)
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.rollback()
+        from loop_manager_internal.maintenance.cycle_service import (
+            AdvanceMaintenanceCycleAfterMergesEffects, _advance_maintenance_cycle_after_merges)
+        from loop_manager_internal.maintenance.maintenance_orchestration import all_cycle_plans_merged
+        effects = AdvanceMaintenanceCycleAfterMergesEffects(all_cycle_plans_merged, cycle_plan_status_error)
+        audit = self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0]
+        finished = _advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source)
+        self.assertEqual(finished.phase.value, 'idle')
+        self.assertEqual((finished.last_cycle_commit, finished.last_cycle_merged_count), (source, 0))
+        self.assertEqual((finished.last_success_commit, finished.last_success_merged_count), ('assessed', 0))
+        self.assertEqual(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0], audit)
+        self.assertIsNone(self.connection.execute('SELECT 1 FROM exec_plans').fetchone())
+        self.assertEqual(_advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source), finished)
+
+    def test_empty_cycle_without_confirmed_cancellation_still_rejects_completion(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        from loop_manager_internal.maintenance.maintenance_orchestration import cycle_plan_status_error
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase) VALUES ('repo','refactoring')")
+        self.connection.commit()
+        current = store.get('repo')
+        self.assertEqual(current.cancelled_scope_plan_ids, ())
+        self.assertIsNotNone(cycle_plan_status_error(store.plan_rows('repo'), current))
+        with self.assertRaisesRegex(MaintenanceStateError, '실제 Merge'):
+            store.finish_cycle('repo', expected=current, source_sha='a' * 40)
+
+    def test_legacy_assessment_prerequisites_finish_after_cancellation_without_new_assessment(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        from loop_manager_internal.maintenance import cycle_service, maintenance_orchestration
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,prerequisite_plan_ids,last_success_commit) "
+            "VALUES ('repo','assessment','[\"G-047\"]','old-assessment')")
+        self.connection.commit()
+        self.cancel()
+        current = store.get('repo')
+        self.assertEqual(current.prerequisite_plan_ids, ())
+        self.assertTrue(current.legacy_prerequisite_wait)
+        self.assertEqual(current.cancelled_scope_plan_ids, ('G-047',))
+        with self.assertRaisesRegex(MaintenanceStateError, 'source revision'):
+            store.finish_cycle('repo', expected=current, source_sha='unconfirmed')
+        source = 'a' * 40
+        self.connection.execute('INSERT INTO execplan_catalog_revisions(repo,revision_sha,catalog_fingerprint) '
+            'VALUES (?,?,?) ON CONFLICT(repo) DO UPDATE SET revision_sha=excluded.revision_sha', ('repo', source, 'confirmed'))
+        self.connection.execute('INSERT INTO execplan_catalog_holds(repo,plan_id,revision_sha,evidence) VALUES (?,?,?,?)',
+                                ('repo', 'G-047', source, '{}'))
+        self.connection.commit()
+        effects = cycle_service.AdvanceMaintenanceCycleAfterMergesEffects(
+            maintenance_orchestration.all_cycle_plans_merged, maintenance_orchestration.cycle_plan_status_error)
+        waiting = cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source)
+        self.assertEqual(waiting.phase.value, 'prerequisite_wait')
+        self.assertEqual(waiting.last_success_commit, 'old-assessment')
+        self.assertIsNone(waiting.last_cycle_commit)
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE plan_id='G-047'")
+        self.connection.commit()
+        completed = cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source)
+        self.assertEqual(completed.phase.value, 'idle')
+        self.assertEqual(completed.last_cycle_commit, source)
+        self.assertEqual(completed.last_cycle_merged_count, 0)
+        self.assertEqual(completed.last_success_commit, 'old-assessment')
+        self.assertFalse(completed.full_assessment_completed)
+        self.assertIsNone(completed.full_assessment_result)
+
+    def test_assessment_without_confirmed_legacy_prerequisites_is_not_finished_by_cancellation(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        from loop_manager_internal.maintenance import cycle_service, maintenance_orchestration
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,assessment_plan_ids,cycle_id) "
+            "VALUES ('repo','assessment','[\"G-047\"]','current-cycle')")
+        self.connection.commit()
+        self.cancel()
+        effects = cycle_service.AdvanceMaintenanceCycleAfterMergesEffects(
+            maintenance_orchestration.all_cycle_plans_merged, maintenance_orchestration.cycle_plan_status_error)
+        for cycle_id in ('current-cycle', None):
+            with self.subTest(cycle_id=cycle_id):
+                self.connection.execute('UPDATE maintenance_cycles SET cycle_id=?', (cycle_id,))
+                self.connection.commit()
+                current = store.get('repo')
+                self.assertFalse(current.legacy_prerequisite_wait)
+                before = tuple(self.connection.iterdump())
+                self.assertEqual(cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', 'a' * 40), current)
+                with self.assertRaisesRegex(MaintenanceStateError, '미확정 평가'):
+                    store.finish_cycle('repo', expected=current, source_sha='a' * 40)
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_mixed_cycle_keeps_cancelled_scope_holds_and_requires_surviving_merge(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        from loop_manager_internal.maintenance import cycle_service, maintenance_orchestration
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO exec_plans(repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+            "VALUES ('repo','G-999','other.md','Other','[]','[]','normal','other','READY')")
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,refactoring_plan_ids) "
+            "VALUES ('repo','refactoring','[\"G-047\",\"G-999\"]')")
+        self.connection.commit()
+        self.cancel()
+        current = store.get('repo')
+        self.assertEqual(current.refactoring_plan_ids, ('G-999',))
+        self.assertEqual(current.cancelled_scope_plan_ids, ('G-047',))
+        effects = cycle_service.AdvanceMaintenanceCycleAfterMergesEffects(
+            maintenance_orchestration.all_cycle_plans_merged, maintenance_orchestration.cycle_plan_status_error)
+        source = 'a' * 40
+        self.connection.execute('INSERT INTO execplan_catalog_revisions(repo,revision_sha,catalog_fingerprint) '
+            'VALUES (?,?,?) ON CONFLICT(repo) DO UPDATE SET revision_sha=excluded.revision_sha', ('repo', source, 'confirmed'))
+        self.connection.commit()
+        self.assertEqual(cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source), current)
+        with self.assertRaisesRegex(MaintenanceStateError, '실제 Merge'):
+            store.finish_cycle('repo', expected=current, source_sha=source)
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-999'")
+        self.connection.execute('INSERT INTO execplan_catalog_holds(repo,plan_id,revision_sha,evidence) VALUES (?,?,?,?)',
+                                ('repo', 'G-047', source, '{}'))
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source), current)
+        with self.assertRaisesRegex(MaintenanceStateError, 'catalog 보류'):
+            store.finish_cycle('repo', expected=current, source_sha=source)
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE plan_id='G-047'")
+        self.connection.commit()
+        completed = cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, 'repo', source)
+        self.assertEqual(completed.phase.value, 'idle')
+        self.assertEqual(completed.last_cycle_merged_count, 1)
+        self.assertIsNotNone(self.connection.execute("SELECT 1 FROM execplan_cancellations WHERE plan_id='G-047'").fetchone())
+
+    def test_cancelled_cycle_with_conflicting_live_row_preserves_all_state(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenanceStateError
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles(repo,phase,refactoring_plan_ids) VALUES ('repo','refactoring','[\"G-047\"]')")
+        self.connection.commit()
+        self.cancel()
+        current = store.get('repo')
+        # Model a legacy runtime that wrote a row without the registration gate.
+        self.connection.execute("INSERT INTO exec_plans(repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+            "VALUES ('repo','G-047','old.md','Old','[]','[]','normal','old','READY')")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaisesRegex(MaintenanceStateError, '현재 실행 row'):
+            store.get('repo')
+        with self.assertRaisesRegex(MaintenanceStateError, '현재 실행 row'):
+            store.finish_cycle('repo', expected=current, source_sha='a' * 40)
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_cancelled_document_snapshots_do_not_replay_after_repository_restart(self):
+        import json
+        from types import SimpleNamespace
+        from unittest import mock
+        from loop_manager_internal.execution import stage_documents
+        from tests.support.revision import definition
+        previous = definition()
+        item = dict(version=1, stage='prepared', base='old-base', phase='REVIEWING',
+            paths=[previous.path], document_only=True, previous=previous.serialize(),
+            assessment=dict(relevant=True, implementation='needed', plan_text=self.original.text,
+                            evidence='Saved publication candidate'), workspace='/preserved', commit='unpublished')
+        current = self.execution.get('repo', 'G-047')
+        self.execution.record('repo', 'G-047', expected_generation=current.generation, operation=None,
+            expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'document_revision': item})
+        self.connection.commit()
+        self.receipts['execution_checkpoints'] = dict(self.connection.execute('SELECT * FROM execution_checkpoints').fetchone())
+        self.assertEqual(stage_documents.pending(self.execution, 'repo', 'G-047'), item)
+        self.cancel()
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertEqual(audit['checkpoints'], self.receipts)
+        # An old runtime's orphan receipt is still historical after restart.
+        receipt = self.receipts['execution_checkpoints']
+        self.connection.execute(f"INSERT INTO execution_checkpoints ({', '.join(receipt)}) "
+            f"VALUES ({', '.join('?' for _ in receipt)})", tuple(receipt.values()))
+        self.connection.commit()
+        reopened = ExecutionCheckpointRepository(self.connection)
+        state, effects = mock.Mock(), mock.Mock()
+        state.row.side_effect = AssertionError('cancelled execution row consumed')
+        result = stage_documents.refresh(effects, state, reopened, SimpleNamespace(repo='repo'),
+            SimpleNamespace(plan=SimpleNamespace(plan_id='G-047')), previous, previous, [])
+        self.assertIsNone(result)
+        self.assertFalse(stage_documents.review_pending(reopened, 'repo', 'G-047', previous, 'unpublished'))
+        state.row.assert_not_called()
+        self.assertEqual(effects.mock_calls, [])
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM execution_checkpoints').fetchone()), receipt)
+
+    def test_external_recheck_never_runs_inside_callers_transaction(self):
+        from unittest import mock
+        from loop_manager_internal.catalog import execplan_catalog, remote_deletions
+        from loop_manager_internal.storage.execplan_catalog_state import DefinitionStateRepository, PinnedCatalog
+        repository = DefinitionStateRepository(self.connection)
+        expected = repository.capture('repo')
+        recheck = mock.Mock(side_effect=AssertionError('external I/O under SQLite writer'))
+        pinned = PinnedCatalog('revision', execplan_catalog.snapshot_from_documents({}),
+            deletions=(remote_deletions.RemoteDeletion(self.original, '{}', recheck),))
+        self.connection.execute('BEGIN IMMEDIATE')
+        self.assertIsNone(repository.apply('repo', pinned, expected, revision_is_current=lambda: True))
+        recheck.assert_not_called()
+        self.assertTrue(self.connection.in_transaction)
+        self.assertEqual(repository.capture('repo'), expected)
+        self.connection.rollback()

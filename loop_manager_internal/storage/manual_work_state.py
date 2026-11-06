@@ -246,6 +246,79 @@ def acceptance_snapshot(connection, repo, group_id, plan_ids):
     })
 
 
+def forget_plan(connection, repo, plan_id):
+    """Remove attributed manual records inside the caller's erasure transaction."""
+    from .task_calls import CallDeferred
+    try:
+        _fingerprint, owned = planning_ownership_state(connection, repo, plan_id, None)
+    except runtime_state.RuntimeStateError as error:
+        raise CallDeferred('수동 소유권의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+    if owned:
+        raise CallDeferred('수동 소유 작업은 자동 제거할 수 없습니다.')
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_groups'").fetchone():
+        return
+    for group in connection.execute('SELECT * FROM manual_work_groups WHERE repo=?', (repo,)).fetchall():
+        try:
+            members = json.loads(group['members'])
+        except (TypeError, ValueError) as error:
+            raise CallDeferred('수동 묶음의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+        if not isinstance(members, list):
+            raise CallDeferred('수동 묶음의 삭제 대상 귀속을 확인할 수 없습니다.')
+        try:
+            documents = json.loads(group['documents'])
+            if (not isinstance(documents, list) or any(not isinstance(item, dict)
+                    or not isinstance(item.get('plan'), dict) or not isinstance(item['plan'].get('id'), str)
+                    for item in documents)):
+                raise ValueError('unattributed manual documents')
+        except (TypeError, ValueError) as error:
+            raise CallDeferred('수동 문서 snapshot의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+        if (plan_id not in members and plan_id not in (group['owner_id'], group['active_id'])
+                and not any(item['plan']['id'] == plan_id for item in documents)):
+            continue
+        try:
+            declared, _stored = _validated_group_members(connection, repo, group)
+        except runtime_state.RuntimeStateError as error:
+            raise CallDeferred('수동 묶음의 전체 소유 목록을 확인할 수 없습니다.') from error
+        retained_members = [member for member in declared if member != plan_id]
+        if (plan_id not in declared or group['state'] != 'CLOSED'
+                or (retained_members and group['owner_id'] == plan_id)
+                or any(group[key] for key in ('branch', 'worktree', 'workspace_created', 'active_id',
+                    'pending_source_head', 'source_update_candidate', 'source_update_remote_oid', 'source_update_conflict'))):
+            raise CallDeferred('수동 자원·복구 근거 또는 공유 소유자 관계가 남아 있어 제거를 보류합니다.')
+        if any(item['plan']['id'] not in declared for item in documents):
+            raise CallDeferred('수동 문서 snapshot과 membership의 귀속이 다릅니다.')
+        retained_documents = [item for item in documents if item['plan']['id'] != plan_id]
+        for item in retained_documents:
+            dependencies = item['plan'].get('depends_on', [])
+            if (not isinstance(dependencies, list) or any(not isinstance(key, str) for key in dependencies)
+                    or plan_id in dependencies):
+                raise CallDeferred('독립 수동 문서의 선행 관계가 아직 개정되지 않았습니다.')
+        group_id = group['group_id']
+        if connection.execute('SELECT 1 FROM manual_work_publications WHERE repo=? AND group_id=?',
+                              (repo, group_id)).fetchone():
+            raise CallDeferred('수동 PR 게시 근거는 확인 없이 제거할 수 없습니다.')
+        if any(row[0] not in declared for row in connection.execute(
+                'SELECT plan_id FROM manual_work_results WHERE repo=? AND group_id=?', (repo, group_id))):
+            raise CallDeferred('수동 묶음의 결과 귀속을 확인할 수 없습니다.')
+        if group['request_id'] and not connection.execute(
+                'SELECT 1 FROM manual_work_requests WHERE request_id=? AND repo=? AND group_id=?',
+                (group['request_id'], repo, group_id)).fetchone():
+            raise CallDeferred('수동 요청의 묶음 귀속을 확인할 수 없습니다.')
+        if retained_members:
+            connection.execute('UPDATE manual_work_groups SET members=?,documents=? WHERE repo=? AND group_id=?',
+                (json.dumps(retained_members), json.dumps(retained_documents, ensure_ascii=False), repo, group_id))
+            for table in ('manual_work_members', 'manual_work_results'):
+                connection.execute(f'DELETE FROM {table} WHERE repo=? AND group_id=? AND plan_id=?',
+                                   (repo, group_id, plan_id))
+            continue
+        if connection.execute('SELECT 1 FROM manual_work_groups g JOIN manual_work_requests r '
+                'ON g.request_id=r.request_id WHERE r.repo=? AND r.group_id=? '
+                'AND (g.repo<>? OR g.group_id<>?)', (repo, group_id, repo, group_id)).fetchone():
+            raise CallDeferred('삭제할 수동 요청이 독립 묶음에도 연결돼 있습니다.')
+        for table in ('manual_work_results', 'manual_work_requests', 'manual_work_members', 'manual_work_groups'):
+            connection.execute(f'DELETE FROM {table} WHERE repo=? AND group_id=?', (repo, group_id))
+
+
 class ManualWorkRepository:
     def __init__(self, connection):
         self.connection = connection
@@ -265,10 +338,14 @@ class ManualWorkRepository:
             "AND source_branch=? AND requirements=?", (repo, branch, json.dumps(sorted(requirements)))).fetchone()
 
     def pending(self, repo):
+        from .execplan_catalog_state import cancelled_plan_ids
         return self.connection.execute("SELECT * FROM manual_work_groups WHERE repo=? "
             "AND state IN ('GENERATING','REGISTERING','AUTOMATIC') AND request_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM json_each(manual_work_groups.members) m "
+            "JOIN json_each(?) c ON c.value=m.value) "
             "ORDER BY (SELECT MIN(r.created_at) FROM manual_work_requests r "
-            "WHERE r.repo=manual_work_groups.repo AND r.group_id=manual_work_groups.group_id), rowid", (repo,)).fetchall()
+            "WHERE r.repo=manual_work_groups.repo AND r.group_id=manual_work_groups.group_id), rowid",
+            (repo, json.dumps(sorted(cancelled_plan_ids(self.connection, repo))))).fetchall()
 
     def create(self, repo, kind, branch, requirements, head, base, *, members=(), documents=()):
         group_id = uuid4().hex
@@ -297,6 +374,11 @@ class ManualWorkRepository:
 
     def accept(self, group, *, head, base, input_token, verify_input_token=None,
                review_input_token=None, skip_verify=False, skip_review=False, reason=''):
+        from .execplan_catalog_state import is_cancelled
+        if not self.connection.in_transaction:
+            self.connection.execute('BEGIN IMMEDIATE')
+        if any(is_cancelled(self.connection, group['repo'], plan_id) for plan_id in json.loads(group['members'])):
+            raise runtime_state.RuntimeStateError('취소된 작업을 포함한 수동 묶음의 실행 요청을 만들 수 없습니다.')
         values = (group['repo'], group['group_id'], head, base, input_token,
                   int(skip_verify), int(skip_review), reason,
                   verify_input_token, review_input_token)

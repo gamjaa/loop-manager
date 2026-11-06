@@ -19,6 +19,35 @@ from loop_manager_internal.verification import inputs
 
 
 class StageResultProvenanceTest(ExecutionFixture, unittest.TestCase):
+    def assert_erasure_during_git_observation(self, *, reconnect):
+        from loop_manager_internal.execution import stage_results
+        from loop_manager_internal.storage import deleted_plan_state
+        definition = self.adopted_origin()[0] if reconnect else None
+        before_git = self.git_port.side_effect
+        erased = []
+        def observe(*args, **kwargs):
+            result = before_git(*args, **kwargs)
+            if not erased:
+                deleted_plan_state.ensure_schema(self.connection)
+                self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('repo','G-047')")
+                self.connection.execute("DELETE FROM exec_plans WHERE repo='repo' AND plan_id='G-047'")
+                self.connection.commit()
+                erased.extend(self.connection.iterdump())
+            return result
+        self.git_port.side_effect = observe
+        if reconnect:
+            self.assertFalse(stage_results.reconnect_worker(self.ports, self.context(), definition))
+        else:
+            self.assertIsNone(stage_results.preserve(self.ports, self.context(), reason='rebase_start'))
+        self.assertTrue(erased)
+        self.assertEqual(list(self.connection.iterdump()), erased)
+
+    def test_erasure_during_git_observation_prevents_new_stage_origin(self):
+        self.assert_erasure_during_git_observation(reconnect=False)
+
+    def test_erasure_during_git_observation_prevents_worker_reconnection(self):
+        self.assert_erasure_during_git_observation(reconnect=True)
+
     def setUp(self):
         super().setUp()
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository

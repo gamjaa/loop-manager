@@ -304,6 +304,29 @@ class ManagerGitTransitionTests(unittest.TestCase):
                 effects._tracking_ref_oid.assert_not_called()
                 self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, saved)
 
+    def test_document_worktree_removal_requires_bound_namespace_owner_and_marker(self):
+        import hashlib
+        expected = dict(exists=False, registration=None, index=None)
+        before = dict(exists=True, registration=dict(head=NEW, branch=None, locked=None), index=OLD)
+        for folder, leaf in (('document-revisions', 'a' * 40), ('document-assessments', 'b' * 64)):
+            target = str(Path('/state/worktrees').resolve() / hashlib.sha256(b'/repo').hexdigest()[:16] / folder / 'G-001' / leaf)
+            intent = dict(kind='managed_worktree_remove', owner='plan:G-001', repo='/repo', target=target,
+                          before=before, expected=expected)
+            with self.subTest(folder=folder):
+                self.assertEqual(journal.verified_transition(intent, expected, True), {'refs': {}, 'worktrees': {target: None}})
+                for invalid in ({**intent, 'owner': 'plan:G-002'}, {**intent, 'owner': 'G-001'}, {**intent, 'repo': '/other'},
+                        {**intent, 'kind': 'managed_worktree_create'},
+                        {**intent, 'target': target.replace(folder, 'unowned')},
+                        {**intent, 'target': target.replace('/' + folder + '/', '/' + folder + '/../' + folder + '/')},
+                        {**intent, 'before': {**before, 'registration': {**before['registration'], 'branch': 'refs/heads/other'}}}):
+                    with self.assertRaises(journal.MutationEvidenceError):
+                        journal.verified_transition(invalid, expected, True)
+                with self.assertRaises(journal.MutationEvidenceError):
+                    journal.verified_transition(intent, expected, False)
+                if folder == 'document-assessments':
+                    with self.assertRaises(journal.MutationEvidenceError):
+                        journal.verified_transition({**intent, 'target': str(Path(target).with_name('c' * 40))}, expected, True)
+
     def test_source_local_delta_cannot_become_agent_baseline(self):
         before = {
             "head": OLD, "branch": "main", "changes": [["untracked", "user.txt", "sig"]],
@@ -536,6 +559,7 @@ class PendingProjectMutationTest(unittest.TestCase):
 
     def test_stage_scope_preserves_intents_and_rejects_shared_writer_and_ownership_races(self):
         from contextlib import nullcontext
+        from loop_manager_internal.catalog.archive_service import ArchiveExecutionResources
         from types import SimpleNamespace
         from tests.support.database import runtime_connection
         from loop_manager_internal.runtime.resource_lock import resource_locks
@@ -602,10 +626,15 @@ class PendingProjectMutationTest(unittest.TestCase):
                 lease = (resource_locks(state, repo, ['plan:G-047'], owner='another-worker')
                          if scenario == 'lease-busy' else nullcontext())
                 with lease, mock.patch('loop_manager_internal.runtime.operation_events.emit') as event:
+                    reporter = ArchiveExecutionResources(connection, state, Path(repo), repo, 'main', git, None, None)
                     blocked = journal.has_conflicting_project_mutation(state, repo, stage='planning_release',
                         connection=connection, git=git, worktrees=(requested,),
-                        refs=('refs/heads/loop-manager/G-047',) if scenario == 'publication-ref' else ())
+                        refs=('refs/heads/loop-manager/G-047',) if scenario == 'publication-ref' else (),
+                        report=reporter._report_journal)
                 self.assertEqual(blocked, scenario not in ('independent', 'writer-stopped'))
+                observation = connection.execute('SELECT * FROM execplan_archive_observations').fetchone()
+                self.assertEqual(observation['scope'], 'git:' + event.call_args.kwargs['intent_id'])
+                self.assertEqual(observation['owner_plan_id'], None if blocked else 'G-047')
                 self.assertEqual(event.call_args.kwargs['decision'], 'hold' if blocked else 'allow')
                 for key in ('owner', 'operation', 'intent_id', 'stage', 'resource', 'next_condition'):
                     self.assertTrue(event.call_args.kwargs[key])

@@ -670,6 +670,9 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
     """A physical process has started, rather than just been selected."""
     if role not in {"worker", "planner", "maintenance_planner"}:
         return
+    from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
+    if plan_id and is_cancelled(connection, repo, plan_id):
+        return
     from loop_manager_internal.storage import execplan_draft_state
     ensure_schema(connection)
     if connection.execute(

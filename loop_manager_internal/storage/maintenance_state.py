@@ -121,6 +121,8 @@ class MaintenanceCycle:
     cycle_id: str | None = None
     legacy_release_identity: str | None = None
     publication_id_allocations: tuple[tuple[str, str, str, str], ...] = ()
+    cancelled_scope_plan_ids: tuple[str, ...] = ()
+    legacy_prerequisite_wait: bool = False
 
 
 @dataclass(frozen=True)
@@ -387,6 +389,141 @@ def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
         connection.execute(f"RELEASE {savepoint}")
 
 
+_CYCLE_PLAN_ID_FIELDS = (
+    'prerequisite_plan_ids', 'refactoring_plan_ids', 'revalidation_plan_ids', 'assessment_plan_ids',
+    'publication_refactoring_plan_ids', 'publication_revalidation_plan_ids',
+)
+
+
+def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None:
+    """Remove exact task membership in the caller's final-erasure transaction."""
+    from .task_calls import CallDeferred
+    cycle_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_cycles'").fetchone()
+    cycle = connection.execute('SELECT * FROM maintenance_cycles WHERE repo=?', (repo,)).fetchone() if cycle_table else None
+    root_changes = []
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tiered_maintenance_root_plan_links'").fetchone():
+        from loop_manager_internal.maintenance.maintenance_validation import _plan_id_from_path
+        for row in connection.execute('SELECT * FROM tiered_maintenance_root_plan_links WHERE repo=?', (repo,)):
+            try:
+                links = json.loads(row['links_json'])
+                fields = {'path', 'destination', 'root_review_hash', 'status', 'plan_id', 'plan_path', 'plan_hash', 'reason'}
+                if (not isinstance(links, list) or any(not isinstance(item, dict) or set(item) != fields
+                        or not isinstance(item['plan_id'], str) or not isinstance(item['plan_path'], str)
+                        or _plan_id_from_path(item['plan_path']) != item['plan_id']
+                        or item['status'] not in ('new_plan', 'existing_plan')
+                        or any(not isinstance(item[field], str) or not re.fullmatch(r'[0-9a-f]{64}', item[field])
+                               for field in ('root_review_hash', 'plan_hash'))
+                        or not isinstance(item['reason'], str) or not 12 <= len(item['reason'].strip()) <= 2000
+                        or any(not isinstance(item[field], str) or not item[field] or item[field].startswith('/')
+                               or '\\' in item[field] or any(part in ('', '.', '..') for part in item[field].split('/'))
+                               for field in ('path', 'destination')) for item in links)):
+                    raise ValueError('unattributed root plan links')
+            except (TypeError, ValueError, RecursionError) as error:
+                raise CallDeferred('루트 이동 계획 연결의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+            if any(item['plan_id'] == plan_id for item in links):
+                if (cycle is None or cycle['phase'] != MaintenancePhase.IDLE.value
+                        or not isinstance(cycle['last_cycle_commit'], str)
+                        or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', cycle['last_cycle_commit'])
+                        or type(cycle['last_cycle_merged_count']) is not int or cycle['last_cycle_merged_count'] < 0
+                        or type(row['cycle']) is not int or row['cycle'] < 0
+                        or row['cycle'] >= cycle['revision'] or cycle['publication_stage'] is not None
+                        or cycle['legacy_release_identity'] is not None):
+                    raise CallDeferred('유지보수 루트 이동의 현재 소유권·정상 종료 확인 전에 최종 제거를 보류합니다.')
+                root_changes.append((row, [item for item in links if item['plan_id'] != plan_id]))
+    if cycle is None:
+        return
+    changes = {}
+    try:
+        for field in _CYCLE_PLAN_ID_FIELDS:
+            if field in cycle.keys() and plan_id in _decode_plan_ids(cycle[field], field):
+                changes[field] = json.dumps([key for key in json.loads(cycle[field]) if key != plan_id], separators=(',', ':'))
+        if 'publication_id_allocations' in cycle.keys():
+            allocations = _decode_publication_id_allocations(cycle['publication_id_allocations'])
+            if any(item[3] == plan_id for item in allocations):
+                changes['publication_id_allocations'] = json.dumps(
+                    [item for item in json.loads(cycle['publication_id_allocations']) if item[3] != plan_id], separators=(',', ':'))
+    except MaintenanceStateError as error:
+        raise CallDeferred('유지보수 공유 목록의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+    if cycle['full_assessment_result']:
+        from loop_manager_internal.maintenance.maintenance_validation import validate_saved_assessment_result
+        try:
+            if not isinstance(cycle['full_assessment_source_sha'], str) or not cycle['full_assessment_source_sha']:
+                raise ValueError('missing historical assessment source')
+            report = json.loads(cycle['full_assessment_result'])
+            # Check the stored contract against its own historical path/hash
+            # inventory; this does not revalidate current Git files or success.
+            inventory = {item['path']: item['source_hash'] for item in report['findings']}
+            validate_saved_assessment_result(cycle['full_assessment_result'], inventory,
+                                             cycle['full_assessment_source_sha'])
+        except (TypeError, ValueError, KeyError, RecursionError) as error:
+            raise CallDeferred('유지보수 평가 원문의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+        from .execplan_catalog_state import is_cancelled
+        report_changed = False
+        retained_findings = []
+        for finding in report['findings']:
+            if plan_id not in finding['plan_ids']:
+                retained_findings.append(finding)
+                continue
+            retained = [key for key in finding['plan_ids'] if key != plan_id]
+            if not retained:
+                # Final withdrawal removes target-only records, not a synthetic resolution.
+                report_changed = True
+                continue
+            for key in retained:
+                existing = connection.execute(
+                    'SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
+                cancelled = is_cancelled(connection, repo, key)
+                # A rowless cancellation remains an attributable historical link;
+                # a missing identity or a live row with that marker does not.
+                if (existing is None and not cancelled) or (existing is not None and cancelled):
+                    raise CallDeferred('유지보수 평가 원문의 대상별 귀속 분리가 필요합니다.')
+            finding['plan_ids'] = retained
+            retained_findings.append(finding)
+            report_changed = True
+        if report_changed:
+            report['findings'] = retained_findings
+            changes['full_assessment_result'] = validate_saved_assessment_result(
+                json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
+                inventory, cycle['full_assessment_source_sha'])
+    if not changes and not root_changes:
+        return
+    if (cycle['publication_stage'] is not None
+            or 'legacy_release_identity' in cycle.keys() and cycle['legacy_release_identity'] is not None):
+        raise CallDeferred('유지보수 게시·workspace 해제 intent의 종료 전에 공유 기록을 제거할 수 없습니다.')
+    roots = ('prerequisite_plan_ids', 'refactoring_plan_ids', 'assessment_plan_ids')
+    if cycle['phase'] != MaintenancePhase.IDLE.value and any(field in changes for field in roots):
+        remaining = set().union(*(json.loads(changes.get(field, cycle[field])) for field in roots))
+        if not remaining:
+            # Catalog adoption and normal cycle completion must consume the
+            # confirmed scope before final erasure removes its last identity.
+            raise CallDeferred('활성 유지보수 cycle의 정상 종료 전에 마지막 대상 연결을 제거할 수 없습니다.')
+    for row, retained in root_changes:
+        identity = (repo, row['cycle'], row['source_revision'])
+        if retained:
+            connection.execute('UPDATE tiered_maintenance_root_plan_links SET links_json=? '
+                'WHERE repo=? AND cycle=? AND source_revision=?',
+                (json.dumps(retained, ensure_ascii=False, separators=(',', ':')), *identity))
+        else:
+            connection.execute('DELETE FROM tiered_maintenance_root_plan_links WHERE repo=? AND cycle=? AND source_revision=?', identity)
+    assignments = [field + '=?' for field in changes]
+    assignments.extend(('revision=revision+1', 'updated_at=CURRENT_TIMESTAMP'))
+    connection.execute('UPDATE maintenance_cycles SET ' + ', '.join(assignments) + ' WHERE repo=?',
+                       (*changes.values(), repo))
+
+
+def cycle_for_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> sqlite3.Row | None:
+    """Read current ownership and audit without creating or migrating a cycle."""
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_cycles'"
+    ).fetchone():
+        return None
+    cycle = connection.execute('SELECT * FROM maintenance_cycles WHERE repo=?', (repo,)).fetchone()
+    if cycle is not None and any(plan_id in json.loads(cycle[field]) for field in _CYCLE_PLAN_ID_FIELDS if field in cycle.keys()):
+        return cycle
+    return None
+
+
 class MaintenanceRepository:
     """Transactional persistence boundary for per-project maintenance cycles."""
 
@@ -482,15 +619,22 @@ class MaintenanceRepository:
                 "SELECT plan_id FROM exec_plans WHERE repo = ?", (repo,)
             )
         }
+        from .execplan_catalog_state import cancelled_plan_ids as collect_cancelled_ids
+        cancelled_plan_ids = collect_cancelled_ids(self.connection, repo)
+        original_roots = set().union(*(_decode_plan_ids(row[field], field) for field in (
+            'prerequisite_plan_ids', 'refactoring_plan_ids', 'assessment_plan_ids')))
+        if original_roots & cancelled_plan_ids & known_plan_ids:
+            raise MaintenanceStateError('유지보수 취소 범위에 현재 실행 row가 남아 있습니다.')
+        cancelled_scope = tuple(sorted(original_roots & cancelled_plan_ids, key=_plan_sort_key))
 
         def stored_plan_ids(field: str) -> tuple[str, ...]:
             plan_ids = _decode_plan_ids(row[field], field)
-            unknown = sorted(set(plan_ids) - known_plan_ids, key=_plan_sort_key)
+            unknown = sorted(set(plan_ids) - known_plan_ids - cancelled_plan_ids, key=_plan_sort_key)
             if unknown:
                 raise MaintenanceStateError(
                     f"{field}에 알 수 없는 plan ID가 있습니다: {', '.join(unknown)}"
                 )
-            return plan_ids
+            return tuple(plan_id for plan_id in plan_ids if plan_id not in cancelled_plan_ids)
 
         return MaintenanceCycle(
             repo=str(row["repo"]),
@@ -571,6 +715,9 @@ class MaintenanceRepository:
             publication_id_allocations=_decode_publication_id_allocations(
                 row["publication_id_allocations"]
             ),
+            cancelled_scope_plan_ids=cancelled_scope,
+            legacy_prerequisite_wait=(phase is MaintenancePhase.ASSESSMENT and row['cycle_id'] is None
+                and bool(_decode_plan_ids(row['prerequisite_plan_ids'], 'prerequisite_plan_ids'))),
         )
 
     def due(self, repo: str, interval: int, *, self_repository: bool = False) -> ReviewDue:
@@ -614,7 +761,7 @@ class MaintenanceRepository:
         return str(row[0]) if row else None
 
     def record_assessment_plans(self, repo: str, expected_revision: int, plan_ids: Sequence[str],
-                                prerequisite_plan_ids: Sequence[str] = ()) -> None:
+                                prerequisite_plan_ids: Sequence[str] = ()) -> MaintenanceCycle:
         """Save validated existing finding targets before publication, without changing its identity."""
         with _transaction(self.connection):
             encoded = self._serialize_plan_ids(repo, plan_ids, "assessment_plan_ids")
@@ -626,6 +773,7 @@ class MaintenanceRepository:
             )
             if cursor.rowcount != 1:
                 raise MaintenanceStateError("평가 범위를 기록할 cycle identity가 변경됐습니다.")
+            return self.get(repo)
 
     def record_legacy_release(self, repo: str, *, expected: MaintenanceCycle, identity: str) -> MaintenanceCycle:
         """Bind a checked clean legacy workspace release before its Git removal."""
@@ -654,7 +802,8 @@ class MaintenanceRepository:
                 MaintenancePhase.POST_REFACTOR_REVALIDATION,
             }:
                 raise MaintenanceStateError("유지보수 종료 단계 또는 revision이 변경됐습니다.")
-            if state.phase is MaintenancePhase.ASSESSMENT and (state.cycle_id is not None or not state.prerequisite_plan_ids):
+            if state.phase is MaintenancePhase.ASSESSMENT and (state.cycle_id is not None
+                    or not (state.prerequisite_plan_ids or state.legacy_prerequisite_wait)):
                 raise MaintenanceStateError("미확정 평가를 Merge 종료로 처리할 수 없습니다.")
             if state.legacy_release_identity is not None:
                 raise MaintenanceStateError("미완료 workspace 해제를 유지보수 종료로 처리할 수 없습니다.")
@@ -669,10 +818,10 @@ class MaintenanceRepository:
             rows = self.plan_rows(repo)
             scope = cycle_scope_plan_ids(rows, state)
             from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
-            if catalog_held_plan_ids(self.connection, repo).intersection(scope):
+            if catalog_held_plan_ids(self.connection, repo).intersection((*scope, *state.cancelled_scope_plan_ids)):
                 raise MaintenanceStateError("유지보수 확정 범위의 catalog 보류가 남아 있습니다.")
             by_id = {row["plan_id"]: row["status"] for row in rows}
-            if not scope or any(by_id[plan_id] != "MERGED" for plan_id in scope):
+            if (not scope and not state.cancelled_scope_plan_ids) or any(by_id[plan_id] != "MERGED" for plan_id in scope):
                 raise MaintenanceStateError("유지보수 확정 범위의 실제 Merge가 완료되지 않았습니다.")
             count = self._verified_merged_count(repo, source_sha, self._merged_count(repo))
             self.connection.execute(

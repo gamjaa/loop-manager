@@ -634,6 +634,51 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
         self.assertEqual(self.state.row()['verify_result'], 'successful verify output')
         self.assertFalse(any(call.args[1] == 'push' for call in document_effects.git.call_args_list))
 
+    def test_erasure_during_workspace_observation_does_not_rewrite_saved_proposal(self):
+        import hashlib
+        import loop_manager as lm
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+        from loop_manager_internal.storage import deleted_plan_state, maintenance_state
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        identity = self.handler._identity
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        maintenance_state.MaintenanceRepository(self.connection)
+        original = ReadyPlanSnapshot('G-047', current.path, 'Existing plan', ('docs/PRODUCT.md',), (),
+            'low', 'low', 'normal', 'saved-content', current.revision_sha, 'original plan',
+            current_metadata_recorded=True)
+        snapshot = MutableReadySnapshot(self.repo, current.revision_sha, (original,),
+            mutable_snapshot_token(self.repo, current.revision_sha, (original,)))
+        workspace = (identity.state_dir / 'worktrees' / hashlib.sha256(self.repo.encode()).hexdigest()[:16]
+                     / 'document-revisions' / 'G-047' / current.revision_sha)
+        target = workspace / current.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(original.text, encoding='utf-8')
+        assessment = dict(relevant=True, implementation='needed', plan_text='stale proposal', evidence='saved proposal')
+        saved = dict(version=1, stage='proposed', base=current.revision_sha, phase='REVIEWING',
+            paths=[current.path], document_only=True, previous=current.serialize(),
+            assessment=assessment, assessment_complete=True, workspace=str(workspace))
+        documents.save(checkpoints, self.repo, 'G-047', saved)
+        effects = self.document_effects(current.revision_sha)
+        effects.prepare_snapshot.return_value = snapshot
+        effects.assert_snapshot = mock.Mock(side_effect=lm._assert_mutable_ready_snapshot_current)
+        erased_state = []
+        def observe(_root, *args, **_kwargs):
+            if args == ('ls-files', '--others', '--exclude-standard'):
+                deleted_plan_state.forget(self.connection, self.repo, 'G-047')
+                erased_state.extend(self.connection.iterdump())
+            return SimpleNamespace(returncode=0, stdout=current.revision_sha if args == ('rev-parse', 'HEAD') else '')
+        effects.git.side_effect = observe
+        with self.assertRaisesRegex(PlannerValidationError, '실행 상태가 변경'):
+            documents.refresh(effects, self.state, checkpoints, identity, context, current, current, [])
+        self.assertTrue(erased_state)
+        self.assertEqual(list(self.connection.iterdump()), erased_state)
+        self.assertEqual(target.read_text(encoding='utf-8'), original.text)
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE plan_id='G-047'").fetchone())
+        effects.validate_result.assert_not_called()
+        self.assertFalse(any(call.args[1] in ('add', 'commit', 'push') for call in effects.git.call_args_list))
+
     def test_unchanged_legacy_plan_keeps_raw_and_normalized_assessment(self):
         context = self.review_context()
         current = self.handler._definition_snapshot

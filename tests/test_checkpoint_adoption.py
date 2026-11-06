@@ -198,12 +198,13 @@ class CheckpointRefreshFixture:
                 output = '100644 blob ' + successor + '\tcode.py'
             return subprocess.CompletedProcess([], code, output)
         real_restart = work_branch_integration.restart_base_rebase
+        # Ownership reconciliation observes each workspace before and after its check.
         with (mock.patch.object(loop_manager, '_BlockedCheckpointAdapter') as adapter,
               mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
               mock.patch.object(loop_manager, 'validate_managed_worktree'),
               mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=(
-                  [snapshot, restored, adopted, confirmed] if base_conflict or base_completed in {'manual', 'with_work'}
-                  else [snapshot, adopted, confirmed])),
+                  [snapshot, snapshot, restored, restored, adopted, confirmed] if base_conflict or base_completed in {'manual', 'with_work'}
+                  else [snapshot, snapshot, adopted, confirmed])),
               mock.patch.object(loop_manager, '_nul_git_paths', side_effect=lambda _, *args:
                                 changed_paths if args[0] == 'diff' else ()),
               mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False),

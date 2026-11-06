@@ -1,11 +1,15 @@
 """Revision-proven cancellation and Planner-owned dependency goal recovery."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
+from pathlib import Path
+from typing import Callable
 import json
 import re
 
 from loop_manager_internal.catalog import execplan_catalog as catalog
+from loop_manager_internal.git.command_adapter import ExternalObservationError
 from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
 from loop_manager_internal.maintenance.maintenance_orchestration import is_unowned_ready
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
@@ -17,6 +21,32 @@ from loop_manager_internal.storage.planning_publication_state import _mutable_re
 class RemoteDeletion:
     snapshot: ReadyPlanSnapshot
     evidence: str
+    recheck: Callable[[], bool] | None = field(default=None, compare=False, repr=False)
+
+
+def deletion_resources_available(row, repo, repository, *, pr_for_branch=None,
+                                 validate_worktree=None, git_operations=None, state_dir=None):
+    """Reobserve external ownership without mutating worktrees or holding SQLite."""
+    from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+    from loop_manager_internal.git.manager_git_journal import has_pending_project_mutation
+    try:
+        if (row['branch'] or row['worktree']) and state_dir is None:
+            return False
+        if row['branch'] and (pr_for_branch is None or pr_for_branch(repository, str(row['branch'])) is not None):
+            return False
+        if row['worktree']:
+            if validate_worktree is None or git_operations is None:
+                return False
+            worktree = Path(str(row['worktree']))
+            validate_worktree(repository, worktree, row['branch'])
+            if controlling_git_operation(git_operations(worktree)):
+                return False
+        targets = {str(row[key]) for key in ('branch', 'worktree') if row[key]}
+        if targets and has_pending_project_mutation(Path(state_dir), repo, targets=targets):
+            return False
+    except (RuntimeError, OSError):
+        return False
+    return True
 
 
 _REQUIREMENT_PROOF_FIELDS = ("text", "revision", "deletion_revision")
@@ -49,6 +79,24 @@ def mutable_row(connection, repo, plan_id):
             and (project["phase"] or project["branch"] or project["worktree"] or project["pr_url"])):
         return None
     return row
+
+
+def historical_reference_ids(connection, repo, pinned):
+    """Reuse verified archive bytes/Merge identity before and after audit backfill."""
+    archived = getattr(pinned.snapshot, 'archived', {})
+    rows = connection.execute('SELECT * FROM exec_plans WHERE repo=?', (repo,)).fetchall()
+    direct = {str(row['plan_id']) for row in rows
+        if row['status'] == 'MERGED' and row['plan_sha'] and row['pr_url'] and row['pr_head_oid']
+        and (entry := archived.get(str(row['plan_id']))) is not None
+        and entry.path == (str(row['path']) if str(row['path']).startswith('docs/plans/archive/') else
+                           str(row['path']).replace('docs/plans/', 'docs/plans/archive/', 1))
+        and catalog.plan_content_hash(entry.text.encode('utf-8')) == row['content_hash']}
+    durable = execplan_catalog_state.verified_merged_archive_execution_ids(connection, repo, rows, include_missing=True)
+    # A changed/reappeared declaration still needs the normal recovery gate.
+    by_id = {str(row['plan_id']): row for row in rows}
+    durable = {key for key in durable if key not in pinned.snapshot.observed_ids
+        or key in archived and catalog.plan_content_hash(archived[key].text.encode('utf-8')) == by_id[key]['content_hash']}
+    return frozenset(durable | direct)
 
 
 def reference_issues(connection, repo, repository, pinned, *, git_bytes):
@@ -90,11 +138,7 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
             missing.setdefault(key, path)
             hold_evidence[key] = (row, evidence)
     # An unchanged archived MERGED execution is historical even before archive audit backfill.
-    merged_references = {str(row['plan_id']) for row in rows
-        if row['status'] == 'MERGED' and row['plan_sha'] and row['pr_url'] and row['pr_head_oid']
-        and (entry := pinned.snapshot.archived.get(str(row['plan_id']))) is not None
-        and entry.path == str(row['path']).replace('docs/plans/', 'docs/plans/archive/', 1)
-        and catalog.plan_content_hash(entry.text.encode('utf-8')) == row['content_hash']}
+    merged_references = historical_reference_ids(connection, repo, pinned)
     latest_contents = {key: entry.text.encode("utf-8") for key, entry in pinned.snapshot.all.items()}
     paths = {str(row["plan_id"]): str(row["path"]) for row in rows}
     paths.update({str(row["plan_id"]): str(row["path"]) for row in cancellations})
@@ -392,7 +436,8 @@ def cancellation_recovery_evidence(connection, repo, repository, pinned, referen
     return result
 
 
-def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, references=None, pr_for_branch=None):
+def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, references=None,
+                    pr_for_branch=None, validate_worktree=None, git_operations=None, state_dir=None):
     """Absence alone cannot cancel a row: prove its last adopted bytes/ancestry."""
     from loop_manager_internal.storage.execplan_catalog_state import DefinitionStateRepository
     state = DefinitionStateRepository(connection).capture(repo)
@@ -401,21 +446,24 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, ref
         references = reference_issues(connection, repo, repository, pinned, git_bytes=git_bytes)
     deletions = []
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
-    manual = {str(row[0]) for row in connection.execute("SELECT plan_id FROM manual_work_members WHERE repo=?", (repo,))}
+    from loop_manager_internal.storage.work_claims import cancellation_available
     for row in rows:
         key = str(row["plan_id"])
+        try:
+            available = cancellation_available(connection, repo, key, row)
+        except RuntimeError:
+            continue  # Incomplete manual ownership protects only this deletion.
+        if not available:
+            continue
         completed = any(row[field] is not None for field in ("worker_result", "verify_result", "review_result", "agent_result_snapshot"))
-        started = bool(row["ever_started"] and completed and key not in manual and revisable_row(row) and row["agent_role"] is None)
-        if started and row["branch"]:
-            if pr_for_branch is None:
-                continue
-            try:
-                if pr_for_branch(repository, str(row["branch"])) is not None:
-                    continue
-            except RuntimeError:
-                continue  # 실제 PR 부재를 확인하지 못한 작업만 보류한다.
+        started = bool(row["ever_started"] and completed and revisable_row(row) and row["agent_role"] is None)
         if (key in pinned.snapshot.observed_ids or key in reserved and not started
                 or not started and mutable_row(connection, repo, key) is None):
+            continue
+        recheck = partial(deletion_resources_available, dict(row), repo, repository,
+            pr_for_branch=pr_for_branch, validate_worktree=validate_worktree,
+            git_operations=git_operations, state_dir=state_dir)
+        if not recheck():
             continue
         revision = str(row["current_revision_sha"] or row["plan_sha"] or "")
         if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
@@ -455,7 +503,7 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, ref
                                "resolved": {}, "cleanup_pending": bool(row["branch"] or row["worktree"]),
                                "cleanup_reason": "취소한 소유 자원의 작업물·PR·writer 안전 재확인 필요"},
                               ensure_ascii=False, sort_keys=True)
-        deletions.append(RemoteDeletion(original, evidence))
+        deletions.append(RemoteDeletion(original, evidence, recheck))
     return tuple(deletions)
 
 
@@ -745,20 +793,23 @@ def requirement_recovery_decisions(connection, repo, snapshot):
     return decisions, withdrawals
 
 
-def prepare_withdrawals(connection, repo, worktree, snapshot, *, assert_current=None):
+def prepare_withdrawals(connection, repo, worktree, snapshot, *, assert_current=None, check_resources=None):
     """시작한 작업의 직접 삭제 대신 안전한 Manager 문서 전환을 준비한다."""
     _decisions, withdrawals = requirement_recovery_decisions(connection, repo, snapshot)
+    if withdrawals and connection.in_transaction:
+        raise ExternalObservationError("작업 철회의 외부 자원 확인은 SQLite transaction 밖에서 수행해야 합니다.")
     if withdrawals and assert_current is not None:
         from dataclasses import replace
         assert_current(connection, replace(snapshot, plans=tuple(
             plan for plan in snapshot.plans if plan.plan_id in withdrawals)))
-    prepared = {}
-    for key, judgment in withdrawals.items():
+    for key in withdrawals:
         original = snapshot.by_id[key]
         from loop_manager_internal.storage import execplan_draft_state, work_claims
         if original.draft or key in execplan_draft_state.pending_ids(connection, repo):
             raise PlannerValidationError("사용자 판단 대기 draft를 철회할 수 없습니다.")
         row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, key)).fetchone()
+        if not work_claims.cancellation_available(connection, repo, key, row):
+            raise PlannerValidationError("작업 철회 전에 호출 예약·writer 종료·Git operation·수동·공유 자원 소유권을 확인할 수 없습니다.")
         manual_state, owned = work_claims.manual_plan_ownership(connection, repo, key, row)
         if owned or manual_state != (original.manual_ownership_state or work_claims.empty_manual_ownership_state()):
             raise PlannerValidationError("작업 철회 전에 수동 소유권·준비 intent가 변경됐습니다.")
@@ -768,6 +819,11 @@ def prepare_withdrawals(connection, repo, worktree, snapshot, *, assert_current=
             from loop_manager_internal.planning.planner_validation import planning_execution_state
             if row is None or planning_execution_state(row) != original.execution_state or row["agent_role"]:
                 raise PlannerValidationError("작업 철회 전에 실행 소유권·writer가 변경됐습니다.")
+        if (row["branch"] or row["worktree"]) and (check_resources is None or not check_resources(row)):
+            raise ExternalObservationError("작업 철회 전에 실제 PR·worktree·Git operation·journal 안전을 확인할 수 없습니다.")
+    prepared = {}
+    for key, judgment in withdrawals.items():
+        original = snapshot.by_id[key]
         prepared[key] = judgment
         if original.execution_state and json.loads(original.execution_state).get("ever_started"):
             path = worktree / original.path

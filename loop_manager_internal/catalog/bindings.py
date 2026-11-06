@@ -61,6 +61,9 @@ def register(assembly: Composition) -> None:
             pr_for_branch=assembly.callback('pr_for_branch'),
             assess_cleanup=assembly.callback('assess_cleanup'),
             remove_cleanup_worktree=assembly.callback('remove_cleanup_worktree'),
+            recover_cleanup_worktree=assembly.callback('_recover_managed_worktree_removal'),
+            validate_managed_worktree=assembly.callback('validate_managed_worktree'),
+            git_operation_entries=assembly.callback('_git_operation_entries'),
         ),
     )
 

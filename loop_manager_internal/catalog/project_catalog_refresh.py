@@ -191,7 +191,23 @@ class ProjectCatalogRefresh:
 
     def refresh(self, revision: str | None = None) -> str:
         revision = revision or self.current_revision()
+        pending_deletion = (self.pinned is not None and self.pinned.regular_paths is not None
+            and any(row[0] not in self.pinned.regular_paths for row in self.repository.connection.execute(
+                "SELECT path FROM exec_plans WHERE repo=? AND status<>'MERGED' "
+                "UNION ALL SELECT path FROM execplan_cancellations WHERE repo=? "
+                "UNION ALL SELECT CASE WHEN json_valid(evidence) THEN json_extract(evidence,'$.path') END "
+                "FROM execplan_catalog_holds WHERE repo=?", (self.repo, self.repo, self.repo),
+            )))
+        connection = self.repository.connection
+        pending_files = (connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='deleted_plan_files'"
+        ).fetchone() is not None and connection.execute(
+            'SELECT 1 FROM deleted_plan_files WHERE repo=? LIMIT 1', (self.repo,),
+        ).fetchone() is not None)
+        from loop_manager_internal.storage.deleted_diagnostic_state import marked_owners
+        pending_diagnostics = bool(marked_owners(connection, self.repo))
         if (revision == self.revision
+                and not pending_deletion and not pending_files and not pending_diagnostics
                 and self.declarations == self._declarations()
                 and self.current_revision() == revision):
             return revision
@@ -204,7 +220,7 @@ class ProjectCatalogRefresh:
         return self.revision
 
     def _remember(self, pinned: state.PinnedCatalog) -> None:
-        self.pinned = pinned
+        self.pinned = replace(pinned, deletions=())
 
     def adopt_history(self) -> None:
         """History reconciliation is a known, durable local DB transition."""

@@ -237,10 +237,10 @@ def remember_workspace_metadata(effects, state, checkpoints, identity, context, 
 def refresh(effects, state, checkpoints, identity, context, previous, definition, changed):
     """저장된 결과·게시를 복구하고 새 조건은 기존 Worker gate에 넘긴다."""
     repo, plan_id = identity.repo, context.plan.plan_id
-    row = state.row()
     item = pending(checkpoints, repo, plan_id)
     if item is None:
         return None
+    row = state.row()
     if row['pr_url'] or effects.pr_for_branch(identity.repo_path, context.branch) is not None:
         if item is not None and item['stage'] not in {'proposed', 'prepared'}:
             save(checkpoints, repo, plan_id, None)
@@ -352,6 +352,7 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
                 or effects.git(workspace, 'ls-files', '--others', '--exclude-standard').stdout.strip()
                 or (workspace / original.path).read_text(encoding='utf-8') not in {original.text, assessment['plan_text']}):
             raise PlannerValidationError("보존된 문서 게시 작업 공간이 예상 입력과 다릅니다.")
+        effects.assert_snapshot(state.connection, snapshot)
         (workspace / original.path).write_text(assessment["plan_text"], encoding="utf-8")
         result = effects.validate_result(workspace, item["base"], [original.path],
                                          connection=state.connection, repo=repo, mutable_snapshot=snapshot)

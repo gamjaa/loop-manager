@@ -8,6 +8,8 @@ import json
 import sqlite3
 import uuid
 
+from .execplan_catalog_state import is_cancelled
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS local_environment_recovery_requests (
@@ -156,6 +158,8 @@ def begin_request(
     # processes. Different scopes queue; repeated scopes reuse the same identity.
     from .runtime_state import _transaction
     with _transaction(connection):
+        if plan_id is not None and is_cancelled(connection, repo, plan_id):
+            raise LocalRecoveryRequestError("취소된 작업의 로컬 재검사를 요청할 수 없습니다.")
         pending = connection.execute(
             "SELECT request_id FROM local_environment_recovery_requests "
             "WHERE repo = ? AND plan_id IS ? AND status = 'pending'",
@@ -184,7 +188,8 @@ def pending_requests(connection: sqlite3.Connection, repo: str) -> tuple[LocalRe
         "SELECT request_id, plan_id FROM local_environment_recovery_requests "
         "WHERE repo = ? AND status = 'pending' ORDER BY created_at, rowid", (repo,),
     )
-    return tuple(LocalRecoveryRequest(str(row[0]), repo, row[1], "pending", True) for row in rows)
+    return tuple(LocalRecoveryRequest(str(row[0]), repo, row[1], "pending", True) for row in rows
+                 if row[1] is None or not is_cancelled(connection, repo, row[1]))
 
 
 def pending_request(connection: sqlite3.Connection, repo: str) -> LocalRecoveryRequest | None:
@@ -206,7 +211,8 @@ def consume_recheck(connection: sqlite3.Connection, request_id: str, subject: st
         (request_id,),
     ).fetchone()
     if (row is None or (repo is not None and row[0] != repo)
-            or (row[1] is not None and row[1] != subject)):
+            or (row[1] is not None and row[1] != subject)
+            or is_cancelled(connection, row[0], subject)):
         raise LocalRecoveryRequestError("유효한 재검사 요청이 없습니다.")
     changed = connection.execute(
         "INSERT OR IGNORE INTO local_environment_recheck_consumption (request_id, subject, cause) VALUES (?, ?, ?)",
@@ -221,7 +227,8 @@ def _require_pending_request(connection, request: LocalRecoveryRequest) -> None:
         (request.request_id,),
     ).fetchone()
     if (row is None or row['repo'] != request.repo or row['plan_id'] != request.plan_id
-            or row['status'] != 'pending'):
+            or row['status'] != 'pending'
+            or (request.plan_id is not None and is_cancelled(connection, request.repo, request.plan_id))):
         raise LocalRecoveryRequestError("로컬 재검사 요청 대상 또는 상태가 변경됐습니다.")
 
 
@@ -293,3 +300,53 @@ def causes_remain(after: dict, plan_id: str | None) -> bool:
     if relevant_blocks:
         return True
     return False
+
+
+def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> set[str]:
+    """Erase the exact request scope in the caller's final-erasure transaction."""
+    rows = connection.execute(
+        'SELECT request_id,plan_id,before_state,after_state FROM local_environment_recovery_requests WHERE repo=?',
+        (repo,),
+    ).fetchall()
+    removed = {row['request_id'] for row in rows if row['plan_id'] == plan_id}
+    fields = {'plans': 'plan_id', 'blocks': 'plan_id', 'recoveries': 'subject'}
+    for row in rows:
+        if row['request_id'] in removed:
+            continue
+        for column in ('before_state', 'after_state'):
+            raw = row[column]
+            if raw is None:
+                continue
+            try:
+                saved = json.loads(raw)
+            except (TypeError, ValueError) as error:
+                raise LocalRecoveryRequestError('로컬 복구 snapshot의 귀속을 확인할 수 없습니다.') from error
+            if (not isinstance(saved, dict) or set(saved) - {
+                    *fields, 'current_failures', 'phase', 'planning_error_sha256', 'pr_conflict_recovery'}):
+                raise LocalRecoveryRequestError('로컬 복구 snapshot의 귀속을 확인할 수 없습니다.')
+            changed = False
+            for field, identity in (*fields.items(), ('current_failures', None)):
+                if field not in saved:
+                    continue
+                items = saved[field]
+                if (not isinstance(items, list) or any(
+                        not isinstance(item, str) if identity is None else
+                        not isinstance(item, dict) or identity not in item
+                        or not (isinstance(item[identity], str) or field == 'blocks' and item[identity] is None)
+                        for item in items)):
+                    raise LocalRecoveryRequestError('로컬 복구 snapshot의 귀속을 확인할 수 없습니다.')
+                retained = [item for item in items if (item if identity is None else item[identity]) != plan_id]
+                changed = changed or len(retained) != len(items)
+                saved[field] = retained
+            if changed:
+                connection.execute(
+                    f'UPDATE local_environment_recovery_requests SET {column}=? WHERE request_id=?',
+                    (json.dumps(saved, sort_keys=True, separators=(',', ':')), row['request_id']),
+                )
+    connection.execute(
+        'DELETE FROM local_environment_recheck_consumption WHERE request_id IN '
+        '(SELECT request_id FROM local_environment_recovery_requests WHERE repo=? AND (plan_id=? OR local_environment_recheck_consumption.subject=?))',
+        (repo, plan_id, plan_id),
+    )
+    connection.execute('DELETE FROM local_environment_recovery_requests WHERE repo=? AND plan_id=?', (repo, plan_id))
+    return removed

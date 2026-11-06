@@ -30,6 +30,30 @@ from loop_manager_internal.catalog.execplan_catalog import (
 )
 
 
+_CANCELLATION_ID_TABLES = ('execplan_cancellations', 'deleted_plan_ids')
+
+
+def cancelled_plan_ids(connection: sqlite3.Connection, repo: str) -> frozenset[str]:
+    """Read both identity stores without migrating schemas in selection threads."""
+    ids = set()
+    for table in _CANCELLATION_ID_TABLES:
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+            ids.update(str(row[0]) for row in connection.execute(f'SELECT plan_id FROM {table} WHERE repo=?', (repo,)))
+    return frozenset(ids)
+
+
+def is_cancelled(connection: sqlite3.Connection, repo: str, plan_id: str) -> bool:
+    """Honor cancellation and final-erasure identities without an execution row."""
+    for table in _CANCELLATION_ID_TABLES:
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,),
+        ).fetchone() and connection.execute(
+            f'SELECT 1 FROM {table} WHERE repo=? AND plan_id=?', (repo, plan_id),
+        ).fetchone():
+            return True
+    return False
+
+
 HISTORICAL_CATALOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS execplan_catalog_history (
     repo TEXT NOT NULL,
@@ -93,7 +117,7 @@ class MergeProof:
     detail: str | None = None
 
 
-def verified_historical_merge_ids(connection: sqlite3.Connection, repo: str) -> frozenset[str]:
+def verified_historical_merge_ids(connection: sqlite3.Connection, repo: str, *, include_missing=False) -> frozenset[str]:
     """Return archived identities whose durable merge proof is complete."""
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_history'"
@@ -102,7 +126,7 @@ def verified_historical_merge_ids(connection: sqlite3.Connection, repo: str) -> 
     return frozenset(str(row[0]) for row in connection.execute(
         "SELECT plan_id, original_path, observed_path, original_content_hash, final_content_hash, "
         "plan_sha, merge_confirmed, identity_verified, proof_kind, proof_revision, diagnostic_code "
-        "FROM execplan_catalog_history WHERE repo=? AND currently_archived=1", (repo,),
+        "FROM execplan_catalog_history WHERE repo=?" + ("" if include_missing else " AND currently_archived=1"), (repo,),
     ) if (
         row[6] and row[7]
         and re.fullmatch(rf"docs/plans/\[{re.escape(str(row[0]))}\] [^/]+\.md", str(row[1]))
@@ -138,16 +162,17 @@ def verified_merged_archive_execution_ids(
     connection: sqlite3.Connection,
     repo: str,
     execution_rows: Iterable[Mapping[str, object]],
+    *, include_missing: bool = False,
 ) -> frozenset[str]:
     """Match MERGED execution rows to their verified archived identity and bytes."""
-    history_ids = verified_historical_merge_ids(connection, repo)
+    history_ids = verified_historical_merge_ids(connection, repo, include_missing=include_missing)
     if not history_ids:
         return frozenset()
     history = {
         str(row["plan_id"]): (str(row["observed_path"]), str(row["final_content_hash"]))
         for row in connection.execute(
             "SELECT plan_id, observed_path, final_content_hash "
-            "FROM execplan_catalog_history WHERE repo=? AND currently_archived=1",
+            "FROM execplan_catalog_history WHERE repo=?" + ("" if include_missing else " AND currently_archived=1"),
             (repo,),
         )
         if str(row["plan_id"]) in history_ids
@@ -541,6 +566,10 @@ def insert_published_plan_row(
 ) -> None:
     """Register validated publication metadata without reading a worktree."""
 
+    if not connection.in_transaction:
+        connection.execute('BEGIN IMMEDIATE')
+    if is_cancelled(connection, repo, str(plan['id'])):
+        raise RuntimeError(f"취소되거나 최종 삭제된 ExecPlan은 재등록할 수 없습니다: {plan['id']}")
     if not archive_fallback and not allow_legacy_priority:
         from . import verify_input_requests
         verify_input_requests.validate_new_priority(plan.get("sources", ()), plan.get("priority"))
@@ -891,6 +920,9 @@ class DefinitionStateRepository:
             revision_current = revision_is_current()
             self._fault("before-revision-recheck")
             revision_stable = revision_is_current()
+            for deletion in pinned.deletions:
+                if deletion.recheck is not None and (self.connection.in_transaction or not deletion.recheck()):
+                    return None
             with _transaction(self.connection):
                 if (self.capture(repo) != expected or self.has_publication_intent(repo)
                         or not revision_current or not revision_stable):
@@ -907,9 +939,15 @@ class DefinitionStateRepository:
                         snapshot_token="remote-deletion", plan_commit=pinned.revision_sha,
                         content_hash=lambda _path: "", agent=False,
                     )
+                    saved = self.connection.execute(
+                        "SELECT recovery_evidence FROM execplan_cancellations WHERE repo=? AND plan_id=?",
+                        (repo, deletion.snapshot.plan_id),
+                    ).fetchone()
+                    evidence = json.loads(saved[0] or "{}")
+                    evidence.update(json.loads(deletion.evidence))
                     self.connection.execute(
                         "UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",
-                        (deletion.evidence, repo, deletion.snapshot.plan_id),
+                        (json.dumps(evidence, ensure_ascii=False, sort_keys=True), repo, deletion.snapshot.plan_id),
                     )
                     changed.append(deletion.snapshot.plan_id)
                     self._fault(f"after-cancellation:{deletion.snapshot.plan_id}")
@@ -1938,6 +1976,10 @@ def register_published_plan_row(
 ) -> None:
     """Apply a validated publication row without committing the caller event."""
     plan_id = str(plan["id"])
+    if not connection.in_transaction:
+        connection.execute('BEGIN IMMEDIATE')
+    if is_cancelled(connection, repo, plan_id):
+        raise RuntimeError(f"취소되거나 최종 삭제된 ExecPlan은 재등록할 수 없습니다: {plan_id}")
     sources, dependencies, priority = serialize_plan_metadata(plan)
     initial_level = worker_level(plan)
     historical = connection.execute(

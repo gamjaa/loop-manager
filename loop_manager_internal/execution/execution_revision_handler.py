@@ -363,7 +363,6 @@ class RevisionHandler:
             terminal = self.ports._reconcile_terminal_publication(context)
             if terminal is not None:
                 return terminal
-        self.ports._publish_rebased_checkpoint(context)
         latest_sha = self.ports._fetch_latest_base()
         try:
             result = self.ports.reconcile_catalog(
@@ -399,6 +398,14 @@ class RevisionHandler:
                 context=context,
             )
 
+        from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
+        if is_cancelled(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id):
+            return ExecutionOutcome(ExecutionOutcomeKind.STABLE_WAIT,
+                detail=f'확인된 작업 취소를 반영했습니다: {context.plan.plan_id}')
+        from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+        if context.plan.plan_id in catalog_held_plan_ids(self.ports.state.connection, self.ports.identity.repo):
+            return ExecutionOutcome(ExecutionOutcomeKind.STABLE_WAIT, context=context,
+                detail=f'현재 원격 선언의 복구를 기다립니다: {context.plan.plan_id}')
         catalog_plan = self.ports.state.active_execplan(self.ports.identity.repo)
         if catalog_plan is None:
             return ExecutionOutcome(
@@ -406,6 +413,7 @@ class RevisionHandler:
                 detail='revision gate에서 활성 ExecPlan을 찾을 수 없습니다.',
                 error=True,
             )
+        self.ports._publish_rebased_checkpoint(context)
         self.ports.update_snapshot(catalog_plan=catalog_plan)
         self.ports.update_snapshot(plan=self.ports._cached_plan(catalog_plan))
         try:

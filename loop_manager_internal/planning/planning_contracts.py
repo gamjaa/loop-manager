@@ -342,7 +342,7 @@ class PlanningStatePort(Protocol):
     ) -> maintenance_state.MaintenanceCycle: ...
 
     def record_maintenance_scope(self, repo: str, revision: int, plan_ids: tuple[str, ...],
-                                 prerequisite_plan_ids: tuple[str, ...] = ()) -> None: ...
+                                 prerequisite_plan_ids: tuple[str, ...] = ()) -> maintenance_state.MaintenanceCycle: ...
 
     def file_assessment_evidence(
         self, repo: str, repository: Path, base_branch: str,
@@ -408,6 +408,8 @@ class PlanningStatePort(Protocol):
         specification_fingerprint: str,
         planning_fingerprint: str,
     ) -> Any: ...
+
+    def assert_general_deletion_resources(self, repo: str, result: Any = None) -> None: ...
 
     def publish_general_batch(
         self,

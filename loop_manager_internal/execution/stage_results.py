@@ -6,6 +6,7 @@ import json
 from loop_manager_internal.agents.scope_observation import RAW_DIFF_OPTIONS
 from loop_manager_internal.git.managed_rebase_observation import parse_raw_changes
 from loop_manager_internal.storage import runtime_state, verify_receipts
+from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
 
 
 def implementation_changes(ports, context, changes, plan_path):
@@ -39,10 +40,12 @@ def preserve(ports, context, *, reason):
     checkpoints = ports.checkpoint
     if checkpoints is None:
         return None
+    repo, plan_id = ports.identity.repo, context.plan.plan_id
+    if is_cancelled(ports.state.connection, repo, plan_id):
+        return None
     row = dict(ports.state.row())
     if all(row[key] is None for key in ('worker_result', 'verify_result', 'review_result')):
         return None
-    repo, plan_id = ports.identity.repo, context.plan.plan_id
     current = checkpoints.get(repo, plan_id)
     selection = verify_receipts.selected(ports.state.connection, repo, plan_id)
     evidence = {key: row[key] for key in (
@@ -75,6 +78,8 @@ def preserve(ports, context, *, reason):
     encoded = json.dumps(evidence, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
     identifier = hashlib.sha256(encoded.encode('utf-8')).hexdigest()
     with runtime_state._transaction(ports.state.connection):
+        if is_cancelled(ports.state.connection, repo, plan_id):
+            return None
         if (dict(ports.state.row()) != row or checkpoints.get(repo, plan_id) != current
                 or verify_receipts.selected(ports.state.connection, repo, plan_id) != selection
                 or verify_receipts.current_receipt(ports.state.connection, selection)
@@ -105,6 +110,8 @@ def reconnect_worker(ports, context, definition):
     if checkpoints is None:
         return False
     repo, plan_id = ports.identity.repo, context.plan.plan_id
+    if is_cancelled(ports.state.connection, repo, plan_id):
+        return False
     current = checkpoints.get(repo, plan_id)
     saved = current.snapshot or {}
     accepted = saved.get('current_rebase_acceptance')
@@ -194,6 +201,8 @@ def reconnect_worker(ports, context, definition):
     except (OSError, RuntimeError, TypeError, ValueError, KeyError, IndexError):
         return False
     with runtime_state._transaction(ports.state.connection):
+        if is_cancelled(ports.state.connection, repo, plan_id):
+            return False
         current_general = planning_review_state.get(ports.state.connection, repo, 'general')
         if (dict(ports.state.row()) != row or checkpoints.get(repo, plan_id) != current
                 or verify_receipts.selected(ports.state.connection, repo, plan_id) != selection

@@ -48,8 +48,8 @@ class _CatalogRefreshCase(unittest.TestCase):
         result = state.CatalogReconciliationService(
             state.DefinitionStateRepository(self.connection), fixtures.FakeDefinitionPort(pinned)
         ).reconcile(self.repo)
-        if result.kind is state.ReconciliationKind.RECONCILED:
-            remember(pinned)
+        if result.usable:
+            remember(result.catalog or pinned)
         return result
 
     def row(self, plan='G-001'):
@@ -190,6 +190,124 @@ class CatalogPlanningConsumerTests(_CatalogRefreshCase):
 
 
 class CatalogCacheAndCasTests(_CatalogRefreshCase):
+    def test_missing_active_file_rechecks_external_deletion_boundary_at_same_revision(self):
+        self.boundary.refresh()
+        previous_sha = self.sha
+        path = self.row()['path']
+        del self.documents[path]
+        self.paths = self.paths - {path}
+        self.sha = 'c' * 40
+        original = self.pinned
+        def isolated(revision):
+            pinned = original(revision)
+            return replace(pinned, snapshot=replace(pinned.snapshot, isolation_enabled=True))
+        self.pinned = isolated
+        self.boundary.refresh()
+        self.assertEqual(self.boundary.pinned.revision_sha, self.sha)
+        self.assertNotIn(path, self.boundary.pinned.regular_paths)
+        before = dict(self.row())
+        self.boundary.refresh()
+        self.assertEqual(self.loads, [previous_sha, self.sha, self.sha])
+        self.assertEqual(dict(self.row()), before)
+        self.assertIsNotNone(self.row('G-002'))
+
+    def test_rowless_cancellation_rechecks_external_cleanup_at_same_revision(self):
+        calls = []
+        def reconcile(revision, remember):
+            calls.append(revision)
+            remember(self.pinned(revision))
+            if len(calls) == 3:
+                self.connection.execute("DELETE FROM execplan_cancellations WHERE repo=? AND plan_id='G-999'", (self.repo,))
+                self.connection.commit()
+            return state.CatalogReconciliationResult(state.ReconciliationKind.RECONCILED, revision_sha=revision)
+        self.boundary.refresh()  # Adopt current paths before isolating cleanup effects.
+        self.boundary.revision = None
+        self.boundary.reconcile = reconcile
+        self.boundary.refresh()
+        self.connection.execute("INSERT INTO execplan_cancellations "
+            "(repo,plan_id,path,title,sources,depends_on,complexity,risk,priority,content_hash,plan_sha,deletion_commit) "
+            "SELECT repo,'G-999','docs/plans/[G-999] Gone.md','Gone',sources,depends_on,'low','low',"
+            "priority,content_hash,plan_sha,'deleted' FROM exec_plans WHERE repo=? AND plan_id='G-001'", (self.repo,))
+        self.connection.commit()
+        self.boundary.refresh()
+        # Writer/ref release is external: revision and declarations have not changed.
+        self.boundary.refresh()
+        self.assertEqual(calls, [self.sha] * 3)
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 3)
+
+    def test_rowless_deleted_hold_rechecks_external_release_at_same_revision(self):
+        self.boundary.refresh()
+        calls = []
+        def reconcile(revision, remember):
+            calls.append(revision)
+            remember(self.pinned(revision))
+            if len(calls) == 2:
+                self.connection.execute("DELETE FROM execplan_catalog_holds WHERE repo=? AND plan_id='G-999'", (self.repo,))
+                self.connection.commit()
+            return state.CatalogReconciliationResult(state.ReconciliationKind.RECONCILED, revision_sha=revision)
+        self.boundary.reconcile = reconcile
+        self.connection.execute('INSERT INTO execplan_catalog_holds VALUES (?,?,?,?,NULL)',
+            (self.repo, 'G-999', self.sha, json.dumps({'path': 'docs/plans/[G-999] Gone.md'})))
+        self.connection.commit()
+        self.boundary.refresh()
+        self.boundary.refresh()
+        self.assertEqual(calls, [self.sha] * 2)
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 2)
+
+    def test_final_marker_diagnostic_owner_rechecks_cleanup_at_same_revision(self):
+        from loop_manager_internal.storage import deleted_plan_state, blocked_checkpoint_state
+        deleted_plan_state.ensure_schema(self.connection)
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.boundary.refresh()
+        calls = []
+        def reconcile(revision, remember):
+            calls.append(revision)
+            remember(self.pinned(revision))
+            if len(calls) == 2:
+                self.connection.execute("DELETE FROM diagnostic_preservations WHERE repo=? AND owner='G-999'", (self.repo,))
+                self.connection.commit()
+            return state.CatalogReconciliationResult(state.ReconciliationKind.RECONCILED, revision_sha=revision)
+        self.boundary.reconcile = reconcile
+        self.connection.execute("INSERT INTO deleted_plan_ids VALUES (?,'G-999')", (self.repo,))
+        self.connection.execute("INSERT INTO diagnostic_preservations (repo,scope,owner,input_identity,payload) VALUES (?,'project','G-999','legacy','{}')", (self.repo,))
+        self.connection.commit()
+        self.boundary.refresh()
+        self.boundary.refresh()
+        self.assertEqual(calls, [self.sha] * 2)
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 2)
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM deleted_plan_ids WHERE repo=? AND plan_id='G-999'", (self.repo,)).fetchone())
+
+    def test_pending_file_cleanup_bypasses_cache_until_queue_is_drained(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        deleted_plan_state.ensure_schema(self.connection)
+        calls = []
+        def reconcile(revision, remember):
+            calls.append(revision)
+            remember(self.pinned(revision))
+            if len(calls) == 3:
+                self.connection.execute('DELETE FROM deleted_plan_files WHERE repo=?', (self.repo,))
+                self.connection.commit()
+            return state.CatalogReconciliationResult(state.ReconciliationKind.RECONCILED, revision_sha=revision)
+        self.boundary.refresh()  # Adopt current paths before isolating cleanup effects.
+        self.boundary.revision = None
+        self.boundary.reconcile = reconcile
+        self.boundary.refresh()
+        self.connection.execute("INSERT INTO deleted_plan_files VALUES (?,'G-999','/owned/log')", (self.repo,))
+        self.connection.commit()
+        self.boundary.refresh()
+        self.boundary.refresh()
+        self.assertEqual(calls, [self.sha] * 3)
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 3)
+        # Another repository's queue does not invalidate this cache.
+        self.connection.execute("INSERT INTO deleted_plan_files VALUES ('/other','G-999','/other/log')")
+        self.connection.commit()
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 3)
+
     def test_refresh_does_not_update_another_repositorys_plan(self):
         project = dict(self.connection.execute(
             "SELECT * FROM projects WHERE repo = ?", (self.repo,)
@@ -344,6 +462,15 @@ class CatalogCacheAndCasTests(_CatalogRefreshCase):
 
 
 class CatalogArchiveConsumerTests(_CatalogRefreshCase):
+    def test_archive_does_not_replay_already_applied_deletion_receipt(self):
+        self.boundary.refresh()
+        recheck = mock.Mock(side_effect=AssertionError('applied deletion replayed'))
+        self.boundary._remember(replace(self.boundary.pinned,
+            deletions=(SimpleNamespace(recheck=recheck),)))
+        self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
+        recheck.assert_not_called()
+        self.assertTrue(self.row('G-002')['path'].startswith('docs/plans/archive/'))
+
     def test_archive_revalidation_preserves_renamed_requirement_contents(self):
         source = 'docs/requirements/[R-066] AGENTS 변경 사전 승인.md'
         renamed = 'docs/requirements/[R-066] Agent CLI 지침의 독립성.md'
@@ -677,7 +804,8 @@ class ProjectCatalogConsumerTests(_CatalogRefreshCase):
              mock.patch.object(fixture.recovery, 'independent_scope', side_effect=lambda *a, **k: events.append('scope')):
             self.assertTrue(coordinator.refresh_catalog('G-106'))
         self.assertEqual(events, ['validate', 'scope', 'fetch', 'catalog'])
-        self.assertEqual(fixture.ports.reconcile_execplan_catalog.call_args.kwargs, {'record_invalid': False})
+        self.assertEqual(fixture.ports.reconcile_execplan_catalog.call_args.kwargs,
+                         {'record_invalid': False, 'state_dir': coordinator.state_dir})
         self.assertEqual(manager.scoped_blocking.project_block(fixture.connection, fixture.repo)['evidence'], 'original project cause')
         events.clear()
         with mock.patch.object(coordinator, '_validate', side_effect=RuntimeError('unsafe')):
@@ -1568,7 +1696,9 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
         self.assertEqual(self.row('G-002')['status'], 'IMPLEMENTING')
         self.assertEqual(self.row('G-002')['worker_session_id'], original['worker_session_id'])
         self.assertFalse(self.held())
-        self.assertEqual(self.loads, ['b' * 40, 'c' * 40, 'c' * 40])
+        # A missing held path needs a fresh deletion check even at the same
+        # revision while independent Planner evidence still owns the slot.
+        self.assertEqual(self.loads, ['b' * 40, 'c' * 40, 'c' * 40, 'c' * 40])
 
     def test_planner_slot_ownership_change_invalidates_catalog_cas(self):
         repository = state.DefinitionStateRepository(self.connection)

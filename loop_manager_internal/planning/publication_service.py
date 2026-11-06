@@ -88,6 +88,7 @@ class PlanningPublicationService(PlanningService):
                     # The intent has not reached origin. Keep its candidate
                     # and session for the owned-worktree rebase boundary.
                     return None
+                self._ports.state.assert_general_deletion_resources(context.repo)
                 recovery = self._ports.state.recover_general_batch(
                     context.repo, worktree, context.base_branch
                 )
@@ -548,6 +549,18 @@ class PlanningPublicationService(PlanningService):
                 self._ports.events.error(message)
                 return self._operational_error()
 
+        if run.maintenance_planning:
+            try:
+                # Prepared intents also need fresh ID/ownership checks after
+                # fetch, before their saved candidate can be pushed again.
+                run.maintenance_cycle = self._ports.state.record_maintenance_intent(
+                    context.repo, worktree, context.base_branch, validated_result, plan_commit,
+                )
+            except MaintenancePlanningRestart:
+                return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED, error=True)
+            except RuntimeError as error:
+                return self._preserve_recovery_error(run, str(run.current_fingerprint or ""), error)
+
         if latest_sha not in {row.active_sha, plan_commit}:
             published = (
                 self._ports.git.run(
@@ -599,6 +612,8 @@ class PlanningPublicationService(PlanningService):
                 return self._operational_error()
 
         try:
+            if not run.maintenance_planning:
+                self._ports.state.assert_general_deletion_resources(context.repo, validated_result)
             if run.maintenance_planning:
                 self._ports.state.publish_maintenance_batch(
                     context.repo,

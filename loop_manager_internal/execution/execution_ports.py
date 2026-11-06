@@ -1,6 +1,7 @@
 """execution execution ports boundaries and named composition effects."""
 from __future__ import annotations
 import json
+from functools import partial
 from loop_manager_internal.storage import runtime_state
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -588,7 +589,8 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             operation_print=state.bind(dependencies.operation_print, name="operation_print", connected=False, mutates=False),
         ),
         revision=execution_handlers.RevisionEffects(
-            reconcile_catalog=state.bind(dependencies.reconcile_execution_execplan_catalog, name="reconcile_execplan_catalog", connected=True, mutates=True),
+            reconcile_catalog=state.bind(partial(dependencies.reconcile_execution_execplan_catalog,
+                state_dir=identity['state_dir']), name="reconcile_execplan_catalog", connected=True, mutates=True),
             source_fingerprint=state.bind(dependencies._revision_execplan_source_fingerprint, name="_revision_execplan_source_fingerprint", connected=False, mutates=False),
             body_hash=state.bind(dependencies._revision_execplan_body_hash, name="_revision_execplan_body_hash", connected=False, mutates=False),
             changed_paths=state.bind(dependencies._revision_changed_paths, name="_revision_changed_paths", connected=False, mutates=False),

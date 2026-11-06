@@ -198,6 +198,10 @@ def apply_mutable_catalog_changes(
     cas = _mutable_ready_cas_where()
     for deletion in deletions:
         original = deletion.snapshot
+        from .work_claims import cancellation_available
+        row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, original.plan_id)).fetchone()
+        if not cancellation_available(connection, repo, original.plan_id, row):
+            raise PlannerValidationError("취소 전에 호출 예약·writer 종료·Git operation·수동·공유 자원 소유권을 확인할 수 없습니다.")
         from . import execplan_draft_state
         if agent and original.plan_id in execplan_draft_state.pending_ids(connection, repo):
             raise PlannerValidationError("사용자 판단 대기 draft를 삭제할 수 없습니다.")
@@ -205,14 +209,11 @@ def apply_mutable_catalog_changes(
         preserved = None
         if original.execution_state and json.loads(original.execution_state).get("ever_started"):
             from loop_manager_internal.planning.planner_validation import planning_execution_state
-            row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, original.plan_id)).fetchone()
             if (row is None or planning_execution_state(row) != original.execution_state or row["agent_role"]
                     or row["pr_url"] or row["pr_head_oid"] or row["status"] == "MERGED"):
                 raise PlannerValidationError("취소 전에 작업의 writer·소유권·PR이 변경됐습니다.")
             if agent and not deletion.judgment:
                 raise PlannerValidationError("시작한 작업의 철회 판단이 없습니다.")
-            if connection.execute("SELECT 1 FROM manual_work_members WHERE repo=? AND plan_id=?", (repo, original.plan_id)).fetchone():
-                raise PlannerValidationError("취소 전에 수동 작업 소유권이 생겼습니다.")
             deletion_cas = "agent_role IS NULL AND pr_url IS NULL AND pr_head_oid IS NULL AND status != 'MERGED'"
             affected = [str(item[0]) for item in connection.execute("SELECT plan_id, depends_on FROM exec_plans WHERE repo=?", (repo,))
                         if item[0] != original.plan_id and original.plan_id in json.loads(item[1])]
@@ -220,6 +221,23 @@ def apply_mutable_catalog_changes(
                          "judgment": deletion.judgment,
                          "cleanup_pending": bool(row["branch"] or row["worktree"]),
                          "cleanup_reason": "취소한 소유 자원의 작업물·PR·writer 안전 재확인 필요"}
+        checkpoint_audit = {}
+        block_audit = None
+        for table in ("execution_checkpoints", "blocked_checkpoints", "execplan_blocks"):
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,),
+            ).fetchone():
+                checkpoint = connection.execute(
+                    f"SELECT * FROM {table} WHERE repo=? AND plan_id=?", (repo, original.plan_id),
+                ).fetchone()
+                if checkpoint is not None:
+                    if table == 'execplan_blocks':
+                        block_audit = dict(checkpoint)
+                    else:
+                        checkpoint_audit[table] = dict(checkpoint)
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE repo=? AND plan_id=?", (repo, original.plan_id),
+                    )
         changed = connection.execute(
             f"""
             DELETE FROM exec_plans
@@ -272,11 +290,21 @@ def apply_mutable_catalog_changes(
             ),
         )
         execplan_draft_state.cancel(connection, repo, original.plan_id, plan_commit)
-        if preserved or deletion.judgment:
-            audit = preserved or {"text": original.text, "row": json.loads(original.execution_state or "{}"),
-                                  "affected": [], "resolved": {}, "judgment": deletion.judgment}
-            connection.execute("UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",
-                               (json.dumps(audit, ensure_ascii=False, sort_keys=True), repo, original.plan_id))
+        from loop_manager_internal.notifications.incidents import cancel_plan_notifications
+        cancel_plan_notifications(connection, repo, original.plan_id)
+        from .maintenance_state import cycle_for_plan
+        cycle = cycle_for_plan(connection, repo, original.plan_id)
+        maintenance_audit = dict(cycle) if cycle is not None else None
+        audit = preserved or {"text": original.text, "row": dict(row),
+                              "affected": [], "resolved": {}, "judgment": deletion.judgment}
+        if checkpoint_audit:
+            audit["checkpoints"] = checkpoint_audit
+        if block_audit is not None:
+            audit['block'] = block_audit
+        if maintenance_audit:
+            audit['maintenance_cycle'] = maintenance_audit
+        connection.execute("UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",
+                           (json.dumps(audit, ensure_ascii=False, sort_keys=True), repo, original.plan_id))
         project = connection.execute("SELECT phase, plan_path FROM projects WHERE repo=?", (repo,)).fetchone()
         if project and project["plan_path"] == original.path and project["phase"] != "PLANNING":
             from .runtime_state import RuntimeStateRepository

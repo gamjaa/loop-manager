@@ -42,7 +42,7 @@ def dispatch_execplan_archive_housekeeping(
         if catalog_refresh is not None:
             return catalog_refresh.refresh(base_sha) == base_sha
         result = effects.reconcile_execplan_catalog(
-            connection, repo_path, repo, base_branch
+            connection, repo_path, repo, base_branch, state_dir=state_dir,
         )
         if result.kind is not execplan_catalog_state.ReconciliationKind.RECONCILED:
             return False
@@ -175,10 +175,18 @@ class ArchiveExecutionResources:
 
     def _report_journal(self, message, **fields):
         from loop_manager_internal.runtime import operation_events
+        # This native decision follows immutable intent, DB owner, writer and
+        # shared-resource checks in manager_git_journal._stage_rebase_is_independent.
+        owner_plan_id = None
+        if (fields.get('decision') == 'allow' and fields.get('reason') == 'separate_rebase'
+                and fields.get('operation') == 'managed_rebase'
+                and str(fields.get('owner', '')).startswith('plan:')):
+            owner_plan_id = fields['owner'].removeprefix('plan:')
         if execplan_archive_state.ExecPlanArchiveRepository(self.connection).observe(
             self.repo, "git:" + fields["intent_id"], category="shared_resource",
             resource=fields["resource"], reason=fields["decision"] + ":" + fields["reason"],
             resume_condition=fields["next_condition"],
+            owner_plan_id=owner_plan_id,
         ):
             operation_events.emit(message, **fields)
 

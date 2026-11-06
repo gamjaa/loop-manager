@@ -206,7 +206,10 @@ class TaskScheduler:
 
     def wait_retry(self, connection, repo, plan_id=None, *, resume=False):
         from loop_manager_internal.storage import recovery_state
+        from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
         from loop_manager_internal.recovery.recovery_runtime import TRANSIENT, RECONCILE, RecoveryReason
+        if plan_id is not None and is_cancelled(connection, repo, plan_id):
+            return False
         repository = recovery_state.RecoveryRepository(connection)
         saved = repository.row(repo, plan_id)
         eligible = {reason.value for reason in TRANSIENT | RECONCILE} | {
@@ -224,21 +227,38 @@ class TaskScheduler:
                         reason_code=saved['reason_code'], occurrence=saved['occurrence'],
                         next_action='작업 보존·입력 또는 복구 조건 변경 후 재검사')
             return False
-        saved = repository.defer_retry(repo, plan_id)
+        try:
+            saved = repository.defer_retry(repo, plan_id)
+        except recovery_state.RecoveryStateConflict:
+            if plan_id is not None and is_cancelled(connection, repo, plan_id):
+                return False
+            raise
+        if saved is None:
+            return False
         events.emit('작업 재시도 대기', project=repo, plan=plan_id, reason_code=saved['reason_code'],
                     retry_after=saved['retry_after'])
         while True:
             self.check_project(repo)
+            if plan_id is not None and is_cancelled(connection, repo, plan_id):
+                return False
             remaining = saved['retry_after'] - time.time()
             if remaining <= 0:
                 break
             with self.condition:
                 self.condition.wait(min(remaining, .2))
-        repository.finish_retry_wait(saved)
+        try:
+            repository.finish_retry_wait(saved)
+        except recovery_state.RecoveryStateConflict:
+            if plan_id is not None and is_cancelled(connection, repo, plan_id):
+                return False
+            raise
         return True
 
     def wait_usage(self, connection, repo, plan_id):
         """Only an independently recorded successful call can clear a quota wait."""
+        from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
+        if is_cancelled(connection, repo, plan_id):
+            return False
         saved = connection.execute(
             'SELECT result_kind, provider, model, finished_at FROM agent_invocations '
             'WHERE repo=? AND plan_id=? ORDER BY started_at DESC, rowid DESC LIMIT 1', (repo, plan_id)).fetchone()
@@ -247,12 +267,14 @@ class TaskScheduler:
         events.emit('사용 한도 조건 대기', project=repo, plan=plan_id)
         while True:
             self.check_project(repo)
+            if is_cancelled(connection, repo, plan_id):
+                return False
             if saved['finished_at'] and connection.execute(
                 "SELECT 1 FROM agent_invocations WHERE repo=? AND provider=? AND model=? "
                 "AND finished_at>? AND result_kind='success' AND result_code=0 "
                 "AND execution_status='executed' AND execution_finished_at IS NOT NULL LIMIT 1",
                 (repo, saved['provider'], saved['model'], saved['finished_at'])).fetchone():
-                return True
+                return not is_cancelled(connection, repo, plan_id)
             with self.condition:
                 self.condition.wait(1)
 
@@ -812,7 +834,7 @@ def run_project_tasks(service, *, newly_activated, planning_context=None):
                         f"refs/remotes/origin/{child.state.base}^{{commit}}").stdout.strip(),
                     lambda revision, remember: service.effects.reconcile_execplan_catalog(
                         owned, child.state.repo_path, repo, child.state.base, remote_sha=revision,
-                        on_reconciled=remember),
+                        on_reconciled=remember, state_dir=service.identity.state_dir),
                 )
                 with scheduler.task(repo, plan_id, owned, resumed=resumed), notifications.immediate_delivery(
                         owned, scheduler.config.telegram_token, scheduler.config.telegram_chat_id, repo):

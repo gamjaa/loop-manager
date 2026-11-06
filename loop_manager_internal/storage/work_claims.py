@@ -87,6 +87,34 @@ def manual_plan_ownership(connection, repo, plan_id, execution_row):
     return planning_ownership_state(connection, repo, plan_id, execution_row)
 
 
+def cancellation_available(connection, repo, plan_id, row):
+    """Recheck durable writers, manual ownership and shared resources before removal."""
+    from .task_calls import pending_for_plan
+    from .execplan_catalog_state import is_cancelled
+    if row is None or is_cancelled(connection, repo, plan_id) or row['agent_role'] or pending_for_plan(connection, repo, plan_id):
+        return False
+    _state, owned = manual_plan_ownership(connection, repo, plan_id, row)
+    if owned:
+        return False
+    from .maintenance_state import cycle_for_plan
+    cycle = cycle_for_plan(connection, repo, plan_id)
+    if cycle is not None and (cycle['publication_stage'] not in (None, 'remote_confirmed')
+            or ('legacy_release_identity' in cycle.keys() and cycle['legacy_release_identity'] is not None)):
+        return False
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_checkpoints'"
+    ).fetchone() and connection.execute(
+        "SELECT 1 FROM execution_checkpoints WHERE repo=? AND plan_id=? AND operation IS NOT NULL",
+        (repo, plan_id),
+    ).fetchone():
+        return False
+    return connection.execute(
+        "SELECT 1 FROM exec_plans WHERE repo=? AND plan_id<>? AND status<>'MERGED' "
+        "AND ((? IS NOT NULL AND branch=?) OR (? IS NOT NULL AND worktree=?)) LIMIT 1",
+        (repo, plan_id, row['branch'], row['branch'], row['worktree'], row['worktree']),
+    ).fetchone() is None
+
+
 def empty_manual_ownership_state():
     from .manual_work_state import digest
     return digest([])

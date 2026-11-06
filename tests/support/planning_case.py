@@ -385,6 +385,7 @@ class FakeStatePort:
 
     def record_maintenance_scope(self, _repo, _revision, plan_ids, prerequisite_plan_ids=()):
         self.cycle = replace(self.cycle, assessment_plan_ids=plan_ids, prerequisite_plan_ids=prerequisite_plan_ids)
+        return self.cycle
 
     def advance_success_baseline(self, *_args, **_kwargs):
         raise AssertionError("unexpected maintenance baseline")
@@ -396,6 +397,8 @@ class FakeStatePort:
         return self.recovered_cycle
 
     def record_maintenance_intent(self, *_args, **_kwargs):
+        if self.cycle.publication_stage == 'prepared':
+            return self.cycle
         raise AssertionError("unexpected maintenance publication intent")
 
     def publish_maintenance_batch(self, *_args, **_kwargs):
@@ -406,6 +409,9 @@ class FakeStatePort:
 
     def general_publication(self, _repo):
         return self.general_intent
+
+    def assert_general_deletion_resources(self, _repo, result=None):
+        pass
 
     def recover_general_batch(self, *_args):
         if self.general_recovery_result != "pending":

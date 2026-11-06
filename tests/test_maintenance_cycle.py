@@ -686,7 +686,9 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
     def test_legacy_assessment_after_prerequisite_merge_does_not_restart_evaluation(self):
         self._insert_plan(self.connection, "/one", "G-001")
         cycle, _ = self._legacy_cycle(self.connection, "/one", self.source)
-        self.repository.record_assessment_plans("/one", cycle.revision, (), ("G-001",))
+        recorded = self.repository.record_assessment_plans("/one", cycle.revision, (), ("G-001",))
+        self.assertEqual(recorded, self.repository.get("/one"))
+        self.assertTrue(recorded.legacy_prerequisite_wait)
         resumed = self.advance()
         self.assertEqual(resumed.phase, maintenance_state.MaintenancePhase.PREREQUISITE_WAIT)
         self.connection.execute("UPDATE exec_plans SET status = 'MERGED'")
