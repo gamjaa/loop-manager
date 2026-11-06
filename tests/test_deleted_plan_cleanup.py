@@ -402,15 +402,76 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 revision_is_current=lambda: True), ('G-001',))
 
     def test_usage_and_invocation_children_are_erased_together(self):
+        from loop_manager_internal.storage.task_calls import CallDeferred
         self.connection.execute('''INSERT INTO agent_invocations
             (invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at)
             VALUES ('call','/repo','G-001','worker','codex','model','high','start',1,'now')''')
         self.connection.execute("INSERT INTO targeted_test_collections(invocation_id,directory,device,inode,receipt) VALUES ('call','directory','1','2','receipt')")
         self.connection.execute("INSERT INTO targeted_test_run_owners VALUES ('run','call')")
         self.connection.commit()
+        for assignment in (None, "finished_at='collected'",
+                           "execution_status='executed',execution_started_at='started',execution_finished_at='stopped'",
+                           "execution_status='not_executed'"):
+            with self.subTest(assignment=assignment):
+                if assignment:
+                    self.connection.execute(f'UPDATE agent_invocations SET {assignment}')
+                    self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("UPDATE agent_invocations SET execution_status='executed',execution_finish_evidence='provider_process_finished'")
+        self.connection.commit()
         deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         for table in ('agent_invocations', 'targeted_test_collections', 'targeted_test_run_owners'):
             self.assertEqual(self.connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0], 0)
+
+    def test_rowless_erasure_waits_for_reservation_return_and_preserves_independent_call(self):
+        from pathlib import Path
+        from loop_manager_internal.storage import task_calls
+        task_calls.ensure_schema(self.connection)
+        target = task_calls.reserve(self.connection, Path('/unused'), '/repo', 'G-001', 'verify', 'target-run')
+        other = task_calls.reserve(self.connection, Path('/unused'), '/repo', 'G-002', 'verify', 'other-run')
+        self.connection.execute("DELETE FROM exec_plans WHERE plan_id='G-001'")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaises(task_calls.CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001', artifacts=('/unused/logs/target',))
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        independent = dict(self.connection.execute('SELECT * FROM task_call_reservations WHERE token=?', (other.token,)).fetchone())
+        task_calls.release(target)
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM task_call_reservations')], [independent])
+        self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
+
+    def test_confirmed_non_execution_can_be_erased_without_physical_finish_time(self):
+        self.connection.execute('''INSERT INTO agent_invocations
+            (invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at,finished_at,execution_status)
+            VALUES ('not-started','/repo','G-001','worker','codex','model','high','start',1,'prepared','rejected','not_executed')''')
+        self.connection.commit()
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertIsNone(self.connection.execute('SELECT * FROM agent_invocations').fetchone())
+
+    def test_confirmed_erasure_removes_target_from_native_usage_summary_only(self):
+        from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+        ledger = InvocationRepository(self.connection)
+        for call, repo, plan, tokens in (('target', '/repo', 'G-001', 100),
+                                         ('independent', '/repo', 'G-002', 200),
+                                         ('foreign', '/other', 'G-001', 300)):
+            self.connection.execute('INSERT INTO agent_invocations '
+                '(invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at,'
+                'finished_at,execution_status,execution_started_at,execution_finished_at,execution_finish_evidence,input_tokens) '
+                "VALUES (?,?,?,'worker','codex','model','high','start',1,'prepared','collected','executed',"
+                "'started','stopped','provider_process_finished',?)", (call, repo, plan, tokens))
+        self.connection.commit()
+        independent = [dict(row) for row in ledger.summary('/repo') if row['plan_id'] == 'G-002']
+        foreign = [dict(row) for row in ledger.summary('/other')]
+        self.assertEqual(sum(row['input_tokens'] for row in ledger.summary('/repo')), 300)
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        current = [dict(row) for row in ledger.summary('/repo')]
+        self.assertEqual(current, independent)
+        self.assertEqual(sum(row['input_tokens'] for row in current), 200)
+        self.assertEqual([dict(row) for row in ledger.summary('/other')], foreign)
 
     def test_file_queue_survives_failure_and_retries_without_task_row(self):
         from tempfile import TemporaryDirectory

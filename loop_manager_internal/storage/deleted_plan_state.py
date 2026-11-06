@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 
 from .runtime_state import _transaction
-from .task_calls import CallDeferred
+from .task_calls import CallDeferred, pending_for_plan
 
 
 def ensure_schema(connection):
@@ -24,6 +24,8 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
         if plan is not None and (plan['status'] == 'MERGED' or plan['agent_role']):
             raise ValueError('완료된 작업 또는 실행 writer의 기록은 제거할 수 없습니다.')
+        if pending_for_plan(connection, repo, plan_id):
+            raise CallDeferred('호출 예약 또는 writer의 실제 종료·결과 인계가 미확정인 작업은 제거할 수 없습니다.')
         for row in connection.execute('SELECT plan_id,depends_on FROM exec_plans WHERE repo=? AND plan_id<>?', (repo, plan_id)):
             if plan_id in json.loads(row['depends_on']):
                 raise ValueError('삭제된 작업의 선행 관계가 아직 남아 있습니다.')

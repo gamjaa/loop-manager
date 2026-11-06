@@ -57,7 +57,10 @@ def pending_for_plan(connection, repo, plan_id):
     """A collected result cannot release an unconfirmed physical call."""
     for table, pending in (
         ('task_call_reservations', '1'),
-        ('agent_invocations', "finished_at IS NULL OR (execution_finished_at IS NULL AND execution_status != 'not_executed')"),
+        ('agent_invocations', "finished_at IS NULL OR "
+         "(execution_status='not_executed' AND execution_started_at IS NOT NULL) OR "
+         "(execution_status!='not_executed' AND "
+         "(COALESCE(execution_finished_at,'')='' OR COALESCE(execution_finish_evidence,'')=''))"),
     ):
         if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
             if connection.execute(
