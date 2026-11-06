@@ -1272,6 +1272,28 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertIsNone(self.connection.execute('SELECT * FROM agent_invocations').fetchone())
 
+    def test_erasure_requires_known_execution_status_and_nonempty_start_and_handoff(self):
+        from loop_manager_internal.storage.task_calls import CallDeferred, pending_for_plan
+        self.artifact_call('target-call', '/repo', 'G-001')
+        self.artifact_call('independent-call', '/other', 'G-001')
+        self.connection.commit()
+        independent = dict(self.connection.execute("SELECT * FROM agent_invocations WHERE invocation_id='independent-call'").fetchone())
+        for field, value in (('execution_status', 'unknown'), ('execution_status', 'prepared'),
+                ('execution_status', ''), ('execution_status', 'legacy-finished'),
+                ('execution_started_at', None), ('execution_started_at', ''), ('finished_at', '')):
+            with self.subTest(field=field, value=value):
+                self.connection.execute(f'UPDATE agent_invocations SET {field}=? WHERE invocation_id=?', (value, 'target-call'))
+                before = tuple(self.connection.iterdump())
+                self.assertTrue(pending_for_plan(self.connection, '/repo', 'G-001'))
+                self.assertFalse(pending_for_plan(self.connection, '/other', 'G-001'))
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+                self.connection.rollback()
+        self.assertFalse(pending_for_plan(self.connection, '/repo', 'G-001'))
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM agent_invocations')], [independent])
+
     def test_confirmed_erasure_removes_target_from_native_usage_summary_only(self):
         from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
         ledger = InvocationRepository(self.connection)
