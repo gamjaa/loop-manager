@@ -470,6 +470,62 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             artifact_paths(self.connection, '/repo', dict(plan_id='G-001', worktree='/shared/worktree'), Path(directory))
         self.assertEqual(tuple(self.connection.iterdump()), before)
 
+    def test_cancelled_worktree_log_owner_is_rechecked_after_queue_persistence(self):
+        import hashlib
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from loop_manager_internal.catalog.deleted_plan_cleanup import artifact_paths, remove_pending_files
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        self.rowless_cancellation()
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.connection.execute("INSERT INTO exec_plans(repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+            "VALUES ('/repo','G-999','target.md','Target','[]','[]','normal','target','READY')")
+        self.connection.commit()
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            log = state / 'logs' / hashlib.sha256(b'/shared/worktree').hexdigest()[:16]
+            log.mkdir(parents=True)
+            (log / 'proof.txt').write_text('independent cancellation log')
+            row = dict(plan_id='G-999', worktree='/shared/worktree')
+            paths = artifact_paths(self.connection, '/repo', row, state)
+            deleted_plan_state.forget(self.connection, '/repo', 'G-999', artifacts=paths)
+            audit['row']['worktree'] = '/shared/worktree'
+            self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+            self.connection.commit()
+            before = tuple(self.connection.iterdump())
+            with self.assertRaises(CallDeferred):
+                artifact_paths(self.connection, '/repo', row, state)
+            self.assertEqual(remove_pending_files(self.connection, '/repo', state), {'G-999'})
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            self.assertEqual((log / 'proof.txt').read_text(), 'independent cancellation log')
+            audit['row']['worktree'] = '/independent/worktree'
+            self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+            self.connection.commit()
+            self.assertEqual(remove_pending_files(self.connection, '/repo', state), set())
+            self.assertFalse(log.exists())
+
+    def test_unattributed_cancellation_preserves_logs_but_allows_independent_runtime_cleanup(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from loop_manager_internal.catalog.deleted_plan_cleanup import remove_pending_files
+        self.rowless_cancellation()
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            log = state / 'logs' / 'retained'
+            runtime = state / 'agent-runtime' / 'independent'
+            log.mkdir(parents=True)
+            runtime.mkdir(parents=True)
+            (log / 'proof.txt').write_text('unattributed historical log')
+            self.connection.executemany('INSERT INTO deleted_plan_files VALUES (?,?,?)',
+                [('/repo', 'G-999', str(path)) for path in (log, runtime)])
+            for evidence in ('{}', 'broken', json.dumps({'row': {'repo': '/other', 'plan_id': 'G-001', 'worktree': '/worktree'}})):
+                self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (evidence,))
+                self.connection.commit()
+                self.assertEqual(remove_pending_files(self.connection, '/repo', state), {'G-999'})
+                self.assertEqual((log / 'proof.txt').read_text(), 'unattributed historical log')
+                self.assertFalse(runtime.exists())
+                self.assertEqual([row['path'] for row in self.connection.execute('SELECT * FROM deleted_plan_files')], [str(log)])
+
     def test_dedicated_collection_without_receipt_is_queued_and_removed(self):
         from tempfile import TemporaryDirectory
         from pathlib import Path

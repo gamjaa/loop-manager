@@ -86,6 +86,25 @@ def _artifact_references(connection, state_dir):
     references.extend((Path(state_dir).resolve() / 'logs' / hashlib.sha256(row['worktree'].encode()).hexdigest()[:16],
                        (row['repo'], row['plan_id'])) for row in connection.execute(
                            'SELECT repo,plan_id,worktree FROM exec_plans WHERE worktree IS NOT NULL'))
+    if 'execplan_cancellations' in tables:
+        for canceled in connection.execute('SELECT repo,plan_id,recovery_evidence FROM execplan_cancellations'):
+            owner = (canceled['repo'], canceled['plan_id'])
+            logs = Path(state_dir).resolve() / 'logs'
+            try:
+                saved = json.loads(canceled['recovery_evidence'])['row']
+                if not isinstance(saved, dict) or (saved['repo'], saved['plan_id']) != owner:
+                    raise ValueError('unattributed cancellation workspace')
+                workspace = saved['worktree']
+                if workspace is None:
+                    continue
+                if not isinstance(workspace, str) or not workspace or not Path(workspace).is_absolute():
+                    raise ValueError('unconfirmed cancellation workspace')
+                logs = logs / hashlib.sha256(workspace.encode()).hexdigest()[:16]
+            except (KeyError, TypeError, ValueError, RecursionError):
+                # Unknown historical workspace ownership protects only logs;
+                # independent receipt/collection cleanup can still proceed.
+                pass
+            references.append((logs, owner))
     return [(candidate, owner) for path, owner in references for candidate in (path, path.resolve())]
 
 
