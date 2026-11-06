@@ -1368,6 +1368,33 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(draft_decisions._remaining_answer(answer, {"Shared line\nRepeat line"}), answer)
         self.assertEqual(draft_decisions._remaining_answer(answer, {"suffix"}), answer)
 
+    def test_repeated_answer_line_is_replayed_in_publication_order(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        third = "Which archival policy should this goal use?"
+        plan = draft_text().replace("Question: " + first,
+            "Question: - " + first + "\n- " + second + "\n- " + third)
+        initial = {PATH: plan, "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        shared = "Apply the shared selected clause."
+        first_answer = shared + "\nKeep the first selection."
+        third_answer = "Keep the final selection."
+        tree = {**initial, PATH: plan + "\n## User Decision\n\nAnswer: " + first_answer + "\n" + shared + "\n" + third_answer + "\n"}
+        saved = self.observe("b" * 40, tree)
+        for question, answer, remaining, expected, revision in (
+                (first, first_answer, second + "\n- " + third, shared + "\n" + third_answer, "f" * 40),
+                (second, shared, third, third_answer, "e" * 40)):
+            cleaned, receipt = self.prepare(PATH, question, answer, QUESTION.replace(first, remaining))
+            self.assertEqual(execplan_drafts.fields(markdown_sections(cleaned).values["User Decision"])["Answer"], expected)
+            parsed = execplan_catalog.parse_execplan_text(PATH, cleaned, validate_sources=False)
+            with self.connection:
+                execplan_draft_state.resolve(self.connection, "repo", PATH, parsed,
+                    execplan_catalog.plan_content_hash(cleaned.encode()), revision, receipt, inputs=saved["basis"]["inputs"])
+            saved = self.observe(revision, {**tree, PATH: cleaned})
+        cleaned, _ = self.prepare(PATH, third, third_answer)
+        self.assertNotIn("User Decision", cleaned)
+        self.assertNotIn("draft: true", cleaned)
+
     def test_body_partial_resolution_requires_current_user_decision_evidence(self):
         first = "Which storage policy should this goal use?"
         second = "Which retry policy should this goal use?"

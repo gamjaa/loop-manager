@@ -285,14 +285,15 @@ def _clean_answers(original, text, saved, assessment, question_items):
                     after_decision = markdown_sections(change["after"]).values.get("User Decision", "")
                     prior = execplan_drafts.fields(after_decision)
                     current_decision = execplan_drafts.fields(decision_body)
-                    consumed = set()
+                    remaining_answer = prior.get("Answer", "")
                     for audit in saved.get("resolutions", []):
                         if audit.get("user_changes", {}).get(source) != change:
                             continue
+                        consumed = set()
                         for resolved_item in audit.get("assessment", {}).get("resolved", []):
                             refs = [{"source": resolved_item["source"], "quote": resolved_item["quote"]}, *resolved_item.get("evidence", [])]
                             consumed.update(ref["quote"].strip() for ref in refs if ref["source"] == source)
-                    remaining_answer = _remaining_answer(prior.get("Answer", ""), consumed)
+                        remaining_answer = _remaining_answer(remaining_answer, consumed)
                     same_decision = current_decision == {**prior, "Answer": remaining_answer}
                     evidence = execplan_draft_state.decision_evidence(saved["basis"], saved.get("decision"), change)
                     if (not same_decision or quote not in current_decision.get("Answer", "")

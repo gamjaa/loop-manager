@@ -48,6 +48,7 @@ priority: high
 - [x] rebase 후 942080c의 base 대비 전체 diff와 R-061·R-082를 대조하고, 본문 근거의 부분 해소에서도 함께 남는 User Decision의 현재 출처 검사를 추가했다. 같은 관측의 상충·불확실 답변과 의미 판단 부재는 정리 없이 보존한다. 현재 후보의 `ExecPlanDraftCatalogTest` 37건, `DraftAnswerReobservationTest` 10건 및 추가 불확실 판단 case를 통과했다.
 - [x] 과거 verify에서 보고된 checkpoint 복구 테스트는 현재 `BlockedCheckpointRefreshUnitTests` 29건, 로컬 복구 알림은 해당 1건을 targeted runner로 다시 확인했다. 이전 전체 verify 실패 기록은 그대로 보존하며 현재 후보의 전체 verify와 Review는 Manager에게 남긴다.
 - [x] Review의 여러 줄 답변 정리 누락을 교정했다. 질문별 연속 원문 범위를 합쳐 전체 정리와 부분 정리 후 재관측에 적용하고, 위치가 모호하거나 줄 일부만 인용된 입력은 보존한다. `DraftAnswerReobservationTest` 14건을 통과했으며 전체 verify와 후속 Review는 Manager가 수행한다.
+- [x] Review의 연속 부분 정리 재생 누락을 교정했다. 각 게시의 인용을 당시 남은 답변에 순서대로 적용하며, 중복 줄이 나중에 유일해지는 세 질문의 두 차례 게시·재관측과 마지막 정리를 확인했다. `DraftAnswerReobservationTest` 15건과 기존 부분 정리·중단 재진입 각 1건이 통과했다. 전체 verify와 후속 Review는 Manager가 수행한다.
 
 ## Decision Log
 
