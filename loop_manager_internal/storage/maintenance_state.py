@@ -121,6 +121,7 @@ class MaintenanceCycle:
     cycle_id: str | None = None
     legacy_release_identity: str | None = None
     publication_id_allocations: tuple[tuple[str, str, str, str], ...] = ()
+    cancelled_scope_plan_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -560,6 +561,10 @@ class MaintenanceRepository:
         }
         from .execplan_catalog_state import cancelled_plan_ids as collect_cancelled_ids
         cancelled_plan_ids = collect_cancelled_ids(self.connection, repo)
+        original_roots = set().union(*(_decode_plan_ids(row[field], field) for field in (
+            'prerequisite_plan_ids', 'refactoring_plan_ids', 'assessment_plan_ids')))
+        cancelled_scope = (tuple(sorted(original_roots, key=_plan_sort_key))
+            if original_roots and original_roots <= cancelled_plan_ids and not original_roots & known_plan_ids else ())
 
         def stored_plan_ids(field: str) -> tuple[str, ...]:
             plan_ids = _decode_plan_ids(row[field], field)
@@ -649,6 +654,7 @@ class MaintenanceRepository:
             publication_id_allocations=_decode_publication_id_allocations(
                 row["publication_id_allocations"]
             ),
+            cancelled_scope_plan_ids=cancelled_scope,
         )
 
     def due(self, repo: str, interval: int, *, self_repository: bool = False) -> ReviewDue:
@@ -747,10 +753,10 @@ class MaintenanceRepository:
             rows = self.plan_rows(repo)
             scope = cycle_scope_plan_ids(rows, state)
             from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
-            if catalog_held_plan_ids(self.connection, repo).intersection(scope):
+            if catalog_held_plan_ids(self.connection, repo).intersection((*scope, *state.cancelled_scope_plan_ids)):
                 raise MaintenanceStateError("유지보수 확정 범위의 catalog 보류가 남아 있습니다.")
             by_id = {row["plan_id"]: row["status"] for row in rows}
-            if not scope or any(by_id[plan_id] != "MERGED" for plan_id in scope):
+            if (not scope and not state.cancelled_scope_plan_ids) or any(by_id[plan_id] != "MERGED" for plan_id in scope):
                 raise MaintenanceStateError("유지보수 확정 범위의 실제 Merge가 완료되지 않았습니다.")
             count = self._verified_merged_count(repo, source_sha, self._merged_count(repo))
             self.connection.execute(

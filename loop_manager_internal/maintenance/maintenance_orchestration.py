@@ -361,7 +361,7 @@ def cycle_plan_status_error(
     except MaintenanceOrchestrationError as error:
         return str(error)
     label = "확정 범위"
-    if not plan_ids:
+    if not plan_ids and not cycle.cancelled_scope_plan_ids:
         return "기존 유지보수 cycle의 확정 범위와 종료 경계를 확인할 수 없습니다."
     by_id = {str(row["plan_id"]): row for row in rows}
     for plan_id in plan_ids:
