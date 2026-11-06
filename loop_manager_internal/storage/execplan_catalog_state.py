@@ -31,14 +31,15 @@ from loop_manager_internal.catalog.execplan_catalog import (
 
 
 def is_cancelled(connection: sqlite3.Connection, repo: str, plan_id: str) -> bool:
-    """Read the durable tombstone, including repositories with no execution row."""
-    if not connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'"
-    ).fetchone():
-        return False
-    return connection.execute(
-        "SELECT 1 FROM execplan_cancellations WHERE repo=? AND plan_id=?", (repo, plan_id),
-    ).fetchone() is not None
+    """Honor cancellation and final-erasure identities without an execution row."""
+    for table in ('execplan_cancellations', 'deleted_plan_ids'):
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,),
+        ).fetchone() and connection.execute(
+            f'SELECT 1 FROM {table} WHERE repo=? AND plan_id=?', (repo, plan_id),
+        ).fetchone():
+            return True
+    return False
 
 
 HISTORICAL_CATALOG_SCHEMA = """

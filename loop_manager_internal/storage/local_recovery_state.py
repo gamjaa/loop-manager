@@ -8,6 +8,8 @@ import json
 import sqlite3
 import uuid
 
+from .execplan_catalog_state import is_cancelled
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS local_environment_recovery_requests (
@@ -156,6 +158,8 @@ def begin_request(
     # processes. Different scopes queue; repeated scopes reuse the same identity.
     from .runtime_state import _transaction
     with _transaction(connection):
+        if plan_id is not None and is_cancelled(connection, repo, plan_id):
+            raise LocalRecoveryRequestError("취소된 작업의 로컬 재검사를 요청할 수 없습니다.")
         pending = connection.execute(
             "SELECT request_id FROM local_environment_recovery_requests "
             "WHERE repo = ? AND plan_id IS ? AND status = 'pending'",
@@ -184,7 +188,8 @@ def pending_requests(connection: sqlite3.Connection, repo: str) -> tuple[LocalRe
         "SELECT request_id, plan_id FROM local_environment_recovery_requests "
         "WHERE repo = ? AND status = 'pending' ORDER BY created_at, rowid", (repo,),
     )
-    return tuple(LocalRecoveryRequest(str(row[0]), repo, row[1], "pending", True) for row in rows)
+    return tuple(LocalRecoveryRequest(str(row[0]), repo, row[1], "pending", True) for row in rows
+                 if row[1] is None or not is_cancelled(connection, repo, row[1]))
 
 
 def pending_request(connection: sqlite3.Connection, repo: str) -> LocalRecoveryRequest | None:
@@ -206,7 +211,8 @@ def consume_recheck(connection: sqlite3.Connection, request_id: str, subject: st
         (request_id,),
     ).fetchone()
     if (row is None or (repo is not None and row[0] != repo)
-            or (row[1] is not None and row[1] != subject)):
+            or (row[1] is not None and row[1] != subject)
+            or is_cancelled(connection, row[0], subject)):
         raise LocalRecoveryRequestError("유효한 재검사 요청이 없습니다.")
     changed = connection.execute(
         "INSERT OR IGNORE INTO local_environment_recheck_consumption (request_id, subject, cause) VALUES (?, ?, ?)",
@@ -221,7 +227,8 @@ def _require_pending_request(connection, request: LocalRecoveryRequest) -> None:
         (request.request_id,),
     ).fetchone()
     if (row is None or row['repo'] != request.repo or row['plan_id'] != request.plan_id
-            or row['status'] != 'pending'):
+            or row['status'] != 'pending'
+            or (request.plan_id is not None and is_cancelled(connection, request.repo, request.plan_id))):
         raise LocalRecoveryRequestError("로컬 재검사 요청 대상 또는 상태가 변경됐습니다.")
 
 

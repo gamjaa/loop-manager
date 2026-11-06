@@ -385,6 +385,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
         delivered.assert_called_once()
         self.assertNotIn(token, delivered.call_args.args[2])
         self.assertNotIn(chat_id, delivered.call_args.args[2])
+        self.assertIsNone(self.events(connection)[0]['last_error'])
 
     def test_new_pr_delivery_is_scoped_and_fallback_keeps_pending_failure(self):
         connection = self.connection()
@@ -2929,6 +2930,58 @@ class RecoveryResultNoticeTests(NotificationFixture, unittest.TestCase):
 
 
 class CancelledPlanNotificationTests(NotificationFixture, unittest.TestCase):
+    def test_recovery_request_cancellation_preserves_partial_send_and_independent_requests(self):
+        from loop_manager_internal.storage import local_recovery_state
+        from loop_manager_internal.notifications.policy import is_current
+        from loop_manager_internal.notifications.repository import cancelled_plan_event
+        local_recovery_state.ensure_schema(self.db)
+        self.db.execute("INSERT INTO project_blocks (repo,plan_id,scope,reason_code,evidence) "
+                        "VALUES (?,'G-999','project','independent','saved')", (self.repo,))
+        for request_id, plan_id in (('target', 'G-018'), ('other', 'G-019'), ('project', None)):
+            self.db.execute("INSERT INTO local_environment_recovery_requests "
+                "(request_id,repo,plan_id,status,before_state,result) VALUES (?,?,?,'completed','{}','unresolved')",
+                (request_id, self.repo, plan_id))
+        notifications.enqueue_current_project_events(self.db, self.repo)
+        self.db.execute("UPDATE notification_outbox SET rendered_text=?,last_error='old error' "
+                        "WHERE json_extract(payload,'$.request_id')='target'", ('long notice\n' * 800,))
+        before = [dict(row) for row in self.db.execute('SELECT * FROM local_environment_recovery_requests')]
+        independent = {row['event_key']: dict(row) for row in self.events(self.db)
+                       if json.loads(row['payload']).get('request_id') in ('other', 'project')}
+        self.db.commit()
+        calls = []
+        def send(_token, _chat, piece):
+            calls.append(piece)
+            self.cancel()
+        # Isolate the partial-send race from unrelated pending messages.
+        target = next(row for row in self.events(self.db) if json.loads(row['payload']).get('request_id') == 'target')
+        from loop_manager_internal.notifications import delivery
+        selected = self.db.execute('SELECT event_key,event_type,payload,repo FROM notification_outbox WHERE event_key=?',
+                                   (target['event_key'],)).fetchall()
+        delivery._deliver_rows(self.db, 'token', 'chat', selected, send)
+        self.assertEqual(len(calls), 1)
+        current = next(row for row in self.events(self.db) if row['event_key'] == target['event_key'])
+        self.assertEqual(current['confirmed_pieces'], 1)
+        self.assertIsNotNone(current['canceled_at'])
+        self.assertIsNone(current['sent_at'])
+        self.assertEqual(current['last_error'], 'old error')
+        payload = json.loads(current['payload'])
+        self.assertFalse(is_current(self.db, self.repo, 'recovery_unresolved', payload))
+        self.assertTrue(cancelled_plan_event(self.db, self.repo, 'recovery_unresolved',
+                                            {**payload, 'execplan_id': 'G-019'}))
+        self.assertFalse(cancelled_plan_event(self.db, self.repo, 'recovery_unresolved',
+            {**payload, 'request_id': 'project', 'execplan_id': 'G-018'}))
+        self.assertFalse(cancelled_plan_event(self.db, '/another', 'recovery_unresolved', payload))
+        notifications.enqueue_current_project_events(self.db, self.repo)
+        notifications._insert(self.db, 'late-recovery', self.repo, 'recovery_unresolved', payload)
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM notification_outbox WHERE event_key='late-recovery'").fetchone())
+        self.assertEqual([dict(row) for row in self.db.execute('SELECT * FROM local_environment_recovery_requests')], before)
+        self.assertEqual({row['event_key']: dict(row) for row in self.events(self.db)
+                          if row['event_key'] in independent}, independent)
+        sender = mock.Mock()
+        delivery._deliver_rows(self.db, 'token', 'chat', selected, sender)
+        sender.assert_not_called()
+
     def setUp(self):
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         self.db = self.connection()
@@ -3030,9 +3083,6 @@ class CancelledPlanNotificationTests(NotificationFixture, unittest.TestCase):
         def send(_token, _chat, piece):
             calls.append(piece)
             self.cancel()
-            # An older error stays auditable even when confirmation races with cancellation.
-            self.db.execute("UPDATE notification_outbox SET last_error='old error'")
-            self.db.commit()
         notifications.dispatch_pending(self.db, 'token', 'chat', adapter=send)
         self.assertEqual(len(calls), 1)
         row = self.events(self.db)[0]

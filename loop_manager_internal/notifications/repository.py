@@ -378,6 +378,16 @@ def _insert(
 def cancelled_plan_event(connection, repo, kind, payload):
     """Retire plan actions while keeping independent project/publication history."""
     from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
+    if kind == 'recovery_unresolved':
+        if not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_environment_recovery_requests'"
+        ).fetchone():
+            return False
+        request = connection.execute(
+            'SELECT plan_id FROM local_environment_recovery_requests WHERE repo=? AND request_id=?',
+            (repo, payload.get('request_id')),
+        ).fetchone()
+        return bool(request and request[0] and is_cancelled(connection, repo, request[0]))
     if kind == 'draft_decisions':
         return any(is_cancelled(connection, repo, str(plan['id'])) for plan in payload['plans'])
     if kind in {'blocked', 'stage_failed', 'persistent_execution_failure'} and payload.get('scope') == 'project':

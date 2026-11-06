@@ -26,6 +26,8 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.assertEqual([tuple(r) for r in self.connection.execute('SELECT * FROM usage_audit')],
                          [('/repo', 'G-002', 200), ('/other', 'G-001', 300)])
         self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
+        self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
+        self.assertFalse(execplan_catalog_state.is_cancelled(self.connection, '/other', 'G-001'))
         self.assertIn(('G-001', ''), execplan_catalog_state.DefinitionStateRepository(self.connection).capture('/repo').reserved)
         deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual(self.connection.execute('SELECT count(*) FROM deleted_plan_ids').fetchone()[0], 1)

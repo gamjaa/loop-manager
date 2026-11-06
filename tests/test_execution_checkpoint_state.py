@@ -485,6 +485,40 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
 
 
 class CancelledCheckpointTests(unittest.TestCase):
+    def test_local_recovery_requests_cannot_resume_cancelled_or_erased_identity(self):
+        from loop_manager_internal.storage import local_recovery_state, deleted_plan_state
+        requests = local_recovery_state
+        target = requests.begin_request(self.connection, 'repo', 'G-047')
+        project = requests.begin_request(self.connection, 'repo', None)
+        independent = requests.begin_request(self.connection, 'repo', 'G-999')
+        before = [dict(row) for row in self.connection.execute(
+            'SELECT * FROM local_environment_recovery_requests ORDER BY rowid')]
+        self.cancel()
+        self.assertEqual([request.request_id for request in requests.pending_requests(self.connection, 'repo')],
+                         [project.request_id, independent.request_id])
+        for request in (target, project):
+            with self.assertRaises(requests.LocalRecoveryRequestError):
+                requests.consume_recheck(self.connection, request.request_id, 'G-047', 'verify', repo='repo')
+        after = requests.snapshot(self.connection, 'repo', 'G-047')
+        for action in (lambda: requests.begin_request(self.connection, 'repo', 'G-047'),
+                       lambda: requests.record_progress(self.connection, target, after),
+                       lambda: requests.complete_request(self.connection, target, 'resolved', after)):
+            with self.assertRaises(requests.LocalRecoveryRequestError):
+                action()
+        self.assertEqual([dict(row) for row in self.connection.execute(
+            'SELECT * FROM local_environment_recovery_requests ORDER BY rowid')], before)
+        self.assertFalse(requests.recheck_consumed(self.connection, target.request_id, 'G-047', 'verify'))
+        # The final erasure marker keeps the same guard after the audit is gone.
+        deleted_plan_state.ensure_schema(self.connection)
+        self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+        self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('repo','G-047')")
+        self.connection.commit()
+        self.assertEqual([request.request_id for request in requests.pending_requests(self.connection, 'repo')],
+                         [project.request_id, independent.request_id])
+        with self.assertRaises(requests.LocalRecoveryRequestError):
+            requests.begin_request(self.connection, 'repo', 'G-047')
+        self.assertTrue(requests.consume_recheck(self.connection, project.request_id, 'G-999', 'verify', repo='repo'))
+
     def setUp(self):
         import json
         from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository

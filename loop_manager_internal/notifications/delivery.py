@@ -105,7 +105,7 @@ def _claim_piece(
             return None
         claimed = connection.execute(
             "UPDATE notification_outbox SET rendered_text = ?, "
-            "attempts = attempts + 1, last_error = NULL, "
+            "attempts = attempts + 1, "
             "delivery_started_at = CURRENT_TIMESTAMP "
             "WHERE event_key = ? AND sent_at IS NULL AND canceled_at IS NULL "
             "AND confirmed_pieces = ?"
