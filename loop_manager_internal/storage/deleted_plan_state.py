@@ -108,7 +108,9 @@ def forget(connection, repo, plan_id, *, artifacts=()):
                         raise CallDeferred('알림의 삭제 대상 귀속을 확인할 수 없습니다.') from error
                     if not isinstance(payload, dict):
                         raise CallDeferred('알림의 삭제 대상 귀속을 확인할 수 없습니다.')
-                    if event['event_type'] in ('plans_published', 'draft_decisions'):
+                    if event['event_type'] in ('plans_published', 'draft_decisions', 'planning_result'):
+                        if event['event_type'] == 'planning_result' and (payload.get('execplan_id') or payload.get('started_execplan_id')):
+                            raise CallDeferred('과거 planning 알림의 작업·프로젝트 귀속을 분리할 수 없습니다.')
                         plans = payload.get('plans')
                         if not isinstance(plans, list) or any(not isinstance(item, dict) or not isinstance(item.get('id'), str) for item in plans):
                             raise CallDeferred('공유 알림의 삭제 대상 귀속을 확인할 수 없습니다.')
@@ -120,10 +122,7 @@ def forget(connection, repo, plan_id, *, artifacts=()):
                                     and event['rendered_text'] is None and event['delivery_started_at'] is None
                                     and event['sent_at'] is None):
                                 pass  # No frozen body or transmission exists to remap.
-                            elif (event['sent_at'] is not None
-                                    or event['attempts'] > 0 and event['confirmed_pieces'] == 0
-                                    and event['delivery_started_at'] is None and event['canceled_at'] is None
-                                    and isinstance(event['last_error'], str) and event['last_error'].strip()):
+                            else:
                                 from loop_manager_internal.notifications.rendering import _message, _pieces
                                 try:
                                     original = _message(event['event_type'], payload)
@@ -131,11 +130,19 @@ def forget(connection, repo, plan_id, *, artifacts=()):
                                 except (KeyError, TypeError, ValueError) as error:
                                     raise CallDeferred('공유 알림의 원래 전송 본문을 확인할 수 없습니다.') from error
                                 if (event['rendered_text'] != original
-                                        or event['sent_at'] is not None and event['confirmed_pieces'] < len(_pieces(original))
                                         or len(rendered) > len(original)):
                                     raise CallDeferred('공유 알림의 원래 본문·전송 확인을 증명할 수 없습니다.')
-                            else:
-                                raise CallDeferred('부분 전송된 공유 알림은 대상별 전송 근거 분리가 필요합니다.')
+                                if event['sent_at'] is not None:
+                                    if event['confirmed_pieces'] < len(_pieces(original)):
+                                        raise CallDeferred('공유 알림의 전체 전송 확인을 증명할 수 없습니다.')
+                                elif (event['attempts'] > 0 and 0 <= event['confirmed_pieces'] < len(_pieces(original))
+                                        and event['delivery_started_at'] is None and event['canceled_at'] is None
+                                        and isinstance(event['last_error'], str) and event['last_error'].strip()):
+                                    confirmed = ''.join(_pieces(original)[:event['confirmed_pieces']])
+                                    if not rendered.startswith(confirmed) or len(rendered) <= len(confirmed):
+                                        raise CallDeferred('공유 알림의 확인된 조각과 미전송 잔여분을 보존할 수 없습니다.')
+                                else:
+                                    raise CallDeferred('부분 전송된 공유 알림은 대상별 전송 근거 분리가 필요합니다.')
                             connection.execute('UPDATE notification_outbox SET payload=?,rendered_text=? WHERE event_key=?',
                                 (json.dumps(retained, ensure_ascii=False), rendered, event['event_key']))
                             owned_event = False

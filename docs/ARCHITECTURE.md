@@ -1903,14 +1903,15 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 삭제 확정의 알림 정리는 일반 취소와 달리 대상 전용 outbox·incident·전송 참조를 최종 제거한다. `deleted_plan_state.forget`는 같은 repository의 `plan:<G ID>` 또는 과거 G subject에 속한 incident와 `block_notice_events`의 직접 관계를 먼저 확보한다. 자식 참조를 부모 incident보다 먼저 제거하고, payload에 작업 ID가 없는 과거 outbox 버전도 그 관계로 제거한다. 남은 독립 incident가 해당 outbox를 참조하거나 연결된 outbox의 repository가 다르면 전체 제거 transaction을 롤백하고 해당 삭제를 보류한다. 명시적인 관계가 없는 잘못된 payload도 귀속 미확인으로 보존한다.
 
-대상 하나만 포함한 `plans_published`·`draft_decisions`는 전용 기록으로 제거한다. 다른 G가 섞인 목록은 다음 조건에서 payload의 대상 항목만 제외하고 독립 항목과 사건 identity·오류·시각을 유지한다.
+대상 하나만 포함한 `plans_published`·`draft_decisions`와 과거 `planning_result`의 plans 목록은 전용 기록으로 제거한다. 과거 planning 결과에 별도 execplan_id/started_execplan_id도 있으면 귀속 미확인으로 보류한다. 다른 G가 섞인 목록은 다음 조건에서 payload의 대상 항목만 제외하고 독립 항목과 사건 identity·오류·시각을 유지한다. 이 정리는 과거 planning 결과의 현재 생성·발송 정책을 활성화하지 않는다.
 
 | 혼합 목록의 전송 근거 | 최종 제거에서의 처리 |
 |---|---|
 | attempts·confirmed_pieces가 0이고 고정 본문·진행 중 claim·sent_at이 없음 | payload만 개정한다. 첫 claim은 남은 목록의 본문을 정상 생성한다. |
 | attempts가 양수이고 confirmed_pieces=0·sent_at/진행 중 claim/canceled_at 부재·비어 있지 않은 전송 오류가 있으며, 저장 본문이 현재 렌더러의 원래 payload와 일치함 | 대상 항목을 제외한 payload·본문만 개정한다. 사건 identity·attempts·오류·시각과 미확인 cursor는 유지해 다음 claim이 독립 항목을 재시도한다. 취소는 HTTP 반환 전에 claim을 비울 수 있으므로 canceled_at이 있으면 이 경로로 승인하지 않는다. |
 | sent_at이 있고 저장 본문이 현재 렌더러의 원래 payload 결과와 정확히 일치하며 모든 원래 조각의 확인이 있음 | 남은 목록의 본문이 더 길어지지 않음을 확인해 저장 payload·본문을 함께 개정한다. 기존 전송 완료·공유 시도/확인 누계는 유지하며 이 row를 다시 전송하지 않는다. 기존 질문·게시 확인 조회는 남은 항목을 계속 확인된 것으로 읽는다. |
-| 부분 전송·진행 중 claim·이전 렌더러의 미확인 본문·불완전 확인 | 원래 payload·본문·cursor·오류를 보존하고 `CallDeferred`로 해당 삭제를 보류한다. |
+| attempts가 양수이고 0 < confirmed_pieces < 원래 전체 조각 수·sent_at/진행 중 claim/canceled_at 부재·비어 있지 않은 전송 오류·원래 본문 일치가 확인되며, 더 길어지지 않은 개정 본문이 확인된 원래 문자 prefix로 시작하고 그 뒤 미전송 잔여분이 있음 | 저장 payload·본문만 개정하고 cursor·시도·오류·시각을 유지한다. 확인된 조각의 문자열은 그대로이며, 새 확인이나 sent_at을 만들지 않는다. |
+| 위 조건 밖의 부분 전송·진행 중 claim·이전 렌더러의 미확인 본문·불완전 확인 | 원래 payload·본문·cursor·오류를 보존하고 `CallDeferred`로 해당 삭제를 보류한다. |
 
 전송 완료 row의 기존 cursor는 실제 공유 전송 감사이며 개정 본문의 새 전송 위치로 재사용하지 않는다. 대상 원인·실제 시작이 포함된 프로젝트 사건의 부분 분리도 미완료이면 보류한다. 이 경계는 일반 취소의 감사 보존이나 독립 사건의 전송 정책을 바꾸지 않는다.
 

@@ -1069,6 +1069,68 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual(tuple(self.connection.iterdump()), before)
 
+    def test_legacy_planning_notice_erases_only_exclusive_target_history(self):
+        from loop_manager_internal.notifications import notifications
+        from loop_manager_internal.notifications.rendering import _message
+        notifications.ensure_schema(self.connection)
+        for key, repo, plan_id in (('target', '/repo', 'G-001'), ('independent', '/repo', 'G-002'),
+                                   ('foreign', '/other', 'G-001')):
+            payload = dict(project=repo, plans=[dict(id=plan_id, title='historical plan')])
+            self.connection.execute('INSERT INTO notification_outbox '
+                '(event_key,repo,event_type,payload,rendered_text,confirmed_pieces,last_error) '
+                "VALUES (?,?,'planning_result',?,?,1,'saved error')", (key, repo, json.dumps(payload), _message('planning_result', payload)))
+        self.connection.commit()
+        retained = [dict(row) for row in self.connection.execute("SELECT * FROM notification_outbox WHERE event_key<>'target'")]
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM notification_outbox')], retained)
+        self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
+
+    def test_partial_legacy_planning_notice_erases_only_unconfirmed_target_suffix(self):
+        from loop_manager_internal.notifications import notifications
+        from loop_manager_internal.notifications.rendering import _message, _pieces
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        notifications.ensure_schema(self.connection)
+        retained_plan = dict(id='G-002', title='independent title ' * 400)
+        target_plan = dict(id='G-001', title='withdrawn title')
+        payload = dict(project='repo', plans=[retained_plan, target_plan], status='작성 완료 · 미게시')
+        original = _message('planning_result', payload)
+        retained = {**payload, 'plans': [retained_plan]}
+        revised = _message('planning_result', retained)
+        self.assertGreater(len(_pieces(original)), 1)
+        self.assertEqual(_pieces(original)[0], _pieces(revised)[0])
+        self.connection.execute('INSERT INTO notification_outbox '
+            '(event_key,repo,event_type,payload,rendered_text,confirmed_pieces,attempts,last_error) '
+            "VALUES ('legacy-list','/repo','planning_result',?,?,1,2,'saved error')", (json.dumps(payload), original))
+        self.connection.commit()
+        baseline = dict(self.connection.execute("SELECT * FROM notification_outbox WHERE event_key='legacy-list'").fetchone())
+        for changes in ({'plans': [target_plan, retained_plan]}, {'execplan_id': 'G-001'}, {'started_execplan_id': 'G-001'}):
+            with self.subTest(changes=changes):
+                changed = {**payload, **changes}
+                self.connection.execute("UPDATE notification_outbox SET payload=?,rendered_text=? WHERE event_key='legacy-list'",
+                    (json.dumps(changed), _message('planning_result', changed)))
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+                self.connection.rollback()
+        for assignment in ("delivery_started_at='in-flight'", "canceled_at='canceled'", 'last_error=NULL'):
+            with self.subTest(assignment=assignment):
+                self.connection.execute('UPDATE notification_outbox SET ' + assignment + " WHERE event_key='legacy-list'")
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+                self.connection.rollback()
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        current = dict(self.connection.execute("SELECT * FROM notification_outbox WHERE event_key='legacy-list'").fetchone())
+        self.assertEqual(current, {**baseline, 'payload': json.dumps(retained, ensure_ascii=False), 'rendered_text': revised})
+        self.assertNotIn('G-001', current['payload'] + current['rendered_text'])
+        self.assertEqual(_pieces(current['rendered_text'])[:current['confirmed_pieces']], _pieces(original)[:1])
+        self.assertIsNone(current['sent_at'])
+        before = tuple(self.connection.iterdump())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
     def test_failed_unconfirmed_publication_notice_removes_target_after_claim_returns(self):
         from unittest import mock
         from loop_manager_internal.notifications import notifications
