@@ -729,7 +729,7 @@ complete/submit의 verify와 Review 생략 근거는 후보·base·환경·현�
 
   Git 복구와 verify·Review의 입력 증명은 별도로 유지하며 세부 실패·재개 계약은 [프로젝트 planning과 작업 문서 반영 기준](ARCHITECTURE.md#프로젝트-planning과-작업-문서-반영-기준)을 따른다.
 
-- 저장된 단계별 문서 개정 후보를 재개할 때 proposed snapshot에서 해당 계획이 PR 때문에 제외된 경우나 prepared 후보의 게시 직전에 해당 branch에 PR이 나타나면 기존 PR의 문서와 작업 기록을 보존하고 후보 게시를 멈춘다. PR 출현은 ExecPlan 입력 오류로 처리하지 않으며 기존 PR 처리 뒤 남은 범위는 새 ExecPlan 기준으로 판단한다.
+- 저장된 단계별 문서 개정 후보를 재개할 때 proposed snapshot에서 해당 계획이 PR 때문에 제외된 경우나 prepared 후보의 게시 직전에 해당 branch에 PR이 나타나면 기존 PR의 문서와 작업 기록을 보존하고 후보 게시를 멈춘다. 저장 제안으로 로컬 문서를 쓰기 직전에도 현재 실행 자격·입력·소유권을 다시 확인하며 관측 중 취소·최종 삭제가 확정되면 오래된 제안을 쓰거나 게시하지 않는다. PR 출현은 ExecPlan 입력 오류로 처리하지 않으며 기존 PR 처리 뒤 남은 범위는 새 ExecPlan 기준으로 판단한다.
 - 새 계획 입력은 실행 중인 작업을 다른 작업으로 선점하지 않는다. 프로젝트 Planner가 명세 변경을 관련 ExecPlan에 반영하고 Worker·Manager verify·Reviewer·게시 진입 전 최신 원본·작업 branch를 확인해 기존 규칙으로 rebase한다. 현재 작업 조건이 바뀌지 않았으면 하던 단계를 계속하며, 코드 변경의 충돌 복구·검증 무효화와 증명된 결과 재사용 규칙은 유지한다
 - 소유 rebase의 Requirement·ExecPlan 충돌은 Manager가 확인한 최신 원격 base의 원문·경로·삭제로 처리한다. 삭제·rename·archive와 ID·source·dependency·실제 PR 경계를 검증하고 교체 전 문서·작업 형상과 실행 이력을 보존한다. 현재 작업의 유효성이나 소유권을 확인하지 못하면 원인과 작업을 보존해 기존 복구 경계로 연결한다. 문서 충돌만 있으면 Manager가 rebase를 이어가며, 그 외 파일과의 혼합 충돌은 문서만 처리하고 Worker 교정으로 연결한다.
 

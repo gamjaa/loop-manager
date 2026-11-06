@@ -352,6 +352,7 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
                 or effects.git(workspace, 'ls-files', '--others', '--exclude-standard').stdout.strip()
                 or (workspace / original.path).read_text(encoding='utf-8') not in {original.text, assessment['plan_text']}):
             raise PlannerValidationError("보존된 문서 게시 작업 공간이 예상 입력과 다릅니다.")
+        effects.assert_snapshot(state.connection, snapshot)
         (workspace / original.path).write_text(assessment["plan_text"], encoding="utf-8")
         result = effects.validate_result(workspace, item["base"], [original.path],
                                          connection=state.connection, repo=repo, mutable_snapshot=snapshot)

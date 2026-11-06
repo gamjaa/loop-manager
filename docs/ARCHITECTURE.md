@@ -602,7 +602,7 @@ planning 게시의 외부 관측·복구·worktree 정리는 공통 DB 접근 �
 
 문서 반영의 이전 선언·발견 단계·과거 Worker/verify 근거·영향 판단·개정 게시 후보는 해당 ExecPlan의 execution checkpoint에 보존한다. 원격 작업 branch의 문서는 단순 관측 OID만으로 통합 완료나 검증 성공을 만들지 않는다. 현재 작업 대상·입력 유효성·작업물 보존을 확인해 실제 수용한 뒤 해당 문서를 입력으로 반영한다. 이 상태는 rebase·교정의 checkpoint 교체에서도 보존하며 다른 작업이나 일반 planning 상태를 덮어쓰지 않는다.
 
-이전 버전의 단일 현재 계획 개정 후보는 기존 소유 detached worktree와 execution checkpoint에서 복구한다. Manager가 구조·source·dependency·기존 ID·경로·실제 PR 부재와 게시 사실을 재검증하고 미완료 적용부터 이어간다. 실행 중 구현 worktree는 수정하지 않으며 PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다. 이전 문서 영향 Planner checkpoint는 이 복구·감사에 사용하며 새로운 작업별 Planner 호출을 만들지 않는다.
+이전 버전의 단일 현재 계획 개정 후보는 기존 소유 detached worktree와 execution checkpoint에서 복구한다. Manager가 구조·source·dependency·기존 ID·경로·실제 PR 부재와 게시 사실을 재검증하고 미완료 적용부터 이어간다. proposed 후보로 detached worktree의 문서를 쓰기 직전에도 게시에 쓰는 mutable snapshot 검사를 재사용해 현재 실행 row·수동 소유권·삭제 목표 감사와 metadata를 대조한다. worktree 관측 중 취소·최종 삭제나 입력 변경이 확정됐으면 파일 쓰기·결과 검증·commit 전에 거부하며 남은 사본의 최종 정리와 구분한다. 실행 중 구현 worktree는 수정하지 않으며 PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다. 이전 문서 영향 Planner checkpoint는 이 복구·감사에 사용하며 새로운 작업별 Planner 호출을 만들지 않는다.
 
 진행 중인 일반·유지보수 planning은 원격 base 전진 시 staged·unstaged·untracked 변경과 세션을 관리 worktree에 보존해 반영하고 최신 catalog·SQLite 권한에서 재검증한다. 시작 revision의 READY 원본과 Planner가 작성한 결과를 구분하며, 관련 근거·의존 문서의 실제 내용이 바뀐 경우에만 해당 계획을 다시 확인한다. 무관한 문서 변경과 내용 보존 이동은 재확인을 만들지 않는다. 관련성 비교는 성공한 revision tree 조회로 정확한 경로의 blob 또는 부재를 확인한다. 조회 실패·잘못된 객체는 부재나 동일 내용으로 축약하지 않고 기존 원격 반영 보류 경계로 전달해 작업물·세션·실패 근거와 미확정 결과를 보존한다.
 
