@@ -485,6 +485,28 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
 
 
 class CancelledCheckpointTests(unittest.TestCase):
+    def test_stage_origins_do_not_read_removed_row_or_reconnect_cancelled_identity(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.execution import stage_results
+        from loop_manager_internal.storage import deleted_plan_state
+        self.cancel()
+        ports = SimpleNamespace(checkpoint=self.execution, identity=SimpleNamespace(repo='repo'),
+            state=SimpleNamespace(connection=self.connection, row=mock.Mock(side_effect=AssertionError('removed row'))),
+            git=mock.Mock(side_effect=AssertionError('cancelled Git observation')))
+        context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-047'))
+        for marker_only in (False, True):
+            if marker_only:
+                deleted_plan_state.ensure_schema(self.connection)
+                self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+                self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('repo','G-047')")
+                self.connection.commit()
+            before = tuple(self.connection.iterdump())
+            self.assertIsNone(stage_results.preserve(ports, context, reason='stale rebase'))
+            self.assertFalse(stage_results.reconnect_worker(ports, context, None))
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+        ports.state.row.assert_not_called()
+        ports.git.assert_not_called()
+
     def test_saved_registration_cannot_restore_cancelled_or_erased_identity(self):
         from loop_manager_internal.storage import deleted_plan_state, execplan_catalog_state as catalog
         plan = dict(id='G-047', title='Saved', sources=['docs/PRODUCT.md'], depends_on=[],
