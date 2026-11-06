@@ -2973,6 +2973,56 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
             token=mutable_snapshot_token("repo", "base", (plan,)),
         )
 
+    def test_cancellation_markers_override_live_row_in_mutable_snapshot_boundaries(self):
+        from loop_manager_internal.planning import planner_validation as validation
+        from loop_manager_internal.storage import deleted_plan_state, execplan_catalog_state
+        execplan_catalog_state.ensure_schema(self.connection)
+        deleted_plan_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO projects(repo,base_branch) VALUES ('other','main')")
+        self.connection.commit()
+        read_plan = mock.Mock(return_value=self.snapshot.plans[0])
+        observer = mock.Mock(return_value=None)
+        snapshot_effects = validation.MutableReadySnapshotEffects(
+            lambda connection: None, read_plan, loop_manager._row_is_mutable_ready,
+            mutable_snapshot_token, observer)
+        check_effects = validation.AssertMutableReadySnapshotCurrentEffects(
+            loop_manager._execplan_metadata, loop_manager._row_is_mutable_ready, observer)
+        cancellation = ("INSERT INTO execplan_cancellations "
+            "(repo,plan_id,path,title,sources,depends_on,complexity,risk,priority,content_hash,plan_sha,deletion_commit) "
+            "SELECT ?,plan_id,path,title,sources,depends_on,'low','low',priority,content_hash,plan_sha,'deleted' FROM exec_plans")
+        for marker in ('cancellation', 'deleted'):
+            with self.subTest(marker=marker):
+                def mark(repo):
+                    if marker == 'cancellation':
+                        self.connection.execute(cancellation, (repo,))
+                    else:
+                        self.connection.execute('INSERT INTO deleted_plan_ids VALUES (?,?)', (repo, 'G-001'))
+                # The same ID in another repository does not retire this candidate.
+                mark('other')
+                self.connection.commit()
+                selected = validation.mutable_ready_snapshot(snapshot_effects, self.connection, 'repo', Path('/unused'), 'base')
+                self.assertEqual([plan.plan_id for plan in selected.plans], ['G-001'])
+                validation._assert_mutable_ready_snapshot_current(check_effects, self.connection, self.snapshot)
+                prepared = validation._observe_mutable_ready_prs(check_effects, self.connection, self.snapshot)
+                mark('repo')
+                self.connection.commit()
+                read_plan.reset_mock()
+                before = tuple(self.connection.iterdump())
+                selected = validation.mutable_ready_snapshot(snapshot_effects, self.connection, 'repo', Path('/unused'), 'base')
+                self.assertEqual(selected.plans, ())
+                read_plan.assert_not_called()
+                with self.assertRaisesRegex(validation.PlannerValidationError, '실행 상태가 변경'):
+                    validation._observe_mutable_ready_prs(check_effects, self.connection, self.snapshot)
+                for observation in (None, prepared):
+                    with self.assertRaisesRegex(validation.PlannerValidationError, '실행 상태가 변경'):
+                        validation._assert_mutable_ready_snapshot_current(
+                            check_effects, self.connection, self.snapshot, pr_observation=observation)
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+                self.connection.execute('DELETE FROM execplan_cancellations')
+                self.connection.execute('DELETE FROM deleted_plan_ids')
+                self.connection.commit()
+        observer.assert_not_called()
+
     def test_prepared_pr_check_preserves_cas_without_repeating_observation(self):
         from loop_manager_internal.planning import planner_validation as validation
         from loop_manager_internal.storage import runtime_state

@@ -525,7 +525,7 @@ planning worktree는 `<state-dir>/worktrees/<project-id>/planning/<input-fingerp
 
 #### 개정 snapshot과 작업 취소
 
-일반 planning snapshot은 실제 PR이 없는 READY·진행 중 선언과 일반 `PLAN_BLOCKED` 선언을 Git 원문과 SQLite의 선언·실행 근거에 결합한다. 차단 상태는 삭제·참조 복구 허용 집합과 별도로 판단하며, 독립 catalog hold는 복구 proof로 허용되지 않는 한 후보에서 제외한다. 실행 이력·branch·worktree·세션·checkpoint는 개정 금지 사유가 아니며, 게시 직전에 실행 근거와 실제 PR 부재를 다시 확인한다.
+일반 planning snapshot은 실제 PR이 없는 READY·진행 중 선언과 일반 `PLAN_BLOCKED` 선언을 Git 원문과 SQLite의 선언·실행 근거에 결합한다. 후보 선택은 공통 취소 감사·최종 삭제 ID 집합을 먼저 제외하며 잔존 실행 row의 상태만으로 그 ID를 되살리지 않는다. 저장 snapshot의 PR 관측 준비와 게시/CAS 재검사도 현재 repository/ID의 공통 취소 조회를 수행한다. 미리 준비한 PR 관측은 이 검사를 대신하지 않으며 다른 repository의 같은 ID 표식은 영향을 주지 않는다. 차단 상태는 삭제·참조 복구 허용 집합과 별도로 판단하며, 독립 catalog hold는 복구 proof로 허용되지 않는 한 후보에서 제외한다. 실행 이력·branch·worktree·세션·checkpoint는 개정 금지 사유가 아니며, 게시 직전에 실행 근거와 실제 PR 부재를 다시 확인한다.
 
 R-077의 수동 소유 계획과 start/submit 준비 intent 대상은 후보에서 제외하고, 계획별 수동 group·membership 지문을 snapshot에 결합해 intent 예약과 게시 transaction에서 현재 소유와 변화를 다시 확인한다. snapshot 이후 시작·등록·membership 변경은 해당 계획의 개정을 거부하고 독립 계획의 게시를 막지 않는다.
 

@@ -1566,6 +1566,8 @@ def mutable_ready_snapshot(
     from loop_manager_internal.catalog import remote_deletions
     recovery = remote_deletions.recoverable_ids(connection, repo, held)
     goals = remote_deletions.recovery_goals(connection, repo)
+    from loop_manager_internal.storage.execplan_catalog_state import cancelled_plan_ids
+    cancelled = cancelled_plan_ids(connection, repo)
     manual_owned = set()
     if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_members'").fetchone():
         manual_owned = {str(item[0]) for item in connection.execute(
@@ -1573,7 +1575,7 @@ def mutable_ready_snapshot(
             "ON g.repo=m.repo AND g.group_id=m.group_id WHERE m.repo=? "
             "AND g.state NOT IN ('MERGED','PREPARATION_CONFLICT')", (repo,))}
     for row in rows:
-        if (str(row['plan_id']) in manual_owned or str(row["plan_id"]) in held - recovery
+        if (str(row['plan_id']) in cancelled or str(row['plan_id']) in manual_owned or str(row["plan_id"]) in held - recovery
                 or not effects._row_is_mutable_ready(row)):
             continue
         if str(row["plan_id"]) in recovery and not (worktree / str(row["path"])).is_file():
@@ -1630,13 +1632,15 @@ def _observe_mutable_ready_prs(
     snapshot: MutableReadySnapshot,
 ) -> MutableReadyPRObservation:
     """Read branch identities briefly, then check actual PRs without DB access."""
+    from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
     branches = []
     for plan in snapshot.plans:
         row = connection.execute(
             "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (snapshot.repo, plan.plan_id),
         ).fetchone()
-        if (row is None or not effects._row_is_mutable_ready(row)
+        if (is_cancelled(connection, snapshot.repo, plan.plan_id)
+                or row is None or not effects._row_is_mutable_ready(row)
                 or (plan.execution_state is not None and planning_execution_state(row) != plan.execution_state)):
             raise PlannerValidationError(
                 f"mutable READY snapshot 이후 실행 상태가 변경됐습니다: {plan.plan_id}"
@@ -1660,6 +1664,7 @@ def _assert_mutable_ready_snapshot_current(
 ) -> None:
     """Compare-and-snapshot guard used immediately before publication."""
     from loop_manager_internal.catalog.remote_deletions import recovery_goals
+    from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
     if pr_observation is not None and (
         pr_observation.repo != snapshot.repo or pr_observation.snapshot_token != snapshot.token
         or tuple(plan_id for plan_id, _branch, _generation in pr_observation.branches)
@@ -1690,7 +1695,7 @@ def _assert_mutable_ready_snapshot_current(
             "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (snapshot.repo, plan.plan_id),
         ).fetchone()
-        if row is None or not effects._row_is_mutable_ready(row):
+        if is_cancelled(connection, snapshot.repo, plan.plan_id) or row is None or not effects._row_is_mutable_ready(row):
             raise PlannerValidationError(
                 f"mutable READY snapshot 이후 실행 상태가 변경됐습니다: {plan.plan_id}"
             )
