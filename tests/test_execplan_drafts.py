@@ -1185,7 +1185,7 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertTrue(result.usable)
         return execplan_draft_state.evidence(self.connection, "repo", "G-001")
 
-    def prepare(self, source, question, answer, remaining="", evidence=None):
+    def prepare(self, source, question, answer, remaining="", evidence=None, resolved=None):
         tree = self.trees[self.current]
         row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
         original = loop_manager._ready_plan_snapshot_from_contents(row, tree[PATH].encode(), allow_started=True)
@@ -1193,6 +1193,8 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
         saved = execplan_draft_state.evidence(self.connection, "repo", "G-001")
         result = [{"id": "G-001", "revision": saved["revision"], "remaining": remaining,
                    "resolved": [{"question": question, "answer": answer, "source": source, "quote": answer}]}]
+        if resolved is not None:
+            result[0]["resolved"] = resolved
         if evidence is not None:
             result[0]["resolved"][0]["evidence"] = evidence
         with self.connection:
@@ -1324,6 +1326,47 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
         cleaned, _ = self.prepare(PATH, second, second_answer)
         self.assertNotIn("User Decision", cleaned)
         self.assertNotIn("draft: true", cleaned)
+
+    def test_multiline_answers_clean_all_questions(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        plan = draft_text().replace("Question: " + first, "Question: - " + first + "\n- " + second)
+        initial = {PATH: plan, "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        answers = ("Use policy A.\nRetain history.", "Retry transient errors.\nStop on permanent errors.")
+        tree = {**initial, PATH: plan + "\n## User Decision\n\nAnswer: " + "\n".join(answers) + "\n"}
+        self.observe("b" * 40, tree)
+        resolved = [{"question": question, "answer": answer, "source": PATH, "quote": answer}
+                    for question, answer in zip((first, second), answers)]
+        cleaned, _ = self.prepare(PATH, first, "\n".join(answers), resolved=resolved)
+        self.assertNotIn("User Decision", cleaned)
+        self.assertNotIn("draft: true", cleaned)
+
+    def test_multiline_partial_cleanup_survives_publication_and_reobservation(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        plan = draft_text().replace("Question: " + first, "Question: - " + first + "\n- " + second)
+        initial = {PATH: plan, "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        first_answer = "Use policy A.\nRetain history."
+        second_answer = "Retry transient errors.\nStop on permanent errors."
+        tree = {**initial, PATH: plan + "\n## User Decision\n\nAnswer: " + first_answer + "\n" + second_answer + "\n"}
+        saved = self.observe("b" * 40, tree)
+        cleaned, receipt = self.prepare(PATH, first, first_answer, QUESTION.replace(first, second))
+        self.assertEqual(execplan_drafts.fields(markdown_sections(cleaned).values["User Decision"])["Answer"], second_answer)
+        parsed = execplan_catalog.parse_execplan_text(PATH, cleaned, validate_sources=False)
+        with self.connection:
+            execplan_draft_state.resolve(self.connection, "repo", PATH, parsed,
+                execplan_catalog.plan_content_hash(cleaned.encode()), "f" * 40, receipt, inputs=saved["basis"]["inputs"])
+        self.observe("f" * 40, {**tree, PATH: cleaned})
+        cleaned, _ = self.prepare(PATH, second, second_answer)
+        self.assertNotIn("User Decision", cleaned)
+        self.assertNotIn("draft: true", cleaned)
+
+    def test_multiline_quote_does_not_consume_ambiguous_or_partial_lines(self):
+        answer = "Shared line\nRepeat line\nShared line\nRepeat line\nUnquoted suffix"
+        self.assertEqual(draft_decisions._remaining_answer(answer, {"Shared line\nRepeat line"}), answer)
+        self.assertEqual(draft_decisions._remaining_answer(answer, {"suffix"}), answer)
 
     def test_body_partial_resolution_requires_current_user_decision_evidence(self):
         first = "Which storage policy should this goal use?"

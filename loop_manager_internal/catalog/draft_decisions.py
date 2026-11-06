@@ -225,6 +225,22 @@ def prepare(connection, repo, worktree, snapshot):
     return prepared
 
 
+def _remaining_answer(answer, quotes):
+    lines = answer.splitlines()
+    normalized = [line.strip() for line in lines]
+    consumed = set()
+    # ponytail: scans each quote against all answer lines; index line sequences if answers grow large.
+    for quote in quotes:
+        quoted = [line.strip() for line in quote.strip().splitlines()]
+        if not quoted:
+            continue
+        starts = [index for index in range(len(lines) - len(quoted) + 1)
+                  if normalized[index:index + len(quoted)] == quoted]
+        if len(starts) == 1:
+            consumed.update(range(starts[0], starts[0] + len(quoted)))
+    return "\n".join(line for index, line in enumerate(lines) if index not in consumed).strip()
+
+
 def _clean_answers(original, text, saved, assessment, question_items):
     if len(set(question_items)) != len(question_items):
         raise PlannerValidationError("중복된 draft 질문을 해소할 수 없습니다.")
@@ -276,7 +292,7 @@ def _clean_answers(original, text, saved, assessment, question_items):
                         for resolved_item in audit.get("assessment", {}).get("resolved", []):
                             refs = [{"source": resolved_item["source"], "quote": resolved_item["quote"]}, *resolved_item.get("evidence", [])]
                             consumed.update(ref["quote"].strip() for ref in refs if ref["source"] == source)
-                    remaining_answer = "\n".join(line for line in prior.get("Answer", "").splitlines() if line.strip() not in consumed).strip()
+                    remaining_answer = _remaining_answer(prior.get("Answer", ""), consumed)
                     same_decision = current_decision == {**prior, "Answer": remaining_answer}
                     evidence = execplan_draft_state.decision_evidence(saved["basis"], saved.get("decision"), change)
                     if (not same_decision or quote not in current_decision.get("Answer", "")
@@ -317,20 +333,18 @@ def _clean_answers(original, text, saved, assessment, question_items):
         consumed = decision_quotes
         decision = execplan_drafts.fields(decision_body)
         answer = decision.get("Answer", "")
-        lines = answer.splitlines()
-        leftover = [line for line in lines if line.strip() not in consumed]
+        leftover = _remaining_answer(answer, consumed)
         if answer and not leftover:
             cleaned = replace_section(cleaned, "User Decision", "")
-        elif leftover != lines:
+        elif leftover != answer:
             decision_body = re.sub(r"^Answer:[ \t]*.*?(?=^[A-Za-z]+:[ \t]*|\Z)",
-                                   lambda _match: "Answer: " + "\n".join(leftover) + "\n\n",
+                                   lambda _match: "Answer: " + leftover + "\n\n",
                                    decision_body, count=1, flags=re.M | re.S)
             cleaned = replace_section(cleaned, "User Decision", decision_body)
     if not outstanding:
         decision = execplan_drafts.fields(markdown_sections(text).values.get("User Decision", ""))
         answer = decision.get("Answer", "")
-        if decision and (not answer or (answer.strip() not in decision_quotes and any(
-                line.strip() and line.strip() not in decision_quotes for line in answer.splitlines()))):
+        if decision and (not answer or _remaining_answer(answer, decision_quotes)):
             raise PlannerValidationError("확인하지 않은 User Decision을 정리할 수 없습니다.")
         cleaned = replace_section(cleaned, "User Decision", "")
         cleaned = re.sub(r"^draft:[ \t]*true[ \t]*\n", "", cleaned, count=1, flags=re.M)

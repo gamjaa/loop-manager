@@ -591,7 +591,7 @@ Manager는 유효한 남은 source·dependency와 현재 snapshot을 검증한 �
 |---|---|
 | 관측 기준 revision 전진 | 현재 원문과 같은 미소비 답변은 원래 출처·revision·before/after를 유지한다. 부분 정리한 ExecPlan은 현재 hash·게시 해소 감사 hash·같은 사용자 근거가 일치해야 연결을 유지한다. |
 | Progress·Decision Log 변경 | 원격 계보·이전 원문 조회가 확인되고 scope·source 입력·User Decision이 같으면 검증된 답변의 원래 diff를 유지한다. 새 진행 기록을 답변으로 승격하지 않으며 현재 인용·source hash는 계속 검사한다. 목표·답변·판단 입력 변경과 계보 불확실성에는 적용하지 않는다. |
-| 질문 일부 해소 | 질문별로 정확히 분리되는 답변 줄만 소비하고 공유 답변·남은 User Decision·사용자 출처·유효한 판단을 보존한다. |
+| 질문 일부 해소 | 질문별로 정확히 분리되는 답변의 연속된 전체 줄을 소비하고 공유 답변·남은 User Decision·사용자 출처·유효한 판단을 보존한다. 여러 줄 인용은 각 원문 범위를 합치며, 동일 인용이 여러 위치에 있거나 줄 일부만 인용한 경우 해당 범위는 소비하지 않는다. |
 
 Planner의 `DRAFT_DECISION_RESULT`는 질문별 답변·새 사용자 원문 인용·근거 경로·남은 질문을 반환한다. 질문의 기본 `source`·`quote` 외에 `evidence` 배열의 `source`·`quote`로 여러 원문을 같은 의미 판단에 결합할 수 있다. 공통 strict JSON 파서가 중복 marker/key·비유한 값·잘못된 identity·필드를 거부하고 Manager가 각 인용의 사용자 출처와 before/after, 현재 ExecPlan 원문 또는 source 입력 hash를 대조한다. 명시 승인 없이 Answer를 사용할 때는 현재 질문·입력에 연결된 사용자 변경이어야 하며 같은 관측의 source 변경도 해당 질문의 근거로 확인한다. 기존 명시 결정의 readiness와 별도로 판단하고 stale Revision·거절·보류는 유지한다. 확인하지 않은 User Decision은 정리하지 않으며 부분 정리 후 남은 답변은 출처와 게시 감사를 연결한다. Agent는 draft·입력 양식을 직접 해제하지 않는다. 같은 revision의 draft 질문에 대해 `outcome` 없이 `resolved: []`와 기존 질문 그대로의 `remaining`을 반환하면 미응답 유지로 처리한다. draft·승인 상태·대기 근거를 보존하고 독립 planning의 게시를 계속한다. 이를 새 사용자 결정이나 질문 해소로 기록하지 않으며, 변경된 질문이나 잘못된 결과는 계속 거부한다.
 
