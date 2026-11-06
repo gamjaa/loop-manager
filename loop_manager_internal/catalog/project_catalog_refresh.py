@@ -193,10 +193,17 @@ class ProjectCatalogRefresh:
         revision = revision or self.current_revision()
         pending_deletion = (self.pinned is not None and self.pinned.regular_paths is not None
             and any(row[0] not in self.pinned.regular_paths for row in self.repository.connection.execute(
-                "SELECT path FROM exec_plans WHERE repo=? AND status<>'MERGED'", (self.repo,),
+                "SELECT path FROM exec_plans WHERE repo=? AND status<>'MERGED' "
+                "UNION ALL SELECT path FROM execplan_cancellations WHERE repo=?", (self.repo, self.repo),
             )))
+        connection = self.repository.connection
+        pending_files = (connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='deleted_plan_files'"
+        ).fetchone() is not None and connection.execute(
+            'SELECT 1 FROM deleted_plan_files WHERE repo=? LIMIT 1', (self.repo,),
+        ).fetchone() is not None)
         if (revision == self.revision
-                and not pending_deletion
+                and not pending_deletion and not pending_files
                 and self.declarations == self._declarations()
                 and self.current_revision() == revision):
             return revision

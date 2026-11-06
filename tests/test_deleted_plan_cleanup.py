@@ -625,6 +625,71 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.assertIsNone(self.connection.execute("SELECT 1 FROM execplan_cancellations WHERE plan_id='G-001'").fetchone())
         self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
 
+    def test_rowless_owned_workspace_audit_finishes_only_after_current_resources_are_absent(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from loop_manager_internal.catalog.deleted_plan_cleanup import cleanup
+        text = self.rowless_cancellation(started=True)
+        self.artifact_call('old-call', '/repo', 'G-001')
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            workspace = state / 'worktrees' / 'repo-key' / 'G-001'
+            audit['row'].update(status='IMPLEMENTING', workspace_owned=1,
+                branch='loop-manager/G-001', worktree=str(workspace), publication_remote_oid='d' * 40)
+            audit['cleanup_pending'] = True
+            self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+            self.connection.commit()
+            before = list(self.connection.iterdump())
+            pinned = SimpleNamespace(regular_paths=set(), revision_sha='c' * 40,
+                snapshot=SimpleNamespace(observed_ids={'G-002'}, all={}, withheld=()))
+            observations = []
+            def run(*, registration='', remote='', pr=None, local=False, race=False):
+                observations.clear()
+                def git(_repo, *args, **kwargs):
+                    observations.append(args)
+                    self.assertFalse(self.connection.in_transaction)
+                    output = registration if args[0] == 'worktree' else remote if args[0] == 'ls-remote' else ''
+                    return SimpleNamespace(returncode=int(args[0] == 'rev-parse' and not local), stdout=output)
+                def observe_pr(*_args):
+                    if race:
+                        workspace.mkdir(parents=True, exist_ok=True)
+                    return pr
+                return cleanup(self.connection, '/repo', '/repo', pinned, (), git=git,
+                    git_bytes=lambda *_: text.encode(), pr_for_branch=observe_pr,
+                    state_dir=state, revision_is_current=lambda: True)
+            for kwargs in ({'remote': 'new-remote-head'}, {'local': True}, {'pr': {'state': 'OPEN'}},
+                    {'registration': 'worktree ' + str(workspace)},
+                    {'registration': 'branch refs/heads/loop-manager/G-001'}, {'race': True}):
+                with self.subTest(kwargs=kwargs):
+                    self.assertEqual(run(**kwargs), ())
+                    self.assertTrue(observations)
+                    self.assertEqual(list(self.connection.iterdump()), before)
+                    if workspace.exists():
+                        workspace.rmdir()
+            self.connection.execute("UPDATE projects SET worktree=? WHERE repo='/repo'", (str(workspace),))
+            self.connection.commit()
+            self.assertEqual(run(), ())
+            self.connection.execute("UPDATE projects SET worktree=NULL WHERE repo='/repo'")
+            from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
+            archive = ExecPlanArchiveRepository(self.connection)
+            archive.observe('/repo', 'git:old', category='shared_resource', resource=str(workspace),
+                reason='unknown historical owner', resume_condition='reobserve', attempted=True)
+            self.connection.commit()
+            before_archive = list(self.connection.iterdump())
+            self.assertEqual(run(), ())
+            self.assertEqual(list(self.connection.iterdump()), before_archive)
+            audit['cleanup_pending'] = False
+            self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+            archive.observe('/repo', 'git:old', category='shared_resource', resource=str(workspace),
+                reason='confirmed historical owner', resume_condition='cleanup', attempted=False, owner_plan_id='G-001')
+            self.connection.commit()
+            self.assertEqual(run(), ('G-001',))
+            self.assertIsNone(self.connection.execute("SELECT * FROM execplan_archive_observations WHERE scope='git:old'").fetchone())
+            self.assertIsNone(self.connection.execute("SELECT * FROM execplan_cancellations WHERE plan_id='G-001'").fetchone())
+            self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
+            self.assertEqual(run(), ())
+
     def test_started_rowless_audit_preserves_uncertain_judgment_resources_and_agent_ownership(self):
         from unittest import mock
         text = self.rowless_cancellation(started=True)

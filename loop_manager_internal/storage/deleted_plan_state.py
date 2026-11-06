@@ -36,7 +36,22 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         from .maintenance_state import forget_plan as forget_maintenance_plan
         forget_maintenance_plan(connection, repo, plan_id)
         if 'execplan_archive_observations' in tables:
-            resources = {plan[key] for key in ('branch', 'worktree') if plan is not None and plan[key]}
+            resource_owner = plan
+            if resource_owner is None and 'execplan_cancellations' in tables:
+                canceled = connection.execute('SELECT recovery_evidence FROM execplan_cancellations WHERE repo=? AND plan_id=?',
+                                              (repo, plan_id)).fetchone()
+                if canceled is not None:
+                    try:
+                        saved = json.loads(canceled['recovery_evidence'])['row']
+                        if (not isinstance(saved, dict) or (saved['repo'], saved['plan_id']) != (repo, plan_id)
+                                or any(field not in saved or saved[field] is not None and not isinstance(saved[field], str)
+                                       for field in ('branch', 'worktree'))):
+                            raise ValueError('unattributed cancellation resources')
+                        resource_owner = saved
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise CallDeferred('취소 감사의 archive 자원 귀속을 확인할 수 없습니다.') from error
+            resources = {resource_owner[key] for key in ('branch', 'worktree')
+                         if resource_owner is not None and resource_owner[key]}
             owner_column = 'owner_plan_id' in tables['execplan_archive_observations']
             for observation in connection.execute(
                 'SELECT * FROM execplan_archive_observations WHERE repo=?', (repo,),

@@ -238,8 +238,8 @@ def release_reference_holds(connection, repo, key, path, resolved):
             connection.execute('DELETE FROM execplan_catalog_holds WHERE repo=? AND plan_id=?', (repo, held['plan_id']))
 
 
-def _unowned_cancellations(connection, repo):
-    """Read complete READY or started PLAN_BLOCKED audits without resource ownership."""
+def _rowless_cancellations(connection, repo, state_dir):
+    """Read complete audits whose saved resources can be proved absent now."""
     from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
     if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'").fetchone():
         return
@@ -279,10 +279,24 @@ def _unowned_cancellations(connection, repo):
                 'reviewer_session_id', 'worker_result', 'verify_result', 'review_result',
                 'blocked_reason', 'guidance_plan_hash',
             } if started else set()
+            retired_workspace = (started and saved.get('workspace_owned') == 1
+                and saved.get('branch') == 'loop-manager/' + canceled['plan_id']
+                and isinstance(saved.get('worktree'), str) and Path(saved['worktree']).is_absolute()
+                and Path(saved['worktree']).name == canceled['plan_id']
+                and Path(saved['worktree']).resolve().parent.parent == Path(state_dir).resolve() / 'worktrees'
+                and not Path(saved['worktree']).is_symlink() and not Path(saved['worktree']).exists())
+            if retired_workspace:
+                historical_fields |= {'branch', 'worktree', 'publication_remote_oid'}
+            allowed_statuses = {'READY'}
+            if started:
+                allowed_statuses.add('PLAN_BLOCKED')
+            if retired_workspace:
+                allowed_statuses.update(('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'))
             judgment = audit.get('judgment')
             decision = judgment.get('decision') if isinstance(judgment, dict) else None
             decision = decision if isinstance(decision, dict) else {}
-            if started and (audit.get('cleanup_pending') is not False
+            if started and (type(audit.get('cleanup_pending')) is not bool
+                    or audit['cleanup_pending'] and not retired_workspace
                     or decision.get('id') != saved['plan_id'] or decision.get('outcome') != 'withdrawn'
                     or decision.get('source') not in json.loads(saved['sources'])
                     or not isinstance(decision.get('reason'), str) or not decision['reason'].strip()):
@@ -292,17 +306,16 @@ def _unowned_cancellations(connection, repo):
                     "AND execution_status='executed' AND execution_started_at IS NOT NULL",
                     (repo, canceled['plan_id'])).fetchone():
                 continue  # Missing historical calls cannot prove a started writer's termination.
-            if (not isinstance(saved, dict) or (saved['status'] != 'READY'
-                    and not (started and saved['status'] == 'PLAN_BLOCKED'))
+            if (not isinstance(saved, dict) or saved['status'] not in allowed_statuses
                     or type(saved['ever_started']) is not int or saved['ever_started'] not in (0, 1)
-                    or type(saved['workspace_owned']) is not int or saved['workspace_owned'] != 0
+                    or type(saved['workspace_owned']) is not int or saved['workspace_owned'] != (1 if retired_workspace else 0)
                     or type(saved['retry_count']) is not int or saved['retry_count'] < 0
                     or (not started and saved['retry_count'] != 0) or saved['pr_conflict_recovery'] != 0
                     or any(not isinstance(json.loads(saved[field]), dict) or not started and saved[field] != '{}'
                            for field in ('verify_failure_history', 'review_failure_history', 'review_level_history'))
                     or any(saved[field] is not None for field in _MUTABLE_READY_EVIDENCE_FIELDS if field not in historical_fields)
                     or any(saved[field] is not None for field in ('pr_conflict_head_oid', 'pr_conflict_base_oid'))
-                    or audit.get('cleanup_pending')
+                    or audit.get('cleanup_pending') and not retired_workspace
                     or any(saved[field] != canceled[field] for field in (
                         'repo', 'plan_id', 'path', 'title', 'sources', 'depends_on', 'priority', 'content_hash'))
                     or (saved['current_revision_sha'] or saved['plan_sha']) != canceled['plan_sha']
@@ -327,7 +340,11 @@ def _rowless_ownership(connection, state_dir, repo, row, canceled):
     from loop_manager_internal.storage import task_calls, work_claims
     from loop_manager_internal.maintenance.maintenance_validation import _plan_id_from_path
     key = row['plan_id']
-    with resource_locks(Path(state_dir), repo, ['plan:' + key], owner='deleted-plan-cleanup'):
+    resources = ['plan:' + key]
+    resources += [prefix + row[field] for prefix, field in (('branch:', 'branch'), ('worktree:', 'worktree')) if row[field]]
+    if row['worktree']:
+        resources.append('git:' + str(Path(row['worktree']).resolve()))
+    with resource_locks(Path(state_dir), repo, resources, owner='deleted-plan-cleanup'):
         if connection.in_transaction:
             raise CallDeferred('row 없는 삭제 대상의 외부 관측은 DB transaction 밖에서 수행해야 합니다.')
         def check():
@@ -338,6 +355,12 @@ def _rowless_ownership(connection, state_dir, repo, row, canceled):
                     or connection.execute('SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
                     or task_calls.pending_for_plan(connection, repo, key)):
                 raise CallDeferred('row 없는 삭제 대상의 감사·writer 상태가 변경됐습니다.')
+            if row['worktree'] and (Path(row['worktree']).is_symlink() or Path(row['worktree']).exists()
+                    or connection.execute('SELECT 1 FROM exec_plans WHERE worktree=? OR (repo=? AND branch=?)',
+                                          (row['worktree'], repo, row['branch'])).fetchone()
+                    or connection.execute('SELECT 1 FROM projects WHERE worktree=? OR (repo=? AND branch=?)',
+                                          (row['worktree'], repo, row['branch'])).fetchone()):
+                raise CallDeferred('이전 취소 자원이 다시 사용 중이어서 감사를 보존합니다.')
             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_checkpoints'").fetchone() and connection.execute(
                     'SELECT 1 FROM execution_checkpoints WHERE repo=? AND plan_id=? AND operation IS NOT NULL', (repo, key)).fetchone():
                 raise CallDeferred('row 없는 삭제 대상의 미확정 Git operation이 남아 있습니다.')
@@ -360,7 +383,7 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
         return ()
     deleted = []
     rows = [(row, None) for row in connection.execute("SELECT * FROM exec_plans WHERE repo=? AND status!='MERGED' AND agent_role IS NULL", (repo,)).fetchall()]
-    rows.extend(_unowned_cancellations(connection, repo))
+    rows.extend(_rowless_cancellations(connection, repo, state_dir))
     for row, canceled in rows:
         key, path = row['plan_id'], row['path']
         if path in pinned.regular_paths or key in pinned.snapshot.observed_ids:
@@ -402,7 +425,11 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                         pr = pr_for_branch(repo_path, canonical)
                     except (OSError, RuntimeError) as error:
                         raise CallDeferred('row 없는 삭제 대상의 실제 PR·ref를 확인할 수 없습니다.') from error
-                    if (pr is not None or remote.returncode or remote.stdout.strip() or local.returncode not in (1, 128)):
+                    registered = git(repo_path, 'worktree', 'list', '--porcelain') if row['worktree'] else None
+                    if (pr is not None or remote.returncode or remote.stdout.strip() or local.returncode not in (1, 128)
+                            or registered is not None and (registered.returncode or any(
+                                line in {'worktree ' + row['worktree'], 'branch refs/heads/' + canonical}
+                                for line in registered.stdout.splitlines()))):
                         continue
                 pr = pr_for_branch(repo_path, row['branch'], row['pr_url']) if row['branch'] else None
                 if row['pr_url'] and (pr is None or pr.get('url') != row['pr_url']):

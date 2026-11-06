@@ -211,6 +211,59 @@ class CatalogCacheAndCasTests(_CatalogRefreshCase):
         self.assertEqual(dict(self.row()), before)
         self.assertIsNotNone(self.row('G-002'))
 
+    def test_rowless_cancellation_rechecks_external_cleanup_at_same_revision(self):
+        calls = []
+        def reconcile(revision, remember):
+            calls.append(revision)
+            remember(self.pinned(revision))
+            if len(calls) == 3:
+                self.connection.execute("DELETE FROM execplan_cancellations WHERE repo=? AND plan_id='G-999'", (self.repo,))
+                self.connection.commit()
+            return state.CatalogReconciliationResult(state.ReconciliationKind.RECONCILED, revision_sha=revision)
+        self.boundary.refresh()  # Adopt current paths before isolating cleanup effects.
+        self.boundary.revision = None
+        self.boundary.reconcile = reconcile
+        self.boundary.refresh()
+        self.connection.execute("INSERT INTO execplan_cancellations "
+            "(repo,plan_id,path,title,sources,depends_on,complexity,risk,priority,content_hash,plan_sha,deletion_commit) "
+            "SELECT repo,'G-999','docs/plans/[G-999] Gone.md','Gone',sources,depends_on,'low','low',"
+            "priority,content_hash,plan_sha,'deleted' FROM exec_plans WHERE repo=? AND plan_id='G-001'", (self.repo,))
+        self.connection.commit()
+        self.boundary.refresh()
+        # Writer/ref release is external: revision and declarations have not changed.
+        self.boundary.refresh()
+        self.assertEqual(calls, [self.sha] * 3)
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 3)
+
+    def test_pending_file_cleanup_bypasses_cache_until_queue_is_drained(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        deleted_plan_state.ensure_schema(self.connection)
+        calls = []
+        def reconcile(revision, remember):
+            calls.append(revision)
+            remember(self.pinned(revision))
+            if len(calls) == 3:
+                self.connection.execute('DELETE FROM deleted_plan_files WHERE repo=?', (self.repo,))
+                self.connection.commit()
+            return state.CatalogReconciliationResult(state.ReconciliationKind.RECONCILED, revision_sha=revision)
+        self.boundary.refresh()  # Adopt current paths before isolating cleanup effects.
+        self.boundary.revision = None
+        self.boundary.reconcile = reconcile
+        self.boundary.refresh()
+        self.connection.execute("INSERT INTO deleted_plan_files VALUES (?,'G-999','/owned/log')", (self.repo,))
+        self.connection.commit()
+        self.boundary.refresh()
+        self.boundary.refresh()
+        self.assertEqual(calls, [self.sha] * 3)
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 3)
+        # Another repository's queue does not invalidate this cache.
+        self.connection.execute("INSERT INTO deleted_plan_files VALUES ('/other','G-999','/other/log')")
+        self.connection.commit()
+        self.boundary.refresh()
+        self.assertEqual(len(calls), 3)
+
     def test_refresh_does_not_update_another_repositorys_plan(self):
         project = dict(self.connection.execute(
             "SELECT * FROM projects WHERE repo = ?", (self.repo,)
