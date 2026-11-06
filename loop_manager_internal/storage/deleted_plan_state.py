@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from .runtime_state import _transaction
+from .task_calls import CallDeferred
 
 
 def ensure_schema(connection):
@@ -29,7 +30,6 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         if connection.execute('SELECT 1 FROM manual_work_members WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone():
             raise ValueError('수동 소유 작업은 자동 제거할 수 없습니다.')
         if 'execplan_archive_observations' in tables:
-            from .task_calls import CallDeferred
             resources = {plan[key] for key in ('branch', 'worktree') if plan is not None and plan[key]}
             owner_column = 'owner_plan_id' in tables['execplan_archive_observations']
             for observation in connection.execute(
@@ -71,6 +71,20 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         for table in ('targeted_test_run_owners', 'targeted_test_collections', 'agent_isolation_evidence'):
             if table in tables:
                 connection.executemany(f'DELETE FROM "{table}" WHERE invocation_id=?', ((key,) for key in calls))
+        incident_events = set()
+        if 'notified_block_incidents' in tables:
+            incident_events.update(row[0] for row in connection.execute(
+                'SELECT event_key FROM notified_block_incidents WHERE repo=? AND subject IN (?,?)',
+                (repo, plan_id, 'plan:' + plan_id),
+            ))
+            if 'block_notice_events' in tables:
+                incident_events.update(row[0] for row in connection.execute(
+                    'SELECT n.event_key FROM block_notice_events n JOIN notified_block_incidents i ON i.id=n.incident_id '
+                    'WHERE i.repo=? AND i.subject IN (?,?)', (repo, plan_id, 'plan:' + plan_id),
+                ))
+                connection.execute('DELETE FROM block_notice_events WHERE incident_id IN '
+                    '(SELECT id FROM notified_block_incidents WHERE repo=? AND subject IN (?,?))',
+                    (repo, plan_id, 'plan:' + plan_id))
         for table in ('recovery_records', 'persistent_execution_failures', 'notified_block_incidents'):
             if table in tables:
                 connection.execute(f'DELETE FROM "{table}" WHERE repo=? AND subject IN (?,?)',
@@ -79,11 +93,36 @@ def forget(connection, repo, plan_id, *, artifacts=()):
             connection.execute("DELETE FROM diagnostic_preservations WHERE repo=? AND scope='plan' AND owner=?", (repo, plan_id))
         if 'notification_outbox' in tables:
             for event in connection.execute('SELECT event_key,event_type,payload FROM notification_outbox WHERE repo=?', (repo,)).fetchall():
-                payload = json.loads(event['payload'])
-                owned_event = (payload.get('request_id') in recovery_requests if event['event_type'] == 'recovery_unresolved'
-                               else payload.get('execplan_id') == plan_id)
+                if event['event_key'] in incident_events:
+                    owned_event = True
+                else:
+                    try:
+                        payload = json.loads(event['payload'])
+                    except (TypeError, ValueError) as error:
+                        raise CallDeferred('알림의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+                    if not isinstance(payload, dict):
+                        raise CallDeferred('알림의 삭제 대상 귀속을 확인할 수 없습니다.')
+                    if event['event_type'] in ('plans_published', 'draft_decisions'):
+                        plans = payload.get('plans')
+                        if not isinstance(plans, list) or any(not isinstance(item, dict) or not isinstance(item.get('id'), str) for item in plans):
+                            raise CallDeferred('공유 알림의 삭제 대상 귀속을 확인할 수 없습니다.')
+                        owned_event = any(item['id'] == plan_id for item in plans)
+                        if owned_event and any(item['id'] != plan_id for item in plans):
+                            raise CallDeferred('여러 작업의 공유 알림은 대상별 전송 근거 분리가 필요합니다.')
+                    elif event['event_type'] == 'recovery_unresolved':
+                        owned_event = payload.get('request_id') in recovery_requests
+                    else:
+                        owned_event = payload.get('execplan_id') == plan_id
+                        if payload.get('scope') == 'project' and (owned_event or payload.get('started_execplan_id') == plan_id):
+                            raise CallDeferred('프로젝트 알림의 삭제 대상과 독립 사건을 분리할 수 없습니다.')
                 if owned_event:
+                    if 'block_notice_events' in tables:
+                        if connection.execute('SELECT 1 FROM block_notice_events WHERE event_key=?', (event['event_key'],)).fetchone():
+                            raise CallDeferred('삭제할 알림이 독립 차단 사건에도 연결돼 있습니다.')
                     connection.execute('DELETE FROM notification_outbox WHERE event_key=?', (event['event_key'],))
+            if any(connection.execute('SELECT 1 FROM notification_outbox WHERE event_key=? AND repo<>?', (key, repo)).fetchone()
+                   for key in incident_events):
+                raise CallDeferred('삭제 대상 차단 사건의 알림 repository가 일치하지 않습니다.')
         if 'manager_metadata' in tables:
             for prefix in ('workspace_seen:', 'remote_adoption:'):
                 connection.execute('DELETE FROM manager_metadata WHERE key=?', (prefix + repo + ':' + plan_id,))

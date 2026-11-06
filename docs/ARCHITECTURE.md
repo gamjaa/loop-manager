@@ -1881,6 +1881,10 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 작업 취소 transaction은 해당 작업의 미전송 실행·판단·차단·시작/재개·PR 알림을 취소하고 계획 범위 incident의 활성 대기를 해제한다. outbox·incident 행, payload·고정 본문·전송 cursor·attempts·오류와 이미 확정한 전송은 유지한다. 생성·재시작 사건 복구·조각 claim도 취소 감사를 재확인하며, 취소와 겹친 전송 확인은 이미 보낸 조각에만 반영하고 다음 조각을 보내거나 새 재개 사건을 만들지 않는다. 프로젝트 범위 차단·실패, 완료·계획 게시 감사는 독립적으로 보존한다. 프로젝트 재개는 기존 원인 작업과 실제 시작 작업을 구분하며 `resumed` payload의 `started_execplan_id`(문자열 또는 `null`)로 실제 작업의 취소 여부를 판단한다. 이전 payload에 이 값이 없으면 저장된 `execplan_id`를 사용한다. 취소 작업을 포함한 draft 목록은 기존 목록을 보존·취소하고 남은 판단 목록으로 다시 구성한다. `recovery_unresolved`는 payload의 작업 ID 대신 `request_id`와 outbox의 repository에 일치하는 로컬 복구 요청의 `plan_id`로 취소 귀속을 확인한다. 일반 취소에서는 그 요청·전송 감사를 보존하며 독립 요청을 변경하지 않는다. 조각 claim은 이전 오류를 지우지 않고, 전송 확인 때 현재 사건의 오류만 해제하므로 취소와 겹친 확인도 오류 감사를 보존한다.
 
+삭제 확정의 알림 정리는 일반 취소와 달리 대상 전용 outbox·incident·전송 참조를 최종 제거한다. `deleted_plan_state.forget`는 같은 repository의 `plan:<G ID>` 또는 과거 G subject에 속한 incident와 `block_notice_events`의 직접 관계를 먼저 확보한다. 자식 참조를 부모 incident보다 먼저 제거하고, payload에 작업 ID가 없는 과거 outbox 버전도 그 관계로 제거한다. 남은 독립 incident가 해당 outbox를 참조하거나 연결된 outbox의 repository가 다르면 전체 제거 transaction을 롤백하고 해당 삭제를 보류한다. 명시적인 관계가 없는 잘못된 payload도 귀속 미확인으로 보존한다.
+
+대상 하나만 포함한 `plans_published`·`draft_decisions`는 전용 기록으로 제거하지만, 다른 G가 섞인 목록과 대상 원인·실제 시작이 포함된 프로젝트 사건은 아직 대상별 전송 근거를 안전하게 분리하지 못하면 `CallDeferred`로 남긴다. 고정 본문·확인 cursor·오류를 통째로 삭제하거나 새 본문에 기존 cursor를 재사용하지 않는다. 이는 최종 부분 제거의 미완료 경계이며 독립 사건의 전송·일반 취소 보존을 바꾸거나 삭제 완료를 의미하지 않는다.
+
 `notifications/rendering.py`는 저장된 payload만으로 텍스트를 결정적으로 생성하며 모델을 호출하지 않는다. 확인된 질문·수정 대상·PR 상태 순으로 정보를 구성하고 원인·복구 시도·Checkpoint 근거를 보존한다. 공통 payload와 `draft_decisions` 목록의 계약은 다음과 같다.
 
 | payload 필드 | 타입·의미 |

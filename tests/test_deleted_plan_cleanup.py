@@ -9,6 +9,85 @@ from tests.support.catalog import catalog_reconciliation_fixture
 
 
 class DeletedPlanCleanupTest(unittest.TestCase):
+    def test_notification_erasure_removes_incident_versions_with_foreign_keys_and_preserves_independent_audit(self):
+        import sqlite3
+        from loop_manager_internal.notifications import notifications
+        notifications.ensure_schema(self.connection)
+        self.connection.execute('PRAGMA foreign_keys=ON')
+        self.connection.execute("INSERT INTO projects (repo,base_branch) VALUES ('/other','main')")
+        for repo, key, plan in (('/repo', 'target', 'G-001'), ('/repo', 'independent', 'G-002'),
+                                ('/repo', 'project', 'G-002'), ('/other', 'foreign', 'G-001')):
+            scope = 'project' if key == 'project' else 'plan'
+            payload = json.dumps(dict(execplan_id=plan, scope=scope, cause='saved cause'))
+            incident = self.connection.execute('INSERT INTO notified_block_incidents '
+                '(repo,subject,block_key,event_key,payload) VALUES (?,?,?,?,?)',
+                (repo, 'project' if scope == 'project' else 'plan:' + plan, key, key, payload))
+            self.connection.execute('INSERT INTO notification_outbox '
+                '(event_key,repo,event_type,payload,rendered_text,confirmed_pieces,last_error) '
+                "VALUES (?,?,'blocked',?,'saved body',1,'saved error')", (key, repo, payload))
+            self.connection.execute('INSERT INTO block_notice_events VALUES (?,?)', (key, incident.lastrowid))
+            if key == 'target':
+                self.connection.execute("INSERT INTO notification_outbox (event_key,repo,event_type,payload) "
+                    "VALUES ('legacy-version','/repo','blocked','legacy raw payload')")
+                self.connection.execute("INSERT INTO block_notice_events VALUES ('legacy-version',?)", (incident.lastrowid,))
+        self.connection.commit()
+        self.assertEqual(self.connection.execute('PRAGMA foreign_keys').fetchone()[0], 1)
+        self.connection.execute("CREATE TRIGGER reject_notification_erasure BEFORE DELETE ON exec_plans "
+                                "BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'interrupted'):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute('DROP TRIGGER reject_notification_erasure')
+        tables = ('notification_outbox', 'notified_block_incidents', 'block_notice_events')
+        expected = {table: [dict(row) for row in self.connection.execute(f'SELECT * FROM {table}')
+                           if row['event_key'] not in ('target', 'legacy-version')] for table in tables}
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        for table in tables:
+            self.assertEqual([dict(row) for row in self.connection.execute(f'SELECT * FROM {table}')], expected[table])
+        self.assertEqual(self.connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+        before = tuple(self.connection.iterdump())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_unattributed_or_mixed_notifications_hold_final_erasure_without_losing_history(self):
+        from loop_manager_internal.notifications import notifications
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        notifications.ensure_schema(self.connection)
+        for kind, payload in (
+            ('blocked', 'broken JSON'), ('draft_decisions', '{"plans":[null]}'),
+            ('draft_decisions', '{"plans":[{"id":"G-001"},{"id":"G-002"}]}'),
+            ('plans_published', '{"plans":[{"id":"G-001"},{"id":"G-002"}]}'),
+            ('blocked', '{"scope":"project","execplan_id":"G-001","started_execplan_id":"G-002"}'),
+        ):
+            with self.subTest(kind=kind, payload=payload):
+                self.connection.execute('INSERT OR REPLACE INTO notification_outbox '
+                    '(event_key,repo,event_type,payload,rendered_text,confirmed_pieces,last_error) '
+                    "VALUES ('mixed','/repo',?,?,'preserved body',1,'saved error')", (kind, payload))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("UPDATE notification_outbox SET event_type='blocked',payload=? WHERE event_key='mixed'",
+                                (json.dumps(dict(execplan_id='G-001', scope='plan')),))
+        incident = self.connection.execute("INSERT INTO notified_block_incidents "
+            "(repo,subject,block_key,event_key,payload) VALUES ('/repo','plan:G-002','other','mixed','{}')")
+        self.connection.execute("INSERT INTO block_notice_events VALUES ('mixed',?)", (incident.lastrowid,))
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaises(CallDeferred):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("DELETE FROM block_notice_events WHERE event_key='mixed'")
+        # A single-owner publication is removable after current evidence is supplied.
+        self.connection.execute("UPDATE notification_outbox SET event_type='plans_published',payload=? WHERE event_key='mixed'",
+                                (json.dumps(dict(plans=[dict(id='G-001')])),))
+        self.connection.commit()
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertIsNone(self.connection.execute('SELECT * FROM notification_outbox').fetchone())
+
     def test_archive_erasure_preserves_dispatch_independent_candidates_and_intents(self):
         from loop_manager_internal.storage.execplan_archive_state import ExecPlanArchiveRepository
         import sqlite3
