@@ -127,13 +127,13 @@ def unpublished_checkpoint_without_resources(row, repo: str, plan_id: str) -> bo
              'inspected_input', 'inspection_reason'}
     zero = {'remote_observed', 'inspection_retryable', 'rebase_recovery', 'retryable'}
     text = {'repo', 'plan_id', 'request_identity', 'phase', 'reason_code', 'evidence',
-            'result', 'unpublished_reason', 'created_at', 'updated_at'}
-    if (not isinstance(row, dict) or set(row) != empty | zero | text | {'publication_history'}
+            'unpublished_reason', 'created_at', 'updated_at'}
+    if (not isinstance(row, dict) or set(row) != empty | zero | text | {'publication_history', 'result'}
             or any(row[field] is not None for field in empty)
             or any(type(row[field]) is not int or row[field] != 0 for field in zero)
             or any(not isinstance(row[field], str) or not row[field].strip() for field in text)
             or row['repo'] != repo or row['plan_id'] != plan_id
-            or row['phase'] != CheckpointPhase.UNPUBLISHED.value or row['result'] != 'local_only'):
+            or row['phase'] != CheckpointPhase.UNPUBLISHED.value or row['result'] not in (None, 'local_only')):
         return False
     try:
         return (json.loads(row['publication_history']) == []

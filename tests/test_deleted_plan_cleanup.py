@@ -143,7 +143,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.assertEqual(list(self.connection.iterdump()), before)
 
     def rowless_cancellation(self, *, started=False, empty_checkpoint=False, blocked=False,
-                             empty_blocked_checkpoint=False):
+                             empty_blocked_checkpoint=False, resolved_blocked_checkpoint=False):
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         from loop_manager_internal.planning.planning_catalog import PlanDeletion
@@ -177,13 +177,16 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
             ExecutionCheckpointRepository(self.connection).record('/repo', 'G-001', expected_generation=0,
                 operation=None, expected_head=None, target_base_oid=None, observed_remote_oid=None, snapshot={})
-        if empty_blocked_checkpoint:
+        if empty_blocked_checkpoint or resolved_blocked_checkpoint:
             from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
             checkpoints = BlockedCheckpointRepository(self.connection)
             request = checkpoints.request(repo='/repo', plan_id='G-001', reason_code='no-resource',
                 evidence='No owned workspace.', branch=None, worktree=None,
                 expected_remote_oid=None, rebase_recovery=False)
-            checkpoints.finish_unpublished(request, 'No workspace was created.', retryable=False)
+            if resolved_blocked_checkpoint:
+                self.assertIsNone(checkpoints.reconcile_cause(request))
+            else:
+                checkpoints.finish_unpublished(request, 'No workspace was created.', retryable=False)
         with _transaction(self.connection):
             apply_mutable_catalog_changes(self.connection, '/repo', deletions=(PlanDeletion(plan, judgment),), revisions=(),
                 snapshot_token='saved', plan_commit='b' * 40, content_hash=lambda _: '', agent=False)
@@ -506,6 +509,31 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 git = mock.Mock(side_effect=AssertionError('checkpoint evidence must be preserved'))
                 self.assertEqual(self.cleanup_rowless(text, git=git), ())
                 self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_resolved_checkpoint_without_publication_result_allows_rowless_erasure(self):
+        from unittest import mock
+        text = self.rowless_cancellation(resolved_blocked_checkpoint=True)
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        checkpoint = audit['checkpoints']['blocked_checkpoints']
+        self.assertEqual(checkpoint['phase'], 'unpublished')
+        self.assertIsNone(checkpoint['result'])
+        self.assertTrue(checkpoint['unpublished_reason'])
+        for field, value in (('phase', 'requested'), ('unpublished_reason', None),
+                ('retryable', 1), ('publication_history', '[{"local_oid":"old-head"}]')):
+            with self.subTest(field=field):
+                changed = {**checkpoint, field: value}
+                audit['checkpoints']['blocked_checkpoints'] = changed
+                self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                self.assertEqual(self.cleanup_rowless(text, git=mock.Mock(side_effect=AssertionError('unresolved checkpoint'))), ())
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+        audit['checkpoints']['blocked_checkpoints'] = checkpoint
+        self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+        self.connection.commit()
+        self.assertEqual(self.cleanup_rowless(text), ('G-001',))
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM execplan_cancellations WHERE plan_id='G-001'").fetchone())
+        self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
 
     def test_started_rowless_audit_preserves_uncertain_judgment_resources_and_agent_ownership(self):
         from unittest import mock
