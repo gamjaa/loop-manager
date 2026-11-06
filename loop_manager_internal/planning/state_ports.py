@@ -505,8 +505,8 @@ class _PlanningStatePorts:
         )
 
     def record_maintenance_scope(self, repo: str, revision: int, plan_ids: tuple[str, ...],
-                                 prerequisite_plan_ids: tuple[str, ...] = ()) -> None:
-        self._maintenance_repository.record_assessment_plans(repo, revision, plan_ids, prerequisite_plan_ids)
+                                 prerequisite_plan_ids: tuple[str, ...] = ()) -> maintenance_state.MaintenanceCycle:
+        return self._maintenance_repository.record_assessment_plans(repo, revision, plan_ids, prerequisite_plan_ids)
 
     def advance_success_baseline(
         self,

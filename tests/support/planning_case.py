@@ -385,6 +385,7 @@ class FakeStatePort:
 
     def record_maintenance_scope(self, _repo, _revision, plan_ids, prerequisite_plan_ids=()):
         self.cycle = replace(self.cycle, assessment_plan_ids=plan_ids, prerequisite_plan_ids=prerequisite_plan_ids)
+        return self.cycle
 
     def advance_success_baseline(self, *_args, **_kwargs):
         raise AssertionError("unexpected maintenance baseline")

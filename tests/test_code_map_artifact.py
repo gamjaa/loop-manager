@@ -310,7 +310,11 @@ class CodeMapPublicationTest(PlanningCase):
             publication_hashes=((artifact.ARTIFACT_PATH, "e" * 64),),
             maintenance_context=context, maintenance_code_map_hash="e" * 64)
         ports.state.prepare_file_assessment_artifact = mock.Mock(return_value=prepared)
-        ports.state.record_maintenance_intent = mock.Mock(return_value=replace(cycle, publication_stage="prepared"))
+        ports.intent_commands = []
+        def record_intent(*_args):
+            ports.intent_commands.append([args for _repo, args, _check in ports.git.calls])
+            return replace(cycle, publication_stage="prepared")
+        ports.state.record_maintenance_intent = mock.Mock(side_effect=record_intent)
         def apply_batch(_repo, _worktree, _base, _result, commit):
             ports.state.retain_planning_after_publication(_repo, commit)
             return cycle
@@ -343,7 +347,12 @@ class CodeMapPublicationTest(PlanningCase):
                          [("commit", "-m", "Update periodic maintenance planning batch")])
         self.assertIn(("add", "--", artifact.ARTIFACT_PATH), commands)
         self.assertIn(("push", "origin", "HEAD:refs/heads/main"), commands)
-        ports.state.record_maintenance_intent.assert_called_once()
+        self.assertEqual(ports.state.record_maintenance_intent.call_args_list,
+                         [ports.state.record_maintenance_intent.call_args] * 2)
+        before_prepare, before_push = ports.intent_commands
+        self.assertGreater(sum(args[0] == 'recorded_base_fetch' for args in before_push),
+                           sum(args[0] == 'recorded_base_fetch' for args in before_prepare))
+        self.assertFalse(any(args[0] == 'push' for args in before_push))
         ports.state.publish_maintenance_batch.assert_called_once()
 
     def test_push_failure_preserves_candidate_and_does_not_promote(self):
@@ -358,7 +367,8 @@ class CodeMapPublicationTest(PlanningCase):
         ports.git.run = git
         outcome = service._publish_planner_result(run)
         self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
-        ports.state.record_maintenance_intent.assert_called_once()
+        self.assertEqual(ports.state.record_maintenance_intent.call_args_list,
+                         [ports.state.record_maintenance_intent.call_args] * 2)
         ports.state.publish_maintenance_batch.assert_not_called()
         self.assertFalse(any(args[:2] == ("worktree", "remove") for _repo, args, _check in ports.git.calls))
 
@@ -368,7 +378,8 @@ class CodeMapPublicationTest(PlanningCase):
         ports.artifact_dirty = False
         self.assertIsNone(service._publish_planner_result(run))
         self.assertFalse(any(args[0] == "commit" for _repo, args, _check in ports.git.calls))
-        ports.state.record_maintenance_intent.assert_called_once()
+        self.assertEqual(ports.state.record_maintenance_intent.call_args_list,
+                         [ports.state.record_maintenance_intent.call_args] * 2)
         ports.state.publish_maintenance_batch.assert_called_once()
 
     def test_empty_assessment_prepares_evidence_before_the_completion_transaction(self):

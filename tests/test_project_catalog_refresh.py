@@ -1696,7 +1696,9 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
         self.assertEqual(self.row('G-002')['status'], 'IMPLEMENTING')
         self.assertEqual(self.row('G-002')['worker_session_id'], original['worker_session_id'])
         self.assertFalse(self.held())
-        self.assertEqual(self.loads, ['b' * 40, 'c' * 40, 'c' * 40])
+        # A missing held path needs a fresh deletion check even at the same
+        # revision while independent Planner evidence still owns the slot.
+        self.assertEqual(self.loads, ['b' * 40, 'c' * 40, 'c' * 40, 'c' * 40])
 
     def test_planner_slot_ownership_change_invalidates_catalog_cas(self):
         repository = state.DefinitionStateRepository(self.connection)

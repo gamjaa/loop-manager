@@ -833,11 +833,8 @@ class PlanningAssessmentService(PlanningService):
             record_result(context.repo, str(run.current_fingerprint), validated_result)
         if decision is not None and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
             prerequisites = decision.plan_ids if decision.outcome is MaintenanceOutcome.PREREQUISITES else ()
-            self._ports.state.record_maintenance_scope(context.repo, run.maintenance_cycle.revision, existing_plan_ids,
+            run.maintenance_cycle = self._ports.state.record_maintenance_scope(context.repo, run.maintenance_cycle.revision, existing_plan_ids,
                 prerequisite_plan_ids=prerequisites)
-            run.maintenance_cycle = replace(run.maintenance_cycle,
-                assessment_plan_ids=tuple(sorted(existing_plan_ids, key=maintenance_state._plan_sort_key)),
-                prerequisite_plan_ids=tuple(sorted(prerequisites, key=maintenance_state._plan_sort_key)))
             self._ports.events.log(f"유지보수 평가 확정 범위: 결과={decision.outcome.value}, 계획={','.join((*decision.plan_ids, *existing_plan_ids)) or '없음'} (필요 dependency 포함)")
         if row.planning_error and row.planning_correction_error:
             if self._ports.git.fetch_base(context.repo_path, context.base_branch) != row.active_sha:

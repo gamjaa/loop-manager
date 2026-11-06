@@ -757,7 +757,7 @@ class MaintenanceRepository:
         return str(row[0]) if row else None
 
     def record_assessment_plans(self, repo: str, expected_revision: int, plan_ids: Sequence[str],
-                                prerequisite_plan_ids: Sequence[str] = ()) -> None:
+                                prerequisite_plan_ids: Sequence[str] = ()) -> MaintenanceCycle:
         """Save validated existing finding targets before publication, without changing its identity."""
         with _transaction(self.connection):
             encoded = self._serialize_plan_ids(repo, plan_ids, "assessment_plan_ids")
@@ -769,6 +769,7 @@ class MaintenanceRepository:
             )
             if cursor.rowcount != 1:
                 raise MaintenanceStateError("평가 범위를 기록할 cycle identity가 변경됐습니다.")
+            return self.get(repo)
 
     def record_legacy_release(self, repo: str, *, expected: MaintenanceCycle, identity: str) -> MaintenanceCycle:
         """Bind a checked clean legacy workspace release before its Git removal."""
