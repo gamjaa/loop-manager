@@ -576,7 +576,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         MaintenanceRepository(self.connection)
         self.connection.execute('INSERT INTO maintenance_cycles '
             '(repo,full_assessment_source_sha,full_assessment_result) VALUES (?,?,?)',
-            ('/repo', 'a' * 40, self.assessment_report(('G-001', 'G-002'))))
+            ('/repo', 'a' * 40, self.assessment_report(('G-001',))))
         self.connection.commit()
         before = tuple(self.connection.iterdump())
         with self.assertRaisesRegex(CallDeferred, '대상별 귀속 분리'):
@@ -609,6 +609,54 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             'revision': 8, 'updated_at': current['updated_at']})
         before = tuple(self.connection.iterdump())
         deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_shared_assessment_erasure_removes_only_target_link_and_preserves_finding(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        MaintenanceRepository(self.connection)
+        report = self.assessment_report(('G-001', 'G-002'))
+        self.connection.execute('INSERT INTO maintenance_cycles '
+            '(repo,phase,revision,full_assessment_completed,full_assessment_source_sha,full_assessment_result) '
+            'VALUES (?,?,?,?,?,?)', ('/repo', 'refactoring', 7, 1, 'a' * 40, report))
+        self.connection.commit()
+        original = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        independent = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        current = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.assertEqual(json.loads(current['full_assessment_result']),
+            {**json.loads(report), 'findings': [{**json.loads(report)['findings'][0], 'plan_ids': ['G-002']}]})
+        self.assertEqual(current, {**original, 'full_assessment_result': current['full_assessment_result'],
+            'revision': 8, 'updated_at': current['updated_at']})
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()), independent)
+        before = tuple(self.connection.iterdump())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_shared_assessment_erasure_preserves_missing_or_cancelled_links_and_rolls_back(self):
+        import sqlite3
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        MaintenanceRepository(self.connection)
+        report = self.assessment_report(('G-001', 'G-002'))
+        self.connection.execute('INSERT INTO maintenance_cycles '
+            '(repo,full_assessment_source_sha,full_assessment_result) VALUES (?,?,?)', ('/repo', 'a' * 40, report))
+        self.connection.commit()
+        for sql in ("DELETE FROM exec_plans WHERE plan_id='G-002'",
+                    "INSERT INTO deleted_plan_ids VALUES ('/repo','G-002')",
+                    "UPDATE maintenance_cycles SET publication_stage='prepared'"):
+            with self.subTest(sql=sql):
+                self.connection.execute(sql)
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+                self.connection.rollback()
+        self.connection.execute("CREATE TRIGGER reject_assessment_erasure BEFORE DELETE ON exec_plans "
+            "BEGIN SELECT RAISE(ABORT,'interrupted assessment erasure'); END")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'interrupted assessment erasure'):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual(tuple(self.connection.iterdump()), before)
 
     def test_live_common_correction_link_requires_same_goal_successor_before_erasure(self):

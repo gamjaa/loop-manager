@@ -426,8 +426,22 @@ def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None
                                              cycle['full_assessment_source_sha'])
         except (TypeError, ValueError, KeyError, RecursionError) as error:
             raise CallDeferred('유지보수 평가 원문의 삭제 대상 귀속을 확인할 수 없습니다.') from error
-        if any(plan_id in finding['plan_ids'] for finding in report['findings']):
-            raise CallDeferred('유지보수 평가 원문의 대상별 귀속 분리가 필요합니다.')
+        from .execplan_catalog_state import is_cancelled
+        report_changed = False
+        for finding in report['findings']:
+            if plan_id not in finding['plan_ids']:
+                continue
+            retained = [key for key in finding['plan_ids'] if key != plan_id]
+            if not retained or any(is_cancelled(connection, repo, key) or not connection.execute(
+                    'SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
+                    for key in retained):
+                raise CallDeferred('유지보수 평가 원문의 대상별 귀속 분리가 필요합니다.')
+            finding['plan_ids'] = retained
+            report_changed = True
+        if report_changed:
+            changes['full_assessment_result'] = validate_saved_assessment_result(
+                json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
+                inventory, cycle['full_assessment_source_sha'])
     if not changes:
         return
     if (cycle['publication_stage'] is not None
