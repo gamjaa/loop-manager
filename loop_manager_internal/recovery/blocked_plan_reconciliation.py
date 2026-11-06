@@ -294,9 +294,9 @@ class BlockedPlanReconciler:
             return context['identity']
         confirmed = planning_input['confirmed_revision']
         revision = plan['current_revision_sha']
-        if not revision or self.ports.git(self.repo_path, 'merge-base', '--is-ancestor',
-                                         revision, confirmed, check=False).returncode != 0:
-            raise InputChanged('문서 개정의 catalog revision이 확정 planning 이력에 없습니다.')
+        if not revision:
+            raise InputChanged('문서 개정의 catalog revision이 없습니다.')
+        # Catalog observation can advance past planning without changing this document.
         raw = self.ports.git_bytes(self.repo_path, 'show', f"{confirmed}:{plan['path']}")
         declaration = parse_execplan_text(plan['path'], raw.decode('utf-8'), validate_sources=False)
         if (plan_content_hash(raw) != plan['content_hash'] or declaration['id'] != plan['plan_id']
@@ -743,8 +743,12 @@ class BlockedPlanReconciler:
         unlinked = common_defect_state.unlinked_reports(self.connection, self.repo, plan_id) if correction is None else []
         previous_context = json.loads(saved['context']) if saved else {}
         previous_input = previous_context.get('planning_input', {})
-        if saved is None or saved['stage'] in TERMINAL:
-            if (not observations.pending_input(row) and planning_input == previous_input
+        block = scoped_blocking.plan_block(self.connection, self.repo, plan_id)
+        cause_changed = bool(saved and block and any(
+            previous_context.get('block', {}).get(field) != block[field]
+            for field in ('reason_code', 'release_fingerprint', 'evidence')))
+        if saved is None or saved['stage'] in TERMINAL or cause_changed:
+            if (not cause_changed and not observations.pending_input(row) and planning_input == previous_input
                     and correction == previous_context.get('common_defect_input')
                     and unlinked == previous_context.get('unlinked_common_defect_reports', [])):
                 if (self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value

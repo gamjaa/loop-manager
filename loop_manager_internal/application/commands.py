@@ -303,22 +303,7 @@ class ExecuteRuntimeCommandEffects:
 
 
 def _local_recovery_causes_remain(after: dict, plan_id: str | None) -> bool:
-    if after["phase"] == "PROJECT_BLOCKED" or (plan_id is None and after["planning_error_sha256"]):
-        return True
-    relevant = [item for item in after["plans"] if plan_id is None or item["plan_id"] == plan_id]
-    if any(item["status"] == "PLAN_BLOCKED" for item in relevant):
-        return True
-    relevant_blocks = [
-        item for item in after["blocks"]
-        if item["scope"] == "project"
-        or plan_id is None or item["plan_id"] == plan_id
-    ]
-    if any(subject != "__project__" or plan_id is None or not after["planning_error_sha256"]
-           for subject in after["current_failures"]):
-        return True
-    if relevant_blocks:
-        return True
-    return False
+    return local_recovery_state.causes_remain(after, plan_id)
 
 
 def _local_recovery_in_progress(after: dict, plan_id: str | None) -> bool:
@@ -547,6 +532,9 @@ def execute_local_recovery_request(
         local_recovery_state.record_progress(connection, request, after)
     else:
         local_recovery_state.complete_request(connection, request, result, after)
+        from loop_manager_internal.notifications import notifications
+        notifications.enqueue_current_project_events(connection, repository)
+        connection.commit()
     request_action = "재개" if request.resumed else "요청"
     effects.operation_print(
         f"로컬 환경 재검사 {'완료' if result_code == 0 else '진행 중' if result == 'in_progress' else '미해결'}: "

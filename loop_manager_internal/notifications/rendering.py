@@ -201,6 +201,11 @@ def _event_message(kind: str, payload: dict[str, object]) -> str:
             + recovery_text
             + checkpoint_text
         )
+    if kind == "recovery_unresolved":
+        return (f"[{payload['project']}] 복구 재검사 미해결: {payload.get('execplan_id') or 'project'}\n"
+                f"요청: {payload['request_id']}\n"
+                + (f"남은 원인: {payload['cause']}\n" if payload.get('cause') else "") +
+                "재검사는 끝났지만 차단 원인이 남아 있습니다. 복구 완료나 작업 재개를 뜻하지 않습니다.")
     if kind == "persistent_execution_failure":
         subject = payload.get("execplan_id") or "project"
         attempts = payload.get("recovery_attempts")

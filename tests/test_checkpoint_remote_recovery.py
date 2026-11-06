@@ -1659,3 +1659,117 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         self.assertIsNotNone(self.connection.execute(
             "SELECT inspected_input FROM blocked_checkpoints"
         ).fetchone()[0])
+
+
+class PublishedRebaseReceiptUnitTests(unittest.TestCase):
+    def test_exact_published_checkpoint_replaces_stale_rebase_without_success_receipt(self):
+        from types import SimpleNamespace
+        from dataclasses import replace
+        from tests.support.scoped_recovery import ScopedGateFixture
+        from loop_manager_internal.recovery.checkpoint_recovery import _retire_superseded_rebase
+        fixture = ScopedGateFixture()
+        fixture.addCleanup = self.addCleanup
+        fixture.enterContext = self.enterContext
+        fixture.setUp()
+        fixture.plan('G-001', 'PLAN_BLOCKED', branch='loop-manager/G-001')
+        c, repo = fixture.connection, fixture.repo
+        worktree, head = str(Path('/state/G-001').resolve()), 'a' * 40
+        c.execute('UPDATE exec_plans SET worktree=?, publication_remote_oid=?', (worktree, head))
+        blocked_checkpoint_state.ensure_schema(c)
+        c.execute('INSERT INTO blocked_checkpoints (repo,plan_id,request_identity,phase,reason_code,evidence,'
+                  'commit_identity,local_oid,remote_oid,published_oid,accepted_remote_oid) '
+                  "VALUES (?,'G-001','request','published','plan_input_invalid','cause','receipt',?,?,?,?)",
+                  (repo, head, head, head, head))
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(c)
+        current = checkpoints.record(repo, 'G-001', expected_generation=0, operation='rebase', expected_head='old',
+            target_base_oid='base', observed_remote_oid='old',
+            snapshot={'rebase_documents': {'old': 'evidence'}, 'worker_result': 'retained'})
+        c.commit()
+        plan = c.execute('SELECT * FROM exec_plans').fetchone()
+        row = c.execute('SELECT * FROM blocked_checkpoints').fetchone()
+        snapshot = loop_manager.GitSnapshot(head, plan['branch'], {}, {},
+            {'refs/heads/' + plan['branch']: (head, '')},
+            {worktree: ('branch=refs/heads/' + plan['branch'],)}, {}, {})
+        effects = SimpleNamespace(git=mock.Mock(return_value=subprocess.CompletedProcess([], 0)),
+                                  capture_git_snapshot=mock.Mock(return_value=snapshot))
+        adapter = SimpleNamespace(observe_remote=mock.Mock(return_value=head))
+        request = SimpleNamespace(repo=repo, plan_id='G-001', branch=plan['branch'],
+                                  worktree=worktree, request_identity='request')
+        for changed in (replace(snapshot, dirty={'code.py': (('M',), 'edit')}),
+                        replace(snapshot, operations={'rebase-merge': 'live'}),
+                        replace(snapshot, head='different')):
+            self.assertEqual(_retire_superseded_rebase(effects,c,checkpoints,repo,plan,row,request,
+                                                      current,head,changed,adapter), current)
+        for changed in (replace(current, snapshot={**current.snapshot, 'stash_oid': 'stash'}),
+                        replace(current, snapshot={**current.snapshot, 'work_branch_integration': {'phase':'rebasing'}})):
+            self.assertEqual(_retire_superseded_rebase(effects,c,checkpoints,repo,plan,row,request,
+                                                      changed,head,snapshot,adapter), changed)
+        adapter.observe_remote.return_value = 'changed'
+        with self.assertRaisesRegex(RuntimeError, '관측이 변경'):
+            _retire_superseded_rebase(effects,c,checkpoints,repo,plan,row,request,
+                                     current,head,snapshot,adapter)
+        self.assertEqual(checkpoints.get(repo,'G-001'), current)
+        adapter.observe_remote.return_value = head
+        effects.git.return_value.returncode = 1
+        self.assertEqual(_retire_superseded_rebase(effects,c,checkpoints,repo,plan,row,request,
+                                                  current,head,snapshot,adapter), current)
+        effects.git.return_value.returncode = 0
+        result = _retire_superseded_rebase(effects,c,checkpoints,repo,plan,row,request,
+                                          current,head,snapshot,adapter)
+        self.assertIsNone(result.operation)
+        self.assertEqual(result.expected_head, head)
+        self.assertEqual(result.snapshot['worker_result'], 'retained')
+        self.assertNotIn('current_rebase_acceptance', result.snapshot)
+        self.assertEqual(result.snapshot['superseded_rebases'][0]['snapshot']['rebase_documents'],
+                         {'old': 'evidence'})
+
+    def test_replacement_block_starts_a_new_assessment_with_the_current_cause(self):
+        from types import SimpleNamespace
+        from tests.support.scoped_recovery import ScopedGateFixture
+        from loop_manager_internal.recovery import blocked_remote_observation
+        fixture = ScopedGateFixture()
+        fixture.addCleanup, fixture.enterContext = self.addCleanup, self.enterContext
+        fixture.setUp()
+        fixture.plan('G-001', 'PLAN_BLOCKED', branch='loop-manager/G-001')
+        c, repo = fixture.connection, fixture.repo
+        c.execute("UPDATE exec_plans SET worktree='/state/G-001'")
+        scoped_blocking.record_plan_block(c, repo, 'G-001',
+            scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID, 'new document cause', None)
+        block = dict(scoped_blocking.plan_block(c, repo, 'G-001'))
+        previous = dict(block, evidence='old timeout cause')
+        c.execute(blocked_remote_observation.SCHEMA)
+        c.execute("INSERT INTO blocked_remote_observations "
+            "(repo,plan_id,registered_origin,base_result,branch_result,observed_at) "
+            "VALUES (?,'G-001','owner/repo','present','present','now')", (repo,))
+        ports = SimpleNamespace(unmet_execplan_dependencies=mock.Mock(return_value=()))
+        reconciler = blocked_plan_reconciliation.BlockedPlanReconciler(ports,c,Path('/repo'),Path('/state'),repo,'main')
+        reconciler._save('G-001','previous','adopted',{'block':previous})
+        with mock.patch.object(blocked_plan_reconciliation,'slot_available',return_value=True), \
+             mock.patch.object(blocked_plan_reconciliation.common_defect_state,'reassessment',return_value=None), \
+             mock.patch.object(blocked_plan_reconciliation.common_defect_state,'unlinked_reports',return_value=[]), \
+             mock.patch.object(reconciler,'_save',side_effect=StopIteration) as save:
+            with self.assertRaises(StopIteration):
+                reconciler._reconcile('G-001')
+        self.assertEqual(save.call_args.args[2], 'observed')
+        self.assertEqual(save.call_args.args[3]['block']['evidence'], 'new document cause')
+
+    def test_planning_document_match_does_not_require_latest_catalog_commit_in_old_planning(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
+        from loop_manager_internal.recovery.blocked_plan_reconciliation import BlockedPlanReconciler, IDENTITY_FIELDS, InputChanged
+        path = 'docs/plans/[G-001] Goal.md'
+        raw = b'---\nid: G-001\ntitle: Goal\nsources:\n  - docs/PRODUCT.md\ndepends_on: []\ncomplexity: low\nrisk: low\npriority: normal\n---\n\nGoal\n'
+        plan = dict.fromkeys(IDENTITY_FIELDS, None)
+        plan.update(path=path, plan_id='G-001', content_hash=plan_content_hash(raw), sources='["docs/PRODUCT.md"]',
+                    depends_on='[]', current_revision_sha='later-archive')
+        context = {'identity': {key:plan[key] for key in IDENTITY_FIELDS}}
+        context['identity']['content_hash'] = 'previous'
+        ports = SimpleNamespace(git=mock.Mock(side_effect=AssertionError('unnecessary Git ancestry')),
+                                git_bytes=mock.Mock(return_value=raw))
+        reconciler = object.__new__(BlockedPlanReconciler)
+        reconciler.ports, reconciler.repo_path = ports, Path('/repo')
+        self.assertEqual(reconciler._confirmed_planning_identity(plan, context, {'confirmed_revision':'planning'}),
+                         {key:plan[key] for key in IDENTITY_FIELDS})
+        ports.git_bytes.return_value = raw + b'Unconfirmed change\n'
+        with self.assertRaises(InputChanged):
+            reconciler._confirmed_planning_identity(plan, context, {'confirmed_revision':'planning'})

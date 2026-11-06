@@ -89,6 +89,12 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
         if isinstance(path, str) and path:
             missing.setdefault(key, path)
             hold_evidence[key] = (row, evidence)
+    # An unchanged archived MERGED execution is historical even before archive audit backfill.
+    merged_references = {str(row['plan_id']) for row in rows
+        if row['status'] == 'MERGED' and row['plan_sha'] and row['pr_url'] and row['pr_head_oid']
+        and (entry := pinned.snapshot.archived.get(str(row['plan_id']))) is not None
+        and entry.path == str(row['path']).replace('docs/plans/', 'docs/plans/archive/', 1)
+        and catalog.plan_content_hash(entry.text.encode('utf-8')) == row['content_hash']}
     latest_contents = {key: entry.text.encode("utf-8") for key, entry in pinned.snapshot.all.items()}
     paths = {str(row["plan_id"]): str(row["path"]) for row in rows}
     paths.update({str(row["plan_id"]): str(row["path"]) for row in cancellations})
@@ -185,7 +191,8 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
         for other in set(saved.get("resolved", {})) - current_references:
             if latest_contents.get(other) is not None:
                 affected.discard(other)
-        affected.difference_update(historical_ids)
+        affected.intersection_update(set(pinned.snapshot.observed_ids) | {str(row['plan_id']) for row in rows})
+        affected.difference_update(historical_ids | merged_references)
         issues.extend(catalog.CatalogIssue(other, paths[other], "missing-plan-reference",
             f"삭제된 계획의 참조 근거를 보존합니다: {other} -> {key}", path)
             for other in sorted(affected - {key}))

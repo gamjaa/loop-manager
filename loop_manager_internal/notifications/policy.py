@@ -516,6 +516,20 @@ def waiting_current(connection, repo, payload):
 def is_current(connection, repo, kind, payload, *, event_key=None):
     """Shared creation/claim boundary; callers provide already recorded facts."""
     try:
+        if kind == 'recovery_unresolved':
+            request = connection.execute(
+                "SELECT plan_id, status, result FROM local_environment_recovery_requests WHERE repo=? AND request_id=?",
+                (repo, payload['request_id'])).fetchone()
+            if not request or tuple(request) != (payload.get('execplan_id'), 'completed', 'unresolved'):
+                return False
+            newer = connection.execute(
+                'SELECT 1 FROM local_environment_recovery_requests WHERE repo=? AND plan_id IS ? '
+                'AND rowid>(SELECT rowid FROM local_environment_recovery_requests WHERE request_id=?)',
+                (repo, request[0], payload['request_id'])).fetchone()
+            if newer:
+                return False
+            from loop_manager_internal.storage import local_recovery_state
+            return local_recovery_state.causes_remain(local_recovery_state.snapshot(connection, repo, request[0]), request[0])
         if kind == 'work_waiting':
             episode = connection.execute(
                 'SELECT signature, generation FROM work_reason_episodes WHERE repo=?', (repo,),

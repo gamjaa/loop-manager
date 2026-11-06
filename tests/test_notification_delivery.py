@@ -2901,3 +2901,28 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                 for field in original.keys() - {'canceled_at', 'delivery_started_at'}:
                     self.assertEqual(after[field], original[field], field)
                 self.assertEqual(connection.execute('SELECT release_fingerprint FROM execplan_blocks').fetchone()[0], '90')
+
+
+class RecoveryResultNoticeTests(NotificationFixture, unittest.TestCase):
+    def test_explicit_unresolved_request_notifies_once_and_cancels_when_resolved(self):
+        from loop_manager_internal.storage import local_recovery_state
+        from loop_manager_internal.notifications.policy import is_current
+        connection = self.connection()
+        repo = '/projects/alpha'
+        local_recovery_state.ensure_schema(connection)
+        connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED'")
+        connection.execute("INSERT INTO local_environment_recovery_requests "
+            "(request_id,repo,plan_id,status,before_state,result) VALUES ('request',?,'G-018','completed','{}','unresolved')", (repo,))
+        for _ in range(2):
+            notifications.enqueue_current_project_events(connection, repo)
+        rows = connection.execute("SELECT event_type,payload FROM notification_outbox WHERE event_type='recovery_unresolved'").fetchall()
+        self.assertEqual(len(rows), 1)
+        payload = json.loads(rows[0][1])
+        self.assertTrue(is_current(connection,repo,'recovery_unresolved',payload))
+        self.assertIn('복구 재검사 미해결', notifications._message('recovery_unresolved',payload))
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection,'token','chat',adapter=sender),1)
+        self.assertEqual(notifications.dispatch_pending(connection,'token','chat',adapter=sender),0)
+        sender.assert_called_once()
+        connection.execute("UPDATE exec_plans SET status='IMPLEMENTING'")
+        self.assertFalse(is_current(connection,repo,'recovery_unresolved',payload))

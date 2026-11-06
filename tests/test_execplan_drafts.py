@@ -925,6 +925,25 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
             "SELECT 1 FROM exec_plans WHERE repo='repo' AND plan_id='G-002'"
         ).fetchone())
 
+    def test_merged_archive_reference_does_not_wait_for_its_own_audit_backfill(self):
+        active = 'docs/plans/[G-002] Historical.md'
+        archive = active.replace('docs/plans/', 'docs/plans/archive/')
+        historical = plan_text('G-002', 'Historical') + '\n- G-001 was a past question.\n'
+        documents = {**self.documents, active: historical}
+        self.reconcile(documents, 'b' * 40)
+        self.connection.execute("UPDATE exec_plans SET status='MERGED', plan_sha=?, pr_url=?, pr_head_oid=? WHERE plan_id='G-002'",
+                                ('b' * 40, 'https://github.com/owner/repo/pull/2', 'b' * 40))
+        snapshot = execplan_catalog.snapshot_from_documents({archive: historical},
+            revision_sha='c' * 40, isolate_errors=True)
+        pinned = execplan_catalog_state.PinnedCatalog('c' * 40, snapshot,
+            frozenset({'docs/PRODUCT.md', archive}), draft_inputs=self.inputs)
+        git_bytes = lambda _repo, *arguments: documents[arguments[1].split(':', 1)[1]].encode()
+        self.assertEqual(remote_deletions.reference_issues(self.connection, 'repo', Path('/repo'),
+                         pinned, git_bytes=git_bytes), ())
+        self.connection.execute("UPDATE exec_plans SET content_hash='unconfirmed' WHERE plan_id='G-002'")
+        self.assertTrue(remote_deletions.reference_issues(self.connection, 'repo', Path('/repo'),
+                        pinned, git_bytes=git_bytes))
+
     def test_deleted_draft_does_not_reopen_archived_reference_or_legacy_hold(self):
         archive = 'docs/plans/archive/[G-002] Historical.md'
         historical = plan_text('G-002', 'Historical') + '\n- G-001 was a past question.\n'

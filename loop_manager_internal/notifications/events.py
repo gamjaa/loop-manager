@@ -154,6 +154,21 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
     if project is None:
         return
     name = Path(repo).name or repo
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='local_environment_recovery_requests'").fetchone():
+        requests = connection.execute(
+            "SELECT request_id, plan_id FROM local_environment_recovery_requests r WHERE repo=? "
+            "AND status='completed' AND result='unresolved' AND rowid=(SELECT MAX(rowid) "
+            "FROM local_environment_recovery_requests n WHERE n.repo=r.repo AND n.plan_id IS r.plan_id)",
+            (repo,)).fetchall()
+        for request in requests:
+            cause = (connection.execute('SELECT last_error FROM exec_plans WHERE repo=? AND plan_id=?',
+                                        (repo, request[1])).fetchone() if request[1] else
+                     connection.execute('SELECT last_error FROM projects WHERE repo=?', (repo,)).fetchone())
+            payload = _redacted_payload(dict(project=name, request_id=request[0], execplan_id=request[1],
+                                             cause=str(cause[0] or '') if cause else ''))
+            if is_current(connection, repo, 'recovery_unresolved', payload):
+                _insert(connection, _key('recovery_unresolved', repo, request[0]), repo,
+                        'recovery_unresolved', payload)
     def final_recovery(plan_id, scope):
         row = block_recovery(connection, repo, plan_id, scope)
         if row is None or row['final_evidence'] is None:

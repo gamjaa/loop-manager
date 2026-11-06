@@ -90,6 +90,61 @@ class EvaluateRemoteCheckpointCauseEffects:
     verify: Callable[..., object]
 
 
+
+def _retire_superseded_rebase(effects, connection, checkpoints, repo, blocked, row, request,
+                              current, observed, snapshot, adapter):
+    """Adopt an exact Manager publication as input, without claiming rebase success."""
+    head = snapshot.head
+    saved = current.snapshot or {}
+    if (saved.get('stash_oid') or saved.get('work_branch_integration') or saved.get('remote_adoption_intent')):
+        return current
+    if (current.operation != 'rebase' or not head or not current.target_base_oid
+            or int(blocked['workspace_owned'] or 0) != WORKSPACE_OWNED
+            or (request.repo, request.plan_id, request.branch, request.worktree, request.request_identity)
+               != (repo, blocked['plan_id'], blocked['branch'], blocked['worktree'], row['request_identity'])
+            or row['phase'] != 'published' or not row['commit_identity']
+            or any(row[key] != head for key in ('local_oid', 'remote_oid', 'published_oid', 'accepted_remote_oid'))
+            or blocked['publication_remote_oid'] != head or observed != head
+            or head == current.observed_remote_oid
+            or snapshot.branch != blocked['branch'] or snapshot.dirty
+            or controlling_git_operation(snapshot.operations)
+            or not snapshot.shared_metadata_complete
+            or any(_non_default_index_flags(entries) or any(entry.split()[-1:] != ['0'] for entry in entries)
+                   for entries in snapshot.index.values())):
+        return current
+    worktree = Path(blocked['worktree'])
+    own_ref = 'refs/heads/' + blocked['branch']
+    if (snapshot.refs.get(own_ref, (None, None))[0] != head
+            or 'branch=' + own_ref not in snapshot.worktrees.get(str(_canonical_path(worktree)), ())
+            or effects.git(worktree, 'merge-base', '--is-ancestor', current.target_base_oid,
+                           head, check=False).returncode != 0):
+        return current
+    if effects.capture_git_snapshot(worktree) != snapshot or adapter.observe_remote(request) != head:
+        raise RuntimeError('게시된 checkpoint의 로컬·원격 관측이 변경됐습니다.')
+    saved = dict(current.snapshot or {})
+    history = list(saved.pop('superseded_rebases', ()))
+    history.append(dict(operation=current.operation, expected_head=current.expected_head,
+                        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                        snapshot=saved))
+    retained = dict(saved)
+    for key in ('current_rebase_acceptance', 'completed_rebase', 'blocked_resume',
+                'rebase_documents', 'rebase_frontmatter', 'stage_evidence'):
+        retained.pop(key, None)
+    retained.update(before_head=head, accepted_work_branch=head, rebase_remote_oid=head,
+                    superseded_rebases=history)
+    from loop_manager_internal.storage import runtime_state
+    with runtime_state._transaction(connection):
+        if (checkpoints.get(repo, blocked['plan_id']) != current
+                or dict(connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                        (repo, blocked['plan_id'])).fetchone() or {}) != dict(blocked)
+                or dict(connection.execute('SELECT * FROM blocked_checkpoints WHERE repo=? AND plan_id=?',
+                        (repo, blocked['plan_id'])).fetchone() or {}) != dict(row)):
+            raise RuntimeError('게시된 checkpoint 채택 전 소유 상태가 변경됐습니다.')
+        return checkpoints.record(repo, blocked['plan_id'], expected_generation=current.generation,
+            operation=None, expected_head=head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=head, snapshot=retained)
+
+
 def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCheckpointEffects,
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -138,6 +193,12 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
             state_dir, repo, manual_workspace_owner(connection, repo, str(blocked["plan_id"])), branch, worktree,
         )
         effects.validate_managed_worktree(repo_path, worktree, branch, allow_rebase=integrating)
+        snapshot = effects.capture_git_snapshot(worktree)
+        if adopt_only and unchanged:
+            current = _retire_superseded_rebase(effects, connection, checkpoints, repo, blocked, row,
+                request, current, observed, snapshot, adapter)
+            if current.operation is None:
+                integrating = base_restarting = False
         if integrating and current.operation == 'rebase':
             effects._current_rebase_service(
                 connection, repo_path, state_dir, repo, str(blocked['plan_id']),

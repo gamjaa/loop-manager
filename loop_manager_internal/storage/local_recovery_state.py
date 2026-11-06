@@ -274,3 +274,22 @@ def record_progress(
             raise LocalRecoveryRequestError("로컬 재검사 요청 대상 또는 상태가 변경됐습니다.")
 
     run_database_request(connection, record)
+
+
+def causes_remain(after: dict, plan_id: str | None) -> bool:
+    if after["phase"] == "PROJECT_BLOCKED" or (plan_id is None and after["planning_error_sha256"]):
+        return True
+    relevant = [item for item in after["plans"] if plan_id is None or item["plan_id"] == plan_id]
+    if any(item["status"] == "PLAN_BLOCKED" for item in relevant):
+        return True
+    relevant_blocks = [
+        item for item in after["blocks"]
+        if item["scope"] == "project"
+        or plan_id is None or item["plan_id"] == plan_id
+    ]
+    if any(subject != "__project__" or plan_id is None or not after["planning_error_sha256"]
+           for subject in after["current_failures"]):
+        return True
+    if relevant_blocks:
+        return True
+    return False
