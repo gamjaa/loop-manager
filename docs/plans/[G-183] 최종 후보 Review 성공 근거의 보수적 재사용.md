@@ -106,6 +106,13 @@ priority: high
 - 최종 receipt 형식 오류·빈 invocation·원래 승인 재연결·원문 provenance 누락 처리 보완 뒤 해당 개별 사례 4개를 targeted runner로 다시 실행해 PASS를 확인했다.
 - `git diff --check` → PASS. 실제 Agent·외부 CLI 계정·native 환경 probe·전체 verify는 실행하지 않았다. 전체 verify·독립 Review·사용자 Merge는 Manager의 다음 단계이며 이번 기록으로 성공을 대신하지 않는다. 새 verify 입력 제외 근거는 선언하지 않는다. 추가한 코드·테스트는 기존 `loop_manager_internal/**`·`tests/**` 입력 목록에 포함된다.
 
+### Manager 전체 verify 실패 관측과 공통 교정 대기
+
+- Manager가 실행한 run `035a327a5bed196ba072f79d0d625273`의 전체 verify는 exit 1이었다. summary의 20 error·2 failure는 checkpoint adoption 21개와 복구 진행 로그 1개에 기록됐다. 이번 호출은 전체 verify를 다시 실행하지 않았다.
+- `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_checkpoint_adoption.BlockedCheckpointRefreshUnitTests.test_adoption_defers_cause_check_and_records_exact_successor_lease` → ERROR (1 test, `StopIteration`). adoption 구현의 시작 snapshot 두 번·채택 후·확정 직전 관측과 fixture의 세 snapshot 배열이 맞지 않으며 다른 분기에도 관측 순서가 영향을 준다. 실제 Git 보존·채택 계약을 약화하거나 snapshot 검사를 삭제하지 않았다.
+- 동일 Manager 로그의 `test_recovery_wait_keeps_request_scope_and_nonzero_exit_warn_level`은 알림 schema의 PRAGMA cursor 순회에서 `TypeError: 'Mock' object is not iterable`이었다. 테스트는 일반 Mock cursor의 fetchone/fetchall만 설정하고 있다. 이 사례는 이번 호출에서 별도 재실행하지 않았다.
+- 위 테스트·checkpoint recovery·복구 명령·알림 schema 파일은 G-183 호출 시작 revision `2db1c9e795349821732f6a4c236f850146bcb4d2`와 현재 `9dfe04605a2783349e1191da34c37caadfdb1a9b` 사이 diff가 없다. 관측된 실패 stack은 최종 Review 재사용 경로에 진입하지 않는다. 선택 작업 밖의 공통 교정으로 보고하며 코드·테스트·다른 계획은 수정하지 않는다. 기존 구현과 실패를 보존하고 Manager의 일반 planning 및 교정 반영 후 전체 검증을 기다린다. 이 기록은 원인 교정 채택·새 검증 성공·최종 승인이나 사용자 결정을 대신하지 않는다.
+
 ## Decision Log
 
 - 현재 원격의 Claude 지원은 G-191의 문서 기반 `prepared` 구성과 실제 호출 관측을 구분한다. 새 지원 구현을 소비하되 이 작업은 기존 비교 불가 fallback만 연결한다. R-085의 실제 소비 source 교정은 G-264에 유지하며 native proof 수집·OS probe를 지원 완료 조건이나 새 구현 목표로 추가하지 않는다. ID·경로·기존 dependency·최종 승인 재사용 목표와 과거 기록을 보존한다.
