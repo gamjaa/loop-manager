@@ -1210,6 +1210,24 @@ Git 조회 후 짧은 transaction에서 실행 row·checkpoint generation·verif
 
 원래 단계 자료는 승인 token 초기화 전에 checkpoint의 `stage_result_origins`에 보존한다. version 1 항목은 canonical JSON evidence의 SHA-256을 key로 사용하고 `evidence`와 최초 보존 `reason`을 가진다. evidence에는 repo·plan·base·관측 HEAD, 원래 definition·단계 결과/token·session·Agent 입력/결과 snapshot, 원래 verify cycle selection과 실제 receipt, raw 변경 및 Worker용 기록 정규화 변경을 구분해 저장한다. 관측할 수 없는 입력은 null과 오류 종류로 남긴다. rebase intent의 `rebase_stage_origin`은 이 key를 참조하며 operation history에는 origin 집합을 중첩 복사하지 않는다. 채택 transaction의 `rebase_revalidation_audit`도 원래 definition·session·receipt 출처를 보존한다. 일반 revision 무효화와 verify 실행/재연결 역시 이전 Review 원문을 보존하되 현재 Review token은 비운다. 실제 Reviewer 호출 identity·관측은 기존 validation 결과와 invocation ledger에 남으며, 보존 자료만으로 최종 Review 승인을 생성하지 않는다. `stage_results.preserve`와 `reconnect_worker`는 row·checkpoint를 읽기 전에 일반 취소 감사와 최종 삭제 ID 표식을 확인한다. 외부 Git 관측 뒤에는 확정 transaction 안에서 같은 검사를 먼저 수행해, 그 사이 row가 제거돼도 원래 출처나 재연결 snapshot·단계 결과를 새로 쓰지 않는다. 일반 취소의 기존 감사는 그대로 두고 실제 최종 제거를 이 조회로 대신 확정하지 않는다.
 
+#### 최종 Review 승인 재연결
+
+`execution/final_review.py`는 마지막 실제 최종 승인과 현재 후보를 비교하며 `stage_results`의 Worker 재연결과 verify receipt 엔진을 재사용한다. checkpoint의 `final_review` version 1은 원래 `approval`과 현재 `binding`을 분리한다. `approval`은 실제 invocation ID·관측 identity·Review 원문·승인 당시 입력을 보존하고 재연결로 덮어쓰지 않는다. `binding`만 현재 HEAD/base로 갱신하며 새 Reviewer 호출·실행 감사·사용량·실패 이력 초기화를 만들지 않는다.
+
+입력에는 repo·plan·branch·worktree, revision SHA를 제외한 전체 definition, 후보별 base와의 raw 변경(path·status·old/new mode·blob OID), 적용 문서 tree entry, transitive dependency와 source, 현재 runtime 전체 지침 해시, 실제 Reviewer instruction/provider/model/effort·환경/정책, Worker 결과와 원래 실제 전체 verify receipt ID·cycle·코드 fingerprint가 포함된다. Requirement source는 기존 exact/archive/고유 R-ID resolver를 사용하고 예약어 source는 등록 규칙과 버전을 포함한다. PRODUCT·ARCHITECTURE와 dependency의 source도 직접 sources 밖의 검토 입력으로 관측한다. 루트 CLI 지침은 별도 수집하지 않으며 과거 instruction snapshot의 부재로 현재 입력을 합성하지 않는다.
+
+base가 달라지면 `stage_result_origins`의 원래 PUBLISHING 결과·definition/token·관측 HEAD·raw 변경·verify cycle/receipt와 보존된 최종 승인 연결을 확인한다. 공유 조건은 최신 원격에 확정된 일반 planning과 현재 definition을 함께 확인한다. 확정 planning 이후의 delta는 기존 catalog의 동일 bytes/mode archive 판정으로만 수용한다. Worker용 기록 정규화나 PR 통지 identity는 최종 승인 증거로 쓰지 않는다.
+
+| 경계 | 허용·거부와 보존 |
+|---|---|
+| 최종 승인 저장 | 호출 전후 입력과 실제 invocation의 identity가 일치하고 현재 후보의 전체 성공이 있어야 재사용 가능한 `pass`를 저장한다. 관측 불가능한 정상 실제 Review는 기존 token 경로로 진행하되 `unproven`으로 남긴다. 관측 가능했던 입력이 호출 중 바뀌면 `invalidated`로 보존하고 현재 Review token을 비워 다시 확인한다. |
+| 현재 후보 재연결 | 같은 전체 성공 run·cycle과 증명된 입력을 두 번 관측하고, 짧은 transaction에서 row·checkpoint generation·verify selection·planning을 재확인해 binding과 현재 token을 함께 확정한다. 경쟁·저장 실패에는 새 승인을 만들지 않는다. |
+| 새 Reviewer 시작 | 원래 approval을 보존한 채 `running`으로 바꿔 실패·중단 뒤 이전 PASS가 되살아나지 않게 한다. 문서 선행·부분 성공·면제는 재사용 가능한 최종 승인을 만들지 않는다. |
+| 일반 선행 승인 | 실제 전체 run과 기존 최종 승격 gate를 통과한 뒤에만 최종 approval을 저장한다. 이후 rebase 재연결은 `finalized_reconnected`로 구분하며 이전 preliminary candidate의 HEAD gate를 새 후보 승인으로 사용하지 않는다. |
+| 게시 | 진입과 마지막 workspace 검사에서 현재 binding·전체 verify·실제 호출 identity·명세·지침을 다시 대조한다. 입력 변화는 필요한 Review로 돌아가고 원격 변경 직전 경쟁은 기존 게시 안전 경계에서 거부한다. |
+
+실제 Reviewer identity는 `preliminary_review.review_identity()`와 `provider_execution.observe()`의 기존 invocation ledger 검증을 사용한다. 현재 환경을 과거 호출로 소급 채택하지 않으며 Claude `observe() is None`·`prepared`는 재사용 증거가 아니다. 인증값은 저장하지 않고 환경 관측 불가를 Claude 정상 실행·지원 완료의 거부 조건으로 확대하지 않는다.
+
 #### 구현 조건과 실행 기록의 구분
 
 definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 보존한다. Worker body 비교는 Progress의 체크 상태만 정규화하고 Progress/Decision Log에서 다음 단독 실행 기록 형식만 분리한다(PASS 또는 FAIL, 날짜·명령·test 수는 실제 과거 사실).
@@ -2073,7 +2091,7 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 
 최종 재사용의 후보 identity는 동일 HEAD/base/전체 diff·직렬화된 definition·Worker 결과·Manager 실행 코드·검증 설정·작업 대상을 결합한다. `preliminary_review.py`와 G-262의 `provider_execution.observe`가 Reviewer의 실제 instruction/provider/model/effort/환경/정책에 대해 호출 전·지정 invocation·현재 관측을 대조한다. 지정 invocation은 기존 완료 기록에서 확인하고 현재 관측도 새 CLI/model 호출 없이 인증·profile·native 지침·격리 정책을 확인한다. 현재 설정으로 과거 호출의 identity를 합성하지 않는다.
 
-전체 성공 근거는 해당 선행 승인 뒤 실행한 `full_verify.receipt_id`와 현재 후보의 실제 `run` receipt가 같아야 한다. 다른 성공 receipt·reuse·waiver로 대신하지 않는다. Reviewer entry에서 현재 전체 verify token/receipt를 확인해 최종 token을 만들고 publication의 소유권·원격 확인 경계에서 identity를 재검사한다. 새 성공으로 과거 문서 선행 PASS를 승격하거나 G-183/G-241/G-262/263/264의 별도 목표 완료를 선언하지 않는다.
+전체 성공 근거는 해당 선행 승인 뒤 실행한 `full_verify.receipt_id`와 현재 후보의 실제 `run` receipt가 같아야 한다. 다른 성공 receipt·reuse·waiver로 대신하지 않는다. Reviewer entry에서 현재 전체 verify token/receipt를 확인해 최종 token을 만들고 publication의 소유권·원격 확인 경계에서 identity를 재검사한다. 새 성공으로 과거 문서 선행 PASS를 승격하지 않는다. 이 gate에서 확정한 최종 승인의 이후 재연결은 [최종 Review 승인 재연결](#최종-review-승인-재연결)을 따르며 선행 PASS 자체를 재사용하지 않는다.
 
 ## Verify 입력 관측과 생성 요청
 

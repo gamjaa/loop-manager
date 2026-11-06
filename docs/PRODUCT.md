@@ -951,6 +951,10 @@ Manager가 생성했지만 DB 소유권 확정 전에 중단된 ExecPlan 예약�
 Worker는 현재 작업의 테스트를 명세·구현과 대조해 폐기된 동작만 검사하거나 다른 테스트가 같은 조건·assertion을 모두 보장하는 중복 테스트를 제거한다. 제거 근거와 남은 회귀 검증을 보고하며 실패·비용만으로 필수 검증을 약화하지 않는다. 유지보수 평가도 같은 기준으로 조사해 기존 비종료 계획 또는 새 정리 계획에 연결하고 Worker가 정리한다.
 
 - Worker는 현재 환경의 전체 검증 스크립트를 생성·유지하고, 프로그램이 Agent 밖에서 실행한다. 최종 후보의 게시 판단은 위 조건표를 따르며, Reviewer는 검증 근거와 실제 변경을 읽기 전용으로 검토한다.
+- 같은 프로젝트·ExecPlan·작업 주기의 마지막 최종 승인은 전체 verify의 원래 성공과 현재 코드 입력, 후보별 base에 대한 실제 PR 변경, ExecPlan·sources·적용 PRODUCT/ARCHITECTURE·dependency·사용자 결정, runtime 전체 지침과 실제 Reviewer instruction/profile·환경·정책이 모두 같을 때 재사용한다. 무관한 base 문서의 추가·수정·archive나 SHA 변화만으로 Worker·targeted test·verify·Reviewer를 반복하지 않는다. 선택 작업의 직접 문서 변경·달라진 충돌 해결 결과는 검토 범위에 남긴다.
+
+  재사용은 원래 승인과 현재 후보의 연결·생략 이유를 보존하며 게시 직전 다시 확인한다. 비교 불가·목록/근거 부재·새 실패·중단·관련 입력 변경에는 필요한 단계를 실행한다. verify 입력은 같지만 검토 입력이 바뀌면 verify를 재사용하고 Reviewer를 실행한다. 일반 선행 PASS는 해당 승인 뒤 실제 전체 verify와 최종 승격을 거쳐야 하며 문서 선행 PASS/VERIFY_REQUIRED·부분 성공·사용자 면제는 최종 승인 재사용 근거가 아니다. Claude의 `prepared`와 실제 호출 성공만으로 검토 환경 동일성을 증명하지 않으며 현재 관측이 불가능하면 정상 Reviewer를 실행한다. 이 비교를 위한 프로젝트 루트 지침의 별도 조회·파일 승인 gate는 두지 않는다.
+
 - 자체 verify는 직렬·프로세스 병렬 모드에서 동일한 unittest manifest·fixture 계약과 전체 compile을 유지한다. 실제 Agent 실행을 테스트 경계에서 차단하며 테스트·준비·대기·정리 시간과 중단 진단은 성공 stdout과 분리해 보존한다.
 - 명시적 공통 verify 연결은 unittest와 Perl TAP adapter를 제공한다. 도구·연결 오류와 부분 결과를 성공으로 처리하지 않으며 두 언어는 같은 자원 예약·종료·진단과 필수 compile 순서를 따른다. 대기 기록의 손상·역행·소실은 실패로 진단하고 원본 근거를 보존한다. 마지막 결과 처리와 종료 확인 뒤 실제 시간 예산을 넘었으면 종료 코드가 0이어도 성공하지 않으며 부분 PASS도 남기지 않는다. Perl의 Agent 호출 차단·지원 버전·한계는 [VERIFY.md](VERIFY.md#perl-tap-지원과-두-언어-예제)를 따른다.
 - 자체 verify 입력에는 실행 코드·테스트·고정 샘플·의존성·실제 verify/copy/실행 스크립트가 포함된다. 저장소의 공통·역할·Ponytail 원문 `docs/AGENTS.common.md`, `docs/AGENTS.planner.md`, `docs/AGENTS.planner_check.md`, `docs/AGENTS.worker.md`, `docs/AGENTS.reviewer.md`, `docs/AGENTS.ponytail.md`를 비롯한 문서·Skill·README·예제 설정의 정책·안내 문구 일관성은 검사하지 않으며 문서 원본을 고정 샘플로 자동 동기화하지 않는다. 현재 runtime의 실제 지침 선택·planning 입력 해시·Agent 전달과 호출 해시는 계속 적용하고, 지침 변경의 의미는 Reviewer가 실제 diff와 명세에서 검토한다. 파서·등록·profile·파일 복사 검증과 필수 unittest·전체 compile은 유지하며 verify가 문서 품질을 보증하지는 않는다.

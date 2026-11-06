@@ -311,6 +311,9 @@ class PublicationHandler:
             if (not preliminary_review.reusable(self.ports, context, preliminary)
                     or not preliminary_review.full_evidence(self.ports, context, preliminary)):
                 raise self.ports.contract.PublicationSafetyError('게시 직전 일반 선행 Review 승인 입력을 확인할 수 없습니다.')
+        from loop_manager_internal.execution import final_review
+        if not final_review.publication_valid(self.ports, self.ports._context()):
+            raise self.ports.contract.PublicationSafetyError('게시 직전 최종 Review 승인 입력을 확인할 수 없습니다.')
         if expected_oid is not None and head != expected_oid:
             raise self.ports.contract.PublicationSafetyError('게시 관측 중 관리 HEAD가 변경됐습니다.')
         if self.ports.snapshot()._definition_snapshot is not None and (
@@ -345,6 +348,15 @@ class PublicationHandler:
                     phase='REVIEWING', review_token=None, publication_token=None,
                     last_error='게시 전 일반 선행 Review 승인 근거가 변경되어 최종 검토를 다시 수행합니다.')
             return self.ports._retry('게시 전 일반 선행 Review 승인 근거를 다시 확인합니다.')
+        from loop_manager_internal.execution import final_review
+        if not final_review.publication_valid(self.ports, context):
+            with runtime_state._transaction(self.ports.state.connection):
+                self.ports.state.check_context(context)
+                final_review.invalidate(self.ports, context, 'invalidated')
+                self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
+                    phase='REVIEWING', review_token=None, publication_token=None,
+                    last_error='게시 전 최종 Review 입력 변경: 다시 검토합니다.')
+            return self.ports._retry('게시 전 최종 Review 승인 근거를 다시 확인합니다.')
         try:
             publication = self._publication_resume().observe(
                 self.ports.identity.repo_path, context.worktree, context.branch,
