@@ -142,7 +142,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual(list(self.connection.iterdump()), before)
 
-    def rowless_cancellation(self):
+    def rowless_cancellation(self, *, started=False):
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         from loop_manager_internal.planning.planning_catalog import PlanDeletion
@@ -155,13 +155,23 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.connection.execute("UPDATE exec_plans SET path='docs/plans/[G-001] Gone.md',title='Gone',"
             "priority='normal',content_hash=?,plan_sha=?,current_revision_sha=? WHERE plan_id='G-001'",
             (plan_content_hash(text), 'a' * 40, 'a' * 40))
+        if started:
+            self.connection.execute("UPDATE exec_plans SET ever_started=1,retry_count=2,worker_session_id='old-session',"
+                "worker_result='saved result',verify_result='saved failure',last_error='historical failure',"
+                "verify_failure_history='{}' WHERE plan_id='G-001'")
         self.connection.commit()
         row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
         plan = ReadyPlanSnapshot('G-001', row['path'], row['title'], tuple(json.loads(row['sources'])), (),
             'low', 'low', row['priority'], row['content_hash'], 'a' * 40, text,
             current_complexity=row['current_complexity'], current_risk=row['current_risk'], current_metadata_recorded=True)
+        if started:
+            from dataclasses import replace
+            from loop_manager_internal.planning.planner_validation import planning_execution_state
+            plan = replace(plan, execution_state=planning_execution_state(row))
+        judgment = {'decision': {'id': 'G-001', 'source': 'docs/PRODUCT.md', 'outcome': 'withdrawn',
+            'reason': 'The original goal was withdrawn.'}} if started else None
         with _transaction(self.connection):
-            apply_mutable_catalog_changes(self.connection, '/repo', deletions=(PlanDeletion(plan),), revisions=(),
+            apply_mutable_catalog_changes(self.connection, '/repo', deletions=(PlanDeletion(plan, judgment),), revisions=(),
                 snapshot_token='saved', plan_commit='b' * 40, content_hash=lambda _: '', agent=False)
         audit = json.loads(self.connection.execute("SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0])
         self.assertEqual(audit['row'], dict(row))
@@ -352,6 +362,46 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             self.assertFalse(runtime.exists())
             self.assertEqual((relocated / 'receipt.json').read_text(), 'independent collection proof')
             self.assertEqual(self.connection.execute('SELECT count(*) FROM deleted_plan_files').fetchone()[0], 0)
+
+    def test_resource_free_started_ready_audit_finishes_after_call_termination(self):
+        text = self.rowless_cancellation(started=True)
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.artifact_call('old-call', '/repo', 'G-001')
+        self.connection.execute("UPDATE agent_invocations SET execution_finish_evidence=NULL WHERE invocation_id='old-call'")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("UPDATE agent_invocations SET execution_finish_evidence='provider_process_finished' WHERE invocation_id='old-call'")
+        self.connection.execute("CREATE TRIGGER reject_started_rowless_resurrection BEFORE INSERT ON exec_plans "
+            "WHEN NEW.plan_id='G-001' BEGIN SELECT RAISE(ABORT,'execution resurrection'); END")
+        self.connection.commit()
+        self.assertEqual(self.cleanup_rowless(text), ('G-001',))
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM execplan_cancellations WHERE plan_id='G-001'").fetchone())
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM agent_invocations WHERE invocation_id='old-call'").fetchone())
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
+
+    def test_started_rowless_audit_preserves_uncertain_judgment_resources_and_agent_ownership(self):
+        from unittest import mock
+        text = self.rowless_cancellation(started=True)
+        self.artifact_call('old-call', '/repo', 'G-001')
+        self.connection.commit()
+        original = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        for audit in ({**original, 'judgment': None}, {**original, 'judgment': {'decision': 'unknown'}},
+                {**original, 'cleanup_pending': True}, {**original, 'checkpoints': {'saved': 'operation'}},
+                *({**original, 'row': {**original['row'], field: value}} for field, value in (
+                    ('branch', 'loop-manager/G-001'), ('worktree', '/old-worktree'), ('agent_role', 'worker'),
+                    ('agent_snapshot', '{}'), ('publication_remote_oid', 'old-oid'), ('workspace_owned', 1)))):
+            with self.subTest(audit=audit):
+                self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                git = mock.Mock(side_effect=AssertionError('uncertain audit must be preserved'))
+                self.assertEqual(self.cleanup_rowless(text, git=git), ())
+                self.assertEqual(tuple(self.connection.iterdump()), before)
 
     def test_orphan_or_relative_collection_reference_keeps_file_queue_pending(self):
         from tempfile import TemporaryDirectory

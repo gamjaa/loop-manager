@@ -190,7 +190,7 @@ def release_reference_holds(connection, repo, key, path, resolved):
 
 
 def _unowned_cancellations(connection, repo):
-    """Only complete, never-started audit can prove the resource-free rowless case."""
+    """Read complete READY audits that retain no resource ownership."""
     from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
     if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'").fetchone():
         return
@@ -200,12 +200,35 @@ def _unowned_cancellations(connection, repo):
         try:
             audit = json.loads(canceled['recovery_evidence'] or '{}')
             saved = audit['row']
+            started = isinstance(saved, dict) and saved.get('ever_started') == 1
+            historical_fields = {
+                'active_sha', 'validated_base_sha', 'last_error', 'blocked_fingerprint',
+                'blocked_worktree_fingerprint', 'blocked_review_fingerprint', 'worker_session_id',
+                'reviewer_session_id', 'worker_result', 'verify_result', 'review_result',
+                'blocked_reason', 'guidance_plan_hash',
+            } if started else set()
+            judgment = audit.get('judgment')
+            decision = judgment.get('decision') if isinstance(judgment, dict) else None
+            decision = decision if isinstance(decision, dict) else {}
+            if started and (audit.get('cleanup_pending') is not False
+                    or decision.get('id') != saved['plan_id'] or decision.get('outcome') != 'withdrawn'
+                    or decision.get('source') not in json.loads(saved['sources'])
+                    or not isinstance(decision.get('reason'), str) or not decision['reason'].strip()):
+                continue
+            if started and not connection.execute(
+                    "SELECT 1 FROM agent_invocations WHERE repo=? AND plan_id=? "
+                    "AND execution_status='executed' AND execution_started_at IS NOT NULL",
+                    (repo, canceled['plan_id'])).fetchone():
+                continue  # Missing historical calls cannot prove a started writer's termination.
             if (not isinstance(saved, dict) or saved['status'] != 'READY'
-                    or type(saved['ever_started']) is not int or saved['ever_started'] != 0
+                    or type(saved['ever_started']) is not int or saved['ever_started'] not in (0, 1)
                     or type(saved['workspace_owned']) is not int or saved['workspace_owned'] != 0
-                    or saved['retry_count'] != 0 or saved['pr_conflict_recovery'] != 0
-                    or any(saved[field] != '{}' for field in ('verify_failure_history', 'review_failure_history', 'review_level_history'))
-                    or any(saved[field] is not None for field in _MUTABLE_READY_EVIDENCE_FIELDS)
+                    or type(saved['retry_count']) is not int or saved['retry_count'] < 0
+                    or (not started and saved['retry_count'] != 0) or saved['pr_conflict_recovery'] != 0
+                    or any(not isinstance(json.loads(saved[field]), dict) or not started and saved[field] != '{}'
+                           for field in ('verify_failure_history', 'review_failure_history', 'review_level_history'))
+                    or any(saved[field] is not None for field in _MUTABLE_READY_EVIDENCE_FIELDS if field not in historical_fields)
+                    or any(saved[field] is not None for field in ('pr_conflict_head_oid', 'pr_conflict_base_oid'))
                     or audit.get('checkpoints') or audit.get('cleanup_pending')
                     or any(saved[field] != canceled[field] for field in (
                         'repo', 'plan_id', 'path', 'title', 'sources', 'depends_on', 'priority', 'content_hash'))
