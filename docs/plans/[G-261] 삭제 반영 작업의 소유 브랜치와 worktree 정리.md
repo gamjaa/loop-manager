@@ -90,8 +90,8 @@ G-238의 명시적 reset/manual stop·READY 복귀는 이 작업에 포함하지
 | 확인된 철회만 정리하고 일반 취소·MERGED 보존 | 기존 원문 hash·revision ancestry·현재 참조 판단·historical Merge·공통 결함 보호를 그대로 통과한 후보만 자원 helper로 전달한다. `test_deleted_plan_cleanup` 89개 회귀로 원문/관계/공유 자료·실제 MERGED 보호를 확인했다. |
 | 살아 있는 소유 원격·로컬 ref/worktree와 row 없는 취소 감사 | `deleted_plan_resources.cleanup`이 결정적 작업 경로·등록 origin·Git 등록/공통 repository·원래 소유 row/감사와 현재 독립/수동 참조를 다시 검사한다. row 없는 경로도 실제 호출 종료를 검사하고 같은 자원 정리와 `forget`/파일 queue에 연결했다. `test_live_rowless_cancellation_hands_partial_cleanup_to_existing_erasure_queue`가 부분 실패부터 최종 ID 표식까지 확인한다. |
 | 작업물·원문·session·실패·PR head 보존 | `assess_cleanup`의 dirty/index flag/Git operation/local-only 거부를 유지하며 수동 잠금·다른 branch 관측도 보존한다. 게시 head의 전체 bundle을 fsync·verify/head 검사하고 정리 중 감사·실패 자료를 유지한다. 복구 원본이 없거나 미게시 commit이면 삭제하지 않는다. 새 정책 행렬과 기존 최소 worktree 회귀가 보존을 확인한다. |
-| 정확한 PR·원격 기대 OID·새 소유자 보호 | 등록 origin과 고정 URL을 검사하며 PR 전체 branch 이력의 Open/Merged/fork·다른 URL/base/head를 거부한다. 저장된 OID의 삭제 lease와 원래 로컬 OID의 no-deref 삭제만 사용한다. lease 경쟁·심볼릭 ref·정리 완료 후 같은 이름/OID의 ref 재생성과 제거 증거 뒤 worktree 재생성을 새 자원으로 보류한다. PR을 close/Merge하지 않는다. |
-| 비원자 삭제·중단 복구와 독립 진행 | 기존 journal에 원격/로컬 삭제 전이·보존본 지문·revision을 저장하고 worktree 제거 journal을 재사용한다. 원격/로컬 효과 뒤 결과 미기록, 원격 삭제 뒤 worktree 실패, 권한/정책 실패는 원래 intent로 재개한다. 자원 충돌 범위의 pending만 유지하며 문서·취소 상태를 rollback하지 않는다. 새 중단 회귀와 기존 journal/cleanup pending 최소 회귀로 확인했다. |
+| 정확한 PR·원격 기대 OID·새 소유자 보호 | 등록 origin과 고정 URL을 검사하며 PR 전체 branch 이력의 Open/Merged/fork·다른 URL/base/head를 거부한다. 저장된 OID의 삭제 lease와 원래 로컬 OID의 no-deref 삭제만 사용한다. lease 경쟁·심볼릭 ref·삭제 intent의 result/active 확정 전후 같은 이름/OID의 ref 재생성과 제거 증거 뒤 worktree 재생성을 새 자원으로 보류한다. PR을 close/Merge하지 않는다. |
+| 비원자 삭제·중단 복구와 독립 진행 | 기존 journal에 원격/로컬 삭제 전이·보존본 지문·revision을 저장하고 worktree 제거 journal을 재사용한다. 원격/로컬 효과 뒤 결과 미기록과 active 해제 전 중단은 현재 ref 부재에서만 원래 intent의 기록 확정을 재개한다. 기록이 남은 상태에서 ref가 살아 있으면 같은 OID여도 재삭제하지 않고 pending으로 보존한다. 원격 삭제 뒤 worktree 실패는 기존 자원별 복구로 이어가며 권한/정책 실패도 효과가 미확정이면 재삭제하지 않는다. 자원 충돌 범위의 pending만 유지하며 문서·취소 상태를 rollback하지 않는다. 새 중단 회귀와 기존 journal/cleanup pending 최소 회귀로 확인했다. |
 | 최종 전용 자료 제거·동일 효과 반복 금지 | 자원 부재 뒤 bundle·정확한 삭제 slot·원래 worktree 생성/제거 slot과 receipt를 기존 `forget` 파일 queue로 넘긴다. queue는 소유·형식·봉인된 결과를 재검사하고 파일 제거 직후 결과 저장 중단도 부재로 확정한다. native 회귀에서 원래 작업 bytes 복구, base 불변, ref/OID와 worktree 등록 제거, 전용 자료/queue 제거 및 ID 표식만 남는 결과를 확인했다. |
 | 승인 경계·문서/검증 입력 | PRODUCT와 ARCHITECTURE의 관련 절을 실제 동작·저장 계약에 맞춰 갱신했다. 일반 Merge 정리·reset/manual stop·사용자 Merge 권한은 확장하지 않았다. 새 코드/테스트는 기존 `loop_manager_internal/**`, `tests/**` verify 입력에 포함되므로 선언 목록 추가가 필요하지 않다. 목록 밖 파일의 비소비는 전수 확인하지 않았으므로 제외 identity를 선언하지 않는다. |
 
@@ -131,6 +131,23 @@ Final result: PASS (1 test).
 추가로 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_support_fixtures.SupportFixtureTests.test_imports_create_no_resources_or_discoverable_cases tests.test_deleted_plan_cleanup tests.test_deleted_plan_resources`를 실행해 97 tests, OK를 확인했다. 이번 targeted 합계는 98개이며 `git diff --check`도 통과했다. 전체 verify는 실행하지 않았다. Manager가 보고한 실패 원인은 교정했으며 전체 verify의 새 PASS를 합성하지 않는다.
 
 위 완료 조건 표와 현행 R-055 D09/D10·PRODUCT·ARCHITECTURE 및 dependency 문서 경로를 다시 대조했다. 제품 구현의 보존·소유권·PR/lease·부분 정리·재생성 거부·최종 queue 계약과 기존 검증 범위는 그대로이며 추가 미구현 항목은 확인하지 않았다. 기존 `tests/**` 입력이 이동한 공유 helper도 포함한다. 남은 절차는 Manager의 전체 verify 재실행·Review와 사용자 Merge이며 새 정책 선택·checkpoint는 필요하지 않다.
+
+### Review 교정: 중단된 삭제와 같은 OID의 ref 재생성
+
+`review:loop_manager_internal/catalog/deleted_plan_resources.py::cleanup::recreated-ref-redelete` occurrence 1/revision 1을 교정했다. 호출 시작 HEAD는 `ea2333b86286f6eb7c447caa6e187a62af907e79`다. 기존 개별 회귀는 중단과 재생성을 따로 확인해 두 조건의 결합을 놓쳤다. 네 결합 회귀를 먼저 작성해 원격/로컬 각각 result 저장 뒤 active 해제 전 중단과 result 미기록 중단에서 재생성 ref를 삭제하는 오류를 모두 재현했다.
+
+원격·로컬 두 호출이 공유하는 `remove`가 기존 삭제 기록과 살아 있는 ref를 만나면 pending으로 보존한다. OID는 ref 수명 식별자가 아니므로 완료 결과 유무·active 잔존·동일 OID로 삭제를 재허용하지 않는다. 초기 부재 관측 뒤 journal 재검사 전에 ref가 재등장해도, 기존 기록으로 진입한 삭제 callback은 거부한다. ref가 계속 부재일 때만 기존 journal·보존 bundle·revision 검사를 거쳐 누락 결과/active 해제를 확정한다. 공통 journal의 일반 재실행 의미나 다른 Git 작업은 바꾸지 않았다.
+
+새 네 회귀는 동일 OID의 재생성, 반복 pending, 관측 사이 재등장, ref/OID·명령 수·journal bytes·bundle bytes·SQLite 불변과 이후 부재 확인에 따른 확정을 검사한다. 기존 보호 실패/native lease 회귀도 원격 값이 원래 OID로 돌아왔다는 이유로 삭제를 다시 실행하지 않음을 확인하도록 교정했다. 실제 Git fixture에서는 경쟁 ref와 원래 작업 bytes를 보존하고, fixture가 원격 부재를 만든 뒤 Manager가 두 번째 push 없이 worktree/local ref·최종 queue 정리를 마침을 확인한다. 기존 base·복구 bytes·재생성 worktree·전용 자료 최종 제거 assertion은 유지한다. 테스트 삭제·skip은 없다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_deleted_plan_resources.DeletedPlanResourceTests.test_remote_recreation_with_result_and_active_is_preserved tests.test_deleted_plan_resources.DeletedPlanResourceTests.test_remote_recreation_without_result_is_preserved tests.test_deleted_plan_resources.DeletedPlanResourceTests.test_local_recreation_with_result_and_active_is_preserved tests.test_deleted_plan_resources.DeletedPlanResourceTests.test_local_recreation_without_result_is_preserved
+Initial result: FAIL (4 tests, 중단 뒤 재생성 ref에 CallDeferred가 발생하지 않음).
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_deleted_plan_resources.DeletedPlanResourceTests.test_remote_recreation_with_result_and_active_is_preserved tests.test_deleted_plan_resources.DeletedPlanResourceTests.test_remote_recreation_without_result_is_preserved tests.test_deleted_plan_resources.DeletedPlanResourceTests.test_local_recreation_with_result_and_active_is_preserved tests.test_deleted_plan_resources.DeletedPlanResourceTests.test_local_recreation_without_result_is_preserved
+Final result: PASS (4 tests).
+
+추가 targeted 명령 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_deleted_plan_resources tests.test_deleted_plan_cleanup`는 자원 정리 11개와 기존 삭제 정리 89개, 총 100 tests OK였다. 재현 네 case는 이 100개에도 포함된다. 이 호출의 미해결 targeted 실패는 없다. `git diff --check`도 통과했으며 전체 verify·integration/build/type check·Windows native는 실행하지 않았다. Review가 전달한 이전 Manager 전체 verify PASS는 이번 후보의 전체 verify를 대신하지 않는다.
+
+PRODUCT의 보존·재개 보장과 ARCHITECTURE의 intent/result/active 계약을 실제 교정 동작으로 통합했다. R-055 D09/D10과 위 완료 조건 전체를 다시 대조했고, 기존 PR·보존/소유권·독립 진행·G-260 최종 제거 경계를 유지한다. 현재 sources와 dependency archive 경로는 그대로이며 새 사용자 판단이나 checkpoint가 필요하지 않다. 새 테스트는 기존 `tests/**`, 교정 코드는 `loop_manager_internal/**` verify 입력에 포함된다. 목록 밖 입력의 제외 identity는 선언하지 않는다.
 
 남은 작업은 Manager 전체 verify·Review와 사용자 Merge다. 구현 중 보존/PR/소유권이 미확인인 실제 입력은 명세대로 pending이며, 새 사용자 정책 선택이나 checkpoint는 필요하지 않았다.
 

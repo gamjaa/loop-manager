@@ -199,6 +199,77 @@ class DeletedPlanResourceTests(DeletedPlanCancellationFixture, unittest.TestCase
         self.assertEqual(len(self.writes), 2)
         self.assertFalse(list(self.state.rglob('active.json')))
 
+    def assert_interrupted_recreation_is_preserved(self, kind, result_saved):
+        real_finish, real_unlink = journal._finish, Path.unlink
+        slot = journal._slot(self.state, '/repo', kind, self.ref)
+        before = list(self.connection.iterdump())
+        def finish(directory, active, intent, *args, **kwargs):
+            if intent['kind'] != kind:
+                return real_finish(directory, active, intent, *args, **kwargs)
+            if not result_saved:
+                raise RuntimeError('interrupted before result')
+            def unlink(path, *values, **options):
+                if path == active:
+                    raise RuntimeError('interrupted before active removal')
+                return real_unlink(path, *values, **options)
+            with mock.patch.object(Path, 'unlink', new=unlink):
+                return real_finish(directory, active, intent, *args, **kwargs)
+        with mock.patch.object(journal, '_finish', side_effect=finish):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                self.run_cleanup()
+        field = 'remote' if kind == resources.KINDS[0] else 'local'
+        self.assertIsNone(getattr(self, field))
+        self.assertTrue((slot / 'active.json').exists())
+        self.assertEqual(bool(list(slot.glob('*.result.json'))), result_saved)
+        saved = {path: path.read_bytes() for path in slot.iterdir()}
+        bundle = next(self.state.rglob('*.bundle'))
+        bundle_bytes = bundle.read_bytes()
+        writes = self.writes.copy()
+        setattr(self, field, self.head)
+        for _ in range(2):
+            with self.assertRaises(CallDeferred):
+                self.run_cleanup()
+            self.assertEqual(getattr(self, field), self.head)
+            self.assertEqual(self.writes, writes)
+            self.assertEqual({path: path.read_bytes() for path in slot.iterdir()}, saved)
+            self.assertEqual(bundle.read_bytes(), bundle_bytes)
+            self.assertEqual(list(self.connection.iterdump()), before)
+        # Reappearance between cleanup's absence read and journal revalidation
+        # must not let the generic journal replay its apply callback either.
+        setattr(self, field, None)
+        observed, calls = self.git, 0
+        def recreate_between_observations(repo, *args, **kwargs):
+            nonlocal calls
+            result = observed(repo, *args, **kwargs)
+            relevant = ('ls-remote' in args if field == 'remote' else args == ('rev-parse', '--verify', self.ref))
+            if relevant:
+                calls += 1
+                if calls == 2:
+                    setattr(self, field, self.head)
+            return result
+        with mock.patch.object(self, 'git', side_effect=recreate_between_observations):
+            with self.assertRaises(CallDeferred):
+                self.run_cleanup()
+        self.assertEqual(getattr(self, field), self.head)
+        self.assertEqual(self.writes, writes)
+        self.assertEqual({path: path.read_bytes() for path in slot.iterdir()}, saved)
+        # A later independently observed absence permits confirmation only.
+        setattr(self, field, None)
+        self.run_cleanup()
+        self.assertFalse(list(self.state.rglob('active.json')))
+
+    def test_remote_recreation_with_result_and_active_is_preserved(self):
+        self.assert_interrupted_recreation_is_preserved(resources.KINDS[0], True)
+
+    def test_remote_recreation_without_result_is_preserved(self):
+        self.assert_interrupted_recreation_is_preserved(resources.KINDS[0], False)
+
+    def test_local_recreation_with_result_and_active_is_preserved(self):
+        self.assert_interrupted_recreation_is_preserved(resources.KINDS[1], True)
+
+    def test_local_recreation_without_result_is_preserved(self):
+        self.assert_interrupted_recreation_is_preserved(resources.KINDS[1], False)
+
     def test_protection_failure_and_owner_race_leave_pending_evidence(self):
         self.fail_push = True
         with self.assertRaises(CallDeferred):
@@ -212,6 +283,12 @@ class DeletedPlanResourceTests(DeletedPlanCancellationFixture, unittest.TestCase
         with self.assertRaises(CallDeferred):
             self.run_cleanup(owner)
         self.assertEqual(len(self.writes), 1)
+        with self.assertRaises(CallDeferred):
+            self.run_cleanup()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.remote, self.head)
+        self.assertTrue(self.workspace.exists())
+        self.remote = None  # Independently observed absence, not a second push.
         self.run_cleanup()
         self.assertIsNone(self.remote)
         self.assertFalse(self.workspace.exists())
@@ -311,12 +388,17 @@ class DeletedPlanNativeRefTest(unittest.TestCase):
                 with self.assertRaises(CallDeferred):
                     run()
                 self.assertEqual(len(pushes), 1)
-                # Restore this isolated fixture explicitly; cleanup itself never
-                # swaps its expectation to the racing OID.
+                # Restoring the original OID still cannot prove its lifetime.
                 git_command(repo, 'push', journal.exact_branch_lease(branch, raced), origin, head + ':' + ref)
+                with self.assertRaises(CallDeferred):
+                    run()
+                self.assertEqual(len(pushes), 1)
+                self.assertEqual(git_command(Path(origin), 'rev-parse', ref), head)
+                # Only independent absence lets the interrupted intent finish.
+                git_command(repo, 'push', journal.exact_branch_lease(branch, head), origin, ':' + ref)
                 artifacts = run()
                 self.assertEqual(run(), artifacts)
-                self.assertEqual(len(pushes), 2)
+                self.assertEqual(len(pushes), 1)
                 git_command(repo, 'worktree', 'add', '-b', branch, str(workspace), head)
                 with self.assertRaises(CallDeferred):
                     run()

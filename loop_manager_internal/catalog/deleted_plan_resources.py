@@ -235,6 +235,11 @@ def cleanup(connection, state_dir, repo_path, repo, row, revision, *, git, pr_fo
     def remove(kind, oid, observe, apply):
         slot = slots[KINDS.index(kind)]
         current = observe()
+        existing = slot.exists() and any(slot.iterdir())
+        # An OID cannot identify a ref's lifetime after an interrupted effect.
+        # Existing evidence permits confirming absence, never replaying deletion.
+        if current is not None and existing:
+            raise CallDeferred('중단·완료된 삭제 기록 뒤 살아 있는 ref를 보존합니다.')
         if slot.exists() and list(slot.glob('*.result.json')) and not (slot / 'active.json').exists():
             if not journal_artifact(slot, repo, row['plan_id']) or current is not None:
                 raise CallDeferred('정리 뒤 재생성되거나 미확인인 ref를 보존합니다.')
@@ -253,6 +258,8 @@ def cleanup(connection, state_dir, repo_path, repo, row, revision, *, git, pr_fo
         def marker(_intent):
             return bundle.is_file() and hashlib.sha256(bundle.read_bytes()).hexdigest() == digest
         def effect(_token):
+            if existing:
+                raise CallDeferred('중단된 삭제의 효과가 불확실해 ref 재삭제를 보류합니다.')
             if check() != origin or observe() != oid or not marker(None):
                 raise CallDeferred('삭제 직전 소유권·ref·보존본이 변경됐습니다.')
             apply()
