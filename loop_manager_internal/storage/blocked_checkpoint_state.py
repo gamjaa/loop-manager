@@ -119,7 +119,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE blocked_checkpoints ADD COLUMN publication_history TEXT NOT NULL DEFAULT '[]'")
 
 
-def cancelled_checkpoint_without_resources(row, repo: str, plan_id: str) -> bool:
+def cancelled_checkpoint_without_resources(row, repo: str, plan_id: str, *, block=None) -> bool:
     """Recognize an inert cancellation audit without synthesizing checkpoint completion."""
     empty = {'branch', 'pr_url', 'worktree', 'expected_remote_oid', 'commit_identity',
              'identity_reason_code', 'identity_evidence', 'tree_oid', 'local_oid', 'remote_oid',
@@ -140,10 +140,22 @@ def cancelled_checkpoint_without_resources(row, repo: str, plan_id: str) -> bool
                 and row['result'] is None and row['unpublished_reason'] is None)
     if not (unpublished or unstarted):
         return False
+    fingerprint = None
+    if block is not None:
+        if (not isinstance(block, dict) or set(block) != {'repo', 'plan_id', 'scope', 'reason_code',
+                'evidence', 'release_fingerprint', 'created_at', 'updated_at', 'recovery_snapshot'}
+                or (block['repo'], block['plan_id'], block['scope']) != (repo, plan_id, 'plan')
+                or (block['reason_code'], block['evidence']) != (row['reason_code'], row['evidence'])
+                or any(not isinstance(block[field], str) or not block[field].strip() for field in ('created_at', 'updated_at'))
+                or block['release_fingerprint'] is not None and (
+                    not isinstance(block['release_fingerprint'], str) or not block['release_fingerprint'].strip())
+                or block['recovery_snapshot'] is not None and not isinstance(block['recovery_snapshot'], str)):
+            return False
+        fingerprint = block['release_fingerprint']
     try:
         return (json.loads(row['publication_history']) == []
                 and row['request_identity'] == request_identity(repo, plan_id, row['reason_code'],
-                                                               row['evidence'], None, None))
+                                                               row['evidence'], None, None, fingerprint))
     except (TypeError, ValueError, RecursionError):
         return False
 

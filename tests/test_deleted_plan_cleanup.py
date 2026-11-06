@@ -144,7 +144,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
 
     def rowless_cancellation(self, *, started=False, empty_checkpoint=False, blocked=False,
                              empty_blocked_checkpoint=False, resolved_blocked_checkpoint=False,
-                             requested_blocked_checkpoint=False):
+                             requested_blocked_checkpoint=False, native_block=False):
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         from loop_manager_internal.planning.planning_catalog import PlanDeletion
@@ -164,6 +164,12 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         if blocked:
             self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED',blocked_reason='saved block' WHERE plan_id='G-001'")
         self.connection.commit()
+        original_block = None
+        if native_block:
+            from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+            RuntimeStateRepository(self.connection).block_plan('/repo', 'G-001', reason_code='plan_input_invalid',
+                evidence='saved native block', release_fingerprint='c' * 64, enqueue=False)
+            original_block = dict(self.connection.execute("SELECT * FROM execplan_blocks WHERE plan_id='G-001'").fetchone())
         row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
         plan = ReadyPlanSnapshot('G-001', row['path'], row['title'], tuple(json.loads(row['sources'])), (),
             'low', 'low', row['priority'], row['content_hash'], 'a' * 40, text,
@@ -196,6 +202,8 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         audit = json.loads(self.connection.execute("SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0])
         self.assertEqual(audit['row'], dict(row))
         self.assertEqual(audit['text'], text)
+        if native_block:
+            self.assertEqual(audit['block'], original_block)
         return text
 
     def cleanup_rowless(self, text, *, git=None, pr=None, current=lambda: True):
@@ -512,6 +520,57 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 git = mock.Mock(side_effect=AssertionError('checkpoint evidence must be preserved'))
                 self.assertEqual(self.cleanup_rowless(text, git=git), ())
                 self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_native_block_and_fingerprint_bound_checkpoint_move_to_audit_before_erasure(self):
+        from unittest import mock
+        self.connection.execute('PRAGMA foreign_keys=ON')
+        self.artifact_call('stopped-worker', '/repo', 'G-001')
+        self.connection.commit()
+        text = self.rowless_cancellation(started=True, native_block=True)
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertEqual(audit['block']['release_fingerprint'], 'c' * 64)
+        self.assertEqual(audit['checkpoints']['blocked_checkpoints']['phase'], 'requested')
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM execplan_blocks WHERE plan_id='G-001'").fetchone())
+        self.assertEqual(self.connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+        original = audit['block']
+        for block in (None, {**original, 'release_fingerprint': 'other'}, {**original, 'repo': '/other'},
+                      {**original, 'reason_code': 'other'}, {**original, 'evidence': 'other'},
+                      {**original, 'future_ownership': 'unknown'}):
+            with self.subTest(block=block):
+                audit['block'] = block
+                self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                self.assertEqual(self.cleanup_rowless(text, git=mock.Mock(side_effect=AssertionError('unknown block binding'))), ())
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+        audit['block'] = original
+        self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+        self.connection.commit()
+        self.assertEqual(self.cleanup_rowless(text), ('G-001',))
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM agent_invocations WHERE plan_id='G-001'").fetchone())
+        self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
+        self.assertEqual(self.connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+
+    def test_block_and_checkpoint_audit_transfer_rolls_back_with_failed_cancellation(self):
+        import sqlite3
+        from unittest import mock
+        from loop_manager_internal.storage import planning_publication_state
+        self.connection.execute('PRAGMA foreign_keys=ON')
+        self.artifact_call('stopped-worker', '/repo', 'G-001')
+        self.connection.execute("CREATE TRIGGER reject_block_cancellation BEFORE DELETE ON exec_plans "
+            "BEGIN SELECT RAISE(ABORT,'interrupted block cancellation'); END")
+        self.connection.commit()
+        before = []
+        apply = planning_publication_state.apply_mutable_catalog_changes
+        def capture(*args, **kwargs):
+            before.extend(self.connection.iterdump())
+            return apply(*args, **kwargs)
+        with mock.patch.object(planning_publication_state, 'apply_mutable_catalog_changes', side_effect=capture):
+            with self.assertRaisesRegex(sqlite3.IntegrityError, 'interrupted block cancellation'):
+                self.rowless_cancellation(started=True, native_block=True)
+        self.assertTrue(before)
+        self.assertEqual(list(self.connection.iterdump()), before)
+        self.assertEqual(self.connection.execute('PRAGMA foreign_key_check').fetchall(), [])
 
     def test_cancelled_resource_free_requested_checkpoint_does_not_require_synthetic_completion(self):
         from unittest import mock

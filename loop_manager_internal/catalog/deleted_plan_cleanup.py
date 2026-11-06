@@ -257,7 +257,8 @@ def _unowned_cancellations(connection, repo):
                     continue
                 if 'blocked_checkpoints' in checkpoints:
                     from loop_manager_internal.storage.blocked_checkpoint_state import cancelled_checkpoint_without_resources
-                    if not cancelled_checkpoint_without_resources(checkpoints['blocked_checkpoints'], repo, canceled['plan_id']):
+                    if not cancelled_checkpoint_without_resources(checkpoints['blocked_checkpoints'], repo, canceled['plan_id'],
+                                                                  block=audit.get('block')):
                         continue
             if checkpoints and 'execution_checkpoints' in checkpoints:
                 checkpoint = checkpoints['execution_checkpoints']

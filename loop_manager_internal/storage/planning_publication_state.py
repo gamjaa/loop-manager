@@ -222,7 +222,8 @@ def apply_mutable_catalog_changes(
                          "cleanup_pending": bool(row["branch"] or row["worktree"]),
                          "cleanup_reason": "취소한 소유 자원의 작업물·PR·writer 안전 재확인 필요"}
         checkpoint_audit = {}
-        for table in ("execution_checkpoints", "blocked_checkpoints"):
+        block_audit = None
+        for table in ("execution_checkpoints", "blocked_checkpoints", "execplan_blocks"):
             if connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,),
             ).fetchone():
@@ -230,7 +231,10 @@ def apply_mutable_catalog_changes(
                     f"SELECT * FROM {table} WHERE repo=? AND plan_id=?", (repo, original.plan_id),
                 ).fetchone()
                 if checkpoint is not None:
-                    checkpoint_audit[table] = dict(checkpoint)
+                    if table == 'execplan_blocks':
+                        block_audit = dict(checkpoint)
+                    else:
+                        checkpoint_audit[table] = dict(checkpoint)
                     connection.execute(
                         f"DELETE FROM {table} WHERE repo=? AND plan_id=?", (repo, original.plan_id),
                     )
@@ -295,6 +299,8 @@ def apply_mutable_catalog_changes(
                               "affected": [], "resolved": {}, "judgment": deletion.judgment}
         if checkpoint_audit:
             audit["checkpoints"] = checkpoint_audit
+        if block_audit is not None:
+            audit['block'] = block_audit
         if maintenance_audit:
             audit['maintenance_cycle'] = maintenance_audit
         connection.execute("UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",
