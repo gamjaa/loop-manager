@@ -796,6 +796,36 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual(tuple(self.connection.iterdump()), before)
 
+    def test_tiered_root_plan_links_preserve_target_and_unknown_ownership_before_erasure(self):
+        from loop_manager_internal.maintenance import tiered_review
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        tiered_review.ensure_schema(self.connection)
+        target = dict(path='legacy', destination='src/legacy', root_review_hash='a' * 64,
+            status='new_plan', plan_id='G-001', plan_path='docs/plans/[G-001] Old.md',
+            plan_hash='b' * 64, reason='Preserve the investigated root tree.')
+        self.connection.execute('INSERT INTO tiered_maintenance_root_plan_links VALUES (?,?,?,?,?)',
+            ('/repo', 1, 'a' * 40, 'b' * 64, json.dumps([target])))
+        self.connection.commit()
+        for links in (json.dumps([target]), 'broken', '{}', '[null]',
+                json.dumps([{**target, 'future_owner': 'unknown'}]),
+                json.dumps([{**target, 'plan_id': 'G-002'}])):
+            with self.subTest(links=links):
+                self.connection.execute('UPDATE tiered_maintenance_root_plan_links SET links_json=?', (links,))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+        independent = {**target, 'plan_id': 'G-002', 'plan_path': 'docs/plans/[G-002] Dependency.md'}
+        self.connection.execute('UPDATE tiered_maintenance_root_plan_links SET links_json=?', (json.dumps([independent]),))
+        self.connection.execute('INSERT INTO tiered_maintenance_root_plan_links VALUES (?,?,?,?,?)',
+            ('/other', 1, 'a' * 40, 'b' * 64, json.dumps([target])))
+        self.connection.commit()
+        retained = [dict(row) for row in self.connection.execute('SELECT * FROM tiered_maintenance_root_plan_links')]
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM tiered_maintenance_root_plan_links')], retained)
+        self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
+
     def test_maintenance_publication_release_or_unattributed_assessment_keeps_erasure_pending(self):
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
         from loop_manager_internal.storage.task_calls import CallDeferred

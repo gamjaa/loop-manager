@@ -398,6 +398,20 @@ _CYCLE_PLAN_ID_FIELDS = (
 def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None:
     """Remove exact task membership in the caller's final-erasure transaction."""
     from .task_calls import CallDeferred
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tiered_maintenance_root_plan_links'").fetchone():
+        from loop_manager_internal.maintenance.maintenance_validation import _plan_id_from_path
+        for row in connection.execute('SELECT links_json FROM tiered_maintenance_root_plan_links WHERE repo=?', (repo,)):
+            try:
+                links = json.loads(row['links_json'])
+                fields = {'path', 'destination', 'root_review_hash', 'status', 'plan_id', 'plan_path', 'plan_hash', 'reason'}
+                if (not isinstance(links, list) or any(not isinstance(item, dict) or set(item) != fields
+                        or not isinstance(item['plan_id'], str) or not isinstance(item['plan_path'], str)
+                        or _plan_id_from_path(item['plan_path']) != item['plan_id'] for item in links)):
+                    raise ValueError('unattributed root plan links')
+            except (TypeError, ValueError, RecursionError) as error:
+                raise CallDeferred('루트 이동 계획 연결의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+            if any(item['plan_id'] == plan_id for item in links):
+                raise CallDeferred('유지보수 루트 이동의 계획 연결이 남아 있어 최종 제거를 보류합니다.')
     if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_cycles'").fetchone():
         return
     cycle = connection.execute('SELECT * FROM maintenance_cycles WHERE repo=?', (repo,)).fetchone()
