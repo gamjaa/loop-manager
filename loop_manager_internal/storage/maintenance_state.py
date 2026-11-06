@@ -531,11 +531,8 @@ class MaintenanceRepository:
                 "SELECT plan_id FROM exec_plans WHERE repo = ?", (repo,)
             )
         }
-        cancelled_plan_ids = ({str(item[0]) for item in self.connection.execute(
-            "SELECT plan_id FROM execplan_cancellations WHERE repo=?", (repo,),
-        )} if self.connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_cancellations'"
-        ).fetchone() else set())
+        from .execplan_catalog_state import cancelled_plan_ids as collect_cancelled_ids
+        cancelled_plan_ids = collect_cancelled_ids(self.connection, repo)
 
         def stored_plan_ids(field: str) -> tuple[str, ...]:
             plan_ids = _decode_plan_ids(row[field], field)

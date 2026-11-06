@@ -30,9 +30,21 @@ from loop_manager_internal.catalog.execplan_catalog import (
 )
 
 
+_CANCELLATION_ID_TABLES = ('execplan_cancellations', 'deleted_plan_ids')
+
+
+def cancelled_plan_ids(connection: sqlite3.Connection, repo: str) -> frozenset[str]:
+    """Read both identity stores without migrating schemas in selection threads."""
+    ids = set()
+    for table in _CANCELLATION_ID_TABLES:
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+            ids.update(str(row[0]) for row in connection.execute(f'SELECT plan_id FROM {table} WHERE repo=?', (repo,)))
+    return frozenset(ids)
+
+
 def is_cancelled(connection: sqlite3.Connection, repo: str, plan_id: str) -> bool:
     """Honor cancellation and final-erasure identities without an execution row."""
-    for table in ('execplan_cancellations', 'deleted_plan_ids'):
+    for table in _CANCELLATION_ID_TABLES:
         if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,),
         ).fetchone() and connection.execute(

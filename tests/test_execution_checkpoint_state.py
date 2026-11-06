@@ -485,6 +485,21 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
 
 
 class CancelledCheckpointTests(unittest.TestCase):
+    def test_cancelled_identity_set_reads_available_tables_without_schema_changes(self):
+        from loop_manager_internal.storage.execplan_catalog_state import cancelled_plan_ids
+        with sqlite3.connect(':memory:') as connection:
+            self.assertEqual(cancelled_plan_ids(connection, 'repo'), frozenset())
+            self.assertEqual(connection.execute('SELECT name FROM sqlite_master').fetchall(), [])
+            for table in ('deleted_plan_ids', 'execplan_cancellations'):
+                connection.execute(f'CREATE TABLE {table} (repo TEXT, plan_id TEXT)')
+                connection.executemany(f'INSERT INTO {table} VALUES (?,?)',
+                    [('repo', 'G-001' if table == 'deleted_plan_ids' else 'G-002'),
+                     ('other-repo', 'G-999')])
+                before = connection.execute('SELECT * FROM sqlite_master').fetchall()
+                self.assertEqual(cancelled_plan_ids(connection, 'repo'),
+                    frozenset({'G-001'} if table == 'deleted_plan_ids' else {'G-001', 'G-002'}))
+                self.assertEqual(connection.execute('SELECT * FROM sqlite_master').fetchall(), before)
+
     def test_local_recovery_requests_cannot_resume_cancelled_or_erased_identity(self):
         from loop_manager_internal.storage import local_recovery_state, deleted_plan_state
         requests = local_recovery_state
@@ -739,6 +754,18 @@ class CancelledCheckpointTests(unittest.TestCase):
         self.assertEqual(dict(store.get('repo', group['group_id'])), dict(group))
         self.assertEqual(store.request(group)['request_id'], 'legacy')
         self.assertEqual(dict(store.request(store.get('repo', other['group_id']))), dict(request))
+        # After final erasure only the ID marker remains; old requests must
+        # still stay out of selection without rewriting either group's audit.
+        from loop_manager_internal.storage import deleted_plan_state
+        deleted_plan_state.ensure_schema(self.connection)
+        self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+        self.connection.executemany('INSERT INTO deleted_plan_ids VALUES (?,?)',
+                                    [('repo', 'G-047'), ('other-repo', 'G-999')])
+        self.connection.commit()
+        self.assertEqual([row['group_id'] for row in store.pending('repo')], [other['group_id']])
+        self.assertEqual(dict(store.get('repo', group['group_id'])), dict(group))
+        self.assertEqual(store.request(group)['request_id'], 'legacy')
+        self.assertEqual(dict(store.request(store.get('repo', other['group_id']))), dict(request))
 
     def test_shared_resource_owner_preserves_both_execution_rows(self):
         from loop_manager_internal.planning.planning_catalog import PlannerValidationError
@@ -806,6 +833,17 @@ class CancelledCheckpointTests(unittest.TestCase):
         audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
         self.assertEqual(audit['maintenance_cycle'], raw)
         self.assertEqual(audit['checkpoints'], self.receipts)
+        from loop_manager_internal.storage import deleted_plan_state
+        deleted_plan_state.ensure_schema(self.connection)
+        self.connection.execute("DELETE FROM execplan_cancellations WHERE repo='repo' AND plan_id='G-047'")
+        self.connection.executemany('INSERT INTO deleted_plan_ids VALUES (?,?)',
+                                    [('repo', 'G-047'), ('other-repo', 'G-999')])
+        self.connection.commit()
+        current = MaintenanceRepository(self.connection).get('repo')
+        for ids in (current.refactoring_plan_ids, current.revalidation_plan_ids, current.assessment_plan_ids):
+            self.assertEqual(ids, ('G-999',))
+        self.assertEqual(current.publication_refactoring_plan_ids, ('G-047', 'G-999'))
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone()), raw)
         rows = store.plan_rows('repo')
         self.assertIsNone(cycle_plan_status_error(rows, current))
         self.assertEqual(select_cycle_ready_execplan(rows, current)['plan_id'], 'G-999')

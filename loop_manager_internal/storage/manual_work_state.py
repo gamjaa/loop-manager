@@ -265,15 +265,14 @@ class ManualWorkRepository:
             "AND source_branch=? AND requirements=?", (repo, branch, json.dumps(sorted(requirements)))).fetchone()
 
     def pending(self, repo):
-        canceled = ("AND NOT EXISTS (SELECT 1 FROM json_each(manual_work_groups.members) m "
-            "JOIN execplan_cancellations c ON c.repo=manual_work_groups.repo AND c.plan_id=m.value) "
-            if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
-                                       "AND name='execplan_cancellations'").fetchone() else "")
+        from .execplan_catalog_state import cancelled_plan_ids
         return self.connection.execute("SELECT * FROM manual_work_groups WHERE repo=? "
             "AND state IN ('GENERATING','REGISTERING','AUTOMATIC') AND request_id IS NOT NULL "
-            + canceled +
+            "AND NOT EXISTS (SELECT 1 FROM json_each(manual_work_groups.members) m "
+            "JOIN json_each(?) c ON c.value=m.value) "
             "ORDER BY (SELECT MIN(r.created_at) FROM manual_work_requests r "
-            "WHERE r.repo=manual_work_groups.repo AND r.group_id=manual_work_groups.group_id), rowid", (repo,)).fetchall()
+            "WHERE r.repo=manual_work_groups.repo AND r.group_id=manual_work_groups.group_id), rowid",
+            (repo, json.dumps(sorted(cancelled_plan_ids(self.connection, repo))))).fetchall()
 
     def create(self, repo, kind, branch, requirements, head, base, *, members=(), documents=()):
         group_id = uuid4().hex
