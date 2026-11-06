@@ -825,7 +825,9 @@ class BlockedPlanReconciler:
                     self.repo, plan_id).operation == 'rebase':
                 remote_before = context['branch_oid']
                 self._remote(context, allow_published=True)
-                if context['branch_oid'] != remote_before:
+                checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, plan_id)
+                if (context['branch_oid'] != remote_before
+                        or checkpoint.observed_remote_oid != context['branch_oid']):
                     # Base incorporation may have paused after work-branch
                     # adoption. Route a proven successor back through adoption
                     # so it can preserve and restart that owned conflict.

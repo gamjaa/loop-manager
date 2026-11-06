@@ -1780,6 +1780,41 @@ class PublishedRebaseReceiptUnitTests(unittest.TestCase):
             coordinator.return_value.reconcile.assert_called_once_with('G-001')
         effects._reconcile_rebase_evidence_block.assert_not_called()
 
+    def test_interrupted_adoption_rechecks_published_head_when_context_already_observed_it(self):
+        from types import SimpleNamespace
+        from tests.support.scoped_recovery import ScopedGateFixture
+        from loop_manager_internal.recovery import blocked_remote_observation
+        fixture=ScopedGateFixture()
+        fixture.addCleanup,fixture.enterContext=self.addCleanup,self.enterContext
+        fixture.setUp()
+        fixture.plan('G-001','PLAN_BLOCKED',branch='loop-manager/G-001')
+        c,repo=fixture.connection,fixture.repo
+        c.execute("UPDATE exec_plans SET worktree='/state/G-001'")
+        scoped_blocking.record_plan_block(c,repo,'G-001',scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID,'cause',None)
+        block=dict(scoped_blocking.plan_block(c,repo,'G-001'))
+        checkpoints=execution_checkpoint_state.ExecutionCheckpointRepository(c)
+        checkpoints.record(repo,'G-001',expected_generation=0,operation='rebase',expected_head='before',
+                           target_base_oid='base',observed_remote_oid='old-lease',snapshot={})
+        c.execute(blocked_remote_observation.SCHEMA)
+        c.execute("INSERT INTO blocked_remote_observations "
+            "(repo,plan_id,registered_origin,base_result,branch_result,branch_oid,observed_at) "
+            "VALUES (?,'G-001','owner/repo','present','present','published-head','now')",(repo,))
+        plan=c.execute('SELECT * FROM exec_plans').fetchone()
+        ports=SimpleNamespace(unmet_execplan_dependencies=mock.Mock(return_value=()),
+                              validate_execplan_workspace_identity=mock.Mock())
+        reconciler=blocked_plan_reconciliation.BlockedPlanReconciler(ports,c,Path('/repo'),Path('/state'),repo,'main')
+        reconciler._save('G-001','old','adopted',{'block':block,'branch_oid':'published-head','input_identity':'old'})
+        with mock.patch.object(blocked_plan_reconciliation,'slot_available',return_value=True), \
+             mock.patch.object(blocked_plan_reconciliation.common_defect_state,'reassessment',return_value=None), \
+             mock.patch.object(blocked_plan_reconciliation.common_defect_state,'unlinked_reports',return_value=[]), \
+             mock.patch.object(reconciler,'_check_owner',return_value=plan), \
+             mock.patch.object(reconciler,'_remote'), \
+             mock.patch.object(reconciler,'_adopt',side_effect=StopIteration) as adopt:
+            with self.assertRaises(StopIteration):
+                reconciler._reconcile('G-001')
+        adopt.assert_called_once()
+        self.assertEqual(c.execute('SELECT stage FROM blocked_plan_reconciliations').fetchone()[0],'observed')
+
     def test_planning_document_match_does_not_require_latest_catalog_commit_in_old_planning(self):
         from types import SimpleNamespace
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
