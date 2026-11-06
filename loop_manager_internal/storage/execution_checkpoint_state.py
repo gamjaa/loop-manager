@@ -4,10 +4,68 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import hashlib
+import re
 import sqlite3
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.git.managed_rebase_validation import valid_acceptance, fingerprint
 from .execplan_catalog_state import is_cancelled
+
+
+def historical_agent_snapshots_match(saved_row, snapshots):
+    """Scope history may refer only to the task workspace proved retired by the caller."""
+    from loop_manager_internal.agents.scope_contracts import GitSnapshot
+    try:
+        for raw in snapshots:
+            if raw is None:
+                continue
+            if not saved_row['branch'] or not saved_row['worktree'] or not isinstance(raw, str):
+                return False
+            scope = GitSnapshot.deserialize(raw)
+            if (scope.branch != 'refs/heads/' + saved_row['branch']
+                    or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', scope.head)):
+                return False
+        return True
+    except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, RecursionError):
+        return False
+
+
+def cancelled_snapshot_without_new_resources(snapshot, repo, plan_id, saved_row):
+    """Recognize owned history; this never grants a stage-result reuse token."""
+    if (not isinstance(snapshot, dict) or set(snapshot) - {
+            'document_revision', 'retired_document_assessment', 'stage_result_origins', 'worker_candidate_token',
+            'retired_agent_scopes'}):
+        return False
+    token = snapshot.get('worker_candidate_token')
+    if token is not None and (not isinstance(token, str) or not re.fullmatch(r'[0-9a-f]{64}', token)):
+        return False
+    origins = snapshot.get('stage_result_origins', {})
+    if not isinstance(origins, dict):
+        return False
+    for identifier, item in origins.items():
+        if (not isinstance(item, dict) or set(item) != {'evidence', 'reason'}
+                or not isinstance(item['reason'], str) or not item['reason'].strip()):
+            return False
+        evidence = item['evidence']
+        if (not isinstance(evidence, dict) or evidence.get('version') != 1
+                or (evidence.get('repo'), evidence.get('plan_id')) != (repo, plan_id)
+                or any(field not in evidence or evidence[field] != saved_row[field]
+                       for field in ('branch', 'worktree', 'pr_url', 'pr_head_oid'))):
+            return False
+        encoded = json.dumps(evidence, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+        if identifier != hashlib.sha256(encoded.encode('utf-8')).hexdigest():
+            return False
+    scopes = snapshot.get('retired_agent_scopes', [])
+    if not isinstance(scopes, list):
+        return False
+    for item in scopes:
+        if (not isinstance(item, dict) or set(item) != {
+                'agent_role', 'agent_snapshot', 'agent_result_snapshot', 'agent_manager_snapshot'}
+                or item['agent_role'] not in (None, 'worker', 'reviewer')
+                or not historical_agent_snapshots_match(saved_row, (item[field] for field in (
+                    'agent_snapshot', 'agent_result_snapshot', 'agent_manager_snapshot')))):
+            return False
+    return True
 
 
 SCHEMA = """

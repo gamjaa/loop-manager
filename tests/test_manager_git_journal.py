@@ -304,6 +304,29 @@ class ManagerGitTransitionTests(unittest.TestCase):
                 effects._tracking_ref_oid.assert_not_called()
                 self.assertEqual({path.name: path.read_bytes() for path in slot.iterdir()}, saved)
 
+    def test_document_worktree_removal_requires_bound_namespace_owner_and_marker(self):
+        import hashlib
+        expected = dict(exists=False, registration=None, index=None)
+        before = dict(exists=True, registration=dict(head=NEW, branch=None, locked=None), index=OLD)
+        for folder, leaf in (('document-revisions', 'a' * 40), ('document-assessments', 'b' * 64)):
+            target = str(Path('/state/worktrees').resolve() / hashlib.sha256(b'/repo').hexdigest()[:16] / folder / 'G-001' / leaf)
+            intent = dict(kind='managed_worktree_remove', owner='plan:G-001', repo='/repo', target=target,
+                          before=before, expected=expected)
+            with self.subTest(folder=folder):
+                self.assertEqual(journal.verified_transition(intent, expected, True), {'refs': {}, 'worktrees': {target: None}})
+                for invalid in ({**intent, 'owner': 'plan:G-002'}, {**intent, 'repo': '/other'},
+                        {**intent, 'kind': 'managed_worktree_create'},
+                        {**intent, 'target': target.replace(folder, 'unowned')},
+                        {**intent, 'target': target.replace('/' + folder + '/', '/' + folder + '/../' + folder + '/')},
+                        {**intent, 'before': {**before, 'registration': {**before['registration'], 'branch': 'refs/heads/other'}}}):
+                    with self.assertRaises(journal.MutationEvidenceError):
+                        journal.verified_transition(invalid, expected, True)
+                with self.assertRaises(journal.MutationEvidenceError):
+                    journal.verified_transition(intent, expected, False)
+                if folder == 'document-assessments':
+                    with self.assertRaises(journal.MutationEvidenceError):
+                        journal.verified_transition({**intent, 'target': str(Path(target).with_name('c' * 40))}, expected, True)
+
     def test_source_local_delta_cannot_become_agent_baseline(self):
         before = {
             "head": OLD, "branch": "main", "changes": [["untracked", "user.txt", "sig"]],

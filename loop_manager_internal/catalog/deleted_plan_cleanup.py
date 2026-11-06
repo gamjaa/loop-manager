@@ -6,13 +6,14 @@ import hashlib
 import shutil
 from types import SimpleNamespace
 from pathlib import Path
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import re
 
 from . import execplan_catalog as catalog
+from . import deleted_document_cleanup
 from loop_manager_internal.recovery.plan_recovery import reserved_workspace_ownership
 from loop_manager_internal.storage import deleted_plan_state, local_recovery_state, runtime_state
-from loop_manager_internal.storage.task_calls import CallDeferred
+from loop_manager_internal.storage.task_calls import CallDeferred, pending_for_plan
 
 
 def resolved_references(plan_id, references, documents):
@@ -174,7 +175,7 @@ def remove_pending_files(connection, repo, state_dir):
     return pending
 
 
-def artifact_paths(connection, repo, row, state_dir):
+def artifact_paths(connection, repo, row, state_dir, *, extra_worktrees=()):
     paths = []
     owner = (repo, row['plan_id'])
     try:
@@ -196,8 +197,8 @@ def artifact_paths(connection, repo, row, state_dir):
             paths.extend((receipt, receipt.with_name(receipt.name.removesuffix('.process.json'))))
         else:
             raise CallDeferred('공유 폴더의 호출 산출물 귀속을 확인할 수 없습니다.')
-    if row['worktree']:
-        paths.append(Path(state_dir) / 'logs' / hashlib.sha256(row['worktree'].encode()).hexdigest()[:16])
+    for workspace in (*((row['worktree'],) if row['worktree'] else ()), *extra_worktrees):
+        paths.append(Path(state_dir) / 'logs' / hashlib.sha256(workspace.encode()).hexdigest()[:16])
     if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='targeted_test_collections'").fetchone():
         for collection in connection.execute('SELECT c.directory FROM targeted_test_collections c '
                 'JOIN agent_invocations a ON a.invocation_id=c.invocation_id WHERE a.repo=? AND a.plan_id=?', owner):
@@ -249,6 +250,39 @@ def _rowless_cancellations(connection, repo, state_dir):
         try:
             audit = json.loads(canceled['recovery_evidence'] or '{}')
             saved = audit['row']
+            started = isinstance(saved, dict) and saved.get('ever_started') == 1
+            historical_fields = {
+                'active_sha', 'validated_base_sha', 'last_error', 'blocked_fingerprint',
+                'blocked_worktree_fingerprint', 'blocked_review_fingerprint', 'worker_session_id',
+                'reviewer_session_id', 'worker_result', 'verify_result', 'review_result',
+                'blocked_reason', 'guidance_plan_hash',
+            } if started else set()
+            retired_workspace = (started and saved.get('workspace_owned') == 1
+                and saved.get('branch') == 'loop-manager/' + canceled['plan_id']
+                and isinstance(saved.get('worktree'), str) and Path(saved['worktree']).is_absolute()
+                and Path(saved['worktree']).name == canceled['plan_id']
+                and Path(saved['worktree']).resolve().parent.parent == Path(state_dir).resolve() / 'worktrees'
+                and not Path(saved['worktree']).is_symlink() and not Path(saved['worktree']).exists())
+            if retired_workspace:
+                historical_fields |= {'branch', 'worktree', 'publication_remote_oid'}
+                from loop_manager_internal.storage.execution_checkpoint_state import historical_agent_snapshots_match
+                if not historical_agent_snapshots_match(saved, (saved[field] for field in (
+                        'agent_snapshot', 'agent_result_snapshot', 'agent_manager_snapshot'))):
+                    continue
+                if saved['agent_input_fingerprint'] is not None and (not isinstance(saved['agent_input_fingerprint'], str)
+                        or not re.fullmatch(r'[0-9a-f]{64}', saved['agent_input_fingerprint'])):
+                    continue
+                if any(saved[field] is not None and (not isinstance(saved[field], str)
+                           or catalog.parse_frontmatter(saved[field]).get('id') != saved['plan_id'])
+                       for field in ('agent_input_plan', 'agent_result_plan')):
+                    continue
+                historical_fields |= {'agent_snapshot', 'agent_result_snapshot', 'agent_manager_snapshot',
+                                      'agent_input_fingerprint', 'agent_input_plan', 'agent_result_plan'}
+            allowed_statuses = {'READY'}
+            if started:
+                allowed_statuses.add('PLAN_BLOCKED')
+            if retired_workspace:
+                allowed_statuses.update(('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'))
             checkpoints = audit.get('checkpoints')
             if checkpoints is not None and not isinstance(checkpoints, dict):
                 continue
@@ -268,30 +302,17 @@ def _rowless_cancellations(connection, repo, state_dir):
                         or checkpoint['repo'] != canceled['repo'] or checkpoint['plan_id'] != canceled['plan_id']
                         or type(checkpoint['generation']) is not int or checkpoint['generation'] < 0
                         or type(checkpoint['workspace_ownership_held']) is not int or checkpoint['workspace_ownership_held'] != 0
-                        or any(checkpoint[field] is not None for field in (
-                            'operation', 'expected_head', 'target_base_oid', 'observed_remote_oid'))
-                        or (checkpoint['snapshot'] is not None and json.loads(checkpoint['snapshot']) != {})):
+                        or checkpoint['operation'] is not None
+                        or any(checkpoint[field] is not None and (not retired_workspace
+                            or not isinstance(checkpoint[field], str)
+                            or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', checkpoint[field]))
+                            for field in ('expected_head', 'target_base_oid', 'observed_remote_oid'))):
                     continue
-            started = isinstance(saved, dict) and saved.get('ever_started') == 1
-            historical_fields = {
-                'active_sha', 'validated_base_sha', 'last_error', 'blocked_fingerprint',
-                'blocked_worktree_fingerprint', 'blocked_review_fingerprint', 'worker_session_id',
-                'reviewer_session_id', 'worker_result', 'verify_result', 'review_result',
-                'blocked_reason', 'guidance_plan_hash',
-            } if started else set()
-            retired_workspace = (started and saved.get('workspace_owned') == 1
-                and saved.get('branch') == 'loop-manager/' + canceled['plan_id']
-                and isinstance(saved.get('worktree'), str) and Path(saved['worktree']).is_absolute()
-                and Path(saved['worktree']).name == canceled['plan_id']
-                and Path(saved['worktree']).resolve().parent.parent == Path(state_dir).resolve() / 'worktrees'
-                and not Path(saved['worktree']).is_symlink() and not Path(saved['worktree']).exists())
-            if retired_workspace:
-                historical_fields |= {'branch', 'worktree', 'publication_remote_oid'}
-            allowed_statuses = {'READY'}
-            if started:
-                allowed_statuses.add('PLAN_BLOCKED')
-            if retired_workspace:
-                allowed_statuses.update(('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'))
+                snapshot = json.loads(checkpoint['snapshot']) if checkpoint['snapshot'] is not None else {}
+                from loop_manager_internal.storage.execution_checkpoint_state import cancelled_snapshot_without_new_resources
+                if not cancelled_snapshot_without_new_resources(snapshot, repo, canceled['plan_id'], saved):
+                    continue
+                deleted_document_cleanup.document_resources(snapshot, state_dir, repo, canceled['plan_id'])
             judgment = audit.get('judgment')
             decision = judgment.get('decision') if isinstance(judgment, dict) else None
             decision = decision if isinstance(decision, dict) else {}
@@ -444,7 +465,7 @@ def _rowless_ownership(connection, state_dir, repo, row, canceled):
 
 
 def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, pr_for_branch, state_dir, revision_is_current,
-            assess_cleanup=None, remove_cleanup_worktree=None):
+            assess_cleanup=None, remove_cleanup_worktree=None, recover_cleanup_worktree=None):
     """Observe outside the DB writer; recheck under task resource leases before erasure."""
     remove_pending_files(connection, repo, state_dir)
     if pinned.regular_paths is None or pr_for_branch is None:
@@ -494,25 +515,20 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
         try:
             lease = (reserved_workspace_ownership(connection, state_dir, repo, key) if canceled is None
                      else _rowless_ownership(connection, state_dir, repo, row, canceled))
-            with lease as ownership:
+            with lease as ownership, ExitStack() as document_leases:
+                document_cleanup = None
                 def check_ownership():
                     ownership.check()
+                    if pending_for_plan(connection, repo, key):
+                        raise CallDeferred('삭제 전에 실제 호출 종료·결과 인계·예약 반환을 확인해야 합니다.')
+                    if document_cleanup is not None:
+                        document_cleanup.check()
                     for other, expected in related_rows.items():
                         current = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, other)).fetchone()
                         if current is None or dict(current) != expected:
                             raise CallDeferred('삭제 대상의 참조 복구 row가 관측 중 변경됐습니다.')
                 if not revision_is_current():
                     continue
-                # stage_documents owns these exact per-task namespaces. A saved
-                # document worktree must not lose its DB cleanup evidence first.
-                managed = Path(state_dir).resolve() / 'worktrees' / hashlib.sha256(repo.encode()).hexdigest()[:16]
-                document_roots = [managed / folder / key for folder in ('document-revisions', 'document-assessments')]
-                try:
-                    if any(any(parent.is_symlink() for parent in (root, *root.parents) if parent != Path(state_dir).resolve())
-                            or root.exists() and (not root.is_dir() or any(root.iterdir())) for root in document_roots):
-                        continue
-                except OSError as error:
-                    raise CallDeferred('전용 문서 사본의 현재 정리 상태를 확인할 수 없습니다.') from error
                 if canceled is not None:
                     canonical = 'loop-manager/' + key
                     try:
@@ -540,11 +556,16 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                 if has_pending_project_mutation(Path(state_dir), repo, targets={row['worktree'], row['branch']}):
                     continue
                 if canceled is not None and has_pending_project_mutation(Path(state_dir), repo,
-                        recoverable=lambda intent: intent['owner'] != 'plan:' + key):
+                        recoverable=lambda intent: (intent['owner'] != 'plan:' + key or recover_cleanup_worktree is not None
+                            and deleted_document_cleanup.removal_recoverable(connection, state_dir, repo, key, canceled, intent))):
                     continue
                 # shortcut: surviving remote refs stay pending until lease-aware deletion is available.
                 if row['branch'] and git(repo_path, 'ls-remote', '--heads', 'origin', f"refs/heads/{row['branch']}").stdout.strip():
                     continue
+                document_cleanup = document_leases.enter_context(deleted_document_cleanup.cleaned_documents(
+                    connection, state_dir, repo_path, repo, key, canceled, git=git,
+                    assess_cleanup=assess_cleanup, remove_cleanup_worktree=remove_cleanup_worktree,
+                    recover_cleanup_worktree=recover_cleanup_worktree, check_owner=check_ownership))
                 if row['branch']:
                     registrations = git(repo_path, 'worktree', 'list', '--porcelain').stdout.split('\n\n')
                     if any(f"branch refs/heads/{row['branch']}" in block.splitlines()
@@ -583,13 +604,7 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                 if not revision_is_current():
                     continue
                 check_ownership()
-                for root in document_roots:
-                    if root.exists():
-                        try:
-                            root.rmdir()  # Empty native namespace only; no recursive worktree deletion.
-                        except OSError as error:
-                            raise CallDeferred('전용 문서 사본의 정리가 아직 끝나지 않았습니다.') from error
-                artifacts = artifact_paths(connection, repo, row, state_dir)
+                artifacts = artifact_paths(connection, repo, row, state_dir, extra_worktrees=document_cleanup.worktrees)
                 with runtime_state._transaction(connection):
                     check_ownership()
                     for other, dependencies in resolved.items():

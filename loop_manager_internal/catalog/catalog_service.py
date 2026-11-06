@@ -411,6 +411,7 @@ class ReconcileExecplanCatalogEffects:
     pr_for_branch: Callable[..., object] | None = None
     assess_cleanup: Callable[..., object] | None = None
     remove_cleanup_worktree: Callable[..., object] | None = None
+    recover_cleanup_worktree: Callable[..., object] | None = None
     validate_managed_worktree: Callable[..., object] | None = None
     git_operation_entries: Callable[..., object] | None = None
 
@@ -471,6 +472,7 @@ def reconcile_execplan_catalog(
                     git_bytes=port._effects.git_bytes, pr_for_branch=effects.pr_for_branch,
                     state_dir=Path(state_file).parent, assess_cleanup=effects.assess_cleanup,
                     remove_cleanup_worktree=effects.remove_cleanup_worktree,
+                    recover_cleanup_worktree=effects.recover_cleanup_worktree,
                     revision_is_current=lambda: port.current_revision() == pinned.revision_sha):
                 port.loaded = None
                 pinned = port.load()

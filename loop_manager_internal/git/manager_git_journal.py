@@ -556,11 +556,22 @@ def verified_transition(
         plan_id = (branch.removeprefix("refs/heads/loop-manager/")
                    if isinstance(branch, str)
                    and branch.startswith("refs/heads/loop-manager/") else None)
+        workspace = Path(target)
+        owner_id = str(intent.get('owner', '')).removeprefix('plan:')
+        document_remove = (kind == 'managed_worktree_remove' and isinstance(registration, dict)
+            and branch is None and re.fullmatch(r'G-\d+', owner_id)
+            and workspace.is_absolute() and '..' not in workspace.parts
+            and workspace.parent.name == owner_id
+            and workspace.parent.parent.name in {'document-revisions', 'document-assessments'}
+            and workspace.parent.parent.parent.name == hashlib.sha256(str(intent.get('repo', '')).encode()).hexdigest()[:16]
+            and workspace.parent.parent.parent.parent.name == 'worktrees'
+            and re.fullmatch(r'[0-9a-f]{64}' if workspace.parent.parent.name == 'document-assessments'
+                             else r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', workspace.name)
+            and isinstance(registration.get('head'), str) and oid.fullmatch(registration['head']))
         valid = (
             set(before) == set(expected) == {"exists", "registration", "index"}
-            and plan_id is not None and re.fullmatch(r"G-\d+", plan_id)
-            and intent.get("owner") == f"plan:{plan_id}"
-            and Path(target).name == plan_id
+            and (document_remove or (plan_id is not None and re.fullmatch(r"G-\d+", plan_id)
+                and intent.get("owner") == f"plan:{plan_id}" and workspace.name == plan_id))
             and (kind != "managed_worktree_create" or (
                 before == {"exists": False, "registration": None, "index": None}
                 and expected["exists"] is True
