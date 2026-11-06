@@ -398,7 +398,19 @@ class PlanningSelectionService(PlanningService):
         except (MaintenancePlanningError, maintenance_state.MaintenanceStateError) as error:
             return self._maintenance_error(run, error)
         if previous_phase is not maintenance_state.MaintenancePhase.IDLE and cycle.phase is maintenance_state.MaintenancePhase.IDLE:
-            self._ports.events.log(f"유지보수 마지막 Merge 확인·cycle 종료: 다음 주기 기준={cycle.last_cycle_merged_count}, 일반 작업으로 복귀합니다.")
+            rows = self._ports.state.execplan_rows(context.repo)
+            try:
+                scope = cycle_scope_plan_ids(rows, cycle)
+                if not scope and not cycle.cancelled_scope_plan_ids:
+                    raise MaintenanceOrchestrationError('종료 범위를 확인할 수 없습니다.')
+                statuses = {str(item['plan_id']): str(item['status']) for item in rows}
+                merged = [plan_id for plan_id in scope if statuses.get(plan_id) == 'MERGED']
+                if len(merged) != len(scope):
+                    raise MaintenanceOrchestrationError('종료 후 범위 관측이 변경됐습니다.')
+                facts = f"범위 내 실제 Merge={', '.join(merged) or '없음'}, 확정 취소={', '.join(cycle.cancelled_scope_plan_ids) or '없음'}"
+            except MaintenanceOrchestrationError:
+                facts = "종료 범위의 Merge·취소 상세 미확인"
+            self._ports.events.log(f"유지보수 cycle 종료: {facts}, 남은 범위 없음, 다음 주기 기준={cycle.last_cycle_merged_count}, 일반 작업으로 복귀합니다.")
         if run.error_input_changed:
             run.maintenance_planning = cycle.phase in {
                 maintenance_state.MaintenancePhase.ASSESSMENT,

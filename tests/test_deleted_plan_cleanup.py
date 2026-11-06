@@ -1806,6 +1806,65 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual(dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone()), before)
 
+    def test_cancelled_and_merged_scope_waits_for_dependency_then_returns_to_ready(self):
+        import loop_manager
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        from tests.support.maintenance_cycle_case import MaintenanceCycleCase
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute('INSERT INTO maintenance_cycles '
+            '(repo,phase,refactoring_plan_ids,last_success_commit,full_assessment_result) '
+            "VALUES ('/repo','refactoring','[\"G-001\",\"G-002\"]','original',?)",
+            (self.assessment_report(('G-001', 'G-002')),))
+        self.connection.commit()
+        self.rowless_cancellation()
+        audit = tuple(self.connection.execute("SELECT * FROM execplan_cancellations WHERE plan_id='G-001'").fetchone())
+        self.connection.execute("UPDATE exec_plans SET status='READY', depends_on='[\"G-003\"]' WHERE repo='/repo' AND plan_id='G-002'")
+        MaintenanceCycleCase._insert_plan(self.connection, '/repo', 'G-003')
+        MaintenanceCycleCase._insert_plan(self.connection, '/repo', 'G-099')
+        source = 'c' * 40
+        self.connection.execute('INSERT INTO execplan_catalog_views(repo,revision_sha,fingerprint,validation_kind) '
+            "VALUES (?,?,?,'full') ON CONFLICT(repo) DO UPDATE SET revision_sha=excluded.revision_sha",
+            ('/repo', source, 'confirmed-catalog'))
+        active = store.get('/repo')
+        receipt = active.full_assessment_result
+        self.assertEqual(loop_manager._advance_maintenance_cycle_after_merges(self.connection, '/repo', source), active)
+        self.assertEqual(loop_manager.catalog_schedule_decision(self.connection, '/repo').runnable_ready['plan_id'], 'G-003')
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE repo='/repo' AND plan_id='G-003'")
+        self.assertEqual(loop_manager._advance_maintenance_cycle_after_merges(self.connection, '/repo', source), active)
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE repo='/repo' AND plan_id='G-002'")
+        from pathlib import Path
+        from unittest import mock
+        from loop_manager_internal.planning import planning_runtime
+        from loop_manager_internal.notifications import repository as notification_repository
+        from tests.support.planning_case import FakePorts, planning_snapshot
+        notification_repository.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO notification_outbox(event_key,repo,event_type,payload,sent_at,confirmed_pieces) "
+            "VALUES ('existing-pr','/repo','pr_open','{}','sent',1)")
+        self.connection.execute("INSERT INTO notification_outbox(event_key,repo,event_type,payload,canceled_at) "
+            "VALUES ('existing-question','/repo','draft_decisions','{}','canceled')")
+        notices = [tuple(row) for row in self.connection.execute('SELECT * FROM notification_outbox ORDER BY event_key')]
+        ports = FakePorts(planning_snapshot(), active)
+        ports.state.advance_maintenance_cycle = mock.Mock(side_effect=lambda repo, sha:
+            loop_manager._advance_maintenance_cycle_after_merges(self.connection, repo, sha))
+        ports.state.execplan_rows = mock.Mock(side_effect=store.plan_rows)
+        context = planning_runtime.PlanningContext(repo='/repo', repo_path=Path('/repo'), state_dir=Path('/state'),
+            base_branch='main', base_sha=source, provider='codex', config_path=Path('/config.ini'), registered_only=True,
+            refactoring_review_interval=20)
+        coordinator = planning_runtime.PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(context)
+        run.error_input_changed = True
+        coordinator._selection._select_planning_work(run)
+        finished = run.maintenance_cycle
+        self.assertIn('실제 Merge=G-002, G-003, 확정 취소=G-001', ports.events.messages[-1][1])
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual([tuple(row) for row in self.connection.execute('SELECT * FROM notification_outbox ORDER BY event_key')], notices)
+        self.assertEqual((finished.phase.value, finished.last_cycle_commit, finished.last_cycle_merged_count), ('idle', source, 2))
+        self.assertEqual((finished.last_success_commit, finished.full_assessment_result), ('original', receipt))
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()), audit)
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE repo='/repo' AND plan_id='G-001'").fetchone())
+        self.assertEqual(loop_manager.catalog_schedule_decision(self.connection, '/repo').runnable_ready['plan_id'], 'G-099')
+        self.assertEqual(loop_manager._advance_maintenance_cycle_after_merges(self.connection, '/repo', source), finished)
+
     def test_last_cancelled_cycle_link_survives_until_verified_completion_before_erasure(self):
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
         from loop_manager_internal.maintenance import cycle_service, maintenance_orchestration
