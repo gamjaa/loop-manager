@@ -19,6 +19,74 @@ from tests.support.database import runtime_connection
 
 
 class RecoveryRepositoryTests(unittest.TestCase):
+    def test_cancelled_and_erased_subjects_cannot_replay_recovery_or_persistent_failure(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repository = RecoveryRepository(connection)
+        deleted_plan_state.ensure_schema(connection)
+        target = replace(self.observation(), plan_id='G-047')
+        begin_external_run(connection, 'original-run')
+        for observation in (target, replace(target, plan_id='G-048'),
+                            replace(target, repo='other'), replace(target, plan_id=None)):
+            repository.observe(observation)
+        connection.execute("INSERT INTO execplan_cancellations "
+            "(repo,plan_id,path,title,sources,depends_on,complexity,risk,priority,content_hash,plan_sha,deletion_commit) "
+            "SELECT repo,plan_id,path,title,sources,depends_on,'low','low',priority,content_hash,plan_sha,'deleted' "
+            "FROM exec_plans WHERE plan_id='G-047'")
+        connection.commit()
+        for erased in (False, True):
+            with self.subTest(erased=erased):
+                if erased:
+                    deleted_plan_state.forget(connection, 'repo', 'G-047')
+                before = tuple(connection.iterdump())
+                with self.assertRaisesRegex(RecoveryStateConflict, '취소·최종 삭제'):
+                    repository.observe(replace(target, detail='late failure', progress_marker='late-input'))
+                for subject in ('G-047', 'plan:G-047'):
+                    repository._record_external_failure('repo', subject, phase='IMPLEMENTING',
+                        reason_code=target.reason.value, fingerprint='late', progress_marker='late',
+                        disposition='state_reconcile', detail='late failure', recovery_attempts='{}', run_id='late-run')
+                self.assertEqual(tuple(connection.iterdump()), before)
+                self.assertFalse(connection.in_transaction)
+                connection.execute("INSERT INTO manager_metadata VALUES ('caller-pending','retained')")
+                with self.assertRaises(RecoveryStateConflict):
+                    repository.observe(target)
+                self.assertTrue(connection.in_transaction)
+                self.assertEqual(connection.execute("SELECT value FROM manager_metadata WHERE key='caller-pending'").fetchone()[0], 'retained')
+                connection.rollback()
+                self.assertEqual(tuple(connection.iterdump()), before)
+
+    def test_erasure_between_recovery_observation_and_writer_reservation_is_rechecked(self):
+        from loop_manager_internal.storage import deleted_plan_state, execplan_catalog_state
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'recovery.db'
+            connection = sqlite3.connect(path)
+            connection.row_factory = sqlite3.Row
+            self.addCleanup(connection.close)
+            repository = RecoveryRepository(connection)
+            deleted_plan_state.ensure_schema(connection)
+            connection.commit()
+            other = sqlite3.connect(path)
+            self.addCleanup(other.close)
+            check = execplan_catalog_state.is_cancelled
+            observed = []
+            def mark_after_read(current, repo, plan_id):
+                canceled = check(current, repo, plan_id)
+                if not observed:
+                    self.assertFalse(current.in_transaction)
+                    with other:
+                        other.execute('INSERT INTO deleted_plan_ids VALUES (?,?)', (repo, plan_id))
+                    observed.append(True)
+                return canceled
+            with mock.patch.object(execplan_catalog_state, 'is_cancelled', side_effect=mark_after_read):
+                with self.assertRaisesRegex(RecoveryStateConflict, '취소·최종 삭제'):
+                    repository.observe(self.observation())
+            self.assertEqual(observed, [True])
+            self.assertFalse(connection.in_transaction)
+            self.assertEqual(connection.execute('SELECT count(*) FROM recovery_records').fetchone()[0], 0)
+            self.assertEqual(connection.execute('SELECT count(*) FROM persistent_execution_failures').fetchone()[0], 0)
+            self.assertEqual(tuple(connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('repo', 'G-042'))
+
     def test_conflict_dispatch_observes_outside_write_and_rolls_back_failed_owner_commit(self):
         from tests.support.pr_recovery import prepared_conflict_assessment
         connection = runtime_connection()

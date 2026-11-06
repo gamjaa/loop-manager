@@ -295,6 +295,23 @@ class RecoveryStateConflict(RuntimeError):
     """Another process changed the selected recovery record."""
 
 
+def _reserve_live_recovery_subject(connection, repo, plan_id):
+    if plan_id is None:
+        return True
+    from .execplan_catalog_state import is_cancelled
+    if is_cancelled(connection, repo, plan_id):
+        return False
+    started = not connection.in_transaction
+    if started:
+        # Reserve before rechecking identity; leave commit with the existing caller.
+        connection.execute('BEGIN IMMEDIATE')
+    if is_cancelled(connection, repo, plan_id):
+        if started:
+            connection.rollback()
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class RecoveryRecord:
     generation: int
@@ -395,6 +412,8 @@ class RecoveryRepository:
             json.dumps(evidence, sort_keys=True, ensure_ascii=False)
             if evidence is not None else None,
         )
+        if not _reserve_live_recovery_subject(self.connection, observation.repo, observation.plan_id):
+            raise RecoveryStateConflict('취소·최종 삭제된 작업의 복구 관측을 저장할 수 없습니다.')
         if previous is None:
             try:
                 self.connection.execute(
@@ -660,6 +679,9 @@ class RecoveryRepository:
     ) -> None:
         """Durably project one observed failure, once per external run."""
 
+        plan_id = None if subject == '__project__' else subject.removeprefix('plan:')
+        if not _reserve_live_recovery_subject(self.connection, repo, plan_id):
+            return
         previous = self.connection.execute(
             "SELECT episode, phase, reason_code, fingerprint, progress_marker, "
             "consecutive_runs, active, notification_queued, last_run_id "

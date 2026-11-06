@@ -1101,6 +1101,8 @@ SQLite 안의 phase·소유 정보 확정과 Git·journal 파일의 실행 효�
 | 수동 준비·제출의 게시 중단 | 아래의 소유 intent·후보·원격 OID·후속 계보로 게시 사실을 재확인한다. 완료 receipt는 보존하며 제거된 후보를 새 lease·대체 후보로 다시 게시하지 않는다. |
 
 
+작업 범위의 복구 관측 저장과 지속 실패 투영은 첫 SQL 쓰기 전에 공통 취소/최종 삭제 ID를 확인한다. 기존 transaction이 없으면 BEGIN IMMEDIATE로 writer를 예약한 뒤 ID를 다시 읽어, 조회와 예약 사이에 확정된 삭제도 거부한다. commit은 기존 호출자에게 맡기며, 직접 예약한 writer의 거부만 rollback하고 호출자 transaction의 변경은 건드리지 않는다. observe는 기존 RecoveryStateConflict로 상태 변경을 알리고 지속 실패의 늦은 투영은 저장 없이 반환해 일반 취소의 기존 감사·episode·오류를 보존한다. `plan:<G ID>` 과거 실패 subject도 같은 작업 ID로 대조한다. 프로젝트 범위와 다른 repository의 같은 ID는 이 작업별 거부 대상이 아니며, 삭제를 복구/실패 해소 성공으로 합성하지 않는다.
+
 복구 관측은 안정적인 원인 code와 repository·plan ID·phase·plan/base revision·진단 fingerprint·진전 marker를 기록한다. 복구 disposition은 `transient_retry`·`state_reconcile`·`agent_correction`·`condition_wait`·`user_action_required`이며 차단 scope와 별도로 판단한다. 원인별 같은 실행의 시도 한도에 도달하면 작업을 보존해 일시 중단하고, 최종 사용자 조치 판정에만 원인 code로 scope를 결합한다. 최종 차단 transaction은 판정의 repository·plan·원인 일치를 검증하며 복구 횟수·마지막 안정 revision·남은 불확실성·실제 조치 대상을 보존한다. 일시 중단은 차단용 게시·알림을 만들지 않고, 최종 차단의 게시·알림은 [차단 작업의 원격 반영과 보존](#차단-작업의-원격-반영과-보존)을 따른다.
 
 rebase 교정 묶음의 소진은 `recovery_records`에 `rebase_conflict/condition_wait/pause`로 저장한다. 대기 fingerprint는 현재 구현 조건·소유 target/원래 HEAD·충돌 stages의 지문, 실행 base·PR URL/head·충돌 복구 head/base OID와 checkpoint·소유 rebase service·원본 byte reader의 가용성에 결합하며, 별도 progress marker는 파일 내용·staged diff·operation 위치·autostash를 구별한다. Worker 진입은 저장된 결과를 먼저 소비하고 진행 중 turn이 없는 동일 대기에서는 새 turn·Agent 호출을 만들지 않는다. session·재시작·시간 경과만으로 지문을 바꾸지 않으며, 실제 입력·파일 진전·복구 자원이 달라지면 기존 소유권·실행 gate에서 다시 판단한다. 파일별 복원 결과의 `paths`에서 `skipped_user_changes`를 뺀 실제 적용 범위가 있어야 재작업으로 전환한다.
