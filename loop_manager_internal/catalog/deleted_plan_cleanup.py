@@ -200,6 +200,23 @@ def _unowned_cancellations(connection, repo):
         try:
             audit = json.loads(canceled['recovery_evidence'] or '{}')
             saved = audit['row']
+            checkpoints = audit.get('checkpoints')
+            if checkpoints is not None and not isinstance(checkpoints, dict):
+                continue
+            if checkpoints:
+                if not isinstance(checkpoints, dict) or set(checkpoints) != {'execution_checkpoints'}:
+                    continue
+                checkpoint = checkpoints['execution_checkpoints']
+                if (not isinstance(checkpoint, dict) or set(checkpoint) != {
+                        'repo', 'plan_id', 'generation', 'operation', 'expected_head', 'target_base_oid',
+                        'observed_remote_oid', 'snapshot', 'workspace_ownership_held'}
+                        or checkpoint['repo'] != canceled['repo'] or checkpoint['plan_id'] != canceled['plan_id']
+                        or type(checkpoint['generation']) is not int or checkpoint['generation'] < 0
+                        or type(checkpoint['workspace_ownership_held']) is not int or checkpoint['workspace_ownership_held'] != 0
+                        or any(checkpoint[field] is not None for field in (
+                            'operation', 'expected_head', 'target_base_oid', 'observed_remote_oid'))
+                        or (checkpoint['snapshot'] is not None and json.loads(checkpoint['snapshot']) != {})):
+                    continue
             started = isinstance(saved, dict) and saved.get('ever_started') == 1
             historical_fields = {
                 'active_sha', 'validated_base_sha', 'last_error', 'blocked_fingerprint',
@@ -229,7 +246,7 @@ def _unowned_cancellations(connection, repo):
                            for field in ('verify_failure_history', 'review_failure_history', 'review_level_history'))
                     or any(saved[field] is not None for field in _MUTABLE_READY_EVIDENCE_FIELDS if field not in historical_fields)
                     or any(saved[field] is not None for field in ('pr_conflict_head_oid', 'pr_conflict_base_oid'))
-                    or audit.get('checkpoints') or audit.get('cleanup_pending')
+                    or audit.get('cleanup_pending')
                     or any(saved[field] != canceled[field] for field in (
                         'repo', 'plan_id', 'path', 'title', 'sources', 'depends_on', 'priority', 'content_hash'))
                     or (saved['current_revision_sha'] or saved['plan_sha']) != canceled['plan_sha']
