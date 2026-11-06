@@ -33,6 +33,8 @@ def forget(connection, repo, plan_id, *, artifacts=()):
             raise ValueError('수동 소유 작업은 자동 제거할 수 없습니다.')
         from .common_defect_state import assert_plan_erasure_available
         assert_plan_erasure_available(connection, repo, plan_id)
+        from .maintenance_state import forget_plan as forget_maintenance_plan
+        forget_maintenance_plan(connection, repo, plan_id)
         if 'execplan_archive_observations' in tables:
             resources = {plan[key] for key in ('branch', 'worktree') if plan is not None and plan[key]}
             owner_column = 'owner_plan_id' in tables['execplan_archive_observations']

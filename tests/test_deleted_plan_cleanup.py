@@ -9,6 +9,77 @@ from tests.support.catalog import catalog_reconciliation_fixture
 
 
 class DeletedPlanCleanupTest(unittest.TestCase):
+    def test_maintenance_erasure_prunes_exact_membership_and_target_allocations_atomically(self):
+        import sqlite3
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        store = MaintenanceRepository(self.connection)
+        fields = ('prerequisite_plan_ids', 'refactoring_plan_ids', 'assessment_plan_ids', 'revalidation_plan_ids',
+                  'publication_refactoring_plan_ids', 'publication_revalidation_plan_ids')
+        allocations = [
+            ['docs/plans/[G-009] Deleted.md', 'G-009', 'docs/plans/[G-001] Deleted.md', 'G-001'],
+            ['docs/plans/[G-001] Independent.md', 'G-001', 'docs/plans/[G-002] Independent.md', 'G-002'],
+        ]
+        self.connection.execute('INSERT INTO maintenance_cycles (repo,phase,cycle_id,cycle_request_id,'
+            'consumed_request_id,last_success_commit,last_success_merged_count,last_cycle_commit,last_cycle_merged_count,'
+            'revision,publication_id_allocations,' + ','.join(fields) + ') '
+            "VALUES ('/repo','refactoring','cycle','request','consumed','assessed',4,'previous',2,7,?" + ',?' * len(fields) + ')',
+            (json.dumps(allocations), *([json.dumps(['G-001', 'G-002'])] * len(fields))))
+        self.connection.execute("INSERT INTO projects (repo,base_branch) VALUES ('/other','main')")
+        self.connection.execute("INSERT INTO maintenance_cycles (repo,refactoring_plan_ids) VALUES ('/other','[\"G-001\"]')")
+        self.connection.commit()
+        original = dict(self.connection.execute("SELECT * FROM maintenance_cycles WHERE repo='/repo'").fetchone())
+        foreign = dict(self.connection.execute("SELECT * FROM maintenance_cycles WHERE repo='/other'").fetchone())
+        self.connection.execute("CREATE TRIGGER reject_maintenance_erasure BEFORE DELETE ON exec_plans "
+                                "BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        with self.assertRaises(sqlite3.IntegrityError):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute('DROP TRIGGER reject_maintenance_erasure')
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        current = dict(self.connection.execute("SELECT * FROM maintenance_cycles WHERE repo='/repo'").fetchone())
+        for field in fields:
+            self.assertEqual(json.loads(current[field]), ['G-002'])
+        self.assertEqual(json.loads(current['publication_id_allocations']), [allocations[1]])
+        self.assertEqual(current['revision'], original['revision'] + 1)
+        for field in set(original) - {*fields, 'publication_id_allocations', 'revision', 'updated_at'}:
+            self.assertEqual(current[field], original[field])
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM maintenance_cycles WHERE repo='/other'").fetchone()), foreign)
+        self.assertEqual(store.get('/repo').refactoring_plan_ids, ('G-002',))
+        before = tuple(self.connection.iterdump())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+
+    def test_maintenance_publication_release_or_unattributed_assessment_keeps_erasure_pending(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        MaintenanceRepository(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles (repo,phase,refactoring_plan_ids) "
+                                "VALUES ('/repo','refactoring','[\"G-001\"]')")
+        for stage, release, assessment, ids in (
+            ('prepared', None, None, '["G-001"]'), ('remote_confirmed', None, None, '["G-001"]'),
+            (None, 'release', None, '["G-001"]'), (None, None, 'saved assessment', '["G-001"]'),
+            (None, None, None, 'broken JSON'),
+        ):
+            with self.subTest(stage=stage, release=release, assessment=assessment, ids=ids):
+                self.connection.execute('UPDATE maintenance_cycles SET publication_stage=?,legacy_release_identity=?,'
+                    'full_assessment_result=?,refactoring_plan_ids=? WHERE repo=?', (stage, release, assessment, ids, '/repo'))
+                self.connection.commit()
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("UPDATE maintenance_cycles SET refactoring_plan_ids='[\"G-001\"]'")
+        self.connection.commit()
+        before = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        after = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
+        self.assertEqual(json.loads(after['refactoring_plan_ids']), [])
+        self.assertEqual(after['phase'], before['phase'])
+        self.assertEqual(after['last_cycle_merged_count'], before['last_cycle_merged_count'])
+        self.assertEqual(after['last_success_commit'], before['last_success_commit'])
+
     def test_live_common_correction_link_requires_same_goal_successor_before_erasure(self):
         from loop_manager_internal.storage import validation_feedback_state
         from loop_manager_internal.storage.task_calls import CallDeferred

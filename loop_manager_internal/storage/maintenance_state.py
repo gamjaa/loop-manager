@@ -387,6 +387,43 @@ def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
         connection.execute(f"RELEASE {savepoint}")
 
 
+_CYCLE_PLAN_ID_FIELDS = (
+    'prerequisite_plan_ids', 'refactoring_plan_ids', 'revalidation_plan_ids', 'assessment_plan_ids',
+    'publication_refactoring_plan_ids', 'publication_revalidation_plan_ids',
+)
+
+
+def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None:
+    """Remove exact task membership in the caller's final-erasure transaction."""
+    from .task_calls import CallDeferred
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='maintenance_cycles'").fetchone():
+        return
+    cycle = connection.execute('SELECT * FROM maintenance_cycles WHERE repo=?', (repo,)).fetchone()
+    if cycle is None:
+        return
+    changes = {}
+    try:
+        for field in _CYCLE_PLAN_ID_FIELDS:
+            if field in cycle.keys() and plan_id in _decode_plan_ids(cycle[field], field):
+                changes[field] = json.dumps([key for key in json.loads(cycle[field]) if key != plan_id], separators=(',', ':'))
+        if 'publication_id_allocations' in cycle.keys():
+            allocations = _decode_publication_id_allocations(cycle['publication_id_allocations'])
+            if any(item[3] == plan_id for item in allocations):
+                changes['publication_id_allocations'] = json.dumps(
+                    [item for item in json.loads(cycle['publication_id_allocations']) if item[3] != plan_id], separators=(',', ':'))
+    except MaintenanceStateError as error:
+        raise CallDeferred('유지보수 공유 목록의 삭제 대상 귀속을 확인할 수 없습니다.') from error
+    if not changes:
+        return
+    if (cycle['publication_stage'] is not None
+            or 'legacy_release_identity' in cycle.keys() and cycle['legacy_release_identity'] is not None):
+        raise CallDeferred('유지보수 게시·workspace 해제 intent의 종료 전에 공유 기록을 제거할 수 없습니다.')
+    if cycle['full_assessment_result']:
+        raise CallDeferred('유지보수 평가 원문의 대상별 귀속 분리가 필요합니다.')
+    connection.execute('UPDATE maintenance_cycles SET ' + ', '.join(field + '=?' for field in changes)
+        + ', revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE repo=?', (*changes.values(), repo))
+
+
 def cycle_for_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> sqlite3.Row | None:
     """Read current ownership and audit without creating or migrating a cycle."""
     if not connection.execute(
@@ -394,10 +431,7 @@ def cycle_for_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> s
     ).fetchone():
         return None
     cycle = connection.execute('SELECT * FROM maintenance_cycles WHERE repo=?', (repo,)).fetchone()
-    if cycle is not None and any(plan_id in json.loads(cycle[field]) for field in (
-        'prerequisite_plan_ids', 'refactoring_plan_ids', 'revalidation_plan_ids', 'assessment_plan_ids',
-        'publication_refactoring_plan_ids', 'publication_revalidation_plan_ids',
-    ) if field in cycle.keys()):
+    if cycle is not None and any(plan_id in json.loads(cycle[field]) for field in _CYCLE_PLAN_ID_FIELDS if field in cycle.keys()):
         return cycle
     return None
 
