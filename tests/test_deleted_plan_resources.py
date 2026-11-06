@@ -12,11 +12,11 @@ from loop_manager_internal.catalog import deleted_plan_resources as resources
 from loop_manager_internal.git import manager_git_journal as journal
 from loop_manager_internal.git.cleanup_service import AssessCleanupEffects, assess_cleanup
 from loop_manager_internal.storage.task_calls import CallDeferred
-from tests.support.catalog import catalog_reconciliation_fixture
+from tests.support.catalog import catalog_reconciliation_fixture, DeletedPlanCancellationFixture
 from tests.support.git import isolated_git_test, make_remote_repository, git_command
 
 
-class DeletedPlanResourceTests(unittest.TestCase):
+class DeletedPlanResourceTests(DeletedPlanCancellationFixture, unittest.TestCase):
     def setUp(self):
         self.fixture = catalog_reconciliation_fixture(self)
         self.connection = self.fixture.connection
@@ -217,12 +217,11 @@ class DeletedPlanResourceTests(unittest.TestCase):
         self.assertFalse(self.workspace.exists())
 
     def test_live_rowless_cancellation_hands_partial_cleanup_to_existing_erasure_queue(self):
-        from tests import test_deleted_plan_cleanup as existing
         from loop_manager_internal.catalog import deleted_plan_cleanup
         self.pr = None
-        text = existing.DeletedPlanCleanupTest.rowless_cancellation(self, started=True,
+        text = self.rowless_cancellation(started=True,
             owned_workspace=self.workspace, publication_oid=self.head)
-        existing.DeletedPlanCleanupTest.artifact_call(self, 'terminated-writer', '/repo', 'G-001')
+        self.artifact_call('terminated-writer', '/repo', 'G-001')
         self.connection.commit()
         pinned = SimpleNamespace(regular_paths=set(), revision_sha='c' * 40,
             snapshot=SimpleNamespace(observed_ids={'G-002'}, all={}, withheld=()))

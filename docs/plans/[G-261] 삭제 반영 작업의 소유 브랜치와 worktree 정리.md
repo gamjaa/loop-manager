@@ -117,6 +117,21 @@ RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_delete
 
 이번 호출에서 동일 두 모듈을 지정 runner로 재실행해 삭제 정리 89개와 자원 정리 7개가 각각 OK였다. 현재 코드·테스트와 위 완료 조건 표, R-055 D09/D10 및 현행 설계를 다시 대조했으며 제품 코드의 추가 교정은 필요하지 않았다. 이전 경계 회귀 7개의 성공 기록은 유지한다. 이전 최종 응답은 실제 `parse_worker_result`에서 같은 TargetedTestFailure로 거부됐고, 교정한 최종 응답은 수용됨을 확인했다. 이 확인은 전체 verify·Review나 Manager의 공식 완료를 대신하지 않는다.
 
+### 전체 verify 피드백의 공유 fixture 교정
+
+`verify:f3c9b86164fd633f46b57fb873892d7cbb587575769bb3d37b63c64850e0b3a2` occurrence 1/revision 1의 실패 원인은 `tests/test_deleted_plan_resources.py`가 `tests.test_deleted_plan_cleanup`의 fixture 메서드를 직접 import한 것이다. 이번 호출 시작 HEAD는 `fee7cb3fec54366577012cac4b16e42206ee2930`이며, 해당 구조 검사를 지정 runner의 단일 case로 재현했다. 기존 검증 조건을 유지하고 원인인 공유 fixture 위치를 교정했다.
+
+`rowless_cancellation`과 `artifact_call`을 기존 `tests/support/catalog.py`의 `DeletedPlanCancellationFixture`로 옮겨 두 소비 테스트가 상속하도록 했다. fixture의 SQLite 준비·실제 취소 transaction·호출 종료 근거·assertion은 변경하지 않았다. HEAD 원본과 이동 후 메서드의 AST를 대조해 본문/기본값/assertion의 동일성을 확인했고, 두 모듈의 테스트 class/case ID도 그대로다. 공유 모듈은 import 시 DB·파일·프로세스·patch를 만들거나 테스트를 수집하지 않는다. 테스트 삭제·skip·조건 완화와 새 파일/의존성 추가는 없다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_support_fixtures.SupportFixtureTests.test_tests_and_support_do_not_import_test_fixtures
+Initial result: FAIL (tests/test_deleted_plan_resources.py의 테스트 모듈 직접 import).
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_support_fixtures.SupportFixtureTests.test_tests_and_support_do_not_import_test_fixtures
+Final result: PASS (1 test).
+
+추가로 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_support_fixtures.SupportFixtureTests.test_imports_create_no_resources_or_discoverable_cases tests.test_deleted_plan_cleanup tests.test_deleted_plan_resources`를 실행해 97 tests, OK를 확인했다. 이번 targeted 합계는 98개이며 `git diff --check`도 통과했다. 전체 verify는 실행하지 않았다. Manager가 보고한 실패 원인은 교정했으며 전체 verify의 새 PASS를 합성하지 않는다.
+
+위 완료 조건 표와 현행 R-055 D09/D10·PRODUCT·ARCHITECTURE 및 dependency 문서 경로를 다시 대조했다. 제품 구현의 보존·소유권·PR/lease·부분 정리·재생성 거부·최종 queue 계약과 기존 검증 범위는 그대로이며 추가 미구현 항목은 확인하지 않았다. 기존 `tests/**` 입력이 이동한 공유 helper도 포함한다. 남은 절차는 Manager의 전체 verify 재실행·Review와 사용자 Merge이며 새 정책 선택·checkpoint는 필요하지 않다.
+
 남은 작업은 Manager 전체 verify·Review와 사용자 Merge다. 구현 중 보존/PR/소유권이 미확인인 실제 입력은 명세대로 pending이며, 새 사용자 정책 선택이나 checkpoint는 필요하지 않았다.
 
 ## Decision Log
