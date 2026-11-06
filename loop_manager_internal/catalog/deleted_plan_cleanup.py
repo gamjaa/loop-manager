@@ -173,15 +173,15 @@ def remove_pending_files(connection, repo, state_dir):
     pending = set()
     for row in connection.execute('SELECT plan_id,path FROM deleted_plan_files WHERE repo=?', (repo,)).fetchall():
         path = Path(row['path'])
-        state_roots = (Path(state_dir).absolute(), Path(state_dir).resolve())
-        redirected_parent = any(parent.is_symlink() and any(parent != root and parent.is_relative_to(root)
-            for root in state_roots) for parent in path.absolute().parents)
-        if not _managed_artifact_path(path, state_dir) or path.is_symlink() or redirected_parent:
-            raise ValueError('삭제할 작업 산출물 경로가 관리 범위 밖입니다.')
         # ponytail: O(queued paths * owners) keeps each destructive step fresh.
         # Index exact path/owner relations if queues grow; retain this recheck.
         try:
-            shared = _independent_artifact(path, (repo, row['plan_id']), _artifact_references(connection, state_dir))
+            deleted_plan_state.assert_no_historical_merge(connection, repo, row['plan_id'])
+            state_roots = (Path(state_dir).absolute(), Path(state_dir).resolve())
+            redirected_parent = any(parent.is_symlink() and any(parent != root and parent.is_relative_to(root)
+                for root in state_roots) for parent in path.absolute().parents)
+            shared = (not _managed_artifact_path(path, state_dir) or path.is_symlink() or redirected_parent
+                or _independent_artifact(path, (repo, row['plan_id']), _artifact_references(connection, state_dir)))
         except (OSError, RuntimeError, TypeError, ValueError):
             shared = True  # Unconfirmed references retain this queue item.
         if shared:
@@ -191,10 +191,17 @@ def remove_pending_files(connection, repo, state_dir):
                      project=repo, plan=row['plan_id'], stage='DELETED_PLAN_CLEANUP', resource=str(path))
             pending.add(row['plan_id'])
             continue
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink(missing_ok=True)
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as error:
+            from loop_manager_internal.runtime.operation_events import emit
+            emit('삭제 산출물 정리 대기: 파일 제거를 재시도합니다.', project=repo,
+                 plan=row['plan_id'], stage='DELETED_PLAN_CLEANUP', resource=str(path), error=str(error))
+            pending.add(row['plan_id'])
+            continue
         with runtime_state._transaction(connection):
             connection.execute('DELETE FROM deleted_plan_files WHERE repo=? AND plan_id=? AND path=?',
                                (repo, row['plan_id'], row['path']))
@@ -293,7 +300,7 @@ def retired_baseline_refs(row, repo):
         if (not isinstance(payload, dict) or set(payload) - {
                 'version', 'ref', 'ref_target', 'index_tree', 'worktree_tree', 'stage_trees'}
                 or type(payload['version']) is not int or payload['version'] != 1
-                or not row['branch'] or scope.branch != 'refs/heads/' + row['branch']
+                or not row['branch'] or scope.branch not in (row['branch'], 'refs/heads/' + row['branch'])
                 or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', scope.head)
                 or any(not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', baseline[field])
                        for field in ('ref_target', 'index_tree', 'worktree_tree'))):
@@ -325,9 +332,35 @@ def retired_integration_baselines(snapshot, row, repo):
                     source = item.get('snapshot', item.get('before'))
                     refs.extend(retired_baseline_refs({**row, 'agent_baseline': item['baseline'],
                                                        'agent_snapshot': source}, repo))
-    for previous in snapshot.get('rebase_operation_history', []):
+    for previous in (*snapshot.get('rebase_operation_history', []),
+                     *(item['snapshot'] for item in snapshot.get('superseded_rebases', []))):
         refs.extend(retired_integration_baselines(previous, row, repo))
     return tuple(dict.fromkeys(refs))
+
+
+def retired_restart_resources(snapshot, row, repo, state_dir):
+    """Inventory native retired copies; live removal remains with the resource owner."""
+    from loop_manager_internal.storage.execution_checkpoint_state import cancelled_branch_restart
+    resources, baselines = [], []
+    intent = cancelled_branch_restart(snapshot, repo, row['plan_id'], row)
+    if intent is not None:
+        old = intent['plan']
+        source = Path(old['worktree'])
+        if (source.name != row['plan_id'] or source.resolve().parent.parent != Path(state_dir).resolve() / 'worktrees'
+                or source.is_symlink()):
+            raise CallDeferred('퇴역 재시작 원본의 관리 경로를 확인할 수 없습니다.')
+        resources.append((intent['archive_branch'], intent['archive']))
+        baselines.extend(retired_baseline_refs(old, repo))
+        baselines.extend(retired_integration_baselines(intent['checkpoint'], old, repo))
+        copies, refs = retired_restart_resources(intent['checkpoint'], old, repo, state_dir)
+        resources.extend(copies)
+        baselines.extend(refs)
+    for previous in (*snapshot.get('rebase_operation_history', []),
+                     *(item['snapshot'] for item in snapshot.get('superseded_rebases', []))):
+        copies, refs = retired_restart_resources(previous, row, repo, state_dir)
+        resources.extend(copies)
+        baselines.extend(refs)
+    return tuple(dict.fromkeys(resources)), tuple(dict.fromkeys(baselines))
 
 
 def _rowless_cancellations(connection, repo, state_dir):
@@ -348,7 +381,7 @@ def _rowless_cancellations(connection, repo, state_dir):
                 'reviewer_session_id', 'worker_result', 'verify_result', 'review_result',
                 'blocked_reason', 'guidance_plan_hash',
             } if started else set()
-            retired_workspace = (started and saved.get('workspace_owned') == 1
+            retired_workspace = (saved.get('workspace_owned') == 1
                 and saved.get('branch') == 'loop-manager/' + canceled['plan_id']
                 and isinstance(saved.get('worktree'), str) and Path(saved['worktree']).is_absolute()
                 and Path(saved['worktree']).name == canceled['plan_id']
@@ -380,7 +413,7 @@ def _rowless_cancellations(connection, repo, state_dir):
                 allowed_statuses.add('PLAN_BLOCKED')
             if retired_workspace:
                 allowed_statuses.update(('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'))
-            integration_refs = ()
+            integration_refs, restart_resources = (), ()
             checkpoints = audit.get('checkpoints')
             if checkpoints is not None and not isinstance(checkpoints, dict):
                 continue
@@ -417,10 +450,21 @@ def _rowless_cancellations(connection, repo, state_dir):
                 if not cancelled_snapshot_without_new_resources(snapshot, repo, canceled['plan_id'], saved):
                     continue
                 integration_refs = retired_integration_baselines(snapshot, saved, repo)
+                restart_resources, restart_refs = retired_restart_resources(snapshot, saved, repo, state_dir)
+                integration_refs = (*integration_refs, *restart_refs)
                 deleted_document_cleanup.document_resources(snapshot, state_dir, repo, canceled['plan_id'])
             judgment = audit.get('judgment')
             decision = judgment.get('decision') if isinstance(judgment, dict) else None
             decision = decision if isinstance(decision, dict) else {}
+            confirmed = (decision.get('id') == saved['plan_id'] and decision.get('outcome') == 'withdrawn'
+                and decision.get('source') in json.loads(saved['sources'])
+                and isinstance(decision.get('reason'), str) and bool(decision['reason'].strip()))
+            affected = audit.get('affected', [])
+            if not isinstance(affected, list) or any(not isinstance(other, str) for other in affected):
+                continue
+            from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
+            dependents = tuple(other for other in affected if not is_cancelled(connection, repo, other) and connection.execute(
+                "SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=? AND status<>'MERGED'", (repo, other)).fetchone())
             if started and (type(audit.get('cleanup_pending')) is not bool
                     or audit['cleanup_pending'] and not retired_workspace
                     or decision.get('id') != saved['plan_id'] or decision.get('outcome') != 'withdrawn'
@@ -457,7 +501,8 @@ def _rowless_cancellations(connection, repo, state_dir):
                 continue
         except (KeyError, TypeError, ValueError, RuntimeError):
             continue
-        yield {**saved, '_retired_baseline_refs': integration_refs}, dict(canceled)
+        yield {**saved, '_retired_baseline_refs': integration_refs, '_retired_restart_resources': restart_resources,
+               '_withdrawal_confirmed': confirmed, '_withdrawal_dependents': dependents}, dict(canceled)
 
 
 def _rowless_holds(connection, repo, pinned):
@@ -631,7 +676,14 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
             resolved = resolved_references(key, related, documents)
             if resolved is None:
                 continue
-        if any(key in json.loads(other['depends_on']) and other['plan_id'] not in resolved
+            if not resolved and not row.get('_withdrawal_confirmed'):
+                continue  # Plain file deletion is ordinary cancellation, not authority to erase its audit.
+        from .remote_deletions import historical_reference_ids
+        historical_ids = historical_reference_ids(connection, repo, pinned)
+        historical_dependencies = tuple(dict(other) for other in connection.execute(
+            'SELECT * FROM exec_plans WHERE repo=? AND plan_id<>?', (repo, key))
+            if other['plan_id'] in historical_ids and key in json.loads(other['depends_on']))
+        if any(key in json.loads(other['depends_on']) and other['plan_id'] not in resolved and other['plan_id'] not in historical_ids
                for other in connection.execute('SELECT plan_id,depends_on FROM exec_plans WHERE repo=? AND plan_id<>?', (repo, key))):
             continue
         if row['branch'] and row['branch'] != 'loop-manager/' + key:
@@ -642,24 +694,65 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
             continue
         related_rows = {other: dict(record) for other, record in related_rows.items()}
         try:
+            deleted_plan_state.assert_no_historical_merge(connection, repo, key)
+            from loop_manager_internal.storage.common_defect_state import assert_plan_erasure_available
+            assert_plan_erasure_available(connection, repo, key)
             diagnostics = deleted_diagnostic_state.capture(connection, repo, key)
             extra_baselines = row.get('_retired_baseline_refs', ())
+            restart_resources = row.get('_retired_restart_resources', ())
             if canceled is None and connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_checkpoints'").fetchone():
                 checkpoint = connection.execute('SELECT snapshot FROM execution_checkpoints WHERE repo=? AND plan_id=?', (repo, key)).fetchone()
                 if checkpoint is not None:
                     try:
-                        extra_baselines = retired_integration_baselines(json.loads(checkpoint['snapshot'] or '{}'), row, repo)
+                        saved = json.loads(checkpoint['snapshot'] or '{}')
+                        extra_baselines = retired_integration_baselines(saved, row, repo)
+                        restart_resources, restart_refs = retired_restart_resources(saved, row, repo, state_dir)
+                        extra_baselines = (*extra_baselines, *restart_refs)
                     except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, RecursionError) as error:
                         raise CallDeferred('과거 통합의 baseline 소유권을 확인할 수 없습니다.') from error
             baselines = tuple(dict.fromkeys((*retired_baseline_refs(row, repo), *extra_baselines)))
             diagnostic_resources = ['diagnostic:' + ref for ref in diagnostics['refs']] + ['git:' + ref for ref in baselines]
             diagnostic_resources += [prefix + path for path in diagnostics['worktrees'] for prefix in ('worktree:', 'git:')]
+            diagnostic_resources += [prefix + branch for branch, path in restart_resources for prefix in ('branch:', 'git:')]
+            diagnostic_resources += [prefix + path for branch, path in restart_resources for prefix in ('worktree:', 'git:')]
             diagnostic_resources = [resource for resource in diagnostic_resources if not resource_owned(Path(state_dir), repo, resource)]
             lease = (reserved_workspace_ownership(connection, state_dir, repo, key) if canceled is None
                      else _rowless_ownership(connection, state_dir, repo, row, canceled))
             with lease as ownership, resource_locks(Path(state_dir), repo, diagnostic_resources, owner='deleted-plan-diagnostics'), ExitStack() as document_leases:
                 document_cleanup = None
+                def check_restarts(*, external=False):
+                    for branch, raw in restart_resources:
+                        workspace = Path(raw)
+                        if (workspace.exists() or workspace.is_symlink()
+                                or any(parent.is_symlink() for parent in workspace.parents)):
+                            raise CallDeferred('퇴역 재시작 사본의 실제 정리가 남아 있습니다.')
+                        deleted_document_cleanup.check_workspace_references(connection, raw)
+                        for table in ('exec_plans', 'projects', 'manual_work_groups'):
+                            columns = {item[1] for item in connection.execute('PRAGMA table_info(' + table + ')')}
+                            if {'repo', 'worktree', 'branch'} <= columns and connection.execute(
+                                    'SELECT 1 FROM ' + table + ' WHERE worktree=? OR (repo=? AND branch=?)',
+                                    (raw, repo, branch)).fetchone():
+                                raise CallDeferred('독립 작업이 참조하는 퇴역 재시작 자원을 보존합니다.')
+                        if connection.execute(
+                                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_groups'").fetchone() and connection.execute(
+                                'SELECT 1 FROM manual_work_groups WHERE repo=? AND source_branch=?', (repo, branch)).fetchone():
+                            raise CallDeferred('수동 source가 참조하는 퇴역 ref를 보존합니다.')
+                        if external:
+                            from loop_manager_internal.recovery.checkpoint_adapter import _frozen_push_target
+                            origin = (diagnostics['project'] or {}).get('origin')
+                            options, operand = _frozen_push_target(origin) if origin else ((), 'origin')
+                            try:
+                                remote = git(repo_path, *options, 'ls-remote', '--heads', operand, 'refs/heads/' + branch, check=False)
+                                local = git(repo_path, 'rev-parse', '--verify', 'refs/heads/' + branch, check=False)
+                                pr = pr_for_branch(repo_path, branch)
+                                registered = git(repo_path, 'worktree', 'list', '--porcelain')
+                            except (OSError, RuntimeError, ValueError) as error:
+                                raise CallDeferred('퇴역 재시작 자원의 현재 관측을 확인할 수 없습니다.') from error
+                            if (remote.returncode or remote.stdout.strip() or local.returncode not in (1, 128)
+                                    or pr is not None or registered.returncode or any(line in {
+                                        'worktree ' + raw, 'branch refs/heads/' + branch} for line in registered.stdout.splitlines())):
+                                raise CallDeferred('퇴역 재시작 ref·PR·등록의 정리가 남아 있습니다.')
                 def check_baselines():
                     for ref in baselines:
                         try:
@@ -670,6 +763,7 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                             raise CallDeferred('baseline ref의 실제 정리가 아직 확인되지 않았습니다.')
                 def check_ownership():
                     ownership.check()
+                    check_restarts()
                     if deleted_diagnostic_state.capture(connection, repo, key) != diagnostics:
                         raise CallDeferred('진단 소유 기록이 관측 중 변경됐습니다.')
                     if any(Path(path).exists() or Path(path).is_symlink() for path in diagnostics['worktrees']):
@@ -678,6 +772,10 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                         raise CallDeferred('삭제 전에 실제 호출 종료·결과 인계·예약 반환을 확인해야 합니다.')
                     if document_cleanup is not None:
                         document_cleanup.check()
+                    for expected in historical_dependencies:
+                        current = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, expected['plan_id'])).fetchone()
+                        if current is None or dict(current) != expected:
+                            raise CallDeferred('과거 Merge 참조가 관측 중 변경됐습니다.')
                     for other, expected in related_rows.items():
                         current = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, other)).fetchone()
                         if current is None or dict(current) != expected:
@@ -699,6 +797,7 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                             or pull_request is not None):
                         raise CallDeferred('진단 ref·PR의 현재 부재를 확인할 수 없습니다.')
                 check_baselines()
+                check_restarts(external=True)
                 if diagnostics['worktrees']:
                     registered = git(repo_path, 'worktree', 'list', '--porcelain')
                     if registered.returncode or any('worktree ' + path in registered.stdout.splitlines() for path in diagnostics['worktrees']):
@@ -782,13 +881,15 @@ def cleanup(connection, repo_path, repo, pinned, references, *, git, git_bytes, 
                     continue
                 check_ownership()
                 check_baselines()
-                artifacts = artifact_paths(connection, repo, row, state_dir, extra_worktrees=(*document_cleanup.worktrees, *diagnostics['worktrees']))
+                check_restarts(external=True)
+                artifacts = artifact_paths(connection, repo, row, state_dir, extra_worktrees=(*document_cleanup.worktrees, *diagnostics['worktrees'], *(path for branch, path in restart_resources)))
                 with runtime_state._transaction(connection):
                     check_ownership()
                     for other, dependencies in resolved.items():
                         connection.execute('UPDATE exec_plans SET depends_on=? WHERE repo=? AND plan_id=?',
                                            (json.dumps(dependencies, ensure_ascii=False, separators=(',', ':')), repo, other))
-                    deleted_plan_state.forget(connection, repo, key, artifacts=artifacts, diagnostic_snapshot=diagnostics)
+                    deleted_plan_state.forget(connection, repo, key, artifacts=artifacts, diagnostic_snapshot=diagnostics,
+                        historical_dependencies=historical_dependencies)
                     release_reference_holds(connection, repo, key, path, resolved)
                 if key not in remove_pending_files(connection, repo, state_dir):
                     deleted.append(key)

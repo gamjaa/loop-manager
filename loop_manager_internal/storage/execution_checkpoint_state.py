@@ -22,7 +22,7 @@ def historical_agent_snapshots_match(saved_row, snapshots):
             if not saved_row['branch'] or not saved_row['worktree'] or not isinstance(raw, str):
                 return False
             scope = GitSnapshot.deserialize(raw)
-            if (scope.branch != 'refs/heads/' + saved_row['branch']
+            if (scope.branch not in (saved_row['branch'], 'refs/heads/' + saved_row['branch'])
                     or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', scope.head)):
                 return False
         return True
@@ -33,9 +33,11 @@ def historical_agent_snapshots_match(saved_row, snapshots):
 def _cancelled_rebase_history(snapshot, repo, plan_id, saved_row, origins):
     """Validate retired ownership, never reissue an acceptance/publication token."""
     def owned(acceptance):
+        from loop_manager_internal.maintenance.maintenance_validation import _plan_id_from_path
         return (valid_acceptance(acceptance)
+                and _plan_id_from_path(acceptance['plan_path']) == plan_id
                 and all(acceptance[field] == expected for field, expected in (
-                    ('repo', repo), ('plan_id', plan_id), ('plan_path', saved_row['path']),
+                    ('repo', repo), ('plan_id', plan_id),
                     ('branch', saved_row['branch']), ('worktree', saved_row['worktree'])))
                 and (acceptance['remote']['pull_request'] or {}).get('state') != 'MERGED')
 
@@ -64,17 +66,42 @@ def _cancelled_rebase_history(snapshot, repo, plan_id, saved_row, origins):
         acceptances = snapshot.get('current_rebase_acceptance_history', [])
         if not isinstance(acceptances, list) or not all(owned(item) for item in acceptances):
             return False
-        if 'rebase_publication_intent' in snapshot:
-            if not publication(snapshot['rebase_publication_intent'], snapshot.get('rebase_publication_result')):
-                return False
-        elif 'rebase_publication_result' in snapshot:
+        retired = snapshot.get('retired_rebase_publications', [])
+        if not isinstance(retired, list):
             return False
+        for item in retired:
+            if (not isinstance(item, dict) or set(item) != {'intent', 'observed_remote', 'confirmed'}
+                    or item['confirmed'] is not False or not publication(item['intent'], None)
+                    or item['observed_remote'] is not None and (not isinstance(item['observed_remote'], str)
+                        or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', item['observed_remote']))):
+                return False
+        intent, result = snapshot.get('rebase_publication_intent'), snapshot.get('rebase_publication_result')
+        if intent is not None:
+            if not publication(intent, result):
+                return False
+        elif result is not None:
+            previous = next((item['intent'] for item in retired if item['intent']['id'] == result.get('intent_id')), None)
+            if not publication(previous, result):
+                return False
+        superseded = snapshot.get('superseded_rebases', [])
+        if not isinstance(superseded, list):
+            return False
+        for item in superseded:
+            if (not isinstance(item, dict) or set(item) != {
+                    'operation', 'expected_head', 'target_base_oid', 'observed_remote_oid', 'snapshot'}
+                    or item['operation'] != 'rebase'
+                    or any(item[field] is not None and (not isinstance(item[field], str)
+                        or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', item[field]))
+                           for field in ('expected_head', 'target_base_oid', 'observed_remote_oid'))
+                    or not cancelled_snapshot_without_new_resources(item['snapshot'], repo, plan_id, saved_row,
+                        _origins=origins, _historical=True)):
+                return False
         publications = snapshot.get('rebase_publication_history', [])
         if not isinstance(publications, list) or any(not isinstance(item, dict)
                 or set(item) != {'intent', 'result'} or not publication(item['intent'], item['result'])
                 for item in publications):
             return False
-        if snapshot.get('integration_repo', repo) != repo or snapshot.get('pending_work_branch_input') is not None:
+        if snapshot.get('integration_repo', repo) != repo:
             return False
         for field in ('base_rebase_restart', 'work_branch_integration'):
             frames = snapshot.get(field + '_history', [])
@@ -106,14 +133,55 @@ def _cancelled_rebase_history(snapshot, repo, plan_id, saved_row, origins):
                         return False
         history = snapshot.get('rebase_operation_history', [])
         if not isinstance(history, list) or not all(
-                cancelled_snapshot_without_new_resources(item, repo, plan_id, saved_row, _origins=origins) for item in history):
+                cancelled_snapshot_without_new_resources(item, repo, plan_id, saved_row, _origins=origins, _historical=True) for item in history):
             return False
         return True
     except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, RecursionError):
         return False
 
 
-def cancelled_snapshot_without_new_resources(snapshot, repo, plan_id, saved_row, *, _origins=None):
+def cancelled_branch_restart(snapshot, repo, plan_id, saved_row):
+    """Read the native completed reset intent without granting a reset or cleanup."""
+    from pathlib import Path
+    intent = snapshot.get('deleted_branch_restart')
+    if intent is None:
+        return None
+    try:
+        fields = {'state', 'base', 'plan', 'block', 'snapshot', 'archive', 'archive_branch',
+                  'checkpoint', 'operation', 'publication', 'recovery'}
+        if (not isinstance(intent, dict) or set(intent) - fields - {'correction'} or not fields <= set(intent)
+                or intent['state'] != 'complete' or not isinstance(intent['base'], str)
+                or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', intent['base'])):
+            raise ValueError('unknown restart intent')
+        old = intent['plan']
+        if (not isinstance(old, dict) or (old['repo'], old['plan_id']) != (repo, plan_id)
+                or old['status'] == 'MERGED' or old['branch'] != 'loop-manager/' + plan_id
+                or not isinstance(old['worktree'], str) or not Path(old['worktree']).is_absolute()
+                or old['branch'] != saved_row['branch'] or old['worktree'] != saved_row['worktree']
+                or not historical_agent_snapshots_match(old, (intent['snapshot'],))):
+            raise ValueError('restart owner differs')
+        archive = Path(intent['archive'])
+        if (not archive.is_absolute() or not re.fullmatch(r'[0-9a-f]{32}', archive.name)
+                or archive != Path(old['worktree']).parent / 'retired' / archive.name
+                or intent['archive_branch'] != f'loop-manager/retired/{plan_id}/{archive.name}'):
+            raise ValueError('restart archive differs')
+        for name in ('block', 'publication', 'correction'):
+            item = intent.get(name)
+            if item is not None and (not isinstance(item, dict)
+                    or (item.get('repo'), item.get('plan_id')) != (repo, plan_id)):
+                raise ValueError('restart audit owner differs')
+        recovery = intent['recovery']
+        if recovery is not None and (not isinstance(recovery, dict) or recovery.get('repo') != repo
+                or recovery.get('subject') not in (plan_id, 'plan:' + plan_id)):
+            raise ValueError('restart recovery owner differs')
+        if not cancelled_snapshot_without_new_resources(intent['checkpoint'], repo, plan_id, old):
+            raise ValueError('restart checkpoint owner is unknown')
+        return intent
+    except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, RecursionError) as error:
+        raise ValueError('unknown retired branch restart resources') from error
+
+
+def cancelled_snapshot_without_new_resources(snapshot, repo, plan_id, saved_row, *, _origins=None, _historical=False):
     """Recognize owned history; this never grants a stage-result reuse token."""
     from dataclasses import fields
     from loop_manager_internal.execution.execution_checkpoint import CheckpointSnapshot
@@ -126,8 +194,67 @@ def cancelled_snapshot_without_new_resources(snapshot, repo, plan_id, saved_row,
                       'rebase_policy', 'rebase_stage_origin', 'accepted_work_branch', 'pushed_checkpoint_head',
                       'last_adopted_remote_oid', 'rebase_revalidation_audit', 'integration_repo',
                       'base_rebase_restart', 'base_rebase_restart_history', 'work_branch_integration',
-                      'work_branch_integration_history', 'pending_work_branch_input'}
-    if not isinstance(snapshot, dict) or set(snapshot) - native_fields - history_fields:
+                      'work_branch_integration_history', 'pending_work_branch_input', 'deleted_branch_restart', 'fresh_remote_creation',
+                      'retired_rebase_publications', 'superseded_rebases'}
+    metadata_dicts = {'rebase_completion', 'completed_rebase', 'rebase_documents', 'rebase_frontmatter',
+        'rebase_files', 'stage_evidence', 'commit_recovery', 'document_record', 'blocked_resume',
+        'published_review_resume', 'remote_adoption', 'remote_adoption_scope', 'worker_checkpoint_request',
+        'worker_checkpoint_result', 'worker_reconnection', 'planning_reassessment', 'planning_resume_artifacts',
+        'user_decision_assessment', 'common_defect_assessment', 'manager_metadata_agent_baseline',
+        'workspace_identity_recovery', 'recovered_rebase_metadata', 'rebase_resolution_commit',
+        'worker_checkpoint_pending', 'remote_adoption_intent', 'rebase_block_release',
+        'confirmed_manual_stage_revalidation', 'metadata_block_git'}
+    metadata_lists = {'worker_checkpoint_requests', 'worker_frontmatter_restores', 'workspace_scope_audit',
+        'user_decision_assessment_history', 'common_defect_assessment_history', 'rebase_block_recovery_audit',
+        'scope_block_release_audit', 'publication_block_release_audit', 'retired_publications'}
+    metadata_strings = {'commit_message', 'worker_result', 'rebase_run_id', 'rebase_start_session_id',
+        'rebase_block_release_state', 'scope_block_resume_status', 'rebase_publication_deferred', 'pending'}
+    metadata_flags = {'worktree_recovery_pending', 'workspace_reservation_recovered'}
+    metadata_oids = {'after_head', 'commit_tree_oid', 'head', 'reactivated_from_head', 'remote_before',
+        'remote_user_input', 'stored_active_sha', 'manual_candidate_head', 'stale_review_candidate', 'pending_work_branch_input'}
+    known = native_fields | history_fields | metadata_dicts | metadata_lists | metadata_strings | metadata_flags | metadata_oids | {
+        'worktree', 'rebase_evidence_version', 'workspace_ownership_hold'}
+    if not isinstance(snapshot, dict) or set(snapshot) - known:
+        return False
+    if any(snapshot.get(field) is not None and not isinstance(snapshot[field], dict) for field in metadata_dicts):
+        return False
+    if any(field in snapshot and not isinstance(snapshot[field], list) for field in metadata_lists):
+        return False
+    if any(snapshot.get(field) is not None and not isinstance(snapshot[field], str) for field in metadata_strings):
+        return False
+    if any(field in snapshot and type(snapshot[field]) is not bool for field in metadata_flags):
+        return False
+    if any(snapshot.get(field) is not None and not (field == 'stored_active_sha' and snapshot[field] == '')
+            and (not isinstance(snapshot[field], str)
+                or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', snapshot[field])) for field in metadata_oids):
+        return False
+    if snapshot.get('pr_state') == 'MERGED':
+        return False
+    if snapshot.get('worktree', saved_row['worktree']) not in ((None, '') if saved_row['worktree'] is None else (saved_row['worktree'],)):
+        return False
+    if snapshot.get('rebase_evidence_version', 2) != 2:
+        return False
+    if snapshot.get('workspace_ownership_hold'):
+        return False
+    if snapshot.get('pending') not in (None, 'stage', 'continue'):
+        return False
+    for field in metadata_dicts:
+        item = snapshot.get(field)
+        if item is not None and (('version' in item and (type(item['version']) is not int or item['version'] != 1))
+                or any(name in item and item[name] != expected for name, expected in (
+                    ('repo', repo), ('plan_id', plan_id), ('branch', saved_row['branch']), ('worktree', saved_row['worktree'])))):
+            return False
+    for item in snapshot.get('workspace_scope_audit', []):
+        if (not isinstance(item, dict) or set(item) != {'scope', 'plan_id', 'branch', 'worktree', 'baseline', 'observation'}
+                or (item['scope'], item['plan_id'], item['branch'], item['worktree']) != (
+                    'plan', plan_id, saved_row['branch'], saved_row['worktree'])
+                or not historical_agent_snapshots_match(saved_row, (item['baseline'], item['observation']))):
+            return False
+    try:
+        cancelled_branch_restart(snapshot, repo, plan_id, saved_row)
+    except ValueError:
+        return False
+    if 'fresh_remote_creation' in snapshot and type(snapshot['fresh_remote_creation']) is not bool:
         return False
     origins = snapshot.get('stage_result_origins', _origins or {})
     if not isinstance(origins, dict):
@@ -169,26 +296,37 @@ def cancelled_snapshot_without_new_resources(snapshot, repo, plan_id, saved_row,
     if set(snapshot) & native_fields:
         # A complete native observation is history only after its original
         # workspace has retired; pending operations/stashes still own resources.
-        if (not native_fields <= set(snapshot) or not saved_row.get('workspace_owned')
+        complete_observation = native_fields <= set(snapshot)
+        if not complete_observation:
+            if not saved_row.get('branch') or not saved_row.get('worktree'):
+                if (not {'worktree_recovery_pending', 'worktree', 'branch', 'stored_active_sha'} <= set(snapshot)
+                        or snapshot['branch'] not in (None, '') or snapshot['worktree'] not in (None, '')):
+                    return False
+            elif (not _historical and (snapshot.get('branch') != saved_row['branch']
+                    or snapshot.get('worktree') != saved_row['worktree'])
+                    or snapshot.get('branch', saved_row['branch']) != saved_row['branch']):
+                return False
+        elif (not saved_row.get('workspace_owned')
                 or snapshot['plan_id'] != plan_id or snapshot['branch'] != saved_row['branch']
                 or snapshot['local_branch'] not in (None, saved_row['branch'])
                 or snapshot['phase'] not in {'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'}
                 or type(snapshot['worktree_owned']) is not bool
                 or snapshot['base_is_ancestor'] is not None and type(snapshot['base_is_ancestor']) is not bool
-                or snapshot['rebase_intent'] is not False
-                or any(snapshot[field] is not None for field in ('pending_operation', 'git_operation', 'stash_oid'))
-                or any(snapshot[field] not in ([], ()) for field in ('git_operation_markers', 'unmerged_stages'))
+                or type(snapshot['rebase_intent']) is not bool
+                or any(snapshot[field] is not None and not isinstance(snapshot[field], str)
+                       for field in ('pending_operation', 'git_operation'))
+                or any(not isinstance(snapshot[field], (list, tuple)) for field in ('git_operation_markers', 'unmerged_stages'))
                 or not isinstance(snapshot['staged_paths'], (list, tuple))
                 or any(not isinstance(path, str) for path in snapshot['staged_paths'])
                 or snapshot['pr_state'] not in (None, 'OPEN', 'CLOSED')):
             return False
         oid_fields = {'base_oid', 'local_head', 'recorded_local_head', 'active_sha', 'validated_base_sha',
                       'rebase_before_head', 'rebase_target_oid', 'remote_oid', 'recorded_remote_oid',
-                      'pr_head_oid', 'recorded_pr_head_oid'}
-        if any(snapshot[field] is not None and (not isinstance(snapshot[field], str)
+                      'pr_head_oid', 'recorded_pr_head_oid', 'stash_oid'}
+        if any(snapshot.get(field) is not None and (not isinstance(snapshot[field], str)
                 or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', snapshot[field])) for field in oid_fields):
             return False
-        if any(snapshot[field] is not None and not isinstance(snapshot[field], str)
+        if any(snapshot.get(field) is not None and not isinstance(snapshot[field], str)
                 for field in ('definition_revision', 'verify_token', 'review_token', 'archive_token', 'publication_token')):
             return False
     token = snapshot.get('worker_candidate_token')

@@ -2961,22 +2961,23 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
             recovery_state.start_review_correction(self.connection, 'A', 'G-001', run, 4)
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM review_correction_turns WHERE started_at IS NOT NULL').fetchone()[0], 4)
 
-    def test_usage_wait_never_probes_and_requires_same_provider_model_success_evidence(self):
+    def usage_result(self, plan, provider, model, kind):
         from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
         from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
-        scheduler = self.scheduler()
         ledger = InvocationRepository(self.connection)
-        def result(plan, provider, model, kind):
-            identity = ledger.start(InvocationContext('A', plan), 'worker', provider, ResolvedProfile(model, 'low'), 'same-session')
-            ledger.mark_execution_started(identity)
-            ledger.mark_execution_finished(identity, 2)
-            ledger.finish(identity, kind, 0 if kind == 'success' else 1, 2, 'same-session', Usage())
-            return identity
-        failed = result('G-001', 'codex', 'model-A', 'usage_limit')
+        identity = ledger.start(InvocationContext('A', plan), 'worker', provider, ResolvedProfile(model, 'low'), 'same-session')
+        ledger.mark_execution_started(identity)
+        ledger.mark_execution_finished(identity, 2)
+        ledger.finish(identity, kind, 0 if kind == 'success' else 1, 2, 'same-session', Usage())
+        return identity
+
+    def test_usage_wait_never_probes_and_requires_same_provider_model_success_evidence(self):
+        scheduler = self.scheduler()
+        failed = self.usage_result('G-001', 'codex', 'model-A', 'usage_limit')
         checks = []
         def wait(_seconds):
             checks.append('wait')
-            result('G-002', 'claude' if len(checks) == 1 else 'codex', 'model-A', 'success')
+            self.usage_result('G-002', 'claude' if len(checks) == 1 else 'codex', 'model-A', 'success')
             self.assertEqual(sum(scheduler.running['agent'].values()), 0)
         with mock.patch.object(scheduler.condition, 'wait', side_effect=wait), \
              mock.patch.object(scheduling, 'observe_runtime') as observe:
@@ -2984,6 +2985,63 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         observe.assert_not_called()
         self.assertEqual(checks, ['wait', 'wait'])
         self.assertEqual(self.connection.execute('SELECT result_kind FROM agent_invocations WHERE invocation_id=?', (failed,)).fetchone()[0], 'usage_limit')
+
+    def test_usage_wait_does_not_resume_cancelled_quota_audit(self):
+        scheduler = self.scheduler()
+        self.usage_result('G-001', 'codex', 'model-A', 'usage_limit')
+        self.usage_result('G-002', 'codex', 'model-A', 'success')
+        self.connection.execute("INSERT INTO execplan_cancellations "
+            "(repo,plan_id,path,title,sources,depends_on,complexity,risk,priority,content_hash,plan_sha,deletion_commit) "
+            "SELECT repo,plan_id,path,title,sources,depends_on,'low','low',priority,content_hash,plan_sha,'deleted' "
+            "FROM exec_plans WHERE repo='A' AND plan_id='G-001'")
+        self.connection.commit()
+        before = list(self.connection.iterdump())
+        with mock.patch.object(scheduler.condition, 'wait') as wait, \
+             mock.patch.object(scheduling.events, 'emit') as emit:
+            self.assertFalse(scheduler.wait_usage(self.connection, 'A', 'G-001'))
+        wait.assert_not_called()
+        emit.assert_not_called()
+        self.assertEqual(list(self.connection.iterdump()), before)
+
+    def test_usage_wait_stops_after_erasure_even_when_independent_success_arrives(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        scheduler = self.scheduler()
+        self.usage_result('G-001', 'codex', 'model-A', 'usage_limit')
+        erased = []
+        def complete_and_erase(_seconds):
+            self.usage_result('G-002', 'codex', 'model-A', 'success')
+            deleted_plan_state.forget(self.connection, 'A', 'G-001')
+            erased.extend(self.connection.iterdump())
+        with mock.patch.object(scheduler.condition, 'wait', side_effect=complete_and_erase) as wait, \
+             mock.patch.object(scheduling, 'observe_runtime') as observe:
+            self.assertFalse(scheduler.wait_usage(self.connection, 'A', 'G-001'))
+        wait.assert_called_once()
+        observe.assert_not_called()
+        self.assertTrue(erased)
+        self.assertEqual(list(self.connection.iterdump()), erased)
+        self.assertFalse(scheduler.wait_usage(self.connection, 'A', 'G-001'))
+        self.assertEqual(list(self.connection.iterdump()), erased)
+
+    def test_usage_wait_rechecks_erasure_after_reading_success_evidence(self):
+        from loop_manager_internal.storage import deleted_plan_state, execplan_catalog_state
+        scheduler = self.scheduler()
+        self.usage_result('G-001', 'codex', 'model-A', 'usage_limit')
+        self.usage_result('G-002', 'codex', 'model-A', 'success')
+        check = execplan_catalog_state.is_cancelled
+        reads, erased = [], []
+        def erase_after_check(connection, repo, plan_id):
+            canceled = check(connection, repo, plan_id)
+            reads.append((repo, plan_id))
+            if len(reads) == 2:
+                deleted_plan_state.forget(connection, repo, plan_id)
+                erased.extend(connection.iterdump())
+            return canceled
+        with mock.patch.object(execplan_catalog_state, 'is_cancelled', side_effect=erase_after_check), \
+             mock.patch.object(scheduler.condition, 'wait') as wait:
+            self.assertFalse(scheduler.wait_usage(self.connection, 'A', 'G-001'))
+        wait.assert_not_called()
+        self.assertTrue(erased)
+        self.assertEqual(list(self.connection.iterdump()), erased)
 
     def test_retry_wait_stops_after_erasure_without_consuming_saved_deadline(self):
         from loop_manager_internal.storage import deleted_plan_state, recovery_state

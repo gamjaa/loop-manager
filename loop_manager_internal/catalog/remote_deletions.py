@@ -81,6 +81,24 @@ def mutable_row(connection, repo, plan_id):
     return row
 
 
+def historical_reference_ids(connection, repo, pinned):
+    """Reuse verified archive bytes/Merge identity before and after audit backfill."""
+    archived = getattr(pinned.snapshot, 'archived', {})
+    rows = connection.execute('SELECT * FROM exec_plans WHERE repo=?', (repo,)).fetchall()
+    direct = {str(row['plan_id']) for row in rows
+        if row['status'] == 'MERGED' and row['plan_sha'] and row['pr_url'] and row['pr_head_oid']
+        and (entry := archived.get(str(row['plan_id']))) is not None
+        and entry.path == (str(row['path']) if str(row['path']).startswith('docs/plans/archive/') else
+                           str(row['path']).replace('docs/plans/', 'docs/plans/archive/', 1))
+        and catalog.plan_content_hash(entry.text.encode('utf-8')) == row['content_hash']}
+    durable = execplan_catalog_state.verified_merged_archive_execution_ids(connection, repo, rows, include_missing=True)
+    # A changed/reappeared declaration still needs the normal recovery gate.
+    by_id = {str(row['plan_id']): row for row in rows}
+    durable = {key for key in durable if key not in pinned.snapshot.observed_ids
+        or key in archived and catalog.plan_content_hash(archived[key].text.encode('utf-8')) == by_id[key]['content_hash']}
+    return frozenset(durable | direct)
+
+
 def reference_issues(connection, repo, repository, pinned, *, git_bytes):
     """Observe deletion impacts independently of cancellation eligibility."""
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
@@ -120,11 +138,7 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
             missing.setdefault(key, path)
             hold_evidence[key] = (row, evidence)
     # An unchanged archived MERGED execution is historical even before archive audit backfill.
-    merged_references = {str(row['plan_id']) for row in rows
-        if row['status'] == 'MERGED' and row['plan_sha'] and row['pr_url'] and row['pr_head_oid']
-        and (entry := pinned.snapshot.archived.get(str(row['plan_id']))) is not None
-        and entry.path == str(row['path']).replace('docs/plans/', 'docs/plans/archive/', 1)
-        and catalog.plan_content_hash(entry.text.encode('utf-8')) == row['content_hash']}
+    merged_references = historical_reference_ids(connection, repo, pinned)
     latest_contents = {key: entry.text.encode("utf-8") for key, entry in pinned.snapshot.all.items()}
     paths = {str(row["plan_id"]): str(row["path"]) for row in rows}
     paths.update({str(row["plan_id"]): str(row["path"]) for row in cancellations})

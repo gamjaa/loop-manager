@@ -16,9 +16,24 @@ def ensure_schema(connection):
         PRIMARY KEY(repo,plan_id,path))''')
 
 
-def forget(connection, repo, plan_id, *, artifacts=(), diagnostic_snapshot=None):
+def assert_no_historical_merge(connection, repo, plan_id):
+    """A removed execution row/archive file cannot erase durable Merge proof."""
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_history'").fetchone():
+        history = connection.execute('SELECT merge_confirmed FROM execplan_catalog_history WHERE repo=? AND plan_id=?',
+                                     (repo, plan_id)).fetchone()
+        if history is not None and history['merge_confirmed']:
+            raise CallDeferred('실행 row 밖의 확인된 Merge 이력은 최종 제거할 수 없습니다.')
+    if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_archive_observations'").fetchone() and connection.execute(
+            "SELECT 1 FROM execplan_archive_observations WHERE repo=? AND scope=? AND category='complete'",
+            (repo, plan_id)).fetchone():
+        raise CallDeferred('완료된 archive 관측은 최종 제거할 수 없습니다.')
+
+
+def forget(connection, repo, plan_id, *, artifacts=(), diagnostic_snapshot=None, historical_dependencies=()):
     """Caller holds resource leases and has finished physical cleanup and publication."""
     with _transaction(connection):
+        assert_no_historical_merge(connection, repo, plan_id)
         tables = {row[0]: {column[1] for column in connection.execute(f'PRAGMA table_info("{row[0]}")')}
                   for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
@@ -26,8 +41,17 @@ def forget(connection, repo, plan_id, *, artifacts=(), diagnostic_snapshot=None)
             raise ValueError('완료된 작업 또는 실행 writer의 기록은 제거할 수 없습니다.')
         if pending_for_plan(connection, repo, plan_id):
             raise CallDeferred('호출 예약 또는 writer의 실제 종료·결과 인계가 미확정인 작업은 제거할 수 없습니다.')
-        for row in connection.execute('SELECT plan_id,depends_on FROM exec_plans WHERE repo=? AND plan_id<>?', (repo, plan_id)):
-            if plan_id in json.loads(row['depends_on']):
+        from .execplan_catalog_state import verified_merged_archive_execution_ids
+        rows = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id<>?', (repo, plan_id)).fetchall()
+        historical = verified_merged_archive_execution_ids(connection, repo, rows, include_missing=True)
+        observed_history = {item['plan_id']: item for item in historical_dependencies}
+        for row in rows:
+            if plan_id not in json.loads(row['depends_on']):
+                continue
+            if row['plan_id'] in observed_history:
+                if dict(row) != observed_history[row['plan_id']] or row['status'] != 'MERGED':
+                    raise CallDeferred('과거 Merge 참조의 원문/실행 identity가 변경됐습니다.')
+            elif row['plan_id'] not in historical:
                 raise ValueError('삭제된 작업의 선행 관계가 아직 남아 있습니다.')
         from . import deleted_diagnostic_state
         observed_diagnostics = deleted_diagnostic_state.capture(connection, repo, plan_id)

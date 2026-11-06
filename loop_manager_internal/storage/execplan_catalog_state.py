@@ -117,7 +117,7 @@ class MergeProof:
     detail: str | None = None
 
 
-def verified_historical_merge_ids(connection: sqlite3.Connection, repo: str) -> frozenset[str]:
+def verified_historical_merge_ids(connection: sqlite3.Connection, repo: str, *, include_missing=False) -> frozenset[str]:
     """Return archived identities whose durable merge proof is complete."""
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_history'"
@@ -126,7 +126,7 @@ def verified_historical_merge_ids(connection: sqlite3.Connection, repo: str) -> 
     return frozenset(str(row[0]) for row in connection.execute(
         "SELECT plan_id, original_path, observed_path, original_content_hash, final_content_hash, "
         "plan_sha, merge_confirmed, identity_verified, proof_kind, proof_revision, diagnostic_code "
-        "FROM execplan_catalog_history WHERE repo=? AND currently_archived=1", (repo,),
+        "FROM execplan_catalog_history WHERE repo=?" + ("" if include_missing else " AND currently_archived=1"), (repo,),
     ) if (
         row[6] and row[7]
         and re.fullmatch(rf"docs/plans/\[{re.escape(str(row[0]))}\] [^/]+\.md", str(row[1]))
@@ -162,16 +162,17 @@ def verified_merged_archive_execution_ids(
     connection: sqlite3.Connection,
     repo: str,
     execution_rows: Iterable[Mapping[str, object]],
+    *, include_missing: bool = False,
 ) -> frozenset[str]:
     """Match MERGED execution rows to their verified archived identity and bytes."""
-    history_ids = verified_historical_merge_ids(connection, repo)
+    history_ids = verified_historical_merge_ids(connection, repo, include_missing=include_missing)
     if not history_ids:
         return frozenset()
     history = {
         str(row["plan_id"]): (str(row["observed_path"]), str(row["final_content_hash"]))
         for row in connection.execute(
             "SELECT plan_id, observed_path, final_content_hash "
-            "FROM execplan_catalog_history WHERE repo=? AND currently_archived=1",
+            "FROM execplan_catalog_history WHERE repo=?" + ("" if include_missing else " AND currently_archived=1"),
             (repo,),
         )
         if str(row["plan_id"]) in history_ids

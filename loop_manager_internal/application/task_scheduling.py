@@ -256,6 +256,9 @@ class TaskScheduler:
 
     def wait_usage(self, connection, repo, plan_id):
         """Only an independently recorded successful call can clear a quota wait."""
+        from loop_manager_internal.storage.execplan_catalog_state import is_cancelled
+        if is_cancelled(connection, repo, plan_id):
+            return False
         saved = connection.execute(
             'SELECT result_kind, provider, model, finished_at FROM agent_invocations '
             'WHERE repo=? AND plan_id=? ORDER BY started_at DESC, rowid DESC LIMIT 1', (repo, plan_id)).fetchone()
@@ -264,12 +267,14 @@ class TaskScheduler:
         events.emit('사용 한도 조건 대기', project=repo, plan=plan_id)
         while True:
             self.check_project(repo)
+            if is_cancelled(connection, repo, plan_id):
+                return False
             if saved['finished_at'] and connection.execute(
                 "SELECT 1 FROM agent_invocations WHERE repo=? AND provider=? AND model=? "
                 "AND finished_at>? AND result_kind='success' AND result_code=0 "
                 "AND execution_status='executed' AND execution_finished_at IS NOT NULL LIMIT 1",
                 (repo, saved['provider'], saved['model'], saved['finished_at'])).fetchone():
-                return True
+                return not is_cancelled(connection, repo, plan_id)
             with self.condition:
                 self.condition.wait(1)
 

@@ -60,7 +60,13 @@ def document_resources(snapshot, state_dir, repo, plan_id):
             raise ValueError('unknown checkpoint snapshot')
         for field in ('document_revision', 'retired_document_assessment'):
             read(item.get(field))
-        history = item.get('rebase_operation_history', [])
+        restart = item.get('deleted_branch_restart')
+        if restart is not None:
+            if not isinstance(restart, dict) or restart.get('state') != 'complete':
+                raise ValueError('unknown branch restart')
+            read_snapshot(restart['checkpoint'])
+        history = [*item.get('rebase_operation_history', []),
+                   *(record['snapshot'] for record in item.get('superseded_rebases', []))]
         if not isinstance(history, list):
             raise ValueError('unknown operation history')
         for previous in history:
@@ -95,6 +101,33 @@ def removal_recoverable(connection, state_dir, repo, plan_id, canceled, intent):
         return False
 
 
+def check_workspace_references(connection, raw):
+    workspace = Path(raw)
+    if workspace.is_symlink():
+        raise CallDeferred('전용 문서 사본의 symlink 소유권을 확인할 수 없습니다.')
+    tables = ['exec_plans', 'projects']
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_groups'").fetchone():
+        tables.append('manual_work_groups')
+    # ponytail: O(copies * stored workspaces) handles path aliases without a new index.
+    # Index canonical resource owners if this scan becomes material.
+    for table in tables:
+        for row in connection.execute('SELECT worktree FROM ' + table + ' WHERE worktree IS NOT NULL'):
+            other = Path(row['worktree'])
+            if (not other.is_absolute() or workspace.resolve().is_relative_to(other.resolve())
+                    or other.resolve().is_relative_to(workspace.resolve())):
+                raise CallDeferred('독립 실행·프로젝트·수동 작업이 참조하는 문서 사본을 보존합니다.')
+    from loop_manager_internal.storage import runtime_state
+    for project in connection.execute('SELECT planning_preserved_state FROM projects WHERE planning_preserved_state IS NOT NULL'):
+        try:
+            preserved = runtime_state._preserved_planning_values(project['planning_preserved_state'])['worktree']
+        except (runtime_state.RuntimeStateError, TypeError, ValueError) as error:
+            raise CallDeferred('보존된 planning 문맥의 사본 소유권을 확인할 수 없습니다.') from error
+        if preserved is not None and (not Path(preserved).is_absolute()
+                or Path(preserved).resolve().is_relative_to(workspace.resolve())
+                or workspace.resolve().is_relative_to(Path(preserved).resolve())):
+            raise CallDeferred('보존된 planning 문맥이 사용하는 문서 사본을 보존합니다.')
+
+
 @contextmanager
 def cleaned_documents(connection, state_dir, repo_path, repo, plan_id, canceled, *, git,
                       assess_cleanup, remove_cleanup_worktree, recover_cleanup_worktree, check_owner):
@@ -112,31 +145,6 @@ def cleaned_documents(connection, state_dir, repo_path, repo, plan_id, canceled,
         if any(root.exists() or root.is_symlink() for root in roots):
             raise CallDeferred('전용 문서 사본이 다시 생성돼 최종 제거를 보류합니다.')
 
-    def check_copy_owner(raw):
-        workspace = Path(raw)
-        if workspace.is_symlink():
-            raise CallDeferred('전용 문서 사본의 symlink 소유권을 확인할 수 없습니다.')
-        tables = ['exec_plans', 'projects']
-        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_groups'").fetchone():
-            tables.append('manual_work_groups')
-        # ponytail: O(copies * stored workspaces) handles path aliases without a new index.
-        # Index canonical resource owners if this scan becomes material.
-        for table in tables:
-            for row in connection.execute('SELECT worktree FROM ' + table + ' WHERE worktree IS NOT NULL'):
-                other = Path(row['worktree'])
-                if (not other.is_absolute() or workspace.resolve().is_relative_to(other.resolve())
-                        or other.resolve().is_relative_to(workspace.resolve())):
-                    raise CallDeferred('독립 실행·프로젝트·수동 작업이 참조하는 문서 사본을 보존합니다.')
-        from loop_manager_internal.storage import runtime_state
-        for project in connection.execute('SELECT planning_preserved_state FROM projects WHERE planning_preserved_state IS NOT NULL'):
-            try:
-                preserved = runtime_state._preserved_planning_values(project['planning_preserved_state'])['worktree']
-            except (runtime_state.RuntimeStateError, TypeError, ValueError) as error:
-                raise CallDeferred('보존된 planning 문맥의 사본 소유권을 확인할 수 없습니다.') from error
-            if preserved is not None and (not Path(preserved).is_absolute()
-                    or Path(preserved).resolve() == workspace.resolve()):
-                raise CallDeferred('보존된 planning 문맥이 사용하는 문서 사본을 보존합니다.')
-
     locks = [prefix + path for path in resources for prefix in ('worktree:', 'git:')]
     locks = [key for key in locks if not resource_owned(Path(state_dir), repo, key)]
     try:
@@ -153,7 +161,7 @@ def cleaned_documents(connection, state_dir, repo_path, repo, plan_id, canceled,
                 workspace = Path(raw)
                 check_owner()
                 check_checkpoint()
-                check_copy_owner(raw)
+                check_workspace_references(connection, raw)
                 if has_pending_project_mutation(Path(state_dir), repo, targets={raw}):
                     allowed = lambda intent: (intent.get('owner') == 'plan:' + plan_id
                         and intent.get('kind') == 'managed_worktree_remove' and intent.get('target') == raw)
@@ -175,7 +183,7 @@ def cleaned_documents(connection, state_dir, repo_path, repo, plan_id, canceled,
                     if workspace.is_symlink() or blocks:
                         raise CallDeferred('사라진 문서 사본의 등록·소유권 정리가 남아 있습니다.')
                     continue
-                check_copy_owner(raw)
+                check_workspace_references(connection, raw)
                 if (registration.returncode or len(blocks) != 1 or 'detached' not in blocks[0]
                         or git(workspace, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()
                         != git(repo_path, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()
@@ -183,13 +191,13 @@ def cleaned_documents(connection, state_dir, repo_path, repo, plan_id, canceled,
                     raise CallDeferred('전용 문서 worktree의 현재 등록·정리 권한을 확인할 수 없습니다.')
                 check_owner()
                 check_checkpoint()
-                check_copy_owner(raw)
+                check_workspace_references(connection, raw)
                 assessment = assess_cleanup(workspace, head)
                 if assessment.status != 'safe':
                     raise CallDeferred('변경되거나 미확인인 전용 문서 worktree를 보존합니다.')
                 check_owner()
                 check_checkpoint()
-                check_copy_owner(raw)
+                check_workspace_references(connection, raw)
                 removed = remove_cleanup_worktree(repo_path, workspace, assessment, state_dir=Path(state_dir), owner='plan:' + plan_id)
                 if removed.status != 'safe' or workspace.exists():
                     raise CallDeferred('전용 문서 worktree 정리가 미완료입니다.')

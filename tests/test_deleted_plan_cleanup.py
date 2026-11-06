@@ -145,7 +145,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
 
     def rowless_cancellation(self, *, started=False, empty_checkpoint=False, blocked=False,
                              empty_blocked_checkpoint=False, resolved_blocked_checkpoint=False,
-                             requested_blocked_checkpoint=False, native_block=False, checkpoint_snapshot=None, owned_workspace=None, published_blocked=False, checkpoint_builder=None):
+                             requested_blocked_checkpoint=False, native_block=False, checkpoint_snapshot=None, owned_workspace=None, published_blocked=False, checkpoint_builder=None, withdrawn=True):
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         from loop_manager_internal.planning.planning_catalog import PlanDeletion
@@ -196,7 +196,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             from loop_manager_internal.planning.planner_validation import planning_execution_state
             plan = replace(plan, execution_state=planning_execution_state(row))
         judgment = {'decision': {'id': 'G-001', 'source': 'docs/PRODUCT.md', 'outcome': 'withdrawn',
-            'reason': 'The original goal was withdrawn.'}} if started else None
+            'reason': 'The original goal was withdrawn.'}} if withdrawn else None
         if empty_checkpoint:
             from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
             ExecutionCheckpointRepository(self.connection).record('/repo', 'G-001', expected_generation=0,
@@ -226,12 +226,12 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             self.assertEqual(audit['block'], original_block)
         return text
 
-    def cleanup_rowless(self, text, *, git=None, pr=None, current=lambda: True):
+    def cleanup_rowless(self, text, *, git=None, pr=None, current=lambda: True, documents=None):
         from tempfile import TemporaryDirectory
         from unittest import mock
         from loop_manager_internal.catalog.deleted_plan_cleanup import cleanup
         pinned = SimpleNamespace(regular_paths=set(), revision_sha='c' * 40,
-            snapshot=SimpleNamespace(observed_ids={'G-002'}, all={}, withheld=()))
+            snapshot=SimpleNamespace(observed_ids={'G-002'}, all=documents or {}, withheld=()))
         def observe(_repo, *args, **kwargs):
             self.assertFalse(self.connection.in_transaction)
             return SimpleNamespace(returncode=1 if args[0] == 'rev-parse' else 0, stdout='')
@@ -240,8 +240,39 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 git_bytes=lambda *_: text.encode(), pr_for_branch=pr or mock.Mock(return_value=None),
                 state_dir=state, revision_is_current=current)
 
+    def test_plain_unstarted_remote_deletion_keeps_general_cancellation_audit(self):
+        from unittest import mock
+        text = self.rowless_cancellation(withdrawn=False)
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+        self.assertIsNone(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone())
+
+    def test_unstarted_final_erasure_requires_published_recovery_for_live_dependents(self):
+        text = self.rowless_cancellation(withdrawn=False)
+        audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        audit['affected'] = ['G-002']
+        self.connection.execute("UPDATE exec_plans SET status='READY' WHERE plan_id='G-002'")
+        self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
+        self.connection.commit()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.assertEqual(self.cleanup_rowless(text, documents=self.published_withdrawal()), ('G-001',))
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone())
+        self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+
+    def published_withdrawal(self):
+        path = 'docs/plans/[G-002] Dependency.md'
+        decision = dict(deleted_id='G-001', outcome='obsolete', replacement_ids=[], sources=['docs/PRODUCT.md'],
+                        reason='The withdrawn goal is no longer needed.')
+        text = self.fixture._text('G-002', 'Dependency') + '\n## Decision Log\nDEPENDENCY_RECOVERY: ' + json.dumps(decision) + '\n'
+        return {'G-002': SimpleNamespace(path=path, text=text)}
+
     def test_complete_unstarted_cancellation_can_finish_without_recreating_execution_row(self):
-        text = self.rowless_cancellation()
+        text = self.rowless_cancellation(empty_checkpoint=True, checkpoint_snapshot=dict(
+            worktree_recovery_pending=False, branch='', worktree='', stored_active_sha=''))
         self.connection.execute("CREATE TRIGGER reject_rowless_resurrection BEFORE INSERT ON exec_plans "
             "WHEN NEW.plan_id='G-001' BEGIN SELECT RAISE(ABORT,'execution resurrection'); END")
         self.connection.commit()
@@ -664,9 +695,10 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 return journal.recover_active(state, repo='/repo', kind='managed_worktree_remove', target=str(path),
                     observe=observe_removal, marker=lambda intent: receipt == intent['id'])
             pinned = SimpleNamespace(regular_paths=set(), revision_sha='c' * 40,
-                snapshot=SimpleNamespace(observed_ids={'G-002'}, all={}, withheld=()))
+                snapshot=SimpleNamespace(observed_ids={'G-002'}, all=self.published_withdrawal() if active else {}, withheld=()))
+            references = (SimpleNamespace(plan_id='G-002', source='docs/plans/[G-001] Gone.md'),) if active else ()
             def run():
-                return cleanup(self.connection, '/repo', '/repo', pinned, (), git=git, git_bytes=lambda *_: text.encode(),
+                return cleanup(self.connection, '/repo', '/repo', pinned, references, git=git, git_bytes=lambda *_: text.encode(),
                     pr_for_branch=lambda *_: None, state_dir=state, revision_is_current=lambda: True,
                     assess_cleanup=assess, remove_cleanup_worktree=remove, recover_cleanup_worktree=recover)
             self.assertEqual(run(), ())
@@ -953,7 +985,9 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 remote_oid=None, pull_request=None, rebase_intent=False, rebase_before_head=None,
                 rebase_target_oid=None, stash_oid=None))
             checkpoint.update(expected_head='d' * 40, target_base_oid='a' * 40, observed_remote_oid='d' * 40,
-                snapshot=json.dumps(dict(**observation, fetch_in_progress=False, fetched_base_oid='a' * 40, stage_result_origins={origin_id: dict(evidence=origin, reason='rebase')},
+                snapshot=json.dumps(dict(**{**observation, 'pending_operation': 'rebase', 'stash_oid': 'c' * 40}, worktree=str(workspace), worktree_recovery_pending=False,
+                                         stored_active_sha='a' * 40, worker_checkpoint_result=dict(head='d' * 40, title='preserved'),
+                                         worker_checkpoint_requests=[], fetch_in_progress=False, fetched_base_oid='a' * 40, stage_result_origins={origin_id: dict(evidence=origin, reason='rebase')},
                                          worker_candidate_token='e' * 64, retired_agent_scopes=[retired_scope])))
             self.connection.execute('UPDATE execplan_cancellations SET recovery_evidence=?', (json.dumps(audit),))
             self.connection.commit()
@@ -981,10 +1015,11 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                     git_bytes=lambda *_: text.encode(), pr_for_branch=observe_pr,
                     state_dir=state, revision_is_current=lambda: True)
             for bad_snapshot in (
-                    {**observation, 'stash_oid': 'a' * 40},
                     {**observation, 'pr_state': 'MERGED'},
                     {**observation, 'branch': 'foreign'},
-                    {**observation, 'pending_operation': 'rebase'},
+                    {**observation, 'worktree': '/independent'},
+                    {**observation, 'worktree_recovery_pending': 'false'},
+                    {**observation, 'worker_checkpoint_result': dict(worktree='/independent')},
                     {'phase': 'IMPLEMENTING'},
                     {'stage_result_origins': {origin_id: dict(evidence={**origin, 'repo': '/other'}, reason='rebase')}},
                     {'stage_result_origins': {'bad-checksum': dict(evidence=origin, reason='rebase')}},
@@ -1035,6 +1070,142 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
             self.assertEqual(run(), ())
 
+    def test_native_deleted_branch_restart_waits_for_retired_copy_and_refs_then_erases(self):
+        import shutil
+        import hashlib
+        from dataclasses import replace
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from unittest import mock
+        from loop_manager_internal.agents.scope_contracts import GitSnapshot
+        from loop_manager_internal.recovery import deleted_branch_restart, scoped_blocking
+        from loop_manager_internal.storage import runtime_state
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion
+        from loop_manager_internal.planning.planner_validation import planning_execution_state
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.catalog.deleted_plan_cleanup import cleanup
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            workspace = state / 'worktrees' / 'repo-key' / 'G-001'
+            text = self.rowless_cancellation(started=True, native_block=True, empty_checkpoint=True, owned_workspace=workspace)
+            audit = json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+            self.connection.execute('DELETE FROM execplan_cancellations')
+            for table, row in [('exec_plans', audit['row']), ('execplan_blocks', audit['block']),
+                               *audit['checkpoints'].items()]:
+                self.connection.execute('INSERT INTO ' + table + ' (' + ','.join(row) + ') VALUES ('
+                    + ','.join('?' for _ in row) + ')', tuple(row.values()))
+            self.connection.execute("UPDATE projects SET origin='owner/repo',registered=1 WHERE repo='/repo'")
+            scoped_blocking.record_plan_block(self.connection, '/repo', 'G-001',
+                scoped_blocking.BlockReasonCode.REMOTE_BRANCH_DELETED, 'native deleted branch', None)
+            self.connection.commit()
+            workspace.mkdir(parents=True)
+            (workspace / 'original.txt').write_text('original user input')
+            branches, heads = {str(workspace): 'loop-manager/G-001'}, {str(workspace): 'a' * 40}
+            def capture(path):
+                content = path / 'original.txt'
+                dirty = {'original.txt': (('untracked',), hashlib.sha256(content.read_bytes()).hexdigest())} if content.exists() else {}
+                return GitSnapshot(heads[str(path)], branches[str(path)], {}, dirty, {}, {}, {}, {})
+            def reset_git(path, *args, **kwargs):
+                output = ''
+                if args[:2] == ('remote', 'get-url'):
+                    output = '/mock-origin'
+                elif args[:2] == ('ls-remote', '--heads'):
+                    pass
+                elif args[:2] == ('rev-parse', 'FETCH_HEAD^{commit}'):
+                    output = 'b' * 40
+                elif args[:2] == ('worktree', 'move'):
+                    shutil.move(args[2], args[3])
+                    branches[args[3]], heads[args[3]] = branches.pop(args[2]), heads.pop(args[2])
+                elif args[:2] == ('branch', '-m'):
+                    branches[str(path)] = args[3]
+                elif args[:2] == ('worktree', 'add'):
+                    Path(args[4]).mkdir()
+                    branches[args[4]], heads[args[4]] = args[3], args[5]
+                elif args[0] != 'fetch':
+                    raise AssertionError(args)
+                return SimpleNamespace(returncode=0, stdout=output)
+            effects = SimpleNamespace(git=reset_git, github_repository=lambda _: 'owner/repo',
+                validate_execplan_workspace_identity=lambda *_: None, validate_managed_worktree=lambda *_: None,
+                capture_git_snapshot=capture)
+            deleted_branch_restart.restart(effects, self.connection, Path('/repo'), state, '/repo', 'G-001',
+                complete_merged=mock.Mock(side_effect=AssertionError('not merged')), unmet_dependencies=lambda *_: (),
+                lookup_pr=lambda *_: None)
+            checkpoints = ExecutionCheckpointRepository(self.connection)
+            restart = checkpoints.get('/repo', 'G-001').snapshot['deleted_branch_restart']
+            archive = Path(restart['archive'])
+            self.assertEqual((archive / 'original.txt').read_text(), 'original user input')
+            self.assertEqual(restart['state'], 'complete')
+            row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
+            original = ReadyPlanSnapshot('G-001', row['path'], row['title'], tuple(json.loads(row['sources'])), (),
+                'low', 'low', row['priority'], row['content_hash'], 'a' * 40, text,
+                current_complexity=row['current_complexity'], current_risk=row['current_risk'], current_metadata_recorded=True,
+                execution_state=planning_execution_state(row))
+            with runtime_state._transaction(self.connection):
+                apply_mutable_catalog_changes(self.connection, '/repo', deletions=(PlanDeletion(original,
+                    {'decision': {'id': 'G-001', 'source': 'docs/PRODUCT.md', 'outcome': 'withdrawn', 'reason': 'goal withdrawn'}}),),
+                    revisions=(), snapshot_token='withdrawn', plan_commit='c' * 40, content_hash=lambda _: '', agent=False)
+            self.artifact_call('stopped-before-restart', '/repo', 'G-001')
+            self.connection.commit()
+            workspace.rmdir()  # Existing native resource owner retired the fresh workspace.
+            pinned = SimpleNamespace(regular_paths=set(), revision_sha='d' * 40,
+                snapshot=SimpleNamespace(observed_ids={'G-002'}, all={}, withheld=()))
+            live, registration, race, local, unreadable, pull_request = False, '', False, False, False, None
+            observations = []
+            def git(_repo, *args, **kwargs):
+                observations.append(args)
+                self.assertFalse(self.connection.in_transaction)
+                if unreadable and 'ls-remote' in args and args[-1].endswith(restart['archive_branch']):
+                    raise RuntimeError('mock remote unavailable')
+                output = registration if args[0] == 'worktree' else ('head' if live and 'ls-remote' in args and args[-1].endswith(restart['archive_branch']) else '')
+                return SimpleNamespace(returncode=int(args[0] == 'rev-parse' and not (local and args[-1].endswith(restart['archive_branch']))), stdout=output)
+            def pr(_repo, branch, *_):
+                nonlocal race
+                if race and branch == restart['archive_branch']:
+                    race = False
+                    archive.mkdir(parents=True)
+                return pull_request if branch == restart['archive_branch'] else None
+            def run():
+                return cleanup(self.connection, '/repo', '/repo', pinned, (), git=git,
+                    git_bytes=lambda *_: text.encode(), pr_for_branch=pr, state_dir=state, revision_is_current=lambda: True)
+            before = tuple(self.connection.iterdump())
+            self.assertEqual(run(), ())
+            self.assertEqual((archive / 'original.txt').read_text(), 'original user input')
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            (archive / 'original.txt').unlink()
+            archive.rmdir()  # This observation follows physical retirement, without redoing reset.
+            live = True
+            self.assertEqual(run(), ())
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            live, local = False, True
+            self.assertEqual(run(), ())
+            local, unreadable = False, True
+            self.assertEqual(run(), ())
+            unreadable, pull_request = False, dict(state='OPEN')
+            self.assertEqual(run(), ())
+            pull_request, registration = None, 'worktree ' + str(archive)
+            self.assertEqual(run(), ())
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            registration = ''
+            self.connection.execute("UPDATE projects SET worktree=? WHERE repo='/repo'",
+                                    (str(archive.parent / '..' / 'retired' / archive.name),))
+            self.connection.commit()
+            shared = tuple(self.connection.iterdump())
+            self.assertEqual(run(), ())
+            self.assertEqual(tuple(self.connection.iterdump()), shared)
+            self.connection.execute("UPDATE projects SET worktree=NULL WHERE repo='/repo'")
+            self.connection.commit()
+            registration, race = '', True
+            self.assertEqual(run(), ())
+            self.assertTrue(archive.exists())
+            archive.rmdir()
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            self.assertEqual(run(), ('G-001',))
+            self.assertIsNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+            self.assertEqual(tuple(self.connection.execute('SELECT * FROM deleted_plan_ids').fetchone()), ('/repo', 'G-001'))
+            self.assertEqual(run(), ())
+
     def test_retired_native_rebase_publications_and_history_erase_without_replaying_tokens(self):
         import copy
         import sqlite3
@@ -1051,7 +1222,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 checkpoints = ExecutionCheckpointRepository(self.connection)
                 for head in ('c' * 40, 'd' * 40):
                     current = checkpoints.get('/repo', 'G-001')
-                    expected = expectation(repo='/repo', plan_id='G-001', plan_path='docs/plans/[G-001] Gone.md',
+                    expected = expectation(repo='/repo', plan_id='G-001', plan_path='docs/plans/[G-001] Before Rename.md',
                         branch='loop-manager/G-001', worktree=str(workspace), generation=current.generation,
                         target_base_oid='a' * 40)
                     expected = replace(expected, remote=replace(expected.remote, branch=expected.branch,
@@ -1072,7 +1243,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 # new rebase begins. No execution success is inferred from it.
                 from loop_manager_internal.agents.scope_contracts import GitSnapshot
                 import hashlib
-                scope = GitSnapshot('f' * 40, 'refs/heads/loop-manager/G-001', {}, {}, {}, {}, {}, {}).serialize()
+                scope = GitSnapshot('f' * 40, 'loop-manager/G-001', {}, {}, {}, {}, {}, {}).serialize()
                 baseline_id = hashlib.sha256(('f' * 40 + '\0' + 'a' * 40 + '\0' + 'b' * 40).encode()).hexdigest()
                 baseline_ref = 'refs/loop-manager/baselines/' + hashlib.sha256(b'/repo').hexdigest()[:16] + '/' + baseline_id
                 baseline = json.dumps(dict(version=1, ref=baseline_ref, ref_target='e' * 40,
@@ -1086,8 +1257,13 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                 snapshot = {**saved.snapshot,
                     'stage_result_origins': {origin_id: dict(evidence=origin, reason='rebase_start')},
                     'rebase_operation_history': [{**copy.deepcopy(saved.snapshot), 'rebase_stage_origin': origin_id}],
-                    'integration_repo': '/repo', 'base_rebase_restart': preserved,
-                    'base_rebase_restart_history': [{**preserved, 'phase': 'preserving'}]}
+                    'integration_repo': '/repo', 'pending_work_branch_input': 'a' * 40, 'base_rebase_restart': preserved,
+                    'base_rebase_restart_history': [{**preserved, 'phase': 'preserving'}],
+                    'retired_rebase_publications': [dict(intent=copy.deepcopy(saved.snapshot['rebase_publication_intent']),
+                                                        observed_remote='e' * 40, confirmed=False)],
+                    'rebase_publication_intent': None,
+                    'superseded_rebases': [dict(operation='rebase', expected_head='a' * 40,
+                        target_base_oid='b' * 40, observed_remote_oid='c' * 40, snapshot=copy.deepcopy(saved.snapshot))]}
                 checkpoints.record('/repo', 'G-001', expected_generation=saved.generation, operation=None,
                     expected_head=saved.expected_head, target_base_oid=saved.target_base_oid,
                     observed_remote_oid=saved.observed_remote_oid, snapshot=snapshot)
@@ -1125,7 +1301,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
                     from loop_manager_internal.git.managed_rebase_validation import fingerprint
                     acceptance['id'] = fingerprint({key: value for key, value in acceptance.items() if key != 'id'})
                 elif change == 'intent':
-                    invalid['rebase_publication_intent']['id'] = 'forged'
+                    invalid['retired_rebase_publications'][0]['intent']['id'] = 'forged'
                 elif change == 'result':
                     invalid['rebase_publication_result']['intent_id'] = 'other-request'
                 elif change == 'baseline':
@@ -2203,6 +2379,92 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.assertEqual(self.connection.execute('SELECT count(*) FROM diagnostic_preservations').fetchone()[0], 0)
         self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
 
+    def test_confirmed_catalog_merge_survives_missing_execution_row_and_archive_file(self):
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        self.rowless_cancellation()
+        columns = ('repo,plan_id,original_path,observed_path,original_content_hash,final_content_hash,'
+                   'plan_sha,merge_confirmed,identity_verified,currently_archived,proof_kind,proof_revision')
+        for repo in ('/repo', '/other'):
+            self.connection.execute('INSERT INTO execplan_catalog_history (' + columns + ') VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                (repo, 'G-001', 'docs/plans/[G-001] Gone.md', 'docs/plans/archive/[G-001] Gone.md',
+                 'original-hash', 'final-hash', 'a' * 40, 1, 1, 1, 'github-pr', 'b' * 40))
+        self.connection.commit()
+        for archived in (1, 0):
+            self.connection.execute("UPDATE execplan_catalog_history SET currently_archived=? WHERE repo='/repo'", (archived,))
+            self.connection.commit()
+            before = tuple(self.connection.iterdump())
+            with self.assertRaises(CallDeferred):
+                deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.connection.execute("DELETE FROM execplan_catalog_history WHERE repo='/repo'")
+        self.connection.commit()
+        foreign = dict(self.connection.execute("SELECT * FROM execplan_catalog_history WHERE repo='/other'").fetchone())
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM execplan_catalog_history').fetchone()), foreign)
+
+    def test_verified_archive_dependency_is_historical_before_backfill_and_preserved(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from loop_manager_internal.catalog.deleted_plan_cleanup import cleanup
+        from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
+        text = self.rowless_cancellation()
+        archived = self.fixture._text('G-002', 'Dependency', depends_on=('G-001',))
+        archive_path = 'docs/plans/archive/[G-002] Dependency.md'
+        self.connection.execute("UPDATE exec_plans SET depends_on='[\"G-001\"]',plan_sha=?,pr_url='https://example/pr/2',"
+            "pr_head_oid=?,content_hash=? WHERE plan_id='G-002'", ('a' * 40, 'b' * 40, plan_content_hash(archived)))
+        self.connection.commit()
+        original = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone())
+        self.assertIsNone(self.connection.execute("SELECT * FROM execplan_catalog_history WHERE plan_id='G-002'").fetchone())
+        entry = SimpleNamespace(path=archive_path, text=archived)
+        pinned = SimpleNamespace(regular_paths={archive_path}, revision_sha='c' * 40,
+            snapshot=SimpleNamespace(observed_ids={'G-002'}, all={'G-002': entry}, archived={'G-002': entry}, withheld=()))
+        from loop_manager_internal.catalog.remote_deletions import historical_reference_ids
+        self.assertEqual(historical_reference_ids(self.connection, '/repo', pinned), {'G-002'})
+        race = False
+        def git(_repo, *args, **kwargs):
+            self.assertFalse(self.connection.in_transaction)
+            return SimpleNamespace(returncode=int(args[0] == 'rev-parse'), stdout='')
+        def pr(*_):
+            if race:
+                self.connection.execute("UPDATE exec_plans SET content_hash='new-observation' WHERE plan_id='G-002'")
+                self.connection.commit()
+            return None
+        with TemporaryDirectory() as directory:
+            def run():
+                return cleanup(self.connection, '/repo', '/repo', pinned, (), git=git,
+                    git_bytes=lambda *_: text.encode(), pr_for_branch=pr, state_dir=Path(directory), revision_is_current=lambda: True)
+            before = tuple(self.connection.iterdump())
+            entry.text = archived + 'mismatch'
+            self.assertEqual(run(), ())
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            entry.text = archived
+            self.connection.execute("UPDATE exec_plans SET pr_head_oid=NULL WHERE plan_id='G-002'")
+            self.connection.commit()
+            self.assertEqual(run(), ())
+            self.connection.execute("UPDATE exec_plans SET pr_head_oid=? WHERE plan_id='G-002'", ('b' * 40,))
+            self.connection.commit()
+            race = True
+            self.assertEqual(run(), ())
+            self.assertIsNotNone(self.connection.execute('SELECT * FROM execplan_cancellations').fetchone())
+            self.assertEqual(self.connection.execute("SELECT content_hash FROM exec_plans WHERE plan_id='G-002'").fetchone()[0], 'new-observation')
+            self.connection.execute("UPDATE exec_plans SET content_hash=? WHERE plan_id='G-002'", (original['content_hash'],))
+            self.connection.commit()
+            race = False
+            self.connection.execute('INSERT INTO execplan_catalog_history '
+                '(repo,plan_id,original_path,observed_path,original_content_hash,final_content_hash,plan_sha,'
+                'merge_confirmed,identity_verified,currently_archived,proof_kind,proof_revision) '
+                "VALUES ('/repo','G-002',?,?,?,?,?,1,1,0,'github-pr',?)",
+                (original['path'], archive_path, original['content_hash'], original['content_hash'], 'a' * 40, 'b' * 40))
+            self.connection.execute("UPDATE exec_plans SET path=? WHERE plan_id='G-002'", (archive_path,))
+            self.connection.commit()
+            original['path'] = archive_path
+            history = dict(self.connection.execute("SELECT * FROM execplan_catalog_history WHERE plan_id='G-002'").fetchone())
+            pinned.snapshot.observed_ids, pinned.snapshot.all, pinned.snapshot.archived, pinned.regular_paths = set(), {}, {}, set()
+            self.assertEqual(historical_reference_ids(self.connection, '/repo', pinned), {'G-002'})
+            self.assertEqual(run(), ('G-001',))
+            self.assertEqual(dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()), original)
+            self.assertEqual(dict(self.connection.execute("SELECT * FROM execplan_catalog_history WHERE plan_id='G-002'").fetchone()), history)
+
     def test_dependency_writer_and_merge_prevent_erasure(self):
         for assignment in ("status='MERGED'", "agent_role='worker'"):
             with self.subTest(assignment=assignment):
@@ -2247,7 +2509,8 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.connection.execute("UPDATE exec_plans SET worktree=NULL,branch='loop-manager/G-001',pr_url='https://example/pr/1',current_revision_sha=? WHERE plan_id='G-001'", ('a'*40,))
         self.connection.commit()
         pinned = SimpleNamespace(regular_paths=set(), revision_sha='b'*40,
-            snapshot=SimpleNamespace(observed_ids={'G-002'}, all={}, withheld=()))
+            snapshot=SimpleNamespace(observed_ids={'G-002'}, all=self.published_withdrawal(), withheld=()))
+        references = (SimpleNamespace(plan_id='G-002', source='docs/plans/[G-001] Old.md'),)
         @contextmanager
         def ownership(*args):
             yield SimpleNamespace(check=lambda: None)
@@ -2258,7 +2521,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
              mock.patch('loop_manager_internal.catalog.deleted_plan_cleanup.catalog.plan_content_hash', return_value=row['content_hash']):
             for state, current in [('OPEN', True), ('MERGED', True), ('CLOSED', False)]:
                 with self.subTest(state=state, current=current):
-                    self.assertEqual(cleanup(self.connection, '/repo', '/repo', pinned, (), git=git,
+                    self.assertEqual(cleanup(self.connection, '/repo', '/repo', pinned, references, git=git,
                         git_bytes=lambda *a: b'original', pr_for_branch=lambda *a: {**pr, 'state': state},
                         state_dir=self.fixture.state_dir if hasattr(self.fixture,'state_dir') else '/tmp',
                         revision_is_current=lambda: current), ())
@@ -2268,13 +2531,13 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             self.connection.execute("INSERT INTO local_environment_recovery_requests "
                 "(request_id,repo,status,before_state) VALUES ('shared','/repo','completed','{\"unknown\":1}')")
             self.connection.commit()
-            self.assertEqual(cleanup(self.connection, '/repo', '/repo', pinned, (), git=git,
+            self.assertEqual(cleanup(self.connection, '/repo', '/repo', pinned, references, git=git,
                 git_bytes=lambda *a: b'original', pr_for_branch=lambda *a: pr, state_dir='/tmp',
                 revision_is_current=lambda: True), ())
             self.assertIsNotNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE plan_id='G-001'").fetchone())
             self.connection.execute("UPDATE local_environment_recovery_requests SET before_state='{}'")
             self.connection.commit()
-            self.assertEqual(cleanup(self.connection, '/repo', '/repo', pinned, (), git=git,
+            self.assertEqual(cleanup(self.connection, '/repo', '/repo', pinned, references, git=git,
                 git_bytes=lambda *a: b'original', pr_for_branch=lambda *a: pr, state_dir='/tmp',
                 revision_is_current=lambda: True), ('G-001',))
 
@@ -2383,16 +2646,24 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             artifact.write_text('private task log')
             deleted_plan_state.forget(self.connection, '/repo', 'G-001', artifacts=(artifact,))
             with mock.patch.object(Path, 'unlink', side_effect=OSError('locked')):
-                with self.assertRaises(OSError):
-                    remove_pending_files(self.connection, '/repo', directory)
+                self.assertEqual(remove_pending_files(self.connection, '/repo', directory), {'G-001'})
+            self.assertTrue(artifact.exists())
             self.assertEqual(self.connection.execute('SELECT count(*) FROM deleted_plan_files').fetchone()[0], 1)
             remove_pending_files(self.connection, '/repo', directory)
             self.assertFalse(artifact.exists())
             self.assertEqual(self.connection.execute('SELECT count(*) FROM deleted_plan_files').fetchone()[0], 0)
-            self.connection.execute('INSERT INTO deleted_plan_files VALUES (?,?,?)', ('/repo','G-001',str(Path(directory)/'outside')))
+            outside = Path(directory) / 'outside'
+            outside.write_text('unowned bytes')
+            independent = Path(directory) / 'logs' / 'independent-file'
+            independent.write_text('finished independent task')
+            self.connection.executemany('INSERT INTO deleted_plan_files VALUES (?,?,?)', (
+                ('/repo', 'G-001', str(outside)), ('/repo', 'G-999', str(independent))))
             self.connection.commit()
-            with self.assertRaises(ValueError):
-                remove_pending_files(self.connection, '/repo', directory)
+            self.assertEqual(remove_pending_files(self.connection, '/repo', directory), {'G-001'})
+            self.assertEqual(outside.read_text(), 'unowned bytes')
+            self.assertFalse(independent.exists())
+            self.assertEqual([tuple(row) for row in self.connection.execute('SELECT * FROM deleted_plan_files')],
+                             [('/repo', 'G-001', str(outside))])
 
     def test_closed_pr_takes_precedence_over_deleted_branch_block(self):
         from pathlib import Path
@@ -2555,7 +2826,9 @@ class DeletedDiagnosticArtifactTests(ArtifactRecoveryFixture, unittest.TestCase)
             row['content_hash'], 'a' * 40, text, current_complexity='low', current_risk='low', current_metadata_recorded=True)
         with runtime_state._transaction(self.connection):
             planning_publication_state.apply_mutable_catalog_changes(self.connection, 'repo',
-                deletions=(PlanDeletion(plan),), revisions=(), snapshot_token='withdrawn', plan_commit='b' * 40,
+                deletions=(PlanDeletion(plan, {'decision': dict(id='G-047', source='docs/PRODUCT.md',
+                    outcome='withdrawn', reason='The original goal was withdrawn.')}),),
+                revisions=(), snapshot_token='withdrawn', plan_commit='b' * 40,
                 content_hash=lambda _: '', agent=False)
         # Preserve the real native failed preparation/attempt; no rebase success is invented.
         effects = diagnostic_cleanup.CleanupEffects(*[mock.Mock(side_effect=AssertionError('no actual Git/Agent')) for _ in range(6)])
