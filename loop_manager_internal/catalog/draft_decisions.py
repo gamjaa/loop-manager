@@ -153,6 +153,7 @@ def prepare(connection, repo, worktree, snapshot):
         text = path.read_text(encoding="utf-8")
         receipt = saved.get("prepared_resolution")
         if (receipt and receipt["revision"] == saved["revision"] and receipt["basis"] == saved["basis"]
+                and execplan_draft_state.resolution_matches(saved, receipt)
                 and receipt["content_hash"] == execplan_catalog.plan_content_hash(path.read_bytes())):
             prepared[original.plan_id] = receipt
             continue
@@ -161,6 +162,8 @@ def prepare(connection, repo, worktree, snapshot):
         assessment = assessments.get(original.plan_id)
         question_items = questions(saved["question"])
         decision = saved.get("decision", {})
+        if execplan_drafts.fields(markdown_sections(original.text).values.get("User Decision", "")) != decision:
+            raise PlannerValidationError("User Decision의 현재 원문이 변경됐습니다.")
         if assessment is None or assessment.get("outcome") == "uncertain":
             continue
         if (assessment.get("outcome") is None and assessment.get("resolved") == []
@@ -170,7 +173,7 @@ def prepare(connection, repo, worktree, snapshot):
             continue
         if decision.get("Decision") in {"reject", "defer"}:
             raise PlannerValidationError("거절·보류한 사용자 결정을 해소할 수 없습니다.")
-        if decision and not saved.get("decision_ready"):
+        if (decision.get("Decision") and not saved.get("decision_ready")) or (decision.get("Revision") and decision["Revision"] != saved["revision"] and not saved.get("decision_ready")):
             raise PlannerValidationError("User Decision의 현재 사용자 판단 근거를 확인할 수 없습니다.")
         if assessment.get("revision") != saved["revision"]:
             raise PlannerValidationError("draft 판단 revision이 변경됐습니다.")
@@ -194,6 +197,8 @@ def prepare(connection, repo, worktree, snapshot):
         if parsed["id"] != original.plan_id or parsed["sources"] != plan["sources"] or parsed["depends_on"] != plan["depends_on"]:
             raise PlannerValidationError("결정 입력 정리가 계획 identity·관계를 변경했습니다.")
         resolution = {"revision": saved["revision"], "basis": saved["basis"],
+                      "decision": saved.get("decision"),
+                      "decision_evidence": saved.get("decision_evidence"),
                       "assessment": assessment, "user_changes": saved["user_changes"],
                       "original": original.text, "content_hash": execplan_catalog.plan_content_hash(cleaned.encode())}
         cleaned = cleaned.rstrip() + "\n"
@@ -228,30 +233,65 @@ def _clean_answers(original, text, saved, assessment, question_items):
             raise PlannerValidationError("남은 질문에 다른 문서 절을 포함할 수 없습니다.")
         remaining = fragment["Draft Decision"]
     answered = set()
+    decision_quotes = set()
     for item in resolved:
-        if not isinstance(item, dict) or set(item) != {"question", "answer", "source", "quote"}:
+        item_decision_quotes = set()
+        if (not isinstance(item, dict) or not {"question", "answer", "source", "quote"} <= set(item)
+                or set(item) - {"question", "answer", "source", "quote", "evidence"}):
             raise PlannerValidationError("draft 질문 해소 근거가 유효하지 않습니다.")
         if not isinstance(item["question"], str) or not isinstance(item["source"], str):
             raise PlannerValidationError("draft 질문·근거 경로는 문자열이어야 합니다.")
-        change = saved.get("user_changes", {}).get(item["source"], {})
         if (item["question"] not in question_items or item["question"] in answered
-                or not isinstance(item["answer"], str) or not item["answer"].strip()
-                or not isinstance(item["quote"], str) or not item["quote"].strip()
-                or not change.get("verified") or item["quote"] not in change["after"]
-                or item["quote"] in change["before"]):
+                or not isinstance(item["answer"], str) or not item["answer"].strip()):
             raise PlannerValidationError("사용자 변경에서 draft 질문 해소를 확인할 수 없습니다.")
-        if item["source"] == original.path:
-            current = original.text
-        else:
-            current = change["after"]
-            if saved["basis"]["inputs"].get(change.get("input_path", item["source"])) != execplan_drafts.content_digest(current.encode()):
-                raise PlannerValidationError("사용자 변경의 현재 source 근거가 변경됐습니다.")
-        if item["quote"] not in current:
-            raise PlannerValidationError("현재 원격 원문에 사용자 답변이 없습니다.")
-        if (item["source"] == original.path
-                and item["quote"] in markdown_sections(change["after"]).values.get("User Decision", "")
-                and not saved.get("decision_ready")):
-            raise PlannerValidationError("User Decision의 현재 판단 근거를 확인할 수 없습니다.")
+        extra = item.get("evidence", [])
+        if not isinstance(extra, list):
+            raise PlannerValidationError("질문별 추가 근거가 유효하지 않습니다.")
+        references = [{"source": item["source"], "quote": item["quote"]}, *extra]
+        for reference in references:
+            if (not isinstance(reference, dict) or set(reference) != {"source", "quote"}
+                    or not isinstance(reference["source"], str) or not isinstance(reference["quote"], str)
+                    or not reference["quote"].strip()):
+                raise PlannerValidationError("질문별 추가 근거가 유효하지 않습니다.")
+            source, quote = reference["source"], reference["quote"]
+            change = saved.get("user_changes", {}).get(source, {})
+            if not change.get("verified") or quote not in change["after"] or quote in change["before"]:
+                raise PlannerValidationError("사용자 변경에서 draft 질문 해소를 확인할 수 없습니다.")
+            if source == original.path:
+                current = original.text
+                decision_body = markdown_sections(current).values.get("User Decision", "")
+                if quote in decision_body:
+                    after_decision = markdown_sections(change["after"]).values.get("User Decision", "")
+                    prior = execplan_drafts.fields(after_decision)
+                    current_decision = execplan_drafts.fields(decision_body)
+                    consumed = set()
+                    for audit in saved.get("resolutions", []):
+                        if audit.get("user_changes", {}).get(source) != change:
+                            continue
+                        for resolved_item in audit.get("assessment", {}).get("resolved", []):
+                            refs = [{"source": resolved_item["source"], "quote": resolved_item["quote"]}, *resolved_item.get("evidence", [])]
+                            consumed.update(ref["quote"].strip() for ref in refs if ref["source"] == source)
+                    remaining_answer = "\n".join(line for line in prior.get("Answer", "").splitlines() if line.strip() not in consumed).strip()
+                    same_decision = current_decision == {**prior, "Answer": remaining_answer}
+                    evidence = execplan_draft_state.decision_evidence(saved["basis"], saved.get("decision"), change)
+                    if (not same_decision or quote not in current_decision.get("Answer", "")
+                            or (not saved.get("decision_ready") and saved.get("decision_evidence") != evidence)):
+                        raise PlannerValidationError("User Decision의 현재 판단 근거를 확인할 수 없습니다.")
+                    decision_quotes.add(quote.strip())
+                    item_decision_quotes.add(quote.strip())
+            else:
+                current = change["after"]
+                if saved["basis"]["inputs"].get(change.get("input_path", source)) != execplan_drafts.content_digest(current.encode()):
+                    raise PlannerValidationError("사용자 변경의 현재 source 근거가 변경됐습니다.")
+            if quote not in current:
+                raise PlannerValidationError("현재 원격 원문에 사용자 답변이 없습니다.")
+        if item_decision_quotes and not saved.get("decision_ready"):
+            decision_revision = saved.get("user_changes", {}).get(original.path, {}).get("revision")
+            changed_sources = {path for path, change in saved.get("user_changes", {}).items()
+                               if path != original.path and change.get("revision") == decision_revision
+                               and change.get("before") != change.get("after")}
+            if not changed_sources <= {ref["source"] for ref in references}:
+                raise PlannerValidationError("같은 관측의 source 변경에 대한 질문별 판단 근거가 필요합니다.")
         sections = markdown_sections(text).values
         body = "\n".join(value for key, value in sections.items() if key not in {"Draft Decision", "User Decision", "Progress"})
         if item["answer"] not in body:
@@ -269,7 +309,7 @@ def _clean_answers(original, text, saved, assessment, question_items):
         decision_body = markdown_sections(text).values.get("User Decision", "")
         # Only consume independently quoted lines; a shared free-form answer
         # cannot safely be split by a substring match.
-        consumed = {item["quote"].strip() for item in resolved if item["source"] == original.path}
+        consumed = decision_quotes
         decision = execplan_drafts.fields(decision_body)
         answer = decision.get("Answer", "")
         lines = answer.splitlines()
@@ -283,8 +323,9 @@ def _clean_answers(original, text, saved, assessment, question_items):
             cleaned = replace_section(cleaned, "User Decision", decision_body)
     if not outstanding:
         decision = execplan_drafts.fields(markdown_sections(text).values.get("User Decision", ""))
-        if decision and not any(item["source"] == original.path and item["quote"].strip() == decision.get("Answer")
-                                for item in resolved):
+        answer = decision.get("Answer", "")
+        if decision and (not answer or (answer.strip() not in decision_quotes and any(
+                line.strip() and line.strip() not in decision_quotes for line in answer.splitlines()))):
             raise PlannerValidationError("확인하지 않은 User Decision을 정리할 수 없습니다.")
         cleaned = replace_section(cleaned, "User Decision", "")
         cleaned = re.sub(r"^draft:[ \t]*true[ \t]*\n", "", cleaned, count=1, flags=re.M)
