@@ -1017,6 +1017,53 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         deleted_plan_state.forget(self.connection, '/repo', 'G-001')
         self.assertEqual(tuple(self.connection.iterdump()), before)
 
+    def test_failed_unconfirmed_publication_notice_removes_target_after_claim_returns(self):
+        from unittest import mock
+        from loop_manager_internal.notifications import notifications
+        from loop_manager_internal.notifications.rendering import _message
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        notifications.ensure_schema(self.connection)
+        plans = []
+        for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id').fetchall():
+            self.connection.execute('UPDATE exec_plans SET publication_path=path,publication_sha=? WHERE plan_id=?',
+                                    ('a' * 40, row['plan_id']))
+            plans.append(dict(id=row['plan_id'], title=row['title'], source_path=row['path'], waiting_for=[]))
+        payload = dict(project='repo', publication_revision='a' * 40, plans=plans)
+        self.connection.execute('INSERT INTO notification_outbox (event_key,repo,event_type,payload) '
+            "VALUES ('failed-list','/repo','plans_published',?)", (json.dumps(payload),))
+        self.connection.commit()
+        def fail_during_send(_token, _chat, text):
+            self.assertEqual(text, _message('plans_published', payload))
+            before = tuple(self.connection.iterdump())
+            with self.assertRaises(CallDeferred):
+                deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+            self.assertEqual(tuple(self.connection.iterdump()), before)
+            raise RuntimeError('mock transport failure')
+        self.assertEqual(notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=fail_during_send), 0)
+        original = dict(self.connection.execute("SELECT * FROM notification_outbox WHERE event_key='failed-list'").fetchone())
+        self.assertEqual((original['attempts'], original['confirmed_pieces']), (1, 0))
+        self.assertIsNone(original['delivery_started_at'])
+        self.assertTrue(original['last_error'])
+        # Cancellation can clear a claim before HTTP returns; it is not a handoff.
+        for assignment in ("canceled_at='canceled'", 'confirmed_pieces=1',
+                           "rendered_text='legacy body'", 'attempts=0', 'last_error=NULL', "last_error=''"):
+            with self.subTest(assignment=assignment):
+                self.connection.execute('UPDATE notification_outbox SET ' + assignment + " WHERE event_key='failed-list'")
+                before = tuple(self.connection.iterdump())
+                with self.assertRaises(CallDeferred):
+                    deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+                self.assertEqual(tuple(self.connection.iterdump()), before)
+                self.connection.rollback()
+        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        retained = {**payload, 'plans': [plans[1]]}
+        current = dict(self.connection.execute("SELECT * FROM notification_outbox WHERE event_key='failed-list'").fetchone())
+        self.assertEqual(current, {**original, 'payload': json.dumps(retained, ensure_ascii=False),
+                                   'rendered_text': _message('plans_published', retained)})
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=sender), 1)
+        sender.assert_called_once_with('token', 'chat', _message('plans_published', retained))
+        self.assertEqual(notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=sender), 0)
+
     def test_unattributed_or_mixed_notifications_hold_final_erasure_without_losing_history(self):
         from loop_manager_internal.notifications import notifications
         from loop_manager_internal.storage.task_calls import CallDeferred

@@ -1908,6 +1908,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 | 혼합 목록의 전송 근거 | 최종 제거에서의 처리 |
 |---|---|
 | attempts·confirmed_pieces가 0이고 고정 본문·진행 중 claim·sent_at이 없음 | payload만 개정한다. 첫 claim은 남은 목록의 본문을 정상 생성한다. |
+| attempts가 양수이고 confirmed_pieces=0·sent_at/진행 중 claim/canceled_at 부재·비어 있지 않은 전송 오류가 있으며, 저장 본문이 현재 렌더러의 원래 payload와 일치함 | 대상 항목을 제외한 payload·본문만 개정한다. 사건 identity·attempts·오류·시각과 미확인 cursor는 유지해 다음 claim이 독립 항목을 재시도한다. 취소는 HTTP 반환 전에 claim을 비울 수 있으므로 canceled_at이 있으면 이 경로로 승인하지 않는다. |
 | sent_at이 있고 저장 본문이 현재 렌더러의 원래 payload 결과와 정확히 일치하며 모든 원래 조각의 확인이 있음 | 남은 목록의 본문이 더 길어지지 않음을 확인해 저장 payload·본문을 함께 개정한다. 기존 전송 완료·공유 시도/확인 누계는 유지하며 이 row를 다시 전송하지 않는다. 기존 질문·게시 확인 조회는 남은 항목을 계속 확인된 것으로 읽는다. |
 | 부분 전송·진행 중 claim·이전 렌더러의 미확인 본문·불완전 확인 | 원래 payload·본문·cursor·오류를 보존하고 `CallDeferred`로 해당 삭제를 보류한다. |
 

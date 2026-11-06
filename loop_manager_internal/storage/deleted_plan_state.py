@@ -120,7 +120,10 @@ def forget(connection, repo, plan_id, *, artifacts=()):
                                     and event['rendered_text'] is None and event['delivery_started_at'] is None
                                     and event['sent_at'] is None):
                                 pass  # No frozen body or transmission exists to remap.
-                            elif event['sent_at'] is not None:
+                            elif (event['sent_at'] is not None
+                                    or event['attempts'] > 0 and event['confirmed_pieces'] == 0
+                                    and event['delivery_started_at'] is None and event['canceled_at'] is None
+                                    and isinstance(event['last_error'], str) and event['last_error'].strip()):
                                 from loop_manager_internal.notifications.rendering import _message, _pieces
                                 try:
                                     original = _message(event['event_type'], payload)
@@ -128,9 +131,9 @@ def forget(connection, repo, plan_id, *, artifacts=()):
                                 except (KeyError, TypeError, ValueError) as error:
                                     raise CallDeferred('공유 알림의 원래 전송 본문을 확인할 수 없습니다.') from error
                                 if (event['rendered_text'] != original
-                                        or event['confirmed_pieces'] < len(_pieces(original))
+                                        or event['sent_at'] is not None and event['confirmed_pieces'] < len(_pieces(original))
                                         or len(rendered) > len(original)):
-                                    raise CallDeferred('공유 알림의 전체 전송 확인을 증명할 수 없습니다.')
+                                    raise CallDeferred('공유 알림의 원래 본문·전송 확인을 증명할 수 없습니다.')
                             else:
                                 raise CallDeferred('부분 전송된 공유 알림은 대상별 전송 근거 분리가 필요합니다.')
                             connection.execute('UPDATE notification_outbox SET payload=?,rendered_text=? WHERE event_key=?',
