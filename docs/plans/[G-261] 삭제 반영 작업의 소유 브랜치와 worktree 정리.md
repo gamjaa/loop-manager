@@ -55,8 +55,8 @@ Answer: 선택지 A를 승인한다. 앞으로 작업 문서의 확인된 삭제
 
 ## Implementation
 
-- [ ] 확인한 `catalog/deleted_plan_cleanup.py:cleanup()`의 원격 ref 부재 시 worktree/정확한 local ref 정리와 `storage/deleted_plan_state.py`의 파일 queue를 재사용한다. 현재 ref가 있으면 보류하는 경계를 기존 Manager journal·정확한 기대 OID의 삭제 lease로 연결한다. 확인한 `_rowless_cancellations()`의 native 감사와 `_rowless_ownership()`의 실제 부재 판정은 최종 제거 근거로 재사용한다. 실제 자원이 있는 후보는 별도 소유/보존 확인 뒤 물리 정리하고, 부재가 확인된 뒤에만 기존 최종 제거로 넘긴다. 형식 검사나 과거 cleanup_pending을 살아 있는 자원 소유의 증명으로 대신 쓰지 않는다. 일반 Merge cleanup·원격 사용자/base/다른 작업·수동 소유 보호를 확대하지 않는다.
-- [ ] 물리 정리 완료를 G-260의 기존 `storage/deleted_plan_state.py`·`catalog/deleted_document_cleanup.py`·파일 queue의 최종 제거/재시도에 연결한다. 문서 사본/native journal 복구·퇴역 acceptance/retired 사본의 실제 부재 확인·공유 usage/outbox/공통 결함/완료 Merge 보호는 이미 구현된 경계를 소비한다. 원래 자원 정리와 후속 기록 제거의 확정 지점을 구분하며 같은 엔진을 복제하지 않는다. 작업물/PR head 보존·소유/종료 확인에 필요한 자료를 먼저 지우지 않고, 일반 취소·실제 MERGED의 원문/실행 이력과 타 작업의 공유 자료는 유지한다. 별도 무차별 보존 폴더 삭제·새 정리 엔진은 만들지 않는다.
+- [x] 확인한 `catalog/deleted_plan_cleanup.py:cleanup()`의 원격 ref 부재 시 worktree/정확한 local ref 정리와 `storage/deleted_plan_state.py`의 파일 queue를 재사용한다. 현재 ref가 있으면 보류하는 경계를 기존 Manager journal·정확한 기대 OID의 삭제 lease로 연결한다. 확인한 `_rowless_cancellations()`의 native 감사와 `_rowless_ownership()`의 실제 부재 판정은 최종 제거 근거로 재사용한다. 실제 자원이 있는 후보는 별도 소유/보존 확인 뒤 물리 정리하고, 부재가 확인된 뒤에만 기존 최종 제거로 넘긴다. 형식 검사나 과거 cleanup_pending을 살아 있는 자원 소유의 증명으로 대신 쓰지 않는다. 일반 Merge cleanup·원격 사용자/base/다른 작업·수동 소유 보호를 확대하지 않는다.
+- [x] 물리 정리 완료를 G-260의 기존 `storage/deleted_plan_state.py`·`catalog/deleted_document_cleanup.py`·파일 queue의 최종 제거/재시도에 연결한다. 문서 사본/native journal 복구·퇴역 acceptance/retired 사본의 실제 부재 확인·공유 usage/outbox/공통 결함/완료 Merge 보호는 이미 구현된 경계를 소비한다. 원래 자원 정리와 후속 기록 제거의 확정 지점을 구분하며 같은 엔진을 복제하지 않는다. 작업물/PR head 보존·소유/종료 확인에 필요한 자료를 먼저 지우지 않고, 일반 취소·실제 MERGED의 원문/실행 이력과 타 작업의 공유 자료는 유지한다. 별도 무차별 보존 폴더 삭제·새 정리 엔진은 만들지 않는다.
 
 아래 User Decision의 승인 범위에서 `git/cleanup_service.py`·`merge_cleanup_service.py`의 소유권·재검사·pending 처리, 기존 Manager Git journal·자원 claim·PR 관측·게시 lease를 재사용한다. 취소/완료의 현재 수명과 자원별 보존·삭제 intent를 연결하고 실제 ref 삭제 효과를 의미 판단·DB 취소와 분리한다. 복구 가능한 보존·정확한 기대 OID의 거부를 기존 관리 저장 경계 안에서 구현하며 새로운 외부 서비스·비호환 migration·독립 운영 상태 원본을 만들지 않는다.
 
@@ -74,12 +74,50 @@ G-238의 명시적 reset/manual stop·READY 복귀는 이 작업에 포함하지
 
 ## Progress
 
-- [ ] 살아 있는 원격 ref·row 없는 취소 감사의 실제 소유 자원 정리와 기존 최종 제거 인계. 이미 부재한 자원/문서 사본·기록/파일 제거는 G-260의 직접 구현을 소비한다.
+- [x] 살아 있는 원격 ref·row 없는 취소 감사의 실제 소유 자원 정리와 기존 최종 제거 인계. 이미 부재한 자원/문서 사본·기록/파일 제거는 G-260의 직접 구현을 소비한다.
 
 - [x] 2026-10-10 delta·R-055 D09/D10·ARCHITECTURE의 현행 정리/변경 정책·cleanup 구현과 기존 회귀를 정적으로 대조했다. 구현·테스트·전체 verify를 실행하지 않았다.
 - [x] 2026-10-11 사용자 Architecture Change Policy 판단: 선택지 A 승인 및 draft 해제 요청을 위 User Decision에 기록했다.
-- [ ] 승인 범위의 자원 보존·정리·재개 구현과 targeted unit 검증
+- [x] 승인 범위의 자원 보존·정리·재개 구현과 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+
+### 2026-11-06 구현 후보와 완료 조건 대조
+
+구현과 관련 교정을 마쳤으며 미해결 targeted 실패는 없다. Manager 전체 verify·Reviewer·사용자 Merge는 남아 있으며 이 기록은 공식 완료나 dependency 충족 선언이 아니다. 시작 HEAD는 `49c5f60e34b1b70103fd1565ebbe2099bae99700`이다. sources의 실제 R-055 D09/D10과 PRODUCT/ARCHITECTURE를 대조했고 모든 depends_on ID의 archive 경로를 확인했다. 원격 게시·삭제 판단·취소 원문 복구와 기존 문서/퇴역 사본 정리는 현재 G-258/G-260 계열 구현을 소비하며 새 게시·취소 엔진을 만들지 않았다.
+
+| 완료 조건 | 현재 구현·확인 근거 |
+|---|---|
+| 확인된 철회만 정리하고 일반 취소·MERGED 보존 | 기존 원문 hash·revision ancestry·현재 참조 판단·historical Merge·공통 결함 보호를 그대로 통과한 후보만 자원 helper로 전달한다. `test_deleted_plan_cleanup` 89개 회귀로 원문/관계/공유 자료·실제 MERGED 보호를 확인했다. |
+| 살아 있는 소유 원격·로컬 ref/worktree와 row 없는 취소 감사 | `deleted_plan_resources.cleanup`이 결정적 작업 경로·등록 origin·Git 등록/공통 repository·원래 소유 row/감사와 현재 독립/수동 참조를 다시 검사한다. row 없는 경로도 실제 호출 종료를 검사하고 같은 자원 정리와 `forget`/파일 queue에 연결했다. `test_live_rowless_cancellation_hands_partial_cleanup_to_existing_erasure_queue`가 부분 실패부터 최종 ID 표식까지 확인한다. |
+| 작업물·원문·session·실패·PR head 보존 | `assess_cleanup`의 dirty/index flag/Git operation/local-only 거부를 유지하며 수동 잠금·다른 branch 관측도 보존한다. 게시 head의 전체 bundle을 fsync·verify/head 검사하고 정리 중 감사·실패 자료를 유지한다. 복구 원본이 없거나 미게시 commit이면 삭제하지 않는다. 새 정책 행렬과 기존 최소 worktree 회귀가 보존을 확인한다. |
+| 정확한 PR·원격 기대 OID·새 소유자 보호 | 등록 origin과 고정 URL을 검사하며 PR 전체 branch 이력의 Open/Merged/fork·다른 URL/base/head를 거부한다. 저장된 OID의 삭제 lease와 원래 로컬 OID의 no-deref 삭제만 사용한다. lease 경쟁·심볼릭 ref·정리 완료 후 같은 이름/OID의 ref 재생성과 제거 증거 뒤 worktree 재생성을 새 자원으로 보류한다. PR을 close/Merge하지 않는다. |
+| 비원자 삭제·중단 복구와 독립 진행 | 기존 journal에 원격/로컬 삭제 전이·보존본 지문·revision을 저장하고 worktree 제거 journal을 재사용한다. 원격/로컬 효과 뒤 결과 미기록, 원격 삭제 뒤 worktree 실패, 권한/정책 실패는 원래 intent로 재개한다. 자원 충돌 범위의 pending만 유지하며 문서·취소 상태를 rollback하지 않는다. 새 중단 회귀와 기존 journal/cleanup pending 최소 회귀로 확인했다. |
+| 최종 전용 자료 제거·동일 효과 반복 금지 | 자원 부재 뒤 bundle·정확한 삭제 slot·원래 worktree 생성/제거 slot과 receipt를 기존 `forget` 파일 queue로 넘긴다. queue는 소유·형식·봉인된 결과를 재검사하고 파일 제거 직후 결과 저장 중단도 부재로 확정한다. native 회귀에서 원래 작업 bytes 복구, base 불변, ref/OID와 worktree 등록 제거, 전용 자료/queue 제거 및 ID 표식만 남는 결과를 확인했다. |
+| 승인 경계·문서/검증 입력 | PRODUCT와 ARCHITECTURE의 관련 절을 실제 동작·저장 계약에 맞춰 갱신했다. 일반 Merge 정리·reset/manual stop·사용자 Merge 권한은 확장하지 않았다. 새 코드/테스트는 기존 `loop_manager_internal/**`, `tests/**` verify 입력에 포함되므로 선언 목록 추가가 필요하지 않다. 목록 밖 파일의 비소비는 전수 확인하지 않았으므로 제외 identity를 선언하지 않는다. |
+
+### Targeted 검증과 교정
+
+- 프로젝트 Python `python3`와 지정된 targeted runner로 실행 결과를 호출 기록 폴더에 남겼다. 최종 삭제 정리 모듈 89개, 새 소유 자원 모듈 7개, 기존 경계 최소 회귀 7개가 각각 통과했다. 전체 suite/verify·lint/build/type check는 실행하지 않았다.
+- 실제 Git은 기존 격리 fixture의 임시 원격 하나에서 생산 자원 정리 함수의 lease 경쟁·거부/재시도·bundle 복구 bytes·worktree/로컬·원격 ref 제거와 최종 queue 중단을 확인했다. 실제 외부 repository·CLI/API는 호출하지 않았다. Windows native는 이 Linux 호출에서 실행하지 않았으며 Manager의 환경별 검증에 남긴다.
+- 첫 기존 모듈 실행의 4개 실패 중 자원 없는 취소/hold의 canonical PR/ref 관측 누락 3개를 복원했다. 남은 기존 검증은 새 명세가 살아 있는 자원의 조회를 허용하므로 “관측 없음” 대신 읽기 전용 관측만 허용하고 실제 작업 bytes·DB 불변을 모두 검사하도록 교정했다. 테스트 삭제·skip은 없다. 새 모듈의 초기 오류는 base branch 입력을 관측 전에 거부하도록 교정하고, 취소 fixture의 게시 OID를 execution snapshot 생성 전에 지정해 실제 CAS를 통과하도록 해결했다. 최종 실패는 없다.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_deleted_plan_cleanup
+Initial result: FAIL (이전 호출 첫 실행 4개 assertion, 다음 실행 1개 assertion).
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_deleted_plan_cleanup
+결과: 89 tests, OK.
+
+FAILED_COMMAND: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_deleted_plan_resources
+Initial result: ERROR (이전 호출 초기 정책 입력·취소 fixture 오류).
+RERUN: python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_deleted_plan_resources
+결과: 7 tests, OK.
+
+기존 경계 최소 실행은 `test_worktree_cleanup.WorktreeCleanupTest`의 `test_last_removal_guard_preserves_late_operations_and_index_flags`, `test_interrupted_cleanup_with_changed_head_recovers_for_recheck`, `test_local_only_and_unverifiable_commits_are_preserved`, `test_cleanup_pending_state.CleanupPendingStateTest.test_unowned_pending_is_not_inspected_and_clears_only_when_missing`, `test_workspace_cleanup_ownership.WorkspaceCleanupOwnershipTest.test_merge_cleanup_preserves_unowned_deterministic_worktree`, `test_manager_git_journal.ManagerGitTransitionTests`의 `test_pending_mixed_state_blocks_and_preserves_intent`, `test_candidates_require_an_unbroken_chain_to_live_ref`를 `tests.` prefix의 정확한 7개 ID로 한 번 실행했다. 결과는 7 tests, OK다. `git diff --check`도 통과했다.
+
+이번 교정 호출(`call-5w367pre`)에서는 결과 검증 거부의 원인을 먼저 대조했다. 이전 호출의 19개 targeted JSONL을 읽기 전용으로 확인한 결과, 과거 실패/오류가 있던 모든 test ID의 최신 결과는 success였다. 폐기한 중간 native 테스트 ID까지 포함하면 최신 성공 ID는 104개이며, 최종 구현의 실행 단위는 앞서 보고한 103개다. 결과 검증기는 `FAILED_COMMAND`와 같은 명령의 `RERUN` 사이에 최초 FAIL/ERROR 결과가 있어야 해결된 이력으로 처리한다. 이전 최종 응답과 본문의 command pair에 그 결과가 빠져 보고가 거부됐으므로, 기존 검증기를 변경하지 않고 최초 결과를 명시했다.
+
+이번 호출에서 동일 두 모듈을 지정 runner로 재실행해 삭제 정리 89개와 자원 정리 7개가 각각 OK였다. 현재 코드·테스트와 위 완료 조건 표, R-055 D09/D10 및 현행 설계를 다시 대조했으며 제품 코드의 추가 교정은 필요하지 않았다. 이전 경계 회귀 7개의 성공 기록은 유지한다. 이전 최종 응답은 실제 `parse_worker_result`에서 같은 TargetedTestFailure로 거부됐고, 교정한 최종 응답은 수용됨을 확인했다. 이 확인은 전체 verify·Review나 Manager의 공식 완료를 대신하지 않는다.
+
+남은 작업은 Manager 전체 verify·Review와 사용자 Merge다. 구현 중 보존/PR/소유권이 미확인인 실제 입력은 명세대로 pending이며, 새 사용자 정책 선택이나 checkpoint는 필요하지 않았다.
 
 ## Decision Log
 

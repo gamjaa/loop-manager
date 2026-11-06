@@ -145,7 +145,7 @@ class DeletedPlanCleanupTest(unittest.TestCase):
 
     def rowless_cancellation(self, *, started=False, empty_checkpoint=False, blocked=False,
                              empty_blocked_checkpoint=False, resolved_blocked_checkpoint=False,
-                             requested_blocked_checkpoint=False, native_block=False, checkpoint_snapshot=None, owned_workspace=None, published_blocked=False, checkpoint_builder=None, withdrawn=True):
+                             requested_blocked_checkpoint=False, native_block=False, checkpoint_snapshot=None, owned_workspace=None, published_blocked=False, checkpoint_builder=None, withdrawn=True, publication_oid=None):
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         from loop_manager_internal.planning.planning_catalog import PlanDeletion
@@ -187,6 +187,8 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             checkpoints.record_local(request, 'b' * 40)
             checkpoints.finish_published(request, 'b' * 40)
             checkpoints.record_rebased_publication(request, 'e' * 40, 'f' * 40)
+        if publication_oid is not None:
+            self.connection.execute("UPDATE exec_plans SET publication_remote_oid=? WHERE plan_id='G-001'", (publication_oid,))
         row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
         plan = ReadyPlanSnapshot('G-001', row['path'], row['title'], tuple(json.loads(row['sources'])), (),
             'low', 'low', row['priority'], row['content_hash'], 'a' * 40, text,
@@ -1401,7 +1403,9 @@ class DeletedPlanCleanupTest(unittest.TestCase):
             workspace.mkdir(parents=True)
             (workspace / 'unpublished.txt').write_text('preserved work')
             self.assertEqual(run(), ())
-            self.assertEqual(observations, [])
+            self.assertTrue(all(args[0] in {'merge-base', 'worktree', 'rev-parse', 'ls-remote'}
+                                and (args[0] != 'worktree' or args[1] == 'list') for args in observations))
+            self.assertEqual(list(self.connection.iterdump()), before)
             self.assertEqual((workspace / 'unpublished.txt').read_text(), 'preserved work')
             (workspace / 'unpublished.txt').unlink()
             workspace.rmdir()
