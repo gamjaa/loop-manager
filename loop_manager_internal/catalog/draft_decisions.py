@@ -175,6 +175,11 @@ def prepare(connection, repo, worktree, snapshot):
             raise PlannerValidationError("거절·보류한 사용자 결정을 해소할 수 없습니다.")
         if (decision.get("Decision") and not saved.get("decision_ready")) or (decision.get("Revision") and decision["Revision"] != saved["revision"] and not saved.get("decision_ready")):
             raise PlannerValidationError("User Decision의 현재 사용자 판단 근거를 확인할 수 없습니다.")
+        if decision and not saved.get("decision_ready"):
+            change = saved.get("user_changes", {}).get(original.path, {})
+            if (not change.get("verified") or saved.get("decision_evidence") !=
+                    execplan_draft_state.decision_evidence(saved["basis"], decision, change)):
+                raise PlannerValidationError("User Decision의 현재 사용자 판단 근거를 확인할 수 없습니다.")
         if assessment.get("revision") != saved["revision"]:
             raise PlannerValidationError("draft 판단 revision이 변경됐습니다.")
         if assessment.get("outcome") == "valid":

@@ -42,9 +42,11 @@ priority: high
 ## Progress
 
 - [x] revision `d59136fc6d559ba21c69e2232a21bb4a4be9fd90`의 R-061·R-082, 관측/정리/게시 경계와 관련 회귀를 정적으로 대조했다. 이전 게시 준비 오류가 발생하는 전역 readiness 거부와 Answer-only 입력의 형식 조건을 확인했다. 구현·테스트·verify·운영 DB 조회는 수행하지 않았다.
-- [ ] 중간 보존점: 전체 해소 시 인용으로 확인되지 않은 User Decision의 삭제를 거부한다. 질문별 복수 근거 결합과 부분 답변 처리, 이 임시 보수 경계의 완성은 후속 작업에 남는다.
+- [x] 중간 보존점에서 확인되지 않은 User Decision의 전체 정리를 막은 뒤 질문별 복수 근거 결합과 부분 답변 처리를 완성했다.
 - [x] 현재 질문·verified 본문/Answer 근거 결합과 기존 명시 결정 보호의 정합화
 - [x] targeted unit·부분 해소/중단·게시/재관측 회귀와 설계 반영. 전체 verify와 Reviewer 검토는 Manager가 수행한다.
+- [x] rebase 후 942080c의 base 대비 전체 diff와 R-061·R-082를 대조하고, 본문 근거의 부분 해소에서도 함께 남는 User Decision의 현재 출처 검사를 추가했다. 같은 관측의 상충·불확실 답변과 의미 판단 부재는 정리 없이 보존한다. 현재 후보의 `ExecPlanDraftCatalogTest` 37건, `DraftAnswerReobservationTest` 10건 및 추가 불확실 판단 case를 통과했다.
+- [x] 과거 verify에서 보고된 checkpoint 복구 테스트는 현재 `BlockedCheckpointRefreshUnitTests` 29건, 로컬 복구 알림은 해당 1건을 targeted runner로 다시 확인했다. 이전 전체 verify 실패 기록은 그대로 보존하며 현재 후보의 전체 verify와 Review는 Manager에게 남긴다.
 
 ## Decision Log
 

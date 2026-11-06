@@ -1325,6 +1325,48 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertNotIn("User Decision", cleaned)
         self.assertNotIn("draft: true", cleaned)
 
+    def test_body_partial_resolution_requires_current_user_decision_evidence(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        source = "docs/requirements/[R-001] Policy.md"
+        plan = draft_text().replace("docs/PRODUCT.md", source).replace(
+            "Question: " + first, "Question: - " + first + "\n- " + second)
+        initial = {PATH: plan, source: "# [R-001] Policy\n\nUndecided.\n"}
+        self.observe("a" * 40, initial)
+        answer = "Use policy A and retain history."
+        tree = {PATH: plan + "\n## User Decision\n\nAnswer: Retry only transient errors.\n",
+                source: initial[source] + answer + "\n"}
+        saved = self.observe("b" * 40, tree)
+        saved["user_changes"][PATH]["verified"] = False
+        with self.connection:
+            self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo='repo' AND plan_id='G-001'", (json.dumps(saved),))
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "User Decision"):
+            self.prepare(source, first, answer, QUESTION.replace(first, second))
+        self.assertTrue(execplan_draft_state.evidence(self.connection, "repo", "G-001")["pending"])
+
+    def test_combined_evidence_without_semantic_resolution_preserves_hold(self):
+        source = "docs/requirements/[R-001] Policy.md"
+        plan = draft_text().replace("docs/PRODUCT.md", source)
+        initial = {PATH: plan, source: "# [R-001] Policy\n\nUndecided.\n"}
+        self.observe("a" * 40, initial)
+        tree = {PATH: plan + "\n## User Decision\n\nAnswer: Maybe policy A.\n",
+                source: initial[source] + "Use policy B.\n"}
+        saved = self.observe("b" * 40, tree)
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
+        original = loop_manager._ready_plan_snapshot_from_contents(row, tree[PATH].encode(), allow_started=True)
+        snapshot = MutableReadySnapshot("repo", self.current, (original,), "fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / PATH
+            target.parent.mkdir(parents=True)
+            target.write_text(tree[PATH], encoding="utf-8")
+            for output in ("", draft_decisions.PREFIX + json.dumps([{"id": "G-001", "revision": saved["revision"], "outcome": "uncertain"}])):
+                with self.connection:
+                    self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'", (output,))
+                self.assertEqual(draft_decisions.prepare(self.connection, "repo", root, snapshot), {})
+                self.assertEqual(target.read_text(encoding="utf-8"), tree[PATH])
+                self.assertEqual(execplan_draft_state.evidence(self.connection, "repo", "G-001"), saved)
+
     def test_body_answer_survives_reobservation(self):
         initial = {PATH: draft_text(), "docs/PRODUCT.md": "# Product\n"}
         self.observe("a" * 40, initial)
