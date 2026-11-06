@@ -1753,6 +1753,33 @@ class PublishedRebaseReceiptUnitTests(unittest.TestCase):
         self.assertEqual(save.call_args.args[2], 'observed')
         self.assertEqual(save.call_args.args[3]['block']['evidence'], 'new document cause')
 
+    def test_explicit_metadata_recheck_adopts_a_changed_remote_before_using_old_rebase_lease(self):
+        from types import SimpleNamespace
+        from tests.support.scoped_recovery import ScopedGateFixture
+        from loop_manager_internal.recovery import blocked_remote_observation, scope_reconciliation
+        fixture = ScopedGateFixture()
+        fixture.addCleanup, fixture.enterContext = self.addCleanup, self.enterContext
+        fixture.setUp()
+        fixture.plan('G-001','PLAN_BLOCKED',branch='loop-manager/G-001')
+        c, repo = fixture.connection, fixture.repo
+        scoped_blocking.record_plan_block(c,repo,'G-001',scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID,'metadata',None)
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(c)
+        checkpoints.record(repo,'G-001',expected_generation=0,operation='rebase',expected_head='before',
+                           target_base_oid='base',observed_remote_oid='old-lease',snapshot={})
+        c.execute(blocked_remote_observation.SCHEMA)
+        c.execute("INSERT INTO blocked_remote_observations "
+            "(repo,plan_id,registered_origin,base_result,branch_result,branch_oid,observed_at) "
+            "VALUES (?,'G-001','owner/repo','present','present','published-head','now')",(repo,))
+        plan = c.execute('SELECT * FROM exec_plans').fetchone()
+        effects = SimpleNamespace(plan_blocked_execplans=mock.Mock(return_value=[plan]),
+            plan_recovery_effects=mock.Mock(), _reconcile_rebase_evidence_block=mock.Mock())
+        with mock.patch.object(scope_reconciliation.blocked_plan_reconciliation,'BlockedPlanReconciler') as coordinator:
+            coordinator.return_value.reconcile.return_value='resumed'
+            self.assertTrue(scope_reconciliation._resume_plan_blocks(effects,c,Path('/repo'),Path('/state'),
+                repo,'main',plan_id='G-001',force_timeout_recheck=True,recovery_request_id='request'))
+            coordinator.return_value.reconcile.assert_called_once_with('G-001')
+        effects._reconcile_rebase_evidence_block.assert_not_called()
+
     def test_planning_document_match_does_not_require_latest_catalog_commit_in_old_planning(self):
         from types import SimpleNamespace
         from loop_manager_internal.catalog.execplan_catalog import plan_content_hash

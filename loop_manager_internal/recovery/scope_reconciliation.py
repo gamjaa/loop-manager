@@ -844,7 +844,7 @@ def _resume_plan_blocks(effects: ResumePlanBlocksEffects,
                 remote = connection.execute(
                     'SELECT registered_origin, branch_result, branch_oid FROM blocked_remote_observations '
                     'WHERE repo=? AND plan_id=?', (repo, blocked['plan_id'])).fetchone()
-                if (not local_metadata_recheck and remote is not None and remote['registered_origin']
+                if (remote is not None and remote['registered_origin']
                         and remote['branch_result'] == 'present'
                         and remote['branch_oid'] != checkpoint.observed_remote_oid):
                     result = blocked_plan_reconciliation.BlockedPlanReconciler(
