@@ -1226,7 +1226,7 @@ base가 달라지면 `stage_result_origins`의 원래 PUBLISHING 결과·definit
 | 일반 선행 승인 | 실제 전체 run과 기존 최종 승격 gate를 통과한 뒤에만 최종 approval을 저장한다. 이후 rebase 재연결은 `finalized_reconnected`로 구분하며 이전 preliminary candidate의 HEAD gate를 새 후보 승인으로 사용하지 않는다. |
 | 게시 | 진입과 마지막 workspace 검사에서 현재 binding·전체 verify·실제 호출 identity·명세·지침을 다시 대조한다. 입력 변화는 필요한 Review로 돌아가고 원격 변경 직전 경쟁은 기존 게시 안전 경계에서 거부한다. |
 
-실제 Reviewer identity는 `preliminary_review.review_identity()`와 `provider_execution.observe()`의 기존 invocation ledger 검증을 사용한다. 현재 환경을 과거 호출로 소급 채택하지 않으며 Claude `observe() is None`·`prepared`는 재사용 증거가 아니다. 인증값은 저장하지 않고 환경 관측 불가를 Claude 정상 실행·지원 완료의 거부 조건으로 확대하지 않는다.
+실제 Reviewer identity는 `preliminary_review.review_identity()`와 `provider_execution.observe()`의 기존 invocation ledger 검증을 사용한다. 입력 snapshot에 함께 관측한 identity를 실제 invocation과 직접 대조하며, 이후 별도로 다시 읽은 현재 설정으로 그 관측을 대용하지 않는다. 관측 가능한 실제 호출 identity가 다르면 최종 승인을 무효화하고, 실제/현재 관측 자체가 불가능하면 정상 호출 결과는 유지하되 재사용 가능한 증거로 저장하지 않는다. 현재 환경을 과거 호출로 소급 채택하지 않으며 Claude `observe() is None`·`prepared`는 재사용 증거가 아니다. 인증값은 저장하지 않고 환경 관측 불가를 Claude 정상 실행·지원 완료의 거부 조건으로 확대하지 않는다.
 
 #### 구현 조건과 실행 기록의 구분
 

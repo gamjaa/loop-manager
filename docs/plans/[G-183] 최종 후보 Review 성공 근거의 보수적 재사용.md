@@ -106,12 +106,39 @@ priority: high
 - 최종 receipt 형식 오류·빈 invocation·원래 승인 재연결·원문 provenance 누락 처리 보완 뒤 해당 개별 사례 4개를 targeted runner로 다시 실행해 PASS를 확인했다.
 - `git diff --check` → PASS. 실제 Agent·외부 CLI 계정·native 환경 probe·전체 verify는 실행하지 않았다. 전체 verify·독립 Review·사용자 Merge는 Manager의 다음 단계이며 이번 기록으로 성공을 대신하지 않는다. 새 verify 입력 제외 근거는 선언하지 않는다. 추가한 코드·테스트는 기존 `loop_manager_internal/**`·`tests/**` 입력 목록에 포함된다.
 
-### Manager 전체 verify 실패 관측과 공통 교정 대기
+### 이전 후보의 Manager 전체 verify 실패 관측과 공통 교정 대기
 
 - Manager가 실행한 run `035a327a5bed196ba072f79d0d625273`의 전체 verify는 exit 1이었다. summary의 20 error·2 failure는 checkpoint adoption 21개와 복구 진행 로그 1개에 기록됐다. 이번 호출은 전체 verify를 다시 실행하지 않았다.
 - `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_checkpoint_adoption.BlockedCheckpointRefreshUnitTests.test_adoption_defers_cause_check_and_records_exact_successor_lease` → ERROR (1 test, `StopIteration`). adoption 구현의 시작 snapshot 두 번·채택 후·확정 직전 관측과 fixture의 세 snapshot 배열이 맞지 않으며 다른 분기에도 관측 순서가 영향을 준다. 실제 Git 보존·채택 계약을 약화하거나 snapshot 검사를 삭제하지 않았다.
 - 동일 Manager 로그의 `test_recovery_wait_keeps_request_scope_and_nonzero_exit_warn_level`은 알림 schema의 PRAGMA cursor 순회에서 `TypeError: 'Mock' object is not iterable`이었다. 테스트는 일반 Mock cursor의 fetchone/fetchall만 설정하고 있다. 이 사례는 이번 호출에서 별도 재실행하지 않았다.
-- 위 테스트·checkpoint recovery·복구 명령·알림 schema 파일은 G-183 호출 시작 revision `2db1c9e795349821732f6a4c236f850146bcb4d2`와 현재 `9dfe04605a2783349e1191da34c37caadfdb1a9b` 사이 diff가 없다. 관측된 실패 stack은 최종 Review 재사용 경로에 진입하지 않는다. 선택 작업 밖의 공통 교정으로 보고하며 코드·테스트·다른 계획은 수정하지 않는다. 기존 구현과 실패를 보존하고 Manager의 일반 planning 및 교정 반영 후 전체 검증을 기다린다. 이 기록은 원인 교정 채택·새 검증 성공·최종 승인이나 사용자 결정을 대신하지 않는다.
+- 위 테스트·checkpoint recovery·복구 명령·알림 schema 파일은 G-183 호출 시작 revision `2db1c9e795349821732f6a4c236f850146bcb4d2`와 당시 후보 `9dfe04605a2783349e1191da34c37caadfdb1a9b` 사이 diff가 없었다. 관측된 실패 stack은 최종 Review 재사용 경로에 진입하지 않는다. 선택 작업 밖의 공통 교정으로 보고하며 코드·테스트·다른 계획은 수정하지 않는다. 기존 구현과 실패를 보존하고 Manager의 일반 planning 및 교정 반영 후 전체 검증을 기다린다. 이 기록은 원인 교정 채택·새 검증 성공·최종 승인이나 사용자 결정을 대신하지 않는다.
+
+### Rebase 후 현재 후보의 완료 조건 재대조 (2026-11-06)
+
+이번 호출 시작 HEAD `1d0db00db8e2a74186bf2d2916756b1017b553f2`와 base `49c5f60e34b1b70103fd1565ebbe2099bae99700`의 전체 최종 diff를 확인하고 현재 ExecPlan 전문·상위 명세·제공된 R-033/R-055/R-079/R-086 관련 조건을 대조했다. frontmatter·sources·dependency와 사용자 결정은 수정하지 않는다. 이전 후보의 targeted 성공이나 Manager 원인 재평가를 현재 검증 성공으로 사용하지 않고 아래 테스트를 새로 실행했다.
+
+현재 구현에서 남아 있던 identity 관측 경합을 교정했다. `approval()`과 `reusable()`은 전체 입력 snapshot에 포함된 Reviewer identity를 실제 invocation 증거와 직접 대조한다. 호출 전후 관측은 A인데 별도 현재 조회와 실제 호출이 B인 경우 기존 코드는 `pass`를 저장할 수 있었으나 이제 `invalidated`로 처리해 Review token 없이 재확인한다. 비교 불가인 Claude의 정상 실행은 `unproven`으로 유지한다. 새 인프라·정책·권한이나 provider 증명 수집을 추가하지 않았다.
+
+| 완료 조건 | 현재 구현·검증 근거 |
+|---|---|
+| verify와 Review의 독립 재사용 | `final_review.inputs()`가 현재 후보의 실제 전체 run/reuse receipt·코드 지문·주기를 확인한다. `VerifyReceiptPolicyTest.test_review_gate_reobserves_reused_code_without_invalidating_worker` 및 `test_reviewer_receipt_proof_distinguishes_run_reuse_and_waiver`가 재사용/실제 실행/면제와 전달 근거를 구분한다. |
+| 각 후보의 실제 PR 변경·문서·결정·dependency | raw 변경의 path/status/mode/OID, 전체 definition·sources와 PRODUCT/ARCHITECTURE·간접 dependency·예약어 source를 비교한다. `FinalReviewTests`의 변경 경로/mode/definition·transitive source·shared planning·archive delta 사례가 필요한 Review를 확인한다. Worker 기록 정규화와 PR 통지 identity는 최종 승인 증거가 아니다. |
+| 무관한 base 문서 뒤 원래 성공 재연결 | `test_verify_reuse_then_final_review_and_publication_keep_all_execution_counts_zero`가 실제 verify handler의 재사용 → Review handler → 게시 입력 검사로 이어지며 원래 승인/run ID를 보존한다. Worker/Reviewer Agent 호출·verify 실행은 0이고 targeted 결과도 추가되지 않는다. G-320 Worker 재연결/문서 채택 조건은 현재 `StageResultProvenanceTest` 13개로 소비하며 해당 엔진을 재구현하지 않는다. |
+| 현재 지침·실제 전달/profile·환경·정책 | runtime 전체 원본과 실제 invocation identity를 별도로 비교한다. 동일 원본의 runtime 경로 이동은 재사용하고 Ponytail 변경·역할 변경·실제 호출 policy 불일치는 거부한다. 새 관측 경합 및 handler token 미생성 회귀를 추가했다. root CLI 지침의 별도 gate, 과거 snapshot 복원·인증값 저장·native probe는 없다. |
+| 원래 최종 승인·작업 주기·실패 보존 | `stage_result_origins`의 PUBLISHING 원문/token·raw 변경·verify receipt와 immutable approval을 소비한다. `FinalReviewTests`의 원문 누락·빈 invocation/손상·다른 작업·새 verify 실패/pending/cycle·호출 중단 사례가 이전 승인을 거부하며 원래 승인과 실패 감사를 보존한다. |
+| revision/rebase/재시작·저장 경쟁·게시 | `reconnect()`가 두 입력 관측 후 transaction에서 row/checkpoint/selection/planning을 재확인하고 게시 진입·마지막 workspace에서 binding을 검사한다. 최종 승인 재시작·저장 경합·게시 policy 변경, revision lifecycle·source/무관 명세 변경·복구 marker 사례를 현재 후보에서 실행했다. |
+| 일반/문서 선행 및 Claude 경계 | 현재 `PreliminaryReviewTests` 22개가 일반 선행 PASS 뒤 실제 전체 run과 최종 승격, 실패·다른 receipt·문서 선행과의 구분을 유지한다. `FinalReviewTests`는 최종 승격 후 재연결과 Claude 비교 불가에서 verify만 재사용하고 Reviewer를 호출하는 분기를 확인한다. |
+| R-033/R-055/R-079 관련 재개 조건 | 전체 목표·미해결 실패 delta 안내는 기존 prompt 계층을 소비하고 Worker 결과·지침/실제 호출 입력의 차이는 기존 재사용 비교에 남긴다. 이전 공통 결함 교정의 반영만으로 후보를 승인하지 않고 아래 현재 회귀를 실행했다. 공통/모든 역할/Ponytail 내용 변경을 누락하거나 예전 전달 해시를 현재 값으로 덮지 않는다. |
+
+#### 이번 호출의 실제 targeted 실행
+
+- 교정된 `tests.test_checkpoint_adoption.BlockedCheckpointRefreshUnitTests`와 `tests.test_execution_progress_logs.ExecutionProgressLogTest.test_recovery_wait_keeps_request_scope_and_nonzero_exit_warn_level` → PASS (30 tests). 원래 Manager 실패의 22개 사례를 모두 포함한다. 과거 실패는 위 감사로 남기며 새 실패로 재보고하지 않는다.
+- 새 관측 경합 회귀 `tests.test_final_review.FinalReviewTests.test_actual_invocation_must_match_the_observed_input_not_a_later_identity_read` → 교정 전 FAIL (1 test, 예상 `invalidated` 대신 `pass`). 같은 targeted runner 명령을 코드 교정 후 재실행해 PASS (1 test)를 확인했다.
+- `tests.test_final_review`, `tests.test_preliminary_review.PreliminaryReviewTests`, `tests.test_verify_receipts.StageResultProvenanceTest`, `tests.test_verify_receipts.VerifyReceiptPolicyTest.test_review_gate_reobserves_reused_code_without_invalidating_worker` → PASS (56 tests). 그 뒤 final Review fixture를 실제 verify 재사용 경로와 연결하고 runtime 이동/Ponytail·알려진 실제 policy 불일치 회귀를 추가해 `tests.test_final_review`를 다시 실행했다 → PASS (23 tests).
+- `tests.test_execution_revision_gate.ExecutionRevisionGateTests` 중 `test_revision_guard_tokens_follow_complete_phase_lifecycle`, `test_source_revision_without_execplan_change_keeps_worker_and_rechecks_verification`, `test_global_specification_change_does_not_interrupt_task_revision`, `test_successful_revision_refresh_clears_rebase_recovery_marker`와 `tests.test_verify_receipts.VerifyReceiptPolicyTest.test_reviewer_receipt_proof_distinguishes_run_reuse_and_waiver` → PASS (5 tests).
+- 모든 위 실행은 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest <나열한 test ID/class/module>`로 현재 worktree에서 수행했다. 현재 고유 사례 94개가 통과했고 새 회귀의 교정 전 실패 1회와 동일 명령 재실행 결과를 구분해 보존한다. 전체 suite·integration·실계정/native probe·전체 verify는 Worker가 실행하지 않았다.
+
+구현 및 관련 교정의 미해결 항목은 없다. 남은 완료 단계는 Manager의 현재 후보 전체 verify·독립 Reviewer·게시 안전 검사와 사용자 PR Merge다. 이번 targeted 성공은 그 단계의 성공이나 Manager 상태 변경을 대신하지 않는다. verify 입력 목록은 새 코드·테스트를 기존 `loop_manager_internal/**`·`tests/**`로 포함하며 새 목록 밖 제외 승인을 선언하지 않는다.
 
 ## Decision Log
 

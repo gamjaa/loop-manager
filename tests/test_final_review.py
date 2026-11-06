@@ -1,6 +1,8 @@
 """Final approval consumers use actual invocation and full verify provenance."""
 import copy
 from dataclasses import replace
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -11,7 +13,7 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKi
 from loop_manager_internal.storage import planning_review_state, runtime_state, verify_receipts
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository, CheckpointRace
 from loop_manager_internal.verification.inputs import InputObservation
-from tests.support.execution import ExecutionFixture, REVIEW_IDENTITY
+from tests.support.execution import ExecutionFixture, READY_WORKER_RESULT, REVIEW_IDENTITY
 
 
 class FinalReviewTests(ExecutionFixture, unittest.TestCase):
@@ -80,7 +82,7 @@ class FinalReviewTests(ExecutionFixture, unittest.TestCase):
         self.assertEqual(saved['approval']['invocation_id'], 'actual-invocation')
         return saved
 
-    def rebase(self):
+    def rebase(self, *, through_verify=False):
         stage_results.preserve(self.ports, self.context(), reason='rebase_start')
         self.head = 'rebased-head'
         self.remote = 'new-base'
@@ -90,11 +92,15 @@ class FinalReviewTests(ExecutionFixture, unittest.TestCase):
         observation = self.effects.validation.observe_verify_inputs(None)
         selection = verify_receipts.selected(self.connection, self.repo, 'G-047')
         origin = verify_receipts.success(self.connection, selection, observation)
-        verify_receipts.record(self.connection, selection, head=self.head,
-            observation=observation, kind='reuse', reason='same code', origin=origin)
-        self.state.update_project(self.repo, phase='REVIEWING', active_sha=self.remote,
-            validated_base_sha=self.remote, review_result=None, review_token=None,
-            verify_token=definition.verify_token(self.remote, self.head, row['verify_result']))
+        if not through_verify:
+            verify_receipts.record(self.connection, selection, head=self.head,
+                observation=observation, kind='reuse', reason='same code', origin=origin)
+        self.state.update_project(self.repo, phase='VERIFYING' if through_verify else 'REVIEWING',
+            active_sha=self.remote, definition_snapshot=definition.serialize(),
+            validated_base_sha=None if through_verify else self.remote,
+            verify_result=None if through_verify else row['verify_result'],
+            review_result=None, review_token=None, publication_token=None,
+            verify_token=None if through_verify else definition.verify_token(self.remote, self.head, row['verify_result']))
         planning_review_state.begin(self.connection, self.repo, purpose='full', revision=self.remote,
             input_fingerprint='planning', specification_fingerprint='specification',
             work_cycle='project-cycle', comparison_revision='base')
@@ -344,3 +350,57 @@ class FinalReviewTests(ExecutionFixture, unittest.TestCase):
         self.handler.publish(self.context(), self.handler)
         self.assertEqual(self.state.row()['phase'], 'REVIEWING')
         self.effects.publication.push_managed_publication_branch.assert_not_called()
+
+    def test_actual_invocation_must_match_the_observed_input_not_a_later_identity_read(self):
+        before = final_review.observe(self.ports, self.context())
+        different = {**REVIEW_IDENTITY, 'policy': 'different-during-call'}
+        current = iter([dict(REVIEW_IDENTITY), different])
+        def observer(_context, *, invocation_id=None):
+            return different if invocation_id else next(current)
+        self.ports.pre_review_identity = observer
+        approval = final_review.approval(self.ports, self.context(), before,
+            'actual-invocation', 'VERDICT: PASS')
+        self.assertEqual(approval['status'], 'invalidated')
+
+    def test_verify_reuse_then_final_review_and_publication_keep_all_execution_counts_zero(self):
+        self.state.update_project(self.repo, worker_result=READY_WORKER_RESULT)
+        original = self.approved()
+        targeted = list(self.connection.execute('SELECT * FROM targeted_test_results'))
+        self.rebase(through_verify=True)
+        self.effects.agent.run_agent.reset_mock()
+        latest = SimpleNamespace(reconcile=mock.Mock(return_value=None))
+        self.assertEqual(self.handler.verify(self.context(), latest).kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertEqual(self.state.row()['phase'], 'REVIEWING')
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertEqual(self.review().kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertTrue(final_review.publication_valid(self.ports, self.context()))
+        saved = final_review.current(self.ports, self.context())
+        self.assertEqual(saved['approval'], original['approval'])
+        self.assertEqual(saved['binding']['verify_origin'], original['approval']['inputs']['verify_origin'])
+        self.assertEqual(list(self.connection.execute('SELECT * FROM targeted_test_results')), targeted)
+        self.effects.agent.run_agent.assert_not_called()  # Worker and Reviewer use this shared port.
+        self.effects.validation.verify.assert_not_called()
+
+    def test_identical_runtime_content_relocation_reuses_but_new_ponytail_requires_review(self):
+        guidance = final_review.common_guidance
+        original = self.approved()
+        with tempfile.TemporaryDirectory() as directory:
+            relocated = Path(directory)
+            for relative in guidance.GUIDANCE_PATHS:
+                target = relocated / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((guidance.RUNTIME_ROOT / relative).read_bytes())
+            with mock.patch.object(guidance, 'RUNTIME_ROOT', relocated):
+                self.assertIsNotNone(final_review.reusable(self.ports, self.context()))
+                ponytail = relocated / guidance.PONYTAIL_PATH
+                ponytail.write_bytes(ponytail.read_bytes() + b'\nAdditional runtime instruction.\n')
+                self.assertIsNone(final_review.reusable(self.ports, self.context()))
+        self.assertEqual(final_review.current(self.ports, self.context())['approval'], original['approval'])
+
+    def test_known_actual_policy_mismatch_returns_to_review_without_approval_token(self):
+        self.actual = {**REVIEW_IDENTITY, 'policy': 'actual-call-used-another-policy'}
+        self.review()
+        self.assertEqual(final_review.current(self.ports, self.context())['status'], 'invalidated')
+        self.assertEqual(self.state.row()['phase'], 'REVIEWING')
+        self.assertIsNone(self.state.row()['review_token'])
+        self.effects.agent.run_agent.assert_called_once()

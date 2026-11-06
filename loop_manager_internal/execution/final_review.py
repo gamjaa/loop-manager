@@ -152,13 +152,15 @@ def approval(ports, context, before, invocation_id, review):
     if before is None:
         return {**(current(ports, context) or {}), 'status': 'unproven'}
     after = observe(ports, context)
-    identity = preliminary_review.review_identity(ports, context)
+    identity = after['review_identity'] if after is not None else None
     actual = (preliminary_review.review_identity(ports, context, invocation_id=invocation_id)
               if isinstance(invocation_id, str) and invocation_id else None)
     if before != after:
         return {**(current(ports, context) or {}), 'status': 'invalidated'}
-    if identity is None or identity != actual:
+    if identity is None or actual is None:
         return {**(current(ports, context) or {}), 'status': 'unproven'}
+    if identity != actual:
+        return {**(current(ports, context) or {}), 'status': 'invalidated'}
     return {'version': 1, 'status': 'pass', 'approval': {'inputs': before,
         'identity': actual, 'invocation_id': invocation_id, 'review': review}, 'binding': after}
 
@@ -185,7 +187,7 @@ def reusable(ports, context):
         if {k: v for k, v in before.items() if k not in {'head', 'base'}} != {
                 k: v for k, v in after.items() if k not in {'head', 'base'}}:
             return None
-        identity = preliminary_review.review_identity(ports, context)
+        identity = after['review_identity']
         if (identity is None or identity != approval['identity']
                 or identity != preliminary_review.review_identity(ports, context,
                     invocation_id=approval['invocation_id'])):
