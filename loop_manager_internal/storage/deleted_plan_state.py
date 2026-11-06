@@ -92,7 +92,7 @@ def forget(connection, repo, plan_id, *, artifacts=()):
         if 'diagnostic_preservations' in tables:
             connection.execute("DELETE FROM diagnostic_preservations WHERE repo=? AND scope='plan' AND owner=?", (repo, plan_id))
         if 'notification_outbox' in tables:
-            for event in connection.execute('SELECT event_key,event_type,payload FROM notification_outbox WHERE repo=?', (repo,)).fetchall():
+            for event in connection.execute('SELECT * FROM notification_outbox WHERE repo=?', (repo,)).fetchall():
                 if event['event_key'] in incident_events:
                     owned_event = True
                 else:
@@ -108,7 +108,28 @@ def forget(connection, repo, plan_id, *, artifacts=()):
                             raise CallDeferred('공유 알림의 삭제 대상 귀속을 확인할 수 없습니다.')
                         owned_event = any(item['id'] == plan_id for item in plans)
                         if owned_event and any(item['id'] != plan_id for item in plans):
-                            raise CallDeferred('여러 작업의 공유 알림은 대상별 전송 근거 분리가 필요합니다.')
+                            retained = {**payload, 'plans': [item for item in plans if item['id'] != plan_id]}
+                            rendered = None
+                            if (event['attempts'] == 0 and event['confirmed_pieces'] == 0
+                                    and event['rendered_text'] is None and event['delivery_started_at'] is None
+                                    and event['sent_at'] is None):
+                                pass  # No frozen body or transmission exists to remap.
+                            elif event['sent_at'] is not None:
+                                from loop_manager_internal.notifications.rendering import _message, _pieces
+                                try:
+                                    original = _message(event['event_type'], payload)
+                                    rendered = _message(event['event_type'], retained)
+                                except (KeyError, TypeError, ValueError) as error:
+                                    raise CallDeferred('공유 알림의 원래 전송 본문을 확인할 수 없습니다.') from error
+                                if (event['rendered_text'] != original
+                                        or event['confirmed_pieces'] < len(_pieces(original))
+                                        or len(rendered) > len(original)):
+                                    raise CallDeferred('공유 알림의 전체 전송 확인을 증명할 수 없습니다.')
+                            else:
+                                raise CallDeferred('부분 전송된 공유 알림은 대상별 전송 근거 분리가 필요합니다.')
+                            connection.execute('UPDATE notification_outbox SET payload=?,rendered_text=? WHERE event_key=?',
+                                (json.dumps(retained, ensure_ascii=False), rendered, event['event_key']))
+                            owned_event = False
                     elif event['event_type'] == 'recovery_unresolved':
                         owned_event = payload.get('request_id') in recovery_requests
                     else:

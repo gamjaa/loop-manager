@@ -1883,7 +1883,15 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 
 삭제 확정의 알림 정리는 일반 취소와 달리 대상 전용 outbox·incident·전송 참조를 최종 제거한다. `deleted_plan_state.forget`는 같은 repository의 `plan:<G ID>` 또는 과거 G subject에 속한 incident와 `block_notice_events`의 직접 관계를 먼저 확보한다. 자식 참조를 부모 incident보다 먼저 제거하고, payload에 작업 ID가 없는 과거 outbox 버전도 그 관계로 제거한다. 남은 독립 incident가 해당 outbox를 참조하거나 연결된 outbox의 repository가 다르면 전체 제거 transaction을 롤백하고 해당 삭제를 보류한다. 명시적인 관계가 없는 잘못된 payload도 귀속 미확인으로 보존한다.
 
-대상 하나만 포함한 `plans_published`·`draft_decisions`는 전용 기록으로 제거하지만, 다른 G가 섞인 목록과 대상 원인·실제 시작이 포함된 프로젝트 사건은 아직 대상별 전송 근거를 안전하게 분리하지 못하면 `CallDeferred`로 남긴다. 고정 본문·확인 cursor·오류를 통째로 삭제하거나 새 본문에 기존 cursor를 재사용하지 않는다. 이는 최종 부분 제거의 미완료 경계이며 독립 사건의 전송·일반 취소 보존을 바꾸거나 삭제 완료를 의미하지 않는다.
+대상 하나만 포함한 `plans_published`·`draft_decisions`는 전용 기록으로 제거한다. 다른 G가 섞인 목록은 다음 조건에서 payload의 대상 항목만 제외하고 독립 항목과 사건 identity·오류·시각을 유지한다.
+
+| 혼합 목록의 전송 근거 | 최종 제거에서의 처리 |
+|---|---|
+| attempts·confirmed_pieces가 0이고 고정 본문·진행 중 claim·sent_at이 없음 | payload만 개정한다. 첫 claim은 남은 목록의 본문을 정상 생성한다. |
+| sent_at이 있고 저장 본문이 현재 렌더러의 원래 payload 결과와 정확히 일치하며 모든 원래 조각의 확인이 있음 | 남은 목록의 본문이 더 길어지지 않음을 확인해 저장 payload·본문을 함께 개정한다. 기존 전송 완료·공유 시도/확인 누계는 유지하며 이 row를 다시 전송하지 않는다. 기존 질문·게시 확인 조회는 남은 항목을 계속 확인된 것으로 읽는다. |
+| 부분 전송·진행 중 claim·이전 렌더러의 미확인 본문·불완전 확인 | 원래 payload·본문·cursor·오류를 보존하고 `CallDeferred`로 해당 삭제를 보류한다. |
+
+전송 완료 row의 기존 cursor는 실제 공유 전송 감사이며 개정 본문의 새 전송 위치로 재사용하지 않는다. 대상 원인·실제 시작이 포함된 프로젝트 사건의 부분 분리도 미완료이면 보류한다. 이 경계는 일반 취소의 감사 보존이나 독립 사건의 전송 정책을 바꾸지 않는다.
 
 `notifications/rendering.py`는 저장된 payload만으로 텍스트를 결정적으로 생성하며 모델을 호출하지 않는다. 확인된 질문·수정 대상·PR 상태 순으로 정보를 구성하고 원인·복구 시도·Checkpoint 근거를 보존한다. 공통 payload와 `draft_decisions` 목록의 계약은 다음과 같다.
 

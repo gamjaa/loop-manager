@@ -2929,6 +2929,106 @@ class RecoveryResultNoticeTests(NotificationFixture, unittest.TestCase):
         self.assertFalse(is_current(connection,repo,'recovery_unresolved',payload))
 
 
+class DeletedPlanNotificationProjectionTests(NotificationFixture, unittest.TestCase):
+    def setUp(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        from loop_manager_internal.notifications import events
+        self.db = self.connection()
+        self.repo = '/projects/alpha'
+        self.deleted = deleted_plan_state
+        deleted_plan_state.ensure_schema(self.db)
+        for plan_id, title in (('G-018', 'Reliable notices'), ('G-019', 'Independent')):
+            DraftListNotificationTest.draft(self, self.db, plan_id, title)
+        events.enqueue_draft_decisions(self.db, self.repo)
+        self.db.commit()
+
+    def test_unclaimed_list_prunes_only_deleted_item_before_first_delivery(self):
+        before = dict(self.events(self.db)[0])
+        self.deleted.forget(self.db, self.repo, 'G-018')
+        current = dict(self.events(self.db)[0])
+        payload = json.loads(current['payload'])
+        self.assertEqual([item['id'] for item in payload['plans']], ['G-019'])
+        self.assertEqual(payload['plans'][0], json.loads(before['payload'])['plans'][1])
+        for key in set(before) - {'payload'}:
+            self.assertEqual(current[key], before[key])
+        notifications.enqueue_current_project_events(self.db, self.repo)
+        self.assertEqual(len(self.events(self.db)), 1)
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(self.db, 'token', 'chat', adapter=sender), 1)
+        body = sender.call_args.args[2]
+        self.assertIn('G-019', body)
+        self.assertNotIn('G-018', body)
+
+    def test_fully_confirmed_list_preserves_independent_confirmation_without_replay(self):
+        payload = json.loads(self.events(self.db)[0]['payload'])
+        payload['plans'][0]['title'] = 'Long title ' * 1000
+        self.db.execute("UPDATE exec_plans SET title=? WHERE plan_id='G-018'", (payload['plans'][0]['title'],))
+        self.db.execute('UPDATE notification_outbox SET payload=?', (json.dumps(payload),))
+        self.db.commit()
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(self.db, 'token', 'chat', adapter=sender), 1)
+        self.assertGreater(sender.call_count, 1)
+        before = dict(self.events(self.db)[0])
+        self.deleted.forget(self.db, self.repo, 'G-018')
+        current = dict(self.events(self.db)[0])
+        for key in set(before) - {'payload', 'rendered_text'}:
+            self.assertEqual(current[key], before[key])
+        self.assertNotIn('G-018', current['rendered_text'])
+        self.assertIn('G-019', current['rendered_text'])
+        from loop_manager_internal.notifications.policy import _confirmed_draft_question_keys
+        self.assertEqual(_confirmed_draft_question_keys(self.db, self.repo), {('G-019', 'question-G-019', 'revision')})
+        notifications.enqueue_current_project_events(self.db, self.repo)
+        self.assertEqual(len(self.events(self.db)), 1)
+        sender.reset_mock()
+        self.assertEqual(notifications.dispatch_pending(self.db, 'token', 'chat', adapter=sender), 0)
+        sender.assert_not_called()
+
+    def test_confirmed_publication_keeps_remaining_publication_receipt_after_restart(self):
+        from loop_manager_internal.notifications.policy import confirmed_publication_keys
+        self.db.execute('DELETE FROM notification_outbox')
+        self.db.execute("UPDATE execplan_drafts SET pending=0,evidence='{}'")
+        self.db.execute("UPDATE exec_plans SET publication_path=path,publication_sha='remote-sha'")
+        entries = [(row['path'], dict(id=row['plan_id'])) for row in self.db.execute('SELECT path,plan_id FROM exec_plans')]
+        notifications.record_planning_publication(self.db, self.repo, entries, 'remote-sha')
+        self.db.commit()
+        sender = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(self.db, 'token', 'chat', adapter=sender), 1)
+        before = dict(self.events(self.db)[0])
+        self.deleted.forget(self.db, self.repo, 'G-018')
+        self.assertEqual(confirmed_publication_keys(self.db, self.repo, 'plans_published'), {('G-019', 'remote-sha')})
+        current = dict(self.events(self.db)[0])
+        self.assertNotIn('G-018', current['payload'])
+        self.assertNotIn('G-018', current['rendered_text'])
+        for key in set(before) - {'payload', 'rendered_text'}:
+            self.assertEqual(current[key], before[key])
+        notifications.record_planning_publication(self.db, self.repo, entries, 'remote-sha')
+        self.assertEqual(len(self.events(self.db)), 1)
+        sender.reset_mock()
+        self.assertEqual(notifications.dispatch_pending(self.db, 'token', 'chat', adapter=sender), 0)
+        sender.assert_not_called()
+
+    def test_partial_or_unproven_fixed_body_keeps_erasure_pending(self):
+        from loop_manager_internal.storage.task_calls import CallDeferred
+        for sent, rendered, pieces in ((None, 'partial body', 1), ('sent', 'legacy body', 1), ('sent', None, 0)):
+            with self.subTest(sent=sent, rendered=rendered, pieces=pieces):
+                self.db.execute('UPDATE notification_outbox SET attempts=1,confirmed_pieces=?,rendered_text=?,sent_at=?,last_error=?',
+                                (pieces, rendered, sent, 'saved error'))
+                self.db.commit()
+                before = tuple(self.db.iterdump())
+                with self.assertRaises(CallDeferred):
+                    self.deleted.forget(self.db, self.repo, 'G-018')
+                self.assertEqual(tuple(self.db.iterdump()), before)
+
+    def test_list_projection_rolls_back_with_execution_erasure(self):
+        self.db.execute("CREATE TRIGGER reject_list_projection BEFORE DELETE ON exec_plans "
+                        "BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        self.db.commit()
+        before = tuple(self.db.iterdump())
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'interrupted'):
+            self.deleted.forget(self.db, self.repo, 'G-018')
+        self.assertEqual(tuple(self.db.iterdump()), before)
+
+
 class CancelledPlanNotificationTests(NotificationFixture, unittest.TestCase):
     def test_recovery_request_cancellation_preserves_partial_send_and_independent_requests(self):
         from loop_manager_internal.storage import local_recovery_state
