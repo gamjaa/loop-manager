@@ -282,6 +282,10 @@ def _clean_answers(original, text, saved, assessment, question_items):
                                    decision_body, count=1, flags=re.M | re.S)
             cleaned = replace_section(cleaned, "User Decision", decision_body)
     if not outstanding:
+        decision = execplan_drafts.fields(markdown_sections(text).values.get("User Decision", ""))
+        if decision and not any(item["source"] == original.path and item["quote"].strip() == decision.get("Answer")
+                                for item in resolved):
+            raise PlannerValidationError("확인하지 않은 User Decision을 정리할 수 없습니다.")
         cleaned = replace_section(cleaned, "User Decision", "")
         cleaned = re.sub(r"^draft:[ \t]*true[ \t]*\n", "", cleaned, count=1, flags=re.M)
     return cleaned

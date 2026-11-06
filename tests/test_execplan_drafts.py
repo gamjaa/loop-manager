@@ -144,6 +144,19 @@ class ExecPlanDraftDocumentTest(unittest.TestCase):
 
 
 class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
+    def test_full_cleanup_preserves_unquoted_user_decision(self):
+        answer = "Use policy A and retain history."
+        decision = "A separate user response."
+        text = draft_decisions.replace_section(self.text, "Implementation", answer)
+        text += "\n## User Decision\n\nAnswer: " + decision + "\n"
+        saved = {"user_changes": {PATH: {"verified": True, "before": self.text, "after": text}},
+                 "basis": {"inputs": {}}, "decision_ready": True}
+        assessment = {"resolved": [{"question": draft_decisions.questions(self.waiting()["question"])[0],
+                                    "answer": answer, "source": PATH, "quote": answer}], "remaining": ""}
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "User Decision"):
+            draft_decisions._clean_answers(SimpleNamespace(path=PATH, text=text), text, saved,
+                                           assessment, draft_decisions.questions(self.waiting()["question"]))
+
     def test_published_draft_can_be_snapshotted_without_releasing_its_hold(self):
         row = self.connection.execute(
             "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-001'"
