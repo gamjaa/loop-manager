@@ -119,6 +119,30 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE blocked_checkpoints ADD COLUMN publication_history TEXT NOT NULL DEFAULT '[]'")
 
 
+def unpublished_checkpoint_without_resources(row, repo: str, plan_id: str) -> bool:
+    """Recognize a complete inert audit; unknown fields retain ownership evidence."""
+    empty = {'branch', 'pr_url', 'worktree', 'expected_remote_oid', 'commit_identity',
+             'identity_reason_code', 'identity_evidence', 'tree_oid', 'local_oid', 'remote_oid',
+             'published_oid', 'accepted_remote_oid', 'pending_remote_oid', 'inspected_remote_oid',
+             'inspected_input', 'inspection_reason'}
+    zero = {'remote_observed', 'inspection_retryable', 'rebase_recovery', 'retryable'}
+    text = {'repo', 'plan_id', 'request_identity', 'phase', 'reason_code', 'evidence',
+            'result', 'unpublished_reason', 'created_at', 'updated_at'}
+    if (not isinstance(row, dict) or set(row) != empty | zero | text | {'publication_history'}
+            or any(row[field] is not None for field in empty)
+            or any(type(row[field]) is not int or row[field] != 0 for field in zero)
+            or any(not isinstance(row[field], str) or not row[field].strip() for field in text)
+            or row['repo'] != repo or row['plan_id'] != plan_id
+            or row['phase'] != CheckpointPhase.UNPUBLISHED.value or row['result'] != 'local_only'):
+        return False
+    try:
+        return (json.loads(row['publication_history']) == []
+                and row['request_identity'] == request_identity(repo, plan_id, row['reason_code'],
+                                                               row['evidence'], None, None))
+    except (TypeError, ValueError, RecursionError):
+        return False
+
+
 def request_identity(
     repo: str,
     plan_id: str,
