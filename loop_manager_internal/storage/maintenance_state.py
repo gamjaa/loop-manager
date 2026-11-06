@@ -448,6 +448,13 @@ def forget_plan(connection: sqlite3.Connection, repo: str, plan_id: str) -> None
     if (cycle['publication_stage'] is not None
             or 'legacy_release_identity' in cycle.keys() and cycle['legacy_release_identity'] is not None):
         raise CallDeferred('유지보수 게시·workspace 해제 intent의 종료 전에 공유 기록을 제거할 수 없습니다.')
+    roots = ('prerequisite_plan_ids', 'refactoring_plan_ids', 'assessment_plan_ids')
+    if cycle['phase'] != MaintenancePhase.IDLE.value and any(field in changes for field in roots):
+        remaining = set().union(*(json.loads(changes.get(field, cycle[field])) for field in roots))
+        if not remaining:
+            # Catalog adoption and normal cycle completion must consume the
+            # confirmed scope before final erasure removes its last identity.
+            raise CallDeferred('활성 유지보수 cycle의 정상 종료 전에 마지막 대상 연결을 제거할 수 없습니다.')
     connection.execute('UPDATE maintenance_cycles SET ' + ', '.join(field + '=?' for field in changes)
         + ', revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE repo=?', (*changes.values(), repo))
 

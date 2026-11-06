@@ -553,12 +553,44 @@ class DeletedPlanCleanupTest(unittest.TestCase):
         self.connection.execute("UPDATE maintenance_cycles SET refactoring_plan_ids='[\"G-001\"]'")
         self.connection.commit()
         before = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
-        deleted_plan_state.forget(self.connection, '/repo', 'G-001')
-        after = dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone())
-        self.assertEqual(json.loads(after['refactoring_plan_ids']), [])
-        self.assertEqual(after['phase'], before['phase'])
-        self.assertEqual(after['last_cycle_merged_count'], before['last_cycle_merged_count'])
-        self.assertEqual(after['last_success_commit'], before['last_success_commit'])
+        with self.assertRaisesRegex(CallDeferred, '마지막 대상 연결'):
+            deleted_plan_state.forget(self.connection, '/repo', 'G-001')
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM maintenance_cycles').fetchone()), before)
+
+    def test_last_cancelled_cycle_link_survives_until_verified_completion_before_erasure(self):
+        from loop_manager_internal.storage.maintenance_state import MaintenanceRepository
+        from loop_manager_internal.maintenance import cycle_service, maintenance_orchestration
+        store = MaintenanceRepository(self.connection)
+        self.connection.execute('INSERT INTO maintenance_cycles '
+            '(repo,phase,refactoring_plan_ids,last_success_commit,last_success_merged_count) '
+            "VALUES ('/repo','refactoring','[\"G-001\"]','original-assessment',0)")
+        self.connection.commit()
+        text = self.rowless_cancellation()
+        before = tuple(self.connection.iterdump())
+        self.assertEqual(self.cleanup_rowless(text), ())
+        self.assertEqual(tuple(self.connection.iterdump()), before)
+        self.assertEqual(store.get('/repo').cancelled_scope_plan_ids, ('G-001',))
+        source = 'c' * 40
+        self.connection.execute('INSERT INTO execplan_catalog_views(repo,revision_sha,fingerprint,validation_kind) '
+            "VALUES (?,?,?,'full') ON CONFLICT(repo) DO UPDATE SET revision_sha=excluded.revision_sha",
+            ('/repo', source, 'confirmed-catalog'))
+        self.connection.commit()
+        count = store._merged_count('/repo')
+        effects = cycle_service.AdvanceMaintenanceCycleAfterMergesEffects(
+            maintenance_orchestration.all_cycle_plans_merged, maintenance_orchestration.cycle_plan_status_error)
+        completed = cycle_service._advance_maintenance_cycle_after_merges(effects, self.connection, '/repo', source)
+        self.assertEqual(completed.phase.value, 'idle')
+        self.assertEqual((completed.last_cycle_commit, completed.last_cycle_merged_count), (source, count))
+        self.assertEqual((completed.last_success_commit, completed.last_success_merged_count), ('original-assessment', 0))
+        self.assertEqual(self.cleanup_rowless(text), ('G-001',))
+        after = store.get('/repo')
+        self.assertEqual(after.phase.value, 'idle')
+        self.assertEqual(after.refactoring_plan_ids, ())
+        self.assertEqual(after.cancelled_scope_plan_ids, ())
+        self.assertEqual((after.last_cycle_commit, after.last_cycle_merged_count), (source, count))
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM execplan_cancellations WHERE plan_id='G-001'").fetchone())
+        self.assertTrue(execplan_catalog_state.is_cancelled(self.connection, '/repo', 'G-001'))
+        self.assertEqual(self.cleanup_rowless(text), ())
 
     def assessment_report(self, plan_ids):
         from loop_manager_internal.maintenance.maintenance_validation import parse_assessment_result
