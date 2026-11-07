@@ -50,18 +50,29 @@ class OwnershipHandler:
         from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
         published = result.get('current_acceptance')
         if (remote_oid and remote_oid == row['publication_remote_oid']
-                and result.get('head') == remote_oid and result.get('intent_id') == intent.get('id')
-                and valid_acceptance(published)
-                and all(published[key] == value for key, value in {
+                and result.get('head') == remote_oid):
+            if not (result.get('intent_id') == intent.get('id')
+                    and valid_acceptance(published)
+                    and all(published[key] == value for key, value in {
                     'repo': self.ports.identity.repo, 'plan_id': context.plan.plan_id,
                     'branch': context.branch, 'worktree': str(context.worktree), 'head': remote_oid}.items())
-                and published['remote']['oid'] == remote_oid):
-            service = self.ports._current_rebase_service(context, remote_oid=remote_oid)
-            _, decision = service.require_owned(checkpoint=current)
-            if decision.status not in {RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
+                    and published['remote']['oid'] == remote_oid):
                 return False
-            return manager_git_journal.live_remote_branch_oid(
-                self.ports.git, self.ports.identity.repo_path, context.branch) == remote_oid
+            service = self.ports._current_rebase_service(context, remote_oid=remote_oid)
+            observed, decision = service.require_owned(checkpoint=current)
+            if decision.status is RebaseStatus.START:
+                if not managed_rebase_adoption.owns_published_rebase_start(current, service.expected, observed):
+                    return False
+            elif decision.status not in {RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
+                return False
+            if pull_request and ((row['pr_url'] and pull_request.get('url') != row['pr_url'])
+                    or pull_request.get('headRefName') != context.branch
+                    or pull_request.get('headRefOid') != remote_oid):
+                return False
+            live = manager_git_journal.live_remote_branch_oid(
+                self.ports.git, self.ports.identity.repo_path, context.branch)
+            return (live == remote_oid and (self.ports.checkpoint is None
+                or self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id) == current))
         pending_push = current is not None and current.operation == 'push' and current.expected_head == remote_oid
         # A confirmed intermediate push can precede the SQLite lease update;
         # its exact intent retains ownership across older BLOCKED receipts.

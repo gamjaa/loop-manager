@@ -270,7 +270,11 @@ def _reconcile_rebase_evidence_block(
         observation = observe()
         if (observation[1].status is managed_rebase_validation.RebaseStatus.START
                 and block['reason_code'] != scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID.value):
-            return False
+            if (block['reason_code'] != scoped_blocking.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value
+                    or plan['publication_remote_oid'] != observation[0].remote.oid
+                    or not managed_rebase_adoption.owns_published_rebase_start(
+                        checkpoint, service.expected, observation[0])):
+                return False
         confirmed = observe()
         from loop_manager_internal.recovery.plan_recovery import recovery_admission
         with recovery_admission(connection, repo, plan_id):
