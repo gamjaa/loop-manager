@@ -52,6 +52,24 @@ def semantic_review_identity(saved: Mapping) -> str | None:
         ensure_ascii=False, sort_keys=True).encode())
 
 
+def decision_evidence(basis, decision, change):
+    return execplan_drafts.content_digest(json.dumps(
+        {"basis": basis, "decision": decision, "change": change},
+        ensure_ascii=False, sort_keys=True).encode())
+
+
+def resolution_matches(saved, resolution):
+    if saved.get("user_changes") != resolution.get("user_changes"):
+        return False
+    if "decision" in resolution:
+        return (saved.get("decision") == resolution["decision"]
+                and saved.get("decision_evidence") == resolution.get("decision_evidence"))
+    # Older receipts were only prepared for ready explicit decisions or no decision.
+    from loop_manager_internal.maintenance.maintenance_planning import markdown_sections
+    original = execplan_drafts.fields(markdown_sections(resolution.get("original", "")).values.get("User Decision", ""))
+    return saved.get("decision", {}) == original and (not original or saved.get("decision_ready"))
+
+
 def needs_semantic_review(connection: sqlite3.Connection, repo: str, entries) -> bool:
     for plan_id in pending_ids(connection, repo):
         saved = evidence(connection, repo, plan_id) or {}
@@ -168,6 +186,14 @@ def observe(connection: sqlite3.Connection, repo: str, path: str, plan: Mapping[
               "path": path, "remote_revision": question_revision, "pending": True,
               "decision": decision if not agent else (previous or {}).get("decision", {}),
               "decisions": decisions, "decision_ready": approved, "user_changes": changes}
+    decision_change = changes.get(path, {})
+    prior_evidence = (previous or {}).get("decision_evidence")
+    current_evidence = decision_evidence(basis, decision, decision_change)
+    if (not agent and decision and decision_change.get("verified")
+            and decision_change.get("revision") == revision):
+        record["decision_evidence"] = current_evidence
+    elif prior_evidence and prior_evidence == current_evidence:
+        record["decision_evidence"] = prior_evidence
     if cleaned:
         record.update(question="", identity=None, reassessment=True)
     if previous and unchanged and previous.get("prepared_resolution"):
@@ -193,7 +219,8 @@ def prepare_resolution(connection, repo, plan_id, resolution):
     from .runtime_state import _transaction
     with _transaction(connection):
         saved = evidence(connection, repo, plan_id)
-        if not saved or saved["revision"] != resolution["revision"] or saved["basis"] != resolution["basis"]:
+        if (not saved or saved["revision"] != resolution["revision"] or saved["basis"] != resolution["basis"]
+                or not resolution_matches(saved, resolution)):
             raise RuntimeError("draft 질문 정리 전에 판단 근거가 변경됐습니다.")
         saved["prepared_resolution"] = resolution
         connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo=? AND plan_id=?",
@@ -205,6 +232,7 @@ def resolve(connection, repo, path, plan, content_hash, revision, resolution, *,
     saved = evidence(connection, repo, str(plan["id"]))
     if (not saved or saved.get("prepared_resolution") != resolution
             or saved["revision"] != resolution["revision"] or saved["basis"] != resolution["basis"]
+            or not resolution_matches(saved, resolution)
             or resolution["content_hash"] != content_hash
             or any((inputs or {}).get(key) != value for key, value in saved["basis"]["inputs"].items())):
         raise RuntimeError("draft 질문 해소의 게시·현재 입력 근거가 변경됐습니다.")
@@ -213,6 +241,8 @@ def resolve(connection, repo, path, plan, content_hash, revision, resolution, *,
     if audit not in history:
         history.append(audit)
     pending = bool(plan.get("draft"))
+    current_evidence = saved.get("decision_evidence") == decision_evidence(
+        saved["basis"], saved.get("decision"), saved.get("user_changes", {}).get(path, {}))
     relevant = set(plan["sources"]) | {"docs/PRODUCT.md", "docs/ARCHITECTURE.md"}
     saved.update(path=path, remote_revision=revision, pending=pending,
                  question=plan.get("draft_question", ""),
@@ -222,6 +252,11 @@ def resolve(connection, repo, path, plan, content_hash, revision, resolution, *,
                  decision=plan.get("draft_decision", {}) if pending else {},
                  decision_ready=bool(pending and plan.get("draft_decision") and saved.get("decision_ready")),
                  user_changes=saved.get("user_changes", {}) if pending else {})
+    if pending and current_evidence:
+        saved["decision_evidence"] = decision_evidence(saved["basis"], saved["decision"],
+                                                       saved["user_changes"].get(path, {}))
+    else:
+        saved.pop("decision_evidence", None)
     saved.pop("prepared_resolution", None)
     saved.pop("reassessment", None)
     saved["revision"] = execplan_drafts.content_digest(json.dumps(saved["basis"], sort_keys=True).encode())

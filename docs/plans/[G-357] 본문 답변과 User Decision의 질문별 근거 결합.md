@@ -27,10 +27,10 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `storage/execplan_draft_state.py:observe()`·`semantic_review_identity()`·`prompt_evidence()`와 `catalog/execplan_drafts.py:metadata()`/`fields()`의 질문·scope·입력·실제 사용자 필드 보존을 재사용한다. 명시 승인 readiness와 verified 본문/Answer의 의미 평가 가능성을 구분해 현재 질문에 필요한 근거를 제공한다. 새 승인 상태 원본·비호환 schema·운영 데이터 직접 수정·기존 필드 자동 보충을 추가하지 않는다.
-- [ ] 확인한 `catalog/draft_decisions.py:user_changes()`·`prepare()`·`_clean_answers()`에서 인용 출처·before/after의 실제 추가 원문·현재 source hash·질문/판단 revision을 검증하는 경계를 재사용한다. 전역 `decision && !decision_ready` 거부와 User Decision 인용의 추가 거부를 현재 근거별로 정합화한다. 같은 원격 변경의 verified Requirement 정정·Answer가 현재 질문을 해소하는 경우와 거절·stale 명시 결정·불명확 근거를 구분하고, 모든 질문 해소 시 입력을 제거하는 기존 정리가 확인하지 못한 User Decision까지 소비하지 않게 한다. 원문 인용의 단순 존재를 의미상 충분성으로 대체하지 않는다.
-- [ ] 확인한 `prepare_resolution()`·`resolve()`의 준비 영수증·scope/입력 CAS·게시 확인 뒤 원자 전이와 기존 `resolutions` 감사를 유지한다. 이전 판단 지문·답변 출처·새 질문별 판단과 현재 owner를 연결하며 준비된 결과 재사용·부분 해소·재관측에서 같은 답변을 잃거나 중복 적용하지 않게 한다.
-- [ ] 확인한 `tests/test_execplan_drafts.py:ExecPlanDraftCatalogTest`·`DraftAnswerReobservationTest`·`ExecPlanDraftPublicationTest`의 실제 SQLite·임시 파일·관측 double을 재사용한다. 필요한 최소 재현을 추가하고 현재 거부/보존 assertion을 다른 성공 기대값으로 바꾸지 않는다. 정책 조합을 위해 실제 Git/CLI lifecycle을 추가하지 않으며 `docs/ARCHITECTURE.md`의 draft 사용자 결정과 게시 절에는 구현된 근거 결합·보존 경계만 반영한다.
+- [x] 확인한 `storage/execplan_draft_state.py:observe()`·`semantic_review_identity()`·`prompt_evidence()`와 `catalog/execplan_drafts.py:metadata()`/`fields()`의 질문·scope·입력·실제 사용자 필드 보존을 재사용한다. 명시 승인 readiness와 verified 본문/Answer의 의미 평가 가능성을 구분해 현재 질문에 필요한 근거를 제공한다. 새 승인 상태 원본·비호환 schema·운영 데이터 직접 수정·기존 필드 자동 보충을 추가하지 않는다.
+- [x] 확인한 `catalog/draft_decisions.py:user_changes()`·`prepare()`·`_clean_answers()`에서 인용 출처·before/after의 실제 추가 원문·현재 source hash·질문/판단 revision을 검증하는 경계를 재사용한다. 전역 `decision && !decision_ready` 거부와 User Decision 인용의 추가 거부를 현재 근거별로 정합화한다. 같은 원격 변경의 verified Requirement 정정·Answer가 현재 질문을 해소하는 경우와 거절·stale 명시 결정·불명확 근거를 구분하고, 모든 질문 해소 시 입력을 제거하는 기존 정리가 확인하지 못한 User Decision까지 소비하지 않게 한다. 원문 인용의 단순 존재를 의미상 충분성으로 대체하지 않는다.
+- [x] 확인한 `prepare_resolution()`·`resolve()`의 준비 영수증·scope/입력 CAS·게시 확인 뒤 원자 전이와 기존 `resolutions` 감사를 유지한다. 이전 판단 지문·답변 출처·새 질문별 판단과 현재 owner를 연결하며 준비된 결과 재사용·부분 해소·재관측에서 같은 답변을 잃거나 중복 적용하지 않게 한다.
+- [x] 확인한 `tests/test_execplan_drafts.py:ExecPlanDraftCatalogTest`·`DraftAnswerReobservationTest`·`ExecPlanDraftPublicationTest`의 실제 SQLite·임시 파일·관측 double을 재사용한다. 필요한 최소 재현을 추가하고 현재 거부/보존 assertion을 다른 성공 기대값으로 바꾸지 않는다. 정책 조합을 위해 실제 Git/CLI lifecycle을 추가하지 않으며 `docs/ARCHITECTURE.md`의 draft 사용자 결정과 게시 절에는 구현된 근거 결합·보존 경계만 반영한다.
 
 ## Validation
 
@@ -42,8 +42,13 @@ priority: high
 ## Progress
 
 - [x] revision `d59136fc6d559ba21c69e2232a21bb4a4be9fd90`의 R-061·R-082, 관측/정리/게시 경계와 관련 회귀를 정적으로 대조했다. 이전 게시 준비 오류가 발생하는 전역 readiness 거부와 Answer-only 입력의 형식 조건을 확인했다. 구현·테스트·verify·운영 DB 조회는 수행하지 않았다.
-- [ ] 현재 질문·verified 본문/Answer 근거 결합과 기존 명시 결정 보호의 정합화
-- [ ] 최소 targeted unit·부분 해소/중단·게시/재관측 회귀와 설계 반영
+- [x] 중간 보존점에서 확인되지 않은 User Decision의 전체 정리를 막은 뒤 질문별 복수 근거 결합과 부분 답변 처리를 완성했다.
+- [x] 현재 질문·verified 본문/Answer 근거 결합과 기존 명시 결정 보호의 정합화
+- [x] targeted unit·부분 해소/중단·게시/재관측 회귀와 설계 반영. 전체 verify와 Reviewer 검토는 Manager가 수행한다.
+- [x] rebase 후 942080c의 base 대비 전체 diff와 R-061·R-082를 대조하고, 본문 근거의 부분 해소에서도 함께 남는 User Decision의 현재 출처 검사를 추가했다. 같은 관측의 상충·불확실 답변과 의미 판단 부재는 정리 없이 보존한다. 현재 후보의 `ExecPlanDraftCatalogTest` 37건, `DraftAnswerReobservationTest` 10건 및 추가 불확실 판단 case를 통과했다.
+- [x] 과거 verify에서 보고된 checkpoint 복구 테스트는 현재 `BlockedCheckpointRefreshUnitTests` 29건, 로컬 복구 알림은 해당 1건을 targeted runner로 다시 확인했다. 이전 전체 verify 실패 기록은 그대로 보존하며 현재 후보의 전체 verify와 Review는 Manager에게 남긴다.
+- [x] Review의 여러 줄 답변 정리 누락을 교정했다. 질문별 연속 원문 범위를 합쳐 전체 정리와 부분 정리 후 재관측에 적용하고, 위치가 모호하거나 줄 일부만 인용된 입력은 보존한다. `DraftAnswerReobservationTest` 14건을 통과했으며 전체 verify와 후속 Review는 Manager가 수행한다.
+- [x] Review의 연속 부분 정리 재생 누락을 교정했다. 각 게시의 인용을 당시 남은 답변에 순서대로 적용하며, 중복 줄이 나중에 유일해지는 세 질문의 두 차례 게시·재관측과 마지막 정리를 확인했다. `DraftAnswerReobservationTest` 15건과 기존 부분 정리·중단 재진입 각 1건이 통과했다. 전체 verify와 후속 Review는 Manager가 수행한다.
 
 ## Decision Log
 

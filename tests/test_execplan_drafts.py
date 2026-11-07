@@ -144,6 +144,19 @@ class ExecPlanDraftDocumentTest(unittest.TestCase):
 
 
 class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
+    def test_full_cleanup_preserves_unquoted_user_decision(self):
+        answer = "Use policy A and retain history."
+        decision = "A separate user response."
+        text = draft_decisions.replace_section(self.text, "Implementation", answer)
+        text += "\n## User Decision\n\nAnswer: " + decision + "\n"
+        saved = {"user_changes": {PATH: {"verified": True, "before": self.text, "after": text}},
+                 "basis": {"inputs": {}}, "decision_ready": True}
+        assessment = {"resolved": [{"question": draft_decisions.questions(self.waiting()["question"])[0],
+                                    "answer": answer, "source": PATH, "quote": answer}], "remaining": ""}
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "User Decision"):
+            draft_decisions._clean_answers(SimpleNamespace(path=PATH, text=text), text, saved,
+                                           assessment, draft_decisions.questions(self.waiting()["question"]))
+
     def test_published_draft_can_be_snapshotted_without_releasing_its_hold(self):
         row = self.connection.execute(
             "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-001'"
@@ -772,6 +785,9 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
             self.assertTrue(self.waiting()["pending"])
             self.assertEqual(draft_decisions.prepare(self.connection, "repo", root, snapshot), first)
             self.assertEqual(target.read_bytes(), cleaned)
+            legacy = {key: value for key, value in first["G-001"].items() if key not in {"decision", "decision_evidence"}}
+            self.assertTrue(execplan_draft_state.resolution_matches(self.waiting(), legacy))
+            self.assertFalse(execplan_draft_state.resolution_matches({**self.waiting(), "decision_ready": False}, legacy))
             plan = execplan_catalog.parse_execplan_text(PATH, cleaned.decode(), validate_sources=False)
             saved = self.waiting()
             with self.assertRaises(KeyboardInterrupt):
@@ -1169,7 +1185,7 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertTrue(result.usable)
         return execplan_draft_state.evidence(self.connection, "repo", "G-001")
 
-    def prepare(self, source, question, answer, remaining=""):
+    def prepare(self, source, question, answer, remaining="", evidence=None, resolved=None):
         tree = self.trees[self.current]
         row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
         original = loop_manager._ready_plan_snapshot_from_contents(row, tree[PATH].encode(), allow_started=True)
@@ -1177,6 +1193,10 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
         saved = execplan_draft_state.evidence(self.connection, "repo", "G-001")
         result = [{"id": "G-001", "revision": saved["revision"], "remaining": remaining,
                    "resolved": [{"question": question, "answer": answer, "source": source, "quote": answer}]}]
+        if resolved is not None:
+            result[0]["resolved"] = resolved
+        if evidence is not None:
+            result[0]["resolved"][0]["evidence"] = evidence
         with self.connection:
             self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'", (draft_decisions.PREFIX + json.dumps(result),))
         with tempfile.TemporaryDirectory() as directory:
@@ -1195,6 +1215,227 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
                     self.assertEqual((root / path).read_text(), text)
         self.assertTrue(execplan_draft_state.evidence(self.connection, "repo", "G-001")["pending"])
         return cleaned, prepared['G-001']
+
+    def test_requirement_and_answer_only_decision_are_bound_on_reobservation(self):
+        source = "docs/requirements/[R-001] Policy.md"
+        plan = draft_text().replace("docs/PRODUCT.md", source)
+        initial = {PATH: plan, source: "# [R-001] Policy\n\nUndecided.\n"}
+        self.observe("a" * 40, initial)
+        answer = "Use policy A and retain history."
+        tree = {PATH: plan + "\n## User Decision\n\nAnswer: " + answer + "\n",
+                source: initial[source] + answer + "\n"}
+        saved = self.observe("b" * 40, tree)
+        self.assertFalse(saved["decision_ready"])
+        self.assertEqual(saved["decision"], {"Answer": answer})
+        saved = self.observe("b" * 40, tree)
+        question = draft_decisions.questions(saved["question"])[0]
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "User Decision"):
+            self.prepare(source, question, answer)
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "source 변경"):
+            self.prepare(PATH, question, answer)
+        cleaned, receipt = self.prepare(source, question, answer, evidence=[{"source": PATH, "quote": answer}])
+        self.assertNotIn("draft: true", cleaned)
+        self.assertNotIn("User Decision", cleaned)
+        self.assertNotIn("Decision: approve", cleaned)
+        self.assertTrue(execplan_draft_state.evidence(self.connection, "repo", "G-001")["pending"])
+        self.assertEqual(receipt["assessment"]["resolved"][0]["evidence"][0]["source"], PATH)
+        changed = execplan_draft_state.evidence(self.connection, "repo", "G-001")
+        changed["user_changes"][source]["verified"] = False
+        with self.connection:
+            self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo='repo' AND plan_id='G-001'", (json.dumps(changed),))
+        with self.assertRaisesRegex(RuntimeError, "판단 근거"):
+            execplan_draft_state.prepare_resolution(self.connection, "repo", "G-001", receipt)
+        changed["user_changes"][source]["verified"] = True
+        with self.connection:
+            self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo='repo' AND plan_id='G-001'", (json.dumps(changed),))
+            parsed = execplan_catalog.parse_execplan_text(PATH, cleaned, validate_sources=False)
+            execplan_draft_state.resolve(self.connection, "repo", PATH, parsed,
+                execplan_catalog.plan_content_hash(cleaned.encode()), "f" * 40, receipt, inputs=saved["basis"]["inputs"])
+        self.assertFalse(execplan_draft_state.evidence(self.connection, "repo", "G-001")["pending"])
+        self.assertEqual(len(execplan_draft_state.evidence(self.connection, "repo", "G-001")["resolutions"]), 1)
+
+    def test_combined_evidence_rejects_stale_or_unverified_inputs(self):
+        source = "docs/requirements/[R-001] Policy.md"
+        plan = draft_text().replace("docs/PRODUCT.md", source)
+        initial = {PATH: plan, source: "# [R-001] Policy\n\nUndecided.\n"}
+        self.observe("a" * 40, initial)
+        answer = "Use policy A and retain history."
+        tree = {PATH: plan + "\n## User Decision\n\nAnswer: " + answer + "\n",
+                source: initial[source] + answer + "\n"}
+        saved = self.observe("b" * 40, tree)
+        question = draft_decisions.questions(saved["question"])[0]
+        variants = []
+        for path in (PATH, source):
+            variant = json.loads(json.dumps(saved))
+            variant["user_changes"][path]["verified"] = False
+            variants.append(variant)
+            variant = json.loads(json.dumps(saved))
+            variant["user_changes"][path]["before"] += answer
+            variants.append(variant)
+        variant = json.loads(json.dumps(saved))
+        variant["basis"]["inputs"][source] = "stale"
+        variants.append(variant)
+        variant = json.loads(json.dumps(saved))
+        variant["user_changes"][PATH]["revision"] = "old"
+        variants.append(variant)
+        for decision in ({"Answer": answer, "Revision": "old"},
+                         {"Answer": answer, "Decision": "reject"},
+                         {"Answer": answer, "Decision": "defer"},
+                         {"Answer": answer, "Decision": "approve"}):
+            variant = json.loads(json.dumps(saved))
+            variant["decision"] = decision
+            variants.append(variant)
+        for variant in variants:
+            with self.subTest(variant=variant):
+                with self.connection:
+                    self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo='repo' AND plan_id='G-001'", (json.dumps(variant),))
+                with self.assertRaises(loop_manager.PlannerValidationError):
+                    self.prepare(source, question, answer, evidence=[{"source": PATH, "quote": answer}])
+                self.assertTrue(execplan_draft_state.evidence(self.connection, "repo", "G-001")["pending"])
+        original_text = tree[PATH]
+        for field in ("Revision: stale", "Decision: reject", "Decision: defer", "Decision: approve"):
+            with self.subTest(field=field):
+                decision_text = original_text + field + "\n"
+                self.trees[self.current][PATH] = decision_text
+                variant = json.loads(json.dumps(saved))
+                variant["decision"] = execplan_drafts.fields(markdown_sections(decision_text).values["User Decision"])
+                variant["user_changes"][PATH]["after"] = decision_text
+                with self.connection:
+                    self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo='repo' AND plan_id='G-001'", (json.dumps(variant),))
+                    self.connection.execute("UPDATE exec_plans SET content_hash=? WHERE repo='repo' AND plan_id='G-001'",
+                                            (execplan_catalog.plan_content_hash(decision_text.encode()),))
+                with self.assertRaises(loop_manager.PlannerValidationError):
+                    self.prepare(source, question, answer, evidence=[{"source": PATH, "quote": answer}])
+
+    def test_answer_only_partial_cleanup_keeps_remaining_answer(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        plan = draft_text().replace("Question: " + first, "Question: - " + first + "\n- " + second)
+        initial = {PATH: plan, "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        first_answer, second_answer = "Use policy A and retain history.", "Retry only transient errors."
+        tree = {**initial, PATH: plan + "\n## User Decision\n\nAnswer: " + first_answer + "\n" + second_answer + "\n"}
+        saved = self.observe("b" * 40, tree)
+        cleaned, receipt = self.prepare(PATH, first, first_answer, QUESTION.replace(first, second))
+        self.assertEqual(execplan_drafts.fields(markdown_sections(cleaned).values["User Decision"])["Answer"], second_answer)
+        parsed = execplan_catalog.parse_execplan_text(PATH, cleaned, validate_sources=False)
+        with self.connection:
+            execplan_draft_state.resolve(self.connection, "repo", PATH, parsed,
+                execplan_catalog.plan_content_hash(cleaned.encode()), "f" * 40, receipt, inputs=saved["basis"]["inputs"])
+        self.observe("f" * 40, {**tree, PATH: cleaned})
+        cleaned, _ = self.prepare(PATH, second, second_answer)
+        self.assertNotIn("User Decision", cleaned)
+        self.assertNotIn("draft: true", cleaned)
+
+    def test_multiline_answers_clean_all_questions(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        plan = draft_text().replace("Question: " + first, "Question: - " + first + "\n- " + second)
+        initial = {PATH: plan, "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        answers = ("Use policy A.\nRetain history.", "Retry transient errors.\nStop on permanent errors.")
+        tree = {**initial, PATH: plan + "\n## User Decision\n\nAnswer: " + "\n".join(answers) + "\n"}
+        self.observe("b" * 40, tree)
+        resolved = [{"question": question, "answer": answer, "source": PATH, "quote": answer}
+                    for question, answer in zip((first, second), answers)]
+        cleaned, _ = self.prepare(PATH, first, "\n".join(answers), resolved=resolved)
+        self.assertNotIn("User Decision", cleaned)
+        self.assertNotIn("draft: true", cleaned)
+
+    def test_multiline_partial_cleanup_survives_publication_and_reobservation(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        plan = draft_text().replace("Question: " + first, "Question: - " + first + "\n- " + second)
+        initial = {PATH: plan, "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        first_answer = "Use policy A.\nRetain history."
+        second_answer = "Retry transient errors.\nStop on permanent errors."
+        tree = {**initial, PATH: plan + "\n## User Decision\n\nAnswer: " + first_answer + "\n" + second_answer + "\n"}
+        saved = self.observe("b" * 40, tree)
+        cleaned, receipt = self.prepare(PATH, first, first_answer, QUESTION.replace(first, second))
+        self.assertEqual(execplan_drafts.fields(markdown_sections(cleaned).values["User Decision"])["Answer"], second_answer)
+        parsed = execplan_catalog.parse_execplan_text(PATH, cleaned, validate_sources=False)
+        with self.connection:
+            execplan_draft_state.resolve(self.connection, "repo", PATH, parsed,
+                execplan_catalog.plan_content_hash(cleaned.encode()), "f" * 40, receipt, inputs=saved["basis"]["inputs"])
+        self.observe("f" * 40, {**tree, PATH: cleaned})
+        cleaned, _ = self.prepare(PATH, second, second_answer)
+        self.assertNotIn("User Decision", cleaned)
+        self.assertNotIn("draft: true", cleaned)
+
+    def test_multiline_quote_does_not_consume_ambiguous_or_partial_lines(self):
+        answer = "Shared line\nRepeat line\nShared line\nRepeat line\nUnquoted suffix"
+        self.assertEqual(draft_decisions._remaining_answer(answer, {"Shared line\nRepeat line"}), answer)
+        self.assertEqual(draft_decisions._remaining_answer(answer, {"suffix"}), answer)
+
+    def test_repeated_answer_line_is_replayed_in_publication_order(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        third = "Which archival policy should this goal use?"
+        plan = draft_text().replace("Question: " + first,
+            "Question: - " + first + "\n- " + second + "\n- " + third)
+        initial = {PATH: plan, "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        shared = "Apply the shared selected clause."
+        first_answer = shared + "\nKeep the first selection."
+        third_answer = "Keep the final selection."
+        tree = {**initial, PATH: plan + "\n## User Decision\n\nAnswer: " + first_answer + "\n" + shared + "\n" + third_answer + "\n"}
+        saved = self.observe("b" * 40, tree)
+        for question, answer, remaining, expected, revision in (
+                (first, first_answer, second + "\n- " + third, shared + "\n" + third_answer, "f" * 40),
+                (second, shared, third, third_answer, "e" * 40)):
+            cleaned, receipt = self.prepare(PATH, question, answer, QUESTION.replace(first, remaining))
+            self.assertEqual(execplan_drafts.fields(markdown_sections(cleaned).values["User Decision"])["Answer"], expected)
+            parsed = execplan_catalog.parse_execplan_text(PATH, cleaned, validate_sources=False)
+            with self.connection:
+                execplan_draft_state.resolve(self.connection, "repo", PATH, parsed,
+                    execplan_catalog.plan_content_hash(cleaned.encode()), revision, receipt, inputs=saved["basis"]["inputs"])
+            saved = self.observe(revision, {**tree, PATH: cleaned})
+        cleaned, _ = self.prepare(PATH, third, third_answer)
+        self.assertNotIn("User Decision", cleaned)
+        self.assertNotIn("draft: true", cleaned)
+
+    def test_body_partial_resolution_requires_current_user_decision_evidence(self):
+        first = "Which storage policy should this goal use?"
+        second = "Which retry policy should this goal use?"
+        source = "docs/requirements/[R-001] Policy.md"
+        plan = draft_text().replace("docs/PRODUCT.md", source).replace(
+            "Question: " + first, "Question: - " + first + "\n- " + second)
+        initial = {PATH: plan, source: "# [R-001] Policy\n\nUndecided.\n"}
+        self.observe("a" * 40, initial)
+        answer = "Use policy A and retain history."
+        tree = {PATH: plan + "\n## User Decision\n\nAnswer: Retry only transient errors.\n",
+                source: initial[source] + answer + "\n"}
+        saved = self.observe("b" * 40, tree)
+        saved["user_changes"][PATH]["verified"] = False
+        with self.connection:
+            self.connection.execute("UPDATE execplan_drafts SET evidence=? WHERE repo='repo' AND plan_id='G-001'", (json.dumps(saved),))
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "User Decision"):
+            self.prepare(source, first, answer, QUESTION.replace(first, second))
+        self.assertTrue(execplan_draft_state.evidence(self.connection, "repo", "G-001")["pending"])
+
+    def test_combined_evidence_without_semantic_resolution_preserves_hold(self):
+        source = "docs/requirements/[R-001] Policy.md"
+        plan = draft_text().replace("docs/PRODUCT.md", source)
+        initial = {PATH: plan, source: "# [R-001] Policy\n\nUndecided.\n"}
+        self.observe("a" * 40, initial)
+        tree = {PATH: plan + "\n## User Decision\n\nAnswer: Maybe policy A.\n",
+                source: initial[source] + "Use policy B.\n"}
+        saved = self.observe("b" * 40, tree)
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
+        original = loop_manager._ready_plan_snapshot_from_contents(row, tree[PATH].encode(), allow_started=True)
+        snapshot = MutableReadySnapshot("repo", self.current, (original,), "fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / PATH
+            target.parent.mkdir(parents=True)
+            target.write_text(tree[PATH], encoding="utf-8")
+            for output in ("", draft_decisions.PREFIX + json.dumps([{"id": "G-001", "revision": saved["revision"], "outcome": "uncertain"}])):
+                with self.connection:
+                    self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'", (output,))
+                self.assertEqual(draft_decisions.prepare(self.connection, "repo", root, snapshot), {})
+                self.assertEqual(target.read_text(encoding="utf-8"), tree[PATH])
+                self.assertEqual(execplan_draft_state.evidence(self.connection, "repo", "G-001"), saved)
 
     def test_body_answer_survives_reobservation(self):
         initial = {PATH: draft_text(), "docs/PRODUCT.md": "# Product\n"}
