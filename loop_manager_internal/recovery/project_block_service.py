@@ -185,7 +185,7 @@ def _reconcile_rebase_evidence_block(
             or (plan_block and (plan['status'] != 'PLAN_BLOCKED'
                 or plan['blocked_reason'] != block['reason_code']
                 or scoped_blocking.project_block(connection, repo) is not None))
-            or (not plan_block and project['phase'] != 'PROJECT_BLOCKED')):
+            or (not plan_block and not scoped_blocking.project_cause_matches(connection, block))):
         return False
     worktree, branch = Path(str(plan['worktree'])), str(plan['branch'])
     try:
