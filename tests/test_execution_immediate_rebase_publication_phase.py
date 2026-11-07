@@ -45,6 +45,8 @@ class ImmediateRebasePublicationTests(TestCase):
             factory(context, **{'remote_oid': self.state.row()['publication_remote_oid'] or self.seed.expected.remote.oid, **options})))
 
     def git(self, path, *args, **kwargs):
+        if args == ('rev-parse', 'origin/main'):
+            return SimpleNamespace(returncode=0, stdout=self.handler._fetch_latest_base.return_value)
         if args[0] == 'ls-remote':
             return SimpleNamespace(returncode=0, stdout=(
                 f'{self.remote}\trefs/heads/loop-manager/G-047\n' if self.remote else ''))
@@ -65,6 +67,145 @@ class ImmediateRebasePublicationTests(TestCase):
 
     def complete(self):
         self.handler._complete_rebase_intent(self.handler._context())
+
+    def start_next_rebase(self):
+        self.complete()
+        current = self.checkpoints.get('repo', 'G-047')
+        self.seed.expected = replace(self.seed.expected, target_base_oid='later-base',
+            before_head=self.remote, remote=self.seed.observed.remote)
+        self.seed.observed = replace(self.seed.observed, base_is_ancestor=False)
+        self.handler._fetch_latest_base.return_value = 'later-base'
+        return self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head=self.remote, target_base_oid='later-base',
+            observed_remote_oid=self.remote,
+            snapshot={**current.snapshot, 'current_rebase_acceptance': None})
+
+    def test_confirmed_publication_allows_next_target_to_start_without_push_or_completion(self):
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        from loop_manager_internal.execution.execution_runtime import ExecutionContext
+        from loop_manager_internal.recovery import scoped_blocking
+        self._existing_pr()
+        current = self.start_next_rebase()
+        self.assertEqual(self.seed.factory(None).require_owned()[1].status, RebaseStatus.START)
+        before_pushes = list(self.pushes)
+        with mock.patch.object(self.handler, '_record_rebase_intent') as record, \
+                mock.patch.object(self.handler, '_run_managed_rebase',
+                    return_value=SimpleNamespace(stdout='conflict', returncode=1)) as run, \
+                mock.patch.object(self.handler, '_post_rebase_observation',
+                    side_effect=lambda *_: self.handler._context()), \
+                mock.patch.object(self.handler, '_complete_rebase_intent') as complete:
+            result = self.handler.recover(self.handler._context())
+        self.assertIsInstance(result, ExecutionContext)
+        record.assert_called_once()
+        run.assert_called_once_with(mock.ANY, 'later-base', autostash=True)
+        complete.assert_not_called()
+        self.assertEqual(self.pushes, before_pushes)
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(saved.operation, 'rebase')
+        self.assertIsNone(saved.snapshot['current_rebase_acceptance'])
+        self.assertEqual(saved.snapshot['rebase_publication_result'], current.snapshot['rebase_publication_result'])
+        self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+
+    def test_next_rebase_start_requires_immutable_publication_and_current_identity(self):
+        from copy import deepcopy
+        from loop_manager_internal.git.managed_rebase_adoption import owns_published_rebase_start
+        current = self.start_next_rebase()
+        service = self.seed.factory(None)
+        observed, _ = service.require_owned()
+        self.assertTrue(owns_published_rebase_start(current, service.expected, observed))
+        retired = {**current.snapshot, 'rebase_publication_intent': None,
+            'retired_rebase_publications': [{'intent': current.snapshot['rebase_publication_intent'],
+                                            'confirmed': False, 'observed_remote': self.remote}]}
+        self.assertTrue(owns_published_rebase_start(
+            replace(current, snapshot=retired), service.expected, observed))
+        for field in ('id', 'head', 'target_base_oid', 'remote_before'):
+            with self.subTest(intent=field):
+                saved = deepcopy(current.snapshot)
+                saved['rebase_publication_intent'][field] = 'invalid'
+                self.assertFalse(owns_published_rebase_start(
+                    replace(current, snapshot=saved), service.expected, observed))
+        for field in ('intent_id', 'head', 'current_acceptance'):
+            with self.subTest(result=field):
+                saved = deepcopy(current.snapshot)
+                saved['rebase_publication_result'][field] = None
+                self.assertFalse(owns_published_rebase_start(
+                    replace(current, snapshot=saved), service.expected, observed))
+        for field in ('repo', 'repository_identity', 'plan_id', 'branch', 'worktree'):
+            with self.subTest(expected=field):
+                self.assertFalse(owns_published_rebase_start(current,
+                    replace(service.expected, **{field: 'foreign'}), observed))
+        self.assertFalse(owns_published_rebase_start(current, service.expected,
+            replace(observed, remote=replace(observed.remote, oid='foreign'))))
+        self.assertFalse(self.handler._owned_checkpoint_remote(self.handler._context(),
+            self.state.row(), self.remote, current, {'url': 'foreign', 'headRefName': 'other'}))
+        self.remote = 'foreign'
+        self.assertFalse(self.handler._owned_checkpoint_remote(self.handler._context(),
+            self.state.row(), current.observed_remote_oid, current))
+
+    def test_next_rebase_publication_owner_rejects_checkpoint_generation_race(self):
+        current = self.start_next_rebase()
+        def drift(*_):
+            self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+                operation=current.operation, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid=self.remote,
+                snapshot=current.snapshot)
+            return self.remote
+        with mock.patch.object(handlers.manager_git_journal, 'live_remote_branch_oid', side_effect=drift):
+            self.assertFalse(self.handler._owned_checkpoint_remote(self.handler._context(),
+                self.state.row(), self.remote, current))
+
+    def test_saved_publication_block_rechecks_start_without_completing_rebase(self):
+        from loop_manager_internal.recovery import project_block_service, scoped_blocking
+        from loop_manager_internal.git.rebase_block_reconciliation import LEGACY_COMPLETION_DIAGNOSTIC
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+        for separate in (False, True):
+            with self.subTest(separate=separate):
+                self._reset_publication_case()
+                current = self.start_next_rebase()
+                connection = self.fixture.connection
+                with connection:
+                    connection.execute("UPDATE projects SET planning_attempt_fingerprint=NULL, phase='PROJECT_BLOCKED'")
+                    connection.execute("UPDATE exec_plans SET workspace_owned=1")
+                    scoped_blocking.record_project_block(connection, 'repo',
+                        BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN, LEGACY_COMPLETION_DIAGNOSTIC,
+                        'old-input', plan_id='G-047', previous_phase='WORKING')
+                    if separate:
+                        connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED', blocked_reason='worker_decision_required'")
+                        connection.execute("INSERT INTO execplan_blocks (repo,plan_id,scope,reason_code,evidence) "
+                            "VALUES ('repo','G-047','plan','worker_decision_required','independent')")
+                block = scoped_blocking.project_block(connection, 'repo')
+                effects = project_block_service.ReconcileRebaseEvidenceBlockEffects(
+                    _current_rebase_service=lambda *_: self.seed.factory(None),
+                    _revision_execplan_input_fingerprint=mock.Mock(),
+                    _worktree_execplan_input_fingerprint=mock.Mock(), capture_git_snapshot=mock.Mock(),
+                    operation_log=mock.Mock(), unmet_execplan_dependencies=lambda *_: (),
+                    validate_blocked_agent_scope=mock.Mock())
+                def reconcile():
+                    return project_block_service._reconcile_rebase_evidence_block(
+                        effects, connection, Path('/repo'), Path('/state'), 'repo', block, plan_block=False)
+                if not separate:
+                    invalid = {**current.snapshot, 'rebase_publication_result': {
+                        **current.snapshot['rebase_publication_result'], 'intent_id': 'invalid'}}
+                    changed = self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+                        operation='rebase', expected_head=current.expected_head,
+                        target_base_oid=current.target_base_oid, observed_remote_oid=self.remote, snapshot=invalid)
+                    self.assertFalse(reconcile())
+                    self.assertEqual(dict(scoped_blocking.project_block(connection, 'repo')), dict(block))
+                    current = self.checkpoints.record('repo', 'G-047', expected_generation=changed.generation,
+                        operation='rebase', expected_head=current.expected_head,
+                        target_base_oid=current.target_base_oid, observed_remote_oid=self.remote, snapshot=current.snapshot)
+                self.assertTrue(reconcile())
+                self.assertIsNone(scoped_blocking.project_block(connection, 'repo'))
+                self.assertEqual(bool(scoped_blocking.plan_block(connection, 'repo', 'G-047')), separate)
+                saved = self.checkpoints.get('repo', 'G-047')
+                self.assertEqual(saved.operation, 'rebase')
+                self.assertEqual(saved.snapshot['rebase_publication_result'], current.snapshot['rebase_publication_result'])
+                self.assertEqual(saved.snapshot['failure'], 'old failure')
+                plan = connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-047'").fetchone()
+                self.assertEqual(plan['worker_session_id'], 'saved-worker')
+                self.assertIsNone(saved.snapshot['current_rebase_acceptance'])
+                self.assertIsNone(plan['verify_token'])
+                self.assertEqual(len(self.pushes), 1)
 
     def test_confirmed_rebase_publication_owns_remote_after_block_receipt_is_retired(self):
         self.complete()
