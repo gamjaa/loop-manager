@@ -6,6 +6,7 @@ sources:
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
   - docs/requirements/[R-061] Agent 역할·문서 권한과 draft ExecPlan 사용자 판단.md
   - docs/requirements/[R-055] 차단 경로 전수 조사와 불필요한 작업 중단 축소.md
+  - docs/requirements/[R-072] 입력 동일성이 증명된 구현 후보 성공 결과 재사용.md
 depends_on: []
 complexity: medium
 risk: critical
@@ -33,8 +34,11 @@ R-082의 후속 복원 목표와 확인된 사용자 결정에 따라, 종료한
 - [ ] 확인한 `storage/execution_checkpoint_state.py:ExecutionCheckpointRepository`에 이 작업의 보존·미완료 적용·확정 결과를 현재 snapshot/CAS 경계로 연결한다. 새 DB 원본·비호환 schema·범용 journal을 추가하지 않는다. 원문은 소유 checkpoint의 기존 저장 방식으로 보존하고 prompt·운영 요약·invocation ledger에 문서 전문을 추가하지 않는다.
 - [ ] 확인한 `execution/execution_worker_handler.py:WorkerHandler.run()`의 frontmatter 복원 피드백·기존 `_retry()`와 session/feedback 저장을 재사용해 경로별 복원 결과를 전달한다. 현재 `_bind_document_report()`와 `documents/pr_description.py:common_guidance_report()`의 작업 base 비교를 소비해 복원 뒤 보고/교정에도 같은 기준을 전달한다. `execution/plan_validation.py:restore_worker_frontmatter()`가 catalog identity를 확인한 공식 선언과 현재 선언의 일치에 쓰기 없이 반환하는 직접 구현도 소비한다. 시작 전 선언 차이만으로 이 결과를 복원 실패·재시도로 바꾸거나 실제 복원 감사·피드백을 합성하지 않는다. 원문 보존과 필요한 적용 완료 확인이 끝나기 전에 정상 진행을 확정하지 않는다. 선택 frontmatter 부분 복원·문서 결합 알고리즘은 재구현하지 않고 후속 교체에서도 기존 `worker_frontmatter_restores`·문서 반영 기록과 독립 감사를 유지한다.
 - [ ] 필요한 effect를 `agents/bindings.py`·`execution/execution_ports.py`의 명시적 계약에만 연결한다. PRODUCT·ARCHITECTURE의 현재 결과 검증·문서 보존 절에 승인된 경계와 실제 구현만 반영한다. Worker는 이 작업에서도 모든 Requirement를 수정하지 않으며 R-082 자체를 교정하거나 archive하지 않는다.
+- [ ] 복원 뒤 후보의 단계 판단은 현재 `execution/final_review.py`·`stage_results.py`·`execution_review_handler.py`·`execution_publication_handler.py`를 소비한다. R-072의 실제 raw 변경·적용 문서/source·전체 verify 근거와 마지막 최종 approval을 대조하는 경계를 유지하며, 복원 자체로 Review 승인·실패 초기화나 새 성공을 만들지 않는다. 복원 전후 입력이 같은 단계의 재사용과 실제 입력이 바뀐 단계의 재진입만 연결하고 별도 승인/receipt 체계를 만들지 않는다.
 
 ## Validation
+
+- `tests/test_final_review.py:FinalReviewTests`의 실제 문서/경로/mode 변경·입력 불완전·같은 입력 재연결·게시 직전 경쟁 회귀를 소비한다. 이 작업의 기존 복원 완료/피드백 fixture에 복원 후 후보와 이전 승인 입력이 달라진 경우만 최소 연결해 낡은 binding으로 게시하지 않는지 확인한다. verify 코드 입력이 같으면 기존 receipt 재사용을 유지하되 Review 입력 변화에는 필요한 검토로 돌아가야 한다. 같은 입력에 대한 재사용 행렬이나 terminal PR 복구를 이 작업에서 재구현하지 않는다.
 
 - Worker는 `tests/test_scope_services.py:ScopeValidationTests`, `tests/test_execution_worker_phase.py:ExecutionWorkerPhaseTests`와 `tests/test_requirement_sources.py:WorkerFrontmatterRestoreTests`에서 변경한 최소 unit case만 실행한다. 실제 SQLite/checkpoint·파일 bytes·순수 판정과 handler를 검사하고 Git·provider 효과만 double로 제공한다. 기존 선택 frontmatter 복원·범위 거부 회귀와 fixture를 재사용한다. `test_worker_correction_to_official_header_needs_no_restore`의 공식 선언 일치·교체 0회·본문 보존은 직접 회귀로 유지하며 같은 helper case를 복제하지 않는다. 후속 파일/index 복원·피드백을 연결할 때 이 무변경 결과가 불필요한 교정이나 독립 범위 검사 생략으로 바뀌는 누락만 확인한다.
 - 호출 전 clean 보호 문서에 대한 Worker 수정·삭제·추가·rename/이동, 원본 rebase 유입과 혼합 변경을 구성한다. 경로별 원문/mode/index 복원과 보존 감사, 선택 본문·구현·테스트·다른 staged/unstaged/untracked 파일·HEAD/branch·session/실패 불변을 확인한다. 원본 유입 문서에는 복원 효과가 호출되지 않아야 한다.
@@ -52,6 +56,8 @@ R-082의 후속 복원 목표와 확인된 사용자 결정에 따라, 종료한
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- revision `7be6f620bff8f2df1cd36454c60b4dbceae0a72a`의 최종 승인 재연결은 직접 구현으로 소비하고 복원 후 후보 검증의 소비 경계만 구체화한다. R-072는 실제 문서 변경과 단계별 입력 동일성 판단에 실질적으로 적용돼 source로 연결한다. snapshot token `2a4613355d51b07821f0b5bf7cf48c4dd08127e667baaef0d4a36e5fdbe36aa8`의 원문 hash를 대조했고 started ID·경로·기존 사용자 결정·수행 기록·무dependency·분류를 보존한다. 새 파일 복원 권한이나 승인을 만들지 않았고 구현·테스트·차단 해제는 수행하지 않았다. 보고 407의 과거 중첩 runner는 현재 R-067의 신뢰된 필수 통합 단계로 이전돼 같은 일반 unittest 실행을 복원하지 않으며, 현재 후보의 전체 검증 성공은 Manager가 별도로 확인한다.
 
 - 이번 R-082 delta는 공식 선언 교정과 종료한 Worker의 직접 금지 변경 복원을 분리한다. 기존 사용자 결정이 승인한 경로별 원문/index 보존·제한 복원·동일 Worker 보고 갱신은 유지한다. `8869fe08`의 새 rebase 선언 복원 intent 생성 제거는 이 정상 Worker 부분 복원의 제거가 아니며 저장된 과거 intent만의 복구도 확대하지 않는다. 공식 base 교정/반영은 G-348의 후속 목표로 분리하고 이 started 작업의 새 선행으로 요구하지 않는다. snapshot token `80407ee04d89b85fd664a78404e4164fba6121f5fa414a02449cd0f307569a06`의 원문 hash를 대조했고 ID·경로·metadata·무dependency·사용자 판단 원문과 기존 수행 기록을 보존한다. 구현·테스트·차단 해제는 수행하지 않았다.
 
