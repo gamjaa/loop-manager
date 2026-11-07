@@ -20,7 +20,7 @@ from loop_manager_internal.execution.validation_feedback import normalize_feedba
 from loop_manager_internal.execution.common_defect_report import result_observation
 from loop_manager_internal.documents.reviewer_specification import SpecificationDeadlock, validate_locations
 from loop_manager_internal.execution import stage_documents
-from loop_manager_internal.execution import preliminary_review
+from loop_manager_internal.execution import preliminary_review, final_review
 from loop_manager_internal.storage import pre_review
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
@@ -77,6 +77,16 @@ class ReviewHandler:
     """Review policy; durable transitions stay in the existing repositories."""
     def __init__(self, ports: ReviewHandlerPorts):
         self.ports = ports
+
+    def _changed_final_inputs(self, context, approval, review):
+        detail = '최종 Review 중 승인 입력이 변경되어 현재 근거를 다시 확인합니다.'
+        with runtime_state._transaction(self.ports.state.connection):
+            self.ports.state.check_context(context)
+            final_review.save(self.ports, context, approval)
+            self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
+                phase='REVIEWING', review_result=review, review_token=None,
+                publication_token=None, last_error=detail)
+        return self.ports._retry(detail)
 
     def _pending_document_review(self, context):
         definition = self.ports.snapshot()._definition_snapshot
@@ -326,6 +336,13 @@ class ReviewHandler:
         worker_publication, verify_evidence = entry_evidence
         preliminary = self._preliminary
         if not preliminary and not self._pending_document_review(context):
+            if final_review.reconnect(self.ports, context):
+                candidate_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+                candidate_proof = self._pr_review_candidate_proof(context, self.ports._row(), candidate_head)
+                with runtime_state._transaction(self.ports.state.connection):
+                    self._record_pr_review_candidate(candidate_proof, context)
+                events.emit('최종 Review 승인 재사용: 원래 호출과 현재 후보 입력 동일성 확인', next_stage='PUBLISHING')
+                return self.ports._advanced()
             approved = preliminary_review.active(self.ports, context, {'review_pass', 'final_review_pending'})
             if (preliminary_review.reusable(self.ports, context, approved)
                     and preliminary_review.full_evidence(self.ports, context, approved)):
@@ -333,12 +350,18 @@ class ReviewHandler:
                 candidate_proof = self._pr_review_candidate_proof(context, row, candidate_head)
                 reusable = preliminary_review.reusable(self.ports, context, approved)
                 full_evidence = preliminary_review.full_evidence(self.ports, context, approved)
+                final_inputs = final_review.observe(self.ports, context)
+                approval = final_review.approval(self.ports, context, final_inputs,
+                    json.loads(approved['identity'])['invocation_id'], approved['review'])
+                if approval['status'] == 'invalidated':
+                    return self._changed_final_inputs(context, approval, approved['review'])
                 with runtime_state._transaction(self.ports.state.connection):
                     self.ports.state.check_context(context)
                     # Entry evidence already required current full token + receipt;
                     # repeat input identity at the state transition boundary.
                     if not reusable or not full_evidence:
                         return self.ports._retry('선행 Review 최종 승인 입력이 변경됐습니다.')
+                    final_review.save(self.ports, context, approval)
                     pre_review.update(self.ports.state.connection, approved, 'finalized_reuse')
                     self.ports.clear_validation_failure_history(self.ports.identity.repo, 'review')
                     self._record_pr_review_candidate(candidate_proof, context)
@@ -407,6 +430,9 @@ class ReviewHandler:
             if manual and manual.user_submission(row)
             else 'Worker 보고:\n' + reviewer_targeted_test_evidence(worker_publication.test_evidence)
         )
+        final_inputs = final_review.observe(self.ports, context) if not preliminary and not document_review else None
+        with runtime_state._transaction(self.ports.state.connection):
+            final_review.invalidate(self.ports, context, 'running')
         protocol_error: str | None = None
         verdict: str | None = None
         review = ''
@@ -715,14 +741,20 @@ class ReviewHandler:
                 RecoveryReason.REVIEW_FEEDBACK_CORRECTION, review,
                 context=context, fingerprint=decision.fingerprint,
             )
-        events.emit("최종 Review PASS: 게시 단계로 진행", next_stage="PUBLISHING")
-        self.ports.clear_validation_failure_history(self.ports.identity.repo, 'review')
-        prior = pre_review.current(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id)
-        if prior and prior['status'] in {'review_pass', 'final_review_running'}:
-            pre_review.update(self.ports.state.connection, prior, 'finalized_review')
         candidate_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
         candidate_proof = self._pr_review_candidate_proof(context, row, candidate_head)
+        approval = final_review.approval(self.ports, context, final_inputs,
+            getattr(review_result, 'isolation_invocation_id', None), review)
+        if approval['status'] == 'invalidated':
+            return self._changed_final_inputs(context, approval, review)
+        events.emit("최종 Review PASS: 게시 단계로 진행", next_stage="PUBLISHING")
+        self.ports.clear_validation_failure_history(self.ports.identity.repo, 'review')
         with runtime_state._transaction(self.ports.state.connection):
+            self.ports.state.check_context(context)
+            prior = pre_review.current(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id)
+            if prior and prior['status'] in {'review_pass', 'final_review_running'}:
+                pre_review.update(self.ports.state.connection, prior, 'finalized_review')
+            final_review.save(self.ports, context, approval)
             self._record_pr_review_candidate(candidate_proof, context)
             self.ports.state.update_project(
                 self.ports.identity.repo,

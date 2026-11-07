@@ -60,6 +60,7 @@ def preserve(ports, context, *, reason):
         verify_selection=selection,
         verify_receipt=verify_receipts.current_receipt(ports.state.connection, selection),
         worker_candidate_token=(current.snapshot or {}).get('worker_candidate_token'),
+        final_review=(current.snapshot or {}).get('final_review'),
         observed_head=None, changes=None, implementation_changes=None)
     try:
         head = ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
