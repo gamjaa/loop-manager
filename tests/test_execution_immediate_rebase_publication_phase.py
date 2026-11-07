@@ -173,6 +173,8 @@ class ImmediateRebasePublicationTests(TestCase):
                         connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED', blocked_reason='worker_decision_required'")
                         connection.execute("INSERT INTO execplan_blocks (repo,plan_id,scope,reason_code,evidence) "
                             "VALUES ('repo','G-047','plan','worker_decision_required','independent')")
+                    else:
+                        connection.execute("UPDATE projects SET phase='VERIFYING'")
                 block = scoped_blocking.project_block(connection, 'repo')
                 effects = project_block_service.ReconcileRebaseEvidenceBlockEffects(
                     _current_rebase_service=lambda *_: self.seed.factory(None),
@@ -196,6 +198,7 @@ class ImmediateRebasePublicationTests(TestCase):
                         target_base_oid=current.target_base_oid, observed_remote_oid=self.remote, snapshot=current.snapshot)
                 self.assertTrue(reconcile())
                 self.assertIsNone(scoped_blocking.project_block(connection, 'repo'))
+                self.assertFalse(reconcile())
                 self.assertEqual(bool(scoped_blocking.plan_block(connection, 'repo', 'G-047')), separate)
                 saved = self.checkpoints.get('repo', 'G-047')
                 self.assertEqual(saved.operation, 'rebase')
