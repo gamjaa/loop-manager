@@ -1428,6 +1428,16 @@ rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실�
 
 새 사용자 수정은 덮어쓰지 않으며 복원한 파일은 Worker 재작업과 후보 검증을 거친다.
 
+#### 확인된 목표 철회의 소유 자원 정리
+
+`catalog/deleted_plan_cleanup`은 현재 선언·게시된 철회 판단·삭제 revision과 기존 수명/공유 자료 보호를 검사하고, `deleted_plan_resources`에 정확한 원래 branch/worktree와 보존·종료 근거를 넘긴다. 실행 row가 없는 경우도 native 취소 감사를 읽되 그 형식을 실제 소유권 증명으로 대신 쓰지 않는다. 기존 plan/branch/worktree lease와 실제 호출 종료 검사를 유지하며, 결정적 관리 경로·현재 Git 등록·공통 repository·정확한 branch·등록 origin·독립/수동 참조를 삭제 직전 재검사한다. dirty·index flag·사용자 Git operation·미게시 commit은 기존 `assess_cleanup`의 pending 경계를 유지한다. 일반 취소·MERGED·base·사용자 자원에는 이 예외를 적용하지 않는다.
+
+게시 head는 전용 `logs/<repository와 plan의 해시>/<OID>.bundle`에 전체 이력으로 보존한다. 임시 파일의 fsync·rename과 디렉터리 동기화 뒤 `git bundle verify`와 head 목록을 대조한다. 원문·session·실패 감사는 기존 수명에 남기고, 정확한 게시 head를 포함한 로컬 원본이나 보존 검증이 없으면 물리 정리를 시작하지 않는다. PR은 repository/base가 검증된 전체 branch 이력에서 Open·Merged·fork 사용을 배제하고, 저장된 URL·head/base·OID와 일치하는 CLOSED 미Merge 관측만 허용한다. 등록 origin과 fetch/push URL을 기존 검증으로 대조하고 고정 URL·정확한 ref/OID의 삭제 lease를 사용한다. 새 OID로 lease를 교체하거나 PR을 close·Merge하지 않는다.
+
+기존 Manager Git journal의 `deleted_plan_remote_remove`와 `deleted_plan_local_remove`는 `plan:<G ID>` 소유자와 정확한 `refs/heads/loop-manager/<G ID>`를 결합한다. before/expected는 `oid`, 고정 `origin`, 절대 `bundle` 경로, SHA-256 `digest`, 삭제 관측 `revision`을 보존하며 expected는 `oid=null`만 바꾼다. 허용 전이와 OID/경로/지문 형식을 검증하고 Agent 기준선 후보를 만들지 않는다. 원격·로컬 ref의 삭제 기록이 이미 있으면 result 저장 여부·active 잔존·같은 OID와 관계없이 현재 살아 있는 ref를 pending으로 보존한다. 현재 부재일 때만 같은 intent·bundle로 누락된 결과와 active 해제를 확정하며, journal 재검사 사이에 ref가 재등장해도 기존 intent의 삭제 callback은 실행하지 않는다. 결과 미기록에는 실제 삭제 여부와 같은 OID의 재생성을 구분할 근거가 없으므로 삭제를 재시도하지 않는다. worktree는 기존 제거 journal/receipt로 복구하며 로컬 ref는 원래 OID의 `update-ref --no-deref -d`로 제거한다. 심볼릭 alias를 거부하고, 완료된 ref 삭제 뒤 같은 이름/OID가 재등장하거나 worktree 제거 receipt/완료 결과 뒤 경로가 재생성되면 새 자원으로 보류한다. 실패 이유는 비밀값을 제거한 정리 대기 관측에 남기며 확인된 문서·DB 상태는 유지한다.
+
+세 자원의 부재와 기존 최종 제거 조건이 확인된 뒤 `deleted_plan_state.forget`가 전용 bundle·봉인된 삭제 journal slot과 원래 worktree의 생성/제거 journal·receipt를 기존 파일 queue에 함께 등록한다. queue는 정확한 repository/작업·관리 경로·허용 전이·봉인된 완료/안전 복원 결과·독점 slot과 receipt 형식을 다시 검사한다. 미확정·다른 소유자의 자료는 queue에 넘기지 않으며 제거 뒤 queue 결과 저장이 중단되면 확인된 파일 부재로 확정한다. 제거 실패는 ID 표식과 queue로 재시도하며 다른 작업의 자료·일반 Merge 감사는 보존한다. 작업별 전용 삭제 자료를 영구 감사 원본으로 추가하지 않는다.
+
 #### 원격 관측의 중복 방지
 
 원격 관측 기록은 origin identity·정확한 ref·OID·실패 원인·시각을 계획별로 보존한다. 조회 실패는 마지막 확정 OID를 덮지 않는다. 처리 키는 원래 원인·검사 지문·관측 base/work branch OID·로컬 작업 지문을 포함한다. 같은 키의 확정 결과를 재사용하며 관련 입력이 달라지면 재평가한다.
@@ -1999,7 +2009,7 @@ YYYY-MM-DD HH:mm:ss±HH:mm LEVEL [run=<실행 ID> project=<프로젝트> plan=<�
 - PR head 정보나 commit 관계를 확인할 수 없으면 worktree를 보존하고 `cleanup_pending`으로 기록한다
 - `cleanup_pending`은 clean 상태만으로 해제하지 않는다. 소유권·PR head·commit 관계·현재 Git 상태를 재검증해 강제 옵션 없이 제거를 확인한 경우 또는 경로 부재를 확인한 경우에 기록을 해제한다. 불확실하면 경로·이유·작업물을 보존하며 소유권 불명 경로는 자동으로 살피거나 제거하지 않는다. 상세 조건은 [Merge 후 정리](#github와-pr)를 따른다.
 - planning worktree·diff·session과 미게시 결과는 오류·게시 복구 동안 보존한다. 폐기·교체는 소유권과 보존 결과를 검증한 관리 경계에서만 수행한다
-- Merge 뒤 자원별 정리 범위와 branch 삭제의 미구현 차이는 [GitHub와 PR](#github와-pr)을 따른다. R-055의 삭제 처리 목표로 현재 정리 권한을 확대하지 않는다.
+- Merge 뒤 자원별 정리 범위와 branch 삭제의 미구현 차이는 [GitHub와 PR](#github와-pr)을 따른다. 확인된 목표 철회의 승인된 branch/worktree 정리는 [확인된 목표 철회의 소유 자원 정리](#확인된-목표-철회의-소유-자원-정리)의 별도 경계에 한정한다.
 - 동일한 Loop Manager 소유 작업 branch 게시에는 현재 원격 OID에 결합한 `--force-with-lease`를 사용한다. 이력 재작성은 현재 입력의 보존·통합과 필요한 검증을 거친 후보만 허용하며 새 lease만 바꾼 재시도는 하지 않는다
 - 공통 파일 복사 스크립트는 사용자가 명시적으로 실행하는 초기 설정 도구이며 자동 Loop에서 호출하지 않는다
 - 등록 프로젝트의 문서와 verify 스크립트는 사용자가 신뢰한 입력으로 취급한다

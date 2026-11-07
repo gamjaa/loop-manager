@@ -2,6 +2,7 @@ from loop_manager_internal.storage import database
 from loop_manager_internal.storage import execplan_catalog_state
 from tests.support.lifecycle import fixture_cleanup
 import sqlite3
+import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
@@ -309,6 +310,104 @@ def catalog_reconciliation_fixture(test):
     fixture.setUp()
     test.addCleanup(fixture.tearDown)
     return fixture
+
+
+class DeletedPlanCancellationFixture:
+    """Native cancellation and terminated-call setup for catalog deletion tests."""
+
+    def rowless_cancellation(self, *, started=False, empty_checkpoint=False, blocked=False,
+                             empty_blocked_checkpoint=False, resolved_blocked_checkpoint=False,
+                             requested_blocked_checkpoint=False, native_block=False, checkpoint_snapshot=None, owned_workspace=None, published_blocked=False, checkpoint_builder=None, withdrawn=True, publication_oid=None):
+        from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes, _MUTABLE_READY_EVIDENCE_FIELDS
+        from loop_manager_internal.storage.runtime_state import _transaction
+        text = self.fixture._text('G-001', 'Gone')
+        self.connection.execute('UPDATE exec_plans SET ' + ','.join(field + '=NULL' for field in _MUTABLE_READY_EVIDENCE_FIELDS)
+            + ",status='READY',ever_started=0,workspace_owned=0,retry_count=0,pr_conflict_recovery=0 WHERE plan_id='G-001'")
+        self.connection.execute('UPDATE projects SET phase=NULL,plan_path=NULL,branch=NULL,worktree=NULL,worker_session_id=NULL,pr_url=NULL')
+        self.connection.execute("UPDATE exec_plans SET path='docs/plans/[G-001] Gone.md',title='Gone',"
+            "priority='normal',content_hash=?,plan_sha=?,current_revision_sha=? WHERE plan_id='G-001'",
+            (plan_content_hash(text), 'a' * 40, 'a' * 40))
+        if started:
+            self.connection.execute("UPDATE exec_plans SET ever_started=1,retry_count=2,worker_session_id='old-session',"
+                "worker_result='saved result',verify_result='saved failure',last_error='historical failure',"
+                "verify_failure_history='{}' WHERE plan_id='G-001'")
+        if blocked:
+            self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED',blocked_reason='saved block' WHERE plan_id='G-001'")
+        self.connection.commit()
+        original_block = None
+        if owned_workspace is not None:
+            self.connection.execute("UPDATE exec_plans SET branch='loop-manager/G-001',worktree=?,workspace_owned=1 WHERE plan_id='G-001'",
+                                    (str(owned_workspace),))
+            self.connection.commit()
+        if native_block:
+            from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+            RuntimeStateRepository(self.connection).block_plan('/repo', 'G-001', reason_code='plan_input_invalid',
+                evidence='saved native block', release_fingerprint='c' * 64, enqueue=False)
+            original_block = dict(self.connection.execute("SELECT * FROM execplan_blocks WHERE plan_id='G-001'").fetchone())
+        if published_blocked:
+            from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
+            from loop_manager_internal.recovery.blocked_checkpoint import PreparedCheckpoint, checkpoint_identity
+            checkpoints = BlockedCheckpointRepository(self.connection)
+            request = checkpoints.get('/repo', 'G-001')
+            identity = checkpoint_identity(plan_id='G-001', reason_code=request.reason_code, evidence=request.evidence,
+                parent_oid='a' * 40, tree_oid='c' * 40, included_paths=())
+            checkpoints.record_prepared(request, PreparedCheckpoint('a' * 40, 'c' * 40, identity, 'checkpoint', ()))
+            checkpoints.record_remote_observation(request, None)
+            checkpoints.record_local(request, 'b' * 40)
+            checkpoints.finish_published(request, 'b' * 40)
+            checkpoints.record_rebased_publication(request, 'e' * 40, 'f' * 40)
+        if publication_oid is not None:
+            self.connection.execute("UPDATE exec_plans SET publication_remote_oid=? WHERE plan_id='G-001'", (publication_oid,))
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
+        plan = ReadyPlanSnapshot('G-001', row['path'], row['title'], tuple(json.loads(row['sources'])), (),
+            'low', 'low', row['priority'], row['content_hash'], 'a' * 40, text,
+            current_complexity=row['current_complexity'], current_risk=row['current_risk'], current_metadata_recorded=True)
+        if started:
+            from dataclasses import replace
+            from loop_manager_internal.planning.planner_validation import planning_execution_state
+            plan = replace(plan, execution_state=planning_execution_state(row))
+        judgment = {'decision': {'id': 'G-001', 'source': 'docs/PRODUCT.md', 'outcome': 'withdrawn',
+            'reason': 'The original goal was withdrawn.'}} if withdrawn else None
+        if empty_checkpoint:
+            from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+            ExecutionCheckpointRepository(self.connection).record('/repo', 'G-001', expected_generation=0,
+                operation=None, expected_head=None, target_base_oid=None, observed_remote_oid=None,
+                snapshot=checkpoint_snapshot if checkpoint_snapshot is not None else {})
+        if checkpoint_builder is not None:
+            checkpoint_builder()
+        if empty_blocked_checkpoint or resolved_blocked_checkpoint or requested_blocked_checkpoint:
+            from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
+            checkpoints = BlockedCheckpointRepository(self.connection)
+            request = checkpoints.request(repo='/repo', plan_id='G-001', reason_code='no-resource',
+                evidence='No owned workspace.', branch=None, worktree=None,
+                expected_remote_oid=None, rebase_recovery=False)
+            if resolved_blocked_checkpoint:
+                self.assertIsNone(checkpoints.reconcile_cause(request))
+            elif not requested_blocked_checkpoint:
+                checkpoints.finish_unpublished(request, 'No workspace was created.', retryable=False)
+            else:
+                self.connection.commit()
+        with _transaction(self.connection):
+            apply_mutable_catalog_changes(self.connection, '/repo', deletions=(PlanDeletion(plan, judgment),), revisions=(),
+                snapshot_token='saved', plan_commit='b' * 40, content_hash=lambda _: '', agent=False)
+        audit = json.loads(self.connection.execute("SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0])
+        self.assertEqual(audit['row'], dict(row))
+        self.assertEqual(audit['text'], text)
+        if native_block:
+            self.assertEqual(audit['block'], original_block)
+        return text
+
+    def artifact_call(self, identity, repo, plan_id, receipt=None):
+        self.connection.execute('INSERT INTO agent_invocations '
+            '(invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,started_at,finished_at,'
+            'execution_status,execution_started_at,execution_finished_at,execution_finish_evidence,process_receipt_path,session_id) '
+            "VALUES (?,?,?,'worker','codex','model','high','start',1,'prepared','collected','executed',"
+            "'started','stopped','provider_process_finished',?,'shared-session')",
+            (identity, repo, plan_id, str(receipt) if receipt else None))
+
 
 
 QUESTION = """\n## Draft Decision

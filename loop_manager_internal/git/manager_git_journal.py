@@ -508,6 +508,18 @@ def verified_transition(
             and (before["oid"] is None or (
                 isinstance(before["oid"], str) and oid.fullmatch(before["oid"])))
         )
+    elif kind in {"deleted_plan_remote_remove", "deleted_plan_local_remove"}:
+        plan = re.fullmatch(r"refs/heads/loop-manager/(G-\d{3,})", target)
+        valid = (
+            plan is not None and intent.get("owner") == "plan:" + plan.group(1)
+            and set(before) == set(expected) == {"oid", "origin", "bundle", "digest", "revision"}
+            and isinstance(before["oid"], str) and oid.fullmatch(before["oid"])
+            and expected == dict(before, oid=None)
+            and isinstance(before["origin"], str) and bool(before["origin"])
+            and isinstance(before["bundle"], str) and Path(before["bundle"]).is_absolute()
+            and isinstance(before["digest"], str) and re.fullmatch(r"[0-9a-f]{64}", before["digest"])
+            and isinstance(before["revision"], str) and oid.fullmatch(before["revision"])
+        )
     elif kind in {"source_fast_forward", "manual_fast_forward"}:
         valid = (
             set(before) == set(expected)
@@ -606,7 +618,7 @@ def verified_transition(
         return {"refs": {}, "worktrees": {target: expected["registration"]}}
     if kind == "managed_worktree_remove":
         return {"refs": {}, "worktrees": {target: None}}
-    if kind in {"source_fast_forward", "manual_fast_forward"}:
+    if kind in {"source_fast_forward", "manual_fast_forward", "deleted_plan_remote_remove", "deleted_plan_local_remove"}:
         return {"refs": {}, "worktrees": {}}
     raise MutationEvidenceError(f"지원하지 않는 Manager Git 작업: {kind}")
 
@@ -653,6 +665,8 @@ def _read(path: Path, *, require_rebase_branch: bool = False) -> dict[str, Any]:
         if value.get('kind') in {'bootstrap_fetch', 'project_fetch', 'manual_branch_push'}:
             valid = (isinstance(before.get('oid'), (str, type(None)))
                      and isinstance(expected.get('oid'), str))
+        elif value.get('kind') in {'deleted_plan_remote_remove', 'deleted_plan_local_remove'}:
+            valid = (isinstance(before.get('oid'), str) and expected == dict(before, oid=None))
         elif value.get('kind') in {'source_fast_forward', 'manual_fast_forward'}:
             valid = all(isinstance(item.get('index'), dict)
                         and isinstance(item.get('changes'), list)
