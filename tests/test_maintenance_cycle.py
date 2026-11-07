@@ -35,6 +35,34 @@ from tests.support.maintenance import request_maintenance
 
 @isolated_git_test
 class MaintenanceCycleTest(MaintenanceCycleCase):
+    def test_completion_log_distinguishes_confirmed_merge_and_cancellation(self):
+        from tests.support.planning_case import FakePorts, maintenance_cycle, planning_snapshot
+        for ids, cancelled, rows, expected in (
+            ((), ('G-001',), [], '실제 Merge=없음, 확정 취소=G-001'),
+            (('G-002',), ('G-001',), [{'plan_id': 'G-002', 'status': 'MERGED', 'depends_on': '[]'}], '실제 Merge=G-002, 확정 취소=G-001'),
+            (('G-002',), (), [{'plan_id': 'G-002', 'status': 'MERGED', 'depends_on': '[]'}], '실제 Merge=G-002, 확정 취소=없음'),
+            (('G-002',), (), [], '상세 미확인'),
+        ):
+            with self.subTest(ids=ids, cancelled=cancelled, rows=rows):
+                active = maintenance_cycle(phase=maintenance_state.MaintenancePhase.REFACTORING,
+                    refactoring_plan_ids=ids, cancelled_scope_plan_ids=cancelled)
+                ports = FakePorts(planning_snapshot(), active)
+                ports.state.advance_maintenance_cycle = mock.Mock(return_value=maintenance_cycle(
+                    last_cycle_merged_count=7, refactoring_plan_ids=ids, cancelled_scope_plan_ids=cancelled))
+                ports.state.execplan_rows = mock.Mock(return_value=rows)
+                context = planning_runtime.PlanningContext(repo='/repo', repo_path=Path('/repo'), state_dir=Path('/state'),
+                    base_branch='main', base_sha='base', provider='codex', config_path=Path('/config.ini'), registered_only=True,
+                    refactoring_review_interval=20)
+                coordinator = planning_runtime.PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(context)
+                run.error_input_changed = True
+                coordinator._selection._select_planning_work(run)
+                message = ports.events.messages[-1][1]
+                self.assertIn(expected, message)
+                self.assertIn('남은 범위 없음, 다음 주기 기준=7, 일반 작업으로 복귀', message)
+                self.assertNotIn('마지막 Merge', message)
+                self.assertEqual(ports.agent.run_count, 0)
+
     def test_first_and_interval_due_are_project_scoped(self):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)
@@ -493,6 +521,89 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
                      else "refactoring_plan_ids": ids}
         return self.repository.transition("/one", expected_phase=cycle.phase, expected_revision=cycle.revision,
                                           next_phase=phase, **arguments)
+
+    def test_cancelled_scope_guards_and_finish_compare_and_swap(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        deleted_plan_state.ensure_schema(self.connection)
+        self._insert_plan(self.connection, '/one', 'G-001')
+        self.start(maintenance_state.MaintenancePhase.REFACTORING, ('G-001',))
+        self.connection.execute("DELETE FROM exec_plans WHERE repo='/one' AND plan_id='G-001'")
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            self.repository.get('/one')
+        self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('/two','G-001')")
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            self.repository.get('/one')
+        self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('/one','G-001')")
+        self.catalog()
+        cancelled = self.repository.get('/one')
+        self._insert_plan(self.connection, '/one', 'G-001')
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            self.repository.get('/one')
+        self.connection.execute("DELETE FROM exec_plans WHERE repo='/one' AND plan_id='G-001'")
+        self.connection.execute("INSERT INTO execplan_catalog_holds VALUES ('/one','G-001',?, '{}', NULL)", (self.latest,))
+        self.assertEqual(self.advance(), cancelled)
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            self.repository.finish_cycle('/one', expected=cancelled, source_sha=self.latest)
+        self.connection.execute("DELETE FROM execplan_catalog_holds")
+        self.connection.execute("DELETE FROM deleted_plan_ids WHERE repo='/one' AND plan_id='G-001'")
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            self.repository.finish_cycle('/one', expected=cancelled, source_sha=self.latest)
+        self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('/one','G-001')")
+        self.connection.execute("UPDATE maintenance_cycles SET publication_stage='prepared'")
+        pending = self.repository.get('/one')
+        self.assertEqual(self.advance(), pending)
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            self.repository.finish_cycle('/one', expected=pending, source_sha=self.latest)
+        self.connection.execute("UPDATE maintenance_cycles SET publication_stage=NULL, revision=revision+1")
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            self.repository.finish_cycle('/one', expected=cancelled, source_sha=self.latest)
+        current = self.repository.get('/one')
+        self.catalog(self.source)
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            self.repository.finish_cycle('/one', expected=current, source_sha=self.latest)
+        self.assertEqual(self.repository.get('/one'), current)
+        self.catalog()
+        self.assertEqual(self.advance().last_cycle_merged_count, 0)
+
+    def test_legacy_cancelled_prerequisite_closes_but_unconfirmed_assessment_does_not(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        deleted_plan_state.ensure_schema(self.connection)
+        self._insert_plan(self.connection, '/one', 'G-001')
+        self._legacy_cycle(self.connection, '/one', self.source)
+        unconfirmed = self.repository.get('/one')
+        self.assertEqual(self.advance(), unconfirmed)
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            self.repository.finish_cycle('/one', expected=unconfirmed, source_sha=self.latest)
+        self.connection.execute("UPDATE maintenance_cycles SET prerequisite_plan_ids='[\"G-001\"]'")
+        self.connection.execute("DELETE FROM exec_plans WHERE repo='/one' AND plan_id='G-001'")
+        self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('/one','G-001')")
+        self.catalog()
+        self.connection.execute("INSERT INTO execplan_catalog_holds VALUES ('/one','G-001',?, '{}', NULL)", (self.latest,))
+        waiting = self.advance()
+        self.assertEqual(waiting.phase, maintenance_state.MaintenancePhase.PREREQUISITE_WAIT)
+        self.assertEqual(self.advance(), waiting)
+        self.connection.execute("DELETE FROM execplan_catalog_holds")
+        self.assertEqual(self.advance().phase, maintenance_state.MaintenancePhase.IDLE)
+
+    def test_cancelled_post_and_prerequisite_scopes_finish(self):
+        from loop_manager_internal.storage import deleted_plan_state
+        deleted_plan_state.ensure_schema(self.connection)
+        for phase in (maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                      maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION):
+            with self.subTest(phase=phase):
+                self.connection.execute('DELETE FROM maintenance_cycles')
+                self.connection.execute('DELETE FROM deleted_plan_ids')
+                self._insert_plan(self.connection, '/one', 'G-001')
+                started = self.start(maintenance_state.MaintenancePhase.PREREQUISITE_WAIT if phase is maintenance_state.MaintenancePhase.PREREQUISITE_WAIT
+                                     else maintenance_state.MaintenancePhase.REFACTORING, ('G-001',))
+                if phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
+                    self.repository.transition('/one', expected_phase=started.phase, expected_revision=started.revision,
+                        next_phase=phase)
+                self.connection.execute("DELETE FROM exec_plans WHERE repo='/one' AND plan_id='G-001'")
+                self.connection.execute("INSERT INTO deleted_plan_ids VALUES ('/one','G-001')")
+                self.catalog()
+                finished = self.advance()
+                self.assertEqual((finished.phase, finished.last_cycle_merged_count), (maintenance_state.MaintenancePhase.IDLE, 0))
 
     def test_prerequisite_and_final_merge_close_without_new_assessment_or_receipt(self):
         for phase in (maintenance_state.MaintenancePhase.PREREQUISITE_WAIT, maintenance_state.MaintenancePhase.REFACTORING):

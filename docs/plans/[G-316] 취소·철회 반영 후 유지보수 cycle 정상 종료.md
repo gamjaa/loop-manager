@@ -36,10 +36,10 @@ G-260에 반영된 취소 후 cycle 종료를 재사용하고, 남은 Merge/취�
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/maintenance/cycle_service.py:_advance_maintenance_cycle_after_merges()`·`maintenance_orchestration.py:cycle_plan_status_error()`/`cycle_scope_plan_ids()`와 `storage/maintenance_state.py:get()`/`finish_cycle()`의 구현을 재사용한다. `cancelled_scope_plan_ids`·`legacy_prerequisite_wait`, 실제 MERGED 집계·관련 hold·게시/반환·expected 비교와 canonical cycle 반환을 새 원본이나 별도 취소 엔진으로 대체하지 않는다. 테스트에서 현재 명세의 실제 결함을 확인한 경우에만 그 경계의 필요한 국소 교정을 수행한다.
-- [ ] 확인한 `tests/test_maintenance_cycle.py:SinglePassMaintenanceCycleTest`, `tests/test_maintenance_cycle_scheduling.py`와 `tests/test_deleted_plan_cleanup.py:test_last_cancelled_cycle_link_survives_until_verified_completion_before_erasure`의 실제 SQLite fixture를 재사용한다. 현재 단일 refactoring 전체 취소→종료→최종 제거 회귀는 그대로 소비하며, Merge/취소 혼합·필요 dependency·legacy 취소/hold·종료 CAS의 남은 조건만 추가한다. 새 case는 추가 예정이며 기존 case의 실행 성공으로 기록하지 않는다. 종료 뒤 별도 교정 소진·게시 lifecycle을 반복하지 않는다.
-- [ ] 확인한 `loop_manager_internal/planning/selection_service.py`의 `previous_phase`와 IDLE 전이 로그를 기존 cycle/상태 관측으로 정합화한다. 이전 확정 범위·검증된 취소 투영·실제 잔여 Merge와 반환 cycle의 기준값만 사용한다. 새 DB 필드·삭제/평가 성공 원본·추가 Git/Agent 호출 없이 기존 events 경계를 재사용하며, 취소/종료 source를 확인할 수 없으면 미확인 사실을 보존한다.
-- [ ] 기존 selection/상태 fixture에서 사실별 종료 로그와 내부 종료 알림 0건을 확인한다. PRODUCT·ARCHITECTURE의 현재 취소 종료 보장은 이미 반영돼 있으므로 중복 정책 설명·미구현 기능을 추가하지 않고 필요한 경우 해당 로그 설명만 정합화한다.
+- [x] 확인한 `loop_manager_internal/maintenance/cycle_service.py:_advance_maintenance_cycle_after_merges()`·`maintenance_orchestration.py:cycle_plan_status_error()`/`cycle_scope_plan_ids()`와 `storage/maintenance_state.py:get()`/`finish_cycle()`의 구현을 재사용한다. `cancelled_scope_plan_ids`·`legacy_prerequisite_wait`, 실제 MERGED 집계·관련 hold·게시/반환·expected 비교와 canonical cycle 반환을 새 원본이나 별도 취소 엔진으로 대체하지 않는다. 테스트에서 현재 명세의 실제 결함을 확인한 경우에만 그 경계의 필요한 국소 교정을 수행한다.
+- [x] 확인한 `tests/test_maintenance_cycle.py:SinglePassMaintenanceCycleTest`, `tests/test_maintenance_cycle_scheduling.py`와 `tests/test_deleted_plan_cleanup.py:test_last_cancelled_cycle_link_survives_until_verified_completion_before_erasure`의 실제 SQLite fixture를 재사용한다. 현재 단일 refactoring 전체 취소→종료→최종 제거 회귀는 그대로 소비하며, Merge/취소 혼합·필요 dependency·legacy 취소/hold·종료 CAS의 남은 조건만 추가한다. 혼합·거부·legacy case를 추가했고 기존 case의 실행 결과는 아래에 구분한다. 종료 뒤 별도 교정 소진·게시 lifecycle을 반복하지 않는다.
+- [x] 확인한 `loop_manager_internal/planning/selection_service.py`의 `previous_phase`와 IDLE 전이 로그를 기존 cycle/상태 관측으로 정합화한다. 이전 확정 범위·검증된 취소 투영·실제 잔여 Merge와 반환 cycle의 기준값만 사용한다. 새 DB 필드·삭제/평가 성공 원본·추가 Git/Agent 호출 없이 기존 events 경계를 재사용하며, 취소/종료 source를 확인할 수 없으면 미확인 사실을 보존한다.
+- [x] 기존 selection/상태 fixture에서 사실별 종료 로그와 내부 종료 알림 0건을 확인한다. PRODUCT·ARCHITECTURE의 현재 취소 종료 보장은 이미 반영돼 있으므로 중복 정책 설명·미구현 기능을 추가하지 않고 필요한 경우 해당 로그 설명만 정합화한다.
 
 ## Validation
 
@@ -53,8 +53,10 @@ G-260에 반영된 취소 후 cycle 종료를 재사용하고, 남은 Merge/취�
 - [x] `44931a876fe0901d138946be7268840685e4489b`의 PRODUCT·ARCHITECTURE·활성 Requirement 전문을 읽고 R-074/R-055의 취소 후 정상 종료 목표를 현재 cycle 서비스·저장소·선택 및 관련 테스트와 정적으로 대조했다. 활성 row 삭제/감사는 직접 구현된 것으로 제외했다.
 - [x] 비종료 catalog와 G-226/G-260/G-261/G-189의 본문을 대조했다. G-226 보존 후보는 읽기 전용으로 확인했으며 유지보수 통지 제거와 기존 상태 보존을 소비한다. 후보의 기록을 새 verify/Review 성공으로 판단하지 않았다.
 - [x] revision `249477cd835923fa7923e92e55482efdc4ddce11`에서 G-260의 실제 Merge·archive와 취소 범위/legacy 투영·종료 transaction·canonical 반환 및 단일 전체 취소 회귀를 정적으로 확인했다. 과거 엔진 보완 목표는 직접 구현으로 소비하며 이번 Planner는 테스트·전체 verify를 실행하지 않았다.
-- [ ] 남은 혼합/legacy·guard·CAS의 최소 회귀와 사실별 종료 로그 보완
-- [ ] 변경 관련 targeted unit 검증
+- [x] 반환된 cycle의 취소 투영과 현재 catalog 범위를 이용해 실제 Merge·확정 취소·남은 범위·주기 기준을 기록한다. 종료 뒤 범위를 확인하지 못하면 상세 미확인으로 표시한다. 별도 알림이나 성공 근거를 만들지 않는다.
+- [x] 실제 취소 적용과 SQLite를 이용해 잔여 dependency 및 Merge 뒤 일반 READY 복귀, 취소 감사·원래 평가·실제 Merge 수·기존 알림 보존과 Planner 호출 0회를 확인했다. 전체 취소/혼합/전체 Merge 및 상세 미확인의 로그를 별도 검사했다.
+- [x] 취소 근거 없는 부재·다른 repository·row 공존·hold·게시 대기·취소 범위/revision/catalog 변경, legacy 미확정 평가와 취소된 prerequisite hold, prerequisite/post 종료를 검사했다. 기존 workspace 반환 대기·중단 rollback·평가 receipt·전체 취소 최종 제거 case도 targeted 실행했다.
+- [x] 변경 관련 targeted unit 9개가 통과했다. 전체 verify·Reviewer 및 Merge는 Manager의 후속 검증이며 여기서 실행하거나 완료로 간주하지 않는다.
 
 ## Decision Log
 
