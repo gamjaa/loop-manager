@@ -792,7 +792,13 @@ class ImmediateRebasePublicationTests(TestCase):
                     self.assertEqual(project_block['reason_code'], 'publication_ownership_uncertain')
                 self.assertEqual(runtime_state.RuntimeStateRepository(
                     self.fixture.connection).get('repo', 'G-047').pr_head_oid, 'owned-head')
-                self.assertEqual(self.checkpoints.get('repo', 'G-047'), confirmed)
+                observed = self.checkpoints.get('repo', 'G-047')
+                native_snapshot = dict(observed.snapshot)
+                completion = native_snapshot.pop('external_completion', None)
+                if not head_race:
+                    self.assertEqual(completion['kind'], 'unconfirmed')
+                    self.assertTrue(completion['db_pending'])
+                self.assertEqual(replace(observed, snapshot=native_snapshot), confirmed)
                 self.assertEqual(len(self.pushes), 1)
 
     def test_pending_rebase_or_publication_cannot_recover_as_merge_wait(self):
@@ -864,7 +870,8 @@ class ImmediateRebasePublicationTests(TestCase):
                     self.before_push = lambda: self.pr_changes.update(state='MERGED')
                 else:
                     self.pr_changes = {'state': 'MERGED'}
-                self.assertEqual(self._terminal_project_step('MERGED'), lm.PROJECT_STEP_PLANNING_PENDING)
+                self.assertEqual(self._terminal_project_step('MERGED'),
+                    lm.PROJECT_STEP_PLANNING_PENDING if timing == 'during-push' else 0)
                 runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
                 merged = runtime.get('repo', 'G-047')
                 self.assertEqual(merged.status, 'MERGED')
@@ -876,7 +883,13 @@ class ImmediateRebasePublicationTests(TestCase):
                 self.assertEqual(cleanup['worktree'], merged.worktree)
                 self.assertEqual(cleanup['pr_url'], merged.pr_url)
                 self.assertEqual(cleanup['pr_head_oid'], merged.pr_head_oid)
-                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                observed = self.checkpoints.get('repo', 'G-047')
+                native_snapshot = dict(observed.snapshot)
+                completion = native_snapshot.pop('external_completion', None)
+                if timing != 'during-push':
+                    self.assertEqual(completion['kind'], 'github-pr')
+                    self.assertFalse(completion['db_pending'])
+                self.assertEqual(replace(observed, snapshot=native_snapshot), pending)
                 self.assertEqual(self._terminal_project_step('MERGED'), 0)
                 self.assertEqual(len(self.pushes), 2 if timing == 'during-push' else 1)
 

@@ -335,6 +335,9 @@ def flush_observed_pr_events(connection, repo):
             "AND sent_at IS NULL AND canceled_at IS NULL "
             "ORDER BY created_at, event_key", (repo,),
         ).fetchall()
+        from loop_manager_internal.storage.execution_checkpoint_state import pending_completion_plan_ids
+        pending = pending_completion_plan_ids(connection, repo)
+        rows = [row for row in rows if json.loads(row['payload']).get('execplan_id') not in pending]
         return _deliver_rows(connection, token, chat_id, rows, send_telegram)
     except Exception as error:
         events.emit("PR 알림 재확인 전송 실패: 다음 실행에서 다시 확인", level="WARN",

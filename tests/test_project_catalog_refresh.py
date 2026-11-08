@@ -737,6 +737,53 @@ class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
                 remove.assert_not_called()
                 agent.assert_not_called()
 
+    def test_stored_pr_retains_optional_branch_field_compatibility(self):
+        before = dict(self.row())
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state': 'MERGED', 'url': before['pr_url'], 'headRefOid': 'd'*40}), \
+             mock.patch.object(manager, '_recorded_base_fetch'), \
+             mock.patch.object(manager, '_assess_missing_managed_cleanup',
+                               return_value=manager.CleanupAssessment('missing')):
+            result = manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertTrue(result.merged)
+        self.assertEqual(self.row()['status'], 'MERGED')
+        self.assertEqual(self.row()['branch'], before['branch'])
+        self.assertEqual(self.row()['pr_url'], before['pr_url'])
+        self.assertEqual(self.row()['worker_session_id'], before['worker_session_id'])
+
+    def test_unlinked_empty_pr_history_preserves_registration_and_execution(self):
+        # A registered local test remote is sufficient when the PR port proves
+        # an empty all-state history; no PR repository identity is adopted.
+        self.connection.execute("UPDATE projects SET origin='/local/remote.git'")
+        self.connection.execute("UPDATE exec_plans SET pr_url=NULL WHERE plan_id='G-001'")
+        self.connection.commit()
+        original = dict(self.row())
+        with mock.patch.object(manager, 'pr_for_branch', return_value=None) as observe:
+            result = manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertFalse(result.merged)
+        self.assertEqual(dict(self.row()), original)
+        self.assertFalse(manager.scoped_blocking.catalog_held_plan_ids(self.connection, self.repo))
+        observe.assert_called_once_with(Path(self.repo), original['branch'])
+
+    def test_open_pr_recovery_failure_retains_its_original_disposition(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED',blocked_reason=? WHERE plan_id='G-001'",
+            (manager.PR_CLOSED_BLOCK_REASON,))
+        self.connection.commit()
+        before = dict(self.row())
+        error = RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN, 'remote snapshot changed')
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state': 'OPEN', 'url': before['pr_url'], 'headRefName': before['branch'],
+                'baseRefName': 'main', 'headRefOid': 'd'*40}), \
+             mock.patch.object(manager, '_resume_reopened_pull_request', side_effect=error):
+            with self.assertRaises(RecoveryFailure) as raised:
+                manager.observe_waiting_pull_requests(self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertIs(raised.exception, error)
+        self.assertFalse(manager.scoped_blocking.catalog_held_plan_ids(self.connection, self.repo))
+        self.assertEqual(dict(self.row()), before)
+
     def test_unlinked_ready_row_uses_registered_repository_pr_history_without_workspace(self):
         self.connection.execute("UPDATE projects SET origin='https://github.com/owner/repo.git'")
         self.connection.execute("DELETE FROM exec_plans WHERE plan_id='G-001'")
@@ -750,8 +797,10 @@ class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
             result = manager.observe_waiting_pull_requests(
                 self.connection, Path(self.repo), Path('/state'), self.repo)
         self.assertTrue(result.merged)
-        observe.assert_called_once_with(Path(self.repo), 'loop-manager/G-001', history=True,
-            expected_repository='owner/repo', expected_base='main')
+        self.assertEqual(observe.call_args_list, [
+            mock.call(Path(self.repo), 'loop-manager/G-001'),
+            mock.call(Path(self.repo), 'loop-manager/G-001', history=True,
+                      expected_repository='owner/repo', expected_base='main')])
         self.assertEqual(self.row()['status'], 'MERGED')
         self.assertEqual(self.row()['branch'], 'loop-manager/G-001')
         self.assertIsNone(self.connection.execute('SELECT * FROM cleanup_pending').fetchone())

@@ -124,18 +124,23 @@ def observe_waiting_pull_requests(
         checkpoint_store = ExecutionCheckpointRepository(connection)
         checkpoint = checkpoint_store.get(repo, str(stored['plan_id']))
         evidence = (checkpoint.snapshot or {}).get('external_completion')
+        observing = True
         try:
             if not stored['pr_url']:
                 # Catalog registration supplies the ID; full PR history supplies the
                 # repository/base/head link, including an already deleted branch.
                 if not project['origin']:
                     continue
-                from loop_manager_internal.git.git_adapter import github_repository
-                pull_request = effects.pr_for_branch(
-                    repo_path, branch, history=True,
-                    expected_repository=github_repository(str(project['origin'])),
-                    expected_base=registered_base,
-                )
+                # An empty all-state lookup has no PR identity to adopt. Only
+                # a discovered history needs the registered repository check.
+                pull_request = effects.pr_for_branch(repo_path, branch)
+                if pull_request is not None:
+                    from loop_manager_internal.git.git_adapter import github_repository
+                    pull_request = effects.pr_for_branch(
+                        repo_path, branch, history=True,
+                        expected_repository=github_repository(str(project['origin'])),
+                        expected_base=registered_base,
+                    )
             else:
                 pull_request = effects.pr_for_branch(repo_path, branch, str(stored['pr_url']))
             if pull_request is None:
@@ -181,7 +186,7 @@ def observe_waiting_pull_requests(
             if read_only:
                 continue
             if state == "MERGED" or pull_request.get("mergedAt"):
-                if not observed_url or not head_name or not observed_base or not head_oid:
+                if not observed_url or not head_oid or (not stored_url and (not head_name or not observed_base)):
                     raise PublicationSafetyError('Merge PR의 URL/head/base/revision identity가 불완전합니다.')
                 evidence = {
                     'version': 1, 'repo': repo, 'plan_id': stored['plan_id'],
@@ -228,6 +233,7 @@ def observe_waiting_pull_requests(
                                      'resolution': state})
             if completion_only or scoped_blocking.project_block(connection, repo) is not None or not waiting:
                 continue
+            observing = False
             if group and group['state']=='AUTOMATIC' and state == 'OPEN':
                 continue
             if state == "CLOSED":
@@ -346,7 +352,7 @@ def observe_waiting_pull_requests(
                 merged_pr_urls.append(str(stored['pr_url'] or (evidence or {}).get('pr_url') or ''))
                 effects.operation_print(f"Merge 확인 완료; 정리 재시도 대기: {stored['plan_id']} ({error})", file=sys.stderr)
                 continue
-            if read_only or require_base_identity:
+            if read_only or require_base_identity or not observing:
                 raise
             pending = evidence or {
                 'version': 1, 'repo': repo, 'plan_id': stored['plan_id'],

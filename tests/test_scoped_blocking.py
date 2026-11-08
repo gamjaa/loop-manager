@@ -1061,25 +1061,28 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         self.assertIsNone(decision.runnable_ready)
 
 
-    def test_cleanup_project_block_stops_later_merge_mutation(self):
+    def test_cleanup_project_block_preserves_later_merge_but_defers_resource_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             for plan_id in ("G-001", "G-002"):
                 self.plan(plan_id, "PR_OPEN", branch=f"loop-manager/{plan_id}")
+                self.connection.execute('UPDATE exec_plans SET pr_url=? WHERE plan_id=?',
+                    (f'https://pr/{plan_id}', plan_id))
             self.connection.execute("UPDATE exec_plans SET workspace_owned = 0, worktree = ?", (directory,))
             self.connection.commit()
             merged = {"state": "MERGED", "url": "https://pr/1", "headRefOid": "a" * 40}
-            with mock.patch("loop_manager.pr_for_branch", return_value=merged) as read, mock.patch("loop_manager._recorded_base_fetch", return_value="a" * 40) as fetched, mock.patch(
+            def observe(_repo, branch, url):
+                return {**merged, 'url': url, 'headRefName': branch, 'baseRefName': 'main'}
+            with mock.patch("loop_manager.pr_for_branch", side_effect=observe) as read, mock.patch("loop_manager._recorded_base_fetch", return_value="a" * 40) as fetched, mock.patch(
                 "loop_manager.complete_merged_execplan_worktree", wraps=loop_manager.complete_merged_execplan_worktree
             ) as cleanup:
                 loop_manager.synchronize_waiting_pull_requests(self.connection, Path(self.repo), Path(directory), self.repo)
             self.assertEqual(read.call_count, 2)
-            cleanup.assert_called_once()
-            fetched.assert_called_once_with(
-                Path(self.repo), Path(directory), "main", owner="project",
-            )
-            self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+            self.assertEqual(cleanup.call_count, 2)
+            fetched.assert_not_called()
+            self.assertTrue(Path(directory).exists())
+            self.assertEqual(scoped_blocking.project_block(self.connection, self.repo)['plan_id'], 'G-001')
             statuses = dict(self.connection.execute("SELECT plan_id, status FROM exec_plans"))
-            self.assertEqual(statuses, {"G-001": "MERGED", "G-002": "PR_OPEN"})
+            self.assertEqual(statuses, {"G-001": "MERGED", "G-002": "MERGED"})
 
 
     def test_reason_mapping_and_atomic_plan_project_records(self):

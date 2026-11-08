@@ -2720,17 +2720,13 @@ class CurrentActionPolicyTest(NotificationFixture, unittest.TestCase):
                         notifications.flush_observed_pr_events(connection, repo)
 
                     observe_options = {'after_observation': after_observation}
+                    waiting_pr_service.synchronize_waiting_pull_requests(
+                        synchronize_effects, connection, Path('/unused'), Path('/state'), repo,
+                        **observe_options,
+                    )
                     if outcome == 'lookup_failure':
-                        with self.assertRaisesRegex(RuntimeError, 'lookup unavailable'):
-                            waiting_pr_service.synchronize_waiting_pull_requests(
-                                synchronize_effects, connection, Path('/unused'), Path('/state'), repo,
-                                **observe_options,
-                            )
-                    else:
-                        waiting_pr_service.synchronize_waiting_pull_requests(
-                            synchronize_effects, connection, Path('/unused'), Path('/state'), repo,
-                            **observe_options,
-                        )
+                        from loop_manager_internal.storage.execution_checkpoint_state import pending_completion_plan_ids
+                        self.assertIn('G-018', pending_completion_plan_ids(connection, repo))
 
                 rows = {row['event_key']: row for row in self.events(connection)}
                 current = rows[original['event_key']]

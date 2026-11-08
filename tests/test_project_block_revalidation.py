@@ -168,7 +168,7 @@ class ProjectCauseRevalidationTests(ProjectRemoteRecoveryFixture, unittest.TestC
                 registered_only=True), 1)
         observe.assert_called_once()
         pr.assert_called_once()
-        self.assertTrue(pr.call_args.kwargs['read_only'])
+        self.assertTrue(pr.call_args.kwargs['completion_only'])
         recovery.return_value.refresh_catalog.assert_called_once_with('G-106')
         recovery.return_value.reconcile.assert_called_once_with('G-106')
         fetch.assert_not_called()
