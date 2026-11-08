@@ -526,7 +526,7 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
         self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
             self.connection, self.repo)}, {'G-001', 'G-002'})
 
-    def test_legacy_archive_diagnostic_does_not_pause_dependency_validation(self):
+    def test_planning_migrates_legacy_archive_before_dependency_validation(self):
         self.connection.execute(
             "UPDATE exec_plans SET publication_sha=? WHERE repo=? AND plan_id='G-002'",
             ('d' * 40, self.repo),
@@ -536,19 +536,39 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
             "UPDATE execplan_catalog_history SET plan_sha=?, diagnostic_code=? WHERE repo=?",
             ('a' * 40, 'stable-identity-mismatch', self.repo),
         )
+        self.connection.execute(
+            "UPDATE projects SET phase='PLANNING', planner_session_id='saved-planner', "
+            "worktree='/owned/planning', planning_workspace_owned=1, "
+            "planning_error='saved-planning-error', planning_result_completed=1 WHERE repo=?",
+            (self.repo,),
+        )
+        manager._ensure_execplans_schema(self.connection)
+        self.connection.commit()
+        project = dict(self.connection.execute('SELECT * FROM projects WHERE repo=?', (self.repo,)).fetchone())
+        independent = dict(self.row('G-001'))
         history = state.CatalogStateRepository(self.connection)
-        external = mock.Mock()
-        for _restart in range(2):
-            stored = {row['plan_id']: state.publication_identity(row)
-                      for row in self.connection.execute('SELECT * FROM exec_plans')}
-            recovered = state.CatalogRecoveryService(history, external).reconcile(
-                self.repo, self.boundary.pinned.snapshot, stored,
-            )
-            self.assertEqual(recovered.diagnostics, ())
-            self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
-                self.connection, self.repo)}, {'G-001', 'G-002'})
+        with mock.patch.object(manager, '_LegacyCatalogMergeProof') as external:
+            for _restart in range(2):
+                pinned = self.boundary.pinned if _restart == 0 else replace(
+                    self.boundary.pinned, snapshot=replace(self.boundary.pinned.snapshot, active={}),
+                )
+                prepared = manager.migrate_legacy_execplans(
+                    self.connection, reconcile_history=True, target_repo=self.repo,
+                    ensure_schema=False, pinned_catalog=pinned, prepare_only=True,
+                )
+                manager.migrate_legacy_execplans(
+                    self.connection, reconcile_history=True, target_repo=self.repo,
+                    ensure_schema=False, pinned_catalog=pinned, prepared=prepared,
+                )
+                self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
+                    self.connection, self.repo)}, {'G-001', 'G-002'})
+                self.assertEqual(dict(self.connection.execute(
+                    'SELECT * FROM projects WHERE repo=?', (self.repo,),
+                ).fetchone()), project)
+                self.assertEqual(dict(self.row('G-001')), independent)
+            external.return_value.proof_for.assert_not_called()
+            external.return_value.verify_stored.assert_not_called()
         self.assertEqual(history.historical_row(self.repo, 'G-002')['plan_sha'], 'a' * 40)
-        self.assertEqual(external.mock_calls, [])
 
     def test_archive_unconfirmed_remote_does_not_record_success(self):
         self.assertEqual(self.archive(remote=False), archive_state.ArchiveWriteResult.SUPERSEDED)

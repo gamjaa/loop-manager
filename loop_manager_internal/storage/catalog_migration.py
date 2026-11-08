@@ -188,7 +188,8 @@ def _apply_execplan_catalog(
 
     with connection if manage_transaction else contextlib.nullcontext():
         for project in projects:
-            if project["phase"] == "PLANNING":
+            planning = project["phase"] == "PLANNING"
+            if planning and (not reconcile_history or pinned_catalog is None):
                 continue
             root = Path(str(project["repo"]))
             revision = f"refs/remotes/origin/{project['base_branch']}"
@@ -232,7 +233,7 @@ def _apply_execplan_catalog(
                 set(snapshot.archived) - set(stored) - historical_ids
             )
             unknown_ids = sorted(unknown_active_ids | unknown_archived_ids)
-            if missing_stored_ids:
+            if missing_stored_ids and not planning:
                 missing_id = sorted(missing_stored_ids)[0]
                 if unknown_ids:
                     replacement_id = unknown_ids[0]
@@ -249,7 +250,7 @@ def _apply_execplan_catalog(
                     code="missing-plan",
                     path=stored[missing_id].path,
                 )
-            if catalog_initialized and unknown_active_ids:
+            if catalog_initialized and unknown_active_ids and not planning:
                 unknown_id = sorted(unknown_active_ids)[0]
                 raise execplan_catalog.ExecPlanCatalogError(
                     "원격 ExecPlan ID를 SQLite 실행 이력과 대응할 수 없습니다: "
@@ -261,7 +262,9 @@ def _apply_execplan_catalog(
                 connection, ensure=False
             )
             runtime_repository = runtime_state.RuntimeStateRepository(connection)
-            for entry in snapshot.active.values():
+            # Planning owns its workspace; only pinned archive recovery may run alongside it.
+            active_entries = () if planning else snapshot.active.values()
+            for entry in active_entries:
                 row = connection.execute(
                     "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
                     (project["repo"], entry.plan_id),
@@ -286,7 +289,7 @@ def _apply_execplan_catalog(
                     runtime_repository.hydrate(str(project["repo"]), entry.plan_id)
             catalog_repository.mark_active(str(project["repo"]), snapshot.active)
 
-            for entry in snapshot.active.values():
+            for entry in active_entries:
                 is_active = (
                     entry.path == active_path
                     and str(project["phase"] or "") in phase_status
