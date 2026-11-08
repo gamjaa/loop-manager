@@ -61,6 +61,24 @@ def _reservation_owners(connection, repo, plan_id, workspace=None):
     if owned or plan_id in ids or {plan['path'], *json.loads(plan['sources'])} & paths:
         raise task_calls.CallDeferred('예약 workspace에 수동 또는 게시 소유자가 있습니다.')
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    members = (plan_id,)
+    if plan['status'] == 'MERGED' and 'manual_work_groups' in tables:
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository, acceptance_snapshot
+        store = ManualWorkRepository(connection)
+        group = store.for_plan(repo, plan_id)
+        if group is not None:
+            store.workspace_owner(repo, plan_id)  # Validate the complete membership proof.
+            members = tuple(sorted(json.loads(group['members'])))
+            rows = connection.execute(
+                'SELECT * FROM exec_plans WHERE repo=? AND plan_id IN ('
+                + ','.join('?' for _ in members) + ') ORDER BY plan_id', (repo, *members)).fetchall()
+            if (group['state'] != 'MERGED' or len(rows) != len(members)
+                    or not plan['pr_url'] or not plan['pr_head_oid']
+                    or group['branch'] != branch or group['worktree'] != worktree
+                    or any(row['status'] != 'MERGED' or any(row[key] != plan[key]
+                           for key in ('branch', 'worktree', 'pr_url', 'pr_head_oid')) for row in rows)):
+                raise task_calls.CallDeferred('완료 묶음의 공유 workspace/PR 소유권이 일치하지 않습니다.')
+            manual = (manual, acceptance_snapshot(connection, repo, group['group_id'], members))
     claims = list(connection.execute('SELECT plan_id,status,workspace_owned,branch,worktree FROM exec_plans WHERE repo=? AND plan_id<>?',
                                      (repo, plan_id)))
     if 'manual_work_groups' in tables:
@@ -68,6 +86,9 @@ def _reservation_owners(connection, repo, plan_id, workspace=None):
                                          "AND state NOT IN ('PR_OPEN','CLOSED','MERGED')", (repo,)))
     pending_claims = []
     for other in claims:
+        if other['plan_id'] in members:
+            pending_claims.append(dict(other))
+            continue  # Verified terminal group members share one resource owner.
         if ((branch and branch == other['branch'])
                 or (worktree and other['worktree']
                     and Path(worktree).resolve() == Path(other['worktree']).resolve())):
@@ -83,12 +104,14 @@ def _reservation_owners(connection, repo, plan_id, workspace=None):
                 continue  # A dormant claimant waits behind this resource owner.
             raise task_calls.CallDeferred('예약 workspace에 다른 작업의 자원 소유자가 있습니다.')
     calls = (tuple(dict(row) for row in connection.execute(
-        'SELECT * FROM task_call_reservations WHERE repo=? AND plan_id=? ORDER BY token',
-        (repo, plan_id))) if 'task_call_reservations' in tables else ())
+        'SELECT * FROM task_call_reservations WHERE repo=? AND plan_id IN ('
+        + ','.join('?' for _ in members) + ') ORDER BY token',
+        (repo, *members))) if 'task_call_reservations' in tables else ())
     invocations = (tuple(dict(row) for row in connection.execute(
         'SELECT invocation_id,scope_id,role,session_id,execution_status,execution_started_at,execution_finish_evidence,'
-        'process_receipt_path,finished_at FROM agent_invocations WHERE repo=? AND plan_id=? ORDER BY invocation_id',
-        (repo, plan_id))) if 'agent_invocations' in tables else ())
+        'process_receipt_path,finished_at FROM agent_invocations WHERE repo=? AND plan_id IN ('
+        + ','.join('?' for _ in members) + ') ORDER BY invocation_id',
+        (repo, *members))) if 'agent_invocations' in tables else ())
     grant = (connection.execute('SELECT value FROM manager_metadata WHERE key=?',
                                 (f'remote_adoption:{repo}:{plan_id}',)).fetchone()
              if 'manager_metadata' in tables else None)
@@ -185,6 +208,7 @@ def reserved_workspace_ownership(connection, state_dir, repo, plan_id, *, worksp
     observed = _reservation_owners(connection, repo, plan_id, workspace)
     branch, worktree, _, _, calls, invocations, _adoption, _pending_claims = observed
     resources = ['plan:' + plan_id]
+    resources += ['plan:' + row['plan_id'] for row in _pending_claims if row['status'] == 'MERGED']
     resources += [prefix + value for prefix, value in (('branch:', branch), ('worktree:', worktree)) if value]
     if worktree:
         resources.append('git:' + str(Path(worktree).resolve()))

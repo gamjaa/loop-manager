@@ -42,7 +42,12 @@ def _insert_recovered_execplan(
         (repo, entry.plan_id),
     ).fetchone()
     if existing is not None:
-        if (
+        history = execplan_catalog_state.CatalogStateRepository(connection, ensure=False).historical_row(repo, entry.plan_id)
+        verified = (history is not None and history['merge_confirmed'] and history['identity_verified']
+            and history['diagnostic_code'] is None and history['original_path'] == path
+            and history['original_content_hash'] == content_hash
+            and history['observed_path'] == entry.path and history['final_content_hash'] == entry.content_hash)
+        if not verified and (
             (str(existing["publication_path"] or existing["path"]) != path
              and not (entry.archived and status == existing["status"] == "MERGED"
                       and not existing["publication_path"]
@@ -211,11 +216,11 @@ def _apply_execplan_catalog(
             active_path = str(project["plan_path"] or "")
             rows = connection.execute(
                 "SELECT plan_id, path, content_hash, plan_sha, status, "
-                "publication_path, publication_content_hash, publication_sha "
+                "publication_path, publication_content_hash, publication_sha, pr_url, branch "
                 "FROM exec_plans WHERE repo = ?",
                 (project["repo"],),
             ).fetchall()
-            stored = {str(row["plan_id"]): execplan_catalog_state.publication_identity(row)
+            stored = {str(row["plan_id"]): replace(execplan_catalog_state.publication_identity(row), base=project['base_branch'])
                       for row in rows}
             historical_ids = {
                 str(row["plan_id"])

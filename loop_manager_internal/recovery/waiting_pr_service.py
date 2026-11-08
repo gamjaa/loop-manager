@@ -81,6 +81,7 @@ def observe_waiting_pull_requests(
     *,
     require_base_identity: bool = False,
     read_only: bool = False,
+    completion_only: bool = False,
     config_path: Path | None = None,
 ) -> WaitingPullRequestObservation:
     """Commit every merge-wait observation before source or conflict work."""
@@ -88,21 +89,13 @@ def observe_waiting_pull_requests(
     from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
     manual_store=ManualWorkRepository(connection)
     rows = connection.execute(
-        "SELECT * FROM exec_plans WHERE repo = ? AND "
-        "(status = 'PR_OPEN' OR (status = 'PLAN_BLOCKED' AND (blocked_reason = ? "
-        "OR (blocked_reason IN (?, ?) AND pr_url IS NOT NULL))) "
-        "OR (status IN ('MANUAL_PENDING','IMPLEMENTING','VERIFYING','REVIEWING','PUBLISHING') "
-        "AND pr_url IS NOT NULL AND EXISTS (SELECT 1 FROM manual_work_members m "
-        "JOIN manual_work_groups g ON g.repo=m.repo AND g.group_id=m.group_id "
-        "WHERE m.repo=exec_plans.repo AND m.plan_id=exec_plans.plan_id AND g.state='AUTOMATIC'))) "
-        "ORDER BY plan_id",
-        (repo, PR_CLOSED_BLOCK_REASON, BlockReasonCode.REMOTE_BRANCH_DELETED.value,
-         BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value),
+        "SELECT * FROM exec_plans WHERE repo = ? AND status <> 'MERGED' ORDER BY plan_id",
+        (repo,),
     ).fetchall()
     registered_base = ""
     if rows:
         project = connection.execute(
-            "SELECT base_branch,provider FROM projects WHERE repo = ?", (repo,)
+            "SELECT base_branch,provider,origin FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
         if project is None or not project["base_branch"]:
             raise RuntimeError("Merge 대기 PR의 등록 base branch를 확인할 수 없습니다.")
@@ -123,185 +116,264 @@ def observe_waiting_pull_requests(
             if group['group_id'] in seen_groups:
                 continue
             seen_groups.add(group['group_id'])
-        branch = str(stored["branch"] or "")
-        if not branch:
-            raise RuntimeError(
-                f"저장된 Merge 대기 PR의 관리 branch를 확인할 수 없습니다: {stored['plan_id']}"
-            )
-        pull_request = effects.pr_for_branch(
-            repo_path,
-            branch,
-            str(stored["pr_url"] or "") or None,
-        )
-        if pull_request is None:
-            raise RuntimeError(
-                f"저장된 Merge 대기 PR의 GitHub 상태를 확인할 수 없습니다: {branch}"
-            )
-        observed_url = str(pull_request.get("url") or "")
-        stored_url = str(stored["pr_url"] or "")
-        if stored_url and observed_url and observed_url != stored_url:
-            raise PublicationSafetyError(
-                f"저장된 PR URL과 GitHub PR identity가 다릅니다: {branch}"
-            )
-        head_name = pull_request.get("headRefName")
-        if head_name and str(head_name) != branch:
-            raise PublicationSafetyError(
-                f"저장된 PR head branch와 GitHub PR identity가 다릅니다: {branch}"
-            )
-        observed_base = pull_request.get("baseRefName")
-        if observed_base is not None and str(observed_base) != registered_base:
-            raise PublicationSafetyError(
-                f"GitHub PR base branch가 등록 base와 다릅니다: {branch}"
-            )
-        if require_base_identity and not observed_base:
-            raise PublicationSafetyError(
-                f"self PR base branch identity를 확인할 수 없습니다: {branch}"
-            )
-        url = str(pull_request.get("url") or stored["pr_url"] or "")
-        if not url:
-            raise RuntimeError(f"저장된 Merge 대기 PR URL을 확인할 수 없습니다: {branch}")
-        head_value = pull_request.get("headRefOid")
-        head_oid = str(head_value) if head_value else stored["pr_head_oid"]
-        state = str(pull_request.get("state") or "OPEN").upper()
-        if read_only:
-            continue
-        if state == "MERGED" or pull_request.get("mergedAt"):
-            if scoped_blocking.project_block(connection, repo) is not None:
-                continue
-            assessment = effects.complete_merged_execplan_worktree(
-                connection,
-                repo_path,
-                repo,
-                state_dir,
-                stored,
-                url,
-                str(head_oid) if head_oid else None,
-                **({'merge_commit_oid': pull_request['mergeCommit']['oid']}
-                   if isinstance(pull_request.get('mergeCommit'), dict) and pull_request['mergeCommit'].get('oid') else {}),
-            )
-            merged = True
-            merged_pr_urls.append(url)
-            if assessment.status in {"safe", "missing"}:
-                effects.operation_print(f"Merge 확인 및 worktree 정리 완료: {url}")
-            else:
-                effects.operation_print(
-                    f"Merge 확인 완료; worktree 보존: {stored['worktree']} "
-                    f"({assessment.reason or assessment.status})",
-                    file=sys.stderr,
-                )
-            continue
-        if group and group['state']=='AUTOMATIC' and state == 'OPEN':
-            continue
-        if state == "CLOSED":
-            if stored["blocked_reason"] != PR_CLOSED_BLOCK_REASON:
-                effects._block_closed_pull_request(connection, repo, stored, url, head_oid)
-            continue
-        if stored['blocked_reason'] == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
-            continue
-        if (stored['status'] == 'PLAN_BLOCKED'
-                and stored['blocked_reason'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value):
-            # Remote terminal transitions remain observable. OPEN is not proof
-            # of recovery; the cause-specific recheck owns admission/release.
-            from loop_manager_internal.notifications.policy import block_recovery
-            recovery = block_recovery(connection, repo, str(stored['plan_id']), 'plan')
-            if (recovery is not None and recovery['reason_code'] == RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value
-                    and recovery['pending_action'] == 'final_block'):
-                base_oid = effects.base_head(repo_path, registered_base) if effects.base_head else None
-                if ((head_oid and head_oid != stored['pr_head_oid'])
-                        or (base_oid and base_oid != stored['pr_conflict_base_oid'])
-                        or effects.classify_pull_request_mergeability(pull_request) == 'mergeable'):
-                    with connection:
-                        recovery_state.RecoveryRepository(connection).defer_conflict_assessment(repo, str(stored['plan_id']))
-                        notifications.enqueue_current_project_events(connection, repo)
-            continue
-        from loop_manager_internal.recovery.work_branch_integration import published_branch
-        if effects.git is not None and published_branch(connection, repo, stored):
-            from loop_manager_internal.git.manager_git_journal import live_remote_branch_oid
-            from loop_manager_internal.recovery.work_branch_integration import require_remote_present
-            remote = live_remote_branch_oid(effects.git, repo_path, branch)
-            if remote != live_remote_branch_oid(effects.git, repo_path, branch):
-                raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '삭제 확인 중 원격 branch가 변경됐습니다.')
-            try:
-                require_remote_present(connection, repo, stored, remote, pull_request)
-            except RecoveryFailure as error:
-                if error.reason is not RecoveryReason.REMOTE_BRANCH_DELETED:
-                    raise
-                with connection:
-                    scoped_blocking.record_plan_block(connection, repo, str(stored['plan_id']),
-                        BlockReasonCode.REMOTE_BRANCH_DELETED, str(error), None)
-                continue
-        if state != "OPEN":
-            raise RuntimeError(f"지원하지 않는 GitHub PR 상태입니다: {state}")
-        if group and effects.base_head and stored['status']=='PR_OPEN':
-            from loop_manager_internal.recovery import manual_work_recovery
-            if manual_work_recovery.revalidate_waiting(connection,repo,stored,pull_request,
-                    effects.base_head(repo_path,registered_base),config_path=config_path,
-                    provider=project['provider'],resolve_profile=effects.resolve_profile):
-                continue
-        if (
-            stored["status"] == "PLAN_BLOCKED"
-            and stored["blocked_reason"] == PR_CLOSED_BLOCK_REASON
-        ):
-            expected_head = str(stored["pr_head_oid"] or "")
-            if expected_head and head_oid and str(head_oid) != expected_head:
-                if not runtime_state.RuntimeStateRepository(
-                    connection
-                ).recovery_slot_available(repo):
-                    # Keep the closed-PR block until its head can be checked
-                    # without replacing an unrelated planning projection.
+        waiting = (stored['status'] == 'PR_OPEN' or (
+            stored['status'] == 'PLAN_BLOCKED' and stored['blocked_reason'] in {
+                PR_CLOSED_BLOCK_REASON, BlockReasonCode.REMOTE_BRANCH_DELETED.value,
+                BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value}))
+        branch = str(stored["branch"] or f"loop-manager/{stored['plan_id']}")
+        checkpoint_store = ExecutionCheckpointRepository(connection)
+        checkpoint = checkpoint_store.get(repo, str(stored['plan_id']))
+        evidence = (checkpoint.snapshot or {}).get('external_completion')
+        observing = True
+        try:
+            if not stored['pr_url']:
+                # Catalog registration supplies the ID; full PR history supplies the
+                # repository/base/head link, including an already deleted branch.
+                if not project['origin']:
                     continue
-                if effects.git is not None:
-                    from loop_manager_internal.git.manager_git_journal import live_remote_branch_oid
-                    if live_remote_branch_oid(effects.git, repo_path, branch) != head_oid:
-                        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '재개 PR과 원격 branch의 관측 시점이 다릅니다.')
-            effects._resume_reopened_pull_request(
-                connection,
-                repo,
-                stored,
-                url,
-                head_oid,
-                recovery=False,
-            )
-            stored = connection.execute(
-                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
-                (repo, stored["plan_id"]),
-            ).fetchone()
-            if stored["status"] != "PR_OPEN":
-                # An unvalidated candidate resumes execution when its slot is
-                # available; it never joins the Merge-wait conflict selection.
+                # An empty all-state lookup has no PR identity to adopt. Only
+                # a discovered history needs the registered repository check.
+                pull_request = effects.pr_for_branch(repo_path, branch)
+                if pull_request is not None:
+                    from loop_manager_internal.git.git_adapter import github_repository
+                    pull_request = effects.pr_for_branch(
+                        repo_path, branch, history=True,
+                        expected_repository=github_repository(str(project['origin'])),
+                        expected_base=registered_base,
+                    )
+            else:
+                pull_request = effects.pr_for_branch(repo_path, branch, str(stored['pr_url']))
+            if pull_request is None:
+                if not stored['pr_url']:
+                    if evidence and evidence.get('kind') == 'github-pr':
+                        raise PublicationSafetyError('이전에 관측한 Merge의 현재 PR 연결을 확인할 수 없습니다.')
+                    if not read_only and (checkpoint.snapshot or {}).get('external_completion'):
+                        with connection:
+                            checkpoint_store.record_completion_observation(
+                                repo, str(stored['plan_id']), expected=checkpoint,
+                                observation={**checkpoint.snapshot['external_completion'],
+                                             'db_pending': False, 'resolution': 'no-pr'})
+                    continue
+                raise RuntimeError(
+                    f"저장된 Merge 대기 PR의 GitHub 상태를 확인할 수 없습니다: {branch}"
+                )
+            observed_url = str(pull_request.get("url") or "")
+            stored_url = str(stored["pr_url"] or "")
+            if stored_url and observed_url and observed_url != stored_url:
+                raise PublicationSafetyError(
+                    f"저장된 PR URL과 GitHub PR identity가 다릅니다: {branch}"
+                )
+            head_name = pull_request.get("headRefName")
+            if head_name and str(head_name) != branch:
+                raise PublicationSafetyError(
+                    f"저장된 PR head branch와 GitHub PR identity가 다릅니다: {branch}"
+                )
+            observed_base = pull_request.get("baseRefName")
+            if observed_base is not None and str(observed_base) != registered_base:
+                raise PublicationSafetyError(
+                    f"GitHub PR base branch가 등록 base와 다릅니다: {branch}"
+                )
+            if require_base_identity and not observed_base:
+                raise PublicationSafetyError(
+                    f"self PR base branch identity를 확인할 수 없습니다: {branch}"
+                )
+            url = str(pull_request.get("url") or stored["pr_url"] or "")
+            if not url:
+                raise RuntimeError(f"저장된 Merge 대기 PR URL을 확인할 수 없습니다: {branch}")
+            head_value = pull_request.get("headRefOid")
+            head_oid = str(head_value) if head_value else stored["pr_head_oid"]
+            state = str(pull_request.get("state") or "OPEN").upper()
+            if read_only:
                 continue
-            if group and effects.base_head:
+            if state == "MERGED" or pull_request.get("mergedAt"):
+                if not observed_url or not head_oid or (not stored_url and (not head_name or not observed_base)):
+                    raise PublicationSafetyError('Merge PR의 URL/head/base/revision identity가 불완전합니다.')
+                evidence = {
+                    'version': 1, 'repo': repo, 'plan_id': stored['plan_id'],
+                    'branch': branch, 'pr_url': url, 'head': head_oid,
+                    'base': registered_base, 'repository': project['origin'],
+                    'kind': 'github-pr',
+                    'revision': (pull_request.get('mergeCommit') or {}).get('oid') or pull_request.get('mergedAt') or head_oid,
+                    'db_pending': True,
+                }
+                with connection:
+                    checkpoint = checkpoint_store.record_completion_observation(
+                        repo, str(stored['plan_id']), expected=checkpoint, observation=evidence)
+                assessment = effects.complete_merged_execplan_worktree(
+                    connection,
+                    repo_path,
+                    repo,
+                    state_dir,
+                    stored,
+                    url,
+                    str(head_oid) if head_oid else None,
+                    observed_registration=(project['origin'], project['base_branch']),
+                    observed_checkpoint_generation=checkpoint.generation,
+                    **({'merge_commit_oid': pull_request['mergeCommit']['oid']}
+                       if isinstance(pull_request.get('mergeCommit'), dict) and pull_request['mergeCommit'].get('oid') else {}),
+                )
+                merged = True
+                merged_pr_urls.append(url)
+                if assessment.status in {"safe", "missing"}:
+                    effects.operation_print(f"Merge 확인 및 worktree 정리 완료: {url}")
+                else:
+                    effects.operation_print(
+                        f"Merge 확인 완료; worktree 보존: {stored['worktree']} "
+                        f"({assessment.reason or assessment.status})",
+                        file=sys.stderr,
+                    )
+                continue
+            if evidence and evidence.get('kind') == 'github-pr':
+                raise PublicationSafetyError('이전에 관측한 Merge와 현재 PR 상태가 충돌합니다.')
+            if (checkpoint.snapshot or {}).get('external_completion'):
+                with connection:
+                    checkpoint = checkpoint_store.record_completion_observation(
+                        repo, str(stored['plan_id']), expected=checkpoint,
+                        observation={**checkpoint.snapshot['external_completion'], 'db_pending': False,
+                                     'resolution': state})
+            if completion_only or scoped_blocking.project_block(connection, repo) is not None or not waiting:
+                continue
+            observing = False
+            if group and group['state']=='AUTOMATIC' and state == 'OPEN':
+                continue
+            if state == "CLOSED":
+                if stored["blocked_reason"] != PR_CLOSED_BLOCK_REASON:
+                    effects._block_closed_pull_request(connection, repo, stored, url, head_oid)
+                continue
+            if stored['blocked_reason'] == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
+                continue
+            if (stored['status'] == 'PLAN_BLOCKED'
+                    and stored['blocked_reason'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value):
+                # Remote terminal transitions remain observable. OPEN is not proof
+                # of recovery; the cause-specific recheck owns admission/release.
+                from loop_manager_internal.notifications.policy import block_recovery
+                recovery = block_recovery(connection, repo, str(stored['plan_id']), 'plan')
+                if (recovery is not None and recovery['reason_code'] == RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value
+                        and recovery['pending_action'] == 'final_block'):
+                    base_oid = effects.base_head(repo_path, registered_base) if effects.base_head else None
+                    if ((head_oid and head_oid != stored['pr_head_oid'])
+                            or (base_oid and base_oid != stored['pr_conflict_base_oid'])
+                            or effects.classify_pull_request_mergeability(pull_request) == 'mergeable'):
+                        with connection:
+                            recovery_state.RecoveryRepository(connection).defer_conflict_assessment(repo, str(stored['plan_id']))
+                            notifications.enqueue_current_project_events(connection, repo)
+                continue
+            from loop_manager_internal.recovery.work_branch_integration import published_branch
+            if effects.git is not None and published_branch(connection, repo, stored):
+                from loop_manager_internal.git.manager_git_journal import live_remote_branch_oid
+                from loop_manager_internal.recovery.work_branch_integration import require_remote_present
+                remote = live_remote_branch_oid(effects.git, repo_path, branch)
+                if remote != live_remote_branch_oid(effects.git, repo_path, branch):
+                    raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '삭제 확인 중 원격 branch가 변경됐습니다.')
+                try:
+                    require_remote_present(connection, repo, stored, remote, pull_request)
+                except RecoveryFailure as error:
+                    if error.reason is not RecoveryReason.REMOTE_BRANCH_DELETED:
+                        raise
+                    with connection:
+                        scoped_blocking.record_plan_block(connection, repo, str(stored['plan_id']),
+                            BlockReasonCode.REMOTE_BRANCH_DELETED, str(error), None)
+                    continue
+            if state != "OPEN":
+                raise RuntimeError(f"지원하지 않는 GitHub PR 상태입니다: {state}")
+            if group and effects.base_head and stored['status']=='PR_OPEN':
                 from loop_manager_internal.recovery import manual_work_recovery
                 if manual_work_recovery.revalidate_waiting(connection,repo,stored,pull_request,
                         effects.base_head(repo_path,registered_base),config_path=config_path,
                         provider=project['provider'],resolve_profile=effects.resolve_profile):
                     continue
-        with connection:
-            resumed = notifications.record_work_start(
-                connection, repo, "PR handling", plan_id=str(stored["plan_id"]),
-            )
-        if resumed:
-            effects.operation_log(f"차단 해제 후 PR 처리 재개: {stored['plan_id']}")
-        mergeability = effects.classify_pull_request_mergeability(pull_request)
-        with connection:
-            plan_values: dict[str, object] = {"pr_url": url}
-            # Conflict recovery must compare GitHub's head with the stored
-            # ownership OID before adopting a changed head.
-            if mergeability != "conflicting":
-                plan_values["pr_head_oid"] = head_oid
-            runtime_state.RuntimeStateRepository(connection).update_plan(
-                repo,
-                str(stored["plan_id"]),
-                plan_values=plan_values,
-                enqueue=False,
-            )
-            notifications.enqueue_current_project_events(connection, repo)
-        if mergeability == "conflicting":
-            conflicts.append((stored, pull_request))
+            if (
+                stored["status"] == "PLAN_BLOCKED"
+                and stored["blocked_reason"] == PR_CLOSED_BLOCK_REASON
+            ):
+                expected_head = str(stored["pr_head_oid"] or "")
+                if expected_head and head_oid and str(head_oid) != expected_head:
+                    if not runtime_state.RuntimeStateRepository(
+                        connection
+                    ).recovery_slot_available(repo):
+                        # Keep the closed-PR block until its head can be checked
+                        # without replacing an unrelated planning projection.
+                        continue
+                    if effects.git is not None:
+                        from loop_manager_internal.git.manager_git_journal import live_remote_branch_oid
+                        if live_remote_branch_oid(effects.git, repo_path, branch) != head_oid:
+                            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '재개 PR과 원격 branch의 관측 시점이 다릅니다.')
+                effects._resume_reopened_pull_request(
+                    connection,
+                    repo,
+                    stored,
+                    url,
+                    head_oid,
+                    recovery=False,
+                )
+                stored = connection.execute(
+                    "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                    (repo, stored["plan_id"]),
+                ).fetchone()
+                if stored["status"] != "PR_OPEN":
+                    # An unvalidated candidate resumes execution when its slot is
+                    # available; it never joins the Merge-wait conflict selection.
+                    continue
+                if group and effects.base_head:
+                    from loop_manager_internal.recovery import manual_work_recovery
+                    if manual_work_recovery.revalidate_waiting(connection,repo,stored,pull_request,
+                            effects.base_head(repo_path,registered_base),config_path=config_path,
+                            provider=project['provider'],resolve_profile=effects.resolve_profile):
+                        continue
+            with connection:
+                resumed = notifications.record_work_start(
+                    connection, repo, "PR handling", plan_id=str(stored["plan_id"]),
+                )
+            if resumed:
+                effects.operation_log(f"차단 해제 후 PR 처리 재개: {stored['plan_id']}")
+            mergeability = effects.classify_pull_request_mergeability(pull_request)
+            with connection:
+                plan_values: dict[str, object] = {"pr_url": url}
+                # Conflict recovery must compare GitHub's head with the stored
+                # ownership OID before adopting a changed head.
+                if mergeability != "conflicting":
+                    plan_values["pr_head_oid"] = head_oid
+                runtime_state.RuntimeStateRepository(connection).update_plan(
+                    repo,
+                    str(stored["plan_id"]),
+                    plan_values=plan_values,
+                    enqueue=False,
+                )
+                notifications.enqueue_current_project_events(connection, repo)
+            if mergeability == "conflicting":
+                conflicts.append((stored, pull_request))
+        except (RuntimeError, sqlite3.Error) as error:
+            current = connection.execute(
+                'SELECT status FROM exec_plans WHERE repo=? AND plan_id=?',
+                (repo, stored['plan_id']),
+            ).fetchone()
+            if current and current['status'] == 'MERGED':
+                merged = True
+                merged_pr_urls.append(str(stored['pr_url'] or (evidence or {}).get('pr_url') or ''))
+                effects.operation_print(f"Merge 확인 완료; 정리 재시도 대기: {stored['plan_id']} ({error})", file=sys.stderr)
+                continue
+            if read_only or require_base_identity or not observing:
+                raise
+            pending = evidence or {
+                'version': 1, 'repo': repo, 'plan_id': stored['plan_id'],
+                'branch': branch, 'pr_url': stored['pr_url'], 'kind': 'unconfirmed',
+                'revision': None, 'db_pending': True,
+            }
+            from loop_manager_internal.execution.validation_feedback import redact_secrets
+            pending = {**pending, 'db_pending': True, 'error': redact_secrets(str(error))}
+            try:
+                with connection:
+                    checkpoint_store.record_completion_observation(
+                        repo, str(stored['plan_id']), expected=checkpoint, observation=pending)
+            except (RuntimeError, sqlite3.Error) as persistence_error:
+                effects.operation_print(f"완료 관측 저장 보류: {stored['plan_id']} ({persistence_error})", file=sys.stderr)
+                raise error
+            effects.operation_print(f"완료 확인/반영 보류: {stored['plan_id']} ({error})", file=sys.stderr)
+            continue
 
     # Each completed transition is committed before a remote fetch can fail.
     # A later run fetches again and resumes source synchronization from SQLite.
-    if merged:
+    if merged and not completion_only and scoped_blocking.project_block(connection, repo) is None:
         project = connection.execute(
             "SELECT base_branch FROM projects WHERE repo = ?", (repo,)
         ).fetchone()

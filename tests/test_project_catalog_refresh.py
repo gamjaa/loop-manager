@@ -526,6 +526,38 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
         self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
             self.connection, self.repo)}, {'G-001', 'G-002'})
 
+        # Reobserve the legacy archive-path identity through the public migration
+        # boundary, then consume its missing-document dependency as history.
+        self.connection.execute(
+            "UPDATE exec_plans SET publication_path=NULL, publication_content_hash=NULL "
+            "WHERE repo=? AND plan_id='G-002'", (self.repo,))
+        self.connection.commit()
+        original = dict(self.row('G-002'))
+        history = state.CatalogStateRepository(self.connection)
+        audit = dict(history.historical_row(self.repo, 'G-002'))
+        with mock.patch.object(manager, '_LegacyCatalogMergeProof') as external:
+            for _restart in range(2):
+                prepared = manager.migrate_legacy_execplans(
+                    self.connection, reconcile_history=True, target_repo=self.repo,
+                    ensure_schema=False, pinned_catalog=self.boundary.pinned, prepare_only=True)
+                manager.migrate_legacy_execplans(
+                    self.connection, reconcile_history=True, target_repo=self.repo,
+                    ensure_schema=False, pinned_catalog=self.boundary.pinned, prepared=prepared)
+                self.assertEqual(dict(self.row('G-002')), original)
+                current = history.historical_row(self.repo, 'G-002')
+                for field in ('original_path', 'original_content_hash', 'plan_sha', 'proof_kind', 'proof_revision'):
+                    self.assertEqual(current[field], audit[field])
+                self.assertIsNone(current['diagnostic_code'])
+            external.return_value.proof_for.assert_not_called()
+            external.return_value.verify_stored.assert_not_called()
+        from loop_manager_internal.catalog.remote_deletions import reference_issues
+        without_archive = replace(self.boundary.pinned,
+            snapshot=replace(self.boundary.pinned.snapshot, archived={}))
+        self.assertEqual(reference_issues(self.connection, self.repo, Path(self.repo),
+            without_archive, git_bytes=lambda *_: b''), ())
+        self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
+            self.connection, self.repo)}, {'G-001', 'G-002'})
+
     def test_planning_migrates_legacy_archive_before_dependency_validation(self):
         self.connection.execute(
             "UPDATE exec_plans SET publication_sha=? WHERE repo=? AND plan_id='G-002'",
@@ -674,6 +706,290 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
 
 
 class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
+    def test_linked_merge_is_accepted_in_every_nonterminal_phase_under_project_block(self):
+        statuses = ('READY', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING',
+                    'MANUAL_PENDING', 'PLAN_BLOCKED')
+        manager.scoped_blocking.record_project_block(
+            self.connection, self.repo, manager.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+            'independent safety cause', 'safety', plan_id='G-001', previous_phase='WORKING')
+        for status in statuses:
+            with self.subTest(status=status):
+                self.connection.execute("UPDATE exec_plans SET status=?, blocked_reason='unrelated' WHERE plan_id='G-001'", (status,))
+                self.connection.commit()
+                before = dict(self.row())
+                project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+                pr = {'state': 'MERGED', 'url': before['pr_url'], 'headRefName': before['branch'],
+                      'baseRefName': 'main', 'headRefOid': 'd'*40, 'mergeCommit': {'oid': 'e'*40}}
+                with mock.patch.object(manager, 'pr_for_branch', return_value=pr), \
+                     mock.patch.object(manager, '_recorded_base_fetch') as fetch, \
+                     mock.patch.object(manager, 'remove_cleanup_worktree') as remove, \
+                     mock.patch.object(manager, 'run_agent') as agent:
+                    result = manager.observe_waiting_pull_requests(
+                        self.connection, Path(self.repo), Path('/state'), self.repo, completion_only=True)
+                self.assertTrue(result.merged)
+                self.assertEqual(self.row()['status'], 'MERGED')
+                for field in ('worker_session_id', 'reviewer_session_id', 'retry_count', 'worker_result', 'verify_result'):
+                    self.assertEqual(self.row()[field], before[field])
+                self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
+                self.assertEqual(manager.scoped_blocking.project_block(self.connection, self.repo)['evidence'], 'independent safety cause')
+                self.assertIsNotNone(self.connection.execute('SELECT * FROM cleanup_pending').fetchone())
+                fetch.assert_not_called()
+                remove.assert_not_called()
+                agent.assert_not_called()
+
+    def test_stored_pr_retains_optional_branch_field_compatibility(self):
+        before = dict(self.row())
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state': 'MERGED', 'url': before['pr_url'], 'headRefOid': 'd'*40}), \
+             mock.patch.object(manager, '_recorded_base_fetch'), \
+             mock.patch.object(manager, '_assess_missing_managed_cleanup',
+                               return_value=manager.CleanupAssessment('missing')):
+            result = manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertTrue(result.merged)
+        self.assertEqual(self.row()['status'], 'MERGED')
+        self.assertEqual(self.row()['branch'], before['branch'])
+        self.assertEqual(self.row()['pr_url'], before['pr_url'])
+        self.assertEqual(self.row()['worker_session_id'], before['worker_session_id'])
+
+    def test_unlinked_empty_pr_history_preserves_registration_and_execution(self):
+        # A registered local test remote is sufficient when the PR port proves
+        # an empty all-state history; no PR repository identity is adopted.
+        self.connection.execute("UPDATE projects SET origin='/local/remote.git'")
+        self.connection.execute("UPDATE exec_plans SET pr_url=NULL WHERE plan_id='G-001'")
+        self.connection.commit()
+        original = dict(self.row())
+        with mock.patch.object(manager, 'pr_for_branch', return_value=None) as observe:
+            result = manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertFalse(result.merged)
+        self.assertEqual(dict(self.row()), original)
+        self.assertFalse(manager.scoped_blocking.catalog_held_plan_ids(self.connection, self.repo))
+        observe.assert_called_once_with(Path(self.repo), original['branch'])
+
+    def test_open_pr_recovery_failure_retains_its_original_disposition(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED',blocked_reason=? WHERE plan_id='G-001'",
+            (manager.PR_CLOSED_BLOCK_REASON,))
+        self.connection.commit()
+        before = dict(self.row())
+        error = RecoveryFailure(RecoveryReason.GIT_INPUT_UNCERTAIN, 'remote snapshot changed')
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state': 'OPEN', 'url': before['pr_url'], 'headRefName': before['branch'],
+                'baseRefName': 'main', 'headRefOid': 'd'*40}), \
+             mock.patch.object(manager, '_resume_reopened_pull_request', side_effect=error):
+            with self.assertRaises(RecoveryFailure) as raised:
+                manager.observe_waiting_pull_requests(self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertIs(raised.exception, error)
+        self.assertFalse(manager.scoped_blocking.catalog_held_plan_ids(self.connection, self.repo))
+        self.assertEqual(dict(self.row()), before)
+
+    def test_unlinked_ready_row_uses_registered_repository_pr_history_without_workspace(self):
+        self.connection.execute("UPDATE projects SET origin='https://github.com/owner/repo.git'")
+        self.connection.execute("DELETE FROM exec_plans WHERE plan_id='G-001'")
+        self.connection.commit()
+        self.boundary.refresh()
+        self.assertEqual(self.row()['status'], 'READY')
+        pr = {'state': 'MERGED', 'url': 'https://github.com/owner/repo/pull/1',
+              'headRefName': 'loop-manager/G-001', 'baseRefName': 'main', 'headRefOid': 'd'*40}
+        with mock.patch.object(manager, 'pr_for_branch', return_value=pr) as observe, \
+             mock.patch.object(manager, '_recorded_base_fetch'):
+            result = manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertTrue(result.merged)
+        self.assertEqual(observe.call_args_list, [
+            mock.call(Path(self.repo), 'loop-manager/G-001'),
+            mock.call(Path(self.repo), 'loop-manager/G-001', history=True,
+                      expected_repository='owner/repo', expected_base='main')])
+        self.assertEqual(self.row()['status'], 'MERGED')
+        self.assertEqual(self.row()['branch'], 'loop-manager/G-001')
+        self.assertIsNone(self.connection.execute('SELECT * FROM cleanup_pending').fetchone())
+
+    def test_open_or_closed_pr_does_not_resume_other_execution_phases(self):
+        for status in ('READY', 'IMPLEMENTING', 'PLAN_BLOCKED'):
+            for pr_state in ('OPEN', 'CLOSED'):
+                with self.subTest(status=status, pr_state=pr_state):
+                    self.connection.execute("UPDATE exec_plans SET status=?, blocked_reason='unrelated' WHERE plan_id='G-001'", (status,))
+                    self.connection.commit()
+                    before = dict(self.row())
+                    with mock.patch.object(manager, 'pr_for_branch', return_value={
+                            'state': pr_state, 'url': before['pr_url'], 'headRefName': before['branch'],
+                            'baseRefName': 'main', 'headRefOid': 'd'*40}), \
+                         mock.patch.object(manager, 'complete_merged_execplan_worktree') as complete:
+                        result = manager.observe_waiting_pull_requests(
+                            self.connection, Path(self.repo), Path('/state'), self.repo)
+                    self.assertFalse(result.merged)
+                    self.assertEqual(dict(self.row()), before)
+                    complete.assert_not_called()
+
+    def test_lookup_failure_holds_only_target_and_recovers_without_replacing_git_intent(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        with self.connection:
+            checkpoints.record(self.repo, 'G-001', expected_generation=0, operation='rebase',
+                expected_head='a'*40, target_base_oid='b'*40, observed_remote_oid='c'*40,
+                snapshot={'pending': 'original rebase audit'})
+        before = dict(self.row())
+        native_generation = checkpoints.get(self.repo, 'G-001').generation
+        with mock.patch.object(manager, 'pr_for_branch', side_effect=RuntimeError('lookup unavailable')):
+            result = manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertFalse(result.merged)
+        self.assertEqual(dict(self.row()), before)
+        self.assertEqual(manager.scoped_blocking.catalog_held_plan_ids(self.connection, self.repo), {'G-001'})
+        checkpoint = checkpoints.get(self.repo, 'G-001')
+        self.assertEqual(checkpoint.operation, 'rebase')
+        self.assertEqual(checkpoint.generation, native_generation)
+        self.assertEqual(checkpoint.snapshot['pending'], 'original rebase audit')
+        self.assertEqual(checkpoint.snapshot['external_completion']['kind'], 'unconfirmed')
+        from loop_manager_internal.application.project_service import ProjectService
+        effects = SimpleNamespace(_recorded_base_fetch=mock.Mock(),
+            ensure_safe_base_worktree=mock.Mock(), log_base_worktree_sync=mock.Mock())
+        service = SimpleNamespace(
+            identity=SimpleNamespace(connection=self.connection, state_dir=Path('/state')),
+            state=SimpleNamespace(repo=self.repo, repo_path=Path(self.repo), base='main', base_sha=self.sha),
+            effects=effects, _refresh_catalog=lambda: self.sha, _archive_housekeeping=mock.Mock())
+        ProjectService._synchronize_source_after_pr_reconciliation(service)
+        effects.ensure_safe_base_worktree.assert_not_called()
+        self.assertEqual(effects.log_base_worktree_sync.call_args.args[1].status, 'skipped')
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state': 'OPEN', 'url': before['pr_url'], 'headRefName': before['branch'],
+                'baseRefName': 'main', 'headRefOid': 'd'*40}):
+            manager.observe_waiting_pull_requests(self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertFalse(manager.scoped_blocking.catalog_held_plan_ids(self.connection, self.repo))
+        self.assertEqual(checkpoints.get(self.repo, 'G-001').operation, 'rebase')
+        self.assertEqual(checkpoints.get(self.repo, 'G-001').generation, native_generation)
+
+    def test_interrupted_merge_acceptance_preserves_proof_and_restarts_once(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        before = dict(self.row())
+        pr = {'state': 'MERGED', 'url': before['pr_url'], 'headRefName': before['branch'],
+              'baseRefName': 'main', 'headRefOid': 'd'*40, 'mergeCommit': {'oid': 'e'*40}}
+        self.connection.execute("CREATE TEMP TRIGGER interrupt_merge BEFORE UPDATE OF status ON exec_plans WHEN NEW.status='MERGED' BEGIN SELECT RAISE(ABORT,'DB interrupted'); END")
+        with mock.patch.object(manager, 'pr_for_branch', return_value=pr), \
+             mock.patch.object(manager, '_recorded_base_fetch') as fetch:
+            result = manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertFalse(result.merged)
+        fetch.assert_not_called()
+        self.assertEqual(self.row()['status'], before['status'])
+        proof = ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-001').snapshot['external_completion']
+        self.assertTrue(proof['db_pending'])
+        self.assertEqual(proof['kind'], 'github-pr')
+        self.assertEqual(proof['revision'], 'e'*40)
+        self.assertIn('DB interrupted', proof['error'])
+        self.connection.execute('DROP TRIGGER interrupt_merge')
+        self.connection.commit()
+        with mock.patch.object(manager, 'pr_for_branch', return_value=pr), \
+             mock.patch.object(manager, '_assess_missing_managed_cleanup', return_value=manager.CleanupAssessment('missing')), \
+             mock.patch.object(manager, '_recorded_base_fetch'), \
+             mock.patch.object(manager, 'run_agent') as agent:
+            self.assertTrue(manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo).merged)
+            merge_audit = [tuple(row) for row in self.connection.execute('SELECT * FROM common_defect_merges')]
+            self.assertFalse(manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo).merged)
+        self.assertEqual([tuple(row) for row in self.connection.execute('SELECT * FROM common_defect_merges')], merge_audit)
+        agent.assert_not_called()
+        self.assertFalse(ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-001').snapshot['external_completion']['db_pending'])
+        self.assertIn('G-001', {row.plan_id for row in archive_state.ExecPlanArchiveRepository(self.connection).merged_candidates(self.repo)})
+        self.assertEqual(self.row()['worker_session_id'], before['worker_session_id'])
+
+    def test_merge_races_preserve_new_identity_and_observation(self):
+        for mutation in ("UPDATE exec_plans SET worker_session_id='competing' WHERE plan_id='G-001'",
+                         "UPDATE projects SET base_branch='other'"):
+            with self.subTest(mutation=mutation):
+                self.connection.execute("UPDATE projects SET base_branch='main'")
+                before = dict(self.row())
+                def observe(*args, **kwargs):
+                    self.connection.execute(mutation)
+                    self.connection.commit()
+                    return {'state': 'MERGED', 'url': before['pr_url'], 'headRefName': before['branch'],
+                            'baseRefName': 'main', 'headRefOid': 'd'*40}
+                with mock.patch.object(manager, 'pr_for_branch', side_effect=observe), \
+                     mock.patch.object(manager, 'remove_cleanup_worktree') as remove:
+                    result = manager.observe_waiting_pull_requests(
+                        self.connection, Path(self.repo), Path('/state'), self.repo)
+                self.assertFalse(result.merged)
+                self.assertNotEqual(self.row()['status'], 'MERGED')
+                self.assertIn('G-001', manager.scoped_blocking.catalog_held_plan_ids(self.connection, self.repo))
+                remove.assert_not_called()
+
+    def test_independent_merge_continues_after_another_pr_lookup_fails(self):
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN',branch='independent',pr_url='https://example/pr/2',worktree=NULL WHERE plan_id='G-002'")
+        self.connection.commit()
+        def observe(_repo, branch, *args, **kwargs):
+            if branch == 'branch':
+                raise RuntimeError('first PR unavailable')
+            return {'state': 'MERGED', 'url': 'https://example/pr/2', 'headRefName': branch,
+                    'baseRefName': 'main', 'headRefOid': 'd'*40}
+        with mock.patch.object(manager, 'pr_for_branch', side_effect=observe), \
+             mock.patch.object(manager, '_recorded_base_fetch'):
+            result = manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+        self.assertTrue(result.merged)
+        self.assertEqual(self.row('G-002')['status'], 'MERGED')
+        self.assertNotEqual(self.row()['status'], 'MERGED')
+        self.assertEqual(manager.scoped_blocking.catalog_held_plan_ids(self.connection, self.repo), {'G-001'})
+
+    def test_pending_call_and_projection_survive_merge_without_cleanup(self):
+        from loop_manager_internal.storage import task_calls
+        task_calls.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO task_call_reservations(token,repo,plan_id,kind,uncertain) VALUES ('writer',?,'G-001','agent',1)", (self.repo,))
+        self.connection.commit()
+        before = dict(self.row())
+        project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        reservation = tuple(self.connection.execute('SELECT * FROM task_call_reservations').fetchone())
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state': 'MERGED', 'url': before['pr_url'], 'headRefName': before['branch'],
+                'baseRefName': 'main', 'headRefOid': 'd'*40}), \
+             mock.patch.object(manager, 'remove_cleanup_worktree') as remove, \
+             mock.patch.object(manager, '_recorded_base_fetch'):
+            self.assertTrue(manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo).merged)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
+        self.assertEqual(tuple(self.connection.execute('SELECT * FROM task_call_reservations').fetchone()), reservation)
+        self.assertEqual(self.row()['status'], 'MERGED')
+        remove.assert_not_called()
+
+    def test_cleanup_retry_preserves_pending_writer_until_confirmed_release(self):
+        from loop_manager_internal.storage import task_calls, agent_invocation_state
+        task_calls.ensure_schema(self.connection)
+        agent_invocation_state.ensure_schema(self.connection)
+        before = dict(self.row())
+        self.connection.execute("INSERT INTO task_call_reservations(token,repo,plan_id,kind,uncertain) VALUES ('writer',?,'G-001','agent',1)", (self.repo,))
+        self.connection.commit()
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state':'MERGED','url':before['pr_url'],'headRefName':before['branch'],
+                'baseRefName':'main','headRefOid':'d'*40}), \
+             mock.patch.object(manager, '_recorded_base_fetch'), \
+             mock.patch.object(manager, '_recover_managed_worktree_removal') as recover, \
+             mock.patch.object(manager, 'validate_pending_cleanup_worktree'), \
+             mock.patch.object(manager, 'assess_cleanup', return_value=manager.CleanupAssessment('safe')) as assess, \
+             mock.patch.object(manager, 'capture_git_snapshot', return_value=SimpleNamespace(worktrees={})), \
+             mock.patch.object(manager, 'remove_cleanup_worktree', return_value=manager.CleanupAssessment('safe')) as remove:
+            manager.observe_waiting_pull_requests(self.connection,Path(self.repo),Path('/state'),self.repo)
+            for _ in range(2):
+                self.assertTrue(manager.recheck_cleanup_pending(self.connection,Path(self.repo),self.repo,Path('/state')))
+            remove.assert_not_called()
+            recover.assert_not_called()
+            assess.assert_not_called()
+            with self.connection:
+                self.connection.execute("DELETE FROM task_call_reservations WHERE token='writer'")
+                self.connection.execute("""INSERT INTO agent_invocations
+                    (invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,
+                     started_at,execution_status,execution_started_at,finished_at)
+                    VALUES ('writer',?,'G-001','worker','codex','model','high','start',1,
+                            'start','executed','started','collected')""",(self.repo,))
+            self.assertTrue(manager.recheck_cleanup_pending(self.connection,Path(self.repo),self.repo,Path('/state')))
+            remove.assert_not_called()
+            with self.connection:
+                self.connection.execute("UPDATE agent_invocations SET execution_finished_at='stopped',execution_finish_evidence='process_finished'")
+            self.assertFalse(manager.recheck_cleanup_pending(self.connection,Path(self.repo),self.repo,Path('/state')))
+            remove.assert_called_once()
+        self.assertEqual(self.row()['status'],'MERGED')
+        self.assertEqual(self.row()['worker_session_id'],before['worker_session_id'])
+
     def test_restart_after_committed_pr_result_keeps_merge_and_session(self):
         self.boundary.refresh()
         self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-001'")
@@ -713,8 +1029,11 @@ class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
             confirmed = manager._catalog_archive_conflict_ids(self.connection, Path(self.repo), self.repo, self.sha)
             self.assertIn('G-001', confirmed)
             self.assertEqual(dict(self.row()), before)
+            with mock.patch.object(manager, 'pr_for_branch', return_value={**proof, 'headRefOid': 'e'*40}):
+                self.assertIn('G-001', manager._catalog_archive_conflict_ids(
+                    self.connection, Path(self.repo), self.repo, self.sha))
             for field, value in (('baseRefName', 'other'), ('headRefName', 'other'),
-                                 ('headRefOid', 'other'), ('url', 'other')):
+                                 ('url', 'other')):
                 with mock.patch.object(manager, 'pr_for_branch', return_value={**proof, field: value}):
                     self.assertNotIn('G-001', manager._catalog_archive_conflict_ids(
                         self.connection, Path(self.repo), self.repo, self.sha))
@@ -737,7 +1056,7 @@ class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
                                return_value=SimpleNamespace(status='missing')) as cleanup, \
              mock.patch.object(manager, '_recorded_base_fetch'):
             for field, value in (('baseRefName', 'other'), ('headRefName', 'other'),
-                                 ('headRefOid', 'other'), ('url', 'other')):
+                                 ('url', 'other')):
                 with mock.patch.object(manager, 'pr_for_branch', return_value={**proof, field: value}):
                     self.assertNotIn('G-001', manager._catalog_archive_conflict_ids(
                         self.connection, Path(self.repo), self.repo, self.sha))
@@ -764,7 +1083,7 @@ class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
             self.connection.execute(
                 "UPDATE exec_plans SET blocked_reason='unrelated safety block' WHERE plan_id='G-001'")
             self.connection.commit()
-            self.assertNotIn('G-001', manager._catalog_archive_conflict_ids(
+            self.assertIn('G-001', manager._catalog_archive_conflict_ids(
                 self.connection, Path(self.repo), self.repo, self.sha))
 
 

@@ -230,7 +230,7 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
                     self.connection.execute(
                         "UPDATE exec_plans SET publication_sha=?, publication_path=?, "
                         "publication_content_hash=? WHERE plan_id='G-001'",
-                        ('c' * 40, self.entry.active_path, self.entry.content_hash),
+                        ('c' * 40, 'docs/plans/[G-001] Stale.md', 'stale-publication-hash'),
                     )
                     history = execplan_catalog_state.CatalogStateRepository(self.connection)
                     history.record(
@@ -250,6 +250,8 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
                             self.migrate(archived=True)
                             self.assertEqual(self.row()['status'], 'MERGED')
                             self.assertEqual(self.row()['publication_sha'], 'c' * 40)
+                            self.assertEqual(self.row()['publication_path'], 'docs/plans/[G-001] Stale.md')
+                            self.assertEqual(self.row()['publication_content_hash'], 'stale-publication-hash')
                             self.assertEqual(self.row()['worker_session_id'], 'worker-session')
                             self.assertEqual(self.row()['retry_count'], 3)
                             audit = history.historical_row('/repo', 'G-001')
@@ -283,6 +285,26 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
                 self.assertEqual(result.merged, ())
                 self.assertTrue(result.diagnostics)
                 self.assertEqual(self.row()['status'], 'MERGED')
+
+    def test_verified_archive_does_not_override_a_different_connected_pr(self):
+        self.insert_runtime('READY')
+        history = execplan_catalog_state.CatalogStateRepository(self.connection)
+        history.record('/repo', self.entry, original_path=self.entry.active_path,
+            original_content_hash=self.entry.content_hash, plan_sha='a'*40,
+            proof=execplan_catalog_state.MergeProof(True,
+                kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
+                revision='b'*40, pr_url='https://github.com/owner/repo/pull/1'),
+            diagnostic=None, identity_verified=True)
+        self.connection.execute("UPDATE exec_plans SET pr_url='https://github.com/owner/repo/pull/2'")
+        identity = execplan_catalog_state.publication_identity(self.row())
+        external = mock.Mock()
+        result = execplan_catalog_state.CatalogRecoveryService(history, external).reconcile(
+            '/repo', execplan_catalog.ExecPlanCatalogSnapshot({}, {'G-001': self.entry}), {'G-001': identity})
+        self.assertFalse(result.merged)
+        self.assertEqual(result.diagnostics[0].code, 'stable-identity-mismatch')
+        self.assertEqual(self.row()['status'], 'READY')
+        self.assertEqual(history.historical_row('/repo', 'G-001')['pr_url'], 'https://github.com/owner/repo/pull/1')
+        external.proof_for.assert_not_called()
 
     def recover_stored_history(self, observed, stored=None):
         snapshot = execplan_catalog.ExecPlanCatalogSnapshot(

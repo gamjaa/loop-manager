@@ -1061,25 +1061,28 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         self.assertIsNone(decision.runnable_ready)
 
 
-    def test_cleanup_project_block_stops_later_merge_mutation(self):
+    def test_cleanup_project_block_preserves_later_merge_but_defers_resource_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             for plan_id in ("G-001", "G-002"):
                 self.plan(plan_id, "PR_OPEN", branch=f"loop-manager/{plan_id}")
+                self.connection.execute('UPDATE exec_plans SET pr_url=? WHERE plan_id=?',
+                    (f'https://pr/{plan_id}', plan_id))
             self.connection.execute("UPDATE exec_plans SET workspace_owned = 0, worktree = ?", (directory,))
             self.connection.commit()
             merged = {"state": "MERGED", "url": "https://pr/1", "headRefOid": "a" * 40}
-            with mock.patch("loop_manager.pr_for_branch", return_value=merged) as read, mock.patch("loop_manager._recorded_base_fetch", return_value="a" * 40) as fetched, mock.patch(
+            def observe(_repo, branch, url):
+                return {**merged, 'url': url, 'headRefName': branch, 'baseRefName': 'main'}
+            with mock.patch("loop_manager.pr_for_branch", side_effect=observe) as read, mock.patch("loop_manager._recorded_base_fetch", return_value="a" * 40) as fetched, mock.patch(
                 "loop_manager.complete_merged_execplan_worktree", wraps=loop_manager.complete_merged_execplan_worktree
             ) as cleanup:
                 loop_manager.synchronize_waiting_pull_requests(self.connection, Path(self.repo), Path(directory), self.repo)
             self.assertEqual(read.call_count, 2)
-            cleanup.assert_called_once()
-            fetched.assert_called_once_with(
-                Path(self.repo), Path(directory), "main", owner="project",
-            )
-            self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+            self.assertEqual(cleanup.call_count, 2)
+            fetched.assert_not_called()
+            self.assertTrue(Path(directory).exists())
+            self.assertEqual(scoped_blocking.project_block(self.connection, self.repo)['plan_id'], 'G-001')
             statuses = dict(self.connection.execute("SELECT plan_id, status FROM exec_plans"))
-            self.assertEqual(statuses, {"G-001": "MERGED", "G-002": "PR_OPEN"})
+            self.assertEqual(statuses, {"G-001": "MERGED", "G-002": "MERGED"})
 
 
     def test_reason_mapping_and_atomic_plan_project_records(self):
@@ -1504,20 +1507,23 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         }
         with mock.patch("loop_manager.pr_for_branch", return_value=merged) as read_pr, mock.patch(
             "loop_manager.git"
-        ) as git, mock.patch(
-            "loop_manager.complete_merged_execplan_worktree"
-        ) as complete:
+        ) as git, mock.patch("loop_manager.remove_cleanup_worktree") as cleanup:
             loop_manager.synchronize_waiting_pull_requests(
                 self.connection, Path(self.repo), Path("/state"), self.repo
             )
         read_pr.assert_called_once()
         git.assert_not_called()
-        complete.assert_not_called()
+        cleanup.assert_not_called()
         status = self.connection.execute(
             "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
             (self.repo,),
         ).fetchone()[0]
-        self.assertEqual(status, "PR_OPEN")
+        self.assertEqual(status, "MERGED")
+        block=scoped_blocking.project_block(self.connection,self.repo)
+        self.assertEqual(block['plan_id'],'G-001')
+        self.assertEqual(block['reason_code'],BlockReasonCode.DEFAULT_WORKTREE_MUTATION.value)
+        self.assertFalse(ExecutionCheckpointRepository(self.connection).get(
+            self.repo,'G-001').snapshot['external_completion']['db_pending'])
 
 
     def test_selected_pr_can_escalate_without_occupying_active_status(self):
@@ -1593,6 +1599,152 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
                 self.assertEqual(self.connection.execute(
                     f'SELECT last_error FROM {table} WHERE repo = ?', (self.repo,)).fetchone()[0],
                     f'new-{table}')
+
+    def test_merged_owner_releases_resolved_scope_without_restarting_execution(self):
+        from loop_manager_internal.storage import task_calls
+        self.plan('G-001','MERGED',branch='loop-manager/G-001',pr_url='https://pr/1')
+        self.plan('G-002','READY')
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET worktree='/state/G-001',worker_result='saved',verify_result='saved verify',verify_token='receipt' WHERE plan_id='G-001'")
+            scoped_blocking.record_project_block(self.connection,self.repo,BlockReasonCode.SHARED_REF_MUTATION,
+                'old scope','same',plan_id='G-001',previous_phase=None)
+        before=dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        snapshot=loop_manager.GitSnapshot('a'*40,'loop-manager/G-001',{}, {}, {}, {}, {}, {})
+        task_calls.ensure_schema(self.connection)
+        self.connection.commit()
+        owner=task_calls.reserve(self.connection,Path('/state'),self.repo,'G-001','agent','run')
+        task_calls.mark_uncertain(owner)
+        with mock.patch('loop_manager.validate_execplan_workspace_identity'), \
+             mock.patch('loop_manager.validate_managed_worktree'), \
+             mock.patch('loop_manager.capture_git_snapshot',return_value=snapshot) as observe, \
+             mock.patch('loop_manager.validate_blocked_agent_scope',side_effect=loop_manager.AgentScopeError('still unsafe')) as validate, \
+             mock.patch('loop_manager.run_agent') as agent:
+            self.assertFalse(loop_manager.resume_project_block_if_safe(self.connection,Path(self.repo),Path('/state'),self.repo))
+            observe.assert_not_called()
+            task_calls.release(owner)
+            # A remaining safety violation keeps the cause even after Merge.
+            self.connection.execute("UPDATE exec_plans SET agent_snapshot=? WHERE plan_id='G-001'",(snapshot.serialize(),))
+            self.connection.commit()
+            self.assertFalse(loop_manager.resume_project_block_if_safe(self.connection,Path(self.repo),Path('/state'),self.repo))
+            self.assertIsNotNone(scoped_blocking.project_block(self.connection,self.repo))
+            validate.side_effect=None
+            self.assertTrue(loop_manager.resume_project_block_if_safe(self.connection,Path(self.repo),Path('/state'),self.repo))
+            agent.assert_not_called()
+        after=dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        for field in ('status','worker_result','verify_result','verify_token','branch','worktree'):
+            self.assertEqual(after[field],before[field])
+        self.assertIsNone(scoped_blocking.project_block(self.connection,self.repo))
+        self.assertEqual(loop_manager.catalog_schedule_decision(self.connection,self.repo).runnable_ready['plan_id'],'G-002')
+
+    def test_merged_manual_group_releases_project_block_only_after_all_writers_stop(self):
+        from loop_manager_internal.storage import task_calls, agent_invocation_state
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        for key in ('G-001','G-002'):
+            self.plan(key,'MERGED',branch='shared',pr_url='https://pr/1')
+        self.plan('G-003','READY')
+        self.plan('G-004','READY')
+        store=ManualWorkRepository(self.connection)
+        group=store.create(self.repo,'submit','source',(),'a'*40,'b'*40,members=('G-001','G-002'))
+        store.update(group,state='MERGED',owner_id='G-001',active_id='G-002',branch='shared',worktree='/shared')
+        task_calls.ensure_schema(self.connection)
+        agent_invocation_state.ensure_schema(self.connection)
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET worktree='/shared',pr_head_oid=?,worker_result='saved',verify_token='receipt' WHERE plan_id IN ('G-001','G-002')",('a'*40,))
+            scoped_blocking.record_plan_block(self.connection,self.repo,'G-004',
+                BlockReasonCode.USER_DECISION_REQUIRED,'separate question','question')
+            scoped_blocking.record_project_block(self.connection,self.repo,
+                BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,'old cause','same',plan_id='G-002',previous_phase=None)
+        before=[dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')]
+        checkpoints=ExecutionCheckpointRepository(self.connection)
+        saved={key:checkpoints.get(self.repo,key) for key in ('G-001','G-002')}
+        self.connection.commit()
+        owner=task_calls.reserve(self.connection,Path('/state'),self.repo,'G-001','agent','run')
+        task_calls.mark_uncertain(owner)
+        snapshot=loop_manager.GitSnapshot('a'*40,'shared',{},{},{},{},{},{})
+        def resume():
+            return loop_manager.resume_project_block_if_safe(self.connection,Path(self.repo),Path('/state'),self.repo)
+        with mock.patch('loop_manager.validate_execplan_workspace_identity'), \
+             mock.patch('loop_manager.validate_managed_worktree'), \
+             mock.patch('loop_manager.capture_git_snapshot',return_value=snapshot) as observe, \
+             mock.patch('loop_manager.run_agent') as agent, \
+             mock.patch('loop_manager._resume_owned_checkpoint_project_block') as execution:
+            self.assertFalse(resume())
+            observe.assert_not_called()
+            task_calls.release(owner)
+            with self.connection:
+                self.connection.execute("""INSERT INTO agent_invocations
+                    (invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,
+                     started_at,execution_status,execution_started_at,finished_at)
+                    VALUES ('sibling-writer',?,'G-001','worker','codex','model','high','start',1,
+                            'start','executed','started','collected')""",(self.repo,))
+            self.assertFalse(resume())
+            observe.assert_not_called()
+            with self.connection:
+                self.connection.execute("UPDATE agent_invocations SET execution_finished_at='stopped',execution_finish_evidence='process_finished'")
+            for update,restore in (
+                    ("UPDATE exec_plans SET pr_head_oid='foreign' WHERE plan_id='G-001'",
+                     "UPDATE exec_plans SET pr_head_oid='"+'a'*40+"' WHERE plan_id='G-001'"),
+                    ("UPDATE exec_plans SET status='PR_OPEN' WHERE plan_id='G-001'",
+                     "UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-001'"),
+                    ("UPDATE manual_work_groups SET members='[\"G-002\"]'",
+                     "UPDATE manual_work_groups SET members='[\"G-001\", \"G-002\"]'")):
+                with self.subTest(update=update):
+                    with self.connection:
+                        self.connection.execute(update)
+                    self.assertFalse(resume())
+                    self.assertIsNotNone(scoped_blocking.project_block(self.connection,self.repo))
+                    with self.connection:
+                        self.connection.execute(restore)
+            self.plan('G-005','MERGED',branch='shared',pr_url='https://other/pr')
+            self.assertFalse(resume())
+            with self.connection:
+                self.connection.execute("DELETE FROM exec_plans WHERE plan_id='G-005'")
+            def race(*args):
+                with self.connection:
+                    self.connection.execute("UPDATE manual_work_groups SET active_id='G-001'")
+                return snapshot
+            observe.side_effect=race
+            self.assertFalse(resume())
+            self.assertIsNotNone(scoped_blocking.project_block(self.connection,self.repo))
+            observe.side_effect=None
+            self.assertTrue(resume())
+            agent.assert_not_called()
+            execution.assert_not_called()
+        self.assertIsNone(scoped_blocking.project_block(self.connection,self.repo))
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')],before)
+        for key in saved:
+            self.assertEqual(checkpoints.get(self.repo,key),saved[key])
+        self.assertIsNotNone(scoped_blocking.plan_block(self.connection,self.repo,'G-004'))
+        self.assertEqual(loop_manager.catalog_schedule_decision(self.connection,self.repo).runnable_ready['plan_id'],'G-003')
+
+    def test_completion_hold_covers_rotated_manual_group_and_dependency_closure(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        self.plan('G-001','MANUAL_PENDING',branch='shared',pr_url='https://pr/1')
+        self.plan('G-002','IMPLEMENTING',branch='shared',pr_url='https://pr/1')
+        self.plan('G-003','READY',dependencies=('G-002',))
+        self.plan('G-004','READY')
+        store=ManualWorkRepository(self.connection)
+        group=store.create(self.repo,'submit','source',(),'a'*40,'b'*40,members=('G-001','G-002'))
+        store.update(group,state='AUTOMATIC',owner_id='G-001',active_id='G-002',request_id='request',branch='shared',worktree='/shared')
+        self.connection.commit()
+        with mock.patch('loop_manager.pr_for_branch',side_effect=RuntimeError('lookup unavailable')) as lookup:
+            loop_manager.observe_waiting_pull_requests(self.connection,Path(self.repo),Path('/state'),self.repo)
+        lookup.assert_called_once()
+        self.assertEqual(scoped_blocking.catalog_held_plan_ids(self.connection,self.repo),{'G-001','G-002','G-003'})
+        from types import SimpleNamespace
+        from loop_manager_internal.application.task_scheduling import Task, TaskScheduler
+        scheduler=SimpleNamespace(priority_reader=None)
+        def eligible(key):
+            return TaskScheduler._eligible(scheduler,Task(self.repo,key,self.connection),
+                                          self.connection,check_management=False)
+        self.assertFalse(eligible('G-002'))
+        self.assertFalse(eligible('G-003'))
+        self.assertTrue(eligible('G-004'))
+        with mock.patch('loop_manager.pr_for_branch',return_value={
+                'state':'OPEN','url':'https://pr/1','headRefName':'shared','baseRefName':'main','headRefOid':'a'*40}):
+            loop_manager.observe_waiting_pull_requests(self.connection,Path(self.repo),Path('/state'),self.repo)
+        self.assertFalse(scoped_blocking.catalog_held_plan_ids(self.connection,self.repo))
+        self.assertTrue(eligible('G-002'))
 
     def test_project_release_restores_phase_and_preserves_plan_block(self):
         snapshot = loop_manager.GitSnapshot(

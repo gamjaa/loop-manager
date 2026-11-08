@@ -333,8 +333,20 @@ def recheck_cleanup_pending(
     pending = connection.execute(
         "SELECT * FROM cleanup_pending WHERE repo = ? ORDER BY worktree", (repo,)
     ).fetchall()
+    from loop_manager_internal.storage import task_calls
+    def pending_writer(worktree):
+        if not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='exec_plans'").fetchone():
+            return False
+        return any(task_calls.pending_for_plan(connection, repo, row[0])
+                   for row in connection.execute(
+                       'SELECT plan_id FROM exec_plans WHERE repo=? AND worktree=?',
+                       (repo, str(worktree))).fetchall())
+
     for item in pending:
         worktree = Path(item["worktree"])
+        if pending_writer(worktree):
+            continue
         if int(item["workspace_owned"]) != WORKSPACE_OWNED:
             if not worktree.exists() and not worktree.is_symlink():
                 connection.execute(
@@ -359,6 +371,8 @@ def recheck_cleanup_pending(
             assessment = effects.assess_cleanup(worktree, item["pr_head_oid"])
             registration = (effects.capture_git_snapshot(repo_path).worktrees.get(str(effects._canonical_path(worktree)))
                             if assessment.status == 'safe' else None)
+            if pending_writer(worktree):
+                continue
             assessment = effects.remove_cleanup_worktree(
                 repo_path, worktree, assessment, state_dir=state_dir,
                 owner=f"plan:{worktree.name}",

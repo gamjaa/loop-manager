@@ -51,7 +51,8 @@ def project_slot_available(connection, repo, plan_id):
     block = scoped_blocking.project_block(connection, repo)
     runtime = runtime_state.RuntimeStateRepository(connection)
     projected = runtime.projected_row(repo)
-    return bool(block is not None and block['plan_id'] == plan_id
+    plan = connection.execute('SELECT status FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id)).fetchone()
+    return bool(plan is not None and plan['status'] != 'MERGED' and block is not None and block['plan_id'] == plan_id
                 and slot_available(connection, repo, plan_id, project_recovery=True)
                 and (projected is None or projected['plan_id'] == plan_id))
 

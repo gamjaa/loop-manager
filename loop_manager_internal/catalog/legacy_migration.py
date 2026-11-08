@@ -160,11 +160,17 @@ class _LegacyCatalogMergeProof:
             if proof.merged:
                 return proof
 
+        branch = (identity.branch if identity else None) or f"loop-manager/{entry.plan_id}"
         pull_request = self._effects.pr_for_branch(
-            self.root, f"loop-manager/{entry.plan_id}"
+            self.root, branch, *([identity.pr_url] if identity and identity.pr_url else []),
         )
         if pull_request is None:
             return self._stored_git_proof(entry)
+        if (identity is not None and (
+                identity.pr_url and pull_request.get('url') != identity.pr_url
+                or identity.branch and pull_request.get('headRefName') != branch
+                or identity.base and pull_request.get('baseRefName') != identity.base)):
+            return execplan_catalog_state.MergeProof(False, detail='PR repository/head/base identity mismatch')
         merged = bool(
             pull_request["state"] == "MERGED" or pull_request.get("mergedAt")
         )

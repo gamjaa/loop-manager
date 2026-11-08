@@ -19,6 +19,41 @@ from loop_manager_internal.git.managed_rebase_validation import Remote
 
 
 class ProjectRecoveryGateTests(ProjectRemoteRecoveryFixture, unittest.TestCase):
+    def test_merged_owner_preserves_project_block_without_catalog_or_git_recovery(self):
+        before = dict(scoped_blocking.project_block(self.connection, self.repo))
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-106'")
+        self.connection.commit()
+        self.assertFalse(self.recovery.project_slot_available(self.connection, self.repo, 'G-106'))
+        self.assertFalse(self.coordinator.refresh_catalog('G-106'))
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'deferred')
+        plan = dict(self.plan())
+        other = dict(self.plan('G-107'))
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(self.repo,'G-106')
+        snapshot = loop_manager.GitSnapshot(self.head,plan['branch'],{},{},{},{},{},{})
+        with mock.patch('loop_manager.capture_git_snapshot',return_value=snapshot), \
+             mock.patch('loop_manager.validate_execplan_workspace_identity',
+                        side_effect=loop_manager.WorkspaceOwnershipError('ownership unresolved')) as identity, \
+             mock.patch('loop_manager.validate_managed_worktree'), \
+             mock.patch('loop_manager._resume_owned_checkpoint_project_block') as execution_recovery, \
+             mock.patch('loop_manager._reconcile_rebase_evidence_block') as rebase_recovery, \
+             mock.patch('loop_manager.run_agent') as agent:
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                self.connection,Path('/repo'),Path('/state'),self.repo))
+            self.assertEqual(dict(scoped_blocking.project_block(self.connection,self.repo)),before)
+            identity.side_effect=None
+            self.assertTrue(loop_manager.resume_project_block_if_safe(
+                self.connection,Path('/repo'),Path('/state'),self.repo))
+            self.assertIsNone(scoped_blocking.project_block(self.connection,self.repo))
+            execution_recovery.assert_not_called()
+            rebase_recovery.assert_not_called()
+            agent.assert_not_called()
+        self.assertEqual(dict(self.plan()),plan)
+        self.assertEqual(dict(self.plan('G-107')),other)
+        self.assertEqual(execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection).get(self.repo,'G-106'),checkpoint)
+        self.ports._recorded_base_fetch.assert_not_called()
+        self.ports.reconcile_execplan_catalog.assert_not_called()
+
     def test_cycle_project_owner_can_recover_without_waiting_for_cycle_completion(self):
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenancePhase
         cycle = MaintenanceRepository(self.connection).get(self.repo)
@@ -152,7 +187,7 @@ class ProjectCauseRevalidationTests(ProjectRemoteRecoveryFixture, unittest.TestC
                 registered_only=True), 1)
         observe.assert_called_once()
         pr.assert_called_once()
-        self.assertTrue(pr.call_args.kwargs['read_only'])
+        self.assertTrue(pr.call_args.kwargs['completion_only'])
         recovery.return_value.refresh_catalog.assert_called_once_with('G-106')
         recovery.return_value.reconcile.assert_called_once_with('G-106')
         fetch.assert_not_called()

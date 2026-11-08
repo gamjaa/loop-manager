@@ -106,7 +106,8 @@ class ManualWorkCase(ManualWorkFixture, unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch('loop_manager.validate_repository',return_value=service.repo_path))
             stack.enter_context(mock.patch('loop_manager.ensure_safe_base_worktree'))
-            stack.enter_context(mock.patch('loop_manager.pr_for_branch',return_value=pr))
+            stack.enter_context(mock.patch('loop_manager.pr_for_branch',
+                side_effect=pr if callable(pr) else None,return_value=pr))
             stack.enter_context(mock.patch('loop_manager.immutable_github_blob_url',return_value='https://example/blob'))
             stack.enter_context(mock.patch('loop_manager.command',side_effect=command))
             stack.enter_context(mock.patch('loop_manager._agent_profile',
