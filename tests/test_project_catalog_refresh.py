@@ -952,6 +952,44 @@ class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
         self.assertEqual(self.row()['status'], 'MERGED')
         remove.assert_not_called()
 
+    def test_cleanup_retry_preserves_pending_writer_until_confirmed_release(self):
+        from loop_manager_internal.storage import task_calls, agent_invocation_state
+        task_calls.ensure_schema(self.connection)
+        agent_invocation_state.ensure_schema(self.connection)
+        before = dict(self.row())
+        self.connection.execute("INSERT INTO task_call_reservations(token,repo,plan_id,kind,uncertain) VALUES ('writer',?,'G-001','agent',1)", (self.repo,))
+        self.connection.commit()
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state':'MERGED','url':before['pr_url'],'headRefName':before['branch'],
+                'baseRefName':'main','headRefOid':'d'*40}), \
+             mock.patch.object(manager, '_recorded_base_fetch'), \
+             mock.patch.object(manager, '_recover_managed_worktree_removal') as recover, \
+             mock.patch.object(manager, 'validate_pending_cleanup_worktree'), \
+             mock.patch.object(manager, 'assess_cleanup', return_value=manager.CleanupAssessment('safe')) as assess, \
+             mock.patch.object(manager, 'capture_git_snapshot', return_value=SimpleNamespace(worktrees={})), \
+             mock.patch.object(manager, 'remove_cleanup_worktree', return_value=manager.CleanupAssessment('safe')) as remove:
+            manager.observe_waiting_pull_requests(self.connection,Path(self.repo),Path('/state'),self.repo)
+            for _ in range(2):
+                self.assertTrue(manager.recheck_cleanup_pending(self.connection,Path(self.repo),self.repo,Path('/state')))
+            remove.assert_not_called()
+            recover.assert_not_called()
+            assess.assert_not_called()
+            with self.connection:
+                self.connection.execute("DELETE FROM task_call_reservations WHERE token='writer'")
+                self.connection.execute("""INSERT INTO agent_invocations
+                    (invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,
+                     started_at,execution_status,execution_started_at,finished_at)
+                    VALUES ('writer',?,'G-001','worker','codex','model','high','start',1,
+                            'start','executed','started','collected')""",(self.repo,))
+            self.assertTrue(manager.recheck_cleanup_pending(self.connection,Path(self.repo),self.repo,Path('/state')))
+            remove.assert_not_called()
+            with self.connection:
+                self.connection.execute("UPDATE agent_invocations SET execution_finished_at='stopped',execution_finish_evidence='process_finished'")
+            self.assertFalse(manager.recheck_cleanup_pending(self.connection,Path(self.repo),self.repo,Path('/state')))
+            remove.assert_called_once()
+        self.assertEqual(self.row()['status'],'MERGED')
+        self.assertEqual(self.row()['worker_session_id'],before['worker_session_id'])
+
     def test_restart_after_committed_pr_result_keeps_merge_and_session(self):
         self.boundary.refresh()
         self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-001'")

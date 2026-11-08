@@ -1600,6 +1600,71 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
                     f'SELECT last_error FROM {table} WHERE repo = ?', (self.repo,)).fetchone()[0],
                     f'new-{table}')
 
+    def test_merged_owner_releases_resolved_scope_without_restarting_execution(self):
+        from loop_manager_internal.storage import task_calls
+        self.plan('G-001','MERGED',branch='loop-manager/G-001',pr_url='https://pr/1')
+        self.plan('G-002','READY')
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET worktree='/state/G-001',worker_result='saved',verify_result='saved verify',verify_token='receipt' WHERE plan_id='G-001'")
+            scoped_blocking.record_project_block(self.connection,self.repo,BlockReasonCode.SHARED_REF_MUTATION,
+                'old scope','same',plan_id='G-001',previous_phase=None)
+        before=dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        snapshot=loop_manager.GitSnapshot('a'*40,'loop-manager/G-001',{}, {}, {}, {}, {}, {})
+        task_calls.ensure_schema(self.connection)
+        self.connection.commit()
+        owner=task_calls.reserve(self.connection,Path('/state'),self.repo,'G-001','agent','run')
+        task_calls.mark_uncertain(owner)
+        with mock.patch('loop_manager.validate_execplan_workspace_identity'), \
+             mock.patch('loop_manager.validate_managed_worktree'), \
+             mock.patch('loop_manager.capture_git_snapshot',return_value=snapshot) as observe, \
+             mock.patch('loop_manager.validate_blocked_agent_scope',side_effect=loop_manager.AgentScopeError('still unsafe')) as validate, \
+             mock.patch('loop_manager.run_agent') as agent:
+            self.assertFalse(loop_manager.resume_project_block_if_safe(self.connection,Path(self.repo),Path('/state'),self.repo))
+            observe.assert_not_called()
+            task_calls.release(owner)
+            # A remaining safety violation keeps the cause even after Merge.
+            self.connection.execute("UPDATE exec_plans SET agent_snapshot=? WHERE plan_id='G-001'",(snapshot.serialize(),))
+            self.connection.commit()
+            self.assertFalse(loop_manager.resume_project_block_if_safe(self.connection,Path(self.repo),Path('/state'),self.repo))
+            self.assertIsNotNone(scoped_blocking.project_block(self.connection,self.repo))
+            validate.side_effect=None
+            self.assertTrue(loop_manager.resume_project_block_if_safe(self.connection,Path(self.repo),Path('/state'),self.repo))
+            agent.assert_not_called()
+        after=dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        for field in ('status','worker_result','verify_result','verify_token','branch','worktree'):
+            self.assertEqual(after[field],before[field])
+        self.assertIsNone(scoped_blocking.project_block(self.connection,self.repo))
+        self.assertEqual(loop_manager.catalog_schedule_decision(self.connection,self.repo).runnable_ready['plan_id'],'G-002')
+
+    def test_completion_hold_covers_rotated_manual_group_and_dependency_closure(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        self.plan('G-001','MANUAL_PENDING',branch='shared',pr_url='https://pr/1')
+        self.plan('G-002','IMPLEMENTING',branch='shared',pr_url='https://pr/1')
+        self.plan('G-003','READY',dependencies=('G-002',))
+        self.plan('G-004','READY')
+        store=ManualWorkRepository(self.connection)
+        group=store.create(self.repo,'submit','source',(),'a'*40,'b'*40,members=('G-001','G-002'))
+        store.update(group,state='AUTOMATIC',owner_id='G-001',active_id='G-002',request_id='request',branch='shared',worktree='/shared')
+        self.connection.commit()
+        with mock.patch('loop_manager.pr_for_branch',side_effect=RuntimeError('lookup unavailable')) as lookup:
+            loop_manager.observe_waiting_pull_requests(self.connection,Path(self.repo),Path('/state'),self.repo)
+        lookup.assert_called_once()
+        self.assertEqual(scoped_blocking.catalog_held_plan_ids(self.connection,self.repo),{'G-001','G-002','G-003'})
+        from types import SimpleNamespace
+        from loop_manager_internal.application.task_scheduling import Task, TaskScheduler
+        scheduler=SimpleNamespace(priority_reader=None)
+        def eligible(key):
+            return TaskScheduler._eligible(scheduler,Task(self.repo,key,self.connection),
+                                          self.connection,check_management=False)
+        self.assertFalse(eligible('G-002'))
+        self.assertFalse(eligible('G-003'))
+        self.assertTrue(eligible('G-004'))
+        with mock.patch('loop_manager.pr_for_branch',return_value={
+                'state':'OPEN','url':'https://pr/1','headRefName':'shared','baseRefName':'main','headRefOid':'a'*40}):
+            loop_manager.observe_waiting_pull_requests(self.connection,Path(self.repo),Path('/state'),self.repo)
+        self.assertFalse(scoped_blocking.catalog_held_plan_ids(self.connection,self.repo))
+        self.assertTrue(eligible('G-002'))
+
     def test_project_release_restores_phase_and_preserves_plan_block(self):
         snapshot = loop_manager.GitSnapshot(
             head="a" * 40,

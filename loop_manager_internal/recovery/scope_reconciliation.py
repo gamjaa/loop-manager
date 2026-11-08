@@ -113,7 +113,14 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
     plan = (connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                                (repo, block['plan_id'])).fetchone() if block is not None and block['plan_id'] else None)
     if plan is not None and plan['status'] == 'MERGED':
-        return False  # Completion never authorizes a new workspace recovery.
+        if workspace_plan_id is not None:
+            return False
+        try:
+            with reserved_workspace_ownership(connection, state_dir, repo, plan['plan_id']) as owner:
+                return _resume_project_block_if_safe(effects, connection, repo_path, state_dir, repo,
+                                                    reservation_owner=owner)
+        except (CallDeferred, ProcessLockBusyError, runtime_state.RuntimeStateError):
+            return False
     if (plan is not None and int(plan['workspace_owned']) == WORKSPACE_OWNED
             and block['reason_code'] in {BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value,
                                          BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL.value}):
@@ -292,6 +299,9 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
     block = workspace_block if workspace_block is not None else scoped_blocking.project_block(connection, repo)
     if block is None:
         return False
+    terminal = bool(block['plan_id'] and connection.execute(
+        "SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=? AND status='MERGED'",
+        (repo, block['plan_id'])).fetchone())
     original_block = block
     expected_plan_block = scoped_blocking.plan_block(connection, repo, block['plan_id'])
     ownership_cause = (workspace_block is not None
@@ -368,7 +378,7 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                 plan_values=values, enqueue=False)
         _cancel_workspace_checkpoint(connection, repo, block['plan_id'], original_block)
 
-    if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value and block['plan_id']:
+    if not terminal and block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value and block['plan_id']:
         project = runtime_state.project_row(connection, repo)
         plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                                   (repo, block['plan_id'])).fetchone()
@@ -388,13 +398,13 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
     workspace_recovery = bool(reservation_owner is not None
         and block['reason_code'] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value)
     recovery = recovery_state.RecoveryRepository(connection).row(repo, str(block['plan_id'] or ''))
-    if not workspace_recovery and (rebase_block_reconciliation.could_be_rebase_evidence_block(block, recovery, checkpoint)
+    if not terminal and not workspace_recovery and (rebase_block_reconciliation.could_be_rebase_evidence_block(block, recovery, checkpoint)
             or scoped_blocking.is_scope_baseline_block(block) and checkpoint.operation == 'rebase'):
         return effects._reconcile_rebase_evidence_block(
             connection, repo_path, state_dir, repo, block, plan_block=False,
             **({'recovery_request_id': recovery_request_id} if recovery_request_id else {}),
         )
-    if (not workspace_recovery and block['plan_id'] and block['reason_code'] in rebase_block_reconciliation.REBASE_BLOCK_REASONS
+    if (not terminal and not workspace_recovery and block['plan_id'] and block['reason_code'] in rebase_block_reconciliation.REBASE_BLOCK_REASONS
             and checkpoint.operation == 'rebase'):
         # A pending rebase cannot borrow the generic branch-only release path
         # when its stored safety cause cannot be connected to this operation.
@@ -485,7 +495,7 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
         == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value
     ):
         return False
-    if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value:
+    if not terminal and block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value:
         return effects._resume_owned_checkpoint_project_block(
             connection, repo_path, state_dir, repo, block, project, plan,
         )
@@ -515,15 +525,18 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
                 effects._clear_active_in_current_transaction(connection, repo)
         return True
     if (not scoped_blocking.is_scope_baseline_block(block)
-            and block['reason_code'] != BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value):
+            and block['reason_code'] != BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value
+            and not (terminal and block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value)):
         return False
     def rebase_source(snapshot):
-        if checkpoint.operation != 'rebase':
+        if terminal or checkpoint.operation != 'rebase':
             return None
         return workspace.reserved_rebase_before_head(effects._current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch,
             allow_reserved=True), checkpoint, snapshot)
 
+    if terminal and int(plan['workspace_owned']) != WORKSPACE_OWNED:
+        return False
     reserved_recovered = False
     terminal_pr = None
     if (
@@ -629,7 +642,7 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
             effects.validate_blocked_agent_scope(
                 connection, repo_path, repo, str(project['base_branch']),
                 worktree, str(plan['path']), saved_plan=plan,
-                require_safe_result=scoped_blocking.is_scope_baseline_block(block))
+                require_safe_result=terminal or scoped_blocking.is_scope_baseline_block(block))
         if not agent_scope_decision._same_local_snapshot(effects.capture_git_snapshot(worktree), checked):
             return False
     except RecoveryFailure:
@@ -714,7 +727,7 @@ def _resume_project_block_if_safe(effects, connection, repo_path, state_dir, rep
             if checked.dirty and plan['status'] in {'REVIEWING', 'PUBLISHING'}:
                 matches = False
             values = {'agent_recovery': None}
-            if not matches:
+            if not matches and not terminal:
                 values.update(managed_rebase_adoption.revalidation_values(plan['active_sha']))
                 values.pop('phase')
                 if str(plan['status']) in ACTIVE_EXECPLAN_STATUSES:

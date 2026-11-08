@@ -168,10 +168,16 @@ def catalog_held_plan_ids(connection: sqlite3.Connection, repo: str) -> frozense
     dependencies = [(str(row[0]), json.loads(row[1])) for row in connection.execute(
         "SELECT plan_id,depends_on FROM exec_plans WHERE repo=? AND status<>'MERGED'", (repo,),
     )] if pending else ()
+    groups = [frozenset(row[0] for row in connection.execute(
+        'SELECT plan_id FROM manual_work_members WHERE repo=? AND group_id=?', (repo, group[0])))
+        for group in connection.execute('SELECT group_id FROM manual_work_groups WHERE repo=?', (repo,)).fetchall()
+    ] if pending and connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_members'").fetchone() else ()
     # ponytail: repeated scans are quadratic in dependency depth; use a reverse
     # adjacency queue if large pending catalog graphs make this boundary costly.
     while True:
-        dependent = {key for key, requires in dependencies if pending.intersection(requires)} - pending
+        dependent = ({key for key, requires in dependencies if pending.intersection(requires)}
+                     | {key for members in groups if pending.intersection(members) for key in members}) - pending
         if not dependent:
             break
         pending.update(dependent)
