@@ -95,7 +95,7 @@ def _confirmed_original_publication(checkpoint, plan):
     Publication advances both generation and remote OID beyond the original
     rebase acceptance. Its result must still match this selected plan and HEAD.
     """
-    intent = checkpoint.rebase_publication_intent()
+    intent = checkpoint.confirmed_rebase_publication_intent()
     result = (checkpoint.snapshot or {}).get('rebase_publication_result')
     if intent is None or not isinstance(result, dict):
         return None

@@ -42,16 +42,13 @@ class OwnershipHandler:
     ):
         """검증한 현재 작업 입력과 과거 게시 영수증을 분리한다."""
         saved = (current.snapshot or {}) if current else {}
-        intent = saved.get('rebase_publication_intent') or {}
         result = saved.get('rebase_publication_result') or {}
-        if intent.get('id') != result.get('intent_id'):
-            intent = next((entry['intent'] for entry in saved.get('retired_rebase_publications', ())
-                           if entry.get('intent') and entry['intent'].get('id') == result.get('intent_id')), {})
         from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
         published = result.get('current_acceptance')
         if (remote_oid and remote_oid == row['publication_remote_oid']
                 and result.get('head') == remote_oid):
-            if not (result.get('intent_id') == intent.get('id')
+            intent = current.confirmed_rebase_publication_intent()
+            if not (intent and result.get('intent_id') == intent['id']
                     and valid_acceptance(published)
                     and all(published[key] == value for key, value in {
                     'repo': self.ports.identity.repo, 'plan_id': context.plan.plan_id,

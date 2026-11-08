@@ -419,6 +419,45 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
                     self.checkpoints.begin_rebase_publication('repo', 'G-047', **arguments)
                 self.assertEqual(self.checkpoints.get('repo', 'G-047'), self.accepted)
 
+    def test_confirmed_publication_resolves_exact_history_without_accepting_forged_or_unconfirmed_entries(self):
+        from copy import deepcopy
+        from dataclasses import replace
+        pending = self.begin()
+        intent = pending.snapshot['rebase_publication_intent']
+        acceptance = self.after_push()
+        self.state.complete_rebase_publication(self.checkpoints, intent=intent,
+            acceptance=acceptance, reobserve=lambda: ('after', acceptance))
+        completed = self.checkpoints.get('repo', 'G-047')
+        result = completed.snapshot['rebase_publication_result']
+        self.assertEqual(completed.confirmed_rebase_publication_intent(), intent)
+        for field in ('rebase_publication_history', 'retired_rebase_publications'):
+            with self.subTest(field=field):
+                saved = {**completed.snapshot, 'rebase_publication_intent': None,
+                         field: [{'intent': intent, 'result': result}]}
+                later = replace(completed, operation='rebase', expected_head='next',
+                                target_base_oid='next-base', snapshot=saved)
+                original = deepcopy(saved)
+                self.assertEqual(later.confirmed_rebase_publication_intent(), intent)
+                self.assertEqual(saved, original)
+        base = {**completed.snapshot, 'rebase_publication_intent': None,
+                'rebase_publication_history': [{'intent': intent, 'result': result}]}
+        for mutation in ('intent', 'result', 'pair', 'missing', 'conflict', 'malformed'):
+            with self.subTest(mutation=mutation):
+                saved = deepcopy(base)
+                if mutation == 'intent':
+                    saved['rebase_publication_history'][0]['intent']['remote_before'] = 'foreign'
+                elif mutation == 'result':
+                    saved['rebase_publication_result']['current_acceptance']['head'] = 'foreign'
+                elif mutation == 'pair':
+                    saved['rebase_publication_history'][0]['result'] = None
+                elif mutation == 'missing':
+                    saved['rebase_publication_result'] = None
+                elif mutation == 'conflict':
+                    saved['retired_rebase_publications'] = [{'intent': {**intent, 'head': 'foreign'}}]
+                else:
+                    saved['retired_rebase_publications'] = [None]
+                self.assertIsNone(replace(completed, snapshot=saved).confirmed_rebase_publication_intent())
+
     def test_completion_is_idempotent_preserves_phase_failure_and_validation(self):
         pending = self.begin()
         intent = pending.snapshot['rebase_publication_intent']

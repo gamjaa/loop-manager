@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import hashlib
 import re
@@ -433,6 +433,44 @@ class CheckpointRecord:
                 or self.observed_remote_oid != result['remote'].get('oid')):
             return None
         return result
+
+    def confirmed_rebase_publication_intent(self):
+        """Resolve the last success across active, completed and retired intents."""
+        saved = self.snapshot or {}
+        result = saved.get('rebase_publication_result') or {}
+        if not isinstance(result, dict) or not valid_acceptance(result.get('current_acceptance')):
+            return None
+        accepted = result['current_acceptance']
+        candidates = [saved.get('rebase_publication_intent')]
+        for field in ('rebase_publication_history', 'retired_rebase_publications'):
+            history = saved.get(field, ())
+            if not isinstance(history, (list, tuple)) or any(not isinstance(entry, dict) for entry in history):
+                return None
+            for entry in history:
+                intent = entry.get('intent')
+                if isinstance(intent, dict) and intent.get('id') == result.get('intent_id'):
+                    if field == 'rebase_publication_history' and entry.get('result') != result:
+                        return None
+                    candidates.append(intent)
+        matches = [intent for intent in candidates
+                   if isinstance(intent, dict) and intent.get('id') == result.get('intent_id')]
+        if not matches or any(intent != matches[0] for intent in matches):
+            return None
+        intent = matches[0]
+        previous = replace(self, operation=None, expected_head=accepted['head'],
+                           target_base_oid=accepted['target_base_oid'],
+                           snapshot={'rebase_publication_intent': intent})
+        if (previous.rebase_publication_intent() != intent
+                or self.generation <= accepted['generation']
+                or result.get('head') != accepted['head'] or accepted['remote']['oid'] != accepted['head']
+                or any(accepted[key] != intent[key] for key in (
+                    'repo', 'plan_id', 'repository_identity', 'branch', 'worktree', 'target_base_oid', 'head'))
+                or any(accepted['remote'][key] != intent['acceptance']['remote'][key]
+                       for key in ('repository', 'branch'))
+                or (accepted['remote']['pull_request'] or {}).get('identity')
+                   != (intent['acceptance']['remote']['pull_request'] or {}).get('identity')):
+            return None
+        return intent
 
     def rebase_publication_intent(self):
         """Return only the immutable intent bound to this selected checkpoint."""

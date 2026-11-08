@@ -41,20 +41,12 @@ def owns_published_rebase_start(checkpoint, expected, observed):
     """Prove the previous publication without accepting the new rebase result."""
     saved = checkpoint.snapshot or {}
     result = saved.get('rebase_publication_result') or {}
-    intent = saved.get('rebase_publication_intent') or {}
-    if intent.get('id') != result.get('intent_id'):
-        intent = next((entry['intent'] for entry in saved.get('retired_rebase_publications', ())
-                       if entry.get('intent') and entry['intent'].get('id') == result.get('intent_id')), {})
+    intent = checkpoint.confirmed_rebase_publication_intent()
     accepted = result.get('current_acceptance')
     if not valid_acceptance(accepted) or not intent:
         return False
-    # Read the old immutable intent against its own target, not the next target.
-    previous = replace(checkpoint, expected_head=accepted['head'],
-                       target_base_oid=accepted['target_base_oid'],
-                       snapshot={'rebase_publication_intent': intent})
     return bool(
         checkpoint.operation == 'rebase'
-        and previous.rebase_publication_intent() == intent
         and checkpoint.generation > accepted['generation']
         and result.get('intent_id') == intent['id']
         and result.get('head') == intent['head'] == observed.head == observed.remote.oid

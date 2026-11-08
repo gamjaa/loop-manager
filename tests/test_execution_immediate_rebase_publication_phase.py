@@ -106,6 +106,57 @@ class ImmediateRebasePublicationTests(TestCase):
         self.assertEqual(saved.snapshot['rebase_publication_result'], current.snapshot['rebase_publication_result'])
         self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
 
+    def test_second_publication_keeps_previous_success_owned_after_intent_storage(self):
+        class Interrupted(BaseException):
+            pass
+        for with_pr, interruption in ((pr, point) for pr in (False, True)
+                                      for point in (None, 'intent', 'pushed')):
+            with self.subTest(with_pr=with_pr, interruption=interruption):
+                self._reset_publication_case()
+                if with_pr:
+                    self._existing_pr()
+                self.start_next_rebase()
+                self.seed.observed = replace(self.seed.observed,
+                    head='second-head', base_is_ancestor=True, branch_ref=('second-head', ''),
+                    registration=('HEAD=second-head', 'branch=refs/heads/loop-manager/G-047'))
+                observed_git = self.fixture.observed_git
+                self.fixture.observed_git = lambda root, *args, **options: (
+                    SimpleNamespace(stdout=self.seed.observed.head, returncode=0)
+                    if args == ('rev-parse', 'HEAD') else observed_git(root, *args, **options))
+                if interruption is None:
+                    self.complete()
+                else:
+                    def stop(*args, **kwargs):
+                        if interruption == 'intent':
+                            begin(*args, **kwargs)
+                        raise Interrupted()
+                    begin = self.checkpoints.begin_rebase_publication
+                    owner, method = ((self.checkpoints, 'begin_rebase_publication')
+                                     if interruption == 'intent' else (self.state, 'complete_rebase_publication'))
+                    with mock.patch.object(owner, method, side_effect=stop):
+                        with self.assertRaises(Interrupted):
+                            self.complete()
+                    pending = self.checkpoints.get('repo', 'G-047')
+                    self.assertEqual(pending.operation, 'rebase_publish')
+                    self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+                    self.restart()
+                    self.handler._publish_rebased_checkpoint(self.handler._context())
+                    self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
+                                     pending.snapshot['rebase_publication_intent'])
+                saved = self.checkpoints.get('repo', 'G-047')
+                self.assertIsNone(saved.operation)
+                self.assertEqual(saved.snapshot['rebase_publication_result']['head'], 'second-head')
+                self.assertEqual(saved.snapshot['rebase_publication_history'][-1]['result']['head'], 'owned-head')
+                self.assertEqual(self.state.row()['publication_remote_oid'], 'second-head')
+                self.assertEqual(len(self.pushes), 2)
+                self.assertEqual(self.pushes[-1][1], '--force-with-lease=refs/heads/loop-manager/G-047:owned-head')
+                self.handler._publish_rebased_checkpoint(self.handler._context())
+                self.assertEqual(len(self.pushes), 2)
+                self.assertEqual(saved.snapshot['failure'], 'old failure')
+                self.assertEqual(self.state.row()['worker_session_id'], 'saved-worker')
+                self.fixture.effects.agent.run_agent.assert_not_called()
+                self.fixture.effects.validation.verify.assert_not_called()
+
     def test_next_rebase_start_requires_immutable_publication_and_current_identity(self):
         from copy import deepcopy
         from loop_manager_internal.git.managed_rebase_adoption import owns_published_rebase_start
