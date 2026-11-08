@@ -52,18 +52,32 @@ class ManualWorkTest(ManualWorkCase):
                     plan_values={'status':'VERIFYING'},enqueue=False)
                 service.runtime.hydrate(service.repo,group['owner_id'])
             service.connection.commit()
-            # 실제 Merge 전 HEAD 불일치와 단순 CLOSED는 완료 근거가 아니다.
+            def lookup(observation):
+                return lambda _repo, branch, *args, **kwargs: (
+                    observation if branch == group['branch'] else None)
+
+            from loop_manager_internal.storage.execution_checkpoint_state import (
+                ExecutionCheckpointRepository, pending_completion_plan_ids)
+            checkpoints=ExecutionCheckpointRepository(service.connection)
+            checkpoint=checkpoints.get(service.repo,group['owner_id'])
+            # CLOSED/잘못된 Merge HEAD는 재검증 상태나 최종 게시 근거를 바꾸지 않는다.
             if not active:
-                with mock.patch('loop_manager.pr_for_branch',return_value={
-                        **pr,'state':'MERGED','mergedAt':'now','headRefOid':'foreign'}):
-                    with self.assertRaises(loop_manager.PublicationSafetyError):
-                        loop_manager.observe_waiting_pull_requests(service.connection,service.repo_path,
-                            service.state_dir,service.repo)
-                self.assertTrue(all(service.runtime.get(service.repo,key).status=='MANUAL_PENDING' for key in members))
-                with mock.patch('loop_manager.pr_for_branch',return_value={**pr,'state':'CLOSED'}):
+                with mock.patch('loop_manager.pr_for_branch',side_effect=lookup({**pr,'state':'CLOSED'})):
                     loop_manager.observe_waiting_pull_requests(service.connection,service.repo_path,
                         service.state_dir,service.repo)
-                self.assertTrue(all(service.runtime.get(service.repo,key).status=='PLAN_BLOCKED' for key in members))
+                self.assertTrue(all(service.runtime.get(service.repo,key).status=='MANUAL_PENDING' for key in members))
+                with mock.patch('loop_manager.pr_for_branch',side_effect=lookup({
+                        **pr,'state':'MERGED','mergedAt':'now','headRefOid':'foreign'})):
+                    loop_manager.observe_waiting_pull_requests(service.connection,service.repo_path,
+                        service.state_dir,service.repo)
+                self.assertTrue(all(service.runtime.get(service.repo,key).status=='MANUAL_PENDING' for key in members))
+                observed=checkpoints.get(service.repo,group['owner_id'])
+                evidence=observed.snapshot['external_completion']
+                self.assertTrue(evidence['db_pending'])
+                self.assertIn('최종 게시 근거',evidence['error'])
+                self.assertEqual(replace(observed,snapshot={k:v for k,v in observed.snapshot.items()
+                    if k!='external_completion'} or None),checkpoint)
+                self.assertNotIn('G-012',pending_completion_plan_ids(service.connection,service.repo))
             git_command(service.repo_path,'merge','--no-ff',group['branch'],'-m','External Merge')
             git_command(service.repo_path,'push','origin','main')
             merged={**pr,'state':'MERGED','mergedAt':'now'}
@@ -72,20 +86,21 @@ class ManualWorkTest(ManualWorkCase):
                     # Merge 복구 이후의 별도 READY/Planner 배정은 이 회귀의 경계 밖이다.
                     with mock.patch('loop_manager_internal.application.project_service.ProjectService._run_coordinators',
                                     return_value=0):
-                        _,verify,agent=self.step(service,pr=merged)
+                        _,verify,agent=self.step(service,pr=lookup(merged))
                     verify.assert_not_called()
                     agent.assert_not_called()
                 else:
-                    with mock.patch('loop_manager.pr_for_branch',return_value=merged):
+                    with mock.patch('loop_manager.pr_for_branch',side_effect=lookup(merged)):
                         loop_manager.observe_waiting_pull_requests(service.connection,service.repo_path,
                             service.state_dir,service.repo)
                 self.assertEqual(cleanup.call_count,1)
                 self.assertTrue(all(service.runtime.get(service.repo,key).status=='MERGED' for key in members))
                 self.assertEqual(service.store.get(service.repo,group['group_id'])['state'],'MERGED')
-                with mock.patch('loop_manager.pr_for_branch',return_value=merged) as lookup:
+                with mock.patch('loop_manager.pr_for_branch',side_effect=lookup(merged)) as repeated_lookup:
                     loop_manager.observe_waiting_pull_requests(service.connection,service.repo_path,
                         service.state_dir,service.repo)
-                    lookup.assert_not_called()
+                    repeated_lookup.assert_called_once_with(service.repo_path,'loop-manager/G-012')
+                self.assertFalse(checkpoints.get(service.repo,group['owner_id']).snapshot['external_completion']['db_pending'])
                 self.assertEqual(cleanup.call_count,1)
 
     def test_publication_stage_tokens_are_absent_without_manual_request(self):

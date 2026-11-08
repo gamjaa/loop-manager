@@ -1507,20 +1507,23 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         }
         with mock.patch("loop_manager.pr_for_branch", return_value=merged) as read_pr, mock.patch(
             "loop_manager.git"
-        ) as git, mock.patch(
-            "loop_manager.complete_merged_execplan_worktree"
-        ) as complete:
+        ) as git, mock.patch("loop_manager.remove_cleanup_worktree") as cleanup:
             loop_manager.synchronize_waiting_pull_requests(
                 self.connection, Path(self.repo), Path("/state"), self.repo
             )
         read_pr.assert_called_once()
         git.assert_not_called()
-        complete.assert_not_called()
+        cleanup.assert_not_called()
         status = self.connection.execute(
             "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
             (self.repo,),
         ).fetchone()[0]
-        self.assertEqual(status, "PR_OPEN")
+        self.assertEqual(status, "MERGED")
+        block=scoped_blocking.project_block(self.connection,self.repo)
+        self.assertEqual(block['plan_id'],'G-001')
+        self.assertEqual(block['reason_code'],BlockReasonCode.DEFAULT_WORKTREE_MUTATION.value)
+        self.assertFalse(ExecutionCheckpointRepository(self.connection).get(
+            self.repo,'G-001').snapshot['external_completion']['db_pending'])
 
 
     def test_selected_pr_can_escalate_without_occupying_active_status(self):
