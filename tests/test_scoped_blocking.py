@@ -1636,6 +1636,87 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         self.assertIsNone(scoped_blocking.project_block(self.connection,self.repo))
         self.assertEqual(loop_manager.catalog_schedule_decision(self.connection,self.repo).runnable_ready['plan_id'],'G-002')
 
+    def test_merged_manual_group_releases_project_block_only_after_all_writers_stop(self):
+        from loop_manager_internal.storage import task_calls, agent_invocation_state
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        for key in ('G-001','G-002'):
+            self.plan(key,'MERGED',branch='shared',pr_url='https://pr/1')
+        self.plan('G-003','READY')
+        self.plan('G-004','READY')
+        store=ManualWorkRepository(self.connection)
+        group=store.create(self.repo,'submit','source',(),'a'*40,'b'*40,members=('G-001','G-002'))
+        store.update(group,state='MERGED',owner_id='G-001',active_id='G-002',branch='shared',worktree='/shared')
+        task_calls.ensure_schema(self.connection)
+        agent_invocation_state.ensure_schema(self.connection)
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET worktree='/shared',pr_head_oid=?,worker_result='saved',verify_token='receipt' WHERE plan_id IN ('G-001','G-002')",('a'*40,))
+            scoped_blocking.record_plan_block(self.connection,self.repo,'G-004',
+                BlockReasonCode.USER_DECISION_REQUIRED,'separate question','question')
+            scoped_blocking.record_project_block(self.connection,self.repo,
+                BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,'old cause','same',plan_id='G-002',previous_phase=None)
+        before=[dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')]
+        checkpoints=ExecutionCheckpointRepository(self.connection)
+        saved={key:checkpoints.get(self.repo,key) for key in ('G-001','G-002')}
+        self.connection.commit()
+        owner=task_calls.reserve(self.connection,Path('/state'),self.repo,'G-001','agent','run')
+        task_calls.mark_uncertain(owner)
+        snapshot=loop_manager.GitSnapshot('a'*40,'shared',{},{},{},{},{},{})
+        def resume():
+            return loop_manager.resume_project_block_if_safe(self.connection,Path(self.repo),Path('/state'),self.repo)
+        with mock.patch('loop_manager.validate_execplan_workspace_identity'), \
+             mock.patch('loop_manager.validate_managed_worktree'), \
+             mock.patch('loop_manager.capture_git_snapshot',return_value=snapshot) as observe, \
+             mock.patch('loop_manager.run_agent') as agent, \
+             mock.patch('loop_manager._resume_owned_checkpoint_project_block') as execution:
+            self.assertFalse(resume())
+            observe.assert_not_called()
+            task_calls.release(owner)
+            with self.connection:
+                self.connection.execute("""INSERT INTO agent_invocations
+                    (invocation_id,repo,plan_id,role,provider,model,effort,transition,attempt,
+                     started_at,execution_status,execution_started_at,finished_at)
+                    VALUES ('sibling-writer',?,'G-001','worker','codex','model','high','start',1,
+                            'start','executed','started','collected')""",(self.repo,))
+            self.assertFalse(resume())
+            observe.assert_not_called()
+            with self.connection:
+                self.connection.execute("UPDATE agent_invocations SET execution_finished_at='stopped',execution_finish_evidence='process_finished'")
+            for update,restore in (
+                    ("UPDATE exec_plans SET pr_head_oid='foreign' WHERE plan_id='G-001'",
+                     "UPDATE exec_plans SET pr_head_oid='"+'a'*40+"' WHERE plan_id='G-001'"),
+                    ("UPDATE exec_plans SET status='PR_OPEN' WHERE plan_id='G-001'",
+                     "UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-001'"),
+                    ("UPDATE manual_work_groups SET members='[\"G-002\"]'",
+                     "UPDATE manual_work_groups SET members='[\"G-001\", \"G-002\"]'")):
+                with self.subTest(update=update):
+                    with self.connection:
+                        self.connection.execute(update)
+                    self.assertFalse(resume())
+                    self.assertIsNotNone(scoped_blocking.project_block(self.connection,self.repo))
+                    with self.connection:
+                        self.connection.execute(restore)
+            self.plan('G-005','MERGED',branch='shared',pr_url='https://other/pr')
+            self.assertFalse(resume())
+            with self.connection:
+                self.connection.execute("DELETE FROM exec_plans WHERE plan_id='G-005'")
+            def race(*args):
+                with self.connection:
+                    self.connection.execute("UPDATE manual_work_groups SET active_id='G-001'")
+                return snapshot
+            observe.side_effect=race
+            self.assertFalse(resume())
+            self.assertIsNotNone(scoped_blocking.project_block(self.connection,self.repo))
+            observe.side_effect=None
+            self.assertTrue(resume())
+            agent.assert_not_called()
+            execution.assert_not_called()
+        self.assertIsNone(scoped_blocking.project_block(self.connection,self.repo))
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')],before)
+        for key in saved:
+            self.assertEqual(checkpoints.get(self.repo,key),saved[key])
+        self.assertIsNotNone(scoped_blocking.plan_block(self.connection,self.repo,'G-004'))
+        self.assertEqual(loop_manager.catalog_schedule_decision(self.connection,self.repo).runnable_ready['plan_id'],'G-003')
+
     def test_completion_hold_covers_rotated_manual_group_and_dependency_closure(self):
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
         self.plan('G-001','MANUAL_PENDING',branch='shared',pr_url='https://pr/1')
