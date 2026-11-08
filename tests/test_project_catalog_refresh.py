@@ -496,6 +496,10 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
         self.assertEqual(len(self.loads), 1)
 
     def test_verified_archive_delta_and_audit_are_atomic_without_reread(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET publication_sha=? WHERE repo=? AND plan_id='G-002'",
+            ('d' * 40, self.repo),
+        )
         self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
         item = self.archive_repo.item(self.repo, 'G-002')
         self.assertEqual(item['archived'], 1)
@@ -506,6 +510,7 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
         self.assertTrue(history['identity_verified'])
         self.assertTrue(history['merge_confirmed'])
         self.assertEqual(history['proof_revision'], self.sha)
+        self.assertEqual(history['plan_sha'], self.row('G-002')['publication_sha'])
         self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
             self.connection, self.repo)}, {'G-001', 'G-002'})
         self.boundary.refresh()
@@ -520,6 +525,30 @@ class CatalogArchiveConsumerTests(_CatalogRefreshCase):
             self.repo, self.boundary.pinned, repository.capture(self.repo), revision_is_current=lambda: True))
         self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
             self.connection, self.repo)}, {'G-001', 'G-002'})
+
+    def test_legacy_archive_diagnostic_does_not_pause_dependency_validation(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET publication_sha=? WHERE repo=? AND plan_id='G-002'",
+            ('d' * 40, self.repo),
+        )
+        self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
+        self.connection.execute(
+            "UPDATE execplan_catalog_history SET plan_sha=?, diagnostic_code=? WHERE repo=?",
+            ('a' * 40, 'stable-identity-mismatch', self.repo),
+        )
+        history = state.CatalogStateRepository(self.connection)
+        external = mock.Mock()
+        for _restart in range(2):
+            stored = {row['plan_id']: state.publication_identity(row)
+                      for row in self.connection.execute('SELECT * FROM exec_plans')}
+            recovered = state.CatalogRecoveryService(history, external).reconcile(
+                self.repo, self.boundary.pinned.snapshot, stored,
+            )
+            self.assertEqual(recovered.diagnostics, ())
+            self.assertEqual({row['plan_id'] for row in manager.prerequisite_validation_rows(
+                self.connection, self.repo)}, {'G-001', 'G-002'})
+        self.assertEqual(history.historical_row(self.repo, 'G-002')['plan_sha'], 'a' * 40)
+        self.assertEqual(external.mock_calls, [])
 
     def test_archive_unconfirmed_remote_does_not_record_success(self):
         self.assertEqual(self.archive(remote=False), archive_state.ArchiveWriteResult.SUPERSEDED)

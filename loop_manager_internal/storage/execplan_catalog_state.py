@@ -986,14 +986,15 @@ class DefinitionStateRepository:
                             self._fault(f"after-plan:{plan_id}")
                         continue
                     history = CatalogStateRepository(self.connection, ensure=False)
+                    publication = publication_identity(row)
                     if (entry.archived and row['status'] == 'MERGED'
                             and row['path'] in {entry.active_path, entry.path}
-                            and row['content_hash'] == entry.content_hash and row['plan_sha']
+                            and row['content_hash'] == entry.content_hash and publication.plan_sha
                             and history.historical_row(repo, plan_id) is None):
                         history.record(
-                            repo, entry, original_path=entry.active_path,
-                            original_content_hash=row['publication_content_hash'] or entry.content_hash,
-                            plan_sha=row['plan_sha'],
+                            repo, entry, original_path=publication.path,
+                            original_content_hash=publication.content_hash,
+                            plan_sha=publication.plan_sha,
                             proof=MergeProof(True, kind=MergeProofKind.ARCHIVE_DOCUMENT,
                                              revision=pinned.revision_sha),
                             diagnostic=None, identity_verified=True,
@@ -1803,7 +1804,21 @@ class CatalogRecoveryService:
             proof = MergeProof(False)
             diagnostic: CatalogDiagnostic | None = None
 
+            # Confirmed PR/archive evidence outranks stale status and legacy SHA fields.
             if (
+                history_proof is not None
+                and history_proof.kind in {MergeProofKind.ARCHIVE_DOCUMENT, MergeProofKind.GITHUB_PR}
+                and audit["observed_path"] == entry.path
+                and audit["original_path"] == entry.active_path
+                and audit["final_content_hash"] == entry.content_hash
+                and (identity is None or (
+                    identity.path == audit["original_path"]
+                    and identity.content_hash == audit["original_content_hash"]
+                ))
+            ):
+                proof = history_proof
+                current_hash = str(audit["final_content_hash"])
+            elif (
                 audit is not None
                 and audit["identity_verified"]
                 and identity is not None
@@ -1827,6 +1842,13 @@ class CatalogRecoveryService:
                     entry, "publication-proof-missing",
                     "확정된 Merge 이력의 게시 identity 또는 증명이 불완전합니다: "
                     f"{entry.plan_id}",
+                )
+            elif (history_proof is not None
+                  and history_proof.kind in {MergeProofKind.ARCHIVE_DOCUMENT, MergeProofKind.GITHUB_PR}
+                  and audit["observed_path"] != entry.path):
+                diagnostic = self._diagnostic(
+                    entry, "stable-identity-mismatch",
+                    f"검증된 archive 이동의 목적지와 현재 경로가 다릅니다: {entry.plan_id}",
                 )
             elif history_proof is not None and (
                 identity is None or identity.status == "MERGED"

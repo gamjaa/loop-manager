@@ -236,7 +236,7 @@ SQLite는 `<state-dir>/loop-manager.db`에 저장하고 상태 변경은 transac
 
 SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 과거 등록·승인 감사, 마지막 성공 Planner의 명세·전체 계획 입력 지문과 `planning_error`, 복구 가능한 planning publication intent, ExecPlan 메타데이터와 의존성, 최초 실행 여부, 실행 상태와 재시도 횟수, AI Agent 세션, worktree, branch, PR, 삭제된 미착수 ExecPlan의 ID 예약·감사 기록, `cleanup_pending`, 알림과 프로젝트 완료 주기를 저장한다.
 
-실행 시작 시 원격 문서·Git worktree/branch·SQLite·GitHub PR을 대조하되 전체에 공통 우선순위를 적용하지 않는다. 문서의 현재 선언은 Git에서, 실행 상태·session·재시도·연결·감사는 SQLite에서, 실제 PR 상태는 GitHub에서 확인하고 검증된 전이로 연결한다. 유효한 문서 개정이나 cache 갱신만으로 실행 이력을 초기화하지 않는다.
+실행 시작 시 원격 문서·Git worktree/branch·SQLite·GitHub PR을 대조한다. 완료 판단은 실제 PR Merge·검증된 원격 archive 이동을 SQLite의 과거 실행 상태보다 우선해 검증된 전이로 연결한다. 문서의 현재 선언은 Git에서, 진행 단계·session·재시도·연결·감사는 SQLite에서, 실제 PR 상태는 GitHub에서 확인한다. 유효한 문서 개정이나 cache 갱신만으로 실행 이력을 초기화하지 않는다.
 
 정상적으로 열린 DB에서 작업 행만 없는 경우의 archive 문서 기반 완료 수락은 아래의 별도 복구 규칙을 따른다. 이때의 완료 근거와 실제 GitHub PR Merge 관측을 혼동하지 않는다.
 
@@ -246,7 +246,9 @@ SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 과거 등�
 
 catalog 동기화는 정상적으로 열린 DB에서 개별 작업 행이 없을 때 같은 원격 snapshot의 활성·archive 선언으로 행을 보완한다. 활성 선언은 기본 READY 등록과 기존 실행 복구 규칙을 따르고, archive 선언은 별도 병합 조회나 과거 게시 본문 비교 없이 MERGED로 수락한다. `archive-document` 근거와 관측 revision·본문 hash를 기존 archive 감사에 기록하며 실제 PR Merge 관측과 구분한다. 유실된 최초 게시·세션·실패 이력은 추정해 생성하지 않는다. DB 파일 부재·손상은 이 보완 절차에 진입하기 전에 오류로 처리하며 백업 복원이나 초기화가 필요하다.
 
-기존 게시 감사가 있으면 보존하고, 문서 기반 완료 수락은 재시작에서 추가 Git/PR 검증 없이 재사용한다. 기존 작업 행에는 이 fallback을 적용하지 않으며 정상적인 archive identity 검증과 실행 이력 보존을 유지한다. 선언·source·dependency 검증, 취소·예약 충돌과 snapshot/CAS transaction 경계는 그대로 적용한다.
+기존 게시 감사가 있으면 보존하고, 문서 기반 완료 수락은 재시작에서 추가 Git/PR 검증 없이 재사용한다. 기존 작업 행에는 파일 위치만을 근거로 이 fallback을 적용하지 않는다. 다만 검증된 `archive-document` 또는 실제 PR Merge를 기록한 `github-pr` 이력의 최초 active 경로·게시 본문과 작업 identity, 실제 archive 목적지·최종 hash가 현재 원격 문서와 일치하면 그 완료 근거를 먼저 수락한다. 이때 과거 실행 상태와 legacy `plan_sha` 차이는 완료 거부 조건이 아니며 진단을 해제하고 MERGED로 복구한다. 과거 archive SHA와 실행·session·실패 감사는 덮어쓰지 않는다. 새 archive 이력은 공통 `publication_identity()`의 path·hash·SHA를 함께 사용해 서로 다른 게시본의 필드를 섞지 않는다. 실제 경로·내용 불일치는 계속 거부한다. 선언·source·dependency 검증, 취소·예약 충돌과 snapshot/CAS transaction 경계는 그대로 적용한다.
+
+archive 복구의 로컬 게시 검증이 실패해도 저장된 MERGED 상태만으로 PR 조회를 생략하지 않는다. 연결 PR의 실제 Merge를 확인하면 기존 게시 identity를 감사로 보존해 terminal 근거를 반환하며 로컬 과거 객체 재조회 성공을 추가 완료 조건으로 요구하지 않는다. OPEN·미Merge CLOSED·PR 부재·조회 실패는 Merge 성공으로 바꾸지 않으며 archive 최종 내용 검증과 실제 쓰기의 소유권·lease 보호를 유지한다.
 
 유효한 ExecPlan 선언 변경은 계획 또는 프로젝트 차단 사유가 아니다. 일반 원격 catalog 동기화는 아래 경계로 실행 가능한 선언과 보류할 작업을 구분하고, 원격 revision과 SQLite 상태·소유권 snapshot이 유지될 때 검증한 cache 변경과 보류 진단을 한 transaction으로 반영한다. snapshot이 달라지면 적용하지 않고 최신 입력으로 다시 확인한다.
 

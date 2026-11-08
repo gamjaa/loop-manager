@@ -267,9 +267,9 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
         self.assertEqual(len(result.merged), 1)
         self.assertEqual(
             result.merged[0].proof.kind,
-            execplan_catalog_state.MergeProofKind.STORED_AND_GIT,
+            execplan_catalog_state.MergeProofKind.GITHUB_PR,
         )
-        self.assertEqual(len(port.local_calls), 1)
+        self.assertEqual(port.local_calls, [])
         self.assertEqual(result.merged[0].proof.pr_url, "https://example.test/pr/1")
 
     def test_verified_audit_only_history_rejects_tampered_archive_without_port_call(self):

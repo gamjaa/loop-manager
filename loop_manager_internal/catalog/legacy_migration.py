@@ -154,13 +154,11 @@ class _LegacyCatalogMergeProof:
     def proof_for(
         self, entry: execplan_catalog.ExecPlanCatalogEntry
     ) -> execplan_catalog_state.MergeProof:
-        # SQLite's MERGED transition is the durable result of the first
-        # GitHub observation.  Archive reconciliation may still need local
-        # publication evidence, but it must never turn an incomplete local
-        # proof into another PR query.
         identity = self.stored.get(entry.plan_id)
         if identity is not None and identity.status == "MERGED":
-            return self._stored_git_proof(entry)
+            proof = self._stored_git_proof(entry)
+            if proof.merged:
+                return proof
 
         pull_request = self._effects.pr_for_branch(
             self.root, f"loop-manager/{entry.plan_id}"
@@ -178,6 +176,8 @@ class _LegacyCatalogMergeProof:
             )
         if identity is not None and identity.plan_sha:
             plan_sha = identity.plan_sha
+            # PR Merge is terminal; missing local publication objects cannot undo it.
+            published_hash = identity.content_hash
         else:
             # Use the latest active publication, including maintenance revisions.
             # Matching archive bytes against any older revision would accept
@@ -189,9 +189,9 @@ class _LegacyCatalogMergeProof:
             ).stdout.strip()
             if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", plan_sha):
                 raise RuntimeError("archived ExecPlan의 게시 revision이 없습니다.")
-        published_hash = hashlib.sha256(
-            self._effects.git_bytes(self.root, "show", f"{plan_sha}:{entry.active_path}")
-        ).hexdigest()
+            published_hash = hashlib.sha256(
+                self._effects.git_bytes(self.root, "show", f"{plan_sha}:{entry.active_path}")
+            ).hexdigest()
         return execplan_catalog_state.MergeProof(
             True,
             kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,

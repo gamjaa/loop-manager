@@ -165,22 +165,46 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
             proof.kind, execplan_catalog_state.MergeProofKind.STORED_AND_GIT
         )
 
-    def test_stored_merge_with_unavailable_git_does_not_query_pr_again(self):
+    def test_actual_pr_merge_outranks_unavailable_local_publication(self):
         identity = execplan_catalog_state.StoredPlanIdentity(
             "G-001", self.entry.active_path, self.entry.content_hash,
             "c" * 40, "MERGED",
         )
         with (
-            mock.patch("loop_manager.pr_for_branch") as pr_for_branch,
+            mock.patch("loop_manager.pr_for_branch", return_value={
+                'state': 'MERGED', 'mergeCommit': {'oid': 'd' * 40},
+                'url': 'https://example.test/pr/1',
+            }) as pr_for_branch,
             mock.patch("loop_manager.git", side_effect=RuntimeError("git unavailable")),
         ):
             proof = loop_manager._LegacyCatalogMergeProof(
                 Path("/repo"), "origin/main", {"G-001": identity}
             ).proof_for(self.entry)
 
-        pr_for_branch.assert_not_called()
-        self.assertFalse(proof.merged)
-        self.assertEqual(proof.detail, "git unavailable")
+        pr_for_branch.assert_called_once_with(Path('/repo'), 'loop-manager/G-001')
+        self.assertTrue(proof.merged)
+        self.assertEqual(proof.kind, execplan_catalog_state.MergeProofKind.GITHUB_PR)
+        self.assertEqual(proof.plan_sha, 'c' * 40)
+        self.assertEqual(proof.revision, 'd' * 40)
+
+    def test_pr_fallback_does_not_turn_nonmerge_or_lookup_failure_into_completion(self):
+        identity = execplan_catalog_state.StoredPlanIdentity(
+            'G-001', self.entry.active_path, self.entry.content_hash, 'c' * 40, 'MERGED',
+        )
+        for observed in ({'state': 'OPEN'}, {'state': 'CLOSED'}, None, RuntimeError('lookup failed')):
+            with self.subTest(observed=observed), \
+                 mock.patch('loop_manager.git', side_effect=RuntimeError('git unavailable')), \
+                 mock.patch('loop_manager.pr_for_branch',
+                            **({'side_effect': observed} if isinstance(observed, Exception)
+                               else {'return_value': observed})):
+                port = loop_manager._LegacyCatalogMergeProof(
+                    Path('/repo'), 'origin/main', {'G-001': identity},
+                )
+                if isinstance(observed, Exception):
+                    with self.assertRaisesRegex(RuntimeError, 'lookup failed'):
+                        port.proof_for(self.entry)
+                else:
+                    self.assertFalse(port.proof_for(self.entry).merged)
 
     def seed_history(self, original, final):
         execplan_catalog_state.CatalogStateRepository(self.connection).record(
@@ -194,6 +218,71 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
             ), diagnostic=None, identity_verified=True,
         )
         self.connection.commit()
+
+    def test_verified_archive_recovers_stale_status_and_legacy_sha_on_restart(self):
+        for proof_kind in (execplan_catalog_state.MergeProofKind.ARCHIVE_DOCUMENT,
+                           execplan_catalog_state.MergeProofKind.GITHUB_PR):
+            for status in ('READY', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PLAN_BLOCKED', 'MERGED'):
+                with self.subTest(status=status, proof_kind=proof_kind):
+                    self.connection.execute('DELETE FROM exec_plans')
+                    self.connection.execute('DELETE FROM execplan_catalog_history')
+                    self.insert_runtime(status)
+                    self.connection.execute(
+                        "UPDATE exec_plans SET publication_sha=?, publication_path=?, "
+                        "publication_content_hash=? WHERE plan_id='G-001'",
+                        ('c' * 40, self.entry.active_path, self.entry.content_hash),
+                    )
+                    history = execplan_catalog_state.CatalogStateRepository(self.connection)
+                    history.record(
+                        '/repo', self.entry, original_path=self.entry.active_path,
+                        original_content_hash=self.entry.content_hash, plan_sha='a' * 40,
+                        proof=execplan_catalog_state.MergeProof(
+                            True, kind=proof_kind,
+                            revision='b' * 40,
+                        ), diagnostic=None, identity_verified=True,
+                    )
+                    self.connection.execute(
+                        "UPDATE execplan_catalog_history SET diagnostic_code='stable-identity-mismatch'"
+                    )
+                    self.connection.commit()
+                    with mock.patch('loop_manager._LegacyCatalogMergeProof') as external:
+                        for _restart in range(2):
+                            self.migrate(archived=True)
+                            self.assertEqual(self.row()['status'], 'MERGED')
+                            self.assertEqual(self.row()['publication_sha'], 'c' * 40)
+                            self.assertEqual(self.row()['worker_session_id'], 'worker-session')
+                            self.assertEqual(self.row()['retry_count'], 3)
+                            audit = history.historical_row('/repo', 'G-001')
+                            self.assertIsNone(audit['diagnostic_code'])
+                            self.assertEqual(audit['plan_sha'], 'a' * 40)
+                            self.assertEqual(audit['proof_revision'], 'b' * 40)
+                        external.return_value.proof_for.assert_not_called()
+                        external.return_value.verify_stored.assert_not_called()
+
+    def test_verified_archive_does_not_accept_changed_bytes_or_move_identity(self):
+        self.insert_runtime('MERGED')
+        history = execplan_catalog_state.CatalogStateRepository(self.connection)
+        history.record(
+            '/repo', self.entry, original_path=self.entry.active_path,
+            original_content_hash=self.entry.content_hash, plan_sha='a' * 40,
+            proof=execplan_catalog_state.MergeProof(
+                True, kind=execplan_catalog_state.MergeProofKind.ARCHIVE_DOCUMENT,
+                revision='b' * 40,
+            ), diagnostic=None, identity_verified=True,
+        )
+        stored = {'G-001': execplan_catalog_state.publication_identity(self.row())}
+        for entry in (replace(self.entry, content_hash='tampered'),
+                      replace(self.entry, path='docs/plans/archive/[G-001] Other.md')):
+            with self.subTest(entry=entry.path):
+                snapshot = execplan_catalog.ExecPlanCatalogSnapshot(active={}, archived={'G-001': entry})
+                external = mock.Mock()
+                external.proof_for.return_value = execplan_catalog_state.MergeProof(False)
+                result = execplan_catalog_state.CatalogRecoveryService(history, external).reconcile(
+                    '/repo', snapshot, stored,
+                )
+                self.assertEqual(result.merged, ())
+                self.assertTrue(result.diagnostics)
+                self.assertEqual(self.row()['status'], 'MERGED')
 
     def recover_stored_history(self, observed, stored=None):
         snapshot = execplan_catalog.ExecPlanCatalogSnapshot(
@@ -286,8 +375,11 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
                 self.assertEqual(call.args, (Path("/repo"), "show", "a" * 40 + ":" + original.active_path))
             pr.assert_not_called()
 
-    def test_verified_history_still_requires_publication_blob_and_git_ancestry(self):
+    def test_git_only_history_still_requires_publication_blob_and_git_ancestry(self):
         self.seed_history(self.entry, self.entry)
+        self.connection.execute(
+            "UPDATE execplan_catalog_history SET proof_kind='stored-and-git'"
+        )
         with (
             mock.patch("loop_manager.pr_for_branch", side_effect=AssertionError("PR query")) as pr,
             mock.patch("loop_manager.git", return_value=subprocess.CompletedProcess(
