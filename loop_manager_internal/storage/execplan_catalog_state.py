@@ -1751,8 +1751,10 @@ class CatalogRecoveryService:
         return any(
             stored and stored != recorded
             for stored, recorded in (
-                (identity.path, str(audit["original_path"])),
-                (identity.content_hash, str(audit["original_content_hash"])),
+                (identity.path, str(audit["observed_path"] if identity.path == audit["observed_path"]
+                                    else audit["original_path"])),
+                (identity.content_hash, str(audit["final_content_hash"] if identity.path == audit["observed_path"]
+                                           else audit["original_content_hash"])),
                 (identity.plan_sha, str(audit["plan_sha"] or "") or None),
             )
         )
@@ -1812,11 +1814,15 @@ class CatalogRecoveryService:
                 and audit["original_path"] == entry.active_path
                 and audit["final_content_hash"] == entry.content_hash
                 and (identity is None or (
-                    identity.path == audit["original_path"]
-                    and identity.content_hash == audit["original_content_hash"]
+                    (identity.path == audit["original_path"]
+                     and identity.content_hash == audit["original_content_hash"])
+                    or (identity.path == audit["observed_path"]
+                        and identity.content_hash == audit["final_content_hash"])
                 ))
             ):
                 proof = history_proof
+                original_path = str(audit["original_path"])
+                original_hash = str(audit["original_content_hash"])
                 current_hash = str(audit["final_content_hash"])
             elif (
                 audit is not None

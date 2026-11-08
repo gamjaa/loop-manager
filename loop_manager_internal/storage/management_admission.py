@@ -109,7 +109,8 @@ def release_blocks(connection, repo, plan_ids):
             if row['status'] != 'PLAN_BLOCKED':
                 continue
             block = db.execute('SELECT * FROM execplan_blocks WHERE repo=? AND plan_id=?',(repo,pid)).fetchone()
-            if block is None or block['reason_code'] not in {'user_decision_required','common_defect_pending'}:
+            if block is None or block['reason_code'] not in {'user_decision_required','common_defect_pending',
+                    'worker_output_invalid','verify_retry_exhausted'}:
                 raise ValueError(f'{pid}: 안전·소유권 차단은 원인별 복구가 필요합니다.')
             if db.execute('SELECT 1 FROM agent_invocations WHERE repo=? AND plan_id=? AND finished_at IS NULL', (repo,pid)).fetchone():
                 raise ValueError(f'{pid}: 종료 미확인 호출이 있습니다.')

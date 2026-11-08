@@ -597,6 +597,8 @@ Manager는 유효한 남은 source·dependency와 현재 snapshot을 검증한 �
 
 Planner의 `DRAFT_DECISION_RESULT`는 질문별 답변·새 사용자 원문 인용·근거 경로·남은 질문을 반환한다. 질문의 기본 `source`·`quote` 외에 `evidence` 배열의 `source`·`quote`로 여러 원문을 같은 의미 판단에 결합할 수 있다. 공통 strict JSON 파서가 중복 marker/key·비유한 값·잘못된 identity·필드를 거부하고 Manager가 각 인용의 사용자 출처와 before/after, 현재 ExecPlan 원문 또는 source 입력 hash를 대조한다. 명시 승인 없이 Answer를 사용할 때는 현재 질문·입력에 연결된 사용자 변경이어야 하며 같은 관측의 source 변경도 해당 질문의 근거로 확인한다. 기존 명시 결정의 readiness와 별도로 판단하고 stale Revision·거절·보류는 유지한다. 확인하지 않은 User Decision은 정리하지 않으며 부분 정리 후 남은 답변은 출처와 게시 감사를 연결한다. Agent는 draft·입력 양식을 직접 해제하지 않는다. 같은 revision의 draft 질문에 대해 `outcome` 없이 `resolved: []`와 기존 질문 그대로의 `remaining`을 반환하면 미응답 유지로 처리한다. draft·승인 상태·대기 근거를 보존하고 독립 planning의 게시를 계속한다. 이를 새 사용자 결정이나 질문 해소로 기록하지 않으며, 변경된 질문이나 잘못된 결과는 계속 거부한다.
 
+사용자 변경의 출처 판별에서 archive/Merge를 관측한 `proof_revision`은 Agent 게시 commit으로 취급하지 않는다. 실제 작업 게시 revision과 원래 plan revision은 계속 제외한다. 미해소 질문과 Answer가 같은 상태에서 관련 명세 입력이 바뀌어도 답변 비교의 원격 기준은 유지하며, 새 입력에 대한 의미 판단과 게시 검증은 다시 수행한다.
+
 정리 전 `execplan_drafts`에 준비 영수증을 저장하고 cleanup hash·현재 입력·revision·결정과 사용자 출처·원격 게시를 같은 publication transaction에서 대조해 질문별 감사와 대기를 확정한다. 부분 해소·중단 재개에도 결정 감사·source·dependency·실행 이력을 유지한다.
 
 양식 없는 일반 계획에도 `draft_scope`를 계산하되 Progress·Decision Log·User Decision은 제외한다. `execplan_draft_state.observe`는 정리된 결정의 scope·source 입력이 바뀌면 기존 소유권·실행 이력 검사 안에서 `pending`과 `reassessment` 근거를 보존하며 같은 입력은 재처리하지 않는다. Planner는 이전 질문별 assessment와 현재 입력을 비교해 `outcome: valid`·`reason` 또는 필요한 새 draft 질문을 반환한다. Manager는 현재 revision·scope·해소 감사를 확인하고 Decision Log에 이유를 남겨 기존 정리 영수증·publication manifest·원격 확인·DB transaction으로 적용한다.

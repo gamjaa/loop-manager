@@ -43,7 +43,12 @@ def _insert_recovered_execplan(
     ).fetchone()
     if existing is not None:
         if (
-            str(existing["publication_path"] or existing["path"]) != path
+            (str(existing["publication_path"] or existing["path"]) != path
+             and not (entry.archived and status == existing["status"] == "MERGED"
+                      and not existing["publication_path"]
+                      and existing["path"] == entry.path
+                      and existing["content_hash"] == entry.content_hash
+                      and path == entry.active_path))
             or str(
                 existing["publication_content_hash"] or existing["content_hash"]
             ) != content_hash

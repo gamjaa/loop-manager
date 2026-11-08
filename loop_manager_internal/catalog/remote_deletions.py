@@ -139,6 +139,7 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
             hold_evidence[key] = (row, evidence)
     # An unchanged archived MERGED execution is historical even before archive audit backfill.
     merged_references = historical_reference_ids(connection, repo, pinned)
+    missing = {key: path for key, path in missing.items() if key not in merged_references}
     latest_contents = {key: entry.text.encode("utf-8") for key, entry in pinned.snapshot.all.items()}
     paths = {str(row["plan_id"]): str(row["path"]) for row in rows}
     paths.update({str(row["plan_id"]): str(row["path"]) for row in cancellations})

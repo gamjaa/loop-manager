@@ -180,7 +180,11 @@ def observe(connection: sqlite3.Connection, repo: str, path: str, plan: Mapping[
         audit = {"value": decision, "basis": basis, "revision": content_hash, "accepted": approved}
         if audit not in decisions:
             decisions.append(audit)
-    question_revision = previous["remote_revision"] if unchanged and previous["path"] == path else revision
+    # Keep the answer's comparison baseline when unrelated specification inputs change.
+    keep_baseline = bool(previous and previous.get("pending") and previous["path"] == path
+                         and previous["question"] == question
+                         and (unchanged or bool(decision) and decision == previous.get("decision")))
+    question_revision = previous["remote_revision"] if keep_baseline else revision
     record = {"question": question, "basis": basis, "revision": held_revision,
               "identity": execplan_drafts.question_identity(plan) or (previous or {}).get("identity"),
               "path": path, "remote_revision": question_revision, "pending": True,
@@ -190,7 +194,10 @@ def observe(connection: sqlite3.Connection, repo: str, path: str, plan: Mapping[
     prior_evidence = (previous or {}).get("decision_evidence")
     current_evidence = decision_evidence(basis, decision, decision_change)
     if (not agent and decision and decision_change.get("verified")
-            and decision_change.get("revision") == revision):
+            and (decision_change.get("revision") == revision
+                 or previous and previous.get("question") == question
+                 and previous.get("decision") == decision
+                 and prior_evidence == decision_evidence(previous["basis"], decision, decision_change))):
         record["decision_evidence"] = current_evidence
     elif prior_evidence and prior_evidence == current_evidence:
         record["decision_evidence"] = prior_evidence

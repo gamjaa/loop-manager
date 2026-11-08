@@ -40,7 +40,7 @@ def user_changes(connection, repo, repository, pinned, *, git, git_bytes):
     managed = set()
     for row in connection.execute("SELECT publication_sha, publication_remote_oid, pr_head_oid FROM exec_plans WHERE repo=?", (repo,)):
         managed.update(str(value) for value in row if value)
-    for row in connection.execute("SELECT plan_sha, proof_revision FROM execplan_catalog_history WHERE repo=?", (repo,)):
+    for row in connection.execute("SELECT plan_sha FROM execplan_catalog_history WHERE repo=?", (repo,)):
         managed.update(str(value) for value in row if value)
     documents = {}
     def requirement_path(source, revision):
@@ -55,10 +55,6 @@ def user_changes(connection, repo, repository, pinned, *, git, git_bytes):
         if entry is None or not saved:
             continue
         metadata = entry.metadata()
-        relevant = set(entry.sources) | {"docs/PRODUCT.md", "docs/ARCHITECTURE.md"}
-        same_basis = saved["basis"] == {
-            "scope": metadata.get("draft_scope"),
-            "inputs": {key: value for key, value in (pinned.draft_inputs or {}).items() if key in relevant}}
         previous = str(saved["remote_revision"])
         changes = dict(saved.get("user_changes", {}))
         ancestry = git(repository, "merge-base", "--is-ancestor", previous, pinned.revision_sha, check=False)
@@ -81,7 +77,8 @@ def user_changes(connection, repo, repository, pinned, *, git, git_bytes):
                 changes.pop(path, None)
                 continue  # 새 경로만으로 이전 질문의 사용자 답변을 증명하지 않는다.
             current = git_bytes(repository, "show", f"{pinned.revision_sha}:{path}").decode("utf-8")
-            if (path == entry.path and same_basis and changes.get(path, {}).get("verified")
+            if (path == entry.path and changes.get(path, {}).get("verified")
+                    and metadata.get("draft_question") == saved.get("question")
                     and metadata.get("draft_decision", {}) == saved.get("decision", {})):
                 # Progress/log edits add no decision input. Keep the proven
                 # answer's original delta across the checked remote lineage.

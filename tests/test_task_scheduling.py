@@ -107,6 +107,24 @@ class TaskSchedulingTests(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual([tuple(row) for row in self.connection.execute('SELECT * FROM task_call_reservations')], calls_before)
         self.assertEqual(scheduler.uncertain['agent'], 1)
 
+    def test_explicit_release_of_validation_failures_preserves_history(self):
+        from loop_manager_internal.storage import management_admission as admission
+        for reason in ('worker_output_invalid', 'verify_retry_exhausted'):
+            with self.subTest(reason=reason):
+                self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED', "
+                    "verify_failure_history=? WHERE repo='A' AND plan_id='G-001'", ('{"failure":3}',))
+                self.connection.execute("INSERT OR REPLACE INTO execplan_blocks "
+                    "(repo,plan_id,scope,reason_code,evidence) VALUES ('A','G-001','plan',?,'failure')", (reason,))
+                self.connection.commit()
+                admission.release_blocks(self.connection, 'A', ['G-001'])
+                row = self.connection.execute("SELECT status,verify_failure_history FROM exec_plans "
+                    "WHERE repo='A' AND plan_id='G-001'").fetchone()
+                self.assertEqual(tuple(row), ('IMPLEMENTING', '{"failure":3}'))
+                self.assertTrue(admission.parked(self.connection, 'A', 'G-001'))
+                audit = self.connection.execute("SELECT release_evidence FROM task_management_admissions "
+                    "WHERE repo='A' AND plan_id='G-001'").fetchone()[0]
+                self.assertEqual(json.loads(audit)[-1]['block']['reason_code'], reason)
+
     def test_explicit_release_queues_at_capacity_and_preserves_rebase_then_yields_last(self):
         from loop_manager_internal.storage import management_admission as admission
         self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE repo='A'")

@@ -713,6 +713,25 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         row = self.connection.execute("SELECT status, worker_session_id FROM exec_plans WHERE plan_id='G-001'").fetchone()
         self.assertEqual(tuple(row), ('IMPLEMENTING', 'session'))
 
+    def test_historical_observation_is_not_an_agent_publication(self):
+        with self.connection:
+            self.connection.execute("INSERT INTO execplan_catalog_history "
+                "(repo,plan_id,original_path,observed_path,original_content_hash,final_content_hash,proof_revision) "
+                "VALUES ('repo','G-099','old','archive','hash','hash','user')")
+        self.test_user_provenance_checks_the_entire_path_history()
+
+    def test_pending_question_keeps_baseline_across_input_changes(self):
+        documents = {PATH: self.text + "\n## User Decision\n\nAnswer: Use policy A.\n"}
+        self.reconcile(documents)
+        original = self.waiting()["remote_revision"]
+        self.reconcile(documents, "c" * 40,
+                       inputs={**self.inputs, "docs/PRODUCT.md": "changed"})
+        self.assertEqual(self.waiting()["remote_revision"], original)
+        saved = self.waiting()
+        self.assertEqual(saved["decision_evidence"], execplan_draft_state.decision_evidence(
+            saved["basis"], saved["decision"], saved["user_changes"][PATH]))
+        self.assertTrue(saved["pending"])
+
     def test_user_provenance_checks_the_entire_path_history(self):
         text = accepted_text(self.text, self.waiting()["revision"])
         snapshot = execplan_catalog.snapshot_from_documents({PATH: text}, revision_sha="b" * 40)
