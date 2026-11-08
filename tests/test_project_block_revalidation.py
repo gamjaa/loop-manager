@@ -19,6 +19,22 @@ from loop_manager_internal.git.managed_rebase_validation import Remote
 
 
 class ProjectRecoveryGateTests(ProjectRemoteRecoveryFixture, unittest.TestCase):
+    def test_merged_owner_preserves_project_block_without_catalog_or_git_recovery(self):
+        before = dict(scoped_blocking.project_block(self.connection, self.repo))
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-106'")
+        self.connection.commit()
+        self.assertFalse(self.recovery.project_slot_available(self.connection, self.repo, 'G-106'))
+        self.assertFalse(self.coordinator.refresh_catalog('G-106'))
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'deferred')
+        from loop_manager_internal.recovery.scope_reconciliation import resume_project_block_if_safe
+        effects = mock.Mock()
+        self.assertFalse(resume_project_block_if_safe(
+            effects, self.connection, Path('/repo'), Path('/state'), self.repo))
+        self.assertFalse(effects.mock_calls)
+        self.ports._recorded_base_fetch.assert_not_called()
+        self.ports.reconcile_execplan_catalog.assert_not_called()
+        self.assertEqual(dict(scoped_blocking.project_block(self.connection, self.repo)), before)
+
     def test_cycle_project_owner_can_recover_without_waiting_for_cycle_completion(self):
         from loop_manager_internal.storage.maintenance_state import MaintenanceRepository, MaintenancePhase
         cycle = MaintenanceRepository(self.connection).get(self.repo)

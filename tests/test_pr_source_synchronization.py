@@ -385,10 +385,10 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.pr_for_branch", side_effect=RuntimeError("GitHub unavailable")
             ), mock.patch("loop_manager.ensure_safe_base_worktree") as synchronize:
-                with self.assertRaisesRegex(RuntimeError, "GitHub unavailable"):
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    )
+                loop_manager.run_project(
+                    connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                )
+            self.assertIn('G-026', loop_manager.scoped_blocking.catalog_held_plan_ids(connection, str(repo)))
             synchronize.assert_not_called()
             self.assertEqual(
                 connection.execute(

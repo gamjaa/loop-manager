@@ -235,18 +235,12 @@ def _catalog_archive_conflict_ids(
         ).fetchone()
         if plan is None or not plan["branch"]:
             continue
-        if not (plan["status"] == "PR_OPEN" or (
-            plan["status"] == "PLAN_BLOCKED"
-            and plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
-        )):
-            continue
         pull_request = effects.pr_for_branch(repo_path, str(plan["branch"]), plan["pr_url"])
         if pull_request is None:
             continue
         if (pull_request.get("baseRefName") != project["base_branch"]
                 or pull_request.get("headRefName") != plan["branch"]
-                or (plan["pr_url"] and pull_request.get("url") != plan["pr_url"])
-                or (plan["pr_head_oid"] and pull_request.get("headRefOid") != plan["pr_head_oid"])):
+                or (plan["pr_url"] and pull_request.get("url") != plan["pr_url"])):
             continue
         if pull_request.get("state") == "MERGED" or pull_request.get("mergedAt"):
             confirmed.add(plan_id)

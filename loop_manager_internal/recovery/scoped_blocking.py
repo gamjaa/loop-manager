@@ -155,14 +155,28 @@ def _reason(value: object) -> BlockReasonCode:
 
 
 def catalog_held_plan_ids(connection: sqlite3.Connection, repo: str) -> frozenset[str]:
-    """Additional catalog causes never replace approval or execution blocks."""
+    """Catalog and unresolved completion scopes never replace execution blocks."""
+    held = set()
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_holds'"
-    ).fetchone() is None:
-        return frozenset()
-    return frozenset(str(row[0]) for row in connection.execute(
-        "SELECT plan_id FROM execplan_catalog_holds WHERE repo = ?", (repo,),
-    ))
+    ).fetchone():
+        held.update(str(row[0]) for row in connection.execute(
+            "SELECT plan_id FROM execplan_catalog_holds WHERE repo = ?", (repo,),
+        ))
+    from loop_manager_internal.storage.execution_checkpoint_state import pending_completion_plan_ids
+    pending = set(pending_completion_plan_ids(connection, repo))
+    dependencies = [(str(row[0]), json.loads(row[1])) for row in connection.execute(
+        "SELECT plan_id,depends_on FROM exec_plans WHERE repo=? AND status<>'MERGED'", (repo,),
+    )] if pending else ()
+    # ponytail: repeated scans are quadratic in dependency depth; use a reverse
+    # adjacency queue if large pending catalog graphs make this boundary costly.
+    while True:
+        dependent = {key for key, requires in dependencies if pending.intersection(requires)} - pending
+        if not dependent:
+            break
+        pending.update(dependent)
+    held.update(pending)
+    return frozenset(held)
 
 
 def plan_blocks(connection: sqlite3.Connection, repo: str) -> tuple[sqlite3.Row, ...]:

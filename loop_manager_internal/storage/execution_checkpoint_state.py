@@ -12,6 +12,17 @@ from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
 from .execplan_catalog_state import is_cancelled
 
 
+def pending_completion_plan_ids(connection, repo):
+    """Read unresolved observations without remote I/O or schema mutation."""
+    if not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_checkpoints'").fetchone():
+        return frozenset()
+    return frozenset(str(row[0]) for row in connection.execute(
+        "SELECT x.plan_id,x.snapshot FROM execution_checkpoints x JOIN exec_plans p "
+        "ON p.repo=x.repo AND p.plan_id=x.plan_id WHERE x.repo=? AND p.status<>'MERGED'", (repo,),
+    ) if ((json.loads(row[1] or '{}') or {}).get('external_completion') or {}).get('db_pending'))
+
+
 def historical_agent_snapshots_match(saved_row, snapshots):
     """Scope history may refer only to the task workspace proved retired by the caller."""
     from loop_manager_internal.agents.scope_contracts import GitSnapshot
@@ -203,7 +214,7 @@ def cancelled_snapshot_without_new_resources(snapshot, repo, plan_id, saved_row,
         'user_decision_assessment', 'common_defect_assessment', 'manager_metadata_agent_baseline',
         'workspace_identity_recovery', 'recovered_rebase_metadata', 'rebase_resolution_commit',
         'worker_checkpoint_pending', 'remote_adoption_intent', 'rebase_block_release',
-        'confirmed_manual_stage_revalidation', 'metadata_block_git'}
+        'confirmed_manual_stage_revalidation', 'metadata_block_git', 'external_completion'}
     metadata_lists = {'worker_checkpoint_requests', 'worker_frontmatter_restores', 'workspace_scope_audit',
         'user_decision_assessment_history', 'common_defect_assessment_history', 'rebase_block_recovery_audit',
         'scope_block_release_audit', 'publication_block_release_audit', 'retired_publications'}
@@ -532,6 +543,8 @@ class ExecutionCheckpointRepository:
                     'common_defect_assessment', 'common_defect_assessment_history'):
             if current.snapshot and key in current.snapshot and key not in (snapshot or {}):
                 snapshot = {**(snapshot or {}), key: current.snapshot[key]}
+        if current.snapshot and 'external_completion' in current.snapshot:
+            snapshot = {**(snapshot or {}), 'external_completion': current.snapshot['external_completion']}
         if current.operation == 'rebase_publish':
             saved = current.snapshot or {}
             intent = current.rebase_publication_intent()
@@ -580,6 +593,28 @@ class ExecutionCheckpointRepository:
             self.connection.execute("ROLLBACK TO SAVEPOINT execution_checkpoint_record")
             self.connection.execute("RELEASE SAVEPOINT execution_checkpoint_record")
             raise
+        return self.get(repo, plan_id)
+
+    def record_completion_observation(self, repo, plan_id, *, expected, observation):
+        """Retain remote evidence without replacing Git intents or prior stage audits."""
+        raw = self.connection.execute(
+            'SELECT snapshot FROM execution_checkpoints WHERE repo=? AND plan_id=?', (repo, plan_id),
+        ).fetchone()
+        if self.get(repo, plan_id) != expected or is_cancelled(self.connection, repo, plan_id):
+            raise CheckpointRace('completion observation checkpoint changed')
+        payload = json.dumps({**(expected.snapshot or {}), 'external_completion': observation}, sort_keys=True)
+        # Native generation binds rebase acceptance/publication contracts. This
+        # metadata has its own snapshot CAS and must not invalidate those proofs.
+        if raw is None:
+            changed = self.connection.execute(
+                'INSERT OR IGNORE INTO execution_checkpoints(repo,plan_id,generation,snapshot) VALUES (?,?,1,?)',
+                (repo, plan_id, payload))
+        else:
+            changed = self.connection.execute(
+                'UPDATE execution_checkpoints SET snapshot=? WHERE repo=? AND plan_id=? AND generation=? AND snapshot IS ?',
+                (payload, repo, plan_id, expected.generation, raw[0]))
+        if changed.rowcount != 1:
+            raise CheckpointRace('completion observation snapshot changed')
         return self.get(repo, plan_id)
 
     def accept_current_rebase(self, repo: str, plan_id: str, *,

@@ -204,6 +204,9 @@ class StoredPlanIdentity:
     plan_sha: str | None
     status: str | None = None
     current_content_hash: str | None = None
+    pr_url: str | None = None
+    branch: str | None = None
+    base: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1807,18 +1810,16 @@ class CatalogRecoveryService:
             diagnostic: CatalogDiagnostic | None = None
 
             # Confirmed PR/archive evidence outranks stale status and legacy SHA fields.
-            if (
+            if (identity is not None and identity.pr_url and history_proof is not None
+                    and history_proof.pr_url and identity.pr_url != history_proof.pr_url):
+                diagnostic = self._diagnostic(entry, 'stable-identity-mismatch',
+                    f'검증된 완료 이력과 현재 작업의 PR identity가 다릅니다: {entry.plan_id}')
+            elif (
                 history_proof is not None
                 and history_proof.kind in {MergeProofKind.ARCHIVE_DOCUMENT, MergeProofKind.GITHUB_PR}
                 and audit["observed_path"] == entry.path
                 and audit["original_path"] == entry.active_path
                 and audit["final_content_hash"] == entry.content_hash
-                and (identity is None or (
-                    (identity.path == audit["original_path"]
-                     and identity.content_hash == audit["original_content_hash"])
-                    or (identity.path == audit["observed_path"]
-                        and identity.content_hash == audit["final_content_hash"])
-                ))
             ):
                 proof = history_proof
                 original_path = str(audit["original_path"])
@@ -1980,6 +1981,8 @@ def publication_identity(row: sqlite3.Row) -> StoredPlanIdentity:
                   if row["publication_sha"] or row["plan_sha"] else None),
         status=str(row["status"]),
         current_content_hash=str(row["content_hash"]),
+        pr_url=(str(row['pr_url'] or '') or None) if 'pr_url' in row.keys() else None,
+        branch=(str(row['branch'] or '') or None) if 'branch' in row.keys() else None,
     )
 
 

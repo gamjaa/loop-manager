@@ -112,6 +112,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             return False
     plan = (connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                                (repo, block['plan_id'])).fetchone() if block is not None and block['plan_id'] else None)
+    if plan is not None and plan['status'] == 'MERGED':
+        return False  # Completion never authorizes a new workspace recovery.
     if (plan is not None and int(plan['workspace_owned']) == WORKSPACE_OWNED
             and block['reason_code'] in {BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value,
                                          BlockReasonCode.WORKSPACE_OWNERSHIP_LOCAL.value}):

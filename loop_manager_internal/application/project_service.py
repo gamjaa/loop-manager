@@ -295,7 +295,7 @@ class ProjectService:
                 return 1
             self.effects.observe_waiting_pull_requests(
                 self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo,
-                require_base_identity=self.state.require_self_pr_base, read_only=True,
+                require_base_identity=self.state.require_self_pr_base, completion_only=True,
                 config_path=self.identity.config_path,
             )
             self.effects.resume_project_block_if_safe(self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo)
@@ -1318,7 +1318,12 @@ class ProjectService:
                 current_project is not None
                 and int(current_project["pr_conflict_recovery"])
             )
-            if (waiting_open or conflict_recovery) and not confirmed_merge:
+            from loop_manager_internal.storage.execution_checkpoint_state import pending_completion_plan_ids
+            if pending_completion_plan_ids(self.identity.connection, self.state.repo):
+                sync_result = BaseWorktreeSyncResult(
+                    "skipped", "PR 완료 확인/DB 반영 대기 중 source checkout 보존", self.state.base_sha,
+                )
+            elif (waiting_open or conflict_recovery) and not confirmed_merge:
                 sync_result = BaseWorktreeSyncResult(
                     "skipped",
                     "PR 충돌 감지/복구 중 source checkout 보존",

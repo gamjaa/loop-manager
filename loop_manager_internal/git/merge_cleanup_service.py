@@ -256,6 +256,8 @@ def complete_merged_execplan_worktree(
     pr_url: str,
     pr_head_oid: str | None,
     *, merge_commit_oid: str | None = None,
+    observed_registration: tuple[str, str] | None = None,
+    observed_checkpoint_generation: int | None = None,
 ) -> CleanupAssessment:
     """Complete exactly one merge-wait plan without hydrating another plan."""
 
@@ -270,31 +272,57 @@ def complete_merged_execplan_worktree(
         current = current_connection.execute(
             'SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, plan_id),
         ).fetchone()
+        registration = current_connection.execute(
+            'SELECT origin,base_branch FROM projects WHERE repo=?', (repo,),
+        ).fetchone()
+        if observed_registration is not None and (
+                registration is None or tuple(registration) != observed_registration):
+            raise WorkspaceOwnershipError('Merge 관측 뒤 프로젝트 연결이 변경됐습니다.')
         identity_fields = ('path', 'content_hash', 'catalog_generation', 'branch',
-                           'worktree', 'workspace_owned', 'worker_session_id')
+                           'worktree', 'workspace_owned', 'worker_session_id', 'pr_url', 'pr_head_oid',
+                           'current_revision_sha')
         if (current is None or any(current[key] != plan[key] for key in identity_fields)
                 or current['status'] not in {plan['status'], 'MERGED'}
                 or current['pr_url'] and current['pr_url'] != pr_url):
             raise WorkspaceOwnershipError('Merge 관측 뒤 ExecPlan identity/소유 상태가 변경됐습니다.')
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        checkpoint_store = ExecutionCheckpointRepository(current_connection)
+        checkpoint = checkpoint_store.get(repo, plan_id)
+        if observed_checkpoint_generation is not None and checkpoint.generation != observed_checkpoint_generation:
+            raise WorkspaceOwnershipError('Merge 관측 뒤 checkpoint generation이 변경됐습니다.')
         effects._ensure_cleanup_pending_schema(current_connection)
-        effects._store_cleanup_pending(
-            current_connection, repo, Path(str(current['worktree'] or '')),
-            pr_url, pr_head_oid, 'Merge 확인; worktree 정리 대기',
-            workspace_owned=int(current['workspace_owned']),
-        )
+        if current['worktree']:
+            effects._store_cleanup_pending(
+                current_connection, repo, Path(str(current['worktree'])),
+                pr_url, pr_head_oid, 'Merge 확인; worktree 정리 대기',
+                workspace_owned=int(current['workspace_owned']),
+            )
+        from loop_manager_internal.storage import task_calls
         mirrored = runtime_state.project_row(current_connection, repo)
         project_values = (effects._clear_active_values()
             if mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
+            and scoped_blocking.project_block(current_connection, repo) is None
+            and not task_calls.pending_for_plan(current_connection, repo, plan_id)
             and mirrored['plan_path'] == current['path'] else {})
         runtime_state.RuntimeStateRepository(current_connection).mark_merged(
             repo, plan_id, project_values=project_values, enqueue=False,
             pr_url=pr_url, pr_head_oid=pr_head_oid,
         )
+        if not current['branch']:
+            runtime_state.RuntimeStateRepository(current_connection).update_plan(
+                repo, plan_id, plan_values={'branch': f'loop-manager/{plan_id}'}, enqueue=False,
+            )
         from loop_manager_internal.storage import common_defect_state
         manual_store.mark_group_merged(repo, plan_id)
         group = manual_store.for_plan(repo, plan_id)
         for member in json.loads(group['members']) if group else (plan_id,):
             common_defect_state.record_merge(current_connection, repo, member, pr_url, pr_head_oid, merge_commit_oid)
+        completion = (checkpoint.snapshot or {}).get('external_completion')
+        if completion is not None:
+            checkpoint_store.record_completion_observation(
+                repo, plan_id, expected=checkpoint,
+                observation={**completion, 'db_pending': False},
+            )
         scoped_blocking.clear_plan_block(current_connection, repo, plan_id)
         notifications.record_merged_plan(current_connection, repo, plan_id, str(current['title']))
         notifications.enqueue_current_project_events(current_connection, repo)
@@ -306,6 +334,8 @@ def complete_merged_execplan_worktree(
         with connection:
             record_merge(connection)
 
+    if not plan['worktree']:
+        return CleanupAssessment('missing')
     effects._ensure_cleanup_pending_schema(connection)
     branch = str(plan["branch"] or "")
     worktree = Path(str(plan["worktree"] or ""))
@@ -316,8 +346,14 @@ def complete_merged_execplan_worktree(
     planning_owns_slot = not runtime_state.RuntimeStateRepository(
         connection
     ).recovery_slot_available(repo)
+    from loop_manager_internal.storage import task_calls
     if planning_owns_slot:
         assessment = CleanupAssessment("deferred", "planning 실행 자리 보존")
+    elif (scoped_blocking.project_block(connection, repo) is not None
+            or any(task_calls.pending_for_plan(connection, repo, member)
+                   for member in (json.loads(manual_store.for_plan(repo, plan_id)['members'])
+                                  if manual_store.for_plan(repo, plan_id) else (plan_id,)))):
+        assessment = CleanupAssessment("deferred", "planning·프로젝트 차단·미종료 호출 보존")
     elif not (worktree.exists() or worktree.is_symlink()):
         assessment = effects._assess_missing_managed_cleanup(state_dir, repo_path, worktree)
     elif int(plan["workspace_owned"]) != WORKSPACE_OWNED:
