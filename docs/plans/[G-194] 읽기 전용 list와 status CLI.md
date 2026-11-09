@@ -65,7 +65,7 @@ priority: normal
 
 ## Implementation
 
-- [ ] G-359의 기존 catalog/실행 감사·완료 근거와 pending 관측을 읽기 전용 list/status 투영에 연결한다. `storage/execplan_catalog_state.py`의 저장 proof kind/revision·진단, 현재 완료/cleanup 자료를 재사용하고 schema ensure·복구 service·PR 조회를 호출하지 않는다. 기본/JSON의 nullable·legacy/불일치 의미를 같은 안내에 통합하고 후보별 복구 상세는 G-195에 남긴다.
+- [ ] G-359의 현재 catalog/실행 감사·완료 근거와 pending 관측을 읽기 전용 list/status 투영에 연결한다. `storage/execplan_catalog_state.py`의 저장 proof kind/revision·진단과 `execution_checkpoints.snapshot.external_completion` version 1의 `kind`·`revision`·`db_pending`·error, cleanup pending을 같은 읽기 snapshot에서 구분한다. `pending_completion_plan_ids()`의 순수 조회와 수동 묶음/의존 범위의 저장 관계를 재사용하되 `ExecutionCheckpointRepository` 생성·schema ensure·복구 service·PR 조회는 호출하지 않는다. 원래 native generation/operation과 완료 관측을 섞지 않고 기본/JSON의 nullable·legacy/불일치 의미를 같은 안내에 통합한다. 후보별 복구 상세는 G-195에 남긴다.
 
 - [ ] 직접 구현된 `_project_limits_status()`의 `management_waiting`과 `storage/management_admission.py`에 반영된 G-345의 순서/인계 근거를 읽기 전용 투영에 통합한다. `pending`은 미반영 명시 요청, `parked`는 후속 배정 보류, `handoff`는 선택됐으나 기존 단위의 반환을 기다리는 상태로 읽는다. 수동 최초 수락·명시 요청의 양수 `priority`·미소비 `retry_order`·nullable `resumed`와 현재 유효 priority를 구분하고 admission의 `sequence`를 실제 실행 순서로 표시하지 않는다. 과거 수락 행만으로 현재 요청·인계·시작을 추정하지 않는다. 선택 column 부재와 NULL은 미확인으로 남기며 조회에서 schema를 보완하지 않는다. 현재 status의 parked ID 나열을 소급 구현하지 않으며 추가 상세 필드·legacy 부재·수락/시작 구별만 완성한다. 순서 결정·reconcile·release_blocks를 조회에서 호출하지 않는다.
 
@@ -96,6 +96,8 @@ priority: normal
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- revision `e8bd11e7d237aea4c6236d52da2b4718ae525664`의 G-359 archive·실제 snapshot CAS/보류 조회·cleanup/완료 회귀를 대조했다. 이제 확인한 저장 필드만 기존 조회 작업에 연결하며 같은 ID의 G-359 dependency는 보존한다. snapshot token `5fab29734839c3afbe6a0a485048dfdbab785973ec909a5113e24fb7e7ef78eb`의 원문 hash·ID/경로·metadata·기존 목표/기록을 유지한다. 조회에서 완료 관측/DB 복구를 실행하거나 원격 직접 구현을 소급 계획하지 않는다. 테스트·verify·최종 제품 전문 확인은 수행하지 않았다.
 
 - revision `2e642e0e8148bbec6244c23c99b266682402f4e7`의 R-055 완료 우선·진단 구분은 기존 list/status 범위에 통합한다. G-359의 저장 완료 결과만 읽기 위해 선행을 추가하며 조회 권한·R-076 JSON/오류·source 관계·기존 metadata/기록은 유지한다. 외부 사실을 조회 중 새로 판정하거나 복구를 실행하는 목표는 추가하지 않는다.
 

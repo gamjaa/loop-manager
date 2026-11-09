@@ -7,6 +7,7 @@ sources:
   - docs/requirements/[R-067] 프로젝트 공통 verify 실행 규약.md
   - docs/requirements/[R-086] 영향 기반 부분 검증과 일반 선행 Review.md
   - docs/requirements/[R-091] 프로젝트 공정 배정과 우선순위 기반 병렬 작업.md
+  - docs/requirements/[R-080] Git Mock Defaults for Tests.md
 depends_on:
   - G-186
   - G-208
@@ -56,6 +57,7 @@ priority: normal
 
 ## Implementation
 
+- [ ] 보존된 공통 보고 409·499·503·515의 원래 run과 현재 실행 자료를 기존 실측 준비에서 대조한다. `tests/support/bootstrap_saved_scope.py`의 역할별 실제 부모/자식 연결·원래 90초/플랫폼별 상한과 `bootstrap-costs` 진단, `verification/coordination.py:CoordinatorClient.request()`의 3초 응답 제한·`VerifyCoordinator.request()`의 잠금/관측·예약 처리, `core.py:execute_manifest()`/`stop_worker()`와 `manager_adapter.py`의 종료/예약 보존을 확인한다. bootstrap 비용·전체 실제 시간 상한·acquire 응답 지연·후속 worker 정리 오류를 각각 원래 run/시점으로 구분하고, 마지막 정리 오류만으로 최초 중단 원인을 확정하지 않는다. 확인한 원인의 교정이 이미 별도 소유 계획에 있으면 소비하며 미확정 원인을 성공·동일 원인·임계값 정책 문제로 바꾸지 않는다. timeout 증가·가드/수집 축소·고정 CPU로 우회하지 않는다.
 - [ ] R-091의 새 큐 조율은 G-356의 선행 closure를 소비한 뒤 실제 Manager 자료를 수집한다. 프로젝트 단계·기존 작업의 후속 배정·Git/DB/Telegram 대기를 각 큐의 요청 identity와 실제 실행/종료 자료로 연결한다. 이미 구현된 coordinator·runner/adapter를 바꾸거나 큐 전환을 이 실측 작업에서 구현하지 않는다.
 - [ ] 기존 `loop_manager_internal/verification/resources.py`·`coordination.py`·`timing.py`의 진단과 확인한 `tests/support/verify_examples/python/`·`perl/`의 선언/launcher를 재사용해 bounded 실제 검증/비교 진입을 기존 verify 경계에 연결한다. 현재 `verification/integration.py:execute()`·`validate_example()`·`partial_case()`의 고정 suite와 `scripts/verify.json`의 필수 단계가 이전한 정상/native 실패·partial/full assertion을 소유한다. 삭제된 `tests/test_verify_language_examples.py`·`tests/support/verify_fixture.py`와 고정 sampler를 복원하거나 같은 실제 실행을 unittest에 추가하지 않는다. 통합 단계·상하위 시간 계산은 원격에 반영된 G-309 구현을 소비하며 별도 상시 benchmark 서비스나 새 루트 launcher를 만들지 않는다.
 - [ ] 확인한 `loop_manager_internal/verification/contract.py`·`runner.py`·`perl_adapter.py`의 version 1 dispatch·파일 suite/동적 TAP assertion·serial/independent·부분 FALLBACK을 실제 실행 자료에 연결한다. `perl_reporter.pl`·`LoopManagerVerifyGuard.pm`의 native 로그/TAP spool·BEGIN 이전 Agent/fork/network 거부를 보존한다. Perl의 미지원 AST 부분 선정·시간 큐 재사용이나 Windows native 지원을 새 목표로 추가하지 않는다.
@@ -67,6 +69,7 @@ priority: normal
 
 ## Validation
 
+- 통신 응답 timeout·worker shutdown 오류와 전체 실행 시간 초과는 별도 결과/진단으로 대조한다. 같은 수정 전후 비교에 원래 최초 오류·후속 정리·실제 중단 위치·종료 확인·예약 트리를 함께 보존하며, 관련 unit은 기존 `tests/test_verify_runtime.py:test_pool_failure_paths_stop_before_release_and_preserve_original_error`·예약/종료 회귀를 재사용한다. 서버 응답 지연 원인은 현재 보고만으로 확정할 수 없고, mock 종료 통과나 더 긴 전체 예산의 완주는 그 통신 원인 해소의 증거가 아니다. 실제 bootstrap의 현재 계측/회수 개선도 보고 409의 모든 비용 원인 해결로 합산하지 않는다. 필요한 실제 연결은 유지하고 조건 조합은 R-080에 따라 실제 판정/저장과 제어된 관측으로 검사한다.
 - G-356 이후 같은 후보/환경에서 큐 대기·중앙 순회·실제 Agent/verify 실행을 구별한다. 독립 큐 지연이 verify 실행 시간이나 미수행 결과로 합산되지 않고, 기존 관리/실행 상한·상하위 대기 증명·자식 종료/예약 보존이 유지되는지 실제 자료로 확인한다. 큐 단위 정책 행렬은 선행 unit을 재사용하며 여기서는 실제 연결·OS 자료만 수집한다.
 - Worker는 resource reservation·process cleanup·diagnostic aggregation에서 변경한 경계의 최소 unit case만 실행한다. `tests/test_verify_runtime.py`·`test_verify_contract.py`·`test_verify_perl_adapter.py`와 현재 `tests/test_verify_integration.py`의 결과/소유권·종료 보존 unit을 재사용한다. 상위 집계의 ID 없는 중첩 진단 제외는 이미 직접 구현된 `TimingAndManifestTests.test_summary_does_not_adopt_unowned_nested_diagnostics`로 계속 검증하며 같은 unit을 복제하지 않는다. 고정 suite의 실제 실행은 전체 verify에 유지하고 결과 확인/배정 진단은 G-248, Windows 부하 관측은 G-249의 목표와 중복하지 않는다.
 - 선택기 버전 안내는 위 구현의 선언·선택 직렬화·이전 algorithm 거부·runner 결과 기록과 정적으로 대조한다. `tests/test_verify_impact.py`의 기존 계약 변경·삭제/rename·algorithm identity 회귀와 `tests/test_partial_verify_runner.py`의 실행 없는 FALLBACK·NOT_SELECTED 회귀를 보존하며, 안내 문구만의 교정에 고정 prose assertion을 추가하지 않는다.
@@ -84,6 +87,8 @@ priority: normal
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- revision `e8bd11e7d237aea4c6236d52da2b4718ae525664`와 snapshot token `5fab29734839c3afbe6a0a485048dfdbab785973ec909a5113e24fb7e7ef78eb`의 started ID·경로·원문 hash·기존 실측 목표/기록을 보존한다. R-080은 실제 bootstrap/OS 연결을 남기고 정책 조합·비용 측정을 분리하는 직접 검증 근거로 추가했다. 과거 406/407의 중첩 runner는 현재 필수 통합 단계로 이전됐으므로 복원하지 않는다. 409·499·503·515는 원인이 미확정인 관측으로 보존하며 G-236 후보의 일부 PASS·공통 fixture 직접 교정·G-359 Merge를 전체 verify/통신 성공이나 차단 해제로 쓰지 않는다. 기존 dependency·metadata와 실제 OS/같은 범위 비교 완료 조건을 유지하고 새 인프라·성능 보장·보고 연결을 만들지 않는다.
 
 - 검토 revision `37e3ec6ec2bb12ee93907a79de1f8a312aac047d`와 snapshot token `06cc9502c2e4a5f69ce409cb645d39daa6134c635b823f2db161da886022e34a`의 원문 hash를 대조했다. started ID·경로·기존 수행/검증 기록과 OS 실측 목표를 보존하며, 최종 큐 연결을 실제 측정할 수 있도록 G-356 선행을 추가했다. G-347의 실패/정상 bootstrap 회수와 상위 run 집계 분리·대응 unit은 현재 Merge된 코드로 소비한다. 이 정적 개정은 보고 409의 timeout 원인 확정·실제 OS 실행·성능·기존 차단 해소나 프로젝트 최종 전문 확인이 아니다.
 - revision `79d56d1df767cbbd7c3a9fb0274ca0b53a0294ff`의 run ID 엄격 비교와 대응 unit은 직접 구현으로 소비한다. snapshot token `22f83effbf72610e55ef3eacb8b4134f17d50e530e98825c854dfb36bf245f60`의 원문 hash를 대조했고 started ID·경로·metadata·dependency·기존 기록을 보존했다. R-080의 실제 효과 검증·기존 assertion 보존은 이 실측 작업에도 적용되며, 보고 406·407의 과거 중첩 실행을 복원하거나 timeout을 늘리지 않는다. bootstrap 회수의 추가 연결은 G-347에 남기고 공통 필터·실제 OS 검증을 중복 계획하지 않는다. 정적 확인은 OS/통합 실행·성능·차단 해제의 성공이 아니다.
