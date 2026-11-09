@@ -7,7 +7,7 @@ from loop_manager_internal.application.contracts import PROJECT_STEP_TRANSIENT_P
 from loop_manager_internal.application.contracts import PROJECT_STEP_USAGE_PAUSE
 from loop_manager_internal.application.contracts import ProjectRunKind
 from loop_manager_internal.application.contracts import ProjectRunResult
-from loop_manager_internal.notifications import notifications
+from loop_manager_internal.notifications import notifications, work_exhaustion
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.recovery import recovery_runtime
 from loop_manager_internal.recovery import scoped_blocking
@@ -360,8 +360,11 @@ def _run_project_result(
                 )
             except (RuntimeError, OSError):
                 snapshot = None
+            if snapshot is None:
+                snapshot = work_exhaustion.blocked_selection(connection, repo)
             if snapshot is not None and not snapshot.completed:
                 notifications.enqueue_waiting_reason(connection, repo, snapshot)
+                reason = redact_secrets(snapshot.describe())
         effects.operation_log(str(reason), error=True)
         return ProjectRunResult(ProjectRunKind.BLOCKED, 1, reason)
     if step_result == PROJECT_STEP_TRANSIENT_PAUSE:
@@ -396,6 +399,8 @@ def _run_project_result(
         snapshot = effects._stable_work_reason(
             connection, repo, refactoring_review_interval=refactoring_review_interval,
         )
+        if snapshot is None:
+            snapshot = work_exhaustion.blocked_selection(connection, repo)
     if snapshot is not None:
         reason = redact_secrets(snapshot.describe())
         effects.operation_log(f"작업 선택 결과 ({repo}): {reason}")

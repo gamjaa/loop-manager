@@ -286,6 +286,87 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
 
 
 class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
+    def blocked_selection_fixture(self, connection):
+        from loop_manager_internal.storage import execplan_draft_state
+        repo = '/projects/alpha'
+        path = 'docs/plans/[G-018] Reliable notices.md'
+        plan = {'id': 'G-018', 'title': 'Reliable notices', 'sources': ['docs/PRODUCT.md'],
+                'draft': True, 'draft_scope': 'scope',
+                'draft_question': 'Question: Choose A or B?\nOptions: A, B',
+                'draft_question_identity': 'question-1'}
+        connection.execute("UPDATE projects SET phase='WORKING', origin='org/repo', "
+                           "planning_fingerprint='cycle', processed_sha='base', last_error='stale error'")
+        execplan_draft_state.observe(connection, repo, path, plan, 'hash', 'base',
+                                    remote_url='https://github.com/org/repo')
+        for plan_id, status, dependencies in (
+                ('G-019', 'PLAN_BLOCKED', '[]'),
+                ('G-020', 'IMPLEMENTING', '["G-019"]')):
+            connection.execute("INSERT INTO exec_plans (repo,plan_id,path,title,sources,depends_on,priority,content_hash,status) "
+                               "VALUES (?,?,?,?, '[]',?,'normal','hash',?)",
+                               (repo, plan_id, f'docs/plans/[{plan_id}] Work.md', plan_id, dependencies, status))
+        connection.execute("INSERT INTO execplan_blocks (repo,plan_id,scope,reason_code,evidence) "
+                           "VALUES (?, 'G-019', 'plan', 'common_defect_pending', 'Correction pending')", (repo,))
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        checkpoints = ExecutionCheckpointRepository(connection)
+        checkpoints.record(repo, 'G-020', expected_generation=0, operation='rebase',
+                           expected_head='a' * 40, target_base_oid='b' * 40,
+                           observed_remote_oid=None, snapshot={})
+        connection.commit()
+        return repo
+
+    def test_blocked_selection_logs_and_notifies_once_with_drafts_and_blocks_after_restart(self):
+        from loop_manager_internal.application import project_runner
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / 'state.db'
+            connection = self.connection(database=database)
+            self.addCleanup(connection.close)
+            repo = self.blocked_selection_fixture(connection)
+            effects = project_runner.InternalRunProjectResultEffects(
+                _checkpoint_dispatch_ready=mock.Mock(return_value=False),
+                _record_project_recovery=mock.Mock(), _run_project_step=mock.Mock(return_value=0),
+                _stable_work_reason=mock.Mock(return_value=None), catalog_schedule_decision=mock.Mock(),
+                dispatch_blocked_checkpoints=mock.Mock(), is_loop_manager_repository=lambda _: False,
+                operation_log=mock.Mock())
+            result = project_runner._run_project_result(
+                effects, connection, Path(directory), repo, Path('/config'), 'main', False)
+            self.assertIn('진행 불가', result.detail)
+            self.assertIn('G-019 (PLAN_BLOCKED)', result.detail)
+            self.assertNotIn('stale error', result.detail)
+            self.assertTrue(any('진행 불가' in call.args[0] for call in effects.operation_log.call_args_list))
+            sender = mock.Mock()
+            notifications.dispatch_pending(connection, 'token', 'chat', adapter=sender)
+            messages = [call.args[2] for call in sender.call_args_list if '진행 불가' in call.args[2]]
+            self.assertEqual(len(messages), 1)
+            for text in ('G-018', 'Choose A or B?', 'G-019', 'Correction pending',
+                         'docs/plans/', 'https://github.com/org/repo'):
+                self.assertIn(text, messages[0])
+            connection.close()
+            restarted = sqlite3.connect(database)
+            self.addCleanup(restarted.close)
+            restarted.row_factory = sqlite3.Row
+            notifications.configure_session(restarted, enabled=True)
+            snapshot = work_exhaustion.blocked_selection(restarted, repo)
+            self.assertFalse(notifications.enqueue_waiting_reason(restarted, repo, snapshot))
+            self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=sender), 0)
+            self.assertEqual(restarted.execute(
+                "SELECT COUNT(*) FROM notification_outbox WHERE event_type='work_waiting'").fetchone()[0], 1)
+
+    def test_blocked_selection_rejects_live_or_runnable_work_and_cancels_old_notice(self):
+        connection = self.connection()
+        repo = self.blocked_selection_fixture(connection)
+        snapshot = work_exhaustion.blocked_selection(connection, repo)
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        connection.execute("INSERT INTO task_call_reservations (token,repo,plan_id,kind,uncertain) "
+                           "VALUES ('reserved', ?, 'G-020', 'verify', 1)", (repo,))
+        self.assertIsNone(work_exhaustion.blocked_selection(connection, repo))
+        connection.execute("DELETE FROM task_call_reservations WHERE token='reserved'")
+        connection.execute("UPDATE exec_plans SET depends_on='[]' WHERE plan_id='G-020'")
+        connection.commit()
+        self.assertIsNone(work_exhaustion.blocked_selection(connection, repo))
+        notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock())
+        self.assertIsNotNone(connection.execute(
+            "SELECT canceled_at FROM notification_outbox WHERE event_type='work_waiting'").fetchone()[0])
+
     def test_waiting_snapshot_and_episode_survive_restart_without_notice(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / 'state.db'

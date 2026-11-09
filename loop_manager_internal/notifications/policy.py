@@ -475,6 +475,9 @@ def completion_current(connection, repo, cycle, work_cycle):
 
 def waiting_current(connection, repo, payload):
     from . import work_exhaustion
+    if payload.get('blocked_selection'):
+        observed = work_exhaustion.blocked_selection(connection, repo)
+        return bool(observed and work_exhaustion.episode_signature(observed) == payload['signature'])
     from loop_manager_internal.storage import maintenance_state, planning_review_state, runtime_state
     project = connection.execute(
         "SELECT * FROM projects WHERE repo=?", (repo,),

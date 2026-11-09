@@ -73,7 +73,8 @@ def _event_message(kind: str, payload: dict[str, object]) -> str:
             f"시작한 작업: {payload['operation']}"
         )
     if kind == "work_waiting":
-        lines = [f"[{payload['project']}] 다음 작업 대기 (시작 가능한 작업 없음)"]
+        title = '진행 불가' if payload.get('blocked_selection') else '다음 작업 대기'
+        lines = [f"[{payload['project']}] {title} (시작 가능한 작업 없음)"]
         entries = [*payload["plans"], *payload["requirements"]]
         if payload.get("project_block"):
             entries.append({

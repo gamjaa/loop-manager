@@ -538,6 +538,8 @@ Planner의 표준 결과는 `FINAL_SPECIFICATION_REVIEW: <JSON object>` 하나�
 
 안정적 완료·작업 소진의 원본은 현재 원격 입력·catalog·SQLite 상태다. 완료 기록의 `cycle_key`는 유효 planning 입력 지문이며 최종 확인의 `work_cycle`과 구분한다. `project_completion_cycles`의 완료 시각·마지막 Merge 계획·세대와 `work_reason_episodes`의 원인 지문·세대는 Telegram 활성 여부와 독립적으로 유지한다. 안정 관측은 기존 선택·복구·유지보수 결과와 전체 대상 상태를 대조하고, 다른 대상의 호출 예약이나 종료 미확인 invocation이 남으면 보류한다. 관리 인계·순번만으로 실제 진행을 만들지 않는다. 완료와 대기 사건은 각각 해당 주기와 episode에 결합한다. Merge 후 worktree cleanup·ExecPlan archive pending은 완료를 막지 않지만 미완료 planning publication·활성 writer·안전 gate를 우회하는 근거로 사용하지 않는다.
 
+선택 종료의 안정적 소진 판정이 없는 경우 `work_exhaustion.blocked_selection`은 현재 catalog·draft·차단과 미충족 dependency를 다시 읽어 진행 불가 snapshot을 만든다. 시작된 실행 상태도 선행 미충족이 확인된 경우만 대기로 설명하고, 독립 READY·선행을 충족한 활성 단계·알 수 없는 상태는 진행 불가로 확정하지 않는다. 실제 호출/예약, planning 소유·미확정 일반 게시와 유지보수 진행은 snapshot 생성을 막는다. 과거 `projects.last_error`와 terminal 작업의 복구 감사는 현재 원인의 원본이 아니다. 선행 차단으로 재개할 수 없는 작업의 저장된 rebase/checkpoint intent만으로 실행 중이라고 판단하지 않으며 실제 호출·예약과 현재 실행 자격으로 구분한다. 이 snapshot은 완료 근거로 쓰지 않고 `blocked_selection: true`를 기존 `work_waiting` payload·episode 지문에 결합한다. `project_runner`는 snapshot의 실제 draft/차단/선행 관계를 로그·결과로 반환하고 기존 episode 세대·outbox로 최초 한 번만 통지한다. 전송 claim에서도 같은 현재 판정을 재수행해 해소·실행 재개의 미전송 조각을 취소하며, 질문·문서 링크와 차단 목록은 기존 렌더러로 한 메시지에 표시한다. 새 DB 상태·재시도 한도·최종 차단이나 원격 쓰기 권한을 만들지 않는다.
+
 ### 계획 게시와 작업 공간
 
 계획을 실행 이력에 적용하기 전에 원격 게시와 catalog 전체의 유효성을 확인한다. 계획·FUTURE_IDEAS 변경이 없으면 관측한 두 입력 지문을 저장하고 planning worktree를 정리해 완료 여부를 확인한다.

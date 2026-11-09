@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import hashlib
 import re
@@ -21,6 +21,7 @@ class WorkReasonSnapshot:
     project_block: dict[str, str] | None
     planning_error: str | None
     source_relations: dict[str, dict[str, object]] | None = None
+    blocked_selection: bool = False
 
     @property
     def completed(self) -> bool:
@@ -39,6 +40,7 @@ class WorkReasonSnapshot:
             "project_block": self.project_block,
             "planning_error": self.planning_error,
             "source_relations": self.source_relations,
+            **({"blocked_selection": True} if self.blocked_selection else {}),
         }
 
     def describe(self) -> str:
@@ -56,6 +58,8 @@ class WorkReasonSnapshot:
                 reason += " " + str(plan["url"])
             if plan.get("revision"):
                 reason += " (Revision: " + str(plan["revision"]) + ")"
+            if self.blocked_selection and plan.get('path'):
+                reason += " (문서: " + str(plan['path']) + ")"
             parts.append(f"{plan['id']} {plan['title']}: {reason}")
         for requirement in self.requirements:
             parts.append(f"{requirement['id']}: {requirement['reason']}")
@@ -63,11 +67,12 @@ class WorkReasonSnapshot:
             parts.append("PROJECT_BLOCKED: " + self.project_block["reason"])
         if self.planning_error:
             parts.append("planning_error: " + self.planning_error)
-        return "; ".join(parts)
+        return ("진행 불가 (시작 가능한 작업 없음): " if self.blocked_selection else "") + "; ".join(parts)
 
 
 def episode_signature(snapshot: WorkReasonSnapshot) -> str:
     identity = {
+        **({"blocked_selection": True} if snapshot.blocked_selection else {}),
         "plans": [{key: value for key, value in plan.items()
                    if key not in {"url", "pr_url", "path", "revision"}}
                   for plan in snapshot.plans],
@@ -211,7 +216,7 @@ def collect(
             item.pop("url", None)
             if waiting.get("url"):
                 item["url"] = waiting["url"]
-        elif status == "READY":
+        elif status in {"READY", "IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING"}:
             dependencies = json.loads(str(row["depends_on"]))
             missing = [
                 {"id": str(dependency), "status": statuses.get(str(dependency), "UNKNOWN")}
@@ -219,7 +224,7 @@ def collect(
                 if statuses.get(str(dependency)) != "MERGED"
             ]
             if not missing:
-                if project_block is None:
+                if project_block is None or status != "READY":
                     return None
                 item["reason"] = "프로젝트 차단 해소 후 실행 조건을 다시 확인합니다"
             else:
@@ -344,3 +349,24 @@ def collect(
         cycle, tuple(plans), tuple(requirement_reasons), project_block, planning_error,
         relation_evidence,
     )
+
+
+def blocked_selection(connection: sqlite3.Connection, repo: str) -> WorkReasonSnapshot | None:
+    """Explain a completed selection with durable blockers, not a stale error."""
+    from loop_manager_internal.storage import maintenance_state, planning_review_state, runtime_state
+    project = connection.execute('SELECT * FROM projects WHERE repo=?', (repo,)).fetchone()
+    if (project is None or project['phase'] not in
+            {None, 'WORKING', 'VERIFYING', 'REVIEW', 'PUBLISHING', 'PR_OPEN', 'PLAN_BLOCKED', 'PROJECT_BLOCKED'}
+            or project['pr_conflict_recovery'] or runtime_state.planning_owns_execution_slot(project)
+            or execution_pending(connection, repo)
+            or planning_review_state.general_pending(connection, repo)):
+        return None
+    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    if cycle.phase is not maintenance_state.MaintenancePhase.IDLE or cycle.publication_stage is not None:
+        return None
+    snapshot = collect(connection, repo, cycle=str(project['planning_fingerprint'] or ''),
+                       active_requirements=(), base_revision=project['processed_sha'])
+    if snapshot is None or (not snapshot.project_block and not any(
+            plan['status'] in {'DRAFT', 'PLAN_BLOCKED', 'CATALOG_HELD'} for plan in snapshot.plans)):
+        return None
+    return replace(snapshot, blocked_selection=True)
