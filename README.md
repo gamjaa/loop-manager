@@ -104,7 +104,7 @@ Windows:
 
 제품 문서 변경을 push한 뒤 `run`을 실행하면 Planner가 남은 작업을 계획한다. Worker는 구현·관련 unit test, Manager는 전체 verify, Reviewer는 읽기 전용 검토를 맡는다. 의존 작업은 선행 PR의 실제 Merge를 기다리며 안정된 열린 PR이나 계획별 차단이 있어도 독립 READY는 진행한다. 한 프로젝트의 차단·일시 실패는 다른 프로젝트를 막지 않는다.
 
-반복 실행은 cron 또는 Windows 작업 스케줄러에 `run --skip-if-running`으로 등록한다. 같은 성공 입력에 할 일이 없으면 Agent를 반복 호출하지 않는다. 실행 코드는 최신 `origin/main`의 정확한 SHA를 사용하며 source checkout의 로컬 변경은 실행 revision이 아니다. [runtime·동기화 구조](docs/ARCHITECTURE.md#git과-worktree-실행-모델)
+반복 실행은 cron 또는 Windows 작업 스케줄러에 `run --skip-if-running`으로 등록한다. 같은 성공 입력에 할 일이 없으면 Agent를 반복 호출하지 않는다. 실행 코드는 최신 `origin/main`의 정확한 SHA를 사용하며 source checkout의 로컬 변경은 실행 revision이 아니다. [runtime·동기화 구조](docs/ARCHITECTURE.md#11-자체-runtime-선택과-갱신)
 
 `run`에 경로를 지정하면 해당 등록 프로젝트만 처리한다. 여러 경로와 공백이 있는 경로를 지원하며, 경로를 정규화·중복 제거한 뒤 전체가 등록됐는지 확인한다. 하나라도 등록되지 않았다면 어떤 프로젝트도 처리하지 않는다.
 
@@ -129,4 +129,4 @@ PR 생성은 완료가 아니다. 같은 PR의 실제 Merge를 확인한 뒤 완
 - [PLANS](docs/PLANS.md): 공통 ExecPlan 형식
 - [Specification Skill](.agents/skills/specification-docs/SKILL.md): 문서 작성·검토
 
-Worker의 코드 품질 지침에는 [Ponytail](https://github.com/DietrichGebert/ponytail)을 사용한다. [적용 방식·출처·라이선스](docs/ARCHITECTURE.md#ponytail-지침)
+Worker의 코드 품질 지침에는 [Ponytail](https://github.com/DietrichGebert/ponytail)을 사용한다. [재설계의 적용 방식](docs/ARCHITECTURE.md#6-agent-실행과-품질-지침)

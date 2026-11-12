@@ -13,7 +13,7 @@ Git·`gh`와 선택한 Agent CLI를 설치·인증하고 대상 GitHub 저장소
 | Codex | CLI 0.159.3 이상, 세 OS의 내장 sandbox 사전 검사 통과 |
 | Claude Code | Linux·macOS CLI 2.1.307 이상, 시작 설정 확인 필요 |
 
-Codex는 세 OS에서 상태 루트의 공통 홈을 인증·설정·session 저장소로 직접 사용한다. Windows ACL·Job Object, macOS Seatbelt, Linux 읽기 전용 mount·프로세스 그룹의 경계를 확인할 수 없으면 권한을 완화하지 않고 중단한다. Claude는 공식 native 호출 구성과 모의 회귀를 기준으로 시작 설정을 확인하며, 이를 실제 OS 격리 검증 성공으로 표시하지 않는다. [Codex 권한 정책](https://developers.openai.com/codex/permissions) · [격리 설계](ARCHITECTURE.md#repository-safety-and-security)
+Codex는 세 OS에서 상태 루트의 공통 홈을 인증·설정·session 저장소로 직접 사용한다. Windows ACL·Job Object, macOS Seatbelt, Linux 읽기 전용 mount·프로세스 그룹의 경계를 확인할 수 없으면 권한을 완화하지 않고 중단한다. Claude는 공식 native 호출 구성과 모의 회귀를 기준으로 시작 설정을 확인하며, 이를 실제 OS 격리 검증 성공으로 표시하지 않는다. [Codex 권한 정책](https://developers.openai.com/codex/permissions) · [격리 설계](ARCHITECTURE.md#13-telegram과-보안)
 
 ### 전용 공급자 홈과 인증
 
@@ -39,7 +39,7 @@ env CLAUDE_CONFIG_DIR=/path/to/state/automation-claude claude auth status
 
 기존 역할·worktree별 runtime 홈의 config·auth·session은 삭제·이동·복제하지 않으며 새 호출 입력으로 연결하지 않는다. 이전 session은 저장된 ID로 재개를 시도하고 사용할 수 없으면 기존 작업·실패 문맥을 보존하는 새 session fallback을 따른다. 호출 기록용 임시 폴더는 runtime 아래에 분리하며 Claude Bash의 짧은 임시 폴더는 `/tmp` 아래 호출별 비공개 경로를 사용한다. 공통 홈을 Agent 도구의 쓰기 허용 범위에 추가하지 않으며 역할별 권한과 명시적 실행값을 유지한다. Claude는 선택 공통 홈의 `settings.json`과 프로젝트·local·managed 설정을 현재 호출에서 검사한다. 개인 홈의 settings·Hook은 연결하지 않는다. 공통 홈 설정의 정상 생성·원자 교체·삭제는 다음 호출에 반영되며, 소비 설정의 확장·권한 충돌·읽기 실패·소유권 불명·조회 뒤 변경은 원본을 보존해 거부한다. 오류가 나면 진단된 소비 경로를 확인하고 충돌을 해소한 뒤 재시도한다. 과거 runtime의 설정이나 개인 설정을 다시 연결해 우회하지 않는다.
 
-Claude의 파일 수정은 sandboxed Bash로 수행하며 Edit·Write·NotebookEdit는 거부한다. Worker의 targeted runner는 환경변수에 지정된 명령을 Bash에서 실행한다. 홈 아래 설치된 Manager Python 패키지의 읽기만 허용하며 해당 설치 경로는 쓰기 금지다. 실제 CLI·계정·OS·session 호환성 후속 확인은 [개발·지원 범위](PRODUCT.md#claude-개발지원-범위)를 따른다.
+Claude의 파일 수정은 sandboxed Bash로 수행하며 Edit·Write·NotebookEdit는 거부한다. Worker의 targeted runner는 환경변수에 지정된 명령을 Bash에서 실행한다. 홈 아래 설치된 Manager Python 패키지의 읽기만 허용하며 해당 설치 경로는 쓰기 금지다. 실제 CLI·계정·OS·session 호환성 후속 확인은 [Claude 개발 지침](../AGENTS.md#claude-지원-개발)를 따른다.
 
 기존 상태 루트가 `/home/ubuntu/.local/state/loop-manager`인 cron은 기존 `automation-codex`를 재사용하므로 `env CODEX_HOME=...`을 제거하고 `bash /home/ubuntu/loop-manager/run.sh --skip-if-running`으로 전환할 수 있다. DB의 상태 루트를 고정하는 `LOOP_MANAGER_STATE_DIR` 등 다른 옵션은 유지한다. 실제 crontab은 자동 수정하지 않는다.
 
@@ -95,7 +95,7 @@ bootstrap은 source checkout 기준으로 설정 경로를 확정해 runtime에 
 
 기존 프로젝트는 `.agents/skills/`, `docs/PLANS.md`, `docs/*.template.md`와 필요한 문서를 선택적으로 병합한다. PLANS와 템플릿은 복사된 공통 파일을 사용하고 [예약 경로](AGENTS.common.md#예약-경로)를 유지한다. 복사 스크립트는 자동 Loop에서 실행하지 않는다.
 
-등록 검사는 fetch한 원격 base를 사용한다. `docs/PLANS.md`는 Manager 기준 해시와 일치해야 하고 작성된 ARCHITECTURE 및 PRODUCT 또는 활성 Requirement가 필요하다. 빈 템플릿만 게시하면 등록할 수 없다. [등록 조건](ARCHITECTURE.md#프로젝트-등록)
+등록 검사는 fetch한 원격 base를 사용한다. `docs/PLANS.md`는 Manager 기준 해시와 일치해야 하고 작성된 ARCHITECTURE 및 PRODUCT 또는 활성 Requirement가 필요하다. 빈 템플릿만 게시하면 등록할 수 없다. [등록 절차](../README.md#3-등록과-첫-실행)
 
 Requirement는 frontmatter·상태 없이 `docs/requirements/` 바로 아래에 두며 모두 Planner 입력이다. 새 기능·정책 변경을 요청받은 대화형 Agent는 관련 활성 Requirement를 먼저 작성·갱신하거나 충분한 기존 문서를 재사용한다. Skill은 명세를 정리하고 Planner가 ExecPlan을 만든다.
 
@@ -191,7 +191,7 @@ Windows에서는 `.\.venv\Scripts\python.exe`와 `D:\repo\my-project` 같은 경
 | Windows | `%LOCALAPPDATA%\loop-manager\` |
 | Linux·macOS | `${XDG_STATE_HOME:-~/.local/state}/loop-manager/` |
 
-**SQLite와 기존 감사 자료를 함께 백업한다.** 과거 `agent-guidance/` snapshot은 감사에만 보존하며 재개 지침은 매 호출 현재 runtime에서 읽는다. `agent-instructions/`의 실행용 파일은 현재 원본으로 재생성할 수 있다. [지침 적용 계약](ARCHITECTURE.md#지침-원본과-호출별-적용)
+**SQLite와 기존 감사 자료를 함께 백업한다.** 과거 `agent-guidance/` snapshot은 감사에만 보존하며 재개 지침은 매 호출 현재 runtime에서 읽는다. `agent-instructions/`의 실행용 파일은 현재 원본으로 재생성할 수 있다. [지침 적용 계약](ARCHITECTURE.md#6-agent-실행과-품질-지침)
 
 비정상 종료 뒤 `SQLITE_READONLY_ROLLBACK`은 DB 파일 권한 부족과 구분한다. bootstrap은 해당 오류에만 쓰기 연결을 한 번 사용해 SQLite가 미완료 트랜잭션을 복구하도록 한다. 수동 조치가 필요하면 다른 실행과 DB 접근을 정지·조율하고 DB와 같은 이름의 `-journal` 파일을 함께 보존한 뒤 SQLite의 정상 복구를 사용한다. 원인과 무관한 권한 변경이나 journal 삭제로 우회하지 않는다. pause DB의 접근 경합에서도 pause 확인은 자기 자신을 재귀 호출하지 않고 기존 대기 제한과 실제 중단 결정을 유지한다.
 
@@ -217,7 +217,7 @@ Worker는 관련 targeted unit test와 verify 스크립트를 준비하고 전�
 python -m loop_manager_internal.verification.runner --report <직렬 기록 디렉터리> <auto 기록 디렉터리>
 ```
 
-비교 범위·관측 환경이 같고 원본의 부하·메모리 제한을 확인한 경우에만 시간을 비교한다. [검증·복구 설계](ARCHITECTURE.md#검증과-재시도)
+비교 범위·관측 환경이 같고 원본의 부하·메모리 제한을 확인한 경우에만 시간을 비교한다. [검증·복구 설계](ARCHITECTURE.md#7-verify와-reviewer)
 
 ### Windows Defender와 테스트 임시 폴더
 
