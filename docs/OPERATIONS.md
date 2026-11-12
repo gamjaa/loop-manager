@@ -1,5 +1,7 @@
 # Loop Manager 운영 안내
 
+> **문서 구분:** 여기의 명령·옵션은 현재 구현 기준이다. [PRODUCT](PRODUCT.md)·[ARCHITECTURE](ARCHITECTURE.md)에 기록한 재설계 목표와 다를 수 있으며, 특히 기존 `manual submit`은 새 설계의 지원 범위에 포함되지 않는다.
+
 첫 설치와 실행은 [README Quick Start](../README.md#quick-start)를 따른다. 이 문서는 설정 조정, 수동 제출과 장애 복구를 다룬다. 아래 `python`은 Loop Manager 저장소의 `.venv` Python을 뜻한다.
 
 ## 인증과 실행 조건

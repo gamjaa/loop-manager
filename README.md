@@ -1,5 +1,7 @@
 # Loop Manager
 
+> **문서 구분:** 이 README와 [운영 안내](docs/OPERATIONS.md)는 현재 구현의 사용법을 설명한다. `develop`의 [PRODUCT](docs/PRODUCT.md)·[ARCHITECTURE](docs/ARCHITECTURE.md)는 아직 구현되지 않은 재설계 목표이며, 수동 제출 등 일부 기능 범위가 다르다.
+
 Loop Manager는 여러 로컬 GitHub 프로젝트의 **Planner → Worker → Verify → Reviewer → PR 생성**을 자동화한다. 사용자는 제품 문서를 게시하고, 필요한 결정을 내리고, PR을 검토·Merge한다.
 
 중단된 작업과 Agent 세션은 다음 실행에서 이어진다. 구현·Review는 전체 `max_workers`, 프로젝트별 관리 대상은 `max_tasks_per_project`, verify는 별도 `verify_concurrency` 한도에서 병렬 처리하며 PR·차단·대기·완료를 Telegram으로 알린다.
