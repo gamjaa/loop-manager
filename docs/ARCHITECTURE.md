@@ -82,7 +82,7 @@ Observer는 원격 base·문서 내용·G의 정의·PR 상태를 구분해 관�
 | `external_jobs` (통합) | 고유 작업 키, `repo`, 종류·대상·입력·상태·원격 확인 결과 | Commit/Push/PR 갱신·Archive·정리의 중단 복구 |
 | `requirement_judgments` | 기존 완료 판단 근거 | R의 최종 충족 판단 |
 | `notification_outbox` | 기존 고유 사건·전송 정보 | Telegram 재시도·중복 억제 |
-| `execplan_cancellations` 또는 간소화된 tombstone | `(repo, plan_id)`, 실제 철회 revision·근거 | 취소 G-ID 재사용 방지 |
+| `execplan_tombstones` (신규) | `(repo, plan_id)`, 철회 revision·근거 | 취소 G-ID 재사용 방지. 기존 `execplan_cancellations`의 유효 기록만 이관 |
 
 `agent_calls`는 **세션과 사용량에 필요한 최소 호출 단위**만 남긴다. 호출별 상세 비용·프롬프트·전환 이력 전체를 새로운 DB에 복제하지 않는다. 사용량은 `invocation_id`로 중복 기록을 막고 PR 게시 시 역할·모델별로 합산한다. Planner의 여러 G에 공유된 사용량은 계획 PR에 귀속하고 각 G에 임의 분할하지 않는다. Provider별 입력·캐시 토큰의 의미를 유지하며 모르는 값은 0으로 채우지 않는다.
 
