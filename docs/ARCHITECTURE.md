@@ -79,7 +79,7 @@ Observer는 원격 base·문서 내용·G의 정의·PR 상태를 구분해 관�
 | `projects` | `repo`, `base_branch`, 등록·Provider 설정 | 프로젝트 설정 |
 | `exec_plans` | `(repo, plan_id)`, 정의 필드, `status`, `branch`, `pr_url` | G 식별·현재 계획·종단 상태 |
 | `planning_input_baselines` | `(repo, scope)`, R-ID 단위 입력 지문·버전·마지막 확정 revision | 동일 Requirement의 계획 중복 실행 방지 |
-| `execplan_runs` (신규) | `(repo, plan_id)`, `generation`, `input_fingerprint`, `worktree`, `retry_after`, `last_error`, `manual_mode`, 수동·복구 요청 표식 | G 실행 세대·후속 요청·대기·재개. 실행 단계 중복 없음 |
+| `execplan_runs` (신규) | `(repo, plan_id)`, `generation`, `input_fingerprint`, `worktree`, `retry_after`, `last_error`, `manual_mode`, 요청 순번·최종 결과 표식 | G 실행 세대·후속 요청·대기·재개·비동기 CLI 결과 확인. 실행 단계 중복 없음 |
 | `agent_calls` (간소화) | `invocation_id`, `repo`, `scope`, `role`, `provider`, `model`, `session_id`, 지침 해시·토큰 | 세션·호출 중복 방지·모델별 집계 |
 | `validation_receipts` (통합) | `repo`, `plan_id`, `stage`, `input_fingerprint`, `generation`, 결과·근거 | Verify·Review 성공 재사용 |
 | `managed_prs` (신규) | `repo`, `pr_number`, 종류·계획 PR의 source R-ID·연결 G-ID 목록·head/base·Draft·Closed·충돌 관측 | R별 계획 PR 하나와 구현 G별 PR 관측·연결 |
@@ -187,7 +187,7 @@ ExecPlan 실행 단계는 `exec_plans.status`의 `READY`, `WORKING`, `VERIFYING`
 CLI의 상태 변경은 **짧은 SELECT·조건부 UPDATE/INSERT를 같은 SQLite 트랜잭션에서 처리**한다. 이미 다른 프로세스가 바꾼 상태를 덮어쓰지 않도록 `WHERE status = ...` 등 현재 G 상태·실행 세대·요청 순번을 비교하는 CAS를 사용한다.
 
 - `pause` / `resume`: `pause_scopes`의 최신 의도를 즉시 갱신한다. runtime은 신규 작업·Agent·Verify 단계 배정 직전에 읽는다. 이미 실행 중인 호출은 안전하게 반환하며, 오래된 pause 요청이 이후 resume을 뒤집지 않는다.
-- `unblock`: CLI가 `BLOCKED` G와 대상의 현재 상태를 확인한 뒤 `execplan_runs`에 재평가·재개 요청을 기록한다. **요청 기록은 실제 충돌 해결이나 READY 전이의 성공이 아니다.** runtime이 안전한 경계에서 최신 원격·차단 사유를 재검증하고 유효할 때만 상태를 전이시킨다.
+- `unblock`: CLI가 `BLOCKED` G와 대상의 현재 상태를 확인한 뒤 `execplan_runs`에 재평가·재개 요청을 기록한다. **요청 기록은 실제 충돌 해결이나 READY 전이의 성공이 아니다.** runtime이 안전한 경계에서 최신 원격·차단 사유를 재검증하고 유효할 때만 상태를 전이시킨다. 재개 불가·요청 거부가 확정되더라도 CLI의 최종 피드백이 없었다면 결과·원인·사용자 조치를 Telegram으로 통지한다.
 - `recover`: 관련 G 또는 프로젝트의 현재 실행 기록에 복구 요청을 표시하고, runtime이 외부 Git 효과·검증 근거를 확인해 필요한 단계만 재개한다.
 - `manual start` / `manual complete`: 기존 G의 수동 요청 상태를 즉시 바꾸되 브랜치 생성·원격 제출 확인·Verify는 runtime이 수행한다. `manual start`를 기록한 G는 자동 Worker 선정에서 즉시 제외한다.
 - 프로젝트 설정 변경: `projects`의 설정·등록 요청을 조건부 갱신하고 원격 확인 등 실제 외부 효과는 runtime에서 수행한다.
@@ -195,7 +195,7 @@ CLI의 상태 변경은 **짧은 SELECT·조건부 UPDATE/INSERT를 같은 SQLit
 
 runtime은 시작·재시작, 현재 호출의 완료·실패·중단 후 **다음 단계·작업 선택마다** 최신 `pause_scopes`, 프로젝트 설정과 관련 G의 요청 표식을 다시 조회한다. 이미 진행 중인 Agent·Verify를 CLI 명령 때문에 강제 종료하거나, 각 작업 도중 일정 주기로 DB를 조회하는 별도 polling 루프를 만들지 않는다. 경합으로 실패한 CLI 변경은 명시적인 잠금·상태 변경 오류를 반환하며 영속 기록이 없는데 요청이 접수됐다고 주장하지 않는다.
 
-요청 표식과 실제 상태 변경·외부 효과는 분리한다. runtime은 Git·Agent 작업 전 짧은 트랜잭션으로 실행 대상과 `generation`을 확정하고 COMMIT한다. 실행 종료 후 새 트랜잭션에서 현재 세대와 기대한 상태를 확인한 다음 결과를 적용한다. 중단되면 요청 표식·확정 상태·실제 GitHub 효과를 다시 관측하고 이미 완료된 외부 작업을 중복 실행하지 않는다. 요청이 적용되거나 필요 없어지면 해당 G의 표식을 정리한다. 한 G의 요청이나 잠금 문제가 다른 독립 G를 BLOCKED로 만들지 않는다.
+요청 표식과 실제 상태 변경·외부 효과는 분리한다. runtime은 Git·Agent 작업 전 짧은 트랜잭션으로 실행 대상과 `generation`을 확정하고 COMMIT한다. 실행 종료 후 새 트랜잭션에서 현재 세대와 기대한 상태를 확인한 다음 결과를 적용한다. 중단되면 요청 표식·확정 상태·실제 GitHub 효과를 다시 관측하고 이미 완료된 외부 작업을 중복 실행하지 않는다. 요청이 적용·거부되거나 필요 없어지면 최종 결과와 알림 의도를 보존한 뒤 해당 G의 불필요한 요청 표식을 정리한다. **CLI가 접수 결과만 반환한 명령은 최종 결과(성공·실패·거부)를 기록하면서 동일 트랜잭션으로 `notification_outbox`에 사건을 추가**한다. 일시 오류·자동 재시도는 최종 결과로 기록하지 않는다. 한 G의 요청이나 잠금 문제가 다른 독립 G를 BLOCKED로 만들지 않는다.
 
 
 ## 6. Agent 실행과 품질 지침
@@ -275,7 +275,7 @@ Codex·Claude의 입력·캐시 읽기·캐시 쓰기·출력 토큰 정의를 �
 
 ## 13. Telegram과 보안
 
-모든 프로젝트의 Telegram은 기존 `notification_outbox`를 활용하는 공통 큐에서 처리한다. 작업·PR·현재 후보·차단 원인으로 사건 키를 만들어 중복 전송을 억제한다. 계획/구현 PR 등록, 구현 PR Ready 재검토, 충돌 복구, 최종 차단과 확인된 장기 무진전은 일반 알림이고, 신규 G 시작·차단된 G 실제 재개는 무음이다. 계획 PR이 Draft라면 등록 사건에 draft G-ID·제목·질문을 포함하고 별도 draft 알림을 생성하지 않는다. Draft 해제와 충돌 해소가 같은 후보의 사건이면 하나의 알림으로 합친다. 전송 실패는 개발 작업을 막지 않는다. 해결·취소돼 더 이상 유효하지 않은 미전송 payload는 취소하며 발송 뒤 불필요한 본문 데이터는 정리한다.
+모든 프로젝트의 Telegram은 기존 `notification_outbox`를 활용하는 공통 큐에서 처리한다. 작업·PR·현재 후보·차단 원인으로 사건 키를 만들어 중복 전송을 억제한다. **비동기 CLI 명령의 결과는 프로젝트·대상 G·명령 종류·요청 순번에 결합한 사건 키**로 한 번만 발행한다. 최종 결과의 성공·거부·실패 여부와 원인, 현재 상태 및 필요한 사용자 조치를 작은 payload에 포함한다. 처리 도중 종료되면 기존 요청과 실제 상태를 대조해 동일 결과 알림을 다시 생성하지 않는다. 계획/구현 PR 등록, 구현 PR Ready 재검토, 충돌 복구, 최종 차단과 확인된 장기 무진전은 일반 알림이고, 신규 G 시작·자율적으로 재개된 G는 무음이다. **명시적 CLI `unblock` 요청에 대한 늦은 재개 성공 또는 재개 불가 확정은 일반 알림**이다. 즉시 CLI로 최종 결과를 돌려준 경우에는 별도 결과 알림을 보내지 않는다. 계획 PR이 Draft라면 등록 사건에 draft G-ID·제목·질문을 포함하고 별도 draft 알림을 생성하지 않는다. Draft 해제와 충돌 해소가 같은 후보의 사건이면 하나의 알림으로 합친다. 전송 실패는 개발 작업을 막지 않는다. 해결·취소돼 더 이상 유효하지 않은 미전송 payload는 취소하며 발송 뒤 불필요한 본문 데이터는 정리한다.
 
 Agent에는 역할·작업 공간에 필요한 최소 권한과 프로젝트 설정만 전달한다. 사용자 checkout·다른 G의 작업물·공개 커밋을 덮어쓰지 않고, 비밀값·환경정보가 포함된 로그를 PR·Telegram에 노출하지 않는다. 실제 대상 게시·삭제 시점에만 필요한 보호 검사를 수행한다. ignored-only 변경이나 다른 Worktree의 일반 변경을 Agent의 권한 위반으로 추정하지 않는다.
 
@@ -305,6 +305,8 @@ Agent에는 역할·작업 공간에 필요한 최소 권한과 프로젝트 설
 - MERGED 후 G Archive와 R 완료 재확인·후속 계획·Archive
 - 완료 후 Worktree 정리 실패가 다른 작업을 막지 않음
 - Agent 지침·Ponytail·세션·Checkpoint·실제 모델 사용량 PR 집계
+- 비동기 CLI `unblock` 재개 성공·재개 거부 통지, 다른 비동기 명령 결과와 즉시 응답의 중복 억제
+- CLI 결과 확정 직후 중단 시 결과·Outbox 원자 기록과 재전송 중복 방지
 - Telegram 재전송·중복 억제, DB 없는 새 환경의 원격 복구
 - 서로 다른 언어·프레임워크에서 프로젝트 정의 Verify 명령 실행
 
