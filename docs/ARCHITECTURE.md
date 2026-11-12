@@ -190,7 +190,7 @@ runtime은 시작·재시작, 현재 호출의 완료·실패·중단 후 **다�
 
 ### CLI 비동기 결과 식별
 
-CLI가 요청을 반영할 때 `request_id`(G·프로젝트별 고유 ID), `request_kind`, `feedback_mode`(`CLI_FINAL` 또는 `TELEGRAM_PENDING`), 현재 요청 세대·결과를 **같은 짧은 트랜잭션**으로 저장한다. 수동 Git 준비처럼 CLI가 최종 결과를 직접 반환하는 명령은 `CLI_FINAL`, `unblock`·`recover`·`manual complete`처럼 실행을 넘기는 요청은 `TELEGRAM_PENDING`으로 구분한다. 단순 상태 조회·pause 등 즉시 확정되는 명령은 별도의 후속 알림을 만들지 않는다.
+CLI가 요청을 반영할 때 `request_id`(G·프로젝트별 고유 ID), `request_kind`, `feedback_mode`(`CLI_FINAL` 또는 `TELEGRAM_PENDING`), 현재 요청 세대·결과를 **같은 짧은 트랜잭션**으로 저장한다. `unblock`·`recover`·`manual complete`처럼 실행을 넘기는 요청은 `TELEGRAM_PENDING`이며, 수동 Git 준비처럼 CLI가 최종 결과를 직접 돌려준 요청만 `CLI_FINAL`로 확정한다. **`manual start` 준비 도중 CLI가 중단돼 최종 응답이 확인되지 않은 경우에는 기존 Git 상태를 재관측해 재실행·결과 조회를 허용하고, 비동기로 최종 확정했다면 Telegram 통지 대상으로 처리**한다. 응답 전달과 DB 기록 사이의 중단은 미통지보다 중복 가능성을 감수하되 요청 ID·Outbox로 반복 전송을 억제한다. 단순 상태 조회·pause 등 즉시 확정되는 명령은 별도의 후속 알림을 만들지 않는다.
 
 한 G에 미완료 비동기 요청이 이미 있으면 같은 내용의 반복 요청은 기존 ID로 응답하고, **결과를 덮어쓸 다른 요청은 즉시 거부하거나 기존 결과 확정 뒤에 다시 접수**한다. 프로젝트 단위 요청은 `projects`의 요청 표식으로 같은 규칙을 따른다. runtime은 실제 성공·거부·실패를 확정할 때 `request_id`·`feedback_mode`를 함께 조회한다. `TELEGRAM_PENDING`에 대해서는 **요청의 최종 결과 기록과 `notification_outbox` 저장을 동일 SQLite 트랜잭션으로 처리**하고, 전송될 사건을 남긴 뒤 요청 표식을 정리한다. 지연된 결과나 재시작에서 요청 ID가 같다면 중복 사건을 만들지 않는다. 즉시 처리된 명령은 Telegram에 반복 통지하지 않는다.
 
