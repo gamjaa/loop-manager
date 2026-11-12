@@ -77,12 +77,12 @@ Observer는 원격 base·문서 내용·G의 정의·PR 상태를 구분해 관�
 | 테이블 | 주요 키·필드 | 목적 |
 |---|---|---|
 | `projects` | `repo`, `base_branch`, 등록·Provider 설정 | 프로젝트 설정 |
-| `exec_plans` | `(repo, plan_id)`, 정의 필드, `status`, `branch`, `pr_url` | G 식별·현재 계획·종단 상태 |
+| `exec_plans` | `(repo, plan_id)`, 정의 필드, **`primary_requirement_id`**, `sources`, `status`, `branch`, `pr_url` | G 식별·주 R 소속·다른 R과 공유 관계·현재 상태 |
 | `planning_input_baselines` | `(repo, scope)`, R-ID 단위 입력 지문·버전·마지막 확정 revision | 동일 Requirement의 계획 중복 실행 방지 |
-| `execplan_runs` (신규) | `(repo, plan_id)`, `generation`, `input_fingerprint`, `worktree`, `retry_after`, `last_error`, `manual_mode`, 요청 순번·최종 결과 표식 | G 실행 세대·후속 요청·대기·재개·비동기 CLI 결과 확인. 실행 단계 중복 없음 |
+| `execplan_runs` (신규) | `(repo, plan_id)`, `generation`, `input_fingerprint`, `worktree`, `retry_after`, `last_error`, `manual_mode`, **`request_id`, `request_kind`, `feedback_mode`, `request_result`** | G 실행 세대·수동 예약·후속 요청·비동기 CLI 결과. 실행 단계 중복 없음 |
 | `agent_calls` (간소화) | `invocation_id`, `repo`, `scope`, `role`, `provider`, `model`, `session_id`, 지침 해시·토큰 | 세션·호출 중복 방지·모델별 집계 |
 | `validation_receipts` (통합) | `repo`, `plan_id`, `stage`, `input_fingerprint`, `generation`, 결과·근거 | Verify·Review 성공 재사용 |
-| `managed_prs` (신규) | `repo`, `pr_number`, 종류·계획 PR의 source R-ID·연결 G-ID 목록·head/base·Draft·Closed·충돌 관측 | R별 계획 PR 하나와 구현 G별 PR 관측·연결 |
+| `managed_prs` (신규) | `repo`, `pr_number`, 종류·계획 PR의 **주 R-ID**·연결 G-ID 목록·head/base·Draft·Closed·충돌 관측 | 주 R별 계획 PR 하나와 구현 G별 PR 관측·연결 |
 | `external_jobs` (통합) | 고유 작업 키, `repo`, 종류·대상·입력·상태·원격 확인 결과 | 중단 복구가 필요한 미완료 게시·Archive·정리만 기록 |
 | `requirement_judgments` | 기존 완료 판단 근거 | R의 최종 충족 판단 |
 | `notification_outbox` | 기존 고유 사건·전송 정보 | Telegram 재시도·중복 억제 |
@@ -97,13 +97,13 @@ Observer는 원격 base·문서 내용·G의 정의·PR 상태를 구분해 관�
 | 기존 또는 목표 테이블 | CLI가 직접 처리하는 내용 | runtime이 처리하는 내용 |
 |---|---|---|
 | `pause_scopes` (신규) | 전체·프로젝트 scope의 pause/resume 상태와 변경 순번 즉시 갱신 | 새 단계 배정 직전 최신 pause 상태 조회 |
-| `exec_plans` / `execplan_runs` | 기존 G의 차단 해제·수동 시작·수동 제출·복구 의도를 조건부 갱신 | 실제 차단 원인 재평가, 브랜치 준비, 검증·Review·단계 전이 |
+| `exec_plans` / `execplan_runs` | 기존 G의 차단 해제·수동 시작 예약·수동 제출·복구 의도를 조건부 갱신. **수동 시작 브랜치·Worktree는 CLI에서 직접 준비** | 차단 재평가, 수동 제출 후 Verify·Review·PR, 일반 단계 전이 |
 | `projects` | 등록·해제 등 설정 변경·후속 확인 필요 상태 기록 | 실제 원격·프로젝트 준비 작업 및 설정 영향 반영 |
 | 각 상태·집계 테이블 | `list`·`status`·`usage`·`logs`의 읽기 전용 SELECT | 필요한 실행·집계·정리 기록 작성 |
 
-`execplan_runs`의 현재 실행 세대·수동 의도·복구 요청 표식과 `exec_plans.status`는 다른 상태를 중복 표현하지 않도록 구분한다. **CLI는 G의 목표 상태나 후속 작업 요청을 기록할 뿐, 미수행 Git·Verify·Review의 완료 상태를 임의로 기록하지 않는다.** 새 수동 제출·복구 명령마다 별도 큐·그룹·상태 테이블을 추가하지 않는다.
+`execplan_runs`의 실행 세대·수동 소유·복구 요청 표식과 `exec_plans.status`는 다른 정보를 표현한다. `manual_mode`는 작업의 수동 소유·준비 여부이지 별도의 G 실행 `phase`가 아니다. **CLI는 G의 목표 상태나 후속 작업 요청을 기록할 뿐, 미수행 Git·Verify·Review의 완료 상태를 임의로 기록하지 않는다.** 새 수동 제출·복구 명령마다 별도 큐·그룹·상태 테이블을 추가하지 않는다.
 
-DB 생성·기존 DB의 WAL 전환은 `init` 또는 안전한 runtime 초기화·마이그레이션 단계에서 수행하고 `PRAGMA journal_mode`가 실제 `wal`인지 확인한다. CLI 연결에서는 단순 조회마다 모드 전환이나 스키마 마이그레이션을 시도하지 않는다. 메인 DB가 없는 최초 상태는 명시적인 초기화로 처리하고, 기존 DB의 접근·마이그레이션 실패를 새 DB 부재로 숨기지 않는다. 기존 `pause.db`에 유효한 pause 기록이 있다면 안전한 전환 시 `pause_scopes`로 한 번 이관한다. 아직 구현되지 않은 `control.db`의 별도 이행을 전제하지 않는다.
+`init`에서 목표 스키마와 SQLite WAL 설정을 적용하고 `PRAGMA journal_mode`가 실제 `wal`인지 확인한다. 평소 CLI 연결은 조회마다 모드 전환·스키마 수정을 시도하지 않는다. DB 파일이 없는 첫 실행과 기존 파일의 접근·스키마 오류를 구분해 실패를 새 DB로 덮어쓰지 않는다. **기존 DB·`pause.db`의 이행과 백업 절차는 이번 설계 범위에서 정하지 않는다.**
 
 **DB 트랜잭션은 읽기·조건 검사·필요한 INSERT/UPDATE·COMMIT으로 짧게 끝낸다.** Agent·Verify·Git·네트워크·프로세스 대기·파일 삭제·runtime 교체는 트랜잭션 밖에서 실행한다. 명령 처리마다 `BEGIN IMMEDIATE`를 무조건 선점하지 않고, 복합 조건부 변경에만 짧은 쓰기 트랜잭션을 사용한다. CLI에는 제한된 `busy_timeout`을 적용해 잠금 오류를 명확히 반환하거나 짧게 재시도하고, 성공하지 않은 쓰기를 성공으로 표시하지 않는다.
 
@@ -121,25 +121,15 @@ DB 생성·기존 DB의 WAL 전환은 `init` 또는 안전한 runtime 초기화�
 
 `external_jobs`는 서로 다른 외부 효과를 임의의 JSON 상태 기계로 합치는 수단이 아니다. 작업 종류·식별 대상·진행 단계·외부 성공 확인 방법을 구분한 작은 공통 기록이다. 수행 전에 의도를 기록하고, 재시작 후에는 원격을 먼저 확인한다. Archive·Worktree·불필요한 실행 데이터 정리는 실행·완료를 차단하지 않는 독립 후속 작업으로 실행한다. 정리 실패를 G의 BLOCKED로 승격하지 않는다.
 
-### 기존 DB 이행
+### 현재 구현과의 적용 경계
 
-새 스키마를 기존 파일 위에 무조건 덮어쓰거나 `CREATE TABLE IF NOT EXISTS`만으로 완료했다고 판단하지 않는다.
-
-1. 기존 DB 스키마·버전을 판별하고, 실행 중인 구버전 Writer가 없는 안전한 전환 지점에서 임시 백업한다. 전환·복구·대조가 확인되면 자동 실행의 최종 근거로 백업 파일을 남기지 않고 정리한다. 사용자 요청으로 별도 보관한 DB 백업은 작업 결과의 최소 근거로 취급하지 않는다.
-2. 프로젝트 등록·설정과 활성 G 정의를 이관한다. `READY` 외의 기존 상태 명칭은 새 단계로 명시적으로 대응시키고, 대응이 불확실하면 성공·MERGED로 승격하지 않는다.
-3. 진행 중 G의 브랜치·PR·Checkpoint·외부 효과를 실제 GitHub·원격 Git과 대조한다. GitHub에서 확인되지 않는 과거 성공·소유권 표식을 새 상태로 복사하지 않는다.
-4. 검증 Receipt는 실제 입력·후보·PASS 근거가 확인될 때만 이관한다. 불완전한 과거 기록은 재검증 대상으로 둔다.
-5. 사용량은 사용 가능한 원본에서 호출 식별자별로 한 번만 이관한다. 이전 집계가 불완전하면 누락으로 표시한다.
-6. 알림 Outbox와 취소·완료·Archive·보류 상태를 보존한다. 이미 전송한 사건과 이미 생성한 PR을 재발행하지 않는다. 오래된 로그·세션·사용량·검증 기록은 완료·PR/Archive 근거를 안전하게 이관한 뒤에만 정리한다.
-7. 새 스키마에서 주요 ID 수·현재 PR 연결·완료·미완료·취소·알림을 대조한 뒤 전환을 확정한다.
-
-이행은 **재실행 가능하고 원자적**이어야 한다. 실패하면 기존 DB를 보존한 채 이전 상태로 계속 접근하거나 안전하게 재시도한다. 새 환경에 DB가 없는 경우에는 원격 문서·브랜치·PR에서 재구성하고 확인되지 않는 과거 세션·검증·토큰 수치는 추정하지 않는다.
+이 문서의 테이블 구성은 **새 목표 스키마**이며 현재 `main`의 SQLite 파일에 그대로 적용할 수 있다고 가정하지 않는다. 이번 설계에서는 기존 DB의 데이터 마이그레이션·백업·전환 절차를 구체화하지 않는다. 운영 중인 기존 데이터나 원격 Git·PR·알림을 초기화·파기하는 승인으로 해석해서도 안 된다. 실제 실행 환경을 이 설계로 전환하기 전 호환·전환 필요 여부는 별도 판단한다.
 
 ## 4. Planning과 작업 반영
 
 Planner 입력은 최신 유효 Requirement, 실제 코드·테스트, 활성·완료 G, 의존 관계와 열린 계획 PR로 구성한다. 이미 충족된 목표와 기존 G의 중복을 먼저 배제하고 현재 파악 가능한 전체 작업을 제안한다.
 
-Planner는 **Requirement R-ID를 계획 PR의 묶음 기준**으로 사용한다. 한 R에서 도출한 신규·수정 G를 `loop-manager/plans/{short-summary}`의 한 계획 PR에 게시하고, 해당 R의 열린 계획 PR이 있으면 같은 PR에서 G를 추가·수정·제거한다. 다른 R과 공유하는 구현은 이미 존재하는 G를 연결하고 중복 생성하지 않는다. PR 관측은 source R-ID로 연결하며 G가 한 개도 남지 않아도 해당 R의 PR identity를 유지한다. 사용자의 PR 편집은 보존한다.
+Planner는 **계획 평가를 시작한 Requirement를 주 R-ID**로 확정한다. 여기서 새로 도출된 G의 `primary_requirement_id`와 계획 PR의 주 R-ID를 일치시키고, `loop-manager/plans/{short-summary}`의 **하나의 주 R 계획 PR**에서 G를 추가·수정·제거한다. 그 G가 다른 R도 충족하면 `sources`에 관련 R을 연결하지만 **소속 PR은 바꾸지 않고 새로운 G·계획 PR을 중복 생성하지 않는다.** 다른 R의 변경으로 기존 공유 G의 필요성을 다시 평가할 수 있으나 생성 출처는 임의로 교체하지 않는다. 사용자 PR 편집을 보존하며 제안 G가 없어져도 주 R과 PR의 연결은 유지한다.
 
 **같은 R의 계획에 `draft: true`인 G가 하나라도 있으면 GitHub Draft PR로 게시**한다. 일반 G와 draft G를 별도 계획 PR로 분리하지 않으며, 질문이 해소될 때 같은 PR에서 관련 G를 다시 평가한다. 모든 draft가 해소되고 실제 계획 후보가 있으면 같은 PR을 Ready로 전환한다. 사용자가 Merge 없이 닫은 계획 PR은 입력이 동일한 동안 자동 재생성하지 않는다.
 
@@ -151,9 +141,9 @@ G 정의·Requirement 변경은 영향받은 현재 실행에 반영한다. 이�
 
 ### 불필요해진 계획 PR과 Requirement 완료
 
-Planner가 최신 R 전체 Acceptance Criteria, 실제 코드·테스트와 이미 확정된 G를 대조하여 **해당 R의 모든 제안 ExecPlan이 불필요하고 남은 목표도 충족됐다고 확정**하면, 기존 미Merge 계획 PR을 Close하고 해당 R의 Archive를 후속 게시한다. 아직 관련 미완료 G가 있는지 확인하며, G가 0개라는 사실만으로 무조건 완료를 추정하지 않는다.
+Planner가 최신 R 전체 Acceptance Criteria, 실제 코드·테스트와 이미 확정된 G를 대조하여 **해당 R의 모든 제안 ExecPlan이 불필요하고 남은 목표도 충족됐다고 확정**하면, 기존 미Merge 계획 PR을 Close하고 해당 R의 Archive를 후속 게시한다. **Close 직전 원격 PR의 최신 head/base 및 PR에만 있는 사용자 편집을 다시 확인**하고, 해당 편집이 R·G 판단에 영향을 주면 그 내용을 포함해 재평가한다. 미Merge 사용자 변경은 원격 PR·커밋·브랜치에 보존하고 자동 삭제하지 않는다. 다른 변경이 현재 기준을 바꾸었거나 충족 여부가 불확실하면 Close·Archive를 보류한다. G가 0개라는 사실만으로 완료를 추정하지 않는다.
 
-PR Close 이후 Archive 게시 전에 중단되면 원격 PR의 Closed 상태·R의 최신 입력·완료 판단을 확인하고 **Archive만 재시도**한다. 동일 입력으로 계획 PR을 다시 만들지 않는다. PR Close와 Archive는 외부 효과 기록에 결합하되, 이미 완료한 효과를 재실행하지 않는다. 판단 불충분·미충족·미해결 draft라면 계획 PR을 자동 Close하거나 R을 Archive하지 않고 해당 판단·계획 보완을 이어간다.
+PR Close 이후 Archive 게시 전에 중단되면 원격 PR의 Closed 상태·R의 최신 입력·완료 판단과 사용자 편집의 보존 여부를 확인하고 **Archive만 재시도**한다. 동일 입력으로 계획 PR을 다시 만들지 않는다. PR Close와 Archive는 외부 효과 기록에 결합하되, 이미 완료한 효과를 재실행하지 않는다. 판단 불충분·미충족·미해결 draft라면 계획 PR을 자동 Close하거나 R을 Archive하지 않고 해당 판단·계획 보완을 이어간다.
 
 ### Planner 실행 조건
 
@@ -161,18 +151,18 @@ Planner는 최초 계획, 활성 Requirement의 추가·수정·삭제, draft �
 
 ### 수동 개발·제출
 
-`manual start`와 `manual complete`는 **CLI가 기존 G의 실행 기록을 짧은 트랜잭션으로 조건부 갱신**한다. G의 상태·의존성·수동 요청 중복을 즉시 확인하고 접수 결과를 반환하며, 원격 Git 작업은 runtime이 수행한다.
+`manual start`와 `manual complete`는 기존 G의 상태·의존성·요청 중복을 확인하고 짧은 SQLite 트랜잭션으로 반영한다. **`manual start`는 CLI가 Git 준비까지 완료하고 즉시 최종 결과를 돌려주며**, `manual complete`는 제출 접수만 반환하고 runtime이 Verify·Reviewer·PR을 수행한다.
 
-- `manual start <repo> <G-ID>`: runtime이 base의 기존 G와 dependency·현재 실행 상태를 확인한 뒤 수동 작업 브랜치를 준비한다. **브랜치 준비가 실제 완료된 후에만** CLI 조회 결과에서 준비 완료로 표시하며, 해당 G의 자동 Worker 중복 선정을 막는다.
+- `manual start <repo> <G-ID>`: CLI는 base의 확정 G·dependency·진행 중 Writer를 확인하고, **CAS로 `manual_mode=PREPARING`을 예약·COMMIT**해 같은 G의 자동 Worker 선정을 막는다. 그 뒤 DB 트랜잭션 **밖에서** 해당 G의 브랜치·Worktree를 Git으로 준비한다. 실제 브랜치·경로 확인 후 `manual_mode=MANUAL_WORKING`을 기록하고 성공을 반환한다. Git 실패 시 오류를 바로 반환하고 준비 의도를 보존하며, 재실행 시 기존 경로·Git 결과를 확인해 안전하게 완료·재시도한다. 이미 자동 Worker가 예약한 G를 빼앗거나 다른 작업물·사용자 파일을 덮어쓰지 않는다.
 - `manual complete <repo> <G-ID>`: runtime이 사용자 원격 브랜치의 제출 후보 HEAD를 확인해 Verify → Reviewer → 동일 G 구현 PR로 인수한다. 실패하면 같은 G에서 교정한다.
 - **수동 제출 하나는 확정된 G 하나에만 연결한다.** G 없는 `manual submit`, Requirement·코드 묶음 제출, 여러 G 공유 수동 그룹은 지원하지 않는다.
-- `manual start`의 요청 표식이 기록된 순간부터 자동 Worker가 같은 G를 선택하지 못하게 한다. runtime이 브랜치 준비를 확인해야 실제 준비 완료이며, 준비 전 `manual complete`는 성공으로 처리하지 않는다. 수동 상태는 G별 최신 값만 보존하며 요청 처리 후 불필요한 이력은 정리한다.
+- `manual_mode=PREPARING`부터 해당 G의 자동 Worker 선정을 중지한다. CLI 종료·Git 실패로 준비가 미확정이면 재실행에서 실제 브랜치·Worktree를 확인해 완료하거나 안전하게 보류한다. **준비 완료 전 `manual complete`는 성공으로 취급하지 않는다.** 준비 실패만으로 G를 BLOCKED로 전환하지 않는다. 수동 상태는 G별 최신 값만 남기고 불필요한 이력을 정리한다.
 - 요청 접수와 자원 배정을 분리하고, 동일 G·브랜치의 중복·상충 요청을 검증한다. 수동 후보 HEAD가 바뀌면 기존 Verify·Review 근거를 재검사한다.
 - 과거 `--skip-verify`·`--skip-review` 옵션은 제외한다. 구현 PR Merge 전에는 수동 G도 완료가 아니다.
 
 ## 5. Scheduling과 실행 전이
 
-Coordinator는 명세·계획 갱신, 기존 진행·교정·복구, 신규 G, PR 게시, 완료 보관을 **선택 우선순위**로 처리한다. CLI는 `loop-manager.db`의 해당 테이블을 짧게 조회·조건부 수정하며, 원격 Git·Agent 작업은 runtime이 수행한다. `run`은 기존 runtime 실행 잠금을 확인해 실행을 시작하는 진입 명령이며 별도의 DB 명령 큐를 거치지 않는다. `init`은 DB 생성·WAL 전환과 필수 스키마 초기화만 담당한다. 읽기 전용 `list`·`status`·`usage`·`logs`는 직접 SELECT하고 Agent·Verify·Git 게시를 유발하지 않는다. 전역 단계 장벽을 두지 않으며 독립 작업은 겹쳐 수행한다.
+Coordinator는 명세·계획 갱신, 기존 진행·교정·복구, 신규 G, PR 게시, 완료 보관을 **선택 우선순위**로 처리한다. CLI는 `loop-manager.db`의 해당 테이블을 짧게 조회·조건부 수정하며, **`manual start`의 분리된 Git 준비만 CLI가 수행**한다. 나머지 원격 게시·Agent·Verify·PR 작업은 runtime이 담당한다. `run`은 기존 runtime 실행 잠금을 확인해 실행을 시작하는 진입 명령이며 별도의 DB 명령 큐를 거치지 않는다. `init`은 DB 생성·WAL 전환과 필수 스키마 초기화만 담당한다. 읽기 전용 `list`·`status`·`usage`·`logs`는 직접 SELECT하고 Agent·Verify·Git 게시를 유발하지 않는다. 전역 단계 장벽을 두지 않으며 독립 작업은 겹쳐 수행한다.
 
 Worker·Reviewer는 전역 공통 AI 한도, Verify는 독립된 전역 1개 한도를 사용한다. 한 프로젝트의 Worker는 기본적으로 1개이며 그 Worker가 Verify에 들어가면 다른 독립 G의 Worker를 시작할 수 있다. 자원을 실제 사용하지 않는 PR Merge 대기·사용자 판단·재시도는 슬롯을 점유하지 않는다.
 
@@ -189,7 +179,7 @@ CLI의 상태 변경은 **짧은 SELECT·조건부 UPDATE/INSERT를 같은 SQLit
 - `pause` / `resume`: `pause_scopes`의 최신 의도를 즉시 갱신한다. runtime은 신규 작업·Agent·Verify 단계 배정 직전에 읽는다. 이미 실행 중인 호출은 안전하게 반환하며, 오래된 pause 요청이 이후 resume을 뒤집지 않는다.
 - `unblock`: CLI가 `BLOCKED` G와 대상의 현재 상태를 확인한 뒤 `execplan_runs`에 재평가·재개 요청을 기록한다. **요청 기록은 실제 충돌 해결이나 READY 전이의 성공이 아니다.** runtime이 안전한 경계에서 최신 원격·차단 사유를 재검증하고 유효할 때만 상태를 전이시킨다. 재개 불가·요청 거부가 확정되더라도 CLI의 최종 피드백이 없었다면 결과·원인·사용자 조치를 Telegram으로 통지한다.
 - `recover`: 관련 G 또는 프로젝트의 현재 실행 기록에 복구 요청을 표시하고, runtime이 외부 Git 효과·검증 근거를 확인해 필요한 단계만 재개한다.
-- `manual start` / `manual complete`: 기존 G의 수동 요청 상태를 즉시 바꾸되 브랜치 생성·원격 제출 확인·Verify는 runtime이 수행한다. `manual start`를 기록한 G는 자동 Worker 선정에서 즉시 제외한다.
+- `manual start` / `manual complete`: `manual start`는 CLI의 G 예약 후 직접 Git 준비·확정까지 처리하고 결과를 즉시 돌려준다. `manual complete`는 해당 G의 원격 제출 요청을 기록하며 runtime이 원격 HEAD 확인·Verify·Review를 수행한다. 준비 중인 G는 자동 Worker가 선택하지 않는다.
 - 프로젝트 설정 변경: `projects`의 설정·등록 요청을 조건부 갱신하고 원격 확인 등 실제 외부 효과는 runtime에서 수행한다.
 - `list` / `status` / `usage` / `logs`: 조회 시점의 DB 내용을 반환한다. 조회 자체로 Planner·Worker·Verify를 호출하거나 상태 기록을 만들지 않는다.
 
@@ -197,6 +187,12 @@ runtime은 시작·재시작, 현재 호출의 완료·실패·중단 후 **다�
 
 요청 표식과 실제 상태 변경·외부 효과는 분리한다. runtime은 Git·Agent 작업 전 짧은 트랜잭션으로 실행 대상과 `generation`을 확정하고 COMMIT한다. 실행 종료 후 새 트랜잭션에서 현재 세대와 기대한 상태를 확인한 다음 결과를 적용한다. 중단되면 요청 표식·확정 상태·실제 GitHub 효과를 다시 관측하고 이미 완료된 외부 작업을 중복 실행하지 않는다. 요청이 적용·거부되거나 필요 없어지면 최종 결과와 알림 의도를 보존한 뒤 해당 G의 불필요한 요청 표식을 정리한다. **CLI가 접수 결과만 반환한 명령은 최종 결과(성공·실패·거부)를 기록하면서 동일 트랜잭션으로 `notification_outbox`에 사건을 추가**한다. 일시 오류·자동 재시도는 최종 결과로 기록하지 않는다. 한 G의 요청이나 잠금 문제가 다른 독립 G를 BLOCKED로 만들지 않는다.
 
+
+### CLI 비동기 결과 식별
+
+CLI가 요청을 반영할 때 `request_id`(G·프로젝트별 고유 ID), `request_kind`, `feedback_mode`(`CLI_FINAL` 또는 `TELEGRAM_PENDING`), 현재 요청 세대·결과를 **같은 짧은 트랜잭션**으로 저장한다. 수동 Git 준비처럼 CLI가 최종 결과를 직접 반환하는 명령은 `CLI_FINAL`, `unblock`·`recover`·`manual complete`처럼 실행을 넘기는 요청은 `TELEGRAM_PENDING`으로 구분한다. 단순 상태 조회·pause 등 즉시 확정되는 명령은 별도의 후속 알림을 만들지 않는다.
+
+한 G에 미완료 비동기 요청이 이미 있으면 같은 내용의 반복 요청은 기존 ID로 응답하고, **결과를 덮어쓸 다른 요청은 즉시 거부하거나 기존 결과 확정 뒤에 다시 접수**한다. 프로젝트 단위 요청은 `projects`의 요청 표식으로 같은 규칙을 따른다. runtime은 실제 성공·거부·실패를 확정할 때 `request_id`·`feedback_mode`를 함께 조회한다. `TELEGRAM_PENDING`에 대해서는 **요청의 최종 결과 기록과 `notification_outbox` 저장을 동일 SQLite 트랜잭션으로 처리**하고, 전송될 사건을 남긴 뒤 요청 표식을 정리한다. 지연된 결과나 재시작에서 요청 ID가 같다면 중복 사건을 만들지 않는다. 즉시 처리된 명령은 Telegram에 반복 통지하지 않는다.
 
 ## 6. Agent 실행과 품질 지침
 
@@ -290,13 +286,13 @@ Agent에는 역할·작업 공간에 필요한 최소 권한과 프로젝트 설
 실행 검증은 정상 작업뿐 아니라 다음 경계를 포함한다.
 
 - 최신 문서 변경·충돌하는 R-ID 우선순위, 동일 입력 계획 중복 방지
-- 구버전 DB 데이터 이행·완료/취소 후 불필요한 데이터 정리·중단 재시도·기존 PR/알림 중복 방지
-- G별 수동 start/complete의 실제 검증과 자체 runtime 갱신의 안전한 인계·pause 초기 판정
-- Requirement별 계획 PR에 G 묶기·Draft 전환·모든 G 불필요 판정 후 PR Close와 R Archive의 중단 복구
+- 완료/취소 후 불필요한 데이터 정리·중단 재시도·기존 PR/알림 중복 방지
+- G별 CLI `manual start` 예약 → Git 준비 → 확정·오류·중단 복구, `manual complete`의 자동 검증 및 자체 runtime 갱신·pause 초기 판정
+- 주 Requirement의 공유 G 소속·R별 계획 PR·Draft 전환·최신 사용자 수정 반영 후 모든 G 불필요 판정·PR Close와 R Archive의 중단 복구
 - WAL의 동시 읽기·짧은 CLI 쓰기·런타임 쓰기 경합에서 응답 시간을 제한하고, 기존 DB `_Gate` 순번 대기를 사용하지 않는지
 - 트랜잭션 중 Agent·Git·Verify·네트워크 호출이 없고, 오류 시 잠금을 반환하며 다른 G는 진행 가능한지
 - 같은 G의 수동 요청·차단 해제·복구·상충하는 pause/resume을 조건부 갱신하고 다음 배정 경계에서 정확하게 관측하는지
-- 실행 중 CLI 요청·재시작·오래된 Agent 결과·DB busy와 스키마 초기화·기존 pause.db 이관 시 중복 효과나 작업 유실이 없는지
+- 실행 중 CLI 요청·재시작·오래된 Agent 결과·DB busy와 SQLite 초기 상태에서 중복 효과나 작업 유실이 없는지
 - 계획 Draft PR 등록·알림 및 ignored-only 파일의 비차단 처리
 - Worker·Verify·Reviewer의 겹친 실행, 오래된 호출 결과의 적용 거부
 - GitHub 충돌 확인 후 Merge 교정과 비충돌 시 불필요한 복구 배제
@@ -305,7 +301,7 @@ Agent에는 역할·작업 공간에 필요한 최소 권한과 프로젝트 설
 - MERGED 후 G Archive와 R 완료 재확인·후속 계획·Archive
 - 완료 후 Worktree 정리 실패가 다른 작업을 막지 않음
 - Agent 지침·Ponytail·세션·Checkpoint·실제 모델 사용량 PR 집계
-- 비동기 CLI `unblock` 재개 성공·재개 거부 통지, 다른 비동기 명령 결과와 즉시 응답의 중복 억제
+- 비동기 CLI `unblock` 재개 성공·재개 거부 통지, 요청 시점의 피드백 방식 보존·중복 요청 및 즉시 결과 응답의 중복 억제
 - CLI 결과 확정 직후 중단 시 결과·Outbox 원자 기록과 재전송 중복 방지
 - Telegram 재전송·중복 억제, DB 없는 새 환경의 원격 복구
 - 서로 다른 언어·프레임워크에서 프로젝트 정의 Verify 명령 실행
