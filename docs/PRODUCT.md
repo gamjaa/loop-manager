@@ -71,15 +71,17 @@ Manager는 최신 원격 base, 활성 문서, 관련 PR과 저장된 진행 정�
 사용자는 Requirement를 작성·수정하고 base에 반영한다. Planner는 최신 Requirement의 전문·Acceptance Criteria, 실제 구현, 활성·완료 ExecPlan, 의존성 및 열린 계획 PR을 비교한다.
 
 - Requirement 변경 시 영향받는 목표를 평가하고 **현재 확인 가능한 전체 작업을 한 번의 계획에 도출**한다. 동일 구현을 중복하는 ExecPlan을 만들지 않는다.
-- 신규·변경 ExecPlan과 필요한 선행 관계를 계획 PR로 제안하며 여러 Requirement를 묶을 수 있다.
-- 열린 계획 PR이 관련 범위를 다루면 가능한 한 같은 PR에서 갱신하고 사용자 편집을 보존한다.
+- **한 Requirement에서 도출된 신규·변경 ExecPlan은 모두 하나의 계획 PR로 제안**한다. 같은 R의 계획을 여러 PR로 분리하지 않으며, 여러 R에 공통으로 필요한 구현도 별도 G로 중복 생성하지 않는다.
+- 해당 Requirement의 열린 계획 PR이 있으면 같은 PR에서 ExecPlan을 추가·수정·제거하고 사용자 편집을 보존한다.
 - 계획 브랜치 이름은 `loop-manager/plans/{short-summary}`를 기본으로 한다.
 - 최초 계획의 완전성을 전제하지 않는다. 구현 중 새로운 제약이나 미충족 조건이 발견되면 필요한 계획을 추가한다.
 - 미결정 제품 판단이 있는 G는 `draft: true`와 질문·근거·선택지·영향을 기록하고 Worker 실행에서 제외한다.
-- **미결정 G가 있더라도 영향받은 전체 계획은 하나의 계획 PR에 유지한다.** Requirement 수정에 따라 G가 추가·수정·제거될 수 있으므로 Draft와 다른 G를 별도의 계획 PR로 분리하지 않는다. base에 반영되지 않은 G는 확정 전까지 실행하지 않으며, 이미 base에 확정된 독립 G는 계속 진행한다.
+- **draft G가 있어도 해당 R의 ExecPlan을 같은 계획 PR에 유지한다.** Requirement 보완에 따라 G가 추가·수정·제거될 수 있으므로 Draft와 일반 G를 별도 PR로 나누지 않는다. 아직 base에 없는 G는 실행하지 않으며, 이미 base에 확정된 독립 G는 계속 진행한다.
 - **계획 PR에 draft ExecPlan이 하나라도 포함되면 GitHub Draft PR로 등록**하고, PR 등록 알림에 해당 G의 ID·제목과 미결정 질문을 함께 적는다. 모든 draft의 판단이 반영되면 동일 PR을 Ready for review로 전환한다.
 
-계획 PR을 Merge하지 않고 Close하면 동일한 입력·제안을 자동으로 반복 생성하지 않는다. **그 뒤 관련 문서가 실제 수정되면** 최신 변경을 기준으로 새 계획 PR을 제안한다.
+Planner 재평가로 **해당 Requirement에서 제안할 모든 ExecPlan이 불필요해졌고, 최신 Acceptance Criteria가 기존 구현으로 전부 충족됨을 확인하면** 그 계획 PR을 Close하고 Requirement를 `docs/requirements/archive/`에 보관한다. 닫힌 PR을 같은 입력으로 다시 만들지 않으며, Archive 게시만 실패하면 Archive만 재시도한다. 판단이 불확실하거나 미충족 조건이 있으면 자동 완료·보관하지 않는다.
+
+사용자가 계획 PR을 Merge하지 않고 Close한 경우에도 동일 입력·제안을 자동 재생성하지 않는다. **그 뒤 관련 Requirement가 실제 수정되면** 최신 변경을 기준으로 새 계획을 평가한다.
 
 ### 3. 계획 확정과 문서 수정
 
@@ -123,7 +125,7 @@ base의 유효한 ExecPlan은 의존성과 현재 조건을 충족하면 실행�
 
 연결된 ExecPlan이 모두 완료되거나 이미 구현으로 충족되어 더 필요한 G가 없는 Requirement는 Planner가 **최신 Requirement의 전체 Acceptance Criteria와 실제 구현·테스트**를 다시 확인한다.
 
-- **모두 충족**: 해당 R을 완료하고 `docs/requirements/archive/`로 이동한다.
+- **모두 충족**: 해당 R을 완료하고 `docs/requirements/archive/`로 이동한다. 진행 중인 해당 R의 계획 PR에서 제안 G가 모두 불필요해진 경우에는 계획 PR을 Close한 뒤 보관한다.
 - **미충족**: 필요한 추가 ExecPlan만 계획 PR로 제안한다. 완료된 G를 되살리거나 중복 구현하지 않는다.
 - **판단 불충분·사용자 결정 필요**: 완료를 보류하고 근거와 필요한 조치를 보존한다.
 
@@ -229,7 +231,7 @@ PR 알림에는 링크와 현재 검토 행동을, 계획 PR이 Draft인 경우 
 
 ### 운영 명령과 수동 제어
 
-CLI는 프로젝트 등록·해제, 실행, 전체·프로젝트별 pause/resume, 작업 재개 요청, 상태·대기 사유·로그·모델 사용량 조회를 제공한다. 읽기 전용 조회는 Agent·Verify·Git 게시를 실행하지 않는다. 일시중지는 새 작업 진입을 막고 진행 중 작업의 안전한 반환·보존을 확인하며, 재개 명령은 검증 성공이나 차단 해소를 임의로 확정하지 않는다.
+CLI는 프로젝트 등록·해제, 실행, 전체·프로젝트별 pause/resume, 작업 재개 요청, 상태·대기 사유·로그·모델 사용량 조회를 제공한다. 읽기 전용 조회는 Agent·Verify·Git 게시를 실행하지 않는다. 일시중지는 새 작업 진입을 막고 진행 중 작업의 안전한 반환·보존을 확인하며, 재개 명령은 검증 성공이나 차단 해소를 임의로 확정하지 않는다. 새 환경에서는 이전 Writer의 종료를 전제로 로컬 pause 기록이 없어도 일시중지되지 않은 초기 상태에서 시작할 수 있다.
 
 ### 자체 runtime 갱신
 
