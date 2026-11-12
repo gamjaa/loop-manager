@@ -77,11 +77,11 @@ Observer는 원격 base·문서 내용·G의 정의·PR 상태를 구분해 관�
 |---|---|---|
 | `projects` | `repo`, `base_branch`, 등록·Provider 설정 | 프로젝트 설정 |
 | `exec_plans` | `(repo, plan_id)`, 정의 필드, `status`, `branch`, `pr_url` | G 식별·현재 계획·종단 상태 |
-| `planning_input_baselines` | `(repo, scope)`, 입력 지문·버전·마지막 확정 revision | Planner 중복 호출 방지 |
+| `planning_input_baselines` | `(repo, scope)`, R-ID 단위 입력 지문·버전·마지막 확정 revision | 동일 Requirement의 계획 중복 실행 방지 |
 | `execplan_runs` (신규) | `(repo, plan_id)`, `generation`, `input_fingerprint`, `worktree`, `retry_after`, `last_error`, `manual_mode` | G 실행 세대·수동 접수·대기·재개. 실행 단계 중복 없음 |
 | `agent_calls` (간소화) | `invocation_id`, `repo`, `scope`, `role`, `provider`, `model`, `session_id`, 지침 해시·토큰 | 세션·호출 중복 방지·모델별 집계 |
 | `validation_receipts` (통합) | `repo`, `plan_id`, `stage`, `input_fingerprint`, `generation`, 결과·근거 | Verify·Review 성공 재사용 |
-| `managed_prs` (신규) | `repo`, `pr_number`, 종류·연결 G-ID 목록·head/base·Draft 관측·충돌 판단·검토 후보 | PR identity·관측 캐시 |
+| `managed_prs` (신규) | `repo`, `pr_number`, 종류·계획 PR의 source R-ID·연결 G-ID 목록·head/base·Draft·Closed·충돌 관측 | R별 계획 PR 하나와 구현 G별 PR 관측·연결 |
 | `external_jobs` (통합) | 고유 작업 키, `repo`, 종류·대상·입력·상태·원격 확인 결과 | 중단 복구가 필요한 미완료 게시·Archive·정리만 기록 |
 | `requirement_judgments` | 기존 완료 판단 근거 | R의 최종 충족 판단 |
 | `notification_outbox` | 기존 고유 사건·전송 정보 | Telegram 재시도·중복 억제 |
@@ -117,13 +117,21 @@ Observer는 원격 base·문서 내용·G의 정의·PR 상태를 구분해 관�
 
 Planner 입력은 최신 유효 Requirement, 실제 코드·테스트, 활성·완료 G, 의존 관계와 열린 계획 PR로 구성한다. 이미 충족된 목표와 기존 G의 중복을 먼저 배제하고 현재 파악 가능한 전체 작업을 제안한다.
 
-새 계획·개정은 `loop-manager/plans/{short-summary}` 브랜치의 **하나의 관련 계획 PR**로 게시한다. 열린 관련 PR에 G를 추가·수정·제거하며 사용자 편집을 보존한다. 미결정 G와 다른 G를 별도 계획 PR로 나누지 않는다. **`draft: true`인 G가 하나라도 포함되면 GitHub Draft PR**로 등록하고, 미결정 G가 모두 해소되면 같은 PR을 Ready로 전환한다. 사용자 Merge 없이 닫힌 계획 PR은 같은 입력으로 다시 만들지 않지만, 관련 문서가 실제로 변경되면 재계획할 수 있다.
+Planner는 **Requirement R-ID를 계획 PR의 묶음 기준**으로 사용한다. 한 R에서 도출한 신규·수정 G를 `loop-manager/plans/{short-summary}`의 한 계획 PR에 게시하고, 해당 R의 열린 계획 PR이 있으면 같은 PR에서 G를 추가·수정·제거한다. 다른 R과 공유하는 구현은 이미 존재하는 G를 연결하고 중복 생성하지 않는다. PR 관측은 source R-ID로 연결하며 G가 한 개도 남지 않아도 해당 R의 PR identity를 유지한다. 사용자의 PR 편집은 보존한다.
+
+**같은 R의 계획에 `draft: true`인 G가 하나라도 있으면 GitHub Draft PR로 게시**한다. 일반 G와 draft G를 별도 계획 PR로 분리하지 않으며, 질문이 해소될 때 같은 PR에서 관련 G를 다시 평가한다. 모든 draft가 해소되고 실제 계획 후보가 있으면 같은 PR을 Ready로 전환한다. 사용자가 Merge 없이 닫은 계획 PR은 입력이 동일한 동안 자동 재생성하지 않는다.
 
 사용자는 base·계획 PR·구현 브랜치에서 문서를 수정할 수 있다. base의 G는 실행 기준, 계획 PR의 G는 미확정 후보, 구현 브랜치의 편집은 해당 G의 작업 입력이다. 다른 G의 확정 목표는 base 변경 없이 자동 교체하지 않는다.
 
 G 정의·Requirement 변경은 영향받은 현재 실행에 반영한다. 이미 열린 구현 PR에서 추가 작업이 필요하면 Draft 전환을 확인한 뒤 Worker·Verify·Reviewer를 다시 수행한다. 완료된 G는 수정으로 소급 미완료 처리하지 않는다.
 
 제품 결정이 불명확한 계획은 **`draft: true`와 `Draft Decision`의 Question·Facts·Options·Impact**로 기록하고 그 G를 실행하지 않는다. 동일 계획 PR의 다른 미확정 G도 Merge 전에는 실행하지 않으며, base에 확정된 독립 G는 계속 진행한다. 사용자 답변 또는 문서 수정으로 미결정 사항이 해소되면 기존 G를 갱신한다. ExecPlan의 draft 선언과 GitHub Draft PR은 별개 정보지만, 계획 PR의 Draft 여부는 포함된 미해결 draft G로 결정한다. 계획 PR 등록 알림에는 draft G-ID·제목·질문을 포함한다.
+
+### 불필요해진 계획 PR과 Requirement 완료
+
+Planner가 최신 R 전체 Acceptance Criteria, 실제 코드·테스트와 이미 확정된 G를 대조하여 **해당 R의 모든 제안 ExecPlan이 불필요하고 남은 목표도 충족됐다고 확정**하면, 기존 미Merge 계획 PR을 Close하고 해당 R의 Archive를 후속 게시한다. 아직 관련 미완료 G가 있는지 확인하며, G가 0개라는 사실만으로 무조건 완료를 추정하지 않는다.
+
+PR Close 이후 Archive 게시 전에 중단되면 원격 PR의 Closed 상태·R의 최신 입력·완료 판단을 확인하고 **Archive만 재시도**한다. 동일 입력으로 계획 PR을 다시 만들지 않는다. PR Close와 Archive는 외부 효과 기록에 결합하되, 이미 완료한 효과를 재실행하지 않는다. 판단 불충분·미충족·미해결 draft라면 계획 PR을 자동 Close하거나 R을 Archive하지 않고 해당 판단·계획 보완을 이어간다.
 
 ### Planner 실행 조건
 
@@ -151,7 +159,9 @@ ExecPlan 실행 단계는 `exec_plans.status`의 `READY`, `WORKING`, `VERIFYING`
 
 ### Pause 저장과 실행 경계
 
-`pause.db`는 메인 실행 DB와 분리된 작은 SQLite 파일이다. 전체 범위(`scope = ''`)와 프로젝트별 scope의 pause를 저장하며, **Bootstrap이 실행 DB를 초기화·마이그레이션하거나 runtime을 교체하기 전에도** 검사한다. 파일이 처음부터 없으면 pause 요청이 없는 상태지만 기존 파일의 조회 오류를 임의 resume로 해석하지 않는다.
+SQLite는 여러 프로세스에서 읽고 쓸 수 있지만 **한 DB 파일의 쓰기 트랜잭션은 직렬화**된다. `pause.db`는 메인 실행 DB와 분리된 작은 SQLite 파일로, 긴 실행 작업의 DB 접근 순번·프로세스 실행 잠금을 거치지 않고 별도 CLI 프로세스가 pause 요청을 접수하게 한다. 이 파일에 전체 범위(`scope = ''`)와 프로젝트별 scope의 pause만 저장하며, Bootstrap이 실행 DB를 초기화·마이그레이션하거나 runtime을 교체하기 전에도 확인한다. pause/resume 명령은 메인 실행 DB의 쓰기 잠금이나 장시간 유지되는 Manager 실행 잠금을 획득하지 않고 수행할 수 있어야 한다.
+
+**새 실행 환경에 `pause.db`가 없으면 초기 상태를 '일시중지 없음'으로 보고 정상 시작한다.** 최초 pause 요청 때 DB·테이블을 생성하면 되며, 실행 시작 때 빈 DB를 미리 만들어도 된다. 기존 파일의 조회 오류는 파일 부재와 구별하고 임의 resume로 해석하지 않는다. 새 환경 인수는 이전 Writer가 먼저 종료됐다는 기존 조건을 따른다. 이전 환경의 pause 상태를 자동 이관하거나 원격 Git에서 복원할 필요는 없다.
 
 `pause`는 요청을 먼저 저장한 뒤 새 단계 진입을 막고 진행 중 Agent·Verify의 안전한 종료와 작업물 보존을 확인한다. `resume`은 해당 범위의 pause만 해제하고 작업 실행·검증·게시나 별도 BLOCKED 해제를 수행하지 않는다. 실행 단계 테이블에는 pause를 중복 기록하지 않는다.
 
@@ -202,7 +212,7 @@ GitHub의 PR mergeability가 충돌 판단의 기준이다. 신규 PR 또는 PR 
 
 구현 PR의 실제 Merge가 확인되면 G를 `MERGED`로 처리하고 `docs/plans/archive/`에 이동한다. Archive 게시 실패는 이동만 재시도한다. 실제 Merge에 따른 다른 G의 dependency 충족은 유지한다.
 
-관련 G의 작업이 모두 소진되거나 이미 직접 구현으로 충족된 R은 Planner가 최신 Acceptance Criteria와 구현·테스트 근거를 다시 대조한다. 충족하면 `docs/requirements/archive/`로 이동하고, 미충족이면 필요한 G만 새 계획 PR에 제안한다. 판단 근거가 불충분하면 완료를 유보한다. 각 G Merge 때마다 전면 평가를 반복하지 않는다.
+관련 G의 작업이 모두 소진되거나 이미 직접 구현으로 충족된 R은 Planner가 최신 Acceptance Criteria와 구현·테스트 근거를 다시 대조한다. 충족하면 `docs/requirements/archive/`로 이동하고, 미충족이면 필요한 G만 계획한다. **열린 계획 PR에서 더 이상 필요한 G가 없고 R 전체 충족이 확인되면 그 PR을 Close한 뒤 Archive한다.** 판단 근거가 불충분하면 완료를 유보한다. 각 G Merge 때마다 전면 평가를 반복하지 않는다.
 
 Requirement·ExecPlan의 실제 철회는 ID와 변경 근거를 확인한 경우에만 취소한다. 다른 R에서도 필요한 공유 G는 남은 목표를 유지하고, 미Merge 구현 PR은 필요 없는 경우 안전하게 Close한다. 삭제·이름 변경·보관·조회 실패는 서로 구분한다. 완료·취소 ID는 다시 사용하지 않는다.
 
@@ -249,6 +259,8 @@ Agent에는 역할·작업 공간에 필요한 최소 권한과 프로젝트 설
 - 최신 문서 변경·충돌하는 R-ID 우선순위, 동일 입력 계획 중복 방지
 - 구버전 DB 데이터 이행·완료/취소 후 불필요한 데이터 정리·중단 재시도·기존 PR/알림 중복 방지
 - G별 수동 start/complete의 실제 검증과 자체 runtime 갱신의 안전한 인계·pause 초기 판정
+- Requirement별 계획 PR에 G 묶기·Draft 전환·모든 G 불필요 판정 후 PR Close와 R Archive의 중단 복구
+- 동시 Manager 실행 중 별도 CLI pause/resume 접수·새 환경의 pause.db 부재 초기화
 - 계획 Draft PR 등록·알림 및 ignored-only 파일의 비차단 처리
 - Worker·Verify·Reviewer의 겹친 실행, 오래된 호출 결과의 적용 거부
 - GitHub 충돌 확인 후 Merge 교정과 비충돌 시 불필요한 복구 배제
