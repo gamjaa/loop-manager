@@ -8,7 +8,7 @@
 - 참고 main: `668928f2cbd9069bb24f6b5e5cf1fc8baf627bd5`.
 - 작업 브랜치: `codex/rewrite-loop-manager`; PR base: `develop`.
 - 운영 DB·원격 작업·기존 PR·main은 변경하지 않는다. 기존 DB 마이그레이션은 만들지 않는다.
-- 현재 단계: S1 조사·설계 추적 완료, S2 신규 저장소 구현 준비.
+- 현재 단계: S2 저장소·직접 CLI의 단위 계약 검증 완료, S3/S4/S5의 독립 경계 구현 중. Coordinator·진입부 연결은 아직 하지 않았다.
 - 상태: `TODO`, `IN_PROGRESS`, `DONE`, `BLOCKED`.
 - 완료되지 않은 구현을 현재 동작으로 설명하거나 목표 문서를 구현에 맞춰 축소하지 않는다.
 
@@ -17,7 +17,7 @@
 | 영역 | 기존 구현 | 재구현 목표 |
 |---|---|---|
 | 계획 | PRODUCT 포함 전체 입력 지문, base 직접 게시, 유지보수 Planner | R Blob OID 변경·최종 충족 재평가, 주 R별 단일 계획 PR, draft G |
-| 저장 | 다수 복구·이력 테이블, phase와 상태의 중복, 파일 receipt | 명세의 12개 책임 테이블, G status 단일 원본, 작은 DB 근거 |
+| 저장 | 다수 복구·이력 테이블, phase와 상태의 중복, 파일 receipt | 명세의 11개 책임 테이블, G status 단일 원본, 작은 DB 근거 |
 | CLI | bootstrap과 실행 잠금에 결합, legacy 제출·생략 옵션 | 짧은 WAL 직접 조회/CAS, pause/resume, G별 수동 접수·원자 결과 알림 |
 | 실행 | 광범위 binding/compatibility exports, 관리 대상 한도·유지보수 | 명시적 함수 경계, 공통 AI 한도·프로젝트 Worker 1·전역 Verify 1 |
 | Git | Rebase와 소유권/snapshot 증명 중심 | 분리 작업 공간, Merge, 실제 게시·삭제 경계 보호, ignored-only 허용 |
@@ -31,9 +31,9 @@
 |---|---|---|---|---|
 | S1 기준·전체 대응표 | DONE | 없음 | 최신 refs, 지침·PRODUCT·ARCHITECTURE·PLANS 조사, 영향 경계 | 기준 SHA·전체 추적표·이 계획을 코드 변경 전에 보존 |
 | S2 WAL 저장소·CLI 계약 | IN_PROGRESS | S1 | 신규 DDL, 상태/CAS/요청/Outbox, 순수 조회, 설정, pause/resume | 초기화·재시작·busy·rollback·중복 요청·오래된 결과·원자 알림 unit 회귀 |
-| S3 문서 관측·Planning | TODO | S2 | ID/metadata/DAG/draft, R OID 감지, 공유 G/주 R, 계획 PR·닫힘·최종 R 평가 | rename/archive/삭제 구분, 입력 무변경 skip, R 충돌 문맥, 사용자 계획 편집 보존 |
-| S4 Git·GitHub·수동 준비 | TODO | S2 | 격리 공간, 원격 관측, Merge/Push/PR/외부 의도, manual start | 실제 Git 소수 대표 경로와 mock API; 게시 후 중단·기존 PR·미게시 변경 보존 |
-| S5 Agent·Verify·근거 | TODO | S2 | Provider 지침/홈/세션/Checkpoint/토큰, 프로젝트 명령, timeout/프로세스 종료, 후보 지문 | Provider mock, 지침 1회, 누락 사용량, 후보 변경 무효화, 실패·중단 PASS 거부 |
+| S3 문서 관측·Planning | IN_PROGRESS | S2 | ID/metadata/DAG/draft, R OID 감지, 공유 G/주 R, 계획 PR·닫힘·최종 R 평가 | rename/archive/삭제 구분, 입력 무변경 skip, R 충돌 문맥, 사용자 계획 편집 보존 |
+| S4 Git·GitHub·수동 준비 | IN_PROGRESS | S2 | 격리 공간, 원격 관측, Merge/Push/PR/외부 의도, manual start | 실제 Git 소수 대표 경로와 mock API; 게시 후 중단·기존 PR·미게시 변경 보존 |
+| S5 Agent·Verify·근거 | IN_PROGRESS | S2 | Provider 지침/홈/세션/Checkpoint/토큰, 프로젝트 명령, timeout/프로세스 종료, 후보 지문 | Provider mock, 지침 1회, 누락 사용량, 후보 변경 무효화, 실패·중단 PASS 거부 |
 | S6 Coordinator·재시작·Runtime | TODO | S3/S4/S5 | 단계 선택, 자원 겹침, CLI 재관측, generation, 새 환경 복구, 안전 인계 | Worker/Verify/Review 겹침·pause·취소·늦은 반환·runtime drain·복구·경합 |
 | S7 완료·Archive·정리·알림 | TODO | S3/S4/S6 | 실제 Merge 완료, R 전체 재확인, 철회·tombstone, 비차단 정리, Telegram | 실패 재시도·Outbox 중복 억제·미게시 파일 보존·작은 확정 기록 |
 | S8 전환·구형 구성 제거·문서 | TODO | S2–S7 | 진입부 연결, 구형 패키지/테스트/설정 삭제, README/OPERATIONS/VERIFY/PLANS/지침/템플릿 | 폐기 참조·미사용 코드 검색, CLI help·문서 링크·새 설치 절차 정합성 |
@@ -103,8 +103,11 @@ S3/S4/S5의 책임은 독립적으로 구성하며 공유 DB 계약 변경을 �
 ## 검증 기록
 
 - S1: `git fetch origin develop main`, 깨끗한 detached HEAD 확인 후 최신 develop에서 전용 브랜치 생성. 코드 변경 없음.
+- Windows 집중 회귀: `tests.test_rewrite_state`, `test_rewrite_catalog`, `test_rewrite_commands`, `test_rewrite_git.GitBoundaryTests`, `test_rewrite_agents` 총 35개 통과. SQLite WAL/짧은 busy/동시 claim/오래된 결과/요청·Outbox rollback, R OID·draft·DAG·실제 Merge dependency, CLI 무효과 조회, Provider mock·캐시 의미, 실제 Windows Job timeout을 확인했다.
+- 초기 native 실행은 샌드박스 TEMP 접근 오류로 실패했고, 작업공간의 `.cache/rewrite-tests`를 TEMP/TMP/TMPDIR로 지정해 재검증했다. 초기화 연결의 명시적 close 누락은 수정 후 ResourceWarning 오류 모드에서도 통과했다.
+- 새 코드: `storage/state.py`, `catalog/observer.py`, `application/direct_commands.py`, `git/repository.py`, `agents/runner.py`, `config/settings.py`, `execution/processes.py`, `execution/validation.py`. 기존 공개 진입부와 호출자는 그대로 유지한다.
 - 전체 Verify·운영 실행: 미실행. 작업 중 직접 `loop_manager.py run` 금지.
 
 ## 다음 작업
 
-S2의 새 DDL과 짧은 상태 변경/비동기 요청 계약을 구현하고, 격리 DB에서 초기화·WAL·재시작·CAS·경합·알림 원자성을 검증한다. S3–S7 전체 계약 구현 전에는 새 진입부로 전환하지 않는다.
+S3의 계획 PR 서비스, S6 Coordinator·원격 복구·runtime 인계와 S7 완료·알림을 구현한다. 실제 Git 보존 회귀는 WSL에서 실행하고, 기존 진입부와 새 직접 CLI는 S8에서 전환한다. S3–S7 전체 계약 구현 전에는 새 진입부로 전환하지 않는다.
