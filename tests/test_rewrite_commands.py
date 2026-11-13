@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from loop_manager_internal.application.direct_commands import build_parser, execute, manual_start, query
 from loop_manager_internal.storage.state import Store, StateError
-from tests.test_rewrite_catalog import requirement, plan
+from tests.support.rewrite_fixtures import requirement, plan
 from loop_manager_internal.catalog.observer import catalog,synchronize
 
 

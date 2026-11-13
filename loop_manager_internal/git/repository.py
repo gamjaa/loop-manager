@@ -39,7 +39,7 @@ def github_repository(url):
     match = re.fullmatch(r'(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?',url)
     if not match or any(part in ('.','..') for part in match.group(1).split('/')):
         raise ValueError('GitHub origin URL이 필요합니다.')
-    return match.group(1)
+    return match.group(1).casefold()
 
 
 class Repository:
@@ -232,8 +232,11 @@ class GitHub:
         return self.api(f'repos/{self.repo}/pulls/{number}')
 
     def ensure_pull(self,branch,base,title,body,*,draft=False):
+        from loop_manager_internal.execution.validation_feedback import redact_secrets
+        body = redact_secrets(body)
+        title = redact_secrets(title)
         existing = [item for item in self.pulls() if item['head']['ref']==branch
-                    and item['head']['repo'] and item['head']['repo']['full_name']==self.repo]
+                    and item['head']['repo'] and item['head']['repo']['full_name'].casefold()==self.repo.casefold()]
         opened = [item for item in existing if item['state']=='open']
         if len(opened)>1:
             raise GitError('같은 작업 브랜치의 열린 PR이 여러 개입니다.')

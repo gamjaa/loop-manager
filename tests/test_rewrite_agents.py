@@ -1,12 +1,15 @@
 """Provider mock과 실제 최소 프로세스 종료를 구분한다."""
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
-from loop_manager_internal.agents.runner import arguments,decode_events,decision,instructions
+from loop_manager_internal.agents.runner import Agent,arguments,decode_events,decision,instructions
+from loop_manager_internal.storage.state import Store
 from loop_manager_internal.execution.processes import run
 from loop_manager_internal.execution.validation import verify_command,verify
 
@@ -54,6 +57,36 @@ class AgentContractTests(unittest.TestCase):
         for message in ('PASS','{"result":"CANDIDATE","evidence":"구현"}','{"result":"PASS","evidence":""}'):
             with self.assertRaises(ValueError):
                 decision(message,'reviewer')
+
+    def test_agent_invocation_filters_manager_secrets_and_records_unknown_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/'docs').mkdir()
+            for role in ('common','reviewer'):
+                (root/f'docs/AGENTS.{role}.md').write_text('지침',encoding='utf-8')
+            store=Store(root/'state/loop-manager.db')
+            store.initialize()
+            store.register('owner/repo','/project','remote','main','codex')
+            settings=SimpleNamespace(profile=lambda *args:('model','high'),fast=lambda *args:False,agent_timeout=30)
+            def execute(argv,cwd,timeout,**kwargs):
+                environment=kwargs['environment']
+                self.assertNotIn('TELEGRAM_TOKEN',environment)
+                self.assertNotIn('LOOP_MANAGER_SECRET',environment)
+                self.assertEqual(environment['OPENAI_API_KEY'],'provider-key')
+                event={'type':'item.completed','item':{'type':'agent_message',
+                       'text':json.dumps({'result':'PASS','evidence':'코드·검증 근거 확인'})}}
+                Path(kwargs['output_path']).write_text(json.dumps(event),encoding='utf-8')
+                return SimpleNamespace(code=0,timed_out=False,output='')
+            with patch.dict(os.environ,{'TELEGRAM_TOKEN':'secret','LOOP_MANAGER_SECRET':'secret',
+                             'OPENAI_API_KEY':'provider-key','CODEX_HOME':str(root/'absent-user-home')}), \
+                 patch('loop_manager_internal.agents.agent_codex_sandbox._owned_directory'), \
+                 patch('loop_manager_internal.agents.runner.run',side_effect=execute):
+                result=Agent(store,root/'state',root,settings).call({'repo':'owner/repo','provider':'codex'},
+                    'G-001','reviewer',root,'현재 후보를 검토하세요.')
+            self.assertEqual(result.kind,'SUCCESS')
+            call=store.rows('SELECT * FROM agent_calls')[0]
+            self.assertIsNone(call['input_tokens'])
+            self.assertEqual(call['result'],'SUCCESS')
 
     def test_project_command_has_no_language_runner_requirement(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -160,7 +160,7 @@ def synchronize(store, repo, snapshot):
             db.execute('INSERT INTO exec_plan_runs(repo,plan_id) VALUES(?,?) ON CONFLICT DO NOTHING',(repo,identity))
             relevant = {source_ids[source] for source in item['sources'] if source in source_ids}
             if old and (old['source_oid'] != doc.oid or relevant & changed):
-                db.execute('UPDATE exec_plan_runs SET generation=generation+1,input_fingerprint=NULL '
+                db.execute('UPDATE exec_plan_runs SET generation=generation+1,input_fingerprint=NULL,worker_result=NULL '
                            'WHERE repo=? AND plan_id=?',(repo,identity))
                 db.execute("UPDATE exec_plans SET status='READY' WHERE repo=? AND plan_id=? AND status!='BLOCKED'",
                            (repo,identity))
@@ -179,6 +179,8 @@ def planning_targets(store, repo, snapshot):
     for identity,item in sorted(snapshot.requirements.items(),key=lambda pair:int(pair[0][2:]),reverse=True):
         row = rows.get(identity)
         if item['document'].path in snapshot.errors:
+            continue
+        if row and row['judgment']=='UNRESOLVED' and row['judgment_revision']==item['document'].oid:
             continue
         if row is None or row['last_planned_source_oid'] != item['document'].oid or row['judgment']=='REPLAN':
             targets.append((identity,'requirement_changed'))

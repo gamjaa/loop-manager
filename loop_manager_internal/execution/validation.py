@@ -75,7 +75,7 @@ def fingerprint(repository,plan,command,instruction_hash):
     return hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest()
 
 
-def verify(specification):
-    result = run(specification.argv,specification.cwd,specification.timeout,environment=specification.environment)
+def verify(specification,**callbacks):
+    result = run(specification.argv,specification.cwd,specification.timeout,environment=specification.environment,**callbacks)
     evidence = f'종료 코드={result.code}, timeout={result.timed_out}\n'+bounded_diagnostic(result.output)
     return result.code==0 and not result.timed_out,evidence

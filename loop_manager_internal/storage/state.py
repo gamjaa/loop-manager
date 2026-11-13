@@ -52,7 +52,8 @@ CREATE TABLE exec_plans (
 CREATE TABLE exec_plan_runs (
  repo TEXT NOT NULL, plan_id TEXT NOT NULL,
  generation INTEGER NOT NULL DEFAULT 0, input_fingerprint TEXT,
- worktree TEXT, candidate_sha TEXT, retry_after REAL, last_error TEXT,
+ worktree TEXT, candidate_sha TEXT, worker_result TEXT, retry_after REAL, last_error TEXT,
+ process_pid INTEGER, process_identity TEXT,
  manual_mode TEXT CHECK(manual_mode IN ('PREPARING','MANUAL_WORKING','SUBMITTED')),
  request_id TEXT, request_kind TEXT,
  feedback_mode TEXT CHECK(feedback_mode IN ('CLI_FINAL','TELEGRAM_PENDING')),
@@ -67,6 +68,7 @@ CREATE TABLE agent_calls (
  session_id TEXT, instruction_hash TEXT NOT NULL, generation INTEGER,
  input_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,
  output_tokens INTEGER, result TEXT, created_at REAL NOT NULL,
+ process_pid INTEGER, process_identity TEXT,
  CHECK(input_tokens IS NULL OR input_tokens >= 0),
  CHECK(cache_read_tokens IS NULL OR cache_read_tokens >= 0),
  CHECK(cache_write_tokens IS NULL OR cache_write_tokens >= 0),
@@ -101,7 +103,7 @@ CREATE TABLE notification_outbox (
  event_key TEXT PRIMARY KEY, repo TEXT NOT NULL REFERENCES projects(repo),
  scope TEXT NOT NULL, payload TEXT, silent INTEGER NOT NULL DEFAULT 0 CHECK(silent IN (0,1)),
  state TEXT NOT NULL DEFAULT 'PENDING' CHECK(state IN ('PENDING','SENT','CANCELLED')),
- retry_after REAL, attempts INTEGER NOT NULL DEFAULT 0
+ retry_after REAL, attempts INTEGER NOT NULL DEFAULT 0, delivered_parts INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE exec_plan_tombstones (
  repo TEXT NOT NULL REFERENCES projects(repo), plan_id TEXT NOT NULL,
@@ -227,8 +229,9 @@ class Store:
 
     @staticmethod
     def notify(db, event_key, repo, scope, message, *, silent=False):
+        from loop_manager_internal.execution.validation_feedback import redact_secrets
         db.execute('INSERT INTO notification_outbox(event_key,repo,scope,payload,silent) VALUES(?,?,?,?,?) '
-                   'ON CONFLICT(event_key) DO NOTHING', (event_key,repo,scope,message,int(silent)))
+                   'ON CONFLICT(event_key) DO NOTHING', (event_key,repo,scope,redact_secrets(message),int(silent)))
 
     def request(self, repo, plan_id, kind):
         if kind not in ('unblock','manual_start','manual_complete'):
@@ -338,7 +341,7 @@ class Store:
                                  "WHERE repo=? AND plan_id=? AND status NOT IN ('MERGED','CANCELLED')",
                                  (repo,plan_id)).rowcount
             if changed:
-                db.execute('UPDATE exec_plan_runs SET generation=generation+1 WHERE repo=? AND plan_id=?',
+                db.execute('UPDATE exec_plan_runs SET generation=generation+1,worker_result=NULL WHERE repo=? AND plan_id=?',
                            (repo,plan_id))
                 db.execute('INSERT INTO exec_plan_tombstones VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
                            (repo,plan_id,revision,evidence))

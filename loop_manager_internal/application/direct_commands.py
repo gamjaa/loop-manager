@@ -58,7 +58,8 @@ def query(store, kind, repo=None):
                           'FROM projects'+condition+' ORDER BY repo',parameters)
     if kind=='status':
         return {'projects':query(store,'list',repo),
-                'pause':store.rows('SELECT * FROM pause_scopes'+condition,parameters),
+                'pause':store.rows("SELECT * FROM pause_scopes WHERE repo IN ('*',?)",(repo,)) if repo
+                        else store.rows('SELECT * FROM pause_scopes'),
                 'plans':store.rows('SELECT p.repo,p.plan_id,p.title,p.status,p.draft,p.pr_url,p.block_reason,'
                                    'r.generation,r.manual_mode,r.worktree,r.retry_after,r.last_error,r.request_id,'
                                    'r.request_kind,r.request_result FROM exec_plans p JOIN exec_plan_runs r '
@@ -95,6 +96,14 @@ def register(store,args):
 
 
 def manual_start(store, state_dir, item):
+    import hashlib
+    from loop_manager_internal.runtime.process_lock import process_lock
+    key = hashlib.sha256((item['repo']+'\0'+item['plan_id']).encode()).hexdigest()[:24]
+    with process_lock(Path(state_dir),name=f'manual-{key}.lock'):
+        return _manual_start(store,state_dir,item)
+
+
+def _manual_start(store, state_dir, item):
     repo,identity = item['repo'],item['plan_id']
     existing = store.plan(repo,identity)
     if store.paused(repo):

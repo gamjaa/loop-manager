@@ -29,6 +29,19 @@ class GitBoundaryTests(unittest.TestCase):
             api.ensure_pull('work','main','제목','내용')
         api.api.assert_not_called()
 
+    def test_manager_pr_region_redacts_secrets_and_preserves_user_region(self):
+        api=GitHub('owner/repo')
+        current={'number':1,'draft':False,'body':'사용자 password=그대로',
+                 'head':{'ref':'work','repo':{'full_name':'Owner/Repo'}},'state':'open'}
+        api.pulls=Mock(return_value=[current])
+        api.pull=Mock(return_value=current)
+        api.api=Mock(return_value=current)
+        api.ensure_pull('work','main','제목','password=민감값')
+        body=api.api.call_args.kwargs['payload']['body']
+        self.assertIn('사용자 password=그대로',body)
+        self.assertNotIn('민감값',body)
+        self.assertIn('<REDACTED>',body)
+
     def test_close_rechecks_user_head_and_preserves_branch(self):
         api = GitHub('owner/repo')
         api.pull = Mock(return_value={'number':2,'head':{'sha':'new'},'state':'open','merged_at':None})

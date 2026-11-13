@@ -12,6 +12,7 @@ import time
 import uuid
 
 from loop_manager_internal.agents.agent_provider_usage import codex_usage,claude_usage
+from loop_manager_internal.agents.agent_profiles import agent_environment
 from loop_manager_internal.execution.processes import run
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 
@@ -130,14 +131,15 @@ class Agent:
                                    (project['repo'],scope,role,provider,model))
         session = previous[0]['session_id'] if previous else None
         invocation = uuid.uuid4().hex
-        environment = dict(os.environ)
+        environment = agent_environment(provider,role,state_dir=self.state_dir,
+                                        environment_variables=dict(os.environ))
         variable,folder,auth_name = ('CODEX_HOME','.codex','auth.json') if provider=='codex' else (
             'CLAUDE_CONFIG_DIR','.claude','.credentials.json')
         home = self.state_dir/f'automation-{provider}'
         home.mkdir(mode=0o700,parents=True,exist_ok=True)
         from loop_manager_internal.agents.agent_codex_sandbox import _owned_directory
         _owned_directory(home)
-        source_home = Path(environment.get(variable,str(Path.home()/folder)))
+        source_home = Path(os.environ.get(variable,str(Path.home()/folder)))
         source = source_home/auth_name
         auth = home/auth_name
         if source.is_file() and not auth.exists() and not auth.is_symlink() and source.resolve()!=auth.resolve():
@@ -147,13 +149,20 @@ class Agent:
             db.execute('INSERT INTO agent_calls(invocation_id,repo,scope,role,provider,model,instruction_hash,generation,created_at) '
                        'VALUES(?,?,?,?,?,?,?,?,?)',
                        (invocation,project['repo'],scope,role,provider,model,instruction_hash,generation,time.time()))
-        with tempfile.TemporaryDirectory(prefix='agent-',dir=self.state_dir) as directory:
+        with tempfile.TemporaryDirectory(prefix=f'agent-{invocation}-',dir=self.state_dir) as directory:
             environment['TMPDIR'] = environment['TMP'] = environment['TEMP'] = directory
             path = Path(directory)/'provider.jsonl'
             argv = arguments(provider,role,model,effort,guidance,session_id=session,
                              fast=self.settings.fast(provider))
+            def started(pid,identity):
+                with self.store.transaction() as db:
+                    db.execute('UPDATE agent_calls SET process_pid=?,process_identity=? WHERE invocation_id=?',
+                               (pid,identity,invocation))
+            def stopped():
+                with self.store.transaction() as db:
+                    db.execute('UPDATE agent_calls SET process_pid=NULL,process_identity=NULL WHERE invocation_id=?',(invocation,))
             result = run(argv,worktree,self.settings.agent_timeout,input_text=prompt,
-                         environment=environment,output_path=path)
+                         environment=environment,output_path=path,on_started=started,on_stopped=stopped)
             message,new_session,usage,errored = decode_events(provider,path)
             kind = 'TIMEOUT' if result.timed_out else failure_kind(result.code,message or result.output)
             parsed = None
