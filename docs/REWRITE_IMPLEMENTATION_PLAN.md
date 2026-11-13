@@ -7,6 +7,7 @@
 - 기준 develop: `086c89936433eac06511af035daada51afd77ff2` (2026-11-13 원격 fetch 확인).
 - 참고 main: `668928f2cbd9069bb24f6b5e5cf1fc8baf627bd5`.
 - 작업 브랜치: `codex/rewrite-loop-manager`; PR base: `develop`.
+- 진행 PR: [Draft #375](https://github.com/gamjaa/loop-manager/pull/375). 전체 재구현 미완료 상태와 검증 실패를 명시했다.
 - 운영 DB·원격 작업·기존 PR·main은 변경하지 않는다. 기존 DB 마이그레이션은 만들지 않는다.
 - 현재 단계: S2–S7의 신규 경계와 Coordinator 프로토타입을 작성·집중 검증했다. 기존 CLI 전환, 완전한 원격 복구·runtime bootstrap, 구형 구성·문서 정리는 미완료다. 전체 재구현 완료 상태가 아니다.
 - 상태: `TODO`, `IN_PROGRESS`, `DONE`, `BLOCKED`.
