@@ -36,27 +36,27 @@ fast_mode = false
 [codex.models]
 frontier = gpt-6-astra
 strong = gpt-6.1-sol
-balanced = gpt-5.6-terra
+balanced = gpt-6.1-terra
 fast = gpt-6-luna
 
 [codex.roles]
 planner = strong,high
 ; 읽기 전용 점검 Planner.
-planner_check = fast,high
+planner_check = strong,medium
 ; 유지보수 평가·관계 검토·계획에 사용할 Model alias,Effort.
-maintenance_planner = strong,high
+maintenance_planner = strong,xhigh
 reviewer = strong,high
 
 [codex.worker]
-level1 = fast,low
-level2 = fast,medium
-level3 = balanced,medium
-level4 = balanced,high
-level5 = strong,medium
-level6 = strong,high
+level1 = balanced,low
+level2 = balanced,medium
+level3 = balanced,high
+level4 = strong,medium
+level5 = strong,high
+level6 = strong,xhigh
 level7 = strong,xhigh
-; 마지막 단계도 Sol 6.1 xhigh를 사용한다.
-level8 = strong,xhigh
+; 최종 승격 level 8에서만 Sol 6.1 max를 사용한다.
+level8 = strong,max
 
 [claude]
 ; 동일하게 기본값은 false이며 공란·생략도 Fast를 끈다.
