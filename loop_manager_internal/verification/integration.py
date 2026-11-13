@@ -28,7 +28,7 @@ def _require(condition, message):
 
 def case_ids():
     return [f'{language}-{mode}-{outcome}' for language in ('python', 'perl')
-            for mode in ('standalone', 'coordinated') for outcome in ('pass', 'native-failure')] + ['partial-full']
+            for mode in ('standalone', 'coordinated') for outcome in ('pass', 'native-failure')]
 
 
 def validate_stage(result, run_id, stage_id, revision):
@@ -47,13 +47,9 @@ def validate_stage(result, run_id, stage_id, revision):
             _require(case.get('reason') == 'Perl native examples support Linux', 'unsupported skip reason')
             continue
         evidence = case.get('evidence', {})
-        if case['id'] == 'partial-full':
-            identities = [evidence.get('partial_run'), evidence.get('full_run')]
-            _require(isinstance(evidence.get('fixture_revision'), str) and evidence['fixture_revision'], 'missing fixture revision')
-        else:
-            identities = [evidence.get('run_id')]
-            _require(evidence.get('revision') == revision and evidence.get('adapter') ==
-                ('perl-tap' if case['id'].startswith('perl-') else 'unittest'), 'case revision/adapter mismatch')
+        identities = [evidence.get('run_id')]
+        _require(evidence.get('revision') == revision and evidence.get('adapter') ==
+            ('perl-tap' if case['id'].startswith('perl-') else 'unittest'), 'case revision/adapter mismatch')
         for identity in identities:
             _require(isinstance(identity, str) and identity and identity not in seen, 'missing/duplicate child run identity')
             seen.add(identity)
@@ -205,7 +201,7 @@ class TrustedRunnerPort:
         self.client, self.budget, self.timeout = client, budget, timeout
         self.parent_run_id = parent_run_id
 
-    def run(self, project, directory, *, coordinated, partial_base=None, git_directory=None):
+    def run(self, project, directory, *, coordinated, git_directory=None):
         _require_orchestrator()
         remaining = self.budget.remaining(self.timeout)
         if remaining is not None and remaining <= 0:
@@ -224,8 +220,6 @@ class TrustedRunnerPort:
                      '--protocol-version', '1', '--project-python', sys.executable, '--parallelism', '1']
         if remaining is not None:
             arguments += ['--timeout', str(remaining)]
-        if partial_base is not None:
-            arguments += ['--partial-base', partial_base]
         expected = tuple(arguments)
         def launch(command, **options):
             _require_orchestrator()
@@ -355,16 +349,13 @@ def execute(root, directory, client, budget, timeout, run_id, stage_id, revision
         result['cases'].append(case)
         atomic_json(path, result)
         try:
-            if identity == 'partial-full':
-                case['evidence'] = partial_case(port, case_directory)
-            else:
-                language, mode, outcome = identity.split('-', 2)
-                if language == 'perl' and not sys.platform.startswith('linux'):
-                    case.update(status='SKIP', reason='Perl native examples support Linux')
-                    atomic_json(path, result)
-                    continue
-                case['evidence'] = language_case(root, case_directory, port, language,
-                    mode == 'coordinated', outcome == 'native-failure', revision)
+            language, mode, outcome = identity.split('-', 2)
+            if language == 'perl' and not sys.platform.startswith('linux'):
+                case.update(status='SKIP', reason='Perl native examples support Linux')
+                atomic_json(path, result)
+                continue
+            case['evidence'] = language_case(root, case_directory, port, language,
+                mode == 'coordinated', outcome == 'native-failure', revision)
             case['status'] = 'PASS'
         except BaseException as error:
             case.update(status='FAIL', error=redact_secrets(f'{type(error).__name__}: {error}'))
@@ -379,97 +370,3 @@ def execute(root, directory, client, budget, timeout, run_id, stage_id, revision
     atomic_json(path, result)
     return result
 
-def partial_case(port, directory):
-    check = unittest.TestCase()
-    environment = _fixture_environment(directory)
-    root = directory / 'project'
-    root.mkdir()
-    (root / 'tests').mkdir()
-    (root / 'pkg').mkdir()
-    (root / 'scripts').mkdir()
-    (root / 'docs/requirements').mkdir(parents=True)
-    document = root / 'docs/requirements/[R-086] Impact.md'
-    document.write_text('# Review inputs\n')
-    def git(*args):
-        return subprocess.run(['git', '-C', str(root), *args], check=True,
-                              capture_output=True, text=True, env=environment,
-                              timeout=port.budget.remaining(port.timeout)).stdout.strip()
-    git('init', '-q')
-    (root / '.gitignore').write_text('__pycache__/\n')
-    (root / 'pkg/value.py').write_text('def _value():\n    return 1\n')
-    # An opaque module elsewhere must be reported without forcing the
-    # precheck to run the whole manifest; actual full verify still runs.
-    (root / 'pkg/opaque.py').write_text('def dynamic(name):\n    return __import__(name)\n')
-    (root / 'tests/test_selected.py').write_text(
-        'import unittest\nfrom pkg.value import _value\n'
-        'class Case(unittest.TestCase):\n'
-        '    def test_value(self):\n        self.assertEqual(_value(), 2)\n'
-        '    @unittest.skip("intentional skip")\n'
-        '    def test_skip(self):\n        pass\n')
-    for index in range(5):
-        (root / f'tests/test_other{index}.py').write_text(
-            'import unittest\nclass Case(unittest.TestCase):\n'
-            '    def test_ok(self):\n        self.assertTrue(True)\n')
-    declaration = {'version': 1, 'adapter': 'unittest', 'environment': {'python': 'launcher'},
-        'stages': [{'id': 'tests', 'kind': 'tests', 'cwd': '.',
-                    'collection': {'directory': 'tests', 'pattern': 'test*.py'}, 'execution': 'serial'},
-                   {'id': 'compile', 'kind': 'command', 'cwd': '.',
-                    'argv': ['{python}', '{runner}', '--compile', 'pkg']}]}
-    (root / 'scripts/verify.json').write_text(json.dumps(declaration))
-    git('add', '.')
-    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'base')
-    base = git('rev-parse', 'HEAD')
-    (root / 'pkg/value.py').write_text('def _value():\n    return 2\n')
-    document.write_text('# Updated review inputs\n')
-    git('add', '.')
-    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'candidate')
-    reports = []
-    for mode in ('partial', 'full'):
-        logs = directory / mode
-        passed, timed_out, output = port.run(root, logs, coordinated=False,
-            partial_base=base if mode == 'partial' else None)
-        summary = _json(logs / 'summary.json')
-        process = _json(logs / 'process.json')
-        proof = _json(logs / 'coordination.json')
-        check.assertEqual(summary['metadata']['revision'], git('rev-parse', 'HEAD'))
-        check.assertEqual(summary['metadata']['mode'], mode)
-        check.assertEqual(summary['metadata']['run_id'], proof['session'])
-        check.assertTrue(proof['stopped'])
-        check.assertTrue(proof['observer_only'])
-        check.assertFalse(proof['reservations'])
-        _validate_budget(process['budget'], summary['result']['budget'])
-        check.assertEqual(summary['counts'], {'success': 1, 'skip': 1} if mode == 'partial' else {'success': 6, 'skip': 1})
-        check.assertTrue(passed, f'{mode}: timed_out={timed_out}, '
-                        f'exit_code={getattr(output, "exit_code", None)}; {output}; '
-                        + '\n'.join(path.read_text(encoding='utf-8', errors='replace')[-3000:]
-                                    for path in logs.rglob('*')
-                                    if path.suffix in {'.log', '.jsonl'}))
-        check.assertFalse(timed_out)
-        reports.append(json.loads((logs / 'manifest.json').read_text()))
-        if mode == 'partial':
-            result = json.loads((logs / 'partial-result.json').read_text())
-            check.assertEqual(result['status'], 'PASS')
-            check.assertEqual(result['kind'], 'partial_verify')
-            check.assertEqual(result['selection']['modules'], ['test_selected'])
-            check.assertEqual(len(result['selection']['ids']), 2)
-            check.assertEqual(result['selection']['total_tests'], 7)
-            check.assertEqual(result['selection']['analysis']['coverage'], 'selected_modules_only')
-            check.assertTrue(result['selection']['analysis']['remaining_uncertainties'])
-            proof = result['selection']['analysis']['documents'][0]
-            check.assertEqual(proof['path'], 'docs/requirements/[R-086] Impact.md')
-            check.assertNotEqual(proof['source_identity']['base'], proof['source_identity']['head'])
-            units = reports[-1]['stages'][0]['units']
-            check.assertEqual(sum(unit['status'] == 'NOT_SELECTED' for unit in units), 5)
-            events = [json.loads(line) for line in (logs / 'runner.jsonl').read_text().splitlines()]
-            check.assertEqual([e['unit_id'] for e in events if e['kind'] == 'module_result'], ['test_selected'])
-            check.assertFalse(any(e.get('unit_id') == 'compile' for e in events))
-        else:
-            check.assertFalse((logs / 'partial-result.json').exists())
-            check.assertEqual(len(reports[-1]['stages']), 2)
-    check.assertEqual([unit['payload'] for unit in reports[0]['stages'][0]['units']],
-                     [unit['payload'] for unit in reports[1]['stages'][0]['units']])
-
-    if all(_json(directory / mode / 'coordination.json').get('stopped') is True for mode in ('partial', 'full')):
-        shutil.rmtree(root)
-    return {'fixture_revision': summary['metadata']['revision'],
-            'partial_run': reports[0]['run_id'], 'full_run': reports[1]['run_id']}

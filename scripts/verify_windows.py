@@ -533,7 +533,7 @@ def windows_main(root):
     entrypoint, runtime_python = runtime(root)
     from loop_manager_internal.execution.verify_process import run_verify_process
     from loop_manager_internal.verification.timing import EventWriter, atomic_json, diagnostic, phase
-    from loop_manager_internal.config.managed_config import load_managed_config
+    from loop_manager_internal.config.settings import Settings
     from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
     @contextmanager
     def preserving_phase(name):
@@ -553,9 +553,9 @@ def windows_main(root):
     timeout = float(os.environ.get('LOOP_MANAGER_VERIFY_TIMEOUT', '600'))
     cap = os.environ.get('LOOP_MANAGER_VERIFY_PARALLELISM', 'auto')
     if (root / 'config/config.ini').is_file():
-        config = load_managed_config(root / 'config/config.ini')
+        config = Settings(root / 'config/config.ini')
         if 'LOOP_MANAGER_VERIFY_TIMEOUT' not in os.environ:
-            timeout = config.verify_timeout_seconds
+            timeout = config.verify_timeout
         if 'LOOP_MANAGER_VERIFY_PARALLELISM' not in os.environ:
             cap = config.verify_parallelism
     if not math.isfinite(timeout) or timeout <= CLEANUP_SECONDS:
@@ -563,14 +563,6 @@ def windows_main(root):
     directory = Path(os.environ.get('LOOP_MANAGER_VERIFY_LOG_DIR', root / '.cache/verify' / uuid.uuid4().hex)).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     session = os.environ.get('LOOP_MANAGER_VERIFY_SESSION', uuid.uuid4().hex)
-    if os.environ.get('LOOP_MANAGER_VERIFY_PARTIAL_BASE'):
-        atomic_json(directory / 'partial-result.json', {'version': 1, 'kind': 'partial_verify',
-            'run_id': session, 'status': 'FALLBACK', 'selection': {'fallback': ['self_windows_requires_full']},
-            'temporary_directories': {'windows_launcher': temporary_directory, 'wsl': None,
-                                      'windows_native': None}})
-        from loop_manager_internal.verification.timing import diagnostic
-        print(diagnostic(directory), flush=True)
-        return 0
     writer = EventWriter(directory / 'launcher.jsonl', identity={'run_id': session})
     report = {'kind': 'loop_manager_windows_verify', 'run_id': session, 'passed': False,
               'wsl': 'NOT_RUN', 'windows': 'NOT_RUN',

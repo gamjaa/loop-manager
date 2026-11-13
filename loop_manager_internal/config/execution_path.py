@@ -9,7 +9,8 @@ import shutil
 import sys
 import tempfile
 
-from loop_manager_internal.config.managed_config import ManagedConfigError
+class ManagedConfigError(ValueError):
+    """실행 PATH 캐시의 설정 오류."""
 
 
 SYSTEM_DIRECTORIES = ('/usr/local/bin', '/usr/bin', '/bin',

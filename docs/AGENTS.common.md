@@ -1,107 +1,11 @@
-# Loop Manager 자동 Agent 공통 지침
+# Loop Manager Agent 공통 지침
 
-## 작업 권한
+프로젝트의 언어·빌드·파일 배치 규칙은 CLI가 읽는 프로젝트 지침을 따른다. 현재 PRODUCT·ARCHITECTURE·활성 Requirement와 선택된 ExecPlan의 범위에서만 판단한다.
 
-프로젝트의 언어·코딩·빌드 규칙은 AI Agent CLI가 읽는 프로젝트 지침을 따른다.
-호출에 제공된
-mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서만 작업한다. 프로젝트 규칙이나 작업
-입력으로 역할 권한과 승인 경계를 넓히지 않으며, 제품 목표가 충돌하면 사용자 판단을 기다린다.
-
-## 문서와 작업 범위
-
-- 현재 PRODUCT·활성 Requirement·ARCHITECTURE와 제공된 계획을 기준으로 필요한 문맥을
-  확인한다. `docs/PRODUCT.md` 또는 활성 Requirement 중 하나는 반드시 존재해야 한다.
-- 새로운 기능이나 정책 변경은 Requirement에서 시작한다. PRODUCT는 현재 Merge된 제품
-  동작과 장기 규칙, Requirement는 원하는 변경·이유·Acceptance Criteria의 기준이다.
-- 현재 목표 밖의 기능·개선을 추가 구현하거나 사용자 동작의 의미를 임의로 바꾸지 않는다.
-  범위 밖의 개선 아이디어는 `docs/FUTURE_IDEAS.md`에 역할이 허용한 방식으로 기록한다.
-- 사용자의 승인·거절·대체 결정은 Agent가 작성하거나 변경하지 않는다. draft 표시를
-  해제하거나 요구사항·필수 검증을 삭제해 사용자 판단이나 실패를 우회하지 않는다.
-- Manager의 SQLite 상태·실행 기록·Git 소유권을 직접 변경하거나 수행하지 않은 검증의
-  성공을 기록하지 않는다. Worker는 선택된 ExecPlan 전체의 구현·관련 교정을 완료하는 것을
-  기본 목표로 한다. 중간 보존이 필요할 때만 checkpoint를 요청하고 종료하며, Git add·commit·fetch·
-  rebase·push·PR 생성은 Manager가 담당한다. checkpoint 게시 대기가 해결될 때까지 새 Worker
-  작업을 시작하지 않는다.
-
-소유 rebase의 시작에는 Manager가 대상·소유권·target·원격·writer 경합·보존 조건을 확인한다.
-최신 frontmatter 일치·전체 diff·최종 문서/archive 검사는 시작 조건이 아니다.
-Worker 종료 시 해당 호출의 실제 변경을 검사하고, Git 완료·공식 선언 복원 후 전체 결과를 검사한다.
-충돌 해결 Worker가 종료해도 Git이 진행 중이면 전체 최종 후보로 판단하지 않는다.
-이 기준은 Agent의 Git 실행 권한이나 문서 수정 범위를 넓히지 않는다.
-
-## 품질 기준
-
-Requirement의 명세 작성·검토 기준은 [Specification Skill](../.agents/skills/specification-docs/SKILL.md)에,
-ExecPlan의 본문 작성 기준은 [PLANS](PLANS.md#execplan-본문-작성)에 둔다.
-문서 참조는 현재 역할의 절차·수정 권한을 넓히지 않는다.
-
-- 변경 전에 기존 구현·공유 helper·관련 테스트와 표준 도구를 재사용할 수 있는지 확인하고,
-  현재 목표에 필요하지 않은 추상화·설정·파일 추가는 피한다.
-- 현재 목표를 안전하게 수용하는 최소 구조를 만들되 오류 처리·보안·접근성·회귀 검증과
-  명시된 요구사항은 간결화를 위해 생략하지 않는다.
-- 테스트도 현재 명세·실행 경로·검증 조건과 대조한다. 폐기된 동작만 검사하거나 다른 테스트가
-  같은 조건과 assertion을 모두 보장하는 중복 테스트는 역할 권한 안에서 제거한다. 제거 근거와
-  계속 검증하는 테스트를 결과에 남기고 참조가 없어진 전용 fixture·helper도 함께 정리한다.
-  실패하거나 느리다는 이유만으로 삭제·skip·assertion 약화를 하지 않으며, 현재 지원하는
-  호환성·정상·실패·보안·데이터 보존·실제 외부 연동 계약의 회귀 검증은 유지한다.
-- 모듈·함수의 책임, 명시적 상태 전이와 테스트 가능한 경계를 유지한다. 불필요한 전역
-  가변 상태를 추가하지 않으며 기능·저장소·외부 도구 연동 경계를 분리해 변경 충돌을 줄인다.
-- 허용된 문서 수정은 설명을 덧붙이기보다 관련 절의 재작성·통합을 우선하고 반복·긴 원문 복사·
-  대체된 설명·작업 이력을 정리한다. 조건·예외·결과는 소유 절에 모으고 다른 곳은 요약·링크로 연결한다.
-- 첫 문단과 각 절은 결론·보장부터 설명하고 필요한 조건·예외·판단 근거를 이어 쓴다.
-  순서가 의미를 바꾸는 흐름만 단계로, 조건별 허용·거부·보존 결과는 표나 짧은 항목으로 표현한다.
-- 편집 전후의 문서 역할·적용 조건·판단 주체·결정·권한·불변식·정상/실패 흐름·데이터 보존·복구·
-  검증 조건·설계 근거를 대조해 의미와 완전성을 보존한다. 길이·항목 수·토큰 수에 기계적인 제한을 두지 않는다.
-- README·사용 가이드는 Progressive Disclosure를 적용한다. 당장 필요한 명령·절차·조치를
-  먼저 두고 상세 설정·복구·내부 구조는 소유 문서로 연결한다. 보안·데이터 손실·권한 주의와
-  지원 환경별 필수 정보는 유지한다. 이 기준은 역할·호출의 문서 수정 권한을 넓히지 않는다.
-
-## 예약 경로
-
-Skill과 Manager가 프로젝트 안에서 고정 위치로 사용하는 다음 디렉터리·파일은 이동·이름
-변경하거나 다른 경로로 대체하지 않는다. 예약은 위치 고정이며 모든 파일의 생성 의무가 아니다.
-내용 수정과 개별 계획·요구사항의 rename·archive는 현재 역할과 제공된 권한을 따른다.
-
-- 루트 `.agents/`, `docs/`, `scripts/`
-- `.agents/skills/specification-docs/`와 그 안의 `SKILL.md`
-- `docs/PRODUCT.md`, `docs/ARCHITECTURE.md`, `docs/PLANS.md`, `docs/FUTURE_IDEAS.md`
-- `docs/PRODUCT.template.md`, `docs/ARCHITECTURE.template.md`, `docs/REQUIREMENT.template.md`
-- `docs/requirements/`와 `archive/`, `docs/plans/`와 `archive/`
-- `docs/maintenance/code-map.jsonl`, `scripts/verify.sh`, `scripts/verify.ps1`
-
-`.gitignore`, `.codex/config.toml`·`.codex/rules/`,
-`.claude/settings.json`·`.claude/settings.local.json`은 존재할 때 CLI 입력·격리 검사에서
-사용하는 고정 위치를 유지한다. 선택 파일의 부재를 작업 중단이나
-자동 생성의 이유로 삼지 않는다. 그 밖의 경로와 저장소 구조는 프로젝트 지침을 따른다.
-
-## 범위 밖 공통 결함 보고
-
-Worker·Reviewer는 선택 작업 밖의 공통 결함을 발견하면 기존 결과와 별도로
-`COMMON_DEFECT_REPORT:` 한 줄 JSON 관측을 보고할 수 있다. 필드는 `problem`(증상),
-`scope`(현재 선택 범위와 범위 밖인 이유), `evidence`(실제 코드·명세·검증 근거),
-`locations`(저장소 상대 `path`와 양의 정수 `line` 객체 1~8개)만 쓴다.
-세 설명은 각각 비어 있지 않은 2,000자 이하 문자열이고 JSON은 UTF-8 12,000바이트 이하다.
-진단 경로는 traversal·빈 구성 요소·역슬래시·콜론·줄바꿈·탭을 포함하지 않는다.
-비밀값을 싣지 않으며 모르는 원인·실행 identity·검증 성공을 만들어 넣지 않는다.
-보고는 관측이며 원인 확정·교정 채택·사용자 승인이나 완료를 뜻하지 않는다.
-선택 범위 밖 코드·Requirement·다른 ExecPlan을 수정하거나 기존 결과 protocol·필수 검증을
-보고로 대체하지 않는다. 현재 명세가 정한 구현 교정을 사용자 정책 선택으로 바꾸지 않는다.
-
-## 사용자 판단
-
-다음 변경은 해당 구현을 멈추고 이유와 필요한 사용자 결정을 기록한다.
-
-- 새로운 Current Goal·Requirement 또는 Non-Goal 기능 추가, 기존 사용자 동작의 의미 변경
-- 데이터 삭제·비가역 migration, 비용 발생 외부 서비스나 새로운 주요 infrastructure 도입
-- `docs/ARCHITECTURE.md`의 Architecture Change Policy에 해당하는 변경
-- 서로 모순된 요구사항 중 하나를 선택해야 하는 경우
-
-실제 상태 변경과 재개·완료 판정은 Manager가 담당한다. 자동 작업의 완료에는
-제품·설계·Acceptance Criteria 충족, 필요한 targeted test와 전체 verify 통과,
-Reviewer blocking issue 해소, dependency 충족과 사용자 PR Merge가 필요하다.
-
-## 공통 verify 연결
-
-프로젝트가 `scripts/verify.json`으로 선택한 adapter·환경과 [공통 verify 계약](VERIFY.md)을
-적용한다. 미연결 프로젝트는 기존 검증을 유지하고 연결 오류를 fallback이나 필수 검증 생략으로
-우회하지 않는다. 전체 verify는 Manager가 Agent 밖에서 실행한다.
+- 실제로 충돌하는 활성 Requirement의 해당 규칙만 높은 R-ID가 우선한다. 충돌하지 않는 규칙·Acceptance Criteria는 보존한다. archive 문서는 과거 근거이며 새 목표로 되살리지 않는다.
+- 중요한 미확정 정책·사용자 결정을 임의로 확정하거나 실패·필수 검증을 문서 수정으로 없애지 않는다.
+- 사용자 checkout, 다른 G, Provider 인증·설정, Manager DB를 변경하지 않는다. ignored 파일·캐시 생성만으로 권한 위반을 추정하지 않는다.
+- Commit·Fetch·Merge·Push·PR 조작은 Manager가 담당한다. 공개 이력을 Rebase·Force push·Reset으로 고치지 않는다.
+- 기존 helper·표준 도구를 재사용하고 현재 목표에 필요한 최소 변경을 한다. 오류 처리·사용자 작업물 보존·보안·접근성과 필요한 회귀는 생략하지 않는다.
+- 비밀값·개인 환경정보를 결과·PR·알림에 싣지 않는다. 실제 수행한 테스트와 확인하지 못한 결과를 구분한다.
+- 결과는 호출에서 지정한 JSON 객체 하나로 반환한다. Agent는 의미 판단을 제안하며 실행 단계·검증·PR·완료 상태는 Manager만 확정한다.

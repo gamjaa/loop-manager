@@ -5,7 +5,25 @@ from __future__ import annotations
 import json
 from typing import Mapping
 
-from loop_manager_internal.agents.agent_invocation import Usage
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Usage:
+    input_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    cache_write_input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_output_tokens: int | None = None
+    status: str = "unknown"
+
+    def __post_init__(self) -> None:
+        if self.status == "unknown" and any(value is not None for value in (
+            self.input_tokens, self.cached_input_tokens,
+            self.cache_write_input_tokens, self.output_tokens,
+            self.reasoning_output_tokens,
+        )):
+            object.__setattr__(self, "status", "known")
 
 
 def _counter(value: object) -> tuple[int | None, bool]:

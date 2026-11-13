@@ -9,7 +9,8 @@
 - 작업 브랜치: `codex/rewrite-loop-manager`; PR base: `develop`.
 - 진행 PR: [Draft #375](https://github.com/gamjaa/loop-manager/pull/375). 전체 재구현 미완료 상태와 검증 실패를 명시했다.
 - 운영 DB·원격 작업·기존 PR·main은 변경하지 않는다. 기존 DB 마이그레이션은 만들지 않는다.
-- 현재 단계: S2–S7의 신규 경계와 Coordinator 프로토타입을 작성·집중 검증했다. 기존 CLI 전환, 완전한 원격 복구·runtime bootstrap, 구형 구성·문서 정리는 미완료다. 전체 재구현 완료 상태가 아니다.
+- 이전 단계: S2–S7의 신규 경계와 Coordinator 프로토타입을 작성·집중 검증했다. 기존 CLI 전환, 완전한 원격 복구·runtime bootstrap, 구형 구성·문서 정리는 미완료다. 전체 재구현 완료 상태가 아니다.
+- 현재 단계: 사용자 요청에 따라 S8의 구형 코드 정리를 먼저 수행하고 공개 CLI를 새 구조로 전환했다. 최신 명세 반영·원격 인수·완료/알림 통합을 이어서 구현한다.
 - 상태: `TODO`, `IN_PROGRESS`, `DONE`, `BLOCKED`.
 - 완료되지 않은 구현을 현재 동작으로 설명하거나 목표 문서를 구현에 맞춰 축소하지 않는다.
 
@@ -37,7 +38,7 @@
 | S5 Agent·Verify·근거 | IN_PROGRESS | S2 | Provider 지침/홈/세션/Checkpoint/토큰, 프로젝트 명령, timeout/프로세스 종료, 후보 지문 | Provider mock, 지침 1회, 누락 사용량, 후보 변경 무효화, 실패·중단 PASS 거부 |
 | S6 Coordinator·재시작·Runtime | IN_PROGRESS | S3/S4/S5 | 단계 선택, 자원 겹침, CLI 재관측, generation, 새 환경 복구, 안전 인계 | Worker/Verify/Review 겹침·pause·취소·늦은 반환·runtime drain·복구·경합 |
 | S7 완료·Archive·정리·알림 | IN_PROGRESS | S3/S4/S6 | 실제 Merge 완료, R 전체 재확인, 철회·tombstone, 비차단 정리, Telegram | 실패 재시도·Outbox 중복 억제·미게시 파일 보존·작은 확정 기록 |
-| S8 전환·구형 구성 제거·문서 | TODO | S2–S7 | 진입부 연결, 구형 패키지/테스트/설정 삭제, README/OPERATIONS/VERIFY/PLANS/지침/템플릿 | 폐기 참조·미사용 코드 검색, CLI help·문서 링크·새 설치 절차 정합성 |
+| S8 전환·구형 구성 제거·문서 | IN_PROGRESS | 사용자 요청으로 정리 우선 | 진입부 연결, 구형 패키지/테스트/설정 삭제, README/OPERATIONS/VERIFY/PLANS/지침/템플릿 | 폐기 참조·미사용 코드 검색, CLI help·문서 링크·새 설치 절차 정합성 |
 | S9 최종 검토·Verify·PR | TODO | S8 | 계약별 대조, WSL 전체+Windows 핵심, 커밋·Push·develop PR | 추적표 전부 검증, 미완료는 Draft PR+계획 보존; 전부 완료 때만 계획 삭제 |
 
 S3/S4/S5의 책임은 독립적으로 구성하며 공유 DB 계약 변경을 먼저 확정한다. 자동 Manager/Agent를 실행해 이 작업을 위임하지 않는다. `loop_manager.py run`은 직접 실행하지 않는다.
@@ -118,11 +119,11 @@ S3/S4/S5의 책임은 독립적으로 구성하며 공유 DB 계약 변경을 �
 
 ## 남은 구현과 확인할 문제
 
-- TODO: 공개 CLI·bootstrap·runtime child를 새 저장소/Coordinator로 전환한다. 현재 `loop_manager.py`는 구형 구현을 실행한다.
+- DONE: 공개 CLI·bootstrap·runtime child를 새 저장소/Coordinator로 전환했다. 직접 조회/상태 변경은 원격 runtime과 무관하게 DB에 접근하고, run은 별도 bootstrap/실행 잠금과 정확한 원격 SHA로 연결한다. 실제 Agent run은 실행하지 않는다.
 - TODO: 원격 base 변경의 실제 최신 Requirement 전문과 OID를 Worker/Verify/Review 입력에 일관되게 반영하고 관련 없는 변경의 성공 재사용을 구분한다.
 - TODO: R 철회·공유 G·의존 G의 남은 목표 재평가, 주 R 소속의 원격 복원, 닫힌 구현 PR/원격 삭제/취소 ID 최초 인수 전체 시나리오를 완성한다.
 - TODO: 프로젝트 설정·등록 해제 요청의 최종 결과, 같은 G의 수동 준비 프로세스와 runtime 복구의 잠금 조율, 반복 checkpoint와 같은 우선순위 신규 G의 기아 방지를 검증한다.
-- TODO: 실제 runtime 선택→child 실행→drain→인계→재개를 연결한다. 현재는 입력 지문/영수증 helper와 Coordinator hook만 검증했다.
+- IN_PROGRESS: runtime 선택→child→drain→인계→재개를 연결했다. 부모/자식 잠금 분리, CLI 동시 쓰기, 정확한 SHA와 인계 영수증 소비 mock 회귀를 추가했다. 최종 실제 Git 후보 복사와 bootstrap 오류 경계 검증을 이어간다.
 - TODO: Archive의 모든 중단 지점·최신 사용자 변경/완료 근거 대조, base 게시 변경 범위, 최종 PR 사용량 확정 후 세션/근거/실행 데이터 정리를 통합 검증한다.
 - TODO: CLI 최종 결과와 PR/차단 알림의 중복 통합, 무효화된 payload 취소, 실제 장기 무진전 판정을 완성한다.
 - TODO: 기존 역할 지침의 결과 protocol을 새 구조화 JSON과 일치시키고 README/OPERATIONS/VERIFY/PLANS·템플릿·설정·설치 스크립트를 전환한다. 구형 구현/스키마/테스트 제거는 이 전환 뒤 수행한다.
@@ -130,4 +131,12 @@ S3/S4/S5의 책임은 독립적으로 구성하며 공유 DB 계약 변경을 �
 
 ## 다음 작업
 
-이 파일과 Git 상태를 먼저 확인한 뒤 위 TODO를 이어간다. 우선 최신 명세 입력의 실제 전달과 원격 최초 복구·R 철회/공유 G를 완성하고 runtime bootstrap/child와 연결한다. S3–S7 전체 계약 구현 전에는 새 진입부로 전환하지 않는다. S8의 구형 구성·문서 정리와 S9의 필수 Verify가 끝나기 전까지 이 파일을 유지하고 Draft PR로 진행 기록을 보존한다.
+이 파일과 Git 상태를 먼저 확인한 뒤 위 TODO를 이어간다. 우선 최신 명세 입력의 실제 전달과 원격 최초 복구·R 철회/공유 G를 완성하고 runtime bootstrap/child와 연결한다. 구형 코드 정리 우선 요청에 따라 새 진입부로 전환했으며 미완료 계약은 아래 TODO로 계속 추적한다. S8의 구형 구성·문서 정리와 S9의 필수 Verify가 끝나기 전까지 이 파일을 유지하고 Draft PR로 진행 기록을 보존한다.
+
+## 구형 구성 정리 결과
+
+- DONE: 구형 Manager·자동 유지보수·Rebase/scope 증명·중복 DB/마이그레이션·binding/compatibility exports와 그 전용 테스트·fixture 598개 파일(277,731줄)을 먼저 삭제했다. 경로는 Git diff로 추적하고 운영 데이터·사용자 checkout·원격 브랜치는 삭제하지 않았다.
+- DONE: Provider Usage/환경 필터/비공개 홈, 프로세스 종료·WAL CLI·문서 parser와 자체 verify의 실제 호출 경계를 남겼다. 사용하지 않는 자체 부분 Verify 영향 분석·코드맵·Manager adapter·targeted wrapper도 제거했다.
+- DONE: 공통/Planner/Worker/Reviewer 지침을 새 JSON 결과·Merge 중심 역할로 전환했다. 기존 planner_check 역할은 제거했다.
+- DONE: 새 CLI 및 parent→child→handoff 회귀 4개와 기존 신규 Agent 회귀 7개, 총 11개가 native에서 통과했다. 삭제 후 공식 verify는 WSL 전체 118 success, Windows 핵심 91 success / 9 skip으로 두 단계 PASS. `.cache/verify/b02f037b8b344d4d8100ed916c103723/result.json`과 양쪽 summary 참조. WSL 전체+Windows 핵심 조합이며 Windows 전체 verify 통과로 표시하지 않는다.
+- TODO: 삭제로 영향을 받는 운영 문서·PLANS·설정 예제를 정리하고 신규 계약의 전체 통합 검증을 완료한다.

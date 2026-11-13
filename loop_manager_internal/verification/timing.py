@@ -395,8 +395,6 @@ def summarize(directory: Path, *, now=None):
                 child_events.append(event)
             elif kind == "execution_queue":
                 queues.append(event)
-            elif kind == "partial_selection":
-                selections.append(event)
             elif kind == "fixture_result":
                 fixtures.append(event)
             elif kind == 'git_cost':
@@ -455,7 +453,6 @@ def summarize(directory: Path, *, now=None):
         if end_at is None and domain == sys.platform:
             end_at = now
         item["elapsed"] = max(0.0, end_at - item["at"]) if end_at is not None else None
-    partial_result = _read_summary_object(directory / "partial-result.json")
     windows_pipeline = _windows_pipeline_summary(directory, metadata.get("run_id"))
     summary = {"metadata": metadata, "counts": dict(Counter(item["result"] for item in completed)),
                "tests": sorted(completed, key=lambda item: item["duration"], reverse=True),
@@ -466,7 +463,6 @@ def summarize(directory: Path, *, now=None):
                "bytecode_cache": bytecode_cache, "result": result, "integrations": integrations,
                "assignments": assignments, "module_results": module_results,
                "child_lifecycle": child_events, "execution_queues": queues,
-               "partial_selections": selections, "partial_result": partial_result,
                "execution_runs": execution_runs,
                "elapsed_seconds": primary_run.get("elapsed_seconds") if primary_run else None,
                "windows_pipeline": windows_pipeline}
@@ -626,9 +622,6 @@ def diagnostic(directory: Path):
                      f"result_files_observed={sum(event['kind'] == 'result_file_observed' for event in summary['child_lifecycle'])}, "
                      f"modules_completed={len(summary['module_results'])}, "
                      f"Job_child_waits={sum(event['kind'] == 'job_child_wait' for event in summary['child_lifecycle'])}")
-    partial = summary.get("partial_result")
-    if isinstance(partial, dict):
-        lines.append(f"부분 verify: {partial.get('status', '상태 미기록')} (전체 verify 아님)")
     pipeline = summary.get("windows_pipeline")
     if isinstance(pipeline, dict):
         result = pipeline.get("result") or {}

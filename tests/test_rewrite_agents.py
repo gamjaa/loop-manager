@@ -79,7 +79,7 @@ class AgentContractTests(unittest.TestCase):
                 return SimpleNamespace(code=0,timed_out=False,output='')
             with patch.dict(os.environ,{'TELEGRAM_TOKEN':'secret','LOOP_MANAGER_SECRET':'secret',
                              'OPENAI_API_KEY':'provider-key','CODEX_HOME':str(root/'absent-user-home')}), \
-                 patch('loop_manager_internal.agents.agent_codex_sandbox._owned_directory'), \
+                 patch('loop_manager_internal.agents.provider_home._owned_directory'), \
                  patch('loop_manager_internal.agents.runner.run',side_effect=execute):
                 result=Agent(store,root/'state',root,settings).call({'repo':'owner/repo','provider':'codex'},
                     'G-001','reviewer',root,'현재 후보를 검토하세요.')

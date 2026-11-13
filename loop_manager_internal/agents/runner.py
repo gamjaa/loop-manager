@@ -137,7 +137,7 @@ class Agent:
             'CLAUDE_CONFIG_DIR','.claude','.credentials.json')
         home = self.state_dir/f'automation-{provider}'
         home.mkdir(mode=0o700,parents=True,exist_ok=True)
-        from loop_manager_internal.agents.agent_codex_sandbox import _owned_directory
+        from loop_manager_internal.agents.provider_home import _owned_directory
         _owned_directory(home)
         source_home = Path(os.environ.get(variable,str(Path.home()/folder)))
         source = source_home/auth_name
