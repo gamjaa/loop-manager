@@ -55,6 +55,7 @@ Observer는 원격 base·Requirement별 Git Blob OID·G 정의·PR 상태를 구
 | 테이블 | 주요 키·필드 | 목적 |
 |---|---|---|
 | `projects` | `repo`, `base_branch`, 등록·Provider 설정 | 프로젝트 설정 |
+| `pause_scopes` | `(repo, scope)`, 전체·프로젝트 범위의 최신 pause 상태·변경 순번 | CLI의 일시중지·재개와 runtime의 작업 진입 제어 |
 | `exec_plans` | `(repo, plan_id)`, 정의 필드, **`primary_requirement_id`**, `sources`, `status`, `branch`, `pr_url` | G 식별·주 R 소속·다른 R과 공유 관계·현재 상태 |
 | `requirement_states` | `(repo, requirement_id)`, `source_path`, `last_planned_source_oid`, `last_planned_base_sha`, 최종 충족 판단·근거 | R별 마지막 계획 revision과 완료 판단을 한곳에 보관 |
 | `exec_plan_runs` | `(repo, plan_id)`, `generation`, `input_fingerprint`, `worktree`, `retry_after`, `last_error`, `manual_mode`, **`request_id`, `request_kind`, `feedback_mode`, `request_result`** | G 실행 세대·수동 예약·후속 요청·비동기 CLI 결과. 실행 단계 중복 없음 |
