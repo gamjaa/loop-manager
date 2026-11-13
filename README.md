@@ -6,7 +6,7 @@ Requirement에서 계획 PR을 제안하고, base에 확정된 ExecPlan을 Worke
 
 ## 설치
 
-Python, Git, 인증된 GitHub CLI(`gh`), Codex 또는 Claude Code CLI가 필요하다. Windows는 Python 3.13 이상과 PowerShell 7, 이 저장소 자체 전체 검증에는 WSL이 필요하다. Python 외부 패키지는 사용하지 않는다.
+Python 3.11 이상, Git, 인증된 GitHub CLI(`gh`), Codex 또는 Claude Code CLI가 필요하다. Windows는 Python 3.13 이상과 PowerShell 7, 이 저장소 자체 전체 검증에는 WSL이 필요하다. Python 외부 패키지는 사용하지 않는다.
 
 ```sh
 bash scripts/setup.sh

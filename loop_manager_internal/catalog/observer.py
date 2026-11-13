@@ -28,6 +28,7 @@ class Catalog:
     errors: dict = field(default_factory=dict)
     document_oids: dict = field(default_factory=dict)
     specifications: dict = field(default_factory=dict)
+    source_history: dict = field(default_factory=dict)
 
 
 def reused_plans(requirement):
@@ -70,7 +71,7 @@ def parse_plan(document):
         raise ValueError('sources가 비어 있습니다.')
     for path in values['sources']:
         parsed = PurePosixPath(path)
-        if (parsed.is_absolute() or '..' in parsed.parts
+        if (parsed.is_absolute() or '..' in parsed.parts or any(char in path for char in '\r\n\0')
                 or not (path == 'docs/PRODUCT.md' or re.fullmatch(r'docs/requirements/[^/]+\.md',path))):
             raise ValueError(f'유효하지 않은 source 경로: {path}')
     if any(not re.fullmatch(r'G-[0-9]{3,}',item) for item in values['depends_on']):
@@ -142,15 +143,27 @@ def synchronize(store, repo, snapshot):
     """완전히 관측한 Git 트리만 받는다. 오류 문서는 보존하고 독립 G를 반영한다."""
     old_requirements = {row['requirement_id']:row for row in store.rows(
         'SELECT * FROM requirement_states WHERE repo=?',(repo,))}
+    historical={item['id']:item['document'] for item in snapshot.source_history.values()}
+    for identity,item in snapshot.requirements.items():
+        old=old_requirements.get(identity)
+        if old and (old['judgment']=='WITHDRAWN' or '/archive/' in old['source_path']):
+            snapshot.errors[item['document'].path]='보관·철회된 R-ID를 새 활성 목표로 재사용할 수 없습니다.'
     changed = {identity for identity,item in snapshot.requirements.items()
                if identity not in old_requirements or old_requirements[identity]['source_oid'] != item['document'].oid}
-    missing = {identity for identity,row in old_requirements.items() if row['judgment']!='WITHDRAWN'} \
+    missing = {identity for identity,row in old_requirements.items() if row['judgment']!='WITHDRAWN' and '/archive/' not in row['source_path']} \
               - snapshot.requirements.keys() - snapshot.archived_requirements.keys()
+    missing.update({identity for identity in historical if identity not in old_requirements
+                    or old_requirements[identity]['judgment']!='WITHDRAWN' and '/archive/' not in old_requirements[identity]['source_path']}
+                   -snapshot.requirements.keys()-snapshot.archived_requirements.keys())
     # 파싱 실패한 문서가 있으면 그 정체를 삭제로 추정할 수 없다.
     if snapshot.errors:
         missing = set()
     with store.transaction() as db:
         for identity in missing:
+            if identity not in old_requirements:
+                doc=historical[identity]
+                db.execute("INSERT INTO requirement_states(repo,requirement_id,source_path,source_oid,judgment) VALUES(?,?,?,?,'WITHDRAWN')",
+                           (repo,identity,doc.path,doc.oid))
             db.execute("UPDATE requirement_states SET judgment='WITHDRAWN',evidence=NULL WHERE repo=? AND requirement_id=?",
                        (repo,identity))
         for identity,item in snapshot.requirements.items():
@@ -161,7 +174,14 @@ def synchronize(store, repo, snapshot):
                        'VALUES(?,?,?,?) ON CONFLICT(repo,requirement_id) DO UPDATE '
                        'SET source_path=excluded.source_path,source_oid=excluded.source_oid',
                        (repo,identity,doc.path,doc.oid))
+        for identity,item in snapshot.archived_requirements.items():
+            doc=item['document']
+            if doc.path not in snapshot.errors:
+                db.execute("INSERT INTO requirement_states(repo,requirement_id,source_path,source_oid,judgment) VALUES(?,?,?,?,'ARCHIVED') "
+                           'ON CONFLICT(repo,requirement_id) DO UPDATE SET source_path=excluded.source_path,source_oid=excluded.source_oid',
+                           (repo,identity,doc.path,doc.oid))
         source_ids = {item['document'].path:identity for identity,item in snapshot.requirements.items()}
+        source_ids.update({path:item['id'] for path,item in snapshot.source_history.items()})
         existing = {row['plan_id']:dict(row) for row in db.execute('SELECT p.*,r.specification_fingerprint FROM exec_plans p '
                     'JOIN exec_plan_runs r USING(repo,plan_id) WHERE repo=?',(repo,))}
         for identity,old in existing.items():
@@ -185,6 +205,11 @@ def synchronize(store, repo, snapshot):
             bindings={path:identity for path,identity in json.loads((old or {}).get('source_requirements') or '{}').items()
                       if path in item['sources']}
             bindings.update({path:source_ids[path] for path in item['sources'] if path in source_ids})
+            unresolved=[path for path in item['sources'] if path.startswith('docs/requirements/')
+                        and path not in snapshot.document_oids and path not in bindings]
+            if unresolved:
+                snapshot.errors[doc.path]=f'현재 문서·원격 이력에서 근거 R 경로를 확인할 수 없습니다: {unresolved}'
+                continue
             if primary is None:
                 primary = next(iter(bindings.values()),None)
             db.execute('INSERT INTO exec_plans(repo,plan_id,source_path,source_oid,title,primary_requirement_id,'
@@ -217,9 +242,11 @@ def synchronize(store, repo, snapshot):
         for identity,old in existing.items():
             if identity not in snapshot.plans and identity not in snapshot.archived_plans:
                 store.cancel(repo,identity,snapshot.revision,'원격 base의 전체 트리에서 G 철회 확인')
-        for identity,old in existing.items():
+        current_requirements=store.rows('SELECT * FROM requirement_states WHERE repo=?',(repo,))
+        for old in store.rows('SELECT * FROM exec_plans WHERE repo=?',(repo,)):
+            identity=old['plan_id']
             sources=set(json.loads(old['sources']))
-            linked={key for key,row in old_requirements.items() if old in related_plans(row,[old])}
+            linked={row['requirement_id'] for row in current_requirements if related_plans(row,[old])}
             if linked & missing and not linked & snapshot.requirements.keys() and 'docs/PRODUCT.md' not in sources:
                 store.cancel(repo,identity,snapshot.revision,'연결 Requirement의 확정 철회와 남은 유효 목표 부재')
     return changed,missing

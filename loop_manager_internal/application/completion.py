@@ -11,6 +11,25 @@ from loop_manager_internal.planning.proposals import usage_body
 from loop_manager_internal.runtime.process_lock import process_lock
 
 
+def running(store,repo,scope):
+    rows=store.rows('SELECT process_pid,process_identity FROM agent_calls WHERE repo=? AND scope=? AND process_pid IS NOT NULL '
+                    'UNION ALL SELECT process_pid,process_identity FROM exec_plan_runs WHERE repo=? AND plan_id=? AND process_pid IS NOT NULL',
+                    (repo,scope,repo,scope))
+    return any(still_running(row['process_pid'],row['process_identity']) for row in rows)
+
+
+def planning_workspaces(store,repository,identity):
+    for job in store.rows("SELECT * FROM external_jobs WHERE repo=? AND target=? AND kind='planning_publish'",(repository.repo,identity)):
+        path=job['remote_result']
+        if path and Path(path).is_dir():
+            branch=repository.git('symbolic-ref','--short','HEAD',cwd=path)
+            if not branch.startswith('loop-manager/plans/'):
+                continue
+            repository.defer_cleanup(path,branch)
+        with store.transaction() as db:
+            db.execute('DELETE FROM external_jobs WHERE job_key=?',(job['job_key'],))
+
+
 def archive(store,repository,kind,identity,source,expected_revision=None):
     repo = repository.repo
     key = f'archive:{repo}:{identity}:{source.oid}'
@@ -109,10 +128,7 @@ def complete(store,repository,github,snapshot):
                             "WHERE repo=? AND status IN ('MERGED','CANCELLED')",(repo,)):
         identity = plan['plan_id']
         try:
-            processes = store.rows('SELECT process_pid,process_identity FROM exec_plan_runs WHERE repo=? AND plan_id=?',
-                                   (repo,identity))
-            processes += store.rows('SELECT process_pid,process_identity FROM agent_calls WHERE repo=? AND scope=?',(repo,identity))
-            if any(still_running(row['process_pid'],row['process_identity']) for row in processes):
+            if running(store,repo,identity):
                 continue
             if plan['status']=='MERGED' and identity in snapshot.plans:
                 archive(store,repository,'plan',identity,snapshot.plans[identity]['document'])
@@ -150,6 +166,8 @@ def complete(store,repository,github,snapshot):
     for row in store.rows("SELECT * FROM requirement_states WHERE repo=? AND judgment='SATISFIED'",(repo,)):
         identity = row['requirement_id']
         try:
+            if running(store,repo,identity):
+                continue
             if identity in snapshot.requirements:
                 source = snapshot.requirements[identity]['document']
                 if row['last_planned_source_oid']!=source.oid:
@@ -164,6 +182,7 @@ def complete(store,repository,github,snapshot):
                 continue
             final_usage(store,github,repo,identity,'planning')
             sessions(store,repository.state_dir,repo,identity)
+            planning_workspaces(store,repository,identity)
             with store.transaction() as db:
                 db.execute('UPDATE requirement_states SET evidence=NULL WHERE repo=? AND requirement_id=?',(repo,identity))
                 # 미완료 R의 최종 판단에 필요한 Verify 근거는 남긴다.
@@ -178,6 +197,8 @@ def complete(store,repository,github,snapshot):
         for row in store.rows("SELECT * FROM requirement_states WHERE repo=? AND judgment='WITHDRAWN'",(repo,)):
             identity=row['requirement_id']
             try:
+                if running(store,repo,identity):
+                    continue
                 for pull in store.rows("SELECT * FROM managed_prs WHERE repo=? AND kind='planning' AND primary_requirement_id=? AND state='OPEN'",
                                        (repo,identity)):
                     candidate=repository.snapshot(pull['head_sha'])
@@ -195,6 +216,7 @@ def complete(store,repository,github,snapshot):
                     continue
                 final_usage(store,github,repo,identity,'planning')
                 sessions(store,repository.state_dir,repo,identity)
+                planning_workspaces(store,repository,identity)
                 with store.transaction() as db:
                     db.execute('UPDATE requirement_states SET evidence=NULL WHERE repo=? AND requirement_id=?',(repo,identity))
             except (OSError,RuntimeError,ValueError) as error:

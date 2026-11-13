@@ -7,7 +7,6 @@ import math
 import os
 import platform
 from pathlib import Path
-import py_compile
 import shutil
 import subprocess
 import sys
@@ -19,7 +18,7 @@ import uuid
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.verification.coordination import CoordinatorClient, VerifyCoordinator
 from loop_manager_internal.verification.guard import MARKER, install_guard, _local
-from loop_manager_internal.verification.unittest_adapter import (worker_main, start_worker, stop_worker, failure_output, compile_project)
+from loop_manager_internal.verification.unittest_adapter import worker_main, start_worker, stop_worker, failure_output
 from loop_manager_internal.verification.manifest import validate_report
 from loop_manager_internal.verification.contract import VERSION, ADAPTERS, ContractError, load, fields
 from loop_manager_internal.verification import unittest_adapter, perl_adapter
@@ -27,9 +26,9 @@ from loop_manager_internal.verification.core import execute_command
 from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
 from loop_manager_internal.verification.resources import DEFAULT_WORKER_BYTES, ResourceSampler, parse_parallelism, process_memory
 from loop_manager_internal.verification.timing import (
-    EventWriter, TimedResult, atomic_json, bytecode_cache_changes,
+    EventWriter, atomic_json, bytecode_cache_changes,
     bytecode_cache_snapshot, bytecode_policy, comparison, diagnostic,
-    fixture_timing, phase, summarize,
+    phase, summarize,
 )
 
 

@@ -53,7 +53,7 @@ CREATE TABLE exec_plan_runs (
  repo TEXT NOT NULL, plan_id TEXT NOT NULL,
  generation INTEGER NOT NULL DEFAULT 0, input_fingerprint TEXT, specification_fingerprint TEXT,
  worktree TEXT, candidate_sha TEXT, worker_result TEXT, published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0,1)),
- progress_at REAL NOT NULL DEFAULT (unixepoch()), retry_after REAL, last_error TEXT,
+ progress_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)), retry_after REAL, last_error TEXT,
  process_pid INTEGER, process_identity TEXT,
  manual_mode TEXT CHECK(manual_mode IN ('PREPARING','MANUAL_WORKING','SUBMITTED')),
  request_id TEXT, request_kind TEXT,
@@ -230,6 +230,11 @@ class Store:
             row=db.execute('SELECT * FROM projects WHERE repo=? AND request_id=?',(repo,request_id)).fetchone()
             if row is None or row['request_result'] is not None:
                 return False
+            if row['request_kind']=='remove':
+                pending=db.execute('SELECT plan_id,request_id FROM exec_plan_runs WHERE repo=? AND request_kind IS NOT NULL',(repo,)).fetchall()
+                for request in pending:
+                    self.finish_request_in(db,repo,request['plan_id'],request['request_id'],'프로젝트 등록 해제로 요청이 종료됐습니다. 작업물은 보존합니다.')
+                db.execute("UPDATE exec_plan_runs SET manual_mode=NULL WHERE repo=? AND manual_mode='PREPARING'",(repo,))
             self.notify(db,f'cli:{repo}:{request_id}',repo,'project',result)
             db.execute('UPDATE projects SET request_kind=NULL,request_result=?,last_error=NULL WHERE repo=? AND request_id=?',
                        (result,repo,request_id))
@@ -264,6 +269,8 @@ class Store:
         if kind not in ('unblock','manual_start','manual_complete'):
             raise ValueError('지원하지 않는 G 요청입니다.')
         with self.transaction() as db:
+            if not db.execute('SELECT 1 FROM projects WHERE repo=? AND enabled=1',(repo,)).fetchone():
+                raise StateError('등록이 활성화된 프로젝트에만 요청할 수 있습니다.')
             row = db.execute('SELECT p.status,p.draft,r.* FROM exec_plans p JOIN exec_plan_runs r '
                              'USING(repo,plan_id) WHERE repo=? AND plan_id=?', (repo,plan_id)).fetchone()
             if row is None:

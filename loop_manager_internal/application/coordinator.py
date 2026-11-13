@@ -10,14 +10,13 @@ from loop_manager_internal.catalog.observer import synchronize,planning_targets,
 from loop_manager_internal.execution.processes import still_running,VerifyTerminationUncertain
 from loop_manager_internal.execution.validation import verify_command,verify,fingerprint
 from loop_manager_internal.execution.validation_feedback import bounded_diagnostic
-from loop_manager_internal.git.repository import Repository,GitHub,GitError,MergeConflict,RemoteDeleted
+from loop_manager_internal.git.repository import Repository,GitHub,GitError,MergeConflict
 from loop_manager_internal.notifications.outbox import deliver
 from loop_manager_internal.planning.proposals import proposal,observe_pulls,record_pull,metadata,usage_body,classification
 from loop_manager_internal.storage.state import packed,TERMINAL,StateError
-from loop_manager_internal.application.completion import complete
+from loop_manager_internal.application.completion import complete,running
 from loop_manager_internal.config.settings import Settings
 from loop_manager_internal.runtime.process_lock import process_lock
-from loop_manager_internal.runtime.contracts import ProcessLockBusyError
 
 
 class Coordinator:
@@ -68,7 +67,8 @@ class Coordinator:
             if not info or info['kind']!='implementation' or pull['state']!='open' or pull.get('merged_at'):
                 continue
             for identity in info['plan_ids']:
-                if identity not in snapshot.plans or (repo,identity) in self.active or self.live_process(repo,identity):
+                if (identity not in snapshot.plans or snapshot.plans[identity]['document'].path in snapshot.errors
+                        or (repo,identity) in self.active or self.live_process(repo,identity)):
                     continue
                 plan=self.store.plan(repo,identity)
                 if plan['status'] in TERMINAL or plan['status']=='BLOCKED' or plan['manual_mode'] in ('PREPARING','MANUAL_WORKING'):
@@ -87,6 +87,11 @@ class Coordinator:
                                    'WHERE repo=? AND plan_id=?',(str(path),pull['head']['sha'],repo,identity))
         if project['request_kind']=='register':
             self.store.finish_project_request(repo,project['request_id'],f'{repo} 등록 확인 완료')
+        if snapshot.errors:
+            self.retry(repo,'project','문서 오류: '+packed(snapshot.errors))
+        elif (project.get('last_error') or '').startswith('문서 오류:'):
+            with self.store.transaction() as db:
+                db.execute('UPDATE projects SET last_error=NULL WHERE repo=? AND last_error=?',(repo,project['last_error']))
         return snapshot
 
     def retry(self,repo,identity,error):
@@ -99,11 +104,7 @@ class Coordinator:
                 db.execute('UPDATE projects SET last_error=? WHERE repo=?',(message,repo))
 
     def live_process(self,repo,identity):
-        rows = self.store.rows('SELECT process_pid,process_identity FROM agent_calls '
-                               'WHERE repo=? AND scope=? AND process_pid IS NOT NULL',(repo,identity))
-        rows += self.store.rows('SELECT process_pid,process_identity FROM exec_plan_runs '
-                                'WHERE repo=? AND plan_id=? AND process_pid IS NOT NULL',(repo,identity))
-        return any(still_running(row['process_pid'],row['process_identity']) for row in rows)
+        return running(self.store,repo,identity)
 
     def stalled(self):
         for row in self.store.rows("SELECT p.repo,p.plan_id,r.progress_at FROM exec_plans p JOIN exec_plan_runs r USING(repo,plan_id) "
@@ -120,7 +121,18 @@ class Coordinator:
                if (row['repo'],row['scope']) not in self.active and still_running(row['process_pid'],row['process_identity'])]
         verifies=any((row['repo'],row['plan_id']) not in self.active and still_running(row['process_pid'],row['process_identity'])
                      for row in self.store.rows('SELECT repo,plan_id,process_pid,process_identity FROM exec_plan_runs WHERE process_pid IS NOT NULL'))
-        return len(calls),{row['repo'] for row in calls if row['role']=='worker'},verifies
+        return (len(calls),{row['repo'] for row in calls if row['role']=='worker'},verifies,
+                {row['repo'] for row in calls if row['role']=='planner'})
+
+    def preparing_manual(self,repo):
+        for row in self.store.rows("SELECT plan_id FROM exec_plan_runs WHERE repo=? AND manual_mode='PREPARING'",(repo,)):
+            key=hashlib.sha256((repo+'\0'+row['plan_id']).encode()).hexdigest()[:24]
+            try:
+                with process_lock(self.state_dir,name=f'manual-{key}.lock'):
+                    pass
+            except (OSError,RuntimeError):
+                return True
+        return False
 
     def requests(self,repo):
         for row in self.store.rows('SELECT p.status,p.block_reason,r.* FROM exec_plans p JOIN exec_plan_runs r '
@@ -524,7 +536,9 @@ class Coordinator:
                 for project in current_projects:
                     repo=project['repo']
                     if not project['enabled'] and project['request_kind']=='remove' and not any(job[1]==repo for job in futures.values()):
-                        if not any(self.live_process(repo,row['plan_id']) for row in self.store.rows('SELECT plan_id FROM exec_plans WHERE repo=?',(repo,))):
+                        scopes=self.store.rows('SELECT scope FROM agent_calls WHERE repo=? AND process_pid IS NOT NULL '
+                                               'UNION SELECT plan_id AS scope FROM exec_plan_runs WHERE repo=? AND process_pid IS NOT NULL',(repo,repo))
+                        if not any(self.live_process(repo,row['scope']) for row in scopes) and not self.preparing_manual(repo):
                             self.store.finish_project_request(repo,project['request_id'],f'{repo} 등록 해제 완료. 작업물은 보존합니다.')
                     elif project['enabled']:
                         previous=self.repositories.get(repo)
@@ -545,7 +559,7 @@ class Coordinator:
                             self.requests(repo)
                         except (OSError,RuntimeError,ValueError) as error:
                             self.retry(repo,'project',error)
-                external_ai,external_workers,external_verify=self.external_resources()
+                external_ai,external_workers,external_verify,external_planners=self.external_resources()
                 busy_ai = external_ai+sum(job[0] in ('planner','worker','reviewer') for job in futures.values())
                 busy_verify = external_verify or any(job[0]=='verify' for job in futures.values())
                 dispatched = False
@@ -554,10 +568,11 @@ class Coordinator:
                     if not can_dispatch or repo not in self.catalogs or self.store.paused(repo):
                         continue
                     snapshot = self.catalogs[repo]
-                    if busy_ai<self.settings.max_ai and not any(job[0]=='planner' and job[1]==repo for job in futures.values()):
+                    if (busy_ai<self.settings.max_ai and repo not in external_planners
+                            and not any(job[0]=='planner' and job[1]==repo for job in futures.values())):
                         for identity,reason in planning_targets(self.store,repo,snapshot):
                             key = (repo,identity,snapshot.requirements[identity]['document'].oid,reason)
-                            if key in self.planned_inputs or (repo,identity) in self.active:
+                            if key in self.planned_inputs or (repo,identity) in self.active or self.live_process(repo,identity):
                                 continue
                             self.planned_inputs.add(key)
                             if not self.boundary():
@@ -677,7 +692,8 @@ class Coordinator:
                     self.active.pop((repo,identity),None)
                     try:
                         current = self.store.rows('SELECT * FROM projects WHERE repo=?',(repo,))[0]
-                        self.observe(current)
+                        if current['enabled']:
+                            self.observe(current)
                         self.finish(job,future)
                     except VerifyTerminationUncertain:
                         raise

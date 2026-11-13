@@ -15,7 +15,7 @@ from loop_manager_internal.verification.git_timing import git_command_timing
 from loop_manager_internal.verification.manifest import Module, discover, load_module, test_cases, validate_report
 from loop_manager_internal.verification.resources import process_memory
 from loop_manager_internal.verification.core import stop_worker, failure_output
-from loop_manager_internal.verification.worker_transport import Worker, start_worker, SerialClient
+from loop_manager_internal.verification.worker_transport import start_worker, SerialClient
 from loop_manager_internal.verification import timing as instrumentation
 from loop_manager_internal.verification.timing import EventWriter, TimedResult, atomic_json, fixture_timing, phase
 
@@ -99,12 +99,6 @@ def worker_main():
         if writer:
             writer.close()
     return 0
-
-
-
-def compile_project(root):
-    for path in [root / "loop_manager.py", *sorted((root / "loop_manager_internal").rglob("*.py"))]:
-        py_compile.compile(str(path), doraise=True)
 
 
 

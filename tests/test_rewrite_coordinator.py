@@ -13,6 +13,8 @@ from loop_manager_internal.application.coordinator import Coordinator
 from loop_manager_internal.catalog.observer import catalog,synchronize
 from loop_manager_internal.storage.state import Store
 from loop_manager_internal.planning.proposals import metadata
+from loop_manager_internal.application.direct_commands import execute,build_parser
+from loop_manager_internal.config.settings import Settings
 from tests.support.rewrite_fixtures import requirement,plan
 
 
@@ -161,7 +163,7 @@ class CoordinatorTests(unittest.TestCase):
         with self.store.transaction() as db:
             db.execute("UPDATE exec_plan_runs SET process_pid=123,process_identity='identity'")
         self.coordinator.worker=Mock(side_effect=AssertionError('기존 프로세스가 실행 중입니다.'))
-        with patch('loop_manager_internal.application.coordinator.still_running',return_value=True):
+        with patch('loop_manager_internal.application.completion.still_running',return_value=True):
             self.coordinator.run()
         self.coordinator.worker.assert_not_called()
 
@@ -193,10 +195,68 @@ class CoordinatorTests(unittest.TestCase):
                        'VALUES(?,?,?,?,?,?,?,?,?,?)',('orphan','owner/repo','G-099','worker','codex','model','hash',0,123,'live'))
             db.execute("UPDATE exec_plan_runs SET process_pid=456,process_identity='live' WHERE plan_id='G-001'")
         self.coordinator.worker=Mock(side_effect=AssertionError('살아 있는 Worker 자원을 초과했습니다.'))
-        with patch('loop_manager_internal.application.coordinator.still_running',return_value=True):
-            self.assertEqual(self.coordinator.external_resources(),(1,{'owner/repo'},True))
+        with patch('loop_manager_internal.application.coordinator.still_running',return_value=True), \
+             patch('loop_manager_internal.application.completion.still_running',return_value=True):
+            self.assertEqual(self.coordinator.external_resources(),(1,{'owner/repo'},True,set()))
             self.coordinator.run()
         self.coordinator.worker.assert_not_called()
+
+    def test_orphan_planner_reserves_project_id_allocation_even_for_another_r(self):
+        self.snapshot=catalog('base',[requirement(),requirement('R-002'),plan(draft=True),plan('G-002',draft=True)])
+        self.repository.snapshot.return_value=self.snapshot
+        with self.store.transaction() as db:
+            db.execute('INSERT INTO agent_calls(invocation_id,repo,scope,role,provider,model,instruction_hash,created_at,process_pid,process_identity) '
+                       'VALUES(?,?,?,?,?,?,?,?,?,?)',('orphan','owner/repo','R-099','planner','codex','model','hash',0,123,'live'))
+        with patch('loop_manager_internal.application.coordinator.still_running',return_value=True), \
+             patch('loop_manager_internal.application.completion.still_running',return_value=True):
+            self.assertEqual(self.coordinator.run(),[])
+        self.coordinator.agent.call.assert_not_called()
+
+    def test_remove_finalizes_pending_g_request_and_rejects_later_requests(self):
+        self.coordinator.observe(self.store.rows('SELECT * FROM projects')[0])
+        request=self.store.request('owner/repo','G-001','manual_start')
+        execute(build_parser().parse_args(['remove','owner/repo']),self.store,self.root)
+        self.assertEqual(self.coordinator.run(),[])
+        current=self.store.plan('owner/repo','G-001')
+        self.assertIn('등록 해제',current['request_result'])
+        self.assertIsNone(current['manual_mode'])
+        self.assertEqual(len(self.store.rows('SELECT * FROM notification_outbox WHERE event_key=?',
+            (f'cli:owner/repo:G-001:{request}',))),1)
+        with self.assertRaisesRegex(RuntimeError,'활성화'):
+            self.store.request('owner/repo','G-001','manual_start')
+
+    def test_remove_during_worker_drains_without_new_verify_or_remote_observation(self):
+        self.snapshot=catalog('base',[requirement(),plan(),plan('G-002',draft=True)])
+        self.repository.snapshot.return_value=self.snapshot
+        def worker(*args):
+            execute(build_parser().parse_args(['remove','owner/repo']),self.store,self.root)
+            return 'CANDIDATE','보존된 진행 작업','candidate'
+        self.coordinator.worker=worker
+        self.coordinator.verify=Mock(side_effect=AssertionError('등록 해제 뒤 신규 Verify 금지'))
+        self.assertEqual(self.coordinator.run(),[])
+        self.coordinator.verify.assert_not_called()
+        self.assertEqual(self.github.pulls.call_count,1)
+        current=self.store.rows('SELECT * FROM projects')[0]
+        self.assertFalse(current['enabled'])
+        self.assertIn('등록 해제 완료',current['request_result'])
+        self.assertEqual(self.store.plan('owner/repo','G-001')['status'],'VERIFYING')
+
+    def test_settings_change_is_used_at_next_stage_boundary(self):
+        configuration=self.root/'config.ini'
+        configuration.write_text('[loop]\nmax_workers=1\nverify_timeout_seconds=10\n',encoding='utf-8')
+        self.coordinator.settings=Settings(configuration)
+        def worker(repo,item,*args):
+            configuration.write_text('[loop]\nmax_workers=2\nverify_timeout_seconds=90\n',encoding='utf-8')
+            return 'CANDIDATE','구현','sha:'+item['plan_id']
+        timeouts=[]
+        def verify(*args):
+            timeouts.append(self.coordinator.settings.verify_timeout)
+            return True,'검증 완료'
+        self.coordinator.worker=worker
+        self.coordinator.verify=verify
+        self.assertEqual(self.coordinator.run(),[])
+        self.assertEqual(timeouts,[90,90])
+        self.assertEqual(self.coordinator.settings.max_ai,2)
 
     def test_equal_priority_new_g_gets_a_turn_after_interrupted_worker(self):
         with self.store.transaction() as db:

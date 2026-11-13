@@ -8,7 +8,7 @@ from pathlib import Path
 from loop_manager_internal.git.repository import Repository,GitHub, command, github_repository
 from loop_manager_internal.catalog.observer import synchronize
 from loop_manager_internal.planning.proposals import observe_pulls
-from loop_manager_internal.storage.state import Store, StateError,TERMINAL
+from loop_manager_internal.storage.state import StateError,TERMINAL
 
 
 def build_parser():
@@ -56,7 +56,7 @@ def project(store, reference):
 def query(store, kind, repo=None):
     condition,parameters = (' WHERE repo=?',(repo,)) if repo else ('',())
     if kind=='list':
-        return store.rows('SELECT repo,path,base_branch,provider,enabled,request_id,request_kind,request_result '
+        return store.rows('SELECT repo,path,base_branch,provider,enabled,request_id,request_kind,request_result,last_error '
                           'FROM projects'+condition+' ORDER BY repo',parameters)
     if kind=='status':
         return {'projects':query(store,'list',repo),
@@ -74,7 +74,8 @@ def query(store, kind, repo=None):
                           'CASE WHEN COUNT(output_tokens)=COUNT(*) THEN SUM(output_tokens) END AS output_tokens '
                           'FROM agent_calls'+condition+' GROUP BY repo,scope,role,provider,model',parameters)
     if kind=='logs':
-        return {'current':store.rows('SELECT repo,plan_id,last_error,retry_after FROM exec_plan_runs'+condition,parameters),
+        return {'projects':store.rows('SELECT repo,last_error FROM projects'+condition,parameters),
+                'current':store.rows('SELECT repo,plan_id,last_error,retry_after FROM exec_plan_runs'+condition,parameters),
                 'calls':store.rows('SELECT invocation_id,repo,scope,role,result,created_at FROM agent_calls'+condition+
                                    ' ORDER BY created_at DESC LIMIT 100',parameters)}
     raise ValueError('지원하지 않는 조회입니다.')
@@ -109,7 +110,10 @@ def _manual_start(store, state_dir, item):
     repo,identity = item['repo'],item['plan_id']
     if store.paused(repo):
         raise StateError('일시중지 상태입니다. 수동 준비를 시작하려면 resume을 실행하세요.')
-    repository = Repository(project(store,repo),state_dir,store)
+    registered=project(store,repo)
+    if not registered['enabled']:
+        raise StateError('등록이 해제된 프로젝트는 수동 준비할 수 없습니다.')
+    repository = Repository(registered,state_dir,store)
     if not store.rows('SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?',(repo,identity)):
         with repository.observation():
             synchronize(store,repo,repository.snapshot(repository.refresh()))

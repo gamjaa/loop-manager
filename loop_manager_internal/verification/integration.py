@@ -6,7 +6,6 @@ import subprocess
 import sys
 import shutil
 import math
-import unittest
 from collections import Counter
 
 from loop_manager_internal.verification.contract import ContractError, inside, validate_manifest, load

@@ -32,7 +32,10 @@ def main(argv=None, *, root=None):
                     return 0
                 raise StateError('전체 일시중지 상태입니다. resume 후 수동 준비하세요.')
             if args.command=='manual':
-                if store.paused(direct_commands.project(store,args.repository)['repo']):
+                registered=direct_commands.project(store,args.repository)
+                if not registered['enabled']:
+                    raise StateError('등록이 해제된 프로젝트는 수동 준비할 수 없습니다.')
+                if store.paused(registered['repo']):
                     raise StateError('프로젝트 일시중지 상태입니다. resume 후 수동 준비하세요.')
             elif args.repositories:
                 selected={direct_commands.project(store,value)['repo'] for value in args.repositories}

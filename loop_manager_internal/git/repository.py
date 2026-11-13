@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 
 from loop_manager_internal.catalog.observer import Document, catalog
+from loop_manager_internal.catalog.frontmatter import requirement_identity
 from loop_manager_internal.runtime.process_lock import process_lock
 
 
@@ -86,7 +87,21 @@ class Repository:
             if kind == 'blob' and mode in ('100644','100755') and path.endswith('.md'):
                 content = command(['git','show',f'{revision}:{path}'],cwd=self.mirror).stdout
                 documents.append(Document(path,oid,content))
-        return catalog(revision,documents)
+        result=catalog(revision,documents)
+        paths={source for item in result.plans.values() for source in item['sources']
+               if source.startswith('docs/requirements/') and source not in result.document_oids}
+        for path in paths:
+            previous=self.git('log','-1','--format=%H','--diff-filter=AM',revision,'--',path)
+            if not previous:
+                continue
+            content=command(['git','show',f'{previous}:{path}'],cwd=self.mirror).stdout
+            try:
+                identity,_=requirement_identity(content)
+            except ValueError:
+                continue
+            oid=self.git('rev-parse',f'{previous}:{path}')
+            result.source_history[path]={'id':identity,'document':Document(path,oid,content)}
+        return result
 
     def remote_head(self, branch):
         lines = self.git('ls-remote','--heads','origin',f'refs/heads/{branch}').splitlines()

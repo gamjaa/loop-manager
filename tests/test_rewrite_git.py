@@ -7,6 +7,8 @@ from unittest.mock import Mock, patch
 from loop_manager_internal.git.repository import (GitHub, GitError, MergeConflict, Repository, RemoteDeleted,
                                                   command, github_repository, managed_body)
 from loop_manager_internal.runtime.revision_runtime import prepare as prepare_runtime
+from loop_manager_internal.catalog.observer import synchronize
+from tests.support.rewrite_fixtures import requirement,plan
 from loop_manager_internal.storage.state import Store
 
 
@@ -90,6 +92,10 @@ class GitPreservationTests(unittest.TestCase):
             (source/'.gitignore').write_text('cache/\n',encoding='utf-8')
             (source/'base.txt').write_bytes(b'base\r\n')
             (source/'loop_manager.py').write_text('REWRITE_RUNTIME_VERSION = 1\n',encoding='utf-8')
+            for document in (requirement(),plan()):
+                target=source/document.path
+                target.parent.mkdir(parents=True,exist_ok=True)
+                target.write_text(document.text,encoding='utf-8')
             command(['git','add','.'],cwd=source)
             command(['git','commit','-m','initial'],cwd=source)
             command(['git','clone','--bare',str(source),str(remote)])
@@ -160,3 +166,22 @@ class GitPreservationTests(unittest.TestCase):
             self.assertEqual((source/'base.txt').read_bytes(),'사용자 수정\r\n'.encode('utf-8'))
             self.assertEqual(command(['git','rev-parse','HEAD'],cwd=source).stdout,original)
             self.assertEqual((work/'cache'/'ignored.txt').read_bytes(),b'cache\r\n')
+            command(['git','checkout','main'],cwd=peer)
+            old=peer/requirement().path
+            renamed=old.with_name('[R-001] 새 이름.md')
+            old.rename(renamed)
+            command(['git','add','--all'],cwd=peer)
+            command(['git','commit','-m','Requirement 경로 변경'],cwd=peer)
+            command(['git','push','origin','main'],cwd=peer)
+            observed=repository.snapshot(repository.refresh())
+            synchronize(store,'owner/repo',observed)
+            current=store.plan('owner/repo','G-001')
+            self.assertEqual(current['primary_requirement_id'],'R-001')
+            self.assertIn('R-001',current['source_requirements'])
+            renamed.unlink()
+            command(['git','add','--all'],cwd=peer)
+            command(['git','commit','-m','Requirement 실제 철회'],cwd=peer)
+            command(['git','push','origin','main'],cwd=peer)
+            observed=repository.snapshot(repository.refresh())
+            synchronize(store,'owner/repo',observed)
+            self.assertEqual(store.plan('owner/repo','G-001')['status'],'CANCELLED')

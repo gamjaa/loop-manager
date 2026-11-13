@@ -51,6 +51,18 @@ class CatalogTests(unittest.TestCase):
         snapshot = self.sync([requirement(),plan()])
         self.assertIn(plan().path,snapshot.errors)
 
+    def test_archived_and_withdrawn_r_ids_cannot_become_new_active_goals(self):
+        archived=requirement(path='docs/requirements/archive/[R-001] 목표.md')
+        self.sync([archived])
+        self.assertEqual(self.store.rows('SELECT judgment FROM requirement_states')[0]['judgment'],'ARCHIVED')
+        snapshot=self.sync([requirement(oid='new')])
+        self.assertIn(requirement().path,snapshot.errors)
+        self.assertEqual(planning_targets(self.store,'owner/repo',snapshot),[])
+        self.sync([requirement('R-002')])
+        self.sync([])
+        snapshot=self.sync([requirement('R-002',oid='new')])
+        self.assertIn(requirement('R-002').path,snapshot.errors)
+
     def test_requirement_rename_keeps_shared_link_until_final_acceptance(self):
         self.sync([requirement(),plan()])
         self.planned()
@@ -76,6 +88,12 @@ class CatalogTests(unittest.TestCase):
         snapshot = self.sync([requirement(),Document(plan().path,'bad','broken')])
         self.assertIn(plan().path,snapshot.errors)
         self.assertEqual(self.store.plan('owner/repo','G-001')['status'],'READY')
+
+    def test_unknown_requirement_source_is_deferred_without_inventing_withdrawal(self):
+        snapshot=self.sync([plan()])
+        self.assertIn(plan().path,snapshot.errors)
+        self.assertFalse(self.store.rows('SELECT * FROM exec_plans'))
+        self.assertFalse(self.store.rows('SELECT * FROM exec_plan_tombstones'))
 
     def test_duplicate_ids_invalid_dag_and_independent_plan(self):
         snapshot = catalog('base',[plan(),plan(path='docs/plans/duplicate.md'),
@@ -123,6 +141,12 @@ class CatalogTests(unittest.TestCase):
         rows={row['requirement_id']:row for row in self.store.rows('SELECT * FROM requirement_states')}
         self.assertEqual(rows['R-001']['judgment'],'WITHDRAWN')
         self.assertEqual(rows['R-002']['judgment'],'REPLAN')
+        with self.store.transaction() as db:
+            db.execute("UPDATE requirement_states SET judgment=NULL,last_planned_source_oid=source_oid WHERE requirement_id='R-002'")
+        unchanged=catalog('same-input',[requirement('R-002'),shared])
+        unchanged.source_history[requirement().path]={'id':'R-001','document':requirement()}
+        synchronize(self.store,'owner/repo',unchanged)
+        self.assertEqual(planning_targets(self.store,'owner/repo',unchanged),[])
 
     def test_terminal_plan_is_not_reopened_by_document_change(self):
         self.sync([requirement(),plan()])

@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import tempfile
 import time
@@ -211,6 +210,6 @@ class Agent:
                             usage.cached_input_tokens if usage else None,usage.cache_write_input_tokens if usage else None,
                             usage.output_tokens if usage else None,kind,invocation))
                 if kind=='SESSION_LOST':
-                    db.execute('UPDATE agent_calls SET session_id=NULL WHERE repo=? AND scope=? AND role=?',
-                               (project['repo'],scope,role))
+                    db.execute('UPDATE agent_calls SET session_id=NULL WHERE repo=? AND scope=? AND role=? AND provider=? AND session_id=?',
+                               (project['repo'],scope,role,provider,session))
             return AgentResult(kind,redact_secrets(message or result.output)[-6000:],new_session,parsed)
