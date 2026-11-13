@@ -112,7 +112,7 @@ class ProposalTests(unittest.TestCase):
         item=pull(head='initial')
         info={'kind':'planning','primary_requirement_id':'R-001','plan_ids':['G-001']}
         record_pull(self.store,'owner/repo',item,info,input_revision='r1')
-        self.agent.call.return_value.decision={'result':'SATISFIED','evidence':'最新 base AC와 테스트 충족'}
+        self.agent.call.return_value.decision={'result':'SATISFIED','evidence':'최신 base AC와 테스트 충족'}
         def lost(*args):
             item['state']='closed'
             record_pull(self.store,'owner/repo',item,info,input_revision='r1')
