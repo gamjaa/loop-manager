@@ -110,7 +110,9 @@ S3/S4/S5의 책임은 독립적으로 구성하며 공유 DB 계약 변경을 �
 - 공식 verify 1차: WSL success 5699 / failure 8 / error 6 / skip 8, Windows native NOT_RUN, 전체 FAIL. `.cache/verify/f9a2d995e5f4402ea14dd8f4eb24bebb/result.json` 및 `...-wsl/summary.json`. WSL 전용 `/tmp/loop-manager-verify-nf6c92di`의 stopped/removed=true 확인.
 - 이번 변경의 fixture 오류: `tests.test_*` 모듈에서 helper를 import한 4곳을 `tests/support/rewrite_fixtures.py`로 옮겨 해결했다. fixture 무효과 import/교차 import 규칙 2개 회귀 통과.
 - 기존 실패 재현: 변경 전 develop `086c8993`을 별도 `/tmp/loop-manager-baseline-*` 복사본에 초기화하고 `test_provider_home`, `test_provider_runtime`, `test_stable_work_reason`의 해당 case, `test_scoped_blocking`의 해당 case를 실행했다. 57 tests, failures 9 / errors 9 (unittest subtest 집계). 동일 Claude WSL managed 정책 guard와 기존 알림/대기 사유 불일치를 재현했다. `.cache/rewrite-wsl/baseline.log`. 이를 이번 변경의 성공 근거로 사용하지 않는다.
-- 추가 집중 검증: 계획 PR 회귀 6개, 완료/runtime 경계 4개, runtime drain·게시 재개·비밀 필터 회귀 통과. 최종 focused/verify 결과는 후속 기록으로 갱신한다.
+- 최종 Windows 집중 회귀: 신규 unit/mock/SQLite/Job 회귀 55개 통과. 실제 Git의 경로·CRLF·ignored·사용자 변경 보존 대표 회귀 1개도 native에서 별도로 통과(합계 56개). native Git의 첫 sandbox 실행은 MSYS `NtCreateDirectoryObject` 접근 오류로 실패해, 동일 격리 회귀를 sandbox 밖에서 재실행했다. 공식 Windows 핵심 회귀 통과로 표기하지 않는다.
+- 공식 verify 2차(최종 코드): WSL success 5704 / failure 7 / error 6 / skip 8, Windows native NOT_RUN, 전체 FAIL. 신규 9개 테스트 모듈은 모두 passed=true. 남은 실패 모듈은 `test_provider_home`, `test_provider_runtime`, `test_stable_work_reason`, `test_scoped_blocking`이며 기준 develop에서도 재현했다. `.cache/verify/33a9835f1971422e8d83c37211508c39/result.json` 및 `...-wsl/summary.json`, `runner.jsonl` 참조. WSL `/tmp/loop-manager-verify-v6awwg9k` stopped/removed=true 확인.
+- 최종 코드 점검: `git diff --check` 통과. 코드 기준 커밋 `0f75db62`이며 이후 변경은 이 검증 결과 기록뿐이다. 전체 목표 완료·필수 Verify 통과 상태가 아니다.
 - 운영 실행: 미실행. 작업 중 직접 `loop_manager.py run` 금지.
 
 ## 남은 구현과 확인할 문제
@@ -127,4 +129,4 @@ S3/S4/S5의 책임은 독립적으로 구성하며 공유 DB 계약 변경을 �
 
 ## 다음 작업
 
-S3의 계획 PR 서비스, S6 Coordinator·원격 복구·runtime 인계와 S7 완료·알림을 구현한다. 실제 Git 보존 회귀는 WSL에서 실행하고, 기존 진입부와 새 직접 CLI는 S8에서 전환한다. S3–S7 전체 계약 구현 전에는 새 진입부로 전환하지 않는다.
+이 파일과 Git 상태를 먼저 확인한 뒤 위 TODO를 이어간다. 우선 최신 명세 입력의 실제 전달과 원격 최초 복구·R 철회/공유 G를 완성하고 runtime bootstrap/child와 연결한다. S3–S7 전체 계약 구현 전에는 새 진입부로 전환하지 않는다. S8의 구형 구성·문서 정리와 S9의 필수 Verify가 끝나기 전까지 이 파일을 유지하고 Draft PR로 진행 기록을 보존한다.
