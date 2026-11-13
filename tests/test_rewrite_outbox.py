@@ -9,6 +9,35 @@ from loop_manager_internal.notifications.outbox import deliver
 
 
 class OutboxTests(unittest.TestCase):
+    def test_unicode_limit_and_cancellation_between_parts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store=Store(Path(directory)/'loop-manager.db')
+            store.initialize()
+            store.register('owner/repo','/project','remote','main','codex')
+            with store.transaction() as db:
+                store.notify(db,'event','owner/repo','G-001','😀'*4000)
+            sent=[]
+            def transport(token,chat,message,silent):
+                sent.append(message)
+                self.assertLessEqual(len(message.encode('utf-16-le'))//2,3500)
+                with store.transaction() as db:
+                    store.cancel_notifications(db,'owner/repo','G-001')
+            deliver(store,SimpleNamespace(telegram_token='token',telegram_chat='chat'),transport=transport)
+            self.assertEqual(len(sent),1)
+            self.assertEqual(store.rows('SELECT state FROM notification_outbox')[0]['state'],'CANCELLED')
+
+    def test_disabled_telegram_cancels_payload_without_blocking_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store=Store(Path(directory)/'loop-manager.db')
+            store.initialize()
+            store.register('owner/repo','/project','remote','main','codex')
+            with store.transaction() as db:
+                store.notify(db,'event','owner/repo','G-001','전송하지 않을 사건')
+            transport=Mock()
+            deliver(store,SimpleNamespace(telegram_token=''),transport=transport)
+            transport.assert_not_called()
+            self.assertEqual(store.rows('SELECT state,payload FROM notification_outbox')[0],{'state':'CANCELLED','payload':None})
+
     def test_retry_continues_after_confirmed_part_and_clears_sent_payload(self):
         with tempfile.TemporaryDirectory() as directory:
             store=Store(Path(directory)/'loop-manager.db')

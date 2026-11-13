@@ -37,4 +37,3 @@ def bounded_diagnostic(value: str) -> str:
     """Preserve the useful tail without inserting an unbounded raw log."""
     clean = _ANSI.sub("", value).replace("\r\n", "\n").replace("\r", "\n").strip()
     return redact_secrets(clean)[-MAX_DIAGNOSTIC:]
-

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
+import hashlib
 import json
 import re
 
@@ -25,6 +26,23 @@ class Catalog:
     archived_requirements: dict = field(default_factory=dict)
     archived_plans: dict = field(default_factory=dict)
     errors: dict = field(default_factory=dict)
+    document_oids: dict = field(default_factory=dict)
+    specifications: dict = field(default_factory=dict)
+
+
+def reused_plans(requirement):
+    try:
+        value=json.loads(requirement.get('evidence') or '{}')
+    except ValueError:
+        return set()
+    return set(value.get('reuses',[])) if isinstance(value,dict) else set()
+
+
+def related_plans(requirement,plans):
+    reused=reused_plans(requirement)
+    return [plan for plan in plans if plan['plan_id'] in reused
+            or requirement['requirement_id'] in json.loads(plan.get('source_requirements') or '{}').values()
+            or requirement['source_path'] in json.loads(plan['sources'])]
 
 
 def parse_plan(document):
@@ -71,11 +89,16 @@ def catalog(revision, documents):
     result = Catalog(revision)
     all_ids = {}
     for document in documents:
+        result.document_oids[document.path]=document.oid
+        if document.path in ('docs/PRODUCT.md','docs/ARCHITECTURE.md'):
+            result.specifications[document.path]=document
         path = PurePosixPath(document.path)
         if path.suffix != '.md' or str(path.parent) not in (
                 'docs/requirements','docs/requirements/archive','docs/plans','docs/plans/archive'):
             continue
         try:
+            if any(char in document.path for char in '\r\n\0'):
+                raise ValueError('문서 경로에 줄바꿈·NUL을 사용할 수 없습니다.')
             if path.parts[1] == 'requirements':
                 identity,title = requirement_identity(document.text)
                 value = {'id':identity,'title':title,'document':document}
@@ -121,11 +144,15 @@ def synchronize(store, repo, snapshot):
         'SELECT * FROM requirement_states WHERE repo=?',(repo,))}
     changed = {identity for identity,item in snapshot.requirements.items()
                if identity not in old_requirements or old_requirements[identity]['source_oid'] != item['document'].oid}
-    missing = set(old_requirements) - snapshot.requirements.keys() - snapshot.archived_requirements.keys()
+    missing = {identity for identity,row in old_requirements.items() if row['judgment']!='WITHDRAWN'} \
+              - snapshot.requirements.keys() - snapshot.archived_requirements.keys()
     # 파싱 실패한 문서가 있으면 그 정체를 삭제로 추정할 수 없다.
     if snapshot.errors:
         missing = set()
     with store.transaction() as db:
+        for identity in missing:
+            db.execute("UPDATE requirement_states SET judgment='WITHDRAWN',evidence=NULL WHERE repo=? AND requirement_id=?",
+                       (repo,identity))
         for identity,item in snapshot.requirements.items():
             doc = item['document']
             if doc.path in snapshot.errors:
@@ -135,7 +162,15 @@ def synchronize(store, repo, snapshot):
                        'SET source_path=excluded.source_path,source_oid=excluded.source_oid',
                        (repo,identity,doc.path,doc.oid))
         source_ids = {item['document'].path:identity for identity,item in snapshot.requirements.items()}
-        existing = {row['plan_id']:dict(row) for row in db.execute('SELECT * FROM exec_plans WHERE repo=?',(repo,))}
+        existing = {row['plan_id']:dict(row) for row in db.execute('SELECT p.*,r.specification_fingerprint FROM exec_plans p '
+                    'JOIN exec_plan_runs r USING(repo,plan_id) WHERE repo=?',(repo,))}
+        for identity,old in existing.items():
+            problem_path=next((path for path in [old['source_path'],*json.loads(old['sources'])] if path in snapshot.errors),None)
+            problem=snapshot.errors.get(problem_path)
+            if problem and old['status'] not in TERMINAL:
+                error=f'문서 오류 {snapshot.document_oids.get(problem_path, "unknown")}: {problem}'
+                db.execute('UPDATE exec_plan_runs SET generation=generation+1,input_fingerprint=NULL,worker_result=NULL,last_error=? '
+                           'WHERE repo=? AND plan_id=? AND (last_error IS NULL OR last_error!=?)',(error,repo,identity,error))
         for identity,item in {**snapshot.archived_plans,**snapshot.plans}.items():
             doc = item['document']
             if doc.path in snapshot.errors:
@@ -147,28 +182,46 @@ def synchronize(store, repo, snapshot):
             if old and old['status'] in TERMINAL:
                 continue
             primary = (old or {}).get('primary_requirement_id')
+            bindings={path:identity for path,identity in json.loads((old or {}).get('source_requirements') or '{}').items()
+                      if path in item['sources']}
+            bindings.update({path:source_ids[path] for path in item['sources'] if path in source_ids})
             if primary is None:
-                primary = next((source_ids[source] for source in item['sources'] if source in source_ids),None)
+                primary = next(iter(bindings.values()),None)
             db.execute('INSERT INTO exec_plans(repo,plan_id,source_path,source_oid,title,primary_requirement_id,'
-                       'sources,depends_on,complexity,risk,priority,draft,branch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) '
+                       'sources,source_requirements,depends_on,complexity,risk,priority,draft,branch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) '
                        'ON CONFLICT(repo,plan_id) DO UPDATE SET source_path=excluded.source_path,source_oid=excluded.source_oid,'
-                       'title=excluded.title,sources=excluded.sources,depends_on=excluded.depends_on,'
+                       'title=excluded.title,sources=excluded.sources,source_requirements=excluded.source_requirements,depends_on=excluded.depends_on,'
                        'complexity=excluded.complexity,risk=excluded.risk,priority=excluded.priority,draft=excluded.draft',
-                       (repo,identity,doc.path,doc.oid,item['title'],primary,packed(item['sources']),
+                       (repo,identity,doc.path,doc.oid,item['title'],primary,packed(item['sources']),packed(bindings),
                         packed(item['depends_on']),item['complexity'],item['risk'],item['priority'],
                         int(item['draft']),f'loop-manager/{identity}'))
             db.execute('INSERT INTO exec_plan_runs(repo,plan_id) VALUES(?,?) ON CONFLICT DO NOTHING',(repo,identity))
-            relevant = {source_ids[source] for source in item['sources'] if source in source_ids}
-            if old and (old['source_oid'] != doc.oid or relevant & changed):
+            relevant = set(bindings.values()) & snapshot.requirements.keys()
+            relevant.update(key for key,row in old_requirements.items() if identity in reused_plans(row) and key in snapshot.requirements)
+            definition=hashlib.sha256(packed([doc.oid,[(key,snapshot.requirements[key]['document'].oid) for key in sorted(relevant)],
+                [(path,item.oid) for path,item in sorted(snapshot.specifications.items())]]).encode()).hexdigest()
+            db.execute('UPDATE exec_plan_runs SET specification_fingerprint=? WHERE repo=? AND plan_id=?',(definition,repo,identity))
+            related_before=set(bindings.values()) | {key for key,row in old_requirements.items() if row['source_path'] in item['sources'] or identity in reused_plans(row)}
+            if related_before & (changed|missing):
+                for related in relevant-(changed|missing):
+                    db.execute("UPDATE requirement_states SET judgment='REPLAN' WHERE repo=? AND requirement_id=?",(repo,related))
+            if old and (old['specification_fingerprint']!=definition or relevant & changed
+                        or identity in snapshot.archived_plans and old['source_path']!=doc.path):
+                store.cancel_notifications(db,repo,identity)
                 db.execute('UPDATE exec_plan_runs SET generation=generation+1,input_fingerprint=NULL,worker_result=NULL '
                            'WHERE repo=? AND plan_id=?',(repo,identity))
-                db.execute("UPDATE exec_plans SET status='READY' WHERE repo=? AND plan_id=? AND status!='BLOCKED'",
+                db.execute("UPDATE exec_plans SET status='READY',block_reason=NULL WHERE repo=? AND plan_id=?",
                            (repo,identity))
         db.execute('UPDATE projects SET observed_base_sha=? WHERE repo=?',(snapshot.revision,repo))
     if not snapshot.errors:
         for identity,old in existing.items():
             if identity not in snapshot.plans and identity not in snapshot.archived_plans:
                 store.cancel(repo,identity,snapshot.revision,'원격 base의 전체 트리에서 G 철회 확인')
+        for identity,old in existing.items():
+            sources=set(json.loads(old['sources']))
+            linked={key for key,row in old_requirements.items() if old in related_plans(row,[old])}
+            if linked & missing and not linked & snapshot.requirements.keys() and 'docs/PRODUCT.md' not in sources:
+                store.cancel(repo,identity,snapshot.revision,'연결 Requirement의 확정 철회와 남은 유효 목표 부재')
     return changed,missing
 
 
@@ -185,8 +238,7 @@ def planning_targets(store, repo, snapshot):
         if row is None or row['last_planned_source_oid'] != item['document'].oid or row['judgment']=='REPLAN':
             targets.append((identity,'requirement_changed'))
             continue
-        related = [plan for plan in store.rows('SELECT * FROM exec_plans WHERE repo=?',(repo,))
-                   if item['document'].path in json.loads(plan['sources'])]
+        related = related_plans(row,store.rows('SELECT * FROM exec_plans WHERE repo=?',(repo,)))
         if related and all(plan['status'] in TERMINAL for plan in related) and row['judgment'] not in ('SATISFIED','UNRESOLVED'):
             targets.append((identity,'final_acceptance'))
     return targets

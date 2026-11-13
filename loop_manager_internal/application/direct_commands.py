@@ -5,8 +5,10 @@ import argparse
 import json
 from pathlib import Path
 
-from loop_manager_internal.git.repository import Repository, command, github_repository
-from loop_manager_internal.storage.state import Store, StateError
+from loop_manager_internal.git.repository import Repository,GitHub, command, github_repository
+from loop_manager_internal.catalog.observer import synchronize
+from loop_manager_internal.planning.proposals import observe_pulls
+from loop_manager_internal.storage.state import Store, StateError,TERMINAL
 
 
 def build_parser():
@@ -105,23 +107,40 @@ def manual_start(store, state_dir, item):
 
 def _manual_start(store, state_dir, item):
     repo,identity = item['repo'],item['plan_id']
-    existing = store.plan(repo,identity)
     if store.paused(repo):
         raise StateError('일시중지 상태입니다. 수동 준비를 시작하려면 resume을 실행하세요.')
     repository = Repository(project(store,repo),state_dir,store)
+    if not store.rows('SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=?',(repo,identity)):
+        with repository.observation():
+            synchronize(store,repo,repository.snapshot(repository.refresh()))
+            observe_pulls(store,repository,GitHub(repo))
+    existing = store.plan(repo,identity)
+    if existing['status'] in TERMINAL or existing['draft']:
+        raise StateError('완료·취소·draft G는 수동 준비할 수 없습니다.')
     if existing['manual_mode']=='MANUAL_WORKING':
         path = repository.validate_workspace(existing['worktree'],existing['branch'])
-        return {'result':'수동 준비 완료','worktree':str(path),'branch':existing['branch']}
+        return {'request_id':existing['request_id'],'repo':repo,'plan_id':identity,
+                'result':'수동 준비 완료','worktree':str(path),'branch':existing['branch']}
     request_id = store.request(repo,identity,'manual_start')
     current = store.plan(repo,identity)
     def reserved(path):
         with store.transaction() as db:
             if not db.execute("UPDATE exec_plan_runs SET worktree=? WHERE repo=? AND plan_id=? "
-                              "AND request_id=? AND manual_mode='PREPARING'",
+                              "AND request_id=? AND manual_mode='PREPARING' AND request_result IS NULL",
                               (str(path),repo,identity,request_id)).rowcount:
                 raise StateError('수동 준비 예약이 변경됐습니다.')
     try:
-        path = repository.prepare(current['branch'],saved_path=current['worktree'],published=bool(current['pr_url']),
+        with repository.observation():
+            snapshot=repository.snapshot(repository.refresh())
+            synchronize(store,repo,snapshot)
+        current=store.plan(repo,identity)
+        if (identity not in snapshot.plans or current['status'] in TERMINAL or current['draft']
+                or current['source_path'] in snapshot.errors):
+            raise StateError('최신 base에 실행 가능한 확정 G가 없습니다. 준비한 작업물은 보존합니다.')
+        for dependency in json.loads(current['depends_on']):
+            if store.plan(repo,dependency)['status']!='MERGED':
+                raise StateError(f'최신 계획의 선행 PR Merge가 필요합니다: {dependency}')
+        path = repository.prepare(current['branch'],saved_path=current['worktree'],published=bool(current['published'] or current['pr_url']),
                                   on_reserved=reserved)
     except (OSError,RuntimeError) as error:
         # 예약을 유지하므로 재실행이 자동 Worker와 경쟁하지 않는다.
@@ -134,9 +153,11 @@ def _manual_start(store, state_dir, item):
                              "AND request_id=? AND manual_mode='PREPARING'",(str(path),repo,identity,request_id)).rowcount
         if not updated:
             raise StateError('수동 준비 요청이 바뀌었습니다. Git 작업물은 보존합니다.')
-    store.finish_request(repo,identity,request_id,'수동 준비 완료',cli_final=True,
-                         manual_mode='MANUAL_WORKING',worktree=str(path))
-    return {'request_id':request_id,'result':'수동 준비 완료','worktree':str(path),'branch':current['branch']}
+    if not store.finish_request(repo,identity,request_id,'수동 준비 완료',
+                                manual_mode='MANUAL_WORKING',worktree=str(path)):
+        raise StateError('수동 준비 중 요청이 종료됐습니다. Git 작업물은 보존합니다.')
+    return {'request_id':request_id,'repo':repo,'plan_id':identity,
+            'result':'수동 준비 완료','worktree':str(path),'branch':current['branch']}
 
 
 def execute(args,store,state_dir):
@@ -174,5 +195,7 @@ def execute(args,store,state_dir):
     raise ValueError('실행 명령은 Coordinator가 담당합니다.')
 
 
-def output(value):
-    print(json.dumps(value,ensure_ascii=False,indent=2))
+def output(value,store=None):
+    print(json.dumps(value,ensure_ascii=False,indent=2),flush=True)
+    if store and isinstance(value,dict) and all(value.get(key) for key in ('repo','plan_id','request_id')):
+        store.acknowledge_output(value['repo'],value['plan_id'],value['request_id'])

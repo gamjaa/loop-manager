@@ -10,7 +10,7 @@ import uuid
 
 
 APPLICATION_ID = 0x4C4D5231
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STATUSES = ('READY', 'WORKING', 'VERIFYING', 'REVIEWING', 'PR_OPEN',
             'BLOCKED', 'CANCELLED', 'MERGED')
 TERMINAL = ('CANCELLED', 'MERGED')
@@ -39,7 +39,7 @@ CREATE TABLE requirement_states (
 CREATE TABLE exec_plans (
  repo TEXT NOT NULL REFERENCES projects(repo), plan_id TEXT NOT NULL,
  source_path TEXT NOT NULL, source_oid TEXT NOT NULL, title TEXT NOT NULL,
- primary_requirement_id TEXT, sources TEXT NOT NULL, depends_on TEXT NOT NULL,
+ primary_requirement_id TEXT, sources TEXT NOT NULL, source_requirements TEXT NOT NULL DEFAULT '{}', depends_on TEXT NOT NULL,
  complexity TEXT NOT NULL CHECK(complexity IN ('low','medium','high')),
  risk TEXT NOT NULL CHECK(risk IN ('low','medium','high','critical')),
  priority TEXT NOT NULL CHECK(priority IN ('critical','high','normal','low')),
@@ -51,13 +51,14 @@ CREATE TABLE exec_plans (
 );
 CREATE TABLE exec_plan_runs (
  repo TEXT NOT NULL, plan_id TEXT NOT NULL,
- generation INTEGER NOT NULL DEFAULT 0, input_fingerprint TEXT,
- worktree TEXT, candidate_sha TEXT, worker_result TEXT, retry_after REAL, last_error TEXT,
+ generation INTEGER NOT NULL DEFAULT 0, input_fingerprint TEXT, specification_fingerprint TEXT,
+ worktree TEXT, candidate_sha TEXT, worker_result TEXT, published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0,1)),
+ progress_at REAL NOT NULL DEFAULT (unixepoch()), retry_after REAL, last_error TEXT,
  process_pid INTEGER, process_identity TEXT,
  manual_mode TEXT CHECK(manual_mode IN ('PREPARING','MANUAL_WORKING','SUBMITTED')),
  request_id TEXT, request_kind TEXT,
  feedback_mode TEXT CHECK(feedback_mode IN ('CLI_FINAL','TELEGRAM_PENDING')),
- request_result TEXT, request_sequence INTEGER NOT NULL DEFAULT 0,
+ request_result TEXT, request_sequence INTEGER NOT NULL DEFAULT 0, request_generation INTEGER,
  PRIMARY KEY(repo,plan_id),
  FOREIGN KEY(repo,plan_id) REFERENCES exec_plans(repo,plan_id)
 );
@@ -191,7 +192,7 @@ class Store:
     def plan(self, repo, plan_id):
         rows = self.rows('SELECT p.*,r.generation,r.input_fingerprint,r.worktree,r.candidate_sha,'
                          'r.manual_mode,r.request_id,r.request_kind,r.feedback_mode,r.request_result,'
-                         'r.retry_after,r.last_error FROM exec_plans p JOIN exec_plan_runs r '
+                         'r.retry_after,r.last_error,r.published,r.progress_at,r.specification_fingerprint FROM exec_plans p JOIN exec_plan_runs r '
                          'USING(repo,plan_id) WHERE repo=? AND plan_id=?', (repo, plan_id))
         if not rows:
             raise StateError(f'등록된 G가 없습니다: {plan_id}')
@@ -224,8 +225,34 @@ class Store:
                        "ON CONFLICT(repo,scope) DO UPDATE SET paused=excluded.paused,sequence=sequence+1",
                        (repo,int(paused)))
 
+    def finish_project_request(self,repo,request_id,result):
+        with self.transaction() as db:
+            row=db.execute('SELECT * FROM projects WHERE repo=? AND request_id=?',(repo,request_id)).fetchone()
+            if row is None or row['request_result'] is not None:
+                return False
+            self.notify(db,f'cli:{repo}:{request_id}',repo,'project',result)
+            db.execute('UPDATE projects SET request_kind=NULL,request_result=?,last_error=NULL WHERE repo=? AND request_id=?',
+                       (result,repo,request_id))
+            return True
+
+    def acknowledge_output(self,repo,plan_id,request_id):
+        with self.transaction() as db:
+            row=db.execute('SELECT * FROM exec_plan_runs WHERE repo=? AND plan_id=? AND request_id=?',
+                           (repo,plan_id,request_id)).fetchone()
+            if row is None or row['request_result'] is None:
+                return
+            db.execute("UPDATE exec_plan_runs SET feedback_mode='CLI_FINAL' WHERE repo=? AND plan_id=? AND request_id=?",
+                       (repo,plan_id,request_id))
+            db.execute("UPDATE notification_outbox SET state='CANCELLED',payload=NULL WHERE event_key=? AND state='PENDING'",
+                       (f'cli:{repo}:{plan_id}:{request_id}',))
+
     def paused(self, repo):
         return bool(self.rows("SELECT 1 FROM pause_scopes WHERE repo IN ('*',?) AND paused=1", (repo,)))
+
+    @staticmethod
+    def cancel_notifications(db,repo,scope):
+        db.execute("UPDATE notification_outbox SET state='CANCELLED',payload=NULL WHERE repo=? AND scope=? "
+                   "AND state='PENDING' AND event_key NOT LIKE 'cli:%'",(repo,scope))
 
     @staticmethod
     def notify(db, event_key, repo, scope, message, *, silent=False):
@@ -263,7 +290,7 @@ class Store:
                 raise StateError('수동 Git 준비가 완료되지 않았습니다.')
             request_id = uuid.uuid4().hex
             db.execute('UPDATE exec_plan_runs SET request_id=?,request_kind=?,feedback_mode=?,request_result=NULL,'
-                       'request_sequence=request_sequence+1,manual_mode=CASE WHEN ? THEN ? ELSE manual_mode END '
+                       'request_sequence=request_sequence+1,request_generation=generation,manual_mode=CASE WHEN ? THEN ? ELSE manual_mode END '
                        'WHERE repo=? AND plan_id=? AND generation=?',
                        (request_id,kind,'TELEGRAM_PENDING',kind=='manual_start','PREPARING',repo,plan_id,row['generation']))
             return request_id
@@ -271,18 +298,22 @@ class Store:
     def finish_request(self, repo, plan_id, request_id, result, *, cli_final=False,
                        manual_mode=None, worktree=None):
         with self.transaction() as db:
-            row = db.execute('SELECT * FROM exec_plan_runs WHERE repo=? AND plan_id=? AND request_id=?',
-                             (repo,plan_id,request_id)).fetchone()
-            if row is None or row['request_result'] is not None:
-                return False
-            feedback = 'CLI_FINAL' if cli_final else row['feedback_mode']
-            if feedback == 'TELEGRAM_PENDING':
-                self.notify(db,f'cli:{repo}:{plan_id}:{request_id}',repo,plan_id,result)
-            db.execute('UPDATE exec_plan_runs SET request_result=?,feedback_mode=?,request_kind=NULL,'
-                       'manual_mode=COALESCE(?,manual_mode),worktree=COALESCE(?,worktree) '
-                       'WHERE repo=? AND plan_id=? AND request_id=?',
-                       (result,feedback,manual_mode,worktree,repo,plan_id,request_id))
-            return True
+            return self.finish_request_in(db,repo,plan_id,request_id,result,cli_final=cli_final,
+                                          manual_mode=manual_mode,worktree=worktree)
+
+    def finish_request_in(self,db,repo,plan_id,request_id,result,*,cli_final=False,manual_mode=None,worktree=None):
+        row = db.execute('SELECT * FROM exec_plan_runs WHERE repo=? AND plan_id=? AND request_id=?',
+                         (repo,plan_id,request_id)).fetchone()
+        if row is None or row['request_result'] is not None:
+            return False
+        feedback = 'CLI_FINAL' if cli_final else row['feedback_mode']
+        if feedback == 'TELEGRAM_PENDING':
+            self.notify(db,f'cli:{repo}:{plan_id}:{request_id}',repo,plan_id,result)
+        db.execute('UPDATE exec_plan_runs SET request_result=?,feedback_mode=?,request_kind=NULL,'
+                   'manual_mode=COALESCE(?,manual_mode),worktree=COALESCE(?,worktree) '
+                   'WHERE repo=? AND plan_id=? AND request_id=?',
+                   (result,feedback,manual_mode,worktree,repo,plan_id,request_id))
+        return True
 
     def claim(self, repo, plan_id, expected_status, next_status, fingerprint):
         with self.transaction() as db:
@@ -296,7 +327,7 @@ class Store:
                              (repo,plan_id,expected_status,time.time())).fetchone()
             if row is None or row['manual_mode'] in ('PREPARING','MANUAL_WORKING'):
                 return None
-            if expected_status == 'READY':
+            if next_status in ('WORKING','VERIFYING','REVIEWING'):
                 dependencies = json.loads(db.execute('SELECT depends_on FROM exec_plans '
                                                      'WHERE repo=? AND plan_id=?',(repo,plan_id)).fetchone()[0])
                 for predecessor in dependencies:
@@ -311,6 +342,8 @@ class Store:
             generation = row['generation'] + 1
             db.execute('UPDATE exec_plan_runs SET generation=?,input_fingerprint=?,retry_after=NULL,last_error=NULL '
                        'WHERE repo=? AND plan_id=?', (generation,fingerprint,repo,plan_id))
+            if expected_status=='READY':
+                db.execute('UPDATE exec_plan_runs SET progress_at=? WHERE repo=? AND plan_id=?',(time.time(),repo,plan_id))
             return generation
 
     def apply(self, repo, plan_id, generation, fingerprint, expected_status, next_status, *,
@@ -323,9 +356,15 @@ class Store:
                 return False
             db.execute('UPDATE exec_plans SET status=?,block_reason=? WHERE repo=? AND plan_id=?',
                        (next_status,reason,repo,plan_id))
+            if row['status']=='BLOCKED' or next_status in ('PR_OPEN','MERGED') or candidate_sha and candidate_sha!=row['candidate_sha']:
+                self.cancel_notifications(db,repo,plan_id)
             if candidate_sha:
+                db.execute('UPDATE exec_plan_runs SET progress_at=CASE WHEN candidate_sha IS NULL OR candidate_sha!=? '
+                           'THEN ? ELSE progress_at END WHERE repo=? AND plan_id=?',(candidate_sha,time.time(),repo,plan_id))
                 db.execute('UPDATE exec_plan_runs SET candidate_sha=? WHERE repo=? AND plan_id=?',
                            (candidate_sha,repo,plan_id))
+            if next_status=='PR_OPEN':
+                db.execute('UPDATE exec_plan_runs SET progress_at=? WHERE repo=? AND plan_id=?',(time.time(),repo,plan_id))
             if stage:
                 if evidence is None:
                     raise ValueError('검증 근거가 필요합니다.')
@@ -347,4 +386,7 @@ class Store:
                            (repo,plan_id,revision,evidence))
                 db.execute("UPDATE notification_outbox SET state='CANCELLED',payload=NULL "
                            "WHERE repo=? AND scope=? AND state='PENDING'", (repo,plan_id))
+                row=db.execute('SELECT request_id,request_kind FROM exec_plan_runs WHERE repo=? AND plan_id=?',(repo,plan_id)).fetchone()
+                if row['request_kind']:
+                    self.finish_request_in(db,repo,plan_id,row['request_id'],f'{plan_id} 요청 종료: 작업의 확정 철회로 취소됐습니다.')
             return bool(changed)

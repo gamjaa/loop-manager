@@ -369,4 +369,3 @@ def execute(root, directory, client, budget, timeout, run_id, stage_id, revision
     validate_stage(result, run_id, stage_id, revision)
     atomic_json(path, result)
     return result
-

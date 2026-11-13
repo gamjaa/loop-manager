@@ -111,6 +111,30 @@ class AgentContractTests(unittest.TestCase):
 
 
 class NativeProcessTests(unittest.TestCase):
+    def test_auth_copy_fallback_keeps_existing_auth_and_user_source(self):
+        from loop_manager_internal.agents.runner import reuse_auth
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'user-auth.json'
+            auth=Path(directory)/'automation-auth.json'
+            source.write_text('사용자 인증',encoding='utf-8')
+            with patch.object(Path,'symlink_to',side_effect=PermissionError('링크 권한 없음')):
+                reuse_auth(source,auth)
+            self.assertEqual(auth.read_text(encoding='utf-8'),'사용자 인증')
+            auth.write_text('별도 갱신',encoding='utf-8')
+            reuse_auth(source,auth)
+            self.assertEqual(source.read_text(encoding='utf-8'),'사용자 인증')
+            self.assertEqual(auth.read_text(encoding='utf-8'),'별도 갱신')
+
+    def test_private_provider_directory_checks_real_native_permissions(self):
+        from loop_manager_internal.agents.provider_home import _owned_directory
+        with tempfile.TemporaryDirectory() as directory:
+            private=Path(directory)/'provider'
+            _owned_directory(private)
+            if os.name!='nt':
+                private.chmod(0o755)
+                with self.assertRaises(RuntimeError):
+                    _owned_directory(private)
+
     def test_stdin_unicode_arguments_and_child_timeout(self):
         with tempfile.TemporaryDirectory() as directory:
             normal = run([sys.executable,'-c','import sys; print(sys.stdin.read()+sys.argv[1])',' 인자 공백'],

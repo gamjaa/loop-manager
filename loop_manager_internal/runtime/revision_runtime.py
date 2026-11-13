@@ -3,8 +3,7 @@ import hashlib
 import json
 from pathlib import Path,PurePosixPath
 import re
-import subprocess
-import sys
+import tempfile
 
 from loop_manager_internal.git.repository import command,GitError
 
@@ -41,9 +40,14 @@ def prepare(repository,state_dir,revision):
     root=Path(state_dir).resolve()/'runtimes'
     root.mkdir(parents=True,exist_ok=True)
     path=root/revision
+    if path.is_symlink():
+        raise GitError('runtime 경로는 심볼릭 링크일 수 없습니다.')
     if not path.exists():
-        command(['git','clone','--no-checkout','--no-hardlinks','--',repository.remote,str(path)])
-        repository.git('checkout','--detach',revision,cwd=path)
+        with tempfile.TemporaryDirectory(prefix=f'.prepare-{revision}-',dir=root) as directory:
+            candidate=Path(directory)/'checkout'
+            command(['git','clone','--no-checkout','--no-hardlinks','--',repository.remote,str(candidate)])
+            repository.git('checkout','--detach',revision,cwd=candidate)
+            candidate.rename(path)
     if (repository.git('remote','get-url','origin',cwd=path)!=repository.remote
             or repository.head(path)!=revision or repository.dirty(path)):
         raise GitError('선택 runtime의 저장소·HEAD·작업 내용이 일치하지 않습니다.')

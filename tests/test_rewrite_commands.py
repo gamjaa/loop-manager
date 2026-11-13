@@ -5,7 +5,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from loop_manager_internal.application.direct_commands import build_parser, execute, manual_start, query
+from loop_manager_internal.application.direct_commands import build_parser, execute, manual_start, query,output
+from contextlib import redirect_stdout
+import io
 from loop_manager_internal.storage.state import Store, StateError
 from tests.support.rewrite_fixtures import requirement, plan
 from loop_manager_internal.catalog.observer import catalog,synchronize
@@ -42,6 +44,7 @@ class CommandTests(unittest.TestCase):
     def test_manual_git_io_is_outside_db_transaction_and_after_reservation(self):
         with patch('loop_manager_internal.application.direct_commands.Repository') as factory:
             repository = factory.return_value
+            repository.snapshot.return_value=catalog('base',[requirement(),plan()])
             path = self.root/'isolated'
             def prepare(branch,**kwargs):
                 self.assertEqual(self.store.plan('owner/repo','G-001')['manual_mode'],'PREPARING')
@@ -53,10 +56,15 @@ class CommandTests(unittest.TestCase):
             result = manual_start(self.store,self.root,{'repo':'owner/repo','plan_id':'G-001'})
             self.assertEqual(result['result'],'수동 준비 완료')
             self.assertEqual(self.store.plan('owner/repo','G-001')['manual_mode'],'MANUAL_WORKING')
-            self.assertFalse(self.store.rows('SELECT * FROM notification_outbox'))
+            self.assertEqual(self.store.rows('SELECT state FROM notification_outbox')[0]['state'],'PENDING')
+            with redirect_stdout(io.StringIO()):
+                output(result,self.store)
+            self.assertFalse(self.store.rows("SELECT * FROM notification_outbox WHERE state='PENDING'"))
+            self.assertEqual(self.store.plan('owner/repo','G-001')['feedback_mode'],'CLI_FINAL')
 
     def test_failed_manual_preparation_retains_request_and_path_for_restart(self):
         with patch('loop_manager_internal.application.direct_commands.Repository') as factory:
+            factory.return_value.snapshot.return_value=catalog('base',[requirement(),plan()])
             def prepare(branch,**kwargs):
                 kwargs['on_reserved'](self.root/'preserved')
                 raise RuntimeError('Git 준비 실패')
@@ -68,6 +76,31 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(row['worktree'],str(self.root/'preserved'))
         self.assertEqual(row['request_kind'],'manual_start')
         self.assertIsNone(self.store.claim('owner/repo','G-001','READY','WORKING','input'))
+
+    def test_manual_start_can_observe_confirmed_g_in_fresh_registered_database(self):
+        fresh=Store(self.root/'fresh.db')
+        fresh.initialize()
+        fresh.register('owner/repo',self.root/'project','remote','main','codex')
+        with patch('loop_manager_internal.application.direct_commands.Repository') as factory, \
+             patch('loop_manager_internal.application.direct_commands.GitHub') as api:
+            repository=factory.return_value
+            repository.repo='owner/repo'
+            repository.base='main'
+            repository.snapshot.return_value=catalog('base',[requirement(),plan()])
+            repository.plan_branches.return_value=[]
+            repository.prepare.return_value=self.root/'prepared'
+            api.return_value.pulls.return_value=[]
+            result=manual_start(fresh,self.root,{'repo':'owner/repo','plan_id':'G-001'})
+        self.assertEqual(result['result'],'수동 준비 완료')
+        self.assertEqual(fresh.plan('owner/repo','G-001')['manual_mode'],'MANUAL_WORKING')
+
+    def test_latest_draft_prevents_manual_git_after_reservation(self):
+        with patch('loop_manager_internal.application.direct_commands.Repository') as factory:
+            factory.return_value.snapshot.return_value=catalog('changed',[requirement(),plan(draft=True,oid='g2')])
+            with self.assertRaisesRegex(StateError,'최신 base'):
+                manual_start(self.store,self.root,{'repo':'owner/repo','plan_id':'G-001'})
+            factory.return_value.prepare.assert_not_called()
+        self.assertEqual(self.store.plan('owner/repo','G-001')['manual_mode'],'PREPARING')
 
     def test_pause_precedes_manual_git_and_resume_does_not_unblock(self):
         self.store.pause('*',True)

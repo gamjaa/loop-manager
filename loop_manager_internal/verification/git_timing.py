@@ -70,5 +70,3 @@ def git_command_timing():
             writer.emit('git_cost', test=test, phases=phases, callers=callers, command=command, **cost)
         if pending:
             writer.emit('git_cost_incomplete', count=len(pending))
-
-

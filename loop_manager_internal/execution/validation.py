@@ -24,12 +24,17 @@ def verify_command(worktree,timeout):
     root = Path(worktree).resolve()
     manifest = root/'scripts/verify.json'
     values = json.loads(manifest.read_text(encoding='utf-8')) if manifest.is_file() else {}
+    if not isinstance(values,dict) or values.get('version') not in (None,1,2):
+        raise ValueError('지원하지 않는 Verify manifest입니다.')
     if values.get('version')==2:
         platform = 'windows' if os.name=='nt' else 'posix'
-        argv = values['commands'][platform]
+        commands=values.get('commands')
+        argv=commands.get(platform) if isinstance(commands,dict) else None
         if not isinstance(argv,list) or not argv or any(not isinstance(item,str) or not item for item in argv):
             raise ValueError('Verify command는 문자열 argv 목록이어야 합니다.')
         argv = [sys.executable if item=='{python}' else item for item in argv]
+        if not isinstance(values.get('cwd','.'),str):
+            raise ValueError('Verify cwd는 문자열 경로여야 합니다.')
         cwd = (root/values.get('cwd','.')).resolve()
         if not cwd.is_relative_to(root) or not cwd.is_dir():
             raise ValueError('Verify cwd는 프로젝트 안의 디렉터리여야 합니다.')
@@ -66,12 +71,13 @@ def verify_command(worktree,timeout):
             with path.open('rb') as stream:
                 while block := stream.read(1024*1024):
                     fingerprint.update(block)
+    fingerprint.update(str(timeout).encode())
     return VerifyCommand(argv,cwd,environment,timeout,fingerprint.hexdigest(),reusable)
 
 
-def fingerprint(repository,plan,command,instruction_hash):
+def fingerprint(repository,plan,command,instruction_hash,requirements=()):
     value = [repository.head(plan['worktree']),plan['source_oid'],plan['sources'],
-             command.fingerprint,instruction_hash]
+             command.fingerprint,instruction_hash,list(requirements)]
     return hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest()
 
 

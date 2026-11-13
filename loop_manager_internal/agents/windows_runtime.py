@@ -28,4 +28,3 @@ foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
     )
     if result.returncode:
         raise RuntimeError("Codex runtime 경로의 Windows 소유권·ACL을 확인할 수 없습니다.")
-

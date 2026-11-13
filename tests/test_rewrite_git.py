@@ -4,12 +4,31 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from loop_manager_internal.git.repository import (GitHub, GitError, Repository, RemoteDeleted,
+from loop_manager_internal.git.repository import (GitHub, GitError, MergeConflict, Repository, RemoteDeleted,
                                                   command, github_repository, managed_body)
+from loop_manager_internal.runtime.revision_runtime import prepare as prepare_runtime
 from loop_manager_internal.storage.state import Store
 
 
 class GitBoundaryTests(unittest.TestCase):
+    def test_final_usage_changes_only_usage_inside_manager_region(self):
+        api=GitHub('owner/repo')
+        old='<!-- loop-manager:usage -->\n이전 집계\n<!-- loop-manager:usage-end -->'
+        new='<!-- loop-manager:usage -->\n최종 집계\n<!-- loop-manager:usage-end -->'
+        current={'body':managed_body('사용자 머리','검증 근거\n'+old)+'\n사용자 꼬리'}
+        api.pull=Mock(return_value=current)
+        api.api=Mock()
+        api.update_usage(1,new)
+        written=api.api.call_args.kwargs['payload']['body']
+        self.assertIn('검증 근거',written)
+        self.assertTrue(written.startswith('사용자 머리'))
+        self.assertTrue(written.endswith('사용자 꼬리'))
+        self.assertIn('최종 집계',written)
+        self.assertNotIn('이전 집계',written)
+        current['body']=written
+        api.update_usage(1,new)
+        self.assertEqual(api.api.call_count,1)
+
     def test_github_url_and_managed_body_preserve_user_content(self):
         self.assertEqual(github_repository('git@github.com:owner/repo.git'),'owner/repo')
         self.assertEqual(github_repository('https://github.com/owner/repo'),'owner/repo')
@@ -70,6 +89,7 @@ class GitPreservationTests(unittest.TestCase):
                 command(['git','config',key,value],cwd=source)
             (source/'.gitignore').write_text('cache/\n',encoding='utf-8')
             (source/'base.txt').write_bytes(b'base\r\n')
+            (source/'loop_manager.py').write_text('REWRITE_RUNTIME_VERSION = 1\n',encoding='utf-8')
             command(['git','add','.'],cwd=source)
             command(['git','commit','-m','initial'],cwd=source)
             command(['git','clone','--bare',str(source),str(remote)])
@@ -82,6 +102,9 @@ class GitPreservationTests(unittest.TestCase):
             store.register('owner/repo',source,str(remote),'main','codex')
             repository = Repository(project,state,store)
             repository.refresh()
+            runtime=prepare_runtime(repository,state,original.strip())
+            self.assertEqual(repository.head(runtime),original.strip())
+            self.assertEqual((runtime/'loop_manager.py').read_text(encoding='utf-8'),'REWRITE_RUNTIME_VERSION = 1\n')
             branch = 'loop-manager/G-001'
             work = repository.prepare(branch)
             (work/'cache').mkdir()
@@ -106,6 +129,31 @@ class GitPreservationTests(unittest.TestCase):
                 repository.publish(work,branch,published=True)
             self.assertEqual((work/'remote-user.txt').read_text(encoding='utf-8'),'원격 사용자')
             repository.publish(work,branch,published=True)
+            command(['git','fetch','origin'],cwd=peer)
+            command(['git','merge','--no-edit',f'origin/{branch}'],cwd=peer)
+            (peer/'worker.txt').write_text('원격 교정',encoding='utf-8')
+            command(['git','commit','-am','원격 충돌 변경'],cwd=peer)
+            command(['git','push','origin',branch],cwd=peer)
+            (work/'worker.txt').write_text('로컬 교정',encoding='utf-8')
+            repository.commit(work,branch,'로컬 충돌 변경')
+            with self.assertRaises(MergeConflict):
+                repository.publish(work,branch,published=True)
+            self.assertIn('원격 교정',(work/'worker.txt').read_text(encoding='utf-8'))
+            self.assertIn('로컬 교정',(work/'worker.txt').read_text(encoding='utf-8'))
+            (work/'worker.txt').write_text('원격 교정과 로컬 교정 보존',encoding='utf-8')
+            repository.commit(work,branch,'충돌 해결')
+            repository.publish(work,branch,published=True)
+            self.assertFalse(repository.cleanup(work,branch),'미게시 ignored 파일을 보존해야 합니다.')
+            command(['git','fetch','origin'],cwd=peer)
+            command(['git','merge','--no-edit',f'origin/{branch}'],cwd=peer)
+            (peer/'cache').mkdir(exist_ok=True)
+            (peer/'cache/ignored.txt').write_text('원격에서 추적한 파일',encoding='utf-8')
+            command(['git','add','-f','cache/ignored.txt'],cwd=peer)
+            command(['git','commit','-m','추적 경로 추가'],cwd=peer)
+            command(['git','push','origin',branch],cwd=peer)
+            with self.assertRaises(GitError):
+                repository.synchronize_head(work,branch)
+            self.assertEqual((work/'cache/ignored.txt').read_bytes(),b'cache\r\n')
             (work/'unpublished.txt').write_text('미게시 보존',encoding='utf-8')
             self.assertFalse(repository.cleanup(work,branch))
             self.assertTrue((work/'unpublished.txt').exists())

@@ -9,7 +9,7 @@ from loop_manager_internal.application import direct_commands
 from loop_manager_internal.config import execution_path
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.runtime.process_lock import state_directory
-from loop_manager_internal.storage.state import Store
+from loop_manager_internal.storage.state import Store,StateError
 
 
 def main(argv=None, *, root=None):
@@ -28,12 +28,21 @@ def main(argv=None, *, root=None):
             if args.runtime_child:
                 return launcher.child(args,root,store,state,configuration)
             if store.paused('*'):
-                return 0
+                if args.command=='run':
+                    return 0
+                raise StateError('전체 일시중지 상태입니다. resume 후 수동 준비하세요.')
+            if args.command=='manual':
+                if store.paused(direct_commands.project(store,args.repository)['repo']):
+                    raise StateError('프로젝트 일시중지 상태입니다. resume 후 수동 준비하세요.')
+            elif args.repositories:
+                selected={direct_commands.project(store,value)['repo'] for value in args.repositories}
+                if all(store.paused(repo) for repo in selected):
+                    return 0
             execution_path.apply_execution_path(root)
             return launcher.launch(args,root,store,state,configuration)
         if args.command=='add':
             execution_path.apply_execution_path(root)
-        direct_commands.output(direct_commands.execute(args,store,state))
+        direct_commands.output(direct_commands.execute(args,store,state),store)
         return 0
     except (OSError,RuntimeError,ValueError,sqlite3.DatabaseError,configparser.Error) as error:
         print('오류: '+redact_secrets(str(error)),file=sys.stderr)

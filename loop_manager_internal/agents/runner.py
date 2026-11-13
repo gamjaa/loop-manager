@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import configparser
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import time
 import uuid
@@ -23,6 +25,30 @@ class AgentResult:
     message: str
     session_id: str | None = None
     decision: dict | None = None
+
+
+def reuse_auth(source,auth):
+    if not source.is_file() or auth.exists() or auth.is_symlink() or source.resolve()==auth.resolve():
+        return
+    try:
+        auth.symlink_to(source.resolve())
+    except FileExistsError:
+        return
+    except OSError:
+        # Windows에서 링크 권한이 없으면 비공개 홈 안에 인증 파일만 원자적으로 복사한다.
+        temporary=None
+        try:
+            with tempfile.NamedTemporaryFile(dir=auth.parent,delete=False) as target:
+                temporary=Path(target.name)
+                with source.open('rb') as stream:
+                    shutil.copyfileobj(stream,target)
+            try:
+                os.link(temporary,auth)
+            except FileExistsError:
+                pass
+        finally:
+            if temporary:
+                temporary.unlink(missing_ok=True)
 
 
 def instructions(root,role):
@@ -67,7 +93,8 @@ def failure_kind(code,message):
         return 'SESSION_LOST'
     if any(word in lower for word in ('usage limit','rate limit','quota','rate_limit')):
         return 'USAGE_LIMIT'
-    if any(word in lower for word in ('authentication','unauthorized','api key','login','permission','sandbox unavailable')):
+    if any(word in lower for word in ('authentication','unauthorized','api key','login','permission','sandbox unavailable',
+                                     'filenotfounderror','command not found','not recognized')):
         return 'CONFIGURATION'
     return 'TRANSIENT' if code else 'INVALID_OUTPUT'
 
@@ -124,8 +151,11 @@ class Agent:
 
     def call(self,project,scope,role,worktree,prompt,*,generation=None,complexity='medium',risk='medium'):
         provider = project['provider']
-        model,effort = self.settings.profile(provider,role,complexity,risk)
-        guidance,instruction_hash = instructions(self.root,role)
+        try:
+            model,effort = self.settings.profile(provider,role,complexity,risk)
+            guidance,instruction_hash = instructions(self.root,role)
+        except (configparser.Error,ValueError,OSError) as error:
+            return AgentResult('CONFIGURATION',redact_secrets(str(error)))
         previous = self.store.rows('SELECT session_id FROM agent_calls WHERE repo=? AND scope=? AND role=? '
                                    'AND provider=? AND model=? AND session_id IS NOT NULL ORDER BY created_at DESC LIMIT 1',
                                    (project['repo'],scope,role,provider,model))
@@ -138,12 +168,14 @@ class Agent:
         home = self.state_dir/f'automation-{provider}'
         home.mkdir(mode=0o700,parents=True,exist_ok=True)
         from loop_manager_internal.agents.provider_home import _owned_directory
-        _owned_directory(home)
+        try:
+            _owned_directory(home)
+        except (OSError,RuntimeError) as error:
+            return AgentResult('CONFIGURATION',redact_secrets(str(error)))
         source_home = Path(os.environ.get(variable,str(Path.home()/folder)))
         source = source_home/auth_name
         auth = home/auth_name
-        if source.is_file() and not auth.exists() and not auth.is_symlink() and source.resolve()!=auth.resolve():
-            auth.symlink_to(source.resolve())
+        reuse_auth(source,auth)
         environment[variable] = str(home)
         with self.store.transaction() as db:
             db.execute('INSERT INTO agent_calls(invocation_id,repo,scope,role,provider,model,instruction_hash,generation,created_at) '

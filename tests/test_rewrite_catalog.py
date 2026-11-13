@@ -51,6 +51,26 @@ class CatalogTests(unittest.TestCase):
         snapshot = self.sync([requirement(),plan()])
         self.assertIn(plan().path,snapshot.errors)
 
+    def test_requirement_rename_keeps_shared_link_until_final_acceptance(self):
+        self.sync([requirement(),plan()])
+        self.planned()
+        renamed=requirement(path='docs/requirements/[R-001] 새 이름.md')
+        snapshot=self.sync([renamed,plan()])
+        self.assertEqual(planning_targets(self.store,'owner/repo',snapshot),[])
+        with self.store.transaction() as db:
+            db.execute("UPDATE exec_plans SET status='MERGED'")
+        self.assertEqual(planning_targets(self.store,'owner/repo',snapshot),[('R-001','final_acceptance')])
+
+    def test_reused_g_survives_withdrawal_of_its_original_requirement(self):
+        self.sync([requirement(),requirement('R-002'),plan()])
+        self.planned()
+        with self.store.transaction() as db:
+            db.execute('UPDATE requirement_states SET evidence=? WHERE requirement_id=?',
+                       ('{"reuses":["G-001"]}','R-002'))
+        self.sync([requirement('R-002'),plan()])
+        self.assertEqual(self.store.plan('owner/repo','G-001')['status'],'READY')
+        self.assertEqual(self.store.plan('owner/repo','G-001')['primary_requirement_id'],'R-001')
+
     def test_invalid_document_does_not_cancel_preserved_work(self):
         self.sync([requirement(),plan()])
         snapshot = self.sync([requirement(),Document(plan().path,'bad','broken')])
@@ -74,6 +94,35 @@ class CatalogTests(unittest.TestCase):
         self.sync([requirement(oid='r2'),plan()])
         self.assertFalse(self.store.apply('owner/repo','G-001',generation,'old','WORKING','VERIFYING'))
         self.assertEqual(self.store.plan('owner/repo','G-001')['status'],'READY')
+
+    def test_product_change_invalidates_execution_but_is_not_a_planner_trigger(self):
+        self.sync([requirement(),plan(),Document('docs/PRODUCT.md','p1','제품 규칙')])
+        self.planned()
+        generation=self.store.claim('owner/repo','G-001','READY','WORKING','old')
+        snapshot=self.sync([requirement(),plan(),Document('docs/PRODUCT.md','p2','수정된 제품 규칙')])
+        self.assertFalse(self.store.apply('owner/repo','G-001',generation,'old','WORKING','VERIFYING'))
+        self.assertEqual(planning_targets(self.store,'owner/repo',snapshot),[])
+
+    def test_invalid_current_document_invalidates_late_result_without_cancelling(self):
+        self.sync([requirement(),plan()])
+        generation=self.store.claim('owner/repo','G-001','READY','WORKING','old')
+        self.sync([requirement(),Document(plan().path,'bad','broken')])
+        self.assertFalse(self.store.apply('owner/repo','G-001',generation,'old','WORKING','VERIFYING'))
+        self.assertIn('문서 오류',self.store.plan('owner/repo','G-001')['last_error'])
+        self.assertFalse(self.store.rows('SELECT * FROM exec_plan_tombstones'))
+
+    def test_requirement_withdrawal_cancels_only_unshared_goal(self):
+        shared=plan('G-002')
+        shared=Document(shared.path,shared.oid,shared.text.replace('depends_on:',
+                        f'  - {requirement("R-002").path}\ndepends_on:'))
+        self.sync([requirement(),requirement('R-002'),plan(),shared])
+        self.planned()
+        self.sync([requirement('R-002'),plan(),shared])
+        self.assertEqual(self.store.plan('owner/repo','G-001')['status'],'CANCELLED')
+        self.assertEqual(self.store.plan('owner/repo','G-002')['status'],'READY')
+        rows={row['requirement_id']:row for row in self.store.rows('SELECT * FROM requirement_states')}
+        self.assertEqual(rows['R-001']['judgment'],'WITHDRAWN')
+        self.assertEqual(rows['R-002']['judgment'],'REPLAN')
 
     def test_terminal_plan_is_not_reopened_by_document_change(self):
         self.sync([requirement(),plan()])

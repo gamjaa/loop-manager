@@ -28,8 +28,11 @@ class RemoteDeleted(GitError):
 
 def command(argv, cwd=None, *, data=None, timeout=120, check=True):
     environment = dict(os.environ, GIT_TERMINAL_PROMPT='0', GCM_INTERACTIVE='never', GH_PROMPT_DISABLED='1')
-    result = subprocess.run(argv,cwd=cwd,input=data,capture_output=True,timeout=timeout,
-                            env=environment,encoding='utf-8',errors='strict')
+    try:
+        result = subprocess.run(argv,cwd=cwd,input=data,capture_output=True,timeout=timeout,
+                                env=environment,encoding='utf-8',errors='strict')
+    except subprocess.TimeoutExpired as error:
+        raise GitError(f'{argv[0]} 명령 시간이 초과됐습니다. 실제 원격 결과를 재관측합니다.') from error
     if check and result.returncode:
         raise GitError(f'{argv[0]} 명령 실패 ({result.returncode}): {result.stderr.strip()}')
     return result
@@ -54,20 +57,26 @@ class Repository:
         self.mirror = self.state_dir/'repositories'/f'{self.identity}.git'
 
     def git(self, *args, cwd=None, check=True):
-        return command(['git',*args],cwd=cwd or self.mirror,check=check).stdout.strip()
+        return command(['git','-c','core.quotepath=false',*args],cwd=cwd or self.mirror,check=check).stdout.strip()
+
+    def observation(self):
+        return process_lock(self.state_dir,name=f'catalog-{self.identity}.lock')
 
     def refresh(self):
         with process_lock(self.state_dir,name=f'git-{self.identity}.lock'):
             if not self.mirror.exists():
                 self.mirror.parent.mkdir(parents=True,exist_ok=True)
                 command(['git','clone','--bare','--no-hardlinks','--',self.remote,str(self.mirror)])
-            if self.git('remote','get-url','origin') != self.remote:
-                raise GitError('관측 저장소의 origin이 등록 URL과 다릅니다.')
+            observed_remote=self.git('remote','get-url','origin')
+            if observed_remote != self.remote:
+                if github_repository(observed_remote)!=self.repo or github_repository(self.remote)!=self.repo:
+                    raise GitError('관측 저장소의 origin이 등록 저장소와 다릅니다.')
+                self.git('remote','set-url','origin',self.remote)
             self.git('fetch','--prune','--no-tags','origin','+refs/heads/*:refs/remotes/origin/*')
             return self.git('rev-parse','--verify',f'refs/remotes/origin/{self.base}^{{commit}}')
 
     def snapshot(self, revision):
-        raw = self.git('ls-tree','-rz','--full-tree',revision,'--','docs/requirements','docs/plans')
+        raw = self.git('ls-tree','-rz','--full-tree',revision,'--','docs/requirements','docs/plans','docs/PRODUCT.md','docs/ARCHITECTURE.md')
         documents = []
         for record in raw.split('\0'):
             if not record:
@@ -82,6 +91,10 @@ class Repository:
     def remote_head(self, branch):
         lines = self.git('ls-remote','--heads','origin',f'refs/heads/{branch}').splitlines()
         return lines[0].split()[0] if lines else None
+
+    def plan_branches(self):
+        return [branch.rsplit('/',1)[-1] for branch in self.git('for-each-ref','--format=%(refname:strip=3)',
+                'refs/remotes/origin/loop-manager/').splitlines() if re.fullmatch(r'loop-manager/G-[0-9]{3,}',branch)]
 
     def validate_workspace(self, path, branch):
         path = Path(path).resolve()
@@ -113,9 +126,9 @@ class Repository:
             on_reserved(path)
         command(['git','clone','--no-checkout','--no-hardlinks','--',self.remote,str(path)])
         if remote_head:
-            self.git('checkout','-b',branch,f'origin/{branch}',cwd=path)
+            self.git('checkout','--no-overwrite-ignore','-b',branch,f'origin/{branch}',cwd=path)
         else:
-            self.git('checkout','-b',branch,f'origin/{self.base}',cwd=path)
+            self.git('checkout','--no-overwrite-ignore','-b',branch,f'origin/{self.base}',cwd=path)
         for name,value in (('user.name','Loop Manager'),('user.email','loop-manager@users.noreply.github.com')):
             if not self.git('config','--get',name,cwd=path,check=False):
                 self.git('config',name,value,cwd=path)
@@ -124,6 +137,16 @@ class Repository:
     def head(self,path):
         return self.git('rev-parse','HEAD',cwd=path)
 
+    def synchronize_head(self,path,branch):
+        self.validate_workspace(path,branch)
+        remote=self.remote_head(branch)
+        if remote is None:
+            raise RemoteDeleted('기존 원격 브랜치가 삭제됐습니다. 작업물을 보존합니다.')
+        self.git('fetch','origin',f'refs/heads/{branch}:refs/remotes/origin/{branch}',cwd=path)
+        if command(['git','merge-base','--is-ancestor',remote,self.head(path)],cwd=path,check=False).returncode:
+            self.merge(path,branch,f'origin/{branch}')
+        return self.head(path)
+
     def dirty(self,path):
         return bool(self.git('status','--porcelain','--untracked-files=all',cwd=path))
 
@@ -131,7 +154,7 @@ class Repository:
         self.validate_workspace(path,branch)
         if self.dirty(path):
             raise GitError('미커밋 변경을 보존합니다. Merge 전에 Checkpoint가 필요합니다.')
-        result = command(['git','merge','--no-edit','--',target],cwd=path,check=False)
+        result = command(['git','merge','--no-edit','--no-overwrite-ignore','--',target],cwd=path,check=False)
         if result.returncode:
             if self.git('diff','--name-only','--diff-filter=U',cwd=path):
                 raise MergeConflict('양쪽 변경을 보존하며 충돌을 교정해야 합니다.')
@@ -140,8 +163,10 @@ class Repository:
 
     def commit(self,path,branch,message):
         self.validate_workspace(path,branch)
-        if self.git('diff','--name-only','--diff-filter=U',cwd=path):
-            raise MergeConflict('미해결 Merge 충돌이 있습니다.')
+        unmerged=self.git('diff','--name-only','--diff-filter=U','-z',cwd=path).split('\0')
+        unmerged=[item for item in unmerged if item]
+        if unmerged and command(['git','diff','--check','--',*unmerged],cwd=path,check=False).returncode:
+            raise MergeConflict('Merge 충돌 표식이나 Git 교정 지적이 남아 있습니다.')
         self.git('add','--all',cwd=path)
         merging = Path(self.git('rev-parse','--git-path','MERGE_HEAD',cwd=path))
         if not merging.is_absolute():
@@ -173,23 +198,44 @@ class Repository:
         if self.remote_head(branch) != candidate:
             raise GitError('원격 게시 결과가 아직 일치하지 않습니다.')
         with self.store.transaction() as db:
-            db.execute('DELETE FROM external_jobs WHERE job_key=?',(key,))
+            if re.fullmatch(r'loop-manager/G-[0-9]{3,}',branch):
+                db.execute('UPDATE exec_plan_runs SET published=1 WHERE repo=? AND plan_id=?',(self.repo,branch.rsplit('/',1)[-1]))
+            db.execute("DELETE FROM external_jobs WHERE repo=? AND kind='push' AND target=?",(self.repo,branch))
         return candidate
 
     def cleanup(self,path,branch):
         path = self.validate_workspace(path,branch)
         if self.dirty(path) or self.git('diff','--name-only','--diff-filter=U',cwd=path):
             return False
+        if self.git('ls-files','--others','--ignored','--exclude-standard',cwd=path):
+            return False
         remote = self.remote_head(branch)
+        target=branch if remote else self.base
+        if remote is None:
+            remote=self.remote_head(self.base)
         if remote is None:
             return False
-        self.git('fetch','origin',f'refs/heads/{branch}:refs/remotes/origin/{branch}',cwd=path)
+        self.git('fetch','origin',f'refs/heads/{target}:refs/remotes/origin/{target}',cwd=path)
         if command(['git','merge-base','--is-ancestor',self.head(path),remote],cwd=path,check=False).returncode:
             return False
         if any((path/'.git'/name).exists() for name in ('MERGE_HEAD','rebase-merge','rebase-apply','index.lock')):
             return False
         shutil.rmtree(path)
         return True
+
+    def defer_cleanup(self,path,branch):
+        key=f'cleanup:{self.repo}:'+hashlib.sha256(str(path).encode()).hexdigest()
+        try:
+            done=not Path(path).exists() or self.cleanup(path,branch)
+        except (OSError,RuntimeError):
+            done=False
+        with self.store.transaction() as db:
+            if done:
+                db.execute('DELETE FROM external_jobs WHERE job_key=?',(key,))
+            else:
+                db.execute('INSERT INTO external_jobs(job_key,repo,kind,target,expected_input,remote_result) '
+                           'VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING',(key,self.repo,'cleanup',branch,branch,str(path)))
+        return done
 
 
 MANAGED_START = '<!-- loop-manager:start -->'
@@ -202,7 +248,7 @@ def managed_body(existing, content):
         if existing.count(MANAGED_START)!=1 or existing.count(MANAGED_END)!=1:
             raise ValueError('PR 관리 영역 구분자가 모호합니다.')
         start,end = existing.index(MANAGED_START),existing.index(MANAGED_END)+len(MANAGED_END)
-        if end < start:
+        if end < start+len(MANAGED_START)+len(MANAGED_END):
             raise ValueError('PR 관리 영역 순서가 잘못됐습니다.')
         return existing[:start]+block+existing[end:]
     return (existing.rstrip()+'\n\n' if existing.strip() else '')+block
@@ -246,6 +292,8 @@ class GitHub:
             return self.api(f'repos/{self.repo}/pulls',method='POST',
                             payload={'head':branch,'base':base,'title':title,'body':managed_body('',body),'draft':draft})
         current = self.pull(opened[0]['number'])
+        if current.get('base',{}).get('ref',base)!=base:
+            raise GitError('기존 PR의 base가 등록 base와 다릅니다. 사용자 PR을 보존합니다.')
         updated = managed_body(current.get('body') or '',body)
         if updated != (current.get('body') or ''):
             current = self.api(f'repos/{self.repo}/pulls/{current["number"]}',method='PATCH',payload={'body':updated})
@@ -260,10 +308,29 @@ class GitHub:
             'query':f'mutation($id:ID!){{{operation}(input:{{pullRequestId:$id}}){{pullRequest{{id}}}}}}',
             'variables':{'id':pull['node_id']}})
 
-    def close(self,pull,expected_head):
+    def update_usage(self,number,usage):
+        from loop_manager_internal.execution.validation_feedback import redact_secrets
+        usage=redact_secrets(usage)
+        current=self.pull(number)
+        body=current.get('body') or ''
+        start,end='<!-- loop-manager:usage -->','<!-- loop-manager:usage-end -->'
+        if MANAGED_START not in body or MANAGED_END not in body:
+            raise GitError('사용량을 갱신할 Manager 본문 영역이 없습니다.')
+        left,right=body.index(MANAGED_START)+len(MANAGED_START),body.index(MANAGED_END)
+        managed=body[left:right]
+        if managed.count(start)!=1 or managed.count(end)!=1:
+            raise GitError('사용량 영역을 확인할 수 없어 호출 원본을 보존합니다.')
+        updated=managed[:managed.index(start)]+usage+managed[managed.index(end)+len(end):]
+        result=body[:left]+updated+body[right:]
+        if result!=body:
+            self.api(f'repos/{self.repo}/pulls/{number}',method='PATCH',payload={'body':result})
+
+    def close(self,pull,expected_head,expected_base=None):
         current = self.pull(pull['number'])
         if current['head']['sha'] != expected_head:
             raise GitError('PR 사용자 변경이 있어 Close 판단을 다시 확인해야 합니다.')
+        if expected_base and current['base']['sha']!=expected_base:
+            raise GitError('PR base가 바뀌어 Close 판단을 다시 확인해야 합니다.')
         if current['merged_at']:
             raise GitError('이미 Merge된 PR을 Close하지 않습니다.')
         if current['state']=='closed':

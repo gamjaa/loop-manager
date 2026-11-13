@@ -56,4 +56,3 @@ def agent_environment(
         environment = {key: value for key, value in environment.items() if key.upper() != variable}
         environment[variable] = str(state_dir.expanduser().resolve() / f'automation-{provider}')
     return environment
-

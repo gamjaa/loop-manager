@@ -78,7 +78,7 @@ def child(args,root,store,state,configuration):
     if repository.head(root)!=args.runtime_sha or repository.git('remote','get-url','origin',cwd=root)!=args.runtime_origin:
         raise RuntimeError('runtime 저장소 또는 commit이 일치하지 않습니다.')
     if args.command=='manual':
-        direct_commands.output(direct_commands.execute(args,store,state))
+        direct_commands.output(direct_commands.execute(args,store,state),store)
         return 0
     selected=None
     if args.repositories:

@@ -18,4 +18,3 @@ def _owned_directory(path: Path) -> None:
         assert_private_directory(path)
     elif status.st_uid != os.getuid() or status.st_mode & 0o077:
         raise RuntimeError('Codex runtime 경로의 소유권·권한을 확인할 수 없습니다.')
-
