@@ -1,249 +1,86 @@
-# Loop Manager 운영 안내
-
-> **문서 구분:** 여기의 명령·옵션은 현재 구현 기준이다. [PRODUCT](PRODUCT.md)·[ARCHITECTURE](ARCHITECTURE.md)에 기록한 재설계 목표와 다를 수 있으며, 특히 기존 `manual submit`은 새 설계의 지원 범위에 포함되지 않는다.
-
-첫 설치와 실행은 [README Quick Start](../README.md#quick-start)를 따른다. 이 문서는 설정 조정, 수동 제출과 장애 복구를 다룬다. 아래 `python`은 Loop Manager 저장소의 `.venv` Python을 뜻한다.
+# 운영 안내
 
 ## 인증과 실행 조건
 
-Git·`gh`와 선택한 Agent CLI를 설치·인증하고 대상 GitHub 저장소에 접근할 수 있는지 확인한다. Planner의 계획 게시에는 base branch 직접 push 권한이 필요하며 구현 PR은 사용자가 검토·Merge한다.
+Git·GitHub CLI·선택 Agent CLI를 같은 실행 계정에서 설치·인증한다. Manager는 Git Push와 PR 생성·본문 갱신·Draft/Ready·필요 없는 PR Close·완료 문서 Archive를 수행한다. 최종 PR Merge는 사용자가 맡는다. Archive 게시에는 base Push 권한이 필요하다.
 
-| 환경 | 실행 조건 |
-|---|---|
-| Windows | PowerShell, Codex 사용 시 Python 3.13 이상과 초기 설정을 마친 elevated sandbox |
-| Linux·macOS | Bash, 공급자별 공통 홈과 호출별 임시 폴더 사용 |
-| Codex | CLI 0.159.3 이상, 세 OS의 내장 sandbox 사전 검사 통과 |
-| Claude Code | Linux·macOS CLI 2.1.307 이상, 시작 설정 확인 필요 |
-
-Codex는 세 OS에서 상태 루트의 공통 홈을 인증·설정·session 저장소로 직접 사용한다. Windows ACL·Job Object, macOS Seatbelt, Linux 읽기 전용 mount·프로세스 그룹의 경계를 확인할 수 없으면 권한을 완화하지 않고 중단한다. Claude는 공식 native 호출 구성과 모의 회귀를 기준으로 시작 설정을 확인하며, 이를 실제 OS 격리 검증 성공으로 표시하지 않는다. [Codex 권한 정책](https://developers.openai.com/codex/permissions) · [격리 설계](ARCHITECTURE.md#13-telegram과-보안)
-
-### 전용 공급자 홈과 인증
-
-DB·잠금에 실제 사용하는 `state_dir` 아래의 `automation-codex`·`automation-claude`를 공급자별 공통 홈으로 직접 사용한다. 상태 루트는 `--state-dir`, `LOOP_MANAGER_STATE_DIR`, OS 기본 경로 순서로 선택한다. 외부 `CODEX_HOME`·`CLAUDE_CONFIG_DIR`은 홈 선택에 사용하지 않고 기존 허용 인증 환경변수의 전달은 유지한다. Manager는 설정 파일을 생성하거나 개인 홈에서 가져오지 않는다. Codex 준비 조회가 공통 home의 `config.toml`을 안전하게 생성·교체하면 새 내용의 확장·권한 충돌을 재검사해 같은 호출의 지침과 최종 증거에 결합한다. 공통 설정의 developer instruction 변경도 새 값을 기준으로 다시 해석한다. Manager `config.ini`나 project/system Codex 설정의 변경, 읽기 실패·충돌은 거부하며 native 지침 조회에서 충돌을 발견하면 다음 Codex 조회 전에 중단한다. 변경이 반복되어 지침 조회를 같은 설정에 결합할 수 없는 경우도 거부한다. 이후 호출도 현재 설정을 다시 검사한다.
-
-| 공급자 | 전용 환경값 | 기본 인증 파일 |
-|---|---|---|
-| Codex | `CODEX_HOME=<state_dir>/automation-codex` | `~/.codex/auth.json` |
-| Claude | `CLAUDE_CONFIG_DIR=<state_dir>/automation-claude` | `~/.claude/.credentials.json` |
-
-전용 인증 위치가 비어 있고 기본 파일이 있으면 그 파일만 절대 경로의 심볼릭 링크로 연결한다. 기존 파일·링크는 덮어쓰지 않는다. 기본 파일이 없으면 빈 파일·끊긴 링크를 만들지 않으며 전용 경로에서 인증을 확인한다. 끊긴 링크·읽기 불가·비공개 경로 검증이나 링크 권한 실패는 자동 복사·권한 확대 없이 진단한다. Windows의 최초 링크 생성에도 심볼릭 링크를 만들 수 있는 실행 환경이 필요하다.
-
-인증 실패 메시지에 실제 사용한 홈과 해당 OS의 로그인·상태 확인 명령을 표시한다. 다음은 Bash 예시이며 `/path/to/state`를 실제 DB의 상태 루트로 바꾼다. PowerShell에서는 `$env:CODEX_HOME='실제 경로'; codex login` 또는 `$env:CLAUDE_CONFIG_DIR='실제 경로'; claude auth login`처럼 현재 셸에 지정한다.
-
-```sh
-env CODEX_HOME=/path/to/state/automation-codex codex login
-env CODEX_HOME=/path/to/state/automation-codex codex login status
-env CLAUDE_CONFIG_DIR=/path/to/state/automation-claude claude auth login
-env CLAUDE_CONFIG_DIR=/path/to/state/automation-claude claude auth status
-```
-
-링크를 사용하는 인증 갱신은 기본 인증 파일에도 영향을 줄 수 있다. 로그인·로그아웃은 Manager가 자동 실행하지 않는다. CLI 호출 전후에 링크 공유를 확인하며 링크를 사본으로 교체한 결과는 정상 실행으로 사용하지 않는다. 원본 파일의 같은 경로에서 내용 갱신·원자적 교체는 다음 호출에도 반영한다. [Codex 파일·credential store](https://learn.chatgpt.com/docs/auth#credential-storage)와 [Claude 파일·Keychain](https://code.claude.com/docs/en/authentication#credential-management)은 별개다. 파일이 없는 저장소의 비밀을 추출하지 않으며 Linux·macOS Codex의 기본 사용자 저장소와 자동 실행 홈 사이에서 재사용을 확인하지 못한 `keyring`·`auto`·`ephemeral` 설정은 계속 거부한다. 필요한 파일 인증은 CLI의 지원 방식으로 준비하고 조직의 저장 정책을 완화하지 않는다.
-
-기존 역할·worktree별 runtime 홈의 config·auth·session은 삭제·이동·복제하지 않으며 새 호출 입력으로 연결하지 않는다. 이전 session은 저장된 ID로 재개를 시도하고 사용할 수 없으면 기존 작업·실패 문맥을 보존하는 새 session fallback을 따른다. 호출 기록용 임시 폴더는 runtime 아래에 분리하며 Claude Bash의 짧은 임시 폴더는 `/tmp` 아래 호출별 비공개 경로를 사용한다. 공통 홈을 Agent 도구의 쓰기 허용 범위에 추가하지 않으며 역할별 권한과 명시적 실행값을 유지한다. Claude는 선택 공통 홈의 `settings.json`과 프로젝트·local·managed 설정을 현재 호출에서 검사한다. 개인 홈의 settings·Hook은 연결하지 않는다. 공통 홈 설정의 정상 생성·원자 교체·삭제는 다음 호출에 반영되며, 소비 설정의 확장·권한 충돌·읽기 실패·소유권 불명·조회 뒤 변경은 원본을 보존해 거부한다. 오류가 나면 진단된 소비 경로를 확인하고 충돌을 해소한 뒤 재시도한다. 과거 runtime의 설정이나 개인 설정을 다시 연결해 우회하지 않는다.
-
-Claude의 파일 수정은 sandboxed Bash로 수행하며 Edit·Write·NotebookEdit는 거부한다. Worker의 targeted runner는 환경변수에 지정된 명령을 Bash에서 실행한다. 홈 아래 설치된 Manager Python 패키지의 읽기만 허용하며 해당 설치 경로는 쓰기 금지다. 실제 CLI·계정·OS·session 호환성 후속 확인은 [Claude 개발 지침](../AGENTS.md#claude-지원-개발)를 따른다.
-
-기존 상태 루트가 `/home/ubuntu/.local/state/loop-manager`인 cron은 기존 `automation-codex`를 재사용하므로 `env CODEX_HOME=...`을 제거하고 `bash /home/ubuntu/loop-manager/run.sh --skip-if-running`으로 전환할 수 있다. DB의 상태 루트를 고정하는 `LOOP_MANAGER_STATE_DIR` 등 다른 옵션은 유지한다. 실제 crontab은 자동 수정하지 않는다.
-
-### Linux PATH 캐시
-
-`bash scripts/setup.sh`는 호출 환경의 PATH를 source checkout의 `config/execution-path.txt`에 저장한다. Git·gh와 Codex 또는 Claude가 발견되는 정상 터미널에서 실행하며 별도 로그인 셸이나 `.bashrc`를 자동 실행하지 않는다. 경로 순서·공백·심볼릭 링크는 유지하고 중복·빈 항목·상대 경로·존재하지 않는 디렉터리는 제외한다. setup 준비·경로 검사·저장 실패는 기존 캐시를 보존한다. `config`의 미추적 파일은 폴더 전체가 Git에서 제외되며 기존 `config.ini.example`은 계속 추적한다.
-
-Python source 진입은 bootstrap의 첫 Git 호출 전에 저장된 PATH, 현재 PATH의 추가 디렉터리, 기본 시스템 디렉터리 순서로 합친다. runtime 자식·Agent·verify는 확정된 환경을 상속하며 캐시를 다시 읽지 않는다. 캐시 위치는 source checkout에 고정되고 cwd·`--config`·state_dir 변경과 무관하다. 캐시가 없으면 현재 PATH와 시스템 후보를 사용하므로 PATH를 명시한 기존 cron 설정도 사용할 수 있다.
-
-bootstrap의 Git, 등록의 Git·gh·선택 provider, Agent 사전 확인과 실제 호출에서 필수 CLI 또는 Node 등 확인된 실행 의존성을 찾지 못하면 오류 원인·기존 provider 출력·실패 결과를 보존해 복구 방법을 안내한다. 같은 실행 계정의 정상 터미널에서 설치 경로를 확인하고 Loop Manager source checkout에서 다음 명령을 실행한다.
-
-```sh
-bash scripts/setup.sh
-```
-
-명령 누락 표식이 확인된 실패만 PATH 복구 대상으로 안내한다. 일반 명령 실패·session 부재·인증 실패·권한 거부는 원래 실패로 처리한다. 진단은 환경 전체나 인증값을 추가 출력하지 않고 캐시 변경·로그인·다른 provider 실행을 시작하지 않는다. 읽기 불가·빈 파일·손상된 캐시는 bootstrap 전에 중단하며 현재 PATH로 조용히 대체하지 않는다. setup 재실행은 PATH 캐시만 갱신하고 `config.ini`·인증·DB·session은 초기화하지 않는다. 실행 중 캐시 갱신은 다음 source 실행부터 적용된다. 가상환경을 다시 만들어도 `config`의 PATH 캐시는 유지된다.
+Windows는 Python 3.13 이상과 PowerShell 7을 사용한다. Agent는 Provider의 sandbox·자동 실행 정책을 사용하고 권한 확대를 자동 허용하지 않는다. 조직 정책·실계정 호환성의 관측 한계는 [Claude 실환경 후속 점검](FUTURE_IDEAS.md#claude-실환경-후속-점검)에 구분한다.
 
 ## 설정
 
-[config.ini.example](../config/config.ini.example)을 `config/config.ini`로 복사해 편집한다. setup은 기존 `.venv`를 재사용하고 `requirements.txt`의 패키지를 설치한다. 현재 외부 Python 의존성은 없으며 추가되면 같은 setup을 다시 실행한다.
+`config/config.ini.example`을 `config/config.ini`로 복사한다. `--config <절대경로>`로 대체할 수 있다. 설정 파일은 안전한 배정 경계에서 다시 읽는다. 실행 중인 호출의 설정은 소급 변경하지 않는다.
 
-| 항목 | 설정 기준 |
+| 항목 | 의미 |
 |---|---|
-| provider 모델·역할 | 선택 provider의 Model alias와 `Model alias,Effort`를 직접 지정한다. `planner`·`planner_check`·Worker level 1~8과 참조 alias는 모두 필요하다. 누락·빈 값·미지원 조합은 실행 전에 거부하며 예시를 fallback으로 읽지 않는다. |
-| `planner_check` | 기존 호출 이력·저장 상태의 호환성을 위해 역할 설정을 유지한다. 코드·테스트·설정 변경만으로 새 점검 호출을 만들지 않는다. 유지보수 Planner는 `maintenance_planner`를 사용하며 생략하면 일반 `planner` 설정을 재사용한다. |
-| `[codex] fast_mode` · `[claude] fast_mode` | provider별 Fast 선택. 기본값은 `false`이며 공란·공백·section 또는 항목 생략도 off다. CLI 기본 설정이나 저장된 session에서 on이어도 off가 우선하도록 전달한다. `true`는 on이며 `on/off`·`yes/no`·`1/0`도 허용한다. 모델·Effort는 그대로 전달하며 지원·대체 실행은 CLI에 맡긴다. Fast 사용에는 추가 비용 또는 구독 사용량 증가가 발생할 수 있다. |
-| `[telegram]` | `token`·`chat_id`가 모두 있으면 알림 사용, 둘 다 없으면 비활성화, 하나만 있으면 설정 오류다. |
-| `[loop] max_workers` | 전체 Worker·Reviewer 실제 동시 호출 상한. 기본값 `3`. |
-| `[loop] max_tasks_per_project` | 프로젝트별 관리 대상 기본 상한. 기본값 `1`. 프로젝트 DB의 0은 이 값을 상속하고 양수는 개별 상한이다. |
-| `[loop] verify_concurrency` | 전체 verify 동시 호출 상한. 기본값 `1`. Worker·Reviewer와 겹칠 수 있다. |
-| `[loop] refactoring_review_interval` | 새 MERGED 작업 수에 따른 자동 유지보수 주기. 기본값 `20`. `0`이면 자동 전환을 끄며 누적 수와 실행 중 cycle은 보존한다. `python loop_manager.py maintenance-review <project-path>`로 등록된 프로젝트의 다음 안전한 경계에 점검을 요청할 수 있다. |
-| `verify_timeout_seconds` | 확인된 순번 대기를 제외한 전체 verify 실제 실행 상한(초). 기본값 `600`. 필요한 검증이 정상 진행 중이라는 근거가 있을 때 조정한다. |
-| `verify_parallelism` | Loop Manager 자체 verify의 모듈 배정 상한. 기본값 `auto`, 양의 정수는 verify별 상한, `1`은 직렬이다. [배정·기록](#verify-배정과-진단) |
+| `[loop] max_workers` | 전체 프로젝트 Planner·Worker·Reviewer 공통 AI 한도, 양수 |
+| `verify_timeout_seconds` | 필수 Verify 실제 실행 제한, 양수 초. 자원 대기 제외 |
+| `verify_parallelism` | 이 저장소 자체 검증 도구의 내부 병렬도. `auto` 또는 양수. 다른 프로젝트에 강제하지 않음 |
+| `[provider.models]` | 모델 별칭과 실제 모델 이름 |
+| `[provider.roles] planner`, `reviewer` | `모델별칭,effort` |
+| `[provider.worker] level1`–`level6` | complexity low/medium/high의 1/3/5에 critical risk일 때만 1을 더해 선택 |
+| `[provider] fast_mode` | 선택 Provider Fast 요청. 생략·공란은 false |
+| `[telegram] token`, `chat_id` | 둘 다 비우면 미사용. 하나만 설정하면 오류 |
 
-Fast 선택은 한 번 실행을 시작할 때 읽어 신규·재개·재시도 호출에 고정한다. 설정 변경은 다음 Manager 실행에 반영하고 session·작업물·Worker level은 Fast 선택만으로 초기화하지 않는다. 호출 로그의 `loop_manager.fast_mode` 기록에서 요청값 `true`·`false`를 확인한다. 이 값은 실제 Fast 적용 성공을 뜻하지 않는다. CLI 진단·실패는 기존 처리 규칙을 따르며 모델별 사전 판정이나 CLI 버그 우회를 추가하지 않는다.
+프로젝트별 Worker와 전역 Verify는 각각 하나다. 별도 관리 대상 수·유지보수·부분 검증 설정은 없다. 잘못된 필수 모델 설정을 다른 모델로 조용히 대체하지 않는다. Linux CLI 설치 경로가 바뀌면 같은 계정의 정상 터미널에서 `scripts/setup.sh`를 다시 실행해 `config/execution-path.txt`를 갱신한다.
 
-Fast 선택의 CLI 전달 구문은 다음과 같다. Manager는 기존 모델·Effort·지침·권한·sandbox 인자를 보존한 채 이 설정을 합친다. 공란·생략도 아래 off 설정을 전달한다.
+## 상태와 요청
 
-| provider | on | off |
+상태 경로는 `--state-dir`, `LOOP_MANAGER_STATE_DIR`, 사용자별 기본 경로 순으로 선택한다. 정확한 DB 경로는 `init` 출력으로 확인한다. 모든 프로젝트와 CLI는 해당 경로의 `loop-manager.db` 하나를 WAL 모드로 사용한다.
+
+```sh
+python loop_manager.py --state-dir /path/to/new-state init
+python loop_manager.py --state-dir /path/to/new-state add /path/to/project --base develop
+python loop_manager.py --state-dir /path/to/new-state status
+```
+
+조회는 SELECT만 수행하며 설정·네트워크·runtime 잠금이 필요 없다. 쓰기 경합은 짧은 busy 제한 후 오류를 반환한다. runtime 중복 방지 잠금과 CLI 직접 DB 접근은 별개다.
+
+| 명령 | 즉시 반환 | 후속 처리 |
 |---|---|---|
-| Codex | `-c 'service_tier="fast"' -c 'features.fast_mode=true'` | `-c 'service_tier="default"' -c 'features.fast_mode=false'` |
-| Claude | 기존 `--settings` JSON에 `"fastMode": true` 추가 | 기존 `--settings` JSON에 `"fastMode": false` 추가 |
+| `pause`, `resume` | 최신 배정 의도 확정 | 신규 단계 직전 반영. 실행 중 호출은 안전한 반환 |
+| `add`, `remove` | 요청 ID와 접수 결과 | 실제 준비/진행 호출 반환 확인 뒤 최종 결과 |
+| `unblock` | 차단 재평가 접수 | Worker 재평가의 재개 성공·재개 불가 결과 |
+| `manual start` | 실제 준비 경로·브랜치 또는 오류 | 응답 전 중단이면 같은 요청과 Git 상태 재관측 |
+| `manual complete` | 게시 후보 인수 접수 | dependency·자원 충족 후 Verify·Reviewer·같은 G PR |
 
-실제 config는 commit하지 않고 현재 사용자만 읽을 수 있도록 관리한다. 별도 경로는 전역 옵션으로 지정한다.
+같은 미완료 요청은 같은 ID로 응답하고 상충하는 요청은 거부한다. 접수만 반환한 명령의 최종 결과는 DB와 Outbox에 원자적으로 남긴다. CLI에 최종 결과를 출력한 요청은 중복 Telegram을 억제한다. 출력·DB 기록 사이 중단에서는 누락보다 중복 가능성을 감수한다.
 
-```sh
-python loop_manager.py --config /path/to/config.ini --state-dir /path/to/state run
-```
+`status`는 G 상태·수동 소유·작업 경로·현재 오류·요청 결과를 표시한다. `logs`는 현재 오류와 남아 있는 호출의 작은 결과다. `usage`는 보존 중인 실제 호출만 역할·Provider·모델별로 집계한다. 종료 후 정리된 사용량은 원격 PR 본문에서 확인한다. 누락 토큰은 0으로 추정하지 않는다.
 
-bootstrap은 source checkout 기준으로 설정 경로를 확정해 runtime에 전달하며 runtime별로 비밀 설정을 복제하지 않는다.
+## 수동 구현
 
-## 프로젝트 문서와 등록
+1. `manual start <project> G-001`로 base의 비 draft READY G를 준비한다. 선행 G는 실제 Merge돼 있어야 한다.
+2. 반환된 격리 공간에서 구현·관련 테스트 후 `git commit`·`git push origin HEAD`로 게시한다.
+3. `manual complete <project> G-001`로 접수한다. 필수 Verify·Reviewer는 생략하지 않는다.
 
-기존 프로젝트는 `.agents/skills/`, `docs/PLANS.md`, `docs/*.template.md`와 필요한 문서를 선택적으로 병합한다. PLANS와 템플릿은 복사된 공통 파일을 사용하고 [예약 경로](AGENTS.common.md#예약-경로)를 유지한다. 복사 스크립트는 자동 Loop에서 실행하지 않는다.
+준비 오류에도 작업물과 예약을 유지한다. 같은 `manual start` 재실행이나 runtime 재관측으로 이어간다. 미게시 변경이 남아 있으면 원격 제출 성공으로 취급하지 않는다. 다른 G는 독립적으로 진행한다.
 
-등록 검사는 fetch한 원격 base를 사용한다. `docs/PLANS.md`는 Manager 기준 해시와 일치해야 하고 작성된 ARCHITECTURE 및 PRODUCT 또는 활성 Requirement가 필요하다. 빈 템플릿만 게시하면 등록할 수 없다. [등록 절차](../README.md#3-등록과-첫-실행)
+## 차단과 재시작
 
-Requirement는 frontmatter·상태 없이 `docs/requirements/` 바로 아래에 두며 모두 Planner 입력이다. 새 기능·정책 변경을 요청받은 대화형 Agent는 관련 활성 Requirement를 먼저 작성·갱신하거나 충분한 기존 문서를 재사용한다. Skill은 명세를 정리하고 Planner가 ExecPlan을 만든다.
+중요 정책 질문이나 Agent 교정으로도 해결할 수 없는 충돌만 관련 G를 BLOCKED로 처리한다. 문서 오류·일시 네트워크 오류·원격 전진·공간 경합은 작업물을 보존하며 재시도한다. `logs`의 원인을 고친 뒤 다음 실행을 기다리거나 명시적 `unblock`을 접수한다. 문서 변경으로 차단 근거가 바뀌면 자동 재평가할 수 있다.
 
-```sh
-python loop_manager.py add /path/to/my-project --base main --provider codex
-python loop_manager.py remove /path/to/my-project
-```
+열린 PR에 추가 작업이 필요하면 같은 PR을 Draft로 바꾼다. 현재 후보의 Verify·Reviewer와 충돌 해소가 확인되면 Ready로 전환한다. Merge 없이 닫힌 구현 PR은 필요하면 같은 PR을 다시 연다. 삭제된 기존 관리 원격 브랜치는 자동 재생성하지 않는다.
 
-진행 중인 계획·프로젝트 차단·미해결 planning 오류가 없을 때만 등록을 해제할 수 있다. 해제는 registry만 바꾸며 파일·branch·worktree·PR·MERGED 감사는 보존한다.
+다음 `run`은 요청·generation·실행 프로세스와 실제 Git·GitHub 효과를 대조한다. 게시 직후 중단해도 원격 결과부터 확인한다. 현재 검증 입력을 안전하게 비교할 수 없거나 성공 근거가 없으면 PASS로 가정하지 않는다.
 
-기본 `run`은 모든 등록 프로젝트를 처리한다. 특정 프로젝트만 실행하려면 경로를 하나 이상 지정한다. 공백이 있는 경로는 shell에서 따옴표로 감싼다.
+## runtime과 스케줄러
 
-```sh
-python loop_manager.py run /path/to/project-a '/path with spaces/project-b'
-```
+`run.sh` 또는 `run.ps1`에 `--skip-if-running`을 전달해 cron·작업 스케줄러에서 호출한다. 내부 상시 스케줄러는 없다. 배정 가능한 작업을 처리하고 PR·pause·재시도 시각 등으로 할 일이 없으면 반환한다.
 
-상대 경로는 명령을 호출한 작업 디렉터리 기준으로 해석한다. 지정 경로는 정규화한 뒤 중복 제거하며 전체 경로의 등록 여부를 처리 전에 확인한다. 하나라도 등록되지 않으면 프로젝트 처리를 시작하지 않는다. `--skip-if-running`은 지정 범위에서도 기존처럼 다른 Loop Manager 실행이 있을 때 조용히 성공 종료한다.
+Bootstrap은 자신의 등록 원격 base, 등록이 없으면 origin 기본 브랜치의 SHA를 선택한다. `runtimes/<SHA>`의 저장소·HEAD·진입부 계약·Python 구문을 확인한 뒤 child를 실행한다. 초기 전환은 새 구현을 원격 base에 먼저 반영한다. 사용자 checkout의 미게시 수정은 실행 코드가 아니다.
 
-## 프로젝트별 관리 한도
+새 단계 경계에서 실행 코드·스크립트·의존성·역할 지침의 실질적 변경이 확인되면 신규 배정을 멈춘다. 진행 호출은 강제 종료하지 않고 반환·Checkpoint 저장 후 인계한다. 문서 전용·SHA 전용 변화와 사용자 PR Merge 대기를 갱신 조건으로 삼지 않는다.
 
-등록된 프로젝트의 관리 대상 상한은 실행 중에도 변경할 수 있다.
+## 상태 보존과 환경 인수
 
-```sh
-python loop_manager.py config set /path/to/my-project --max-tasks-per-project 4
-python loop_manager.py config set /path/to/my-project --max-tasks-per-project 0
-python loop_manager.py status /path/to/my-project --json
-```
+기존 DB를 자동 초기화·마이그레이션하지 않는다. 전환은 이전 Writer 종료 → 기존 상태 디렉터리 별도 보관 → 새 상태 경로 `init` → 같은 원격/base로 `add` 순서다. 실행 중 WAL의 `-wal`·`-shm`을 임의 삭제하지 않는다. 백업은 Writer 종료 후 DB 복사 또는 SQLite 백업 도구를 사용한다.
 
-0은 config 기본값 상속, 양수는 개별 상한이다. 음수·정수가 아닌 값과 미등록 대상은 거부한다. 변경은 Agent·Git·bootstrap·Manager 재시작을 실행하지 않으며 다음 안전한 관리 배정에서 DB를 다시 읽는다. 상한 축소는 기존 작업·세션·작업물을 보존하고 새 관리 배정만 보류한다. pause 중에도 저장할 수 있다.
+새 DB에서는 base의 활성/보관 문서·관리 원격 브랜치·전체 PR 이력으로 ID와 실제 Merge를 복원한다. 과거 토큰·세션·PASS와 미게시 로컬 변경은 합성하지 않는다. 여러 호스트의 동시 WAL Writer는 지원하지 않는다.
 
-`status <repo>`는 읽기 전용으로 저장값·유효값·출처·현재 DB의 관리 수를 표시한다. 유효값은 조회 명령이 읽은 config 기준이다. 실행 중 Manager의 config·실제 호출 수·반영 여부는 이 조회로 확인하지 않으며 JSON의 `warnings`에도 표시한다. 전체 운영 상태·다른 설정 CLI·Loop Manager 관리 Skill의 안내는 [R-076](requirements/%5BR-076%5D%20운영%20명령어와%20상태%20조회%20및%20Skill%20지원.md)의 별도 목표다.
+완료·취소 뒤 최종 PR 집계·Archive·알림·R 최종 평가용 작은 근거를 먼저 보존한다. 이후 세션·토큰·임시 공간을 정리한다. 미게시 사용자 변경이나 삭제 불확실성이 있으면 보존하고 정리만 재시도한다. 원격 작업 브랜치는 삭제하지 않는다.
 
-## 수동 구현과 제출
+## 알림과 검증 진단
 
-기존 G를 다른 기기에서 구현하려면 다음을 실행한다.
+PR·Ready 재검토·차단·비동기 CLI 최종 결과를 공통 Outbox에서 전송한다. 신규 G 시작과 자율 재개는 별도 통지하지 않는다. 같은 후보의 충돌 복구·Ready는 한 사건으로 알린다. 여러 실제 Worker 시도 후 24시간 동안 후보 진전이 없을 때만 장기 무진전을 알리며 순번·PR·사용량 대기 자체는 경고하지 않는다.
 
-```sh
-python loop_manager.py manual start /path/to/my-project G-012
-```
-
-Manager가 선행 작업의 실제 원격 base Merge를 확인한 뒤 소유 branch를 생성·push한다. 안내된 branch를 다른 기기에서 checkout해 코드·테스트와 필요한 R 변경을 push한 뒤 제출한다. 수동 작업 대기는 실행 자리를 점유하지 않아 독립 G는 계속 처리한다.
-
-```sh
-python loop_manager.py manual complete /path/to/my-project G-012
-```
-
-G 없이 R부터 구현까지 원격 branch에 올렸으면 source branch와 R 경로를 제출한다. `--requirement`는 반복할 수 있다. 다음 예시는 Bash이며 PowerShell에서는 한 줄로 실행한다.
-
-```sh
-python loop_manager.py manual submit /path/to/my-project \
-  --branch feature/manual --requirement 'docs/requirements/[R-001] Feature.md'
-```
-
-Manager가 완성된 G를 생성하고 별도 소유 branch에 source 이력과 함께 보존한다. 복수 G는 같은 최종 후보·PR을 공유하므로 내부 선행 Merge가 필요한 묶음은 분리 제출한다. 이후 수정은 안내된 소유 branch로 push한다. 최초 source의 새 변경은 같은 source·R 범위로 `submit`을 다시 실행해야 반영된다.
-
-`complete`·`submit`은 기본적으로 전체 verify와 읽기 전용 Review를 수행하고 실패하면 자동 교정·재검증한다. 외부 검증을 생략하려면 해당 단계에 대응하는 `--skip-verify` 또는 `--skip-review`와 원격 commit 전체 SHA인 `--expected-head`를 제공한다. `--skip-reason`은 선택 입력이며, 생략·빈 문자열·공백은 감사·Reviewer·PR 설명에 `사유 미입력`으로 표시되고 입력한 사유는 `제공 사유`로 표시된다. 생략 옵션 없는 사유만의 지정은 거부한다. 생략은 `SKIPPED_BY_USER`로 기록해 PASS와 구분한다. SHA·base·G/R·환경 또는 관련 단계 입력이 달라지면 기본 검증을 다시 실행한다. `submit`의 G 생성 commit도 SHA를 바꾸므로 source SHA의 생략 승인은 무효화된다.
-
-| 종료 코드 | 의미 |
-|---|---|
-| `0` | 수동 준비 또는 PR 연결 완료 |
-| `1` | 수락 후 대기·자동 복구 중. 저장된 요청은 다음 `run`에서 이어진다. |
-| `2` | 인자 오류 |
-
-PR 생성이나 검증 생략은 완료 근거가 아니다. 저장된 동일 branch·PR의 실제 Merge를 확인해야 구성 G 전체가 MERGED가 된다.
-
-직접 작업·대화형 Agent의 로컬 구현도 활성 Requirement에서 시작하지만 ExecPlan·자동 Worker 역할·SQLite 전이·자동 완료 절차를 요구하지 않는다. 구현과 Requirement를 원격 base에 게시하면 Planner는 실제 미충족 작업만 재점검하며 소급·중복 계획이나 자동 검증 성공 기록을 만들지 않는다.
-
-## 차단과 로컬 복구
-
-알림의 원인·질문·확인 대상과 Checkpoint를 먼저 확인한다. 원격 코드·문서·사용자 결정 변경은 commit·push하고 `run`으로 재평가한다. 자동 복구·재시도 중이라는 이유만으로 사용자 수정이 필요한 것은 아니다.
-
-사용자가 재시도를 결정한 `worker_output_invalid`·`verify_retry_exhausted` 차단도 `unblock <project-path> <G-ID>`로 우선 재개를 요청할 수 있다. 원래 차단 근거·실패 이력·checkpoint는 보존하며 검증 성공으로 기록하지 않는다. 안전·소유권 차단과 종료 미확인 호출은 이 명령으로 우회하지 않는다.
-
-로컬 설정·인증·도구·권한·timeout을 고쳤다면 원격 변경 없이 재검사한다.
-
-```sh
-python loop_manager.py recover /path/to/my-project
-python loop_manager.py recover /path/to/my-project --plan G-001
-```
-
-Windows에서는 `.\.venv\Scripts\python.exe`와 `D:\repo\my-project` 같은 경로를 사용한다. `--plan`은 해당 계획만 검사하며 원격 변경은 기존 `run`의 자동 복구 경로가 처리한다.
-
-다른 작업 중에도 요청을 저장할 수 있다. 실제 복구는 같은 상태 디렉터리의 전역 실행 잠금을 얻은 뒤 진행하며 즉시 실행할 수 없으면 요청 identity와 대기 안내를 출력하고 다음 `run`에서 이어진다. 프로젝트 전체와 서로 다른 계획의 요청은 모두 저장하고 같은 범위의 반복 요청만 미완료 요청을 재사용한다. 접수 순서대로 실행 가능한 요청을 하나씩 처리하며 앞선 요청이 대기 중이어도 뒤의 실행 가능한 요청은 진행한다. 잘못된 대상·미해결 원인·실행 자리 대기는 0이 아닌 종료 코드로 보고한다.
-
-스케줄러의 정상 중복 실행은 `run --skip-if-running`으로 건너뛴다. 옵션 없이 전역 lock이 충돌하면 시각이 포함된 오류와 종료 코드 `1`을 반환하며 lock 외 오류는 그대로 보고한다.
-
-## 상태 보존과 복원
-
-상태·PR·session은 source checkout 밖 사용자 상태 디렉터리의 SQLite에 저장한다.
-
-| OS | 기본 경로 |
-|---|---|
-| Windows | `%LOCALAPPDATA%\loop-manager\` |
-| Linux·macOS | `${XDG_STATE_HOME:-~/.local/state}/loop-manager/` |
-
-**SQLite와 기존 감사 자료를 함께 백업한다.** 과거 `agent-guidance/` snapshot은 감사에만 보존하며 재개 지침은 매 호출 현재 runtime에서 읽는다. `agent-instructions/`의 실행용 파일은 현재 원본으로 재생성할 수 있다. [지침 적용 계약](ARCHITECTURE.md#6-agent-실행과-품질-지침)
-
-비정상 종료 뒤 `SQLITE_READONLY_ROLLBACK`은 DB 파일 권한 부족과 구분한다. bootstrap은 해당 오류에만 쓰기 연결을 한 번 사용해 SQLite가 미완료 트랜잭션을 복구하도록 한다. 수동 조치가 필요하면 다른 실행과 DB 접근을 정지·조율하고 DB와 같은 이름의 `-journal` 파일을 함께 보존한 뒤 SQLite의 정상 복구를 사용한다. 원인과 무관한 권한 변경이나 journal 삭제로 우회하지 않는다. pause DB의 접근 경합에서도 pause 확인은 자기 자신을 재귀 호출하지 않고 기존 대기 제한과 실제 중단 결정을 유지한다.
-
-SQLite가 없거나 손상되면 일반 `run`은 자동 초기화하지 않는다. 백업을 복원하거나 손상 DB를 별도 보관한 뒤 명시적으로 `config init`·재등록한다. 자동 상태 재구성은 지원하지 않는다.
-
-Merge 확인 후 clean하고 PR head에 없는 로컬 commit이 없는 worktree만 Merge·Squash·Rebase 방식과 관계없이 정리한다. 불확실한 작업 공간은 `cleanup_pending`으로 보존한다. 다음 작업·프로젝트 완료를 막지 않으며 안전 조건 충족·경로 부재 시 자동 해제된다.
-
-### 새 환경에서 원격 작업 이어하기
-
-이전 환경의 Worker와 Git writer를 먼저 종료하고 checkpoint가 원격에 게시됐는지 확인한다. 새 환경은 같은 저장소·base로 clone한 뒤 [등록과 첫 실행](../README.md#3-등록과-첫-실행)의 기존 `config init`·`add` 절차를 따른다. 복구할 프로젝트는 첫 `run` 전에 모두 등록한다. 최초 catalog에 고정한 프로젝트·활성 작업만 인수하며, 이후 추가한 작업이나 기존 DB의 일부 행 유실을 원격 인수로 복원하지 않는다. 손상·읽기 불가 DB는 먼저 백업 복원 또는 별도 보관이 필요하며 기존 DB를 덮지 않는다.
-
-일치하는 OPEN PR은 같은 URL·branch로 이어가고 새 Worker와 필요한 검증·Review를 수행한다. PR 없는 작업은 정확한 원격 HEAD에서 시작한다. 이름이나 OID만 같은 기존 로컬 branch/worktree는 인수하지 않으며 미게시 로컬 전용 작업은 새 환경 복구 대상이 아니다. 실제 MERGED는 branch가 삭제됐어도 완료로 남고 동기화·정리·archive 실패는 다음 실행에서 남은 처리만 재시도한다. CLOSED unmerged는 같은 PR을 다시 열거나 명시적인 처리 결정을 내릴 때까지 보류하며, 새 작업으로 재시작하기로 결정하면 새 ExecPlan ID를 사용한다. 여러 환경의 동시 실행은 지원하지 않는다.
-
-## Verify 배정과 진단
-
-Worker는 관련 targeted unit test와 verify 스크립트를 준비하고 전체 verify는 Manager가 Agent 밖에서 실행한다. Windows는 `scripts/verify.ps1`, Linux·macOS는 `scripts/verify.sh`를 사용한다. Loop Manager 자체 스크립트는 `.venv`를 우선 사용하고 어디서 호출해도 저장소 루트에서 실행한다. 공통 runner가 전체 unittest·compile을 수행하며 테스트 프로세스의 실제 Agent CLI·외부 API 연결은 차단된다.
-
-`verify_parallelism = auto`는 허용 CPU·실제 부하·메모리 여유와 아직 관측에 반영되지 않은 예약을 확인해 새 테스트 모듈을 배정한다. 정수 상한 안에서도 자원이 부족하면 기다리며 관측 실패 시 직렬로 축소한다. macOS도 CPU·메모리 관측이 불가능하면 직렬로 축소한다. `max_workers` 및 verify 호출 수를 제한하는 `verify_concurrency`와 별개이며 다른 등록 프로젝트의 내부 테스트 병렬도에는 적용하지 않는다.
-
-시간 이벤트·worker 원문·manifest·집계는 Manager 실행에서 `<state-dir>/logs/verify/<실행 ID>/`, 단독 스크립트에서 `.cache/verify/<실행 ID>/`에 남는다. 시간 집계만 읽으려면 다음을 실행한다. 테스트는 실행하지 않는다.
-
-```sh
-python -m loop_manager_internal.verification.runner --report <직렬 기록 디렉터리> <auto 기록 디렉터리>
-```
-
-비교 범위·관측 환경이 같고 원본의 부하·메모리 제한을 확인한 경우에만 시간을 비교한다. [검증·복구 설계](ARCHITECTURE.md#7-verify와-reviewer)
-
-### Windows Defender와 테스트 임시 폴더
-
-Loop Manager 자체 `scripts/verify.ps1`은 `LOOP_MANAGER_VERIFY_TEMP_DIR`로 테스트 임시 경로를 선택한다. 단독 실행은 PowerShell에서, Manager 실행은 Manager를 시작하는 프로세스에서 설정하면 같은 launcher 입력으로 전달된다. 상대 경로는 checkout 기준으로 해석된다.
-
-```powershell
-$env:LOOP_MANAGER_VERIFY_TEMP_DIR = 'D:\verify temp\테스트'
-.\scripts\verify.ps1
-```
-
-입력이 없으면 `%USERPROFILE%\.cache\loop-manager\verify\tmp\`를 사용한다. launcher는 Python 실행 전에 최종 경로를 만들고 파일 생성·삭제가 가능한지 확인한 뒤 `TEMP`·`TMP`·`TMPDIR`로 설정한다. 경로를 만들거나 쓸 수 없으면 그 경로 오류로 실패하며 기본 경로나 다른 디스크로 바꾸지 않는다. Python의 실제 임시 위치는 launcher `result.json`의 `temporary_directories.windows_launcher`, Windows native `summary.json`의 `temporary_directory`, WSL `summary.json`의 `metadata.execution_context.temporary_directory`에서 확인할 수 있다. 부분 요청의 FALLBACK 진단은 launcher 위치만 포함한다. 성공·실패 모두에서 선택 입력을 포함한 기존 환경 변수와 작업 디렉터리를 복원하며, 동시 실행의 파일을 지우지 않도록 공유 임시 폴더 전체를 삭제하지 않는다. 다른 등록 프로젝트의 verify에는 자동 적용되지 않는다.
-
-Defender 검사로 verify가 느릴 때만 검사 제외를 선택적으로 설정한다. 기본 추천 범위는 테스트 전용 임시 폴더다. 관리자 PowerShell에서 다음을 실행한다.
-
-```powershell
-Add-MpPreference -ExclusionPath (Join-Path $env:USERPROFILE '.cache\loop-manager\verify\tmp')
-```
-
-다른 경로를 선택했다면 진단에 기록된 실제 임시 경로를 대상으로 제외를 설정한다.
-
-폴더 제외 후에도 Defender의 CPU 점유와 verify 지연이 계속되면 성능 기록으로 원인 프로세스를 확인한 뒤 실제 실행 파일의 전체 경로에 대한 프로세스 제외를 검토한다. 프로세스 제외는 그 프로세스가 여는 파일에 적용되므로 폴더 제외보다 범위가 넓다. 실행 파일 이름만으로 모든 같은 이름의 프로세스를 제외하거나 드라이브·사용자 임시 폴더 전체를 제외하지 않는다. 설정은 사용자가 선택하며 스크립트는 변경하지 않는다. [Microsoft 제외 설정 안내](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-exclusions-overview#process-exclusions)
-
-같은 사용자 계정에서 기본값을 사용하는 checkout과 worktree는 같은 테스트 임시 폴더를 사용하므로 실행 checkout마다 제외를 등록할 필요가 없다. 진단 로그는 단독 실행의 `.cache/verify/<실행 ID>/` 또는 Manager 실행의 `<state-dir>/logs/verify/<실행 ID>/`에 계속 남는다. 제외 전후에는 같은 검증 범위와 비슷한 부하에서 시간을 비교한다.
-
-## 재시도와 배정 중단
-
-RETRY 로그는 진행 중인 작업을 수동 제출 다음, 다른 일반 작업보다 먼저 재배정한다는 뜻이다. PLAN_BLOCKED이면 독립 작업은 계속 진행한다. Planner 필요 시 해당 프로젝트, runtime handoff 시 전체 프로젝트의 새 배정이 중단되고 실행 중 호출 반환을 기다린다. verify·실행 자리 대기는 작업 전체 완료로 취급하지 않으며 대기 시간은 timeout에서 제외한다.
+전송 실패는 개발 작업을 막지 않으며 미전송 부분부터 재시도한다. Telegram을 끄면 보류 payload를 취소한다. 전송 직후 DB 확인 전 중단에는 중복 가능성이 있다. 이 저장소의 검증 명령·임시 폴더·보고서는 [VERIFY](VERIFY.md)를 따른다.

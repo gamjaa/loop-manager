@@ -376,28 +376,19 @@ def run_verify_process(
             command = [sys.executable, "-c", _WINDOWS_VERIFY_BOOTSTRAP, *arguments]
         options["env"] = dict(os.environ if environment is None else environment)
         options["env"][BUDGET_DIRECTORY] = str(budget.directory)
-        from loop_manager_internal.storage import task_calls
-        receipt=None
         def confirmed_stop():
             nonlocal stopped
-            try:
-                budget.require_stopped()
-            except VerifyTerminationUncertain:
-                task_calls.verify_waiting_for_wsl(receipt,budget.directory)
-                raise
-            task_calls.verify_stopped(receipt)
+            budget.require_stopped()
             stopped = True
             if on_stopped:
                 on_stopped()
         try:
-            receipt=task_calls.prepare_verify_receipt()
             process = (launch_process or subprocess.Popen)(
                 command, cwd=worktree,
                 stdin=subprocess.PIPE if job else subprocess.DEVNULL,
                 stdout=output, stderr=subprocess.STDOUT, **options,
             )
             budget.active_processes += 1
-            task_calls.verify_started(receipt,process)
             if job:
                 job.assign(process)
                 assigned = True

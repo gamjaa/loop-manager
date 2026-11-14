@@ -246,37 +246,6 @@ class PerlAdapterTests(unittest.TestCase):
         self.assertTrue(any(event['name'] == 'module:' + self.unit.name
             and event['result'] == 'error' for event in summary['phases']))
 
-    def test_runner_dispatches_perl_compile_manifest_and_partial_fallback(self):
-        from types import SimpleNamespace
-        self.declaration['stages'].insert(0, {'id': 'compile', 'kind': 'command', 'cwd': '.',
-            'argv': ['{perl}', '-c', 'tests/example.t']})
-        self.connection()
-        for partial in (False, True):
-            logs = self.root / str(partial)
-            with mock.patch.object(runner.Path, 'cwd', return_value=self.root), \
-                    mock.patch.object(runner, 'install_guard'), mock.patch.dict(os.environ, {}, clear=True), \
-                    mock.patch.object(runner, 'VerifyCoordinator') as coordinator, \
-                    mock.patch.object(runner.subprocess, 'run', return_value=SimpleNamespace(stdout='revision')), \
-                    mock.patch.object(perl_adapter, 'collect_project', return_value=([self.unit], {'perl': 'v5.38.2'})) as collect, \
-                    mock.patch.object(perl_adapter, 'execute', return_value=True) as execute, \
-                    mock.patch.object(runner, 'execute_command', return_value=True) as command, \
-                    mock.patch.object(sys, 'stdout', io.StringIO()):
-                coordinator.return_value.open.return_value = ('session', 'secret')
-                coordinator.return_value.reservations = {}
-                self.assertEqual(runner.run(logs, 1, project_python=sys.executable,
-                    partial_base='base' if partial else None), 0)
-                if partial:
-                    command.assert_not_called()
-                    collect.assert_not_called()
-                    execute.assert_not_called()
-                    self.assertEqual(json.loads((logs / 'partial-result.json').read_text())['status'], 'FALLBACK')
-                else:
-                    self.assertEqual(command.call_args.args[0][:3], [self.tool,
-                        '-I' + str(perl_adapter.REPORTER.parent), '-MLoopManagerVerifyGuard'])
-                    manifest = json.loads((logs / 'manifest.json').read_text())
-                    self.assertEqual(manifest['adapter'], 'perl-tap')
-                    self.assertEqual(manifest['stages'][1]['tool']['perl'], 'v5.38.2')
-                    self.assertEqual(manifest['stages'][1]['units'][0]['argv'][-1], '--perl-worker')
 
     def test_completed_plan_bailout_with_zero_exit_never_completes(self):
         records = [
@@ -311,11 +280,8 @@ class PerlAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(sys, 'platform', 'win32'), \
                 mock.patch.object(integration, 'TrustedRunnerPort'), \
                 mock.patch.object(integration, 'language_case', side_effect=lambda root, path, port, language, coordinated, failing, revision:
-                    {'run_id': f'{language}-{coordinated}-{failing}', 'revision': revision, 'adapter': 'unittest'}) as language, \
-                mock.patch.object(integration, 'partial_case', return_value={
-                    'partial_run': 'partial', 'full_run': 'full', 'fixture_revision': 'fixture'}) as partial:
+                    {'run_id': f'{language}-{coordinated}-{failing}', 'revision': revision, 'adapter': 'unittest'}) as language:
             result = integration.execute(Path(directory), Path(directory), mock.Mock(), mock.Mock(), 10, 'parent', 'integration', 'head')
             self.assertEqual(language.call_count, 4)
             self.assertTrue(all(call.args[3] == 'python' for call in language.call_args_list))
             self.assertEqual(sum(case['status'] == 'SKIP' for case in result['cases']), 4)
-            partial.assert_called_once()

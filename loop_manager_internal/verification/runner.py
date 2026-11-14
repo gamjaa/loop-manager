@@ -7,7 +7,6 @@ import math
 import os
 import platform
 from pathlib import Path
-import py_compile
 import shutil
 import subprocess
 import sys
@@ -19,7 +18,7 @@ import uuid
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.verification.coordination import CoordinatorClient, VerifyCoordinator
 from loop_manager_internal.verification.guard import MARKER, install_guard, _local
-from loop_manager_internal.verification.unittest_adapter import (worker_main, start_worker, stop_worker, failure_output, compile_project)
+from loop_manager_internal.verification.unittest_adapter import worker_main, start_worker, stop_worker, failure_output
 from loop_manager_internal.verification.manifest import validate_report
 from loop_manager_internal.verification.contract import VERSION, ADAPTERS, ContractError, load, fields
 from loop_manager_internal.verification import unittest_adapter, perl_adapter
@@ -27,9 +26,9 @@ from loop_manager_internal.verification.core import execute_command
 from loop_manager_internal.verification.execution_clock import ExecutionClock, BUDGET_DIRECTORY, VerifyBudgetError
 from loop_manager_internal.verification.resources import DEFAULT_WORKER_BYTES, ResourceSampler, parse_parallelism, process_memory
 from loop_manager_internal.verification.timing import (
-    EventWriter, TimedResult, atomic_json, bytecode_cache_changes,
+    EventWriter, atomic_json, bytecode_cache_changes,
     bytecode_cache_snapshot, bytecode_policy, comparison, diagnostic,
-    fixture_timing, phase, summarize,
+    phase, summarize,
 )
 
 
@@ -56,7 +55,7 @@ def execution_queue(modules, directory, metadata, manifest, stage_id):
         prior_manifest = json.loads((history.parent / "manifest.json").read_text(encoding="utf-8"))
         if (type(prior_manifest.get("version")) is not int or prior_manifest["version"] != VERSION
                 or prior_manifest.get("run_id") != previous["metadata"]["run_id"]
-                or previous["metadata"].get("mode") not in ("full", "partial")):
+                or previous["metadata"].get("mode") != "full"):
             return original
         prior_index = next(index for index, item in enumerate(prior_manifest["stages"])
                            if item["id"] == stage_id)
@@ -118,7 +117,7 @@ def execute_manifest(modules, directory, writer, client, *, spawn=None, sleep=ti
                    failure_output=failure_output, coverage=lambda unit, report: report["completed"] + report.get("fixture_skipped", []), sleep=sleep)
 
 
-def run(directory, cap, timeout=600, project_python=None, partial_base=None):
+def run(directory, cap, timeout=600, project_python=None):
     connection = load(Path.cwd(), project_python=project_python or sys.executable)
     if connection is None:
         raise ContractError("scripts/verify.json is required for the common runner")
@@ -127,7 +126,7 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
     if integration_stage:
         from loop_manager_internal.verification.integration import _require_orchestrator
         _require_orchestrator()
-        if os.name == 'nt' and not partial_base:
+        if os.name == 'nt' :
             raise ContractError('Loop Manager full integration requires WSL; use scripts/verify.ps1')
     observation = json.loads(os.environ["LOOP_MANAGER_VERIFY_OBSERVER"]) if "LOOP_MANAGER_VERIFY_OBSERVER" in os.environ else None
     observer = None
@@ -159,8 +158,6 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
     writer = EventWriter(directory / "runner.jsonl", identity=writer_identity)
     coordinator = None
     session = None
-    partial = None
-    partial_status = "ERROR"
     preserve_budget = False
     termination_uncertain = False
     try:
@@ -189,7 +186,7 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
             client, coordinated = LocalClient(), False
         def git_value(*arguments):
             return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=5).stdout.strip()
-        metadata = writer.emit("run_start", version=VERSION, run_id=run_id, mode="partial" if partial_base else "full", adapter=connection.adapter, adapter_support=ADAPTERS[connection.adapter], revision=git_value("rev-parse", "HEAD"), git=git_value("--version"),
+        metadata = writer.emit("run_start", version=VERSION, run_id=run_id, mode="full", adapter=connection.adapter, adapter_support=ADAPTERS[connection.adapter], revision=git_value("rev-parse", "HEAD"), git=git_value("--version"),
                     python=sys.version, command=sys.argv, cap=cap, coordinated=coordinated,
                     bytecode_policy=bytecode_policy(),
                     execution_context={"python": str(connection.python), "stages": list(connection.stages),
@@ -203,17 +200,6 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                 bytecode_before = bytecode_cache_snapshot(Path.cwd())
             passed = True
             manifest_stages = []
-            if partial_base and (connection.adapter != "unittest" or len([stage for stage in connection.stages if stage["kind"] == "tests"]) != 1
-                                 or connection.stages[0]["kind"] != "tests"):
-                from loop_manager_internal.verification import impact
-                partial = {"fallback": ["unsupported_stage_layout"], "head": git_value("rev-parse", "HEAD"),
-                    "base": git_value("rev-parse", partial_base + "^{commit}"), "modules": [], "ids": [], "reasons": {},
-                    "total_modules": None, "total_tests": None, "manifest_identity": None,
-                    "configuration_identity": impact.digest({"adapter": connection.adapter,
-                        "python": str(connection.python), "stages": connection.stages}),
-                    "algorithm": f"python-ast-impact-v{impact.VERSION}/index-v{impact.code_index.VERSION}"}
-                partial_status = "FALLBACK"
-                return 0
             for index, stage in enumerate(connection.stages):
                 remaining = budget.remaining(timeout)
                 if remaining is not None and remaining <= 0:
@@ -226,38 +212,18 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                         modules, project_python = adapter.collect_project(connection, stage, stage_directory,
                             run_id, entrypoint, remaining, execute_command, writer, client)
                         chosen = modules
-                        if partial_base:
-                            from loop_manager_internal.verification import impact
-                            with phase("impact_selection", writer=writer):
-                                selection = impact.select(connection.root, partial_base, modules,
-                                    {"adapter": connection.adapter, "python": str(connection.python),
-                                     "stages": connection.stages}, stage["collection"]["directory"])
-                            partial = selection.serialize()
-                            writer.emit("partial_selection", **partial)
-                            if selection.fallback:
-                                partial_status = "FALLBACK"
-                            else:
-                                chosen = impact.selected_modules(selection, modules)
                         units = [{"id": module.name, "ids": list(module.ids),
                             "argv": [str(connection.python) if connection.adapter == "unittest" else sys.executable, "-u", str(entrypoint), "--worker" if connection.adapter == "unittest" else "--perl-worker"],
                             "cwd": str(connection.root / stage["cwd"]), "execution": stage["execution"],
-                            "payload": asdict(module), **({"status": "SELECTED" if module in chosen and partial_status != "FALLBACK" else "NOT_SELECTED"} if partial_base else {})} for module in modules]
+                            "payload": asdict(module)} for module in modules]
                         manifest_stages.append({"id": stage["id"], "kind": "tests", "python" if connection.adapter == "unittest" else "tool": project_python, "units": units})
                         atomic_json(directory / "manifest.json", {"version": VERSION, "run_id": run_id,
                             "adapter": connection.adapter, "adapter_version": ADAPTERS[connection.adapter]["version"], "stages": manifest_stages})
-                        if partial_status == "FALLBACK" and partial_base:
-                            return 0
-                        if partial_base:
-                            impact.assert_candidate(connection.root, selection.head, selection.base)
                         queue = execution_queue(chosen, directory, metadata,
                             {"version": VERSION, "adapter": connection.adapter,
                              "adapter_version": ADAPTERS[connection.adapter]["version"], "stages": manifest_stages}, stage["id"]) if connection.adapter == "unittest" else chosen
                         writer.emit("execution_queue", units=[unit.name for unit in queue])
                         passed = adapter.execute(connection, stage, queue, stage_directory, writer, client, run_id, entrypoint)
-                        if partial_base:
-                            impact.assert_candidate(connection.root, selection.head, selection.base)
-                            partial_status = "PASS" if passed else "FAIL"
-                            break  # Mandatory commands remain part of the later full verify.
                     elif stage['kind'] == 'runner-integration':
                         from loop_manager_internal.verification import integration
                         units = [{'id': identity, 'ids': [identity], 'execution': 'serial'} for identity in integration.case_ids()]
@@ -291,7 +257,7 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
             remaining = budget.remaining(timeout)
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("verify total timeout")
-            if passed and not partial_base and [stage['id'] for stage in manifest_stages] != [stage['id'] for stage in connection.stages]:
+            if passed  and [stage['id'] for stage in manifest_stages] != [stage['id'] for stage in connection.stages]:
                 raise ContractError('missing mandatory verify stage')
             writer.emit("run_end", version=VERSION, run_id=run_id, passed=passed, memory=process_memory(),
                         budget=budget.snapshot(timeout),
@@ -301,8 +267,6 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
         if isinstance(error, VerifyTerminationUncertain):
             preserve_budget = True
             termination_uncertain = True
-        if partial_base:
-            partial_status = "ERROR"
         if isinstance(error, VerifyBudgetError):
             preserve_budget = True
             # session 종료가 누계 파일을 갱신하기 전에 실패한 원본을 남긴다.
@@ -312,11 +276,6 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
     finally:
         try:
             writer.close()
-            if partial_base:
-                atomic_json(directory / "partial-result.json", {"version": 1, "kind": "partial_verify",
-                    "run_id": run_id, "status": partial_status, "selection": partial,
-                    "duration": time.monotonic() - started_at,
-                    "diagnostic": str(directory / "summary.json")})
             if coordinator and session:
                 if coordinator.reservations:
                     atomic_json(directory / "uncertain-reservations.json", coordinator.reservations)
@@ -350,7 +309,6 @@ def main():
     parser.add_argument("--collect", type=Path)
     parser.add_argument("--compile", nargs="+", type=Path)
     parser.add_argument("--project-python", type=Path)
-    parser.add_argument("--partial-base", default=os.environ.get("LOOP_MANAGER_VERIFY_PARTIAL_BASE"))
     parser.add_argument("--timeout", type=float, default=os.environ.get("LOOP_MANAGER_VERIFY_TIMEOUT"))
     parser.add_argument("--report", nargs="+", type=Path)
     parser.add_argument("--parallelism", default=os.environ.get("LOOP_MANAGER_VERIFY_PARALLELISM", "auto"))
@@ -391,19 +349,17 @@ def main():
         # Older coordinated Managers own the outer deadline but do not transmit it.
         timeout = arguments.timeout if arguments.timeout is not None else (
             None if coordinated or "LOOP_MANAGER_VERIFY_OBSERVER" in os.environ else 600)
-        return run(directory, cap, timeout, arguments.project_python, arguments.partial_base)
+        return run(directory, cap, timeout, arguments.project_python)
     # 단독 스크립트도 기존 전체 verify timeout과 자식 종료 확인 경계를 사용한다.
     from loop_manager_internal.execution.verify_process import run_verify_process
     environment = dict(os.environ, LOOP_MANAGER_VERIFY_LOG_DIR=str(directory), PYTHONIOENCODING="utf-8")
-    if arguments.partial_base:
-        environment["LOOP_MANAGER_VERIFY_PARTIAL_BASE"] = arguments.partial_base
     timeout = arguments.timeout if arguments.timeout is not None else 600
     config = Path("config/config.ini")
     if config.is_file():
-        from loop_manager_internal.config.managed_config import load_managed_config
-        managed = load_managed_config(config)
+        from loop_manager_internal.config.settings import Settings
+        managed = Settings(config)
         if arguments.timeout is None:
-            timeout = managed.verify_timeout_seconds
+            timeout = managed.verify_timeout
         if "--parallelism" not in sys.argv and "LOOP_MANAGER_VERIFY_PARALLELISM" not in os.environ:
             cap = managed.verify_parallelism
     passed, timed_out, output = run_verify_process(

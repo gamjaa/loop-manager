@@ -25,13 +25,14 @@ Copy-Item -LiteralPath (Join-Path $sourceRoot '.agents') -Destination (Join-Path
 $directories = @(
     (Join-Path $target 'docs')
     (Join-Path $target 'docs/plans')
+    (Join-Path $target 'docs/plans/archive')
     (Join-Path $target 'docs/requirements')
     (Join-Path $target 'docs/requirements/archive')
 )
 New-Item -ItemType Directory -Path $directories | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $sourceRoot 'docs/PLANS.md') -Destination (Join-Path $target 'docs/PLANS.md')
-Copy-Item -LiteralPath (Join-Path $sourceRoot 'docs/FUTURE_IDEAS.md') -Destination (Join-Path $target 'docs/FUTURE_IDEAS.md')
+Set-Content -LiteralPath (Join-Path $target 'docs/FUTURE_IDEAS.md') -Value '# 후속 아이디어' -Encoding utf8
 Get-ChildItem -LiteralPath (Join-Path $sourceRoot 'docs') -Filter '*.template.md' |
     Copy-Item -Destination (Join-Path $target 'docs')
 

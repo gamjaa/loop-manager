@@ -28,11 +28,11 @@ fi
 cp -R "$source_root/.agents" "$target/.agents"
 
 mkdir -p \
-    "$target/docs/plans" \
+    "$target/docs/plans/archive" \
     "$target/docs/requirements/archive"
 
 cp "$source_root/docs/PLANS.md" "$target/docs/PLANS.md"
-cp "$source_root/docs/FUTURE_IDEAS.md" "$target/docs/FUTURE_IDEAS.md"
+printf '# 후속 아이디어\n' > "$target/docs/FUTURE_IDEAS.md"
 cp "$source_root"/docs/*.template.md "$target/docs/"
 cp "$source_root/docs/PRODUCT.template.md" "$target/docs/PRODUCT.md"
 cp "$source_root/docs/ARCHITECTURE.template.md" "$target/docs/ARCHITECTURE.md"

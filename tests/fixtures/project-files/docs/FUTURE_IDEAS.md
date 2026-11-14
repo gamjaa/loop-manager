@@ -1,1 +1,0 @@
-# Future ideas fixture
