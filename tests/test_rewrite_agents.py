@@ -12,9 +12,23 @@ from loop_manager_internal.agents.runner import Agent,arguments,decode_events,de
 from loop_manager_internal.storage.state import Store
 from loop_manager_internal.execution.processes import run
 from loop_manager_internal.execution.validation import verify_command,verify
+from loop_manager_internal.config.settings import Settings
 
 
 class AgentContractTests(unittest.TestCase):
+    def test_example_models_and_reachable_worker_profiles_are_complete(self):
+        root=Path(__file__).resolve().parents[1]
+        settings=Settings(root/'config/config.ini.example')
+        self.assertFalse(hasattr(settings,'verify_parallelism'))
+        for provider in ('codex','claude'):
+            self.assertEqual(set(settings.values[f'{provider}.models']),{'fast','balanced','strong','frontier'})
+            for complexity in ('low','medium','high'):
+                for risk in ('low','critical'):
+                    model,effort=settings.profile(provider,'worker',complexity,risk)
+                    self.assertTrue(model)
+                    self.assertTrue(effort)
+            self.assertEqual(settings.profile(provider,'reviewer','low','low')[0],settings.values[f'{provider}.models']['strong'])
+
     def test_guidance_contains_ponytail_exactly_once_only_for_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

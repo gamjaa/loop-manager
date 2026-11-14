@@ -14,7 +14,6 @@ Windows는 Python 3.13 이상과 PowerShell 7을 사용한다. Agent는 Provider
 |---|---|
 | `[loop] max_workers` | 전체 프로젝트 Planner·Worker·Reviewer 공통 AI 한도, 양수 |
 | `verify_timeout_seconds` | 필수 Verify 실제 실행 제한, 양수 초. 자원 대기 제외 |
-| `verify_parallelism` | 이 저장소 자체 검증 도구의 내부 병렬도. `auto` 또는 양수. 다른 프로젝트에 강제하지 않음 |
 | `[provider.models]` | 모델 별칭과 실제 모델 이름 |
 | `[provider.roles] planner`, `reviewer` | `모델별칭,effort` |
 | `[provider.worker] level1`–`level6` | complexity low/medium/high의 1/3/5에 critical risk일 때만 1을 더해 선택 |

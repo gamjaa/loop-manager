@@ -3,8 +3,6 @@
 ; Planner·Worker·Reviewer 공통 AI 한도. 프로젝트 Worker 1, 전역 Verify 1은 고정이다.
 max_workers = 3
 verify_timeout_seconds = 600
-; 이 저장소 자체 Verify의 내부 병렬도. 등록 프로젝트에는 강제하지 않는다.
-verify_parallelism = auto
 
 [telegram]
 ; 둘 다 비우면 미사용. 하나만 입력하면 설정 오류다.
@@ -15,8 +13,10 @@ chat_id =
 fast_mode = false
 
 [codex.models]
-strong = gpt-6.1-sol
+fast = gpt-6-luna
 balanced = gpt-6.1-terra
+strong = gpt-6.1-sol
+frontier = gpt-6-astra
 
 [codex.roles]
 planner = strong,high
@@ -35,13 +35,14 @@ level6 = strong,xhigh
 fast_mode = false
 
 [claude.models]
-strong = claude-opus-5-5
+fast = claude-haiku-5-5
 balanced = claude-sonnet-5-5
-review = claude-opus-5
+strong = claude-opus-5-5
+frontier = claude-fable-5-2
 
 [claude.roles]
 planner = strong,medium
-reviewer = review,high
+reviewer = strong,high
 
 [claude.worker]
 level1 = balanced,low

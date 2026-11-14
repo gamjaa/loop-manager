@@ -44,7 +44,7 @@ POSIX 자체 검증은 `bash scripts/verify.sh`다. Python unittest와 compile, 
 ## 시간·병렬도·진단
 
 - 전체 실행 제한: `LOOP_MANAGER_VERIFY_TIMEOUT`(초, 기본 600).
-- 자체 도구 내부 병렬도: `LOOP_MANAGER_VERIFY_PARALLELISM` 또는 `config/config.ini`의 `verify_parallelism`. `auto`는 CPU·메모리 부하와 예약을 확인하고 관측 불확실 시 직렬로 축소한다.
+- 자체 도구 내부 병렬도: `LOOP_MANAGER_VERIFY_PARALLELISM` 또는 러너의 `--parallelism`. 기본 `auto`는 CPU·메모리 부하와 예약을 확인하고 관측 불확실 시 직렬로 축소한다. Manager 설정과는 분리한다.
 - Windows 임시 폴더: `LOOP_MANAGER_VERIFY_TEMP_DIR`. 기본값은 사용자 홈 아래 `.cache/loop-manager/verify/tmp`다. Defender 제외를 설정한다면 이 전용 임시 경로만 사용자가 직접 판단해 지정한다.
 - 실행 보고서: `.cache/verify/<run-id>/`의 `result.json`, 각 단계의 `summary.json`·manifest·진단. 테스트 결과와 WSL/native 상태를 구분한다. 운영 G의 장기 결과 저장소가 아니다.
 

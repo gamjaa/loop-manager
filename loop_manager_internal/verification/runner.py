@@ -360,8 +360,6 @@ def main():
         managed = Settings(config)
         if arguments.timeout is None:
             timeout = managed.verify_timeout
-        if "--parallelism" not in sys.argv and "LOOP_MANAGER_VERIFY_PARALLELISM" not in os.environ:
-            cap = managed.verify_parallelism
     passed, timed_out, output = run_verify_process(
         [sys.executable, "-u", str(Path(__file__).with_name("entrypoint.py")), "--execute", "--parallelism", str(cap), "--timeout", str(timeout), "--project-python", str(arguments.project_python or sys.executable)],
         Path.cwd(), timeout, environment=environment, job_scope=True)
