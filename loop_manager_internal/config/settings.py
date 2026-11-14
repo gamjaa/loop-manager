@@ -12,7 +12,6 @@ class Settings:
         self.max_ai = self.values.getint('loop','max_workers')
         self.verify_timeout = self.values.getint('loop','verify_timeout_seconds')
         self.agent_timeout = 3600
-        self.verify_parallelism = self.values.get("loop","verify_parallelism",fallback="auto")
         if self.max_ai<1 or self.verify_timeout<1:
             raise ValueError('AI 한도와 Verify timeout은 양수여야 합니다.')
         self.telegram_token = self.values.get('telegram','token',fallback='').strip()

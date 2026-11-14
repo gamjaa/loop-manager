@@ -556,8 +556,6 @@ def windows_main(root):
         config = Settings(root / 'config/config.ini')
         if 'LOOP_MANAGER_VERIFY_TIMEOUT' not in os.environ:
             timeout = config.verify_timeout
-        if 'LOOP_MANAGER_VERIFY_PARALLELISM' not in os.environ:
-            cap = config.verify_parallelism
     if not math.isfinite(timeout) or timeout <= CLEANUP_SECONDS:
         raise ValueError(f'전체 verify 시간은 {CLEANUP_SECONDS}초보다 커야 합니다.')
     directory = Path(os.environ.get('LOOP_MANAGER_VERIFY_LOG_DIR', root / '.cache/verify' / uuid.uuid4().hex)).resolve()
