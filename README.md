@@ -22,7 +22,7 @@ Copy-Item config/config.ini.example config/config.ini
 
 ## 프로젝트 준비
 
-빈 문서 구조는 `bash scripts/copy-project-files.sh /path/to/project` 또는 `pwsh -File scripts/copy-project-files.ps1 -TargetPath D:\repo\project`로 복사한다. 기존 `.agents`나 `docs`가 있으면 중단하므로 기존 프로젝트에는 필요한 파일을 직접 병합한다.
+빈 문서 구조는 `bash scripts/copy-project-files.sh /path/to/project` 또는 `pwsh -File scripts/copy-project-files.ps1 -TargetPath D:\repo\project`로 복사한다. 두 스크립트 모두 기존 폴더를 재사용하고 같은 이름의 파일을 덮어쓰며, 복사 대상과 같은 이름의 스킬 폴더(`.agents/skills/<스킬명>`)는 삭제 후 교체하며, 그 밖의 복사 대상이 아닌 기존 파일과 스킬은 보존한다. 재실행하면 `PRODUCT.md`·`ARCHITECTURE.md`는 템플릿으로, `FUTURE_IDEAS.md`는 빈 문서로 덮어쓴다.
 
 `docs/PRODUCT.md`, `docs/ARCHITECTURE.md`, 활성 `docs/requirements/*.md`를 작성해 원격 base에 commit·push한다. Planner의 `docs/plans/*.md`는 계획 PR을 검토·Merge한 뒤 실행한다. 사용자가 base에 직접 반영한 유효한 G도 실행하며 `draft: true`인 G는 제외한다. 필수 검증 명령은 프로젝트가 제공한다. [Verify 계약](docs/VERIFY.md)
 

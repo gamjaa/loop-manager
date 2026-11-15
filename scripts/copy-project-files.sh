@@ -15,21 +15,20 @@ if [[ ! -d "$target" ]]; then
 fi
 
 target="$(cd -- "$target" && pwd)"
-conflicts=()
-
-for path in "$target/.agents" "$target/docs"; do
-    [[ -e "$path" || -L "$path" ]] && conflicts+=("$path")
-done
-if (( ${#conflicts[@]} > 0 )); then
-    printf '이미 존재하는 파일 또는 폴더: %s\n' "${conflicts[@]}" >&2
+if [[ "$target" == "$source_root" ]]; then
+    echo '복사 원본과 같은 디렉터리는 지정할 수 없습니다.' >&2
     exit 1
 fi
-
-cp -R "$source_root/.agents" "$target/.agents"
-
 mkdir -p \
+    "$target/.agents" \
     "$target/docs/plans/archive" \
     "$target/docs/requirements/archive"
+
+for skill in "$source_root/.agents/skills/"*/; do
+    [[ -d "$skill" ]] || continue
+    rm -rf -- "$target/.agents/skills/$(basename -- "$skill")"
+done
+cp -Rf "$source_root/.agents/." "$target/.agents/"
 
 cp "$source_root/docs/PLANS.md" "$target/docs/PLANS.md"
 printf '# 후속 아이디어\n' > "$target/docs/FUTURE_IDEAS.md"
